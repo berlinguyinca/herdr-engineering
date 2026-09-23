@@ -1,0 +1,85 @@
+version: 1
+repository: berlinguyinca/herdr-engineering
+product: "Super HerdR / HerdR Engineering"
+status: spec-complete-implementation-not-started
+normative_specs_root: docs/specs
+ordering_policy: dependency-gated
+
+supersedes:
+  - repository: berlinguyinca/herdr-powerpack
+    reason: "planned but not implemented; folded into herdr-engineering"
+  - concept: custom-herdr-remote-machine-aggregator
+    reason: "current Herdr native saved machines and --machine forwarding provide the base primitive"
+
+phases:
+  - id: "0010"
+    file: docs/specs/0010-repository-bootstrap-and-reconciliation.md
+    depends_on: []
+  - id: "0020"
+    file: docs/specs/0020-upstream-audit-and-compatibility.md
+    depends_on: ["0010"]
+  - id: "0030"
+    file: docs/specs/0030-native-herdr-contracts.md
+    depends_on: ["0020"]
+  - id: "0040"
+    file: docs/specs/0040-fleet-bootstrap-and-ansible.md
+    depends_on: ["0030"]
+  - id: "0050"
+    file: docs/specs/0050-powerpack-distribution-and-lifecycle.md
+    depends_on: ["0020", "0030", "0040"]
+  - id: "0060"
+    file: docs/specs/0060-web-mobile-control-surface.md
+    depends_on: ["0050"]
+  - id: "0070"
+    file: docs/specs/0070-browser-preview-and-plannotator.md
+    depends_on: ["0050", "0060"]
+  - id: "0080"
+    file: docs/specs/0080-shared-artifact-workspace.md
+    depends_on: ["0040", "0050"]
+  - id: "0090"
+    file: docs/specs/0090-session-journal-and-timeline.md
+    depends_on: ["0030", "0060", "0080"]
+  - id: "0100"
+    file: docs/specs/0100-pi-engineering-autospec-integration.md
+    depends_on: ["0030", "0090"]
+  - id: "0110"
+    file: docs/specs/0110-transparent-dev-fabric.md
+    depends_on: ["0040", "0060", "0070"]
+  - id: "0120"
+    file: docs/specs/0120-unified-test-protocol-and-explorer.md
+    depends_on: ["0060", "0090", "0100"]
+  - id: "0130"
+    file: docs/specs/0130-woodpecker-pileated-ci.md
+    depends_on: ["0060", "0090", "0120"]
+  - id: "0140"
+    file: docs/specs/0140-multi-agent-worktree-comparison.md
+    depends_on: ["0070", "0100", "0110", "0120", "0130"]
+  - id: "0150"
+    file: docs/specs/0150-unified-engineering-ux.md
+    depends_on: ["0090", "0110", "0120", "0130", "0140"]
+  - id: "0160"
+    file: docs/specs/0160-attention-notifications-review.md
+    depends_on: ["0090", "0130", "0150"]
+  - id: "0170"
+    file: docs/specs/0170-observability-security-update-rollback.md
+    depends_on: ["0050", "0090", "0110", "0120", "0130", "0160"]
+  - id: "0180"
+    file: docs/specs/0180-fleet-validation-release-and-docs.md
+    depends_on: ["0170"]
+
+required_cross_cutting_contracts:
+  - docs/contracts/activity-event.md
+  - docs/contracts/artifact-ref.md
+  - docs/contracts/dev-service-lease.md
+  - docs/contracts/test-event.md
+  - docs/contracts/ci-event.md
+
+implementation_evidence:
+  status_file: STATUS.md
+  acceptance_matrix: docs/acceptance-matrix.md
+  required_per_phase:
+    - code_or_config
+    - automated_tests
+    - reproducible_validation_command
+    - documentation
+    - commit_or_pr_reference

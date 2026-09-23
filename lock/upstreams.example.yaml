@@ -1,0 +1,19 @@
+version: 1
+# Populated by phase 0020. Never treat these example names as approved pins.
+dependencies:
+  herdr:
+    source: "official"
+    revision: null
+    decision: pending-audit
+  herdr-browser:
+    source: "StructuPath/herdr-browser"
+    revision: null
+    decision: pending-audit
+  herdr-web:
+    source: "eyalev/herdr-web"
+    revision: null
+    decision: pending-audit
+  herdr-plannotator:
+    source: "plannotator/herdr-plannotator"
+    revision: null
+    decision: pending-audit

@@ -1,0 +1,27 @@
+# Secrets / private config
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+ansible/inventory/private*
+ansible/**/vault*
+
+# Runtime state
+.herdr-engineering/
+state/
+cache/
+artifacts/
+*.db
+*.sqlite*
+
+# Local tooling
+.DS_Store
+.idea/
+.vscode/
+__pycache__/
+node_modules/
+target/
+dist/
+build/

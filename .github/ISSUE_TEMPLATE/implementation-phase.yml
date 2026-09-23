@@ -1,0 +1,28 @@
+name: Implementation phase
+about: Track one dependency-gated HerdR Engineering phase
+body:
+  - type: input
+    id: spec
+    attributes:
+      label: Spec
+      placeholder: "0110-transparent-dev-fabric"
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies / entry gates
+    validations:
+      required: true
+  - type: textarea
+    id: deliverables
+    attributes:
+      label: Deliverables
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Validation evidence / exit gate
+    validations:
+      required: true

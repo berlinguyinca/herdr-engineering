@@ -1,0 +1,66 @@
+You are in the PARENT directory where the new HerdR Powerpack repository should live.
+
+Implement the cumulative GREENFIELD specification in `herdr-powerpack-specs-v2.zip`.
+
+NOTHING HAS BEEN IMPLEMENTED YET. This is not a migration. Build the initial architecture from the complete spec.
+
+MANDATORY FIRST:
+1. Locate/unzip the ZIP (current directory or ~/Downloads).
+2. Read EVERY spec.
+3. Execute Phase 0 research/brainstorming BEFORE production code.
+4. Freshly inspect current HerdR plugin, event, session, socket, persistence, UI, marketplace and packaging APIs.
+5. Independently verify every named upstream repository and search for better/current alternatives.
+6. Create:
+   - docs/upstream-audit.md
+   - docs/shared-filesystem-decision.md
+   - docs/session-journal-design.md
+7. Explicitly identify stale or incorrect assumptions in the supplied specs before committing to architecture.
+
+Create `berlinguyinca/herdr-powerpack`, preferably in a new `herdr-powerpack` repo in this parent directory, following CURRENT HerdR conventions.
+
+CORE PRINCIPLE: REUSE FIRST.
+Powerpack is a thin curated meta-plugin/distribution. Do not reimplement HerdR, Chromium, mobile clients, Pi/Pi Web, Pi Engineering, AutoSpec, Plannotator, GitHub clients, file viewers, timeline systems, swarm/worktree systems, or other functionality already adequately supplied by maintained compatible upstream projects.
+
+SHARED FILESYSTEM IS CORE:
+We need one shared contributor/agent workspace across participating Linux/macOS machines. Do not invent a HerdR filesystem. During Phase 0 compare mature existing technologies appropriate for private/Tailscale networking, concurrency, offline/reconnect, permissions, performance and failure recovery. Document the decision. Integrate it through Powerpack and an existing HerdR file viewer where possible. Shared-storage failure must never corrupt local project work. Never sync credential stores/home directories by default.
+
+SESSION PANEL IS CORE:
+Every agent session needs an automatically populated panel with:
+- how it started / requested work
+- CURRENT activity
+- newest-first timeline
+- completed work
+- next step if known
+- host/repo/branch/worktree/model context where available
+- artifacts/files/screenshots/reports
+- Git/browser/Plannotator/mission references
+
+Reuse HerdR's event/session APIs and existing timeline plugins where possible. Pi Engineering should emit concise semantic events rather than forcing terminal-output inference.
+
+NEVER CAPTURE OR DISPLAY HIDDEN CHAIN-OF-THOUGHT. Journal only observable actions, user-visible statements, tool activity, build/test outcomes, file/git changes and concise factual status summaries.
+
+SUMMARIZATION:
+Maintain Started / Completed / Current / Next incrementally. Do not repeatedly feed entire transcripts to an LLM. Prefer deterministic event formatting; when summarization needs an LLM, summarize previous summary + new events and use existing Pi/InferWeave routing.
+
+ARTIFACTS:
+Make artifacts first-class references connecting the session timeline to shared files, browser inspection, Git and review tools. Avoid duplicating large blobs in journal storage.
+
+BOUNDARIES:
+Pi Engineering owns missions/orchestration. AutoSpec owns spec/issue workflow. Plannotator owns review semantics. HerdR hosts sessions/workspaces. Powerpack integrates. Do not introduce a competing task state machine.
+
+SECURITY:
+Pin reviewed dependencies, inventory licenses/provenance/install hooks/ports/permissions, redact secrets, detect unsafe listeners, keep CDP/dev services private, and default remote access to Tailscale/private networking.
+
+DEPLOYMENT:
+Support Linux/macOS and existing Ansible workflows. Current validation hosts include fry, beast, bender and macbook-m4 but do not hard-code them. Headless systems must degrade gracefully. Preserve existing Pi/InferWeave configuration.
+
+WORKING STYLE:
+- visible checklist/progress
+- show research conclusions before coding
+- run tests and show output
+- commit coherent milestones
+- prefer thin adapters/configuration over forks
+- inspect upstream rather than guessing
+- before completion, audit implementation against EVERY spec and explicitly list justified deferrals
+
+Begin with Phase 0 now. Do not write production implementation until the three required design/audit documents are complete.

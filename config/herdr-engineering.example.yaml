@@ -1,0 +1,36 @@
+version: 1
+
+herdr:
+  capability_cache_ttl_seconds: 30
+
+web:
+  private_only: true
+
+artifacts:
+  provider: filesystem
+  root: "${HERDR_ENGINEERING_ARTIFACT_ROOT:-~/.local/share/herdr-engineering/artifacts}"
+  retention_days: 30
+
+dev_fabric:
+  enabled: true
+  logical_service_name: dev
+  external_port_range: [18000, 28999]
+  lease_ttl_seconds: 90
+  heartbeat_seconds: 30
+  private_only: true
+  allowed_protocols: [http, https, tcp]
+
+tests:
+  adapters: [pytest, go, cargo, junit, scala]
+
+ci:
+  provider: woodpecker
+  pileated_extensions: auto
+
+notifications:
+  enabled: true
+  minimum_severity: notice
+
+security:
+  allow_public_listeners: false
+  persist_hidden_reasoning: false

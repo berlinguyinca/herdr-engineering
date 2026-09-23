@@ -1,0 +1,13 @@
+all:
+  children:
+    herdr_fleet:
+      children:
+        linux:
+          hosts:
+            fry: {}
+            beast: {}
+            bender: {}
+        macos:
+          hosts:
+            macbook-m4: {}
+# Connection addresses/users belong in private inventory/group_vars, not this repository example.
