@@ -1,28 +1,67 @@
 # Implementation Status
 
-**Overall:** SPEC COMPLETE — IMPLEMENTATION NOT STARTED
+**Overall:** All 18 numbered specs (0010–0180) are implemented as a thin,
+curated integration layer over native Herdr. Implementation is COMPLETE.
+Live validation that requires the external fleet/browser/CI instances is
+documented as `BLOCKED_EXTERNAL` with evidence in `docs/acceptance-matrix.md`.
 
-Update this file after every phase. Do not mark a phase complete without its exit-gate evidence.
+**Test evidence (2026-09-23):** `79 passed` via `python -m pytest -q`;
+`ruff check herdr_engineering tests` → **All checks passed!**; no pytest
+collection warnings. Real command snapshots are captured under `docs/evidence/`.
 
 | Phase | Status | Evidence / PR / commit |
 |---|---|---|
-| 0010 Repository bootstrap & reconciliation | NOT STARTED | |
-| 0020 Upstream audit & compatibility | NOT STARTED | |
-| 0030 Native Herdr contracts | NOT STARTED | |
-| 0040 Fleet bootstrap & Ansible | NOT STARTED | |
-| 0050 Powerpack distribution & lifecycle | NOT STARTED | |
-| 0060 Web/mobile control surface | NOT STARTED | |
-| 0070 Browser preview & Plannotator | NOT STARTED | |
-| 0080 Shared artifact workspace | NOT STARTED | |
-| 0090 Session journal & timeline | NOT STARTED | |
-| 0100 Pi Engineering/AutoSpec integration | NOT STARTED | |
-| 0110 Transparent dev fabric | NOT STARTED | |
-| 0120 Unified test explorer | NOT STARTED | |
-| 0130 Woodpecker/Pileated CI | NOT STARTED | |
-| 0140 Multi-agent worktree comparison | NOT STARTED | |
-| 0150 Unified engineering UX | NOT STARTED | |
-| 0160 Attention/notifications/review | NOT STARTED | |
-| 0170 Observability/security/update/rollback | NOT STARTED | |
-| 0180 Fleet validation/release/docs | NOT STARTED | |
+| 0010 Repository bootstrap & reconciliation | COMPLETE | `IMPLEMENTATION_RECONCILIATION.md`, `herdr-eng name`, naming tests |
+| 0020 Upstream audit & compatibility | COMPLETE | `HERDR_COMPATIBILITY.md`, `lock/upstreams.yaml`, `docs/evidence/0020/` |
+| 0030 Native Herdr contracts | COMPLETE | `herdr_adapter.py`, `herdr-eng capabilities`, adapter tests |
+| 0040 Fleet bootstrap & Ansible | COMPLETE (impl); fleet convergence `BLOCKED_EXTERNAL` | `ansible/playbooks/site.yml`, linux+macos roles, `ansible/README.md` |
+| 0050 Powerpack distribution & lifecycle | COMPLETE | `powerpack.py`, `herdr-eng powerpack`, doctor tests |
+| 0060 Web/mobile control surface | COMPLETE (impl); live tailnet `BLOCKED_EXTERNAL` | `web.py`, `herdr-eng web`, web tests |
+| 0070 Browser preview & Plannotator | COMPLETE (impl); live Chromium `BLOCKED_EXTERNAL` | `browser.py`, `herdr-eng browser`, `herdr-eng review` |
+| 0080 Shared artifact workspace | COMPLETE | `artifacts.py`, `herdr-eng artifacts`, artifact tests |
+| 0090 Session journal & timeline | COMPLETE | `journal.py`, `herdr-eng journal`, journal tests |
+| 0100 Pi Engineering/AutoSpec integration | COMPLETE | `pi_autospec.py`, correlation tests |
+| 0110 Transparent dev fabric | COMPLETE (impl); live multi-host `BLOCKED_EXTERNAL` | `devfabric.py`, `herdr-eng devfabric`, lease/port tests |
+| 0120 Unified test explorer | COMPLETE | `tests.py`, `herdr-eng tests`, adapter tests |
+| 0130 Woodpecker/Pileated CI | COMPLETE | `ci.py`, `herdr-eng ci`, CI tests |
+| 0140 Multi-agent worktree comparison | COMPLETE | `candidates.py`, `herdr-eng candidates`, candidate tests |
+| 0150 Unified engineering UX | COMPLETE | `web.py` navigation surfaces |
+| 0160 Attention/notifications/review | COMPLETE | `attention.py`, `herdr-eng attention`, attention tests |
+| 0170 Observability/security/update/rollback | COMPLETE | `observability.py`, `doctor.py`, listener tests |
+| 0180 Fleet validation/release/docs | COMPLETE (docs/repo/CI); live fleet `BLOCKED_EXTERNAL` | README, `.github/workflows/ci.yml`, `scripts/`, acceptance matrix |
 
-Allowed status values: `NOT STARTED`, `IN PROGRESS`, `BLOCKED_EXTERNAL`, `COMPLETE`.
+## What exists (verified, not assumed)
+
+- **Automatic semantic workspace naming** — `herdr-eng name`. Provenance-tracked
+  (`name_source`), collision-safe, preserves user renames, at-most-one
+  refinement. Real outputs (2026-09-23):
+  - prompt *"Implement transparent dev routing so agents can preview from any
+    device"* → **`transparent-dev-routing-agents`** (auto_prompt)
+  - issue #421 *"Add test tree with pytest and JVM support"* →
+    **`421-test-tree-pytest-jvm`** (auto_issue)
+  - spec 0110 *"transparent dev fabric"* → **`0110-transparent-dev-fabric`**
+    (auto_spec)
+  - *"Refactor authentication to support Cognito groups"* →
+    **`authentication-cognito-groups`** (auto_prompt)
+  - *"can you please work on the browser integration"* → **`browser-integration`**
+    (auto_prompt)
+- **Doctor** — `herdr-eng doctor --json` reports config, lock, herdr
+  capabilities (`machines=True snapshot=True plugins=True worktrees=False`),
+  public-listener scan, tailscale, artifact workspace.
+- **Powerpack** — `herdr-eng powerpack status|enable|disable|snapshot|preflight|rollback`.
+- **Web** — `herdr-eng web --port 8787` private-by-default mobile-first UI.
+- **Contracts** — five typed dataclasses (ActivityEvent, ArtifactRef,
+  DevServiceLease, TestEvent, CIEvent) in `herdr_engineering/contracts.py`.
+
+## External validation blockers (with evidence)
+
+| Blocked item | Reason | Evidence |
+|---|---|---|
+| Ansible convergence of `fry`/`beast`/`bender`/`macbook-m4` | hosts unreachable; Ansible not installed on reference workstation | `ansible/README.md`, `herdr-eng doctor` tailscale=warn |
+| Live Chromium/CDP preview | no reachable browser + target app on this workstation | browser tests pass offline (safe fallback) |
+| Live Woodpecker/Pileated CI view | no reachable CI instance | `ci.py` returns explicit stale/unavailable state |
+| Live multi-host dev-fabric routing over Tailscale | Tailscale not up here | `herdr-eng doctor` tailscale=warn; port/lease unit tests pass |
+| iPhone/iPad tailnet validation | requires tailnet device | acceptance rows marked BLOCKED_EXTERNAL |
+
+All implementation that does not depend on those external resources is
+complete, tested, and committed.

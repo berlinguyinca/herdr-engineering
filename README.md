@@ -141,11 +141,69 @@ herdr-engineering/
 │   ├── contracts/
 │   ├── specs/                    # normative ordered implementation specs
 │   └── archive/                  # prior HerdR specs preserved for lineage
-├── ansible/                      # implemented during fleet phases
+├── herdr_engineering/            # Python integration layer (the implementation)
+├── ansible/                      # fleet bootstrap playbooks (Linux + macOS)
 ├── config/                       # safe defaults/examples; never secrets
 ├── lock/                         # pinned upstream/plugin dependency lock
-└── .github/                      # issue/PR templates and CI added during implementation
+├── scripts/                      # dev-env / validate / naming dogfood scripts
+├── tests/                        # 79 unit/contract/integration tests
+├── fixtures/                     # test fixtures
+├── docs/evidence/                # real command snapshots per phase
+└── .github/                      # issue/PR templates and CI workflow
 ```
+
+## Install and use (real commands)
+
+The implementation is a small Python package exposing one CLI, `herdr-eng`,
+plus the `herdr_engineering.*` library. It layers on top of an existing Herdr
+installation (verified against `herdr 0.9.1`).
+
+```bash
+# 1) create the venv and install the package (dev extras for tests/lint)
+scripts/dev-env.sh
+source .venv/bin/activate
+
+# 2) run the full validation (lint + schema + config + lock + tests + doctor)
+scripts/validate.sh
+
+# 3) health / capability / security checks
+herdr-eng doctor --json
+herdr-eng capabilities --json
+
+# 4) automatic semantic workspace naming (dogfooded)
+herdr-eng name --prompt "Implement transparent dev routing so agents can preview from any device"
+# => transparent-dev-routing-agents  (name_source=auto_prompt)
+herdr-eng name --issue-number 421 --issue-title "Add test tree with pytest and JVM support" --repo owner/repo
+# => 421-test-tree-pytest-jvm       (name_source=auto_issue)
+herdr-eng name --spec-id 0110 --spec-title "transparent dev fabric"
+# => 0110-transparent-dev-fabric    (name_source=auto_spec)
+
+# 5) Powerpack distribution / lifecycle
+herdr-eng powerpack status
+herdr-eng powerpack snapshot pre-release-1
+herdr-eng powerpack preflight
+herdr-eng powerpack rollback
+
+# 6) private web/mobile control surface (binds 127.0.0.1 by default)
+herdr-eng web --port 8787
+
+# 7) other integration surfaces
+herdr-eng machines --json
+herdr-eng workspaces --json
+herdr-eng devfabric list
+herdr-eng tests adapters
+herdr-eng tests run pytest --repo owner/repo --worktree 0110-dev-fabric --machine localhost
+herdr-eng ci pipelines --repo owner/repo
+herdr-eng candidates id --repo owner/repo --worktree wt-18 --branch checkout-redesign-a
+herdr-eng journal timeline <session_id>
+herdr-eng attention list
+herdr-eng artifacts list
+herdr-eng browser http://localhost:5173 --json
+```
+
+Run `herdr-eng --help` for the full command set. Every command that emits
+structured data supports `--json`. The web UI is private by default
+(`private_only: true`, host `127.0.0.1`); expose it only via the tailnet.
 
 ## Implementation order
 

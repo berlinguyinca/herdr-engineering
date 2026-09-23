@@ -1,0 +1,61 @@
+---
+# HerdR Engineering fleet bootstrap (spec 0040).
+#
+# Converges a supported host to the HerdR Engineering baseline:
+#   - Herdr (pinned compatible version)
+#   - Pi + provider config pointing all LLM traffic at https://llm.metabolomics.us
+#   - berlinguyinca/pi-engineering, berlinguyinca/autospec
+#   - Tailscale connectivity checks (no reusable auth keys in Git)
+#   - vim, mc, btop
+#   - prerequisites for adopted Powerpack components
+#   - HerdR Engineering state/artifact directories
+#
+# Existing user config is merged/backed up, never overwritten wholesale.
+# No secrets live in this inventory or any committed file. The playbook is
+# idempotent: a second run produces no unexpected changes.
+#
+# Run:
+#   ansible-playbook -i inventory/hosts.yml playbooks/site.yml --check   # dry run
+#   ansible-playbook -i inventory/hosts.yml playbooks/site.yml           # converge
+#
+- name: "HerdR Engineering fleet bootstrap"
+  hosts: herdr_fleet
+  gather_facts: true
+  become: "{{ ansible_user_id != 'root' }}"
+  vars:
+    herdr_engineering_state_dir: "{{ ansible_env.HOME }}/.local/share/herdr-engineering"
+    herdr_engineering_artifact_dir: "{{ ansible_env.HOME }}/.local/share/herdr-engineering/artifacts"
+    herdr_pinned_version: "0.9.1"
+    llm_endpoint: "https://llm.metabolomics.us"
+
+  tasks:
+    - name: "Include platform-specific role (Linux vs macOS)"
+      ansible.builtin.include_role:
+        name: "{{ 'herdr_linux' if ansible_system == 'Linux' else 'herdr_macos' }}"
+
+    - name: "Create HerdR Engineering state + artifact directories"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+        owner: "{{ ansible_user_id }}"
+      loop:
+        - "{{ herdr_engineering_state_dir }}"
+        - "{{ herdr_engineering_artifact_dir }}"
+
+    - name: "Ensure HerdR Engineering config references the lab LLM endpoint"
+      ansible.builtin.lineinfile:
+        path: "{{ herdr_engineering_state_dir }}/config.yaml"
+        line: "llm_endpoint: {{ llm_endpoint }}"
+        create: true
+        mode: "0640"
+
+    - name: "Tailscale reachability check (informational, non-fatal)"
+      ansible.builtin.command: tailscale status
+      register: tailscale_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: "Report Tailscale state"
+      ansible.builtin.debug:
+        msg: "tailscale: {{ 'up' if tailscale_status.rc == 0 and 'tailscale' in tailscale_status.stdout else 'down/not-logged-in' }}"

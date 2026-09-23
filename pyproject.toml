@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herdr-engineering"
+version = "0.1.0"
+description = "Super HerdR / HerdR Engineering — thin curated integration layer over Herdr"
+requires-python = ">=3.12"
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+herdr-eng = "herdr_engineering.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+# E501 (line length) is intentionally relaxed: web.py embeds HTML and cli.py
+# contains long URLs. E702 (semicolon chaining) is used deliberately in the
+# argparse builder for compact set_defaults wiring.
+extend-ignore = ["E501", "E702"]
+
+[tool.setuptools.packages.find]
+include = ["herdr_engineering*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

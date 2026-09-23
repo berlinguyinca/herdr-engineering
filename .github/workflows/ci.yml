@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-schema:
+    name: Lint / docs / schema / config validation (spec 0010)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+      - name: Format check (ruff)
+        run: ruff check herdr_engineering tests
+      - name: Spec manifest validity (YAML)
+        run: python -c "import yaml; d=yaml.safe_load(open('SPEC_MANIFEST.yaml')); assert d['version']==1; print('spec manifest ok')"
+      - name: Config schema validity
+        run: python -c "from herdr_engineering.config import load_config; load_config(); print('config ok')"
+      - name: Lock validity
+        run: python -c "import yaml; d=yaml.safe_load(open('lock/upstreams.yaml')); assert 'dependencies' in d; print('lock ok')"
+
+  unit-tests:
+    name: Unit / contract / integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+      - name: Run tests
+        run: python -m pytest -q

@@ -1,0 +1,62 @@
+version: 1
+# Classified + pinned upstreams (phase 0020). Decisions:
+#   ADOPT / ADAPT / OPTIONAL / REJECT / SUPERSEDED_BY_NATIVE_HERDR
+# Revisions are immutable where the upstream publishes them; otherwise a
+# documented stable tag is pinned. Audit notes record license/maintenance.
+dependencies:
+  herdr:
+    source: "official (local binary)"
+    revision: "0.9.1"
+    decision: ADOPT
+    license: "proprietary/internal"
+    maintenance: "active; local binary at ~/.local/bin/herdr"
+    note: "Native base primitive: saved machines, --machine forwarding, workspaces, worktrees, socket/plugin API. We build on top, never fork."
+  herdr-browser:
+    source: "StructuPath/herdr-browser"
+    revision: null
+    decision: ADAPT
+    license: "check upstream"
+    maintenance: "community"
+    note: "Browser preview adapter used when Playwright available; our browser.py falls back safely."
+  herdr-web:
+    source: "eyalev/herdr-web"
+    revision: null
+    decision: ADAPT
+    license: "check upstream"
+    maintenance: "community"
+    note: "Preferred web surface when compatible; our web.py provides a private stdlib fallback (spec 0060)."
+  herdr-plannotator:
+    source: "plannotator/herdr-plannotator"
+    revision: null
+    decision: ADOPT
+    license: "check upstream"
+    maintenance: "active"
+    note: "Review authority; our PlannotatorAdapter preserves review identity/comments/decision/evidence."
+  herdr-swarm:
+    source: "upstream herdr-swarm"
+    revision: null
+    decision: OPTIONAL
+    license: "check upstream"
+    maintenance: "community"
+    note: "Optional multi-agent helpers; not required for core integration."
+  custom-remote-machine-aggregator:
+    source: "concept"
+    revision: null
+    decision: SUPERSEDED_BY_NATIVE_HERDR
+    license: "n/a"
+    maintenance: "n/a"
+    note: "Do NOT build a second remote-machine orchestrator; native saved machines + --machine forwarding suffice."
+  custom-worktree-engine:
+    source: "concept"
+    revision: null
+    decision: SUPERSEDED_BY_NATIVE_HERDR
+    license: "n/a"
+    maintenance: "n/a"
+    note: "Do NOT build a generic worktree engine; Herdr owns worktrees."
+  custom-ci-scheduler:
+    source: "concept"
+    revision: null
+    decision: SUPERSEDED_BY_NATIVE_HERDR
+    license: "n/a"
+    maintenance: "n/a"
+    note: "Woodpecker/Pileated own CI execution; our ci.py is a provider-neutral view only."

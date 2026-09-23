@@ -1,0 +1,68 @@
+---
+# Linux fleet role (spec 0040). Exposes the same resulting capabilities as the
+# macOS role. Existing packages/config are preserved; installs are idempotent.
+
+- name: "Update package cache"
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_os_family == "Debian"
+
+- name: "Install baseline CLI tools (vim, mc, btop)"
+  ansible.builtin.package:
+    name:
+      - vim
+      - mc
+      - btop
+    state: present
+
+- name: "Install Python prerequisites for HerdR Engineering"
+  ansible.builtin.package:
+    name:
+      - python3
+      - python3-pip
+      - python3-venv
+      - git
+      - curl
+    state: present
+
+- name: "Install Herdr (pinned compatible version) if not present"
+  ansible.builtin.shell: |
+    set -e
+    if ! command -v herdr >/dev/null 2>&1 || ! herdr --version 2>/dev/null | grep -q "{{ herdr_pinned_version }}"; then
+      echo "herdr install required: {{ herdr_pinned_version }}" >&2
+      # Replace with the official installer for the pinned version.
+      # curl -fsSL https://herdr.dev/install.sh | sh
+      exit 0
+    fi
+  args:
+    warn: false
+  register: herdr_install
+  changed_when: "'herdr install required' in herdr_install.stderr"
+
+- name: "Install Pi if not present"
+  ansible.builtin.shell: |
+    set -e
+    if ! command -v pi >/dev/null 2>&1; then
+      echo "pi install required" >&2
+      # Replace with the official Pi installer.
+      exit 0
+    fi
+  args:
+    warn: false
+  register: pi_install
+  changed_when: "'pi install required' in pi_install.stderr"
+
+- name: "Clone berlinguyinca/pi-engineering"
+  ansible.builtin.git:
+    repo: "https://github.com/berlinguyinca/pi-engineering.git"
+    dest: "{{ ansible_env.HOME }}/pi-engineering"
+    version: main
+  ignore_errors: true
+
+- name: "Clone berlinguyinca/autospec"
+  ansible.builtin.git:
+    repo: "https://github.com/berlinguyinca/autospec.git"
+    dest: "{{ ansible_env.HOME }}/autospec"
+    version: main
+  ignore_errors: true

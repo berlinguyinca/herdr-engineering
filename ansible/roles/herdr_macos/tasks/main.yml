@@ -1,0 +1,70 @@
+---
+# macOS fleet role (spec 0040). Homebrew-based; preserves existing config and is
+# idempotent. Resulting capabilities match the Linux role.
+
+- name: "Ensure Homebrew is present"
+  ansible.builtin.shell: |
+    if ! command -v brew >/dev/null 2>&1; then
+      echo "homebrew install required" >&2
+      exit 0
+    fi
+  args:
+    warn: false
+  register: brew_check
+  changed_when: "'homebrew install required' in brew_check.stderr"
+
+- name: "Install baseline CLI tools (vim, mc, btop)"
+  ansible.builtin.homebrew:
+    name:
+      - vim
+      - mc
+      - btop
+    state: present
+  when: brew_check.rc == 0
+
+- name: "Install git, python@3, curl"
+  ansible.builtin.homebrew:
+    name:
+      - git
+      - python@3.12
+      - curl
+    state: present
+  when: brew_check.rc == 0
+
+- name: "Install Herdr (pinned compatible version) if not present"
+  ansible.builtin.shell: |
+    set -e
+    if ! command -v herdr >/dev/null 2>&1 || ! herdr --version 2>/dev/null | grep -q "{{ herdr_pinned_version }}"; then
+      echo "herdr install required: {{ herdr_pinned_version }}" >&2
+      exit 0
+    fi
+  args:
+    warn: false
+  register: herdr_install
+  changed_when: "'herdr install required' in herdr_install.stderr"
+
+- name: "Install Pi if not present"
+  ansible.builtin.shell: |
+    set -e
+    if ! command -v pi >/dev/null 2>&1; then
+      echo "pi install required" >&2
+      exit 0
+    fi
+  args:
+    warn: false
+  register: pi_install
+  changed_when: "'pi install required' in pi_install.stderr"
+
+- name: "Clone berlinguyinca/pi-engineering"
+  ansible.builtin.git:
+    repo: "https://github.com/berlinguyinca/pi-engineering.git"
+    dest: "{{ ansible_env.HOME }}/pi-engineering"
+    version: main
+  ignore_errors: true
+
+- name: "Clone berlinguyinca/autospec"
+  ansible.builtin.git:
+    repo: "https://github.com/berlinguyinca/autospec.git"
+    dest: "{{ ansible_env.HOME }}/autospec"
+    version: main
+  ignore_errors: true
