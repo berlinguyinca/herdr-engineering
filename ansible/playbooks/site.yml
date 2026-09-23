@@ -25,6 +25,10 @@
   vars:
     herdr_engineering_state_dir: "{{ ansible_env.HOME }}/.local/share/herdr-engineering"
     herdr_engineering_artifact_dir: "{{ ansible_env.HOME }}/.local/share/herdr-engineering/artifacts"
+    # machine-local config (XDG config home) — matches scripts/install.sh and
+    # herdr_engineering.config._discover_config_paths()
+    herdr_engineering_config_dir: "{{ ansible_env.HOME }}/.config/herdr-engineering"
+    herdr_engineering_config_file: "{{ herdr_engineering_config_dir }}/config.yaml"
     herdr_pinned_version: "0.9.1"
     llm_endpoint: "https://llm.metabolomics.us"
 
@@ -43,9 +47,16 @@
         - "{{ herdr_engineering_state_dir }}"
         - "{{ herdr_engineering_artifact_dir }}"
 
+    - name: "Create HerdR Engineering config directory"
+      ansible.builtin.file:
+        path: "{{ herdr_engineering_config_dir }}"
+        state: directory
+        mode: "0750"
+        owner: "{{ ansible_user_id }}"
+
     - name: "Ensure HerdR Engineering config references the lab LLM endpoint"
       ansible.builtin.lineinfile:
-        path: "{{ herdr_engineering_state_dir }}/config.yaml"
+        path: "{{ herdr_engineering_config_file }}"
         line: "llm_endpoint: {{ llm_endpoint }}"
         create: true
         mode: "0640"

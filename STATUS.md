@@ -30,6 +30,22 @@ collection warnings. Real command snapshots are captured under `docs/evidence/`.
 | 0170 Observability/security/update/rollback | COMPLETE | `observability.py`, `doctor.py`, listener tests |
 | 0180 Fleet validation/release/docs | COMPLETE (docs/repo/CI); live fleet `BLOCKED_EXTERNAL` | README, `.github/workflows/ci.yml`, `scripts/`, acceptance matrix |
 
+## One-shot installer
+
+`scripts/install.sh` assumes Herdr already exists and sets up the HerdR
+Engineering layer on the machine it runs on — without installing, upgrading,
+or restarting Herdr, and without touching Herdr's state. It is idempotent and
+enrolls the local machine (detected host + OS) into the private fleet
+inventory. Verified on this host (a fleet member): Herdr binary unmodified and
+still running after install.
+
+```bash
+cd herdr-engineering && scripts/install.sh
+```
+
+Machine-local config now auto-discovered by the CLI (`~/.config/herdr-engineering/config.yaml`),
+overridden by repo `config/herdr-engineering.yaml`, then `$HERDR_ENGINEERING_CONFIG`.
+
 ## What exists (verified, not assumed)
 
 - **Automatic semantic workspace naming** — `herdr-eng name`. Provenance-tracked

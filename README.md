@@ -158,6 +158,28 @@ The implementation is a small Python package exposing one CLI, `herdr-eng`,
 plus the `herdr_engineering.*` library. It layers on top of an existing Herdr
 installation (verified against `herdr 0.9.1`).
 
+### One-shot install (assumes Herdr already exists)
+
+`scripts/install.sh` sets everything up on the machine it runs on and does
+**not** install, upgrade, or restart Herdr — your running agent sessions are
+unaffected. It is idempotent.
+
+```bash
+git clone https://github.com/berlinguyinca/herdr-engineering
+cd herdr-engineering
+scripts/install.sh
+```
+
+The installer, in order: verifies Herdr is present; creates a project `.venv`
+and installs the package; creates the machine-local state + artifact
+directories; writes a private-by-default machine-local config at
+`~/.config/herdr-engineering/config.yaml` (preserved if present); enrolls this
+machine (detected host + OS) into the private fleet inventory
+(`ansible/inventory/hosts.yml`); puts `herdr-eng` on PATH via
+`~/.local/bin`; and runs `herdr-eng doctor` to confirm.
+
+### Manual setup (equivalent)
+
 ```bash
 # 1) create the venv and install the package (dev extras for tests/lint)
 scripts/dev-env.sh

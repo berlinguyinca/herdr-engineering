@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import __version__
-from .config import InvalidError, load_config
+from .config import InvalidError, _discover_config_paths, load_config
 from .observability import detect_listeners
 
 
@@ -89,10 +89,17 @@ def run_doctor(config: dict[str, Any] | None = None,
     report.python = platform.python_version()
 
     # config / lock validity
+    discovered = _discover_config_paths()
     if config is None:
         try:
             config = load_config()
-            report.add("config", "ok", "config loads and validates")
+            if discovered:
+                report.add("config", "ok",
+                           f"config loads ({discovered[-1]})",
+                           {"files": [str(p) for p in discovered]})
+            else:
+                report.add("config", "ok",
+                           "config loads (built-in defaults, no config file found)")
         except InvalidError as exc:
             report.add("config", "fail", f"invalid config: {exc}")
             config = {}
@@ -186,13 +193,9 @@ def _adopted_plugins(lock_path: str) -> list[str]:
 
 
 def doctor_main(args) -> int:
-    from .config import load_config
-    try:
-        cfg = load_config()
-    except InvalidError as exc:
-        print(f"doctor: config invalid: {exc}", file=__import__("sys").stderr)
-        cfg = {}
-    report = run_doctor(config=cfg)
+    # Pass config=None so run_doctor performs default discovery and reports
+    # which config file (if any) is actually in effect.
+    report = run_doctor()
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     else:

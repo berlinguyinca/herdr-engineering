@@ -68,10 +68,35 @@ def _expand_env(value: Any) -> Any:
     return value
 
 
+def _discover_config_paths() -> list[Path]:
+    """Default config discovery, in increasing precedence (later overrides).
+
+    1. machine-local: ``~/.config/herdr-engineering/config.yaml``
+       (written by ``scripts/install.sh``; per-host settings)
+    2. repository:     ``./config/herdr-engineering.yaml`` or ``./herdr-engineering.yaml``
+    3. explicit env:   ``$HERDR_ENGINEERING_CONFIG`` (highest)
+    """
+    home = Path.home()
+    candidates = [
+        home / ".config" / "herdr-engineering" / "config.yaml",
+        Path.cwd() / "config" / "herdr-engineering.yaml",
+        Path.cwd() / "herdr-engineering.yaml",
+    ]
+    env = os.environ.get("HERDR_ENGINEERING_CONFIG")
+    if env:
+        candidates.append(Path(env))
+    return [c for c in candidates if c.exists()]
+
+
 def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
-    """Load config by precedence. Each path may be missing (skipped)."""
+    """Load config by precedence. Each path may be missing (skipped).
+
+    When ``paths`` is omitted, a sensible default set is discovered (machine-
+    local, then repository, then ``$HERDR_ENGINEERING_CONFIG``) so that the
+    file written by the installer is actually used.
+    """
     cfg = copy.deepcopy(DEFAULTS)
-    for path in paths or []:
+    for path in (paths if paths is not None else _discover_config_paths()):
         if not path.exists():
             continue
         try:
