@@ -13,6 +13,9 @@
 #   3. creates the machine-local state + artifact directories
 #   4. writes a safe private-by-default machine-local config (if absent)
 #   5. enrolls THIS machine (detected host + OS) into the private fleet inventory
+#      and brings it onto the Tailscale tailnet (auto only if you provide a
+#      key via $TS_AUTH_KEY or ~/.config/herdr-engineering/tailscale-auth.key;
+#      otherwise it prints the command and continues)
 #   6. puts `herdr-eng` on PATH (~/.local/bin) when that directory is writable
 #   7. runs `herdr-eng doctor` and prints a summary
 #
@@ -134,6 +137,55 @@ print(f"  enrolled host '{local}' under group '{os_name}' ({'added' if added els
 print(f"  fleet hosts: " + ", ".join(sorted(h for g in fleet.values()
                                             for h in (g.get('hosts', {}) or {}))))
 PYCODE
+
+# --- 5b. Tailscale tailnet reachability (private) -------------------------
+# Auto-enrolls only if you've provided an auth key (a secret we never commit):
+#   - env var TS_AUTH_KEY, or
+#   - the file ~/.config/herdr-engineering/tailscale-auth.key  (gitignored)
+# Otherwise it prints the exact command and continues (never blocks, never
+# writes a secret to the repo). Requires sudo when not running as root.
+step "5b/7 Tailscale (private tailnet reachability)"
+TS_KEY_FILE="$HOME/.config/herdr-engineering/tailscale-auth.key"
+if command -v tailscale >/dev/null 2>&1; then
+  if tailscale status >/dev/null 2>&1; then
+    TS_IP="$(tailscale ip -4 2>/dev/null || true)"
+    TS_HOST="$(tailscale hostname 2>/dev/null || hostname)"
+    printf '  already on tailnet: %s (%s) — nothing to do\n' "${TS_IP:-?}" "${TS_HOST:-?}"
+  else
+    TS_KEY="${TS_AUTH_KEY:-}"
+    if [ -z "$TS_KEY" ] && [ -f "$TS_KEY_FILE" ]; then
+      TS_KEY="$(tr -d '[:space:]' < "$TS_KEY_FILE")"
+    fi
+    if [ -n "$TS_KEY" ]; then
+      if [ "$(id -u)" = "0" ]; then
+        SUDO=""
+      elif command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+      else
+        SUDO=""
+      fi
+      if [ -n "$SUDO" ] || [ "$(id -u)" = "0" ]; then
+        if $SUDO tailscale up --authkey="$TS_KEY" >/dev/null 2>&1; then
+          printf '  enrolled on tailnet (tailscale up)\n'
+        else
+          warn "tailscale up failed — run manually: sudo tailscale up --authkey=***"
+        fi
+      else
+        warn "no sudo available to run 'tailscale up'. Run manually: sudo tailscale up --authkey=***"
+      fi
+    else
+      warn "tailscale is installed but not up."
+      warn "  1) get a key: https://login.tailscale.com/admin/settings/security"
+      warn "  2) export TS_AUTH_KEY=tskey-... and re-run, OR"
+      warn "     save it to $TS_KEY_FILE, OR"
+      warn "     run now: sudo tailscale up --authkey=***"
+    fi
+  fi
+else
+  warn "tailscale not installed. Install it, then 'sudo tailscale up --authkey=***'"
+  warn "  Debian/Ubuntu: sudo apt-get install -y tailscale && sudo systemctl enable --now tailscaled"
+  warn "  macOS:         brew install --cask tailscale"
+fi
 
 # --- 6. put herdr-eng on PATH ---------------------------------------------
 step "6/7 making herdr-eng available on PATH"
