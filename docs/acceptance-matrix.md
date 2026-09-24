@@ -21,11 +21,13 @@ unit-tested; only live convergence/validation is pending.
 ## Fleet
 
 - [ ] `fry`, `beast`, `bender`, `macbook-m4` pass Ansible convergence.
-      **BLOCKED_EXTERNAL** — hosts unreachable; Ansible not installed on the
-      reference workstation. Playbooks provided (`ansible/playbooks/site.yml`).
-      Evidence: `ansible/README.md`.
-- [ ] Second Ansible run is idempotent. **BLOCKED_EXTERNAL** — designed
-      idempotent (package/state-based guards), not yet converged live.
+      **PARTIAL** — playbook `--syntax-check` passes for all hosts and a full
+      `--check` dry-run on `bender` passes (`ok=12 changed=6 failed=0`,
+      ansible-core 2.21.4). Real convergence of the four hosts is pending an
+      operator go-ahead (it installs packages on live machines).
+- [ ] Second Ansible run is idempotent. **PARTIAL** — dry-run validated; the
+      playbook is guard-based (skip-if-present, state dirs, lineinfile) but a
+      double real-run proof requires a converged host.
 - [ ] Pi on every validation host routes LLM traffic through
       `https://llm.metabolomics.us`. **BLOCKED_EXTERNAL** — enforced by
       `ansible/playbooks/site.yml`; live host not reachable.

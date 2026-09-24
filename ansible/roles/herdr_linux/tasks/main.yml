@@ -35,10 +35,8 @@
       # curl -fsSL https://herdr.dev/install.sh | sh
       exit 0
     fi
-  args:
-    warn: false
   register: herdr_install
-  changed_when: "'herdr install required' in herdr_install.stderr"
+  changed_when: "'herdr install required' in (herdr_install.stderr | default(''))"
 
 - name: "Install Pi if not present"
   ansible.builtin.shell: |
@@ -48,10 +46,8 @@
       # Replace with the official Pi installer.
       exit 0
     fi
-  args:
-    warn: false
   register: pi_install
-  changed_when: "'pi install required' in pi_install.stderr"
+  changed_when: "'pi install required' in (pi_install.stderr | default(''))"
 
 - name: "Clone berlinguyinca/pi-engineering"
   ansible.builtin.git:

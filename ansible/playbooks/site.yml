@@ -20,29 +20,42 @@
 #
 - name: "HerdR Engineering fleet bootstrap"
   hosts: herdr_fleet
-  gather_facts: true
-  become: "{{ ansible_user_id != 'root' }}"
+  gather_facts: false
+  # become is evaluated before fact gathering, so use the connection user /
+  # controller env USER rather than the ansible_user_id fact.
+  become: "{{ (ansible_user | default(lookup('env', 'USER'), true)) != 'root' }}"
   vars:
-    herdr_engineering_state_dir: "{{ ansible_env.HOME }}/.local/share/herdr-engineering"
-    herdr_engineering_artifact_dir: "{{ ansible_env.HOME }}/.local/share/herdr-engineering/artifacts"
+    # State/config live in the FLEET user's home (the user who runs herdr-eng),
+    # not root's — captured via a no-become fact gather below (fleet_home).
+    herdr_engineering_state_dir: "{{ fleet_home }}/.local/share/herdr-engineering"
+    herdr_engineering_artifact_dir: "{{ fleet_home }}/.local/share/herdr-engineering/artifacts"
     # machine-local config (XDG config home) — matches scripts/install.sh and
     # herdr_engineering.config._discover_config_paths()
-    herdr_engineering_config_dir: "{{ ansible_env.HOME }}/.config/herdr-engineering"
+    herdr_engineering_config_dir: "{{ fleet_home }}/.config/herdr-engineering"
     herdr_engineering_config_file: "{{ herdr_engineering_config_dir }}/config.yaml"
     herdr_pinned_version: "0.9.1"
     llm_endpoint: "https://llm.metabolomics.us"
 
   tasks:
+    - name: "Gather facts as the connection user (no become)"
+      ansible.builtin.setup:
+      become: false
+
+    - name: "Record the fleet user's home + uid for paths/ownership"
+      ansible.builtin.set_fact:
+        fleet_home: "{{ ansible_env.HOME }}"
+        fleet_user: "{{ ansible_user_id }}"
+
     - name: "Include platform-specific role (Linux vs macOS)"
       ansible.builtin.include_role:
-        name: "{{ 'herdr_linux' if ansible_system == 'Linux' else 'herdr_macos' }}"
+        name: "{{ 'herdr_linux' if ansible_facts['system'] == 'Linux' else 'herdr_macos' }}"
 
     - name: "Create HerdR Engineering state + artifact directories"
       ansible.builtin.file:
         path: "{{ item }}"
         state: directory
         mode: "0750"
-        owner: "{{ ansible_user_id }}"
+        owner: "{{ fleet_user }}"
       loop:
         - "{{ herdr_engineering_state_dir }}"
         - "{{ herdr_engineering_artifact_dir }}"
@@ -52,7 +65,7 @@
         path: "{{ herdr_engineering_config_dir }}"
         state: directory
         mode: "0750"
-        owner: "{{ ansible_user_id }}"
+        owner: "{{ fleet_user }}"
 
     - name: "Ensure HerdR Engineering config references the lab LLM endpoint"
       ansible.builtin.lineinfile:

@@ -96,11 +96,14 @@ OS-level bindings. All have regression tests.
 
 | Blocked item | Reason | Evidence |
 |---|---|---|
-| Ansible convergence of `fry`/`beast`/`bender`/`macbook-m4` | hosts unreachable; Ansible not installed on reference workstation | `ansible/README.md`, `herdr-eng doctor` tailscale=warn |
-| Live Chromium/CDP preview | no reachable browser + target app on this workstation | browser tests pass offline (safe fallback) |
-| Live Woodpecker/Pileated CI view | no reachable CI instance | `ci.py` returns explicit stale/unavailable state |
-| Live multi-host dev-fabric routing over Tailscale | Tailscale not up here | `herdr-eng doctor` tailscale=warn; port/lease unit tests pass |
-| iPhone/iPad tailnet validation | requires tailnet device | acceptance rows marked BLOCKED_EXTERNAL |
+| Real Ansible convergence of the 4 fleet hosts | playbooks `--check`-validated on `bender` (ok=12 failed=0, ansible-core 2.21.4); real convergence installs packages on live machines — pending operator go-ahead | `ansible/README.md` |
+| Live Woodpecker/Pileated CI view | no reachable CI instance and no configured server URL (`~/.config/woodpecker` empty) | `ci.py` returns explicit stale/unavailable state |
+| Human confirmation of phone/iPad on the tailnet | the tailnet address is proven reachable (HTTP 200 via `100.104.39.6`); opening it on an actual device is a human step | `docs/evidence/0180/live-validation.txt` |
+| Push to GitHub + CI run | no remote configured; creating the repo is an operator decision (private/public) | `git remote -v` empty |
+
+Cleared during live validation (2026-09-24): Chromium/CDP browser preview
+(captured live, artifact published), dev-fabric HTTP on loopback and on the
+tailnet interface, and cross-machine Herdr access (`herdr --machine beast`).
 
 All implementation that does not depend on those external resources is
 complete, tested, and committed.

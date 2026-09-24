@@ -8,10 +8,8 @@
       echo "homebrew install required" >&2
       exit 0
     fi
-  args:
-    warn: false
   register: brew_check
-  changed_when: "'homebrew install required' in brew_check.stderr"
+  changed_when: "'homebrew install required' in (brew_check.stderr | default(''))"
 
 - name: "Install baseline CLI tools (vim, mc, btop)"
   ansible.builtin.homebrew:
@@ -38,10 +36,8 @@
       echo "herdr install required: {{ herdr_pinned_version }}" >&2
       exit 0
     fi
-  args:
-    warn: false
   register: herdr_install
-  changed_when: "'herdr install required' in herdr_install.stderr"
+  changed_when: "'herdr install required' in (herdr_install.stderr | default(''))"
 
 - name: "Install Pi if not present"
   ansible.builtin.shell: |
@@ -50,10 +46,8 @@
       echo "pi install required" >&2
       exit 0
     fi
-  args:
-    warn: false
   register: pi_install
-  changed_when: "'pi install required' in pi_install.stderr"
+  changed_when: "'pi install required' in (pi_install.stderr | default(''))"
 
 - name: "Clone berlinguyinca/pi-engineering"
   ansible.builtin.git:

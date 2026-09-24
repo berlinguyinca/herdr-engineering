@@ -240,6 +240,72 @@ structured data supports `--json`. The web UI is private by default
 
 Parallel work is allowed only when the manifest marks specs independent and their dependencies are complete.
 
+## Upgrades and rollback
+
+Updates are safe, previewed, and reversible. Nothing is auto-upgraded.
+
+```bash
+herdr-eng powerpack snapshot pre-update      # capture current lock+config
+herdr-eng powerpack preflight                # doctor + incompatible-dep check; blocks bad updates
+herdr-eng powerpack rollback                 # restore the last known-good snapshot
+```
+
+`preflight` returns non-zero (and `ok: false`) when the doctor fails or a
+locked dependency is `REJECT`-classified, so a bad update is blocked before it
+applies. A failed optional plugin never takes Herdr down: the layer degrades
+and `herdr-eng doctor` reports which check failed.
+
+## Plugin policy (reuse-first)
+
+We adopt/adapt upstream Herdr plugins rather than rebuild. Every dependency is
+classified and pinned in `lock/upstreams.yaml`; `HERDR_COMPATIBILITY.md` is the
+human-readable audit. Decisions: `ADOPT` (Herdr core, herdr-plannotator),
+`ADAPT` (herdr-web, herdr-browser, Pi-Web), `OPTIONAL` (swarm, worktree
+include, gh-checks, pr-board, notifications), `REJECT` (Pi Forge, any duplicate
+of a native primitive). A new dependency enters the Powerpack only after being
+re-verified against the installed Herdr version (see `HERDR_COMPATIBILITY.md`
+refresh rule).
+
+## Security model
+
+- **Private by default.** Web binds `127.0.0.1`; dev-fabric refuses public bind
+  addresses; nothing listens on the public internet unless you explicitly opt
+  in.
+- **No secrets in Git.** Inventories, auth keys, and credentials are gitignored
+  and live outside the repo. The installer never writes a secret anywhere.
+- **Audited.** `herdr-eng doctor` reports public listeners, config/lock
+  validity, and capability state in human + `--json` form.
+- **No hidden reasoning persisted.** Only user-visible summaries, tool actions,
+  test/CI results, Git changes, and artifacts are stored.
+
+See `SECURITY.md` for the reporting policy.
+
+## Platforms
+
+Linux (Debian/Ubuntu) and macOS (Homebrew) are the supported fleet targets;
+the Ansible roles and the installer both branch on `uname`. The Python layer
+runs on 3.11+. Validation evidence to date is from a Linux host (`bender`);
+macOS convergence is a documented `BLOCKED_EXTERNAL` item pending a fleet run.
+
+## Troubleshooting
+
+| Symptom | Check / fix |
+|---|---|
+| `herdr-eng: command not found` | `source .venv/bin/activate` or re-run `scripts/install.sh` (symlinks into `~/.local/bin`) |
+| doctor: `tailscale` warn | `tailscale status`; if down, `sudo tailscale up` (key via `TS_AUTH_KEY`, see installer) |
+| doctor: `public listener` warn | `herdr-eng doctor --json` lists it; stop the offending process or scope it to the tailnet |
+| web UI not reachable from phone | confirm `tailscale up` on both, then open `http://<tailnet-ip>:8787` (web is private-only) |
+| dev service not forwarding | `herdr-eng devfabric list` (lease active?) then run `herdr-eng devfabric serve <lease>` |
+| config not taking effect | `herdr-eng doctor --json` shows the config file in use; precedence is machine-local < repo < `$HERDR_ENGINEERING_CONFIG` |
+| stale dev port | `herdr-eng devfabric reconcile` expires stale leases |
+
+## Contributing
+
+See `CONTRIBUTING.md`. In short: run `scripts/validate.sh` (lint + tests +
+docs + config + lock), keep the acceptance matrix honest (mark
+`BLOCKED_EXTERNAL` with evidence rather than guessing), and never commit
+secrets or hidden chain-of-thought.
+
 ## Definition of done
 
 The project is complete when a fresh supported Linux or macOS machine can be enrolled declaratively, the four-machine validation fleet passes the acceptance matrix, mobile/tablet access works privately, concurrent agent worktrees can publish and compare dev previews, local and CI test evidence is navigable, session activity survives reconnect/restart, and all security/update/rollback drills pass.

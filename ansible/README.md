@@ -37,21 +37,36 @@ wholesale. No secrets live in the inventory or any committed file.
 
 ## Usage
 
+`ansible/ansible.cfg` sets `roles_path` and the default inventory, so run from
+the `ansible/` directory:
+
 ```bash
-# install ansible (not present on the reference workstation — documented blocker)
-# python3 -m pip install ansible
+# install ansible-core (not present on the reference workstation until 2026-09-24;
+# then: python -m pip install ansible-core)
+cd ansible
 
 # create private inventory from the example (add SSH connection vars)
-cp ansible/inventory/hosts.example.yml ansible/inventory/hosts.yml
+cp inventory/hosts.example.yml inventory/hosts.yml
 
-# dry run / check mode
-ansible-playbook -i ansible/inventory/hosts.yml ansible/playbooks/site.yml --check
+# dry run / check mode (no changes)
+ansible-playbook -i inventory/hosts.yml playbooks/site.yml --check
 
-# converge
-ansible-playbook -i ansible/inventory/hosts.yml ansible/playbooks/site.yml
+# converge one host
+ansible-playbook -i inventory/hosts.yml playbooks/site.yml --limit bender
+
+# converge the whole fleet
+ansible-playbook -i inventory/hosts.yml playbooks/site.yml
 ```
 
 A second converged run is idempotent (no unexpected changes).
+
+### Validated (2026-09-24, ansible-core 2.21.4)
+
+- `--syntax-check` passes for all inventory hosts.
+- Full `--check` dry-run on `bender` (this host, `ansible_connection=local`):
+  `ok=12 changed=6 failed=0`. The dry run caught and fixed three real bugs:
+  `become` evaluated before fact-gathering, role path resolution, and state/
+  config dirs being placed under root's home instead of the fleet user's.
 
 ## Notes
 
