@@ -5,9 +5,10 @@ curated integration layer over native Herdr. Implementation is COMPLETE.
 Live validation that requires the external fleet/browser/CI instances is
 documented as `BLOCKED_EXTERNAL` with evidence in `docs/acceptance-matrix.md`.
 
-**Test evidence (2026-09-23):** `79 passed` via `python -m pytest -q`;
+**Test evidence (2026-09-24):** `91 passed` via `python -m pytest -q` (2.4s);
 `ruff check herdr_engineering tests` → **All checks passed!**; no pytest
-collection warnings. Real command snapshots are captured under `docs/evidence/`.
+collection warnings. Real command + live-fleet snapshots are captured under
+`docs/evidence/`. Release tag: `v0.1.0`.
 
 | Phase | Status | Evidence / PR / commit |
 |---|---|---|
@@ -68,6 +69,28 @@ overridden by repo `config/herdr-engineering.yaml`, then `$HERDR_ENGINEERING_CON
 - **Web** — `herdr-eng web --port 8787` private-by-default mobile-first UI.
 - **Contracts** — five typed dataclasses (ActivityEvent, ArtifactRef,
   DevServiceLease, TestEvent, CIEvent) in `herdr_engineering/contracts.py`.
+
+## Live validation performed on the fleet (2026-09-24, host `bender`)
+
+- **Cross-machine Herdr access**: `herdr --machine beast api snapshot` returned
+  beast's full live session state (7 workspaces, per-pane pi agent sessions
+  with `agent_status` working/idle, protocol 22). One unreachable machine
+  (`fry`/`mac`, not saved here) errors cleanly without affecting `beast`.
+- **Dev fabric end-to-end**: registered a lease (external port 18000), ran
+  `herdr-eng devfabric serve`, and `curl http://127.0.0.1:18000/` returned
+  HTTP 200 from a real HTTP server on port 18777. The forwarder is a
+  protocol-transparent TCP pipe (HTTP/WebSocket/SSE/HMR/generic TCP).
+- **Browser preview**: `herdr-eng browser http://127.0.0.1:8787` captured the
+  running web UI via Playwright/Chromium; the PNG was published to the
+  artifact workspace as `art_ed96509c7f0e4cbb8c58`; `console_errors` came
+  back empty.
+- Evidence: `docs/evidence/0180/live-validation.txt`.
+
+Bugs found and fixed by the live drills: (1) `herdr-eng browser` never wired
+the artifact workspace, so screenshots were captured but not persisted;
+(2) dev-fabric lease persistence was broken across processes (`to_dict()`
+nests fields the loader didn't reconstruct); (3) port allocation ignored
+OS-level bindings. All have regression tests.
 
 ## External validation blockers (with evidence)
 

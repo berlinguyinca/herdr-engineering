@@ -213,6 +213,9 @@ herdr-eng web --port 8787
 herdr-eng machines --json
 herdr-eng workspaces --json
 herdr-eng devfabric list
+# lease a port for a running app, then forward it (protocol-transparent TCP):
+herdr-eng devfabric register --machine bender --host 127.0.0.1 --port 5173 --label my-app
+herdr-eng devfabric serve lease_xxx            # or --bind <tailscale-ip> for other hosts
 herdr-eng tests adapters
 herdr-eng tests run pytest --repo owner/repo --worktree 0110-dev-fabric --machine localhost
 herdr-eng ci pipelines --repo owner/repo

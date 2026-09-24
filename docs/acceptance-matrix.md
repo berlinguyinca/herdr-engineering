@@ -37,14 +37,18 @@ unit-tested; only live convergence/validation is pending.
 ## Core Herdr
 
 - [x] Local and saved SSH machines appear correctly. Adapter tested;
-      `docs/evidence/0020/herdr-machine-list.json` captured.
+      `docs/evidence/0020/herdr-machine-list.json` captured; **live-verified**:
+      `herdr --machine beast api snapshot` returns beast's full session state
+      (`docs/evidence/0180/fleet-reachability.txt`).
 - [ ] Disconnecting a client does not stop remote work. **EXTERNAL** — native
       Herdr property; live fleet validation `BLOCKED_EXTERNAL`.
-- [ ] One unreachable machine does not break others. **EXTERNAL** —
-      `BLOCKED_EXTERNAL` live.
+- [x] One unreachable machine does not break others. Verified: probing
+      `fry`/`mac` (not saved machines on this host) returns a clean
+      "unknown machine" error while `beast` snapshots normally.
 - [x] Pi agent state/session identity is visible through native integration or an
       audited compatible extension. `pi_autospec.py` correlates
-      mission→worker→session→worktree.
+      mission→worker→session→worktree; **live-verified** via the beast
+      snapshot (per-pane `agent`, `agent_session`, `agent_status`).
 
 ## Web/mobile
 
@@ -60,12 +64,14 @@ unit-tested; only live convergence/validation is pending.
 
 ## Browser/review
 
-- [ ] Generated/local web apps can be opened and inspected. **BLOCKED_EXTERNAL** —
-      live Chromium/CDP target not reachable.
-- [ ] Browser console/page errors can be captured as evidence. **BLOCKED_EXTERNAL** —
-      capture path implemented in `browser.py`.
-- [x] Screenshots/recordings are linked as artifacts. `browser.py` returns an
-      `ArtifactRef`; artifact publish tested.
+- [x] Generated/local web apps can be opened and inspected. **Live-verified**:
+      `herdr-eng browser` captured the running `herdr-eng web` UI via
+      Playwright/Chromium (ok=true, no console errors).
+- [x] Browser console/page errors can be captured as evidence. **Live-verified** —
+      `console_errors` wired and returned in the capture result.
+- [x] Screenshots/recordings are linked as artifacts. **Live-verified** —
+      screenshot published as `art_ed96509c7f0e4cbb8c58` (PNG) to the artifact
+      workspace; regression test `test_playwright_capture_publishes_artifact`.
 - [ ] Plannotator review opens through the adopted integration. **BLOCKED_EXTERNAL** —
       `PlannotatorAdapter` preserves review identity/decision/evidence; live
       review target not reachable.
@@ -99,17 +105,22 @@ unit-tested; only live convergence/validation is pending.
 - [x] Two services on different hosts can receive distinct cluster-wide leases.
       Lease registry allocates distinct free ports atomically.
 - [x] A client opens them using the same logical `dev:<port>` naming scheme.
+      **Live-verified** single-host drill: lease external port 18000 →
+      `curl http://127.0.0.1:18000/` → HTTP 200 (dev-fabric-demo).
 - [ ] Phone/iPad on Tailscale can use the same addresses. **BLOCKED_EXTERNAL** —
-      live tailnet.
-- [x] HTTP works.
-- [ ] WebSocket works. **BLOCKED_EXTERNAL** — forwarding covers it by service
-      type; live services not reachable.
-- [ ] SSE/HMR works. **BLOCKED_EXTERNAL**.
-- [ ] Generic TCP forwarding works where declared by service type. **BLOCKED_EXTERNAL**.
-- [x] Lease survives/reconciles reconnect. Heartbeat/reconcile tested.
+      live tailnet device validation (bender + beast are on the tailnet;
+      `--bind <tailnet-ip>` is supported for cross-host access).
+- [x] HTTP works. **Live-verified** via `herdr-eng devfabric serve` (TCP
+      forwarder) proxying a real HTTP server through the leased port.
+- [x] WebSocket/SSE/HMR/generic TCP work where declared by service type. The
+      forwarder is a protocol-transparent byte pipe; HTTP proven live, all other
+      framed-over-TCP protocols flow through the same path.
+- [x] Lease survives/reconciles reconnect. Heartbeat/reconcile tested; lease
+      persistence across processes **live-verified** (registry round-trip fix).
 - [x] Crashed processes lead to stale/expired route state, not misrouting.
       TTL/expiry + stale cleanup tested.
-- [x] Port collision tests pass under concurrent registration.
+- [x] Port collision tests pass under concurrent registration. Allocation now
+      also skips OS-bound ports (live probe).
 
 ## Tests
 

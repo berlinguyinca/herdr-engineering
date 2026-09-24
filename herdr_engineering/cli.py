@@ -111,10 +111,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("lease_id"); p2.set_defaults(func=_cmd_dev_heartbeat)
     p2 = dsub.add_parser("close", help="close a lease")
     p2.add_argument("lease_id"); p2.set_defaults(func=_cmd_dev_close)
-    dsub.add_parser("list", help="list active leases").set_defaults(func=_cmd_dev_list)
+    p2 = dsub.add_parser("list", help="list active leases")
+    p2.add_argument("--json", action="store_true", default=True)
+    p2.set_defaults(func=_cmd_dev_list)
     p2 = dsub.add_parser("resolve", help="resolve a dev port to a lease")
     p2.add_argument("port", type=int); p2.set_defaults(func=_cmd_dev_resolve)
     dsub.add_parser("reconcile", help="expire stale leases").set_defaults(func=_cmd_dev_reconcile)
+    p2 = dsub.add_parser("serve", help="forward the leased external port to the target")
+    p2.add_argument("lease_id")
+    p2.add_argument("--bind", default="127.0.0.1",
+                    help="bind address (loopback or private; public refused)")
+    p2.add_argument("--timeout", type=float, default=None,
+                    help="auto-stop after N seconds (for tests)")
+    p2.set_defaults(func=_cmd_dev_serve)
 
     # attention ------------------------------------------------------------
     p = sub.add_parser("attention", help="attention/notifications (spec 0160)")
@@ -391,6 +400,46 @@ def _cmd_dev_reconcile(args) -> int:
     return 0
 
 
+def _cmd_dev_serve(args) -> int:
+    import signal
+    import time
+
+    from .devfabric import DevServiceForwarder, DevServiceRegistry
+    from .errors import ConflictError
+    lease = DevServiceRegistry().get(args.lease_id)
+    if lease is None:
+        _print_json({"ok": False, "error": f"unknown lease {args.lease_id}"})
+        return 1
+    try:
+        fwd = DevServiceForwarder(lease, bind_host=args.bind).start()
+    except ConflictError as exc:
+        _print_json({"ok": False, "error": str(exc)})
+        return 1
+    _print_json({
+        "ok": True,
+        "lease_id": lease.id,
+        "dev_address": f"http://dev:{lease.external_port}",
+        "local_address": f"http://{args.bind}:{lease.external_port}",
+        "target": f"{lease.target_host}:{lease.target_port}",
+        "protocol": lease.protocol,
+    })
+    stop = {"flag": False}
+
+    def _on_sigint(_signum, _frame) -> None:
+        stop["flag"] = True
+    signal.signal(signal.SIGINT, _on_sigint)
+    try:
+        deadline = time.monotonic() + args.timeout if args.timeout else None
+        while not stop["flag"]:
+            if deadline is not None and time.monotonic() > deadline:
+                break
+            time.sleep(0.2)
+    finally:
+        fwd.stop()
+        _print_json({"stopped": True, "lease_id": lease.id})
+    return 0
+
+
 def _cmd_att_raise(args) -> int:
     from .attention import AttentionCenter
     item = AttentionCenter().raise_item(
@@ -450,10 +499,12 @@ def _cmd_ci_pipelines(args) -> int:
 
 
 def _cmd_browser(args) -> int:
+    from .artifacts import FilesystemArtifactWorkspace
     from .browser import NoopBrowserAdapter, PlaywrightBrowserAdapter
-    adapter = PlaywrightBrowserAdapter()
+    artifacts = FilesystemArtifactWorkspace()
+    adapter = PlaywrightBrowserAdapter(artifacts=artifacts)
     if not adapter.available:
-        adapter = NoopBrowserAdapter()
+        adapter = NoopBrowserAdapter(artifacts=artifacts)
     cap = adapter.capture(args.url, viewport=args.viewport, project=args.project,
                           mission=args.mission, machine_id=args.machine)
     if args.json:

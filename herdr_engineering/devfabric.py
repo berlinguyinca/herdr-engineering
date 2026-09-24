@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import uuid
 from datetime import UTC, datetime
@@ -22,6 +23,27 @@ _HI = 28999
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def _os_port_free(port: int) -> bool:
+    """Probe whether the OS has ``port`` bound on loopback.
+
+    EADDRINUSE means taken; any other probe error is treated leniently as
+    free (the forwarder's own bind will still fail loudly on a real
+    collision).
+    """
+    import errno
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))
+        return True
+    except OSError as exc:
+        if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+            return False
+        return True
+    finally:
+        s.close()
 
 
 class DevServiceRegistry:
@@ -46,7 +68,22 @@ class DevServiceRegistry:
         try:
             data = json.loads(self._path.read_text())
             for raw in data.get("leases", []):
-                lease = DevServiceLease(**raw)
+                # to_dict() nests target/owner/health and drops the flat
+                # fields; reconstruct the flat constructor arguments.
+                d = dict(raw)
+                target = d.pop("target", None) or {}
+                owner = d.pop("owner", None) or {}
+                d.pop("health", None)
+                d.setdefault("target_machine_id", target.get("machine_id"))
+                d.setdefault("target_host", target.get("host"))
+                d.setdefault("target_port", target.get("port"))
+                d.setdefault("owner_user_id", owner.get("user_id"))
+                d.setdefault("owner_herdr_session_id",
+                             owner.get("herdr_session_id"))
+                d.setdefault("owner_repository", owner.get("repository"))
+                d.setdefault("owner_worktree_id", owner.get("worktree_id"))
+                d.setdefault("owner_process_id", owner.get("process_id"))
+                lease = DevServiceLease(**d)
                 self._leases[lease.id] = lease
         except Exception:
             pass
@@ -69,8 +106,9 @@ class DevServiceRegistry:
         return False
 
     def _allocate_port(self, exclude_id: str | None = None) -> int:
+        """Allocate a port free of both other leases AND live OS bindings."""
         for port in range(self._lo, self._hi + 1):
-            if not self._is_port_taken(port, exclude_id):
+            if not self._is_port_taken(port, exclude_id) and _os_port_free(port):
                 return port
         raise ConflictError("no free external dev port in configured range")
 
@@ -174,6 +212,106 @@ class DevServiceRegistry:
             if lease.external_port == external_port and lease.state == "active":
                 return lease
         return None
+
+
+class DevServiceForwarder:
+    """Binds an allocated external port and TCP-proxies to the lease target.
+
+    This is the data path of the dev fabric: the lease registry decides which
+    external port a service owns; the forwarder makes traffic on that port
+    actually reach ``target_host:target_port``. HTTP, HTTPS, WebSocket, SSE,
+    HMR and generic TCP all flow through the same byte pipe.
+
+    Private-only: when ``private_only`` is set (the default), the bind address
+    must be loopback or a private address (RFC1918, link-local, CGNAT, or the
+    Tailscale range). Public bind addresses are refused.
+    """
+
+    def __init__(self, lease: DevServiceLease, bind_host: str = "127.0.0.1",
+                 private_only: bool = True) -> None:
+        self.lease = lease
+        self.bind_host = bind_host
+        self.private_only = private_only
+        self._listener: socket.socket | None = None
+        self._accept_thread: threading.Thread | None = None
+        self._stopping = threading.Event()
+
+    def start(self) -> DevServiceForwarder:
+        from .observability import _is_public_ip
+        if self.private_only and _is_public_ip(self.bind_host):
+            raise ConflictError(
+                f"refusing public bind address {self.bind_host} "
+                "(dev fabric is private-only)")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.bind_host, self.lease.external_port))
+        sock.listen(64)
+        sock.settimeout(0.5)
+        self._listener = sock
+
+        def _accept_loop() -> None:
+            while not self._stopping.is_set():
+                try:
+                    client, _addr = self._listener.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(target=self._proxy, args=(client,), daemon=True).start()
+
+        self._accept_thread = threading.Thread(target=_accept_loop, daemon=True)
+        self._accept_thread.start()
+        return self
+
+    def _proxy(self, client: socket.socket) -> None:
+        target = None
+        try:
+            target = socket.create_connection(
+                (self.lease.target_host, self.lease.target_port), timeout=5)
+
+            def _pump(src: socket.socket, dst: socket.socket) -> None:
+                try:
+                    while True:
+                        data = src.recv(65536)
+                        if not data:
+                            break
+                        dst.sendall(data)
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        dst.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+
+            t1 = threading.Thread(target=_pump, args=(client, target), daemon=True)
+            t2 = threading.Thread(target=_pump, args=(target, client), daemon=True)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+        except OSError:
+            pass  # target unreachable: drop the connection, lease stays registered
+        finally:
+            for s in (client, target):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+    def stop(self) -> None:
+        self._stopping.set()
+        if self._listener is not None:
+            try:
+                self._listener.close()
+            except OSError:
+                pass
+            self._listener = None
+
+    @property
+    def bound(self) -> bool:
+        return self._listener is not None
 
 
 def _add_seconds(iso: str, seconds: int) -> str:

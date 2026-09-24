@@ -1,0 +1,21 @@
+# Live validation evidence — 2026-09-24 (host: bender)
+
+## Fleet reachability (herdr --machine)
+beast: REACHABLE
+fry: unreachable (error: unknown machine 'fry'; use `herdr machine list`)
+mac: unreachable (error: unknown machine 'mac'; use `herdr machine list`)
+
+## Dev fabric end-to-end drill (spec 0110)
+1. python3 -m http.server 18777  (demo app)
+2. herdr-eng devfabric register --machine bender --host 127.0.0.1 --port 18777 --label dev-fabric-demo
+   -> lease_9bfe7257bdf94fa4 external_port=18000
+3. herdr-eng devfabric serve lease_9bfe7257bdf94fa4  (binds 18000, proxies to 18777)
+4. curl http://127.0.0.1:18000/ -> HTTP 200 '<h1>dev fabric demo</h1>'
+
+## Browser preview (spec 0070)
+herdr-eng web --port 8787 (started)
+herdr-eng browser http://127.0.0.1:8787 --json
+   -> ok=true, console_errors=[], artifact=art_ed96509c7f0e4cbb8c58 (PNG published to artifact workspace)
+
+## Beast live snapshot (via herdr --machine beast api snapshot)
+7 workspaces with live pi agent sessions (working/idle), protocol 22, herdr 0.9.1

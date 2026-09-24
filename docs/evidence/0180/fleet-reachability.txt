@@ -1,0 +1,3 @@
+beast: REACHABLE
+fry: unreachable (error: unknown machine 'fry'; use `herdr machine list`)
+mac: unreachable (error: unknown machine 'mac'; use `herdr machine list`)
