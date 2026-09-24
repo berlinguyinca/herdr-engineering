@@ -167,10 +167,26 @@ unit-tested; only live convergence/validation is pending.
 
 ## CI
 
-- [ ] Woodpecker/Pileated repositories/pipelines are visible. **BLOCKED_EXTERNAL** —
-      live CI instance not reachable.
-- [ ] Pipeline/step logs are clickable. **BLOCKED_EXTERNAL**.
-- [ ] Queue and runner state is visible. **BLOCKED_EXTERNAL**.
+- [x] Woodpecker/Pileated repositories/pipelines are visible. **Live-verified**
+      against the real instance (Woodpecker 3.18.1 behind an OAuth2 proxy):
+      `herdr-eng ci repos` → 23 repos; `ci pipelines --repo berlinguyinca/autospec`
+      → 11 pipelines with status/branch/commit; `ci pipeline … 12` → full detail
+      with workflows→tasks (the API is addressed by numeric repo id, resolved
+      from `owner/name`). The `/api/v0/` path assumed earlier was wrong — the
+      real base is `/api/`, and trailing slashes 301 to the SPA.
+- [x] Pipeline/step drill-down is visible; raw step logs are honest-degraded.
+      **Live-verified**: `ci pipeline` flattens `workflows[].children[]` into
+      tasks with `state` + `exit_code` (e.g. `rust-validate` exit 2,
+      `rust-workspace-test` exit 101). Woodpecker 3.x streams raw logs over
+      WebSocket with no REST log endpoint, and the OAuth2 proxy only forwards an
+      interactive browser session (not a bearer token) on the upgrade — so
+      `ci logs` returns an explicit "not available via the API" note plus a web
+      UI link rather than guessing. `ci debug` builds a bounded Debug-with-Pi
+      handoff from the failing tasks.
+- [x] Queue and runner state is visible. **Live-verified**: `ci agents` → 8
+      runner agents (name/version/backend/capacity/last_contact); the agent
+      auth `token` in the raw payload is stripped (never surfaced). The
+      pipeline list carries pending/running entries (the queue).
 - [x] Commit/branch/worktree correlation is correct. Correlator tested.
 - [x] Stale/unavailable CI is shown explicitly rather than guessed.
 - [x] Optional retry/cancel controls respect upstream auth/permissions.

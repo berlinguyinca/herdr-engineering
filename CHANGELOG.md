@@ -26,8 +26,24 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   healthy renewal, token auth, list/resolve, restart re-bind, port-taken
   refusal, URL resolution, single-gateway lock, API shape).
 - `docs/architecture/dev-fabric-gateway.md` (design + live evidence).
+- **Live Woodpecker CI view** — validated against the real instance
+  (Woodpecker 3.18.1). `herdr-eng ci repos|agents|pipelines|pipeline|logs|
+  debug`: repos, runner agents (auth token stripped), pipelines with status,
+  pipeline→task drill-down (3.x `workflows[].children[]` flattened to tasks
+  with state + exit code), honest step-log handling, and a bounded
+  Debug-with-Pi handoff for failing pipelines.
 
 ### Fixed
+- **CI provider corrected to the real Woodpecker 3.x API** (found during live
+  validation): base is `/api/`, not `/api/v0/` (the earlier `/v0` was a
+  mis-diagnosis caused by trailing-slash 301s returning the SPA); repos are
+  addressed by numeric id (resolved from `owner/name`); pipeline detail uses
+  `workflows[].children[]` (tasks), not a `steps` array; offline `pipelines`/
+  `pipeline`/`step_log` return empty/None instead of raising.
+- `ci logs` no longer implies logs are missing due to a bug: it reports
+  explicitly that this Woodpecker 3.x build streams logs over WebSocket (no
+  REST endpoint) and the OAuth2 proxy does not forward a bearer token on the
+  upgrade, then links the web UI.
 - Fabric router `unbind` leaked one connection through an in-flight
   `accept()`; unbind now joins the accept threads so a port is only reported
   released when it truly is.

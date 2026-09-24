@@ -163,13 +163,19 @@ def _build_parser() -> argparse.ArgumentParser:
     csub = p.add_subparsers(dest="ci_command", required=True)
     p2 = csub.add_parser("repos", help="list CI repositories")
     p2.set_defaults(func=_cmd_ci_repos)
+    p2 = csub.add_parser("agents", help="list CI runner agents (runner/queue state)")
+    p2.set_defaults(func=_cmd_ci_agents)
     p2 = csub.add_parser("pipelines", help="list pipelines for a repo (owner/name)")
     p2.add_argument("--repo", required=True); p2.set_defaults(func=_cmd_ci_pipelines)
-    p2 = csub.add_parser("pipeline", help="pipeline detail incl. steps (by number)")
-    p2.add_argument("number", type=int); p2.set_defaults(func=_cmd_ci_pipeline)
-    p2 = csub.add_parser("logs", help="raw log of one pipeline step")
+    p2 = csub.add_parser("pipeline", help="pipeline detail incl. tasks (by number)")
+    p2.add_argument("--repo", required=True); p2.add_argument("number", type=int)
+    p2.set_defaults(func=_cmd_ci_pipeline)
+    p2 = csub.add_parser("logs", help="raw log of one pipeline step (if the API exposes it)")
     p2.add_argument("--repo", required=True); p2.add_argument("--pipeline", type=int, required=True)
     p2.add_argument("--step", required=True); p2.set_defaults(func=_cmd_ci_logs)
+    p2 = csub.add_parser("debug", help="build a bounded 'Debug with Pi' handoff for a failing pipeline")
+    p2.add_argument("--repo", required=True); p2.add_argument("number", type=int)
+    p2.set_defaults(func=_cmd_ci_debug)
 
     # browser / review -----------------------------------------------------
     p = sub.add_parser("browser", help="browser preview (spec 0070)")
@@ -652,6 +658,19 @@ def _cmd_ci_repos(args) -> int:
     return 0
 
 
+def _cmd_ci_agents(args) -> int:
+    provider = _ci_provider()
+    if not provider.available:
+        return _ci_offline()
+    try:
+        _print_json({"available": True, "base_url": provider.base_url,
+                     "agents": provider.agents()})
+    except Exception as exc:
+        _print_json({"available": False, "error": str(exc)})
+        return 1
+    return 0
+
+
 def _cmd_ci_pipelines(args) -> int:
     provider = _ci_provider()
     if not provider.available:
@@ -670,10 +689,15 @@ def _cmd_ci_pipeline(args) -> int:
     if not provider.available:
         return _ci_offline()
     try:
-        _print_json({"available": True, "pipeline": provider.pipeline(args.number)})
+        detail = provider.pipeline(args.repo, args.number)
     except Exception as exc:
         _print_json({"available": False, "error": str(exc)})
         return 1
+    if detail is None:
+        _print_json({"available": False,
+                     "note": f"pipeline {args.number} not found for {args.repo}"})
+        return 1
+    _print_json({"available": True, "pipeline": detail})
     return 0
 
 
@@ -686,7 +710,32 @@ def _cmd_ci_logs(args) -> int:
     except Exception as exc:
         _print_json({"available": False, "error": str(exc)})
         return 1
-    print(log if log is not None else "")
+    if log is not None:
+        print(log)
+        return 0
+    # Honest degraded view: this Woodpecker 3.x build streams logs over
+    # WebSocket (no REST log endpoint), and the OAuth2 proxy only forwards
+    # an interactive browser session — not a bearer token — on the upgrade.
+    _print_json({
+        "available": True, "log": None,
+        "note": "step log not available via the API on this instance. "
+                "Woodpecker 3.x streams logs over WebSocket, which the "
+                "OAuth2 proxy only accepts for an interactive browser session "
+                "(a bearer token is not forwarded on the upgrade).",
+        "view_in_web_ui": f"{provider.base_url.rstrip('/')}/{args.repo}/pipelines/{args.pipeline}",
+    })
+    return 0
+
+
+def _cmd_ci_debug(args) -> int:
+    provider = _ci_provider()
+    if not provider.available:
+        return _ci_offline()
+    try:
+        _print_json(provider.debug_with_pi(args.repo, args.number))
+    except Exception as exc:
+        _print_json({"available": False, "error": str(exc)})
+        return 1
     return 0
 
 

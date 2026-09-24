@@ -218,7 +218,11 @@ herdr-eng devfabric register --machine bender --host 127.0.0.1 --port 5173 --lab
 herdr-eng devfabric serve lease_xxx            # or --bind <tailscale-ip> for other hosts
 herdr-eng tests adapters
 herdr-eng tests run pytest --repo owner/repo --worktree 0110-dev-fabric --machine localhost
-herdr-eng ci pipelines --repo owner/repo
+herdr-eng ci repos                          # list CI repositories
+herdr-eng ci agents                         # runner/queue state (agent token stripped)
+herdr-eng ci pipelines --repo owner/repo    # pipelines with status
+herdr-eng ci pipeline --repo owner/repo 12  # detail: workflows -> tasks (state + exit code)
+herdr-eng ci debug --repo owner/repo 12     # bounded Debug-with-Pi handoff for failures
 herdr-eng candidates id --repo owner/repo --worktree wt-18 --branch checkout-redesign-a
 herdr-eng journal timeline <session_id>
 herdr-eng attention list
@@ -298,6 +302,8 @@ macOS convergence is a documented `BLOCKED_EXTERNAL` item pending a fleet run.
 | dev service not forwarding | `herdr-eng devfabric list` (lease active?) then run `herdr-eng devfabric serve <lease>` |
 | config not taking effect | `herdr-eng doctor --json` shows the config file in use; precedence is machine-local < repo < `$HERDR_ENGINEERING_CONFIG` |
 | stale dev port | `herdr-eng devfabric reconcile` expires stale leases |
+| `ci` says offline / stale | set the operator token: `~/.config/herdr-engineering/ci-token` (chmod 600) or `HERDR_ENGINEERING_CI_TOKEN`; the token is a secret and never lives in the repo. Without it the view is explicitly stale, never guessed |
+| `ci logs` returns no log text | expected on this Woodpecker 3.x instance: logs stream over WebSocket (no REST endpoint) and the OAuth2 proxy doesn't forward a bearer token on the upgrade. Use the `view_in_web_ui` link it prints; `ci debug` still gives the failing tasks + exit codes |
 | `dev:<port>` unreachable from other hosts | is the gateway up? `herdr-eng devfabric gateway` on the gateway host; point commands at it with `HERDR_ENGINEERING_FABRIC_URL=http://<gateway>:29999` (or `fabric.gateway_url` in config); the app must be bound to the tailnet interface or `0.0.0.0` |
 
 ## Dev fabric gateway (unified `dev:<port>`)

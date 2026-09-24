@@ -50,14 +50,21 @@ class PlaywrightBrowserAdapter:
         w, h = VIEWPORTS.get(viewport, VIEWPORTS["desktop"])
         from playwright.sync_api import sync_playwright
         console_errors: list[str] = []
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            page = browser.new_page(viewport={"width": w, "height": h})
-            page.on("console", lambda m: console_errors.append(m.text)
-                    if m.type == "error" else None)
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            png = page.screenshot()
-            browser.close()
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_page(viewport={"width": w, "height": h})
+                page.on("console", lambda m: console_errors.append(m.text)
+                        if m.type == "error" else None)
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                png = page.screenshot()
+                browser.close()
+        except Exception as exc:
+            # The playwright *package* can be present while the browser binary
+            # for this version is not (e.g. `playwright install` not run). Degrade
+            # gracefully instead of crashing the caller.
+            return BrowserCapture(ok=False, url=url,
+                                  error=f"browser launch failed: {exc}")
         art = None
         if self.artifacts:
             res = self.artifacts.publish_bytes(

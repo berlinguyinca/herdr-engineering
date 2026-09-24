@@ -24,7 +24,7 @@ collection warnings. Real command + live-fleet snapshots are captured under
 | 0100 Pi Engineering/AutoSpec integration | COMPLETE | `pi_autospec.py`, correlation tests |
 | 0110 Transparent dev fabric | COMPLETE (impl + gateway); cross-host live `BLOCKED_EXTERNAL` | `devfabric.py`, `fabric.py` (gateway/router/probe), `herdr-eng devfabric`, fabric+lease tests |
 | 0120 Unified test explorer | COMPLETE | `tests.py`, `herdr-eng tests`, adapter tests |
-| 0130 Woodpecker/Pileated CI | COMPLETE | `ci.py`, `herdr-eng ci`, CI tests |
+| 0130 Woodpecker/Pileated CI | COMPLETE (impl + live); raw step-log text `BLOCKED_EXTERNAL` (WebSocket-only) | `ci.py`, `herdr-eng ci {repos,agents,pipelines,pipeline,logs,debug}`, CI tests |
 | 0140 Multi-agent worktree comparison | COMPLETE | `candidates.py`, `herdr-eng candidates`, candidate tests |
 | 0150 Unified engineering UX | COMPLETE | `web.py` navigation surfaces |
 | 0160 Attention/notifications/review | COMPLETE | `attention.py`, `herdr-eng attention`, attention tests |
@@ -113,7 +113,7 @@ commands to local mode. All have regression tests.
 | Blocked item | Reason | Evidence |
 |---|---|---|
 | Real Ansible convergence of the 4 fleet hosts | playbooks `--check`-validated on `bender` (ok=12 failed=0, ansible-core 2.21.4); real convergence installs packages on live machines — pending operator go-ahead | `ansible/README.md` |
-| Live Woodpecker/Pileated CI view | instance identified (`ci.metabolomics.us`, Woodpecker 3.18.1, `/api/v0/`); needs an operator API token (`~/.config/herdr-engineering/ci-token`) | `ci.py` returns explicit stale/unavailable state without a token |
+| Raw Woodpecker step-log *text* via API | Woodpecker 3.x streams logs over WebSocket (no REST endpoint); the OAuth2 proxy only forwards an interactive browser session, not a bearer token, on the upgrade. `ci logs`/`ci debug` degrade honestly and link the web UI | `docs/acceptance-matrix.md` (CI) |
 | Human confirmation of phone/iPad on the tailnet | the `dev` front door is proven reachable from the tailnet (HTTP 200 via MagicDNS + IP); opening it on an actual device is a human step | `docs/evidence/0180/live-validation.txt` |
 | Cross-host fabric routing drill | same code path as the proven same-host drill (target_host is a parameter); needs an app on a second fleet machine | `docs/architecture/dev-fabric-gateway.md` |
 
@@ -121,8 +121,23 @@ Cleared during live validation (2026-09-24): Chromium/CDP browser preview
 (captured live, artifact published), dev-fabric HTTP on loopback and on the
 tailnet interface, cross-machine Herdr access (`herdr --machine beast`),
 the unified `dev:<port>` gateway front door on bender (MagicDNS + tailnet IP,
-immediate bind, restart re-bind), and GitHub push + CI (public repo
-`berlinguyinca/herdr-engineering`, CI green).
+immediate bind, restart re-bind), the powerpack up/down (rollback) drill, the
+live pytest test-tree run, and the **live Woodpecker CI view** (repos,
+runner agents, pipelines, pipeline→task drill-down with failing tasks + exit
+codes, and a bounded Debug-with-Pi handoff — see below), plus GitHub push +
+CI (public repo `berlinguyinca/herdr-engineering`, CI green).
+
+- **Live Woodpecker CI (real instance, Woodpecker 3.18.1)**: with an operator
+  token, `herdr-eng ci repos` → 23 repos; `ci agents` → 8 runner agents
+  (auth `token` stripped); `ci pipelines --repo berlinguyinca/autospec` → 11
+  pipelines with status; `ci pipeline … 12` → workflows→tasks incl. failing
+  `rust-validate` (exit 2) and `rust-workspace-test` (exit 101); `ci logs`
+  returns an explicit "not available via the API (WebSocket-only)" note + web
+  UI link; `ci debug … 12` builds a bounded Debug-with-Pi handoff. The
+  provider was corrected to the real API: base `/api/` (not `/api/v0/`),
+  numeric repo ids resolved from `owner/name`, and 3.x `workflows[].children[]`
+  (tasks) instead of a `steps` array. Evidence:
+  `docs/evidence/0180/live-validation.txt`.
 
 All implementation that does not depend on those external resources is
 complete, tested, and committed.

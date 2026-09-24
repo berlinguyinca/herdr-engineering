@@ -80,3 +80,42 @@ herdr-eng tests run pytest --repo berlinguyinca/herdr-engineering \
 → run.started → 10x test.finished (all "passed") → run.finished
   result: {"status": "passed"}
 Proves the TestEvent contract end-to-end on a real run (spec 0120, pytest row).
+
+---
+Live Woodpecker CI validation (2026-09-24, operator token provided)
+---
+Instance: ci.metabolomics.us — Woodpecker 3.18.1 behind OAuth2 Proxy v7.6.0
+  (nginx/1.20.1). Auth: Bearer user JWT (type=user, user-id=1), machine-local
+  ~/.config/herdr-engineering/ci-token (chmod 600; never in repo).
+
+API discovery (the earlier /api/v0/ assumption was WRONG):
+  - Real base is /api/ (NOT /api/v0/). Trailing slashes 301 -> SPA HTML, which
+    is what originally misled the "v0" mis-diagnosis.
+  - Repos are addressed by NUMERIC id: GET /api/repos, /api/repos/{id},
+    /api/repos/{id}/pipelines, /api/repos/{id}/pipelines/{number}.
+  - 3.x pipeline detail exposes workflows[].children[] (tasks), not steps[].
+  - No REST log endpoint (all /.../log variants return the SPA shell); logs
+    stream over WebSocket, and the OAuth2 proxy does NOT forward a bearer
+    token on the /ws/ upgrade (returns the sign-in page). => ci logs/deubg
+    degrade honestly and link the web UI.
+  - /api/agents -> runner state (8 agents); raw payload includes each agent's
+    auth token => stripped in the view.
+
+Live commands (all via `herdr-eng ci ...`):
+  ci repos      -> 23 repos (e.g. berlinguyinca/autospec id 17)
+  ci agents     -> 8 runner agents (whiteale-kvm-node-*), token NOT leaked
+  ci pipelines --repo berlinguyinca/autospec
+                -> 11 pipelines; #12..#8 failure, #5 success, #4 canceled
+  ci pipeline --repo berlinguyinca/autospec 12
+                -> status failure, 15 tasks; FAILED rust-validate (exit 2),
+                   FAILED rust-workspace-test (exit 101)
+  ci logs --repo berlinguyinca/autospec --pipeline 12 --step rust-validate
+                -> {log: null, note: WebSocket-only / web-UI link} (honest)
+  ci debug --repo berlinguyinca/autospec 12
+                -> bounded debug-with-pi handoff: failing_step
+                   "rust-validate, rust-workspace-test", exit codes, web UI link
+
+Code corrected in herdr_engineering/ci.py to the real contract (base /api/,
+numeric id resolution, workflows->tasks flattening, agents with token
+stripping, honest step_log, debug_with_pi). tests/test_ci.py locks the
+contract (13 tests). Full suite: 114 passed, ruff clean, CI green.
