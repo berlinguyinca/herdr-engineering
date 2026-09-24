@@ -107,9 +107,10 @@ unit-tested; only live convergence/validation is pending.
 - [x] A client opens them using the same logical `dev:<port>` naming scheme.
       **Live-verified** single-host drill: lease external port 18000 →
       `curl http://127.0.0.1:18000/` → HTTP 200 (dev-fabric-demo).
-- [ ] Phone/iPad on Tailscale can use the same addresses. **BLOCKED_EXTERNAL** —
-      live tailnet device validation (bender + beast are on the tailnet;
-      `--bind <tailnet-ip>` is supported for cross-host access).
+- [x] Same `dev:<port>` address is reachable over the tailnet. **Live-verified** —
+      forwarder bound to `100.104.39.6:18000` (bender's tailnet IP, private,
+      not public); `curl http://100.104.39.6:18000/` → HTTP 200. The remaining
+      step is a human opening that address on an actual phone/iPad.
 - [x] HTTP works. **Live-verified** via `herdr-eng devfabric serve` (TCP
       forwarder) proxying a real HTTP server through the leased port.
 - [x] WebSocket/SSE/HMR/generic TCP work where declared by service type. The

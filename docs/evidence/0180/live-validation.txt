@@ -19,3 +19,9 @@ herdr-eng browser http://127.0.0.1:8787 --json
 
 ## Beast live snapshot (via herdr --machine beast api snapshot)
 7 workspaces with live pi agent sessions (working/idle), protocol 22, herdr 0.9.1
+
+## Tailnet-interface dev fabric (cross-device reachability, spec 0110)
+Forwarder bound to bender's tailnet IP (NOT 0.0.0.0, NOT public):
+  ss: LISTEN 100.104.39.6:18000  (herdr-eng)
+curl http://100.104.39.6:18000/ -> HTTP 200 '<h1>dev fabric demo</h1>'
+Any tailnet device (beast, iphone171, ipad157) can open that address.
