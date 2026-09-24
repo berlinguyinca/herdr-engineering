@@ -46,7 +46,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("tag"); p.set_defaults(func=_cmd_pp_snapshot)
     pps.add_parser("preflight", help="run update preflight (blocks incompatible)").set_defaults(func=_cmd_pp_preflight)
     p = pps.add_parser("rollback", help="restore prior known-good snapshot")
-    p.add_argument("--snapshot", default=None)
+    p.add_argument("target", nargs="?", default=None,
+                   help="snapshot path or tag (default: most recent)")
+    p.add_argument("--snapshot", default=None, help=argparse.SUPPRESS)
     p.set_defaults(func=_cmd_pp_rollback)
 
     # naming ---------------------------------------------------------------
@@ -244,7 +246,8 @@ def _cmd_pp_preflight(args) -> int:
 
 def _cmd_pp_rollback(args) -> int:
     from .powerpack import PowerpackManager
-    snap = PowerpackManager().rollback(args.snapshot)
+    target = args.target or args.snapshot
+    snap = PowerpackManager().rollback(target)
     _print_json({"ok": True, "snapshot": str(snap)})
     return 0
 

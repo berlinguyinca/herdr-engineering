@@ -26,6 +26,38 @@ def test_snapshot_and_rollback(tmp_path):
     assert "broken" not in lock.read_text()
 
 
+def test_snapshot_and_rollback_restores_plugin_policy(tmp_path):
+    """enable/disable state must survive the up/down drill (the 'down' half)."""
+    pp = PowerpackManager(state_dir=tmp_path / "state",
+                          lock_path=tmp_path / "lock.yaml")
+    pp.snapshot("clean")          # nothing enabled yet
+    pp.enable("plannotator", reason="drill")
+    assert pp.enabled_plugins() == ["plannotator"]
+    pp.rollback("clean")
+    assert pp.enabled_plugins() == []
+
+
+def test_rollback_accepts_str_path_and_tag(tmp_path):
+    lock = tmp_path / "lock.yaml"
+    lock.write_text("version: 1\ndependencies: {good: true}\n")
+    pp = PowerpackManager(state_dir=tmp_path / "state", lock_path=lock)
+    snap = pp.snapshot("drill")
+    lock.write_text("version: 1\ndependencies: {broken: true}\n")
+    # CLI passes --snapshot as a string (possibly with ~): must not crash
+    pp.rollback(str(snap))
+    assert "broken" not in lock.read_text()
+    # tag form: most recent snapshot-drill-*
+    lock.write_text("version: 1\ndependencies: {broken: true}\n")
+    pp.rollback("drill")
+    assert "broken" not in lock.read_text()
+    from herdr_engineering.errors import InvalidError
+    try:
+        pp.rollback("no-such-tag")
+        assert False, "expected InvalidError"
+    except InvalidError:
+        pass
+
+
 def test_update_preflight_blocks_incompatible(tmp_path):
     lock = tmp_path / "lock.yaml"
     lock.write_text(

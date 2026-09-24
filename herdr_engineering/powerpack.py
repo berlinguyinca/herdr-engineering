@@ -98,6 +98,14 @@ class PowerpackManager:
         cfg_path = _find_config()
         if cfg_path and Path(cfg_path).exists():
             shutil.copy(cfg_path, snap / "herdr-engineering.yaml")
+        # the plugin policy is what enable/disable mutate; a rollback that
+        # skipped it would leave the "upgrade" half of up/down in place.
+        # Capture the policy even when empty so "nothing enabled" is
+        # restorable too.
+        if self._policy_path.exists():
+            shutil.copy(self._policy_path, snap / "plugin_policy.json")
+        else:
+            (snap / "plugin_policy.json").write_text("{}")
         marker = {"tag": tag, "created_at": time.time()}
         (snap / "snapshot.json").write_text(json.dumps(marker, indent=2))
         return snap
@@ -118,13 +126,27 @@ class PowerpackManager:
         return PreflightResult(ok=ok, incompatible=incompatible,
                                doctor_overall=report.overall)
 
-    def rollback(self, snapshot: Path | None = None) -> Path:
-        """Restore the most recent (or given) known-good snapshot."""
+    def rollback(self, snapshot: Path | str | None = None) -> Path:
+        """Restore the most recent (or given) known-good snapshot.
+
+        ``snapshot`` may be a full path, an expanded ``~`` path, or a tag
+        (the most recent ``snapshot-<tag>-*`` is used).
+        """
         if snapshot is None:
             snaps = sorted(self.state_dir.glob("snapshot-*"))
             if not snaps:
                 raise InvalidError("no snapshot to roll back to")
             snapshot = snaps[-1]
+        else:
+            candidate = Path(os.path.expanduser(str(snapshot)))
+            if candidate.is_dir():
+                snapshot = candidate
+            else:
+                # treat as a tag: most recent snapshot-<tag>-*
+                tagged = sorted(self.state_dir.glob(f"snapshot-{snapshot}-*"))
+                if not tagged:
+                    raise InvalidError(f"no snapshot found for {snapshot!r}")
+                snapshot = tagged[-1]
         if (snapshot / "upstreams.lock").exists():
             shutil.copy(snapshot / "upstreams.lock", self.lock_path)
         cfg_path = _find_config()
@@ -132,6 +154,8 @@ class PowerpackManager:
             if cfg_path:
                 Path(cfg_path).write_bytes(
                     (snapshot / "herdr-engineering.yaml").read_bytes())
+        if (snapshot / "plugin_policy.json").exists():
+            shutil.copy(snapshot / "plugin_policy.json", self._policy_path)
         return snapshot
 
     def status(self) -> dict[str, Any]:
