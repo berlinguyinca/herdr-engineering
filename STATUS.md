@@ -22,7 +22,7 @@ collection warnings. Real command + live-fleet snapshots are captured under
 | 0080 Shared artifact workspace | COMPLETE | `artifacts.py`, `herdr-eng artifacts`, artifact tests |
 | 0090 Session journal & timeline | COMPLETE | `journal.py`, `herdr-eng journal`, journal tests |
 | 0100 Pi Engineering/AutoSpec integration | COMPLETE | `pi_autospec.py`, correlation tests |
-| 0110 Transparent dev fabric | COMPLETE (impl); live multi-host `BLOCKED_EXTERNAL` | `devfabric.py`, `herdr-eng devfabric`, lease/port tests |
+| 0110 Transparent dev fabric | COMPLETE (impl + gateway); cross-host live `BLOCKED_EXTERNAL` | `devfabric.py`, `fabric.py` (gateway/router/probe), `herdr-eng devfabric`, fabric+lease tests |
 | 0120 Unified test explorer | COMPLETE | `tests.py`, `herdr-eng tests`, adapter tests |
 | 0130 Woodpecker/Pileated CI | COMPLETE | `ci.py`, `herdr-eng ci`, CI tests |
 | 0140 Multi-agent worktree comparison | COMPLETE | `candidates.py`, `herdr-eng candidates`, candidate tests |
@@ -84,26 +84,45 @@ overridden by repo `config/herdr-engineering.yaml`, then `$HERDR_ENGINEERING_CON
   running web UI via Playwright/Chromium; the PNG was published to the
   artifact workspace as `art_ed96509c7f0e4cbb8c58`; `console_errors` came
   back empty.
-- Evidence: `docs/evidence/0180/live-validation.txt`.
+- **Dev fabric gateway (unified `dev:<port>` front door)**: `herdr-eng
+  devfabric gateway` on bender (control :29999 on tailnet+loopback,
+  router on loopback+tailnet). `register --host auto` for a local app
+  allocated external port 18000 and bound it immediately; both
+  `curl http://bender.tail0c50da.ts.net:18000/` and
+  `curl http://100.104.39.6:18000/` returned the app's page (HTTP 200).
+  A gateway restart auto-rebound a surviving lease from the store
+  (port 18001) without any registrar action. Dead-target port release is
+  probe/TTL-driven (unhealthy → no renewal → TTL expiry → unbind with
+  accept-thread join).
+- Evidence: `docs/evidence/0180/live-validation.txt`,
+  `docs/architecture/dev-fabric-gateway.md`.
 
 Bugs found and fixed by the live drills: (1) `herdr-eng browser` never wired
 the artifact workspace, so screenshots were captured but not persisted;
 (2) dev-fabric lease persistence was broken across processes (`to_dict()`
 nests fields the loader didn't reconstruct); (3) port allocation ignored
-OS-level bindings. All have regression tests.
+OS-level bindings; (4) an unbind could leak one connection through an
+in-flight `accept()` (fixed by joining accept threads); (5) the probe loop
+consumed expiry via `active_leases()`' internal reconcile and never released
+ports (fixed with router self-sync); (6) `gateway_url_from_config` ignored
+the `HERDR_ENGINEERING_FABRIC_URL` env var, silently degrading registrar
+commands to local mode. All have regression tests.
 
 ## External validation blockers (with evidence)
 
 | Blocked item | Reason | Evidence |
 |---|---|---|
 | Real Ansible convergence of the 4 fleet hosts | playbooks `--check`-validated on `bender` (ok=12 failed=0, ansible-core 2.21.4); real convergence installs packages on live machines — pending operator go-ahead | `ansible/README.md` |
-| Live Woodpecker/Pileated CI view | no reachable CI instance and no configured server URL (`~/.config/woodpecker` empty) | `ci.py` returns explicit stale/unavailable state |
-| Human confirmation of phone/iPad on the tailnet | the tailnet address is proven reachable (HTTP 200 via `100.104.39.6`); opening it on an actual device is a human step | `docs/evidence/0180/live-validation.txt` |
-| Push to GitHub + CI run | no remote configured; creating the repo is an operator decision (private/public) | `git remote -v` empty |
+| Live Woodpecker/Pileated CI view | instance identified (`ci.metabolomics.us`, Woodpecker 3.18.1, `/api/v0/`); needs an operator API token (`~/.config/herdr-engineering/ci-token`) | `ci.py` returns explicit stale/unavailable state without a token |
+| Human confirmation of phone/iPad on the tailnet | the `dev` front door is proven reachable from the tailnet (HTTP 200 via MagicDNS + IP); opening it on an actual device is a human step | `docs/evidence/0180/live-validation.txt` |
+| Cross-host fabric routing drill | same code path as the proven same-host drill (target_host is a parameter); needs an app on a second fleet machine | `docs/architecture/dev-fabric-gateway.md` |
 
 Cleared during live validation (2026-09-24): Chromium/CDP browser preview
 (captured live, artifact published), dev-fabric HTTP on loopback and on the
-tailnet interface, and cross-machine Herdr access (`herdr --machine beast`).
+tailnet interface, cross-machine Herdr access (`herdr --machine beast`),
+the unified `dev:<port>` gateway front door on bender (MagicDNS + tailnet IP,
+immediate bind, restart re-bind), and GitHub push + CI (public repo
+`berlinguyinca/herdr-engineering`, CI green).
 
 All implementation that does not depend on those external resources is
 complete, tested, and committed.

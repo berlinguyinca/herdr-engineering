@@ -33,6 +33,18 @@ DEFAULTS: dict[str, Any] = {
         "private_only": True,
         "allowed_protocols": ["http", "https", "tcp"],
     },
+    # Fabric gateway (spec 0110 component #3): the fleet front door that gives
+    # every lease a stable dev:<port> address. gateway_url empty = local mode
+    # (no gateway process running). Token is a secret: env
+    # HERDR_ENGINEERING_FABRIC_TOKEN or ~/.config/herdr-engineering/fabric-token.
+    "fabric": {
+        "enabled": True,
+        "gateway_url": "",
+        "control_port": 29999,
+        "bind": "auto",  # auto = loopback + tailnet IPv4
+        "url_base": "",  # empty = auto (MagicDNS name, else tailnet IP)
+        "probe_interval_seconds": 15,
+    },
     "tests": {"adapters": ["pytest", "go", "cargo", "junit", "scala"]},
     "ci": {"provider": "woodpecker", "pileated_extensions": "auto"},
     "notifications": {"enabled": True, "minimum_severity": "notice",

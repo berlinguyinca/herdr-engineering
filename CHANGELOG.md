@@ -3,6 +3,45 @@
 All notable changes to HerdR Engineering are documented here. Dates are
 YYYY-MM-DD. The format follows Keep a Changelog.
 
+## [Unreleased]
+
+### Added
+- **Dev fabric gateway** — the unified `dev:<port>` front door (spec 0110,
+  component #3). `herdr-eng devfabric gateway` runs the fleet gateway:
+  control API (register/heartbeat/close/list/resolve/healthz) on
+  tailnet+loopback with optional bearer token, a dynamic router that binds
+  each leased external port on loopback + tailnet and byte-proxies to the
+  owning machine, and a probe loop that renews healthy leases, expires dead
+  ones (TTL), and releases their ports. Every lease gets a stable fleet-wide
+  address `http://<gateway-magicdns>:<port>` (e.g.
+  `http://bender.tail0c50da.ts.net:18000`) reachable from any tailnet device.
+- `HERDR_ENGINEERING_FABRIC_URL` / `fabric.gateway_url` config: registrar
+  commands route through the gateway automatically and degrade to local mode
+  with an explicit warning when it is unreachable.
+- `--host auto` for `devfabric register`: resolves the local tailnet IPv4 and
+  verifies the target is listening before publishing the lease.
+- `gateway.lock` (pid:nonce): refuses a second live gateway over one store;
+  stale locks from dead PIDs are taken over.
+- Fabric gateway tests (register/route, close/unbind, dead-target expiry,
+  healthy renewal, token auth, list/resolve, restart re-bind, port-taken
+  refusal, URL resolution, single-gateway lock, API shape).
+- `docs/architecture/dev-fabric-gateway.md` (design + live evidence).
+
+### Fixed
+- Fabric router `unbind` leaked one connection through an in-flight
+  `accept()`; unbind now joins the accept threads so a port is only reported
+  released when it truly is.
+- The probe loop never released ports for expired leases (expiry was
+  consumed by `active_leases()`' internal reconcile); the router now
+  self-syncs to the active set each cycle (self-healing after restarts and
+  closes).
+- `gateway_url_from_config` ignored the `HERDR_ENGINEERING_FABRIC_URL`
+  environment variable, silently degrading registrar commands to local mode.
+- Registry store writes from an overlapping process could be lost on the
+  next persist; the gateway now reloads the store when its mtime changes.
+- Test port ranges were host-dependent; allocation tests now pick
+  OS-free ports so they are hermetic.
+
 ## [0.1.0] - 2026-09-24
 
 First public-quality release of the HerdR Engineering integration layer.

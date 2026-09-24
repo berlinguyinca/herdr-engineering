@@ -46,6 +46,34 @@ def _os_port_free(port: int) -> bool:
         s.close()
 
 
+def _parse_leases(data: dict) -> dict[str, DevServiceLease]:
+    """Parse a store payload into leases.
+
+    to_dict() nests target/owner/health and drops the flat fields, so the
+    flat constructor arguments are reconstructed here.
+    """
+    leases: dict[str, DevServiceLease] = {}
+    for raw in data.get("leases", []):
+        d = dict(raw)
+        target = d.pop("target", None) or {}
+        owner = d.pop("owner", None) or {}
+        d.pop("health", None)
+        d.setdefault("target_machine_id", target.get("machine_id"))
+        d.setdefault("target_host", target.get("host"))
+        d.setdefault("target_port", target.get("port"))
+        d.setdefault("owner_user_id", owner.get("user_id"))
+        d.setdefault("owner_herdr_session_id", owner.get("herdr_session_id"))
+        d.setdefault("owner_repository", owner.get("repository"))
+        d.setdefault("owner_worktree_id", owner.get("worktree_id"))
+        d.setdefault("owner_process_id", owner.get("process_id"))
+        try:
+            lease = DevServiceLease(**d)
+        except TypeError:
+            continue  # skip malformed entries rather than losing the whole store
+        leases[lease.id] = lease
+    return leases
+
+
 class DevServiceRegistry:
     """Thread-safe, persistent dev-service lease registry."""
 
@@ -60,33 +88,46 @@ class DevServiceRegistry:
         self._ttl = lease_ttl_seconds
         self._leases: dict[str, DevServiceLease] = {}
         self._lock = threading.RLock()
+        self._loaded_mtime: float | None = None
         self._load()
+
+    @property
+    def store_path(self) -> Path:
+        return self._path
 
     def _load(self) -> None:
         if not self._path.exists():
+            self._loaded_mtime = None
             return
         try:
+            self._loaded_mtime = self._path.stat().st_mtime
             data = json.loads(self._path.read_text())
-            for raw in data.get("leases", []):
-                # to_dict() nests target/owner/health and drops the flat
-                # fields; reconstruct the flat constructor arguments.
-                d = dict(raw)
-                target = d.pop("target", None) or {}
-                owner = d.pop("owner", None) or {}
-                d.pop("health", None)
-                d.setdefault("target_machine_id", target.get("machine_id"))
-                d.setdefault("target_host", target.get("host"))
-                d.setdefault("target_port", target.get("port"))
-                d.setdefault("owner_user_id", owner.get("user_id"))
-                d.setdefault("owner_herdr_session_id",
-                             owner.get("herdr_session_id"))
-                d.setdefault("owner_repository", owner.get("repository"))
-                d.setdefault("owner_worktree_id", owner.get("worktree_id"))
-                d.setdefault("owner_process_id", owner.get("process_id"))
-                lease = DevServiceLease(**d)
-                self._leases[lease.id] = lease
         except Exception:
-            pass
+            return
+        with self._lock:
+            self._leases = _parse_leases(data)
+
+    def reload_if_changed(self) -> bool:
+        """Re-read the store if another process changed it on disk.
+
+        The gateway is the registry's primary writer; this is a backstop so a
+        gateway restart never loses leases an overlapping process persisted
+        (e.g. a register served by an old process that was mid-shutdown).
+        """
+        try:
+            mtime = self._path.stat().st_mtime
+        except OSError:
+            return False
+        if mtime == self._loaded_mtime:
+            return False
+        self._loaded_mtime = mtime
+        try:
+            data = json.loads(self._path.read_text())
+        except Exception:
+            return False
+        with self._lock:
+            self._leases = _parse_leases(data)
+        return True
 
     def _persist(self) -> None:
         try:
@@ -94,8 +135,14 @@ class DevServiceRegistry:
             tmp = self._path.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
             os.replace(tmp, self._path)
+            try:
+                self._loaded_mtime = self._path.stat().st_mtime
+            except OSError:
+                pass
         except OSError:
             pass
+
+
 
     def _is_port_taken(self, port: int, exclude_id: str | None = None) -> bool:
         for lid, lease in self._leases.items():
@@ -312,6 +359,36 @@ class DevServiceForwarder:
     @property
     def bound(self) -> bool:
         return self._listener is not None
+
+
+def proxy_pair(client: socket.socket, target: socket.socket) -> None:
+    """Bidirectionally pump bytes between two sockets until either closes.
+
+    Protocol-transparent: HTTP/HTTPS/WebSocket/SSE/HMR/generic TCP all flow
+    through the same byte pipe. Used by both DevServiceForwarder (per-host
+    mode) and the fabric gateway router.
+    """
+    def _pump(src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    t1 = threading.Thread(target=_pump, args=(client, target), daemon=True)
+    t2 = threading.Thread(target=_pump, args=(target, client), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
 
 def _add_seconds(iso: str, seconds: int) -> str:

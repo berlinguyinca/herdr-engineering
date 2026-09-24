@@ -298,6 +298,22 @@ macOS convergence is a documented `BLOCKED_EXTERNAL` item pending a fleet run.
 | dev service not forwarding | `herdr-eng devfabric list` (lease active?) then run `herdr-eng devfabric serve <lease>` |
 | config not taking effect | `herdr-eng doctor --json` shows the config file in use; precedence is machine-local < repo < `$HERDR_ENGINEERING_CONFIG` |
 | stale dev port | `herdr-eng devfabric reconcile` expires stale leases |
+| `dev:<port>` unreachable from other hosts | is the gateway up? `herdr-eng devfabric gateway` on the gateway host; point commands at it with `HERDR_ENGINEERING_FABRIC_URL=http://<gateway>:29999` (or `fabric.gateway_url` in config); the app must be bound to the tailnet interface or `0.0.0.0` |
+
+## Dev fabric gateway (unified `dev:<port>`)
+
+One gateway host (bender today) runs `herdr-eng devfabric gateway`: it owns
+the shared lease registry, a dynamic router (each leased external port bound
+on loopback + tailnet, byte-proxied to the owning machine), and a probe loop
+that expires dead apps and releases their ports. Every lease then gets a
+stable fleet-wide address — `http://<gateway-magicdns>:<port>` — reachable
+from any tailnet device (desktop, phone, iPad) without knowing the physical
+host. Registrar commands (`register`/`heartbeat`/`close`/`list`) use the
+gateway automatically when configured (`fabric.gateway_url` or
+`HERDR_ENGINEERING_FABRIC_URL`) and degrade to local mode with an explicit
+warning when it is not reachable. The control API is tailnet+loopback only
+and bearer-token protected when a token is configured. Design and live
+evidence: [`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabric-gateway.md).
 
 ## Contributing
 

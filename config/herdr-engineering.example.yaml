@@ -20,6 +20,26 @@ dev_fabric:
   private_only: true
   allowed_protocols: [http, https, tcp]
 
+# Fabric gateway = the unified dev:<port> front door (spec 0110 component #3).
+# Run `herdr-eng devfabric gateway` on the gateway host (bender today).
+# Registrar commands use it automatically when reachable, and degrade to
+# local mode with a warning when it is not. HERDR_ENGINEERING_FABRIC_URL
+# overrides gateway_url without editing config.
+fabric:
+  # full control URL (http://host:port) or bare host/MagicDNS name (given the
+  # default control port); empty = local/standalone mode
+  gateway_url: ""
+  control_port: 29999
+  # router interfaces: "auto" = loopback + this host's tailnet IP
+  bind: auto
+  # advertised base for dev:<port> URLs (defaults to the host's MagicDNS name)
+  url_base: ""
+  probe_interval_seconds: 15
+  # token is a secret: set HERDR_ENGINEERING_FABRIC_TOKEN or write it to
+  # ~/.config/herdr-engineering/fabric-token (never in this file)
+  # empty token = control API unauthenticated (fine on a private tailnet;
+  # set one before exposing the control port further)
+
 tests:
   adapters: [pytest, go, cargo, junit, scala]
 

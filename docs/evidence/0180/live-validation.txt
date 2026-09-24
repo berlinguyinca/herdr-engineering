@@ -25,3 +25,37 @@ Forwarder bound to bender's tailnet IP (NOT 0.0.0.0, NOT public):
   ss: LISTEN 100.104.39.6:18000  (herdr-eng)
 curl http://100.104.39.6:18000/ -> HTTP 200 '<h1>dev fabric demo</h1>'
 Any tailnet device (beast, iphone171, ipad157) can open that address.
+
+---
+Fabric gateway live drill (2026-09-24, host bender)
+---
+gateway: herdr-eng devfabric gateway --control-port 29999
+  control: 100.104.39.6:29999 (tailnet only; loopback view via same local addr)
+  router: loopback + tailnet per-lease binds
+healthz: {"bound_ports": [], "ok": true, "url_base": "bender.tail0c50da.ts.net"}
+
+register: HERDR_ENGINEERING_FABRIC_URL=http://100.104.39.6:29999
+  herdr-eng devfabric register --machine bender --host auto --port 18999 --label final-drill
+  → external_port 18000, url http://bender.tail0c50da.ts.net:18000, target 100.104.39.6:18999
+  (bound immediately: first curl succeeded 0.4s after register)
+
+front door:
+  curl http://bender.tail0c50da.ts.net:18000/ → "<h1>dev fabric drill</h1>" (HTTP 200)
+  curl http://100.104.39.6:18000/            → "<h1>dev fabric drill</h1>" (HTTP 200)
+
+restart rebind:
+  stopped gateway; restarted; healthz showed bound_ports [18001] auto-rebound
+  from the store (lease registered by the previous instance, still active)
+
+dead-target expiry:
+  app (pid 801478) killed at 20:01:38Z
+  PORT 18000 RELEASED after 76s (probe 15s + TTL 90s from last renewal;
+  unbind joins accept threads so the port is fully released)
+
+Bugs found/fixed during the drill (all with regression tests):
+  - unbind leaked one connection through in-flight accept() → join threads
+  - probe loop never released expired ports (active_leases() consumes the
+    reconcile) → router self-sync each cycle
+  - gateway_url_from_config ignored HERDR_ENGINEERING_FABRIC_URL → env wins
+  - store writes from overlapping processes lost → reload_if_changed
+  - two gateways could share one store → gateway.lock (pid:nonce)

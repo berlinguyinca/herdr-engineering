@@ -13,6 +13,16 @@ from herdr_engineering.devfabric import (
 from herdr_engineering.errors import ConflictError
 
 
+def _free_port() -> int:
+    """Ask the OS for a currently-free loopback port."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 def test_collision_free_port_allocation(tmp_path):
     r = DevServiceRegistry(store_path=tmp_path / "leases.json")
     l1 = r.register(target_machine_id="fry", target_host="127.0.0.1", target_port=8080,
@@ -74,7 +84,11 @@ def test_close(tmp_path):
 
 
 def test_port_exhaustion_raises_conflict(tmp_path):
-    r = DevServiceRegistry(store_path=tmp_path / "leases.json", port_range=(18000, 18001))
+    # Pick a pair of ports the OS has free so the test is hermetic (the
+    # allocator skips ports with live OS bindings, e.g. a running gateway).
+    base = _free_port()
+    r = DevServiceRegistry(store_path=tmp_path / "leases.json",
+                           port_range=(base, base + 1))
     r.register(target_machine_id="a", target_host="h", target_port=1, owner_process_id="p1")
     r.register(target_machine_id="a", target_host="h", target_port=2, owner_process_id="p2")
     with pytest.raises(ConflictError):

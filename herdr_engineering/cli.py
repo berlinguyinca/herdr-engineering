@@ -101,7 +101,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("devfabric", help="transparent dev service fabric (spec 0110)")
     dsub = p.add_subparsers(dest="devfabric_command", required=True)
     p2 = dsub.add_parser("register", help="register a dev service lease")
-    p2.add_argument("--machine", required=True); p2.add_argument("--host", required=True)
+    p2.add_argument("--machine", required=True)
+    p2.add_argument("--host", required=True,
+                    help="target host; 'auto' = this machine's tailnet IP")
     p2.add_argument("--port", type=int, required=True)
     p2.add_argument("--protocol", default="http")
     p2.add_argument("--session"); p2.add_argument("--repo"); p2.add_argument("--worktree")
@@ -111,6 +113,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("lease_id"); p2.set_defaults(func=_cmd_dev_heartbeat)
     p2 = dsub.add_parser("close", help="close a lease")
     p2.add_argument("lease_id"); p2.set_defaults(func=_cmd_dev_close)
+    p2 = dsub.add_parser("gateway", help="run the fabric gateway (front door + router)")
+    p2.add_argument("--bind", default=None, help="comma-separated bind IPs (default: config/auto)")
+    p2.add_argument("--control-port", type=int, default=None)
+    p2.add_argument("--url-base", default=None, help="stable base for dev:<port> (default: auto)")
+    p2.set_defaults(func=_cmd_dev_gateway)
     p2 = dsub.add_parser("list", help="list active leases")
     p2.add_argument("--json", action="store_true", default=True)
     p2.set_defaults(func=_cmd_dev_list)
@@ -361,10 +368,65 @@ def _cmd_journal_search(args) -> int:
     return 0
 
 
+def _local_fabric_client():
+    """Return a FabricClient when a gateway is configured AND reachable,
+    else None (local/degraded mode)."""
+    from .config import load_config
+    from .errors import InvalidError
+    from .fabric import FabricClient, gateway_url_from_config
+    try:
+        url = gateway_url_from_config(load_config())
+    except InvalidError:
+        return None
+    if not url:
+        return None
+    try:
+        FabricClient(url).healthz()
+        return FabricClient(url)
+    except Exception:
+        return None  # gateway down: degrade to local mode, never break registration
+
+
+def _resolve_target_host(host: str, port: int) -> str:
+    """Resolve 'auto'/'local' to this machine's tailnet IP (so the gateway can
+    route back to us). Verifies the local target is listening. Explicit hosts
+    are passed through unchanged."""
+    if host not in ("auto", "local"):
+        return host
+    from .errors import ConflictError
+    from .fabric import tailnet_ipv4
+    ts_ip = tailnet_ipv4()
+    if ts_ip is None:
+        raise ConflictError("--host auto requires tailscale (no tailnet IPv4 found)")
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            pass
+    except OSError as exc:
+        raise ConflictError(f"target 127.0.0.1:{port} is not listening: {exc}")
+    return ts_ip
+
+
 def _cmd_dev_register(args) -> int:
     from .devfabric import DevServiceRegistry
+    host = _resolve_target_host(args.host, args.port)
+    client = _local_fabric_client()
+    if client is not None:
+        try:
+            result = client.register(
+                target_machine_id=args.machine, target_host=host,
+                target_port=args.port, protocol=args.protocol,
+                owner_herdr_session_id=args.session, owner_repository=args.repo,
+                owner_worktree_id=args.worktree, owner_process_id=args.process,
+                label=args.label)
+            _print_json(result)
+            return 0
+        except Exception as exc:
+            _print_json({"ok": False, "gateway": str(exc),
+                         "note": "gateway unreachable — fell back to local registry",
+                         "warning": "lease is NOT reachable via dev:<port> until the gateway is up"})
     lease = DevServiceRegistry().register(
-        target_machine_id=args.machine, target_host=args.host, target_port=args.port,
+        target_machine_id=args.machine, target_host=host, target_port=args.port,
         protocol=args.protocol, owner_herdr_session_id=args.session,
         owner_repository=args.repo, owner_worktree_id=args.worktree,
         owner_process_id=args.process, label=args.label)
@@ -374,6 +436,10 @@ def _cmd_dev_register(args) -> int:
 
 def _cmd_dev_heartbeat(args) -> int:
     from .devfabric import DevServiceRegistry
+    client = _local_fabric_client()
+    if client is not None:
+        _print_json(client.heartbeat(args.lease_id))
+        return 0
     lease = DevServiceRegistry().heartbeat(args.lease_id)
     _print_json({"ok": lease is not None,
                  "lease": lease.to_dict() if lease else None})
@@ -382,6 +448,10 @@ def _cmd_dev_heartbeat(args) -> int:
 
 def _cmd_dev_close(args) -> int:
     from .devfabric import DevServiceRegistry
+    client = _local_fabric_client()
+    if client is not None:
+        _print_json(client.close(args.lease_id))
+        return 0
     ok = DevServiceRegistry().close(args.lease_id)
     _print_json({"ok": ok})
     return 0
@@ -389,7 +459,62 @@ def _cmd_dev_close(args) -> int:
 
 def _cmd_dev_list(args) -> int:
     from .devfabric import DevServiceRegistry
+    client = _local_fabric_client()
+    if client is not None:
+        _print_json(client.list())
+        return 0
     _print_json([lease.to_dict() for lease in DevServiceRegistry().active_leases()])
+    return 0
+
+
+def _cmd_dev_gateway(args) -> int:
+    import signal
+    import time
+
+    from .config import InvalidError, load_config
+    from .devfabric import DevServiceRegistry
+    from .fabric import FabricGateway, GatewayRouter, tailnet_ipv4
+    try:
+        cfg = load_config().get("fabric") or {}
+    except InvalidError:
+        cfg = {}
+    control_port = args.control_port or cfg.get("control_port", 29999)
+    if args.bind:
+        bind_hosts = [h.strip() for h in args.bind.split(",") if h.strip()]
+    elif cfg.get("bind") == "auto":
+        bind_hosts = ["127.0.0.1", tailnet_ipv4() or "127.0.0.1"]
+    else:
+        bind_hosts = ["127.0.0.1"]
+    bind_hosts = [h for h in dict.fromkeys(bind_hosts) if h]
+    # Control API must be reachable from other tailnet hosts (they register
+    # through it): prefer the tailnet IP; loopback-only when no tailnet.
+    control_host = next((h for h in bind_hosts if h != "127.0.0.1"), "127.0.0.1")
+    registry = DevServiceRegistry()
+    router = GatewayRouter(bind_hosts)
+    gateway = FabricGateway(
+        registry, router, control_host=control_host, control_port=control_port,
+        url_base=args.url_base or (cfg.get("url_base") or None),
+        probe_interval=float(cfg.get("probe_interval_seconds", 15)))
+    gateway.start()
+    _print_json({
+        "ok": True, "gateway": True,
+        "control_url": f"http://{gateway.control_host}:{control_port}",
+        "url_base": gateway.url_base,
+        "bind_hosts": bind_hosts,
+        "probe_interval_seconds": gateway.probe_interval,
+        "note": f"dev:<port> resolves to http://{gateway.url_base}:<port>",
+    })
+    stop = {"flag": False}
+
+    def _on_sigint(_signum, _frame) -> None:
+        stop["flag"] = True
+    signal.signal(signal.SIGINT, _on_sigint)
+    try:
+        while not stop["flag"]:
+            time.sleep(0.5)
+    finally:
+        gateway.stop()
+        _print_json({"stopped": True})
     return 0
 
 

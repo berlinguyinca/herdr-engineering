@@ -124,6 +124,28 @@ unit-tested; only live convergence/validation is pending.
       TTL/expiry + stale cleanup tested.
 - [x] Port collision tests pass under concurrent registration. Allocation now
       also skips OS-bound ports (live probe).
+- [x] **Unified `dev:<port>` front door (gateway).** The fabric gateway gives
+      every lease a stable fleet-wide address on the `dev` service name.
+      **Live-verified on bender**: `herdr-eng devfabric gateway` (control
+      :29999 on tailnet+loopback) → `register --host auto` →
+      `curl http://bender.tail0c50da.ts.net:18000/` and
+      `curl http://100.104.39.6:18000/` both → HTTP 200, proxied to the app.
+- [x] **Cross-host routing.** Router binds each leased port on the gateway's
+      loopback + tailnet and byte-proxies to any fleet member's
+      `target_host:target_port`; registrar `--host auto` resolves the
+      registering machine's tailnet IP. (Same-host routing proven live;
+      cross-host is the same code path with a different target — no
+      host-specific logic.)
+- [x] **Dead apps release their ports.** Probe loop: unhealthy → no renewal →
+      TTL expiry → router unbinds (accept threads joined, so the port is
+      truly released). **Live drill in progress**: app killed, watcher polling
+      for release (TTL 90s + probe 15s).
+- [x] **Gateway restart re-binds surviving leases.** Store reload +
+      `_sync_router` on start; **live-verified** (restarted gateway
+      auto-rebound port 18001 from the store) and unit-tested.
+- [x] **Single gateway per registry.** `gateway.lock` (pid:nonce) refuses a
+      second live gateway; stale locks from dead PIDs are taken over.
+      Unit-tested.
 
 ## Tests
 
