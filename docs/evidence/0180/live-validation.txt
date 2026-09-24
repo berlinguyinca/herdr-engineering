@@ -59,3 +59,24 @@ Bugs found/fixed during the drill (all with regression tests):
   - gateway_url_from_config ignored HERDR_ENGINEERING_FABRIC_URL → env wins
   - store writes from overlapping processes lost → reload_if_changed
   - two gateways could share one store → gateway.lock (pid:nonce)
+
+---
+Powerpack up/down (upgrade/rollback) live drill (2026-09-24, host bender)
+---
+herdr-eng powerpack status            → enabled: []
+herdr-eng powerpack snapshot clean    → ok (captures lock + config + plugin_policy.json)
+herdr-eng powerpack enable plannotator → UP: enabled ['plannotator']
+herdr-eng powerpack rollback clean    → DOWN: enabled [] (policy restored)
+Bug found+fixed: rollback crashed on str paths and did not restore the plugin
+policy file (the enable/disable half of the drill). Now accepts path/~path/tag
+and snapshots always capture the policy (empty {} = "nothing enabled").
+
+---
+Live pytest test-tree run (2026-09-24, host bender)
+---
+herdr-eng tests run pytest --repo berlinguyinca/herdr-engineering \
+  --worktree 0110-transparent-dev-fabric --machine localhost \
+  --workdir ~/IdeaProjects/herdr-engineering --selector tests/test_naming.py
+→ run.started → 10x test.finished (all "passed") → run.finished
+  result: {"status": "passed"}
+Proves the TestEvent contract end-to-end on a real run (spec 0120, pytest row).

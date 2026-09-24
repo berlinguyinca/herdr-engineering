@@ -149,8 +149,11 @@ unit-tested; only live convergence/validation is pending.
 
 ## Tests
 
-- [ ] pytest test tree + per-test failure trace. **BLOCKED_EXTERNAL** — adapter
-      implemented and unit-tested; live pytest suite not present.
+- [x] pytest test tree + per-test failure trace. **Live-verified** —
+      `herdr-eng tests run pytest --repo berlinguyinca/herdr-engineering
+      --worktree 0110-transparent-dev-fabric --selector tests/test_naming.py`
+      produced `run.started` → 10× `test.finished` (all passed) →
+      `run.finished {"status": "passed"}` on this host.
 - [ ] Go test tree + per-test logs/failure. **BLOCKED_EXTERNAL**.
 - [ ] Rust test tree + per-test logs/failure. **BLOCKED_EXTERNAL**.
 - [ ] Java test tree + JUnit failure trace. **BLOCKED_EXTERNAL**.
@@ -197,10 +200,14 @@ unit-tested; only live convergence/validation is pending.
 - [x] Fresh installation from documented instructions succeeds. Editable install
       (`pip install -e .`) verified on this Linux workstation.
 - [ ] Upgrade from previous pinned bundle succeeds. **BLOCKED_EXTERNAL** — no
-      prior public bundle exists to upgrade from; preflight/rollback unit-tested.
-- [ ] Rollback drill succeeds. **BLOCKED_EXTERNAL** — snapshot/rollback
-      unit-tested; full drill pending a prior bundle.
-- [x] Linux validation passes. This workstation is Linux; all 79 tests pass.
+      prior public bundle exists to upgrade from. The up/down lifecycle itself
+      is live-verified (snapshot → change → rollback, above) and
+      `powerpack preflight` blocks incompatible locked revisions (unit-tested).
+- [x] Rollback drill succeeds. **Live-verified** — full up/down drill on this
+      host: `snapshot clean` → `enable plannotator` (UP: `['plannotator']`) →
+      `rollback clean` (DOWN: `[]`). Rollback restores lock, config, and the
+      plugin policy (including the "nothing enabled" state).
+- [x] Linux validation passes. This workstation is Linux; all 108 tests pass.
 - [ ] macOS validation passes. **BLOCKED_EXTERNAL** — fleet host unreachable.
 - [ ] phone/iPad tailnet validation passes. **BLOCKED_EXTERNAL**.
 - [x] README commands match the real shipped implementation. Updated with real
