@@ -95,6 +95,12 @@ dev_fabric:
   private_only: true
   allowed_protocols: [http, https, tcp]
 
+ci:
+  provider: woodpecker
+  base_url: https://ci.metabolomics.us
+  # token is a secret: set HERDR_ENGINEERING_CI_TOKEN or write it to
+  # ~/.config/herdr-engineering/ci-token (never in this file)
+
 security:
   allow_public_listeners: false
   persist_hidden_reasoning: false

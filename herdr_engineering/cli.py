@@ -152,8 +152,15 @@ def _build_parser() -> argparse.ArgumentParser:
     # ci -------------------------------------------------------------------
     p = sub.add_parser("ci", help="Woodpecker/Pileated CI (spec 0130)")
     csub = p.add_subparsers(dest="ci_command", required=True)
-    p2 = csub.add_parser("pipelines", help="list pipelines for a repo")
+    p2 = csub.add_parser("repos", help="list CI repositories")
+    p2.set_defaults(func=_cmd_ci_repos)
+    p2 = csub.add_parser("pipelines", help="list pipelines for a repo (owner/name)")
     p2.add_argument("--repo", required=True); p2.set_defaults(func=_cmd_ci_pipelines)
+    p2 = csub.add_parser("pipeline", help="pipeline detail incl. steps (by number)")
+    p2.add_argument("number", type=int); p2.set_defaults(func=_cmd_ci_pipeline)
+    p2 = csub.add_parser("logs", help="raw log of one pipeline step")
+    p2.add_argument("--repo", required=True); p2.add_argument("--pipeline", type=int, required=True)
+    p2.add_argument("--step", required=True); p2.set_defaults(func=_cmd_ci_logs)
 
     # browser / review -----------------------------------------------------
     p = sub.add_parser("browser", help="browser preview (spec 0070)")
@@ -486,15 +493,72 @@ def _cmd_tests_run(args) -> int:
     return 0
 
 
-def _cmd_ci_pipelines(args) -> int:
+def _ci_provider():
     from .ci import WoodpeckerProvider
-    provider = WoodpeckerProvider()
+    from .config import load_config
+    try:
+        base = (load_config().get("ci") or {}).get("base_url")
+    except Exception:
+        base = None
+    return WoodpeckerProvider(base_url=base)
+
+
+def _ci_offline() -> int:
+    _print_json({"available": False, "repos": [], "pipelines": [],
+                 "note": "CI provider offline — set HERDR_ENGINEERING_CI_TOKEN "
+                         "(or ~/.config/herdr-engineering/ci-token). Stale view, "
+                         "never guessed success."})
+    return 0
+
+
+def _cmd_ci_repos(args) -> int:
+    provider = _ci_provider()
     if not provider.available:
-        _print_json({"available": False, "pipelines": [],
-                     "note": "CI provider offline — stale view (never guessed success)"})
-        return 0
-    views = provider.pipelines(args.repo)
+        return _ci_offline()
+    try:
+        _print_json({"available": True, "base_url": provider.base_url,
+                     "repos": provider.repos()})
+    except Exception as exc:
+        _print_json({"available": False, "error": str(exc)})
+        return 1
+    return 0
+
+
+def _cmd_ci_pipelines(args) -> int:
+    provider = _ci_provider()
+    if not provider.available:
+        return _ci_offline()
+    try:
+        views = provider.pipelines(args.repo)
+    except Exception as exc:
+        _print_json({"available": False, "error": str(exc)})
+        return 1
     _print_json({"available": True, "pipelines": [v.to_dict() for v in views]})
+    return 0
+
+
+def _cmd_ci_pipeline(args) -> int:
+    provider = _ci_provider()
+    if not provider.available:
+        return _ci_offline()
+    try:
+        _print_json({"available": True, "pipeline": provider.pipeline(args.number)})
+    except Exception as exc:
+        _print_json({"available": False, "error": str(exc)})
+        return 1
+    return 0
+
+
+def _cmd_ci_logs(args) -> int:
+    provider = _ci_provider()
+    if not provider.available:
+        return _ci_offline()
+    try:
+        log = provider.step_log(args.repo, args.pipeline, args.step)
+    except Exception as exc:
+        _print_json({"available": False, "error": str(exc)})
+        return 1
+    print(log if log is not None else "")
     return 0
 
 

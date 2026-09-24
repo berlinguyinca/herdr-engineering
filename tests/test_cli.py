@@ -46,7 +46,8 @@ def test_tests_adapters(capsys):
     assert "pytest" in d["adapters"]
 
 
-def test_ci_pipelines_offline_safe(capsys):
+def test_ci_pipelines_offline_safe(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))  # hermetic: no token file
     os.environ.pop("HERDR_ENGINEERING_CI_TOKEN", None)
     rc = main(["ci", "pipelines", "--repo", "r"])
     assert rc == 0
