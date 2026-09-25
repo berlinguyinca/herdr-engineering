@@ -15,7 +15,7 @@ collection warnings. Real command + live-fleet snapshots are captured under
 | 0010 Repository bootstrap & reconciliation | COMPLETE | `IMPLEMENTATION_RECONCILIATION.md`, `herdr-eng name`, naming tests |
 | 0020 Upstream audit & compatibility | COMPLETE | `HERDR_COMPATIBILITY.md`, `lock/upstreams.yaml`, `docs/evidence/0020/` |
 | 0030 Native Herdr contracts | COMPLETE | `herdr_adapter.py`, `herdr-eng capabilities`, adapter tests |
-| 0040 Fleet bootstrap & Ansible | COMPLETE (impl); fleet convergence `BLOCKED_EXTERNAL` | `ansible/playbooks/site.yml`, linux+macos roles, `ansible/README.md` |
+| 0040 Fleet bootstrap & Ansible | COMPLETE (impl); `mac` live-converged + idempotent; `fry`/`beast`/`bender` pending operator go-ahead | `ansible/playbooks/site.yml`, linux+macos roles, `ansible/README.md` |
 | 0050 Powerpack distribution & lifecycle | COMPLETE | `powerpack.py`, `herdr-eng powerpack`, doctor tests |
 | 0060 Web/mobile control surface | COMPLETE (impl); live tailnet `BLOCKED_EXTERNAL` | `web.py`, `herdr-eng web`, web tests |
 | 0070 Browser preview & Plannotator | COMPLETE (impl); live Chromium `BLOCKED_EXTERNAL` | `browser.py`, `herdr-eng browser`, `herdr-eng review` |
@@ -112,7 +112,7 @@ commands to local mode. All have regression tests.
 
 | Blocked item | Reason | Evidence |
 |---|---|---|
-| Real Ansible convergence of the 4 fleet hosts | playbooks `--check`-validated on `bender` (ok=12 failed=0, ansible-core 2.21.4); real convergence installs packages on live machines — pending operator go-ahead | `ansible/README.md` |
+| Ansible convergence of `fry`, `beast`, `bender` | `mac` is converged and idempotent (see below); the remaining Linux hosts each need an operator go-ahead (installs packages on live machines) | `docs/acceptance-matrix.md` (Fleet) |
 | Raw Woodpecker step-log *text* via API | Woodpecker 3.x streams logs over WebSocket (no REST endpoint); the OAuth2 proxy only forwards an interactive browser session, not a bearer token, on the upgrade. `ci logs`/`ci debug` degrade honestly and link the web UI | `docs/acceptance-matrix.md` (CI) |
 | Human confirmation of phone/iPad on the tailnet | the `dev` front door is proven reachable from the tailnet (HTTP 200 via MagicDNS + IP); opening it on an actual device is a human step | `docs/evidence/0180/live-validation.txt` |
 | Cross-host fabric routing drill | same code path as the proven same-host drill (target_host is a parameter); needs an app on a second fleet machine | `docs/architecture/dev-fabric-gateway.md` |
@@ -122,10 +122,14 @@ Cleared during live validation (2026-09-24): Chromium/CDP browser preview
 tailnet interface, cross-machine Herdr access (`herdr --machine beast`),
 the unified `dev:<port>` gateway front door on bender (MagicDNS + tailnet IP,
 immediate bind, restart re-bind), the powerpack up/down (rollback) drill, the
-live pytest test-tree run, and the **live Woodpecker CI view** (repos,
+live pytest test-tree run, the **live Woodpecker CI view** (repos,
 runner agents, pipelines, pipeline→task drill-down with failing tasks + exit
-codes, and a bounded Debug-with-Pi handoff — see below), plus GitHub push +
-CI (public repo `berlinguyinca/herdr-engineering`, CI green).
+codes, and a bounded Debug-with-Pi handoff — see below), the **real Ansible
+convergence of the macOS fleet host `mac`** (first run `ok=17 changed=8
+failed=0`, immediate second run `changed=0` — idempotent; herdr 0.9.1,
+pi 0.87.1, vim/mc/btop via brew, both repos cloned, LLM endpoint config
+written), plus GitHub push + CI (public repo
+`berlinguyinca/herdr-engineering`, CI green).
 
 - **Live Woodpecker CI (real instance, Woodpecker 3.18.1)**: with an operator
   token, `herdr-eng ci repos` → 23 repos; `ci agents` → 8 runner agents

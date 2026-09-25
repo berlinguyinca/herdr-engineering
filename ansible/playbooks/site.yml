@@ -22,8 +22,20 @@
   hosts: herdr_fleet
   gather_facts: false
   # become is evaluated before fact gathering, so use the connection user /
-  # controller env USER rather than the ansible_user_id fact.
-  become: "{{ (ansible_user | default(lookup('env', 'USER'), true)) != 'root' }}"
+  # controller env USER rather than the ansible_user_id fact. Override with
+  # -e herdr_engineering_become=false for hosts where every task is
+  # user-scoped and passwordless sudo is not available (e.g. macOS fleet
+  # hosts: home dirs, Homebrew and git clones never need root).
+  become: "{{ herdr_engineering_become | default((ansible_user | default(lookup('env', 'USER'), true)) != 'root') }}"
+  # Non-interactive SSH on macOS does not source the login PATH, so the
+  # Homebrew prefix is missing from PATH and every brew/tailscale lookup
+  # fails ("command -v brew" -> MISSING even though brew is installed).
+  # Prepend the standard Homebrew prefixes for all tasks, plus the fleet
+  # user's ~/.local/bin (where herdr is installed). Note ansible_env is
+  # only available after the fact-gather task, so the setup task itself
+  # runs with the defaults — fine, it needs nothing from PATH.
+  environment:
+    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_env.HOME | default('~', true) }}/.local/bin:{{ ansible_env.PATH | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
   vars:
     # State/config live in the FLEET user's home (the user who runs herdr-eng),
     # not root's — captured via a no-become fact gather below (fleet_home).
@@ -82,4 +94,4 @@
 
     - name: "Report Tailscale state"
       ansible.builtin.debug:
-        msg: "tailscale: {{ 'up' if tailscale_status.rc == 0 and 'tailscale' in tailscale_status.stdout else 'down/not-logged-in' }}"
+        msg: "tailscale: {{ 'up' if tailscale_status.rc == 0 and tailscale_status.stdout | length > 0 else 'down/not-logged-in' }}"

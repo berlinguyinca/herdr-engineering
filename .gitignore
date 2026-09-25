@@ -9,6 +9,7 @@ ansible/inventory/private*
 ansible/**/vault*
 # private fleet inventory (contains local hostnames + connection vars)
 ansible/inventory/hosts.yml
+ansible/inventory/host_vars/
 
 # Runtime state
 .herdr-engineering/

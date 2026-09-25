@@ -9,5 +9,9 @@ all:
             bender: {}
         macos:
           hosts:
-            macbook-m4: {}
+            mac: {}
 # Connection addresses/users belong in private inventory/group_vars, not this repository example.
+# e.g. ansible/inventory/host_vars/mac.yml:
+#   ansible_host: mac.<tailnet>.ts.net
+#   ansible_user: <fleet-user>
+#   ansible_python_interpreter: /usr/bin/python3

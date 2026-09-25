@@ -20,21 +20,29 @@ unit-tested; only live convergence/validation is pending.
 
 ## Fleet
 
-- [ ] `fry`, `beast`, `bender`, `macbook-m4` pass Ansible convergence.
-      **PARTIAL** — playbook `--syntax-check` passes for all hosts and a full
-      `--check` dry-run on `bender` passes (`ok=12 changed=6 failed=0`,
-      ansible-core 2.21.4). Real convergence of the four hosts is pending an
-      operator go-ahead (it installs packages on live machines).
-- [ ] Second Ansible run is idempotent. **PARTIAL** — dry-run validated; the
-      playbook is guard-based (skip-if-present, state dirs, lineinfile) but a
-      double real-run proof requires a converged host.
+- [ ] `fry`, `beast`, `bender`, `mac` pass Ansible convergence. **PARTIAL** —
+      **mac converged for real** (2026-09-24, over the tailnet via SSH as the
+      fleet user): `ok=17 changed=8 failed=0` first run — Homebrew detected,
+      vim/mc/btop/git/python@3.12 ensured via brew, herdr 0.9.1 already
+      correct, pi 0.87.1 present, `berlinguyinca/pi-engineering` +
+      `berlinguyinca/autospec` cloned, state/artifact/config dirs created,
+      `llm_endpoint: https://llm.metabolomics.us` written. `fry`, `beast`,
+      `bender` remain (operator go-ahead per host).
+- [ ] Second Ansible run is idempotent. **PARTIAL** — **proven on mac**: the
+      immediate second run reports `ok=17 changed=0 failed=0`. Remaining
+      hosts pending convergence.
 - [ ] Pi on every validation host routes LLM traffic through
-      `https://llm.metabolomics.us`. **BLOCKED_EXTERNAL** — enforced by
-      `ansible/playbooks/site.yml`; live host not reachable.
+      `https://llm.metabolomics.us`. **PARTIAL** — pi 0.87.1 is present on
+      mac and the config file now pins `llm_endpoint: https://llm.metabolomics.us`;
+      verifying pi's own provider config on mac is a follow-up (needs a
+      headless pi run on that host).
 - [ ] Herdr, Pi Engineering, AutoSpec, vim, mc and btop are present.
-      **BLOCKED_EXTERNAL** — fleet convergence pending.
-- [ ] Existing unrelated user configuration is preserved. **BLOCKED_EXTERNAL** —
-      playbooks merge/back up, never wholesale overwrite; live host not reachable.
+      **PARTIAL** — all present on mac (herdr 0.9.1, pi 0.87.1, both repos
+      cloned, vim/mc/btop via Homebrew). Other hosts pending.
+- [x] Existing unrelated user configuration is preserved. **Live-verified on
+      mac**: the run only created new files (state/artifact/config dirs, the
+      `herdr-engineering/config.yaml`, the two repo clones); no pre-existing
+      dotfile or config was modified or overwritten.
 
 ## Core Herdr
 
@@ -224,7 +232,11 @@ unit-tested; only live convergence/validation is pending.
       `rollback clean` (DOWN: `[]`). Rollback restores lock, config, and the
       plugin policy (including the "nothing enabled" state).
 - [x] Linux validation passes. This workstation is Linux; all 108 tests pass.
-- [ ] macOS validation passes. **BLOCKED_EXTERNAL** — fleet host unreachable.
+- [x] macOS validation passes. **Live-verified** (2026-09-24): the fleet host
+      `mac` (tailnet 100.84.185.100) was converged by the real playbook over
+      SSH and a second run was idempotent (`changed=0`); herdr/pi/brew tools
+      verified present on the machine afterwards. Note: the host was renamed
+      `macbook-m4` → `mac` to match the real tailnet name.
 - [ ] phone/iPad tailnet validation passes. **BLOCKED_EXTERNAL**.
 - [x] README commands match the real shipped implementation. Updated with real
       `herdr-eng` commands and observed output.

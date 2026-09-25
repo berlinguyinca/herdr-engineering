@@ -2,14 +2,35 @@
 # macOS fleet role (spec 0040). Homebrew-based; preserves existing config and is
 # idempotent. Resulting capabilities match the Linux role.
 
-- name: "Ensure Homebrew is present"
+- name: "Check Homebrew presence"
   ansible.builtin.shell: |
-    if ! command -v brew >/dev/null 2>&1; then
-      echo "homebrew install required" >&2
+    if command -v brew >/dev/null 2>&1; then
       exit 0
     fi
+    # Belt & braces: the play environment PATH already includes the standard
+    # prefixes, but check them explicitly in case PATH was overridden.
+    if [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; then
+      exit 0
+    fi
+    echo "homebrew install required" >&2
+    exit 0
   register: brew_check
-  changed_when: "'homebrew install required' in (brew_check.stderr | default(''))"
+  changed_when: false
+
+- name: "Record whether Homebrew is usable"
+  ansible.builtin.set_fact:
+    brew_present: "{{ 'homebrew install required' not in (brew_check.stderr | default('')) }}"
+
+# Installing Homebrew itself needs an interactive sudo password, which an
+# unattended run does not have; report it and skip the brew-managed tasks
+# (the role stays idempotent — a later run picks them up once brew exists).
+- name: "Report Homebrew status"
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Homebrew present — brew-managed tools will be ensured'
+         if brew_present else
+         'Homebrew NOT installed — brew-managed tools skipped (install
+         Homebrew interactively, then re-run)' }}
 
 - name: "Install baseline CLI tools (vim, mc, btop)"
   ansible.builtin.homebrew:
@@ -18,7 +39,7 @@
       - mc
       - btop
     state: present
-  when: brew_check.rc == 0
+  when: brew_present | bool
 
 - name: "Install git, python@3, curl"
   ansible.builtin.homebrew:
@@ -27,7 +48,7 @@
       - python@3.12
       - curl
     state: present
-  when: brew_check.rc == 0
+  when: brew_present | bool
 
 - name: "Install Herdr (pinned compatible version) if not present"
   ansible.builtin.shell: |

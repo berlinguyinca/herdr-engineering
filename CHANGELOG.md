@@ -32,6 +32,18 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   pipeline→task drill-down (3.x `workflows[].children[]` flattened to tasks
   with state + exit code), honest step-log handling, and a bounded
   Debug-with-Pi handoff for failing pipelines.
+- **Real Ansible convergence of the macOS fleet host `mac`** — first run
+  `ok=17 changed=8 failed=0`, immediate second run `changed=0` (idempotent).
+  Inventory renamed `macbook-m4` → `mac` to match the real tailnet name;
+  connection details moved to gitignored `host_vars/mac.yml`.
+- Ansible fixes found during the live run: brew check gated on a
+  `brew_present` fact (the old check always exited 0, so brew tasks would
+  fail on a Mac), `become` overridable (`-e herdr_engineering_become=false`)
+  for user-scoped hosts without passwordless sudo, play PATH now includes
+  the Homebrew prefixes and the fleet user's `~/.local/bin` (non-interactive
+  SSH on macOS does not source the login PATH — and the setup-task
+  interaction made herdr checks fail on every run), and the tailscale report
+  no longer matches a word that `tailscale status` never prints.
 
 ### Fixed
 - **CI provider corrected to the real Woodpecker 3.x API** (found during live

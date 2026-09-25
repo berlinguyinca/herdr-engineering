@@ -119,3 +119,42 @@ Code corrected in herdr_engineering/ci.py to the real contract (base /api/,
 numeric id resolution, workflows->tasks flattening, agents with token
 stripping, honest step_log, debug_with_pi). tests/test_ci.py locks the
 contract (13 tests). Full suite: 114 passed, ruff clean, CI green.
+
+---
+Real Ansible convergence — macOS fleet host `mac` (2026-09-24)
+---
+Host: mac.tail0c50da.ts.net (100.84.185.100, macOS, Darwin), SSH as the fleet
+  user over the tailnet. Inventory updated: `macbook-m4` -> `mac` (real
+  tailnet name); connection details in ansible/inventory/host_vars/mac.yml
+  (gitignored).
+
+Bugs found and fixed during the live run:
+  1. macOS role brew check always exited 0, so `when: brew_check.rc == 0`
+     passed and the homebrew tasks would fail on any Mac. Now gated on a
+     brew_present fact (command -v + explicit /opt/homebrew and /usr/local
+     prefixes) with an explicit report.
+  2. site.yml forced become:true for non-root users; mac's sudo needs a
+     password and every mac task is user-scoped. become is now overridable:
+     -e herdr_engineering_become=false.
+  3. Non-interactive SSH on macOS does not source the login PATH: brew,
+     tailscale and pi live in /opt/homebrew/bin -> everything looked MISSING.
+     Play-level environment now prepends /opt/homebrew/bin, /usr/local/bin
+     and the fleet user's ~/.local/bin (herdr). Subtle: the environment also
+     applies to the setup task, so ansible_env.PATH is captured WITHOUT
+     ~/.local/bin — herdr checks then fail every run (non-idempotent).
+     Fixed by adding $HOME/.local/bin via ansible_env.HOME.
+  4. Tailscale report matched 'tailscale' in `tailscale status` output, which
+     never contains that word (it lists peers) -> always "down". Now rc==0
+     and non-empty stdout.
+
+Run 1 (converge):  ok=17 changed=8  failed=0
+  - Homebrew detected (7.0.6), vim/mc/btop installed, git + python@3.12 ensured
+  - herdr 0.9.1 already correct (pinned version), pi 0.87.1 present
+  - berlinguyinca/pi-engineering + berlinguyinca/autospec cloned to ~/
+  - ~/.local/share/herdr-engineering{,/artifacts} + ~/.config/herdr-engineering
+    created (0750); config.yaml: llm_endpoint: https://llm.metabolomics.us
+Run 2 (idempotency): ok=17 changed=0 failed=0
+Post-check on the machine: vim/mc/btop via brew, herdr 0.9.1, pi 0.87.1
+  (@earendil-works/pi-coding-agent), tailscale status "up", both repos and
+  config present. No pre-existing user config was modified.
+Remaining: fry, beast, bender convergence (operator go-ahead per host).

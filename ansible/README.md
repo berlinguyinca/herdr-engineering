@@ -9,6 +9,7 @@ Engineering ecosystem without ad-hoc SSH edits.
 ansible/
 ├── inventory/
 │   ├── hosts.yml            # real inventory (private; NOT committed)
+│   ├── host_vars/           # per-host connection details (private; NOT committed)
 │   └── hosts.example.yml    # committed example (no connection secrets)
 ├── playbooks/
 │   └── site.yml             # fleet bootstrap entry point
@@ -20,8 +21,16 @@ ansible/
 
 ## Validation inventory
 
-`fry`, `beast`, `bender`, `macbook-m4`. These are **examples**, never
+`fry`, `beast`, `bender`, `mac`. These are **examples**, never
 hard-coded into application logic. Add machines by editing the inventory only.
+Connection details (MagicDNS address, SSH user) go in
+`inventory/host_vars/<host>.yml`, e.g. for the macOS host:
+
+```yaml
+ansible_host: mac.<tailnet>.ts.net
+ansible_user: <fleet-user>
+ansible_python_interpreter: /usr/bin/python3
+```
 
 ## Managed baseline (idempotent)
 
@@ -58,6 +67,14 @@ ansible-playbook -i inventory/hosts.yml playbooks/site.yml --limit bender
 ansible-playbook -i inventory/hosts.yml playbooks/site.yml
 ```
 
+On hosts where every task is user-scoped and passwordless sudo is not
+available (e.g. macOS), disable privilege escalation:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/site.yml \
+  --limit mac -e herdr_engineering_become=false
+```
+
 A second converged run is idempotent (no unexpected changes).
 
 ### Validated (2026-09-24, ansible-core 2.21.4)
@@ -67,11 +84,19 @@ A second converged run is idempotent (no unexpected changes).
   `ok=12 changed=6 failed=0`. The dry run caught and fixed three real bugs:
   `become` evaluated before fact-gathering, role path resolution, and state/
   config dirs being placed under root's home instead of the fleet user's.
+- **Real convergence of `mac` over the tailnet** (SSH, fleet user,
+  `herdr_engineering_become=false`): run 1 `ok=17 changed=8 failed=0`
+  (Homebrew detected, vim/mc/btop/git/python@3.12 ensured, herdr 0.9.1 and
+  pi 0.87.1 verified, both repos cloned, state/config dirs + LLM endpoint
+  written); run 2 immediately after: `ok=17 changed=0 failed=0` — idempotent.
+  The live run found and fixed four more bugs (see `docs/evidence/0180/
+  live-validation.txt`): a brew check that always "passed", forced `become`
+  on hosts without passwordless sudo, a PATH clobber that hid `~/.local/bin`
+  from every task (breaking herdr detection), and a tailscale report that
+  could never say "up".
 
 ## Notes
 
-- The reference workstation does not have Ansible installed and cannot reach
-  the remote validation fleet, so live convergence of `fry`/`beast`/`bender`/
-  `macbook-m4` is a documented **external blocker** (acceptance rows marked
-  `BLOCKED_EXTERNAL`). The playbooks are provided and are structurally
-  idempotent; they are validated by review and by the CI config-schema job.
+- Live convergence is proven for `mac`; `fry`, `beast` and `bender` still
+  need an operator go-ahead per host (the playbook installs packages on
+  live machines).
