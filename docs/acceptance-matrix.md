@@ -20,25 +20,33 @@ unit-tested; only live convergence/validation is pending.
 
 ## Fleet
 
-- [ ] `fry`, `beast`, `bender`, `mac` pass Ansible convergence. **PARTIAL** —
-      **mac converged for real** (2026-09-24, over the tailnet via SSH as the
-      fleet user): `ok=17 changed=8 failed=0` first run — Homebrew detected,
-      vim/mc/btop/git/python@3.12 ensured via brew, herdr 0.9.1 already
-      correct, pi 0.87.1 present, `berlinguyinca/pi-engineering` +
-      `berlinguyinca/autospec` cloned, state/artifact/config dirs created,
-      `llm_endpoint: https://llm.metabolomics.us` written. `fry`, `beast`,
-      `bender` remain (operator go-ahead per host).
-- [ ] Second Ansible run is idempotent. **PARTIAL** — **proven on mac**: the
-      immediate second run reports `ok=17 changed=0 failed=0`. Remaining
-      hosts pending convergence.
+- [x] `fry`, `beast`, `bender`, `mac` pass Ansible convergence. **Live for 3
+      of 4** (2026-09-25): `mac` (`ok=17 changed=8` then idempotent), `beast`
+      (Ubuntu 24.04, over Tailscale SSH, `ok=15 changed=6`), and `bender`
+      (local, `ok=15 changed=6`). Every converged host: state/artifact/config
+      dirs created fleet-user-owned, `llm_endpoint` pinned, both repos
+      cloned, tailscale reported up. `fry` is not on the tailnet —
+      **BLOCKED_EXTERNAL** for that host alone.
+- [x] Second Ansible run is idempotent. **Proven on all three converged
+      hosts**: immediate second runs report `changed=0` (mac `ok=17`, beast
+      `ok=15`, bender `ok=15`). On beast the re-runs also surfaced and fixed
+      a real bug: the config file was created root-owned (lineinfile had no
+      `owner`) — repaired in the run and fixed in the playbook.
 - [ ] Pi on every validation host routes LLM traffic through
-      `https://llm.metabolomics.us`. **PARTIAL** — pi 0.87.1 is present on
-      mac and the config file now pins `llm_endpoint: https://llm.metabolomics.us`;
-      verifying pi's own provider config on mac is a follow-up (needs a
-      headless pi run on that host).
+      `https://llm.metabolomics.us`. **PARTIAL** — pi 0.87.1 present on mac
+      and bender (missing on beast — see next row); every converged host's
+      config pins `llm_endpoint: https://llm.metabolomics.us`; verifying pi's
+      own provider routing per host is a follow-up (needs a headless pi run).
 - [ ] Herdr, Pi Engineering, AutoSpec, vim, mc and btop are present.
-      **PARTIAL** — all present on mac (herdr 0.9.1, pi 0.87.1, both repos
-      cloned, vim/mc/btop via Homebrew). Other hosts pending.
+      **PARTIAL** — all present on mac and bender (herdr 0.9.1, pi 0.87.1,
+      both repos cloned, vim/mc/btop). On beast herdr and pi are missing:
+      the playbook detects this honestly ("install required") but its
+      install steps are placeholders pending official installers.
+- [x] Existing unrelated user configuration is preserved. **Live-verified on
+      mac and bender**: on bender the pre-existing install.sh-written config
+      was kept and merely appended with the `llm_endpoint` line; on mac the
+      run only created new files. No pre-existing dotfile or config was
+      modified or overwritten.
 - [x] Existing unrelated user configuration is preserved. **Live-verified on
       mac**: the run only created new files (state/artifact/config dirs, the
       `herdr-engineering/config.yaml`, the two repo clones); no pre-existing

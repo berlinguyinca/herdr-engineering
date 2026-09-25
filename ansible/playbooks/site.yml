@@ -85,6 +85,9 @@
         line: "llm_endpoint: {{ llm_endpoint }}"
         create: true
         mode: "0640"
+        # become runs the tasks as root on Linux; without this the config
+        # file is created root-owned and the fleet user cannot read it.
+        owner: "{{ fleet_user }}"
 
     - name: "Tailscale reachability check (informational, non-fatal)"
       ansible.builtin.command: tailscale status

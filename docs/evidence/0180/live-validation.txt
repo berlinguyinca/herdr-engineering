@@ -158,3 +158,31 @@ Post-check on the machine: vim/mc/btop via brew, herdr 0.9.1, pi 0.87.1
   (@earendil-works/pi-coding-agent), tailscale status "up", both repos and
   config present. No pre-existing user config was modified.
 Remaining: fry, beast, bender convergence (operator go-ahead per host).
+
+---
+Real Ansible convergence — `beast` and `bender` (2026-09-25)
+---
+beast (Ubuntu 24.04.4, tailnet 100.96.156.65, Tailscale SSH with interactive
+  check approval, fleet user wohlgemuth, passwordless sudo):
+  Run 1:  ok=15 changed=6  failed=0 (tailscale reported up)
+  Run 2:  ok=15 changed=0  failed=0 (idempotent)
+  Run 3:  ok=15 changed=1  failed=0 — the re-runs caught a REAL BUG: with
+          become=true the lineinfile task created config.yaml root-owned
+          (the dir tasks set owner, lineinfile did not) — the fleet user
+          could not read its own config. Playbook fixed (owner added);
+          the re-run itself repaired the ownership (changed=1 was the chown).
+  Run 4:  ok=15 changed=0  failed=0 (idempotent again)
+  Post-check: clones + artifacts dir present; vim/mc/btop pre-existing;
+  herdr + pi NOT installed — the role's install steps are placeholders and
+  it reports "install required" honestly rather than pretending.
+  Note: beast's SSH required a one-time browser approval of the Tailscale
+  check (human step).
+
+bender (this workstation, local connection):
+  Run 1:  ok=15 changed=6  failed=0 (tailscale up)
+  Run 2:  ok=15 changed=0  failed=0 (idempotent)
+  Pre-existing install.sh config preserved and only appended with the
+  llm_endpoint line (merge-never-overwrite proven on a live config).
+
+Fleet status: mac + beast + bender converged and idempotent. fry is not on
+the tailnet (absent from `tailscale status`) — blocked for that host alone.

@@ -84,19 +84,28 @@ A second converged run is idempotent (no unexpected changes).
   `ok=12 changed=6 failed=0`. The dry run caught and fixed three real bugs:
   `become` evaluated before fact-gathering, role path resolution, and state/
   config dirs being placed under root's home instead of the fleet user's.
-- **Real convergence of `mac` over the tailnet** (SSH, fleet user,
-  `herdr_engineering_become=false`): run 1 `ok=17 changed=8 failed=0`
+- **Real convergence of `mac`** (macOS, over the tailnet, SSH as the fleet
+  user, `herdr_engineering_become=false`): run 1 `ok=17 changed=8 failed=0`
   (Homebrew detected, vim/mc/btop/git/python@3.12 ensured, herdr 0.9.1 and
   pi 0.87.1 verified, both repos cloned, state/config dirs + LLM endpoint
   written); run 2 immediately after: `ok=17 changed=0 failed=0` — idempotent.
-  The live run found and fixed four more bugs (see `docs/evidence/0180/
-  live-validation.txt`): a brew check that always "passed", forced `become`
-  on hosts without passwordless sudo, a PATH clobber that hid `~/.local/bin`
-  from every task (breaking herdr detection), and a tailscale report that
-  could never say "up".
+- **Real convergence of `beast`** (Ubuntu 24.04, over Tailscale SSH — one
+  interactive browser check approval) and **`bender`** (local): each
+  `ok=15 changed=6` then idempotent `changed=0`. The beast re-runs caught a
+  real bug: with `become: true` the config `lineinfile` created the file
+  root-owned (unreadable by the fleet user) — fixed in the playbook; the
+  re-run itself repaired the live file.
+- The live runs found and fixed five bugs in total (see
+  `docs/evidence/0180/live-validation.txt`): a brew check that always
+  "passed", forced `become` on hosts without passwordless sudo, a PATH
+  clobber that hid `~/.local/bin` from every task (breaking herdr
+  detection), a tailscale report that could never say "up", and the
+  root-owned config file.
 
 ## Notes
 
-- Live convergence is proven for `mac`; `fry`, `beast` and `bender` still
-  need an operator go-ahead per host (the playbook installs packages on
-  live machines).
+- Live convergence is proven for `mac`, `beast` and `bender`. `fry` is not
+  on the tailnet (absent from `tailscale status`) — blocked for that host
+  alone. On `beast`, herdr and pi are not installed: the role detects this
+  honestly ("install required") and its install steps are placeholders
+  pending official installers.

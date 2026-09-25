@@ -81,10 +81,10 @@ Pi Forge is explicitly excluded.
 
 The initial fleet is:
 
-- `fry`
-- `beast`
-- `bender`
-- `macbook-m4`
+- `fry` (not currently on the tailnet)
+- `beast` — converged, idempotent
+- `bender` — converged, idempotent
+- `mac` (renamed from `macbook-m4` to match the real tailnet name) — converged, idempotent
 
 These names are validation inventory, not hard-coded application logic. Future machines must be addable without code changes.
 
