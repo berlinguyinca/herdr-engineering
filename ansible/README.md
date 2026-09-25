@@ -106,6 +106,8 @@ A second converged run is idempotent (no unexpected changes).
 
 - Live convergence is proven for `mac`, `beast` and `bender`. `fry` is not
   on the tailnet (absent from `tailscale status`) — blocked for that host
-  alone. On `beast`, herdr and pi are not installed: the role detects this
-  honestly ("install required") and its install steps are placeholders
-  pending official installers.
+  alone. All three converged hosts have herdr 0.9.1 and pi 0.87.1. Caveat:
+  on beast these live in `~/.local/bin`, which is absent from
+  non-interactive SSH PATH — the playbook finds them via its play-level
+  PATH, but a manual check must use `bash -lc` (a non-interactive
+  `command -v herdr` reports MISSING and is wrong).

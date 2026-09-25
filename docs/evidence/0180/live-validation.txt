@@ -172,9 +172,14 @@ beast (Ubuntu 24.04.4, tailnet 100.96.156.65, Tailscale SSH with interactive
           could not read its own config. Playbook fixed (owner added);
           the re-run itself repaired the ownership (changed=1 was the chown).
   Run 4:  ok=15 changed=0  failed=0 (idempotent again)
-  Post-check: clones + artifacts dir present; vim/mc/btop pre-existing;
-  herdr + pi NOT installed — the role's install steps are placeholders and
-  it reports "install required" honestly rather than pretending.
+  Post-check: clones + artifacts dir present; vim/mc/btop pre-existing.
+  CORRECTION (same day): an earlier post-check claimed herdr/pi were NOT
+  installed on beast — wrong. They live in ~/.local/bin (pi also via nvm
+  node v20.20.2), which is absent from beast's non-interactive SSH PATH;
+  `bash -lc` finds them: herdr 0.9.1 (pinned version) and pi 0.87.1, both
+  repos cloned. The playbook itself always found them — its play-level PATH
+  includes $HOME/.local/bin, proven by the changed=0 idempotency re-runs
+  (a false "install required" would have been changed=1 every run).
   Note: beast's SSH required a one-time browser approval of the Tailscale
   check (human step).
 

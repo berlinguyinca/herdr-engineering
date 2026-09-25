@@ -33,15 +33,18 @@ unit-tested; only live convergence/validation is pending.
       a real bug: the config file was created root-owned (lineinfile had no
       `owner`) — repaired in the run and fixed in the playbook.
 - [ ] Pi on every validation host routes LLM traffic through
-      `https://llm.metabolomics.us`. **PARTIAL** — pi 0.87.1 present on mac
-      and bender (missing on beast — see next row); every converged host's
-      config pins `llm_endpoint: https://llm.metabolomics.us`; verifying pi's
-      own provider routing per host is a follow-up (needs a headless pi run).
-- [ ] Herdr, Pi Engineering, AutoSpec, vim, mc and btop are present.
-      **PARTIAL** — all present on mac and bender (herdr 0.9.1, pi 0.87.1,
-      both repos cloned, vim/mc/btop). On beast herdr and pi are missing:
-      the playbook detects this honestly ("install required") but its
-      install steps are placeholders pending official installers.
+      `https://llm.metabolomics.us`. **PARTIAL** — pi 0.87.1 is present on
+      all three converged hosts (mac, beast, bender) and every converged
+      host's config pins `llm_endpoint: https://llm.metabolomics.us`;
+      verifying pi's own provider routing per host is a follow-up (needs a
+      headless pi run on each).
+- [x] Herdr, Pi Engineering, AutoSpec, vim, mc and btop are present.
+      **Live-verified on all three converged hosts** — herdr 0.9.1 (pinned
+      version), pi 0.87.1, both repos cloned, vim/mc/btop present. Note:
+      beast's herdr/pi live in `~/.local/bin`, which is absent from
+      non-interactive SSH PATH — the playbook finds them via its play-level
+      PATH (proven by the `changed=0` idempotency re-runs); a manual
+      non-interactive check must use `bash -lc`.
 - [x] Existing unrelated user configuration is preserved. **Live-verified on
       mac and bender**: on bender the pre-existing install.sh-written config
       was kept and merely appended with the `llm_endpoint` line; on mac the
