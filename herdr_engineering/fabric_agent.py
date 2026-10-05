@@ -430,9 +430,15 @@ class FabricAgent:
         """Heartbeat a tracked lease; re-register it if the gateway lost it."""
         lease_id = entry.get("lease_id")
         try:
-            self._client.heartbeat(lease_id)
-            entry["last_hb"] = time.monotonic()
-            return
+            # The gateway answers 200 {"ok": false} for an unknown/expired
+            # lease (it does NOT 404), so success must be read from the body,
+            # not inferred from the absence of an exception.
+            res = self._client.heartbeat(lease_id)
+            if res.get("ok", True):
+                entry["last_hb"] = time.monotonic()
+                return
+            log.info("lease %s (port %s) gone (gateway: no such lease); "
+                     "re-registering", lease_id, port_s)
         except Exception as exc:
             log.info("lease %s (port %s) not alive (%s); re-registering",
                      lease_id, port_s, exc)

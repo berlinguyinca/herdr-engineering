@@ -153,10 +153,10 @@ def _make_fake_handler(gw: _FakeGateway):
                 self._send(200, {"closed": lease_id})
             elif self.path == "/heartbeat":
                 lease_id = body.get("lease_id") or body.get("id")
-                if lease_id in gw.leases:
-                    self._send(200, {"ok": True, "renewed": lease_id})
-                else:  # gateway dropped it -> client re-registers
-                    self._send(404, {"error": "no such lease"})
+                # Match the REAL gateway contract: 200 {"ok": bool}, never 404.
+                self._send(200, {"ok": lease_id in gw.leases,
+                                 "renewed": lease_id
+                                 if lease_id in gw.leases else None})
             else:
                 self._send(404, {"error": "not found"})
 
