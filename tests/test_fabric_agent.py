@@ -85,7 +85,9 @@ class _FakeGateway:
     def __init__(self):
         self.leases: dict[str, dict] = {}
         self.closed: list[str] = []
-        self._port_counter = _free_port()
+        # External ports are just opaque numbers here (the fake never binds
+        # them); start in the dev window to mirror the real gateway's _LO.
+        self._port_counter = 18000
         self._lock = threading.Lock()
         self._httpd = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), _make_fake_handler(self))
@@ -122,6 +124,9 @@ def _make_fake_handler(gw: _FakeGateway):
         def do_GET(self):
             if self.path == "/healthz":
                 self._send(200, {"ok": True})
+            elif self.path == "/list":
+                with gw._lock:
+                    self._send(200, {"leases": list(gw.leases.values())})
             else:
                 self._send(404, {"error": "not found"})
 
@@ -352,6 +357,33 @@ def test_dropped_lease_is_reregistered(tmp_path, monkeypatch):
         gw.leases.pop(lease_id)  # simulate gateway restart (lease gone)
         agent.scan_once()        # keepalive: heartbeat 404 -> re-register
         assert any(lease["target"]["port"] == port for lease in gw.leases.values())
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_gateway_front_door_ports_are_not_registered(tmp_path, monkeypatch):
+    """On the gateway host the router's own dev:<port> front-door ports are
+    live local HTTP listeners; the agent must never register them (feedback
+    loop). They are excluded via the gateway's current external-port set."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "testapp"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()  # registers `port` -> gets a gateway external_port
+        ext = next(lease["external_port"] for lease in gw.leases.values()
+                   if lease["target"]["port"] == port)
+        # Now the front-door port `ext` also appears as a local listener
+        # (exactly what the gateway host's agent scanner sees).
+        monkeypatch.setattr(fa, "scan_listening_ports",
+                            lambda: _listeners({port: "testapp", ext: "router"}))
+        before = len(gw.leases)
+        agent.scan_once()
+        assert not any(lease["target"]["port"] == ext for lease in gw.leases.values())
+        assert len(gw.leases) == before  # no feedback registration
     finally:
         server.shutdown()
         agent.stop()

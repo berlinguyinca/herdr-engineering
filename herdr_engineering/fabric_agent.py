@@ -386,6 +386,20 @@ class FabricAgent:
         registered: list[str] = []
         closed: list[str] = []
 
+        # Ports the gateway itself binds (its dev:<port> front-door range) are
+        # never adoption candidates. On the GATEWAY host these are live local
+        # HTTP listeners (the router proxies them); registering one would make
+        # the agent proxy its own front door — a feedback loop. Best effort:
+        # an empty set when the gateway is momentarily unreachable.
+        gateway_ext_ports: set[int] = set()
+        try:
+            for lease in self._client.list().get("leases", []):
+                ep = lease.get("external_port")
+                if ep:
+                    gateway_ext_ports.add(int(ep))
+        except Exception as exc:  # noqa: BLE001 - best effort
+            log.debug("gateway external-port lookup failed: %s", exc)
+
         # Ports owned by this agent's own forwarders are never candidates —
         # they proxy an already-tracked service (double-registration guard).
         with self._lock:
@@ -401,6 +415,8 @@ class FabricAgent:
         # 2) adopt new web services
         for port in sorted(live_ports):
             if port <= 0 or not self._is_dev_web_port(port):
+                continue
+            if port in gateway_ext_ports:
                 continue
             with self._lock:
                 if (str(port) in self._store
