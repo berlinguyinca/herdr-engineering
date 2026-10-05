@@ -93,6 +93,37 @@ every `register`/`list`/`resolve` response as the lease's `url`.
 4. App stops → probes fail → no renewal → TTL expiry → port released.
 5. `herdr-eng devfabric close <lease_id>` releases a port immediately.
 
+## Auto-registration agent (zero manual steps)
+
+Manual `devfabric register` is the explicit path; the **agent** makes it
+automatic. A per-host service (`herdr-eng devfabric agent`, deployed by
+Ansible on every fleet host as a systemd user unit) runs one scan cycle every
+few seconds:
+
+1. **Detect** — enumerate listening TCP ports (`ss` on Linux, `lsof` on
+   macOS). A port is a candidate only when it looks like a *dev* web service:
+   non-privileged (`>= 1024`, or a common web port), below the OS ephemeral
+   range, not a well-known infrastructure daemon (CUPS, restic, Prometheus,
+   exporters, …), and it answers an HTTP `GET /` with a status `< 500`. This
+   noise filter keeps system daemons and debug/agent endpoints out of the
+   fabric; every threshold is configurable (`fabric.agent_*`).
+2. **Adopt** — register the service with the gateway. If the app is reachable
+   on the host's tailnet IP the target is registered directly; if it is
+   loopback-only the agent starts a tailnet-bound **forwarder** in front of it
+   (same byte pipe as the router, bound to the tailnet IP only) and registers
+   the forwarder's port. Either way the app appears at a stable `dev:<port>`.
+3. **Keepalive** — tracked leases are heartbeated at half the gateway TTL; a
+   lease the gateway dropped (restart or TTL lapse) is transparently
+   re-registered, so the mapping never goes stale.
+4. **Release** — when a tracked service stops, its lease is closed and its
+   forwarder stopped, freeing the `dev:<port>` port fleet-wide.
+
+The agent’s local store (`state/fabric-agent.json`) is what it has already
+adopted; it is the single writer and re-derives its forwarder set on restart.
+Because every host runs an agent, **starting a web service on any fleet host
+makes it appear in the gateway host's web UI and at `dev:<port>` with no
+manual registration.**
+
 ## Degraded / local mode
 
 If no gateway is configured (`fabric.gateway_url` /
@@ -121,6 +152,11 @@ herdr-eng devfabric gateway
 
 # register an app running on this machine (tailnet-reachable)
 herdr-eng devfabric register --machine beast --host auto --port 5678
+
+# run the auto-registration agent on this host (normally a systemd unit):
+# detects local web services and keeps the gateway's lease set in sync\r
+herdr-eng devfabric agent            # foreground loop (Ctrl-C to stop)
+herdr-eng devfabric agent --once     # one scan cycle (cron / smoke test)
 
 # point commands at the gateway without editing config
 HERDR_ENGINEERING_FABRIC_URL=http://bender.tail0c50da.ts.net:29999 \

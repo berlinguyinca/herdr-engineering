@@ -61,7 +61,7 @@ function render(d){
  if(active==='fleet'){ main.innerHTML='<div class="grid">'+(d.machines||[]).map(m=>card(m.label, m.reachable?'reachable':'unknown', m.reachable?'ok':'warn')).join('')||'<div class="card muted">no machines</div>'+'</div>'; }
  else if(active==='sessions'){ main.innerHTML='<div class="grid">'+(d.sessions||[]).map(s=>card(s.agent,s.status+' · '+esc(s.cwd),'')).join('')+'</div>'; }
  else if(active==='activity'){ main.innerHTML=(d.events||[]).map(e=>card(e.summary, esc(e.occurred_at)+' · '+esc(e.source))).join('')||'<div class="card muted">no activity</div>'; }
- else if(active==='dev'){ main.innerHTML='<div class="grid">'+(d.leases||[]).map(l=>card(l.label||l.id, esc(l.protocol)+' :'+l.external_port+' → '+esc(l.target_host)+':'+l.target_port,'')).join('')+'</div>'; }
+ else if(active==='dev'){ main.innerHTML='<div class="grid">'+(d.leases||[]).map(l=>{ const sub=esc(l.protocol)+' :'+l.external_port+' → '+esc(l.target_host)+':'+l.target_port+(l.url?'<br><a href="'+esc(l.url)+'" target="_blank" rel="noopener">'+esc(l.url)+'</a>':''); return card(l.label||l.id, sub,''); }).join('')+'</div>'; }
  else if(active==='tests'){ main.innerHTML='<div class="card muted">adapters: '+esc((d.adapters||[]).join(', '))+'</div>'; }
  else if(active==='ci'){ main.innerHTML='<div class="card muted">CI provider: '+(d.available===false?'offline (stale view)':'configured')+'</div>'; }
  else if(active==='attention'){ main.innerHTML=(d.items||[]).map(i=>card(i.title, esc(i.summary)+' · '+esc(i.severity),'')).join('')||'<div class="card muted">no attention items</div>'; }
@@ -100,8 +100,32 @@ def _activity() -> dict[str, Any]:
 
 
 def _dev() -> dict[str, Any]:
+    from .config import InvalidError, load_config
     from .devfabric import DevServiceRegistry
+    from .errors import HerdrEngineeringError
+    from .fabric import FabricClient, gateway_url_from_config
+    try:
+        cfg = load_config()
+    except InvalidError:
+        cfg = {}
     leases = [lease.to_dict() for lease in DevServiceRegistry().active_leases()]
+    # Annotate each lease with its stable dev:<port> URL so the UI shows a
+    # clickable front-door link. url_base comes from the LIVE gateway
+    # (/healthz is the single source of truth); fall back to config when no
+    # gateway is reachable (local mode).
+    url_base = ((cfg.get("fabric") or {}).get("url_base") or "").strip()
+    base = gateway_url_from_config(cfg)
+    if base:
+        try:
+            live = FabricClient(base).healthz().get("url_base")
+            if live:
+                url_base = live
+        except (HerdrEngineeringError, OSError):
+            pass
+    if url_base:
+        for lease in leases:
+            if lease.get("external_port") is not None:
+                lease["url"] = f"http://{url_base}:{lease['external_port']}"
     return {"leases": leases}
 
 

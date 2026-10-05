@@ -1,0 +1,85 @@
+# Auto-registration agent — live validation (2026-09-25)
+
+Hosts: gateway = bender (100.104.39.6, MagicDNS bender.tail0c50da.ts.net,
+control :29999, tailnet-bound); agent + demo app = beast (100.96.156.65).
+
+## Gateway up (token-less on the private tailnet)
+$ herdr-eng devfabric gateway            # on bender
+$ curl -s http://bender.tail0c50da.ts.net:29999/healthz
+{"ok": true, "url_base": "http://bender.tail0c50da.ts.net", ...}
+
+Note: the control API binds the gateway host's tailnet IP only (bind: auto),
+NOT loopback — so every agent (including one on bender itself) reaches the
+control plane via the MagicDNS URL. No bearer token: the control plane is
+reachable only from the tailnet, which is itself the access control.
+
+## Zero-manual drill: a web service on beast appears at dev:<port>
+1. On beast, start a demo app:   python3 -m http.server 5678   (binds 0.0.0.0)
+2. On beast, run one agent scan cycle against the gateway:
+   $ HERDR_ENGINEERING_FABRIC_URL=http://bender.tail0c50da.ts.net:29999 \
+       herdr-eng devfabric agent --once
+   -> registered: 19  (beast's dev web services; noise filtered, see below)
+   -> includes: "python3 on beast (port 5678)"
+3. Resolve the lease's external port from the gateway:
+   $ curl -s http://bender.tail0c50da.ts.net:29999/list | jq '.leases[] |
+       select(.target.port==5678) | .external_port'
+   18007
+4. Open it via the fleet front door (from bender, and from beast itself):
+   $ curl -s http://bender.tail0c50da.ts.net:18007/
+   <!doctype html><meta charset="utf-8"><title>beast</title>   -> HTTP 200
+   (routed gateway -> beast:5678, no manual `register` on either host)
+5. It surfaces with a clickable link in the gateway host web UI:
+   $ python -c "from herdr_engineering.web import _dev; print(_dev())"
+   url=http://bender.tail0c50da.ts.net:18007  <- beast:5678
+
+## Noise filter (registers dev web services, not infrastructure)
+Before the filter the agent registered 26 HTTP responders on beast; after the
+dev-service heuristic it registers 19, correctly dropping:
+  :631   CUPS scheduler          (responds HTTP-ish, not a dev service)
+  :1933  restic REST server      (infra)
+  :9090  prometheus/node_exporter (metrics)
+  :9091  metrics                  (metrics)
+  :38105 chrome DevTools          (ephemeral range, >= 32768)
+  :46883 codex helper             (ephemeral range)
+The filter keeps non-privileged, sub-ephemeral ports that answer HTTP GET /
+with a status < 500, minus a deny-list of well-known infrastructure ports.
+Thresholds are configurable: fabric.agent_web_port_min / agent_ephemeral_min /
+agent_exclude_ports.
+
+## Loopback-only services get a forwarder
+A service bound only to 127.0.0.1 (e.g. restic on :1933, when it passes the
+filter) is adopted via a tailnet-bound forwarder the agent starts in front of
+it (bound to the host's tailnet IP only, never 0.0.0.0), so the gateway can
+reach it. The forwarder's own port is excluded from the next scan so it is
+never double-registered as a separate service.
+
+## Reliability: heartbeat + re-register on gateway drop
+Tracked leases are heartbeated at half the gateway TTL (default 90s -> every
+45s). If a heartbeat fails because the gateway lost the lease (restart or TTL
+lapse), the agent re-registers the SAME target (keeping any forwarder), so the
+dev:<port> mapping survives a gateway restart with no manual action. Covered
+by tests test_heartbeat_keeps_lease and test_dropped_lease_is_reregistered.
+
+## Bugs found and fixed during the live drill
+1. probe_web must tolerate non-HTTP responders: an SSH banner on port 22 made
+   http.client raise BadStatusLine; the probe now catches HTTPException so a
+   non-web port is simply skipped, not fatal.
+2. The agent's register request used the wrong keys (machine/host/port) vs the
+   gateway contract (target_machine_id/target_host/target_port); the gateway
+   read them as null. Fixed to match the dev-service-lease contract, and the
+   response is parsed as the nested {"lease": {...}, "url": ...}.
+3. The agent re-registered its own loopback forwarder ports as new services
+   each cycle (double registration). Forwarder ports are now excluded from the
+   scan.
+4. config.load rejected a config.yaml missing the `version` field. It now
+   defaults to version 1 (lenient) and only refuses an explicit unsupported
+   version.
+
+## Deployment
+scripts/fabric-agent.sh installs the agent as a systemd USER service (with
+loginctl linger) on a single host; the fleet Ansible playbook
+(ansible/tasks/fabric-agent.yml, wired into playbooks/site.yml for every host)
+provisions herdr-eng into a per-user venv (kept current via git pull + pip
+upgrade) and runs the installer, pointing every host at the gateway's MagicDNS
+control URL. Restart=on-failure; the agent re-derives its state from
+state/fabric-agent.json on restart.

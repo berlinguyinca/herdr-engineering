@@ -18,6 +18,21 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `HERDR_ENGINEERING_FABRIC_URL` / `fabric.gateway_url` config: registrar
   commands route through the gateway automatically and degrade to local mode
   with an explicit warning when it is unreachable.
+- **Dev-fabric auto-registration agent** (spec 0110, zero manual steps) —
+  `herdr-eng devfabric agent` runs a per-host loop that detects web services
+  starting locally and registers them with the gateway automatically: it
+  scans listeners (`ss`/`lsof`), probes each for HTTP, puts a tailnet-bound
+  forwarder in front of loopback-only apps, heartbeats tracked leases and
+  transparently re-registers any the gateway drops (restart/TTL), and closes
+  leases when a service disappears. A noise filter registers only *dev* web
+  services (skips privileged/ephemeral ports and well-known infrastructure
+  daemons; thresholds configurable via `fabric.agent_*`). Deployed as a
+  systemd user service by `scripts/fabric-agent.sh` and the fleet Ansible
+  playbook on every host, so a web service started on any fleet member
+  appears at a stable `dev:<port>` and in the gateway host's web UI with no
+  manual registration.
+- The web UI's dev tab now sources `url_base` from the live gateway
+  (`/healthz`) and renders a clickable front-door link per lease.
 - `--host auto` for `devfabric register`: resolves the local tailnet IPv4 and
   verifies the target is listening before publishing the lease.
 - `gateway.lock` (pid:nonce): refuses a second live gateway over one store;

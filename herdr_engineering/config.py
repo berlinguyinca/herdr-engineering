@@ -44,6 +44,12 @@ DEFAULTS: dict[str, Any] = {
         "bind": "auto",  # auto = loopback + tailnet IPv4
         "url_base": "",  # empty = auto (MagicDNS name, else tailnet IP)
         "probe_interval_seconds": 15,
+        # Auto-registration agent noise filter (spec 0110): only register web
+        # services on ports in [agent_web_port_min, agent_ephemeral_min) that
+        # are not in agent_exclude_ports (well-known daemons are also skipped).
+        "agent_exclude_ports": [],
+        "agent_web_port_min": 1024,
+        "agent_ephemeral_min": 32768,
     },
     "tests": {"adapters": ["pytest", "go", "cargo", "junit", "scala"]},
     "ci": {"provider": "woodpecker", "pileated_extensions": "auto"},
@@ -118,7 +124,10 @@ def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
             data = _read_simple_yaml(path)
         if not isinstance(data, dict):
             raise InvalidError(f"config file {path} is not a mapping")
-        if data.get("version") != 1:
+        # A config may omit `version` (minimal per-host files written by
+        # Ansible carry a single key); an absent version means the only
+        # supported schema (1). Only an explicitly wrong version is rejected.
+        if "version" in data and data["version"] != 1:
             raise InvalidError(f"config file {path} has unsupported version")
         cfg = _deep_merge(cfg, data)
     return _expand_env(cfg)

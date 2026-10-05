@@ -1,0 +1,33 @@
+# HerdR Engineering dev-fabric auto-registration agent (spec 0110).
+#
+# Persistent systemd USER unit that watches THIS host for web services and
+# auto-registers them with the fabric gateway, so they appear at a stable
+# dev:<port> URL fleet-wide (and in the gateway host's web UI) with zero
+# manual steps. Loopback-only services get a tailnet-bound forwarder in
+# front of them; leases are closed when a service disappears.
+#
+# The __HERDR_ENG__ placeholder is replaced by scripts/fabric-agent.sh with
+# the resolved herdr-eng binary path for this host.
+#
+# The gateway control URL is read from
+# ~/.config/herdr-engineering/fabric.env (HERDR_ENGINEERING_FABRIC_URL),
+# written by scripts/fabric-agent.sh or Ansible. Machine-local, no secrets
+# (a tailnet URL, not a credential).
+#
+# To uninstall:
+#   systemctl --user disable --now herdr-eng-fabric-agent.service
+#   rm -f ~/.config/systemd/user/herdr-eng-fabric-agent.service
+#   systemctl --user daemon-reload
+[Unit]
+Description=HerdR Engineering dev-fabric auto-registration agent
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-%h/.config/herdr-engineering/fabric.env
+ExecStart=__HERDR_ENG__ devfabric agent
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

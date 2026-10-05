@@ -120,6 +120,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--control-port", type=int, default=None)
     p2.add_argument("--url-base", default=None, help="stable base for dev:<port> (default: auto)")
     p2.set_defaults(func=_cmd_dev_gateway)
+    p2 = dsub.add_parser(
+        "agent",
+        help="auto-register this host's web services with the gateway")
+    p2.add_argument("--interval", type=float, default=5.0,
+                    help="seconds between scan cycles (default: 5)")
+    p2.add_argument("--once", action="store_true",
+                    help="run a single scan cycle and exit")
+    p2.add_argument("--label-prefix", default="",
+                    help="prefix for auto-generated lease labels")
+    p2.set_defaults(func=_cmd_dev_agent)
     p2 = dsub.add_parser("list", help="list active leases")
     p2.add_argument("--json", action="store_true", default=True)
     p2.set_defaults(func=_cmd_dev_list)
@@ -524,6 +534,73 @@ def _cmd_dev_gateway(args) -> int:
     finally:
         gateway.stop()
         _print_json({"stopped": True})
+    return 0
+
+
+def _cmd_dev_agent(args) -> int:
+    """Run the per-host auto-registration agent (spec 0110)."""
+    import logging
+    import os
+    from pathlib import Path
+
+    from .config import InvalidError, load_config
+    from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
+    from .fabric_agent import AgentConfig, FabricAgent
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        cfg = load_config()
+    except InvalidError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
+    base = gateway_url_from_config(cfg)
+    if not base:
+        _print_json({
+            "code": "config",
+            "message": "no gateway configured: set fabric.gateway_url or "
+                       "HERDR_ENGINEERING_FABRIC_URL",
+        })
+        return 1
+    tailnet_ip = tailnet_ipv4()
+    if not tailnet_ip:
+        _print_json({
+            "code": "config",
+            "message": "no tailnet IPv4 found (is tailscale up?)",
+        })
+        return 1
+    fabric_cfg = cfg.get("fabric") or {}
+    web_port = int((cfg.get("web") or {}).get("port", 8787))
+    control_port = int(fabric_cfg.get("control_port", 29999))
+    state_dir = Path(os.environ.get(
+        "HERDR_ENGINEERING_STATE",
+        str(Path.home() / ".local/share/herdr-engineering/state")))
+    # Noise filter knobs (all optional, sensible defaults in AgentConfig):
+    # extra excluded ports + the dev-port window the agent will register.
+    extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
+        "agent_exclude_ports", []))
+    agent = FabricAgent(
+        client=FabricClient(base),
+        config=AgentConfig(
+            tailnet_ip=tailnet_ip,
+            store_path=state_dir / "fabric-agent.json",
+            exclude_ports=frozenset({web_port, control_port}) | extra_exclude,
+            label_prefix=args.label_prefix,
+            interval=args.interval,
+            web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
+            ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
+        ))
+    if args.once:
+        summary = agent.scan_once()
+        agent.stop()
+        _print_json({"ok": True, **summary})
+        return 0
+    try:
+        agent.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        agent.stop()
     return 0
 
 

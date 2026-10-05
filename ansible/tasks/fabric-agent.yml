@@ -1,0 +1,66 @@
+# Deploy the dev-fabric auto-registration agent on EVERY fleet host
+# (spec 0110): the agent detects web services that start on the host and
+# auto-registers them with the fabric gateway, so they appear at a stable
+# dev:<port> URL fleet-wide (and in the gateway host's web UI) with zero
+# manual steps. Loopback-only services get a tailnet-bound forwarder in
+# front of them; leases are closed when a service disappears. No public
+# listeners.
+#
+# Runs as the fleet (connection) user (become: false). herdr-eng is
+# provisioned when missing (shallow clone of the public repo + user venv).
+# The gateway control URL is written to the machine-local
+# ~/.config/herdr-engineering/fabric.env (a tailnet URL, not a secret).
+- name: "Deploy dev-fabric auto-registration agent"
+  become: false
+  block:
+    - name: "Write the fabric gateway control URL for this host"
+      ansible.builtin.copy:
+        dest: "{{ fleet_home }}/.config/herdr-engineering/fabric.env"
+        owner: "{{ fleet_user }}"
+        mode: "0600"
+        content: "HERDR_ENGINEERING_FABRIC_URL={{ fabric_agent_gateway_url }}\n"
+
+    - name: "Provision/refresh herdr-eng (public repo clone + user venv, kept current)"
+      ansible.builtin.shell: |
+        set -e
+        VENV="$HOME/.venvs/herdr-engineering"
+        REPO="$HOME/herdr-engineering-repo"
+        if [ ! -d "$REPO/.git" ]; then
+          git clone --depth 1 \
+            https://github.com/berlinguyinca/herdr-engineering.git "$REPO"
+          echo "cloned"
+        else
+          git -C "$REPO" pull --ff-only --quiet 2>/dev/null || true
+        fi
+        [ -d "$VENV" ] || python3 -m venv "$VENV"
+        before="$("$VENV/bin/pip" show herdr-engineering 2>/dev/null | awk '/^Version:/{print $2}')"
+        "$VENV/bin/pip" install --quiet --upgrade "$REPO"
+        after="$("$VENV/bin/pip" show herdr-engineering 2>/dev/null | awk '/^Version:/{print $2}')"
+        if [ "$before" != "$after" ]; then echo "installed $before -> $after"; fi
+      args:
+        executable: /bin/bash
+      environment:
+        HOME: "{{ fleet_home }}"
+        USER: "{{ fleet_user }}"
+        PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{{ fleet_home }}/.local/bin:{{ fleet_home }}/.venvs/herdr-engineering/bin"
+      register: fabric_agent_provision
+      changed_when: "'installed' in fabric_agent_provision.stdout or 'cloned' in fabric_agent_provision.stdout"
+      check_mode: no
+      ignore_errors: true
+
+    - name: "Copy the fabric-agent setup script"
+      ansible.builtin.copy:
+        src: "{{ herdr_engineering_repo_root }}/scripts/fabric-agent.sh"
+        dest: "{{ fleet_home }}/herdr-eng-fabric-agent.sh"
+        mode: "0755"
+
+    - name: "Install/enable the agent service (idempotent script)"
+      ansible.builtin.command: "{{ fleet_home }}/herdr-eng-fabric-agent.sh"
+      environment:
+        HOME: "{{ fleet_home }}"
+        USER: "{{ fleet_user }}"
+        PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{{ fleet_home }}/.local/bin:{{ fleet_home }}/.venvs/herdr-engineering/bin"
+      register: fabric_agent_result
+      changed_when: false
+      ignore_errors: true
+      check_mode: no

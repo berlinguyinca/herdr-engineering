@@ -218,6 +218,10 @@ herdr-eng devfabric list
 # lease a port for a running app, then forward it (protocol-transparent TCP):
 herdr-eng devfabric register --machine bender --host 127.0.0.1 --port 5173 --label my-app
 herdr-eng devfabric serve lease_xxx            # or --bind <tailscale-ip> for other hosts
+# ... or run the auto-registration agent so web services that start on this
+#     host appear at a stable dev:<port> (and in the gateway web UI) with zero
+#     manual steps — deployed as a systemd user unit by Ansible on every host:
+scripts/fabric-agent.sh --gateway http://bender.tail0c50da.ts.net:29999
 herdr-eng tests adapters
 herdr-eng tests run pytest --repo owner/repo --worktree 0110-dev-fabric --machine localhost
 herdr-eng ci repos                          # list CI repositories

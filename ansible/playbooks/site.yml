@@ -51,6 +51,12 @@
     # exposes it tailnet-only via `tailscale serve` (https://<gateway-magicdns>).
     herdr_engineering_gateway_host: "bender"
     herdr_engineering_repo_root: "{{ playbook_dir }}/../.."
+    # MagicDNS name of the gateway host. The gateway's control API binds the
+    # tailnet IPv4 (reachable via MagicDNS from EVERY tailnet host, including
+    # the gateway itself), so all auto-registration agents use this one stable
+    # control URL. A tailnet URL, not a secret.
+    herdr_engineering_gateway_dns: "bender.tail0c50da.ts.net"
+    fabric_agent_gateway_url: "http://{{ herdr_engineering_gateway_dns }}:29999"
 
   tasks:
     - name: "Gather facts as the connection user (no become)"
@@ -116,3 +122,15 @@
     - name: "Deploy private web UI as a persistent systemd user service (gateway host only)"
       ansible.builtin.include_tasks: ../tasks/web-serve.yml
       when: inventory_hostname == herdr_engineering_gateway_host
+
+    # ----------------------------------------------------------------------
+    # Dev-fabric auto-registration agent (spec 0110). Runs on EVERY fleet
+    # host (not just the gateway): it detects web services that start on the
+    # host and auto-registers them with the fabric gateway, so they appear
+    # at a stable dev:<port> URL fleet-wide (and in the gateway host's web
+    # UI) with zero manual steps. Loopback-only services get a tailnet-bound
+    # forwarder in front of them; leases are closed when a service dies.
+    # No public listeners. herdr-eng is provisioned when missing.
+    # ----------------------------------------------------------------------
+    - name: "Deploy dev-fabric auto-registration agent (all fleet hosts)"
+      ansible.builtin.include_tasks: ../tasks/fabric-agent.yml

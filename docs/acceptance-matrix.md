@@ -169,6 +169,17 @@ unit-tested; only live convergence/validation is pending.
       :29999 on tailnet+loopback) → `register --host auto` →
       `curl http://bender.tail0c50da.ts.net:18000/` and
       `curl http://100.104.39.6:18000/` both → HTTP 200, proxied to the app.
+- [x] **Zero-manual auto-registration (agent).** A per-host agent (systemd
+      user unit, deployed by Ansible on every fleet host) detects web services
+      that start locally and registers them with the gateway automatically —
+      loopback-only apps get a tailnet-bound forwarder, tracked leases are
+      heartbeated and re-registered if the gateway drops them, and vanished
+      services are closed. A noise filter registers only *dev* web services
+      (not system daemons / debug endpoints). **Live-verified on beast**:
+      `python3 -m http.server 5678` on beast → agent auto-registered it →
+      `curl http://bender.tail0c50da.ts.net:18007/` → HTTP 200 (beast page),
+      and the lease surfaced with a clickable URL in the gateway host's web
+      UI — no manual `register` step.
 - [x] **Cross-host routing.** Router binds each leased port on the gateway's
       loopback + tailnet and byte-proxies to any fleet member's
       `target_host:target_port`; registrar `--host auto` resolves the
@@ -177,8 +188,8 @@ unit-tested; only live convergence/validation is pending.
       host-specific logic.)
 - [x] **Dead apps release their ports.** Probe loop: unhealthy → no renewal →
       TTL expiry → router unbinds (accept threads joined, so the port is
-      truly released). **Live drill in progress**: app killed, watcher polling
-      for release (TTL 90s + probe 15s).
+      truly released). Agent also closes the lease the instant a tracked
+      service disappears (next scan cycle).
 - [x] **Gateway restart re-binds surviving leases.** Store reload +
       `_sync_router` on start; **live-verified** (restarted gateway
       auto-rebound port 18001 from the store) and unit-tested.
