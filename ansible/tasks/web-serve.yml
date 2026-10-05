@@ -1,0 +1,47 @@
+---
+# Deploy the private HerdR Engineering web UI as a persistent systemd USER
+# service on the designated gateway host and expose it tailnet-only via
+# `tailscale serve` (spec 0060 + dev-fabric-gateway model).
+#
+# Model: the UI binds LOOPBACK ONLY (private-by-default invariant — web.py
+# defaults are NOT changed; the unit pins --host 127.0.0.1). ONE gateway host
+# (bender today) runs the service; `tailscale serve --bg 8787` maps
+# https://<gateway-magicdns> -> 127.0.0.1:8787. Other fleet hosts use that
+# stable URL or an SSH tunnel. No public listeners.
+#
+# Runs as the fleet (connection) user (become: false) so the unit lands under
+# the user's ~/.config/systemd/user and linger is enabled for that user via
+# passwordless sudo (the playbook's normal become path implies it). The
+# underlying scripts/web-serve.sh is idempotent and graceful when `tailscale
+# serve` is not yet enabled. No secrets in the repo.
+- name: "Deploy private web UI as a persistent systemd user service"
+  become: false
+  block:
+    - name: "Create the user systemd unit directory on the gateway host"
+      ansible.builtin.file:
+        path: "{{ fleet_home }}/.config/systemd/user"
+        state: directory
+        mode: "0755"
+
+    - name: "Copy the herdr-eng-web systemd user unit"
+      ansible.builtin.copy:
+        src: "{{ herdr_engineering_repo_root }}/scripts/herdr-eng-web.service"
+        dest: "{{ fleet_home }}/.config/systemd/user/herdr-eng-web.service"
+        mode: "0644"
+
+    - name: "Copy the web-serve setup script"
+      ansible.builtin.copy:
+        src: "{{ herdr_engineering_repo_root }}/scripts/web-serve.sh"
+        dest: "{{ fleet_home }}/herdr-eng-web-serve.sh"
+        mode: "0755"
+
+    - name: "Install/enable the web service, enable linger, and tailscale serve"
+      ansible.builtin.command: "{{ fleet_home }}/herdr-eng-web-serve.sh"
+      environment:
+        HOME: "{{ fleet_home }}"
+        USER: "{{ fleet_user }}"
+        PATH: "/usr/local/bin:{{ fleet_home }}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+      register: web_serve_result
+      changed_when: false
+      ignore_errors: true
+      check_mode: no

@@ -208,6 +208,8 @@ herdr-eng powerpack rollback
 
 # 6) private web/mobile control surface (binds 127.0.0.1 by default)
 herdr-eng web --port 8787
+#    ... or, for the persistent gateway deployment on the designated host:
+#    scripts/web-serve.sh   # systemd user unit + linger + `tailscale serve --bg 8787`
 
 # 7) other integration surfaces
 herdr-eng machines --json
@@ -320,6 +322,37 @@ gateway automatically when configured (`fabric.gateway_url` or
 warning when it is not reachable. The control API is tailnet+loopback only
 and bearer-token protected when a token is configured. Design and live
 evidence: [`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabric-gateway.md).
+
+## Persistent private web UI (gateway)
+
+`herdr-eng web` (spec 0060) is the fleet-wide private control surface. It runs
+**persistently on ONE designated gateway host** (bender today) and is exposed
+tailnet-only. The model mirrors the dev-fabric gateway:
+
+- **Private-by-default invariant.** `web.py` binds loopback only and its
+  defaults are **not** changed. The systemd user unit pins
+  `--host 127.0.0.1` so a machine-local config can never turn it into a public
+  listener. There is no public listener, ever.
+- **One gateway host.** Only the designated host runs the service. Other fleet
+  hosts reach the UI via the stable `https://<gateway-magicdns>` URL or an SSH
+  tunnel (`ssh -L 8787:127.0.0.1:8787 <gateway>`), never via a public listener.
+- **Persistent.** A systemd **user** unit (`scripts/herdr-eng-web.service`)
+  keeps it running across reboots/logout (linger enabled).
+- **Tailscale serve.** `tailscale serve --bg 8787` maps
+  `https://<gateway-magicdns>` → `127.0.0.1:8787`. The serve feature must be
+  enabled once on the tailnet (admin console); until then the setup script
+  prints the exact command and continues gracefully.
+
+```bash
+# on the gateway host (bender), from a checkout:
+scripts/web-serve.sh   # idempotent: installs+starts the user unit, enables
+                       # linger, then `tailscale serve --bg 8787`
+```
+
+Ansible deploys the same unit + script on the designated gateway host
+(`ansible/playbooks/site.yml`, gated by `herdr_engineering_gateway_host`).
+Design and deployment model:
+[`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabric-gateway.md).
 
 ## Contributing
 

@@ -75,9 +75,22 @@ unit-tested; only live convergence/validation is pending.
 
 - [x] Web UI is accessible only through the private tailnet by default.
       `web.py` defaults to `private_only=True`, host `127.0.0.1`.
+- [x] Web UI runs persistently on ONE designated gateway host and is exposed
+      tailnet-only. **Deployed live on bender**: `scripts/herdr-eng-web.service`
+      (systemd user unit, `--host 127.0.0.1 --port 8787`, loopback only) +
+      `loginctl enable-linger`, installed via `scripts/web-serve.sh`; verified
+      active and serving HTTP 200 on `127.0.0.1:8787`. `tailscale serve --bg
+      8787` maps `https://<gateway-magicdns>` → `127.0.0.1:8787` (serve feature
+      must be enabled once on the tailnet admin console; until then the script
+      warns and continues). Other fleet hosts use the stable URL or an SSH
+      tunnel — no public listener. Ansible block in `ansible/playbooks/site.yml`
+      (gated by `herdr_engineering_gateway_host`).
 - [ ] iPhone/iPad-sized layouts can navigate agents, activity, files, browser,
-      tests and CI. **BLOCKED_EXTERNAL** — responsive UI implemented; device
-      validation requires a tailnet device.
+      tests and CI **via the stable tailnet URL
+      `https://<gateway-magicdns>`** (or an SSH tunnel). **BLOCKED_EXTERNAL** —
+      responsive UI + persistent gateway deployment implemented and
+      loopback-verified on bender; device validation requires a tailnet device
+      (phone/iPad) opening the gateway URL.
 - [ ] Reconnect restores the selected machine/session without killing work.
       **BLOCKED_EXTERNAL** — live tailnet validation.
 - [x] Terminal input/control is permission-aware and does not expose public
@@ -131,7 +144,9 @@ unit-tested; only live convergence/validation is pending.
 - [x] Same `dev:<port>` address is reachable over the tailnet. **Live-verified** —
       forwarder bound to `100.104.39.6:18000` (bender's tailnet IP, private,
       not public); `curl http://100.104.39.6:18000/` → HTTP 200. The remaining
-      step is a human opening that address on an actual phone/iPad.
+      step is a human opening that address on an actual phone/iPad (the same
+      phone/iPad tailnet UI path also serves the private web UI via the stable
+      `https://<gateway-magicdns>` URL — see the Web/mobile rows above).
 - [x] HTTP works. **Live-verified** via `herdr-eng devfabric serve` (TCP
       forwarder) proxying a real HTTP server through the leased port.
 - [x] WebSocket/SSE/HMR/generic TCP work where declared by service type. The
@@ -248,6 +263,9 @@ unit-tested; only live convergence/validation is pending.
       SSH and a second run was idempotent (`changed=0`); herdr/pi/brew tools
       verified present on the machine afterwards. Note: the host was renamed
       `macbook-m4` → `mac` to match the real tailnet name.
-- [ ] phone/iPad tailnet validation passes. **BLOCKED_EXTERNAL**.
+- [ ] phone/iPad tailnet validation passes via the persistent gateway URL
+      (`https://<gateway-magicdns>`, `tailscale serve` → `127.0.0.1:8787`).
+      **BLOCKED_EXTERNAL** — deployment artifacts live; requires a physical
+      phone/iPad on the tailnet to open the stable URL.
 - [x] README commands match the real shipped implementation. Updated with real
       `herdr-eng` commands and observed output.

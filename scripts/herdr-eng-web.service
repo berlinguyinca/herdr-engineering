@@ -1,0 +1,31 @@
+# HerdR Engineering private web/mobile control surface (spec 0060).
+#
+# Persistent systemd USER unit that runs `herdr-eng web` on ONE designated
+# gateway host (bender today). The UI binds LOOPBACK ONLY (private-by-default
+# invariant — web.py defaults are unchanged; --host is pinned to 127.0.0.1 so
+# a machine-local config can never turn it into a public listener). It is
+# reached fleet-wide as https://<gateway-magicdns> via `tailscale serve` on
+# the same host. Other fleet hosts use that stable URL or an SSH tunnel.
+#
+# Install/enable idempotently:  scripts/web-serve.sh   (or via Ansible,
+# see ansible/playbooks/site.yml "Deploy private web UI ..." block).
+#
+# To uninstall:
+#   systemctl --user disable --now herdr-eng-web.service
+#   rm -f ~/.config/systemd/user/herdr-eng-web.service
+#   systemctl --user daemon-reload
+[Unit]
+Description=HerdR Engineering private web/mobile control surface
+# See docs/architecture/dev-fabric-gateway.md for the deployment model.
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %h = the fleet user's home (systemd user-unit expansion).
+ExecStart=%h/.local/bin/herdr-eng web --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
