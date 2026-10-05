@@ -80,17 +80,22 @@ unit-tested; only live convergence/validation is pending.
       (systemd user unit, `--host 127.0.0.1 --port 8787`, loopback only) +
       `loginctl enable-linger`, installed via `scripts/web-serve.sh`; verified
       active and serving HTTP 200 on `127.0.0.1:8787`. `tailscale serve --bg
-      8787` maps `https://<gateway-magicdns>` → `127.0.0.1:8787` (serve feature
-      must be enabled once on the tailnet admin console; until then the script
-      warns and continues). Other fleet hosts use the stable URL or an SSH
-      tunnel — no public listener. Ansible block in `ansible/playbooks/site.yml`
-      (gated by `herdr_engineering_gateway_host`).
+      8787` maps `https://bender.tail0c50da.ts.net/` → `127.0.0.1:8787` —
+      **live, verified 2026-10-05**: HTTP 200 from bender, from beast, and
+      from mac over the tailnet; loopback remains the only bind. (The serve
+      feature was enabled once on the tailnet admin console; `sudo tailscale
+      set --operator=<user>` was needed once so the fleet user can manage
+      serve config.) Other fleet hosts use the stable URL or an SSH tunnel —
+      no public listener. Ansible block in `ansible/playbooks/site.yml`
+      (gated by `herdr_engineering_gateway_host`). Note: the macOS host was
+      renamed on the tailnet `mac` → `gerts-macbook-pro` (2026-10-05); its
+      `ansible_host` was updated accordingly (inventory label stays `mac`).
 - [ ] iPhone/iPad-sized layouts can navigate agents, activity, files, browser,
       tests and CI **via the stable tailnet URL
-      `https://<gateway-magicdns>`** (or an SSH tunnel). **BLOCKED_EXTERNAL** —
+      `https://bender.tail0c50da.ts.net`** (or an SSH tunnel). **BLOCKED_EXTERNAL** —
       responsive UI + persistent gateway deployment implemented and
-      loopback-verified on bender; device validation requires a tailnet device
-      (phone/iPad) opening the gateway URL.
+      tailnet-verified from three hosts; device validation requires a tailnet
+      device (phone/iPad) opening `https://bender.tail0c50da.ts.net`.
 - [ ] Reconnect restores the selected machine/session without killing work.
       **BLOCKED_EXTERNAL** — live tailnet validation.
 - [x] Terminal input/control is permission-aware and does not expose public

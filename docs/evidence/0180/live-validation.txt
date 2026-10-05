@@ -191,3 +191,23 @@ bender (this workstation, local connection):
 
 Fleet status: mac + beast + bender converged and idempotent. fry is not on
 the tailnet (absent from `tailscale status`) — blocked for that host alone.
+
+## tailscale serve front door (live, 2026-10-05)
+
+The persistent private web UI is now exposed tailnet-only via `tailscale
+serve`. Evidence:
+
+* Enablement: tailnet admin console used once to enable Serve;
+  `sudo tailscale set --operator=wohlgemuth` was needed once so the fleet
+  user could manage serve config (otherwise `tailscale serve` returned
+  `Access denied: serve config denied`).
+* Serve: `tailscale serve --bg 8787` on bender maps
+  `https://bender.tail0c50da.ts.net/` -> `http://127.0.0.1:8787`.
+* Reachability (tailnet-only, loopback-only bind preserved):
+  - bender local:  HTTP 200
+  - from BEAST (ssh + curl):    HTTP 200
+  - from MAC (ssh + curl):      HTTP 200
+* The macOS host was renamed on the tailnet `mac` -> `gerts-macbook-pro`
+  (same IP 100.84.185.100); its `ansible_host` was updated to
+  `gerts-macbook-pro.tail0c50da.ts.net` (inventory label stays `mac`).
+  Post-rename mac re-run: `ok=17 changed=0 failed=0` (idempotent).
