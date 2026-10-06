@@ -6,6 +6,47 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- **HerdR Dev Fabric Control Plane — Phase 1 Foundation (spec 0190)** — new
+  `herdr_engineering/control_plane/` subpackage laying the structured-state
+  backbone for the unified `http://dev.lan` control plane:
+  - **Stable entity IDs** (`ids.py`) — time-ordered, lexicographically sortable
+    Crockford-base32 ULID-style ids (`new_id(kind)` for mission/session/
+    service/artifact/host/agent/plan/worktree) with a per-process monotonic
+    counter so creation order matches string order even within the same
+    millisecond. Identity is stable; location is dynamic.
+  - **Versioned SQL migration runner** (`db.py`) — homegrown idempotent
+    `Migrator` (`ensure_schema`/`applied`/`apply`, `schema_migrations` table,
+    per-file transactions, filename order).
+  - **Phase-1 schema** — `deploy/control-plane/migrations/0001_control_plane.sql`
+    with all Spec §53 tables (hosts, host_samples, missions, mission_events,
+    mission_stage_runs, plans, plan_revisions, sessions, session_events, agents,
+    agent_runs, services, service_events, artifacts, artifact_bindings,
+    artifact_materializations, token_usage, resource_usage, test_runs,
+    test_results, reviews, review_findings, pull_requests, audit_events,
+    fabric_events, state_snapshots) + indexes.
+  - **Event envelope / sequencing / idempotent ingestion** (`events.py`) —
+    `EventStore` with per-stream 0-indexed sequences, exclusive resumable
+    `read_stream(after)`, and `INSERT ... ON CONFLICT DO NOTHING RETURNING`
+    so a duplicate `event_id` is ignored (idempotency enforced by the PK).
+  - **Mission/Session/Service stores** (`models.py`) — stable-id CRUD with
+    provenance fields.
+  - **State snapshots + replay-after** (`snapshots.py`) — `SnapshotStore.save`/
+    `load_latest` and `recover()` folding later event payloads over state, so
+    no full event replay is needed after restart.
+  - **Content-addressed RustFS client** (`rustfs.py`) — `content_key` =
+    `sha256/ab/cd/<hex>`, `put`/`get`/`head`/`delete`, `IntegrityError` on
+    SHA-256 mismatch. boto3/S3-agnostic (MinIO drop-in for Phase 1).
+  - **Artifact model** (`artifacts.py`) — `ArtifactStore.register`/`download`/
+    `attach`/`materialize`/`mark_available`; artifacts are content-addressed,
+    never stored in Postgres, integrity-verified on download.
+  - **Bounded background worker** (`worker.py`) — `run_one_pass`
+    (stale-lease detection + host health reconciliation + snapshots + artifact
+    GC hook; hosts/services marked unavailable, never deleted) and `run_worker`
+    (infinite loop with `stop` event that never raises).
+  - **Compose project** — `deploy/control-plane/` with `postgres:16-alpine`,
+    `rustfs` (MinIO drop-in), and `control-plane-worker` (runs migrations then
+    the worker; separate from the web frontend).
+  - **CLI** — `herdr-eng control-plane migrate|worker` subcommands.
 - **Multi-operator fleet lifecycle** — idempotent scripts + guide so any
   operator can stand up a private dev net, join a machine, and leave one:
   `scripts/fabric-agent-macos.sh` (join a macOS host via `uv` + Python 3.12

@@ -218,6 +218,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default=None); p.add_argument("--port", type=int, default=None)
     p.set_defaults(func=_cmd_web)
 
+    # control-plane --------------------------------------------------------
+    p = sub.add_parser("control-plane",
+                       help="HerdR Dev Fabric Control Plane (spec 0190)")
+    csub = p.add_subparsers(dest="control_plane_command", required=True)
+    p2 = csub.add_parser("migrate", help="apply versioned SQL migrations")
+    p2.add_argument("--migrations", default=None,
+                    help="migrations dir (default: bundled deploy/control-plane)")
+    p2.set_defaults(func=_cmd_cp_migrate)
+    p2 = csub.add_parser("worker", help="run the bounded background worker")
+    p2.add_argument("--interval", type=float, default=30.0,
+                    help="seconds between passes (default: 30)")
+    p2.add_argument("--once", action="store_true",
+                    help="run a single pass and exit")
+    p2.set_defaults(func=_cmd_cp_worker)
+
     return parser
 
 
@@ -870,6 +885,74 @@ def _cmd_cand_id(args) -> int:
 def _cmd_web(args) -> int:
     from .web import serve
     return serve(host=args.host, port=args.port)
+
+
+def _cp_migrations_dir() -> str:
+    from pathlib import Path
+    pkg = Path(__file__).resolve().parent          # .../herdr_engineering
+    return str(pkg.parent / "deploy" / "control-plane" / "migrations")
+
+
+def _cp_config() -> dict:
+    from .config import load_config
+    from .control_plane.db import control_plane_config
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    return control_plane_config(cfg)
+
+
+async def _cp_connect(dsn: str):
+    import asyncpg
+    return await asyncpg.connect(dsn)
+
+
+def _cmd_cp_migrate(args) -> int:
+    import asyncio
+
+    from .control_plane.db import Migrator
+    migrations = args.migrations or _cp_migrations_dir()
+
+    async def _run():
+        conn = await _cp_connect(_cp_config()["postgres_dsn"])
+        try:
+            return await Migrator(conn).apply(migrations)
+        finally:
+            await conn.close()
+
+    applied = asyncio.run(_run())
+    _print_json({"ok": True, "applied": applied, "migrations_dir": migrations})
+    return 0
+
+
+def _cmd_cp_worker(args) -> int:
+    import asyncio
+    import logging
+
+    from .control_plane.db import Migrator
+    from .control_plane.worker import run_one_pass, run_worker
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    async def _run():
+        conn = await _cp_connect(_cp_config()["postgres_dsn"])
+        try:
+            await Migrator(conn).apply(_cp_migrations_dir())
+            if args.once:
+                return await run_one_pass(conn)
+            await run_worker(conn, interval=args.interval)
+            return None
+        finally:
+            await conn.close()
+
+    try:
+        result = asyncio.run(_run())
+    except KeyboardInterrupt:
+        return 130
+    if result is not None:
+        _print_json({"ok": True, "pass": result})
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

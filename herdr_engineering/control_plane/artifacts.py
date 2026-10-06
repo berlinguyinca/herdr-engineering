@@ -5,7 +5,9 @@ import hashlib
 from typing import Any
 
 from . import ids
-from .rustfs import RustFSClient
+from .rustfs import IntegrityError, RustFSClient
+
+__all__ = ["ArtifactStore", "ArtifactError", "IntegrityError"]
 
 
 class ArtifactError(Exception):

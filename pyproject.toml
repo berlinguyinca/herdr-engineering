@@ -31,3 +31,7 @@ include = ["herdr_engineering*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import test modules by file path (not basename) so nested packages like
+# tests/control_plane/ can share a basename with top-level tests (e.g.
+# test_artifacts.py) without an ``import file mismatch`` collection error.
+addopts = "--import-mode=importlib"

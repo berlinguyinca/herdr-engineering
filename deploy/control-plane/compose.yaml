@@ -1,0 +1,97 @@
+# HerdR Dev Fabric Control Plane — Phase 1 Foundation (spec 0190).
+#
+# Runs the control plane's persistence + background worker as one compose
+# project on the master/gateway host:
+#
+#   postgres              PostgreSQL 16 — structured state (missions, sessions,
+#                         services, events, token_usage, state_snapshots, ...).
+#                         NOT SQLite; no large binaries stored here (those live
+#                         in rustfs).
+#
+#   rustfs                object store for artifact payloads. Phase 1 uses
+#                         MinIO as an S3 drop-in because RustFS does not ship a
+#                         maintained container image yet (known open item). The
+#                         client (herdr_engineering.control_plane.rustfs) is
+#                         boto3/S3-agnostic, so swapping in a real RustFS image
+#                         later is a config-only change.
+#
+#   control-plane-worker  the bounded background worker: runs migrations on
+#                         startup, then loops over stale-lease detection, host
+#                         health reconciliation, snapshots, artifact GC.
+#                         Deliberately NOT part of the web frontend.
+#
+# Unlike deploy/fabric-stack (which needs host networking for the gateway and
+# CoreDNS), this project uses ordinary bridge networking: the services only
+# talk to each other, so they resolve by service name (postgres/rustfs).
+#
+# Usage (see README.md in this directory):
+#   docker compose up -d --build
+#   docker compose exec postgres psql -U herdr -d herdr -c '\dt'
+name: herdr-control-plane
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: herdr-cp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: herdr
+      POSTGRES_PASSWORD: herdr
+      POSTGRES_DB: herdr
+    volumes:
+      - herdr-cp-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U herdr -d herdr"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    ports:
+      - "5432:5432"  # exposed so `herdr-eng control-plane migrate` works on-host
+
+  rustfs:
+    image: minio/minio:latest
+    container_name: herdr-cp-rustfs
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: herdr
+      MINIO_ROOT_PASSWORD: herdr
+    volumes:
+      - herdr-cp-rustfs:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    ports:
+      - "9000:9000"   # S3 API (RustFSClient endpoint)
+      - "9001:9001"   # MinIO console
+
+  control-plane-worker:
+    build:
+      context: ../..
+      dockerfile: deploy/fabric-stack/Dockerfile
+    image: herdr-engineering:0.1.0
+    container_name: herdr-cp-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      # Bundle the SQL migrations into the worker image so it can apply them
+      # on startup regardless of the working directory.
+      - ../../deploy/control-plane/migrations:/app/migrations:ro
+    environment:
+      HERDR_ENGINEERING_CONFIG: /app/config.yaml
+    command:
+      - "control-plane"
+      - "worker"
+
+volumes:
+  herdr-cp-pg:
+  herdr-cp-rustfs:

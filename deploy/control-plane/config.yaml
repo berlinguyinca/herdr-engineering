@@ -1,0 +1,5 @@
+control_plane:
+  postgres_dsn: postgresql://herdr:herdr@postgres:5432/herdr
+  rustfs_endpoint: http://rustfs:9000
+  rustfs_bucket: herdr-artifacts
+  rustfs_region: us-east-1
