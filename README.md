@@ -220,8 +220,11 @@ herdr-eng devfabric register --machine bender --host 127.0.0.1 --port 5173 --lab
 herdr-eng devfabric serve lease_xxx            # or --bind <tailscale-ip> for other hosts
 # ... or run the auto-registration agent so web services that start on this
 #     host appear at a stable dev:<port> (and in the gateway web UI) with zero
-#     manual steps — deployed as a systemd user unit by Ansible on every host:
-scripts/fabric-agent.sh --gateway http://bender.tail0c50da.ts.net:29999
+#     manual steps — a per-host service on every fleet host:
+scripts/fabric-agent.sh --gateway http://dev.lan:29999         # Linux (systemd user unit)
+scripts/fabric-agent-macos.sh --gateway http://dev.lan:29999   # macOS (launchd LaunchAgent)
+# remove a machine from the fleet (stop agent, close leases, drop from inventory):
+scripts/fabric-offboard.sh
 herdr-eng tests adapters
 herdr-eng tests run pytest --repo owner/repo --worktree 0110-dev-fabric --machine localhost
 herdr-eng ci repos                          # list CI repositories
@@ -311,6 +314,17 @@ macOS convergence is a documented `BLOCKED_EXTERNAL` item pending a fleet run.
 | `ci` says offline / stale | set the operator token: `~/.config/herdr-engineering/ci-token` (chmod 600) or `HERDR_ENGINEERING_CI_TOKEN`; the token is a secret and never lives in the repo. Without it the view is explicitly stale, never guessed |
 | `ci logs` returns no log text | expected on this Woodpecker 3.x instance: logs stream over WebSocket (no REST endpoint) and the OAuth2 proxy doesn't forward a bearer token on the upgrade. Use the `view_in_web_ui` link it prints; `ci debug` still gives the failing tasks + exit codes |
 | `dev:<port>` unreachable from other hosts | is the gateway up? `herdr-eng devfabric gateway` on the gateway host; point commands at it with `HERDR_ENGINEERING_FABRIC_URL=http://<gateway>:29999` (or `fabric.gateway_url` in config); the app must be bound to the tailnet interface or `0.0.0.0` |
+
+## Dev fabric fleet lifecycle (multi-operator)
+
+Any operator of this repo can stand up a private dev net and add/remove
+machines with a couple of idempotent scripts: `scripts/fabric-stack.sh`
+(deploy the master-host CoreDNS + gateway + web stack), `scripts/fabric-agent.sh`
+/ `scripts/fabric-agent-macos.sh` (join a Linux / macOS machine), and
+`scripts/fabric-offboard.sh` (leave the fleet). Full walkthrough — set up your
+dev net, join a machine, verify, offboard — plus the one external Tailscale
+admin-console split-DNS step:
+[`docs/operations/fleet-lifecycle.md`](docs/operations/fleet-lifecycle.md).
 
 ## Dev fabric gateway (unified `dev:<port>`)
 
