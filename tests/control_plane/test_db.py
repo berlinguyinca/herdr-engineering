@@ -1,6 +1,32 @@
 import asyncio
+from pathlib import Path
 
 from herdr_engineering.control_plane import db
+
+REQUIRED_TABLES = {
+    "hosts", "host_samples", "missions", "mission_events", "mission_stage_runs",
+    "plans", "plan_revisions", "sessions", "session_events", "agents", "agent_runs",
+    "services", "service_events", "artifacts", "artifact_bindings",
+    "artifact_materializations", "token_usage", "resource_usage", "test_runs",
+    "test_results", "reviews", "review_findings", "pull_requests", "audit_events",
+    "fabric_events", "state_snapshots",
+}
+
+
+_MIGRATION = Path(__file__).parents[2] / "deploy" / "control-plane" / "migrations" / "0001_control_plane.sql"
+
+
+def test_phase1_schema_contains_all_spec_tables():
+    sql = _MIGRATION.read_text()
+    for table in REQUIRED_TABLES:
+        assert f"CREATE TABLE {table}" in sql, f"missing table {table}"
+
+
+def test_phase1_schema_indexes_heavily_queried_fields():
+    sql = _MIGRATION.read_text()
+    assert "CREATE INDEX" in sql
+    for col in ("mission_id", "session_id", "host_id", "event_type"):
+        assert col in sql
 
 
 class _FakeConn:
