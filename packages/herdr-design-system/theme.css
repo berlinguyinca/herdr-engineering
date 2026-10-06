@@ -1,0 +1,78 @@
+/* herdr-design-system — canonical light theme tokens (Spec §6-16, §92).
+ *
+ * Light, neutral, clean, ChatGPT-inspired developer UI. White surfaces, light
+ * gray backgrounds, subtle borders. Inter for UI, monospace only for
+ * terminal/code/paths/IDs/hashes/logs.
+ *
+ * Status is NEVER communicated by color alone — every color token pairs with a
+ * label/icon in the consuming components (see herdr-web-components).
+ *
+ * Tokens are plain CSS custom properties so they work with any component
+ * model (Web Components, or a build-time framework) with no build step.
+ */
+:root {
+  /* surfaces */
+  --background: #f7f7f8;
+  --surface: #ffffff;
+  --surface-2: #ececf1;
+  --surface-hover: #f2f2f5;
+  --border: #d9d9e3;
+  --border-subtle: #ececf1;
+
+  /* text */
+  --text: #353740;
+  --text-secondary: #6e6e80;
+  --text-muted: #8e8ea0;
+  --text-on-accent: #ffffff;
+
+  /* brand / accent (ChatGPT green) */
+  --accent: #10a37f;
+  --accent-hover: #0d8f6f;
+  --accent-weak: #d2f0e8;
+
+  /* planator / planning violet accent (subtle) */
+  --violet: #7152e3;
+  --violet-weak: #e8e2fb;
+
+  /* semantic status colors (Spec §9) */
+  --status-ok: #0d9d6c;        /* healthy / complete */
+  --status-active: #2563eb;    /* active / running */
+  --status-waiting: #9ca3af;   /* waiting */
+  --status-attention: #d97706; /* needs attention */
+  --status-blocked: #ea580c;   /* blocked */
+  --status-failed: #dc2626;    /* failed / critical */
+  --status-planning: #7152e3;  /* planning / specification (violet) */
+  --status-ready: #6b7280;     /* ready (gray) */
+  --status-testing: #0e7490;   /* testing (cyan/blue) */
+  --status-review: #b45309;    /* review (amber) */
+  --status-repair: #c2410c;    /* repair (orange) */
+  --status-validation: #0f766e;/* validation (teal/green) */
+  --status-pr: #4f46e5;        /* pr (blue/indigo) */
+
+  /* typography */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+    Consolas, "Liberation Mono", monospace;
+
+  /* layout / elevation */
+  --radius: 8px;
+  --radius-sm: 4px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-lg: 0 8px 24px rgba(16, 24, 40, 0.1);
+  --sidebar-width: 232px;
+  --content-max: 1080px;
+
+  /* motion */
+  --motion-fast: 120ms;
+  --motion-normal: 200ms;
+}
+
+/* reduced-motion (Spec §88 a11y): honor the OS preference */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
