@@ -217,3 +217,36 @@ The same deployment is driven by Ansible on the gateway host
 to the host and runs the script as the fleet user. See the README section
 "Persistent private web UI (gateway)" for the full model and `ansible/README.md`
 for fleet convergence notes.
+
+## Shared `dev.lan` domain (Option B)
+
+The front door is reachable from every tailnet device via one stable name,
+**`dev.lan`**, independent of where a service runs. Because `.local` is the
+mDNS/Bonjour reserved namespace, **Tailscale MagicDNS will not serve it**, so
+we run our own authoritative nameserver and use Tailscale **split-DNS**:
+
+- A **CoreDNS** container on the master host (bender) is authoritative for the
+  `dev.lan` namespace and answers `dev.lan` / `*.dev.lan` with the master
+  host's tailnet IPv4.
+- Tailscale admin console → **DNS → Nameservers** adds that IP as a nameserver
+  **restricted to the `dev.lan` domain** (split-DNS). Tailscale sends only
+  `dev.lan` queries there; every other name keeps using MagicDNS. Devices on
+  the tailnet that accept Tailscale DNS (desktop, macOS, iOS, Android) then
+  resolve `dev.lan` fleet-wide.
+- The fabric gateway advertises `url_base: dev.lan`, so every lease is
+  `http://dev.lan:<port>`; the router binds each external port on the
+  gateway and proxies to the owning host.
+
+The whole front door runs as one Docker Compose project on the master host —
+CoreDNS + fabric gateway + private web UI — in **`deploy/fabric-stack/`**
+(see its `README.md`). All services use `network_mode: host` (the gateway must
+bind the tailnet IP + the whole `18000–28999` range and route to other hosts;
+CoreDNS must answer on the tailnet IP:53; the web UI stays loopback-only).
+CoreDNS binds only `127.0.0.1` + the tailnet IP to avoid colliding with
+systemd-resolved (`127.0.0.53/127.0.0.54`) and libvirt dnsmasq
+(`192.168.122.1`) on port 53.
+
+We use **`dev.lan`** (not `.local`): `.local` is the mDNS/Bonjour reserved
+namespace, so Tailscale MagicDNS will not serve it and the admin console
+refuses it as a custom namespace. `dev.lan` is not reserved, so Tailscale
+accepts it as a split-DNS namespace and it stays private to the tailnet.

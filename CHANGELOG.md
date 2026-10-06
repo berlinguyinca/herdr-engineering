@@ -6,6 +6,37 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- **Multi-operator fleet lifecycle** — idempotent scripts + guide so any
+  operator can stand up a private dev net, join a machine, and leave one:
+  `scripts/fabric-agent-macos.sh` (join a macOS host via `uv` + Python 3.12
+  venv + launchd LaunchAgent; subcommands `install`/`status`/`uninstall
+  [--purge]`), `scripts/fabric-offboard.sh` (cross-platform leave: stop the
+  local agent — systemd on Linux / launchd on macOS — close the host's leases
+  on the gateway via its tailnet IPv4, and drop it from the fleet inventory;
+  flags `--host`/`--gateway`/`--leave-tailnet`/`--purge`), and
+  `docs/operations/fleet-lifecycle.md` (set up → join → verify → leave,
+  including the one external Tailscale split-DNS step). README and
+  `deploy/fabric-stack/README.md` now point at this flow.
+- **`dev.lan` shared dev domain (Option B) + master-host compose stack** —
+  `deploy/fabric-stack/` runs the whole fleet front door as one Docker Compose
+  project on the gateway host: CoreDNS (authoritative for the `dev.lan`
+  namespace, split-DNS from Tailscale), the fabric gateway (`url_base:
+  dev.lan`, so every lease is `http://dev.lan:<port>`), and the private web
+  UI. All services use `network_mode: host`; CoreDNS binds only loopback + the
+  tailnet IP (avoids systemd-resolved/libvirt on port 53). The per-host
+  auto-registration agent stays a host systemd unit. Deploy via
+  `scripts/fabric-stack.sh` (generates `.env` + CoreDNS config from the live
+  tailnet IP, builds the image, replaces the old host-run gateway/web).
+  `.local` is mDNS-reserved, so Tailscale MagicDNS will not serve it — the
+  admin-console split-DNS nameserver (restrict to `dev.lan`) is the one
+  external step. See `deploy/fabric-stack/README.md`.
+- **Gateway container-safe lock handling** — `devfabric gateway` now handles
+  SIGTERM (graceful stop releases `gateway.lock`, so `docker compose stop`/
+  restart no longer leaves a stale lock) and gains `--reset-lock` to take
+  over a stale lock after a hard crash/SIGKILL. This is required in a
+  container, where the entrypoint is always PID 1 and a stale lock from a
+  previous container (`pid=1`) was otherwise mistaken for a live instance and
+  permanently blocked restart. The compose stack passes `--reset-lock`.
 - **Dev fabric gateway** — the unified `dev:<port>` front door (spec 0110,
   component #3). `herdr-eng devfabric gateway` runs the fleet gateway:
   control API (register/heartbeat/close/list/resolve/healthz) on

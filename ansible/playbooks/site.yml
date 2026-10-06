@@ -51,12 +51,14 @@
     # exposes it tailnet-only via `tailscale serve` (https://<gateway-magicdns>).
     herdr_engineering_gateway_host: "bender"
     herdr_engineering_repo_root: "{{ playbook_dir }}/../.."
-    # MagicDNS name of the gateway host. The gateway's control API binds the
-    # tailnet IPv4 (reachable via MagicDNS from EVERY tailnet host, including
-    # the gateway itself), so all auto-registration agents use this one stable
-    # control URL. A tailnet URL, not a secret.
-    herdr_engineering_gateway_dns: "bender.tail0c50da.ts.net"
-    fabric_agent_gateway_url: "http://{{ herdr_engineering_gateway_dns }}:29999"
+    # Shared fleet-wide dev domain (Option B): the master-host stack
+    # (deploy/fabric-stack) runs CoreDNS authoritative for `dev.lan`, and
+    # Tailscale split-DNS (admin console, nameserver restricted to `dev.lan`)
+    # resolves it to the gateway's tailnet IP on every device. All
+    # auto-registration agents use this one stable control URL. A tailnet URL,
+    # not a secret. NOTE: agents only reach the gateway via `dev.lan` once the
+    # admin-console split-DNS nameserver is configured (see deploy/fabric-stack/README).
+    fabric_agent_gateway_url: "http://dev.lan:29999"
 
   tasks:
     - name: "Gather facts as the connection user (no become)"

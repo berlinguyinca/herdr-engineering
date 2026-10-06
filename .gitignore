@@ -11,6 +11,9 @@ ansible/**/vault*
 ansible/inventory/hosts.yml
 ansible/inventory/host_vars/
 
+# Generated CoreDNS config (rendered from *.tmpl by scripts/fabric-stack.sh)
+deploy/fabric-stack/coredns/generated/
+
 # Runtime state
 .herdr-engineering/
 state/

@@ -1,0 +1,108 @@
+# HerdR Engineering — master-host stack (bender).
+#
+# Runs the whole fleet front door as one compose project on the master/
+# gateway host:
+#
+#   coredns          private nameserver for the shared `dev.lan` domain
+#                    (Option B split-DNS). Answers dev.lan + *.dev.lan
+#                    with the master host's tailnet IP; Tailscale sends the
+#                    dev.lan namespace here from every device.
+#
+#   fabric-gateway   the dev:<port> front door (spec 0110 #3): control API +
+#                    per-port router + probe loop. Every leased external port
+#                    (18000-28999) is bound on the host and proxied to the
+#                    owning host, so `http://dev.lan:<port>` works from any
+#                    tailnet device no matter where the service runs.
+#
+#   herdr-web        private web/mobile control surface (spec 0060),
+#                    loopback-only, exposed tailnet-only via `tailscale serve`.
+#
+# ALL services use `network_mode: host` — this is intentional and required:
+#   - the gateway must bind the host's tailnet IP and the whole dev:<port>
+#     range, and reach other tailnet hosts (beast/mac) to route to them;
+#   - CoreDNS must answer on the host's tailnet IP:53 for split-DNS;
+#   - the web UI binds 127.0.0.1 (private-by-default invariant) and is
+#     exposed via `tailscale serve --bg 8787`.
+# No port remapping is done; the containers share the host network stack.
+#
+# The per-host auto-registration agent is intentionally NOT here: it runs as
+# a host systemd user unit (scripts/herdr-eng-fabric-agent.service) because it
+# must see host listeners via ss/lsof. It points at the gateway via
+# HERDR_ENGINEERING_FABRIC_URL=http://dev.lan:29999.
+#
+# Usage (see README.md in this directory):
+#   cp .env.example .env && vi .env          # set GATEWAY_TAILNET_IP
+#   docker compose up -d --build
+name: herdr-fabric
+
+services:
+  coredns:
+    image: coredns/coredns:1.11.4
+    container_name: herdr-coredns
+    restart: unless-stopped
+    network_mode: host
+    # Generated on the HOST by scripts/fabric-stack.sh from the .tmpl files
+    # (the tailnet IP is host-specific; the distroless image has no shell).
+    volumes:
+      - ./coredns/generated/Corefile:/etc/coredns/Corefile:ro
+      - ./coredns/generated/dev.lan.zone:/etc/coredns/dev.lan.zone:ro
+    command: ["-conf", "/etc/coredns/Corefile"]
+
+  fabric-gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/fabric-stack/Dockerfile
+    image: herdr-engineering:0.1.0
+    container_name: herdr-fabric-gateway
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - herdr-state:/state
+    environment:
+      HERDR_ENGINEERING_STATE: /state
+      HERDR_ENGINEERING_CONFIG: /app/config.yaml
+      # Secret-free; used by this host's agent so it reaches the gateway via
+      # the new dev.lan name. (Other hosts get this from Ansible.)
+      HERDR_ENGINEERING_FABRIC_URL: "http://dev.lan:29999"
+    command:
+      - "devfabric"
+      - "gateway"
+      - "--control-port"
+      - "29999"
+      - "--bind"
+      - "127.0.0.1,${GATEWAY_TAILNET_IP:?set GATEWAY_TAILNET_IP in .env}"
+      - "--url-base"
+      - "dev.lan"
+      # The container entrypoint is always PID 1, so a stale gateway.lock from
+      # a previous (SIGKILLed/crashed) container would be mistaken for a live
+      # instance. Compose owns this container's lifecycle, so safe to reset.
+      - "--reset-lock"
+    healthcheck:
+      # The gateway's control API binds the tailnet IP (not loopback), so
+      # probe that address (interpolated from .env).
+      test: ["CMD", "curl", "-fsS", "http://${GATEWAY_TAILNET_IP}:29999/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  herdr-web:
+    image: herdr-engineering:0.1.0
+    container_name: herdr-web
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      HERDR_ENGINEERING_CONFIG: /app/config.yaml
+    command: ["web", "--host", "127.0.0.1", "--port", "8787"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  herdr-state:

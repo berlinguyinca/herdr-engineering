@@ -1,0 +1,21 @@
+# Split-DNS authoritative server for the fleet-wide dev.lan domain (Option B).
+#
+# Tailscale is configured (admin console > DNS > Nameservers) to send ONLY
+# queries under the `dev.lan` namespace here; every other name keeps using
+# MagicDNS. So this server's only job is to answer dev.lan / *.dev.lan
+# with the master host's tailnet IP.
+#
+# {{GATEWAY_TAILNET_IP}} is substituted on the HOST by scripts/fabric-stack.sh
+# (CoreDNS's `file` zone plugin does not expand env vars, and the distroless
+# image has no shell, so generation happens before `docker compose up`).
+#
+# We bind ONLY 127.0.0.1 + the tailnet IP (NOT 0.0.0.0): the host already
+# runs systemd-resolved on 127.0.0.53/127.0.0.54 and a libvirt dnsmasq on
+# 192.168.122.1 — all on port 53 — and we must not collide with them.
+dev.lan:53 {
+    bind 127.0.0.1 {{GATEWAY_TAILNET_IP}}
+    errors
+    log
+    file /etc/coredns/dev.lan.zone dev.lan
+    ready
+}

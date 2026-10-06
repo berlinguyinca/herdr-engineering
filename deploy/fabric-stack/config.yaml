@@ -1,0 +1,22 @@
+# HerdR Engineering config for the master-host container stack.
+#
+# dev.lan is the fleet-wide shared dev domain (Option B): a private
+# nameserver (CoreDNS in this stack) answers `dev.lan` / `*.dev.lan` with
+# the master host's tailnet IP, and Tailscale split-DNS sends `dev.lan`
+# queries to it from every device. The fabric gateway therefore advertises
+# `http://dev.lan:<port>` as the front door, reachable from any tailnet
+# device regardless of which host owns the service.
+#
+# NOTE: `bind: auto` here is documentation only. The compose gateway command
+# passes an explicit `--bind 127.0.0.1,<tailnet-ip>` because `auto` would call
+# the `tailscale` CLI, which is not present in the container image.
+fabric:
+  gateway_url: "http://dev.lan:29999"
+  control_port: 29999
+  url_base: "dev.lan"
+  bind: auto
+  probe_interval_seconds: 15
+
+web:
+  host: 127.0.0.1
+  port: 8787

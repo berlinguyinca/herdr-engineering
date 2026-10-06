@@ -119,6 +119,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--bind", default=None, help="comma-separated bind IPs (default: config/auto)")
     p2.add_argument("--control-port", type=int, default=None)
     p2.add_argument("--url-base", default=None, help="stable base for dev:<port> (default: auto)")
+    p2.add_argument("--reset-lock", action="store_true",
+                    help="take over a stale gateway.lock (e.g. after a crash/SIGKILL; "
+                         "safe when no other gateway is running)")
     p2.set_defaults(func=_cmd_dev_gateway)
     p2 = dsub.add_parser(
         "agent",
@@ -513,7 +516,8 @@ def _cmd_dev_gateway(args) -> int:
     gateway = FabricGateway(
         registry, router, control_host=control_host, control_port=control_port,
         url_base=args.url_base or (cfg.get("url_base") or None),
-        probe_interval=float(cfg.get("probe_interval_seconds", 15)))
+        probe_interval=float(cfg.get("probe_interval_seconds", 15)),
+        reset_lock=bool(getattr(args, "reset_lock", False)))
     gateway.start()
     _print_json({
         "ok": True, "gateway": True,
@@ -528,6 +532,10 @@ def _cmd_dev_gateway(args) -> int:
     def _on_sigint(_signum, _frame) -> None:
         stop["flag"] = True
     signal.signal(signal.SIGINT, _on_sigint)
+    # Docker/compose stop sends SIGTERM; handle it so the gateway releases its
+    # lock (gateway.stop() -> _release_lock) and exits cleanly instead of
+    # leaving a stale lock that blocks the next container start.
+    signal.signal(signal.SIGTERM, _on_sigint)
     try:
         while not stop["flag"]:
             time.sleep(0.5)

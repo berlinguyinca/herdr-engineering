@@ -1,5 +1,6 @@
 """Fabric gateway tests (spec 0110 component #3: unified dev:<port> front door)."""
 import http.server
+import os
 import socket
 import threading
 import time
@@ -237,6 +238,25 @@ def test_second_gateway_refuses_same_store(tmp_path):
         from herdr_engineering.errors import ConflictError
         with pytest.raises(ConflictError):
             gw2.start()
+    finally:
+        gw.stop()
+
+
+def test_reset_lock_takes_over_stale_lock(tmp_path):
+    """A stale lock whose recorded PID looks alive (e.g. pid=1 left by a
+    previous container entrypoint) blocks a normal start but is taken over
+    with reset_lock=True (used by the compose stack)."""
+    (tmp_path / "gateway.lock").write_text("1:stale")  # pid 1 always 'alive'
+    registry = DevServiceRegistry(store_path=tmp_path / "leases.json")
+    router = GatewayRouter(["127.0.0.1"])
+    gw = FabricGateway(registry, router, control_host="127.0.0.1",
+                       control_port=0, url_base="dev.test",
+                       probe_interval=0.5, reset_lock=True)
+    try:
+        gw.start()
+        assert gw.control_port  # started successfully (lock taken over)
+        assert not (tmp_path / "gateway.lock").exists() or \
+            (tmp_path / "gateway.lock").read_text().startswith(f"{os.getpid()}:")
     finally:
         gw.stop()
 

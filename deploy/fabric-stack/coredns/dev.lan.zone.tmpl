@@ -1,0 +1,14 @@
+$ORIGIN dev.lan.
+$TTL 60
+
+@   IN SOA dev.lan. hostmaster.dev.lan. (
+        1          ; serial
+        60         ; refresh
+        60         ; retry
+        60         ; expire
+        60 )       ; minimum
+    IN NS  ns.dev.lan.
+    IN A   {{GATEWAY_TAILNET_IP}}
+
+ns  IN A   {{GATEWAY_TAILNET_IP}}
+*   IN A   {{GATEWAY_TAILNET_IP}}

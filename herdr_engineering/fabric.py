@@ -190,11 +190,18 @@ class FabricGateway:
     def __init__(self, registry: DevServiceRegistry,
                  router: GatewayRouter, control_host: str = "127.0.0.1",
                  control_port: int = 29999, url_base: str | None = None,
-                 probe_interval: float = 15.0, token: str | None = None) -> None:
+                 probe_interval: float = 15.0, token: str | None = None,
+                 reset_lock: bool = False) -> None:
         self.registry = registry
         self.router = router
         self.control_host = control_host
         self.control_port = control_port
+        # Allow taking over a stale lock (e.g. after a hard crash / SIGKILL that
+        # could not release it). Needed in containers where the entrypoint is
+        # always PID 1, so a stale lock from a previous container (pid=1) would
+        # otherwise be mistaken for a live instance. Caller is responsible for
+        # ensuring no other gateway is actually running.
+        self.reset_lock = reset_lock
         # Stable base for the dev:<port> address (MagicDNS name preferred,
         # falling back to the tailnet IP or the control host).
         self.url_base = url_base or magicdns_name() or tailnet_ipv4() or control_host
@@ -251,6 +258,11 @@ class FabricGateway:
         after a crash can still take over a stale lock.
         """
         lock_path = self._lock_path()
+        if self.reset_lock and lock_path.exists():
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass  # best-effort; re-check below
         if lock_path.exists():
             try:
                 old_pid, _, _nonce = (lock_path.read_text() or "").strip().partition(":")
