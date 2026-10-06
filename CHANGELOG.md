@@ -97,6 +97,18 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   idempotency re-run on beast, which also repaired the live file).
 
 ### Fixed
+- **Fabric agent could hang forever on a wedged DNS resolver** (root cause of
+  a long-run live stall): `urllib`'s `timeout=` covers the TCP connect/read
+  but NOT `getaddrinfo`, so a control-plane call to the hostname `dev.lan`
+  could block in the libc resolver indefinitely — no logs, low CPU, single
+  thread, no new services adopted, fixed only by a restart. The `FabricClient`
+  now resolves the gateway host to an IPv4 with a bounded lookup (daemon
+  worker + `join(timeout)`, cached and refreshed), so a stalled resolver
+  surfaces as a normal bounded `UnreachableError` the agent retries next
+  cycle. As a safety net, `FabricAgent.run()` now runs a watchdog that, if a
+  scan cycle fails to complete within `cycle_timeout` (default 300s), dumps
+  every thread's stack to the log and exits so systemd/launchd respawn a
+  healthy agent.
 - **CI provider corrected to the real Woodpecker 3.x API** (found during live
   validation): base is `/api/`, not `/api/v0/` (the earlier `/v0` was a
   mis-diagnosis caused by trailing-slash 301s returning the SPA); repos are

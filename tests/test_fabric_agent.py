@@ -9,6 +9,7 @@ import http.server
 import json
 import socket
 import threading
+import time
 import urllib.request
 
 import herdr_engineering.fabric_agent as fa
@@ -493,3 +494,49 @@ def test_loopback_only_service_gets_forwarder(tmp_path, monkeypatch):
         server.shutdown()
         agent.stop()
         gw.stop()
+
+
+def test_watchdog_exits_on_wedged_scan(tmp_path, monkeypatch):
+    """If a scan cycle never completes (e.g. an unbounded DNS lookup), the
+    watchdog fires and hard-exits so the service manager respawns a healthy
+    agent. os._exit is stubbed to a flag so the test itself survives."""
+    gw = _FakeGateway()
+    agent = _agent(tmp_path, gw, interval=0.1)
+    exited: list[int] = []
+    monkeypatch.setattr(fa.os, "_exit", lambda code: exited.append(code))
+    monkeypatch.setattr(agent, "scan_once", lambda: time.sleep(30))  # wedged
+    stop = threading.Event()
+    threading.Thread(
+        target=agent.run, args=(stop,),
+        kwargs={"cycle_timeout": 0.5, "poll": 0.05},
+        daemon=True).start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not exited:
+        time.sleep(0.05)
+    assert exited == [1]  # watchdog detected the stall and exited
+    stop.set()
+
+
+def test_watchdog_does_not_fire_when_cycles_complete(tmp_path, monkeypatch):
+    """A healthy agent (cycles completing) never trips the watchdog."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "testapp"}))
+    agent = _agent(tmp_path, gw, interval=0.1)
+    exited: list[int] = []
+    monkeypatch.setattr(fa.os, "_exit", lambda code: exited.append(code))
+    stop = threading.Event()
+    threading.Thread(
+        target=agent.run, args=(stop,),
+        kwargs={"cycle_timeout": 0.5, "poll": 0.05},
+        daemon=True).start()
+    time.sleep(1.0)  # several healthy cycles
+    assert exited == []
+    stop.set()
+    try:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+    finally:
+        pass

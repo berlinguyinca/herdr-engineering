@@ -275,3 +275,89 @@ def test_bind_refused_when_port_taken(tmp_path):
         router.unbind(other)
     finally:
         blocker.close()
+
+
+# ---------------------------------------------------------------------------
+# Bounded DNS resolution (root-cause fix for the long-run agent hang)
+# ---------------------------------------------------------------------------
+
+def test_resolve_host_bounded_ip_literal_passthrough():
+    from herdr_engineering.fabric import _resolve_host_bounded
+    assert _resolve_host_bounded("127.0.0.1") == "127.0.0.1"
+    assert _resolve_host_bounded("100.104.39.6") == "100.104.39.6"
+
+
+def test_resolve_host_bounded_resolves_hostname():
+    from herdr_engineering.fabric import _resolve_host_bounded
+    assert _resolve_host_bounded("localhost") == "127.0.0.1"
+
+
+def test_resolve_host_bounded_times_out_not_hangs(monkeypatch):
+    """A wedged resolver must surface as a bounded UnreachableError, never an
+    unbounded hang (urllib's timeout does NOT cover getaddrinfo)."""
+    from herdr_engineering.fabric import _resolve_host_bounded
+
+    def _stuck(host, *a, **k):  # simulate a resolver that never answers
+        time.sleep(30)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _stuck)
+    start = time.monotonic()
+    with pytest.raises(UnreachableError):
+        _resolve_host_bounded("dev.lan", timeout=0.3)
+    assert time.monotonic() - start < 5  # bounded, not 30s
+
+
+def test_client_connects_via_resolved_ip_and_preserves_host_header(tmp_path):
+    """The client rewrites the URL host to a resolved IPv4 (no unbounded DNS
+    at request time) but keeps the original name in the Host header."""
+    from herdr_engineering.fabric import FabricClient
+
+    # hostname -> IP literal rewrite, port preserved.
+    ip_url = FabricClient._resolve_to_ip("http://dev.lan:29999")
+    assert ip_url.startswith("http://100.") or ip_url.startswith("http://127.")
+    assert ip_url.endswith(":29999")
+    # IP literal passes through untouched.
+    assert (FabricClient._resolve_to_ip("http://127.0.0.1:29999")
+            == "http://127.0.0.1:29999")
+
+    # End-to-end: a client pointed at localhost (resolves to 127.0.0.1) talks
+    # to a local fake gateway and the gateway sees the original Host header.
+    gw = _FakeGatewayForHostHeader()
+    client = FabricClient(f"http://localhost:{gw.port}")
+    try:
+        assert client.healthz()["ok"] is True
+        assert gw.last_host_header == f"localhost:{gw.port}"
+    finally:
+        gw.stop()
+
+
+class _FakeGatewayForHostHeader:
+    """Tiny fake gateway that records the Host header it receives."""
+
+    def __init__(self):
+        self.last_host_header = None
+        self._httpd = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _make_host_handler(self))
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        self.port = self._httpd.server_address[1]
+
+    def stop(self):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+def _make_host_handler(gw: _FakeGatewayForHostHeader):
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence
+            pass
+
+        def do_GET(self):
+            gw.last_host_header = self.headers.get("Host")
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return _Handler

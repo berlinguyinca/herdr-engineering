@@ -23,6 +23,7 @@ import json
 import os
 import socket
 import threading
+import time
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +45,58 @@ def read_fabric_token() -> str | None:
             return f.read().strip() or None
     except OSError:
         return None
+
+
+def _is_ip_literal(host: str) -> bool:
+    """True when ``host`` is already an IPv4 literal (no DNS needed)."""
+    if ":" in host:  # IPv6 literals in URLs need brackets; treat as hostname
+        return False
+    try:
+        socket.inet_aton(host)
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_host_bounded(host: str, timeout: float = 5.0) -> str:
+    """Resolve ``host`` to an IPv4 literal with a hard deadline.
+
+    Python's ``socket``/``urllib`` timeouts do NOT bound ``getaddrinfo``: the
+    timeout is applied only after DNS, during the TCP connect/read. If the
+    system resolver stalls (e.g. systemd-resolved wedged on a split-DNS query
+    for a ``*.lan`` name served by a local CoreDNS), ``getaddrinfo`` blocks
+    forever and a host registrar silently stops scanning -- the long-run
+    "agent hang" observed in the field. Resolving on a daemon worker with a
+    bounded join closes that gap: a stalled resolver surfaces as a normal,
+    bounded ``UnreachableError`` (which the caller retries next cycle) instead
+    of an unbounded hang.
+    """
+    if _is_ip_literal(host):
+        return host
+    result: list = []
+
+    def _lookup() -> None:
+        try:
+            result.append(
+                socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM))
+        except Exception as exc:  # noqa: BLE001 - surfaced as UnreachableError
+            result.append(exc)
+
+    worker = threading.Thread(target=_lookup, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        # Resolver is wedged; the daemon thread is abandoned (won't block exit).
+        raise UnreachableError(f"DNS resolution timed out for {host}",
+                               target=host)
+    infos = result[0]
+    if isinstance(infos, BaseException):
+        raise UnreachableError(f"could not resolve {host}: {infos}",
+                               target=host)
+    try:
+        return infos[0][4][0]
+    except (IndexError, TypeError):
+        raise UnreachableError(f"no IPv4 address for {host}", target=host) from None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -441,13 +494,58 @@ class FabricClient:
     def __init__(self, gateway_url: str, token: str | None = None) -> None:
         self.gateway_url = gateway_url.rstrip("/")
         self.token = token if token is not None else read_fabric_token()
+        self._resolved: tuple[str, float] | None = None  # (url-with-IP, monotonic ts)
+
+    def _control_url(self) -> str:
+        """The gateway URL with its hostname replaced by a resolved IPv4.
+
+        Requests therefore never depend on an unbounded ``getaddrinfo`` at
+        request time (see ``_resolve_host_bounded``). The result is cached
+        (tailnet IPs are stable) and refreshed on a timer and on connection
+        failure.
+        """
+        now = time.monotonic()
+        if self._resolved and now - self._resolved[1] < 300:
+            return self._resolved[0]
+        url = self._resolve_to_ip(self.gateway_url)
+        self._resolved = (url, now)
+        return url
+
+    @staticmethod
+    def _resolve_to_ip(url: str) -> str:
+        from urllib.parse import urlparse, urlunparse
+        parts = urlparse(url)
+        host = parts.hostname or ""
+        if not host:
+            return url
+        ip = _resolve_host_bounded(host)
+        if ip == host:
+            return url  # already an IP literal
+        netloc = f"{ip}:{parts.port}" if parts.port else ip
+        if parts.username or parts.password:
+            userinfo = parts.username or ""
+            if parts.password:
+                userinfo = f"{userinfo}:{parts.password}"
+            netloc = f"{userinfo}@{netloc}"
+        return urlunparse((parts.scheme, netloc, parts.path,
+                           parts.params, parts.query, parts.fragment))
+
+    def _host_header(self) -> str:
+        """The original host[:port] from the configured URL. The gateway
+        routes on path only, but preserving the Host keeps any proxy/middlebox
+        and the gateway's logs consistent with the configured name."""
+        from urllib.parse import urlparse
+        parts = urlparse(self.gateway_url)
+        host = parts.hostname or ""
+        return f"{host}:{parts.port}" if parts.port else host
 
     def _req(self, method: str, path: str, payload: dict | None = None) -> dict:
-        url = self.gateway_url + path
+        url = self._control_url() + path
         data = json.dumps(payload or {}).encode()
         req = urllib.request.Request(url, data=data, method=method, headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.token or ''}",
+            "Host": self._host_header(),
         })
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -456,6 +554,9 @@ class FabricClient:
             raise UnreachableError(f"fabric gateway error {exc.code} for {url}",
                                    target=url) from exc
         except Exception as exc:
+            # A stale cached IP (tailnet renumber) or transient failure: drop
+            # the cache so the next call re-resolves before we give up.
+            self._resolved = None
             raise UnreachableError(f"fabric gateway unreachable: {exc}", target=url) from exc
 
     def register(self, **kwargs: Any) -> dict[str, Any]:

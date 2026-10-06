@@ -561,14 +561,51 @@ class FabricAgent:
 
     # -- run loop ---------------------------------------------------------
 
-    def run(self, stop: threading.Event | None = None) -> None:
+    def run(self, stop: threading.Event | None = None,
+            cycle_timeout: float = 300.0, poll: float = 5.0) -> None:
+        """Main scan loop, guarded by a watchdog.
+
+        If a single scan cycle fails to complete within ``cycle_timeout``
+        seconds (e.g. an unbounded DNS lookup wedges the thread), the watchdog
+        dumps every thread's stack to the log -- so the exact blocking frame
+        is captured -- and hard-exits so the service manager (systemd
+        ``Restart=on-failure`` / launchd ``KeepAlive``) respawns a healthy
+        agent. This both self-heals and records the evidence for diagnosis.
+        """
         stop = stop or threading.Event()
+        self._cycle_last = time.monotonic()
+        threading.Thread(target=self._watchdog, args=(stop, cycle_timeout, poll),
+                         daemon=True, name="agent-watchdog").start()
         while not stop.is_set():
             try:
                 self.scan_once()
             except Exception:  # never die on a bad cycle
                 log.exception("agent cycle failed")
+            finally:
+                # Updated even on a raised cycle; NOT updated when scan_once
+                # is itself wedged, so the watchdog can detect the stall.
+                self._cycle_last = time.monotonic()
             stop.wait(self.cfg.interval)
+
+    def _watchdog(self, stop: threading.Event, cycle_timeout: float,
+                  poll: float) -> None:
+        import faulthandler
+        while not stop.is_set():
+            time.sleep(poll)
+            if stop.is_set():
+                return
+            elapsed = time.monotonic() - self._cycle_last
+            if elapsed > cycle_timeout:
+                log.error(
+                    "agent scan cycle stuck for %.0fs (>= %.0fs); dumping "
+                    "thread stacks and exiting so the service manager "
+                    "respawns a healthy agent",
+                    elapsed, cycle_timeout)
+                try:
+                    faulthandler.dump_traceback()
+                except Exception:  # noqa: BLE001 - best-effort diagnostics
+                    pass
+                os._exit(1)
 
     def stop(self) -> None:
         with self._lock:
