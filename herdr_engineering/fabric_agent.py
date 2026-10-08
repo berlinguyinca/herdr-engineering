@@ -203,9 +203,13 @@ class AgentForwarder:
     """
 
     def __init__(self, bind_host: str, target_port: int,
-                 private_only: bool = True) -> None:
+                 bind_port: int = 0, private_only: bool = True) -> None:
         self.bind_host = bind_host
         self.target_port = target_port
+        # bind_port=0 => OS-allocated ephemeral port; a specific bind_port
+        # makes the forwarder reuse the SAME port so port-matching works
+        # (localhost:4040 -> dev.lan:4040). Callers fall back to 0 on EADDRINUSE.
+        self.bind_port = bind_port
         self.private_only = private_only
         self._listener: socket.socket | None = None
         self._stopping = threading.Event()
@@ -225,7 +229,7 @@ class AgentForwarder:
                     "(dev fabric is private-only)")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.bind_host, 0))
+        sock.bind((self.bind_host, self.bind_port))
         sock.listen(64)
         sock.settimeout(0.5)
         self._listener = sock
@@ -417,7 +421,14 @@ class FabricAgent:
             if port <= 0 or not self._is_dev_web_port(port):
                 continue
             if port in gateway_ext_ports:
-                continue
+                # Skip only when the local listener is already reachable on the
+                # tailnet (gateway router front-door / a 0.0.0.0-bound service).
+                # A loopback-only dev server on a port that another host also
+                # uses must still be adopted (it needs its own forwarder).
+                addrs = (listeners[port].get("addrs") or set())
+                if ("*" in addrs or "0.0.0.0" in addrs or "::" in addrs
+                        or self.cfg.tailnet_ip in addrs):
+                    continue
             with self._lock:
                 if (str(port) in self._store
                         or port in fwd_ports):
@@ -506,11 +517,18 @@ class FabricAgent:
             target_host, target_port = self.cfg.tailnet_ip, port
         else:
             # Loopback-only: put a tailnet-bound forwarder in front of it.
-            try:
-                fwd = AgentForwarder(self.cfg.tailnet_ip, port).start()
-            except (OSError, HerdrEngineeringError) as exc:
-                log.warning("no forwarder for loopback service on %d: %s",
-                            port, exc)
+            # Prefer reusing the SAME port (port-matching), falling back to an
+            # ephemeral port when that exact tailnet port is already bound.
+            for bind_port in (port, 0):
+                try:
+                    fwd = AgentForwarder(self.cfg.tailnet_ip, port,
+                                         bind_port=bind_port).start()
+                    break
+                except OSError:
+                    fwd = None
+                    continue
+            if fwd is None:
+                log.warning("no forwarder for loopback service on %d", port)
                 return None
             target_host, target_port = self.cfg.tailnet_ip, fwd.port
 

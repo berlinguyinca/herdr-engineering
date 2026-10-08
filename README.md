@@ -215,7 +215,9 @@ herdr-eng web --port 8787
 herdr-eng machines --json
 herdr-eng workspaces --json
 herdr-eng devfabric list
-# lease a port for a running app, then forward it (protocol-transparent TCP):
+# lease a port for a running app, then forward it (protocol-transparent TCP).
+# Ports match by default: localhost:5173 shows up at dev.lan:5173 (same port),
+# falling back to the 18000-28999 window only when the port is already taken.
 herdr-eng devfabric register --machine bender --host 127.0.0.1 --port 5173 --label my-app
 herdr-eng devfabric serve lease_xxx            # or --bind <tailscale-ip> for other hosts
 # ... or run the auto-registration agent so web services that start on this

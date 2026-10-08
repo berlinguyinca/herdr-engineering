@@ -135,10 +135,15 @@ def _make_fake_handler(gw: _FakeGateway):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
             if self.path == "/register":
-                ext = gw._next_external_port()
+                # Mirror the REAL gateway's port-matching: prefer the requested
+                # port (default = target port) when not already leased, else
+                # fall back to the sequential dev window.
+                pref = int(body.get("preferred_port", body["target_port"]))
+                taken = {lease["external_port"] for lease in gw.leases.values()}
+                ext = pref if pref not in taken else gw._next_external_port()
                 lease = {
                     "id": f"lease_{len(gw.leases) + 1}",
-                    "external_port": ext,
+                    "external_port": ext, "preferred": pref,
                     "state": "active",
                     "protocol": body.get("protocol", "http"),
                     "label": body.get("label", ""),
@@ -366,27 +371,31 @@ def test_dropped_lease_is_reregistered(tmp_path, monkeypatch):
 
 def test_gateway_front_door_ports_are_not_registered(tmp_path, monkeypatch):
     """On the gateway host the router's own dev:<port> front-door ports are
-    live local HTTP listeners; the agent must never register them (feedback
-    loop). They are excluded via the gateway's current external-port set."""
+    live local HTTP listeners bound to the tailnet IP; the agent must never
+    register them (feedback loop). A front-door is skipped even though it
+    answers HTTP, because it is already bound to the tailnet IP."""
     gw = _FakeGateway()
-    server, port = _http_target(tmp_path)
-    monkeypatch.setattr(fa, "scan_listening_ports",
-                        lambda: _listeners({port: "testapp"}))
-    agent = _agent(tmp_path, gw)
+    router_server, ext = _http_target(tmp_path)  # real HTTP front-door
+    tailnet = "100.64.0.1"
+    # A remote host already owns this external port on the gateway, AND the
+    # gateway's router has bound the SAME port on the tailnet IP locally.
+    gw.leases["seed"] = {
+        "id": "seed", "external_port": ext, "state": "active",
+        "protocol": "http", "label": "remote",
+        "target": {"host": "100.1.2.3", "port": ext, "machine_id": "other"},
+    }
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: {
+        ext: {"addrs": {tailnet}, "process": "router"},  # bound to tailnet IP
+    })
+    agent = _agent(tmp_path, gw, tailnet_ip=tailnet, probe_timeout=0.5)
     try:
-        agent.scan_once()  # registers `port` -> gets a gateway external_port
-        ext = next(lease["external_port"] for lease in gw.leases.values()
-                   if lease["target"]["port"] == port)
-        # Now the front-door port `ext` also appears as a local listener
-        # (exactly what the gateway host's agent scanner sees).
-        monkeypatch.setattr(fa, "scan_listening_ports",
-                            lambda: _listeners({port: "testapp", ext: "router"}))
-        before = len(gw.leases)
         agent.scan_once()
-        assert not any(lease["target"]["port"] == ext for lease in gw.leases.values())
-        assert len(gw.leases) == before  # no feedback registration
+        # front-door never adopted -> exactly the pre-seeded remote lease remains
+        assert len(gw.leases) == 1
+        assert not any(lease["target"]["port"] == ext
+                       for lease in gw.leases.values() if lease["id"] != "seed")
     finally:
-        server.shutdown()
+        router_server.shutdown()
         agent.stop()
         gw.stop()
 
@@ -490,6 +499,80 @@ def test_loopback_only_service_gets_forwarder(tmp_path, monkeypatch):
         lease = next(lease for lease in gw.leases.values()
                      if lease["target"]["port"] == entry["fwd_port"])
         assert lease["target"]["port"] != port
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_loopback_only_service_matches_port(tmp_path, monkeypatch):
+    """Port-matching by default: a loopback-only dev server on port P is
+    registered so it appears at dev.lan:P — the forwarder reuses the same
+    port on a distinct (tailnet) bind, and the gateway assigns external_port P.
+    """
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    import herdr_engineering.fabric_agent as fa_mod
+
+    real_tcp_open = fa_mod.tcp_open
+
+    def _loopback_only(host, p, timeout=1.0):
+        # app is bound to 127.0.0.1 only; the "tailnet" bind (127.0.0.2) is
+        # closed, so a forwarder is required
+        if p == port:
+            return False
+        return real_tcp_open(host, p, timeout)
+
+    monkeypatch.setattr(fa_mod, "tcp_open", _loopback_only)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "testapp"}))
+    agent = _agent(tmp_path, gw, tailnet_ip="127.0.0.2")
+    try:
+        agent.scan_once()
+        entry = _store(tmp_path)[str(port)]
+        # forwarder reuses the SAME port on the distinct tailnet bind
+        assert entry["fwd_port"] == port
+        lease = next(lease for lease in gw.leases.values()
+                     if lease["target"]["port"] == port)
+        # gateway assigns the matching external port => dev.lan:P
+        assert lease["external_port"] == port
+        assert lease["target"]["port"] == port
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_forwarder_falls_back_to_ephemeral_when_same_port_taken(tmp_path, monkeypatch):
+    """When the same port is already bound on the tailnet bind (so the
+    forwarder cannot reuse it), the agent falls back to an ephemeral port and
+    the gateway assigns a fallback external port — no crash, still registered.
+    """
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    import herdr_engineering.fabric_agent as fa_mod
+
+    real_tcp_open = fa_mod.tcp_open
+
+    def _loopback_only(host, p, timeout=1.0):
+        if p == port:
+            return False
+        return real_tcp_open(host, p, timeout)
+
+    monkeypatch.setattr(fa_mod, "tcp_open", _loopback_only)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "testapp"}))
+    # tailnet bind == app bind (127.0.0.1): the same-port forwarder cannot
+    # bind, so it must fall back to an ephemeral forwarder port
+    agent = _agent(tmp_path, gw, tailnet_ip="127.0.0.1")
+    try:
+        agent.scan_once()
+        entry = _store(tmp_path)[str(port)]
+        assert entry["fwd_port"] is not None
+        assert entry["fwd_port"] != port  # same port was taken -> ephemeral
+        lease = next(lease for lease in gw.leases.values()
+                     if lease["target"]["port"] == entry["fwd_port"])
+        assert lease["external_port"] != port  # gateway falls back too
     finally:
         server.shutdown()
         agent.stop()

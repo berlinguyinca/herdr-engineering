@@ -32,6 +32,38 @@ def test_collision_free_port_allocation(tmp_path):
     assert l1.external_port != l2.external_port
 
 
+def test_allocate_prefers_target_port(tmp_path):
+    """Port-matching: the gateway assigns the requested (target) port when
+    it is free, so localhost:4040 -> dev.lan:4040."""
+    reg = DevServiceRegistry(tmp_path / "leases.json")
+    lease = reg.register(
+        target_machine_id="m1", target_host="100.1.2.3",
+        target_port=4040, preferred_port=4040, protocol="http")
+    assert lease.external_port == 4040
+
+
+def test_allocate_falls_back_when_preferred_taken(tmp_path):
+    """When another host already owns the preferred port, allocation falls
+    back into the configured range instead of colliding."""
+    reg = DevServiceRegistry(tmp_path / "leases.json")
+    reg.register(target_machine_id="m1", target_host="100.1.2.3",
+                 target_port=4040, preferred_port=4040, protocol="http")
+    # second host wants the same port -> gets a fallback in the dev window
+    lease2 = reg.register(target_machine_id="m2", target_host="100.1.2.4",
+                          target_port=4040, preferred_port=4040, protocol="http")
+    assert lease2.external_port != 4040
+    assert 18000 <= lease2.external_port <= 28999
+
+
+def test_register_defaults_preferred_to_target(tmp_path):
+    """preferred_port defaults to target_port, so port-matching is on by
+    default even when a caller does not pass it explicitly."""
+    reg = DevServiceRegistry(tmp_path / "leases.json")
+    lease = reg.register(target_machine_id="m1", target_host="100.1.2.3",
+                         target_port=5173, protocol="http")
+    assert lease.external_port == 5173
+
+
 def test_idempotent_registration(tmp_path):
     r = DevServiceRegistry(store_path=tmp_path / "leases.json")
     l1 = r.register(target_machine_id="fry", target_host="127.0.0.1", target_port=9000,

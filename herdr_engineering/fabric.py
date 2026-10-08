@@ -380,7 +380,11 @@ class FabricGateway:
             owner_worktree_id=body.get("owner_worktree_id"),
             owner_process_id=body.get("owner_process_id"),
             label=body.get("label"),
-            lease_id=body.get("lease_id"))
+            lease_id=body.get("lease_id"),
+            # Port-matching by default: prefer external dev.<port> == target port
+            # (localhost:4040 -> dev.lan:4040). Falls back to the range when the
+            # preferred port is taken by another host or unbindable.
+            preferred_port=int(body.get("preferred_port", body["target_port"])))
         self.router.bind(lease.external_port, lease.target_host, lease.target_port)
         return {"lease": lease.to_dict(), "url": self.stable_url(lease.external_port)}
 

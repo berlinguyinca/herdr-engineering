@@ -6,6 +6,26 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- **Dev Fabric — port-matching (localhost:<port> -> dev.lan:<port>)** — a
+  locally started dev server now appears at the SAME port on `dev.lan`, not a
+  random range port:
+  - Agent `AgentForwarder` tries binding the same port on the tailnet IP first
+    (falling back to an OS-allocated ephemeral port if that exact tailnet port
+    is taken), so loopback-only services register `(tailnet_ip, <same port>)`.
+  - Gateway `register()`/`_allocate_port()` prefer `preferred_port` (defaults to
+    `target_port`) whenever it is bindable and collision-free — falling back to
+    the `[18000, 28999]` window otherwise. Preferred ports outside the window
+    (4040, 5173, 3000, ...) are honored. Idempotent re-registration still
+    preserves the existing external port across heartbeats.
+  - The gateway front-door feedback-loop guard is narrowed: a port is skipped
+    only when the local listener is already bound to the tailnet IP / all
+    interfaces (i.e. it is the router front-door or a 0.0.0.0 service already
+    reachable on the tailnet). A loopback-only dev server on a port that
+    another host also uses is still adopted (with its own forwarder + fallback
+    external port), so two developers can both run port 4040 on different
+    machines without one being silently dropped.
+
+### Added
 - **Control Plane — Phase 2 Shared Design System (spec 0190 §6-16, §92)** — new
   build-free `packages/` workspace shared by every HerdR web surface:
   - `packages/herdr-design-system/` — canonical **light** theme (ChatGPT-inspired,

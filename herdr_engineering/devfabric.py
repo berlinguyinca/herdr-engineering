@@ -152,8 +152,21 @@ class DevServiceRegistry:
                 return True
         return False
 
-    def _allocate_port(self, exclude_id: str | None = None) -> int:
-        """Allocate a port free of both other leases AND live OS bindings."""
+    def _allocate_port(self, preferred: int | None = None,
+                       exclude_id: str | None = None) -> int:
+        """Allocate a collision-free external port.
+
+        ``preferred`` is honored when it is a bindable dev port (>=1024) that
+        is free in both the lease registry and the local OS — this is what
+        makes ``localhost:4040 -> dev.lan:4040`` port-matching work by default.
+        Falls back to the configured range when the preferred port is taken
+        (e.g. another host already owns it) or unbindable (privileged).
+        """
+        if preferred is not None:
+            if (preferred >= 1024
+                    and not self._is_port_taken(preferred, exclude_id)
+                    and _os_port_free(preferred)):
+                return preferred
         for port in range(self._lo, self._hi + 1):
             if not self._is_port_taken(port, exclude_id) and _os_port_free(port):
                 return port
@@ -163,7 +176,8 @@ class DevServiceRegistry:
                  protocol: str = "http", owner_herdr_session_id: str | None = None,
                  owner_repository: str | None = None, owner_worktree_id: str | None = None,
                  owner_process_id: str | None = None, label: str | None = None,
-                 lease_id: str | None = None) -> DevServiceLease:
+                 lease_id: str | None = None,
+                 preferred_port: int | None = None) -> DevServiceLease:
         """Register (or idempotently renew) a lease. Allocates a collision-free port."""
         now = _now_iso()
         # Idempotent registration for a stable owner/process identity.
@@ -183,7 +197,11 @@ class DevServiceRegistry:
                 lease.state = "active"
                 self._persist()
                 return lease
-            port = self._allocate_port()
+            # Port-matching is on by default: prefer target_port unless the
+            # caller explicitly requested a different preferred port.
+            if preferred_port is None:
+                preferred_port = target_port
+            port = self._allocate_port(preferred=preferred_port)
             lid = lease_id or f"lease_{uuid.uuid4().hex[:16]}"
             expires = _add_seconds(now, self._ttl)
             lease = DevServiceLease(
