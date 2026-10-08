@@ -43,6 +43,38 @@ herdr-eng control-plane migrate
 herdr-eng control-plane worker --once
 ```
 
+## Web UI + API (`control-plane-web` service)
+
+The `control-plane-web` service serves the control-plane UI, the structured
+`/api/v1` JSON API, and the SSE live stream. The web UI is a **client** of this
+API (no UI scraping).
+
+```bash
+# reachable from the gateway host only (127.0.0.1:8080 by default)
+curl http://127.0.0.1:8080/api/v1/health
+# open the UI
+open http://127.0.0.1:8080/
+```
+
+Map the service to `0.0.0.0:8080:8080` (or expose on the dev.lan gateway) if the
+control plane should be reachable from the fabric.
+
+**Auth (RBAC, Spec §104)** — optional. Set `HERDR_CP_API_KEYS` to a comma list
+of `key=role` pairs (`viewer` = read-only, `operator` = read + mutate):
+
+```bash
+HERDR_CP_API_KEYS="viewerkey=viewer,operatorkey=operator" docker compose up -d
+curl -H "X-API-Key: viewerkey" http://127.0.0.1:8080/api/v1/health   # 200
+curl -X POST -H "X-API-Key: viewerkey" ... /api/v1/sessions/s/messages  # 403
+```
+
+Run the same server standalone from the host:
+
+```bash
+herdr-eng control-plane web --host 127.0.0.1 --port 8080
+herdr-eng control-plane web --api-keys 'k1=viewer,k2=operator'  # RBAC
+```
+
 ## On-host CLI
 
 The `control-plane` CLI subcommands work against the same config:

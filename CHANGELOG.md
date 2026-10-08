@@ -52,6 +52,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   - Role-based auth — `api_keys={key: role}` with `viewer` (read-only) /
     `operator` (read + mutate); `X-API-Key`; unknown key → 401, viewer POST
     → 403 (Spec §104).
+- **Control Plane — `control-plane-web` compose service + `--api-keys` RBAC** —
+  compose project now ships a web service (UI + `/api/v1` + SSE, private by
+  default, `127.0.0.1:8080:8080`), and `herdr-eng control-plane web` accepts
+  `--api-keys 'k1=viewer,k2=operator'` (or `HERDR_CP_API_KEYS` env) for
+  role-based `X-API-Key` auth.
 - **Control Plane — `herdr-eng control-plane web`** subcommand — serves the UI +
   `/api/v1` + SSE private-by-default (`--host 127.0.0.1`), optional `--api-key`,
   from the bundled `packages/` web root.

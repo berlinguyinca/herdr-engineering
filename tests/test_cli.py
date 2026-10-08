@@ -4,7 +4,15 @@ import os
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from herdr_engineering.cli import main
+from herdr_engineering.cli import _parse_api_keys, main
+
+
+def test_parse_api_keys_rbac_pairs():
+    assert _parse_api_keys(None, "k1=viewer,k2=operator") == {
+        "k1": "viewer", "k2": "operator"}
+    assert _parse_api_keys("sk", None) == {"sk": "operator"}
+    assert _parse_api_keys("sk", "k=viewer") == {"sk": "operator", "k": "viewer"}
+    assert _parse_api_keys(None, None) is None
 
 
 def test_version_flag(capsys):

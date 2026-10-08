@@ -20,6 +20,13 @@
 #                         health reconciliation, snapshots, artifact GC.
 #                         Deliberately NOT part of the web frontend.
 #
+#   control-plane-web     the control-plane UI + structured /api/v1 + SSE server
+#                         (the web UI is a client of this API). Private-by-default;
+#                         expose 8080 only if you intend the control plane to be
+#                         reachable from the fabric (e.g. on the dev.lan gateway).
+#                         Set HERDR_CP_API_KEYS to a comma list of key=role pairs
+#                         to require X-API-Key auth (roles: viewer/operator).
+#
 # Unlike deploy/fabric-stack (which needs host networking for the gateway and
 # CoreDNS), this project uses ordinary bridge networking: the services only
 # talk to each other, so they resolve by service name (postgres/rustfs).
@@ -68,6 +75,30 @@ services:
     ports:
       - "9000:9000"   # S3 API (RustFSClient endpoint)
       - "9001:9001"   # MinIO console
+
+  control-plane-web:
+    build:
+      context: ../..
+      dockerfile: deploy/fabric-stack/Dockerfile
+    image: herdr-engineering:0.1.0
+    container_name: herdr-cp-web
+    restart: unless-stopped
+    environment:
+      HERDR_CP_WEB_HOST: "0.0.0.0"
+      HERDR_CP_WEB_PORT: "8080"
+      HERDR_CP_API_KEYS: "${HERDR_CP_API_KEYS:-}"
+    ports:
+      # Only reachable inside the project's bridge network by default. Map a
+      # host port (e.g. 8080:8080) if the control plane should be reachable
+      # from the fabric / dev.lan gateway.
+      - "127.0.0.1:8080:8080"
+    command:
+      - "control-plane"
+      - "web"
+      - "--host"
+      - "$${HERDR_CP_WEB_HOST}"
+      - "--port"
+      - "$${HERDR_CP_WEB_PORT}"
 
   control-plane-worker:
     build:

@@ -233,6 +233,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="bind port (default 0 = ephemeral)")
     p2.add_argument("--api-key", default=None,
                     help="require X-API-Key header (Spec §104)")
+    p2.add_argument("--api-keys", default=None,
+                    help="comma list of key=role (viewer|operator) pairs "
+                         "(Spec §104); e.g. k1=viewer,k2=operator")
     p2.set_defaults(func=_cmd_cp_web)
     p2 = csub.add_parser("worker", help="run the bounded background worker")
     p2.add_argument("--interval", type=float, default=30.0,
@@ -944,7 +947,8 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.api import ControlPlaneServer
     from .control_plane.repo import ControlPlaneRepo
 
-    svr = ControlPlaneServer(ControlPlaneRepo(), api_key=args.api_key,
+    api_keys = _parse_api_keys(args.api_key, args.api_keys)
+    svr = ControlPlaneServer(ControlPlaneRepo(), api_keys=api_keys,
                              host=args.host, port=args.port)
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
@@ -956,6 +960,24 @@ def _cmd_cp_web(args) -> int:
     finally:
         svr.shutdown()
     return 0
+
+
+def _parse_api_keys(single_key, pairs_str):
+    """Build the {key: role} auth map from --api-key / --api-keys."""
+    keys = {}
+    if single_key:
+        keys[single_key] = "operator"
+    if pairs_str:
+        for pair in pairs_str.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" in pair:
+                key, role = pair.split("=", 1)
+                keys[key.strip()] = role.strip() or "operator"
+            else:
+                keys[pair] = "operator"
+    return keys or None
 
 
 def _cmd_cp_worker(args) -> int:
