@@ -54,6 +54,17 @@ an orchestration authority.
 | 7 | Analytics | §75–84, §96 | token + resource accounting, stage durations, duration/token histograms, model analytics, repair/retry analytics | **done (mission/model/host analytics)** |
 | 8 | Hardening | §87–88, §96–104, §106, §110 | permissions, secret redaction, retention, backups, restore tests, failure recovery, performance, a11y, mobile | **done (RBAC, redaction, retention, backup/restore, reduced-motion)** |
 
+**Durable bridge (§106, §114-115)** — `control_plane/bridge.py` hydrates the
+in-memory repo from Postgres (`load_into(repo, source)` + `PostgresSource`),
+so the API/UI can serve real persisted state via `--pg-dsn`. Pure mapping,
+fake-tested; asyncpg lazy/graceful.
+
+**Remaining (needs operator access — not runnable from this environment):**
+- Live deploy of the compose stack to `bender` (no SSH key available here).
+- Live attach of a running Pi session to the browser (structured client +
+  SSE implemented; transport wiring to a live session is operator-run).
+- RustFS production image swap (MinIO S3 drop-in stands in).
+
 ## Route inventory (Spec §5)
 
 ```
