@@ -131,3 +131,24 @@ def test_unknown_key_unauthorized():
         assert ei.value.code == 401
     finally:
         svr.shutdown()
+
+
+def test_fail_closed_on_non_loopback_without_keys():
+    repo = ControlPlaneRepo()
+    # an unauthenticated server must never bind a non-loopback address
+    with pytest.raises(ValueError, match="non-loopback|HERDR_CP_API_KEYS|fail-closed"):
+        ControlPlaneServer(repo, host="0.0.0.0")
+    with pytest.raises(ValueError):
+        ControlPlaneServer(repo, host="10.0.0.5")
+    # loopback is still allowed open (private-by-default local dev)
+    assert ControlPlaneServer(repo, host="127.0.0.1") is not None
+
+
+def test_loopback_host_detection():
+    from herdr_engineering.control_plane.api import _is_loopback
+    assert _is_loopback("127.0.0.1")
+    assert _is_loopback("localhost")
+    assert _is_loopback("::1")
+    assert not _is_loopback("0.0.0.0")
+    assert not _is_loopback("10.0.0.5")
+    assert not _is_loopback("100.104.39.6")

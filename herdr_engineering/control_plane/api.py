@@ -10,13 +10,25 @@ Optional `X-API-Key` auth for multi-operator deployments (Spec §104).
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import queue
+import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .redact import redact_payload
+
+
+def _is_loopback(host: str) -> bool:
+    """True if the host we bind resolves to a loopback address (127.0.0.1 / ::1)."""
+    if host in ("localhost", "::1"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 _INDEX = "index.html"
@@ -46,6 +58,14 @@ class ControlPlaneServer:
         if api_key is not None:
             self._keys[api_key] = "operator"
         self.api_key = api_key  # kept for backward compat / introspection
+        # Fail-closed (Spec §104): an unauthenticated server is only ever
+        # allowed on a loopback bind. Binding a non-loopback address with no
+        # API keys configured is refused, never silently exposed.
+        if not self._keys and not _is_loopback(host):
+            raise ValueError(
+                "refusing to bind an unauthenticated control plane to a "
+                f"non-loopback address {host!r}; configure --api-keys / "
+                "HERDR_CP_API_KEYS (Spec §104)")
         self.host = host
         self.port = port
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
@@ -95,8 +115,13 @@ def _make_handler(server):
         # ------------------------------------------------------------ auth
         def _role(self):
             if not server._keys:
-                return "operator"  # open (private-by-default bind)
-            return server._keys.get(self.headers.get("X-API-Key", ""))
+                return "operator"  # open (loopback-only; see fail-closed guard)
+            supplied = self.headers.get("X-API-Key", "")
+            # constant-time compare to avoid a timing side channel
+            for candidate, role in server._keys.items():
+                if secrets.compare_digest(supplied, candidate):
+                    return role
+            return None
 
         def _require(self, min_role):
             """Return an error response (or None) for the current request."""

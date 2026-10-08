@@ -41,29 +41,32 @@ services:
     image: postgres:16-alpine
     container_name: herdr-cp-postgres
     restart: unless-stopped
+    # SECURITY: never use the default password in production. Set
+    # HERDR_CP_PG_PASSWORD (and HERDR_CP_PG_USER) before `docker compose up`.
     environment:
-      POSTGRES_USER: herdr
-      POSTGRES_PASSWORD: herdr
+      POSTGRES_USER: "${HERDR_CP_PG_USER:-herdr}"
+      POSTGRES_PASSWORD: "${HERDR_CP_PG_PASSWORD:?set HERDR_CP_PG_PASSWORD (refusing weak default)}"
       POSTGRES_DB: herdr
     volumes:
       - herdr-cp-pg:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U herdr -d herdr"]
+      test: ["CMD-SHELL", "pg_isready -U ${HERDR_CP_PG_USER:-herdr} -d herdr"]
       interval: 5s
       timeout: 3s
       retries: 10
       start_period: 5s
     ports:
-      - "5432:5432"  # exposed so `herdr-eng control-plane migrate` works on-host
+      - "127.0.0.1:5432:5432"  # loopback-only; on-host `herdr-eng control-plane migrate` still works
 
   rustfs:
     image: minio/minio:latest
     container_name: herdr-cp-rustfs
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
+    # SECURITY: set HERDR_CP_MINIO_USER / HERDR_CP_MINIO_PASSWORD.
     environment:
-      MINIO_ROOT_USER: herdr
-      MINIO_ROOT_PASSWORD: herdr
+      MINIO_ROOT_USER: "${HERDR_CP_MINIO_USER:?set HERDR_CP_MINIO_USER}"
+      MINIO_ROOT_PASSWORD: "${HERDR_CP_MINIO_PASSWORD:?set HERDR_CP_MINIO_PASSWORD}"
     volumes:
       - herdr-cp-rustfs:/data
     healthcheck:
@@ -73,8 +76,8 @@ services:
       retries: 10
       start_period: 5s
     ports:
-      - "9000:9000"   # S3 API (RustFSClient endpoint)
-      - "9001:9001"   # MinIO console
+      - "127.0.0.1:9000:9000"   # S3 API (loopback-only)
+      - "127.0.0.1:9001:9001"   # MinIO console (loopback-only)
 
   control-plane-web:
     build:
@@ -86,11 +89,12 @@ services:
     environment:
       HERDR_CP_WEB_HOST: "0.0.0.0"
       HERDR_CP_WEB_PORT: "8080"
-      HERDR_CP_API_KEYS: "${HERDR_CP_API_KEYS:-}"
+      # Required: the web server binds 0.0.0.0 (non-loopback) and the API now
+      # fail-closes, so an operator key must be supplied.
+      HERDR_CP_API_KEYS: "${HERDR_CP_API_KEYS:?set HERDR_CP_API_KEYS (e.g. op1=operator)}"
     ports:
-      # Only reachable inside the project's bridge network by default. Map a
-      # host port (e.g. 8080:8080) if the control plane should be reachable
-      # from the fabric / dev.lan gateway.
+      # Loopback-only host mapping by default. To expose on the fabric, map
+      # 8080:8080 AND serve it with TLS (e.g. via `tailscale serve`).
       - "127.0.0.1:8080:8080"
     command:
       - "control-plane"

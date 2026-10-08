@@ -243,6 +243,23 @@ Run `herdr-eng --help` for the full command set. Every command that emits
 structured data supports `--json`. The web UI is private by default
 (`private_only: true`, host `127.0.0.1`); expose it only via the tailnet.
 
+### Security model (control plane)
+
+Honest posture — this is **hardened, not yet production-secure**:
+
+- **Fail-closed by default**: an unauthenticated server refuses to bind any
+  non-loopback address. Loopback stays open for local dev only.
+- **RBAC** via `X-API-Key` (`viewer` = read-only, `operator` = read + mutate),
+  verified with a constant-time compare.
+- **Secrets never stored or rendered** — redacted at the API boundary.
+- **What is still required before production exposure:**
+  - serve over **TLS** (e.g. `tailscale serve` gives an HTTPS URL) — plain
+    HTTP carries the API key in clear;
+  - set real credentials for Postgres / MinIO (compose now refuses weak
+    defaults);
+  - add **rate-limiting** (no brute-force protection today);
+  - treat **redaction as best-effort** regex, not a guarantee.
+
 ### Control plane (spec 0190)
 
 The control plane is a structured `/api/v1` JSON + SSE server with a web UI
