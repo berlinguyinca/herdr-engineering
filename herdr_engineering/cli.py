@@ -242,6 +242,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--seed-demo", action="store_true",
                     help="seed a fresh in-memory repo with demo data so the "
                          "UI is populated (useful when no Postgres is present)")
+    p2.add_argument("--allow-open", action="store_true",
+                    help="explicitly permit an unauthenticated server on a "
+                         "non-loopback bind. ONLY safe when the host port is "
+                         "bound to the Tailnet interface / `tailscale serve` "
+                         "(Tailnet = trust boundary). Refused without this flag.")
     p2.set_defaults(func=_cmd_cp_web)
     p2 = csub.add_parser("worker", help="run the bounded background worker")
     p2.add_argument("--interval", type=float, default=30.0,
@@ -959,7 +964,8 @@ def _cmd_cp_web(args) -> int:
         _seed_demo(repo)
     source = _maybe_pg_source(args.pg_dsn)
     svr = ControlPlaneServer(repo, api_keys=api_keys,
-                             host=args.host, port=args.port, source=source)
+                             host=args.host, port=args.port, source=source,
+                             allow_open=args.allow_open)
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})

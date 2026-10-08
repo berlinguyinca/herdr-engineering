@@ -41,16 +41,17 @@ services:
     image: postgres:16-alpine
     container_name: herdr-cp-postgres
     restart: unless-stopped
-    # SECURITY: never use the default password in production. Set
-    # HERDR_CP_PG_PASSWORD (and HERDR_CP_PG_USER) before `docker compose up`.
+    # SECURITY: credentials come from ./.env (see ./generate-env.sh).
+    # Compose refuses to start until HERDR_CP_PG_USER/PASSWORD are present.
+    env_file: .env
     environment:
-      POSTGRES_USER: "${HERDR_CP_PG_USER:-herdr}"
-      POSTGRES_PASSWORD: "${HERDR_CP_PG_PASSWORD:?set HERDR_CP_PG_PASSWORD (refusing weak default)}"
+      POSTGRES_USER: "${HERDR_CP_PG_USER}"
+      POSTGRES_PASSWORD: "${HERDR_CP_PG_PASSWORD}"
       POSTGRES_DB: herdr
     volumes:
       - herdr-cp-pg:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${HERDR_CP_PG_USER:-herdr} -d herdr"]
+      test: ["CMD-SHELL", "pg_isready -U ${HERDR_CP_PG_USER} -d herdr"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -63,10 +64,11 @@ services:
     container_name: herdr-cp-rustfs
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
-    # SECURITY: set HERDR_CP_MINIO_USER / HERDR_CP_MINIO_PASSWORD.
+    # SECURITY: credentials come from ./.env (see ./generate-env.sh).
+    env_file: .env
     environment:
-      MINIO_ROOT_USER: "${HERDR_CP_MINIO_USER:?set HERDR_CP_MINIO_USER}"
-      MINIO_ROOT_PASSWORD: "${HERDR_CP_MINIO_PASSWORD:?set HERDR_CP_MINIO_PASSWORD}"
+      MINIO_ROOT_USER: "${HERDR_CP_MINIO_USER}"
+      MINIO_ROOT_PASSWORD: "${HERDR_CP_MINIO_PASSWORD}"
     volumes:
       - herdr-cp-rustfs:/data
     healthcheck:
@@ -86,16 +88,17 @@ services:
     image: herdr-engineering:0.1.0
     container_name: herdr-cp-web
     restart: unless-stopped
+    # Auth-free within dev.lan: the Tailnet is the trust boundary (all machines
+    # belong to each other, WireGuard-encrypted). The host port below is bound
+    # to the Tailnet interface (HERDR_CP_WEB_BIND), so only Tailnet clients can
+    # reach it — never a plain LAN/`0.0.0.0` exposure. `--allow-open` is the
+    # explicit acknowledgment that the Tailnet boundary replaces API keys.
     environment:
       HERDR_CP_WEB_HOST: "0.0.0.0"
       HERDR_CP_WEB_PORT: "8080"
-      # Required: the web server binds 0.0.0.0 (non-loopback) and the API now
-      # fail-closes, so an operator key must be supplied.
-      HERDR_CP_API_KEYS: "${HERDR_CP_API_KEYS:?set HERDR_CP_API_KEYS (e.g. op1=operator)}"
+      HERDR_CP_WEB_BIND: "${HERDR_CP_WEB_BIND:-127.0.0.1}"
     ports:
-      # Loopback-only host mapping by default. To expose on the fabric, map
-      # 8080:8080 AND serve it with TLS (e.g. via `tailscale serve`).
-      - "127.0.0.1:8080:8080"
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:8080:8080"
     command:
       - "control-plane"
       - "web"
@@ -103,6 +106,7 @@ services:
       - "$${HERDR_CP_WEB_HOST}"
       - "--port"
       - "$${HERDR_CP_WEB_PORT}"
+      - "--allow-open"
 
   control-plane-worker:
     build:

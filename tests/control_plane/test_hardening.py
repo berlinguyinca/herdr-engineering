@@ -144,6 +144,26 @@ def test_fail_closed_on_non_loopback_without_keys():
     assert ControlPlaneServer(repo, host="127.0.0.1") is not None
 
 
+def test_allow_open_opts_into_tailnet_trust_boundary():
+    repo = ControlPlaneRepo()
+    # --allow-open permits an unauthenticated server on a non-loopback bind
+    svr = ControlPlaneServer(repo, host="0.0.0.0", allow_open=True)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    base = f"http://127.0.0.1:{svr.port}"
+    try:
+        # auth-free read succeeds (Tailnet is the trust boundary)
+        req = urllib.request.Request(f"{base}/api/v1/health")
+        body = urllib.request.urlopen(req).read().decode()
+        assert '"status": "ok"' in body
+    finally:
+        svr.shutdown()
+    # but it is NOT the default — non-loopback without allow_open still fails
+    with pytest.raises(ValueError):
+        ControlPlaneServer(repo, host="0.0.0.0")
+
+
 def test_loopback_host_detection():
     from herdr_engineering.control_plane.api import _is_loopback
     assert _is_loopback("127.0.0.1")

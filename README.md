@@ -245,20 +245,32 @@ structured data supports `--json`. The web UI is private by default
 
 ### Security model (control plane)
 
-Honest posture — this is **hardened, not yet production-secure**:
+Two deployment modes, each with an honest posture:
 
+**Compose deployment (dev.lan).** The **Tailnet is the trust boundary** — all
+machines belong to each other and are encrypted end-to-end via WireGuard, so
+access is **auth-free within dev.lan**. Safety comes from *how it is bound*, not
+per-user keys:
+- The web host port binds to the **Tailnet interface** (`HERDR_CP_WEB_BIND` =
+  `tailscale ip -4`), so it is reachable from any dev.lan machine but not from a
+  plain LAN / `0.0.0.0`. The container runs `--allow-open` to acknowledge this
+  boundary explicitly.
+- Postgres / MinIO credentials come from a git-ignored `.env` with **randomly
+  generated strong passwords** (`./generate-env.sh`); compose refuses to start
+  without them, and DB/object-store ports stay loopback-only.
+- Secrets in event payloads/messages are **redacted at the API boundary**
+  (never stored or rendered).
+- **Do not** set `HERDR_CP_WEB_BIND` to `0.0.0.0` — that would expose an
+  unauthenticated admin API beyond the tailnet.
+
+**Standalone server (hardened, not yet production-secure).**
 - **Fail-closed by default**: an unauthenticated server refuses to bind any
-  non-loopback address. Loopback stays open for local dev only.
-- **RBAC** via `X-API-Key` (`viewer` = read-only, `operator` = read + mutate),
-  verified with a constant-time compare.
-- **Secrets never stored or rendered** — redacted at the API boundary.
-- **What is still required before production exposure:**
-  - serve over **TLS** (e.g. `tailscale serve` gives an HTTPS URL) — plain
-    HTTP carries the API key in clear;
-  - set real credentials for Postgres / MinIO (compose now refuses weak
-    defaults);
-  - add **rate-limiting** (no brute-force protection today);
-  - treat **redaction as best-effort** regex, not a guarantee.
+  non-loopback address; loopback stays open for local dev only.
+- **Optional RBAC** via `X-API-Key` (`viewer` = read-only, `operator` = read +
+  mutate), verified with a constant-time compare.
+- **Before production exposure:** serve over **TLS** (`tailscale serve` gives
+  an HTTPS URL), add **rate-limiting** (no brute-force protection today), and
+  treat **redaction as best-effort** regex.
 
 ### Control plane (spec 0190)
 

@@ -52,20 +52,28 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   - Role-based auth — `api_keys={key: role}` with `viewer` (read-only) /
     `operator` (read + mutate); `X-API-Key`; unknown key → 401, viewer POST
     → 403 (Spec §104).
+- **Control Plane — Tailnet trust boundary + .env secrets** —
+  - **Auth-free within dev.lan**: the compose web service no longer needs API
+    keys. The Tailnet is the trust boundary (all machines belong to each other,
+    WireGuard-encrypted); `--allow-open` is the explicit acknowledgment. The
+    web host port binds to the Tailnet interface via `HERDR_CP_WEB_BIND`
+    (default `127.0.0.1`), so it is reachable on dev.lan but not from `0.0.0.0`.
+  - **`.env` with random secrets**: `./generate-env.sh` writes a git-ignored
+    `deploy/control-plane/.env` (0600) with randomly generated strong Postgres
+    + MinIO passwords; compose refuses to start without them and DB/object-store
+    ports stay loopback-only. `.env.example` documents every variable.
+  - **Fail-closed auth kept for standalone**: an unauthenticated standalone
+    server still refuses to bind a non-loopback address unless `--allow-open`
+    is passed; `X-API-Key` compare stays constant-time (`secrets.compare_digest`).
 - **Control Plane — security hardening (fail-closed auth, constant-time, sealed compose)** —
-  - **Fail-closed auth (Spec §104)**: an unauthenticated server now refuses to
-    bind any non-loopback address (raises `ValueError`); loopback stays open
-    for local dev only. The compose `control-plane-web` service (binds
-    `0.0.0.0`) now requires `HERDR_CP_API_KEYS` to start.
-  - **Constant-time key compare**: `X-API-Key` verification now uses
+  - **Fail-closed auth (Spec §104)**: an unauthenticated server refuses to bind
+    any non-loopback address (raises `ValueError`); loopback stays open for
+    local dev only.
+  - **Constant-time key compare**: `X-API-Key` verification uses
     `secrets.compare_digest` instead of `==` (removes a timing side channel).
   - **Sealed compose defaults**: Postgres and MinIO credentials are no longer
-    hardcoded `herdr:herdr`; `docker compose up` refuses to start unless
-    `HERDR_CP_PG_PASSWORD`, `HERDR_CP_MINIO_USER/PASSWORD`, and
-    `HERDR_CP_API_KEYS` are set. Postgres (5432) and MinIO (9000/9001) are now
-    published to `127.0.0.1` only, not all interfaces.
-  - Residual posture documented in README (no TLS by default, redaction is
-    best-effort, no rate-limiting).
+    hardcoded `herdr:herdr`; compose refuses to start without secrets, and
+    Postgres (5432) / MinIO (9000/9001) publish to `127.0.0.1` only.
 - **Control Plane — live SSE wiring + per-entity event stream + demo seed** —
   - The SPA now subscribes to `/api/v1/events/stream` and refreshes the current
     view on incoming events (debounced, no polling) — live interaction (Spec

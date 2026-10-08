@@ -44,11 +44,17 @@ class ControlPlaneServer:
     """Structured control-plane API + SSE + static web server."""
 
     def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
-                 port=0, web_root=None, source=None):
+                 port=0, web_root=None, source=None, allow_open=False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
         (read + mutate). No key configured = open (private-by-default bind).
+
+        `allow_open` is an explicit opt-in that permits an unauthenticated
+        server on a non-loopback bind. Only use it when the host port is bound
+        to the Tailscale interface (or proxied by `tailscale serve`), because
+        the Tailnet is then the trust boundary — all machines belong to each
+        other and are encrypted end-to-end via WireGuard.
         """
         self.repo = repo
         if source is not None:
@@ -58,14 +64,16 @@ class ControlPlaneServer:
         if api_key is not None:
             self._keys[api_key] = "operator"
         self.api_key = api_key  # kept for backward compat / introspection
+        self.allow_open = allow_open
         # Fail-closed (Spec §104): an unauthenticated server is only ever
-        # allowed on a loopback bind. Binding a non-loopback address with no
-        # API keys configured is refused, never silently exposed.
-        if not self._keys and not _is_loopback(host):
+        # allowed on a loopback bind unless the operator explicitly opts in
+        # with allow_open (Tailnet trust boundary). Never silently exposed.
+        if not self._keys and not _is_loopback(host) and not allow_open:
             raise ValueError(
                 "refusing to bind an unauthenticated control plane to a "
                 f"non-loopback address {host!r}; configure --api-keys / "
-                "HERDR_CP_API_KEYS (Spec §104)")
+                "HERDR_CP_API_KEYS, or pass --allow-open to trust the "
+                "Tailnet boundary (Spec §104)")
         self.host = host
         self.port = port
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
@@ -115,7 +123,9 @@ def _make_handler(server):
         # ------------------------------------------------------------ auth
         def _role(self):
             if not server._keys:
-                return "operator"  # open (loopback-only; see fail-closed guard)
+                # open — only reachable via loopback or an explicit --allow-open
+                # (Tailnet trust boundary); the fail-closed guard enforces this
+                return "operator"
             supplied = self.headers.get("X-API-Key", "")
             # constant-time compare to avoid a timing side channel
             for candidate, role in server._keys.items():

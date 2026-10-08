@@ -33,15 +33,23 @@ Compose project (spec 0190). It is the structured-state backbone the unified
 ## Usage
 
 ```bash
+# 1) generate ./.env with randomly generated strong credentials (0600)
+./generate-env.sh
+
+# 2) bring the stack up (refuses to start until .env provides the secrets)
 docker compose up -d --build
 
 # verify migrations applied
-docker compose exec postgres psql -U herdr -d herdr -c '\dt'
+docker compose exec postgres psql -U "$HERDR_CP_PG_USER" -d herdr -c '\dt'
 
 # apply migrations / run one pass from the host (needs asyncpg + reachable db)
 herdr-eng control-plane migrate
 herdr-eng control-plane worker --once
 ```
+
+`.env` is generated once, kept on the host, and is git-ignored. Regenerate
+fresh credentials anytime with `rm .env && ./generate-env.sh` (this rotates
+the DB + object-store passwords).
 
 ## Web UI + API (`control-plane-web` service)
 
@@ -56,17 +64,29 @@ curl http://127.0.0.1:8080/api/v1/health
 open http://127.0.0.1:8080/
 ```
 
-Map the service to `0.0.0.0:8080:8080` (or expose on the dev.lan gateway) if the
-control plane should be reachable from the fabric.
-
-**Auth (RBAC, Spec §104)** — optional. Set `HERDR_CP_API_KEYS` to a comma list
-of `key=role` pairs (`viewer` = read-only, `operator` = read + mutate):
+**Auth-free within dev.lan.** The Tailnet is the trust boundary: all machines
+belong to each other and are encrypted end-to-end (WireGuard), so the web UI
+needs no per-user API keys. The host port is bound to the Tailnet interface via
+`HERDR_CP_WEB_BIND` in `.env` (default `127.0.0.1` = loopback-only), so it is
+reachable from any dev.lan machine but **not** from a plain LAN / `0.0.0.0`:
 
 ```bash
-HERDR_CP_API_KEYS="viewerkey=viewer,operatorkey=operator" docker compose up -d
-curl -H "X-API-Key: viewerkey" http://127.0.0.1:8080/api/v1/health   # 200
-curl -X POST -H "X-API-Key: viewerkey" ... /api/v1/sessions/s/messages  # 403
+# expose on dev.lan: set HERDR_CP_WEB_BIND to this machine's Tailscale IP
+HERDR_CP_WEB_BIND="$(tailscale ip -4)" ./generate-env.sh
+docker compose up -d --build
+# any dev.lan machine:
+curl http://dev.lan:8080/api/v1/health          # 200
 ```
+
+The web container runs with `--allow-open` (explicit acknowledgment that the
+Tailnet replaces API keys). **Do not** change `HERDR_CP_WEB_BIND` to `0.0.0.0`
+or drop the Tailnet-IP mapping — that would expose an unauthenticated admin API
+beyond the tailnet.
+
+**Optional RBAC (Spec §104).** If you still want key auth, run the standalone
+server (not this compose service): `herdr-eng control-plane web --api-keys
+'viewerkey=viewer,operatorkey=operator'` — viewer = read-only, operator = read +
+mutate.
 
 Run the same server standalone from the host:
 
