@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HerdR Dev Fabric — Control Plane</title>
+<link rel="stylesheet" href="herdr-design-system/theme.css">
+<link rel="stylesheet" href="herdr-design-system/base.css">
+<link rel="stylesheet" href="herdr-web-components/components.css">
+<style>
+  .hd-btn {
+    background: var(--accent); color: var(--text-on-accent); border: none;
+    padding: 8px 14px; border-radius: var(--radius-sm); font-weight: 500;
+    cursor: pointer; font-family: var(--font-sans);
+  }
+  .hd-btn:hover { background: var(--accent-hover); }
+  .hd-inline { display: flex; gap: 8px; }
+  code { font-family: var(--font-mono); }
+</style>
+</head>
+<body>
+  <herdr-app-shell id="shell">
+    <div id="view"></div>
+  </herdr-app-shell>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

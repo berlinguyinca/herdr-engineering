@@ -3,6 +3,7 @@ import {
   HerdrStatus, HerdrSpinner, HerdrEmpty, HerdrError,
   HerdrIdent, HerdrMetric,
 } from './components.js';
+import { HerdrAppShell } from './app-shell.js';
 
 const registry = {
   'herdr-status': HerdrStatus,
@@ -11,6 +12,7 @@ const registry = {
   'herdr-error': HerdrError,
   'herdr-ident': HerdrIdent,
   'herdr-metric': HerdrMetric,
+  'herdr-app-shell': HerdrAppShell,
 };
 
 export function defineComponents() {
@@ -22,4 +24,4 @@ export function defineComponents() {
   return registry;
 }
 
-export { HerdrStatus, HerdrSpinner, HerdrEmpty, HerdrError, HerdrIdent, HerdrMetric };
+export { HerdrStatus, HerdrSpinner, HerdrEmpty, HerdrError, HerdrIdent, HerdrMetric, HerdrAppShell };

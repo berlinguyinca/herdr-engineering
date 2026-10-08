@@ -226,6 +226,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--migrations", default=None,
                     help="migrations dir (default: bundled deploy/control-plane)")
     p2.set_defaults(func=_cmd_cp_migrate)
+    p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
+    p2.add_argument("--host", default="127.0.0.1",
+                    help="bind host (default 127.0.0.1; private-by-default)")
+    p2.add_argument("--port", type=int, default=0,
+                    help="bind port (default 0 = ephemeral)")
+    p2.add_argument("--api-key", default=None,
+                    help="require X-API-Key header (Spec §104)")
+    p2.set_defaults(func=_cmd_cp_web)
     p2 = csub.add_parser("worker", help="run the bounded background worker")
     p2.add_argument("--interval", type=float, default=30.0,
                     help="seconds between passes (default: 30)")
@@ -923,6 +931,30 @@ def _cmd_cp_migrate(args) -> int:
 
     applied = asyncio.run(_run())
     _print_json({"ok": True, "applied": applied, "migrations_dir": migrations})
+    return 0
+
+
+def _cmd_cp_web(args) -> int:
+    """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
+
+    The web UI is a client of this structured API. Runs the in-memory
+    ControlPlaneRepo so the whole surface is usable standalone; the durable
+    Postgres/RustFS path (Phase 8) plugs in behind the same repo interface.
+    """
+    from .control_plane.api import ControlPlaneServer
+    from .control_plane.repo import ControlPlaneRepo
+
+    svr = ControlPlaneServer(ControlPlaneRepo(), api_key=args.api_key,
+                             host=args.host, port=args.port)
+    _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
+                 "host": args.host, "port": args.port,
+                 "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
+    try:
+        svr.serve()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        svr.shutdown()
     return 0
 
 

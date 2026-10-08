@@ -21,6 +21,17 @@ YYYY-MM-DD. The format follows Keep a Changelog.
     sessions, services, hosts, activity, analytics, message send, actions,
     health) + SSE `connectEvents()` live-update helper; injectable fetch/
     EventSource for node tests.
+- **Control Plane — web UI (Phases 3-7, spec 0190 §5, §20-34, §42-47)** —
+  `packages/index.html` + `packages/app.js`: a hash-routed SPA that is a pure
+  **client** of the structured API. Implements the full route inventory
+  (`/overview /missions /missions/:id /herd /herd/session/:id /services
+  /services/:id /hosts /hosts/:id /activity /analytics[/*]`), rendering
+  loading/empty/error/data states via the design-system Web Components
+  (`<herdr-app-shell>` sidebar shell, status badges, metric tiles, idents).
+  Live updates are SSE-driven (not polling).
+- **Control Plane — `herdr-eng control-plane web`** subcommand — serves the UI +
+  `/api/v1` + SSE private-by-default (`--host 127.0.0.1`), optional `--api-key`,
+  from the bundled `packages/` web root.
 - **Control Plane — structured repository + API/SSE server (spec 0190 §20-34,
   §42-47, §52, §85, §91-92)** — the UI-is-a-client backbone:
   - `control_plane/repo.py` — in-memory, event-sourced `ControlPlaneRepo`
