@@ -3,7 +3,7 @@
 // stream. Views render loading / empty / error / data states (Spec §91).
 import { HerdrClient } from './herdr-web-client/client.js';
 import { connectEvents } from './herdr-web-client/events.js';
-import { formatBytes, formatDuration, formatTimestamp } from './herdr-web-components/format.js';
+import { formatTimestamp } from './herdr-web-components/format.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
 

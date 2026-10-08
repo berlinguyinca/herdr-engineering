@@ -243,6 +243,31 @@ Run `herdr-eng --help` for the full command set. Every command that emits
 structured data supports `--json`. The web UI is private by default
 (`private_only: true`, host `127.0.0.1`); expose it only via the tailnet.
 
+### Control plane (spec 0190)
+
+The control plane is a structured `/api/v1` JSON + SSE server with a web UI
+that is a *client* of that API. It runs standalone (in-memory, optionally
+hydrated from Postgres) or in the `deploy/control-plane` compose project:
+
+```bash
+# standalone UI + API, populated with demo data (no Postgres needed)
+herdr-eng control-plane web --port 8080 --seed-demo
+# then open http://127.0.0.1:8080/ (Overview / Missions / Sessions / Services / Hosts / Activity / Analytics)
+
+# role-based access (X-API-Key): viewer = read-only, operator = read + mutate
+herdr-eng control-plane web --port 8080 --api-keys 'view1=viewer,op1=operator'
+
+# hydrate from durable Postgres state on startup (asyncpg; graceful if absent)
+herdr-eng control-plane web --port 8080 --pg-dsn 'postgresql://herdr:herdr@127.0.0.1:5432/herdr'
+
+# full compose stack (postgres + rustfs(minio) + worker + web)
+docker compose -f deploy/control-plane/compose.yaml up -d --build
+```
+
+The UI subscribes to `/api/v1/events/stream` (SSE) for live updates — no
+polling. Secrets in event payloads and messages are redacted at the API
+boundary (never stored or rendered).
+
 ## Implementation order
 
 `SPEC_MANIFEST.yaml` is the machine-readable source of order and dependencies. `docs/implementation-roadmap.md` visualizes the dependency graph, while `docs/spec-genealogy.md` maps every predecessor HerdR specification into the current program. Humans should start with:
