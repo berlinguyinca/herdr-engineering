@@ -1,6 +1,8 @@
 """Control-plane configuration normalization."""
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,14 +13,30 @@ _DEFAULTS = {
     "rustfs_region": "us-east-1",
 }
 
+_DSN_RE = re.compile(r"^(postgres(?:ql)?://)(?:[^@/]*@)?([^@/]+.*)$")
+
 
 def control_plane_config(cfg: dict[str, Any]) -> dict[str, str]:
-    """Return normalized control-plane settings from a config dict."""
+    """Return normalized control-plane settings from a config dict.
+
+    The Postgres DSN credentials are taken from ``HERDR_CP_PG_USER`` /
+    ``HERDR_CP_PG_PASSWORD`` when present, so a compose stack that supplies
+    random strong credentials via ``env_file: .env`` still connects without
+    hardcoding them in a committed ``config.yaml``. The DSN host/port/db come
+    from config (e.g. the ``postgres`` service name on the bridge network).
+    """
     cp = cfg.get("control_plane") or {}
     out = dict(_DEFAULTS)
     for key in _DEFAULTS:
         if key in cp and cp[key]:
             out[key] = str(cp[key])
+    dsn = out["postgres_dsn"]
+    user = os.environ.get("HERDR_CP_PG_USER")
+    password = os.environ.get("HERDR_CP_PG_PASSWORD")
+    if user and password:
+        m = _DSN_RE.match(dsn)
+        if m:
+            out["postgres_dsn"] = f"{m.group(1)}{user}:{password}@{m.group(2)}"
     return out
 
 

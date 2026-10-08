@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -42,13 +43,39 @@ class DurableSource:
         raise NotImplementedError
 
 
-class PostgresSource(DurableSource):
-    """Asyncpg-backed durable source (runs its queries via ``run``)."""
+class _LoopRunner:
+    """Runs coroutines on a single dedicated event loop (daemon thread).
 
-    def __init__(self, conn: Any, *, run: Callable | None = None,
-                 events_table: str = "fabric_events"):
+    asyncpg connections are bound to the loop they were created on and cannot
+    be used across separate ``asyncio.run`` calls, so all async work (connect
+    AND fetch) must happen on one persistent loop.
+    """
+
+    def __init__(self):
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever, name="herdr-cp-pg-loop", daemon=True)
+        self._thread.start()
+
+    def run(self, coro: Any):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+
+class PostgresSource(DurableSource):
+    """Asyncpg-backed durable source (runs its queries via ``run``).
+
+    Construct with ``dsn`` for a real Postgres (lazily connects on its own
+    persistent loop so connect+fetch share one loop), or with a ``conn`` plus
+    ``run`` for tests.
+    """
+
+    def __init__(self, conn: Any = None, *, run: Callable | None = None,
+                 events_table: str = "fabric_events", dsn: str | None = None):
+        if run is None:
+            run = _LoopRunner().run
         self._conn = conn
-        self._run = run or asyncio.run
+        self._dsn = dsn
+        self._run = run
         self._events_table = events_table
         self._cache: dict | None = None
 
@@ -58,6 +85,11 @@ class PostgresSource(DurableSource):
         return self._cache
 
     async def _fetch_all(self) -> dict:
+        if self._conn is None:
+            if self._dsn is None:
+                raise ValueError("PostgresSource needs a conn or dsn")
+            import asyncpg
+            self._conn = await asyncpg.connect(self._dsn)
         conn = self._conn
         return {
             "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],

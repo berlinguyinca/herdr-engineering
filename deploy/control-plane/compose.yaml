@@ -56,11 +56,18 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+    # Host port is loopback-only and configurable (HERDR_CP_PG_PORT) so it can
+    # coexist with other Postgres containers on the host. The worker reaches
+    # Postgres over the bridge network by service name, so this publish is only
+    # for on-host `herdr-eng control-plane migrate` convenience.
     ports:
-      - "127.0.0.1:5432:5432"  # loopback-only; on-host `herdr-eng control-plane migrate` still works
+      - "127.0.0.1:${HERDR_CP_PG_PORT:-5432}:5432"
 
   rustfs:
-    image: minio/minio:latest
+    # Pinned: minio/minio:latest is not always pullable; this RELEASE tag is
+    # known-good and cached on the deploy host. Swap image here for a real
+    # RustFS image later (config-only).
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: herdr-cp-rustfs
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
@@ -88,24 +95,34 @@ services:
     image: herdr-engineering:0.1.0
     container_name: herdr-cp-web
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     # Auth-free within dev.lan: the Tailnet is the trust boundary (all machines
     # belong to each other, WireGuard-encrypted). The host port below is bound
     # to the Tailnet interface (HERDR_CP_WEB_BIND), so only Tailnet clients can
     # reach it — never a plain LAN/`0.0.0.0` exposure. `--allow-open` is the
     # explicit acknowledgment that the Tailnet boundary replaces API keys.
+    env_file: .env
     environment:
       HERDR_CP_WEB_HOST: "0.0.0.0"
       HERDR_CP_WEB_PORT: "8080"
       HERDR_CP_WEB_BIND: "${HERDR_CP_WEB_BIND:-127.0.0.1}"
+    # The HerdR UI is served at dev.lan:<public-port> (default 80 = plain
+    # http://dev.lan). Host bind is the Tailnet interface so only Tailnet
+    # clients reach it; container keeps its internal 8080 listener.
     ports:
-      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:8080:8080"
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_CP_WEB_PUBLIC_PORT:-80}:8080"
+    # Exec-form command (no shell): host/port are fixed literals; the Postgres
+    # DSN is read from the HERDR_CP_PG_DSN env var (env_file: .env) by the CLI,
+    # so the password never appears in process args.
     command:
       - "control-plane"
       - "web"
       - "--host"
-      - "$${HERDR_CP_WEB_HOST}"
+      - "0.0.0.0"
       - "--port"
-      - "$${HERDR_CP_WEB_PORT}"
+      - "8080"
       - "--allow-open"
 
   control-plane-worker:
@@ -120,6 +137,7 @@ services:
         condition: service_healthy
       rustfs:
         condition: service_healthy
+    env_file: .env
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       # Bundle the SQL migrations into the worker image so it can apply them
@@ -130,6 +148,8 @@ services:
     command:
       - "control-plane"
       - "worker"
+      - "--migrations"
+      - "/app/migrations"
 
 volumes:
   herdr-cp-pg:

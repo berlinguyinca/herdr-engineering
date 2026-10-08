@@ -4,6 +4,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from herdr_engineering import cli
 from herdr_engineering.cli import _parse_api_keys, _seed_demo, main
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
@@ -85,3 +86,15 @@ def test_unknown_command_returns_error(capsys):
 def pytest_raises_SystemExit():
     import pytest
     return pytest.raises(SystemExit)
+
+
+def test_maybe_pg_source_resolves_correct_module():
+    """Regression: _maybe_pg_source must import PostgresSource from
+    control_plane.bridge (the real module). Before the fix it used
+    `from .bridge` -> herdr_engineering.bridge, a ModuleNotFoundError."""
+    from herdr_engineering.control_plane.bridge import PostgresSource
+
+    src = cli._maybe_pg_source("postgresql://u:p@127.0.0.1:5432/herdr")
+    assert isinstance(src, PostgresSource)
+    assert cli._maybe_pg_source(None) is None
+    assert cli._maybe_pg_source("") is None

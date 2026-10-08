@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any
 
@@ -253,6 +254,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="seconds between passes (default: 30)")
     p2.add_argument("--once", action="store_true",
                     help="run a single pass and exit")
+    p2.add_argument("--migrations", default=None,
+                    help="migrations dir (default: bundled deploy/control-plane)")
     p2.set_defaults(func=_cmd_cp_worker)
 
     return parser
@@ -962,7 +965,9 @@ def _cmd_cp_web(args) -> int:
     repo = ControlPlaneRepo()
     if args.seed_demo:
         _seed_demo(repo)
-    source = _maybe_pg_source(args.pg_dsn)
+    # In the compose stack the DSN is supplied via the HERDR_CP_PG_DSN env var
+    # (from env_file: .env) so the password never appears in process args.
+    source = _maybe_pg_source(args.pg_dsn or os.environ.get("HERDR_CP_PG_DSN"))
     svr = ControlPlaneServer(repo, api_keys=api_keys,
                              host=args.host, port=args.port, source=source,
                              allow_open=args.allow_open)
@@ -982,23 +987,11 @@ def _maybe_pg_source(dsn):
     """Build a PostgresSource from a DSN, or None if not provided."""
     if not dsn:
         return None
-    try:
-        import asyncio
+    from .control_plane.bridge import PostgresSource
 
-        import asyncpg  # noqa: F401  (declared dep; lazy import)
-    except ImportError:
-        print("warning: --pg-dsn requires asyncpg; serving in-memory only",
-              file=sys.stderr)
-        return None
-    from .bridge import PostgresSource
-
-    async def _connect():
-        conn = await asyncpg.connect(dsn)
-        await conn.execute("SELECT 1")
-        return conn
-
-    conn = asyncio.run(_connect())
-    return PostgresSource(conn)
+    # Lazy: PostgresSource connects on its own persistent event loop when the
+    # server first hydrates from Postgres, so connect+fetch share one loop.
+    return PostgresSource(dsn=dsn)
 
 
 def _parse_api_keys(single_key, pairs_str):
@@ -1058,7 +1051,8 @@ def _cmd_cp_worker(args) -> int:
     async def _run():
         conn = await _cp_connect(_cp_config()["postgres_dsn"])
         try:
-            await Migrator(conn).apply(_cp_migrations_dir())
+            migrations = args.migrations or _cp_migrations_dir()
+            await Migrator(conn).apply(migrations)
             if args.once:
                 return await run_one_pass(conn)
             await run_worker(conn, interval=args.interval)

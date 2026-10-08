@@ -6,6 +6,27 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- **Live deploy of the control-plane compose stack on bender** — the HerdR UI
+  is now served at `http://dev.lan` (port 80) on the Tailnet IP, backed by
+  durable Postgres + MinIO. Compose now reads `HERDR_CP_PG_DSN` (generated into
+  `.env`) so the web/worker reach Postgres by service name over the bridge
+  network; MinIO is pinned to a known-good RELEASE tag (minio:latest is not
+  always pullable); the worker takes `--migrations /app/migrations` because the
+  bundled migrations path doesn't exist inside the installed image.
+
+### Fixed
+- **Web/worker durable hydration** (found during live deploy):
+  - `_maybe_pg_source` imported `from .bridge` (wrong module) — now
+    `from .control_plane.bridge`, and it reads `HERDR_CP_PG_DSN` from the env so
+    the DB password never appears in process args.
+  - asyncpg connections cannot be used across separate `asyncio.run` calls —
+    `PostgresSource` now owns a single persistent event loop (`_LoopRunner`,
+    daemon thread) and lazily connects + fetches on it.
+  - Migration `0001_control_plane.sql` had a `UNIQUE (...)` constraint
+    containing `COALESCE(...)` expressions (Postgres forbids expressions in
+    constraints) — replaced with a `CREATE UNIQUE INDEX`.
+
+### Added
 - **Dev Fabric — port-matching (localhost:<port> -> dev.lan:<port>)** — a
   locally started dev server now appears at the SAME port on `dev.lan`, not a
   random range port:

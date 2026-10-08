@@ -209,9 +209,12 @@ CREATE TABLE artifact_bindings (
   agent_id        text REFERENCES agents(agent_id),
   stage           text,
   created_at      timestamptz NOT NULL DEFAULT now(),
-  created_by      text,
-  UNIQUE (artifact_id, mission_id, COALESCE(session_id, ''), COALESCE(stage, ''))
+  created_by      text
 );
+-- Postgres forbids expressions in UNIQUE constraints; use a unique index so
+-- a NULL session_id/stage coalesces to '' for de-duplication.
+CREATE UNIQUE INDEX idx_artifact_bindings_dedup
+  ON artifact_bindings (artifact_id, mission_id, COALESCE(session_id, ''), COALESCE(stage, ''));
 
 CREATE TABLE artifact_materializations (
   materialization_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

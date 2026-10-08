@@ -292,8 +292,28 @@ herdr-eng control-plane web --port 8080 --api-keys 'view1=viewer,op1=operator'
 herdr-eng control-plane web --port 8080 --pg-dsn 'postgresql://herdr:herdr@127.0.0.1:5432/herdr'
 
 # full compose stack (postgres + rustfs(minio) + worker + web)
-docker compose -f deploy/control-plane/compose.yaml up -d --build
+#   the UI is served at http://dev.lan (port 80) on the Tailnet interface
+cd deploy/control-plane
+./generate-env.sh          # writes .env with strong random passwords (idempotent)
+docker compose up -d --build
+# then open http://dev.lan/
 ```
+
+Deployed on **bender**, the control-plane stack serves the HerdR UI at
+`http://dev.lan` (Tailnet IP `:80`) with durable Postgres + MinIO:
+
+- `HERDR_CP_WEB_BIND=100.104.39.6` (Tailnet interface) + `HERDR_CP_WEB_PUBLIC_PORT=80`.
+- `HERDR_CP_PG_DSN` is generated into `.env`; the web reads it from the env (not
+  a `--pg-dsn` process arg) so the DB password never appears in `ps`/`docker inspect`.
+- Postgres host port defaults to `127.0.0.1:5432`; set `HERDR_CP_PG_PORT` to a
+  free loopback port (e.g. `15433`) when 5432 is already taken on the host.
+- MinIO is pinned to `minio/minio:RELEASE.2025-09-07T16-13-09Z` (`minio:latest`
+  is not always pullable); swap the image for a real RustFS image later —
+  config-only.
+
+Note: the web hydrates from Postgres **once at startup**, so it reflects a
+snapshot of durable state; live updates flow over SSE. Restart the web to
+re-hydrate after external writes.
 
 The UI subscribes to `/api/v1/events/stream` (SSE) for live updates — no
 polling. Secrets in event payloads and messages are redacted at the API
