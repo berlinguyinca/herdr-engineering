@@ -123,6 +123,8 @@ services:
       - "0.0.0.0"
       - "--port"
       - "8080"
+      - "--web-root"
+      - "/app/packages"
       - "--allow-open"
 
   control-plane-worker:

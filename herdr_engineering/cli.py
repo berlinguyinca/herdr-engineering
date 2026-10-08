@@ -243,6 +243,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--seed-demo", action="store_true",
                     help="seed a fresh in-memory repo with demo data so the "
                          "UI is populated (useful when no Postgres is present)")
+    p2.add_argument("--web-root", default=None,
+                    help="directory of static UI assets (index.html, app.js, "
+                         "herdr-web-*). Default: resolved relative to the "
+                         "package (dev checkout); set to /app/packages in the "
+                         "container image.")
     p2.add_argument("--allow-open", action="store_true",
                     help="explicitly permit an unauthenticated server on a "
                          "non-loopback bind. ONLY safe when the host port is "
@@ -970,7 +975,7 @@ def _cmd_cp_web(args) -> int:
     source = _maybe_pg_source(args.pg_dsn or os.environ.get("HERDR_CP_PG_DSN"))
     svr = ControlPlaneServer(repo, api_keys=api_keys,
                              host=args.host, port=args.port, source=source,
-                             allow_open=args.allow_open)
+                             web_root=args.web_root, allow_open=args.allow_open)
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})

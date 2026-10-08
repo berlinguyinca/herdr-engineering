@@ -26,6 +26,12 @@ COPY pyproject.toml README.md LICENSE ./
 COPY herdr_engineering/ ./herdr_engineering/
 RUN pip install --no-cache-dir .
 
+# Build-free frontend assets (ES modules + Web Components, no bundler). Copied
+# into the image so the control-plane web is self-contained; serve via
+# `--web-root /app/packages` (dev checkouts resolve packages/ relative to the
+# package instead).
+COPY packages/ ./packages/
+
 # Runtime state + config live here; both are provided at runtime by the stack
 # (state -> named volume, config -> bind-mount). Overridable per service.
 ENV HERDR_ENGINEERING_STATE=/state \
