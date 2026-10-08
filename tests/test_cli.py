@@ -4,7 +4,18 @@ import os
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from herdr_engineering.cli import _parse_api_keys, main
+from herdr_engineering.cli import _parse_api_keys, _seed_demo, main
+from herdr_engineering.control_plane.repo import ControlPlaneRepo
+
+
+def test_seed_demo_populates_repo():
+    repo = ControlPlaneRepo()
+    _seed_demo(repo)
+    assert len(repo.list_missions()) == 2
+    assert len(repo.list_sessions()) == 2
+    assert len(repo.list_hosts()) == 2
+    assert len(repo.list_services()) == 3
+    assert len(repo.recent_events(limit=100)) > 0
 
 
 def test_parse_api_keys_rbac_pairs():

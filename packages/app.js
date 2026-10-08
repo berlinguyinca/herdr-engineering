@@ -4,6 +4,7 @@
 import { HerdrClient } from './herdr-web-client/client.js';
 import { connectEvents } from './herdr-web-client/events.js';
 import { formatBytes, formatDuration, formatTimestamp } from './herdr-web-components/format.js';
+import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
 
 defineComponents();
@@ -197,15 +198,28 @@ async function viewHosts() {
 async function viewHost(parts) {
   const h = await client.request(`/api/v1/hosts/${esc(parts[1])}`);
   if (!h || h.error) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
+  let cpu = '—', mem = '—', disk = '—', seen = '—';
+  try {
+    const { samples } = await client.request(`/api/v1/hosts/${esc(parts[1])}/telemetry?limit=1`);
+    if (samples && samples.length) {
+      const s = samples[0];
+      cpu = (s.cpu ?? s.cpu_pct) ?? '—';
+      mem = (s.mem ?? s.mem_pct) ?? '—';
+      disk = s.disk_pct ?? '—';
+      seen = formatTimestamp(s.at ?? h.last_seen);
+    }
+  } catch { /* telemetry optional */ }
   root.innerHTML = `
     <h1>${esc(h.host_name)}</h1>
     <div style="margin:8px 0"><herdr-status stage="${esc(h.status)}"></herdr-status>
       <span class="hd-card__sub"> · <herdr-ident kind="host" id="${esc(h.host_id)}"></herdr-ident></span></div>
     <div class="hd-grid">
       <herdr-metric label="Tailnet IP" value="${esc(h.tailnet_ip)}"></herdr-metric>
-      <herdr-metric label="CPU" value="${esc(h.cpu ?? '—')}"></herdr-metric>
-      <herdr-metric label="Memory" value="${esc(h.mem ?? '—')}"></herdr-metric>
-    </div>`;
+      <herdr-metric label="CPU" value="${esc(cpu)}"></herdr-metric>
+      <herdr-metric label="Memory" value="${esc(mem)}"></herdr-metric>
+      <herdr-metric label="Disk" value="${esc(disk)}"></herdr-metric>
+    </div>
+    <p class="hd-card__sub">last telemetry ${esc(seen)}</p>`;
 }
 
 async function viewActivity() {
@@ -275,20 +289,26 @@ function stageBars(byStage) {
 }
 
 async function streamList(entityType, entityId) {
-  const events = await client.request(`/api/v1/activity?limit=20`);
-  const filtered = events.events.filter((e) => e.entity_type === entityType && e.entity_id === entityId);
-  return filtered.length
-    ? filtered.map((e) => `<div class="hd-card"><div class="hd-card__title">${esc(e.event_type)}</div>` +
+  const { events } = await client.request(
+    `/api/v1/events?entity_type=${entityType}&entity_id=${entityId}`);
+  return events.length
+    ? events.map((e) => `<div class="hd-card"><div class="hd-card__title">${esc(e.event_type)}</div>` +
         `<div class="hd-card__sub">seq ${e.sequence} · ${formatTimestamp(e.source_timestamp)}</div>` +
         `<code class="hd-card__sub">${esc(JSON.stringify(e.payload))}</code></div>`).join('')
     : '<herdr-empty message="No events for this entity yet"></herdr-empty>';
 }
 
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
+// Live updates (Spec §52, §85): subscribe to the SSE stream and refresh the
+// current view when new events arrive (debounced). No polling.
+let liveTimer = null;
+connectEvents({
+  url: '/api/v1/events/stream',
+  onEvent: () => {
+    if (liveTimer) clearTimeout(liveTimer);
+    liveTimer = setTimeout(render, 150);
+  },
+  onError: () => { /* keep last view; the client auto-reconnects */ },
+});
 
 window.addEventListener('hashchange', render);
 render();

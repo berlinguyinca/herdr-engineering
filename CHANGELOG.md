@@ -52,6 +52,19 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   - Role-based auth — `api_keys={key: role}` with `viewer` (read-only) /
     `operator` (read + mutate); `X-API-Key`; unknown key → 401, viewer POST
     → 403 (Spec §104).
+- **Control Plane — live SSE wiring + per-entity event stream + demo seed** —
+  - The SPA now subscribes to `/api/v1/events/stream` and refreshes the current
+    view on incoming events (debounced, no polling) — live interaction (Spec
+    §52, §85) is wired in the browser, not just available client-side.
+  - New `GET /api/v1/events?entity_type=&entity_id=` returns a single entity's
+    full event stream (previously the UI filtered the global 20-event window).
+  - Fixed host-telemetry route shadowing: `/api/v1/hosts/{id}/telemetry` was
+    being swallowed by the host-detail branch (`len(parts) > 4`); the detail
+    branch is now exact (`len(parts) == 5`). The host view now shows the latest
+    CPU/mem/disk sample instead of always-empty fields.
+  - Removed the duplicated `esc()` in `app.js` (now imports `escapeHtml`).
+  - `herdr-eng control-plane web --seed-demo` seeds a fresh in-memory repo so
+    the UI is populated for local evaluation when no Postgres is present.
 - **Control Plane — Durable bridge (spec 0190 §106, §114-115)** —
   `control_plane/bridge.py`: `load_into(repo, source)` hydrates the in-memory
   repo from a read-only durable view (Phase-1 Postgres tables: missions,

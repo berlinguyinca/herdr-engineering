@@ -140,6 +140,34 @@ def _port(client):
     return int(client.base.rsplit(":", 1)[1])
 
 
+def test_host_detail_and_telemetry_routes(server):
+    c, repo = server
+    hid = repo.register_host("bender", "100.104.39.6")
+    repo.record_telemetry(hid, {"cpu_pct": 12, "mem_pct": 38})
+    # host detail must still work
+    status, _, body = c.get(f"/api/v1/hosts/{hid}")
+    assert status == 200 and json.loads(body)["host_name"] == "bender"
+    # telemetry sub-route must NOT be swallowed by the detail route
+    status, _, body = c.get(f"/api/v1/hosts/{hid}/telemetry")
+    assert status == 200
+    samples = json.loads(body)["samples"]
+    assert samples[0]["cpu_pct"] == 12 and samples[0]["mem_pct"] == 38
+
+
+def test_entity_event_stream(server):
+    c, repo = server
+    mid = repo.create_mission("stream me")
+    repo.set_mission_stage(mid, "implementation")
+    status, _, body = c.get(f"/api/v1/events?entity_type=mission&entity_id={mid}")
+    assert status == 200
+    events = json.loads(body)["events"]
+    assert [e["event_type"] for e in events] == ["MissionCreated", "MissionStageChanged"]
+    assert events[0]["sequence"] == 0 and events[1]["sequence"] == 1
+    # missing params -> 400
+    status, _, _ = c.get("/api/v1/events")
+    assert status == 400
+
+
 def test_unknown_route_404(server):
     c, _ = server
     status, _, _ = c.get("/api/v1/does-not-exist")

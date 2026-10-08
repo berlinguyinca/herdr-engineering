@@ -162,7 +162,9 @@ def _make_handler(server):
                         {"error": "not found"}, 404)
                 return self._json({"services": r.list_services()})
             if resource == "hosts":
-                if len(parts) > 4:
+                if len(parts) > 5 and parts[5] == "telemetry":
+                    return self._json({"samples": r.list_telemetry(parts[4])})
+                if len(parts) == 5:
                     h = r.get_host(parts[4])
                     return self._json(h) if h else self._json(
                         {"error": "not found"}, 404)
@@ -180,8 +182,17 @@ def _make_handler(server):
                 if kind == "hosts":
                     return self._json(r.host_analytics())
                 return self._json({"error": "unknown analytics kind"}, 404)
-            if resource == "events" and parts[4] == "stream":
-                return self._sse()
+            if resource == "events":
+                if len(parts) > 4 and parts[4] == "stream":
+                    return self._sse()
+                if len(parts) == 4:
+                    # per-entity stream: /api/v1/events?entity_type=mission&entity_id=m1
+                    etype = _q(self.path, "entity_type")
+                    eid = _q(self.path, "entity_id")
+                    if not etype or not eid:
+                        return self._json(
+                            {"error": "entity_type and entity_id required"}, 400)
+                    return self._json({"events": r.stream(etype, eid)})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
                 data = r.get_artifact_data(parts[4])
                 a = r.get_artifact(parts[4])
@@ -190,8 +201,6 @@ def _make_handler(server):
                 return self._bytes(data, a.get("mime_type", "application/octet-stream"))
             if resource == "leases":
                 return self._json({"leases": r.list_leases()})
-            if resource == "hosts" and len(parts) > 5 and parts[5] == "telemetry":
-                return self._json({"samples": r.list_telemetry(parts[4])})
             return self._json({"error": "not found"}, 404)
 
         def _api_post(self, parts, resource):

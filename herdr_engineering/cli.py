@@ -239,6 +239,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--pg-dsn", default=None,
                     help="optional Postgres DSN to hydrate the repo from "
                          "durable state on startup (Spec §106)")
+    p2.add_argument("--seed-demo", action="store_true",
+                    help="seed a fresh in-memory repo with demo data so the "
+                         "UI is populated (useful when no Postgres is present)")
     p2.set_defaults(func=_cmd_cp_web)
     p2 = csub.add_parser("worker", help="run the bounded background worker")
     p2.add_argument("--interval", type=float, default=30.0,
@@ -951,8 +954,11 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.repo import ControlPlaneRepo
 
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
+    repo = ControlPlaneRepo()
+    if args.seed_demo:
+        _seed_demo(repo)
     source = _maybe_pg_source(args.pg_dsn)
-    svr = ControlPlaneServer(ControlPlaneRepo(), api_keys=api_keys,
+    svr = ControlPlaneServer(repo, api_keys=api_keys,
                              host=args.host, port=args.port, source=source)
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
@@ -1005,6 +1011,33 @@ def _parse_api_keys(single_key, pairs_str):
             else:
                 keys[pair] = "operator"
     return keys or None
+
+
+def _seed_demo(repo):
+    """Populate a fresh repo with demo missions/sessions/hosts/services."""
+    hid1 = repo.register_host("bender", "100.104.39.6")
+    hid2 = repo.register_host("beast", "100.96.156.65")
+    repo.record_telemetry(hid1, {"cpu_pct": 12, "mem_pct": 38, "disk_pct": 54})
+    repo.record_telemetry(hid2, {"cpu_pct": 3, "mem_pct": 21, "disk_pct": 30})
+
+    mid = repo.create_mission("HerdR control-plane program",
+                              purpose="Spec 0190 — dev fabric control plane",
+                              stage="implementation")
+    sid = repo.create_session(mid, agent_role="orchestrator", model="gpt-4")
+    repo.send_message(sid, "steer: focus on the durable Postgres bridge")
+    repo.record_tool_call(sid, "edit", "bridge.py")
+    repo.set_mission_stage(mid, "review")
+
+    mid2 = repo.create_mission("Fleet telemetry rollout",
+                               purpose="Host health sampling across the fabric")
+    sid2 = repo.create_session(mid2, agent_role="implementer", model="claude")
+    repo.send_message(sid2, "add CPU/RAM/disk sampling agent")
+    repo.set_mission_stage(mid2, "testing")
+
+    repo.register_service("herdr-control-plane", hid1, 8080,
+                          session_id=sid, status="healthy")
+    repo.register_service("fabric-gateway", hid1, 53, status="healthy")
+    repo.register_service("analytics-api", hid2, 9001, status="healthy")
 
 
 def _cmd_cp_worker(args) -> int:
