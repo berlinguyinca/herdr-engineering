@@ -33,7 +33,9 @@ class ControlPlaneRepo:
         self._services = {}
         self._hosts = {}
         self._artifacts = {}
+        self._blobs = {}  # artifact_id -> bytes (in-memory RustFS stand-in)
         self._leases = {}
+        self._telemetry = {}  # host_id -> [sample, ...]
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
@@ -211,10 +213,23 @@ class ControlPlaneRepo:
         h["status"] = "unavailable"
         return True
 
+    def record_telemetry(self, host_id, sample):
+        """Record a telemetry sample (cpu/mem/disk/network/gpu) for a host."""
+        rec = {"host_id": host_id, "at": self._stamp(), **dict(sample or {})}
+        self._telemetry.setdefault(host_id, []).append(rec)
+        return True
+
+    def list_telemetry(self, host_id, limit=100):
+        samples = self._telemetry.get(host_id, [])
+        return samples[-limit:]
+
     # ------------------------------------------------------------- artifacts
     def register_artifact(self, session_id=None, original_filename="",
                           mime_type="", size_bytes=0, sha256="",
-                          storage_key="", mission_id=None):
+                          storage_key="", mission_id=None, data=None):
+        import hashlib
+        if data is not None and not sha256:
+            sha256 = hashlib.sha256(data).hexdigest()
         aid = new_id("artifact")
         rec = {
             "artifact_id": aid, "session_id": session_id,
@@ -224,10 +239,16 @@ class ControlPlaneRepo:
             "materializations": 0, "created_at": self._stamp(),
         }
         self._artifacts[aid] = rec
+        if data is not None:
+            self._blobs[aid] = data
+            rec["size_bytes"] = len(data)
         self.record_event("artifact", aid, "ArtifactRegistered",
                           {"filename": original_filename, "sha256": sha256},
                           mission_id=mission_id, session_id=session_id)
         return aid
+
+    def get_artifact_data(self, artifact_id):
+        return self._blobs.get(artifact_id)
 
     def get_artifact(self, artifact_id):
         return _copy(self._artifacts.get(artifact_id))
@@ -326,6 +347,44 @@ class ControlPlaneRepo:
         total = len(self._hosts)
         return {"total": total, "healthy": healthy,
                 "unavailable": total - healthy}
+
+    # --------------------------------------------------- backup / restore
+    def export_state(self):
+        """Serialize the full structured state for backup/restore (Spec §102)."""
+        return {
+            "version": 1,
+            "missions": _copy(self._missions),
+            "sessions": _copy(self._sessions),
+            "services": _copy(self._services),
+            "hosts": _copy(self._hosts),
+            "artifacts": _copy(self._artifacts),
+            "blobs": {k: __import__("base64").b64encode(v).decode()
+                      for k, v in self._blobs.items()},
+            "leases": _copy(self._leases),
+            "telemetry": {k: [dict(s) for s in v]
+                          for k, v in self._telemetry.items()},
+            "events": {f"{t}|{i}": [dict(e) for e in s]
+                       for (t, i), s in self._events.items()},
+            "event_order": list(self._event_order),
+        }
+
+    def import_state(self, state):
+        """Restore state from an export (used by restore tests / recovery)."""
+        self._missions = dict(state.get("missions", {}))
+        self._sessions = dict(state.get("sessions", {}))
+        self._services = dict(state.get("services", {}))
+        self._hosts = dict(state.get("hosts", {}))
+        self._artifacts = dict(state.get("artifacts", {}))
+        self._blobs = {k: __import__("base64").b64decode(v)
+                       for k, v in state.get("blobs", {}).items()}
+        self._leases = dict(state.get("leases", {}))
+        self._telemetry = {k: [dict(s) for s in v]
+                          for k, v in state.get("telemetry", {}).items()}
+        self._events = {}
+        for key, stream in state.get("events", {}).items():
+            t, i = key.split("|")
+            self._events[(t, i)] = [dict(e) for e in stream]
+        self._event_order = [tuple(x) for x in state.get("event_order", [])]
 
     # --------------------------------------------------------------- health
     def health(self):

@@ -16,6 +16,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .redact import redact_payload
+
 _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 _INDEX = "index.html"
 
@@ -29,10 +31,18 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
 class ControlPlaneServer:
     """Structured control-plane API + SSE + static web server."""
 
-    def __init__(self, repo, *, api_key=None, host="127.0.0.1", port=0,
-                 web_root=None):
+    def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
+                 port=0, web_root=None):
+        """
+        Auth (Spec §104): either a single `api_key` (all-access) or a mapping
+        `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
+        (read + mutate). No key configured = open (private-by-default bind).
+        """
         self.repo = repo
-        self.api_key = api_key
+        self._keys = dict(api_keys or {})
+        if api_key is not None:
+            self._keys[api_key] = "operator"
+        self.api_key = api_key  # kept for backward compat / introspection
         self.host = host
         self.port = port
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
@@ -80,22 +90,33 @@ def _make_handler(server):
             pass
 
         # ------------------------------------------------------------ auth
-        def _authorized(self):
-            if not server.api_key:
-                return True
-            return self.headers.get("X-API-Key") == server.api_key
+        def _role(self):
+            if not server._keys:
+                return "operator"  # open (private-by-default bind)
+            return server._keys.get(self.headers.get("X-API-Key", ""))
+
+        def _require(self, min_role):
+            """Return an error response (or None) for the current request."""
+            role = self._role()
+            if role is None:
+                return self._send_json(401, {"error": "unauthorized"})
+            if min_role == "operator" and role != "operator":
+                return self._send_json(403, {"error": "read-only"})
+            return None
 
         # ------------------------------------------------------------ routes
         def do_GET(self):
-            if not self._authorized():
-                return self._send_json(401, {"error": "unauthorized"})
+            err = self._require("viewer")
+            if err:
+                return err
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._serve_static()
 
         def do_POST(self):
-            if not self._authorized():
-                return self._send_json(401, {"error": "unauthorized"})
+            err = self._require("operator")
+            if err:
+                return err
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._send_json(404, {"error": "not found"})
@@ -144,8 +165,9 @@ def _make_handler(server):
                         {"error": "not found"}, 404)
                 return self._json({"hosts": r.list_hosts()})
             if resource == "activity":
-                return self._json(
-                    {"events": r.recent_events(limit=_qint(self.path, "limit", 50))})
+                evs = [_redact_event(e) for e in r.recent_events(
+                    limit=_qint(self.path, "limit", 50))]
+                return self._json({"events": evs})
             if resource == "analytics":
                 kind = parts[4]
                 if kind == "missions":
@@ -157,18 +179,35 @@ def _make_handler(server):
                 return self._json({"error": "unknown analytics kind"}, 404)
             if resource == "events" and parts[4] == "stream":
                 return self._sse()
+            if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
+                data = r.get_artifact_data(parts[4])
+                a = r.get_artifact(parts[4])
+                if data is None or a is None:
+                    return self._json({"error": "not found"}, 404)
+                return self._bytes(data, a.get("mime_type", "application/octet-stream"))
             if resource == "leases":
                 return self._json({"leases": r.list_leases()})
+            if resource == "hosts" and len(parts) > 5 and parts[5] == "telemetry":
+                return self._json({"samples": r.list_telemetry(parts[4])})
             return self._json({"error": "not found"}, 404)
 
         def _api_post(self, parts, resource):
             r = server.repo
+            # artifact upload carries raw bytes, not JSON — handle first
+            if resource == "artifacts" and len(parts) == 4:
+                return self._upload_artifact(r, parts)
             body = self._read_json() or {}
+            if resource == "hosts" and len(parts) == 6 and parts[5] == "telemetry":
+                if not body:
+                    return self._json({"error": "empty body"}, 400)
+                r.record_telemetry(parts[4], body)
+                return self._json({"ok": True})
             if resource == "sessions" and len(parts) == 6 and parts[5] == "messages":
                 s = r.get_session(parts[4])
                 if s is None:
                     return self._json({"error": "session not found"}, 404)
-                r.send_message(parts[4], body.get("message", ""),
+                r.send_message(parts[4],
+                               redact_payload(body.get("message", "")),
                                body.get("artifact_ids"))
                 return self._json({"ok": True})
             if resource == "sessions" and len(parts) == 6 and parts[5] == "actions":
@@ -178,6 +217,22 @@ def _make_handler(server):
                 r.session_action(parts[4], body.get("action"))
                 return self._json({"ok": True})
             return self._json({"error": "not found"}, 404)
+
+        def _upload_artifact(self, r, parts):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0:
+                return self._json({"error": "empty body"}, 400)
+            data = self.rfile.read(length)
+            filename = _q(self.path, "filename") or "upload"
+            mime = _q(self.path, "mime") or \
+                self.headers.get("Content-Type", "application/octet-stream")
+            session_id = _q(self.path, "session_id")
+            mission_id = _q(self.path, "mission_id")
+            aid = r.register_artifact(session_id=session_id,
+                                      mission_id=mission_id,
+                                      original_filename=filename,
+                                      mime_type=mime, data=data)
+            return self._json(r.get_artifact(aid))
 
         # ------------------------------------------------------------ SSE
         def _sse(self):
@@ -251,14 +306,29 @@ def _make_handler(server):
             self.wfile.write(payload)
             return None
 
+        def _bytes(self, data, mime):
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return None
+
         def _send_json(self, status, data):
             return self._json(data, status)
 
     return _Handler
 
 
+def _redact_event(event: dict) -> dict:
+    ev = dict(event)
+    ev["payload"] = redact_payload(ev.get("payload", {}))
+    return ev
+
+
 def _sse_frame(event: dict) -> bytes:
-    return f"data: {json.dumps(event)}\n\n".encode()
+    return f"data: {json.dumps(_redact_event(event))}\n\n".encode()
 
 
 def _q(path, key):

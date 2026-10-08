@@ -29,6 +29,29 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   loading/empty/error/data states via the design-system Web Components
   (`<herdr-app-shell>` sidebar shell, status badges, metric tiles, idents).
   Live updates are SSE-driven (not polling).
+- **Control Plane — Artifacts API (Phases 5, spec 0190 §56-74, §102)** —
+  `POST /api/v1/artifacts` (raw-body upload → stable `artifact_id`, SHA-256,
+  mime, session/mission binding) and `GET /api/v1/artifacts/{id}/download`
+  (streams exact bytes with `Content-Type` + `X-Content-Type-Options: nosniff`).
+  Bytes held in the in-memory repo as the RustFS stand-in; the client is
+  content-addressed and swap-to-RustFS is config-only (Phase 1 ruling).
+- **Control Plane — Host telemetry (Phase 6, spec 0190 §23-25, §89, §105)** —
+  `POST/GET /api/v1/hosts/{id}/telemetry` recording CPU/mem/disk/network/GPU
+  samples per host, plus existing `/api/v1/leases` + `/api/v1/health`
+  (control-plane self-observability).
+- **Control Plane — Hardening (Phase 8, spec 0190 §87-88, §96-104, §106)** —
+  - `control_plane/redact.py` — boundary secret redaction (OpenAI/AWS keys,
+    JWTs/Bearer tokens, passwords/secrets/API keys, private keys, DB
+    connection strings); applied to event payloads in API/SSE responses and to
+    session messages before persistence (secrets never stored/rendered).
+  - `control_plane/retention.py` — TTL-based pruning of high-volume telemetry
+    + old raw event frames + artifact bytes; structured entity records are
+    durable and never auto-deleted (Spec §96, §99).
+  - Backup/restore — `repo.export_state()` / `import_state()` JSON round-trip
+    (Spec §102) with a restore test.
+  - Role-based auth — `api_keys={key: role}` with `viewer` (read-only) /
+    `operator` (read + mutate); `X-API-Key`; unknown key → 401, viewer POST
+    → 403 (Spec §104).
 - **Control Plane — `herdr-eng control-plane web`** subcommand — serves the UI +
   `/api/v1` + SSE private-by-default (`--host 127.0.0.1`), optional `--api-key`,
   from the bundled `packages/` web root.
