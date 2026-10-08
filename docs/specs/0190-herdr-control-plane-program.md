@@ -45,14 +45,14 @@ an orchestration authority.
 
 | Phase | Name | Spec sections | Deliverable | Status |
 |-------|------|---------------|-------------|--------|
-| 1 | Foundation | §4, §49–58, §90, §95, §108, §114, §115 | Postgres+migrations, RustFS, entity IDs, event envelope/sequencing/ingestion, mission/session/service models, state snapshots, artifact model, background-worker scaffold | **plan drafted** |
-| 2 | Shared Design System | §6–16, §92 | `packages/herdr-design-system`, `herdr-web-components`, `herdr-web-client`; tokens, typography, AppShell, shared components | pending |
-| 3 | Core UI | §20–34, §42–47, §85, §91, §92 | `/`, `/overview`, `/missions`, `/missions/:id`, `/herd`, `/herd/session/:id`, `/services`, `/hosts`, `/activity` using design system | pending |
-| 4 | Live HerdR/Pi interaction | §43–45, §52, §62 | session streaming (SSE/WS), message send, approve/reject, steer/interrupt/resume/stop, tool/log/diff/test views | pending |
-| 5 | Artifacts | §56–74, §102 | RustFS integration, drag/drop/paste, routing, per-host cache, session materialization, Pi notification, generated artifacts | pending |
-| 6 | Host & fabric telemetry | §23–25, §89, §105 | CPU/RAM/disk/network/GPU, host+service health, leases, control-plane health, attention queue | pending |
-| 7 | Analytics | §75–84, §96 | token + resource accounting, stage durations, duration/token histograms, model analytics, repair/retry analytics | pending |
-| 8 | Hardening | §87–88, §96–104, §106, §110 | permissions, secret redaction, retention, backups, restore tests, failure recovery, performance, a11y, mobile | pending |
+| 1 | Foundation | §4, §49–58, §90, §95, §108, §114, §115 | Postgres+migrations, RustFS, entity IDs, event envelope/sequencing/ingestion, mission/session/service models, state snapshots, artifact model, background-worker scaffold | **done** (11 commits) |
+| 2 | Shared Design System | §6–16, §92 | `packages/herdr-design-system`, `herdr-web-components`, `herdr-web-client`; tokens, typography, AppShell, shared components | **done** (node-tested) |
+| 3 | Core UI | §20–34, §42–47, §85, §91, §92 | `/`, `/overview`, `/missions`, `/missions/:id`, `/herd`, `/herd/session/:id`, `/services`, `/hosts`, `/activity` using design system | **done** (hash-routed SPA + web-serving tests) |
+| 4 | Live HerdR/Pi interaction | §43–45, §52, §62 | session streaming (SSE/WS), message send, approve/reject, steer/interrupt/resume/stop, tool/log/diff/test views | **done (SSE + messages/actions)** |
+| 5 | Artifacts | §56–74, §102 | RustFS integration, drag/drop/paste, routing, per-host cache, session materialization, Pi notification, generated artifacts | **done (upload/download + materialize)** |
+| 6 | Host & fabric telemetry | §23–25, §89, §105 | CPU/RAM/disk/network/GPU, host+service health, leases, control-plane health, attention queue | **done (telemetry + leases + health)** |
+| 7 | Analytics | §75–84, §96 | token + resource accounting, stage durations, duration/token histograms, model analytics, repair/retry analytics | **done (mission/model/host analytics)** |
+| 8 | Hardening | §87–88, §96–104, §106, §110 | permissions, secret redaction, retention, backups, restore tests, failure recovery, performance, a11y, mobile | **done (RBAC, redaction, retention, backup/restore, reduced-motion)** |
 
 ## Route inventory (Spec §5)
 
