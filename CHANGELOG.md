@@ -52,6 +52,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   - Role-based auth — `api_keys={key: role}` with `viewer` (read-only) /
     `operator` (read + mutate); `X-API-Key`; unknown key → 401, viewer POST
     → 403 (Spec §104).
+- **Control Plane — Durable bridge (spec 0190 §106, §114-115)** —
+  `control_plane/bridge.py`: `load_into(repo, source)` hydrates the in-memory
+  repo from a read-only durable view (Phase-1 Postgres tables: missions,
+  sessions, services, hosts, fabric_events), so the API/UI can serve real
+  persisted state. `PostgresSource` is asyncpg-backed (lazy, graceful
+  degradation if asyncpg is absent); the mapping is pure and unit-tested with
+  fakes (no live DB in CI). `herdr-eng control-plane web --pg-dsn <dsn>`
+  hydrates from Postgres on startup.
 - **Control Plane — `control-plane-web` compose service + `--api-keys` RBAC** —
   compose project now ships a web service (UI + `/api/v1` + SSE, private by
   default, `127.0.0.1:8080:8080`), and `herdr-eng control-plane web` accepts

@@ -236,6 +236,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--api-keys", default=None,
                     help="comma list of key=role (viewer|operator) pairs "
                          "(Spec §104); e.g. k1=viewer,k2=operator")
+    p2.add_argument("--pg-dsn", default=None,
+                    help="optional Postgres DSN to hydrate the repo from "
+                         "durable state on startup (Spec §106)")
     p2.set_defaults(func=_cmd_cp_web)
     p2 = csub.add_parser("worker", help="run the bounded background worker")
     p2.add_argument("--interval", type=float, default=30.0,
@@ -948,8 +951,9 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.repo import ControlPlaneRepo
 
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
+    source = _maybe_pg_source(args.pg_dsn)
     svr = ControlPlaneServer(ControlPlaneRepo(), api_keys=api_keys,
-                             host=args.host, port=args.port)
+                             host=args.host, port=args.port, source=source)
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
@@ -960,6 +964,29 @@ def _cmd_cp_web(args) -> int:
     finally:
         svr.shutdown()
     return 0
+
+
+def _maybe_pg_source(dsn):
+    """Build a PostgresSource from a DSN, or None if not provided."""
+    if not dsn:
+        return None
+    try:
+        import asyncio
+
+        import asyncpg  # noqa: F401  (declared dep; lazy import)
+    except ImportError:
+        print("warning: --pg-dsn requires asyncpg; serving in-memory only",
+              file=sys.stderr)
+        return None
+    from .bridge import PostgresSource
+
+    async def _connect():
+        conn = await asyncpg.connect(dsn)
+        await conn.execute("SELECT 1")
+        return conn
+
+    conn = asyncio.run(_connect())
+    return PostgresSource(conn)
 
 
 def _parse_api_keys(single_key, pairs_str):

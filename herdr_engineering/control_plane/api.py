@@ -32,13 +32,16 @@ class ControlPlaneServer:
     """Structured control-plane API + SSE + static web server."""
 
     def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
-                 port=0, web_root=None):
+                 port=0, web_root=None, source=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
         (read + mutate). No key configured = open (private-by-default bind).
         """
         self.repo = repo
+        if source is not None:
+            from .bridge import load_into
+            load_into(repo, source)
         self._keys = dict(api_keys or {})
         if api_key is not None:
             self._keys[api_key] = "operator"
