@@ -6,6 +6,33 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- **Control Plane — Phase 2 Shared Design System (spec 0190 §6-16, §92)** — new
+  build-free `packages/` workspace shared by every HerdR web surface:
+  - `packages/herdr-design-system/` — canonical **light** theme (ChatGPT-inspired,
+    not dark-NOC) as plain CSS custom properties: surfaces, text, brand accent,
+    semantic status colors, Inter/JetBrains Mono font roles, radius/shadow/
+    motion tokens, plus `base.css` (reset, visible focus ring, reduced-motion).
+    Status is never color-alone — every token pairs with a label/icon.
+  - `packages/herdr-web-components/` — framework-agnostic Web Components
+    (`<herdr-status>`, `<herdr-spinner>`, `<herdr-empty>`, `<herdr-error>`,
+    `<herdr-ident>`, `<herdr-metric>`) with DOM-free pure modules
+    (`status.js`, `format.js`, `util.js`) unit-tested via `node --test`.
+  - `packages/herdr-web-client/` — structured `/api/v1` `HerdrClient` (missions,
+    sessions, services, hosts, activity, analytics, message send, actions,
+    health) + SSE `connectEvents()` live-update helper; injectable fetch/
+    EventSource for node tests.
+- **Control Plane — structured repository + API/SSE server (spec 0190 §20-34,
+  §42-47, §52, §85, §91-92)** — the UI-is-a-client backbone:
+  - `control_plane/repo.py` — in-memory, event-sourced `ControlPlaneRepo`
+    (missions/sessions/services/hosts/artifacts/leases) with stable identity,
+    dynamic location, 0-indexed per-stream event sequencing, replayable
+    `recent_events`, pub/sub `subscribe()`, and mission/model/host analytics.
+  - `control_plane/api.py` — stdlib `ControlPlaneServer` exposing structured
+    `GET/POST /api/v1/*` JSON + **SSE** live stream (with initial frame + history
+    replay + auto-reconnect), optional `X-API-Key` auth, and static serving of
+    the design-system/web packages. Private-by-default (loopback/tailnet),
+    daemon handler threads (a stuck SSE client can never block shutdown).
+
 - **HerdR Dev Fabric Control Plane — Phase 1 Foundation (spec 0190)** — new
   `herdr_engineering/control_plane/` subpackage laying the structured-state
   backbone for the unified `http://dev.lan` control plane:

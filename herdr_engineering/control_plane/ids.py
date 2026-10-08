@@ -6,7 +6,7 @@ from typing import Final
 
 _KINDS: Final[frozenset[str]] = frozenset({
     "mission", "session", "service", "artifact",
-    "host", "agent", "plan", "worktree",
+    "host", "agent", "plan", "worktree", "event", "lease",
 })
 # Crockford base32 in ASCII order (0-9 then a-z, omitting i/l/o/u) so the
 # integer encoding is lexicographically sortable.
