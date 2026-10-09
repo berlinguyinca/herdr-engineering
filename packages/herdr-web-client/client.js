@@ -27,7 +27,11 @@ export class HerdrClient {
       headers['Content-Type'] = 'application/json';
       payload = JSON.stringify(body);
     }
-    const res = await this.fetch(url, { method, headers, body: payload });
+    // Call fetch detached: the native Window.fetch throws "Illegal
+    // invocation" if it is invoked as a method (receiver = this client),
+    // so extract it to a local first (this === undefined).
+    const doFetch = this.fetch;
+    const res = await doFetch(url, { method, headers, body: payload });
     const text = await res.text();
     let json;
     try {
