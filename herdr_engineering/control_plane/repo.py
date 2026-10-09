@@ -26,7 +26,10 @@ _SESSION_ACTIONS = {"steer", "approve", "interrupt", "resume", "stop"}
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
-    def __init__(self, *, now=None):
+    def __init__(self, *, now=None, sink=None):
+        """``sink`` is an optional durable writer (e.g. DurableEventSink) called
+        with each recorded event so ingestion survives a restart."""
+        self._sink = sink
         self._now = now or (lambda: time.time())
         self._missions = {}
         self._sessions = {}
@@ -302,6 +305,11 @@ class ControlPlaneRepo:
         }
         stream.append(ev)
         self._event_order.append((entity_type, entity_id, seq))
+        if self._sink is not None:
+            try:
+                self._sink.record(ev)
+            except Exception:
+                pass  # a sink must never break event recording
         for listener in self._listeners:
             try:
                 listener(_copy(ev))
