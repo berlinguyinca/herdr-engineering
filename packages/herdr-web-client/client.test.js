@@ -59,6 +59,21 @@ test('ApiError carries status and body on non-2xx', async () => {
   });
 });
 
+test('calls fetch detached so native Window.fetch does not throw', async () => {
+  // Simulates a browser where fetch is `this`-sensitive: calling it as a
+  // method (receiver != undefined) throws "Illegal invocation".
+  function browserFetch(url, opts) {
+    if (this !== undefined) {
+      throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) };
+  }
+  const client = new HerdrClient('', { fetchImpl: browserFetch });
+  const res = await client.listMissions();
+  assert.deepEqual(res, { ok: true });
+});
+
+
 test('connectEvents dispatches parsed events and disconnects cleanly', () => {
   const seen = [];
   let handler = null;
