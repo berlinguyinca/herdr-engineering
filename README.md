@@ -325,6 +325,27 @@ The UI subscribes to `/api/v1/events/stream` (SSE) for live updates — no
 polling. Secrets in event payloads and messages are redacted at the API
 boundary (never stored or rendered).
 
+#### Live-Postgres end-to-end test (opt-in)
+
+The default suite is pure-in-memory (no live Postgres needed in CI). The one
+suite that touches a real database is `tests/control_plane/test_e2e_live_db.py`;
+it **skips unless** you point it at a throwaway Postgres via `HERDR_E2E_PG_DSN`
+(and `asyncpg` is installed). It exercises the full durable round-trip the
+deployed stack uses: `Migrator` applies `deploy/control-plane/migrations`, rows
+are seeded into `missions`/`sessions`/`services`/`hosts`/`fabric_events`, then
+`PostgresSource`+`load_into` hydrate a `ControlPlaneRepo` and a real
+`ControlPlaneServer` serves it over `/api/v1` (`/health` reports `source: postgres`).
+Teardown drops the schema, so the target database stays reusable and the real
+`herdr` DB is never touched.
+
+```bash
+# create a dedicated throwaway database (default postgres user is a superuser)
+docker exec herdr-cp-postgres psql -U "$HERDR_CP_PG_USER" -d postgres -c 'CREATE DATABASE herdr_e2e'
+# point the test at it and run just the live e2e suite
+HERDR_E2E_PG_DSN="postgresql://$HERDR_CP_PG_USER:$HERDR_CP_PG_PASSWORD@127.0.0.1:15433/herdr_e2e" \
+  .venv/bin/pytest tests/control_plane/test_e2e_live_db.py
+```
+
 ## Implementation order
 
 `SPEC_MANIFEST.yaml` is the machine-readable source of order and dependencies. `docs/implementation-roadmap.md` visualizes the dependency graph, while `docs/spec-genealogy.md` maps every predecessor HerdR specification into the current program. Humans should start with:
