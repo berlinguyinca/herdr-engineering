@@ -21,6 +21,32 @@ def test_redact_text_masks_common_secrets():
     assert "[REDACTED]" in out
 
 
+def test_redact_text_masks_extended_secret_forms():
+    # connection strings for more schemes + OpenSSH blocks + client_secret
+    t = (
+        "dsn=postgresql://u:hunter2@db:5432/herdr "
+        "client_secret=abc123def456 "
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
+    )
+    out = redact_text(t)
+    assert "hunter2" not in out
+    assert "abc123def456" not in out
+    assert "BEGIN OPENSSH PRIVATE KEY" not in out  # whole block redacted
+    assert "[REDACTED]" in out
+
+
+def test_redact_payload_redacts_dsn_and_connection_keys():
+    payload = {
+        "name": "ok",
+        "dsn": "postgresql://herdr:secretpw@postgres:5432/herdr",
+        "connection_string": "mysql://root:rootpw@db:3306/x",
+    }
+    out = redact_payload(payload)
+    assert out["dsn"] == "[REDACTED]"
+    assert out["connection_string"] == "[REDACTED]"
+    assert out["name"] == "ok"
+
+
 def test_redact_payload_walks_nested_structures():
     payload = {
         "message": "use token sk-xyz",
@@ -172,3 +198,52 @@ def test_loopback_host_detection():
     assert not _is_loopback("0.0.0.0")
     assert not _is_loopback("10.0.0.5")
     assert not _is_loopback("100.104.39.6")
+
+
+# -------------------------------------------------------- rate limiting
+def test_rate_limiter_returns_429_when_burst_exceeds():
+    from herdr_engineering.control_plane.api import _RateLimiter
+    rl = _RateLimiter(max_requests=2, window_seconds=60)
+    assert rl.allow("ip")
+    assert rl.allow("ip")
+    assert not rl.allow("ip")   # third in the window is rejected
+    assert rl.allow("other-ip")  # a different client is unaffected
+
+
+def test_rate_limit_api_returns_429(monkeypatch):
+    from herdr_engineering.control_plane.api import _RateLimiter
+    repo = ControlPlaneRepo()
+    svr = ControlPlaneServer(repo)
+    # shrink the limiter so a small burst trips it
+    svr._limiter = _RateLimiter(max_requests=3, window_seconds=60)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    base = f"http://127.0.0.1:{svr.port}"
+    try:
+        codes = []
+        for _ in range(5):
+            try:
+                with urllib.request.urlopen(f"{base}/api/v1/health") as resp:
+                    codes.append(resp.status)
+            except urllib.error.HTTPError as e:
+                codes.append(e.code)
+        assert codes.count(429) >= 1
+        assert codes.count(200) >= 1
+    finally:
+        svr.shutdown()
+
+
+# ------------------------------------------------- postgres-source health
+def test_health_reports_postgres_when_source_present():
+    class _EmptySource:
+        def missions(self): return []
+        def sessions(self): return []
+        def services(self): return []
+        def hosts(self): return []
+        def events(self): return []
+    repo = ControlPlaneRepo()
+    svr = ControlPlaneServer(repo, source=_EmptySource())
+    h = svr._health()
+    assert h["source"] == "postgres"
+    assert h["version"] == "0.1.0"

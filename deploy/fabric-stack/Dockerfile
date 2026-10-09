@@ -14,6 +14,12 @@
 #   docker build -f deploy/fabric-stack/Dockerfile .
 FROM python:3.12-slim
 
+# Optional build stamp surfaced by /api/v1/health (commit=). Passed via
+# `docker compose build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`;
+# defaults to "dev" for un-stamped / local builds.
+ARG GIT_COMMIT=dev
+ENV HERDR_ENGINEERING_COMMIT=$GIT_COMMIT
+
 # curl = container healthchecks; ca-certificates = HTTPS proxy targets.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates \

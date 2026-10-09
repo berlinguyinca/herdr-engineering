@@ -12,13 +12,20 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import queue
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from ..version import __version__
 from .redact import redact_payload
+
+# Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
+# back to "dev" in a local checkout / un-stamped image.
+_COMMIT = os.environ.get("HERDR_ENGINEERING_COMMIT", "dev")
 
 
 def _is_loopback(host: str) -> bool:
@@ -38,6 +45,32 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
     # Handler threads are daemons so a stuck SSE client can never block
     # server shutdown / process exit.
     daemon_threads = True
+
+
+class _RateLimiter:
+    """Tiny in-memory per-client sliding-window limiter (best-effort).
+
+    Guards against runaway clients / accidental tight loops; not a security
+    boundary. Keyed by client IP with a generous default so it never hinders
+    normal use within the Tailnet. SSE streams are excluded (long-lived).
+    """
+
+    def __init__(self, max_requests=120, window_seconds=60):
+        self.max_requests = max_requests
+        self.window = window_seconds
+        self._hits = {}  # key -> list of monotonic timestamps
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            hits = [t for t in self._hits.get(key, []) if now - t < self.window]
+            if len(hits) >= self.max_requests:
+                self._hits[key] = hits
+                return False
+            hits.append(now)
+            self._hits[key] = hits
+            return True
 
 
 class ControlPlaneServer:
@@ -60,6 +93,8 @@ class ControlPlaneServer:
         if source is not None:
             from .bridge import load_into
             load_into(repo, source)
+        self.source = source
+        self._limiter = _RateLimiter()
         self._keys = dict(api_keys or {})
         if api_key is not None:
             self._keys[api_key] = "operator"
@@ -83,6 +118,15 @@ class ControlPlaneServer:
         self._httpd = None
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    def _health(self):
+        """Repo stats + deployment context (source backend, image version/commit)."""
+        h = self.repo.health()
+        h["source"] = "postgres" if self.source is not None else "memory"
+        h["rustfs"] = "memory"  # object store is an in-memory stand-in (MinIO not wired here)
+        h["version"] = __version__
+        h["commit"] = _COMMIT
+        return h
 
     # ------------------------------------------------------- SSE plumbing
     def _broadcast(self, event):
@@ -159,10 +203,27 @@ def _make_handler(server):
                 return self._route_api()
             return self._send_json(404, {"error": "not found"})
 
+        def _rate_limit(self):
+            # Skip SSE streams: they are long-lived connections, not bursts.
+            if self.path.split("?")[0].rstrip("/").endswith("/events/stream"):
+                return None
+            if server._limiter.allow(self.client_address[0]):
+                return None
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", str(server._limiter.window))
+            payload = json.dumps({"error": "too many requests"}).encode()
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return None
+
         def _route_api(self):
             path = self.path.split("?")[0]
             parts = path.split("/")  # ['', 'api', 'v1', resource, ...]
             resource = parts[3]
+            if self._rate_limit():
+                return None
             try:
                 if self.command == "GET":
                     return self._api_get(parts, resource)
@@ -175,7 +236,7 @@ def _make_handler(server):
         def _api_get(self, parts, resource):
             r = server.repo
             if resource == "health":
-                return self._json(r.health())
+                return self._json(server._health())
             if resource == "missions":
                 if len(parts) > 4:
                     m = r.get_mission(parts[4])

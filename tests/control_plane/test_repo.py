@@ -111,7 +111,10 @@ def test_health_reports_self_observability():
     r = repo.ControlPlaneRepo()
     h = r.health()
     assert h["status"] == "ok"
-    assert "postgres" in h and "events" in h
+    # repo-level stats; deployment context (source/version/commit) is overlaid
+    # by the HTTP server, not the repo itself
+    assert "events" in h and "missions" in h and "timestamp" in h
+    assert "postgres" not in h
     assert h["events"]["ingested"] == 0
 
 

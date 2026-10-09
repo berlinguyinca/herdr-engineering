@@ -50,6 +50,17 @@ def test_health(server):
     assert json.loads(body)["status"] == "ok"
 
 
+def test_health_reports_deployment_context(server):
+    c, _ = server
+    _, _, body = c.get("/api/v1/health")
+    h = json.loads(body)
+    # an in-memory repo reports source=memory + image version/commit
+    assert h["source"] == "memory"
+    assert h["version"] == "0.1.0"
+    assert h["commit"] == "dev"
+    assert "missions" in h and "timestamp" in h
+
+
 def test_missions_roundtrip(server):
     c, repo = server
     mid = repo.create_mission("Dynamic Aliases")

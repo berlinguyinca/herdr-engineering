@@ -310,6 +310,12 @@ Deployed on **bender**, the control-plane stack serves the HerdR UI at
 - MinIO is pinned to `minio/minio:RELEASE.2025-09-07T16-13-09Z` (`minio:latest`
   is not always pullable); swap the image for a real RustFS image later —
   config-only.
+- The image is stamped with the build commit (visible in `/api/v1/health`):
+  build with `docker compose build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`.
+- **TLS:** traffic inside the Tailnet is already WireGuard-encrypted, so plain
+  HTTP on `dev.lan` is fine. To expose beyond the tailnet, terminate TLS with
+  `tailscale serve --https=443 http://127.0.0.1:8080` on bender (gives an HTTPS
+  URL) — the app itself does not do TLS termination.
 
 Note: the web hydrates from Postgres **once at startup**, so it reflects a
 snapshot of durable state; live updates flow over SSE. Restart the web to

@@ -6,6 +6,22 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- **Operability of the live control plane**:
+  - `/api/v1/health` now reports accurate deployment context — `source`
+    (`postgres` when hydrated from durable state, else `memory`), image
+    `version`, and a build-time `commit` stamp (Dockerfile `GIT_COMMIT` build
+    arg / `HERDR_ENGINEERING_COMMIT` env; `dev` for local builds).
+  - Lightweight per-client **rate limiting** on `/api/v1` (in-memory
+    sliding window, generous default, SSE streams excluded) with `429` +
+    `Retry-After`.
+  - **Redaction** extended: `client_secret`/`authorization`/`x-api-key`/`auth`
+    keys, `dsn`/`connection_string` key hints, OpenSSH private-key blocks, and
+    more connection-string schemes (`postgresql`, `rediss`, `mongodb+srv`,
+    `amqp`, `minio`, ...).
+  - README documents the TLS path (`tailscale serve --https` on bender) for
+    exposure beyond the Tailnet.
+
+### Added
 - **Live deploy of the control-plane compose stack on bender** — the HerdR UI
   is now served at `http://dev.lan` (port 80) on the Tailnet IP, backed by
   durable Postgres + MinIO. Compose now reads `HERDR_CP_PG_DSN` (generated into

@@ -92,6 +92,10 @@ services:
     build:
       context: ../..
       dockerfile: deploy/fabric-stack/Dockerfile
+      # Build-time commit stamp surfaced by /api/v1/health; override with
+      # `docker compose build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`.
+      args:
+        GIT_COMMIT: ${HERDR_CP_GIT_COMMIT:-dev}
     image: herdr-engineering:0.1.0
     container_name: herdr-cp-web
     restart: unless-stopped
@@ -131,6 +135,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/fabric-stack/Dockerfile
+      args:
+        GIT_COMMIT: ${HERDR_CP_GIT_COMMIT:-dev}
     image: herdr-engineering:0.1.0
     container_name: herdr-cp-worker
     restart: unless-stopped

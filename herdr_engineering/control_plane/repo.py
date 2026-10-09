@@ -388,10 +388,12 @@ class ControlPlaneRepo:
 
     # --------------------------------------------------------------- health
     def health(self):
+        # Repo-level stats only. Deployment context (whether this repo is
+        # hydrated from durable Postgres, image version/commit) is overlaid by
+        # the HTTP server in api.ControlPlaneServer._health(), because the repo
+        # itself cannot know about its source.
         return {
             "status": "ok",
-            "postgres": {"connected": False, "note": "in-memory repo (Phase 8 bridges asyncpg)"},
-            "rustfs": {"connected": False, "note": "in-memory repo"},
             "events": {"ingested": len(self._event_order)},
             "missions": len(self._missions), "sessions": len(self._sessions),
             "hosts": len(self._hosts), "services": len(self._services),
