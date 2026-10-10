@@ -288,8 +288,15 @@ class ControlPlaneRepo:
         if model:
             existing["model"] = model
         existing["status"] = status
+        # Carry the full identity state in the delta so event-sourced
+        # hydration (bridge._reconstruct_from_events) can rebuild the record.
         self.record_event("session", session_id, "SessionUpdated",
-                          {"status": status}, mission_id=existing["mission_id"],
+                          {"host_id": existing["host_id"],
+                           "mission_id": existing["mission_id"],
+                           "agent_role": existing["agent_role"],
+                           "model": existing["model"],
+                           "status": existing["status"]},
+                          mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)
 
@@ -313,7 +320,11 @@ class ControlPlaneRepo:
         if stage:
             existing["stage"] = existing["status"] = stage
         self.record_event("mission", mission_id, "MissionUpdated",
-                          {"stage": stage}, mission_id=mission_id)
+                          {"title": existing["title"],
+                           "purpose": existing["purpose"],
+                           "stage": existing["stage"],
+                           "status": existing["status"]},
+                          mission_id=mission_id)
         return _copy(existing)
 
     # ------------------------------------------------------------- artifacts
