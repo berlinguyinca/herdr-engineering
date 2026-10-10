@@ -1,6 +1,7 @@
 """Event envelope, sequencing, and idempotent ingestion (Spec §48-51)."""
 from __future__ import annotations
 
+import json
 import secrets
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -68,6 +69,11 @@ class EventStore:
 
     async def append(self, event: Event) -> bool:
         """Insert the event; return False if event_id already exists."""
+        # asyncpg's jsonb codec expects a str, not a dict (it encodes str as
+        # JSON). Serialize the payload here so the durable write path works.
+        payload = event.payload
+        if not isinstance(payload, str):
+            payload = json.dumps(payload or {})
         try:
             row = await self._conn.fetchrow(
                 f"INSERT INTO {self._table} "
@@ -78,7 +84,7 @@ class EventStore:
                 "ON CONFLICT (event_id) DO NOTHING RETURNING event_id",
                 event.event_id, event.sequence, event.event_type,
                 event.entity_type, event.entity_id, event.mission_id,
-                event.session_id, event.payload, event.source_timestamp,
+                event.session_id, payload, event.source_timestamp,
                 event.ingest_timestamp, event.schema_version,
             )
         except Exception:
@@ -97,6 +103,12 @@ class EventStore:
 
 
 def _row_to_event(row: dict[str, Any]) -> Event:
+    payload = row.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (ValueError, TypeError):
+            payload = {}
     return Event(
         event_id=row["event_id"],
         schema_version=row.get("schema_version", 1),
@@ -108,5 +120,5 @@ def _row_to_event(row: dict[str, Any]) -> Event:
         session_id=row.get("session_id"),
         sequence=row["sequence"],
         event_type=row["event_type"],
-        payload=row.get("payload") or {},
+        payload=payload,
     )

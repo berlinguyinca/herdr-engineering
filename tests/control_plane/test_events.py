@@ -59,6 +59,22 @@ def test_make_event_envelope():
     assert isinstance(e.source_timestamp, datetime) and e.source_timestamp.tzinfo is not None
 
 
+def test_append_serializes_dict_payload_to_json_and_read_decodes():
+    """asyncpg's jsonb codec needs a str; append must encode and read decode."""
+    fake = _FakeEvents()
+    store = events.EventStore(fake)
+    ev = events.make_event("mission", "m1", "MissionCreated",
+                           payload={"a": 1, "nested": {"b": [1, 2]}},
+                           mission_id="m1")
+    ev = events.Event(**{**ev.__dict__, "sequence": 0})
+    assert _run(store.append(ev)) is True
+    # append handed a JSON string to the asyncpg-style conn, not a dict
+    assert isinstance(fake.rows[0]["payload"], str)
+    # reading it back decodes the string into a dict payload
+    back = _run(store.read_stream("mission", "m1"))
+    assert back[0].payload == {"a": 1, "nested": {"b": [1, 2]}}
+
+
 def test_append_is_idempotent_and_sequences():
     store = events.EventStore(_FakeEvents())
     e1 = events.make_event("mission", "m1", "MissionCreated", mission_id="m1")
