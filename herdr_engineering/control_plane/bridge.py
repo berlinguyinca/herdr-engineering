@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import json
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -144,6 +145,107 @@ def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
     return streams, order
 
 
+def _ev_payload(event: dict) -> dict:
+    """Return an event's payload as a dict (asyncpg yields jsonb as a str)."""
+    p = event.get("payload") or {}
+    if isinstance(p, str):
+        try:
+            p = json.loads(p)
+        except (ValueError, TypeError):
+            p = {}
+    return p
+
+
+def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict]:
+    """Replay the event log to rebuild hosts/missions/sessions (event sourcing).
+
+    ``streams`` is the ``{stream: [events]}`` dict from ``_rebuild_events``.
+    Flattened into ingest order, this reconstructs the structured entities that
+    the durable write path persists *as events*, so ingestion survives a
+    restart even though only ``fabric_events`` is written to. Returns
+    ``(missions, sessions, hosts)`` dicts keyed by id.
+    """
+    missions: dict = {}
+    sessions: dict = {}
+    hosts: dict = {}
+    flat: list[dict] = []
+    for stream in streams.values():
+        flat.extend(stream)
+    flat.sort(key=lambda e: (e.get("ingest_timestamp") or "",
+                             e.get("sequence") or 0))
+    for ev in flat:
+        et, eid = ev.get("entity_type"), ev.get("entity_id")
+        if not et or not eid:
+            continue
+        ts = _iso(ev.get("source_timestamp"))
+        p = _ev_payload(ev)
+        etype = ev.get("event_type") or ""
+        if et == "host":
+            h = hosts.setdefault(eid, {
+                "host_id": eid, "host_name": None, "tailnet_ip": None,
+                "cpu": None, "mem": None, "status": "healthy",
+                "created_at": ts, "updated_at": ts,
+            })
+            if p.get("host_name"):
+                h["host_name"] = p["host_name"]
+            if p.get("tailnet_ip"):
+                h["tailnet_ip"] = p["tailnet_ip"]
+            if p.get("cpu") is not None:
+                h["cpu"] = p["cpu"]
+            if p.get("mem") is not None:
+                h["mem"] = p["mem"]
+            h["status"] = "unavailable" if "unavailable" in etype.lower() else "healthy"
+            h["updated_at"] = ts
+        elif et == "mission":
+            m = missions.setdefault(eid, {
+                "mission_id": eid, "title": eid, "purpose": "",
+                "stage": "active", "status": "active", "created_at": ts,
+                "updated_at": ts, "sessions": [],
+            })
+            if p.get("title"):
+                m["title"] = p["title"]
+            if p.get("purpose"):
+                m["purpose"] = p["purpose"]
+            if etype == "MissionStageChanged" and p.get("to"):
+                m["stage"] = m["status"] = p["to"]
+            elif p.get("stage"):
+                m["stage"] = m["status"] = p["stage"]
+            m["updated_at"] = ts
+        elif et == "session":
+            s = sessions.setdefault(eid, {
+                "session_id": eid, "mission_id": None, "host_id": None,
+                "agent_role": "", "model": "", "status": "active",
+                "created_at": ts, "updated_at": ts, "messages": 0,
+                "tool_calls": 0,
+            })
+            if p.get("mission_id"):
+                s["mission_id"] = p["mission_id"]
+            if p.get("host_id"):
+                s["host_id"] = p["host_id"]
+            if p.get("agent_role"):
+                s["agent_role"] = p["agent_role"]
+            if p.get("model"):
+                s["model"] = p["model"]
+            if etype == "SessionAction":
+                action = p.get("action")
+                if action in ("stop", "terminate"):
+                    s["status"] = "stopped"
+                elif action:
+                    s["status"] = "active"
+            elif p.get("status"):
+                s["status"] = p["status"]
+            if "messagesent" in etype.lower() or etype == "SessionMessage":
+                s["messages"] = (s.get("messages") or 0) + 1
+            if "toolcalled" in etype.lower() or etype == "SessionToolCall":
+                s["tool_calls"] = (s.get("tool_calls") or 0) + 1
+            s["updated_at"] = ts
+    for sid, s in sessions.items():
+        mid = s.get("mission_id")
+        if mid and mid in missions and sid not in missions[mid]["sessions"]:
+            missions[mid]["sessions"].append(sid)
+    return missions, sessions, hosts
+
+
 def load_into(repo, source: DurableSource) -> dict:
     """Hydrate ``repo`` from ``source``. Idempotent; returns counts.
 
@@ -207,6 +309,34 @@ def load_into(repo, source: DurableSource) -> dict:
         }
 
     events, event_order = _rebuild_events(source.events())
+
+    # Reconstruct the ingestion-managed entities from the event log so durable
+    # events (the only thing the write-through sink persists) survive restart.
+    # Structured-table rows still win where they carry richer state; event
+    # replay fills in entities whose events were persisted but whose structured
+    # row was never written.
+    def _overlay(base: dict, extra: dict) -> None:
+        """Fill gaps in ``base`` from ``extra``; structured rows win."""
+        for k, v in extra.items():
+            if k == "sessions":
+                merged = base.setdefault("sessions", [])
+                for sid in v:
+                    if sid not in merged:
+                        merged.append(sid)
+            elif base.get(k) in (None, "", []):
+                base[k] = v
+
+    rmissions, rsessions, rhosts = _reconstruct_from_events(events)
+    for mid, m in rmissions.items():
+        _overlay(missions.setdefault(mid, m), m)
+    for sid, s in rsessions.items():
+        _overlay(sessions.setdefault(sid, s), s)
+    for hid, h in rhosts.items():
+        _overlay(hosts.setdefault(hid, h), h)
+    for sid, s in sessions.items():
+        mid = s.get("mission_id")
+        if mid in missions and sid not in missions[mid]["sessions"]:
+            missions[mid]["sessions"].append(sid)
 
     repo.import_state({
         "version": 1,
