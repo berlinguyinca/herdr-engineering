@@ -226,6 +226,96 @@ class ControlPlaneRepo:
         samples = self._telemetry.get(host_id, [])
         return samples[-limit:]
 
+    # ---------------------------------------------------------- ingestion
+    # Idempotent upserts that honor an external (runtime-supplied) entity id, so
+    # agents/machines can report their lifecycle without minting new ids on every
+    # heartbeat. The durable sink persists each recorded event, so re-hydration
+    # after a restart reproduces exactly the same stable entities.
+
+    def upsert_host(self, host_id, host_name, tailnet_ip, *,
+                    cpu=None, mem=None, status="healthy"):
+        stamp = self._stamp()
+        existing = self._hosts.get(host_id)
+        if existing is None:
+            rec = {"host_id": host_id, "host_name": host_name,
+                   "tailnet_ip": tailnet_ip, "status": status,
+                   "cpu": cpu, "mem": mem,
+                   "last_seen": stamp, "created_at": stamp}
+            self._hosts[host_id] = rec
+            self.record_event("host", host_id, "HostRegistered",
+                              {"host_name": host_name,
+                               "tailnet_ip": tailnet_ip})
+            return _copy(rec)
+        existing["host_name"] = host_name or existing["host_name"]
+        existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
+        existing["status"] = status
+        existing["last_seen"] = stamp
+        if cpu is not None:
+            existing["cpu"] = cpu
+        if mem is not None:
+            existing["mem"] = mem
+        self.record_event("host", host_id, "HostHeartbeat",
+                          {"host_name": existing["host_name"],
+                           "tailnet_ip": existing["tailnet_ip"],
+                           "cpu": cpu, "mem": mem})
+        return _copy(existing)
+
+    def upsert_session(self, session_id, *, host_id=None, mission_id=None,
+                       agent_role="", model="", status="active"):
+        stamp = self._stamp()
+        existing = self._sessions.get(session_id)
+        if existing is None:
+            rec = {"session_id": session_id, "mission_id": mission_id,
+                   "host_id": host_id, "agent_role": agent_role,
+                   "model": model, "status": status,
+                   "created_at": stamp, "updated_at": stamp,
+                   "messages": 0, "tool_calls": 0}
+            self._sessions[session_id] = rec
+            if mission_id and mission_id in self._missions:
+                self._missions[mission_id]["sessions"].append(session_id)
+            self.record_event("session", session_id, "SessionStarted",
+                              {"host_id": host_id, "mission_id": mission_id,
+                               "agent_role": agent_role, "model": model},
+                              mission_id=mission_id, session_id=session_id)
+            return _copy(rec)
+        existing["updated_at"] = stamp
+        if host_id is not None:
+            existing["host_id"] = host_id
+        if mission_id is not None:
+            existing["mission_id"] = mission_id
+        if agent_role:
+            existing["agent_role"] = agent_role
+        if model:
+            existing["model"] = model
+        existing["status"] = status
+        self.record_event("session", session_id, "SessionUpdated",
+                          {"status": status}, mission_id=existing["mission_id"],
+                          session_id=session_id)
+        return _copy(existing)
+
+    def upsert_mission(self, mission_id, *, title, purpose="", stage="active"):
+        stamp = self._stamp()
+        existing = self._missions.get(mission_id)
+        if existing is None:
+            rec = {"mission_id": mission_id, "title": title,
+                   "purpose": purpose, "stage": stage, "status": stage,
+                   "created_at": stamp, "updated_at": stamp, "sessions": []}
+            self._missions[mission_id] = rec
+            self.record_event("mission", mission_id, "MissionStarted",
+                              {"title": title, "purpose": purpose,
+                               "stage": stage}, mission_id=mission_id)
+            return _copy(rec)
+        existing["updated_at"] = stamp
+        if title:
+            existing["title"] = title
+        if purpose:
+            existing["purpose"] = purpose
+        if stage:
+            existing["stage"] = existing["status"] = stage
+        self.record_event("mission", mission_id, "MissionUpdated",
+                          {"stage": stage}, mission_id=mission_id)
+        return _copy(existing)
+
     # ------------------------------------------------------------- artifacts
     def register_artifact(self, session_id=None, original_filename="",
                           mime_type="", size_bytes=0, sha256="",

@@ -94,6 +94,8 @@ class ControlPlaneServer:
             from .bridge import load_into
             load_into(repo, source)
         self.source = source
+        from .ingest import IngestService
+        self.ingest = IngestService(repo)
         self._limiter = _RateLimiter()
         self._keys = dict(api_keys or {})
         if api_key is not None:
@@ -297,6 +299,9 @@ def _make_handler(server):
                 return self._bytes(data, a.get("mime_type", "application/octet-stream"))
             if resource == "leases":
                 return self._json({"leases": r.list_leases()})
+            if resource == "ingest":
+                return self._json({"endpoint": "POST /api/v1/ingest",
+                                   "entities": ["host", "session", "mission"]})
             return self._json({"error": "not found"}, 404)
 
         def _api_post(self, parts, resource):
@@ -324,6 +329,11 @@ def _make_handler(server):
                     return self._json({"error": "session not found"}, 404)
                 r.session_action(parts[4], body.get("action"))
                 return self._json({"ok": True})
+            if resource == "ingest" and len(parts) == 4:
+                if not body:
+                    return self._json({"error": "empty body"}, 400)
+                entity = server.ingest.ingest(redact_payload(body))
+                return self._json({"ok": True, "entity": entity})
             return self._json({"error": "not found"}, 404)
 
         def _upload_artifact(self, r, parts):

@@ -965,14 +965,20 @@ def _cmd_cp_web(args) -> int:
     """
     from .control_plane.api import ControlPlaneServer
     from .control_plane.repo import ControlPlaneRepo
+    from .control_plane.sink import DurableEventSink
 
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
-    repo = ControlPlaneRepo()
-    if args.seed_demo:
-        _seed_demo(repo)
     # In the compose stack the DSN is supplied via the HERDR_CP_PG_DSN env var
     # (from env_file: .env) so the password never appears in process args.
-    source = _maybe_pg_source(args.pg_dsn or os.environ.get("HERDR_CP_PG_DSN"))
+    dsn = args.pg_dsn or os.environ.get("HERDR_CP_PG_DSN")
+    source = _maybe_pg_source(dsn)
+    # When durable storage is wired, attach a write-through sink so every
+    # ingested event persists to Postgres instead of dying with the in-memory
+    # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
+    sink = DurableEventSink(dsn=dsn) if dsn else None
+    repo = ControlPlaneRepo(sink=sink)
+    if args.seed_demo:
+        _seed_demo(repo)
     svr = ControlPlaneServer(repo, api_keys=api_keys,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root, allow_open=args.allow_open)

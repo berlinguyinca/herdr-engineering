@@ -202,3 +202,34 @@ def test_auth_required_when_key_set():
             assert r.status == 200
     finally:
         svr.shutdown()
+
+
+def test_ingest_endpoint_upserts_host(server):
+    c, repo = server
+    status, body = c.post("/api/v1/ingest", {
+        "entity_type": "host", "entity_id": "bender",
+        "event_type": "host.registered",
+        "payload": {"host_name": "bender", "tailnet_ip": "100.104.39.6"}})
+    assert status == 200
+    assert json.loads(body)["ok"] is True
+    status, body = c.post("/api/v1/ingest", {
+        "entity_type": "host", "entity_id": "bender",
+        "event_type": "host.heartbeat",
+        "payload": {"cpu": 12, "mem": 40}})
+    assert status == 200
+    hosts = repo.list_hosts()
+    assert len(hosts) == 1  # idempotent — one stable host
+    assert hosts[0]["cpu"] == 12
+    # the ingested events are visible to a GET on the same stream
+    _, _, stream = c.get("/api/v1/events?entity_type=host&entity_id=bender")
+    evs = json.loads(stream)["events"]
+    assert [e["event_type"] for e in evs] == [
+        "HostRegistered", "HostHeartbeat"]
+
+
+def test_ingest_endpoint_validates_body(server):
+    c, _ = server
+    status, body = c.post("/api/v1/ingest", {"entity_type": "host"})
+    assert status == 400
+    status, body = c.post("/api/v1/ingest", {})
+    assert status == 400

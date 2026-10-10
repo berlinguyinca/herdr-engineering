@@ -164,6 +164,37 @@ def test_migrations_applied_and_round_trip_hydration(seeded_db):
     assert repo.recent_events(limit=1)[0]["event_type"] == "MissionStageChanged"
 
 
+def test_durable_sink_ingest_survives_restart(seeded_db):
+    """Ingesting via the sink persists to Postgres; a fresh repo (a simulated
+    web restart) re-hydrates the exact same entity from the durable log."""
+    from herdr_engineering.control_plane.ingest import IngestService
+    from herdr_engineering.control_plane.sink import DurableEventSink
+
+    live = ControlPlaneRepo(sink=DurableEventSink(dsn=_PG_DSN))
+    IngestService(live).ingest({
+        "entity_type": "host", "entity_id": "e2e-ingest-host",
+        "event_type": "host.registered",
+        "payload": {"host_name": "ingest-host", "tailnet_ip": "100.64.9.9"}})
+    IngestService(live).ingest({
+        "entity_type": "host", "entity_id": "e2e-ingest-host",
+        "event_type": "host.heartbeat",
+        "payload": {"cpu": 7, "mem": 33}})
+
+    # Simulate a web restart: a brand-new repo hydrated from Postgres alone.
+    fresh = ControlPlaneRepo()
+    counts = load_into(fresh, PostgresSource(dsn=_PG_DSN))
+    h = fresh.get_host("e2e-ingest-host")
+    assert h is not None
+    assert h["host_name"] == "ingest-host"
+    assert h["cpu"] == 7
+    assert h["tailnet_ip"] == "100.64.9.9"
+    # Both ingested events made it into the durable event log.
+    stream = fresh.stream("host", "e2e-ingest-host")
+    assert [e["event_type"] for e in stream] == [
+        "HostRegistered", "HostHeartbeat"]
+    assert counts["events"] >= 2
+
+
 def test_web_serves_postgres_hydrated_state(seeded_db):
     """A real ControlPlaneServer reads the durable state and serves it over HTTP."""
     from herdr_engineering.control_plane.api import ControlPlaneServer
