@@ -107,6 +107,19 @@ def test_session_with_colon_id_fetches_percent_encoded(server):
     assert json.loads(body)["session_id"] == "w9:p5"
 
 
+def test_api_responses_are_never_cached(server):
+    """Dynamic API/static responses carry no-store so stale 404s and stale
+    app bundles can never be served from a browser cache (the fix for the
+    persistent "session not found" view after a server-side route fix)."""
+    c, _ = server
+    status, headers, _ = c.get("/api/v1/sessions/w9%3Ap5")
+    assert status == 404  # unknown session, but headers still present
+    assert headers.get("Cache-Control") == "no-store"
+    status, headers, _ = c.get("/api/v1/health")
+    assert status == 200
+    assert headers.get("Cache-Control") == "no-store"
+
+
 def test_hosts_health(server):
     c, repo = server
     hid = repo.register_host("bender", "100.104.39.6")
