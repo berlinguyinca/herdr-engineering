@@ -395,16 +395,29 @@ async function streamList(entityType, entityId) {
 }
 
 // Live updates (Spec §52, §85): subscribe to the SSE stream and refresh the
-// current view when new events arrive (debounced). No polling.
+// current view when new events arrive. A full re-render re-fetches all data
+// for the view, so refreshing on *every* event (the fleet emits several per
+// second) would trip the API's per-IP rate limit ("too many requests") and
+// exhaust the browser's HTTP/1.1 connection pool ("Failed to fetch"). We
+// therefore throttle the SSE-driven refresh to at most once per
+// LIVE_REFRESH_MS (trailing edge). User navigation still renders immediately.
 let liveTimer = null;
+let lastLiveRender = 0;
+const LIVE_REFRESH_MS = 5000;
 connectEvents({
   url: '/api/v1/events/stream',
   onEvent: () => {
     if (liveTimer) clearTimeout(liveTimer);
-    liveTimer = setTimeout(render, 150);
+    // Fire shortly after the last event, but never more often than once per
+    // LIVE_REFRESH_MS since the previous live refresh.
+    const wait = Math.max(150, LIVE_REFRESH_MS - (Date.now() - lastLiveRender));
+    liveTimer = setTimeout(() => {
+      lastLiveRender = Date.now();
+      render();
+    }, wait);
   },
   onError: () => { /* keep last view; the client auto-reconnects */ },
 });
 
-window.addEventListener('hashchange', render);
+window.addEventListener('hashchange', () => { lastLiveRender = Date.now(); render(); });
 render();
