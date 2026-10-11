@@ -307,10 +307,29 @@ def test_resolve_host_bounded_times_out_not_hangs(monkeypatch):
     assert time.monotonic() - start < 5  # bounded, not 30s
 
 
-def test_client_connects_via_resolved_ip_and_preserves_host_header(tmp_path):
+def test_client_connects_via_resolved_ip_and_preserves_host_header(
+        tmp_path, monkeypatch):
     """The client rewrites the URL host to a resolved IPv4 (no unbounded DNS
-    at request time) but keeps the original name in the Host header."""
+    at request time) but keeps the original name in the Host header.
+
+    ``dev.lan`` is a Tailnet-only name (served by CoreDNS on the fabric host),
+    so it does not resolve in CI. We stub ``socket.getaddrinfo`` to make the
+    rewrite deterministic and DNS-independent; the end-to-end half uses
+    ``localhost`` which resolves everywhere.
+    """
+    import socket
+
     from herdr_engineering.fabric import FabricClient
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _fake_getaddrinfo(host, port=0, family=0, type=0, proto=0, flags=0):
+        if host == "dev.lan":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                     ("100.104.39.6", port))]
+        return real_getaddrinfo(host, port, family, type, proto, flags)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo)
 
     # hostname -> IP literal rewrite, port preserved.
     ip_url = FabricClient._resolve_to_ip("http://dev.lan:29999")
