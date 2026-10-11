@@ -1,0 +1,15 @@
+{
+  "name": "herdr-engineering",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HerdR Dev Fabric control plane and engineering workspace",
+  "type": "module",
+  "scripts": {
+    "test": "node --test packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js tests/playwright/ui.test.mjs",
+    "test:ui": "node --test tests/playwright/ui.test.mjs",
+    "test:client": "node --test packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.64.0"
+  }
+}

@@ -56,7 +56,7 @@ class _RateLimiter:
     normal use within the Tailnet. SSE streams are excluded (long-lived).
     """
 
-    def __init__(self, max_requests=120, window_seconds=60):
+    def __init__(self, max_requests=600, window_seconds=60):
         self.max_requests = max_requests
         self.window = window_seconds
         self._hits = {}  # key -> list of monotonic timestamps
