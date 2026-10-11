@@ -156,18 +156,19 @@ def _ev_payload(event: dict) -> dict:
     return p
 
 
-def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict]:
-    """Replay the event log to rebuild hosts/missions/sessions/artifacts.
+def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dict]:
+    """Replay the event log to rebuild hosts/missions/sessions/services/artifacts.
 
     ``streams`` is the ``{stream: [events]}`` dict from ``_rebuild_events``.
     Flattened into ingest order, this reconstructs the structured entities that
     the durable write path persists *as events*, so ingestion survives a
     restart even though only ``fabric_events`` is written to. Returns
-    ``(missions, sessions, hosts, artifacts)`` dicts keyed by id.
+    ``(missions, sessions, hosts, services, artifacts)`` dicts keyed by id.
     """
     missions: dict = {}
     sessions: dict = {}
     hosts: dict = {}
+    services: dict = {}
     artifacts: dict = {}
     flat: list[dict] = []
     for stream in streams.values():
@@ -261,11 +262,34 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict]:
             if p.get("filename"):
                 a["original_filename"] = p["filename"]
             a["updated_at"] = ts
+        elif et == "service":
+            svc = services.setdefault(eid, {
+                "service_id": eid, "service_name": eid, "host_id": None,
+                "port": 0, "session_id": None, "route": None,
+                "status": "healthy",
+                "created_at": ts, "updated_at": ts,
+            })
+            if p.get("host_id"):
+                svc["host_id"] = p["host_id"]
+            if p.get("service_name"):
+                svc["service_name"] = p["service_name"]
+            if p.get("port") is not None:
+                svc["port"] = p["port"]
+            if p.get("session_id"):
+                svc["session_id"] = p["session_id"]
+            if p.get("route"):
+                svc["route"] = p["route"]
+            if p.get("status"):
+                svc["status"] = p["status"]
+            svc["status"] = "unavailable" if "unavailable" in etype.lower() \
+                else svc["status"]
+            svc["url"] = svc["route"] or f"http://{svc['host_id']}:{svc['port']}"
+            svc["updated_at"] = ts
     for sid, s in sessions.items():
         mid = s.get("mission_id")
         if mid and mid in missions and sid not in missions[mid]["sessions"]:
             missions[mid]["sessions"].append(sid)
-    return missions, sessions, hosts, artifacts
+    return missions, sessions, hosts, services, artifacts
 
 
 def load_into(repo, source: DurableSource) -> dict:
@@ -352,13 +376,16 @@ def load_into(repo, source: DurableSource) -> dict:
             elif base.get(k) in (None, "", []):
                 base[k] = v
 
-    rmissions, rsessions, rhosts, rartifacts = _reconstruct_from_events(events)
+    rmissions, rsessions, rhosts, rservices, rartifacts = \
+        _reconstruct_from_events(events)
     for mid, m in rmissions.items():
         _overlay(missions.setdefault(mid, m), m)
     for sid, s in rsessions.items():
         _overlay(sessions.setdefault(sid, s), s)
     for hid, h in rhosts.items():
         _overlay(hosts.setdefault(hid, h), h)
+    for svcid, s in rservices.items():
+        _overlay(services.setdefault(svcid, s), s)
     # Artifacts have no structured table; the event log is their only durable
     # source. Payload bytes are not in the event (they live in the object
     # store) so only metadata is rebuilt here.

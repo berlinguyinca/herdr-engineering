@@ -145,20 +145,49 @@ class ControlPlaneRepo:
 
     # -------------------------------------------------------------- services
     def register_service(self, service_name, host_id, port,
-                         session_id=None, status="healthy"):
+                         session_id=None, status="healthy", route=None):
         svcid = new_id("service")
         rec = {
             "service_id": svcid, "service_name": service_name,
             "host_id": host_id, "port": port, "session_id": session_id,
-            "status": status, "created_at": self._stamp(),
-            "updated_at": self._stamp(),
-            "url": f"http://{host_id}:{port}",
+            "status": status, "route": route,
+            "created_at": self._stamp(), "updated_at": self._stamp(),
+            "url": route or f"http://{host_id}:{port}",
         }
         self._services[svcid] = rec
         self.record_event("service", svcid, "ServiceRegistered",
                           {"service_name": service_name, "host_id": host_id,
-                           "port": port}, session_id=session_id)
+                           "port": port, "route": route, "status": status},
+                          session_id=session_id)
         return svcid
+
+    def upsert_service(self, host_id, service_name, port, *,
+                       session_id=None, status="healthy", route=None):
+        """Idempotent service registration keyed by ``(host_id, service_name)``.
+
+        Re-invoking (e.g. on every web start or repeated ingest) updates the
+        record in place instead of creating a duplicate, so restarts and
+        heartbeats never accumulate service rows. Records ``ServiceRegistered``
+        the first time and ``ServiceUpdated`` thereafter.
+        """
+        for svcid, rec in self._services.items():
+            if (rec.get("host_id") == host_id
+                    and rec.get("service_name") == service_name):
+                rec["port"] = port
+                rec["status"] = status
+                rec["session_id"] = session_id
+                rec["route"] = route if route is not None else rec.get("route")
+                rec["url"] = route or f"http://{host_id}:{port}"
+                rec["updated_at"] = self._stamp()
+                self.record_event("service", svcid, "ServiceUpdated",
+                                  {"service_name": service_name,
+                                   "host_id": host_id, "port": port,
+                                   "route": rec["route"], "status": status},
+                                  session_id=session_id)
+                return svcid
+        return self.register_service(service_name, host_id, port,
+                                     session_id=session_id, status=status,
+                                     route=route)
 
     def get_service(self, service_id):
         return _copy(self._services.get(service_id))

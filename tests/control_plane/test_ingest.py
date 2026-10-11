@@ -90,6 +90,43 @@ def test_mission_create_without_title_defaults_to_id():
     assert repo.get_mission("MSN-9")["title"] == "MSN-9"
 
 
+def test_service_upsert_is_idempotent_across_ingests():
+    ingest = IngestService(ControlPlaneRepo())
+    first = ingest.ingest({
+        "entity_type": "service", "entity_id": "herdr-control-plane",
+        "event_type": "service.started",
+        "payload": {"host_id": "bender", "port": 8080,
+                    "route": "http://bender:8080", "status": "healthy"},
+    })
+    second = ingest.ingest({
+        "entity_type": "service", "entity_id": "herdr-control-plane",
+        "event_type": "service.heartbeat",
+        "payload": {"host_id": "bender", "port": 8080, "status": "healthy"},
+    })
+    assert first["entity_id"] == second["entity_id"]
+    assert len(ingest.repo.list_services()) == 1
+    svc = ingest.repo.get_service(first["entity_id"])
+    assert svc["service_name"] == "herdr-control-plane"
+    assert svc["host_id"] == "bender" and svc["port"] == 8080
+    assert svc["route"] == "http://bender:8080"
+
+
+def test_service_unavailable_event_marks_status():
+    ingest = IngestService(ControlPlaneRepo())
+    ingest.ingest({
+        "entity_type": "service", "entity_id": "postgres",
+        "event_type": "service.started",
+        "payload": {"host_id": "bender", "port": 5432, "status": "healthy"},
+    })
+    ingest.ingest({
+        "entity_type": "service", "entity_id": "postgres",
+        "event_type": "service.unavailable",
+        "payload": {"host_id": "bender", "port": 5432},
+    })
+    (svc,) = ingest.repo.list_services()
+    assert svc["status"] == "unavailable"
+
+
 def test_ingest_generic_records_event_for_unknown_types():
     repo = ControlPlaneRepo()
     svc = make_svc(repo)

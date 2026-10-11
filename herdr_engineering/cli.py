@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import re
+import socket
 import sys
 from typing import Any
 
@@ -956,6 +959,34 @@ def _cmd_cp_migrate(args) -> int:
     return 0
 
 
+def _parse_service_port(endpoint: str | None, default: int) -> int:
+    """Best-effort port extraction from a URL/DSN (``http://rustfs:9000``)."""
+    if not endpoint:
+        return default
+    m = re.search(r":(\d+)(?:/|$)", endpoint)
+    return int(m.group(1)) if m else default
+
+
+def _self_report_services(repo, *, host_id, web_port, dsn=None,
+                          rustfs_endpoint=None):
+    """Register the control-plane's own stack services (idempotent).
+
+    The Services page is otherwise dead in production: the herdr plugin emits
+    only host/mission/session events and nothing reports services. Self-
+    reporting the stack makes the page show real data, and ``upsert_service``
+    keys by (host, name) so restarting the web never duplicates a row.
+    """
+    repo.upsert_service(host_id, "herdr-control-plane", int(web_port),
+                        status="healthy",
+                        route=f"http://{host_id}:{web_port}")
+    repo.upsert_service(host_id, "postgres", _parse_service_port(dsn, 5432),
+                        status="healthy")
+    repo.upsert_service(host_id, "rustfs",
+                        _parse_service_port(rustfs_endpoint, 9000),
+                        status="healthy")
+    repo.upsert_service(host_id, "worker", 0, status="healthy")
+
+
 def _cmd_cp_web(args) -> int:
     """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
 
@@ -984,6 +1015,17 @@ def _cmd_cp_web(args) -> int:
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root, allow_open=args.allow_open,
                              rustfs=rustfs)
+    # Self-report the control-plane stack so the Services page has real data.
+    try:
+        _self_report_services(
+            repo,
+            host_id=os.environ.get("HERDR_CP_SELF_HOST") or socket.gethostname(),
+            web_port=args.port or os.environ.get("HERDR_CP_WEB_PORT", "8080"),
+            dsn=dsn,
+            rustfs_endpoint=os.environ.get("HERDR_CP_RUSTFS_ENDPOINT"),
+        )
+    except Exception:
+        logging.exception("self-report of stack services failed")
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})

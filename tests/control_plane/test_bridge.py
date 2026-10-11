@@ -153,6 +153,34 @@ def test_load_into_reconstructs_entities_from_event_log():
     assert a["mission_id"] == "MSN-1"
 
 
+def test_load_into_reconstructs_services_from_event_log():
+    """Services, like hosts/missions/sessions, must be rebuilt from durable
+    events on hydration even when the structured table is empty (the write-
+    through sink persists only ``fabric_events``)."""
+    ts = "2026-01-01T00:00:00+00:00"
+    events = [
+        _row(event_id="e1", sequence=0, event_type="ServiceRegistered",
+             entity_type="service", entity_id="svc_1",
+             payload='{"service_name": "herdr-control-plane", "host_id": "bender", "port": 8080, "route": "http://bender:8080", "status": "healthy"}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+        _row(event_id="e2", sequence=1, event_type="ServiceUpdated",
+             entity_type="service", entity_id="svc_1",
+             payload='{"service_name": "herdr-control-plane", "host_id": "bender", "port": 8081, "route": "http://bender:8081", "status": "healthy"}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+    ]
+    src = FakeSource(events=events)  # structured services table intentionally empty
+    repo = ControlPlaneRepo()
+    counts = load_into(repo, src)
+    assert counts["services"] == 1
+    svc = repo.get_service("svc_1")
+    assert svc["service_name"] == "herdr-control-plane"
+    assert svc["host_id"] == "bender"
+    # the latest event wins
+    assert svc["port"] == 8081
+    assert svc["route"] == "http://bender:8081"
+    assert svc["status"] == "healthy"
+
+
 def test_load_into_empty_source():
     repo = ControlPlaneRepo()
     counts = load_into(repo, FakeSource())
