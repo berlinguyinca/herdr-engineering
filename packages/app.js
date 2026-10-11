@@ -6,6 +6,21 @@ import { connectEvents } from './herdr-web-client/events.js';
 import { formatTimestamp } from './herdr-web-components/format.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
+import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
+
+// Cache of { [mission_id]: title } so activity/session text can resolve
+// cryptic mission ids to their human names. Fetched lazily, best-effort.
+let missionTitleCache = null;
+async function missionTitles() {
+  if (missionTitleCache) return missionTitleCache;
+  try {
+    const { missions } = await client.listMissions();
+    missionTitleCache = {};
+    for (const m of missions) missionTitleCache[m.mission_id] = m.title;
+  } catch { missionTitleCache = {}; }
+  return missionTitleCache;
+}
+const titles = (cache) => cache || {};
 
 defineComponents();
 
@@ -91,7 +106,8 @@ async function viewMissions() {
     <div class="hd-card">
       <div class="hd-card__title"><a href="#/missions/${esc(m.mission_id)}">${esc(m.title)}</a></div>
       <div style="margin:6px 0"><herdr-status stage="${esc(m.status)}"></herdr-status></div>
-      <div class="hd-card__sub">${m.sessions ? m.sessions.length : 0} session(s) · created ${formatTimestamp(m.created_at)}</div>
+      <div class="hd-card__sub">${esc(missionSubtitle(m, m.sessions ? m.sessions.length : 0))}</div>
+      <div class="hd-card__sub">created ${formatTimestamp(m.created_at)}</div>
     </div>`).join('') + '</div>';
 }
 
@@ -99,40 +115,67 @@ async function viewMission(parts) {
   const m = await client.getMission(parts[1]);
   if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
   const sessions = m.sessions.length;
+  const scope = m.purpose || m.cwd || m.title;
   root.innerHTML = `
     <h1>${esc(m.title)}</h1>
     <div style="margin:8px 0"><herdr-status stage="${esc(m.status)}"></herdr-status>
       <span class="hd-card__sub"> · <herdr-ident kind="mission" id="${esc(m.mission_id)}"></herdr-ident></span></div>
-    <p>${esc(m.purpose || '—')}</p>
-    <div class="hd-grid">
+    <div class="hd-card" style="margin-top:10px">
+      <div class="hd-card__sub">Scope</div>
+      <div style="font-size:1.05em;margin-top:4px">${esc(scope || 'No scope recorded for this mission.')}</div>
+      ${m.cwd && m.cwd !== scope ? `<div class="hd-card__sub" style="margin-top:8px"><code>${esc(m.cwd)}</code></div>` : ''}
+    </div>
+    <div class="hd-grid" style="margin-top:12px">
       <herdr-metric label="Sessions" value="${sessions}"></herdr-metric>
       <herdr-metric label="Stage" value="${esc(m.stage)}"></herdr-metric>
+      <herdr-metric label="Created" value="${esc(formatTimestamp(m.created_at))}"></herdr-metric>
     </div>
+    <h3 style="margin-top:20px">Sessions</h3>
+    ${await missionSessions(m)}
     <h3 style="margin-top:20px">Event stream</h3>
     <div id="mission-stream">${await streamList('mission', m.mission_id)}</div>`;
+}
+
+async function missionSessions(m) {
+  const list = m.sessions || [];
+  if (!list.length) return '<herdr-empty message="No sessions on this mission yet"></herdr-empty>';
+  const t = titles(await missionTitles());
+  return list.map((s) => `
+    <div class="hd-card">
+      <div class="hd-card__title"><a href="#/herd/session/${esc(s.session_id)}">${esc(s.agent_role || 'agent session')}</a></div>
+      <div style="margin:6px 0"><herdr-status stage="${esc(s.status)}"></herdr-status></div>
+      <div class="hd-card__sub">${esc(sessionSummary(s, t))}</div>
+    </div>`).join('');
 }
 
 async function viewSessions() {
   const { sessions } = await client.listSessions();
   if (!sessions.length) { root.innerHTML = '<herdr-empty message="No sessions yet"></herdr-empty>'; return; }
+  const t = titles(await missionTitles());
   root.innerHTML = '<h1>Sessions</h1><div class="hd-grid">' + sessions.map((s) => `
     <div class="hd-card">
-      <div class="hd-card__title"><a href="#/herd/session/${esc(s.session_id)}">${esc(s.agent_role || 'session')}</a></div>
+      <div class="hd-card__title"><a href="#/herd/session/${esc(s.session_id)}">${esc(s.agent_role || 'agent session')}</a></div>
       <div style="margin:6px 0"><herdr-status stage="${esc(s.status)}"></herdr-status></div>
-      <div class="hd-card__sub">model ${esc(s.model || '—')} · ${s.messages} msg · ${s.tool_calls} tool calls</div>
+      <div class="hd-card__sub">${esc(sessionSummary(s, t))}</div>
     </div>`).join('') + '</div>';
 }
 
 async function viewSession(parts) {
   const s = await client.getSession(parts[1]);
   if (!s) { root.innerHTML = '<herdr-error message="Session not found"></herdr-error>'; return; }
+  const t = titles(await missionTitles());
+  const missionTitle = s.mission_id ? (t[s.mission_id] || s.mission_id) : '—';
   root.innerHTML = `
-    <h1>Session</h1>
+    <h1>${esc(s.agent_role || 'Agent session')}</h1>
     <div style="margin:8px 0"><herdr-status stage="${esc(s.status)}"></herdr-status>
       <span class="hd-card__sub"> · <herdr-ident kind="session" id="${esc(s.session_id)}"></herdr-ident></span></div>
     <div class="hd-grid">
       <herdr-metric label="Agent role" value="${esc(s.agent_role || '—')}"></herdr-metric>
       <herdr-metric label="Model" value="${esc(s.model || '—')}"></herdr-metric>
+      <herdr-metric label="Mission" value="${esc(missionTitle)}"></herdr-metric>
+      <herdr-metric label="Host" value="${esc(s.host_id || '—')}"></herdr-metric>
+    </div>
+    <div class="hd-grid">
       <herdr-metric label="Messages" value="${s.messages}"></herdr-metric>
       <herdr-metric label="Tool calls" value="${s.tool_calls}"></herdr-metric>
     </div>
@@ -229,13 +272,21 @@ async function viewActivity() {
 async function activityList(limit) {
   const { events } = await client.activity(limit);
   if (!events.length) return '<herdr-empty message="No activity yet"></herdr-empty>';
-  return events.map((e) => `
-    <div class="hd-card">
-      <div class="hd-card__title">${esc(e.event_type)}</div>
-      <div class="hd-card__sub">${esc(e.entity_type)} · <herdr-ident kind="event" id="${esc(e.event_id)}"></herdr-ident>
-        · seq ${e.sequence} · ${formatTimestamp(e.source_timestamp)}</div>
-      <code class="hd-card__sub">${esc(JSON.stringify(e.payload))}</code>
-    </div>`).join('');
+  const t = titles(await missionTitles());
+  return events.map((e) => {
+    const d = describeEvent(e, { missionTitles: t });
+    const meta = `<div class="hd-card__sub">${esc(d.kind)} · ${formatTimestamp(e.source_timestamp)}</div>`;
+    if (d.muted) {
+      // Low-signal events (e.g. heartbeats) get a compact, de-emphasised row.
+      return `<div class="hd-card" style="opacity:.6">
+        <div class="hd-card__title">${esc(d.title)}</div>
+        <div class="hd-card__sub">${esc(d.detail)}</div>${meta}</div>`;
+    }
+    return `<div class="hd-card">
+      <div class="hd-card__title">${esc(d.title)}</div>
+      <div class="hd-card__sub">${esc(d.detail)}</div>${meta}
+    </div>`;
+  }).join('');
 }
 
 async function viewAnalytics() {
@@ -291,11 +342,16 @@ function stageBars(byStage) {
 async function streamList(entityType, entityId) {
   const { events } = await client.request(
     `/api/v1/events?entity_type=${entityType}&entity_id=${entityId}`);
-  return events.length
-    ? events.map((e) => `<div class="hd-card"><div class="hd-card__title">${esc(e.event_type)}</div>` +
-        `<div class="hd-card__sub">seq ${e.sequence} · ${formatTimestamp(e.source_timestamp)}</div>` +
-        `<code class="hd-card__sub">${esc(JSON.stringify(e.payload))}</code></div>`).join('')
-    : '<herdr-empty message="No events for this entity yet"></herdr-empty>';
+  if (!events.length) return '<herdr-empty message="No events for this entity yet"></herdr-empty>';
+  const t = titles(await missionTitles());
+  return events.map((e) => {
+    const d = describeEvent(e, { missionTitles: t });
+    return `<div class="hd-card">
+      <div class="hd-card__title">${esc(d.title)}</div>
+      <div class="hd-card__sub">${esc(d.detail)}</div>
+      <div class="hd-card__sub">seq ${e.sequence} · ${formatTimestamp(e.source_timestamp)}</div>
+    </div>`;
+  }).join('');
 }
 
 // Live updates (Spec §52, §85): subscribe to the SSE stream and refresh the
