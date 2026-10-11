@@ -57,7 +57,7 @@ def test_load_into_populates_repo():
     repo = ControlPlaneRepo()
     counts = load_into(repo, src)
     assert counts == {"missions": 1, "sessions": 1, "services": 1,
-                      "hosts": 1, "events": 1}
+                      "hosts": 1, "events": 1, "artifacts": 0}
     m = repo.get_mission("m1")
     assert m["title"] == "Bridge mission"
     assert m["stage"] == "implementation"
@@ -123,12 +123,17 @@ def test_load_into_reconstructs_entities_from_event_log():
              entity_type="session", entity_id="w1H:t1",
              payload='{"host_id": "bender", "mission_id": "MSN-1", "agent_role": "pi", "cwd": "/work/msn1", "branch": "main@abc123", "pid": "1234", "cmdline": "pi --x", "summary": "fixing bug", "attach": "herdr workspace focus MSN-1"}',
              source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+        _row(event_id="e4", sequence=0, event_type="ArtifactRegistered",
+             entity_type="artifact", entity_id="artifact_1",
+             payload='{"filename": "note.txt", "sha256": "abc123", "storage_key": "sha256/ab/c1/abc123", "size_bytes": 5, "mime_type": "text/plain", "session_id": "w1H:t1", "mission_id": "MSN-1"}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
     ]
     src = FakeSource(events=events)  # structured tables intentionally empty
     repo = ControlPlaneRepo()
     counts = load_into(repo, src)
     assert counts["hosts"] == 1 and counts["missions"] == 1
     assert counts["sessions"] == 1
+    assert counts["artifacts"] == 1
     h = repo.get_host("bender")
     assert h["host_name"] == "bender" and h["tailnet_ip"] == "100.104.39.6"
     m = repo.get_mission("MSN-1")
@@ -141,13 +146,18 @@ def test_load_into_reconstructs_entities_from_event_log():
     assert s["pid"] == "1234" and s["cmdline"] == "pi --x"
     assert s["summary"] == "fixing bug"
     assert s["attach"] == "herdr workspace focus MSN-1"
+    a = repo.get_artifact("artifact_1")
+    assert a["original_filename"] == "note.txt"
+    assert a["storage_key"] == "sha256/ab/c1/abc123"
+    assert a["sha256"] == "abc123" and a["size_bytes"] == 5
+    assert a["mission_id"] == "MSN-1"
 
 
 def test_load_into_empty_source():
     repo = ControlPlaneRepo()
     counts = load_into(repo, FakeSource())
     assert counts == {"missions": 0, "sessions": 0, "services": 0,
-                      "hosts": 0, "events": 0}
+                      "hosts": 0, "events": 0, "artifacts": 0}
     assert repo.list_missions() == []
 
 

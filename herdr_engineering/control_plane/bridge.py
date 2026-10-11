@@ -156,18 +156,19 @@ def _ev_payload(event: dict) -> dict:
     return p
 
 
-def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict]:
-    """Replay the event log to rebuild hosts/missions/sessions (event sourcing).
+def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict]:
+    """Replay the event log to rebuild hosts/missions/sessions/artifacts.
 
     ``streams`` is the ``{stream: [events]}`` dict from ``_rebuild_events``.
     Flattened into ingest order, this reconstructs the structured entities that
     the durable write path persists *as events*, so ingestion survives a
     restart even though only ``fabric_events`` is written to. Returns
-    ``(missions, sessions, hosts)`` dicts keyed by id.
+    ``(missions, sessions, hosts, artifacts)`` dicts keyed by id.
     """
     missions: dict = {}
     sessions: dict = {}
     hosts: dict = {}
+    artifacts: dict = {}
     flat: list[dict] = []
     for stream in streams.values():
         flat.extend(stream)
@@ -245,11 +246,26 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict]:
             if "toolcalled" in etype.lower() or etype == "SessionToolCall":
                 s["tool_calls"] = (s.get("tool_calls") or 0) + 1
             s["updated_at"] = ts
+        elif et == "artifact":
+            a = artifacts.setdefault(eid, {
+                "artifact_id": eid, "session_id": None, "mission_id": None,
+                "original_filename": None, "mime_type": None,
+                "size_bytes": 0, "sha256": None, "storage_key": None,
+                "status": "available", "materializations": 0,
+                "created_at": ts, "updated_at": ts,
+            })
+            for k in ("session_id", "mission_id", "mime_type", "size_bytes",
+                      "sha256", "storage_key"):
+                if p.get(k):
+                    a[k] = p[k]
+            if p.get("filename"):
+                a["original_filename"] = p["filename"]
+            a["updated_at"] = ts
     for sid, s in sessions.items():
         mid = s.get("mission_id")
         if mid and mid in missions and sid not in missions[mid]["sessions"]:
             missions[mid]["sessions"].append(sid)
-    return missions, sessions, hosts
+    return missions, sessions, hosts, artifacts
 
 
 def load_into(repo, source: DurableSource) -> dict:
@@ -336,13 +352,19 @@ def load_into(repo, source: DurableSource) -> dict:
             elif base.get(k) in (None, "", []):
                 base[k] = v
 
-    rmissions, rsessions, rhosts = _reconstruct_from_events(events)
+    rmissions, rsessions, rhosts, rartifacts = _reconstruct_from_events(events)
     for mid, m in rmissions.items():
         _overlay(missions.setdefault(mid, m), m)
     for sid, s in rsessions.items():
         _overlay(sessions.setdefault(sid, s), s)
     for hid, h in rhosts.items():
         _overlay(hosts.setdefault(hid, h), h)
+    # Artifacts have no structured table; the event log is their only durable
+    # source. Payload bytes are not in the event (they live in the object
+    # store) so only metadata is rebuilt here.
+    artifacts: dict = {}
+    for aid, a in rartifacts.items():
+        artifacts[aid] = a
     for sid, s in sessions.items():
         mid = s.get("mission_id")
         if mid in missions and sid not in missions[mid]["sessions"]:
@@ -351,9 +373,9 @@ def load_into(repo, source: DurableSource) -> dict:
     repo.import_state({
         "version": 1,
         "missions": missions, "sessions": sessions, "services": services,
-        "hosts": hosts, "artifacts": {}, "blobs": {}, "leases": {},
+        "hosts": hosts, "artifacts": artifacts, "blobs": {}, "leases": {},
         "telemetry": {}, "events": events, "event_order": event_order,
     })
     return {"missions": len(missions), "sessions": len(sessions),
             "services": len(services), "hosts": len(hosts),
-            "events": len(event_order)}
+            "events": len(event_order), "artifacts": len(artifacts)}

@@ -360,8 +360,15 @@ class ControlPlaneRepo:
         if data is not None:
             self._blobs[aid] = data
             rec["size_bytes"] = len(data)
+        # Persist full metadata so artifact records survive a restart via the
+        # event log (payload bytes live in the object store, not the event).
         self.record_event("artifact", aid, "ArtifactRegistered",
-                          {"filename": original_filename, "sha256": sha256},
+                          {"filename": original_filename, "sha256": sha256,
+                           "storage_key": storage_key,
+                           "size_bytes": rec.get("size_bytes", 0),
+                           "mime_type": mime_type,
+                           "session_id": session_id,
+                           "mission_id": mission_id},
                           mission_id=mission_id, session_id=session_id)
         return aid
 
