@@ -90,6 +90,23 @@ def test_sessions_and_services(server):
     assert json.loads(body)["services"][0]["port"] == 8080
 
 
+def test_session_with_colon_id_fetches_percent_encoded(server):
+    """Entity ids like ``w9:p5`` are percent-encoded by the web client
+    (encodeURIComponent -> ``w9%3Ap5``); the server must URL-decode them so
+    session detail resolves instead of 404ing."""
+    c, repo = server
+    repo.upsert_session("w9:p5", host_id="beast", mission_id="w9",
+                        agent_role="pi")
+    # literal colon in the path segment also works
+    status, _, body = c.get("/api/v1/sessions/w9:p5")
+    assert status == 200
+    assert json.loads(body)["agent_role"] == "pi"
+    # percent-encoded colon (what the web client actually sends)
+    status, _, body = c.get("/api/v1/sessions/w9%3Ap5")
+    assert status == 200
+    assert json.loads(body)["session_id"] == "w9:p5"
+
+
 def test_hosts_health(server):
     c, repo = server
     hid = repo.register_host("bender", "100.104.39.6")

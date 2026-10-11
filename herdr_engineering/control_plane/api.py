@@ -19,6 +19,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 from ..version import __version__
 from .redact import redact_payload
@@ -227,7 +228,11 @@ def _make_handler(server):
 
         def _route_api(self):
             path = self.path.split("?")[0]
-            parts = path.split("/")  # ['', 'api', 'v1', resource, ...]
+            # URL-decode each path segment: entity ids like ``w9:p5`` arrive
+            # percent-encoded (``w9%3Ap5``) from the structured client
+            # (encodeURIComponent), so decode before matching. ``unquote``
+            # (not unquote_plus) keeps ``+`` literal, as path segments should.
+            parts = [unquote(seg) for seg in path.split("/")]
             resource = parts[3]
             if self._rate_limit():
                 return None
