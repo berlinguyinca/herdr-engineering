@@ -21,6 +21,35 @@ def server():
     svr.shutdown()
 
 
+class _FakeRustFS:
+    """Minimal stand-in for the S3 content-addressed object store."""
+    def __init__(self):
+        self.objects = {}
+
+    def put(self, data):
+        import hashlib
+        digest = hashlib.sha256(data).hexdigest()
+        key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+        self.objects[key] = data
+        return key, digest
+
+    def get(self, key, sha256):
+        return self.objects[key]
+
+
+@pytest.fixture()
+def s3_server():
+    repo = ControlPlaneRepo()
+    fs = _FakeRustFS()
+    svr = ControlPlaneServer(repo, rustfs=fs)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    base = f"http://127.0.0.1:{svr.port}"
+    yield base, repo, fs
+    svr.shutdown()
+
+
 def upload(base, data, filename="shot.png", mime="image/png", session_id=None):
     url = f"{base}/api/v1/artifacts?filename={filename}&mime={urllib.parse.quote(mime)}"
     if session_id:
@@ -76,3 +105,49 @@ def test_artifact_recorded_with_sha256_and_session_binding(server):
     assert art["session_id"] == sid
     assert art["sha256"]
     assert art["mime_type"] == "text/plain"
+
+
+# ---- durable object-store wiring -------------------------------------------
+
+
+def test_upload_with_rustfs_persists_payload_to_object_store(s3_server):
+    base, repo, fs = s3_server
+    data = b"durable-payload-bytes"
+    status, body = upload(base, data, filename="f.bin")
+    assert status == 200
+    art = json.loads(body)
+    assert art["storage_key"]
+    assert art["sha256"]
+    assert art["size_bytes"] == len(data)
+    # bytes live in the object store, NOT the repo's in-memory blob stand-in
+    assert repo.get_artifact_data(art["artifact_id"]) is None
+    assert art["storage_key"] in fs.objects
+    # download resolves the payload from the object store
+    req = urllib.request.Request(
+        f"{base}/api/v1/artifacts/{art['artifact_id']}/download")
+    with urllib.request.urlopen(req) as r:
+        assert r.read() == data
+        assert r.headers["Content-Type"].startswith("image/png")
+
+
+def test_upload_with_rustfs_is_content_addressed(s3_server):
+    base, _, fs = s3_server
+    _, b1 = upload(base, b"same-bytes")
+    _, b2 = upload(base, b"same-bytes")
+    a1, a2 = json.loads(b1), json.loads(b2)
+    # identical payloads dedupe to the same content-addressed key
+    assert a1["storage_key"] == a2["storage_key"]
+    assert a1["sha256"] == a2["sha256"]
+    assert len(fs.objects) == 1
+
+
+def test_health_reports_s3_backend_when_rustfs_wired(s3_server):
+    base, _, _ = s3_server
+    with urllib.request.urlopen(f"{base}/api/v1/health") as r:
+        assert json.loads(r.read())["rustfs"] == "s3"
+
+
+def test_health_reports_memory_backend_without_rustfs(server):
+    base, _ = server
+    with urllib.request.urlopen(f"{base}/api/v1/health") as r:
+        assert json.loads(r.read())["rustfs"] == "memory"

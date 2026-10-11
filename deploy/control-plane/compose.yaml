@@ -112,6 +112,10 @@ services:
       HERDR_CP_WEB_HOST: "0.0.0.0"
       HERDR_CP_WEB_PORT: "8080"
       HERDR_CP_WEB_BIND: "${HERDR_CP_WEB_BIND:-127.0.0.1}"
+      # Durable artifact object store (the `rustfs` MinIO service on the bridge
+      # network). When unset the web serves with the in-memory stand-in.
+      HERDR_CP_RUSTFS_ENDPOINT: "http://rustfs:9000"
+      HERDR_CP_RUSTFS_BUCKET: "${HERDR_CP_RUSTFS_BUCKET:-herdr-artifacts}"
     # The HerdR UI is served at dev.lan:<public-port> (default 80 = plain
     # http://dev.lan). Host bind is the Tailnet interface so only Tailnet
     # clients reach it; container keeps its internal 8080 listener.

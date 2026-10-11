@@ -7,6 +7,14 @@ class _FakeS3:
     def __init__(self):
         self.objects = {}
         self.calls = []
+        self.buckets = set()
+
+    def head_bucket(self, *, Bucket):
+        if Bucket not in self.buckets:
+            raise KeyError(Bucket)  # like boto3's NoSuchBucket ClientError
+
+    def create_bucket(self, *, Bucket):
+        self.buckets.add(Bucket)
 
     def put_object(self, *, Bucket, Key, Body):
         self.calls.append(("put", Key))
@@ -56,3 +64,12 @@ def test_get_rejects_corruption():
         raise AssertionError("expected IntegrityError")
     except rustfs.IntegrityError:
         pass
+
+
+def test_ensure_bucket_creates_when_missing_and_is_idempotent():
+    c = _client()
+    assert c._s3.buckets == set()
+    c.ensure_bucket()
+    assert c._s3.buckets == {"herdr-artifacts"}
+    c.ensure_bucket()  # already exists -> no error, no dup
+    assert c._s3.buckets == {"herdr-artifacts"}
