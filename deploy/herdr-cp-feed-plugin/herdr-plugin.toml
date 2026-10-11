@@ -8,7 +8,7 @@ platforms = ["linux", "macos"]
 [[startup]]
 command = ["node", "emit.js"]
 
-# ---- host ----
+# ---- host + mission (workspace) ----
 [[events]]
 on = "workspace.focused"
 command = ["node", "emit.js"]
@@ -17,7 +17,6 @@ command = ["node", "emit.js"]
 on = "workspace.created"
 command = ["node", "emit.js"]
 
-# ---- mission (workspace) ----
 [[events]]
 on = "workspace.renamed"
 command = ["node", "emit.js"]
@@ -26,21 +25,13 @@ command = ["node", "emit.js"]
 on = "workspace.closed"
 command = ["node", "emit.js"]
 
-# ---- session (pane / agent) ----
-[[events]]
-on = "pane.created"
-command = ["node", "emit.js"]
-
+# ---- session (pane running an agent) ----
 [[events]]
 on = "pane.agent_detected"
 command = ["node", "emit.js"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["node", "emit.js"]
-
-[[events]]
-on = "pane.focused"
 command = ["node", "emit.js"]
 
 [[events]]
