@@ -312,6 +312,7 @@ class ControlPlaneRepo:
         stamp = self._stamp()
         existing = self._missions.get(mission_id)
         if existing is None:
+            title = title or mission_id  # only default to the id on create
             rec = {"mission_id": mission_id, "title": title,
                    "purpose": purpose, "stage": stage, "status": stage,
                    "cwd": cwd,
