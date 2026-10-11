@@ -31,6 +31,7 @@ import os from "node:os";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { enrichSession } from "./enrich.js";
 
 export const CONTROL_PLANE_DEFAULT = "http://dev.lan";
 
@@ -299,8 +300,12 @@ async function main() {
     ? mapEvent(env, { host, info })
     : base;
   if (envelopes.length === 0) return;
+  // Enrich session envelopes with live detail (cwd/branch/pid/summary/attach)
+  // via the herdr CLI + git, then send everything. Enrichment is best-effort.
+  const enriched = await Promise.all(
+    envelopes.map((e) => enrichSession(env, e).catch(() => e)));
   const url = resolveUrl(env);
-  await Promise.allSettled(envelopes.map((e) => send(url, e)));
+  await Promise.allSettled(enriched.map((e) => send(url, e)));
 }
 
 // Only run when executed directly (not when imported by tests).

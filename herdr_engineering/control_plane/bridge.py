@@ -200,12 +200,14 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict]:
             m = missions.setdefault(eid, {
                 "mission_id": eid, "title": eid, "purpose": "",
                 "stage": "active", "status": "active", "created_at": ts,
-                "updated_at": ts, "sessions": [],
+                "updated_at": ts, "sessions": [], "cwd": None,
             })
             if p.get("title"):
                 m["title"] = p["title"]
             if p.get("purpose"):
                 m["purpose"] = p["purpose"]
+            if p.get("cwd"):
+                m["cwd"] = p["cwd"]
             if etype == "MissionStageChanged" and p.get("to"):
                 m["stage"] = m["status"] = p["to"]
             elif p.get("stage"):
@@ -216,7 +218,8 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict]:
                 "session_id": eid, "mission_id": None, "host_id": None,
                 "agent_role": "", "model": "", "status": "active",
                 "created_at": ts, "updated_at": ts, "messages": 0,
-                "tool_calls": 0,
+                "tool_calls": 0, "cwd": None, "branch": None, "pid": None,
+                "cmdline": None, "summary": None, "attach": None,
             })
             if p.get("mission_id"):
                 s["mission_id"] = p["mission_id"]
@@ -226,6 +229,9 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict]:
                 s["agent_role"] = p["agent_role"]
             if p.get("model"):
                 s["model"] = p["model"]
+            for k in ("cwd", "branch", "pid", "cmdline", "summary", "attach"):
+                if p.get(k):
+                    s[k] = p[k]
             if etype == "SessionAction":
                 action = p.get("action")
                 if action in ("stop", "terminate"):
@@ -262,6 +268,7 @@ def load_into(repo, source: DurableSource) -> dict:
             "purpose": row.get("purpose") or "",
             "stage": row.get("stage") or row.get("status") or "ready",
             "status": row.get("status") or row.get("stage") or "ready",
+            "cwd": row.get("cwd"),
             "created_at": created,
             "updated_at": _iso(row.get("updated_at") or row.get("created_at")),
             "sessions": [],
@@ -276,6 +283,9 @@ def load_into(repo, source: DurableSource) -> dict:
             "agent_role": row.get("agent_role") or "",
             "model": row.get("model") or "",
             "status": row.get("status") or "active",
+            "cwd": row.get("cwd"), "branch": row.get("branch"),
+            "pid": row.get("pid"), "cmdline": row.get("cmdline"),
+            "summary": row.get("summary"), "attach": row.get("attach"),
             "created_at": _iso(row.get("created_at")),
             "updated_at": _iso(row.get("updated_at") or row.get("created_at")),
             "messages": row.get("messages") or 0,

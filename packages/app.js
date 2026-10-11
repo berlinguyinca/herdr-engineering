@@ -165,6 +165,15 @@ async function viewSession(parts) {
   if (!s) { root.innerHTML = '<herdr-error message="Session not found"></herdr-error>'; return; }
   const t = titles(await missionTitles());
   const missionTitle = s.mission_id ? (t[s.mission_id] || s.mission_id) : '—';
+  const attach = s.attach || (s.host_id && s.mission_id
+    ? `ssh ${s.host_id} && herdr workspace focus ${s.mission_id}` : '');
+  const rows = [
+    ['What it is doing', s.summary],
+    ['Directory (cwd)', s.cwd],
+    ['Git branch', s.branch],
+    ['PID', s.pid],
+    ['Command line', s.cmdline],
+  ].filter(([, v]) => v);
   root.innerHTML = `
     <h1>${esc(s.agent_role || 'Agent session')}</h1>
     <div style="margin:8px 0"><herdr-status stage="${esc(s.status)}"></herdr-status>
@@ -175,10 +184,21 @@ async function viewSession(parts) {
       <herdr-metric label="Mission" value="${esc(missionTitle)}"></herdr-metric>
       <herdr-metric label="Host" value="${esc(s.host_id || '—')}"></herdr-metric>
     </div>
-    <div class="hd-grid">
-      <herdr-metric label="Messages" value="${s.messages}"></herdr-metric>
-      <herdr-metric label="Tool calls" value="${s.tool_calls}"></herdr-metric>
-    </div>
+    ${rows.length ? `<div class="hd-card" style="margin-top:12px">
+      <div class="hd-card__sub">Operational detail</div>
+      ${rows.map(([k, v]) => `
+        <div style="margin-top:8px">
+          <div class="hd-card__sub">${esc(k)}</div>
+          <div><code>${esc(v)}</code></div>
+        </div>`).join('')}
+      ${attach ? `<div style="margin-top:10px">
+        <div class="hd-card__sub">Attach</div>
+        <div class="hd-inline">
+          <code style="flex:1">${esc(attach)}</code>
+          <button class="hd-btn" id="copy-attach">Copy</button>
+        </div>
+      </div>` : ''}
+    </div>` : ''}
     <h3 style="margin-top:20px">Send a message</h3>
     <div class="hd-card">
       <form id="msg-form" class="hd-inline">
@@ -189,6 +209,10 @@ async function viewSession(parts) {
     <h3 style="margin-top:20px">Event stream</h3>
     <div id="session-stream">${await streamList('session', s.session_id)}</div>`;
 
+  const copyBtn = document.getElementById('copy-attach');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', () => copyText(attach, copyBtn));
+  }
   document.getElementById('msg-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const input = document.getElementById('msg-input');
@@ -201,6 +225,22 @@ async function viewSession(parts) {
       alert(err.message);
     }
   });
+}
+
+async function copyText(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
+  const original = btn.textContent;
+  btn.textContent = 'Copied';
+  setTimeout(() => { btn.textContent = original; }, 1200);
 }
 
 async function viewServices() {

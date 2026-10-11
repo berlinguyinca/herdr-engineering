@@ -261,21 +261,26 @@ class ControlPlaneRepo:
         return _copy(existing)
 
     def upsert_session(self, session_id, *, host_id=None, mission_id=None,
-                       agent_role="", model="", status="active"):
+                       agent_role="", model="", status="active",
+                       cwd=None, branch=None, pid=None, cmdline=None,
+                       summary=None, attach=None):
         stamp = self._stamp()
         existing = self._sessions.get(session_id)
+        detail = {"cwd": cwd, "branch": branch, "pid": pid,
+                  "cmdline": cmdline, "summary": summary, "attach": attach}
         if existing is None:
             rec = {"session_id": session_id, "mission_id": mission_id,
                    "host_id": host_id, "agent_role": agent_role,
                    "model": model, "status": status,
                    "created_at": stamp, "updated_at": stamp,
-                   "messages": 0, "tool_calls": 0}
+                   "messages": 0, "tool_calls": 0, **detail}
             self._sessions[session_id] = rec
             if mission_id and mission_id in self._missions:
                 self._missions[mission_id]["sessions"].append(session_id)
             self.record_event("session", session_id, "SessionStarted",
                               {"host_id": host_id, "mission_id": mission_id,
-                               "agent_role": agent_role, "model": model},
+                               "agent_role": agent_role, "model": model,
+                               "status": status, **{k: v for k, v in detail.items() if v is not None}},
                               mission_id=mission_id, session_id=session_id)
             return _copy(rec)
         existing["updated_at"] = stamp
@@ -288,42 +293,50 @@ class ControlPlaneRepo:
         if model:
             existing["model"] = model
         existing["status"] = status
+        for k, v in detail.items():
+            if v is not None:
+                existing[k] = v
         # Carry the full identity state in the delta so event-sourced
         # hydration (bridge._reconstruct_from_events) can rebuild the record.
         self.record_event("session", session_id, "SessionUpdated",
-                          {"host_id": existing["host_id"],
-                           "mission_id": existing["mission_id"],
-                           "agent_role": existing["agent_role"],
-                           "model": existing["model"],
-                           "status": existing["status"]},
+                          {k: existing[k] for k in (
+                              "host_id", "mission_id", "agent_role", "model",
+                              "status", "cwd", "branch", "pid", "cmdline",
+                              "summary", "attach") if existing.get(k) is not None},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)
 
-    def upsert_mission(self, mission_id, *, title, purpose="", stage="active"):
+    def upsert_mission(self, mission_id, *, title, purpose="", stage="active",
+                       cwd=None):
         stamp = self._stamp()
         existing = self._missions.get(mission_id)
         if existing is None:
             rec = {"mission_id": mission_id, "title": title,
                    "purpose": purpose, "stage": stage, "status": stage,
+                   "cwd": cwd,
                    "created_at": stamp, "updated_at": stamp, "sessions": []}
             self._missions[mission_id] = rec
             self.record_event("mission", mission_id, "MissionStarted",
                               {"title": title, "purpose": purpose,
-                               "stage": stage}, mission_id=mission_id)
+                               "stage": stage, "cwd": cwd},
+                              mission_id=mission_id)
             return _copy(rec)
         existing["updated_at"] = stamp
         if title:
             existing["title"] = title
         if purpose:
             existing["purpose"] = purpose
+        if cwd:
+            existing["cwd"] = cwd
         if stage:
             existing["stage"] = existing["status"] = stage
         self.record_event("mission", mission_id, "MissionUpdated",
                           {"title": existing["title"],
                            "purpose": existing["purpose"],
                            "stage": existing["stage"],
-                           "status": existing["status"]},
+                           "status": existing["status"],
+                           "cwd": existing.get("cwd")},
                           mission_id=mission_id)
         return _copy(existing)
 
