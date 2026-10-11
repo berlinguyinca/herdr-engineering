@@ -19,7 +19,8 @@ class RustFSClient:
 
     def __init__(self, *, endpoint: str, bucket: str,
                  region: str = "us-east-1", s3: Any | None = None,
-                 sha: Any = hashlib.sha256):
+                 sha: Any = hashlib.sha256,
+                 access_key: str = "herdr", secret_key: str = "herdr"):
         self._bucket = bucket
         self._sha = sha
         if s3 is not None:
@@ -29,8 +30,15 @@ class RustFSClient:
             self._s3 = boto3.client(
                 "s3", endpoint_url=endpoint,
                 region_name=region,
-                aws_access_key_id="herdr", aws_secret_access_key="herdr",
+                aws_access_key_id=access_key, aws_secret_access_key=secret_key,
             )
+
+    def ensure_bucket(self) -> None:
+        """Create the bucket if it does not already exist (idempotent)."""
+        try:
+            self._s3.head_bucket(Bucket=self._bucket)
+        except Exception:
+            self._s3.create_bucket(Bucket=self._bucket)
 
     def put(self, data: bytes) -> tuple[str, str]:
         digest = self._sha(data).hexdigest()

@@ -77,7 +77,8 @@ class ControlPlaneServer:
     """Structured control-plane API + SSE + static web server."""
 
     def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
-                 port=0, web_root=None, source=None, allow_open=False):
+                 port=0, web_root=None, source=None, allow_open=False,
+                 rustfs=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -94,6 +95,10 @@ class ControlPlaneServer:
             from .bridge import load_into
             load_into(repo, source)
         self.source = source
+        # Optional durable object store (RustFS / S3). When wired, artifact
+        # payloads are stored content-addressed here instead of the repo's
+        # in-memory blob stand-in, so they survive a web restart.
+        self.rustfs = rustfs
         from .ingest import IngestService
         self.ingest = IngestService(repo)
         self._limiter = _RateLimiter()
@@ -125,7 +130,7 @@ class ControlPlaneServer:
         """Repo stats + deployment context (source backend, image version/commit)."""
         h = self.repo.health()
         h["source"] = "postgres" if self.source is not None else "memory"
-        h["rustfs"] = "memory"  # object store is an in-memory stand-in (MinIO not wired here)
+        h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
         return h
@@ -294,6 +299,13 @@ def _make_handler(server):
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
                 data = r.get_artifact_data(parts[4])
                 a = r.get_artifact(parts[4])
+                # payload lives in the object store, not the in-memory blob
+                if data is None and a is not None and server.rustfs is not None \
+                        and a.get("storage_key") and a.get("sha256"):
+                    try:
+                        data = server.rustfs.get(a["storage_key"], a["sha256"])
+                    except Exception:
+                        data = None
                 if data is None or a is None:
                     return self._json({"error": "not found"}, 404)
                 return self._bytes(data, a.get("mime_type", "application/octet-stream"))
@@ -346,10 +358,20 @@ def _make_handler(server):
                 self.headers.get("Content-Type", "application/octet-stream")
             session_id = _q(self.path, "session_id")
             mission_id = _q(self.path, "mission_id")
+            # When a durable object store is wired, write the payload there
+            # (content-addressed by sha256) and keep only metadata in the repo.
+            # Otherwise fall back to the repo's in-memory blob stand-in.
+            storage_key = ""
+            sha256 = ""
+            if server.rustfs is not None:
+                storage_key, sha256 = server.rustfs.put(data)
+            blob = None if server.rustfs is not None else data
             aid = r.register_artifact(session_id=session_id,
                                       mission_id=mission_id,
                                       original_filename=filename,
-                                      mime_type=mime, data=data)
+                                      mime_type=mime, size_bytes=len(data),
+                                      sha256=sha256, storage_key=storage_key,
+                                      data=blob)
             return self._json(r.get_artifact(aid))
 
         # ------------------------------------------------------------ SSE

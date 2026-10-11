@@ -979,9 +979,11 @@ def _cmd_cp_web(args) -> int:
     repo = ControlPlaneRepo(sink=sink)
     if args.seed_demo:
         _seed_demo(repo)
+    rustfs = _maybe_rustfs_client()
     svr = ControlPlaneServer(repo, api_keys=api_keys,
                              host=args.host, port=args.port, source=source,
-                             web_root=args.web_root, allow_open=args.allow_open)
+                             web_root=args.web_root, allow_open=args.allow_open,
+                             rustfs=rustfs)
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
@@ -992,6 +994,34 @@ def _cmd_cp_web(args) -> int:
     finally:
         svr.shutdown()
     return 0
+
+
+def _maybe_rustfs_client():
+    """Build an S3/RustFS client for artifact payloads, or None if not wired.
+
+    Configured via HERDR_CP_RUSTFS_ENDPOINT (default http://rustfs:9000) and
+    HERDR_CP_RUSTFS_BUCKET (default herdr-artifacts); the MinIO credentials come
+    from HERDR_CP_MINIO_USER / HERDR_CP_MINIO_PASSWORD when set, else the fixed
+    dev creds. Returns None when no endpoint is reachable/configured so the web
+    server still starts with the in-memory stand-in.
+    """
+    from .control_plane.rustfs import RustFSClient
+    endpoint = os.environ.get("HERDR_CP_RUSTFS_ENDPOINT")
+    if not endpoint:
+        return None
+    bucket = os.environ.get("HERDR_CP_RUSTFS_BUCKET", "herdr-artifacts")
+    region = os.environ.get("HERDR_CP_RUSTFS_REGION", "us-east-1")
+    access_key = os.environ.get("HERDR_CP_MINIO_USER", "herdr")
+    secret_key = os.environ.get("HERDR_CP_MINIO_PASSWORD", "herdr")
+    client = RustFSClient(endpoint=endpoint, bucket=bucket, region=region,
+                          access_key=access_key, secret_key=secret_key)
+    try:
+        client.ensure_bucket()
+    except Exception:
+        # Bucket creation is best-effort; MinIO may already have it. Don't
+        # crash web startup over object storage.
+        pass
+    return client
 
 
 def _maybe_pg_source(dsn):
