@@ -114,3 +114,19 @@ test("sessionSummary includes message counts only when non-zero", () => {
   const summary = sessionSummary(s, TITLES);
   assert.match(summary, /12 msg \/ 4 tool calls/);
 });
+
+test("sessionSummary shows what a session is doing (summary) and its branch", () => {
+  const s = { agent_role: "pi", summary: "go-modules refresh failure",
+    branch: "master_ai@d9891173", mission_id: "wH", host_id: "bender" };
+  const summary = sessionSummary(s, TITLES);
+  assert.match(summary, /— go-modules refresh failure/);
+  assert.match(summary, /\[master_ai@d9891173\]/);
+});
+
+test("sessionSummary omits summary/branch when absent", () => {
+  const s = { agent_role: "pi", mission_id: "wK" };
+  const summary = sessionSummary(s, TITLES);
+  assert.ok(!/— /.test(summary));
+  assert.ok(!/\[/.test(summary));
+  assert.match(summary, /pi · in “herdr frontend work”/);
+});

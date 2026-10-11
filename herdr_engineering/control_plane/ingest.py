@@ -62,7 +62,10 @@ class IngestService:
             entity_id, host_id=payload.get("host_id"),
             mission_id=payload.get("mission_id"),
             agent_role=payload.get("agent_role") or payload.get("role") or "",
-            model=payload.get("model") or "", status=status)
+            model=payload.get("model") or "", status=status,
+            cwd=payload.get("cwd"), branch=payload.get("branch"),
+            pid=payload.get("pid"), cmdline=payload.get("cmdline"),
+            summary=payload.get("summary"), attach=payload.get("attach"))
 
     def _ingest_mission(self, entity_id, event_type, payload) -> dict:
         if "stop" in event_type.lower():
@@ -73,4 +76,5 @@ class IngestService:
             stage = payload.get("stage", "active")
         return self.repo.upsert_mission(
             entity_id, title=payload.get("title") or entity_id,
-            purpose=payload.get("purpose") or "", stage=stage)
+            purpose=payload.get("purpose") or "", stage=stage,
+            cwd=payload.get("cwd"))

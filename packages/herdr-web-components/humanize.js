@@ -149,14 +149,17 @@ export function missionSubtitle(mission, sessionsCount = 0) {
   return bits.join(' · ') || '—';
 }
 
-// A compact one-line summary for a session card.
+// A compact one-line summary for a session card. Shows what the session is
+// doing (terminal title), where it runs, and its branch — hiding empty detail.
 export function sessionSummary(session, missionTitles = {}) {
   const role = session?.agent_role || 'agent session';
+  const doing = session?.summary ? ` — ${session.summary}` : '';
+  const branch = session?.branch ? ` [${session.branch}]` : '';
   const model = session?.model ? ` · ${session.model}` : '';
   const mission = session?.mission_id
     ? ` · in ${label(session.mission_id, missionTitles)}` : '';
   const host = session?.host_id ? ` on ${session.host_id}` : '';
   const activity = (session?.messages || session?.tool_calls)
     ? ` · ${session.messages} msg / ${session.tool_calls} tool calls` : '';
-  return `${role}${model}${mission}${host}${activity}`;
+  return `${role}${doing}${branch}${model}${mission}${host}${activity}`;
 }

@@ -117,11 +117,11 @@ def test_load_into_reconstructs_entities_from_event_log():
              source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
         _row(event_id="e2", sequence=0, event_type="mission.started",
              entity_type="mission", entity_id="MSN-1",
-             payload='{"title": "Reconstructed", "purpose": "p", "stage": "active"}',
+             payload='{"title": "Reconstructed", "purpose": "p", "stage": "active", "cwd": "/work/msn1"}',
              source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
         _row(event_id="e3", sequence=0, event_type="session.started",
              entity_type="session", entity_id="w1H:t1",
-             payload='{"host_id": "bender", "mission_id": "MSN-1", "agent_role": "pi"}',
+             payload='{"host_id": "bender", "mission_id": "MSN-1", "agent_role": "pi", "cwd": "/work/msn1", "branch": "main@abc123", "pid": "1234", "cmdline": "pi --x", "summary": "fixing bug", "attach": "herdr workspace focus MSN-1"}',
              source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
     ]
     src = FakeSource(events=events)  # structured tables intentionally empty
@@ -133,9 +133,14 @@ def test_load_into_reconstructs_entities_from_event_log():
     assert h["host_name"] == "bender" and h["tailnet_ip"] == "100.104.39.6"
     m = repo.get_mission("MSN-1")
     assert m["title"] == "Reconstructed" and m["stage"] == "active"
+    assert m["cwd"] == "/work/msn1"
     assert m["sessions"] == ["w1H:t1"]
     s = repo.get_session("w1H:t1")
     assert s["mission_id"] == "MSN-1" and s["agent_role"] == "pi"
+    assert s["cwd"] == "/work/msn1" and s["branch"] == "main@abc123"
+    assert s["pid"] == "1234" and s["cmdline"] == "pi --x"
+    assert s["summary"] == "fixing bug"
+    assert s["attach"] == "herdr workspace focus MSN-1"
 
 
 def test_load_into_empty_source():
