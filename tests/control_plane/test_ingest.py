@@ -72,6 +72,22 @@ def test_mission_upsert_links_sessions():
                 "event_type": "mission.updated",
                 "payload": {"stage": "testing"}})
     assert repo.get_mission("MSN-1")["stage"] == "testing"
+    # a subsequent update without a title must NOT clobber the human label
+    svc.ingest({"entity_type": "mission", "entity_id": "MSN-1",
+                "event_type": "mission.updated",
+                "payload": {"cwd": "/work/msn1"}})
+    m = repo.get_mission("MSN-1")
+    assert m["title"] == "Control plane"
+    assert m["cwd"] == "/work/msn1"
+
+
+def test_mission_create_without_title_defaults_to_id():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "mission", "entity_id": "MSN-9",
+                "event_type": "mission.started",
+                "payload": {"purpose": "no label"}})
+    assert repo.get_mission("MSN-9")["title"] == "MSN-9"
 
 
 def test_ingest_generic_records_event_for_unknown_types():

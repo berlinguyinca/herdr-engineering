@@ -75,6 +75,6 @@ class IngestService:
         else:
             stage = payload.get("stage", "active")
         return self.repo.upsert_mission(
-            entity_id, title=payload.get("title") or entity_id,
+            entity_id, title=payload.get("title") or "",
             purpose=payload.get("purpose") or "", stage=stage,
             cwd=payload.get("cwd"))
