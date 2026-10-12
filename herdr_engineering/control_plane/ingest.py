@@ -84,15 +84,16 @@ class IngestService:
     def _ingest_service(self, entity_id, event_type, payload) -> dict:
         """A ``service`` envelope maps idempotently to a (host, name) service.
 
-        ``entity_id`` is the external service name; ``host_id``/``port``/
-        ``route``/``status`` come from the payload. Repeated heartbeats for the
-        same (host, name) update in place rather than duplicating.
+        ``payload['service_name']`` (or ``entity_id`` as a fallback) is the
+        display name; ``host_id``/``port``/``route``/``status`` come from the
+        payload. Repeated heartbeats for the same (host, name) update in place
+        rather than duplicating.
         """
         status = ("unavailable" if "unavailable" in event_type.lower()
                   else payload.get("status", "healthy"))
         svcid = self.repo.upsert_service(
             payload.get("host_id") or "",
-            entity_id,
+            payload.get("service_name") or entity_id,
             int(payload["port"]) if payload.get("port") is not None else 0,
             status=status,
             session_id=payload.get("session_id"),

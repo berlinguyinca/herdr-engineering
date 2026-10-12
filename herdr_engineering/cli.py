@@ -645,6 +645,8 @@ def _cmd_dev_agent(args) -> int:
             interval=args.interval,
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
+            control_plane_url=fabric_cfg.get("control_plane_url")
+                or os.environ.get("HERDR_ENGINEERING_CONTROL_PLANE_URL", ""),
         ))
     if args.once:
         summary = agent.scan_once()

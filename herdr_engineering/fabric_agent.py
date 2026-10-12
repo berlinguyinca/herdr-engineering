@@ -299,6 +299,10 @@ class AgentConfig:
     # interval so they never expire; a lease the gateway dropped (restart or
     # TTL lapse) is transparently re-registered. Matches the gateway default.
     heartbeat_ttl: float = 90.0
+    # Base URL of the control plane (e.g. http://dev.lan) to report discovered
+    # services to, so every dev:<port> lease shows up on the fleet Services
+    # page with a clickable route. Empty = reporting disabled.
+    control_plane_url: str = ""
 
 
 class FabricAgent:
@@ -438,6 +442,7 @@ class FabricAgent:
             entry = self._adopt(port, listeners[port])
             if entry:
                 registered.append(entry["label"])
+                self._report_service(entry, "healthy")
 
         # 3) keepalive: heartbeat leases that are due; if the gateway dropped
         # one (restart or TTL lapse), transparently re-register the same
@@ -563,6 +568,44 @@ class FabricAgent:
                  label, lease.get("external_port"))
         return self._store[str(port)]
 
+    def _report_service(self, entry: dict[str, Any], status: str) -> None:
+        """Best-effort report of a discovered service to the control plane.
+
+        Emits a ``service`` envelope to ``{control_plane_url}/api/v1/ingest`` so
+        the app appears on the fleet Services page (visible from any host) with
+        a clickable ``dev:<port>`` route. The control-plane repo keys by
+        (host_id, service_name), so re-reporting the same label updates in place
+        instead of duplicating. Best-effort: a down control plane is never fatal.
+        """
+        if not self.cfg.control_plane_url:
+            return
+        payload = {
+            "service_name": entry.get("label") or "",
+            "host_id": self._machine,
+            "port": entry.get("external_port") or 0,
+            "route": entry.get("url") or "",
+            "status": status,
+            "owner": entry.get("process") or "",
+        }
+        body = {
+            "entity_type": "service",
+            "entity_id": entry.get("lease_id")
+                or f"{self._machine}:{entry.get('external_port')}",
+            "event_type": ("service.registered" if status == "healthy"
+                            else "service.unavailable"),
+            "payload": payload,
+        }
+        url = f"{self.cfg.control_plane_url.rstrip('/')}/api/v1/ingest"
+        try:
+            req = urllib.request.Request(
+                url, data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+        except Exception as exc:  # control plane down: never break the agent
+            log.warning("control-plane report failed for %s: %s",
+                        entry.get("label"), exc)
+
     def _release(self, port_s: str) -> None:
         entry = self._store.pop(port_s, None)
         port = int(port_s)
@@ -576,6 +619,10 @@ class FabricAgent:
                          entry["lease_id"], port_s)
             except Exception as exc:  # already expired, etc.
                 log.warning("close failed for %s: %s", entry["lease_id"], exc)
+        # Mirror the lifecycle into the control plane so the service leaves the
+        # fleet UI when the app stops.
+        if entry:
+            self._report_service(entry, "unavailable")
 
     # -- run loop ---------------------------------------------------------
 

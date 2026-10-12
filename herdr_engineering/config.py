@@ -50,6 +50,11 @@ DEFAULTS: dict[str, Any] = {
         "agent_exclude_ports": [],
         "agent_web_port_min": 1024,
         "agent_ephemeral_min": 32768,
+        # The auto-registration agent reports every discovered service to this
+        # control-plane base URL (e.g. http://dev.lan) so leases show up on the
+        # fleet Services page. Empty = reporting disabled. Overridable via env
+        # HERDR_ENGINEERING_CONTROL_PLANE_URL.
+        "control_plane_url": "",
     },
     "tests": {"adapters": ["pytest", "go", "cargo", "junit", "scala"]},
     "ci": {"provider": "woodpecker", "pileated_extensions": "auto"},
