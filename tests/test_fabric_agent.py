@@ -623,3 +623,97 @@ def test_watchdog_does_not_fire_when_cycles_complete(tmp_path, monkeypatch):
         gw.stop()
     finally:
         pass
+
+
+class _FakeControlPlane:
+    """Records ``POST /api/v1/ingest`` envelopes; returns 200 {"ok": true}."""
+
+    def __init__(self):
+        self.envelopes: list[dict] = []
+        self._lock = threading.Lock()
+        self._httpd = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), self._handler())
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+
+    def _handler(self):
+        cp = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                with cp._lock:
+                    cp.envelopes.append(body)
+                resp = json.dumps({"ok": True}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+        return _Handler
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._httpd.server_address[1]}"
+
+    def stop(self):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+def test_agent_reports_service_to_control_plane(tmp_path, monkeypatch):
+    """A discovered web service is reported as a service.registered envelope,
+    and its removal as service.unavailable, mirroring the lease lifecycle."""
+    gw = _FakeGateway()
+    cp = _FakeControlPlane()
+    server, port = _http_target(tmp_path)
+    live = {"ports": {port: "testapp"}}
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners(live["ports"]))
+    agent = _agent(tmp_path, gw, control_plane_url=cp.url)
+    try:
+        agent.scan_once()
+        with cp._lock:
+            registered = [e for e in cp.envelopes
+                          if e["event_type"] == "service.registered"]
+        assert len(registered) == 1
+        env = registered[0]
+        assert env["entity_type"] == "service"
+        p = env["payload"]
+        assert p["service_name"].endswith(f"(port {port})")
+        assert p["host_id"] == socket.gethostname()
+        assert p["route"].startswith("http://")
+        assert p["port"] > 0
+        assert p["status"] == "healthy"
+
+        # service disappears -> unavailable
+        live["ports"].clear()
+        agent.scan_once()
+        with cp._lock:
+            states = [e["event_type"] for e in cp.envelopes]
+        assert "service.unavailable" in states
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+        cp.stop()
+
+
+def test_agent_skips_control_plane_when_url_empty(tmp_path, monkeypatch):
+    """Default config (no control-plane URL) must not emit anything."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "testapp"}))
+    agent = _agent(tmp_path, gw)  # control_plane_url defaults to ""
+    try:
+        agent.scan_once()
+        assert len(gw.leases) == 1  # still registers with the gateway
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()

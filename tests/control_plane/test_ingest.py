@@ -111,6 +111,24 @@ def test_service_upsert_is_idempotent_across_ingests():
     assert svc["route"] == "http://bender:8080"
 
 
+def test_service_name_comes_from_payload_not_entity_id():
+    # The fabric agent uses entity_id as a routing key (lease id) and carries
+    # the display name in payload.service_name; the repo must key by the label.
+    ingest = IngestService(ControlPlaneRepo())
+    ingest.ingest({
+        "entity_type": "service", "entity_id": "lease_abc123",
+        "event_type": "service.registered",
+        "payload": {"service_name": "web on bender (port 8181)",
+                    "host_id": "bender", "port": 18000,
+                    "route": "http://dev.lan:18000", "status": "healthy"},
+    })
+    (svc,) = ingest.repo.list_services()
+    assert svc["service_name"] == "web on bender (port 8181)"
+    assert svc["host_id"] == "bender"
+    assert svc["port"] == 18000
+    assert svc["route"] == "http://dev.lan:18000"
+
+
 def test_service_unavailable_event_marks_status():
     ingest = IngestService(ControlPlaneRepo())
     ingest.ingest({

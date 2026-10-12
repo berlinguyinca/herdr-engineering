@@ -250,7 +250,7 @@ async function viewServices() {
     <div class="hd-card">
       <div class="hd-card__title"><a href="#/services/${esc(svc.service_id)}">${esc(svc.service_name)}</a></div>
       <div style="margin:6px 0"><herdr-status stage="${esc(svc.status)}"></herdr-status></div>
-      <div class="hd-card__sub"><code>${esc(svc.url)}</code></div>
+      <div class="hd-card__sub"><a href="${esc(svc.url)}" target="_blank" rel="noopener">${esc(svc.url)}</a></div>
     </div>`).join('') + '</div>';
 }
 
@@ -264,7 +264,7 @@ async function viewService(parts) {
       <herdr-metric label="Port" value="${esc(svc.port)}"></herdr-metric>
       <herdr-metric label="Host" value="${esc(svc.host_id)}"></herdr-metric>
     </div>
-    <p>URL: <code>${esc(svc.url)}</code></p>`;
+    <p>URL: <a href="${esc(svc.url)}" target="_blank" rel="noopener">${esc(svc.url)}</a></p>`;
 }
 
 async function viewHosts() {
