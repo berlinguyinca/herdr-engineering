@@ -543,6 +543,56 @@ def test_loopback_only_service_matches_port(tmp_path, monkeypatch):
         gw.stop()
 
 
+def test_forwarder_restored_across_restart_stays_live(tmp_path, monkeypatch):
+    """A loopback-only forwarder must keep serving after an agent restart.
+
+    Regression: the restore path called stop() (setting _stopping) and then
+    _rebind(), which started a fresh accept loop while the stop flag was still
+    set — the loop exited immediately, leaving the rebind listener
+    bound-but-dead (connections reset). Docker apps bound to 127.0.0.1 rely on
+    this forwarder to be reachable at dev.lan:PORT.
+    """
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    import herdr_engineering.fabric_agent as fa_mod
+
+    real_tcp_open = fa_mod.tcp_open
+
+    def _loopback_only(host, p, timeout=1.0):
+        if p == port:
+            return False
+        return real_tcp_open(host, p, timeout)
+
+    monkeypatch.setattr(fa_mod, "tcp_open", _loopback_only)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "testapp"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        fwd_port = _store(tmp_path)[str(port)]["fwd_port"]
+        assert fwd_port is not None
+        agent.stop()
+        gw.stop()
+
+        # Simulate an agent restart: a fresh agent restores the forwarder
+        # from the persisted store (the loopback app is still up).
+        gw2 = _FakeGateway()
+        agent2 = _agent(tmp_path, gw2)
+        try:
+            restored = agent2._forwards.get(port)
+            assert restored is not None, "forwarder not restored after restart"
+            assert restored.port == fwd_port
+            import urllib.request
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{fwd_port}/", timeout=5) as resp:
+                assert resp.status == 200, "restored forwarder not serving"
+        finally:
+            agent2.stop()
+            gw2.stop()
+    finally:
+        server.shutdown()
+
+
 def test_forwarder_falls_back_to_ephemeral_when_same_port_taken(tmp_path, monkeypatch):
     """When the same port is already bound on the tailnet bind (so the
     forwarder cannot reuse it), the agent falls back to an ephemeral port and

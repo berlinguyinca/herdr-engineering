@@ -376,6 +376,10 @@ class FabricAgent:
         sock.listen(64)
         sock.settimeout(0.5)
         fwd._listener = sock  # noqa: SLF001 - reuse accept-loop mechanics
+        # The caller stops the throwaway forwarder (setting _stopping) before
+        # rebinding, so reset the stop flag or the accept loop below would exit
+        # immediately and leave this listener bound-but-dead.
+        fwd._stopping = threading.Event()  # noqa: SLF001
 
         def _accept_loop() -> None:
             while not fwd._stopping.is_set():  # noqa: SLF001
