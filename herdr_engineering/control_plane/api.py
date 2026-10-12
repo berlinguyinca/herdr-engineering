@@ -19,6 +19,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote
 
 from ..version import __version__
@@ -244,6 +245,8 @@ def _make_handler(server):
                 return self._send_json(404, {"error": "not found"})
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})
+            except Exception as exc:  # never drop a connection: surface 500
+                return self._send_json(500, {"error": str(exc)})
 
         def _api_get(self, parts, resource):
             r = server.repo
@@ -319,6 +322,10 @@ def _make_handler(server):
             if resource == "ingest":
                 return self._json({"endpoint": "POST /api/v1/ingest",
                                    "entities": ["host", "session", "mission"]})
+            if resource == "ci":
+                return self._json(_ci_view())
+            if resource == "tests":
+                return self._json(_tests_view())
             return self._json({"error": "not found"}, 404)
 
         def _api_post(self, parts, resource):
@@ -477,6 +484,39 @@ def _redact_event(event: dict) -> dict:
 
 def _sse_frame(event: dict) -> bytes:
     return f"data: {json.dumps(_redact_event(event))}\n\n".encode()
+
+
+def _ci_view() -> dict[str, Any]:
+    """CI view: available flag + repos + recent pipelines. Fail-closed."""
+    from ..ci import WoodpeckerProvider
+    try:
+        provider = WoodpeckerProvider()
+        avail = provider.available
+        if not avail:
+            return {"available": False, "repos": [], "pipelines": {}}
+        repos = provider.repos()
+        pipelines = {}
+        for repo in repos[:10]:
+            try:
+                rows = provider.pipelines(repo)
+                pipelines[repo] = [v.to_dict() if hasattr(v, "to_dict")
+                                   else v for v in rows]
+            except Exception:
+                pipelines[repo] = []
+        return {"available": True, "repos": repos, "pipelines": pipelines}
+    except Exception as exc:
+        return {"available": False, "repos": [], "pipelines": {},
+                "error": str(exc)}
+
+
+def _tests_view() -> dict[str, Any]:
+    """Test-run view: adapters + a coarse per-adapter summary. Fail-closed."""
+    from ..tests import TestExplorer
+    try:
+        explorer = TestExplorer()
+        return {"adapters": explorer.adapters()}
+    except Exception as exc:
+        return {"adapters": [], "error": str(exc)}
 
 
 def _q(path, key):

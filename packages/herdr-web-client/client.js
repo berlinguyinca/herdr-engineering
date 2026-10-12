@@ -97,6 +97,15 @@ export class HerdrClient {
       { method: 'POST', body: { action } });
   }
 
+  // -- ci / test runs (leaf types for the topology view) -------------------
+  getCi() {
+    return this.request('/api/v1/ci');
+  }
+
+  getTests() {
+    return this.request('/api/v1/tests');
+  }
+
   // -- health / self-observability -----------------------------------------
   health() {
     return this.request('/api/v1/health');

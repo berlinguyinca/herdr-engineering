@@ -93,3 +93,23 @@ test('connectEvents dispatches parsed events and disconnects cleanly', () => {
   disconnect();
   assert.equal(fakeES.closed, true);
 });
+
+test('getCi requests /api/v1/ci', async () => {
+  const calls = [];
+  const client = new HerdrClient('', {
+    fetchImpl: async (url) => { calls.push(url); return { ok: true, text: async () => '{"available": false}' }; },
+  });
+  const r = await client.getCi();
+  assert.equal(calls[0], '/api/v1/ci');
+  assert.equal(r.available, false);
+});
+
+test('getTests requests /api/v1/tests', async () => {
+  const calls = [];
+  const client = new HerdrClient('', {
+    fetchImpl: async (url) => { calls.push(url); return { ok: true, text: async () => '{"adapters": ["pytest"]}' }; },
+  });
+  const r = await client.getTests();
+  assert.equal(calls[0], '/api/v1/tests');
+  assert.deepEqual(r.adapters, ['pytest']);
+});

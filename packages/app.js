@@ -29,6 +29,7 @@ const root = document.getElementById('view');
 
 const NAV = [
   { path: '/overview', label: 'Overview' },
+  { path: '/topology', label: 'Topology' },
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Sessions' },
   { path: '/services', label: 'Services' },
@@ -50,6 +51,7 @@ function route() {
 
 const ROUTES = {
   '/overview': viewOverview,
+  '/topology': viewTopology,
   '/missions': viewMissions,
   '/missions/:id': viewMission,
   '/herd': viewSessions,
@@ -82,6 +84,82 @@ async function render() {
 }
 
 // ------------------------------------------------------------- views
+// ------------------------------------------------------------- topology
+// Fleet tree: hosts -> sessions / services / CI runs / test adapters, with
+// a recent-activity leaf. Reuses the existing /api/v1 data + CI/tests views.
+function treeRow(label, sub, href, badge) {
+  const link = href ? `<a href="${href}">${label}</a>` : esc(label);
+  const b = badge ? `<span class="tp-badge">${esc(badge)}</span>` : '';
+  return `<div class="tp-row">${link}${sub ? `<span class="tp-sub">${esc(sub)}</span>` : ''}${b}</div>`;
+}
+
+async function viewTopology() {
+  const [hostsR, sessR, svcR, actR, ciR, testsR] = await Promise.all([
+    client.listHosts(), client.listSessions(), client.listServices(),
+    client.activity(30), client.getCi(), client.getTests(),
+  ]);
+  const hosts = hostsR.hosts || [];
+  const sessions = sessR.sessions || [];
+  const services = svcR.services || [];
+  const events = actR.events || [];
+  const ci = ciR || {};
+  const tests = testsR || {};
+  const t = titles(await missionTitles());
+
+  const hostBlocks = hosts.map((h) => {
+    const hs = sessions.filter((s) => s.host_id === h.host_id);
+    const hsvc = services.filter((s) => s.host_id === h.host_id);
+    const sRows = hs.length ? hs.slice(0, 12).map((s) =>
+      treeRow(sessionSummary(s) || s.session_id, s.status,
+              `#/herd/session/${esc(s.session_id)}`)).join('')
+      : '<div class="tp-sub">no sessions</div>';
+    const svRows = hsvc.length ? hsvc.slice(0, 12).map((s) =>
+      treeRow(s.service_name, `${s.status} · ${s.route || ''}`,
+              s.route ? s.route : undefined)).join('')
+      : '';
+    return `<details class="tp"><summary>${esc(h.host_name)}
+      <span class="tp-sub">${esc(h.tailnet_ip || '')} · <herdr-status stage="${esc(h.status)}"></herdr-status></span></summary>
+      <div class="tp-kids">
+        <div class="tp-h">Sessions (${hs.length})</div>${sRows}
+        ${svRows ? `<div class="tp-h">Services (${hsvc.length})</div>${svRows}` : ''}
+      </div>
+    </details>`;
+  }).join('');
+
+  const ciLeaves = ci.available ? Object.entries(ci.pipelines || {}).map(([repo, runs]) =>
+    `<details class="tp"><summary>CI · ${esc(repo)}</summary><div class="tp-kids">` +
+    (runs || []).slice(0, 8).map((r) =>
+      treeRow(`${r.repository}#${r.run_number}`, `${r.state} · ${r.branch || ''}`,
+              r.url, r.state)).join('') || '<div class="tp-sub">no runs</div>' +
+    `</div></details>`).join('')
+    : '<div class="tp-row">CI <span class="tp-sub">not configured / unavailable</span></div>';
+
+  const testLeaves = (tests.adapters || []).map((a) =>
+    treeRow(a, 'adapter')).join('');
+
+  const actLeaves = events.slice(0, 8).map((e) => {
+    const d = describeEvent(e, { missionTitles: t });
+    return treeRow(d.title, `${d.kind} · ${formatTimestamp(e.source_timestamp)}`);
+  }).join('') || '<div class="tp-sub">no activity</div>';
+
+  root.innerHTML = `
+    <style>
+      .tp{margin:4px 0}.tp summary{cursor:pointer;padding:6px 8px;border-radius:6px;background:#1a2233}
+      .tp summary:hover{background:#1f2b42}.tp-kids{margin-left:18px;padding-left:10px;border-left:1px solid #2a3550}
+      .tp-h{color:#8a93a8;font-size:.78rem;text-transform:uppercase;margin:10px 0 4px}
+      .tp-row{padding:3px 8px;border-radius:5px}.tp-row:hover{background:#1f2b42}
+      .tp-sub{color:#8a93a8;font-size:.78rem;margin-left:8px}
+      .tp-badge{float:right;font-size:.7rem;color:#4ade80}
+    </style>
+    <h1>Topology</h1>
+    <div class="hd-card muted">${hosts.length} hosts · ${sessions.length} sessions · ${services.length} services · ${(ci.repos || []).length} CI repos · ${(tests.adapters || []).length} test adapters</div>
+    <div class="tp-kids">${hostBlocks}
+      <details class="tp" open><summary>CI runs</summary><div class="tp-kids">${ciLeaves}</div></details>
+      <details class="tp" open><summary>Test adapters</summary><div class="tp-kids">${testLeaves}</div></details>
+      <details class="tp" open><summary>Recent activity</summary><div class="tp-kids">${actLeaves}</div></details>
+    </div>`;
+}
+
 async function viewOverview() {
   const [health, missions, sessions, hosts] = await Promise.all([
     client.health(), client.listMissions(), client.listSessions(), client.listHosts(),
