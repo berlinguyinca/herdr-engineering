@@ -717,3 +717,31 @@ def test_agent_skips_control_plane_when_url_empty(tmp_path, monkeypatch):
         server.shutdown()
         agent.stop()
         gw.stop()
+
+
+def test_agent_reports_tracked_leases_on_startup(tmp_path):
+    """On restart, already-tracked leases are re-heartbeated (not re-adopted),
+    so the agent must report them to the control plane at construction time."""
+    import json as _json
+    gw = _FakeGateway()
+    cp = _FakeControlPlane()
+    store = tmp_path / "fabric-agent.json"
+    store.write_text(_json.dumps({
+        "8181": {"lease_id": "lease_a", "label": "web on bender (port 8181)",
+                 "external_port": 18000, "url": "http://dev.lan:18000",
+                 "process": "node", "last_hb": 0.0},
+        "3123": {"lease_id": "lease_b", "label": "api on bender (port 3123)",
+                 "external_port": 18001, "url": "http://dev.lan:18001",
+                 "process": "python", "last_hb": 0.0},
+    }))
+    agent = _agent(tmp_path, gw, control_plane_url=cp.url)
+    try:
+        with cp._lock:
+            regs = [e for e in cp.envelopes
+                    if e["event_type"] == "service.registered"]
+        assert {e["payload"]["service_name"] for e in regs} == {
+            "web on bender (port 8181)", "api on bender (port 3123)"}
+    finally:
+        agent.stop()
+        gw.stop()
+        cp.stop()

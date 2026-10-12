@@ -334,6 +334,12 @@ class FabricAgent:
                 except OSError as exc:
                     log.warning("could not restore forwarder for port %s: %s",
                                 port_s, exc)
+        # Report every currently-tracked service to the control plane so the
+        # fleet Services page is fully populated across agent restarts (a
+        # restart re-heartbeats these leases; it does not re-adopt them, so
+        # without this the pre-existing leases would never surface).
+        for entry in self._store.values():
+            self._report_service(entry, "healthy")
 
     # -- store ----------------------------------------------------------
 
