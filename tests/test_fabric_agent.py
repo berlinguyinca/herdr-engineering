@@ -83,9 +83,13 @@ def _listeners(ports: dict[int, str]) -> dict[int, dict]:
 class _FakeGateway:
     """Minimal fake of the gateway control API (register/close/healthz)."""
 
-    def __init__(self):
+    def __init__(self, port_range: tuple = (18000, 28999)):
         self.leases: dict[str, dict] = {}
         self.closed: list[str] = []
+        # Mirror the real gateway: it binds its WHOLE front-door range, not
+        # just the ports that currently hold leases.
+        self.port_range = port_range
+        self._lo, self._hi = port_range
         # External ports are just opaque numbers here (the fake never binds
         # them); start in the dev window to mirror the real gateway's _LO.
         self._port_counter = 18000
@@ -124,7 +128,8 @@ def _make_fake_handler(gw: _FakeGateway):
 
         def do_GET(self):
             if self.path == "/healthz":
-                self._send(200, {"ok": True})
+                self._send(200, {"ok": True,
+                                 "port_lo": gw._lo, "port_hi": gw._hi})
             elif self.path == "/list":
                 with gw._lock:
                     self._send(200, {"leases": list(gw.leases.values())})
@@ -301,6 +306,80 @@ def test_scan_skips_raw_tcp_service(tmp_path, monkeypatch):
             lease["target"]["port"] for lease in gw.leases.values()]
     finally:
         raw.close()
+        agent.stop()
+        gw.stop()
+
+
+def test_scan_skips_gateway_front_door_port(tmp_path, monkeypatch):
+    """A listener inside the gateway's reserved front-door range is never
+    adopted, even when it looks like a live web service (feedback-loop guard:
+    the gateway binds its whole range, not just leased ports)."""
+    gw = _FakeGateway()
+    front_port = gw._lo + 500  # e.g. 18500, inside the reserved range
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({front_port: "web"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert front_port not in [
+            lease["target"]["port"] for lease in gw.leases.values()]
+        assert str(front_port) not in _store(tmp_path)
+    finally:
+        agent.stop()
+        gw.stop()
+
+
+def test_scan_skips_container_networking_shim(tmp_path, monkeypatch):
+    """Container/VM networking shims (e.g. slirp4netns) are never registered:
+    their bindings are meaningless, mostly-stale port forwards."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "slirp4netns"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert port not in [
+            lease["target"]["port"] for lease in gw.leases.values()]
+        assert str(port) not in _store(tmp_path)
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_scan_releases_previously_registered_noise(tmp_path, monkeypatch):
+    """Noise that was registered BEFORE the filters existed (gateway
+    front-doors, container shims) is actively released on the next scan, not
+    silently left in the store/registry."""
+    import json as _json
+    gw = _FakeGateway()
+    front_port = gw._lo + 500  # inside the gateway's front-door range
+    shim_port = 28050          # a slirp4netns binding, NOT a front-door
+    store = tmp_path / "fabric-agent.json"
+    store.write_text(_json.dumps({
+        str(front_port): {"lease_id": "lease_front",
+                          "label": f"web on bender (port {front_port})",
+                          "external_port": gw._lo,
+                          "url": f"http://dev.lan:{gw._lo}",
+                          "process": "web", "last_hb": 0.0},
+        str(shim_port): {"lease_id": "lease_shim",
+                         "label": f"slirp4netns on bender (port {shim_port})",
+                         "external_port": gw._lo + 1,
+                         "url": f"http://dev.lan:{gw._lo + 1}",
+                         "process": "slirp4netns", "last_hb": 0.0},
+    }))
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({front_port: "web",
+                                            shim_port: "slirp4netns"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert str(front_port) not in _store(tmp_path)
+        assert str(shim_port) not in _store(tmp_path)
+        assert "lease_front" in gw.closed
+        assert "lease_shim" in gw.closed
+    finally:
         agent.stop()
         gw.stop()
 
