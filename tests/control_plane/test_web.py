@@ -1,3 +1,4 @@
+import json
 import threading
 import urllib.error
 import urllib.request
@@ -62,3 +63,22 @@ def test_api_and_static_together(web):
     status, _, body = get(base, "/api/v1/missions")
     assert status == 200
     assert b"web-mission" in body
+
+
+def test_ci_endpoint(web):
+    """CI view is served and fail-closed when the provider is unavailable."""
+    _, base = web
+    status, _, body = get(base, "/api/v1/ci")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["available"] in (True, False)
+    assert "repos" in payload and "pipelines" in payload
+
+
+def test_tests_endpoint(web):
+    """Tests view is served and exposes adapter names."""
+    _, base = web
+    status, _, body = get(base, "/api/v1/tests")
+    assert status == 200
+    payload = json.loads(body)
+    assert isinstance(payload["adapters"], list)
