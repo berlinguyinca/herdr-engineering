@@ -95,6 +95,15 @@ class DevServiceRegistry:
     def store_path(self) -> Path:
         return self._path
 
+    def port_range(self) -> tuple[int, int]:
+        """The gateway's reserved front-door port range (lo, hi).
+
+        The gateway binds this whole range on its bind hosts, not just the
+        ports that currently hold leases. Consumers (e.g. the fabric agent)
+        must exclude the entire range, not merely the leased subset.
+        """
+        return self._lo, self._hi
+
     def _load(self) -> None:
         if not self._path.exists():
             self._loaded_mtime = None

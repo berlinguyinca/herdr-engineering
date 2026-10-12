@@ -70,6 +70,18 @@ DEFAULT_DENY_PORTS: frozenset[int] = frozenset({
 # Ports below ``AgentConfig.web_port_min`` that are still web services.
 COMMON_WEB_PORTS: frozenset[int] = frozenset({80, 443, 8080, 8443})
 
+# Host processes that are container/VM networking shims rather than the dev
+# service itself. They surface as meaningless, mostly-stale port bindings
+# (e.g. rootless podman's slirp4netns) that do not correspond to a service the
+# user can actually open, so they are never adopted/registered.
+_IGNORED_PROCESSES: frozenset[str] = frozenset({
+    "slirp4netns",        # rootless container port-mapping shim
+    "vpnkit",             # Docker Desktop VM port forwarder
+    "com.docker.backend", # Docker Desktop backend
+    "com.docker.vpnkit",
+    "kube-proxy",
+})
+
 
 # ---------------------------------------------------------------------------
 # Listener scanning (per-OS, best effort, no dependencies)
@@ -410,29 +422,50 @@ class FabricAgent:
         # the agent proxy its own front door — a feedback loop. Best effort:
         # an empty set when the gateway is momentarily unreachable.
         gateway_ext_ports: set[int] = set()
+        gateway_front: set[int] = set()
         try:
-            for lease in self._client.list().get("leases", []):
-                ep = lease.get("external_port")
-                if ep:
-                    gateway_ext_ports.add(int(ep))
+            # The gateway binds its WHOLE front-door range (dev.lan:18000-
+            # 28999), not just currently-leased ports. Exclude the entire range
+            # so its own idle front doors are never self-registered as services
+            # (feedback-loop guard). Fall back to the leased subset if the
+            # gateway predates the range in /healthz.
+            hz = self._client.healthz()
+            lo, hi = hz.get("port_lo"), hz.get("port_hi")
+            if lo is not None and hi is not None:
+                gateway_front = set(range(int(lo), int(hi) + 1))
+            else:
+                for lease in self._client.list().get("leases", []):
+                    ep = lease.get("external_port")
+                    if ep:
+                        gateway_ext_ports.add(int(ep))
         except Exception as exc:  # noqa: BLE001 - best effort
-            log.debug("gateway external-port lookup failed: %s", exc)
+            log.debug("gateway front-door lookup failed: %s", exc)
 
         # Ports owned by this agent's own forwarders are never candidates —
         # they proxy an already-tracked service (double-registration guard).
         with self._lock:
             fwd_ports = {e["fwd_port"] for e in self._store.values()
                          if e.get("fwd_port")}
-            # 1) release vanished services
+            # 1) release vanished services, plus any previously-registered
+            # noise that is no longer adoptable: gateway front-door listeners
+            # (feedback-loop guard) and container/VM networking shims.
             for port_s in list(self._store):
                 port = int(port_s)
-                if port not in live_ports:
+                entry = self._store[port_s]
+                process = entry.get("process") or ""
+                if (port not in live_ports
+                        or port in gateway_front
+                        or process in _IGNORED_PROCESSES):
                     self._release(port_s)
                     closed.append(port_s)
 
         # 2) adopt new web services
         for port in sorted(live_ports):
             if port <= 0 or not self._is_dev_web_port(port):
+                continue
+            if port in gateway_front:
+                # Reserved gateway front-door range: the gateway binds these on
+                # its bind hosts regardless of leases. Never adopt them.
                 continue
             if port in gateway_ext_ports:
                 # Skip only when the local listener is already reachable on the
@@ -525,6 +558,10 @@ class FabricAgent:
     def _adopt(self, port: int,
                info: dict[str, Any]) -> dict[str, Any] | None:
         process = info.get("process")
+        if process and process in _IGNORED_PROCESSES:
+            log.debug("ignoring container/VM networking shim %r on port %s",
+                      process, port)
+            return None
         label = (f"{self.cfg.label_prefix}"
                  f"{process or 'web'} on {self._machine} (port {port})")
         fwd: AgentForwarder | None = None

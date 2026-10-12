@@ -458,8 +458,10 @@ def _make_handler(gateway: FabricGateway):
                 self._send(200, gateway.op_resolve(port))
                 return
             if self.path == "/healthz":
+                lo, hi = gateway.registry.port_range()
                 self._send(200, {"ok": True, "bound_ports": gateway.router.bound_ports(),
-                                 "url_base": gateway.url_base})
+                                 "url_base": gateway.url_base,
+                                 "port_lo": lo, "port_hi": hi})
                 return
             self._send(404, {"error": "not found"})
 
