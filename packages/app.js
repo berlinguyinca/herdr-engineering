@@ -7,6 +7,7 @@ import { formatTimestamp } from './herdr-web-components/format.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
 import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
+import { statusForStage, statusLabel, tokenVar } from './herdr-web-components/status.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -87,10 +88,18 @@ async function render() {
 // ------------------------------------------------------------- topology
 // Fleet tree: hosts -> sessions / services / CI runs / test adapters, with
 // a recent-activity leaf. Reuses the existing /api/v1 data + CI/tests views.
-function treeRow(label, sub, href, badge) {
+// Status dots/badges reuse the theme's semantic tokens (theme.css + status.js)
+// so the tree stays consistent with the rest of the control plane.
+function treeRow(label, sub, href, status, accent) {
   const link = href ? `<a href="${href}">${label}</a>` : esc(label);
-  const b = badge ? `<span class="tp-badge">${esc(badge)}</span>` : '';
-  return `<div class="tp-row">${link}${sub ? `<span class="tp-sub">${esc(sub)}</span>` : ''}${b}</div>`;
+  const st = status ? statusForStage(status) : null;
+  const dotColor = st ? tokenVar(st.token) : (accent || 'var(--text-muted)');
+  const dot = `<span class="tp-dot" style="background:${dotColor}"></span>`;
+  const b = st
+    ? `<span class="tp-badge" style="color:${tokenVar(st.token)};border-color:${tokenVar(st.token)}">${esc(statusLabel(status))}</span>`
+    : '';
+  const subHtml = sub ? `<span class="tp-sub">${esc(sub)}</span>` : '';
+  return `<div class="tp-row">${dot}${link}${subHtml}${b}</div>`;
 }
 
 async function viewTopology() {
@@ -110,15 +119,18 @@ async function viewTopology() {
     const hs = sessions.filter((s) => s.host_id === h.host_id);
     const hsvc = services.filter((s) => s.host_id === h.host_id);
     const sRows = hs.length ? hs.slice(0, 12).map((s) =>
-      treeRow(sessionSummary(s) || s.session_id, s.status,
-              `#/herd/session/${esc(s.session_id)}`)).join('')
-      : '<div class="tp-sub">no sessions</div>';
+      treeRow(sessionSummary(s) || s.session_id, '',
+              `#/herd/session/${esc(s.session_id)}`, s.status,
+              'var(--status-active)')).join('')
+      : '<div class="tp-hint">no sessions</div>';
     const svRows = hsvc.length ? hsvc.slice(0, 12).map((s) =>
-      treeRow(s.service_name, `${s.status} · ${s.route || ''}`,
-              s.route ? s.route : undefined)).join('')
+      treeRow(s.service_name, s.route || '', s.route ? s.route : undefined,
+              s.status, 'var(--accent)')).join('')
       : '';
-    return `<details class="tp"><summary>${esc(h.host_name)}
-      <span class="tp-sub">${esc(h.tailnet_ip || '')} · <herdr-status stage="${esc(h.status)}"></herdr-status></span></summary>
+    return `<details class="tp tp-host"><summary>
+        ${esc(h.host_name)}
+        <span class="tp-sub">${esc(h.tailnet_ip || '')} · <herdr-status stage="${esc(h.status)}"></herdr-status></span>
+      </summary>
       <div class="tp-kids">
         <div class="tp-h">Sessions (${hs.length})</div>${sRows}
         ${svRows ? `<div class="tp-h">Services (${hsvc.length})</div>${svRows}` : ''}
@@ -126,37 +138,66 @@ async function viewTopology() {
     </details>`;
   }).join('');
 
-  const ciLeaves = ci.available ? Object.entries(ci.pipelines || {}).map(([repo, runs]) =>
-    `<details class="tp"><summary>CI · ${esc(repo)}</summary><div class="tp-kids">` +
-    (runs || []).slice(0, 8).map((r) =>
-      treeRow(`${r.repository}#${r.run_number}`, `${r.state} · ${r.branch || ''}`,
-              r.url, r.state)).join('') || '<div class="tp-sub">no runs</div>' +
-    `</div></details>`).join('')
-    : '<div class="tp-row">CI <span class="tp-sub">not configured / unavailable</span></div>';
+  const ciLeaves = ci.available
+    ? Object.entries(ci.pipelines || {}).map(([repo, runs]) =>
+        `<details class="tp tp-ci"><summary>${esc(repo)}</summary><div class="tp-kids">` +
+        ((runs || []).length ? (runs || []).slice(0, 8).map((r) =>
+            treeRow(`#${r.run_number}`, r.branch || '', r.url, r.state,
+                    'var(--status-pr)')).join('')
+          : '<div class="tp-hint">no runs</div>') +
+        `</div></details>`).join('')
+    : '<div class="tp-row"><span class="tp-dot" style="background:var(--text-muted)"></span>CI <span class="tp-sub">not configured / unavailable</span></div>';
 
-  const testLeaves = (tests.adapters || []).map((a) =>
-    treeRow(a, 'adapter')).join('');
+  const testLeaves = (tests.adapters || []).length
+    ? (tests.adapters || []).map((a) =>
+        treeRow(a, 'adapter', undefined, undefined, 'var(--status-testing)')).join('')
+    : '<div class="tp-hint">no adapters discovered</div>';
 
   const actLeaves = events.slice(0, 8).map((e) => {
     const d = describeEvent(e, { missionTitles: t });
-    return treeRow(d.title, `${d.kind} · ${formatTimestamp(e.source_timestamp)}`);
-  }).join('') || '<div class="tp-sub">no activity</div>';
+    return treeRow(d.title, `${d.kind} · ${formatTimestamp(e.source_timestamp)}`,
+                    undefined, undefined, 'var(--text-muted)');
+  }).join('') || '<div class="tp-hint">no activity</div>';
 
   root.innerHTML = `
     <style>
-      .tp{margin:4px 0}.tp summary{cursor:pointer;padding:6px 8px;border-radius:6px;background:#1a2233}
-      .tp summary:hover{background:#1f2b42}.tp-kids{margin-left:18px;padding-left:10px;border-left:1px solid #2a3550}
-      .tp-h{color:#8a93a8;font-size:.78rem;text-transform:uppercase;margin:10px 0 4px}
-      .tp-row{padding:3px 8px;border-radius:5px}.tp-row:hover{background:#1f2b42}
-      .tp-sub{color:#8a93a8;font-size:.78rem;margin-left:8px}
-      .tp-badge{float:right;font-size:.7rem;color:#4ade80}
+      .tp{margin:2px 0}
+      .tp summary{display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;
+        padding:7px 10px;border-radius:var(--radius);background:var(--surface);
+        border:1px solid var(--border-subtle);color:var(--text);font-weight:600;
+        font-size:.86rem;transition:background var(--motion-fast),border-color var(--motion-fast)}
+      .tp summary::-webkit-details-marker{display:none}
+      .tp summary::before{content:'';width:8px;height:8px;border-radius:2px;flex:none;
+        border:1px solid var(--text-muted);opacity:.5;transition:transform var(--motion-fast)}
+      .tp summary:hover{background:var(--surface-hover);border-color:var(--border)}
+      .tp[open] summary::before{background:var(--tp-accent,var(--accent));
+        border-color:var(--tp-accent,var(--accent));transform:rotate(45deg)}
+      .tp-host summary{--tp-accent:var(--status-planning)}
+      .tp-ci summary{--tp-accent:var(--status-pr)}
+      .tp-tests summary{--tp-accent:var(--status-testing)}
+      .tp-act summary{--tp-accent:var(--text-muted)}
+      .tp-kids{margin-left:13px;padding-left:13px;border-left:1px solid var(--border);margin-top:2px}
+      .tp-h{color:var(--text-muted);font-size:.68rem;font-weight:700;letter-spacing:.07em;
+        text-transform:uppercase;margin:12px 0 4px}
+      .tp-hint{color:var(--text-muted);font-size:.76rem;padding:3px 8px}
+      .tp-row{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--radius-sm);
+        color:var(--text);font-size:.82rem}
+      .tp-row a{color:inherit;text-decoration:none}
+      .tp-row:hover{background:var(--surface-hover)}
+      .tp-row:hover a{color:var(--accent);text-decoration:underline}
+      .tp-dot{width:7px;height:7px;border-radius:50%;flex:none}
+      .tp-sub{color:var(--text-muted);font-size:.74rem;margin-left:auto;text-align:right;
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
+      .tp-badge{flex:none;font-size:.62rem;font-weight:700;padding:1px 7px;border-radius:99px;
+        background:color-mix(in srgb, currentColor 9%, var(--surface));border:1px solid}
+      .tp-count{color:var(--text-muted);font-weight:600;font-size:.74rem;margin-left:auto}
     </style>
     <h1>Topology</h1>
     <div class="hd-card muted">${hosts.length} hosts · ${sessions.length} sessions · ${services.length} services · ${(ci.repos || []).length} CI repos · ${(tests.adapters || []).length} test adapters</div>
     <div class="tp-kids">${hostBlocks}
-      <details class="tp" open><summary>CI runs</summary><div class="tp-kids">${ciLeaves}</div></details>
-      <details class="tp" open><summary>Test adapters</summary><div class="tp-kids">${testLeaves}</div></details>
-      <details class="tp" open><summary>Recent activity</summary><div class="tp-kids">${actLeaves}</div></details>
+      <details class="tp tp-ci" open><summary>CI runs<span class="tp-count">${(ci.repos || []).length || ''}</span></summary><div class="tp-kids">${ciLeaves}</div></details>
+      <details class="tp tp-tests" open><summary>Test adapters<span class="tp-count">${(tests.adapters || []).length || ''}</span></summary><div class="tp-kids">${testLeaves}</div></details>
+      <details class="tp tp-act" open><summary>Recent activity<span class="tp-count">${events.length || ''}</span></summary><div class="tp-kids">${actLeaves}</div></details>
     </div>`;
 }
 
