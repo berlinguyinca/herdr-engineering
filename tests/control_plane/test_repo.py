@@ -54,6 +54,27 @@ def test_service_register_list_get():
     assert r.get_service(svcid)["port"] == 8080
 
 
+def test_service_upsert_is_idempotent_by_host_and_name():
+    r = repo.ControlPlaneRepo()
+    a = r.upsert_service("bender", "web", 8080, status="healthy",
+                         route="http://bender:8080")
+    b = r.upsert_service("bender", "web", 8081, status="healthy",
+                         route="http://bender:8081")
+    # same (host, name) -> same id, updated in place, no duplicate
+    assert a == b
+    assert len(r.list_services()) == 1
+    svc = r.get_service(a)
+    assert svc["port"] == 8081 and svc["route"] == "http://bender:8081"
+    # same name on a different host is a distinct service
+    c = r.upsert_service("beast", "web", 9090)
+    assert c != a
+    assert len(r.list_services()) == 2
+    # events carry the idempotent id so hydration reconstructs one record
+    stream = r.stream("service", a)
+    assert [e["event_type"] for e in stream] == ["ServiceRegistered", "ServiceUpdated"]
+    assert stream[0]["entity_id"] == stream[1]["entity_id"] == a
+
+
 def test_host_heartbeat_and_unavailable():
     r = repo.ControlPlaneRepo()
     hid = r.register_host("bender", "100.104.39.6")

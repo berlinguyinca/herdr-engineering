@@ -36,6 +36,8 @@ class IngestService:
             return self._ingest_session(entity_id, event_type, payload)
         if entity_type == "mission":
             return self._ingest_mission(entity_id, event_type, payload)
+        if entity_type == "service":
+            return self._ingest_service(entity_id, event_type, payload)
         # Unknown/other entity types: record the event generically so nothing is
         # silently dropped, and the UI still sees it on the activity stream.
         self.repo.record_event(entity_type, entity_id, event_type, payload)
@@ -78,3 +80,23 @@ class IngestService:
             entity_id, title=payload.get("title") or "",
             purpose=payload.get("purpose") or "", stage=stage,
             cwd=payload.get("cwd"))
+
+    def _ingest_service(self, entity_id, event_type, payload) -> dict:
+        """A ``service`` envelope maps idempotently to a (host, name) service.
+
+        ``entity_id`` is the external service name; ``host_id``/``port``/
+        ``route``/``status`` come from the payload. Repeated heartbeats for the
+        same (host, name) update in place rather than duplicating.
+        """
+        status = ("unavailable" if "unavailable" in event_type.lower()
+                  else payload.get("status", "healthy"))
+        svcid = self.repo.upsert_service(
+            payload.get("host_id") or "",
+            entity_id,
+            int(payload["port"]) if payload.get("port") is not None else 0,
+            status=status,
+            session_id=payload.get("session_id"),
+            route=payload.get("route"),
+        )
+        return {"entity_type": "service", "entity_id": svcid,
+                "event_type": event_type}
