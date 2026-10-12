@@ -30,11 +30,27 @@ _INDEX_HTML = """<!doctype html>
  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
  .muted{color:#8a93a8;font-size:.85rem}
  .ok{color:#4ade80}.warn{color:#fbbf24}.bad{color:#f87171}
+ .tree{list-style:none;padding:0;margin:0;font-family:ui-monospace,monospace;font-size:.85rem}
+ .tree ul{list-style:none;padding-left:0;margin:0}
+ .kids{display:none}
+ .node.open>.kids{display:block}
+ .nrow{display:flex;gap:8px;align-items:center;padding:4px 8px;border-radius:6px;cursor:pointer}
+ .nrow:hover{background:#1f2b42}
+ .car{display:inline-block;width:12px;color:#5a6b8c}
+ .car.empty{width:12px}
+ .leaf .lbl{color:#9fb3d1}
+ .lbl{color:#e6e9f0}
+ .link{color:#7aa2f7;text-decoration:none}
+ .dt{border-collapse:collapse;width:100%;font-size:.85rem}
+ .dt td{border:1px solid #2a3550;padding:4px 8px;vertical-align:top}
+ .dt td:first-child{color:#8a93a8;width:30%}
+ .dt h4{margin:.5rem 0}
 </style></head><body>
 <header><h1>HerdR Engineering <span class="muted" id="ver"></span></h1>
 <button onclick="refresh()">Refresh</button></header>
 <nav>
- <a href="#fleet" class="active" data-s="fleet">Fleet</a>
+ <a href="#tree" class="active" data-s="tree">Tree</a>
+ <a href="#fleet" data-s="fleet">Fleet</a>
  <a href="#sessions" data-s="sessions">Sessions</a>
  <a href="#activity" data-s="activity">Activity</a>
  <a href="#dev" data-s="dev">Dev Services</a>
@@ -44,9 +60,56 @@ _INDEX_HTML = """<!doctype html>
 </nav>
 <main id="main"></main>
 <script>
-const API={fleet:'/api/fleet',sessions:'/api/sessions',activity:'/api/activity',
+const API={tree:'/api/tree',fleet:'/api/fleet',sessions:'/api/sessions',activity:'/api/activity',
  dev:'/api/dev',tests:'/api/tests',ci:'/api/ci',attention:'/api/attention'};
-let active='fleet';
+let active='tree';
+function treeHtml(node,depth){
+ if(!node)return ''; depth=depth||0;
+ const kids=(node.children||[]).map(c=>treeHtml(c,depth+1)).join('');
+ const hasKids=!!(node.children&&node.children.length);
+ const leaf=hasKids?'':' leaf';
+ const dot=(node.status==='running')?'<span class="ok">\u25cf</span> ':(node.status?'<span class="warn">\u25cb</span> ':'');
+ const url=node.url?'<a href="'+esc(node.url)+'" target="_blank" rel="noopener" class="link">open</a> ':'';
+ return '<li class="node'+leaf+'" data-id="'+esc(node.id)+'">'+
+  '<div class="nrow"><span style="padding-left:'+(depth*14)+'px">'+
+  (hasKids?'<span class="car">\u25b8</span>':'<span class="car empty"></span>')+
+  dot+'<span class="lbl">'+esc(node.label)+'</span></span>'+
+  (node.subtitle?'<span class="sub muted">'+esc(node.subtitle)+'</span>':'')+
+  url+'</div>'+(kids?'<ul class="kids">'+kids+'</ul>':'')+'</li>';
+}
+function renderTree(d){
+ const root=d.root||{};
+ const html='<div class="card muted">generated '+esc(d.generated_at||'')+' · <b>'+d.counts.machines+'</b> machines · <b>'+d.counts.workspaces+'</b> workspaces · <b>'+d.counts.dev_services+'</b> dev services · <b>'+d.counts.processes+'</b> live processes</div>'
+  +'<div id="detail" class="card" hidden></div>'
+  +'<ul class="tree" id="tree">'+treeHtml(root)+'</ul>';
+ document.getElementById('main').innerHTML=html;
+ document.querySelectorAll('.has-kids>.nrow').forEach(r=>r.addEventListener('click',e=>{
+  const li=r.parentElement; const kids=li.querySelector('.kids');
+  const open=li.classList.toggle('open');
+  kids.style.display=open?'':'none';
+  r.querySelector('.car').textContent=open?'\u25be':'\u25b8';
+  e.stopPropagation();
+ }));
+ document.querySelectorAll('.leaf>.nrow').forEach(r=>r.addEventListener('click',async e=>{
+  const id=r.parentElement.dataset.id;
+  try{
+   const rr=await fetch('/api/node?id='+encodeURIComponent(id));
+   showDetail(await rr.json());
+  }catch(err){ showDetail({error:String(err)}); }
+  e.stopPropagation();
+ }));
+}
+function showDetail(dd){
+ const el=document.getElementById('detail');
+ if(!el)return;
+ el.hidden=false;
+ const rows=Object.entries(dd||{}).filter(([k])=>!['id','kind','activity','dev','children','subtitle'].includes(k))
+  .map(([k,v])=>'<tr><td class="muted">'+esc(k)+'</td><td>'+esc(typeof v==='object'?JSON.stringify(v):v)+'</td></tr>').join('');
+ let extra='';
+ if(dd.activity&&dd.activity.length){ extra+='<h4>Activity</h4><ul>'+(dd.activity.map(a=>'<li><span class="muted">'+esc(a.occurred_at||'')+'</span> '+esc(a.summary||'')+'</li>').join(''))+'</ul>'; }
+ if(dd.dev&&dd.dev.length){ extra+='<h4>Dev services</h4><ul>'+(dd.dev.map(l=>'<li><a class="link" href="'+esc(l.url||'#')+'" target="_blank">'+esc(l.label||l.id)+'</a> · '+esc(l.target||'')+'</li>').join(''))+'</ul>'; }
+ el.innerHTML='<h4>'+esc(dd.label||dd.id||'detail')+'</h4><table class="dt">'+rows+'</table>'+extra+'<div class="muted">'+esc(dd.error||'')+'</div>';
+}
 function esc(s){return (s||'').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));}
 function card(t,body,cls){return '<div class="card '+cls+'"><div>'+esc(t)+'</div><div class="muted">'+body+'</div></div>';}
 async function load(){
@@ -58,6 +121,7 @@ async function load(){
 }
 function render(d){
  const main=document.getElementById('main');
+ if(active==='tree'){ return renderTree(d); }
  if(active==='fleet'){ main.innerHTML='<div class="grid">'+(d.machines||[]).map(m=>card(m.label, m.reachable?'reachable':'unknown', m.reachable?'ok':'warn')).join('')||'<div class="card muted">no machines</div>'+'</div>'; }
  else if(active==='sessions'){ main.innerHTML='<div class="grid">'+(d.sessions||[]).map(s=>card(s.agent,s.status+' · '+esc(s.cwd),'')).join('')+'</div>'; }
  else if(active==='activity'){ main.innerHTML=(d.events||[]).map(e=>card(e.summary, esc(e.occurred_at)+' · '+esc(e.source))).join('')||'<div class="card muted">no activity</div>'; }
@@ -72,6 +136,14 @@ document.getElementById('ver').textContent='v'+window.__VER__;
 load(); setInterval(load,15000);
 </script></body></html>
 """
+
+
+def _tree() -> dict[str, Any]:
+    from .tree import build_tree
+    try:
+        return build_tree()
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 def _fleet() -> dict[str, Any]:
@@ -146,6 +218,7 @@ def _attention() -> dict[str, Any]:
 
 
 _HANDLERS = {
+    "/api/tree": _tree,
     "/api/fleet": _fleet,
     "/api/sessions": _sessions,
     "/api/activity": _activity,
@@ -166,7 +239,18 @@ def _make_handler() -> type:
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802
-            path = self.path.split("?")[0]
+            raw = self.path
+            path = raw.split("?")[0]
+            if path == "/api/node":
+                import urllib.parse
+
+                from .tree import node_detail
+                q = urllib.parse.parse_qs(raw.split("?", 1)[1]) if "?" in raw else {}
+                try:
+                    payload = json.dumps(node_detail(q.get("id", [""])[0]), indent=2, sort_keys=True).encode("utf-8")
+                except Exception as exc:
+                    payload = json.dumps({"error": str(exc)}).encode("utf-8")
+                return self._send(200, payload)
             if path == "/":
                 html = _INDEX_HTML.replace("window.__VER__", f'"{__version__}"')
                 return self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
