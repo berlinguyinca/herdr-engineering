@@ -58,6 +58,7 @@ LOCAL_BIN="$HOME/.local/bin"
 TAILSCALE_LINK="$LOCAL_BIN/tailscale"
 DEFAULT_REPO="https://github.com/berlinguyinca/herdr-engineering.git"
 DEFAULT_GATEWAY="http://dev.lan:29999"
+DEFAULT_CONTROL_PLANE="http://dev.lan"
 
 step() { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
@@ -68,12 +69,14 @@ die()  { printf '\033[1;31m  x %s\033[0m\n' "$*" >&2; exit 1; }
 # --- parse args -------------------------------------------------------------
 CMD="install"
 GATEWAY="$DEFAULT_GATEWAY"
+CONTROL_PLANE="$DEFAULT_CONTROL_PLANE"
 REPO="$DEFAULT_REPO"
 PURGE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     install|status|uninstall) CMD="$1"; shift ;;
     --gateway) GATEWAY="${2:?--gateway needs a URL}"; shift 2 ;;
+    --control-plane) CONTROL_PLANE="${2:?--control-plane needs a URL}"; shift 2 ;;
     --repo)    REPO="${2:?--repo needs a git URL}"; shift 2 ;;
     --purge)   PURGE=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -129,8 +132,10 @@ step "2/6 ensuring Python 3.12 venv + herdr-engineering"
 "$UV_BIN" python install 3.12 >/dev/null 2>&1 || true
 if [ ! -x "$HERDR_ENG" ]; then
   "$UV_BIN" venv --python 3.12 "$VENV" >/dev/null
-  "$UV_BIN" pip install --python "$VENV_BIN/python" "$REPO"
 fi
+# Always upgrade so re-running install converges this host onto the latest
+# herdr-engineering (this is how an existing host auto-picks-up agent changes).
+"$UV_BIN" pip install --upgrade --python "$VENV_BIN/python" "$REPO"
 "$HERDR_ENG" --version
 
 # --- 3/6 tailscale CLI on PATH ---------------------------------------------
@@ -147,8 +152,8 @@ if ! command -v tailscale >/dev/null 2>&1 && [ ! -x "$TAILSCALE_LINK" ]; then
 fi
 "$TAILSCALE_LINK" ip -4 || warn "tailscale not answering; is the Tailscale app running and logged in?"
 
-# --- 4/6 gateway control URL -> fabric.env ---------------------------------
-step "4/6 fabric gateway control URL -> $ENV_FILE"
+# --- 4/6 gateway + control-plane URLs -> fabric.env -------------------------
+step "4/6 fabric gateway + control-plane URLs -> $ENV_FILE"
 if ! grep -q '^HERDR_ENGINEERING_FABRIC_URL=' "$ENV_FILE" 2>/dev/null; then
   mkdir -p "$ENV_DIR"
   printf 'HERDR_ENGINEERING_FABRIC_URL=%s\n' "$GATEWAY" > "$ENV_FILE"
@@ -156,6 +161,13 @@ if ! grep -q '^HERDR_ENGINEERING_FABRIC_URL=' "$ENV_FILE" 2>/dev/null; then
   echo "  wrote HERDR_ENGINEERING_FABRIC_URL=$GATEWAY"
 else
   echo "  unchanged (already set: $(grep '^HERDR_ENGINEERING_FABRIC_URL=' "$ENV_FILE" | cut -d= -f2-))"
+fi
+if ! grep -q '^HERDR_ENGINEERING_CONTROL_PLANE_URL=' "$ENV_FILE" 2>/dev/null; then
+  printf 'HERDR_ENGINEERING_CONTROL_PLANE_URL=%s\n' "$CONTROL_PLANE" >> "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  echo "  wrote HERDR_ENGINEERING_CONTROL_PLANE_URL=$CONTROL_PLANE"
+else
+  echo "  unchanged (control-plane URL already set)"
 fi
 
 # --- 5/6 wrapper script (mirrors systemd EnvironmentFile) ------------------

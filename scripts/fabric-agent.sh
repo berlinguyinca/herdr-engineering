@@ -33,9 +33,11 @@ step() { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 
 GATEWAY_URL=""
+CONTROL_PLANE_URL="http://dev.lan"
 while [ $# -gt 0 ]; do
   case "$1" in
     --gateway) GATEWAY_URL="${2:?--gateway needs a URL}"; shift 2 ;;
+    --control-plane) CONTROL_PLANE_URL="${2:?--control-plane needs a URL}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -54,8 +56,8 @@ if [ ! -x "$HERDR_ENG" ]; then
 fi
 echo "  herdr-eng: $HERDR_ENG"
 
-# --- 1/4 gateway control URL -> env file -----------------------------------
-step "1/4 fabric gateway control URL -> $ENV_FILE"
+# --- 1/4 gateway + control-plane URLs -> env file ---------------------------
+step "1/4 fabric gateway + control-plane URLs -> $ENV_FILE"
 if [ -n "$GATEWAY_URL" ] && ! grep -q '^HERDR_ENGINEERING_FABRIC_URL=' "$ENV_FILE" 2>/dev/null; then
   mkdir -p "$ENV_DIR"
   printf 'HERDR_ENGINEERING_FABRIC_URL=%s\n' "$GATEWAY_URL" >> "$ENV_FILE"
@@ -63,6 +65,14 @@ if [ -n "$GATEWAY_URL" ] && ! grep -q '^HERDR_ENGINEERING_FABRIC_URL=' "$ENV_FIL
   echo "  wrote HERDR_ENGINEERING_FABRIC_URL=$GATEWAY_URL"
 else
   echo "  unchanged (no --gateway given, or already set)"
+fi
+if ! grep -q '^HERDR_ENGINEERING_CONTROL_PLANE_URL=' "$ENV_FILE" 2>/dev/null; then
+  mkdir -p "$ENV_DIR"
+  printf 'HERDR_ENGINEERING_CONTROL_PLANE_URL=%s\n' "$CONTROL_PLANE_URL" >> "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  echo "  wrote HERDR_ENGINEERING_CONTROL_PLANE_URL=$CONTROL_PLANE_URL"
+else
+  echo "  unchanged (control-plane URL already set)"
 fi
 
 # --- 2/4 render + install the systemd user unit ----------------------------
