@@ -365,12 +365,26 @@ async function copyText(text, btn) {
 async function viewServices() {
   const { services } = await client.listServices();
   if (!services.length) { root.innerHTML = '<herdr-empty message="No services registered"></herdr-empty>'; return; }
-  root.innerHTML = '<h1>Services</h1><div class="hd-grid">' + services.map((svc) => `
-    <div class="hd-card">
-      <div class="hd-card__title"><a href="#/services/${esc(svc.service_id)}">${esc(svc.service_name)}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${esc(svc.status)}"></herdr-status></div>
-      <div class="hd-card__sub"><a href="${esc(svc.url)}" target="_blank" rel="noopener">${esc(svc.url)}</a></div>
-    </div>`).join('') + '</div>';
+  const all = route().query.get('all') === '1';
+  const healthy = services.filter((s) => s.status !== 'unavailable');
+  const shown = all ? services : healthy;
+  const hidden = services.length - healthy.length;
+  root.innerHTML = `
+    <h1>Services</h1>
+    <div style="margin:10px 0;font-size:13px">
+      ${shown.length} accessible` + (hidden > 0 ? ` · ${hidden} unavailable ` : '') + `
+      ${all
+        ? `<a href="#/services" class="hd-btn" style="margin-left:8px">Hide unavailable</a>`
+        : hidden > 0
+          ? `<a href="#/services?all=1" class="hd-btn" style="margin-left:8px">Show unavailable (${hidden})</a>`
+          : ''}
+    </div>
+    <div class="hd-grid">` + shown.map((svc) => `
+      <div class="hd-card">
+        <div class="hd-card__title"><a href="#/services/${esc(svc.service_id)}">${esc(svc.service_name)}</a></div>
+        <div style="margin:6px 0"><herdr-status stage="${esc(svc.status)}"></herdr-status></div>
+        <div class="hd-card__sub"><a href="${esc(svc.url)}" target="_blank" rel="noopener">${esc(svc.url)}</a></div>
+      </div>`).join('') + '</div>';
 }
 
 async function viewService(parts) {
