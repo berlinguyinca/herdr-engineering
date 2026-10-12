@@ -103,9 +103,12 @@ class AttentionCenter:
         start, end = qh.get("start", 0), qh.get("end", 0)
         if start == end:
             return False
+        # Both ends inclusive, so {start: 0, end: 23} means all 24 hours. A
+        # half-open [start, end) range would silently skip hour 23, making
+        # "quiet all day" impossible and the suppression test time-of-day flaky.
         if start < end:
-            return start <= hour < end
-        return hour >= start or hour < end
+            return start <= hour <= end
+        return hour >= start or hour <= end
 
     def acknowledge(self, item_id: str) -> bool:
         with self._lock:
