@@ -382,6 +382,7 @@ async function viewServices() {
     <div class="hd-grid">` + shown.map((svc) => `
       <div class="hd-card">
         <div class="hd-card__title"><a href="#/services/${esc(svc.service_id)}">${esc(svc.service_name)}</a></div>
+        <div class="hd-card__sub">${esc(svc.description || '')}</div>
         <div style="margin:6px 0"><herdr-status stage="${esc(svc.status)}"></herdr-status></div>
         <div class="hd-card__sub"><a href="${esc(svc.url)}" target="_blank" rel="noopener">${esc(svc.url)}</a></div>
       </div>`).join('') + '</div>';
@@ -392,10 +393,12 @@ async function viewService(parts) {
   if (!svc || svc.error) { root.innerHTML = '<herdr-error message="Service not found"></herdr-error>'; return; }
   root.innerHTML = `
     <h1>${esc(svc.service_name)}</h1>
+    <p class="muted" style="margin:8px 0;max-width:60ch">${esc(svc.description || '')}</p>
     <div style="margin:8px 0"><herdr-status stage="${esc(svc.status)}"></herdr-status></div>
     <div class="hd-grid">
-      <herdr-metric label="Port" value="${esc(svc.port)}"></herdr-metric>
       <herdr-metric label="Host" value="${esc(svc.host_id)}"></herdr-metric>
+      <herdr-metric label="Port" value="${esc(svc.port)}"></herdr-metric>
+      ${svc.owner ? `<herdr-metric label="Process" value="${esc(svc.owner)}"></herdr-metric>` : ''}
     </div>
     <p>URL: <a href="${esc(svc.url)}" target="_blank" rel="noopener">${esc(svc.url)}</a></p>`;
 }

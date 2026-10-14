@@ -615,14 +615,31 @@ class FabricAgent:
                  label, lease.get("external_port"))
         return self._store[str(port)]
 
+    @staticmethod
+    def _describe_service(entry: dict[str, Any], host: str) -> str:
+        """Human one-liner for a discovered service: what it is, on which
+        system it runs, and how to reach it."""
+        process = (entry.get("process") or "").strip()
+        kind = process or "web"
+        host = (host or "").strip() or "an unknown host"
+        port = entry.get("external_port")
+        url = entry.get("url")
+        desc = f"{kind} service on {host}"
+        if port:
+            desc += f" (port {port})"
+        if url:
+            desc += f", reachable at {url}"
+        return desc
+
     def _report_service(self, entry: dict[str, Any], status: str) -> None:
         """Best-effort report of a discovered service to the control plane.
 
         Emits a ``service`` envelope to ``{control_plane_url}/api/v1/ingest`` so
         the app appears on the fleet Services page (visible from any host) with
-        a clickable ``dev:<port>`` route. The control-plane repo keys by
-        (host_id, service_name), so re-reporting the same label updates in place
-        instead of duplicating. Best-effort: a down control plane is never fatal.
+        a clickable ``dev:<port>`` route and a human description of what it is
+        and where it runs. The control-plane repo keys by (host_id,
+        service_name), so re-reporting the same label updates in place instead
+        of duplicating. Best-effort: a down control plane is never fatal.
         """
         if not self.cfg.control_plane_url:
             return
@@ -633,6 +650,7 @@ class FabricAgent:
             "route": entry.get("url") or "",
             "status": status,
             "owner": entry.get("process") or "",
+            "description": self._describe_service(entry, self._machine),
         }
         body = {
             "entity_type": "service",

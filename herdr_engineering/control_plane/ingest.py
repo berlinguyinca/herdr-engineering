@@ -87,7 +87,9 @@ class IngestService:
         ``payload['service_name']`` (or ``entity_id`` as a fallback) is the
         display name; ``host_id``/``port``/``route``/``status`` come from the
         payload. Repeated heartbeats for the same (host, name) update in place
-        rather than duplicating.
+        rather than duplicating. A human ``description`` and ``owner`` (the
+        process) ride along when present; the repo always ensures a
+        description so every service is self-explanatory.
         """
         status = ("unavailable" if "unavailable" in event_type.lower()
                   else payload.get("status", "healthy"))
@@ -98,6 +100,8 @@ class IngestService:
             status=status,
             session_id=payload.get("session_id"),
             route=payload.get("route"),
+            description=payload.get("description"),
+            owner=payload.get("owner"),
         )
         return {"entity_type": "service", "entity_id": svcid,
                 "event_type": event_type}

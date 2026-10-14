@@ -129,6 +129,36 @@ def test_service_name_comes_from_payload_not_entity_id():
     assert svc["route"] == "http://dev.lan:18000"
 
 
+def test_service_description_and_owner_from_payload():
+    ingest = IngestService(ControlPlaneRepo())
+    ingest.ingest({
+        "entity_type": "service", "entity_id": "lease_abc",
+        "event_type": "service.registered",
+        "payload": {"service_name": "python on beast (port 3011)",
+                    "host_id": "beast", "port": 18142,
+                    "route": "http://dev.lan:18142", "status": "healthy",
+                    "owner": "python",
+                    "description": "Augur Console, a Python web app"},
+    })
+    (svc,) = ingest.repo.list_services()
+    assert svc["description"] == "Augur Console, a Python web app"
+    assert svc["owner"] == "python"
+
+
+def test_service_fallback_description_when_absent():
+    # No explicit description in the payload: the repo still guarantees one.
+    ingest = IngestService(ControlPlaneRepo())
+    ingest.ingest({
+        "entity_type": "service", "entity_id": "herdr-control-plane",
+        "event_type": "service.started",
+        "payload": {"host_id": "bender", "port": 8080,
+                    "route": "http://bender:8080", "status": "healthy"},
+    })
+    (svc,) = ingest.repo.list_services()
+    assert svc["description"]
+    assert "bender" in svc["description"]
+
+
 def test_service_unavailable_event_marks_status():
     ingest = IngestService(ControlPlaneRepo())
     ingest.ingest({
