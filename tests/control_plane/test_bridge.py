@@ -165,7 +165,7 @@ def test_load_into_reconstructs_services_from_event_log():
              source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
         _row(event_id="e2", sequence=1, event_type="ServiceUpdated",
              entity_type="service", entity_id="svc_1",
-             payload='{"service_name": "herdr-control-plane", "host_id": "bender", "port": 8081, "route": "http://bender:8081", "status": "healthy"}',
+             payload='{"service_name": "herdr-control-plane", "host_id": "bender", "port": 8081, "route": "http://bender:8081", "status": "healthy", "description": "The control-plane web UI and API", "owner": "python"}',
              source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
     ]
     src = FakeSource(events=events)  # structured services table intentionally empty
@@ -179,6 +179,27 @@ def test_load_into_reconstructs_services_from_event_log():
     assert svc["port"] == 8081
     assert svc["route"] == "http://bender:8081"
     assert svc["status"] == "healthy"
+    # description + owner survive the replay
+    assert svc["description"] == "The control-plane web UI and API"
+    assert svc["owner"] == "python"
+
+
+def test_load_into_derives_description_for_legacy_services():
+    """Service events predating the description field still hydrate to a
+    record that carries a human description (read-time derivation)."""
+    ts = "2026-01-01T00:00:00+00:00"
+    events = [
+        _row(event_id="e1", sequence=0, event_type="ServiceRegistered",
+             entity_type="service", entity_id="svc_1",
+             payload='{"service_name": "node on mac.lan (port 4000)", "host_id": "mac.lan", "port": 18050, "route": "http://dev.lan:18050", "status": "healthy"}',
+             source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
+    ]
+    src = FakeSource(events=events)
+    repo = ControlPlaneRepo()
+    load_into(repo, src)
+    svc = repo.get_service("svc_1")
+    assert svc["description"]
+    assert "mac.lan" in svc["description"]
 
 
 def test_load_into_empty_source():

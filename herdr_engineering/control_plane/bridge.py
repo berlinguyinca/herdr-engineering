@@ -266,6 +266,7 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
             svc = services.setdefault(eid, {
                 "service_id": eid, "service_name": eid, "host_id": None,
                 "port": 0, "session_id": None, "route": None,
+                "description": None, "owner": None,
                 "status": "healthy",
                 "created_at": ts, "updated_at": ts,
             })
@@ -279,6 +280,10 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 svc["session_id"] = p["session_id"]
             if p.get("route"):
                 svc["route"] = p["route"]
+            if p.get("description"):
+                svc["description"] = p["description"]
+            if p.get("owner"):
+                svc["owner"] = p["owner"]
             if p.get("status"):
                 svc["status"] = p["status"]
             svc["status"] = "unavailable" if "unavailable" in etype.lower() \

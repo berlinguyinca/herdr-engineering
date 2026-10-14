@@ -36,7 +36,7 @@ const ROUTES = [
   ['/missions', 'Alpha'],
   ['/herd', 'Sessions'],
   ['/hosts', 'beast'],
-  ['/services', 'web'],
+  ['/services', 'web service on beast'],
 ];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

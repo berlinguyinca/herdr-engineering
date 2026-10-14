@@ -75,6 +75,63 @@ def test_service_upsert_is_idempotent_by_host_and_name():
     assert stream[0]["entity_id"] == stream[1]["entity_id"] == a
 
 
+def test_service_always_has_description():
+    r = repo.ControlPlaneRepo()
+    svcid = r.register_service(service_name="web", host_id="bender",
+                               port=8080, route="http://dev.lan:18000")
+    svc = r.get_service(svcid)
+    assert svc["description"]
+    assert "bender" in svc["description"]
+    assert "8080" in svc["description"]
+    # list view guarantees the invariant for every service
+    assert all(s["description"] for s in r.list_services())
+
+
+def test_service_explicit_description_wins():
+    r = repo.ControlPlaneRepo()
+    svcid = r.register_service(service_name="web", host_id="beast",
+                               port=3011,
+                               description="Augur Console dashboard")
+    assert r.get_service(svcid)["description"] == "Augur Console dashboard"
+
+
+def test_service_description_uses_owner_process():
+    r = repo.ControlPlaneRepo()
+    svcid = r.register_service(service_name="python on bender (port 3011)",
+                               host_id="bender", port=3011, owner="python")
+    assert r.get_service(svcid)["description"].startswith(
+        "python service on bender")
+
+
+def test_service_upsert_keeps_existing_description():
+    r = repo.ControlPlaneRepo()
+    a = r.upsert_service("bender", "web", 8080, description="Augur Console")
+    b = r.upsert_service("bender", "web", 8081, status="healthy")
+    assert a == b
+    # a heartbeat without a new description must not clobber the old one
+    assert r.get_service(a)["description"] == "Augur Console"
+    # an explicit description replaces it
+    c = r.upsert_service("bender", "web", 8082, description="Renamed app")
+    assert r.get_service(c)["description"] == "Renamed app"
+
+
+def test_service_description_derived_for_imported_records():
+    """Records hydrated from an older event log (no description) still get a
+    human description at read time."""
+    r = repo.ControlPlaneRepo()
+    r.import_state({"services": {
+        "svc_old": {"service_id": "svc_old",
+                    "service_name": "node on mac.lan (port 4000)",
+                    "host_id": "mac.lan", "port": 4000, "status": "healthy",
+                    "route": "http://dev.lan:18050",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"},
+    }})
+    svc = r.get_service("svc_old")
+    assert svc["description"]
+    assert "mac.lan" in svc["description"]
+
+
 def test_host_heartbeat_and_unavailable():
     r = repo.ControlPlaneRepo()
     hid = r.register_host("bender", "100.104.39.6")

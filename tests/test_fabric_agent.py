@@ -818,6 +818,12 @@ def test_agent_reports_service_to_control_plane(tmp_path, monkeypatch):
         assert p["route"].startswith("http://")
         assert p["port"] > 0
         assert p["status"] == "healthy"
+        # every reported service carries a human description: what it is,
+        # which system it runs on, and how to reach it
+        assert p["description"]
+        assert socket.gethostname() in p["description"]
+        assert str(p["port"]) in p["description"]
+        assert p["route"] in p["description"]
 
         # service disappears -> unavailable
         live["ports"].clear()
