@@ -154,7 +154,7 @@ class GatewayRouter:
         self._lock = threading.RLock()
 
     def bind(self, port: int, target_host: str, target_port: int,
-             routes: list | None = None) -> bool:
+             routes: list | None = None, rewrite: str | None = None) -> bool:
         with self._lock:
             if port in self._listeners:
                 return True
@@ -171,7 +171,7 @@ class GatewayRouter:
                     continue  # interface not available here
                 listeners.append(s)
                 threads.append(threading.Thread(target=self._accept_loop,
-                                                args=(s, port, target_host, target_port, routes),
+                                                args=(s, port, target_host, target_port, routes, rewrite),
                                                 daemon=True))
             if not listeners:
                 for s in listeners:
@@ -185,7 +185,7 @@ class GatewayRouter:
 
     def _accept_loop(self, listener: socket.socket, port: int,
                      target_host: str, target_port: int,
-                     routes: list | None = None) -> None:
+                     routes: list | None = None, rewrite: str | None = None) -> None:
         while True:
             try:
                 client, _addr = listener.accept()
@@ -197,11 +197,28 @@ class GatewayRouter:
             except OSError:
                 break
             threading.Thread(target=self._proxy_one,
-                             args=(client, target_host, target_port, routes),
+                             args=(client, target_host, target_port, routes, rewrite),
                              daemon=True).start()
 
     def _proxy_one(self, client: socket.socket, target_host: str,
-                   target_port: int, routes: list | None = None) -> None:
+                   target_port: int, routes: list | None = None,
+                   rewrite: str | None = None) -> None:
+        if rewrite and not routes:
+            target = None
+            try:
+                target = socket.create_connection((target_host, target_port), timeout=5)
+                from .devfabric import rewriting_pipe
+                rewriting_pipe(client, target, target_port, rewrite)
+            except OSError:
+                pass
+            finally:
+                for s in (client, target):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+            return
         if routes:
             route_and_pipe(client, routes, target_host, target_port)
             return
@@ -249,8 +266,11 @@ class FabricGateway:
                  router: GatewayRouter, control_host: str = "127.0.0.1",
                  control_port: int = 29999, url_base: str | None = None,
                  probe_interval: float = 15.0, token: str | None = None,
-                 reset_lock: bool = False) -> None:
+                 reset_lock: bool = False, rewrite_headers: bool = False) -> None:
         self.registry = registry
+        # Opt-in: rewrite loopback URLs in Location / CORS / cookie-domain headers
+        # of HTTP leases to the fabric address (forces Connection: close).
+        self.rewrite_headers = rewrite_headers
         self.router = router
         self.control_host = control_host
         self.control_port = control_port
@@ -275,13 +295,19 @@ class FabricGateway:
         """Bind all active leases and unbind ports with no active lease."""
         active = {lease.external_port: lease for lease in self.registry.active_leases()}
         for port, lease in active.items():
-            if not self.router.bind(port, lease.target_host, lease.target_port):
+            if not self.router.bind(port, lease.target_host, lease.target_port,
+                                    rewrite=self._rewrite_target(lease)):
                 # stale binding to a different target: release so the next
                 # cycle rebinds to the current one
                 self.router.unbind(port)
         for port in self.router.bound_ports():
             if port not in active:
                 self.router.unbind(port)
+
+    def _rewrite_target(self, lease) -> str | None:
+        if self.rewrite_headers and lease.protocol == "http":
+            return f"{self.url_base}:{lease.external_port}"
+        return None
 
     # -- probe loop ---------------------------------------------------------
     def _probe(self) -> None:
@@ -395,7 +421,7 @@ class FabricGateway:
             # own target is the catch-all); when absent, plain 1:1 forwarding.
             routes=body.get("routes"))
         self.router.bind(lease.external_port, lease.target_host, lease.target_port,
-                         routes=lease.routes)
+                         routes=lease.routes, rewrite=self._rewrite_target(lease))
         return {"lease": lease.to_dict(), "url": self.stable_url(lease.external_port)}
 
     def op_heartbeat(self, lease_id: str) -> dict[str, Any]:

@@ -512,3 +512,11 @@ A revoked key stops working within 10 s (the proxy reloads its key table every 1
 Mint a key and an env file for a project (the key is never printed):
 `herdr-eng llm-env --project my-project` writes `~/.config/herdr-engineering/llm-my-project.env`
 (0600, `OPENAI_BASE_URL`, `OPENAI_API_KEY`); `source` it before starting an agent.
+
+### Optional header rewriting for HTTP leases
+
+`herdr-eng dev gateway --rewrite-headers` (off by default) rewrites loopback URLs
+(`http://localhost:<port>`) in the `Location`, `Access-Control-Allow-Origin`, `Content-Location`
+and cookie `Domain` headers of HTTP leases to the fabric address. It forces `Connection: close`
+on those leases so every response passes the filter; bodies (which may hold signed or
+script-built URLs) and websocket upgrades are never touched.
