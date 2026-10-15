@@ -135,3 +135,15 @@ def test_keys_are_stored_hashed_and_revocable():
     assert "key_hash" not in json.dumps(repo.list_project_keys())
     repo.revoke_project_key(minted["key_id"])
     assert repo.llm_config()["keys"] == []
+
+
+def test_key_minted_after_last_refresh_works_without_waiting():
+    import time as _t
+    repo, key, proxy, seen, _, srvs = _setup()
+    try:
+        fresh = repo.create_project_key("proj-b")["key"]
+        _t.sleep(2.1)  # past the miss-reload rate limit
+        assert _post(proxy, fresh, {"model": "qwen", "messages": []})[0] == 200
+    finally:
+        proxy.shutdown()
+        [s.shutdown() for s in srvs]
