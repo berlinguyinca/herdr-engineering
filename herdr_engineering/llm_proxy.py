@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 log = logging.getLogger("herdr.llm_proxy")
 
 FORWARDED_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models")
+MISS_RELOAD_SECONDS = 2.0
 MAX_BODY = 16 * 1024 * 1024
 HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
                "proxy-authorization", "proxy-authenticate", "content-length", "host", "accept-encoding",
@@ -78,10 +79,17 @@ class ProxyState:
     def authenticate(self, presented: str) -> dict | None:
         self.refresh()
         digest = hashlib.sha256(presented.encode()).hexdigest()
-        with self._lock:
-            for h, k in self._keys.items():
-                if hmac.compare_digest(h, digest):
-                    return k
+        for attempt in (0, 1):
+            with self._lock:
+                for h, k in self._keys.items():
+                    if hmac.compare_digest(h, digest):
+                        return k
+            # A key minted after the last refresh must work at once; unknown keys
+            # may force a reload, but at most once per MISS_RELOAD_SECONDS.
+            if attempt == 0:
+                if time.monotonic() - self._last < MISS_RELOAD_SECONDS:
+                    return None
+                self.refresh(force=True)
         return None
 
     def route(self, model: str | None) -> tuple[str, str | None, str | None]:
