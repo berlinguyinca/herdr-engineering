@@ -5,10 +5,12 @@ the lease data model (Route + routes on DevServiceLease, store round-trip,
 backward compatibility), the forwarder dispatch, and a LIVE end-to-end check
 that the edge really routes /api/* and / to different backends over loopback.
 """
+import json
 import os
 import socket
 import sys
 import threading
+import time
 import uuid
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -206,4 +208,73 @@ def test_origin_edge_non_http_falls_back_to_catchall():
         s.close()
     finally:
         edge.stop()
+        api_stop.set(); ui_stop.set(); api_srv.close(); ui_srv.close()
+
+
+# -- devfabric enroll (the 'sets everything up' entry point) -----------------
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_enroll_registers_routes_from_manifest(tmp_path, monkeypatch, capsys):
+    import types
+
+    import herdr_engineering.cli as cli
+    from herdr_engineering.devfabric import DevServiceRegistry
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(cli, "_local_fabric_client", lambda: None)
+    manifest = tmp_path / "origin.json"
+    manifest.write_text(json.dumps({
+        "origin_port": 39411, "machine": "m1", "repo": "augur", "label": "L",
+        "catchall": {"host": "127.0.0.1", "port": 3000},
+        "routes": [{"prefix": "/api", "host": "127.0.0.1", "port": 8300}]}))
+    rc = cli._cmd_dev_enroll(types.SimpleNamespace(
+        manifest=str(manifest), origin_port=None, machine=None, repo=None,
+        label=None, protocol=None, catchall=None, route=None, serve=False,
+        bind="127.0.0.1"))
+    assert rc == 0
+    reg = DevServiceRegistry()   # same (env) store
+    lease = next(cand for cand in reg.active_leases() if cand.external_port == 39411)
+    assert [(r.prefix, r.port) for r in lease.routes] == [("/api", 8300)]
+    assert lease.target_port == 3000            # catch-all
+
+
+def test_enroll_serve_end_to_end(tmp_path):
+    """The real command, end to end: 'devfabric enroll --manifest --serve' sets
+    up a working same-origin edge over loopback."""
+    import subprocess
+    api_port, api_stop, api_srv = _marker_server("FROM-API")
+    ui_port, ui_stop, ui_srv = _marker_server("FROM-UI")
+    origin_port = _free_port()
+    manifest = tmp_path / "origin.json"
+    manifest.write_text(json.dumps({
+        "origin_port": origin_port, "machine": "m1", "repo": "augur",
+        "catchall": {"host": "127.0.0.1", "port": ui_port},
+        "routes": [{"prefix": "/api", "host": "127.0.0.1", "port": api_port}]}))
+    env = os.environ.copy()
+    env["HERDR_ENGINEERING_STATE"] = str(tmp_path / "state")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "herdr_engineering.cli", "devfabric", "enroll",
+         "--manifest", str(manifest), "--serve"],
+        env=env, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        base = f"http://127.0.0.1:{origin_port}"
+        deadline = time.monotonic() + 12
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                assert _http_get(base + "/api/health") == "FROM-API"
+                break
+            except Exception as exc:      # noqa: BLE001 - retry until up
+                last = exc
+                time.sleep(0.3)
+        else:
+            raise AssertionError(f"origin never came up: {last}")
+        assert _http_get(base + "/") == "FROM-UI"       # catch-all -> UI
+        assert _http_get(base + "/apix") == "FROM-UI"   # sibling -> catch-all
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         api_stop.set(); ui_stop.set(); api_srv.close(); ui_srv.close()

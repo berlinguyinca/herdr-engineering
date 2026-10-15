@@ -122,6 +122,22 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="pin the origin's external dev port (default: match --port, "
                          "fall back to the dev range if taken)")
     p2.set_defaults(func=_cmd_dev_register)
+    p2 = dsub.add_parser("enroll", help="enroll a same-origin app edge (register the "
+                    "origin + optional forwarder); see the fabric-enroll skill")
+    p2.add_argument("--manifest", help="JSON manifest: {origin_port, machine, repo, label, "
+                    "catchall:{host,port}, routes:[{prefix,host,port}]}")
+    p2.add_argument("--origin-port", type=int, help="the origin's external dev port")
+    p2.add_argument("--machine", help="machine id where the backends run (default: hostname)")
+    p2.add_argument("--repo"); p2.add_argument("--label"); p2.add_argument("--protocol")
+    p2.add_argument("--catchall", metavar="HOST:PORT",
+                    help="default backend (overrides manifest.catchall)")
+    p2.add_argument("--route", action="append", metavar="PREFIX=HOST:PORT",
+                    help="path-prefix route (repeatable; overrides manifest.routes)")
+    p2.add_argument("--serve", action="store_true",
+                    help="run the per-host forwarder and block (no gateway needed)")
+    p2.add_argument("--bind", default="127.0.0.1",
+                    help="forwarder bind address for --serve (default 127.0.0.1)")
+    p2.set_defaults(func=_cmd_dev_enroll)
     p2 = dsub.add_parser("heartbeat", help="renew a lease")
     p2.add_argument("lease_id"); p2.set_defaults(func=_cmd_dev_heartbeat)
     p2 = dsub.add_parser("close", help="close a lease")
@@ -535,6 +551,122 @@ def _cmd_dev_register(args) -> int:
         owner_process_id=args.process, label=args.label, routes=routes,
         preferred_port=args.preferred_port)
     _print_json(lease.to_dict())
+    return 0
+
+
+def _load_origin_manifest(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError("manifest must be a JSON object")
+    return d
+
+
+def _cmd_dev_enroll(args) -> int:
+    """Enroll a same-origin app edge: register the origin lease (catch-all +
+    path routes) in the fabric and, with --serve, run the per-host forwarder.
+
+    This is the 'sets everything up' entry point (see the fabric-enroll skill).
+    With a reachable gateway the origin is forwarded automatically; otherwise
+    --serve runs the forwarder locally.
+    """
+    from .contracts import Route
+    from .devfabric import DevServiceRegistry, forwarder_for
+    from .errors import ConflictError
+
+    m = {}
+    if args.manifest:
+        try:
+            m = _load_origin_manifest(args.manifest)
+        except (OSError, ValueError) as exc:
+            _print_json({"ok": False, "error": f"manifest: {exc}"})
+            return 1
+
+    origin_port = args.origin_port or m.get("origin_port")
+    machine = args.machine or m.get("machine") or socket.gethostname()
+    repo = args.repo or m.get("repo")
+    label = args.label or m.get("label")
+    protocol = args.protocol or m.get("protocol", "http")
+    catchall = m.get("catchall") or {}
+    routes_in = m.get("routes") or []
+    if args.catchall:
+        ch, _, cp = args.catchall.rpartition(":")
+        catchall = {"host": ch, "port": int(cp)}
+    if args.route:
+        routes_in = _parse_routes(args.route) or []
+
+    if not origin_port:
+        _print_json({"ok": False, "error": "missing origin port (--origin-port or manifest.origin_port)"})
+        return 1
+    if not catchall.get("host") or not catchall.get("port"):
+        _print_json({"ok": False, "error": "missing catch-all backend (--catchall HOST:PORT or manifest.catchall)"})
+        return 1
+    c_host, c_port = catchall["host"], int(catchall["port"])
+    routes = [Route(r.get("prefix", "/"), r.get("host"), int(r.get("port")))
+              if isinstance(r, dict) else r for r in routes_in]
+    routes_wire = [{"prefix": r.prefix, "host": r.host, "port": r.port} for r in routes] or None
+
+    client = _local_fabric_client()
+    if client is not None:
+        try:
+            result = client.register(
+                target_machine_id=machine, target_host=c_host, target_port=c_port,
+                protocol=protocol, owner_repository=repo, label=label,
+                routes=routes_wire, preferred_port=origin_port)
+        except Exception as exc:
+            _print_json({"ok": False, "error": f"gateway register failed: {exc}"})
+            return 1
+        lease = result.get("lease", {})
+        _print_json({
+            "ok": True, "via": "gateway", "lease_id": lease.get("id"),
+            "origin": result.get("url") or f"http://dev:{origin_port}",
+            "catchall": f"{c_host}:{c_port}",
+            "routes": [f"{r['prefix']} -> {r['host']}:{r['port']}" for r in (routes_wire or [])],
+            "note": "the gateway forwards the origin automatically",
+        })
+        return 0
+
+    # Local mode: apply (re)routes by closing any stale lease for the target,
+    # then register fresh (preferred_port keeps the origin port stable).
+    reg = DevServiceRegistry()
+    stale = next((cand for cand in reg.active_leases()
+                  if cand.target_machine_id == machine and cand.target_host == c_host
+                  and cand.target_port == c_port), None)
+    if stale is not None:
+        reg.close(stale.id)
+    lease = reg.register(
+        target_machine_id=machine, target_host=c_host, target_port=c_port,
+        protocol=protocol, owner_repository=repo, label=label,
+        routes=routes, preferred_port=origin_port)
+    origin = f"http://dev:{lease.external_port}"
+    out = {
+        "ok": True, "via": "local", "lease_id": lease.id, "origin": origin,
+        "local_origin": f"http://{args.bind}:{lease.external_port}",
+        "catchall": f"{c_host}:{c_port}",
+        "routes": [f"{r.prefix} -> {r.host}:{r.port}" for r in (lease.routes or [])],
+    }
+    if lease.external_port != origin_port:
+        out["warning"] = (f"origin port {origin_port} was in use; allocated "
+                          f"{lease.external_port} instead")
+    if not args.serve:
+        out["next"] = f"herdr-eng devfabric serve --lease {lease.id}"
+    _print_json(out)
+    if not args.serve:
+        return 0
+
+    try:
+        forwarder_for(lease, bind_host=args.bind).start()
+    except ConflictError as exc:
+        _print_json({"ok": False, "error": str(exc)})
+        return 1
+    _print_json({"ok": True, "serving": f"http://{args.bind}:{lease.external_port}",
+                 "note": "forwarding the origin (Ctrl-C to stop)"})
+    import signal
+    import time
+    stop = {"flag": False}
+    signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
+    while not stop["flag"]:
+        time.sleep(0.2)
     return 0
 
 
