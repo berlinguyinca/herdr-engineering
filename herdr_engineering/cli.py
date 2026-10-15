@@ -304,6 +304,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--migrations", default=None,
                     help="migrations dir (default: bundled deploy/control-plane)")
     p2.set_defaults(func=_cmd_cp_worker)
+    p2 = csub.add_parser("llm-proxy",
+                         help="OpenAI-compatible fabric gateway: project keys, token accounting")
+    p2.add_argument("--host", default="127.0.0.1")
+    p2.add_argument("--port", type=int, default=8088)
+    p2.add_argument("--control-plane", default="http://control-plane-web:8080",
+                    help="control-plane base URL")
+    p2.add_argument("--upstream", default="https://llm.metabolomics.us")
+    p2.set_defaults(func=_cmd_cp_llm_proxy)
 
     return parser
 
@@ -311,6 +319,28 @@ def _build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------
 # Command handlers
 # --------------------------------------------------------------------------
+def _cmd_cp_llm_proxy(args) -> int:
+    """Serve the fabric LLM gateway. The upstream key is read from a file named by
+    FABRIC_LLM_UPSTREAM_KEY_FILE or, failing that, the FABRIC_LLM_UPSTREAM_KEY env
+    var — never from argv."""
+    from .llm_proxy import serve
+    key = os.environ.get("FABRIC_LLM_UPSTREAM_KEY", "")
+    key_file = os.environ.get("FABRIC_LLM_UPSTREAM_KEY_FILE")
+    if key_file:
+        with open(key_file) as fh:
+            key = fh.read().strip()
+    if not key:
+        print("FABRIC_LLM_UPSTREAM_KEY (or _FILE) is required", file=sys.stderr)
+        return 2
+    httpd = serve(args.host, args.port, args.control_plane, args.upstream, key)
+    print(f"llm-proxy listening on {args.host}:{httpd.server_address[1]}", flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def _cmd_doctor(args) -> int:
     from .doctor import doctor_main
     return doctor_main(args)

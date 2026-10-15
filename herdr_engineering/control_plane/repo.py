@@ -550,6 +550,114 @@ class ControlPlaneRepo:
                 break
         return out
 
+    # ------------------------------------------- LLM usage, keys, custom models
+    # All persisted as events (entity types ``token_usage``, ``llm_key``,
+    # ``custom_model``) so the existing durable sink and replay carry them.
+    def record_token_usage(self, project, model, input_tokens=0, output_tokens=0, *,
+                           reasoning_tokens=0, cache_read_tokens=0, duration_ms=None,
+                           success=True, request_id=None, session_id=None,
+                           mission_id=None, key_id=None, source="llm-proxy"):
+        if not project:
+            raise ValueError("project is required")
+        payload = {"project": project, "model": model or "unknown",
+                   "input_tokens": int(input_tokens or 0),
+                   "output_tokens": int(output_tokens or 0),
+                   "reasoning_tokens": int(reasoning_tokens or 0),
+                   "cache_read_tokens": int(cache_read_tokens or 0),
+                   "duration_ms": duration_ms, "success": bool(success),
+                   "request_id": request_id, "key_id": key_id, "source": source}
+        return self.record_event("token_usage", project, "token_usage.recorded",
+                                 payload, mission_id=mission_id, session_id=session_id)
+
+    def token_analytics(self, project=None, since=None):
+        """Aggregate token usage by project, model and day (UTC)."""
+        total = {"requests": 0, "input_tokens": 0, "output_tokens": 0,
+                 "reasoning_tokens": 0, "cache_read_tokens": 0, "failed": 0}
+        by_project, by_model, by_day = {}, {}, {}
+
+        def add(bucket, key, p):
+            b = bucket.setdefault(key, {k: 0 for k in total})
+            _accumulate(b, p)
+
+        for (etype, eid), stream in self._events.items():
+            if etype != "token_usage" or (project and eid != project):
+                continue
+            for ev in stream:
+                if since and ev["source_timestamp"] < since:
+                    continue
+                p = ev["payload"]
+                _accumulate(total, p)
+                add(by_project, p["project"], p)
+                add(by_model, p["model"], p)
+                add(by_day, ev["source_timestamp"][:10], p)
+        return {"total": total, "by_project": by_project, "by_model": by_model,
+                "by_day": dict(sorted(by_day.items()))}
+
+    def create_project_key(self, project, label=""):
+        """Mint a gateway key for ``project``; the secret is returned once and only
+        its SHA-256 is stored."""
+        if not project:
+            raise ValueError("project is required")
+        import hashlib
+        import secrets
+        key = "hk-" + secrets.token_urlsafe(32)
+        key_id = new_id("llmkey")
+        self.record_event("llm_key", key_id, "llm_key.created", {
+            "key_id": key_id, "project": project, "label": label,
+            "key_hash": hashlib.sha256(key.encode()).hexdigest(), "revoked": False})
+        return {"key_id": key_id, "project": project, "key": key}
+
+    def revoke_project_key(self, key_id):
+        keys = {k["key_id"]: k for k in self._llm_keys()}
+        if key_id not in keys:
+            raise KeyError(key_id)
+        self.record_event("llm_key", key_id, "llm_key.revoked",
+                          dict(keys[key_id], revoked=True))
+
+    def _llm_keys(self):
+        out = []
+        for (etype, _), stream in self._events.items():
+            if etype == "llm_key" and stream:
+                out.append(dict(stream[-1]["payload"]))
+        return out
+
+    def list_project_keys(self):
+        return [{k: v for k, v in key.items() if k != "key_hash"}
+                for key in self._llm_keys()]
+
+    def upsert_custom_model(self, name, base_url, upstream_model=None, project=None):
+        if not name or not base_url:
+            raise ValueError("name and base_url are required")
+        if not str(base_url).startswith(("http://", "https://")):
+            raise ValueError("base_url must be http(s)")
+        payload = {"name": name, "base_url": base_url.rstrip("/"),
+                   "upstream_model": upstream_model or name, "project": project,
+                   "deleted": False}
+        return self.record_event("custom_model", name, "custom_model.upserted", payload)
+
+    def delete_custom_model(self, name):
+        cur = self.list_custom_models(include_deleted=True).get(name)
+        if cur is None:
+            raise KeyError(name)
+        self.record_event("custom_model", name, "custom_model.deleted",
+                          dict(cur, deleted=True))
+
+    def list_custom_models(self, include_deleted=False):
+        out = {}
+        for (etype, name), stream in self._events.items():
+            if etype == "custom_model" and stream:
+                p = stream[-1]["payload"]
+                if include_deleted or not p.get("deleted"):
+                    out[name] = dict(p)
+        return out
+
+    def llm_config(self):
+        """What the LLM proxy needs: active key hashes and custom models."""
+        return {"keys": [{"key_id": k["key_id"], "project": k["project"],
+                          "key_hash": k["key_hash"]}
+                         for k in self._llm_keys() if not k.get("revoked")],
+                "custom_models": list(self.list_custom_models().values())}
+
     # ------------------------------------------------------------- analytics
     def mission_analytics(self):
         by_stage = {}
@@ -631,6 +739,14 @@ class ControlPlaneRepo:
 
 
 # ------------------------------------------------------------ helpers
+def _accumulate(bucket, p):
+    bucket["requests"] += 1
+    for k in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens"):
+        bucket[k] += int(p.get(k) or 0)
+    if not p.get("success", True):
+        bucket["failed"] += 1
+
+
 def _copy(d):
     return dict(d) if d is not None else None
 

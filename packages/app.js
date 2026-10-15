@@ -66,6 +66,7 @@ const ROUTES = {
   '/analytics/missions': viewAnalyticsMissions,
   '/analytics/models': viewAnalyticsModels,
   '/analytics/hosts': viewAnalyticsHosts,
+  '/analytics/tokens': viewAnalyticsTokens,
 };
 
 async function render() {
@@ -477,6 +478,7 @@ async function viewAnalytics() {
       <herdr-metric label="Models" value="${Object.keys(models.models).length}"></herdr-metric>
       <herdr-metric label="Hosts healthy" value="${hosts.healthy} / ${hosts.total}"></herdr-metric>
     </div>
+    <p style="margin-top:12px"><a href="#/analytics/tokens">Token usage by project &rarr;</a></p>
     <h3 style="margin-top:20px">Missions by stage</h3>
     ${stageBars(missions.by_stage)}`;
 }
@@ -490,6 +492,24 @@ async function viewAnalyticsModels() {
         <div class="hd-card__title">${esc(model)}</div>
         <div class="hd-card__sub">${u.sessions} session(s) · ${u.messages} messages</div>
       </div>`).join('') + '</div>';
+}
+async function viewAnalyticsTokens() {
+  const t = await client.analytics('tokens');
+  const fmt = (n) => Number(n || 0).toLocaleString();
+  const rows = (bucket) => Object.entries(bucket).map(([k, u]) => `
+      <tr><td>${esc(k)}</td><td>${fmt(u.requests)}</td><td>${fmt(u.input_tokens)}</td>
+      <td>${fmt(u.output_tokens)}</td><td>${fmt(u.reasoning_tokens)}</td><td>${fmt(u.failed)}</td></tr>`).join('');
+  const table = (title, bucket) => `<h3 style="margin-top:20px">${title}</h3>
+    <table class="hd-table"><thead><tr><th></th><th>Requests</th><th>Input</th><th>Output</th>
+    <th>Reasoning</th><th>Failed</th></tr></thead><tbody>${rows(bucket) ||
+      '<tr><td colspan="6">No usage recorded yet.</td></tr>'}</tbody></table>`;
+  root.innerHTML = `<h1>Token usage</h1>
+    <div class="hd-grid">
+      <herdr-metric label="Requests" value="${fmt(t.total.requests)}"></herdr-metric>
+      <herdr-metric label="Input tokens" value="${fmt(t.total.input_tokens)}"></herdr-metric>
+      <herdr-metric label="Output tokens" value="${fmt(t.total.output_tokens)}"></herdr-metric>
+    </div>` + table('By project', t.by_project) + table('By model', t.by_model) +
+    table('By day', t.by_day);
 }
 async function viewAnalyticsHosts() {
   const h = await client.analytics('hosts');
