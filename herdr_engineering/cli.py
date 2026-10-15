@@ -36,6 +36,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="stable machine-readable output")
     p.set_defaults(func=_cmd_doctor)
 
+    # llm-env --------------------------------------------------------------
+    p = sub.add_parser("llm-env", help="mint a project key for the fabric LLM gateway and write "
+                                       "an env file (OPENAI_BASE_URL / OPENAI_API_KEY)")
+    p.add_argument("--project", required=True)
+    p.add_argument("--label", default="")
+    p.add_argument("--control-plane", default="http://dev.lan",
+                   help="control-plane base URL (default http://dev.lan)")
+    p.add_argument("--gateway", default="http://dev.lan:8088/v1",
+                   help="fabric LLM gateway base URL")
+    p.add_argument("--out", default=None,
+                   help="env file to write (default ~/.config/herdr-engineering/llm-<project>.env)")
+    p.set_defaults(func=_cmd_llm_env)
+
     # powerpack ------------------------------------------------------------
     pp = sub.add_parser("powerpack", help="distribution & lifecycle (spec 0050)")
     pps = pp.add_subparsers(dest="powerpack_command", required=True)
@@ -338,6 +351,26 @@ def _cmd_cp_llm_proxy(args) -> int:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
+    return 0
+
+
+def _cmd_llm_env(args) -> int:
+    """Mint a project key and write a 0600 env file; the key is never printed."""
+    import urllib.request
+    req = urllib.request.Request(
+        args.control_plane.rstrip("/") + "/api/v1/llm/keys",
+        data=json.dumps({"project": args.project, "label": args.label}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+        minted = json.loads(resp.read())
+    out = args.out or os.path.join(os.path.expanduser("~/.config/herdr-engineering"),
+                                   f"llm-{args.project}.env")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(f"OPENAI_BASE_URL={args.gateway}\nOPENAI_API_KEY={minted['key']}\n")
+    os.chmod(out, 0o600)
+    _print_json({"project": args.project, "key_id": minted["key_id"], "env_file": out})
     return 0
 
 

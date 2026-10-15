@@ -508,3 +508,7 @@ and never receive the lab key. The gateway is not exposed beyond the fabric. It 
 HTTPS API only; the `upstream` link role (specs repo, spec 63) will replace this path.
 
 A revoked key stops working within 10 s (the proxy reloads its key table every 10 s; an unknown key forces a reload at most every 2 s).
+
+Mint a key and an env file for a project (the key is never printed):
+`herdr-eng llm-env --project my-project` writes `~/.config/herdr-engineering/llm-my-project.env`
+(0600, `OPENAI_BASE_URL`, `OPENAI_API_KEY`); `source` it before starting an agent.
