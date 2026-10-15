@@ -578,6 +578,17 @@ def _load_origin_manifest(path: str) -> dict:
     return d
 
 
+def _stable_origin_lease_id(machine: str, host: str, port: int, repo: str | None) -> str:
+    """A deterministic lease id for an origin (stable across (re)enrolls and
+    process restarts), derived from its identity. register() renews a lease by
+    id, so re-enrolling the same origin RENEWS the same lease/port instead of
+    creating a new one (the gateway's register is otherwise not target-deduped).
+    This is what makes auto-enrollment durable + churn-free."""
+    import hashlib
+    key = f"{machine}:{host}:{int(port)}:{repo or ''}"
+    return "lease_" + hashlib.sha1(key.encode()).hexdigest()[:16]
+
+
 def _routes_equal(a, b) -> bool:
     """Compare two route lists (Route objects or None), order-insensitive."""
     def norm(rs):
@@ -601,37 +612,41 @@ def _spec_from_manifest(m: dict) -> dict:
 
 def _enroll_origin(spec: dict, client, reg, bind: str = "127.0.0.1"):
     """Register one origin (spec): gateway if reachable (it forwards fleet-wide),
-    else the local registry. Idempotent (an unchanged origin is returned as-is).
-    Returns (out_dict, lease). Raises on registration failure."""
+    else the local registry. Idempotent via a STABLE lease_id (re-register
+    renews the same lease/port, no new lease). Returns (out_dict, lease).
+    Raises on registration failure."""
     from .contracts import Route
     c_host, c_port = spec["catchall"]["host"], int(spec["catchall"]["port"])
     origin_port = spec["origin_port"]
+    stable_id = _stable_origin_lease_id(spec["machine"], c_host, c_port, spec["repo"])
     routes = [Route(r.get("prefix", "/"), r.get("host"), int(r.get("port")))
               if isinstance(r, dict) else r for r in spec["routes"]]
     routes_wire = [{"prefix": r.prefix, "host": r.host, "port": r.port}
                    for r in routes] or None
     if client is not None:
+        # Idempotent: the stable lease_id makes the gateway's register RENEW the
+        # existing lease (same port) instead of creating a new one per (re)enroll.
         result = client.register(
             target_machine_id=spec["machine"], target_host=c_host,
             target_port=c_port, protocol=spec["protocol"],
             owner_repository=spec["repo"], label=spec["label"],
-            routes=routes_wire, preferred_port=origin_port)
+            routes=routes_wire, preferred_port=origin_port, lease_id=stable_id)
         lease = result.get("lease", {})
         out = {"ok": True, "via": "gateway", "changed": True,
                "lease_id": lease.get("id"),
-               "origin": result.get("url") or f"http://dev:{origin_port}",
+               "origin": result.get("url")
+               or f"http://dev:{lease.get('external_port')}",
                "catchall": f"{c_host}:{c_port}",
                "routes": [f"{r['prefix']} -> {r['host']}:{r['port']}"
                           for r in (routes_wire or [])],
                "note": "the gateway forwards the origin automatically"}
         return out, lease
-    existing = next((cand for cand in reg.active_leases()
-                     if cand.target_machine_id == spec["machine"]
-                     and cand.target_host == c_host and cand.target_port == c_port),
-                    None)
+    # Local: register with the stable lease_id (idempotent — renews the same
+    # lease/port); re-apply routes by closing the stale lease if they differ.
+    existing = reg.get(stable_id)
     changed = existing is None or not _routes_equal(existing.routes, routes)
     if not changed:
-        lease = existing  # unchanged -> idempotent
+        lease = existing
     else:
         if existing is not None:
             reg.close(existing.id)
@@ -639,7 +654,7 @@ def _enroll_origin(spec: dict, client, reg, bind: str = "127.0.0.1"):
             target_machine_id=spec["machine"], target_host=c_host,
             target_port=c_port, protocol=spec["protocol"],
             owner_repository=spec["repo"], label=spec["label"],
-            routes=routes, preferred_port=origin_port)
+            routes=routes, preferred_port=origin_port, lease_id=stable_id)
     out = {"ok": True, "via": "local", "changed": changed, "lease_id": lease.id,
            "origin": f"http://dev:{lease.external_port}",
            "local_origin": f"http://{bind}:{lease.external_port}",
@@ -766,6 +781,11 @@ def _cmd_dev_enroll_sync(args) -> int:
         for key in list(state):  # reap removed manifests
             if key not in specs:
                 _stop_fwd(key)
+                if client is not None:  # close the gateway lease, too
+                    try:
+                        client.close(state[key]["lease_id"])
+                    except Exception:
+                        pass
                 state.pop(key, None)
                 results.append({"manifest": key, "ok": True, "removed": True})
         return results
@@ -848,18 +868,20 @@ def _cmd_dev_enroll(args) -> int:
 
     client = _local_fabric_client()
     if client is not None:
+        stable_id = _stable_origin_lease_id(machine, c_host, c_port, repo)
         try:
             result = client.register(
                 target_machine_id=machine, target_host=c_host, target_port=c_port,
                 protocol=protocol, owner_repository=repo, label=label,
-                routes=routes_wire, preferred_port=origin_port)
+                routes=routes_wire, preferred_port=origin_port, lease_id=stable_id)
         except Exception as exc:
             _print_json({"ok": False, "error": f"gateway register failed: {exc}"})
             return 1
         lease = result.get("lease", {})
         _print_json({
             "ok": True, "via": "gateway", "lease_id": lease.get("id"),
-            "origin": result.get("url") or f"http://dev:{origin_port}",
+            "origin": result.get("url")
+            or f"http://dev:{lease.get('external_port')}",
             "catchall": f"{c_host}:{c_port}",
             "routes": [f"{r['prefix']} -> {r['host']}:{r['port']}" for r in (routes_wire or [])],
             "note": "the gateway forwards the origin automatically",
