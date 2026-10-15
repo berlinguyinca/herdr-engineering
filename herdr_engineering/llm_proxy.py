@@ -26,7 +26,7 @@ log = logging.getLogger("herdr.llm_proxy")
 FORWARDED_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models")
 MAX_BODY = 16 * 1024 * 1024
 HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
-               "proxy-authorization", "proxy-authenticate", "content-length", "host",
+               "proxy-authorization", "proxy-authenticate", "content-length", "host", "accept-encoding",
                "authorization"}
 
 
