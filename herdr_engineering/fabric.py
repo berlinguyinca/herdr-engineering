@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .devfabric import DevServiceRegistry, proxy_pair
+from .devfabric import DevServiceRegistry, proxy_pair, route_and_pipe
 from .errors import ConflictError, UnreachableError
 
 _FABRIC_TOKEN_FILE = os.path.join("~", ".config", "herdr-engineering", "fabric-token")
@@ -153,7 +153,8 @@ class GatewayRouter:
         self._accept_threads: dict[int, list[threading.Thread]] = {}
         self._lock = threading.RLock()
 
-    def bind(self, port: int, target_host: str, target_port: int) -> bool:
+    def bind(self, port: int, target_host: str, target_port: int,
+             routes: list | None = None) -> bool:
         with self._lock:
             if port in self._listeners:
                 return True
@@ -170,7 +171,7 @@ class GatewayRouter:
                     continue  # interface not available here
                 listeners.append(s)
                 threads.append(threading.Thread(target=self._accept_loop,
-                                                args=(s, port, target_host, target_port),
+                                                args=(s, port, target_host, target_port, routes),
                                                 daemon=True))
             if not listeners:
                 for s in listeners:
@@ -183,7 +184,8 @@ class GatewayRouter:
             return True
 
     def _accept_loop(self, listener: socket.socket, port: int,
-                     target_host: str, target_port: int) -> None:
+                     target_host: str, target_port: int,
+                     routes: list | None = None) -> None:
         while True:
             try:
                 client, _addr = listener.accept()
@@ -195,11 +197,14 @@ class GatewayRouter:
             except OSError:
                 break
             threading.Thread(target=self._proxy_one,
-                             args=(client, target_host, target_port),
+                             args=(client, target_host, target_port, routes),
                              daemon=True).start()
 
     def _proxy_one(self, client: socket.socket, target_host: str,
-                   target_port: int) -> None:
+                   target_port: int, routes: list | None = None) -> None:
+        if routes:
+            route_and_pipe(client, routes, target_host, target_port)
+            return
         target = None
         try:
             target = socket.create_connection((target_host, target_port), timeout=5)
@@ -384,8 +389,13 @@ class FabricGateway:
             # Port-matching by default: prefer external dev.<port> == target port
             # (localhost:4040 -> dev.lan:4040). Falls back to the range when the
             # preferred port is taken by another host or unbindable.
-            preferred_port=int(body.get("preferred_port", body["target_port"])))
-        self.router.bind(lease.external_port, lease.target_host, lease.target_port)
+            preferred_port=int(body.get("preferred_port", body["target_port"])),
+            # Optional same-origin routes: [{prefix, host, port}, ...]. When
+            # present, the gateway edge splits this origin by path (the lease's
+            # own target is the catch-all); when absent, plain 1:1 forwarding.
+            routes=body.get("routes"))
+        self.router.bind(lease.external_port, lease.target_host, lease.target_port,
+                         routes=lease.routes)
         return {"lease": lease.to_dict(), "url": self.stable_url(lease.external_port)}
 
     def op_heartbeat(self, lease_id: str) -> dict[str, Any]:
