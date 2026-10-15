@@ -1,6 +1,6 @@
 # HerdR Engineering master-host stack (`dev.lan` front door)
 
-Runs the entire fleet front door as **one Docker Compose project** on the
+Runs the entire fleet front door. Its three services are defined in the **same compose file as the control plane** (`deploy/control-plane/compose.yaml`, project `herdr-control-plane`); this directory holds only their Dockerfile, config and CoreDNS templates, and `scripts/fabric-stack.sh` drives them. Together with the control plane they form **one Docker Compose project** on the
 master/gateway host (bender today). From any Tailscale device you reach any
 fleet service at `http://dev.lan:<port>` — regardless of which host actually
 runs the service.
