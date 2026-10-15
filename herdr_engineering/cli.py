@@ -150,6 +150,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="no gateway: run a per-host forwarder per origin")
     p2.add_argument("--bind", default="127.0.0.1",
                     help="forwarder bind address (default 127.0.0.1)")
+    p2.add_argument("--git-pull", action="store_true",
+                    help="if --dir is a git repo, 'git pull --ff-only' before "
+                         "each sync (auto-pick-up committed origin.json files)")
     p2.set_defaults(func=_cmd_dev_enroll_sync)
     p2 = dsub.add_parser("heartbeat", help="renew a lease")
     p2.add_argument("lease_id"); p2.set_defaults(func=_cmd_dev_heartbeat)
@@ -649,6 +652,19 @@ def _enroll_origin(spec: dict, client, reg, bind: str = "127.0.0.1"):
     return out, lease
 
 
+def _maybe_git_pull(directory: str) -> None:
+    """Best-effort 'git pull --ff-only' of a fleet-origins repo. No-op if the
+    dir isn't a git repo or the pull fails (the local dir is always the source
+    of truth). Lets a new committed origin.json auto-enroll without a manual pull."""
+    import subprocess
+    try:
+        subprocess.run(["git", "-C", directory, "pull", "--ff-only", "--quiet"],
+                       check=False, timeout=30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def _load_origin_manifests(directory: str) -> dict:
     """All *.json origin manifests in directory -> {file_stem: spec}."""
     import pathlib
@@ -720,6 +736,8 @@ def _cmd_dev_enroll_sync(args) -> int:
                     pass
 
     def sync_once() -> list:
+        if args.git_pull:
+            _maybe_git_pull(args.dir)
         specs = _load_origin_manifests(args.dir)
         results = []
         for key, spec in specs.items():
