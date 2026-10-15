@@ -278,3 +278,82 @@ def test_enroll_serve_end_to_end(tmp_path):
         except subprocess.TimeoutExpired:
             proc.kill()
         api_stop.set(); ui_stop.set(); api_srv.close(); ui_srv.close()
+
+
+# -- devfabric enroll-sync (auto-enroll every manifest in a dir) ------------
+def _run_enroll_sync(origins, state_dir, *extra):
+    import subprocess
+    env = os.environ.copy()
+    env["HERDR_ENGINEERING_STATE"] = str(state_dir)
+    return subprocess.run(
+        [sys.executable, "-m", "herdr_engineering.cli", "devfabric", "enroll-sync",
+         "--dir", str(origins), *extra], env=env, cwd=REPO_ROOT,
+        capture_output=True, text=True)
+
+
+def test_enroll_sync_enrolls_all_and_idempotent(tmp_path):
+    from herdr_engineering.devfabric import DevServiceRegistry
+    origins = tmp_path / "origins"
+    origins.mkdir()
+    (origins / "a.json").write_text(json.dumps({
+        "origin_port": 39601, "repo": "a", "label": "A",
+        "catchall": {"host": "127.0.0.1", "port": 3000},
+        "routes": [{"prefix": "/api", "host": "127.0.0.1", "port": 8300}]}))
+    (origins / "b.json").write_text(json.dumps({
+        "origin_port": 39602, "repo": "b", "label": "B",
+        "catchall": {"host": "127.0.0.1", "port": 3001}}))
+    st = tmp_path / "state"
+    r1 = _run_enroll_sync(origins, st)
+    assert r1.returncode == 0
+    assert sorted(json.loads(r1.stdout)["enrolled"]) == ["a", "b"]
+    reg = DevServiceRegistry(store_path=st / "leases.json")
+    assert sorted(lease.label for lease in reg.active_leases()) == ["A", "B"]
+    # idempotent: a second run enrolls nothing new
+    r2 = _run_enroll_sync(origins, st)
+    assert json.loads(r2.stdout)["enrolled"] == []
+    assert sorted(json.loads(r2.stdout)["unchanged"]) == ["a", "b"]
+
+
+def test_enroll_sync_watch_auto_enrolls_new_manifest(tmp_path):
+    """The auto-enroll engine: a NEW manifest dropped into the dir is enrolled
+    by the watch loop within an interval (no restart, no manual step)."""
+    import subprocess
+
+    from herdr_engineering.devfabric import DevServiceRegistry
+    origins = tmp_path / "origins"
+    origins.mkdir()
+    (origins / "a.json").write_text(json.dumps({
+        "origin_port": 39701, "repo": "a", "label": "A",
+        "catchall": {"host": "127.0.0.1", "port": 3000}}))
+    st = tmp_path / "state"
+    env = os.environ.copy()
+    env["HERDR_ENGINEERING_STATE"] = str(st)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "herdr_engineering.cli", "devfabric", "enroll-sync",
+         "--dir", str(origins), "--watch", "--interval", "1"],
+        env=env, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    def reg():
+        return DevServiceRegistry(store_path=st / "leases.json")
+
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not reg().active_leases():
+            time.sleep(0.3)
+        assert reg().active_leases(), "initial manifest did not enroll"
+        (origins / "b.json").write_text(json.dumps({
+            "origin_port": 39702, "repo": "b", "label": "B",
+            "catchall": {"host": "127.0.0.1", "port": 3001}}))
+        labels = []
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            labels = sorted(lease.label for lease in reg().active_leases())
+            if labels == ["A", "B"]:
+                break
+            time.sleep(0.3)
+        assert labels == ["A", "B"], f"new manifest not auto-enrolled: {labels}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()

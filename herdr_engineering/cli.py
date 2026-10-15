@@ -138,6 +138,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--bind", default="127.0.0.1",
                     help="forwarder bind address for --serve (default 127.0.0.1)")
     p2.set_defaults(func=_cmd_dev_enroll)
+    p2 = dsub.add_parser("enroll-sync", help="auto-enroll every origin manifest in a "
+                    "dir (watch for new projects); see the fabric-enroll skill")
+    p2.add_argument("--dir", required=True,
+                    help="directory of origin.json manifests (one file per app)")
+    p2.add_argument("--watch", action="store_true",
+                    help="keep re-syncing so new/changed manifests auto-enroll")
+    p2.add_argument("--interval", type=float, default=30.0,
+                    help="watch interval in seconds (default 30)")
+    p2.add_argument("--serve", action="store_true",
+                    help="no gateway: run a per-host forwarder per origin")
+    p2.add_argument("--bind", default="127.0.0.1",
+                    help="forwarder bind address (default 127.0.0.1)")
+    p2.set_defaults(func=_cmd_dev_enroll_sync)
     p2 = dsub.add_parser("heartbeat", help="renew a lease")
     p2.add_argument("lease_id"); p2.set_defaults(func=_cmd_dev_heartbeat)
     p2 = dsub.add_parser("close", help="close a lease")
@@ -560,6 +573,215 @@ def _load_origin_manifest(path: str) -> dict:
     if not isinstance(d, dict):
         raise ValueError("manifest must be a JSON object")
     return d
+
+
+def _routes_equal(a, b) -> bool:
+    """Compare two route lists (Route objects or None), order-insensitive."""
+    def norm(rs):
+        return sorted((getattr(r, "prefix", None), getattr(r, "host", None),
+                       getattr(r, "port", None)) for r in (rs or []))
+    return norm(a) == norm(b)
+
+
+def _spec_from_manifest(m: dict) -> dict:
+    """A manifest dict -> an origin spec (no CLI-flag overrides)."""
+    return {
+        "origin_port": m.get("origin_port"),
+        "machine": m.get("machine") or socket.gethostname(),
+        "repo": m.get("repo"),
+        "label": m.get("label"),
+        "protocol": m.get("protocol", "http"),
+        "catchall": dict(m.get("catchall") or {}),
+        "routes": list(m.get("routes") or []),
+    }
+
+
+def _enroll_origin(spec: dict, client, reg, bind: str = "127.0.0.1"):
+    """Register one origin (spec): gateway if reachable (it forwards fleet-wide),
+    else the local registry. Idempotent (an unchanged origin is returned as-is).
+    Returns (out_dict, lease). Raises on registration failure."""
+    from .contracts import Route
+    c_host, c_port = spec["catchall"]["host"], int(spec["catchall"]["port"])
+    origin_port = spec["origin_port"]
+    routes = [Route(r.get("prefix", "/"), r.get("host"), int(r.get("port")))
+              if isinstance(r, dict) else r for r in spec["routes"]]
+    routes_wire = [{"prefix": r.prefix, "host": r.host, "port": r.port}
+                   for r in routes] or None
+    if client is not None:
+        result = client.register(
+            target_machine_id=spec["machine"], target_host=c_host,
+            target_port=c_port, protocol=spec["protocol"],
+            owner_repository=spec["repo"], label=spec["label"],
+            routes=routes_wire, preferred_port=origin_port)
+        lease = result.get("lease", {})
+        out = {"ok": True, "via": "gateway", "changed": True,
+               "lease_id": lease.get("id"),
+               "origin": result.get("url") or f"http://dev:{origin_port}",
+               "catchall": f"{c_host}:{c_port}",
+               "routes": [f"{r['prefix']} -> {r['host']}:{r['port']}"
+                          for r in (routes_wire or [])],
+               "note": "the gateway forwards the origin automatically"}
+        return out, lease
+    existing = next((cand for cand in reg.active_leases()
+                     if cand.target_machine_id == spec["machine"]
+                     and cand.target_host == c_host and cand.target_port == c_port),
+                    None)
+    changed = existing is None or not _routes_equal(existing.routes, routes)
+    if not changed:
+        lease = existing  # unchanged -> idempotent
+    else:
+        if existing is not None:
+            reg.close(existing.id)
+        lease = reg.register(
+            target_machine_id=spec["machine"], target_host=c_host,
+            target_port=c_port, protocol=spec["protocol"],
+            owner_repository=spec["repo"], label=spec["label"],
+            routes=routes, preferred_port=origin_port)
+    out = {"ok": True, "via": "local", "changed": changed, "lease_id": lease.id,
+           "origin": f"http://dev:{lease.external_port}",
+           "local_origin": f"http://{bind}:{lease.external_port}",
+           "catchall": f"{c_host}:{c_port}",
+           "routes": [f"{r.prefix} -> {r.host}:{r.port}"
+                      for r in (lease.routes or [])]}
+    if lease.external_port != origin_port:
+        out["warning"] = (f"origin port {origin_port} in use; "
+                          f"allocated {lease.external_port}")
+    return out, lease
+
+
+def _load_origin_manifests(directory: str) -> dict:
+    """All *.json origin manifests in directory -> {file_stem: spec}."""
+    import pathlib
+    d = pathlib.Path(directory)
+    if not d.is_dir():
+        raise ValueError(f"not a directory: {directory}")
+    out = {}
+    for p in sorted(d.glob("*.json")):
+        try:
+            spec = _spec_from_manifest(_load_origin_manifest(str(p)))
+        except (OSError, ValueError) as exc:
+            print(f"  skip {p.name}: {exc}", file=sys.stderr)
+            continue
+        if (not spec["origin_port"] or not spec["catchall"].get("host")
+                or not spec["catchall"].get("port")):
+            print(f"  skip {p.name}: missing origin_port or catchall", file=sys.stderr)
+            continue
+        out[p.stem] = spec
+    return out
+
+
+def _origin_signature(spec: dict) -> str:
+    """A stable fingerprint of a spec, to detect changes across syncs."""
+    routes = [sorted(r.items()) if isinstance(r, dict) else r
+              for r in spec["routes"]]
+    return json.dumps({"o": spec["origin_port"], "m": spec["machine"],
+                       "c": spec["catchall"], "r": routes}, sort_keys=True)
+
+
+def _cmd_dev_enroll_sync(args) -> int:
+    """Auto-enroll every origin manifest in --dir (idempotent). With a reachable
+    gateway this registers them all — one registration serves every machine on
+    dev.lan (the gateway owns the ports and auto-restarts). Without a gateway it
+    registers locally and, with --serve, runs a per-host forwarder per origin.
+    --watch re-syncs every --interval seconds so NEW/CHANGED manifests auto-enroll
+    and removed ones are reaped — the 'any new project auto-enrolled' engine (see
+    the fabric-enroll skill, Automatic enrollment)."""
+    import signal
+    import time
+
+    from .devfabric import DevServiceRegistry, forwarder_for
+    reg = DevServiceRegistry()
+    client = _local_fabric_client()
+    try:
+        _load_origin_manifests(args.dir)  # validate early
+    except ValueError as exc:
+        _print_json({"ok": False, "error": str(exc)})
+        return 1
+    state: dict = {}    # key -> {"sig": str, "lease_id": str}
+    fwd: dict = {}      # key -> forwarder            [local serve mode]
+    stop = {"flag": False}
+    signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
+    signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("flag", True))
+
+    def _stop_fwd(key):
+        cur = fwd.pop(key, None)
+        if cur is not None:
+            try:
+                cur.stop()
+            except Exception:
+                pass
+
+    def _heartbeat_local():
+        if client is None:
+            for key, st in state.items():
+                try:
+                    reg.heartbeat(st["lease_id"])
+                except Exception:
+                    pass
+
+    def sync_once() -> list:
+        specs = _load_origin_manifests(args.dir)
+        results = []
+        for key, spec in specs.items():
+            sig = _origin_signature(spec)
+            if state.get(key, {}).get("sig") == sig:
+                continue  # unchanged -> idempotent (no re-register)
+            try:
+                out, lease = _enroll_origin(spec, client, reg, bind=args.bind)
+            except Exception as exc:  # noqa: BLE001 - report, keep syncing
+                results.append({"manifest": key, "ok": False, "error": str(exc)})
+                continue
+            out["manifest"] = key
+            results.append(out)
+            lid = lease.get("id") if isinstance(lease, dict) else lease.id
+            state[key] = {"sig": sig, "lease_id": lid}
+            if args.serve and client is None:
+                cur = fwd.get(key)
+                if cur is not None and state[key]["sig"] != sig:
+                    _stop_fwd(key)
+                if key not in fwd:
+                    try:
+                        fwd[key] = forwarder_for(lease, bind_host=args.bind).start()
+                    except Exception as exc:  # noqa: BLE001 - e.g. port in use
+                        fwd[key] = None
+                        out["serve_error"] = str(exc)
+        for key in list(state):  # reap removed manifests
+            if key not in specs:
+                _stop_fwd(key)
+                state.pop(key, None)
+                results.append({"manifest": key, "ok": True, "removed": True})
+        return results
+
+    results = sync_once()
+    _heartbeat_local()
+    _print_json({
+        "ok": True, "dir": args.dir, "watch": args.watch,
+        "gateway": client is not None, "serve": args.serve,
+        "enrolled": [r["manifest"] for r in results
+                     if r.get("ok") and r.get("changed") and not r.get("removed")],
+        "unchanged": [r["manifest"] for r in results
+                      if r.get("ok") and not r.get("changed") and not r.get("removed")],
+        "results": results,
+    })
+    if not args.watch:
+        if args.serve and client is None:
+            _print_json({"ok": True, "serving": len(fwd), "note": "forwarding (Ctrl-C to stop)"})
+            while not stop["flag"]:
+                time.sleep(0.3)
+                _heartbeat_local()
+        return 0
+    while not stop["flag"]:
+        end = time.monotonic() + args.interval
+        while not stop["flag"] and time.monotonic() < end:
+            time.sleep(0.5)
+            _heartbeat_local()
+        if stop["flag"]:
+            break
+        sync_once()
+        _heartbeat_local()
+    for key in list(fwd):
+        _stop_fwd(key)
+    return 0
 
 
 def _cmd_dev_enroll(args) -> int:
