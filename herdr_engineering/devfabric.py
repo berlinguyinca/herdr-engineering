@@ -186,7 +186,8 @@ class DevServiceRegistry:
                  owner_repository: str | None = None, owner_worktree_id: str | None = None,
                  owner_process_id: str | None = None, label: str | None = None,
                  lease_id: str | None = None,
-                 preferred_port: int | None = None) -> DevServiceLease:
+                 preferred_port: int | None = None,
+                 routes: list | None = None) -> DevServiceLease:
         """Register (or idempotently renew) a lease. Allocates a collision-free port."""
         now = _now_iso()
         # Idempotent registration for a stable owner/process identity.
@@ -216,7 +217,7 @@ class DevServiceRegistry:
             lease = DevServiceLease(
                 id=lid, external_port=port, protocol=protocol,
                 target_machine_id=target_machine_id, target_host=target_host,
-                target_port=target_port,
+                target_port=target_port, routes=routes,
                 owner_herdr_session_id=owner_herdr_session_id,
                 owner_repository=owner_repository,
                 owner_worktree_id=owner_worktree_id,
@@ -416,6 +417,196 @@ def proxy_pair(client: socket.socket, target: socket.socket) -> None:
     t2.start()
     t1.join()
     t2.join()
+
+
+# -- Same-origin app edge (path-routing forwarder) ---------------------------
+# A dev app is often two (or more) services — e.g. a UI on one port and an API
+# on another — but the browser wants ONE origin. The fabric is deliberately an
+# L4 byte pipe (one external port -> one target) and stays that way; the
+# OriginEdge adds the missing L7 hop: peek the first HTTP request line, pick the
+# target by longest-prefix path match, then byte-pipe (reusing the same
+# transparent pump, so WS/SSE/HMR still flow). Non-HTTP connections fall back to
+# the lease's catch-all target instead of hanging.
+
+_HTTP_METHODS = frozenset(
+    {"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT"})
+
+
+def _peek_request_path(client: socket.socket, timeout: float = 5.0,
+                       max_bytes: int = 8192) -> tuple[str | None, bytes]:
+    """Read the first HTTP request line.
+
+    Returns ``(path, buffered)``: ``buffered`` is every byte read so far (to be
+    replayed to the target) and ``path`` is the request target — or ``None`` when
+    the bytes do not look like an HTTP request (e.g. a raw TLS ClientHello).
+    """
+    client.settimeout(timeout)
+    buf = b""
+    try:
+        while b"\r\n" not in buf and len(buf) < max_bytes:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    except (TimeoutError, OSError):
+        pass
+    finally:
+        try:
+            client.settimeout(None)
+        except OSError:
+            pass
+    if not buf:
+        return None, buf
+    line = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+    parts = line.split()
+    if len(parts) >= 2 and parts[0].upper() in _HTTP_METHODS:
+        return parts[1], buf
+    return None, buf
+
+
+def path_matches(path: str, prefix: str) -> bool:
+    """True when ``path`` is under ``prefix`` (``/api`` matches ``/api`` and
+    ``/api/...`` but not ``/apix``; ``/`` matches everything)."""
+    if prefix == "/":
+        return True
+    if path == prefix:
+        return True
+    return path.startswith(prefix.rstrip("/") + "/")
+
+
+def match_target(path: str | None, routes, fallback_host: str, fallback_port: int):
+    """Longest-prefix route match for ``path``; else the fallback target.
+
+    ``path`` may be ``None`` (non-HTTP) -> fallback. Returns ``(host, port)``.
+    """
+    if path is None or not routes:
+        return fallback_host, fallback_port
+    best = None
+    best_len = -1
+    for r in routes:
+        if path_matches(path, r.prefix) and len(r.prefix) > best_len:
+            best = (r.host, r.port)
+            best_len = len(r.prefix)
+    return best if best is not None else (fallback_host, fallback_port)
+
+
+def prefixed_pipe(client: socket.socket, target: socket.socket,
+                  client_prefix: bytes = b"") -> None:
+    """Like :func:`proxy_pair`, but first flushes ``client_prefix`` (the bytes
+    already read while peeking) into the client->target direction."""
+    def _pump(src: socket.socket, dst: socket.socket, prefix: bytes = b"") -> None:
+        try:
+            if prefix:
+                dst.sendall(prefix)
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    t1 = threading.Thread(target=_pump, args=(client, target, client_prefix), daemon=True)
+    t2 = threading.Thread(target=_pump, args=(target, client), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+
+def route_and_pipe(client: socket.socket, routes, fallback_host: str,
+                   fallback_port: int) -> None:
+    """Peek the first request line, pick the target (longest-prefix route match,
+    else fallback), and byte-pipe. The peeked bytes are replayed first, so the
+    target sees the original request intact."""
+    path, buffered = _peek_request_path(client)
+    host, port = match_target(path, routes, fallback_host, fallback_port)
+    target = socket.create_connection((host, port), timeout=5)
+    try:
+        prefixed_pipe(client, target, client_prefix=buffered)
+    finally:
+        try:
+            target.close()
+        except OSError:
+            pass
+
+
+class OriginEdge:
+    """Binds a same-origin lease's external port and routes each connection to
+    the matching route target (by URL path) or the lease's catch-all target.
+
+    Same lifecycle as :class:`DevServiceForwarder` (``start``/``stop``/``bound``,
+    private-only bind), but multi-target: the lease carries ``routes`` (path ->
+    backend) and its own ``target_host``/``target_port`` are the fallback.
+    Protocol-transparent after the initial request-line peek.
+    """
+
+    def __init__(self, lease: DevServiceLease, bind_host: str = "127.0.0.1",
+                 private_only: bool = True) -> None:
+        self.lease = lease
+        self.bind_host = bind_host
+        self.private_only = private_only
+        self._listener: socket.socket | None = None
+        self._accept_thread: threading.Thread | None = None
+        self._stopping = threading.Event()
+
+    def start(self) -> OriginEdge:
+        from .observability import _is_public_ip
+        if self.private_only and _is_public_ip(self.bind_host):
+            raise ConflictError(
+                f"refusing public bind address {self.bind_host} "
+                "(dev fabric is private-only)")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.bind_host, self.lease.external_port))
+        sock.listen(64)
+        sock.settimeout(0.5)
+        self._listener = sock
+        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread.start()
+        return self
+
+    def _accept_loop(self) -> None:
+        routes = self.lease.routes
+        fb_host, fb_port = self.lease.target_host, self.lease.target_port
+        while not self._stopping.is_set():
+            try:
+                client, _addr = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=route_and_pipe,
+                             args=(client, routes, fb_host, fb_port),
+                             daemon=True).start()
+
+    def stop(self) -> None:
+        self._stopping.set()
+        if self._listener is not None:
+            try:
+                self._listener.close()
+            except OSError:
+                pass
+            self._listener = None
+
+    @property
+    def bound(self) -> bool:
+        return self._listener is not None
+
+
+def forwarder_for(lease: DevServiceLease, bind_host: str = "127.0.0.1",
+                  private_only: bool = True):
+    """The right forwarder for a lease: a multi-target :class:`OriginEdge` when
+    the lease carries ``routes`` (same-origin app), else the plain 1:1
+    :class:`DevServiceForwarder."""
+    if getattr(lease, "routes", None):
+        return OriginEdge(lease, bind_host=bind_host, private_only=private_only)
+    return DevServiceForwarder(lease, bind_host=bind_host, private_only=private_only)
 
 
 def _add_seconds(iso: str, seconds: int) -> str:

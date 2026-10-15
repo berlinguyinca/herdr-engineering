@@ -153,6 +153,30 @@ _PROTOCOLS = {"http", "https", "tcp"}
 
 
 @dataclass
+class Route:
+    """One path-prefix route for a same-origin app lease.
+
+    A request whose path is under ``prefix`` is proxied to ``host:port``. The
+    longest matching prefix wins. The lease's own ``target_host``/``target_port``
+    act as the catch-all when no route matches, or when the connection is not
+    HTTP and the path cannot be peeked.
+    """
+    prefix: str
+    host: str
+    port: int
+
+    def __post_init__(self) -> None:
+        p = (self.prefix or "").strip()
+        if not p.startswith("/"):
+            p = "/" + p
+        if len(p) > 1:
+            p = p.rstrip("/") or "/"
+        self.prefix = p
+        if not (0 < self.port < 65536):
+            raise ValueError(f"route port out of range: {self.port}")
+
+
+@dataclass
 class DevServiceLease:
     id: str
     external_port: int
@@ -160,6 +184,7 @@ class DevServiceLease:
     target_machine_id: str
     target_host: str
     target_port: int
+    routes: list[Route] | None = None
     owner_user_id: str | None = None
     owner_herdr_session_id: str | None = None
     owner_repository: str | None = None
@@ -183,6 +208,11 @@ class DevServiceLease:
             raise ValueError("external_port out of range")
         if not (0 < self.target_port < 65536):
             raise ValueError("target_port out of range")
+        # Routes may arrive as plain dicts (e.g. re-parsed from the lease store);
+        # coerce them so the data model is always list[Route].
+        if self.routes:
+            self.routes = [Route(**r) if isinstance(r, dict) else r
+                           for r in self.routes]
 
     def to_dict(self) -> dict[str, Any]:
         d = as_dict(self)

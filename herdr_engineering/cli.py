@@ -114,6 +114,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--protocol", default="http")
     p2.add_argument("--session"); p2.add_argument("--repo"); p2.add_argument("--worktree")
     p2.add_argument("--process"); p2.add_argument("--label")
+    p2.add_argument("--route", action="append", default=None, metavar="PREFIX=HOST:PORT",
+                    help="same-origin route (repeatable): a path prefix -> backend, "
+                         "e.g. /api=api:8300. The --host/--port is the catch-all. "
+                         "Makes this a multi-backend same-origin app edge.")
+    p2.add_argument("--preferred-port", type=int, default=None,
+                    help="pin the origin's external dev port (default: match --port, "
+                         "fall back to the dev range if taken)")
     p2.set_defaults(func=_cmd_dev_register)
     p2 = dsub.add_parser("heartbeat", help="renew a lease")
     p2.add_argument("lease_id"); p2.set_defaults(func=_cmd_dev_heartbeat)
@@ -477,9 +484,34 @@ def _resolve_target_host(host: str, port: int) -> str:
     return ts_ip
 
 
+def _parse_routes(specs):
+    """Parse --route PREFIX=HOST:PORT specs into the wire format (list of dicts).
+
+    Returns None when there are no routes (plain 1:1 service). The lease's own
+    --host/--port is the catch-all; each route is a path prefix -> backend.
+    """
+    if not specs:
+        return None
+    routes = []
+    for spec in specs:
+        prefix, eq, hp = spec.partition("=")
+        if not eq:
+            raise ValueError(f"bad --route {spec!r} (want PREFIX=HOST:PORT)")
+        host, colon, port = hp.rpartition(":")
+        if not colon or not host:
+            raise ValueError(f"bad --route backend {hp!r} (want HOST:PORT)")
+        routes.append({"prefix": prefix, "host": host, "port": int(port)})
+    return routes
+
+
 def _cmd_dev_register(args) -> int:
     from .devfabric import DevServiceRegistry
     host = _resolve_target_host(args.host, args.port)
+    try:
+        routes = _parse_routes(args.route)
+    except ValueError as exc:
+        _print_json({"ok": False, "error": str(exc)})
+        return 1
     client = _local_fabric_client()
     if client is not None:
         try:
@@ -488,7 +520,8 @@ def _cmd_dev_register(args) -> int:
                 target_port=args.port, protocol=args.protocol,
                 owner_herdr_session_id=args.session, owner_repository=args.repo,
                 owner_worktree_id=args.worktree, owner_process_id=args.process,
-                label=args.label)
+                label=args.label, routes=routes,
+                preferred_port=args.preferred_port)
             _print_json(result)
             return 0
         except Exception as exc:
@@ -499,7 +532,8 @@ def _cmd_dev_register(args) -> int:
         target_machine_id=args.machine, target_host=host, target_port=args.port,
         protocol=args.protocol, owner_herdr_session_id=args.session,
         owner_repository=args.repo, owner_worktree_id=args.worktree,
-        owner_process_id=args.process, label=args.label)
+        owner_process_id=args.process, label=args.label, routes=routes,
+        preferred_port=args.preferred_port)
     _print_json(lease.to_dict())
     return 0
 
@@ -680,25 +714,29 @@ def _cmd_dev_serve(args) -> int:
     import signal
     import time
 
-    from .devfabric import DevServiceForwarder, DevServiceRegistry
+    from .devfabric import DevServiceRegistry, forwarder_for
     from .errors import ConflictError
     lease = DevServiceRegistry().get(args.lease_id)
     if lease is None:
         _print_json({"ok": False, "error": f"unknown lease {args.lease_id}"})
         return 1
     try:
-        fwd = DevServiceForwarder(lease, bind_host=args.bind).start()
+        fwd = forwarder_for(lease, bind_host=args.bind).start()
     except ConflictError as exc:
         _print_json({"ok": False, "error": str(exc)})
         return 1
-    _print_json({
+    out = {
         "ok": True,
         "lease_id": lease.id,
         "dev_address": f"http://dev:{lease.external_port}",
         "local_address": f"http://{args.bind}:{lease.external_port}",
         "target": f"{lease.target_host}:{lease.target_port}",
         "protocol": lease.protocol,
-    })
+    }
+    if lease.routes:
+        out["origin"] = True
+        out["routes"] = [f"{r.prefix} -> {r.host}:{r.port}" for r in lease.routes]
+    _print_json(out)
     stop = {"flag": False}
 
     def _on_sigint(_signum, _frame) -> None:
