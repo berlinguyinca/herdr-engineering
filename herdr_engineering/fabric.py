@@ -424,6 +424,27 @@ class FabricGateway:
     def stable_url(self, port: int) -> str:
         return f"http://{self.url_base}:{port}"
 
+    def op_resolve_loopback(self, port: int, from_machine: str | None = None,
+                            service: str | None = None) -> dict[str, Any]:
+        """Which fabric address owns loopback ``port`` as seen from ``from_machine``."""
+        from .urlrewrite import AmbiguousTarget, resolve_loopback
+        leases = [lse.to_dict() for lse in self.registry.active_leases()]
+        try:
+            res = resolve_loopback(port, leases, from_machine=from_machine,
+                                   url_base=self.url_base, service=service)
+        except AmbiguousTarget as exc:
+            return {"status": 409, "error": str(exc)}
+        if res is None:
+            return {"status": 200, "port": port, "lease": None, "url": None}
+        return {"status": 200, "port": port, "lease": res.lease,
+                "url": f"http://{res.external}"}
+
+    def op_rewrite(self, text: str, from_machine: str | None = None) -> dict[str, Any]:
+        from .urlrewrite import rewrite_text
+        leases = [lse.to_dict() for lse in self.registry.active_leases()]
+        out, notes = rewrite_text(text, leases, from_machine=from_machine, url_base=self.url_base)
+        return {"text": out, "ambiguous": notes}
+
 
 def _tcp_probe(host: str, port: int, timeout: float = 2.0) -> tuple[bool, str | None]:
     try:
@@ -467,6 +488,19 @@ def _make_handler(gateway: FabricGateway):
                     return
                 self._send(200, gateway.op_resolve(port))
                 return
+            if self.path.startswith("/resolve-loopback/"):
+                from urllib.parse import parse_qs, urlsplit
+                u = urlsplit(self.path)
+                q = parse_qs(u.query)
+                try:
+                    port = int(u.path.rsplit("/", 1)[1])
+                except ValueError:
+                    self._send(400, {"error": "bad port"})
+                    return
+                res = gateway.op_resolve_loopback(port, (q.get("from") or [None])[0],
+                                                  (q.get("service") or [None])[0])
+                self._send(res.pop("status"), res)
+                return
             if self.path == "/healthz":
                 lo, hi = gateway.registry.port_range()
                 self._send(200, {"ok": True, "bound_ports": gateway.router.bound_ports(),
@@ -498,6 +532,9 @@ def _make_handler(gateway: FabricGateway):
             if self.path == "/close":
                 lease_id = body.get("lease_id", "")
                 self._send(200, gateway.op_close(lease_id))
+                return
+            if self.path == "/rewrite":
+                self._send(200, gateway.op_rewrite(str(body.get("text", "")), body.get("from")))
                 return
             self._send(404, {"error": "not found"})
 

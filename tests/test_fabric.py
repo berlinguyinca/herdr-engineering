@@ -380,3 +380,21 @@ def _make_host_handler(gw: _FakeGatewayForHostHeader):
             self.wfile.write(body)
 
     return _Handler
+
+
+def test_loopback_resolve_and_rewrite_ops(tmp_path):
+    server, target_port = _http_target(tmp_path)
+    gw, _, _ = _gateway(tmp_path)
+    try:
+        client = _client(gw)
+        lease = client.register(target_machine_id="bender", target_host="127.0.0.1",
+                                target_port=target_port, label="x")["lease"]
+        ext = lease["external_port"]
+        res = gw.op_resolve_loopback(target_port, from_machine="mac")
+        assert res["url"] == f"http://dev.test:{ext}"
+        assert gw.op_resolve_loopback(target_port, from_machine="bender")["url"] is None
+        out = gw.op_rewrite(f"see http://localhost:{target_port}/ui", from_machine="mac")
+        assert out["text"] == f"see http://dev.test:{ext}/ui"
+    finally:
+        server.shutdown()
+        gw.stop() if hasattr(gw, "stop") else None
