@@ -12,6 +12,7 @@ durable Postgres/RustFS path (Phase 1 async stores) is bridged in deployment.
 """
 from __future__ import annotations
 
+import json
 import time
 
 from .ids import new_id
@@ -585,7 +586,7 @@ class ControlPlaneRepo:
             for ev in stream:
                 if since and ev["source_timestamp"] < since:
                     continue
-                p = ev["payload"]
+                p = _payload(ev)
                 _accumulate(total, p)
                 add(by_project, p["project"], p)
                 add(by_model, p["model"], p)
@@ -618,7 +619,7 @@ class ControlPlaneRepo:
         out = []
         for (etype, _), stream in self._events.items():
             if etype == "llm_key" and stream:
-                out.append(dict(stream[-1]["payload"]))
+                out.append(dict(_payload(stream[-1])))
         return out
 
     def list_project_keys(self):
@@ -646,7 +647,7 @@ class ControlPlaneRepo:
         out = {}
         for (etype, name), stream in self._events.items():
             if etype == "custom_model" and stream:
-                p = stream[-1]["payload"]
+                p = _payload(stream[-1])
                 if include_deleted or not p.get("deleted"):
                     out[name] = dict(p)
         return out
@@ -739,6 +740,17 @@ class ControlPlaneRepo:
 
 
 # ------------------------------------------------------------ helpers
+def _payload(ev):
+    """An event's payload as a dict (a hydrated jsonb column arrives as text)."""
+    p = ev.get("payload") or {}
+    if isinstance(p, str):
+        try:
+            p = json.loads(p)
+        except ValueError:
+            p = {}
+    return p if isinstance(p, dict) else {}
+
+
 def _accumulate(bucket, p):
     bucket["requests"] += 1
     for k in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens"):
