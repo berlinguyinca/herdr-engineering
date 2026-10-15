@@ -665,8 +665,17 @@ def _cmd_dev_enroll(args) -> int:
     import time
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
+    next_hb = time.monotonic()
     while not stop["flag"]:
         time.sleep(0.2)
+        # Keep the lease active (default TTL ~90s) so the origin stays a live
+        # fabric member (visible in `devfabric list`, kept by a central gateway).
+        if time.monotonic() >= next_hb:
+            try:
+                reg.heartbeat(lease.id)
+            except Exception:
+                pass
+            next_hb = time.monotonic() + 30
     return 0
 
 
