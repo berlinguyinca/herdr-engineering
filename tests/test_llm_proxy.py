@@ -147,3 +147,17 @@ def test_key_minted_after_last_refresh_works_without_waiting():
     finally:
         proxy.shutdown()
         [s.shutdown() for s in srvs]
+
+
+def test_hydrated_string_payloads_are_understood():
+    repo = ControlPlaneRepo()
+    minted = repo.create_project_key("p")
+    repo.record_token_usage("p", "m", 1, 2)
+    state = repo.export_state()
+    for stream in state["events"].values():  # what Postgres hydration yields
+        for ev in stream:
+            ev["payload"] = json.dumps(ev["payload"])
+    fresh = ControlPlaneRepo()
+    fresh.import_state(state)
+    assert fresh.llm_config()["keys"][0]["key_id"] == minted["key_id"]
+    assert fresh.token_analytics()["total"]["output_tokens"] == 2
