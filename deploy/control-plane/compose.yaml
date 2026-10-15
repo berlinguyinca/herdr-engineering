@@ -167,6 +167,37 @@ services:
       - "--migrations"
       - "/app/migrations"
 
+  # ---- fabric LLM gateway (project keys + token accounting) --------------------
+  # OpenAI-compatible forwarder: agents use a per-project key minted via
+  # POST /api/v1/llm/keys; the single lab API key (FABRIC_LLM_UPSTREAM_KEY in .env)
+  # never leaves this container. Bound to the tailnet interface only; it is NOT
+  # exposed beyond the fabric. Stopgap until the Rust gateway has the `upstream`
+  # link role (inferweave-specs spec 63).
+  llm-proxy:
+    image: herdr-engineering:0.1.0
+    container_name: herdr-llm-proxy
+    restart: unless-stopped
+    depends_on:
+      - control-plane-web
+    environment:
+      FABRIC_LLM_UPSTREAM_KEY: "${FABRIC_LLM_UPSTREAM_KEY:?set FABRIC_LLM_UPSTREAM_KEY in .env}"
+    ports:
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_LLM_PROXY_PORT:-8088}:8088"
+    command:
+      - "control-plane"
+      - "llm-proxy"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8088"
+      - "--control-plane"
+      - "http://control-plane-web:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8088/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
   # ---- dev.lan front door (host network; was deploy/fabric-stack) -------------
   # The worker mounts ./config.yaml (control plane); the fabric services mount
   # the fabric config from ../fabric-stack. Same project, same .env.

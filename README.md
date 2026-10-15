@@ -487,3 +487,22 @@ secrets or hidden chain-of-thought.
 The project is complete when a fresh supported Linux or macOS machine can be enrolled declaratively, the four-machine validation fleet passes the acceptance matrix, mobile/tablet access works privately, concurrent agent worktrees can publish and compare dev previews, local and CI test evidence is navigable, session activity survives reconnect/restart, and all security/update/rollback drills pass.
 
 The final release must not depend on undocumented manual SSH edits or one-off local configuration.
+
+## Fabric LLM gateway (project keys, token accounting, custom models)
+
+`herdr-llm-proxy` (compose service `llm-proxy`, port 8088 on the tailnet interface) is an
+OpenAI-compatible endpoint for fabric agents. Each project gets its own key:
+
+```
+curl -X POST http://dev.lan/api/v1/llm/keys -d '{"project":"my-project","label":"ci"}'   # secret shown once
+curl -X POST http://dev.lan/api/v1/llm/keys/<key_id>/revoke
+export OPENAI_BASE_URL=http://dev.lan:8088/v1 OPENAI_API_KEY=hk-...
+```
+
+Requests are forwarded to `https://llm.metabolomics.us` with the one dedicated lab key
+(`FABRIC_LLM_UPSTREAM_KEY` in `deploy/control-plane/.env`, never given to agents) and the token
+usage (including streaming) is recorded against the project: `GET /api/v1/analytics/tokens`
+(`?project=`, `?since=`) and the **Token usage** page at `#/analytics/tokens`. Custom models
+(`POST /api/v1/llm/models {"name","base_url","upstream_model"}`) are routed to their own endpoint
+and never receive the lab key. The gateway is not exposed beyond the fabric. It uses the public
+HTTPS API only; the `upstream` link role (specs repo, spec 63) will replace this path.

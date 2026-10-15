@@ -292,6 +292,9 @@ def _make_handler(server):
                     return self._json(r.model_analytics())
                 if kind == "hosts":
                     return self._json(r.host_analytics())
+                if kind == "tokens":
+                    return self._json(r.token_analytics(
+                        project=_q(self.path, "project"), since=_q(self.path, "since")))
                 return self._json({"error": "unknown analytics kind"}, 404)
             if resource == "events":
                 if len(parts) > 4 and parts[4] == "stream":
@@ -319,6 +322,15 @@ def _make_handler(server):
                 return self._bytes(data, a.get("mime_type", "application/octet-stream"))
             if resource == "leases":
                 return self._json({"leases": r.list_leases()})
+            if resource == "llm":
+                what = parts[4] if len(parts) > 4 else ""
+                if what == "config":
+                    return self._json(r.llm_config())
+                if what == "keys":
+                    return self._json({"keys": r.list_project_keys()})
+                if what == "models":
+                    return self._json({"models": list(r.list_custom_models().values())})
+                return self._json({"error": "not found"}, 404)
             if resource == "ingest":
                 return self._json({"endpoint": "POST /api/v1/ingest",
                                    "entities": ["host", "session", "mission"]})
@@ -353,6 +365,32 @@ def _make_handler(server):
                     return self._json({"error": "session not found"}, 404)
                 r.session_action(parts[4], body.get("action"))
                 return self._json({"ok": True})
+            if resource == "token-usage" and len(parts) == 4:
+                rows = body.get("records") if isinstance(body.get("records"), list) else [body]
+                for row in rows[:500]:
+                    r.record_token_usage(
+                        row.get("project"), row.get("model"), row.get("input_tokens"),
+                        row.get("output_tokens"), reasoning_tokens=row.get("reasoning_tokens"),
+                        cache_read_tokens=row.get("cache_read_tokens"),
+                        duration_ms=row.get("duration_ms"), success=row.get("success", True),
+                        request_id=row.get("request_id"), session_id=row.get("session_id"),
+                        mission_id=row.get("mission_id"), key_id=row.get("key_id"))
+                return self._json({"ok": True, "recorded": min(len(rows), 500)})
+            if resource == "llm" and len(parts) >= 5:
+                what = parts[4]
+                if what == "keys" and len(parts) == 5:
+                    return self._json(r.create_project_key(body.get("project"),
+                                                           body.get("label", "")))
+                if what == "keys" and len(parts) == 7 and parts[6] == "revoke":
+                    r.revoke_project_key(parts[5])
+                    return self._json({"ok": True})
+                if what == "models" and len(parts) == 5:
+                    r.upsert_custom_model(body.get("name"), body.get("base_url"),
+                                          body.get("upstream_model"), body.get("project"))
+                    return self._json({"ok": True})
+                if what == "models" and len(parts) == 7 and parts[6] == "delete":
+                    r.delete_custom_model(parts[5])
+                    return self._json({"ok": True})
             if resource == "ingest" and len(parts) == 4:
                 if not body:
                     return self._json({"error": "empty body"}, 400)
