@@ -589,6 +589,29 @@ def _stable_origin_lease_id(machine: str, host: str, port: int, repo: str | None
     return "lease_" + hashlib.sha1(key.encode()).hexdigest()[:16]
 
 
+def _gateway_bound_ports(client):
+    """Set of external ports the gateway is currently SERVING, from healthz's
+    bound_ports — the data plane's authoritative view. More reliable than /list
+    on older gateway builds (whose /list can omit a lease that is still bound +
+    serving). None if it can't be read."""
+    if client is None:
+        return None
+    try:
+        return set(client.healthz().get("bound_ports", []))
+    except Exception:
+        return None
+
+
+def _local_lease_alive(reg, lease_id):
+    """Whether the local registry still holds the lease (local-mode liveness)."""
+    if not lease_id:
+        return False
+    try:
+        return any(lease.id == lease_id for lease in reg.active_leases())
+    except Exception:
+        return True
+
+
 def _routes_equal(a, b) -> bool:
     """Compare two route lists (Route objects or None), order-insensitive."""
     def norm(rs):
@@ -754,11 +777,24 @@ def _cmd_dev_enroll_sync(args) -> int:
         if args.git_pull:
             _maybe_git_pull(args.dir)
         specs = _load_origin_manifests(args.dir)
+        bound = _gateway_bound_ports(client)  # None = can't verify
         results = []
         for key, spec in specs.items():
             sig = _origin_signature(spec)
-            if state.get(key, {}).get("sig") == sig:
-                continue  # unchanged -> idempotent (no re-register)
+            prev = state.get(key)
+            # Self-healing: skip only if the manifest is unchanged AND its origin
+            # port is still bound + serving by the gateway (the data plane's
+            # authoritative view). A dropped lease (e.g. after a gateway restart)
+            # is re-enrolled even though the manifest didn't change — so the
+            # origin always recovers, not just on a manifest edit.
+            if client is not None:
+                prev_port = prev.get("port") if prev else None
+                lease_alive = (bound is None) or (prev_port is not None and prev_port in bound)
+            else:
+                lease_alive = _local_lease_alive(
+                    reg, prev.get("lease_id") if prev else None)
+            if prev is not None and prev.get("sig") == sig and lease_alive:
+                continue  # unchanged + still serving -> idempotent
             try:
                 out, lease = _enroll_origin(spec, client, reg, bind=args.bind)
             except Exception as exc:  # noqa: BLE001 - report, keep syncing
@@ -767,7 +803,9 @@ def _cmd_dev_enroll_sync(args) -> int:
             out["manifest"] = key
             results.append(out)
             lid = lease.get("id") if isinstance(lease, dict) else lease.id
-            state[key] = {"sig": sig, "lease_id": lid}
+            port = lease.get("external_port") if isinstance(lease, dict) \
+                else lease.external_port
+            state[key] = {"sig": sig, "lease_id": lid, "port": port}
             if args.serve and client is None:
                 cur = fwd.get(key)
                 if cur is not None and state[key]["sig"] != sig:
