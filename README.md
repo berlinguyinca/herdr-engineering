@@ -506,3 +506,5 @@ usage (including streaming) is recorded against the project: `GET /api/v1/analyt
 (`POST /api/v1/llm/models {"name","base_url","upstream_model"}`) are routed to their own endpoint
 and never receive the lab key. The gateway is not exposed beyond the fabric. It uses the public
 HTTPS API only; the `upstream` link role (specs repo, spec 63) will replace this path.
+
+A revoked key stops working within 10 s (the proxy reloads its key table every 10 s; an unknown key forces a reload at most every 2 s).

@@ -54,7 +54,7 @@ class ProxyState:
     """Key and custom-model tables, refreshed from the control plane."""
 
     def __init__(self, control: ControlPlaneClient, upstream: str, upstream_key: str,
-                 refresh_seconds: float = 30.0):
+                 refresh_seconds: float = 10.0):
         self.control, self.upstream, self.upstream_key = control, upstream.rstrip("/"), upstream_key
         self.refresh_seconds = refresh_seconds
         self._keys: dict[str, dict] = {}
