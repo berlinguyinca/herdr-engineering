@@ -156,7 +156,7 @@ scripts/fabric-offboard.sh --leave-tailnet --purge
 ```
 
 The CoreDNS + gateway containers are removed; the `herdr-state` named volume
-(leases) can be removed with `docker compose -f deploy/fabric-stack/compose.yaml down -v`.
+(leases) can be removed with `docker compose -f deploy/control-plane/compose.yaml rm -sf coredns fabric-gateway herdr-web  && docker volume rm herdr-fabric_herdr-state`.
 
 ---
 

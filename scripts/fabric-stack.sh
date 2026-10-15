@@ -13,8 +13,10 @@
 set -euo pipefail
 
 STACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../deploy/fabric-stack" && pwd)"
-ENV_FILE="$STACK_DIR/.env"
-COMPOSE=(docker compose -f "$STACK_DIR/compose.yaml" --env-file "$ENV_FILE")
+# The compose project is shared with the control plane: one file, one .env.
+PROJECT_DIR="$(cd "$STACK_DIR/../control-plane" && pwd)"
+ENV_FILE="$PROJECT_DIR/.env"
+COMPOSE=(docker compose -f "$PROJECT_DIR/compose.yaml" --env-file "$ENV_FILE")
 SERVICE_PREFIX='herdr-fabric'
 OLD_GATEWAY_PATTERN='herdr-eng devfabric gateway'
 OLD_WEB_UNIT='herdr-eng-web.service'
@@ -34,10 +36,12 @@ write_env() {
        && [ "$(grep '^GATEWAY_TAILNET_IP=' "$ENV_FILE" | cut -d= -f2)" = "$ip" ]; then
         say "GATEWAY_TAILNET_IP already correct ($ip) in $ENV_FILE"
     else
-        say "Writing $ENV_FILE with GATEWAY_TAILNET_IP=$ip"
-        cat > "$ENV_FILE" <<EOF
-GATEWAY_TAILNET_IP=$ip
-EOF
+        say "Setting GATEWAY_TAILNET_IP=$ip in $ENV_FILE"
+        # Keep the control plane's credentials: replace only our line.
+        touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
+        grep -v '^GATEWAY_TAILNET_IP=' "$ENV_FILE" > "$ENV_FILE.tmp" || true
+        echo "GATEWAY_TAILNET_IP=$ip" >> "$ENV_FILE.tmp"
+        mv "$ENV_FILE.tmp" "$ENV_FILE"; chmod 600 "$ENV_FILE"
     fi
 }
 
@@ -71,7 +75,7 @@ up() {
     write_env
     gen_coredns
     "${COMPOSE[@]}" build fabric-gateway
-    "${COMPOSE[@]}" up -d
+    "${COMPOSE[@]}" up -d --remove-orphans
     "${COMPOSE[@]}" ps
 }
 
@@ -88,7 +92,7 @@ status() {
     fi
 }
 
-down() { "${COMPOSE[@]}" down; }
+down() { "${COMPOSE[@]}" stop coredns fabric-gateway herdr-web; }  # not the control plane
 
 cmd="${1:-up}"
 case "$cmd" in
