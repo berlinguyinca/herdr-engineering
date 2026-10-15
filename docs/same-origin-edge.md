@@ -65,6 +65,33 @@ the API — **one origin**, no CORS, no hardcoding a backend host in the browser
 - `route_and_pipe`, `match_target`, `path_matches`, `_peek_request_path`,
   `prefixed_pipe` — the routing core in `herdr_engineering.devfabric`.
 
+## Deployment modes
+- **Per-host forwarder** — `herdr-eng devfabric enroll --manifest <origin.json> --serve`:
+  the app's machine registers the lease locally and runs the forwarder (binds the
+  origin on `--bind`). Simplest for a single machine.
+- **Central gateway (recommended for a fleet)** — `herdr-eng devfabric enroll
+  --manifest <origin.json>` (no `--serve`): registers with the **gateway**, which
+  binds `dev:<origin_port>` fleet-wide, pipes to the backends, and auto-restarts.
+  The app's backends must be reachable from the gateway (publish them on the app
+  machine's tailnet-routable address; point the manifest's backends at the machine's
+  tailnet IP). One registration serves the whole fleet via `dev.lan:<origin>`.
+
+## Auto-enrollment at fleet scale (`enroll-sync`)
+For ~a dozen+ systems, don't `enroll` by hand per app. Keep one `origin.json` per
+app in a **fleet-origins** dir (a git repo) and run the watcher on the
+**gateway/master host**:
+
+```bash
+herdr-eng devfabric enroll-sync --dir /srv/fleet-origins --watch --interval 30 --git-pull
+```
+
+It idempotently registers every manifest (with the gateway, which serves them
+fleet-wide) and re-syncs: **a new/changed `origin.json` — committed or dropped in —
+enrolls within an interval**, and removed ones are reaped. `--git-pull` keeps a
+fleet-origins git repo current. Without a gateway, add `--serve` to run a per-host
+forwarder per origin. A `fabric-enroll` skill (with a systemd unit template + a
+verify script) automates the whole setup.
+
 ## Guarantees
 - **Backward compatible**: a lease with no `routes` behaves exactly as before
   (plain 1:1 forwarding). All existing fabric behavior/tests are unchanged.
