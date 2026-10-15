@@ -95,3 +95,50 @@ def rewrite_text(text: str, leases: Iterable[dict[str, Any]], *, from_machine: s
             return m.group(0)
 
     return _URL_RE.sub(sub, text), notes
+
+
+# ---- opt-in response-header rewriting for the gateway's HTTP leases ----------
+_LOOPBACK_NAMES = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")
+MAX_HEAD = 64 * 1024
+
+
+def _fix_value(value: str, port: int, external: str) -> str:
+    for name in _LOOPBACK_NAMES:
+        value = re.sub(rf"(https?://){re.escape(name)}:{port}(?![0-9])", rf"\g<1>{external}", value)
+    return value
+
+
+def rewrite_response_head(head: bytes, port: int, external: str) -> bytes:
+    """Rewrite loopback references in Location / Access-Control-Allow-Origin /
+    Set-Cookie (Domain) of one HTTP response head. ``head`` ends at the blank line.
+    Bodies are never touched (a URL inside a body may be signed or built by JS)."""
+    lines = head.split(b"\r\n")
+    host_only = external.rsplit(":", 1)[0]
+    for i, raw in enumerate(lines[1:], start=1):
+        name, sep, value = raw.partition(b":")
+        if not sep:
+            continue
+        lname = name.strip().lower()
+        text = value.decode("latin-1")
+        if lname in (b"location", b"access-control-allow-origin", b"content-location"):
+            new = _fix_value(text, port, external)
+        elif lname == b"set-cookie":
+            new = re.sub(r"(?i)(;\s*domain=)(?:localhost|127\.0\.0\.1)", rf"\g<1>{host_only}", text)
+        else:
+            continue
+        if new != text:
+            lines[i] = name + b":" + new.encode("latin-1")
+    return b"\r\n".join(lines)
+
+
+def force_close(head: bytes) -> bytes:
+    """Ask the origin to close after this exchange so every response of a
+    rewritten lease passes through the head filter (no keep-alive reuse)."""
+    lines = head.split(b"\r\n")
+    kept = [lines[0]] + [ln for ln in lines[1:] if not ln.lower().startswith(b"connection:")]
+    kept.insert(1, b"Connection: close")
+    return b"\r\n".join(kept)
+
+
+def is_upgrade(head: bytes) -> bool:
+    return b"\r\nupgrade:" in head.lower()

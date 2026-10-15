@@ -519,6 +519,75 @@ def prefixed_pipe(client: socket.socket, target: socket.socket,
     t2.join()
 
 
+def _read_head(sock: socket.socket) -> tuple[bytes, bytes]:
+    """Read up to the end of an HTTP head; returns (head incl. blank line, remainder)."""
+    buf = b""
+    while b"\r\n\r\n" not in buf and len(buf) < 65536:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    idx = buf.find(b"\r\n\r\n")
+    if idx < 0:
+        return buf, b""
+    return buf[: idx + 4], buf[idx + 4:]
+
+
+def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, external: str) -> None:
+    """Byte-pipe that filters the headers of the origin's responses.
+
+    Each exchange is forced to ``Connection: close`` so every response passes the
+    head filter. Upgrade requests (websockets) are passed through untouched."""
+    from .urlrewrite import force_close, is_upgrade, rewrite_response_head
+    req_head, rest = _read_head(client)
+    upgrade = is_upgrade(req_head)
+    if not upgrade and req_head.endswith(b"\r\n\r\n"):
+        req_head = force_close(req_head[:-4]) + b"\r\n\r\n"
+    if upgrade:
+        prefixed_pipe(client, target, client_prefix=req_head + rest)
+        return
+    try:
+        target.sendall(req_head + rest)
+    except OSError:
+        return
+
+    def up() -> None:
+        try:
+            while True:
+                data = client.recv(65536)
+                if not data:
+                    break
+                target.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                target.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    t = threading.Thread(target=up, daemon=True)
+    t.start()
+    try:
+        resp_head, body = _read_head(target)
+        if resp_head.endswith(b"\r\n\r\n"):
+            resp_head = rewrite_response_head(resp_head[:-4], port, external) + b"\r\n\r\n"
+        client.sendall(resp_head + body)
+        while True:
+            data = target.recv(65536)
+            if not data:
+                break
+            client.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            client.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+    t.join(timeout=5)
+
+
 def route_and_pipe(client: socket.socket, routes, fallback_host: str,
                    fallback_port: int) -> None:
     """Peek the first request line, pick the target (longest-prefix route match,
