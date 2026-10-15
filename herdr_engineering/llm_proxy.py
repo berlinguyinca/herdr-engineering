@@ -175,7 +175,7 @@ def make_handler(state: ProxyState):
             headers["Content-Length"] = str(len(raw))
             if bearer:
                 headers["Authorization"] = f"Bearer {bearer}"
-            usage, status = {}, 502
+            usage, status, reported = {}, 502, False
             try:
                 conn = conn_cls(parts.hostname, parts.port, timeout=600)
                 conn.request(self.command, parts.path + (f"?{parts.query}" if parts.query else ""),
@@ -199,8 +199,13 @@ def make_handler(state: ProxyState):
                         tail = (tail + chunk)[-65536:]
                     elif len(collected) < MAX_BODY:
                         collected.extend(chunk)
-                self.wfile.write(b"0\r\n\r\n")
                 usage = self._extract(stream, bytes(tail), bytes(collected))
+                # Record before closing the response so a client that reads the
+                # end of the stream always sees its usage counted.
+                if self.command == "POST" and body is not None:
+                    self._report(key, model, usage, status, started)
+                    reported = True
+                self.wfile.write(b"0\r\n\r\n")
             except Exception as exc:
                 log.warning("forward failed: %s", exc)
                 if status == 502:
@@ -209,7 +214,7 @@ def make_handler(state: ProxyState):
                     except Exception:
                         pass
             finally:
-                if self.command == "POST" and body is not None:
+                if self.command == "POST" and body is not None and not reported:
                     self._report(key, model, usage, status, started)
 
         @staticmethod
