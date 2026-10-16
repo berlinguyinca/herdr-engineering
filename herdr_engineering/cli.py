@@ -31,6 +31,29 @@ def _build_parser() -> argparse.ArgumentParser:
                         version=f"herdr-eng {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # build-coordinate ----------------------------------------------------
+    # Cross-agent single-flight build gate: bound concurrent cargo/tsc builds
+    # across ALL agents on a host so they can't create a CPU build-storm.
+    p = sub.add_parser("build-coordinate",
+                       help="run a build command under the per-host build gate "
+                            "(prevents CPU build-storms from concurrent agents)")
+    p.add_argument("--slots", type=int, default=2,
+                   help="max concurrent builds host-wide (default 2)")
+    p.add_argument("--max-load", type=float, default=1.5,
+                   help="back off while 1-min load per core exceeds this (0=off)")
+    p.add_argument("--wait", type=float, default=0.0,
+                   help="seconds to wait for a slot at capacity (0=indefinite)")
+    p.add_argument("--bypass-on-timeout", action="store_true",
+                   help="if no slot frees within --wait, run the command ungated "
+                        "instead of failing (best-effort coordination)")
+    p.add_argument("--status", action="store_true",
+                   help="print current build-gate occupancy and exit")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable output")
+    p.add_argument("command", nargs=argparse.REMAINDER,
+                   help="the build command to run, e.g. `-- cargo check -j 4 --workspace --tests`")
+    p.set_defaults(func=_cmd_build_coordinate)
+
     # doctor ---------------------------------------------------------------
     p = sub.add_parser("doctor", help="capability/health checks (spec 0050/0170)")
     p.add_argument("--json", action="store_true", help="stable machine-readable output")
@@ -216,6 +239,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = dsub.add_parser("resolve", help="resolve a dev port to a lease")
     p2.add_argument("port", type=int); p2.set_defaults(func=_cmd_dev_resolve)
     dsub.add_parser("reconcile", help="expire stale leases").set_defaults(func=_cmd_dev_reconcile)
+    dsub.add_parser("gc", help="drop expired leases past the retention window (shrink the store)"
+                    ).set_defaults(func=_cmd_dev_gc)
     p2 = dsub.add_parser("serve", help="forward the leased external port to the target")
     p2.add_argument("lease_id")
     p2.add_argument("--bind", default="127.0.0.1",
@@ -1167,6 +1192,38 @@ def _cmd_dev_gateway(args) -> int:
     return 0
 
 
+def _cmd_build_coordinate(args) -> int:
+    """Run a build command under the per-host single-flight build gate.
+
+    Bounds the number of concurrent ``cargo``/``tsc``/build jobs across all
+    autonomous agents on a host, so N agents can't each launch a full-workspace
+    build at once and CPU-starve the machine (the "build storm").
+    """
+    from .build_coord import BuildGate, run_gated
+
+    if getattr(args, "status", False):
+        gate = BuildGate(slots=args.slots)
+        if args.json:
+            _print_json({"slots": args.slots, "occupancy": gate.status()})
+        else:
+            for entry in gate.status():
+                if entry["held"]:
+                    h = entry["holder"]
+                    print(f"  slot {entry['slot']}: held by pid {h.get('pid')} "
+                          f"({h.get('host')}) since {h.get('start')} "
+                          f"cmd={h.get('cmd')}")
+                else:
+                    print(f"  slot {entry['slot']}: free")
+        return 0
+
+    cmd = args.command
+    if cmd and cmd[0] == "--":  # argparse REMAINDER keeps a leading `--`
+        cmd = cmd[1:]
+    return run_gated(cmd, slots=args.slots, max_load=args.max_load,
+                     wait_seconds=args.wait, json_out=args.json,
+                     bypass_on_timeout=args.bypass_on_timeout)
+
+
 def _cmd_dev_agent(args) -> int:
     """Run the per-host auto-registration agent (spec 0110)."""
     import logging
@@ -1247,6 +1304,12 @@ def _cmd_dev_reconcile(args) -> int:
     from .devfabric import DevServiceRegistry
     expired = DevServiceRegistry().reconcile()
     _print_json({"expired": expired})
+    return 0
+
+
+def _cmd_dev_gc(args) -> int:
+    from .devfabric import DevServiceRegistry
+    _print_json(DevServiceRegistry().gc())
     return 0
 
 

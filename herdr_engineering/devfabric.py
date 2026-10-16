@@ -11,7 +11,7 @@ import os
 import socket
 import threading
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .contracts import DevServiceLease
@@ -20,9 +20,25 @@ from .errors import ConflictError
 _LO = 18000
 _HI = 28999
 
+# Expired/failed leases older than this are dropped from the store on load and
+# during reconciliation. Without a retention window the store grows without
+# bound (observed: 6,551 leases, 6,408 of them expired -> a 3.8 MB JSON file),
+# and every heartbeat rewrites the whole blob, burning a core. Pruning keeps
+# the store proportional to live services.
+_RETENTION_SECONDS = 24 * 60 * 60  # keep expired leases for 24h
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def _parse_time(iso: str | None):
+    if not iso:
+        return datetime.now(UTC)
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
 
 
 def _os_port_free(port: int) -> bool:
@@ -89,7 +105,26 @@ class DevServiceRegistry:
         self._leases: dict[str, DevServiceLease] = {}
         self._lock = threading.RLock()
         self._loaded_mtime: float | None = None
+        self._dirty = False
         self._load()
+
+    def _prune_expired(self, now=None) -> int:
+        """Drop expired/failed leases older than the retention window.
+
+        Returns the number pruned. Cheap when the store is already small (the
+        common case after the first prune); this is what stops the store from
+        growing without bound over weeks of agent churn.
+        """
+        cutoff = _parse_time(now or _now_iso()) - timedelta(seconds=_RETENTION_SECONDS)
+        with self._lock:
+            doomed = [lid for lid, lease in self._leases.items()
+                      if lease.state in ("expired", "failed")
+                      and _parse_time(lease.expires_at or lease.created_at) < cutoff]
+            for lid in doomed:
+                del self._leases[lid]
+        if doomed:
+            self._dirty = True
+        return len(doomed)
 
     @property
     def store_path(self) -> Path:
@@ -115,6 +150,7 @@ class DevServiceRegistry:
             return
         with self._lock:
             self._leases = _parse_leases(data)
+        self._prune_expired()
 
     def reload_if_changed(self) -> bool:
         """Re-read the store if another process changed it on disk.
@@ -136,13 +172,40 @@ class DevServiceRegistry:
             return False
         with self._lock:
             self._leases = _parse_leases(data)
+        self._prune_expired()
         return True
 
-    def _persist(self) -> None:
+    def gc(self) -> dict:
+        """Drop expired/failed leases past the retention window and persist.
+
+        One-shot maintenance path (CLI ``devfabric gc``) to shrink a store that
+        accumulated garbage before pruning existed. Returns stats.
+        """
+        before = len(self._leases)
+        pruned = self._prune_expired()
+        self.persist()
+        return {"pruned": pruned, "before": before, "after": len(self._leases)}
+
+    def persist(self) -> None:
+        """Write the store only if something changed since the last write.
+
+        Batching callers (the gateway's probe loop) mark many leases dirty and
+        call this once, instead of writing the whole store per lease (which
+        burned a core when the store grew to thousands of leases).
+        """
+        with self._lock:
+            if not self._dirty:
+                return
+            self._write_store()
+            self._dirty = False
+
+    def _write_store(self) -> None:
         try:
             payload = {"leases": [lease.to_dict() for lease in self._leases.values()]}
             tmp = self._path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            # Compact JSON (no indent) keeps the store small and the serialization
+            # cheap; it is parsed back with json.loads, so the format is internal.
+            tmp.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True))
             os.replace(tmp, self._path)
             try:
                 self._loaded_mtime = self._path.stat().st_mtime
@@ -150,6 +213,12 @@ class DevServiceRegistry:
                 pass
         except OSError:
             pass
+
+    def _persist(self) -> None:
+        """Legacy immediate-write helper; equivalent to persist() with force."""
+        with self._lock:
+            self._dirty = True
+        self.persist()
 
 
 
@@ -259,6 +328,43 @@ class DevServiceRegistry:
             else:
                 lease.health_last_error = error
 
+    def renew_and_mark(self, lease_id: str, ok: bool, error: str | None = None) -> bool:
+        """In-memory probe outcome + TTL renewal for one lease (no persist).
+
+        Returns True if anything changed. The gateway's probe loop calls this
+        for every active lease and then ``persist()`` once, so N lease heartbeats
+        cost one store write instead of N full-store rewrites.
+        """
+        now = _now_iso()
+        changed = False
+        with self._lock:
+            lease = self._leases.get(lease_id)
+            if lease is None or lease.state != "active":
+                return False
+            if ok:
+                if lease.health_last_ok_at is None:
+                    changed = True
+                lease.health_last_ok_at = now
+                if lease.health_last_error is not None:
+                    changed = True
+                lease.health_last_error = None
+            else:
+                if lease.health_last_error != error:
+                    changed = True
+                lease.health_last_error = error
+            # Renew the TTL ONLY on a healthy probe. An unhealthy target must not
+            # be renewed, otherwise it never expires and the route never unbinds.
+            if ok:
+                new_expires = _add_seconds(now, self._ttl)
+                if lease.expires_at != new_expires:
+                    changed = True
+                    lease.renewed_at = now
+                    lease.expires_at = new_expires
+        if changed:
+            with self._lock:
+                self._dirty = True
+        return changed
+
     def reconcile(self, now_iso: str | None = None) -> list[str]:
         """Expire stale leases (TTL exceeded). Returns ids expired."""
         now = now_iso or _now_iso()
@@ -269,7 +375,13 @@ class DevServiceRegistry:
                     lease.state = "expired"
                     lease.health_last_error = "lease expired (heartbeat timeout)"
                     expired.append(lid)
+        # Drop expired leases past the retention window so the store stays
+        # proportional to live services instead of accumulating garbage.
+        self._prune_expired(now)
         if expired:
+            self._persist()
+        elif self._dirty:
+            # prune_expired may have dropped leases; persist the smaller store.
             self._persist()
         return expired
 

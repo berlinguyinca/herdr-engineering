@@ -316,11 +316,20 @@ class FabricGateway:
                 # Pick up store changes made by an overlapping process
                 # (e.g. a register served by a gateway that was mid-shutdown).
                 self.registry.reload_if_changed()
+                changed = False
                 for lease in self.registry.active_leases():
                     ok, err = _tcp_probe(lease.target_host, lease.target_port)
-                    self.registry.mark_health(lease.id, ok, err)
-                    if ok:
-                        self.registry.heartbeat(lease.id)  # healthy = renewed
+                    # Batch: update health + renew TTL in memory for every lease,
+                    # then persist once below. (The old code persisted per lease,
+                    # so with N active leases it rewrote the whole store N times
+                    # per cycle — a core-burning cost once the store bloated.)
+                    if self.registry.renew_and_mark(lease.id, ok, err):
+                        changed = True
+                # Drop expired leases past the retention window; keeps the store
+                # proportional to live services (was: thousands of dead leases).
+                if changed:
+                    self.registry.persist()
+                self.registry.reconcile()
                 # Self-heal the router: bind active leases, unbind ports whose
                 # lease expired/closed. (active_leases() reconciles internally,
                 # so the expired ids are consumed there — syncing is the robust
@@ -328,7 +337,20 @@ class FabricGateway:
                 self._sync_router()
             except Exception:
                 pass  # probe cycle is best-effort; never kill the loop
-            self._stop.wait(self.probe_interval)
+            # Load-aware backoff: during a build storm / host overload the probe
+            # cycle (network probes + store writes) would add CPU pressure. Back
+            # off the housekeeping cadence up to 4x rather than skip it entirely
+            # (leases still renew, just less often than their 90s TTL).
+            self._stop.wait(self._effective_probe_interval())
+
+    def _effective_probe_interval(self) -> float:
+        """Scale the probe interval up when the host is under sustained load."""
+        load = _host_load_per_core()
+        if load > 4.0:
+            return self.probe_interval * 4
+        if load > 2.0:
+            return self.probe_interval * 2
+        return self.probe_interval
 
     # -- lifecycle -----------------------------------------------------------
     def _lock_path(self) -> Path:
@@ -470,6 +492,22 @@ class FabricGateway:
         leases = [lse.to_dict() for lse in self.registry.active_leases()]
         out, notes = rewrite_text(text, leases, from_machine=from_machine, url_base=self.url_base)
         return {"text": out, "ambiguous": notes}
+
+
+def _host_load_per_core() -> float:
+    """One-minute host load average divided by CPU count (0.0 when unknown).
+
+    Used to back off the probe cadence under a build storm / overload so the
+    gateway stops adding CPU pressure (it already competes with the agents' own
+    builds for cores). In a container this reflects the host's load.
+    """
+    try:
+        with open("/proc/loadavg") as f:
+            one = float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+    cores = os.cpu_count() or 1
+    return one / cores
 
 
 def _tcp_probe(host: str, port: int, timeout: float = 2.0) -> tuple[bool, str | None]:

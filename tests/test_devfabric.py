@@ -13,6 +13,17 @@ from herdr_engineering.devfabric import (
 from herdr_engineering.errors import ConflictError
 
 
+def _expired_lease(port: int, days_ago: float) -> dict:
+    from datetime import UTC, datetime, timedelta
+    now = datetime.now(UTC)
+    exp = (now - timedelta(days=days_ago)).isoformat(timespec="milliseconds")
+    return {"id": f"dead_{port}", "external_port": port, "protocol": "tcp",
+            "target_machine_id": "m", "target_host": "127.0.0.1",
+            "target_port": port + 1, "state": "expired",
+            "created_at": now.isoformat(timespec="milliseconds"),
+            "renewed_at": exp, "expires_at": exp}
+
+
 def _free_port() -> int:
     """Ask the OS for a currently-free loopback port."""
     import socket
@@ -172,3 +183,57 @@ def test_forwarder_refuses_public_bind(tmp_path):
                        target_port=8080)
     with pytest.raises(ConflictError):
         DevServiceForwarder(lease, bind_host="203.0.113.10").start()
+
+
+def test_load_prunes_expired_garbage(tmp_path):
+    """Loading a store bloated with old expired leases drops them."""
+    import json
+    store = tmp_path / "leases.json"
+    data = {"leases": [_expired_lease(18000 + i, days_ago=3) for i in range(1000)]}
+    data["leases"].append({"id": "live", "external_port": 20000, "protocol": "tcp",
+                           "target_machine_id": "m", "target_host": "127.0.0.1",
+                           "target_port": 9000, "state": "active",
+                           "created_at": "2024-01-01T00:00:00+00:00",
+                           "renewed_at": "2024-01-01T00:00:00+00:00",
+                           "expires_at": "2099-01-01T00:00:00+00:00"})
+    store.write_text(json.dumps(data))
+    r = DevServiceRegistry(store_path=store)
+    assert len(r.active_leases()) == 1
+    assert len(r._leases) == 1  # 1000 dead leases pruned on load
+
+
+def test_prune_keeps_recently_expired(tmp_path):
+    """Leases expired within the retention window are kept for diagnosis."""
+    import json
+    store = tmp_path / "leases.json"
+    data = {"leases": [_expired_lease(18100, days_ago=0.01)]}  # ~14 min old
+    store.write_text(json.dumps(data))
+    r = DevServiceRegistry(store_path=store)
+    assert len(r._leases) == 1  # not pruned yet
+
+
+def test_renew_and_mark_only_renews_when_healthy(tmp_path):
+    """An unhealthy probe must NOT renew the TTL (else dead routes never expire)."""
+    r = DevServiceRegistry(store_path=tmp_path / "leases.json")
+    lease = r.register(target_machine_id="m", target_host="127.0.0.1", target_port=8080)
+    before = lease.expires_at
+    # unhealthy -> no renewal
+    r.renew_and_mark(lease.id, ok=False, error="refused")
+    assert lease.expires_at == before
+    # healthy -> renewal
+    import time; time.sleep(0.02)
+    r.renew_and_mark(lease.id, ok=True)
+    assert lease.expires_at > before
+
+
+def test_persist_is_dirty_aware(tmp_path):
+    """persist() writes only when something changed (batched probe path)."""
+    import json
+    r = DevServiceRegistry(store_path=tmp_path / "leases.json")
+    lease = r.register(target_machine_id="m", target_host="127.0.0.1", target_port=8080)
+    first_mtime = r.store_path.stat().st_mtime
+    r.persist()  # nothing changed since register persisted
+    assert r.store_path.stat().st_mtime == first_mtime
+    r.renew_and_mark(lease.id, ok=True)  # changes state -> dirty
+    r.persist()
+    assert r.store_path.stat().st_mtime >= first_mtime

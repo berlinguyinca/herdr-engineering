@@ -285,6 +285,9 @@ def _run_enroll_sync(origins, state_dir, *extra):
     import subprocess
     env = os.environ.copy()
     env["HERDR_ENGINEERING_STATE"] = str(state_dir)
+    # Hermetic: force LOCAL enrollment (no live gateway) so the result is
+    # written to state_dir/leases.json rather than to a reachable gateway.
+    env["HERDR_ENGINEERING_FABRIC_URL"] = "http://127.0.0.1:1"  # refused -> local
     return subprocess.run(
         [sys.executable, "-m", "herdr_engineering.cli", "devfabric", "enroll-sync",
          "--dir", str(origins), *extra], env=env, cwd=REPO_ROOT,
@@ -328,6 +331,9 @@ def test_enroll_sync_watch_auto_enrolls_new_manifest(tmp_path):
     st = tmp_path / "state"
     env = os.environ.copy()
     env["HERDR_ENGINEERING_STATE"] = str(st)
+    # Hermetic: force LOCAL enrollment (no live gateway) so the watch loop
+    # writes to st/leases.json and the assertions below are deterministic.
+    env["HERDR_ENGINEERING_FABRIC_URL"] = "http://127.0.0.1:1"  # refused -> local
     proc = subprocess.Popen(
         [sys.executable, "-m", "herdr_engineering.cli", "devfabric", "enroll-sync",
          "--dir", str(origins), "--watch", "--interval", "1"],
