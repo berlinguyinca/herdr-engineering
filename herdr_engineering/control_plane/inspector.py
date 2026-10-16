@@ -16,6 +16,7 @@ a reasoning capability, and it is never synthesised.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
@@ -98,6 +99,10 @@ _SENSITIVE_CMD = re.compile(
     r"(\bprintenv\b|\benv\b\s*($|\||;)|\bcat\s+\S*(\.env|id_rsa|\.pem|credentials)|"
     r"\.ssh/|\.aws/|\bsecrets?\b|\bpasswd\b|\bkeychain\b)", re.IGNORECASE)
 
+_SESSION_ID = re.compile(r"^[A-Za-z0-9_.:@\-]{1,128}$")
+_MAX_NUM = 2 ** 53
+MAX_SUBS_PER_SESSION = 16
+MAX_SUBS_TOTAL = 512
 _MAX_SEEN_IDS = 1024
 _MAX_BATCH = 100
 _MARKER = "\n… [{n} bytes truncated] …\n"
@@ -108,9 +113,26 @@ def _now_iso() -> str:
 
 
 def _s(value: Any, limit: int = 512) -> str | None:
+    """Bounded identifier-ish string: control characters stripped, secrets redacted."""
     if value is None:
         return None
-    return str(value)[:limit]
+    text = "".join(ch for ch in str(value)[:limit] if ch >= " " and ch != "\x7f")
+    return redact_text(text)
+
+
+def _ts(value: Any) -> str:
+    """Strict timestamp: a parseable ISO-8601 value (normalised) or 'now'."""
+    if isinstance(value, str) and len(value) <= 64:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat()
+        except ValueError:
+            pass
+    return _now_iso()
+
+
+def _finite(v: Any) -> bool:
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v) and abs(v) <= _MAX_NUM)
 
 
 def truncate_text(text: str, max_bytes: int) -> tuple[str, bool]:
@@ -307,8 +329,8 @@ class InspectorStore:
     # --------------------------------------------------------------- ingest
     def ingest(self, session_id: str, payload: dict, *, persist: bool = True) -> dict:
         """Ingest one envelope payload (``{"events": [...]}`` or a single event)."""
-        if not session_id:
-            raise ValueError("entity_id (session id) is required")
+        if not isinstance(session_id, str) or not _SESSION_ID.match(session_id):
+            raise ValueError("entity_id must be a session id (1-128 chars of [A-Za-z0-9_.:@-])")
         events = payload.get("events") if isinstance(payload, dict) else None
         if events is None:
             events = [payload]
@@ -342,10 +364,15 @@ class InspectorStore:
         kind = ev.get("kind")
         if kind not in KINDS:
             raise ValueError(f"unknown kind {kind!r}")
-        eid = _s(ev.get("event_id"), 128)
+        eid = _s(ev.get("event_id"), 128) or None
         if eid and eid in sess.seen:
             return "dup"
-        status = self._apply(sess, kind, ev, persist)
+        try:
+            status = self._apply(sess, kind, ev, persist)
+        except ValueError:
+            raise
+        except (TypeError, AttributeError, KeyError, OverflowError, IndexError) as exc:
+            raise ValueError(f"malformed {kind} event") from exc
         if eid:  # only remember ids of events that were actually accepted
             sess.seen[eid] = True
             while len(sess.seen) > _MAX_SEEN_IDS:
@@ -357,7 +384,7 @@ class InspectorStore:
         base = {
             "agent_id": _s(ev.get("agent_id"), 128) or "main",
             "parent_agent_id": _s(ev.get("parent_agent_id"), 128),
-            "ts": _s(ev.get("ts"), 64) or _now_iso(),
+            "ts": _ts(ev.get("ts")),
         }
         flagged = bool(ev.get("sensitive"))
         sess.last_event = self._clock()
@@ -381,7 +408,7 @@ class InspectorStore:
             for k in sess.usage_totals:
                 v = data.get(k)
                 if isinstance(v, int) and v > 0:
-                    sess.usage_totals[k] += v
+                    sess.usage_totals[k] = min(sess.usage_totals[k] + v, _MAX_NUM)
             sess.usage_latest = data
         elif kind == "association":
             sess.assoc.update({k: v for k, v in data.items() if v not in (None, "", {})})
@@ -413,9 +440,12 @@ class InspectorStore:
         if value is None:
             return None, False, False
         raw = value if isinstance(value, str) else str(value)
-        red = redact_text(raw)
-        text, trunc = truncate_text(red, max_bytes or self.limits["max_body_bytes"])
-        return text, trunc, red != raw
+        cap = max_bytes or self.limits["max_body_bytes"]
+        # Bound the work redaction does (and the lock hold time) before scanning.
+        pre, pre_trunc = truncate_text(raw, cap * 2)
+        red = redact_text(pre)
+        text, trunc = truncate_text(red, cap)
+        return text, trunc or pre_trunc, red != pre
 
     def _sanitize(self, kind: str, ev: dict) -> dict:
         d: dict = {}
@@ -430,9 +460,8 @@ class InspectorStore:
 
         def num(key: str):
             v = ev.get(key)
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
-                return
-            d[key] = v
+            if _finite(v):
+                d[key] = v
 
         def sstr(key: str, limit: int = 512):
             v = _s(ev.get(key), limit)
@@ -504,7 +533,10 @@ class InspectorStore:
             for k in ("passed", "failed", "skipped", "duration_ms"):
                 num(k)
             fails = []
-            for f in (ev.get("failures") or [])[:50]:
+            raw_failures = ev.get("failures") or []
+            if not isinstance(raw_failures, list):
+                raise ValueError("test.failures must be a list")
+            for f in raw_failures[:50]:
                 if not isinstance(f, dict):
                     continue
                 msg, tr, red = self._text(f.get("message"), 4096)
@@ -512,15 +544,15 @@ class InspectorStore:
                 flags["truncated"] |= tr
                 fails.append({"name": redact_text(_s(f.get("name"), 512) or ""),
                               "message": msg or "",
-                              "file": _s(f.get("file"), 512), "line": f.get("line")
-                              if isinstance(f.get("line"), int) else None})
+                              "file": _s(f.get("file"), 512),
+                              "line": f["line"] if _finite(f.get("line")) and isinstance(f.get("line"), int) else None})
             if fails:
                 d["failures"] = fails
         elif kind == "usage":
             for k in ("input_tokens", "output_tokens", "reasoning_tokens",
                       "cache_read_tokens", "context_tokens", "context_window"):
                 v = ev.get(k)
-                if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                if _finite(v) and isinstance(v, int) and v >= 0:
                     d[k] = v
             sstr("model", 256)
         elif kind == "association":
@@ -529,7 +561,7 @@ class InspectorStore:
                 sstr(k, 512)
             pr = ev.get("pr")
             if isinstance(pr, dict):
-                d["pr"] = {"number": pr.get("number") if isinstance(pr.get("number"), int) else None,
+                d["pr"] = {"number": pr["number"] if _finite(pr.get("number")) and isinstance(pr.get("number"), int) else None,
                            "url": redact_text(_s(pr.get("url"), 1024) or ""),
                            "repo": _s(pr.get("repo"), 256)}
         elif kind == "model":
@@ -587,8 +619,7 @@ class InspectorStore:
                 "event_type": f"inspector.{kind}", "session_id": sess.session_id,
                 "source_timestamp": base["ts"],
                 "payload": {**{k: v for k, v in data.items() if k != "failures"},
-                            "agent_id": base["agent_id"], "kind": kind,
-                            **({"failures": data["failures"][:20]} if kind == "test" and data.get("failures") else {})},
+                            "agent_id": base["agent_id"], "kind": kind, "sensitive": flagged},
             })
         return entry
 
@@ -656,6 +687,8 @@ class InspectorStore:
         for k in ("command", "passed", "failed", "skipped", "duration_ms", "failures"):
             if k in data:
                 d[k] = data[k]
+        live["sensitive"] = live["sensitive"] or flagged or self._cmd_sensitive(
+            {"args_preview": d.get("command")})
         live["redacted"] |= bool(flags.get("redacted"))
         live["truncated"] |= bool(flags.get("truncated"))
         if data["phase"] == "end":
@@ -667,7 +700,10 @@ class InspectorStore:
                     "event_type": "inspector.test", "session_id": sess.session_id,
                     "source_timestamp": base["ts"],
                     "payload": {"kind": "test", **{k: v for k, v in d.items() if k != "failures"},
-                                "failures": (d.get("failures") or [])[:20],
+                                # Sensitive runs persist counts/status only, never bodies.
+                                "failures": [] if live["sensitive"] else (d.get("failures") or [])[:20],
+                                "sensitive": live["sensitive"],
+                                **({"command": None} if live["sensitive"] else {}),
                                 "agent_id": base["agent_id"]}})
         self._touch(sess, live)
         return "ok"
@@ -740,9 +776,11 @@ class InspectorStore:
                                      "sensitive", "redacted", "truncated", "size")}
         data = dict(entry["data"])
         if not self._allowed(entry, role):
-            for k in ("text", "output", "diff", "failures", "args_preview"):
+            for k in ("text", "output", "diff", "failures", "args_preview", "command"):
                 if k in data:
                     data[k] = None
+            if "path" in data:
+                data["path"] = "[withheld]"
             data["withheld"] = True
             data["withheld_reason"] = ("reasoning requires a higher role"
                                        if entry["kind"] == "reasoning"
@@ -827,6 +865,7 @@ class InspectorStore:
         running = []
         tests = []
         for e in sess.events:
+            ok = self._allowed(e, role)   # withheld entries contribute counts only
             counts[e["kind"]] = counts.get(e["kind"], 0) + 1
             a = agents.setdefault(e["agent_id"], {"agent_id": e["agent_id"], "events": 0,
                                                    "tools": 0, "parent_agent_id": e["parent_agent_id"],
@@ -838,9 +877,10 @@ class InspectorStore:
                 a["tools"] += 1
                 if d.get("status") == "running":
                     running.append({"seq": e["seq"], "tool": d.get("tool"), "agent_id": e["agent_id"],
-                                    "call_id": d.get("call_id")})
+                                    "call_id": d.get("call_id") if ok else None})
             elif e["kind"] == "file":
-                f = files.setdefault(d["path"], {"path": d["path"], "ops": [], "additions": 0,
+                pth = d["path"] if ok else "[withheld]"
+                f = files.setdefault(pth, {"path": pth, "ops": [], "additions": 0,
                                                   "deletions": 0, "last_seq": e["seq"],
                                                   "sensitive": False, "agents": []})
                 if d["op"] not in f["ops"]:
@@ -854,9 +894,10 @@ class InspectorStore:
             elif e["kind"] == "test":
                 tests.append({"seq": e["seq"], "run_id": d["run_id"], "status": d.get("status"),
                               "passed": d.get("passed"), "failed": d.get("failed"),
-                              "skipped": d.get("skipped"), "command": d.get("command"),
+                              "skipped": d.get("skipped"),
+                              "command": d.get("command") if ok else None,
                               "agent_id": e["agent_id"],
-                              "failures": [f["name"] for f in d.get("failures", [])][:10]})
+                              "failures": [f["name"] for f in d.get("failures", [])][:10] if ok else []})
         ul = sess.usage_latest or {}
         ctx, win = ul.get("context_tokens"), ul.get("context_window")
         age = (self._clock() - sess.last_event) if sess.last_event else None
@@ -867,7 +908,7 @@ class InspectorStore:
             "files": list(files.values())[-200:],
             "tests": tests[-20:],
             "usage": {**sess.usage_totals, "latest": ul or None,
-                      "context_pct": round(100 * ctx / win, 1) if ctx and win else None},
+                      "context_pct": round(100 * ctx / win, 1) if ctx and win and win > 0 else None},
             "models": list(sess.models),
             "association": dict(sess.assoc),
             "reasoning_withheld": ROLE_RANK.get(role, 0) < self._min_reasoning,
@@ -880,10 +921,18 @@ class InspectorStore:
     # --------------------------------------------------------------- stream
     def subscribe(self, session_id: str) -> Subscriber:
         with self._lock:
+            if not self.can_subscribe(session_id):
+                raise ValueError("too many streams")
             sess = self._session(session_id)
             sub = Subscriber()
             sess.subs.add(sub)
             return sub
+
+    def can_subscribe(self, session_id: str) -> bool:
+        with self._lock:
+            total = sum(len(x.subs) for x in self._sessions.values())
+            cur = self._sessions.get(session_id)
+            return total < MAX_SUBS_TOTAL and (cur is None or len(cur.subs) < MAX_SUBS_PER_SESSION)
 
     def unsubscribe(self, session_id: str, sub: Subscriber) -> None:
         with self._lock:
@@ -929,8 +978,9 @@ class InspectorStore:
                     self.set_prefs(p.get("prefs") or {}, None if p.get("scope") == "global" else sid,
                                    persist=False)
                 elif et.startswith("inspector.") and p.get("kind") in DURABLE_KINDS:
-                    body = {k: v for k, v in p.items() if k not in ("kind", "agent_id")}
+                    body = {k: v for k, v in p.items() if k not in ("kind", "agent_id", "sensitive")}
                     self.ingest(sid, {"kind": p["kind"], "agent_id": p.get("agent_id"),
+                                      "sensitive": bool(p.get("sensitive")),
                                       "ts": _iso_of(ev.get("source_timestamp")), **body,
                                       **({"phase": "end"} if p["kind"] == "test" else {})},
                                 persist=False)

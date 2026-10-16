@@ -41,6 +41,8 @@ def _is_loopback(host: str) -> bool:
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 _INDEX = "index.html"
+_MAX_JSON_BODY = 4 * 1024 * 1024
+_MAX_SSE_SECONDS = 3600
 
 
 class _DaemonThreadingServer(ThreadingHTTPServer):
@@ -484,6 +486,8 @@ def _make_handler(server):
                         before_seq=(_qint(self.path, "before_seq", -1)
                                     if _q(self.path, "before_seq") else None)))
                 if tail[0] == "events" and len(tail) == 2:
+                    if not tail[1].isdigit():
+                        return self._json({"error": "invalid sequence"}, 400)
                     return self._json(store.get_event(sid, int(tail[1]), role))
                 if tail[0] == "preferences":
                     return self._json({"prefs": store.get_prefs(sid),
@@ -491,6 +495,10 @@ def _make_handler(server):
                                        "global": store.raw_prefs(),
                                        "defaults": _defaults()})
                 if tail[0] == "stream":
+                    if not store.has_session(sid) and server.repo.get_session(sid) is None:
+                        return self._json({"error": "session not found"}, 404)
+                    if not store.can_subscribe(sid):
+                        return self._json({"error": "too many streams"}, 429)
                     return self._inspector_sse(sid, role)
             except KeyError:
                 return self._json({"error": "not found"}, 404)
@@ -520,8 +528,8 @@ def _make_handler(server):
             try:
                 self.wfile.write(_raw_frame({"type": "connected", "session_id": sid}))
                 self.wfile.flush()
-                last_beat = time.monotonic()
-                while True:
+                last_beat = started = time.monotonic()
+                while time.monotonic() - started < _MAX_SSE_SECONDS:
                     item = sub.get(timeout=15)
                     if item is None:
                         if time.monotonic() - last_beat >= 15:
@@ -629,6 +637,8 @@ def _make_handler(server):
             length = int(self.headers.get("Content-Length") or 0)
             if not length:
                 return None
+            if length > _MAX_JSON_BODY:
+                raise ValueError("request body too large")
             try:
                 return json.loads(self.rfile.read(length))
             except (ValueError, json.JSONDecodeError):

@@ -26,6 +26,8 @@ class IngestService:
         if not entity_type or not entity_id or not event_type:
             raise ValueError(
                 "entity_type, entity_id, and event_type are required")
+        if not all(isinstance(v, str) for v in (entity_type, entity_id, event_type)):
+            raise ValueError("entity_type, entity_id, and event_type must be strings")
         payload = body.get("payload") or {}
         if not isinstance(payload, dict):
             raise ValueError("payload must be a JSON object")

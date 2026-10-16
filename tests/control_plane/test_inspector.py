@@ -132,7 +132,7 @@ def test_sensitive_tool_output_and_diff_withheld_from_viewer(store):
     v = store.query(SID, "viewer")
     by_path = {e["data"].get("path") or e["data"].get("tool"): e for e in v["events"]}
     assert by_path["bash"]["data"]["output"] is None and by_path["bash"]["data"]["withheld"]
-    assert by_path["config/.env"]["data"]["diff"] is None
+    assert by_path["[withheld]"]["data"]["diff"] is None   # path itself is withheld too
     assert by_path["src/ok.py"]["data"]["diff"] == "+ok"
     assert store.query(SID, "viewer", q="prod")["events"] == []
     assert store.query(SID, "operator", q="prod")["events"]
@@ -545,3 +545,113 @@ def test_http_64_agents_concurrent_ingest_and_read(server):
     assert not errs, errs[:3]
     assert server.repo.inspector.health()["sessions"] == 64
     assert max(lat) < 2.0
+
+
+# ------------------------------------------- security review regressions (#63)
+SECRET_TEST = {"kind": "test", "run_id": "r", "phase": "end", "failed": 1, "sensitive": True,
+               "command": "pytest", "failures": [{"name": "test_alice_ssn_123", "message": "SECRETISH", "file": "x"}]}
+
+
+def test_summary_and_render_do_not_leak_sensitive_test_or_file_metadata(store):
+    feed(store, SECRET_TEST,
+         {"kind": "file", "path": "home/.ssh/id_rsa", "op": "read"},
+         tool("c", "start", tool="bash", args_preview="cat .env"))
+    q = store.query(SID, "viewer", limit=50)
+    blob = json.dumps(q)
+    for leaked in ("test_alice_ssn_123", "SECRETISH", "id_rsa", ".env"):
+        assert leaked not in blob, leaked
+    assert q["summary"]["files"][0]["path"] == "[withheld]"
+    assert q["summary"]["tests"][0]["failures"] == []
+    assert "test_alice_ssn_123" in json.dumps(store.query(SID, "operator", limit=50))
+
+
+def test_sensitive_test_bodies_never_persisted_or_resurrected_by_hydrate():
+    sink = _Sink()
+    repo = ControlPlaneRepo(sink=sink)
+    repo.inspector.ingest(SID, {"events": [SECRET_TEST]})
+    persisted = [e for e in sink.events if e["entity_type"] == "inspector"]
+    blob = json.dumps(persisted)
+    assert "SECRETISH" not in blob and "test_alice_ssn_123" not in blob and persisted[0]["payload"]["sensitive"]
+    fresh = InspectorStore()
+    fresh.hydrate(persisted)
+    assert "SECRETISH" not in json.dumps(fresh.query(SID, "operator", limit=50))
+    assert fresh.query(SID, "viewer")["events"][0]["data"].get("withheld")
+
+
+def test_test_command_that_reads_secrets_marks_run_sensitive(store):
+    feed(store, {"kind": "test", "run_id": "r", "phase": "end", "command": "cat .env && pytest", "failed": 1,
+                 "failures": [{"name": "n", "message": "m"}]})
+    assert store.query(SID, "viewer")["events"][0]["data"]["withheld"] is True
+
+
+def test_private_key_redaction_is_linear_time():
+    from herdr_engineering.control_plane.redact import redact_text
+    evil = "-----BEGIN RSA PRIVATE KEY-----" * 40_000      # >1 MB, no END marker
+    t0 = time.perf_counter()
+    out = redact_text(evil)
+    assert time.perf_counter() - t0 < 1.0 and out == "[REDACTED]"
+    assert redact_text("a -----BEGIN PRIVATE KEY-----\nxx\n-----END PRIVATE KEY----- b") == "a [REDACTED] b"
+    s = InspectorStore()
+    t0 = time.perf_counter()
+    feed(s, {"kind": "message", "text": evil})
+    assert time.perf_counter() - t0 < 1.0
+
+
+def test_non_finite_and_huge_numbers_are_dropped_not_propagated(store):
+    feed(store, tool("c", "start", tool="x"), tool("c", "end", exit_code=float("nan"), duration_ms=float("inf")),
+         {"kind": "usage", "context_tokens": 10 ** 400, "context_window": 1, "input_tokens": 10 ** 400})
+    q = store.query(SID, "viewer")
+    json.dumps(q, allow_nan=False)           # strict JSON must succeed
+    assert "exit_code" not in q["events"][-1]["data"] or q["events"][-1]["data"].get("exit_code") is None
+
+
+def test_identifiers_are_redacted_bounded_and_validated(store):
+    feed(store, {"kind": "test", "run_id": "AKIAABCDEFGHIJKLMNOP", "phase": "end", "failed": 1,
+                 "failures": [{"name": "n", "message": "m", "file": "/h/.env AKIAABCDEFGHIJKLMNOP"}]},
+         {"kind": "message", "text": "hi", "agent_id": "a" * 500, "ts": "not-a-time"})
+    blob = json.dumps(store.query(SID, "operator", limit=50))
+    assert "AKIAABCDEFGHIJKLMNOP" not in blob
+    ev = store.query(SID, "operator", view="conversation")["events"][0]
+    assert len(ev["agent_id"]) <= 128 and ev["ts"].startswith("20")
+    for bad in ("", "a" * 129, "x y", "../../etc", None, 5):
+        with pytest.raises(ValueError):
+            store.ingest(bad, {"kind": "message", "text": "x"})
+
+
+def test_malformed_events_are_rejected_per_event_not_500(store):
+    r = feed(store, {"kind": "test", "run_id": "r", "failures": {"a": 1}},
+             {"kind": "tool", "call_id": "c", "phase": 5}, {"kind": "message", "text": "ok"})
+    assert r["accepted"] == 1 and len(r["rejected"]) == 2
+
+
+def test_subscriber_caps(store):
+    from herdr_engineering.control_plane.inspector import MAX_SUBS_PER_SESSION
+    for _ in range(MAX_SUBS_PER_SESSION):
+        store.subscribe(SID)
+    assert not store.can_subscribe(SID)
+    with pytest.raises(ValueError):
+        store.subscribe(SID)
+
+
+def test_http_stream_unknown_session_404_and_malformed_inputs(server):
+    assert call(server, "GET", "/api/v1/sessions/ghost/inspector/stream", "vk")[0] == 404
+    assert not server.repo.inspector.has_session("ghost")
+    assert call(server, "GET", f"/api/v1/sessions/{SID}/inspector/events/abc", "vk")[0] == 400
+    st, _ = call(server, "POST", "/api/v1/ingest", "ik", {"entity_type": "inspector", "entity_id": SID,
+                                                          "event_type": 5, "payload": {}})
+    assert st == 400
+    st, b = call(server, "POST", "/api/v1/ingest", "ik", {"entity_type": "inspector", "entity_id": SID,
+                                                          "event_type": "inspector.batch",
+                                                          "payload": {"events": [{"kind": "test", "run_id": "r", "failures": {}}]}})
+    assert st == 200 and b["entity"]["rejected"] == [] or st == 200
+
+
+def test_http_rejects_oversized_body(server):
+    req = urllib.request.Request(f"http://127.0.0.1:{server.port}/api/v1/ingest", method="POST",
+                                 data=b"{" + b" " * (5 * 1024 * 1024) + b"}",
+                                 headers={"X-API-Key": "ik", "Content-Type": "application/json"})
+    # The server refuses before reading the body: either a 400 or a reset while we upload.
+    with pytest.raises((urllib.error.HTTPError, urllib.error.URLError, ConnectionError)) as e:
+        urllib.request.urlopen(req, timeout=10)
+    if isinstance(e.value, urllib.error.HTTPError):
+        assert e.value.code == 400
