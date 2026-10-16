@@ -56,6 +56,16 @@ DEFAULTS: dict[str, Any] = {
         # HERDR_ENGINEERING_CONTROL_PLANE_URL.
         "control_plane_url": "",
     },
+    # LLM env injection for sessions started via `herdr-eng session run`: a
+    # per-project gateway key goes into the session's environment only.
+    # key_mode: "session" = mint per session, revoke at end; "project" = reuse a
+    # cached project key. inject:false (or HERDR_ENGINEERING_LLM_INJECT=0) opts out.
+    "llm": {
+        "inject": True,
+        "key_mode": "session",
+        "control_plane_url": "",  # empty = fabric.control_plane_url, then http://dev.lan
+        "gateway_url": "http://dev.lan:8088/v1",
+    },
     "tests": {"adapters": ["pytest", "go", "cargo", "junit", "scala"]},
     "ci": {"provider": "woodpecker", "pileated_extensions": "auto"},
     "notifications": {"enabled": True, "minimum_severity": "notice",

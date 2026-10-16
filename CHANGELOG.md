@@ -5,6 +5,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Added
+- `herdr-eng session run --project P -- <cmd>` injects `OPENAI_BASE_URL` / `OPENAI_API_KEY` (a
+  per-session or reused per-project key) plus service-URL hints into a session's environment,
+  revokes per-session keys at exit, and has opt-outs (flag, `llm.inject`, env). `llm-env` now writes
+  its file atomically at 0600 and never follows redirects.
+- The fabric agent warns once per port that listens like a dev service but has no lease, and
+  `scan_once` returns them as `unleased`.
+
 ### Security
 - **Fixed an authorization bypass in the control-plane API.** `_require` sent the 401/403
   response but returned `None`, so the handler then executed the request anyway: with API keys

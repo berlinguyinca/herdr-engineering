@@ -108,3 +108,13 @@ herdr-eng control-plane worker --once      # run a single pass and exit
 On the host the DSN defaults to `postgresql://herdr:herdr@127.0.0.1:5432/herdr`
 (port 5432 is exposed by the compose project). Override via the
 `control_plane:` block in the config or `HERDR_ENGINEERING_CONFIG`.
+
+## LLM keys for sessions
+
+Sessions started with `herdr-eng session run --project P -- <cmd>` mint a per-session key at
+`POST /api/v1/llm/keys` and revoke it at `/api/v1/llm/keys/<id>/revoke` when the command ends, so
+token analytics are per project without hand-sourcing a file. When this stack runs with
+`--api-keys`, the host running sessions needs an **operator** key in
+`HERDR_ENGINEERING_CONTROL_PLANE_KEY` or `~/.config/herdr-engineering/control-plane-key` (0600).
+A key the host failed to revoke is named on stderr (`key_id`); revoke it with the same endpoint.
+See the README section "Sessions get the LLM env automatically".
