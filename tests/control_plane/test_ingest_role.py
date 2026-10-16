@@ -102,3 +102,50 @@ def test_operator_and_unknown_keys(server):
     assert _post(base, "/api/v1/ingest", _ingest_body(),
                 key="nope") == 401
     assert _get(base, "/api/v1/health", key="nope") == 401
+
+
+@pytest.fixture()
+def fail_closed_server():
+    repo = ControlPlaneRepo()
+    svr = ControlPlaneServer(repo, api_keys={
+        "blank-role": "",
+        "none-role": None,
+        "admin-role": "admin",
+        "ing-1": "ingest",
+    })
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    yield f"http://127.0.0.1:{svr.port}", repo
+    svr.shutdown()
+
+
+def test_blank_and_none_roles_are_read_only(fail_closed_server):
+    base, repo = fail_closed_server
+    for key in ("blank-role", "none-role"):
+        # never defaulted to operator: ingest is forbidden
+        assert _post(base, "/api/v1/ingest", _ingest_body(), key=key) == 403
+        # and an operator-only route is forbidden too
+        sid = repo.create_session()
+        assert _post(base, f"/api/v1/sessions/{sid}/messages",
+                    {"message": "x"}, key=key) == 403
+        # but reads still work (viewer-equivalent)
+        assert _get(base, "/api/v1/health", key=key) == 200
+
+
+def test_unknown_role_admin_is_read_only(fail_closed_server):
+    base, repo = fail_closed_server
+    assert _post(base, "/api/v1/ingest", _ingest_body(),
+                key="admin-role") == 403
+    sid = repo.create_session()
+    assert _post(base, f"/api/v1/sessions/{sid}/messages",
+                {"message": "x"}, key="admin-role") == 403
+
+
+def test_ingest_path_prefix_is_not_ingest(fail_closed_server):
+    base, _ = fail_closed_server
+    # a key with role 'ingest' must not be granted ingest rights on a
+    # path that merely starts with /api/v1/ingest (exact check, not
+    # startswith)
+    assert _post(base, "/api/v1/ingest/x", _ingest_body(),
+                key="ing-1") == 403

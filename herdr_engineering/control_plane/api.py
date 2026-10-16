@@ -105,7 +105,10 @@ class ControlPlaneServer:
         from .ingest import IngestService
         self.ingest = IngestService(repo)
         self._limiter = _RateLimiter()
-        self._keys = {k: (v or "operator").strip()
+        # Fail-closed (Spec §104): never default a blank/missing role to
+        # "operator". Keep roles verbatim after strip; empty/None/unknown
+        # roles are treated as "viewer" (read-only) by `_require`.
+        self._keys = {k: (v.strip() if isinstance(v, str) else "")
                       for k, v in (api_keys or {}).items()}
         if api_key is not None:
             self._keys[api_key] = "operator"
@@ -204,7 +207,7 @@ def _make_handler(server):
                     return None
                 path = self.path.split("?")[0]
                 if (role == "ingest" and self.command == "POST"
-                        and path.rstrip("/") == "/api/v1/ingest"):
+                        and path == "/api/v1/ingest"):
                     return None
                 return self._send_json(403, {"error": "read-only"})
             if min_role == "ingest":
@@ -225,7 +228,8 @@ def _make_handler(server):
         def do_POST(self):
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
-            min_role = ("ingest" if self.path.startswith("/api/v1/ingest")
+            path = self.path.split("?")[0]
+            min_role = ("ingest" if path == "/api/v1/ingest"
                        else "operator")
             err = self._require(min_role)
             if err:
