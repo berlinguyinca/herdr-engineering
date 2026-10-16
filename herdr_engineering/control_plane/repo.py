@@ -122,27 +122,50 @@ class ControlPlaneRepo:
                     break
         return _copy(rec)
 
+    def _resolve_mission_key(self, mission_id, source="herdr"):
+        """Return the stored key for ``mission_id`` under ``source``.
+
+        For a herdr source the raw ``mission_id`` is the stored key (an exact
+        stored key if present, otherwise the raw id as the legacy fallback).
+        For a non-herdr source the namespaced key (e.g. ``pi:MSN-1``) wins so
+        a session for a pi-sourced mission never attaches to a herdr mission
+        that happens to share the same raw id. An exact stored key that already
+        carries the same source prefix is honoured; otherwise ``None`` is
+        returned (fail closed) so callers never attach a session/stage to an
+        unrelated mission.
+        """
+        if source == "herdr":
+            return mission_id
+        namespaced = f"{source}:{mission_id}"
+        if namespaced in self._missions:
+            return namespaced
+        if mission_id in self._missions and mission_id.startswith(source + ":"):
+            return mission_id
+        return None
+
     def list_missions(self, status=None):
         out = [_copy(m) for m in self._missions.values()]
         if status:
             out = [m for m in out if m["status"] == status]
         return _sort_by(out, "created_at", reverse=True)
 
-    def set_mission_stage(self, mission_id, stage):
+    def set_mission_stage(self, mission_id, stage, source="herdr"):
         if stage not in _STAGES:
             raise ValueError(f"unknown stage: {stage}")
-        m = self._missions.get(mission_id)
+        key = self._resolve_mission_key(mission_id, source=source)
+        m = self._missions.get(key)
         if m is None:
             raise KeyError(mission_id)
         old = m["stage"]
         m["stage"] = stage
         m["status"] = stage
         m["updated_at"] = self._stamp()
-        self.record_event("mission", mission_id, "MissionStageChanged",
+        self.record_event("mission", key, "MissionStageChanged",
                           {"from": old, "to": stage}, mission_id=mission_id)
 
     # -------------------------------------------------------------- sessions
-    def create_session(self, mission_id=None, agent_role="", model=""):
+    def create_session(self, mission_id=None, agent_role="", model="",
+                       source="herdr"):
         sid = new_id("session")
         rec = {
             "session_id": sid, "mission_id": mission_id, "agent_role": agent_role,
@@ -150,8 +173,10 @@ class ControlPlaneRepo:
             "updated_at": self._stamp(), "messages": 0, "tool_calls": 0,
         }
         self._sessions[sid] = rec
-        if mission_id and mission_id in self._missions:
-            self._missions[mission_id]["sessions"].append(sid)
+        if mission_id:
+            key = self._resolve_mission_key(mission_id, source=source)
+            if key in self._missions:
+                self._missions[key]["sessions"].append(sid)
         self.record_event("session", sid, "SessionCreated",
                           {"mission_id": mission_id, "agent_role": agent_role},
                           mission_id=mission_id, session_id=sid)
@@ -385,7 +410,7 @@ class ControlPlaneRepo:
     def upsert_session(self, session_id, *, host_id=None, mission_id=None,
                        agent_role="", model="", status="active",
                        cwd=None, branch=None, pid=None, cmdline=None,
-                       summary=None, attach=None):
+                       summary=None, attach=None, source="herdr"):
         stamp = self._stamp()
         existing = self._sessions.get(session_id)
         detail = {"cwd": cwd, "branch": branch, "pid": pid,
@@ -397,8 +422,10 @@ class ControlPlaneRepo:
                    "created_at": stamp, "updated_at": stamp,
                    "messages": 0, "tool_calls": 0, **detail}
             self._sessions[session_id] = rec
-            if mission_id and mission_id in self._missions:
-                self._missions[mission_id]["sessions"].append(session_id)
+            if mission_id:
+                key = self._resolve_mission_key(mission_id, source=source)
+                if key in self._missions:
+                    self._missions[key]["sessions"].append(session_id)
             self.record_event("session", session_id, "SessionStarted",
                               {"host_id": host_id, "mission_id": mission_id,
                                "agent_role": agent_role, "model": model,
