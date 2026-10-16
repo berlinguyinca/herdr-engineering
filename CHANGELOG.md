@@ -5,6 +5,19 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Security
+- **Fixed an authorization bypass in the control-plane API.** `_require` sent the 401/403
+  response but returned `None`, so the handler then executed the request anyway: with API keys
+  configured, a viewer key could set preferences / post session messages / run session actions,
+  and an unauthenticated caller could register hosts via `/api/v1/ingest`. Refusals now stop the
+  request. Deployments that rely on keys should upgrade; `--allow-open` (tailnet-trust) deployments
+  were never affected because they have no keys to enforce. Regression test:
+  `test_refused_requests_do_not_execute`.
+
+### Docs
+- Inspector authentication: tokenless (tailnet-trust) vs keyed operation, and the privacy
+  implications of open mode (spec 0200).
+
 ### Added
 - Agent inspector (spec 0200, ADR-0006): per-session conversation / reasoning /
   tools / files / tests / usage views, streaming tool status, searchable

@@ -78,6 +78,22 @@ Preferences (UI → Preferences, or `POST /api/v1/inspector/preferences` and
 `tool_output_lines`, `follow_tail`, and per-session retention
 (`max_events_per_session`, `max_bytes_per_session`, `retention_hours`).
 
+## Authentication: with and without a token
+
+The inspector adds **no new credential**. Pick the control-plane mode you already run:
+
+| Mode | How | Pi hosts need | Who can read reasoning / sensitive bodies |
+|---|---|---|---|
+| **Tailnet-trust (no token)** — the shipped `deploy/control-plane` default | server runs `--allow-open`, reachable only on the tailnet / loopback | only `HERDR_CP_URL` + `PI_INSPECTOR_FEED=1` | **everyone who can reach the port** (open mode = operator for all) |
+| Keyed | `--api-keys 'ik=ingest,vk=viewer,ok=operator'` | the above + `HERDR_CP_API_KEY=ik` (ingest role: write-only for `/ingest`) | operators only (default) |
+
+Tokenless is a *network* trust decision, not an application one: anyone on the tailnet can
+post events for any session id and read everything, including reasoning if an agent opted in.
+If that is not acceptable, either use keyed mode or keep reasoning off the control plane
+(`PI_INSPECTOR_REASONING=off`, the default, and/or `HERDR_INSPECTOR_STORE_REASONING=0` on the
+server). Verified end to end: the real Pi feed with no key reaches an open control plane, and a
+keyed server answers 401 to the same request (`tests/control_plane/test_inspector.py`).
+
 ## Install
 
 1. Deploy this branch's control plane (no schema migration; no new dependency).

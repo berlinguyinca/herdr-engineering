@@ -709,3 +709,65 @@ def test_has_more_is_exact_and_epoch_is_reported(store):
     assert store.query(SID, limit=4)["has_more"] is True
     assert store.query(SID)["epoch"] == store.epoch
     assert InspectorStore().epoch != store.epoch
+
+
+# ------------------------------------------------ tokenless operation (no API keys)
+def test_open_tailnet_mode_needs_no_token_and_is_operator_for_everyone():
+    """Deployed control planes run --allow-open on the tailnet: no key anywhere."""
+    repo = ControlPlaneRepo()
+    repo.upsert_session(SID, host_id="h")
+    srv = ControlPlaneServer(repo, allow_open=True)          # no api_keys at all
+    threading.Thread(target=srv.serve, daemon=True).start()
+    srv.wait_until_ready()
+    try:
+        def raw(method, path, body=None):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.port}{path}", method=method,
+                data=json.dumps(body).encode() if body is not None else None,
+                headers={"Content-Type": "application/json"})          # note: no X-API-Key
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+
+        st, b = raw("POST", "/api/v1/ingest", {
+            "entity_type": "inspector", "entity_id": SID, "event_type": "inspector.batch",
+            "payload": {"events": [{"kind": "capabilities", "reasoning": "summary"},
+                                   {"kind": "reasoning", "text": "visible to the whole tailnet"}]}})
+        assert st == 200 and b["entity"]["accepted"] == 2
+        st, q = raw("GET", f"/api/v1/sessions/{SID}/inspector?view=reasoning")
+        # Open mode treats every caller as operator, so reasoning is readable by anyone who can
+        # reach the port. Operators who do not want that set HERDR_INSPECTOR_STORE_REASONING=0.
+        assert q["events"][0]["data"]["text"] == "visible to the whole tailnet"
+    finally:
+        srv.shutdown()
+
+
+def test_keyed_server_still_rejects_unauthenticated_inspector_ingest(server):
+    st, _ = call(server, "POST", "/api/v1/ingest", "", {
+        "entity_type": "inspector", "entity_id": SID, "event_type": "inspector.batch",
+        "payload": {"events": [{"kind": "message", "text": "x"}]}})
+    assert st == 401
+    assert server.repo.inspector.health()["events"] == 0
+
+
+# ------------------------------------- authorization must actually stop the request
+def test_refused_requests_do_not_execute(server):
+    """Regression: 401/403 used to be sent and the handler then ran the request anyway."""
+    store = server.repo.inspector
+    assert call(server, "POST", "/api/v1/inspector/preferences", "vk", {"layout": "split"})[0] == 403
+    assert call(server, "POST", "/api/v1/inspector/preferences", "ik", {"layout": "split"})[0] == 403
+    assert call(server, "POST", "/api/v1/inspector/preferences", "nope", {"layout": "split"})[0] == 401
+    assert store.raw_prefs() == {}
+    before = len(server.repo.stream("session", SID))
+    assert call(server, "POST", f"/api/v1/sessions/{SID}/messages", "vk", {"message": "x"})[0] == 403
+    assert call(server, "POST", f"/api/v1/sessions/{SID}/actions", "vk", {"action": "stop"})[0] == 403
+    assert len(server.repo.stream("session", SID)) == before
+    assert call(server, "POST", "/api/v1/ingest", "nope", {
+        "entity_type": "host", "entity_id": "evil", "event_type": "host.registered", "payload": {}})[0] == 401
+    assert "evil" not in server.repo._hosts
+    # an ingest key may ingest, but only ingest
+    assert call(server, "POST", "/api/v1/ingest", "ik", {
+        "entity_type": "host", "entity_id": "ok-host", "event_type": "host.registered", "payload": {}})[0] == 200
+    assert "ok-host" in server.repo._hosts
+    assert call(server, "POST", "/api/v1/token-usage", "ik", {"project": "p", "model": "m"})[0] == 403
+    # an operator key still works
+    assert call(server, "POST", "/api/v1/inspector/preferences", "ok", {"layout": "split"})[0] == 200
