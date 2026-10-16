@@ -519,7 +519,7 @@ class ControlPlaneRepo:
     ):
         stamp = self._stamp()
         existing = self._test_runs.get(run_id)
-        results = [dict(r) for r in (results or [])]
+        results = None if results is None else [dict(r) for r in results]
         if existing is None:
             rec = {
                 "test_run_id": run_id,
