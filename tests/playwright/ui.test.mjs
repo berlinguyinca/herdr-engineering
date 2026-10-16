@@ -151,6 +151,36 @@ test('overview survives a heavy event burst without rate limiting', async () => 
   });
 });
 
+test('pi-sourced mission detail renders by mission_key', async () => {
+  await withApp(async ({ page, base }) => {
+    await page.goto(`${base}/#/missions`);
+    // The list must render the pi mission card before we can click it.
+    // esc() only HTML-escapes (colons are kept as-is), so the href carries the
+    // raw mission_key; the hash router decodes it on click.
+    await page.waitForSelector('a[href="#/missions/pi:MSN-PI1"]', { timeout: 15000 });
+    await page.click('a:has-text("Pi mission")');
+    // Detail route uses the mission_key, not the bare mission_id (UI-005).
+    await page.waitForFunction(
+      () => (location.hash === `#/missions/${encodeURIComponent('pi:MSN-PI1')}`
+        || location.hash === '#/missions/pi:MSN-PI1'),
+      null, { timeout: 15000 });
+    // The mission resolves by key: title renders, not a "Mission not found" card.
+    await page.waitForFunction(
+      () => document.querySelector('#view h1')?.textContent === 'Pi mission',
+      null, { timeout: 15000 });
+    assert.ok(!(await bodyText(page)).includes('Mission not found'));
+    // The event stream is queried by mission_key, so the seeded stage event
+    // (recorded under 'pi:MSN-PI1') must render — not the empty state.
+    await page.waitForFunction(() => {
+      const el = document.getElementById('mission-stream');
+      return el && !el.innerHTML.includes('No events for this entity yet');
+    }, null, { timeout: 15000 });
+    const streamText = await page.locator('#mission-stream').innerText();
+    assert.ok(streamText.includes('MissionStageChanged'),
+      `stage event missing from stream:\n${streamText.slice(0, 400)}`);
+  }, { BURST: '0' });
+});
+
 // ---------------------------------------------------------------- agent inspector (spec 0200)
 async function sessionHash(base) {
   const r = await fetch(`${base}/api/v1/sessions`);
