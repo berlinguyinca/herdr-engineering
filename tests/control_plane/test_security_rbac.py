@@ -241,12 +241,12 @@ def test_operator_can_ingest(server):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
-    "source",
-    ["Pi:Evil", "pi/evil", "1pi", "a" * 33, 123],
+    "index,source",
+    list(enumerate(["Pi:Evil", "pi/evil", "1pi", "a" * 33, 123])),
 )
-def test_ingest_spoofed_source_rejected(server, source):
+def test_ingest_spoofed_source_rejected(server, index, source):
     base_url, repo = server
-    body = {"entity_type": "host", "entity_id": f"h-{abs(hash(source)) % 1000}",
+    body = {"entity_type": "host", "entity_id": f"h-{index}",
             "event_type": "heartbeat", "payload": {"name": "x"},
             "source": source}
     status, parsed, _ = _post(base_url, "/api/v1/ingest", body=body,
@@ -314,7 +314,7 @@ _SECRET_PAYLOAD = {
 }
 
 
-def test_ingested_secret_payload_redacted_on_activity(server):
+def test_ingested_secret_payload_redacted_on_activity_and_events(server):
     base_url, _ = server
     status, _, _ = _post(base_url, "/api/v1/ingest", key="ingest-key", body={
         "entity_type": "note", "entity_id": "n1",
@@ -322,6 +322,7 @@ def test_ingested_secret_payload_redacted_on_activity(server):
     })
     assert status == 200
 
+    # The activity feed is redacted.
     status, parsed, raw = _get(base_url, "/api/v1/activity",
                                key="viewer-key")
     assert status == 200
@@ -338,21 +339,61 @@ def test_ingested_secret_payload_redacted_on_activity(server):
     assert "sk-live-xyz" not in raw_text
     assert "Bearer abc" not in raw_text
 
+    # The per-entity /api/v1/events stream is redacted too.
+    status, parsed, raw = _get(
+        base_url, "/api/v1/events?entity_type=note&entity_id=n1",
+        key="viewer-key")
+    assert status == 200
+    events = [e for e in parsed["events"]
+              if e["entity_type"] == "note" and e["entity_id"] == "n1"]
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["api_key"] == "[REDACTED]"
+    assert payload["Authorization"] == "[REDACTED]"
+    assert payload["secret"] == "[REDACTED]"
+    assert "abc" not in str(payload["msg"])
+
+    raw_text = raw.decode()
+    assert "sk-live-xyz" not in raw_text
+    assert "Bearer abc" not in raw_text
+
 
 # ---------------------------------------------------------------------------
-# (9) mission titles carrying secrets: pin the current wire behaviour.
-# ``upsert_mission`` stores the title un-redacted and the mission API does not
-# pass record fields through the redactor, so the raw secret round-trips.
-# This test pins that behaviour so a future redaction change is caught here.
+# (9) mission titles carrying secrets are redacted at the ingest boundary.
+# The ingest route runs ``redact_payload`` on the whole envelope before
+# storing, so a secret-shaped mission title never reaches the repo and the
+# mission record + mission event stream both expose the redacted form.
 # ---------------------------------------------------------------------------
 
 def test_mission_title_secret_round_trip(server):
-    base_url, repo = server
-    repo.upsert_mission("M1", title="deploy sk-live-xyz")
-    status, parsed, _ = _get(base_url, "/api/v1/missions/M1",
-                             key="viewer-key")
+    base_url, _ = server
+    status, _, _ = _post(base_url, "/api/v1/ingest", key="ingest-key", body={
+        "entity_type": "mission", "entity_id": "M1",
+        "event_type": "mission.started",
+        "payload": {"title": "deploy sk-live-xyz", "stage": "planning"},
+    })
     assert status == 200
-    assert parsed["title"] == "deploy sk-live-xyz"
+
+    # The mission record must be redacted at the ingest boundary.
+    status, parsed, raw = _get(base_url, "/api/v1/missions/M1",
+                               key="viewer-key")
+    assert status == 200
+    assert parsed["title"] == "deploy [REDACTED]"
+    raw_text = raw.decode()
+    assert "sk-live-xyz" not in raw_text
+    assert "sk-live" not in raw_text
+
+    # The mission event stream must be redacted too.
+    status, parsed, raw = _get(
+        base_url, "/api/v1/events?entity_type=mission&entity_id=M1",
+        key="viewer-key")
+    assert status == 200
+    events = parsed["events"]
+    assert len(events) == 1
+    assert events[0]["payload"]["title"] == "deploy [REDACTED]"
+    raw_text = raw.decode()
+    assert "sk-live-xyz" not in raw_text
+    assert "sk-live" not in raw_text
 
 
 # ---------------------------------------------------------------------------
