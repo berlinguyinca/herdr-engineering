@@ -43,7 +43,8 @@ class IngestService:
         if entity_type == "host":
             return self._ingest_host(entity_id, event_type, payload)
         if entity_type == "session":
-            return self._ingest_session(entity_id, event_type, payload)
+            return self._ingest_session(entity_id, event_type, payload,
+                                        source)
         if entity_type == "mission":
             if ":" in entity_id:
                 raise ValueError("invalid mission id")
@@ -74,7 +75,8 @@ class IngestService:
             payload.get("tailnet_ip") or payload.get("ip"),
             cpu=payload.get("cpu"), mem=payload.get("mem"), status=status)
 
-    def _ingest_session(self, entity_id, event_type, payload) -> dict:
+    def _ingest_session(self, entity_id, event_type, payload,
+                        source="herdr") -> dict:
         if "stop" in event_type.lower():
             status = "stopped"
         elif "start" in event_type.lower():
@@ -88,7 +90,8 @@ class IngestService:
             model=payload.get("model") or "", status=status,
             cwd=payload.get("cwd"), branch=payload.get("branch"),
             pid=payload.get("pid"), cmdline=payload.get("cmdline"),
-            summary=payload.get("summary"), attach=payload.get("attach"))
+            summary=payload.get("summary"), attach=payload.get("attach"),
+            source=source)
 
     def _ingest_mission(self, entity_id, event_type, payload,
                         source="herdr") -> dict:
