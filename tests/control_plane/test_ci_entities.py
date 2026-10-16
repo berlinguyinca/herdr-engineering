@@ -272,6 +272,17 @@ def test_update_with_empty_results_clears_results():
     assert r.get_test_run("tr-1")["results"] == []
 
 
+def test_update_omitting_results_preserves_stored_results():
+    r = ControlPlaneRepo()
+    r.upsert_test_run(
+        "tr-1", mission_id="MSN-1", results=[{"name": "a", "status": "pass"}]
+    )
+    r.upsert_test_run("tr-1", status="done")
+    stored = r.get_test_run("tr-1")
+    assert stored["results"] == [{"name": "a", "status": "pass"}]
+    assert stored["status"] == "done"
+
+
 def test_pull_request_merged_on_create_emits_opened_and_merged_once():
     r = ControlPlaneRepo()
     r.upsert_pull_request("pr-1", mission_id="MSN-1", status="merged")
