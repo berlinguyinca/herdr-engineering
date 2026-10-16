@@ -771,3 +771,44 @@ def test_refused_requests_do_not_execute(server):
     assert call(server, "POST", "/api/v1/token-usage", "ik", {"project": "p", "model": "m"})[0] == 403
     # an operator key still works
     assert call(server, "POST", "/api/v1/inspector/preferences", "ok", {"layout": "split"})[0] == 200
+
+
+def test_every_mutating_route_is_refused_without_side_effects(server):
+    repo = server.repo
+    routes = [
+        ("POST", "/api/v1/token-usage", {"project": "p", "model": "m", "input_tokens": 1}),
+        ("POST", "/api/v1/llm/keys", {"project": "p"}),
+        ("POST", "/api/v1/llm/models", {"name": "n", "base_url": "http://x"}),
+        ("POST", f"/api/v1/sessions/{SID}/messages", {"message": "x"}),
+        ("POST", f"/api/v1/sessions/{SID}/actions", {"action": "stop"}),
+        ("POST", f"/api/v1/sessions/{SID}/inspector/preferences", {"layout": "split"}),
+        ("POST", "/api/v1/hosts/h9/telemetry", {"cpu": 1}),
+    ]
+    snapshot = lambda: (len(repo._event_order), json.dumps(repo.inspector.raw_prefs(SID)),  # noqa: E731
+                        json.dumps(sorted(repo._hosts)))
+    before = snapshot()
+    for key in ("vk", "ik", "nope", ""):
+        for method, path, body in routes:
+            st, _ = call(server, method, path, key, body)
+            assert st in (401, 403), (key, path, st)
+    assert snapshot() == before
+    assert call(server, "GET", f"/api/v1/sessions/{SID}/inspector", "nope")[0] == 401
+    assert call(server, "GET", "/api/v1/health", "")[0] == 401
+
+
+def test_refused_post_closes_connection_so_the_body_cannot_be_smuggled(server):
+    import socket
+    inner = json.dumps({"entity_type": "host", "entity_id": "smug", "event_type": "host.registered",
+                        "payload": {}})
+    inner_req = (f"POST /api/v1/ingest HTTP/1.1\r\nHost: x\r\nX-API-Key: ik\r\n"
+                 f"Content-Type: application/json\r\nContent-Length: {len(inner)}\r\n\r\n{inner}")
+    outer = (f"POST /api/v1/token-usage HTTP/1.1\r\nHost: x\r\nX-API-Key: vk\r\n"
+             f"Content-Type: application/json\r\nContent-Length: {len(inner_req)}\r\n\r\n{inner_req}")
+    with socket.create_connection(("127.0.0.1", server.port), timeout=5) as s:
+        s.sendall(outer.encode())
+        data = b""
+        while chunk := s.recv(4096):
+            data += chunk                       # server must close, so this terminates
+    assert data.startswith(b"HTTP/1.1 403") and b"Connection: close" in data
+    assert data.count(b"HTTP/1.") == 1          # no second (smuggled) response
+    assert "smug" not in server.repo._hosts

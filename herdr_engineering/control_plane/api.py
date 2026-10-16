@@ -207,8 +207,21 @@ def _make_handler(server):
             return None
 
         def _deny(self, status, message):
-            """Send the error response and report that the request was refused."""
-            self._send_json(status, {"error": message})
+            """Send the error response, close the connection, and report the refusal.
+
+            The request body (if any) is deliberately left unread, so the connection
+            must not be reused: on keep-alive the unread bytes would be parsed as the
+            next request (request smuggling behind a filtering proxy).
+            """
+            payload = json.dumps({"error": message}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+            self.close_connection = True
             return True
 
         def _require(self, min_role):

@@ -12,7 +12,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   and an unauthenticated caller could register hosts via `/api/v1/ingest`. Refusals now stop the
   request. Deployments that rely on keys should upgrade; `--allow-open` (tailnet-trust) deployments
   were never affected because they have no keys to enforce. Regression test:
-  `test_refused_requests_do_not_execute`.
+  `test_refused_requests_do_not_execute`. Refusals also close the connection so an unread
+  request body can no longer be parsed as the next request.
+- **Behaviour change (keyed mode only):** because refused GETs used to run anyway, the static UI,
+  `/api/v1/health` and the SSE streams worked with no key. They now correctly return 401, and the
+  bundled UI (which sends no `X-API-Key`) cannot load against a keyed server. Tailnet-trust
+  (`--allow-open`) deployments are unaffected.
 
 ### Docs
 - Inspector authentication: tokenless (tailnet-trust) vs keyed operation, and the privacy
