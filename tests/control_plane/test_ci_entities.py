@@ -250,3 +250,83 @@ def test_lists_sorted_by_created_at_then_id():
     ]
     assert [x["review_id"] for x in r.list_reviews(mission_id="MSN-1")] == ["rv-1", "rv-2"]
     assert [x["pr_id"] for x in r.list_pull_requests(mission_id="MSN-1")] == ["pr-1", "pr-2"]
+
+
+# ------------------------------------------------- review-fix regressions
+def test_lists_tie_break_by_id_on_equal_created_at(monkeypatch):
+    import herdr_engineering.control_plane.repo as repo_mod
+
+    monkeypatch.setattr(repo_mod.ControlPlaneRepo, "_stamp", lambda self: "2026-01-01T00:00:00")
+    r = ControlPlaneRepo()
+    r.upsert_test_run("b", mission_id="MSN-1")
+    r.upsert_test_run("a", mission_id="MSN-1")
+    assert [x["test_run_id"] for x in r.list_test_runs(mission_id="MSN-1")] == ["a", "b"]
+
+
+def test_update_with_empty_results_clears_results():
+    r = ControlPlaneRepo()
+    r.upsert_test_run(
+        "tr-1", mission_id="MSN-1", results=[{"name": "a", "status": "ok"}]
+    )
+    r.upsert_test_run("tr-1", results=[])
+    assert r.get_test_run("tr-1")["results"] == []
+
+
+def test_pull_request_merged_on_create_emits_opened_and_merged_once():
+    r = ControlPlaneRepo()
+    r.upsert_pull_request("pr-1", mission_id="MSN-1", status="merged")
+    r.upsert_pull_request("pr-1", status="merged")
+    evs = r.stream("pull_request", "pr-1")
+    types = [e["event_type"] for e in evs]
+    assert types == [
+        "PullRequestOpened",
+        "PullRequestMerged",
+        "PullRequestUpdated",
+    ]
+    assert sum(t == "PullRequestMerged" for t in types) == 1
+
+
+def test_mutating_streamed_event_payload_results_does_not_change_stored_run():
+    r = ControlPlaneRepo()
+    r.upsert_test_run(
+        "tr-1", mission_id="MSN-1", results=[{"name": "a", "status": "ok"}]
+    )
+    evs = r.stream("test_run", "tr-1")
+    evs[0]["payload"]["results"][0]["status"] = "hacked"
+    evs[0]["payload"]["results"].append({"name": "b", "status": "ok"})
+    assert r.get_test_run("tr-1")["results"] == [{"name": "a", "status": "ok"}]
+
+
+def test_mutating_returned_record_results_does_not_change_stored_run():
+    r = ControlPlaneRepo()
+    r.upsert_test_run(
+        "tr-1", mission_id="MSN-1", results=[{"name": "a", "status": "ok"}]
+    )
+    rec = r.get_test_run("tr-1")
+    rec["results"][0]["status"] = "hacked"
+    rec["results"].append({"name": "b", "status": "ok"})
+    assert r.get_test_run("tr-1")["results"] == [{"name": "a", "status": "ok"}]
+
+
+def test_build_updated_via_upsert_test_run_without_kind_uses_stored_kind():
+    r = ControlPlaneRepo()
+    r.upsert_build("b-1", mission_id="MSN-1", status="running")
+    r.upsert_test_run("b-1", status="success")
+    evs = r.stream("test_run", "b-1")
+    assert [e["event_type"] for e in evs] == ["BuildStarted", "BuildUpdated"]
+
+
+def test_namespaced_mission_id_round_trips_through_filters():
+    r = ControlPlaneRepo()
+    r.upsert_test_run("tr-1", mission_id="pi:MSN-1")
+    r.upsert_review("rv-1", mission_id="pi:MSN-1")
+    r.upsert_pull_request("pr-1", mission_id="pi:MSN-1")
+    runs = r.list_test_runs(mission_id="pi:MSN-1")
+    reviews = r.list_reviews(mission_id="pi:MSN-1")
+    prs = r.list_pull_requests(mission_id="pi:MSN-1")
+    assert [x["test_run_id"] for x in runs] == ["tr-1"]
+    assert [x["review_id"] for x in reviews] == ["rv-1"]
+    assert [x["pr_id"] for x in prs] == ["pr-1"]
+    assert runs[0]["mission_id"] == "pi:MSN-1"
+    assert reviews[0]["mission_id"] == "pi:MSN-1"
+    assert prs[0]["mission_id"] == "pi:MSN-1"
