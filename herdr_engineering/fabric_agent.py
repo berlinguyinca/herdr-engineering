@@ -328,6 +328,7 @@ class FabricAgent:
         self._machine = socket.gethostname()
         self._store: dict[str, dict[str, Any]] = self._load_store()
         self._forwards: dict[int, AgentForwarder] = {}
+        self._warned_unleased: set[int] = set()
         self._lock = threading.Lock()
         # Restore forwarders for loopback-only services survived a restart.
         for port_s, entry in self._store.items():
@@ -498,8 +499,37 @@ class FabricAgent:
         for port_s, entry in due:
             self._keepalive(port_s, entry)
 
+        # 4) surface listeners that look like dev services but hold no lease
+        # (probe failed, gateway rejected, no forwarder possible): warn once per
+        # port so "every service gets registered and rewritten" cannot fail
+        # silently. Cleared when the port goes away or gets a lease.
+        unleased: list[int] = []
+        with self._lock:
+            tracked = set(self._store) | {str(p) for p in fwd_ports}
+        for port in sorted(live_ports):
+            if (port <= 0 or port in gateway_front or str(port) in tracked
+                    or not self._is_dev_web_port(port)):
+                continue
+            info = listeners[port]
+            if (info.get("process") or "") in _IGNORED_PROCESSES:
+                continue
+            if port in gateway_ext_ports:
+                addrs = (info.get("addrs") or set())
+                if ("*" in addrs or "0.0.0.0" in addrs or "::" in addrs
+                        or self.cfg.tailnet_ip in addrs):
+                    continue
+            unleased.append(port)
+        self._warned_unleased &= set(unleased)
+        for port in unleased:
+            if port not in self._warned_unleased:
+                self._warned_unleased.add(port)
+                log.warning("port %d (%s) is listening on %s but has no fabric lease; its "
+                            "URLs will not be rewritten (not HTTP, or registration failed)",
+                            port, listeners[port].get("process") or "unknown process",
+                            self._machine)
         self._save_store()
-        return {"registered": registered, "closed": closed}
+        return {"registered": registered, "closed": closed,
+                "unleased": [str(p) for p in unleased]}
 
     def _keepalive(self, port_s: str, entry: dict[str, Any]) -> None:
         """Heartbeat a tracked lease; re-register it if the gateway lost it."""

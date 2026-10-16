@@ -513,6 +513,35 @@ Mint a key and an env file for a project (the key is never printed):
 `herdr-eng llm-env --project my-project` writes `~/.config/herdr-engineering/llm-my-project.env`
 (0600, `OPENAI_BASE_URL`, `OPENAI_API_KEY`); `source` it before starting an agent.
 
+### Sessions get the LLM env automatically
+
+`herdr-eng session run --project my-project [--session S] [--mission M] -- <command...>` starts
+`<command>` (an agent, a shell, a mission runner) with, in **its environment only**:
+
+| Variable | Value |
+| --- | --- |
+| `OPENAI_BASE_URL` | `llm.gateway_url` (default `http://dev.lan:8088/v1`) |
+| `OPENAI_API_KEY` | a key for the project, minted through `POST /api/v1/llm/keys` |
+| `HERDR_PROJECT`, `HERDR_SESSION_ID`, `HERDR_MISSION_ID` | context (non-secret) |
+| `HERDR_ENGINEERING_FABRIC_URL`, `HERDR_ENGINEERING_CONTROL_PLANE_URL`, `HERDR_FABRIC_MACHINE` | service-URL hint: the gateway to call `/resolve-loopback` and `/rewrite` on, and this machine's name for `from_machine` |
+
+Token usage is then attributed to the project with no manual sourcing. Key lifecycle:
+`llm.key_mode: session` (default) mints one key per session labelled `session:<id>` and revokes it
+when the command exits, however it exits; `project` mode reuses a cached project key
+(`~/.config/herdr-engineering/llm-<project>.env`, 0600, ignored if more permissive) and re-mints it
+if it was revoked. The key never appears in argv, logs, stdout or error text. If the control plane is
+unreachable the command still starts, with a warning (`--require-llm-env` makes that an error).
+Opt out with `--no-llm-env`, `llm: {inject: false}` in config or `HERDR_ENGINEERING_LLM_INJECT=0`.
+When the control plane runs with API keys, give the operator key via
+`HERDR_ENGINEERING_CONTROL_PLANE_KEY` or `~/.config/herdr-engineering/control-plane-key` (0600).
+The session's own processes (and root) can read the key from its environment; that is the
+trade-off for tracking, and the reason a session key is short-lived. A wrapper killed with
+SIGKILL cannot revoke; its key stays labelled `session:<id>` in `GET /api/v1/llm/keys` for cleanup.
+
+The auto-registration agent (`herdr-eng devfabric agent`) logs one warning per port that listens
+like a dev service but holds no lease (non-HTTP, or registration failed), and `scan_once` reports
+them under `unleased`; such services are not URL-rewritten.
+
 ### Optional header rewriting for HTTP leases
 
 `herdr-eng dev gateway --rewrite-headers` (off by default) rewrites loopback URLs

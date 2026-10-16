@@ -880,3 +880,42 @@ def test_agent_reports_tracked_leases_on_startup(tmp_path):
         agent.stop()
         gw.stop()
         cp.stop()
+
+
+def test_unleased_listener_is_surfaced_once_and_cleared(tmp_path, monkeypatch, caplog):
+    gw = _FakeGateway()
+    raw, raw_port = _raw_tcp_listener()   # accepts, speaks no HTTP -> never leased
+    live = {"on": True}
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({raw_port: "thing"} if live["on"] else {}))
+    agent = _agent(tmp_path, gw)
+    try:
+        with caplog.at_level("WARNING", logger="herdr_engineering.fabric_agent"):
+            first = agent.scan_once()
+            second = agent.scan_once()
+        assert first["unleased"] == [str(raw_port)] == second["unleased"]
+        warned = [r for r in caplog.records if "no fabric lease" in r.getMessage()]
+        assert len(warned) == 1                      # once per port, not per cycle
+        live["on"] = False
+        assert agent.scan_once()["unleased"] == []
+        live["on"] = True
+        with caplog.at_level("WARNING", logger="herdr_engineering.fabric_agent"):
+            agent.scan_once()
+        assert len([r for r in caplog.records if "no fabric lease" in r.getMessage()]) == 2
+    finally:
+        raw.close()
+        agent.stop()
+        gw.stop()
+
+
+def test_leased_listener_is_not_reported_unleased(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "app"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        assert agent.scan_once()["unleased"] == []
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()

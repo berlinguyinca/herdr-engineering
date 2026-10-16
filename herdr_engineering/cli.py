@@ -49,6 +49,23 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="env file to write (default ~/.config/herdr-engineering/llm-<project>.env)")
     p.set_defaults(func=_cmd_llm_env)
 
+    # session run ----------------------------------------------------------
+    p = sub.add_parser("session", help="run a command as a project session with the fabric "
+                                       "LLM env injected (per-project token tracking)")
+    ssub = p.add_subparsers(dest="session_command", required=True)
+    p2 = ssub.add_parser("run", help="herdr-eng session run --project P -- <command...>")
+    p2.add_argument("--project", required=True)
+    p2.add_argument("--session", default=None); p2.add_argument("--mission", default=None)
+    p2.add_argument("--key-mode", choices=["session", "project"], default=None,
+                    help="session (default): mint per session, revoke at end; "
+                         "project: reuse the cached project key")
+    p2.add_argument("--no-llm-env", action="store_true",
+                    help="opt out (also llm.inject: false / HERDR_ENGINEERING_LLM_INJECT=0)")
+    p2.add_argument("--require-llm-env", action="store_true",
+                    help="fail instead of starting without a key when the control plane is down")
+    p2.add_argument("command", nargs=argparse.REMAINDER, help="-- command and args")
+    p2.set_defaults(func=_cmd_session_run)
+
     # powerpack ------------------------------------------------------------
     pp = sub.add_parser("powerpack", help="distribution & lifecycle (spec 0050)")
     pps = pp.add_subparsers(dest="powerpack_command", required=True)
@@ -360,22 +377,36 @@ def _cmd_cp_llm_proxy(args) -> int:
 
 def _cmd_llm_env(args) -> int:
     """Mint a project key and write a 0600 env file; the key is never printed."""
-    import urllib.request
-    req = urllib.request.Request(
-        args.control_plane.rstrip("/") + "/api/v1/llm/keys",
-        data=json.dumps({"project": args.project, "label": args.label}).encode(),
-        headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-        minted = json.loads(resp.read())
-    out = args.out or os.path.join(os.path.expanduser("~/.config/herdr-engineering"),
-                                   f"llm-{args.project}.env")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(f"OPENAI_BASE_URL={args.gateway}\nOPENAI_API_KEY={minted['key']}\n")
-    os.chmod(out, 0o600)
+    from .session_env import LlmEnvError, mint_key, project_cache_path, write_env_file
+    try:
+        minted = mint_key(args.control_plane, args.project, args.label)
+        out = args.out or project_cache_path(args.project)
+        write_env_file(out, {"OPENAI_BASE_URL": args.gateway,
+                             "OPENAI_API_KEY": minted["key"]})
+    except LlmEnvError as exc:
+        _print_json({"code": "llm-env", "message": str(exc)})
+        return 1
     _print_json({"project": args.project, "key_id": minted["key_id"], "env_file": out})
     return 0
+
+
+def _cmd_session_run(args) -> int:
+    from .config import InvalidError, load_config
+    from .session_env import run_session
+    command = list(args.command)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        _print_json({"code": "usage", "message": "no command given (use: session run --project P -- cmd)"})
+        return 2
+    try:
+        cfg = load_config()
+    except InvalidError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
+    return run_session(cfg, project=args.project, command=command, session=args.session,
+                       mission=args.mission, disable=args.no_llm_env,
+                       require=args.require_llm_env, key_mode=args.key_mode)
 
 
 def _cmd_doctor(args) -> int:
