@@ -125,20 +125,23 @@ class ControlPlaneRepo:
     def _resolve_mission_key(self, mission_id, source="herdr"):
         """Return the stored key for ``mission_id`` under ``source``.
 
+        For a herdr source the raw ``mission_id`` is the stored key (an exact
+        stored key if present, otherwise the raw id as the legacy fallback).
         For a non-herdr source the namespaced key (e.g. ``pi:MSN-1``) wins so
         a session for a pi-sourced mission never attaches to a herdr mission
-        that happens to share the same raw id. An exact stored key is honoured
-        (e.g. a fully-qualified ``pi:MSN-1`` passed with the default source),
-        and the raw ``mission_id`` is the fallback so sessions/stages can
-        attach to missions that are not yet present.
+        that happens to share the same raw id. An exact stored key that already
+        carries the same source prefix is honoured; otherwise ``None`` is
+        returned (fail closed) so callers never attach a session/stage to an
+        unrelated mission.
         """
-        if source != "herdr":
-            namespaced = f"{source}:{mission_id}"
-            if namespaced in self._missions:
-                return namespaced
-        if mission_id in self._missions:
+        if source == "herdr":
             return mission_id
-        return mission_id
+        namespaced = f"{source}:{mission_id}"
+        if namespaced in self._missions:
+            return namespaced
+        if mission_id in self._missions and mission_id.startswith(source + ":"):
+            return mission_id
+        return None
 
     def list_missions(self, status=None):
         out = [_copy(m) for m in self._missions.values()]
