@@ -317,6 +317,8 @@ def _make_handler(server):
             if resource == "health":
                 return self._json(server._health())
             if resource == "missions":
+                if len(parts) > 5 and parts[5] == "timeline":
+                    return self._json({"timeline": r.mission_timeline(parts[4])})
                 if len(parts) > 4:
                     m = r.get_mission(parts[4])
                     return self._json(m) if m else self._json(

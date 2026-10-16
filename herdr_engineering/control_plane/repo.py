@@ -962,6 +962,57 @@ class ControlPlaneRepo:
                 pass  # a listener must never break event recording
         return _copy(ev)
 
+    def mission_timeline(self, mission_key):
+        """Build a per-mission timeline from mission events, CI runs, reviews
+        and pull requests. Items are compact (no payloads), sorted by
+        (ts, kind, entity_id)."""
+        m = self.get_mission(mission_key)
+        if m is None:
+            raise KeyError(mission_key)
+        key = m.get('mission_key') or m['mission_id']
+        items = []
+        for ev in self.stream('mission', key):
+            et = ev.get('event_type')
+            if et == 'MissionCreated':
+                continue
+            payload = ev.get('payload') or {}
+            if et == 'MissionStageChanged':
+                status = payload.get('to')
+            else:
+                status = payload.get('stage')
+            items.append({'ts': ev.get('source_timestamp'), 'kind': 'stage',
+                          'status': status,
+                          'title': f"stage \u2192 {status}", 'ref': None,
+                          'entity_id': key})
+        for rec in self.list_test_runs(mission_id=key):
+            items.append({'ts': rec.get('started_at') or rec.get('created_at'),
+                          'kind': rec.get('kind') or 'test',
+                          'status': rec.get('status'),
+                          'title': f"{rec.get('kind') or 'test'} run {rec.get('test_run_id')}",
+                          'ref': None,
+                          'entity_id': rec.get('test_run_id')})
+        for rec in self.list_reviews(mission_id=key):
+            items.append({'ts': rec.get('started_at') or rec.get('created_at'),
+                          'kind': 'review',
+                          'status': rec.get('verdict') or rec.get('status'),
+                          'title': f"review by {rec.get('reviewer')}",
+                          'ref': None,
+                          'entity_id': rec.get('review_id')})
+        for rec in self.list_pull_requests(mission_id=key):
+            items.append({'ts': rec.get('created_at'), 'kind': 'pr',
+                          'status': rec.get('status'),
+                          'title': f"PR #{rec.get('number')}",
+                          'ref': rec.get('url'),
+                          'entity_id': rec.get('pr_id')})
+            if rec.get('status') == 'merged':
+                items.append({'ts': rec.get('updated_at') or rec.get('created_at'),
+                              'kind': 'merge', 'status': 'merged',
+                              'title': f"PR #{rec.get('number')} merged",
+                              'ref': rec.get('url'),
+                              'entity_id': rec.get('pr_id')})
+        return sorted(items, key=lambda i: (i['ts'] or '', i['kind'],
+                                            i['entity_id'] or ''))
+
     def stream(self, entity_type, entity_id):
         return [_copy(e) for e in self._events.get((entity_type, entity_id), [])]
 
