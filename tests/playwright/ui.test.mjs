@@ -181,6 +181,29 @@ test('pi-sourced mission detail renders by mission_key', async () => {
   }, { BURST: '0' });
 });
 
+test('mission detail renders the timeline', async () => {
+  await withApp(async ({ page, base }) => {
+    // Plain-colon hash (what the missions page links use); the app
+    // URL-encodes it itself when fetching /api/v1/missions/{id}.
+    await page.goto(`${base}/#/missions/pi:MSN-PI1`);
+    // Merged timeline (UI-009): stage events + test run + merged PR.
+    await page.waitForSelector('herdr-timeline .hd-timeline__item', { timeout: 15000 });
+    const kinds = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('herdr-timeline .hd-timeline__item'))
+        .map((el) => el.getAttribute('data-kind')));
+    for (const kind of ['stage', 'test', 'pr', 'merge']) {
+      assert.ok(kinds.includes(kind), `timeline item with data-kind="${kind}" missing (got ${kinds.join(', ')})`);
+    }
+    // Screenshot for the convergence-program review (kept untracked when no
+    // other screenshots are committed to the repo).
+    fs.mkdirSync(path.join(import.meta.dirname, 'screenshots'), { recursive: true });
+    await page.screenshot({
+      path: path.join(import.meta.dirname, 'screenshots', 'mission-timeline.png'),
+      fullPage: true,
+    });
+  }, { BURST: '0' });
+});
+
 // ---------------------------------------------------------------- agent inspector (spec 0200)
 async function sessionHash(base) {
   const r = await fetch(`${base}/api/v1/sessions`);

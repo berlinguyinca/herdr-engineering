@@ -262,8 +262,18 @@ async function viewMission(parts) {
     </div>
     <h3 style="margin-top:20px">Sessions</h3>
     ${await missionSessions(m)}
+    <h3 style="margin-top:20px">Timeline</h3>
+    <herdr-timeline id="mission-timeline"></herdr-timeline>
     <h3 style="margin-top:20px">Event stream</h3>
     <div id="mission-stream">${await streamList('mission', missionKey(m))}</div>`;
+    // Timeline (UI-009): merged mission events + CI/PR data. On error render
+    // the empty state — never throw from the view.
+    try {
+      const { timeline } = await client.missionTimeline(missionKey(m));
+      document.getElementById('mission-timeline').items = timeline || [];
+    } catch {
+      document.getElementById('mission-timeline').items = [];
+    }
 }
 
 async function missionSessions(m) {

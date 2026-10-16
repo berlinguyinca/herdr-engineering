@@ -88,6 +88,15 @@
 .hd-card__sub { color: var(--text-muted); font-size: 0.8125rem; }
 .hd-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
 
+/* ---- mission timeline (herdr-timeline) ---- */
+.hd-timeline { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.hd-timeline__item { display: flex; align-items: baseline; gap: 10px; padding: 8px 12px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); }
+.hd-timeline__title { flex: 1; color: var(--text); }
+.hd-timeline time { color: var(--text-muted); font-size: 0.85em; }
+.hd-timeline a { color: var(--accent); }
+
 /* ---- agent inspector (spec 0200) ---- */
 .hd-ins { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .hd-ins__bar { display: flex; flex-wrap: wrap; gap: 6px; }
