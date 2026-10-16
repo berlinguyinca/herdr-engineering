@@ -416,6 +416,9 @@ class ControlPlaneRepo:
 
     def upsert_mission(self, mission_id, *, title, purpose="", stage="active",
                        cwd=None, source="herdr"):
+        if ":" in source or ":" in mission_id:
+            raise ValueError(
+                "mission source and mission_id must not contain ':'")
         key = mission_id if source == "herdr" else f"{source}:{mission_id}"
         stamp = self._stamp()
         existing = self._missions.get(key)
