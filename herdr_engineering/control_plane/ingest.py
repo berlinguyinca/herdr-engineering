@@ -9,6 +9,7 @@ so repeated heartbeats never duplicate a record, and the same external id maps
 to one control-plane entity.
 """
 from __future__ import annotations
+import re
 
 
 class IngestService:
@@ -30,12 +31,19 @@ class IngestService:
         if not isinstance(payload, dict):
             raise ValueError("payload must be a JSON object")
         source = body.get("source") or "herdr"
+        if not isinstance(source, str):
+            raise ValueError("invalid source")
+        source = source.lower().strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", source):
+            raise ValueError("invalid source")
 
         if entity_type == "host":
             return self._ingest_host(entity_id, event_type, payload)
         if entity_type == "session":
             return self._ingest_session(entity_id, event_type, payload)
         if entity_type == "mission":
+            if ":" in entity_id:
+                raise ValueError("invalid mission id")
             return self._ingest_mission(entity_id, event_type, payload,
                                         source)
         if entity_type == "service":
