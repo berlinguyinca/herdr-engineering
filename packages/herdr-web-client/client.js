@@ -97,6 +97,39 @@ export class HerdrClient {
       { method: 'POST', body: { action } });
   }
 
+  // -- agent inspector (spec 0200) -----------------------------------------
+  getInspector(sessionId, { view = 'all', q, agentId, since_rev, limit, before_seq } = {}) {
+    const p = new URLSearchParams({ view });
+    if (q) p.set('q', q);
+    if (agentId) p.set('agent_id', agentId);
+    if (since_rev) p.set('since_rev', String(since_rev));
+    if (limit) p.set('limit', String(limit));
+    if (before_seq != null) p.set('before_seq', String(before_seq));
+    return this.request(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector?${p}`);
+  }
+
+  getInspectorEvent(sessionId, seq) {
+    return this.request(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector/events/${seq}`);
+  }
+
+  getInspectorPrefs(sessionId) {
+    return this.request(sessionId
+      ? `/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector/preferences`
+      : '/api/v1/inspector/preferences');
+  }
+
+  setInspectorPrefs(sessionId, prefs) {
+    return this.request(sessionId
+      ? `/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector/preferences`
+      : '/api/v1/inspector/preferences', { method: 'POST', body: prefs });
+  }
+
+  inspectorStreamUrl(sessionId) {
+    return `${this.base}/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector/stream`;
+  }
+
   // -- ci / test runs (leaf types for the topology view) -------------------
   getCi() {
     return this.request('/api/v1/ci');

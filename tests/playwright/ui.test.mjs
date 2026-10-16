@@ -150,3 +150,93 @@ test('overview survives a heavy event burst without rate limiting', async () => 
       null, { timeout: 10000 });
   });
 });
+
+// ---------------------------------------------------------------- agent inspector (spec 0200)
+async function sessionHash(base) {
+  const r = await fetch(`${base}/api/v1/sessions`);
+  const { sessions } = await r.json();
+  return `#/herd/session/${sessions[0].session_id}`;
+}
+
+async function postInspector(base, sid, events) {
+  const r = await fetch(`${base}/api/v1/ingest`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entity_type: 'inspector', entity_id: sid, event_type: 'inspector.batch', payload: { events } }),
+  });
+  assert.equal(r.status, 200);
+}
+
+test('inspector: tabs, redaction/ACL, reasoning gating, search, layout, live tool status', async () => {
+  await withApp(async ({ page, base }) => {
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    const hash = await sessionHash(base);
+    const sid = hash.split('/').pop();
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto(`${base}/${hash}`);
+    await page.waitForSelector('.hd-ins__tab', { timeout: 15000 });
+    const inspector = () => page.locator('#ins-root');
+
+    // default view = conversation
+    await page.waitForFunction(() => document.querySelector('#ins-root')?.innerText.includes('make the parser faster'));
+    // wide viewport => split layout
+    assert.ok(await inspector().evaluate((el) => el.classList.contains('hd-ins--split')));
+
+    // reasoning hidden by default preference, even though it is exposed
+    await page.click('[data-view=reasoning]');
+    await page.waitForFunction(() => document.querySelector('#ins-root')?.innerText.includes('Reasoning is hidden'));
+    assert.ok(!(await inspector().innerText()).includes('profile before changing'));
+    await page.click('#ins-show-reasoning');
+    await page.waitForFunction(() => document.querySelector('#ins-root')?.innerText.includes('profile before changing'));
+
+    // tools: failed + subagent attribution + streaming status
+    await page.click('[data-view=tools]');
+    await page.waitForFunction(() => document.querySelector('#ins-root')?.innerText.includes('make build'));
+    let text = await inspector().innerText();
+    assert.ok(text.includes('builder') && text.includes('running') && text.includes('error'));
+    await postInspector(base, sid, [{ kind: 'tool', call_id: 'c2', phase: 'end', output: 'built', exit_code: 0, agent_id: 'builder' }]);
+    await page.waitForFunction(() => [...document.querySelectorAll('.hd-ins__row')]
+      .some((r) => r.innerText.includes('make build') && /\bok\b/.test(r.innerText) && !/running/.test(r.innerText)), null, { timeout: 8000 });
+
+    // files + diff inspection
+    await page.click('[data-view=files]');
+    await page.waitForFunction(() => document.querySelector('#ins-root')?.innerText.includes('src/parser.py'));
+    assert.ok(await page.locator('.hd-diff__add').count() > 0);
+
+    // tests + failure reporting
+    await page.click('[data-view=tests]');
+    await page.waitForFunction(() => document.querySelector('#ins-root')?.innerText.includes('test_parse_empty'));
+
+    // usage / context / associations
+    await page.click('[data-view=usage]');
+    await page.waitForFunction(() => document.querySelector('#ins-root')?.innerText.includes('Context'));
+    text = await inspector().innerText();
+    assert.ok(text.includes('perf/parser') && text.includes('o/r#42') && text.includes('gpt-4o-mini'));
+
+    // searchable history
+    await page.click('[data-view=all]');
+    await page.fill('#ins-q', 'AssertionError');
+    await page.waitForFunction(() => {
+      const t = document.querySelector('.hd-ins__list')?.innerText || '';
+      return t.includes('test_parse_empty') && !t.includes('make the parser faster');
+    });
+
+    // responsive: narrow => stacked
+    await page.setViewportSize({ width: 600, height: 900 });
+    await page.waitForFunction(() => document.querySelector('#ins-root')?.classList.contains('hd-ins--stacked'));
+    assert.deepEqual(errors, []);
+  }, { BURST: '0' });
+});
+
+test('inspector: open server treats the viewer as operator; sessions without telemetry say so', async () => {
+  await withApp(async ({ page, base }) => {
+    const r = await fetch(`${base}/api/v1/sessions`);
+    const { sessions } = await r.json();
+    await page.goto(`${base}/#/herd/session/${sessions[0].session_id}`);
+    await page.waitForSelector('.hd-ins__tab');
+    await page.click('[data-view=reasoning]');
+    await page.waitForFunction(() => /not report|Reasoning/.test(document.querySelector('#ins-root')?.innerText || ''));
+    const text = await page.locator('#ins-root').innerText();
+    assert.ok(/No inspector telemetry|not reported|does not expose/.test(text), text);
+  }, { BURST: '0', INSPECTOR_SEED: '0' });
+});

@@ -87,3 +87,45 @@
 .hd-card__title { font-weight: 600; margin-bottom: 4px; }
 .hd-card__sub { color: var(--text-muted); font-size: 0.8125rem; }
 .hd-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+
+/* ---- agent inspector (spec 0200) ---- */
+.hd-ins { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.hd-ins__bar { display: flex; flex-wrap: wrap; gap: 6px; }
+.hd-ins__badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border-subtle); color: var(--text-secondary); background: var(--surface); }
+.hd-ins__badge--live { color: var(--status-ok, #1a7f37); }
+.hd-ins__badge--run { color: var(--status-active, #0969da); }
+.hd-ins__badge--fail, .hd-ins__badge--warn, .hd-ins__badge--stale { color: var(--status-failed, #b42318); }
+.hd-ins__tools { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.hd-ins__tab { border: 1px solid var(--border-subtle); background: var(--surface); color: var(--text-secondary); padding: 6px 10px; border-radius: var(--radius-sm); cursor: pointer; font-size: 0.8125rem; min-height: 32px; }
+.hd-ins__tab.is-active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }
+.hd-ins__tools input[type=search] { flex: 1 1 160px; min-width: 120px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.hd-ins__list { display: flex; flex-direction: column; gap: 8px; max-height: 70vh; overflow: auto; min-width: 0; }
+.hd-ins--split .hd-ins__list { max-height: 75vh; }
+.hd-ins--stacked .hd-ins__list { max-height: none; }
+.hd-ins__row { border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 8px 10px; background: var(--surface); min-width: 0; }
+.hd-ins--compact .hd-ins__row { padding: 4px 8px; }
+.hd-ins__head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.hd-ins__title { font-weight: 600; font-size: 0.875rem; overflow-wrap: anywhere; }
+.hd-ins__title code { font-weight: 400; }
+.hd-ins__meta { color: var(--text-muted); font-size: 0.75rem; margin-left: auto; }
+.hd-ins__agent { font-size: 0.7rem; padding: 1px 6px; border-radius: 4px; background: var(--accent-weak); color: var(--accent); }
+.hd-ins__text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.875rem; margin-top: 4px; }
+.hd-ins__text--reason { color: var(--text-secondary); font-style: italic; }
+.hd-ins__out, .hd-diff { margin: 6px 0 0; padding: 8px; background: var(--surface-hover); border-radius: var(--radius-sm); font: 0.75rem/1.4 ui-monospace, monospace; overflow: auto; max-height: 320px; white-space: pre; }
+.hd-ins__st { font-size: 0.75rem; color: var(--text-secondary); }
+.hd-ins__st--ok { color: var(--status-ok, #1a7f37); }
+.hd-ins__st--error { color: var(--status-failed, #b42318); }
+.hd-ins__st--running { color: var(--status-active, #0969da); }
+.hd-ins__st--interrupted { color: var(--status-waiting, #9a6700); }
+.hd-ins__withheld, .hd-ins__notice { color: var(--text-muted); font-size: 0.8125rem; padding: 6px 0; }
+.hd-ins__assoc { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; font-size: 0.8125rem; margin: 0; }
+.hd-ins__assoc dt { color: var(--text-muted); } .hd-ins__assoc dd { margin: 0; overflow-wrap: anywhere; }
+.hd-ins__table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
+.hd-ins__table th, .hd-ins__table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border-subtle); overflow-wrap: anywhere; }
+.hd-ins__prefs { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; padding: 10px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); }
+.hd-diff__add { color: var(--status-ok, #1a7f37); } .hd-diff__del { color: var(--status-failed, #b42318); }
+.hd-diff__hunk { color: var(--accent); } .hd-diff__meta { color: var(--text-muted); }
+@media (max-width: 720px) { .hd-ins__meta { margin-left: 0; width: 100%; } .hd-ins__tab { flex: 1 1 30%; } }
+@media (prefers-reduced-motion: no-preference) { .hd-ins__row { transition: background-color .2s; } }
+.hd-ins__cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 280px); gap: 12px; align-items: start; }
+.hd-ins__aside { position: sticky; top: 8px; }

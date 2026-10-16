@@ -8,6 +8,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
 import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
 import { statusForStage, statusLabel, tokenVar } from './herdr-web-components/status.js';
+import { mountInspector } from './inspector-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -69,7 +70,12 @@ const ROUTES = {
   '/analytics/tokens': viewAnalyticsTokens,
 };
 
+// The agent inspector owns a per-session stream; dispose it whenever the view changes.
+let disposeInspector = null;
+const onSessionPage = () => /^#\/herd\/session\//.test(window.location.hash);
+
 async function render() {
+  if (disposeInspector) { disposeInspector(); disposeInspector = null; }
   const { parts } = route();
   const seg = parts.length ? parts.join('/') : 'overview';
   const match = Object.keys(ROUTES).find((r) => {
@@ -281,7 +287,7 @@ async function viewSessions() {
 }
 
 async function viewSession(parts) {
-  const s = await client.getSession(parts[1]);
+  const s = await client.getSession(parts[parts.length - 1]);
   if (!s) { root.innerHTML = '<herdr-error message="Session not found"></herdr-error>'; return; }
   const t = titles(await missionTitles());
   const missionTitle = s.mission_id ? (t[s.mission_id] || s.mission_id) : '—';
@@ -326,8 +332,10 @@ async function viewSession(parts) {
         <button type="submit" class="hd-btn">Send</button>
       </form>
     </div>
+    <div id="inspector-host"></div>
     <h3 style="margin-top:20px">Event stream</h3>
     <div id="session-stream">${await streamList('session', s.session_id)}</div>`;
+  disposeInspector = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
 
   const copyBtn = document.getElementById('copy-attach');
   if (copyBtn) {
@@ -563,6 +571,8 @@ const LIVE_REFRESH_MS = 5000;
 connectEvents({
   url: '/api/v1/events/stream',
   onEvent: () => {
+    // The session page streams its own detail; a full re-render would reset it.
+    if (onSessionPage()) return;
     if (liveTimer) clearTimeout(liveTimer);
     // Fire shortly after the last event, but never more often than once per
     // LIVE_REFRESH_MS since the previous live refresh.

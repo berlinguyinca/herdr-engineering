@@ -45,9 +45,36 @@ def _seed(repo):
     return m1, m2, s1
 
 
+def _seed_inspector(repo, sid):
+    """Rich inspector data for the session detail view (spec 0200)."""
+    t = lambda call, phase, **kw: {"kind": "tool", "call_id": call, "phase": phase, **kw}  # noqa: E731
+    repo.inspector.ingest(sid, {"events": [
+        {"kind": "capabilities", "reasoning": "summary", "streaming_tools": True, "diffs": True},
+        {"kind": "message", "role": "user", "text": "make the parser faster"},
+        {"kind": "reasoning", "text": "I should profile before changing anything"},
+        {"kind": "message", "role": "assistant", "text": "Profiling the parser first."},
+        t("c1", "start", tool="bash", args_preview="pytest -q"),
+        t("c1", "end", output="2 failed, 8 passed", exit_code=1, is_error=True, duration_ms=1500),
+        t("c2", "start", tool="bash", args_preview="make build", agent_id="builder", parent_agent_id="main"),
+        t("c2", "update", output="compiling…", agent_id="builder", parent_agent_id="main"),
+        {"kind": "file", "path": "src/parser.py", "op": "edit",
+         "diff": "--- a/src/parser.py\n+++ b/src/parser.py\n@@ -1,2 +1,2 @@\n-slow()\n+fast()"},
+        {"kind": "file", "path": "config/.env", "op": "read", "diff": "+SECRET_ONLY_FOR_OPERATORS"},
+        {"kind": "test", "run_id": "r1", "phase": "end", "command": "pytest -q", "passed": 8, "failed": 2,
+         "failures": [{"name": "test_parse_empty", "message": "AssertionError: expected []", "file": "t.py", "line": 12}]},
+        {"kind": "usage", "input_tokens": 1200, "output_tokens": 300, "context_tokens": 40000,
+         "context_window": 200000, "model": "gpt-4o"},
+        {"kind": "association", "mission_id": "m-alpha", "branch": "perf/parser", "worktree": "/wt/parser",
+         "handoff_from": "w0:p0", "pr": {"number": 42, "url": "https://github.com/o/r/pull/42", "repo": "o/r"}},
+        {"kind": "model", "model": "gpt-4o", "previous_model": "gpt-4o-mini", "reason": "handoff"},
+    ]})
+
+
 def main():
     repo = ControlPlaneRepo()
-    _seed(repo)
+    _m1, _m2, _s1 = _seed(repo)
+    if os.environ.get("INSPECTOR_SEED", "1") != "0":
+        _seed_inspector(repo, _s1)
 
     svr = ControlPlaneServer(repo, host="127.0.0.1", port=0,
                              web_root=_REPO / "packages")

@@ -16,6 +16,7 @@ import json
 import time
 
 from .ids import new_id
+from .inspector import InspectorStore
 
 _STAGES = {
     "planning", "specification", "ready", "implementation", "testing",
@@ -75,6 +76,20 @@ class ControlPlaneRepo:
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
+        # Agent inspector (spec 0200): bounded per-session detail projection.
+        self.inspector = InspectorStore.from_env(persist=self._persist_inspector)
+
+    def _persist_inspector(self, ev):
+        """Mirror low-volume inspector summaries to the existing durable sink only
+        (never into the in-memory event streams or the global SSE feed)."""
+        if self._sink is None:
+            return
+        ev = dict(ev)
+        ev.setdefault("event_id", new_id("event"))
+        ev.setdefault("schema_version", 1)
+        ev["ingest_timestamp"] = self._stamp()
+        ev["sequence"] = int(time.time() * 1000)
+        self._sink.record(ev)
 
     # ------------------------------------------------------------------ ids
     def subscribe(self, listener):
@@ -723,6 +738,14 @@ class ControlPlaneRepo:
             t, i = key.split("|")
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
+        # Inspector summaries ride the durable log as ``inspector`` streams;
+        # move them into the bounded store instead of the unbounded raw streams.
+        durable = []
+        for key in [k for k in self._events if k[0] == "inspector"]:
+            durable.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != "inspector"]
+        if durable:
+            self.inspector.hydrate(durable)
 
     # --------------------------------------------------------------- health
     def health(self):
@@ -735,6 +758,7 @@ class ControlPlaneRepo:
             "events": {"ingested": len(self._event_order)},
             "missions": len(self._missions), "sessions": len(self._sessions),
             "hosts": len(self._hosts), "services": len(self._services),
+            "inspector": self.inspector.health(),
             "timestamp": self._stamp(),
         }
 
