@@ -56,6 +56,10 @@ export class HerdrClient {
     return this.request(`/api/v1/missions/${encodeURIComponent(id)}`);
   }
 
+  missionTimeline(id) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/timeline`);
+  }
+
   // -- sessions -----------------------------------------------------------
   listSessions(status) {
     const q = status ? `?status=${encodeURIComponent(status)}` : '';
