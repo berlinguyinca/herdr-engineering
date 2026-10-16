@@ -29,13 +29,15 @@ class IngestService:
         payload = body.get("payload") or {}
         if not isinstance(payload, dict):
             raise ValueError("payload must be a JSON object")
+        source = body.get("source") or "herdr"
 
         if entity_type == "host":
             return self._ingest_host(entity_id, event_type, payload)
         if entity_type == "session":
             return self._ingest_session(entity_id, event_type, payload)
         if entity_type == "mission":
-            return self._ingest_mission(entity_id, event_type, payload)
+            return self._ingest_mission(entity_id, event_type, payload,
+                                        source)
         if entity_type == "service":
             return self._ingest_service(entity_id, event_type, payload)
         # Unknown/other entity types: record the event generically so nothing is
@@ -69,7 +71,8 @@ class IngestService:
             pid=payload.get("pid"), cmdline=payload.get("cmdline"),
             summary=payload.get("summary"), attach=payload.get("attach"))
 
-    def _ingest_mission(self, entity_id, event_type, payload) -> dict:
+    def _ingest_mission(self, entity_id, event_type, payload,
+                        source="herdr") -> dict:
         if "stop" in event_type.lower():
             stage = "complete"
         elif "start" in event_type.lower():
@@ -79,7 +82,7 @@ class IngestService:
         return self.repo.upsert_mission(
             entity_id, title=payload.get("title") or "",
             purpose=payload.get("purpose") or "", stage=stage,
-            cwd=payload.get("cwd"))
+            cwd=payload.get("cwd"), source=source)
 
     def _ingest_service(self, entity_id, event_type, payload) -> dict:
         """A ``service`` envelope maps idempotently to a (host, name) service.
