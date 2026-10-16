@@ -16,6 +16,13 @@ test('pickLayout honours explicit prefs and auto-switches on width', () => {
   assert.equal(pickLayout(undefined, 600), 'stacked');
 });
 
+test('pickLayout hysteresis prevents flapping around the breakpoint', () => {
+  assert.equal(pickLayout('auto', 880, 'split'), 'split');      // stays split inside the band
+  assert.equal(pickLayout('auto', 880, 'stacked'), 'stacked');  // stays stacked inside the band
+  assert.equal(pickLayout('auto', 940, 'stacked'), 'split');
+  assert.equal(pickLayout('auto', 850, 'split'), 'stacked');
+});
+
 test('mergeEntry replaces by seq only for newer rev, sorts newest-first and bounds the buffer', () => {
   const list = [];
   mergeEntry(list, ev({ seq: 1, rev: 1, data: { text: 'a' } }));

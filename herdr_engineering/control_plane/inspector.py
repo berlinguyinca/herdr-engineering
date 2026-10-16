@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import secrets
 import threading
 import time
 from collections import OrderedDict, deque
@@ -120,14 +121,24 @@ def _s(value: Any, limit: int = 512) -> str | None:
     return redact_text(text)
 
 
-def _ts(value: Any) -> str:
-    """Strict timestamp: a parseable ISO-8601 value (normalised) or 'now'."""
+def _ts(value: Any, now: float | None = None) -> str:
+    """Strict timestamp: parseable ISO-8601 (UTC-normalised, clamped to a sane window) or 'now'.
+
+    Display only: retention runs on the server's own receive clock, so a bogus
+    client timestamp can neither pin nor shorten retention.
+    """
+    now = time.time() if now is None else now
     if isinstance(value, str) and len(value) <= 64:
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat()
-        except ValueError:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            epoch = dt.timestamp()
+            epoch = max(now - HARD_CEILINGS["retention_hours"] * 3600, min(now + 300, epoch))
+            return datetime.fromtimestamp(epoch, UTC).isoformat()
+        except (ValueError, OverflowError, OSError):
             pass
-    return _now_iso()
+    return datetime.fromtimestamp(now, UTC).isoformat()
 
 
 def _finite(v: Any) -> bool:
@@ -148,7 +159,7 @@ def truncate_text(text: str, max_bytes: int) -> tuple[str, bool]:
 
 
 def _clamp_int(value: Any, lo: int, hi: int) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
     return max(lo, min(hi, int(value)))
 
@@ -264,6 +275,8 @@ class InspectorStore:
         self._clock = clock
         self._sessions: OrderedDict[str, _Session] = OrderedDict()
         self._global_prefs: dict = {}
+        #: Changes on every process start; clients resync when it differs (seq/rev restart).
+        self.epoch = secrets.token_hex(6)
         self._lock = threading.RLock()
         self.stats = {"accepted": 0, "duplicates": 0, "rejected": 0,
                       "evicted_events": 0, "evicted_sessions": 0}
@@ -355,7 +368,7 @@ class InspectorStore:
                     result["accepted"] += 1
                     self.stats["accepted"] += 1
             self._enforce(sess)
-            self._enforce_global()
+            self._enforce_global(keep=session_id)
         return result
 
     def _ingest_one(self, sess: _Session, ev: Any, persist: bool) -> str:
@@ -384,7 +397,7 @@ class InspectorStore:
         base = {
             "agent_id": _s(ev.get("agent_id"), 128) or "main",
             "parent_agent_id": _s(ev.get("parent_agent_id"), 128),
-            "ts": _ts(ev.get("ts")),
+            "ts": _ts(ev.get("ts"), self._clock()),
         }
         flagged = bool(ev.get("sensitive"))
         sess.last_event = self._clock()
@@ -603,7 +616,7 @@ class InspectorStore:
                persist: bool) -> dict:
         flags = data.pop("_flags", {"redacted": False, "truncated": False})
         entry = {
-            "seq": sess.next_seq, "rev": 0, "kind": kind, **base,
+            "seq": sess.next_seq, "rev": 0, "kind": kind, **base, "recv": self._clock(),
             "sensitive": flagged, "redacted": flags["redacted"],
             "truncated": flags["truncated"], "data": data, "size": 0,
         }
@@ -728,10 +741,11 @@ class InspectorStore:
         sess.dropped_ring += 1
         sess.evicted_to = old["seq"]
         self.stats["evicted_events"] += 1
-        if old["kind"] == "tool":
-            sess.tools.pop(old["data"].get("call_id"), None)
-        elif old["kind"] == "test":
-            sess.tests.pop(old["data"].get("run_id"), None)
+        # Only unlink the live map if it still points at the evicted entry (ids can be reused).
+        if old["kind"] == "tool" and sess.tools.get(old["data"].get("call_id")) is old:
+            del sess.tools[old["data"]["call_id"]]
+        elif old["kind"] == "test" and sess.tests.get(old["data"].get("run_id")) is old:
+            del sess.tests[old["data"]["run_id"]]
 
     def _enforce(self, sess: _Session) -> None:
         max_events, max_bytes, hours = self._limits_for(sess)
@@ -739,15 +753,15 @@ class InspectorStore:
         while sess.events and (len(sess.events) > max_events or
                                (sess.bytes > max_bytes and len(sess.events) > 1)):
             self._drop_oldest(sess)
-        while sess.events and _ts_epoch(sess.events[0]["ts"], self._clock()) < cutoff:
+        while sess.events and sess.events[0]["recv"] < cutoff:   # recv is monotonic
             self._drop_oldest(sess)
 
-    def _enforce_global(self) -> None:
+    def _enforce_global(self, keep: str | None = None) -> None:
         total = sum(s.bytes for s in self._sessions.values())
         while (len(self._sessions) > self.limits["max_sessions"] or
                total > self.limits["max_total_bytes"]) and len(self._sessions) > 1:
-            victim = next((s for s in self._sessions.values() if s.ended and not s.subs), None) \
-                or next((s for s in self._sessions.values() if not s.subs), None)
+            cands = [s for s in self._sessions.values() if not s.subs and s.session_id != keep]
+            victim = next((s for s in cands if s.ended), None) or (cands[0] if cands else None)
             if victim is None:
                 break
             total -= victim.bytes
@@ -831,11 +845,12 @@ class InspectorStore:
                     if not self._allowed(e, role) or needle not in self._searchable(e).lower():
                         continue
                 rows.append(e)
-                if len(rows) >= limit:
+                if len(rows) > limit:
                     break
-            has_more = len(rows) >= limit
+            has_more = len(rows) > limit
+            rows = rows[:limit]
             return {
-                "session_id": session_id, "view": view,
+                "session_id": session_id, "view": view, "epoch": self.epoch,
                 "events": [self._render(e, role, full=False) for e in rows],
                 "has_more": has_more, "rev": sess.rev,
                 "dropped": sess.dropped_ring, "oldest_available_seq":
@@ -996,10 +1011,3 @@ def _iso_of(value: Any) -> str | None:
     if isinstance(value, datetime):
         return value.isoformat()
     return value if isinstance(value, str) else None
-
-
-def _ts_epoch(ts: str, default: float) -> float:
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-    except (ValueError, AttributeError):
-        return default

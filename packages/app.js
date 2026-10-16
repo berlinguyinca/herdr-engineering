@@ -572,7 +572,19 @@ connectEvents({
   url: '/api/v1/events/stream',
   onEvent: () => {
     // The session page streams its own detail; a full re-render would reset it.
-    if (onSessionPage()) return;
+    // Only the (cheap) generic event list below the inspector is refreshed there.
+    if (onSessionPage()) {
+      const el = document.getElementById('session-stream');
+      if (el && !liveTimer) {
+        const sid = decodeURIComponent(window.location.hash.split('/').pop());
+        liveTimer = setTimeout(async () => {
+          liveTimer = null;
+          if (!onSessionPage()) return;
+          try { el.innerHTML = await streamList('session', sid); } catch { /* keep last */ }
+        }, LIVE_REFRESH_MS);
+      }
+      return;
+    }
     if (liveTimer) clearTimeout(liveTimer);
     // Fire shortly after the last event, but never more often than once per
     // LIVE_REFRESH_MS since the previous live refresh.
@@ -585,5 +597,8 @@ connectEvents({
   onError: () => { /* keep last view; the client auto-reconnects */ },
 });
 
-window.addEventListener('hashchange', () => { lastLiveRender = Date.now(); render(); });
+window.addEventListener('hashchange', () => {
+  if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
+  lastLiveRender = Date.now(); render();
+});
 render();

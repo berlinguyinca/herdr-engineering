@@ -526,7 +526,8 @@ def _make_handler(server):
                 pass
             sub = store.subscribe(sid)
             try:
-                self.wfile.write(_raw_frame({"type": "connected", "session_id": sid}))
+                self.wfile.write(_raw_frame({"type": "connected", "session_id": sid,
+                                              "epoch": store.epoch}))
                 self.wfile.flush()
                 last_beat = started = time.monotonic()
                 while time.monotonic() - started < _MAX_SSE_SECONDS:
@@ -677,7 +678,7 @@ def _defaults() -> dict:
 
 def _empty_inspector(store, sid: str) -> dict:
     """A known session that has not (yet) sent inspector telemetry: say so, never imply data."""
-    return {"session_id": sid, "view": "all", "events": [], "has_more": False, "rev": 0,
+    return {"session_id": sid, "view": "all", "epoch": store.epoch, "events": [], "has_more": False, "rev": 0,
             "dropped": 0, "oldest_available_seq": None, "telemetry": "none",
             "summary": None, "capabilities": {"declared": False, "reasoning": "unknown"},
             "prefs": store.get_prefs(sid)}

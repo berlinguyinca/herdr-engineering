@@ -51,6 +51,12 @@ under bursts of ≥ ~10 agents — now 256.
 - **Redaction:** applied to every text field at ingest. The ingest route skips
   the blanket key-hint redaction for `inspector` envelopes because it would
   mangle counters such as `input_tokens` and `passed`.
+- **Time:** retention runs on the server's receive clock; client `ts` is display-only
+  and clamped to `[now − 720 h, now + 5 min]`, so a bogus timestamp cannot pin or shorten retention.
+- **Resync:** responses and the stream's `connected` frame carry a process `epoch`;
+  the UI does a full reload on reconnect, gap, epoch change, or when an incremental
+  fetch would skip changes (`has_more`). Client buffer: ≤ 500 rows (≤ 1 000 after
+  "Show more"); older history is reached via search.
 - **Missing/interrupted telemetry:** no telemetry → explicit empty state;
   stale (>120 s without events) → banner; restart/interrupt → running tools are
   marked `interrupted`, never successful.

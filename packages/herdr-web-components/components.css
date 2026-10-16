@@ -129,3 +129,6 @@
 @media (prefers-reduced-motion: no-preference) { .hd-ins__row { transition: background-color .2s; } }
 .hd-ins__cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 280px); gap: 12px; align-items: start; }
 .hd-ins__aside { position: sticky; top: 8px; }
+.hd-ins--stacked .hd-ins__cols { display: flex; flex-direction: column; }
+.hd-ins--stacked .hd-ins__aside { order: -1; position: static; width: 100%; }
+.hd-ins--split .hd-ins__aside:empty, .hd-ins__aside:empty { display: none; }

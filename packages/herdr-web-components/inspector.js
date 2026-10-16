@@ -15,8 +15,9 @@ export const INSPECTOR_VIEWS = [
   { id: 'all', label: 'Timeline' },
 ];
 
-/** Bounded client buffer: never hold more than this many rows per session. */
+/** Bounded client buffer: never hold more than this many rows per session (server max 1000). */
 export const CLIENT_BUFFER = 500;
+export const CLIENT_BUFFER_MAX = 1000;
 /** Rows rendered per page; the rest sit behind "Show more". */
 export const PAGE_SIZE = 100;
 /** No event for this long while the session is not ended => telemetry is stale. */
@@ -24,8 +25,12 @@ export const STALE_AFTER_S = 120;
 
 const SPLIT_MIN_PX = 900;
 
-export function pickLayout(pref, widthPx) {
+/** Hysteresis (prev) stops the layout flapping when the scrollbar changes the width. */
+export function pickLayout(pref, widthPx, prev) {
   if (pref === 'split' || pref === 'stacked') return pref;
+  const HYST = 40;
+  if (prev === 'split') return widthPx >= SPLIT_MIN_PX - HYST ? 'split' : 'stacked';
+  if (prev === 'stacked') return widthPx >= SPLIT_MIN_PX + HYST ? 'split' : 'stacked';
   return widthPx >= SPLIT_MIN_PX ? 'split' : 'stacked';
 }
 

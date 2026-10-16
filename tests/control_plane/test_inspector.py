@@ -259,7 +259,7 @@ def test_age_retention(store):
     t = [1_000_000.0]
     s = InspectorStore(clock=lambda: t[0])
     s.set_prefs({"retention_hours": 1}, SID)
-    feed(s, {"kind": "message", "text": "old", "ts": "1970-01-12T13:46:40+00:00"})
+    feed(s, {"kind": "message", "text": "old"})
     t[0] += 7200
     s.sweep()
     assert s.query(SID)["events"] == []
@@ -655,3 +655,57 @@ def test_http_rejects_oversized_body(server):
         urllib.request.urlopen(req, timeout=10)
     if isinstance(e.value, urllib.error.HTTPError):
         assert e.value.code == 400
+
+
+# ------------------------------------------- correctness review regressions (#63)
+def test_reused_call_id_keeps_live_mapping_after_old_entry_evicted():
+    s = InspectorStore()
+    s.set_prefs({"max_events_per_session": 50}, SID)
+    feed(s, tool("c1", "start", tool="a"), tool("c1", "end"))
+    for i in range(48):
+        feed(s, {"kind": "message", "text": str(i)})
+    feed(s, tool("c1", "start", tool="a"))         # new live entry reusing the id
+    feed(s, {"kind": "message", "text": "evicts the old ended c1"})
+    feed(s, tool("c1", "end", output="x"))
+    q = s.query(SID, view="tools")
+    assert [e["data"]["status"] for e in q["events"]] == ["ok"]
+    assert q["summary"]["running_tools"] == []
+
+
+def test_global_eviction_never_evicts_the_session_being_written():
+    s = InspectorStore(limits={"max_sessions": 2})
+    for sid in ("A", "B"):
+        s.subscribe(sid)
+    feed(s, {"kind": "message", "text": "x"}, sid="C")
+    assert s.has_session("C")
+
+
+def test_client_timestamps_cannot_pin_or_shorten_retention():
+    t = [1_000_000.0]
+    s = InspectorStore(clock=lambda: t[0])
+    s.set_prefs({"retention_hours": 1}, SID)
+    feed(s, {"kind": "message", "text": "future", "ts": "2999-01-01T00:00:00Z"})
+    t[0] += 1800
+    feed(s, {"kind": "message", "text": "fresh", "ts": "2001-01-01T00:00:00Z"})   # past ts must not evict early
+    t[0] += 1801
+    s.sweep()
+    texts = [e["data"]["text"] for e in s.query(SID)["events"]]
+    assert texts == ["fresh"]                    # 'future' aged out on server time; 'fresh' kept
+    for e in s.query(SID)["events"]:
+        assert e["ts"] < "2100"                  # clamped, not echoed
+    feed(s, {"kind": "message", "text": "naive", "ts": "0001-01-01T00:00:00"})  # no exception
+
+
+def test_infinite_prefs_rejected_cleanly():
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValueError):
+            validate_prefs({"tool_output_lines": bad})
+
+
+def test_has_more_is_exact_and_epoch_is_reported(store):
+    for i in range(5):
+        feed(store, {"kind": "message", "text": str(i)})
+    assert store.query(SID, limit=5)["has_more"] is False
+    assert store.query(SID, limit=4)["has_more"] is True
+    assert store.query(SID)["epoch"] == store.epoch
+    assert InspectorStore().epoch != store.epoch
