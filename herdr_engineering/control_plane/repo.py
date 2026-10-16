@@ -10,6 +10,7 @@ This repository is fully unit-testable without a live Postgres/RustFS — it is
 the honest, structured core the UI reads and the SSE stream feeds from. The
 durable Postgres/RustFS path (Phase 1 async stores) is bridged in deployment.
 """
+
 from __future__ import annotations
 
 import json
@@ -19,8 +20,18 @@ from .ids import new_id
 from .inspector import InspectorStore
 
 _STAGES = {
-    "planning", "specification", "ready", "implementation", "testing",
-    "review", "repair", "validation", "pr", "complete", "failed", "cancelled",
+    "planning",
+    "specification",
+    "ready",
+    "implementation",
+    "testing",
+    "review",
+    "repair",
+    "validation",
+    "pr",
+    "complete",
+    "failed",
+    "cancelled",
 }
 _SESSION_ACTIONS = {"steer", "approve", "interrupt", "resume", "stop"}
 
@@ -37,8 +48,7 @@ def _name_prefix(service_name):
     return tokens[0] if tokens else None
 
 
-def describe_service(*, service_name=None, host_id=None, port=None,
-                     owner=None, route=None) -> str:
+def describe_service(*, service_name=None, host_id=None, port=None, owner=None, route=None) -> str:
     """Build a human one-liner describing a service: what it is and where it
     runs.
 
@@ -72,6 +82,9 @@ class ControlPlaneRepo:
         self._artifacts = {}
         self._blobs = {}  # artifact_id -> bytes (in-memory RustFS stand-in)
         self._leases = {}
+        self._test_runs = {}
+        self._reviews = {}
+        self._pull_requests = {}
         self._telemetry = {}  # host_id -> [sample, ...]
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
@@ -96,6 +109,7 @@ class ControlPlaneRepo:
         """Register a callable invoked with each recorded event (for SSE)."""
         self._listeners.add(listener)
         return lambda: self._listeners.discard(listener)
+
     def _stamp(self):
         return _iso(self._now())
 
@@ -103,21 +117,26 @@ class ControlPlaneRepo:
     def create_mission(self, title, purpose="", stage="ready"):
         mid = new_id("mission")
         rec = {
-            "mission_id": mid, "title": title, "purpose": purpose,
-            "stage": stage, "status": stage, "created_at": self._stamp(),
-            "updated_at": self._stamp(), "sessions": [],
+            "mission_id": mid,
+            "title": title,
+            "purpose": purpose,
+            "stage": stage,
+            "status": stage,
+            "created_at": self._stamp(),
+            "updated_at": self._stamp(),
+            "sessions": [],
         }
         self._missions[mid] = rec
-        self.record_event("mission", mid, "MissionCreated",
-                          {"title": title, "purpose": purpose}, mission_id=mid)
+        self.record_event(
+            "mission", mid, "MissionCreated", {"title": title, "purpose": purpose}, mission_id=mid
+        )
         return mid
 
     def get_mission(self, mission_id):
         rec = self._missions.get(mission_id)
         if rec is None:
             for m in self._missions.values():
-                if (m.get("mission_id") == mission_id
-                        and m.get("source", "herdr") == "herdr"):
+                if m.get("mission_id") == mission_id and m.get("source", "herdr") == "herdr":
                     rec = m
                     break
         return _copy(rec)
@@ -138,23 +157,39 @@ class ControlPlaneRepo:
         m["stage"] = stage
         m["status"] = stage
         m["updated_at"] = self._stamp()
-        self.record_event("mission", mission_id, "MissionStageChanged",
-                          {"from": old, "to": stage}, mission_id=mission_id)
+        self.record_event(
+            "mission",
+            mission_id,
+            "MissionStageChanged",
+            {"from": old, "to": stage},
+            mission_id=mission_id,
+        )
 
     # -------------------------------------------------------------- sessions
     def create_session(self, mission_id=None, agent_role="", model=""):
         sid = new_id("session")
         rec = {
-            "session_id": sid, "mission_id": mission_id, "agent_role": agent_role,
-            "model": model, "status": "active", "created_at": self._stamp(),
-            "updated_at": self._stamp(), "messages": 0, "tool_calls": 0,
+            "session_id": sid,
+            "mission_id": mission_id,
+            "agent_role": agent_role,
+            "model": model,
+            "status": "active",
+            "created_at": self._stamp(),
+            "updated_at": self._stamp(),
+            "messages": 0,
+            "tool_calls": 0,
         }
         self._sessions[sid] = rec
         if mission_id and mission_id in self._missions:
             self._missions[mission_id]["sessions"].append(sid)
-        self.record_event("session", sid, "SessionCreated",
-                          {"mission_id": mission_id, "agent_role": agent_role},
-                          mission_id=mission_id, session_id=sid)
+        self.record_event(
+            "session",
+            sid,
+            "SessionCreated",
+            {"mission_id": mission_id, "agent_role": agent_role},
+            mission_id=mission_id,
+            session_id=sid,
+        )
         return sid
 
     def get_session(self, session_id):
@@ -174,8 +209,9 @@ class ControlPlaneRepo:
             raise KeyError(session_id)
         s["status"] = "active" if action != "stop" else "stopped"
         s["updated_at"] = self._stamp()
-        self.record_event("session", session_id, "SessionAction",
-                          {"action": action}, session_id=session_id)
+        self.record_event(
+            "session", session_id, "SessionAction", {"action": action}, session_id=session_id
+        )
 
     def send_message(self, session_id, message, artifact_ids=None):
         s = self._sessions.get(session_id)
@@ -184,9 +220,12 @@ class ControlPlaneRepo:
         s["messages"] += 1
         s["updated_at"] = self._stamp()
         self.record_event(
-            "session", session_id, "SessionMessageSent",
+            "session",
+            session_id,
+            "SessionMessageSent",
             {"text": message, "artifact_ids": artifact_ids or []},
-            session_id=session_id)
+            session_id=session_id,
+        )
 
     def record_tool_call(self, session_id, tool, detail=""):
         s = self._sessions.get(session_id)
@@ -194,37 +233,73 @@ class ControlPlaneRepo:
             raise KeyError(session_id)
         s["tool_calls"] += 1
         s["updated_at"] = self._stamp()
-        self.record_event("session", session_id, "SessionToolCalled",
-                          {"tool": tool, "detail": detail},
-                          session_id=session_id)
+        self.record_event(
+            "session",
+            session_id,
+            "SessionToolCalled",
+            {"tool": tool, "detail": detail},
+            session_id=session_id,
+        )
 
     # -------------------------------------------------------------- services
-    def register_service(self, service_name, host_id, port,
-                         session_id=None, status="healthy", route=None,
-                         description=None, owner=None):
+    def register_service(
+        self,
+        service_name,
+        host_id,
+        port,
+        session_id=None,
+        status="healthy",
+        route=None,
+        description=None,
+        owner=None,
+    ):
         svcid = new_id("service")
         rec = {
-            "service_id": svcid, "service_name": service_name,
-            "host_id": host_id, "port": port, "session_id": session_id,
-            "status": status, "route": route, "owner": owner,
-            "created_at": self._stamp(), "updated_at": self._stamp(),
+            "service_id": svcid,
+            "service_name": service_name,
+            "host_id": host_id,
+            "port": port,
+            "session_id": session_id,
+            "status": status,
+            "route": route,
+            "owner": owner,
+            "created_at": self._stamp(),
+            "updated_at": self._stamp(),
             "url": route or f"http://{host_id}:{port}",
         }
         rec["description"] = (description or "").strip() or describe_service(
-            service_name=service_name, host_id=host_id, port=port,
-            owner=owner, route=rec["url"])
+            service_name=service_name, host_id=host_id, port=port, owner=owner, route=rec["url"]
+        )
         self._services[svcid] = rec
-        self.record_event("service", svcid, "ServiceRegistered",
-                          {"service_name": service_name, "host_id": host_id,
-                           "port": port, "route": route, "status": status,
-                           "description": rec["description"],
-                           "owner": owner},
-                          session_id=session_id)
+        self.record_event(
+            "service",
+            svcid,
+            "ServiceRegistered",
+            {
+                "service_name": service_name,
+                "host_id": host_id,
+                "port": port,
+                "route": route,
+                "status": status,
+                "description": rec["description"],
+                "owner": owner,
+            },
+            session_id=session_id,
+        )
         return svcid
 
-    def upsert_service(self, host_id, service_name, port, *,
-                       session_id=None, status="healthy", route=None,
-                       description=None, owner=None):
+    def upsert_service(
+        self,
+        host_id,
+        service_name,
+        port,
+        *,
+        session_id=None,
+        status="healthy",
+        route=None,
+        description=None,
+        owner=None,
+    ):
         """Idempotent service registration keyed by ``(host_id, service_name)``.
 
         Re-invoking (e.g. on every web start or repeated ingest) updates the
@@ -235,8 +310,7 @@ class ControlPlaneRepo:
         the name/host/port/process so every service is self-explanatory.
         """
         for svcid, rec in self._services.items():
-            if (rec.get("host_id") == host_id
-                    and rec.get("service_name") == service_name):
+            if rec.get("host_id") == host_id and rec.get("service_name") == service_name:
                 rec["port"] = port
                 rec["status"] = status
                 rec["session_id"] = session_id
@@ -245,24 +319,44 @@ class ControlPlaneRepo:
                 if owner is not None:
                     rec["owner"] = owner
                 provided = (description or "").strip()
-                rec["description"] = provided or rec.get("description") \
+                rec["description"] = (
+                    provided
+                    or rec.get("description")
                     or describe_service(
-                        service_name=service_name, host_id=host_id,
-                        port=port, owner=owner or rec.get("owner"),
-                        route=rec["route"])
+                        service_name=service_name,
+                        host_id=host_id,
+                        port=port,
+                        owner=owner or rec.get("owner"),
+                        route=rec["route"],
+                    )
+                )
                 rec["updated_at"] = self._stamp()
-                self.record_event("service", svcid, "ServiceUpdated",
-                                  {"service_name": service_name,
-                                   "host_id": host_id, "port": port,
-                                   "route": rec["route"], "status": status,
-                                   "description": rec["description"],
-                                   "owner": rec.get("owner")},
-                                  session_id=session_id)
+                self.record_event(
+                    "service",
+                    svcid,
+                    "ServiceUpdated",
+                    {
+                        "service_name": service_name,
+                        "host_id": host_id,
+                        "port": port,
+                        "route": rec["route"],
+                        "status": status,
+                        "description": rec["description"],
+                        "owner": rec.get("owner"),
+                    },
+                    session_id=session_id,
+                )
                 return svcid
-        return self.register_service(service_name, host_id, port,
-                                     session_id=session_id, status=status,
-                                     route=route, description=description,
-                                     owner=owner)
+        return self.register_service(
+            service_name,
+            host_id,
+            port,
+            session_id=session_id,
+            status=status,
+            route=route,
+            description=description,
+            owner=owner,
+        )
 
     def _ensure_service_desc(self, rec):
         """Guarantee ``rec`` carries a non-empty human description.
@@ -274,8 +368,11 @@ class ControlPlaneRepo:
         if not (rec.get("description") or "").strip():
             rec["description"] = describe_service(
                 service_name=rec.get("service_name"),
-                host_id=rec.get("host_id"), port=rec.get("port"),
-                owner=rec.get("owner"), route=rec.get("route"))
+                host_id=rec.get("host_id"),
+                port=rec.get("port"),
+                owner=rec.get("owner"),
+                route=rec.get("route"),
+            )
         return rec
 
     def get_service(self, service_id):
@@ -285,9 +382,11 @@ class ControlPlaneRepo:
         return _copy(self._ensure_service_desc(s))
 
     def list_services(self):
-        return _sort_by([_copy(self._ensure_service_desc(s))
-                         for s in self._services.values()],
-                        "created_at", reverse=True)
+        return _sort_by(
+            [_copy(self._ensure_service_desc(s)) for s in self._services.values()],
+            "created_at",
+            reverse=True,
+        )
 
     def mark_service_unavailable(self, service_id):
         s = self._services.get(service_id)
@@ -301,21 +400,24 @@ class ControlPlaneRepo:
     def register_host(self, host_name, tailnet_ip):
         hid = new_id("host")
         rec = {
-            "host_id": hid, "host_name": host_name, "tailnet_ip": tailnet_ip,
-            "status": "healthy", "last_seen": self._stamp(),
+            "host_id": hid,
+            "host_name": host_name,
+            "tailnet_ip": tailnet_ip,
+            "status": "healthy",
+            "last_seen": self._stamp(),
             "created_at": self._stamp(),
         }
         self._hosts[hid] = rec
-        self.record_event("host", hid, "HostRegistered",
-                          {"host_name": host_name, "tailnet_ip": tailnet_ip})
+        self.record_event(
+            "host", hid, "HostRegistered", {"host_name": host_name, "tailnet_ip": tailnet_ip}
+        )
         return hid
 
     def get_host(self, host_id):
         return _copy(self._hosts.get(host_id))
 
     def list_hosts(self):
-        return _sort_by([_copy(h) for h in self._hosts.values()],
-                        "host_name")
+        return _sort_by([_copy(h) for h in self._hosts.values()], "host_name")
 
     def record_heartbeat(self, host_id, tailnet_ip=None, cpu=None, mem=None):
         h = self._hosts.get(host_id)
@@ -354,19 +456,27 @@ class ControlPlaneRepo:
     # heartbeat. The durable sink persists each recorded event, so re-hydration
     # after a restart reproduces exactly the same stable entities.
 
-    def upsert_host(self, host_id, host_name, tailnet_ip, *,
-                    cpu=None, mem=None, status="healthy"):
+    def upsert_host(self, host_id, host_name, tailnet_ip, *, cpu=None, mem=None, status="healthy"):
         stamp = self._stamp()
         existing = self._hosts.get(host_id)
         if existing is None:
-            rec = {"host_id": host_id, "host_name": host_name,
-                   "tailnet_ip": tailnet_ip, "status": status,
-                   "cpu": cpu, "mem": mem,
-                   "last_seen": stamp, "created_at": stamp}
+            rec = {
+                "host_id": host_id,
+                "host_name": host_name,
+                "tailnet_ip": tailnet_ip,
+                "status": status,
+                "cpu": cpu,
+                "mem": mem,
+                "last_seen": stamp,
+                "created_at": stamp,
+            }
             self._hosts[host_id] = rec
-            self.record_event("host", host_id, "HostRegistered",
-                              {"host_name": host_name,
-                               "tailnet_ip": tailnet_ip})
+            self.record_event(
+                "host",
+                host_id,
+                "HostRegistered",
+                {"host_name": host_name, "tailnet_ip": tailnet_ip},
+            )
             return _copy(rec)
         existing["host_name"] = host_name or existing["host_name"]
         existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
@@ -376,34 +486,77 @@ class ControlPlaneRepo:
             existing["cpu"] = cpu
         if mem is not None:
             existing["mem"] = mem
-        self.record_event("host", host_id, "HostHeartbeat",
-                          {"host_name": existing["host_name"],
-                           "tailnet_ip": existing["tailnet_ip"],
-                           "cpu": cpu, "mem": mem})
+        self.record_event(
+            "host",
+            host_id,
+            "HostHeartbeat",
+            {
+                "host_name": existing["host_name"],
+                "tailnet_ip": existing["tailnet_ip"],
+                "cpu": cpu,
+                "mem": mem,
+            },
+        )
         return _copy(existing)
 
-    def upsert_session(self, session_id, *, host_id=None, mission_id=None,
-                       agent_role="", model="", status="active",
-                       cwd=None, branch=None, pid=None, cmdline=None,
-                       summary=None, attach=None):
+    def upsert_session(
+        self,
+        session_id,
+        *,
+        host_id=None,
+        mission_id=None,
+        agent_role="",
+        model="",
+        status="active",
+        cwd=None,
+        branch=None,
+        pid=None,
+        cmdline=None,
+        summary=None,
+        attach=None,
+    ):
         stamp = self._stamp()
         existing = self._sessions.get(session_id)
-        detail = {"cwd": cwd, "branch": branch, "pid": pid,
-                  "cmdline": cmdline, "summary": summary, "attach": attach}
+        detail = {
+            "cwd": cwd,
+            "branch": branch,
+            "pid": pid,
+            "cmdline": cmdline,
+            "summary": summary,
+            "attach": attach,
+        }
         if existing is None:
-            rec = {"session_id": session_id, "mission_id": mission_id,
-                   "host_id": host_id, "agent_role": agent_role,
-                   "model": model, "status": status,
-                   "created_at": stamp, "updated_at": stamp,
-                   "messages": 0, "tool_calls": 0, **detail}
+            rec = {
+                "session_id": session_id,
+                "mission_id": mission_id,
+                "host_id": host_id,
+                "agent_role": agent_role,
+                "model": model,
+                "status": status,
+                "created_at": stamp,
+                "updated_at": stamp,
+                "messages": 0,
+                "tool_calls": 0,
+                **detail,
+            }
             self._sessions[session_id] = rec
             if mission_id and mission_id in self._missions:
                 self._missions[mission_id]["sessions"].append(session_id)
-            self.record_event("session", session_id, "SessionStarted",
-                              {"host_id": host_id, "mission_id": mission_id,
-                               "agent_role": agent_role, "model": model,
-                               "status": status, **{k: v for k, v in detail.items() if v is not None}},
-                              mission_id=mission_id, session_id=session_id)
+            self.record_event(
+                "session",
+                session_id,
+                "SessionStarted",
+                {
+                    "host_id": host_id,
+                    "mission_id": mission_id,
+                    "agent_role": agent_role,
+                    "model": model,
+                    "status": status,
+                    **{k: v for k, v in detail.items() if v is not None},
+                },
+                mission_id=mission_id,
+                session_id=session_id,
+            )
             return _copy(rec)
         existing["updated_at"] = stamp
         if host_id is not None:
@@ -420,35 +573,63 @@ class ControlPlaneRepo:
                 existing[k] = v
         # Carry the full identity state in the delta so event-sourced
         # hydration (bridge._reconstruct_from_events) can rebuild the record.
-        self.record_event("session", session_id, "SessionUpdated",
-                          {k: existing[k] for k in (
-                              "host_id", "mission_id", "agent_role", "model",
-                              "status", "cwd", "branch", "pid", "cmdline",
-                              "summary", "attach") if existing.get(k) is not None},
-                          mission_id=existing["mission_id"],
-                          session_id=session_id)
+        self.record_event(
+            "session",
+            session_id,
+            "SessionUpdated",
+            {
+                k: existing[k]
+                for k in (
+                    "host_id",
+                    "mission_id",
+                    "agent_role",
+                    "model",
+                    "status",
+                    "cwd",
+                    "branch",
+                    "pid",
+                    "cmdline",
+                    "summary",
+                    "attach",
+                )
+                if existing.get(k) is not None
+            },
+            mission_id=existing["mission_id"],
+            session_id=session_id,
+        )
         return _copy(existing)
 
-    def upsert_mission(self, mission_id, *, title, purpose="", stage="active",
-                       cwd=None, source="herdr"):
+    def upsert_mission(
+        self, mission_id, *, title, purpose="", stage="active", cwd=None, source="herdr"
+    ):
         if ":" in source or ":" in mission_id:
-            raise ValueError(
-                "mission source and mission_id must not contain ':'")
+            raise ValueError("mission source and mission_id must not contain ':'")
         key = mission_id if source == "herdr" else f"{source}:{mission_id}"
         stamp = self._stamp()
         existing = self._missions.get(key)
         if existing is None:
             title = title or mission_id  # only default to the id on create
-            rec = {"mission_id": mission_id, "title": title,
-                   "purpose": purpose, "stage": stage, "status": stage,
-                   "cwd": cwd, "source": source, "mission_key": key,
-                   "created_at": stamp, "updated_at": stamp, "sessions": []}
+            rec = {
+                "mission_id": mission_id,
+                "title": title,
+                "purpose": purpose,
+                "stage": stage,
+                "status": stage,
+                "cwd": cwd,
+                "source": source,
+                "mission_key": key,
+                "created_at": stamp,
+                "updated_at": stamp,
+                "sessions": [],
+            }
             self._missions[key] = rec
-            self.record_event("mission", key, "MissionStarted",
-                              {"title": title, "purpose": purpose,
-                               "stage": stage, "cwd": cwd,
-                               "source": source},
-                              mission_id=mission_id)
+            self.record_event(
+                "mission",
+                key,
+                "MissionStarted",
+                {"title": title, "purpose": purpose, "stage": stage, "cwd": cwd, "source": source},
+                mission_id=mission_id,
+            )
             return _copy(rec)
         existing["updated_at"] = stamp
         if title:
@@ -459,29 +640,409 @@ class ControlPlaneRepo:
             existing["cwd"] = cwd
         if stage:
             existing["stage"] = existing["status"] = stage
-        self.record_event("mission", key, "MissionUpdated",
-                          {"title": existing["title"],
-                           "purpose": existing["purpose"],
-                           "stage": existing["stage"],
-                           "status": existing["status"],
-                           "cwd": existing.get("cwd")},
-                          mission_id=mission_id)
+        self.record_event(
+            "mission",
+            key,
+            "MissionUpdated",
+            {
+                "title": existing["title"],
+                "purpose": existing["purpose"],
+                "stage": existing["stage"],
+                "status": existing["status"],
+                "cwd": existing.get("cwd"),
+            },
+            mission_id=mission_id,
+        )
         return _copy(existing)
 
+    # --------------------------------------------- CI: test runs / builds
+    def upsert_test_run(
+        self,
+        run_id,
+        *,
+        mission_id=None,
+        session_id=None,
+        repository=None,
+        status=None,
+        passed=None,
+        failed=None,
+        skipped=None,
+        total=None,
+        started_at=None,
+        ended_at=None,
+        kind="test",
+        results=None,
+    ):
+        stamp = self._stamp()
+        existing = self._test_runs.get(run_id)
+        results = [dict(r) for r in (results or [])]
+        if existing is None:
+            rec = {
+                "test_run_id": run_id,
+                "kind": kind,
+                "mission_id": mission_id,
+                "session_id": session_id,
+                "repository": repository,
+                "status": status,
+                "passed": passed,
+                "failed": failed,
+                "skipped": skipped,
+                "total": total,
+                "started_at": started_at or stamp,
+                "ended_at": ended_at,
+                "results": results,
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+            self._test_runs[run_id] = rec
+            self.record_event(
+                "test_run",
+                run_id,
+                "TestRunStarted" if kind == "test" else "BuildStarted",
+                {
+                    k: rec[k]
+                    for k in (
+                        "kind",
+                        "mission_id",
+                        "session_id",
+                        "repository",
+                        "status",
+                        "passed",
+                        "failed",
+                        "skipped",
+                        "total",
+                        "started_at",
+                        "ended_at",
+                        "results",
+                    )
+                },
+                mission_id=mission_id,
+                session_id=session_id,
+            )
+            return _copy(rec)
+        existing["updated_at"] = stamp
+        for k, v in {
+            "mission_id": mission_id,
+            "session_id": session_id,
+            "repository": repository,
+            "status": status,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+            "total": total,
+            "started_at": started_at,
+            "ended_at": ended_at,
+        }.items():
+            if v is not None:
+                existing[k] = v
+        if results:
+            existing["results"] = results
+        self.record_event(
+            "test_run",
+            run_id,
+            "TestRunUpdated" if kind == "test" else "BuildUpdated",
+            {
+                k: existing[k]
+                for k in (
+                    "kind",
+                    "mission_id",
+                    "session_id",
+                    "repository",
+                    "status",
+                    "passed",
+                    "failed",
+                    "skipped",
+                    "total",
+                    "started_at",
+                    "ended_at",
+                    "results",
+                )
+            },
+            mission_id=existing["mission_id"],
+            session_id=existing["session_id"],
+        )
+        return _copy(existing)
+
+    def upsert_build(self, build_id, **kw):
+        return self.upsert_test_run(build_id, kind="build", **kw)
+
+    def get_test_run(self, run_id):
+        return _deep_copy(self._test_runs.get(run_id))
+
+    def list_test_runs(self, mission_id=None, kind=None):
+        out = []
+        for rec in self._test_runs.values():
+            if mission_id is not None and rec.get("mission_id") != mission_id:
+                continue
+            if kind is not None and rec.get("kind") != kind:
+                continue
+            out.append(_deep_copy(rec))
+        return _sort_by(out, "created_at")
+
+    # ------------------------------------------------------------ reviews
+    def upsert_review(
+        self,
+        review_id,
+        *,
+        mission_id=None,
+        session_id=None,
+        reviewer=None,
+        status=None,
+        verdict=None,
+        started_at=None,
+        completed_at=None,
+    ):
+        stamp = self._stamp()
+        existing = self._reviews.get(review_id)
+        if existing is None:
+            rec = {
+                "review_id": review_id,
+                "mission_id": mission_id,
+                "session_id": session_id,
+                "reviewer": reviewer,
+                "status": status,
+                "verdict": verdict,
+                "started_at": started_at or stamp,
+                "completed_at": completed_at,
+                "findings": [],
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+            self._reviews[review_id] = rec
+            self.record_event(
+                "review",
+                review_id,
+                "ReviewStarted",
+                {
+                    k: rec[k]
+                    for k in (
+                        "mission_id",
+                        "session_id",
+                        "reviewer",
+                        "status",
+                        "verdict",
+                        "started_at",
+                        "completed_at",
+                    )
+                },
+                mission_id=mission_id,
+                session_id=session_id,
+            )
+            return _deep_copy(rec)
+        existing["updated_at"] = stamp
+        for k, v in {
+            "mission_id": mission_id,
+            "session_id": session_id,
+            "reviewer": reviewer,
+            "status": status,
+            "verdict": verdict,
+            "started_at": started_at,
+            "completed_at": completed_at,
+        }.items():
+            if v is not None:
+                existing[k] = v
+        self.record_event(
+            "review",
+            review_id,
+            "ReviewUpdated",
+            {
+                k: existing[k]
+                for k in (
+                    "mission_id",
+                    "session_id",
+                    "reviewer",
+                    "status",
+                    "verdict",
+                    "started_at",
+                    "completed_at",
+                )
+            },
+            mission_id=existing["mission_id"],
+            session_id=existing["session_id"],
+        )
+        return _deep_copy(existing)
+
+    def add_review_finding(
+        self, review_id, *, severity, summary, detail="", status="open", finding_id=None
+    ):
+        review = self._reviews.get(review_id)
+        if review is None:
+            raise KeyError(review_id)
+        findings = review["findings"]
+        if finding_id is None:
+            finding_id = f"{review_id}:{len(findings) + 1}"
+        finding = {
+            "finding_id": finding_id,
+            "severity": severity,
+            "summary": summary,
+            "detail": detail,
+            "status": status,
+        }
+        for i, f in enumerate(findings):
+            if f["finding_id"] == finding_id:
+                findings[i] = finding
+                break
+        else:
+            findings.append(finding)
+        self.record_event(
+            "review",
+            review_id,
+            "ReviewFindingAdded",
+            dict(finding),
+            mission_id=review["mission_id"],
+        )
+        return dict(finding)
+
+    def get_review(self, review_id):
+        return _deep_copy(self._reviews.get(review_id))
+
+    def list_reviews(self, mission_id=None):
+        out = []
+        for rec in self._reviews.values():
+            if mission_id is not None and rec.get("mission_id") != mission_id:
+                continue
+            out.append(_deep_copy(rec))
+        return _sort_by(out, "created_at")
+
+    # ------------------------------------------------------- pull requests
+    def upsert_pull_request(
+        self,
+        pr_id,
+        *,
+        mission_id=None,
+        repository=None,
+        number=None,
+        url=None,
+        status=None,
+        branch=None,
+        base=None,
+        created_at=None,
+    ):
+        stamp = self._stamp()
+        existing = self._pull_requests.get(pr_id)
+        if existing is None:
+            rec = {
+                "pr_id": pr_id,
+                "mission_id": mission_id,
+                "repository": repository,
+                "number": number,
+                "url": url,
+                "status": status,
+                "branch": branch,
+                "base": base,
+                "created_at": created_at or stamp,
+                "updated_at": stamp,
+            }
+            self._pull_requests[pr_id] = rec
+            self.record_event(
+                "pull_request",
+                pr_id,
+                "PullRequestOpened",
+                {
+                    k: rec[k]
+                    for k in (
+                        "mission_id",
+                        "repository",
+                        "number",
+                        "url",
+                        "status",
+                        "branch",
+                        "base",
+                        "created_at",
+                    )
+                },
+                mission_id=mission_id,
+            )
+            return _copy(rec)
+        old_status = existing.get("status")
+        existing["updated_at"] = stamp
+        for k, v in {
+            "mission_id": mission_id,
+            "repository": repository,
+            "number": number,
+            "url": url,
+            "status": status,
+            "branch": branch,
+            "base": base,
+            "created_at": created_at,
+        }.items():
+            if v is not None:
+                existing[k] = v
+        self.record_event(
+            "pull_request",
+            pr_id,
+            "PullRequestUpdated",
+            {
+                k: existing[k]
+                for k in (
+                    "mission_id",
+                    "repository",
+                    "number",
+                    "url",
+                    "status",
+                    "branch",
+                    "base",
+                    "created_at",
+                )
+            },
+            mission_id=existing["mission_id"],
+        )
+        if existing["status"] == "merged" and old_status != "merged":
+            self.record_event(
+                "pull_request",
+                pr_id,
+                "PullRequestMerged",
+                {
+                    "pr_id": pr_id,
+                    "mission_id": existing["mission_id"],
+                    "repository": existing["repository"],
+                    "number": existing["number"],
+                    "status": existing["status"],
+                },
+                mission_id=existing["mission_id"],
+            )
+        return _copy(existing)
+
+    def get_pull_request(self, pr_id):
+        return _copy(self._pull_requests.get(pr_id))
+
+    def list_pull_requests(self, mission_id=None):
+        out = []
+        for rec in self._pull_requests.values():
+            if mission_id is not None and rec.get("mission_id") != mission_id:
+                continue
+            out.append(_copy(rec))
+        return _sort_by(out, "created_at")
+
     # ------------------------------------------------------------- artifacts
-    def register_artifact(self, session_id=None, original_filename="",
-                          mime_type="", size_bytes=0, sha256="",
-                          storage_key="", mission_id=None, data=None):
+    def register_artifact(
+        self,
+        session_id=None,
+        original_filename="",
+        mime_type="",
+        size_bytes=0,
+        sha256="",
+        storage_key="",
+        mission_id=None,
+        data=None,
+    ):
         import hashlib
+
         if data is not None and not sha256:
             sha256 = hashlib.sha256(data).hexdigest()
         aid = new_id("artifact")
         rec = {
-            "artifact_id": aid, "session_id": session_id,
-            "mission_id": mission_id, "original_filename": original_filename,
-            "mime_type": mime_type, "size_bytes": size_bytes, "sha256": sha256,
-            "storage_key": storage_key, "status": "available",
-            "materializations": 0, "created_at": self._stamp(),
+            "artifact_id": aid,
+            "session_id": session_id,
+            "mission_id": mission_id,
+            "original_filename": original_filename,
+            "mime_type": mime_type,
+            "size_bytes": size_bytes,
+            "sha256": sha256,
+            "storage_key": storage_key,
+            "status": "available",
+            "materializations": 0,
+            "created_at": self._stamp(),
         }
         self._artifacts[aid] = rec
         if data is not None:
@@ -489,14 +1050,22 @@ class ControlPlaneRepo:
             rec["size_bytes"] = len(data)
         # Persist full metadata so artifact records survive a restart via the
         # event log (payload bytes live in the object store, not the event).
-        self.record_event("artifact", aid, "ArtifactRegistered",
-                          {"filename": original_filename, "sha256": sha256,
-                           "storage_key": storage_key,
-                           "size_bytes": rec.get("size_bytes", 0),
-                           "mime_type": mime_type,
-                           "session_id": session_id,
-                           "mission_id": mission_id},
-                          mission_id=mission_id, session_id=session_id)
+        self.record_event(
+            "artifact",
+            aid,
+            "ArtifactRegistered",
+            {
+                "filename": original_filename,
+                "sha256": sha256,
+                "storage_key": storage_key,
+                "size_bytes": rec.get("size_bytes", 0),
+                "mime_type": mime_type,
+                "session_id": session_id,
+                "mission_id": mission_id,
+            },
+            mission_id=mission_id,
+            session_id=session_id,
+        )
         return aid
 
     def get_artifact_data(self, artifact_id):
@@ -505,24 +1074,28 @@ class ControlPlaneRepo:
     def get_artifact(self, artifact_id):
         return _copy(self._artifacts.get(artifact_id))
 
-    def materialize_artifact(self, artifact_id, host_id, session_id,
-                             local_path):
+    def materialize_artifact(self, artifact_id, host_id, session_id, local_path):
         a = self._artifacts.get(artifact_id)
         if a is None:
             return False
         a["materializations"] += 1
-        a["last_materialized"] = {"host_id": host_id,
-                                  "session_id": session_id,
-                                  "local_path": local_path,
-                                  "at": self._stamp()}
+        a["last_materialized"] = {
+            "host_id": host_id,
+            "session_id": session_id,
+            "local_path": local_path,
+            "at": self._stamp(),
+        }
         return True
 
     # --------------------------------------------------------------- leases
     def register_lease(self, host_id, target_port, dev_port):
         rec = {
-            "lease_id": new_id("lease"), "host_id": host_id,
-            "target_port": target_port, "dev_port": dev_port,
-            "state": "active", "created_at": self._stamp(),
+            "lease_id": new_id("lease"),
+            "host_id": host_id,
+            "target_port": target_port,
+            "dev_port": dev_port,
+            "state": "active",
+            "created_at": self._stamp(),
         }
         self._leases[rec["lease_id"]] = rec
         return _copy(rec)
@@ -537,8 +1110,9 @@ class ControlPlaneRepo:
         return False
 
     # --------------------------------------------------------------- events
-    def record_event(self, entity_type, entity_id, event_type, payload=None,
-                     mission_id=None, session_id=None):
+    def record_event(
+        self, entity_type, entity_id, event_type, payload=None, mission_id=None, session_id=None
+    ):
         key = (entity_type, entity_id)
         stream = self._events.setdefault(key, [])
         seq = len(stream)
@@ -547,9 +1121,12 @@ class ControlPlaneRepo:
             "schema_version": 1,
             "source_timestamp": self._stamp(),
             "ingest_timestamp": self._stamp(),
-            "entity_type": entity_type, "entity_id": entity_id,
-            "mission_id": mission_id, "session_id": session_id,
-            "sequence": seq, "event_type": event_type,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "mission_id": mission_id,
+            "session_id": session_id,
+            "sequence": seq,
+            "event_type": event_type,
             "payload": payload or {},
         }
         stream.append(ev)
@@ -581,26 +1158,57 @@ class ControlPlaneRepo:
     # ------------------------------------------- LLM usage, keys, custom models
     # All persisted as events (entity types ``token_usage``, ``llm_key``,
     # ``custom_model``) so the existing durable sink and replay carry them.
-    def record_token_usage(self, project, model, input_tokens=0, output_tokens=0, *,
-                           reasoning_tokens=0, cache_read_tokens=0, duration_ms=None,
-                           success=True, request_id=None, session_id=None,
-                           mission_id=None, key_id=None, source="llm-proxy"):
+    def record_token_usage(
+        self,
+        project,
+        model,
+        input_tokens=0,
+        output_tokens=0,
+        *,
+        reasoning_tokens=0,
+        cache_read_tokens=0,
+        duration_ms=None,
+        success=True,
+        request_id=None,
+        session_id=None,
+        mission_id=None,
+        key_id=None,
+        source="llm-proxy",
+    ):
         if not project:
             raise ValueError("project is required")
-        payload = {"project": project, "model": model or "unknown",
-                   "input_tokens": int(input_tokens or 0),
-                   "output_tokens": int(output_tokens or 0),
-                   "reasoning_tokens": int(reasoning_tokens or 0),
-                   "cache_read_tokens": int(cache_read_tokens or 0),
-                   "duration_ms": duration_ms, "success": bool(success),
-                   "request_id": request_id, "key_id": key_id, "source": source}
-        return self.record_event("token_usage", project, "token_usage.recorded",
-                                 payload, mission_id=mission_id, session_id=session_id)
+        payload = {
+            "project": project,
+            "model": model or "unknown",
+            "input_tokens": int(input_tokens or 0),
+            "output_tokens": int(output_tokens or 0),
+            "reasoning_tokens": int(reasoning_tokens or 0),
+            "cache_read_tokens": int(cache_read_tokens or 0),
+            "duration_ms": duration_ms,
+            "success": bool(success),
+            "request_id": request_id,
+            "key_id": key_id,
+            "source": source,
+        }
+        return self.record_event(
+            "token_usage",
+            project,
+            "token_usage.recorded",
+            payload,
+            mission_id=mission_id,
+            session_id=session_id,
+        )
 
     def token_analytics(self, project=None, since=None):
         """Aggregate token usage by project, model and day (UTC)."""
-        total = {"requests": 0, "input_tokens": 0, "output_tokens": 0,
-                 "reasoning_tokens": 0, "cache_read_tokens": 0, "failed": 0}
+        total = {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "cache_read_tokens": 0,
+            "failed": 0,
+        }
         by_project, by_model, by_day = {}, {}, {}
 
         def add(bucket, key, p):
@@ -618,8 +1226,12 @@ class ControlPlaneRepo:
                 add(by_project, p["project"], p)
                 add(by_model, p["model"], p)
                 add(by_day, ev["source_timestamp"][:10], p)
-        return {"total": total, "by_project": by_project, "by_model": by_model,
-                "by_day": dict(sorted(by_day.items()))}
+        return {
+            "total": total,
+            "by_project": by_project,
+            "by_model": by_model,
+            "by_day": dict(sorted(by_day.items())),
+        }
 
     def create_project_key(self, project, label=""):
         """Mint a gateway key for ``project``; the secret is returned once and only
@@ -628,19 +1240,28 @@ class ControlPlaneRepo:
             raise ValueError("project is required")
         import hashlib
         import secrets
+
         key = "hk-" + secrets.token_urlsafe(32)
         key_id = new_id("llmkey")
-        self.record_event("llm_key", key_id, "llm_key.created", {
-            "key_id": key_id, "project": project, "label": label,
-            "key_hash": hashlib.sha256(key.encode()).hexdigest(), "revoked": False})
+        self.record_event(
+            "llm_key",
+            key_id,
+            "llm_key.created",
+            {
+                "key_id": key_id,
+                "project": project,
+                "label": label,
+                "key_hash": hashlib.sha256(key.encode()).hexdigest(),
+                "revoked": False,
+            },
+        )
         return {"key_id": key_id, "project": project, "key": key}
 
     def revoke_project_key(self, key_id):
         keys = {k["key_id"]: k for k in self._llm_keys()}
         if key_id not in keys:
             raise KeyError(key_id)
-        self.record_event("llm_key", key_id, "llm_key.revoked",
-                          dict(keys[key_id], revoked=True))
+        self.record_event("llm_key", key_id, "llm_key.revoked", dict(keys[key_id], revoked=True))
 
     def _llm_keys(self):
         out = []
@@ -650,25 +1271,27 @@ class ControlPlaneRepo:
         return out
 
     def list_project_keys(self):
-        return [{k: v for k, v in key.items() if k != "key_hash"}
-                for key in self._llm_keys()]
+        return [{k: v for k, v in key.items() if k != "key_hash"} for key in self._llm_keys()]
 
     def upsert_custom_model(self, name, base_url, upstream_model=None, project=None):
         if not name or not base_url:
             raise ValueError("name and base_url are required")
         if not str(base_url).startswith(("http://", "https://")):
             raise ValueError("base_url must be http(s)")
-        payload = {"name": name, "base_url": base_url.rstrip("/"),
-                   "upstream_model": upstream_model or name, "project": project,
-                   "deleted": False}
+        payload = {
+            "name": name,
+            "base_url": base_url.rstrip("/"),
+            "upstream_model": upstream_model or name,
+            "project": project,
+            "deleted": False,
+        }
         return self.record_event("custom_model", name, "custom_model.upserted", payload)
 
     def delete_custom_model(self, name):
         cur = self.list_custom_models(include_deleted=True).get(name)
         if cur is None:
             raise KeyError(name)
-        self.record_event("custom_model", name, "custom_model.deleted",
-                          dict(cur, deleted=True))
+        self.record_event("custom_model", name, "custom_model.deleted", dict(cur, deleted=True))
 
     def list_custom_models(self, include_deleted=False):
         out = {}
@@ -681,10 +1304,14 @@ class ControlPlaneRepo:
 
     def llm_config(self):
         """What the LLM proxy needs: active key hashes and custom models."""
-        return {"keys": [{"key_id": k["key_id"], "project": k["project"],
-                          "key_hash": k["key_hash"]}
-                         for k in self._llm_keys() if not k.get("revoked")],
-                "custom_models": list(self.list_custom_models().values())}
+        return {
+            "keys": [
+                {"key_id": k["key_id"], "project": k["project"], "key_hash": k["key_hash"]}
+                for k in self._llm_keys()
+                if not k.get("revoked")
+            ],
+            "custom_models": list(self.list_custom_models().values()),
+        }
 
     # ------------------------------------------------------------- analytics
     def mission_analytics(self):
@@ -692,10 +1319,13 @@ class ControlPlaneRepo:
         for m in self._missions.values():
             by_stage[m["stage"]] = by_stage.get(m["stage"], 0) + 1
         total = len(self._missions)
-        completed = sum(1 for m in self._missions.values()
-                        if m["stage"] == "complete")
-        return {"total": total, "completed": completed,
-                "completion_rate": _pct(completed, total), "by_stage": by_stage}
+        completed = sum(1 for m in self._missions.values() if m["stage"] == "complete")
+        return {
+            "total": total,
+            "completed": completed,
+            "completion_rate": _pct(completed, total),
+            "by_stage": by_stage,
+        }
 
     def model_analytics(self):
         usage = {}
@@ -707,11 +1337,9 @@ class ControlPlaneRepo:
         return {"models": usage, "total_sessions": len(self._sessions)}
 
     def host_analytics(self):
-        healthy = sum(1 for h in self._hosts.values()
-                      if h["status"] == "healthy")
+        healthy = sum(1 for h in self._hosts.values() if h["status"] == "healthy")
         total = len(self._hosts)
-        return {"total": total, "healthy": healthy,
-                "unavailable": total - healthy}
+        return {"total": total, "healthy": healthy, "unavailable": total - healthy}
 
     # --------------------------------------------------- backup / restore
     def export_state(self):
@@ -723,13 +1351,12 @@ class ControlPlaneRepo:
             "services": _copy(self._services),
             "hosts": _copy(self._hosts),
             "artifacts": _copy(self._artifacts),
-            "blobs": {k: __import__("base64").b64encode(v).decode()
-                      for k, v in self._blobs.items()},
+            "blobs": {
+                k: __import__("base64").b64encode(v).decode() for k, v in self._blobs.items()
+            },
             "leases": _copy(self._leases),
-            "telemetry": {k: [dict(s) for s in v]
-                          for k, v in self._telemetry.items()},
-            "events": {f"{t}|{i}": [dict(e) for e in s]
-                       for (t, i), s in self._events.items()},
+            "telemetry": {k: [dict(s) for s in v] for k, v in self._telemetry.items()},
+            "events": {f"{t}|{i}": [dict(e) for e in s] for (t, i), s in self._events.items()},
             "event_order": list(self._event_order),
         }
 
@@ -740,11 +1367,11 @@ class ControlPlaneRepo:
         self._services = dict(state.get("services", {}))
         self._hosts = dict(state.get("hosts", {}))
         self._artifacts = dict(state.get("artifacts", {}))
-        self._blobs = {k: __import__("base64").b64decode(v)
-                       for k, v in state.get("blobs", {}).items()}
+        self._blobs = {
+            k: __import__("base64").b64decode(v) for k, v in state.get("blobs", {}).items()
+        }
         self._leases = dict(state.get("leases", {}))
-        self._telemetry = {k: [dict(s) for s in v]
-                          for k, v in state.get("telemetry", {}).items()}
+        self._telemetry = {k: [dict(s) for s in v] for k, v in state.get("telemetry", {}).items()}
         self._events = {}
         for key, stream in state.get("events", {}).items():
             t, i = key.split("|")
@@ -768,8 +1395,10 @@ class ControlPlaneRepo:
         return {
             "status": "ok",
             "events": {"ingested": len(self._event_order)},
-            "missions": len(self._missions), "sessions": len(self._sessions),
-            "hosts": len(self._hosts), "services": len(self._services),
+            "missions": len(self._missions),
+            "sessions": len(self._sessions),
+            "hosts": len(self._hosts),
+            "services": len(self._services),
             "inspector": self.inspector.health(),
             "timestamp": self._stamp(),
         }
@@ -799,8 +1428,20 @@ def _copy(d):
     return dict(d) if d is not None else None
 
 
+def _deep_copy(d):
+    """Copy a record including its nested lists (findings, results)."""
+    if d is None:
+        return None
+    out = dict(d)
+    for k, v in d.items():
+        if isinstance(v, list):
+            out[k] = [dict(item) for item in v]
+    return out
+
+
 def _iso(ts):
     import datetime as _dt
+
     return _dt.datetime.fromtimestamp(ts, tz=_dt.UTC).isoformat()
 
 
