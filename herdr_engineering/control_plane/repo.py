@@ -534,7 +534,7 @@ class ControlPlaneRepo:
                 "total": total,
                 "started_at": started_at or stamp,
                 "ended_at": ended_at,
-                "results": results,
+                "results": [] if results is None else results,
                 "created_at": stamp,
                 "updated_at": stamp,
             }

@@ -341,3 +341,13 @@ def test_namespaced_mission_id_round_trips_through_filters():
     assert runs[0]["mission_id"] == "pi:MSN-1"
     assert reviews[0]["mission_id"] == "pi:MSN-1"
     assert prs[0]["mission_id"] == "pi:MSN-1"
+
+
+def test_upsert_test_run_and_build_default_results_to_empty_list():
+    r = ControlPlaneRepo()
+    created = r.upsert_test_run("a")
+    assert created["results"] == []
+    assert r.get_test_run("a")["results"] == []
+    ev = [e for e in r.stream("test_run", "a") if e["event_type"] == "TestRunStarted"]
+    assert ev[0]["payload"]["results"] == []
+    assert r.upsert_build("b")["results"] == []
