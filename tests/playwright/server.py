@@ -42,6 +42,12 @@ def _seed(repo):
                       {"cwd": "/home/user/work", "status": "active",
                        "attach": f"herdr workspace focus {m1}"},
                       mission_id=m1, session_id=s1)
+    # Non-herdr-sourced mission: keyed by mission_key 'pi:MSN-PI1' (UI-008).
+    repo.upsert_mission("MSN-PI1", title="Pi mission", purpose="from pi",
+                       stage="implementation", source="pi")
+    repo.record_event("mission", "pi:MSN-PI1", "MissionStageChanged",
+                      {"from": "planning", "to": "implementation"},
+                      mission_id="MSN-PI1")
     return m1, m2, s1
 
 

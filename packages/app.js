@@ -24,6 +24,10 @@ async function missionTitles() {
 }
 const titles = (cache) => cache || {};
 
+// Non-herdr-sourced missions are keyed by mission_key (e.g. 'pi:MSN-1'); the
+// bare mission_id only resolves for herdr-sourced ones (UI-005, UI-008).
+function missionKey(m) { return m.mission_key || m.mission_id; }
+
 defineComponents();
 
 const client = new HerdrClient('');
@@ -230,7 +234,7 @@ async function viewMissions() {
   if (!missions.length) { root.innerHTML = '<herdr-empty message="No missions yet"></herdr-empty>'; return; }
   root.innerHTML = '<h1>Missions</h1><div class="hd-grid">' + missions.map((m) => `
     <div class="hd-card">
-      <div class="hd-card__title"><a href="#/missions/${esc(m.mission_id)}">${esc(m.title)}</a></div>
+      <div class="hd-card__title"><a href="#/missions/${esc(missionKey(m))}">${esc(m.title)}</a></div>
       <div style="margin:6px 0"><herdr-status stage="${esc(m.status)}"></herdr-status></div>
       <div class="hd-card__sub">${esc(missionSubtitle(m, m.sessions ? m.sessions.length : 0))}</div>
       <div class="hd-card__sub">created ${formatTimestamp(m.created_at)}</div>
@@ -259,7 +263,7 @@ async function viewMission(parts) {
     <h3 style="margin-top:20px">Sessions</h3>
     ${await missionSessions(m)}
     <h3 style="margin-top:20px">Event stream</h3>
-    <div id="mission-stream">${await streamList('mission', m.mission_id)}</div>`;
+    <div id="mission-stream">${await streamList('mission', missionKey(m))}</div>`;
 }
 
 async function missionSessions(m) {
