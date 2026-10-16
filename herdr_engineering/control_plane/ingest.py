@@ -9,6 +9,7 @@ so repeated heartbeats never duplicate a record, and the same external id maps
 to one control-plane entity.
 """
 from __future__ import annotations
+
 import re
 
 
