@@ -48,6 +48,13 @@ def _seed(repo):
     repo.record_event("mission", "pi:MSN-PI1", "MissionStageChanged",
                       {"from": "planning", "to": "implementation"},
                       mission_id="MSN-PI1")
+    # Merged timeline entities for the pi mission (UI-009): one passed test
+    # run and one merged pull request -> timeline kinds 'test' and 'pr'/'merge'.
+    repo.upsert_test_run('run-1', mission_id='pi:MSN-PI1', status='passed',
+                         passed=3, failed=0, skipped=0, total=3)
+    repo.upsert_pull_request('pr-1', mission_id='pi:MSN-PI1', number=42,
+                             url='https://example.com/pr/42', status='merged',
+                             branch='ws/x', base='main')
     return m1, m2, s1
 
 
