@@ -41,12 +41,17 @@ def _is_loopback(host: str) -> bool:
 
 _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 _INDEX = "index.html"
+_MAX_JSON_BODY = 4 * 1024 * 1024
+_MAX_SSE_SECONDS = 3600
 
 
 class _DaemonThreadingServer(ThreadingHTTPServer):
     # Handler threads are daemons so a stuck SSE client can never block
     # server shutdown / process exit.
     daemon_threads = True
+    # The stdlib default backlog (5) resets connections when dozens of agents
+    # emit at once (60+ agents is the design point).
+    request_queue_size = 256
 
 
 class _RateLimiter:
@@ -159,7 +164,17 @@ class ControlPlaneServer:
             (self.host, self.port), _make_handler(self))
         self.port = self._httpd.server_address[1]
         self._ready.set()
+        threading.Thread(target=self._sweep_loop, daemon=True).start()
         self._httpd.serve_forever()
+
+    def _sweep_loop(self, interval=300):
+        """Apply inspector age retention to idle sessions too (ingest only prunes the active one)."""
+        while self._httpd is not None:
+            time.sleep(interval)
+            try:
+                self.repo.inspector.sweep()
+            except Exception:
+                pass
 
     def wait_until_ready(self, timeout=5.0):
         self._ready.wait(timeout=timeout)
@@ -285,6 +300,10 @@ def _make_handler(server):
                         {"error": "not found"}, 404)
                 status = _q(self.path, "status")
                 return self._json({"missions": r.list_missions(status)})
+            if resource == "inspector":
+                return self._inspector_global_get(parts)
+            if resource == "sessions" and len(parts) > 5 and parts[5] == "inspector":
+                return self._inspector_get(parts)
             if resource == "sessions":
                 if len(parts) > 4:
                     s = r.get_session(parts[4])
@@ -368,6 +387,13 @@ def _make_handler(server):
 
         def _api_post(self, parts, resource):
             r = server.repo
+            if resource == "inspector" and len(parts) == 5 and parts[4] == "preferences":
+                return self._inspector_set_prefs(None)
+            if (resource == "sessions" and len(parts) == 7 and parts[5] == "inspector"
+                    and parts[6] == "preferences"):
+                if r.get_session(parts[4]) is None and not r.inspector.has_session(parts[4]):
+                    return self._json({"error": "session not found"}, 404)
+                return self._inspector_set_prefs(parts[4])
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
@@ -420,9 +446,112 @@ def _make_handler(server):
             if resource == "ingest" and len(parts) == 4:
                 if not body:
                     return self._json({"error": "empty body"}, 400)
-                entity = server.ingest.ingest(redact_payload(body))
+                # Inspector envelopes are redacted per field by the store: the
+                # blanket key-hint redaction would mangle ``input_tokens`` and
+                # ``passed``.
+                if isinstance(body, dict) and body.get("entity_type") == "inspector":
+                    entity = server.ingest.ingest(body)
+                else:
+                    entity = server.ingest.ingest(redact_payload(body))
                 return self._json({"ok": True, "entity": entity})
             return self._json({"error": "not found"}, 404)
+
+        # ---------------------------------------------------- agent inspector
+        def _inspector_global_get(self, parts):
+            store = server.repo.inspector
+            what = parts[4] if len(parts) > 4 else ""
+            if what == "health":
+                return self._json(store.health())
+            if what == "preferences":
+                return self._json({"prefs": store.get_prefs(), "defaults": _defaults()})
+            return self._json({"error": "not found"}, 404)
+
+        def _inspector_get(self, parts):
+            store = server.repo.inspector
+            sid = parts[4]
+            role = self._role() or "viewer"
+            tail = parts[6:] if len(parts) > 6 else []
+            try:
+                if not tail:
+                    if not store.has_session(sid):
+                        if server.repo.get_session(sid) is None:
+                            return self._json({"error": "session not found"}, 404)
+                        return self._json(_empty_inspector(store, sid))
+                    return self._json(store.query(
+                        sid, role, view=_q(self.path, "view") or "all",
+                        q=_q(self.path, "q"), agent_id=_q(self.path, "agent_id"),
+                        status=_q(self.path, "status"),
+                        since_rev=_qint(self.path, "since_rev", 0),
+                        limit=_qint(self.path, "limit", 200),
+                        before_seq=(_qint(self.path, "before_seq", -1)
+                                    if _q(self.path, "before_seq") else None)))
+                if tail[0] == "events" and len(tail) == 2:
+                    if not tail[1].isdigit():
+                        return self._json({"error": "invalid sequence"}, 400)
+                    return self._json(store.get_event(sid, int(tail[1]), role))
+                if tail[0] == "preferences":
+                    return self._json({"prefs": store.get_prefs(sid),
+                                       "session": store.raw_prefs(sid),
+                                       "global": store.raw_prefs(),
+                                       "defaults": _defaults()})
+                if tail[0] == "stream":
+                    if not store.has_session(sid) and server.repo.get_session(sid) is None:
+                        return self._json({"error": "session not found"}, 404)
+                    if not store.can_subscribe(sid):
+                        return self._json({"error": "too many streams"}, 429)
+                    return self._inspector_sse(sid, role)
+            except KeyError:
+                return self._json({"error": "not found"}, 404)
+            return self._json({"error": "not found"}, 404)
+
+        def _inspector_set_prefs(self, sid):
+            body = self._read_json() or {}
+            try:
+                prefs = server.repo.inspector.set_prefs(body, sid)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+            return self._json({"ok": True, "prefs": prefs})
+
+        def _inspector_sse(self, sid, role):
+            store = server.repo.inspector
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            # A stalled client must not pin a handler thread forever.
+            try:
+                self.connection.settimeout(30)
+            except OSError:
+                pass
+            sub = store.subscribe(sid)
+            try:
+                self.wfile.write(_raw_frame({"type": "connected", "session_id": sid,
+                                              "epoch": store.epoch}))
+                self.wfile.flush()
+                last_beat = started = time.monotonic()
+                while time.monotonic() - started < _MAX_SSE_SECONDS:
+                    item = sub.get(timeout=15)
+                    if item is None:
+                        if time.monotonic() - last_beat >= 15:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            last_beat = time.monotonic()
+                        if sub.closed:
+                            break
+                        continue
+                    if item["type"] == "event":
+                        entry = store.stream_entry(sid, item["entry"], role)
+                        if entry is None:
+                            continue
+                        item = {"type": "event", "event": entry}
+                    self.wfile.write(_raw_frame(item))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                pass
+            finally:
+                store.unsubscribe(sid, sub)
+            return None
 
         def _upload_artifact(self, r, parts):
             length = int(self.headers.get("Content-Length") or 0)
@@ -509,6 +638,8 @@ def _make_handler(server):
             length = int(self.headers.get("Content-Length") or 0)
             if not length:
                 return None
+            if length > _MAX_JSON_BODY:
+                raise ValueError("request body too large")
             try:
                 return json.loads(self.rfile.read(length))
             except (ValueError, json.JSONDecodeError):
@@ -540,10 +671,28 @@ def _make_handler(server):
     return _Handler
 
 
+def _defaults() -> dict:
+    from .inspector import DEFAULT_LIMITS, DEFAULT_PREFS, HARD_CEILINGS
+    return {"prefs": DEFAULT_PREFS, "limits": DEFAULT_LIMITS, "ceilings": HARD_CEILINGS}
+
+
+def _empty_inspector(store, sid: str) -> dict:
+    """A known session that has not (yet) sent inspector telemetry: say so, never imply data."""
+    return {"session_id": sid, "view": "all", "epoch": store.epoch, "events": [], "has_more": False, "rev": 0,
+            "dropped": 0, "oldest_available_seq": None, "telemetry": "none",
+            "summary": None, "capabilities": {"declared": False, "reasoning": "unknown"},
+            "prefs": store.get_prefs(sid)}
+
+
 def _redact_event(event: dict) -> dict:
     ev = dict(event)
     ev["payload"] = redact_payload(ev.get("payload", {}))
     return ev
+
+
+def _raw_frame(obj: dict) -> bytes:
+    """SSE frame for already-sanitised inspector frames (no event-envelope redaction)."""
+    return f"data: {json.dumps(obj)}\n\n".encode()
 
 
 def _sse_frame(event: dict) -> bytes:

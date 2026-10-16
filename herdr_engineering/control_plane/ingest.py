@@ -26,6 +26,8 @@ class IngestService:
         if not entity_type or not entity_id or not event_type:
             raise ValueError(
                 "entity_type, entity_id, and event_type are required")
+        if not all(isinstance(v, str) for v in (entity_type, entity_id, event_type)):
+            raise ValueError("entity_type, entity_id, and event_type must be strings")
         payload = body.get("payload") or {}
         if not isinstance(payload, dict):
             raise ValueError("payload must be a JSON object")
@@ -38,6 +40,14 @@ class IngestService:
             return self._ingest_mission(entity_id, event_type, payload)
         if entity_type == "service":
             return self._ingest_service(entity_id, event_type, payload)
+        if entity_type == "inspector":
+            # Agent inspector detail (spec 0200). Sanitised/redacted per field
+            # by the store; not recorded on the global event feed.
+            if "kind" not in payload and "events" not in payload and event_type != "inspector.batch":
+                payload = {**payload, "kind": event_type.removeprefix("inspector.")}
+            res = self.repo.inspector.ingest(entity_id, payload)
+            return {"entity_type": "inspector", "entity_id": entity_id,
+                    "event_type": event_type, **res}
         # Unknown/other entity types: record the event generically so nothing is
         # silently dropped, and the UI still sees it on the activity stream.
         self.repo.record_event(entity_type, entity_id, event_type, payload)

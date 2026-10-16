@@ -31,15 +31,11 @@ _PATTERNS = [
     re.compile(r"(?i)\b(token|secret|api[_-]?key|access[_-]?token)")
     if False else re.compile(
         r"(?i)\b(token|secret|api[_-]?key|access[_-]?token)\s+[A-Za-z0-9._\-]{8,}"),
-    # private keys
-    re.compile(r"-----BEGIN[ A-Z]*PRIVATE KEY-----.*?-----END[ A-Z]*PRIVATE KEY-----",
-               re.DOTALL),
+    # private keys: handled by the linear scan in _redact_private_keys (a lazy
+    # ".*?" over many unterminated BEGIN markers is quadratic).
     # generic connection strings with embedded credentials
     re.compile(r"(?i)(postgres|postgresql|mysql|redis|rediss|mongodb|mongodb\+srv|"
                r"amqp|amqps|s3|minio)://[^:\s]+:[^@\s]+@"),
-    # OpenSSH private keys (BEGIN OPENSSH PRIVATE KEY block)
-    re.compile(r"-----BEGIN OPENSSH PRIVATE KEY-----.*?"
-               r"-----END OPENSSH PRIVATE KEY-----", re.DOTALL),
 ]
 
 _REDACTED = "[REDACTED]"
@@ -53,11 +49,34 @@ _SECRET_KEY_HINTS = (
 )
 
 
+_BEGIN = re.compile(r"-----BEGIN[ A-Z]*PRIVATE KEY-----")
+_END = re.compile(r"-----END[ A-Z]*PRIVATE KEY-----")
+
+
+def _redact_private_keys(text: str) -> str:
+    """Linear-time PEM block redaction. An unterminated block is redacted to the end."""
+    if "PRIVATE KEY-----" not in text:
+        return text
+    out, pos = [], 0
+    while True:
+        b = _BEGIN.search(text, pos)
+        if not b:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:b.start()])
+        e = _END.search(text, b.end())
+        out.append(_REDACTED)
+        if not e:
+            break
+        pos = e.end()
+    return "".join(out)
+
+
 def redact_text(text: str) -> str:
     """Replace secret-looking substrings in a string with [REDACTED]."""
     if not text:
         return text
-    out = text
+    out = _redact_private_keys(text)
     for pattern in _PATTERNS:
         out = pattern.sub(_REDACTED, out)
     return out

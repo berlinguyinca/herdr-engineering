@@ -6,6 +6,18 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ## [Unreleased]
 
 ### Added
+- Agent inspector (spec 0200, ADR-0006): per-session conversation / reasoning /
+  tools / files / tests / usage views, streaming tool status, searchable
+  history, diffs, subagent attribution, mission/handoff/worktree/PR
+  associations, per-agent & global preferences, bounded retention, role-gated
+  and redacted bodies. Mounted inside the existing session view.
+- `agent-inspector-event` contract; `entity_type=inspector` on `POST /api/v1/ingest`.
+
+### Fixed
+- Session detail page requested the wrong session id (`parts[1]`) and 404'd.
+- Control-plane listen backlog raised from 5 to 256 (connection resets under bursts of agents).
+
+### Added
 - **Operability of the live control plane**:
   - `/api/v1/health` now reports accurate deployment context — `source`
     (`postgres` when hydrated from durable state, else `memory`), image
