@@ -98,7 +98,14 @@ class ControlPlaneRepo:
         return mid
 
     def get_mission(self, mission_id):
-        return _copy(self._missions.get(mission_id))
+        rec = self._missions.get(mission_id)
+        if rec is None:
+            for m in self._missions.values():
+                if (m.get("mission_id") == mission_id
+                        and m.get("source", "herdr") == "herdr"):
+                    rec = m
+                    break
+        return _copy(rec)
 
     def list_missions(self, status=None):
         out = [_copy(m) for m in self._missions.values()]
@@ -408,19 +415,21 @@ class ControlPlaneRepo:
         return _copy(existing)
 
     def upsert_mission(self, mission_id, *, title, purpose="", stage="active",
-                       cwd=None):
+                       cwd=None, source="herdr"):
+        key = mission_id if source == "herdr" else f"{source}:{mission_id}"
         stamp = self._stamp()
-        existing = self._missions.get(mission_id)
+        existing = self._missions.get(key)
         if existing is None:
             title = title or mission_id  # only default to the id on create
             rec = {"mission_id": mission_id, "title": title,
                    "purpose": purpose, "stage": stage, "status": stage,
-                   "cwd": cwd,
+                   "cwd": cwd, "source": source, "mission_key": key,
                    "created_at": stamp, "updated_at": stamp, "sessions": []}
-            self._missions[mission_id] = rec
-            self.record_event("mission", mission_id, "MissionStarted",
+            self._missions[key] = rec
+            self.record_event("mission", key, "MissionStarted",
                               {"title": title, "purpose": purpose,
-                               "stage": stage, "cwd": cwd},
+                               "stage": stage, "cwd": cwd,
+                               "source": source},
                               mission_id=mission_id)
             return _copy(rec)
         existing["updated_at"] = stamp
@@ -432,7 +441,7 @@ class ControlPlaneRepo:
             existing["cwd"] = cwd
         if stage:
             existing["stage"] = existing["status"] = stage
-        self.record_event("mission", mission_id, "MissionUpdated",
+        self.record_event("mission", key, "MissionUpdated",
                           {"title": existing["title"],
                            "purpose": existing["purpose"],
                            "stage": existing["stage"],
