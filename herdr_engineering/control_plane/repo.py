@@ -12,6 +12,7 @@ durable Postgres/RustFS path (Phase 1 async stores) is bridged in deployment.
 """
 from __future__ import annotations
 
+import copy
 import json
 import time
 
@@ -72,6 +73,9 @@ class ControlPlaneRepo:
         self._artifacts = {}
         self._blobs = {}  # artifact_id -> bytes (in-memory RustFS stand-in)
         self._leases = {}
+        self._test_runs = {}
+        self._reviews = {}
+        self._pull_requests = {}
         self._telemetry = {}  # host_id -> [sample, ...]
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
@@ -495,6 +499,371 @@ class ControlPlaneRepo:
                           mission_id=mission_id)
         return _copy(existing)
 
+    # --------------------------------------------- CI: test runs / builds
+    def upsert_test_run(
+        self,
+        run_id,
+        *,
+        mission_id=None,
+        session_id=None,
+        repository=None,
+        status=None,
+        passed=None,
+        failed=None,
+        skipped=None,
+        total=None,
+        started_at=None,
+        ended_at=None,
+        kind="test",
+        results=None,
+    ):
+        stamp = self._stamp()
+        existing = self._test_runs.get(run_id)
+        results = None if results is None else [dict(r) for r in results]
+        if existing is None:
+            rec = {
+                "test_run_id": run_id,
+                "kind": kind,
+                "mission_id": mission_id,
+                "session_id": session_id,
+                "repository": repository,
+                "status": status,
+                "passed": passed,
+                "failed": failed,
+                "skipped": skipped,
+                "total": total,
+                "started_at": started_at or stamp,
+                "ended_at": ended_at,
+                "results": [] if results is None else results,
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+            self._test_runs[run_id] = rec
+            self.record_event(
+                "test_run",
+                run_id,
+                "TestRunStarted" if kind == "test" else "BuildStarted",
+                {
+                    k: copy.deepcopy(rec[k])
+                    for k in (
+                        "kind",
+                        "mission_id",
+                        "session_id",
+                        "repository",
+                        "status",
+                        "passed",
+                        "failed",
+                        "skipped",
+                        "total",
+                        "started_at",
+                        "ended_at",
+                        "results",
+                    )
+                },
+                mission_id=mission_id,
+                session_id=session_id,
+            )
+            return _deep_copy(rec)
+        existing["updated_at"] = stamp
+        for k, v in {
+            "mission_id": mission_id,
+            "session_id": session_id,
+            "repository": repository,
+            "status": status,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+            "total": total,
+            "started_at": started_at,
+            "ended_at": ended_at,
+        }.items():
+            if v is not None:
+                existing[k] = v
+        if results is not None:
+            existing["results"] = results
+        stored_kind = existing.get("kind") or "test"
+        self.record_event(
+            "test_run",
+            run_id,
+            "TestRunUpdated" if stored_kind == "test" else "BuildUpdated",
+            {
+                k: copy.deepcopy(existing[k])
+                for k in (
+                    "kind",
+                    "mission_id",
+                    "session_id",
+                    "repository",
+                    "status",
+                    "passed",
+                    "failed",
+                    "skipped",
+                    "total",
+                    "started_at",
+                    "ended_at",
+                    "results",
+                )
+            },
+            mission_id=existing["mission_id"],
+            session_id=existing["session_id"],
+        )
+        return _deep_copy(existing)
+
+    def upsert_build(self, build_id, **kw):
+        return self.upsert_test_run(build_id, kind="build", **kw)
+
+    def get_test_run(self, run_id):
+        return _deep_copy(self._test_runs.get(run_id))
+
+    def list_test_runs(self, mission_id=None, kind=None):
+        out = []
+        for rec in self._test_runs.values():
+            if mission_id is not None and rec.get("mission_id") != mission_id:
+                continue
+            if kind is not None and rec.get("kind") != kind:
+                continue
+            out.append(_deep_copy(rec))
+        return _sort_by(out, "created_at", id_key="test_run_id")
+
+    # ------------------------------------------------------------ reviews
+    def upsert_review(
+        self,
+        review_id,
+        *,
+        mission_id=None,
+        session_id=None,
+        reviewer=None,
+        status=None,
+        verdict=None,
+        started_at=None,
+        completed_at=None,
+    ):
+        stamp = self._stamp()
+        existing = self._reviews.get(review_id)
+        if existing is None:
+            rec = {
+                "review_id": review_id,
+                "mission_id": mission_id,
+                "session_id": session_id,
+                "reviewer": reviewer,
+                "status": status,
+                "verdict": verdict,
+                "started_at": started_at or stamp,
+                "completed_at": completed_at,
+                "findings": [],
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+            self._reviews[review_id] = rec
+            self.record_event(
+                "review",
+                review_id,
+                "ReviewStarted",
+                {
+                    k: rec[k]
+                    for k in (
+                        "mission_id",
+                        "session_id",
+                        "reviewer",
+                        "status",
+                        "verdict",
+                        "started_at",
+                        "completed_at",
+                    )
+                },
+                mission_id=mission_id,
+                session_id=session_id,
+            )
+            return _deep_copy(rec)
+        existing["updated_at"] = stamp
+        for k, v in {
+            "mission_id": mission_id,
+            "session_id": session_id,
+            "reviewer": reviewer,
+            "status": status,
+            "verdict": verdict,
+            "started_at": started_at,
+            "completed_at": completed_at,
+        }.items():
+            if v is not None:
+                existing[k] = v
+        self.record_event(
+            "review",
+            review_id,
+            "ReviewUpdated",
+            {
+                k: existing[k]
+                for k in (
+                    "mission_id",
+                    "session_id",
+                    "reviewer",
+                    "status",
+                    "verdict",
+                    "started_at",
+                    "completed_at",
+                )
+            },
+            mission_id=existing["mission_id"],
+            session_id=existing["session_id"],
+        )
+        return _deep_copy(existing)
+
+    def add_review_finding(
+        self, review_id, *, severity, summary, detail="", status="open", finding_id=None
+    ):
+        review = self._reviews.get(review_id)
+        if review is None:
+            raise KeyError(review_id)
+        findings = review["findings"]
+        if finding_id is None:
+            finding_id = f"{review_id}:{len(findings) + 1}"
+        finding = {
+            "finding_id": finding_id,
+            "severity": severity,
+            "summary": summary,
+            "detail": detail,
+            "status": status,
+        }
+        for i, f in enumerate(findings):
+            if f["finding_id"] == finding_id:
+                findings[i] = finding
+                break
+        else:
+            findings.append(finding)
+        self.record_event(
+            "review",
+            review_id,
+            "ReviewFindingAdded",
+            copy.deepcopy(finding),
+            mission_id=review["mission_id"],
+        )
+        return copy.deepcopy(finding)
+
+    def get_review(self, review_id):
+        return _deep_copy(self._reviews.get(review_id))
+
+    def list_reviews(self, mission_id=None):
+        out = []
+        for rec in self._reviews.values():
+            if mission_id is not None and rec.get("mission_id") != mission_id:
+                continue
+            out.append(_deep_copy(rec))
+        return _sort_by(out, "created_at", id_key="review_id")
+
+    # ------------------------------------------------------- pull requests
+    def upsert_pull_request(
+        self,
+        pr_id,
+        *,
+        mission_id=None,
+        repository=None,
+        number=None,
+        url=None,
+        status=None,
+        branch=None,
+        base=None,
+        created_at=None,
+    ):
+        stamp = self._stamp()
+        existing = self._pull_requests.get(pr_id)
+        if existing is None:
+            rec = {
+                "pr_id": pr_id,
+                "mission_id": mission_id,
+                "repository": repository,
+                "number": number,
+                "url": url,
+                "status": status,
+                "branch": branch,
+                "base": base,
+                "created_at": created_at or stamp,
+                "updated_at": stamp,
+            }
+            self._pull_requests[pr_id] = rec
+            self.record_event(
+                "pull_request",
+                pr_id,
+                "PullRequestOpened",
+                {
+                    k: rec[k]
+                    for k in (
+                        "mission_id",
+                        "repository",
+                        "number",
+                        "url",
+                        "status",
+                        "branch",
+                        "base",
+                        "created_at",
+                    )
+                },
+                mission_id=mission_id,
+            )
+            if rec["status"] == "merged":
+                self._record_pr_merged(pr_id, rec)
+            return _copy(rec)
+        old_status = existing.get("status")
+        existing["updated_at"] = stamp
+        for k, v in {
+            "mission_id": mission_id,
+            "repository": repository,
+            "number": number,
+            "url": url,
+            "status": status,
+            "branch": branch,
+            "base": base,
+            "created_at": created_at,
+        }.items():
+            if v is not None:
+                existing[k] = v
+        self.record_event(
+            "pull_request",
+            pr_id,
+            "PullRequestUpdated",
+            {
+                k: existing[k]
+                for k in (
+                    "mission_id",
+                    "repository",
+                    "number",
+                    "url",
+                    "status",
+                    "branch",
+                    "base",
+                    "created_at",
+                )
+            },
+            mission_id=existing["mission_id"],
+        )
+        if existing["status"] == "merged" and old_status != "merged":
+            self._record_pr_merged(pr_id, existing)
+        return _copy(existing)
+
+    def _record_pr_merged(self, pr_id, rec):
+        self.record_event(
+            "pull_request",
+            pr_id,
+            "PullRequestMerged",
+            {
+                "pr_id": pr_id,
+                "mission_id": rec["mission_id"],
+                "repository": rec["repository"],
+                "number": rec["number"],
+                "status": rec["status"],
+            },
+            mission_id=rec["mission_id"],
+        )
+
+    def get_pull_request(self, pr_id):
+        return _copy(self._pull_requests.get(pr_id))
+
+    def list_pull_requests(self, mission_id=None):
+        out = []
+        for rec in self._pull_requests.values():
+            if mission_id is not None and rec.get("mission_id") != mission_id:
+                continue
+            out.append(_copy(rec))
+        return _sort_by(out, "created_at", id_key="pr_id")
+
     # ------------------------------------------------------------- artifacts
     def register_artifact(self, session_id=None, original_filename="",
                           mime_type="", size_bytes=0, sha256="",
@@ -826,13 +1195,26 @@ def _copy(d):
     return dict(d) if d is not None else None
 
 
+def _deep_copy(d):
+    """Copy a record including its nested lists (findings, results)."""
+    if d is None:
+        return None
+    return copy.deepcopy(d)
+
+
 def _iso(ts):
     import datetime as _dt
     return _dt.datetime.fromtimestamp(ts, tz=_dt.UTC).isoformat()
 
 
-def _sort_by(items, key, reverse=False):
-    return sorted(items, key=lambda x: x.get(key) or "", reverse=reverse)
+def _sort_by(items, key, reverse=False, id_key=None):
+    """Sort by ``key`` with ``id_key`` as a stable tie-breaker."""
+    if id_key is None:
+        return sorted(items, key=lambda x: x.get(key) or "", reverse=reverse)
+    if reverse:
+        return sorted(items, key=lambda x: (x.get(key) or "", x.get(id_key) or ""),
+                      reverse=True)
+    return sorted(items, key=lambda x: (x.get(key) or "", x.get(id_key) or ""))
 
 
 def _pct(part, whole):
