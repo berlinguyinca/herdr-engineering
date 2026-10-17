@@ -129,6 +129,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=_cmd_capabilities)
 
+    # fleet ----------------------------------------------------------------
+    p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
+    fsub = p.add_subparsers(dest="fleet_command", required=True)
+    pj = fsub.add_parser("join", help="attach a machine via herdr AND join it to the "
+                                       "fabric fleet (herdr-eng fleet join <ssh-target>)")
+    pj.add_argument("ssh_target", help="SSH target of the machine to attach (hostname/ip)")
+    pj.add_argument("--label", default=None, help="fleet/host label (defaults to ssh_target)")
+    pj.add_argument("--os", default="linux", choices=["linux", "macos"],
+                    help="target OS group (linux|macos)")
+    pj.add_argument("--user", default=None, help="fleet ssh user for ansible host_vars")
+    pj.add_argument("--ansible-host", default=None,
+                    help="tailnet MagicDNS/ip for ansible (defaults to ssh_target)")
+    pj.add_argument("--gateway", default="http://dev.lan:29999",
+                    help="fabric gateway URL the agent registers with")
+    pj.add_argument("--no-attach", action="store_true",
+                    help="skip the herdr machine add step")
+    pj.add_argument("--no-provision", action="store_true",
+                    help="skip the fleet-sync provisioning playbook")
+    pj.add_argument("--json", action="store_true")
+    pj.set_defaults(func=_cmd_fleet_join)
+    ps = fsub.add_parser("status", help="read-only fleet version/registration status")
+    ps.add_argument("--json", action="store_true")
+    ps.set_defaults(func=_cmd_fleet_status)
+
     # artifacts ------------------------------------------------------------
     p = sub.add_parser("artifacts", help="shared artifact workspace (spec 0080)")
     asub = p.add_subparsers(dest="artifacts_command", required=True)
@@ -510,6 +534,47 @@ def _cmd_machines(args) -> int:
         for m in machines:
             print(f"{m.id:8} {m.label:24} {m.target}")
     return 0
+
+
+def _cmd_fleet_join(args) -> int:
+    from .fleet import fleet_join
+    report = fleet_join(
+        ssh_target=args.ssh_target,
+        label=args.label,
+        os_name=args.os,
+        user=args.user,
+        ansible_host=args.ansible_host or args.ssh_target,
+        gateway=args.gateway,
+        attach=not args.no_attach,
+        provision=not args.no_provision,
+    )
+    if args.json:
+        _print_json(report)
+    else:
+        print(f"herdr-eng fleet join {args.ssh_target}")
+        for step, detail in report.get("steps", {}).items():
+            ok = detail.get("ok", detail.get("added") is not False)
+            status = "ok" if ok and not detail.get("error") else "warn"
+            print(f"  [{status:>4}] {step}: {detail}")
+        print(f"  registered with gateway: {report.get('registered')}")
+        if report.get("errors"):
+            for e in report["errors"]:
+                print(f"  !! {e}")
+    return 0 if report.get("ok") else 1
+
+
+def _cmd_fleet_status(args) -> int:
+    from .fleet import fleet_status
+    status = fleet_status()
+    if args.json:
+        _print_json(status)
+    else:
+        for h in status.get("hosts", []):
+            print(f"{h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
+                  f"agent={h['agent']}")
+        if not status.get("hosts"):
+            print("no hosts reported (playbook rc=%s)" % status.get("rc"))
+    return 0 if status.get("rc") == 0 else 1
 
 
 def _cmd_workspaces(args) -> int:

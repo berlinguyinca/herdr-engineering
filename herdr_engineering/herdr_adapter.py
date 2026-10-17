@@ -192,6 +192,27 @@ class NativeHerdrAdapter:
         """Run a command on a saved SSH machine via ``--machine`` forwarding."""
         return self._run(["--machine", label] + command, timeout=timeout)
 
+    def add_machine(self, label: str, ssh_target: str, remote_session: str | None = None,
+                    timeout: int = 600) -> str:
+        """Attach a new machine via ``herdr machine add`` (the real binary)."""
+        args = ["machine", "add", "--label", label, ssh_target]
+        if remote_session:
+            args += ["--remote-session", remote_session]
+        return self._run(args, timeout=timeout)
+
+    def devfabric_list(self) -> list[dict[str, Any]]:
+        """List active fabric leases (gateway's view of registered machines)."""
+        return self._run_json(["devfabric", "list", "--json"])
+
+    def devfabric_register(self, machine_id: str, port: int, url: str, **kwargs) -> dict[str, Any]:
+        """Register a dev service lease for a machine (idempotent)."""
+        args = ["devfabric", "register", "--machine", machine_id, "--port", str(port),
+                "--url", url]
+        for flag, val in kwargs.items():
+            if val is not None:
+                args += [f"--{flag.replace('_', '-')}", str(val)]
+        return self._run_json(args)
+
     # -- snapshot ----------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
         return self._run_json(["api", "snapshot"])

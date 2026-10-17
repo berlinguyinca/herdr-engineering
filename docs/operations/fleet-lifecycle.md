@@ -79,8 +79,11 @@ Android) resolve `dev.lan` fleet-wide. Verify with `tailscale dns status`
 ---
 
 > **Skill: `fleet-sync`** — for a one-shot, version-synced join + self-update,
-> use the `fleet-sync` skill (`skills/fleet-sync/SKILL.md`). It wraps the
-> scripts below into three commands:
+> use the `fleet-sync` skill (`skills/fleet-sync/SKILL.md`). The primary
+> **one-command** path is `herdr-eng fleet join <ssh-target>` (attaches the
+> machine via `herdr machine add` AND joins it to the fleet in one step);
+> `herdr-eng fleet status` shows parity. The skill also wraps the scripts
+> below:
 > - `scripts/fleet-join.sh <host> [--os linux|macos] [--ansible-host <addr>] [--user <u>]` — onboard a new site from the controller (adds it to the private inventory + runs `fleet-sync.yml` + verifies it's registered with the gateway).
 > - `scripts/fleet-self-update.sh [--host <h>]` — update the controller + every host to the current version, then verify parity.
 > - `scripts/fleet-sync-status.sh` — read-only table of each host's herdr-eng version, build-gate checksum, agent state, and gateway registration.

@@ -49,19 +49,22 @@ the fleet.
 
 ## Operations
 
-### 1. Join a new site (onboard a machine)
+### 1. Join a new site — ONE command
 
 On the **controller** (where the ansible inventory + SSH keys live):
 
 ```bash
-scripts/fleet-join.sh <host> \
+herdr-eng fleet join <ssh-target> \
+    --label <host> \
     --os linux|macos \
-    --ansible-host <tailnet-magicdns-or-ip> \
     --user <fleet-user> \
+    [--ansible-host <tailnet-magicdns-or-ip>] \
     [--gateway http://dev.lan:29999]
 ```
 
-This:
+This single command does the whole onboarding — it **attaches the machine via
+`herdr` itself** (`herdr machine add --label <host> <ssh-target>`, the same
+flow as `herdr machine add`), then:
 1. Adds `<host>` to the private inventory (`hosts.yml` + `host_vars/<host>.yml`).
 2. Runs `ansible/playbooks/fleet-sync.yml -l <host>` to converge:
    - `herdr-eng` (pulled from `origin/main`, pip-installed into the venv)
@@ -70,30 +73,31 @@ This:
    - the pi build-gate extension (`build-gate.ts`)
 3. Verifies registration (`devfabric list`) and reports version parity.
 
-If you can't reach the host from the controller, run on the host itself:
-```bash
-scripts/install.sh
-scripts/fabric-agent.sh --gateway http://dev.lan:29999   # linux
-scripts/fabric-agent-macos.sh --gateway http://dev.lan:29999   # macos
-```
-then run `fleet-sync` from the controller once it's reachable.
+Flags: `--no-attach` (host already attached in herdr), `--no-provision` (already
+provisioned), `--json` (machine-readable report).
+
+> The older multi-command path is still available as `scripts/fleet-join.sh`.
+> If you can't reach the host from the controller, run on the host itself
+> `scripts/install.sh` then `scripts/fabric-agent.sh --gateway <url>`, and run
+> `herdr-eng fleet join --no-attach` from the controller once it's reachable.
 
 ### 2. Self-update the whole fleet
 
 ```bash
+herdr-eng fleet status    # shows parity (see below)
 scripts/fleet-self-update.sh            # update controller + every host
 scripts/fleet-self-update.sh --host <h> # update just one host
 ```
 
-Pulls the controller checkout (`--no-pull` to skip), reinstalls local herdr-eng
-(`--no-local-reinstall` to skip), runs `fleet-sync.yml` across the fleet, then
-`fleet-status.yml` to show parity.
+`fleet-self-update.sh` pulls the controller checkout, reinstalls local herdr-eng,
+runs `fleet-sync.yml` across the fleet, then `fleet-status.yml` for parity.
 
 ### 3. Status / parity
 
 ```bash
-scripts/fleet-sync-status.sh            # table: host | herdr-eng | build-gate | agent | registered
-scripts/fleet-sync-status.sh --json     # machine list
+herdr-eng fleet status          # table: host | herdr-eng | build-gate | agent
+herdr-eng fleet status --json
+scripts/fleet-sync-status.sh            # table + gateway registration
 ansible-playbook -i ansible/inventory/hosts.yml \
     ansible/playbooks/fleet-status.yml  # raw read-only fingerprints
 ```
@@ -117,6 +121,8 @@ ansible-playbook -i ansible/inventory/hosts.yml \
 
 ## Files
 
+- `herdr_engineering/fleet.py` (the one-command engine) + `herdr-eng fleet join/status` CLI
+- `herdr_engineering/herdr_adapter.py` (`add_machine` → `herdr machine add`)
 - `scripts/fleet-join.sh`, `scripts/fleet-self-update.sh`, `scripts/fleet-sync-status.sh`
 - `scripts/fleet_inventory.py` (private inventory mutation helper)
 - `ansible/playbooks/fleet-sync.yml` (converge), `ansible/playbooks/fleet-status.yml` (read-only)
