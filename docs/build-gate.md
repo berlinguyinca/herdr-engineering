@@ -1,0 +1,83 @@
+# Build-Gate: cross-agent CPU build-storm prevention
+
+Status: **implemented, deployed, live-verified** (2026-10-16/17).
+
+## Problem
+
+Autonomous pi sessions (and the workers/subagents they spawn) each fire
+full-workspace builds (`cargo check --workspace --tests`, `tsc --noEmit`)
+independently. With no shared gate, N agents launch N×`-j` compiler jobs at
+once and CPU-starve the host. Observed on bender: 24 cores, load 27→46, the
+dev-fabric gateway and the machine became unresponsive.
+
+## Solution (two pieces)
+
+1. **`herdr-eng build-coordinate`** — a per-host, flock-based slot gate
+   (`herdr_engineering/build_coord.py`). Acquires one of N slot locks, then
+   `execvp`s the build so the flock is held for the child's full lifetime and
+   released automatically on exit. Load-aware backoff refuses new builds while
+   1-min load/core exceeds `--max-load`. `--bypass-on-timeout` runs the build
+   **ungated** (never fails/hangs the agent) if no slot frees within `--wait`,
+   making the gate best-effort coordination.
+
+   Defaults: `slots=2`, `max-load=3.0`, `wait=900s`, `bypass-on-timeout`.
+
+2. **Pi build-gate extension** (`deploy/pi-build-gate/build-gate.ts`) — hooks
+   pi's `tool_call` event and rewrites heavy build commands
+   (`cargo check|build|test|clippy` + `--workspace|--all-targets|--tests|--all-features`,
+   and any `tsc`) to route through the gate. Single-crate `-p foo` checks,
+   `git status`, and compound commands are left ungated. Resolves `herdr-eng`
+   to an absolute path at load time and **no-ops (builds pass through) if it is
+   absent** — it can never break a build, only coordinate it.
+
+## Deployment
+
+- Extension is version-controlled at `deploy/pi-build-gate/build-gate.ts`
+  (install via `deploy/pi-build-gate/install.sh`), and deployed to every fleet
+  host by Ansible (`ansible/tasks/pi-build-gate.yml` + `site.yml`).
+- `herdr-eng` (with `build-coordinate`) is provisioned fleet-wide by
+  `ansible/tasks/fabric-agent.yml`.
+
+Current fleet state (2026-10-17):
+
+| host | pi | herdr-eng | build-gate ext | notes |
+|------|----|-----------|----------------|-------|
+| bender | ✅ | ✅ | ✅ active | live-verified |
+| beast  | ✅ | ✅ | ✅ (next pi restart) | herdr-eng in `~/.venvs/herdr-engineering` |
+| fry    | ✗ unreachable | ✗ | — | pending full `site.yml` |
+| mac    | ✗ unreachable | ✗ | — | pending full `site.yml` |
+
+## Verification
+
+### Live pi e2e (bender)
+A real `pi --print` session issuing `cargo check --workspace --tests` was
+intercepted and routed through the gate. Slot payload confirmed the build ran
+under `herdr-eng build-coordinate` (host bender, slot 0).
+
+### Multi-agent contention (bender, 2026-10-17)
+4 concurrent gated builds, `slots=2`, each `sleep 6s`:
+
+- **max concurrent builds: 2** (exactly the configured bound)
+- **wall time: 12.1s** = 2 batches of 6s (builds 2,4 then 1,3) — perfect serialization
+- 2 contention telemetry events recorded
+
+Without the gate the same 4 builds would run fully parallel (~6s) and, at the
+fleet scale of 14+ concurrent full-workspace cargo builds, starve the CPU.
+
+## Monitoring & tuning
+
+- `scripts/monitor-fabric-gateway.sh` reports gateway health/CPU, lease-store
+  size + active/expired counts, host load/core, and build-gate slot/contention
+  usage (`--json`, `--alerts`).
+- `scripts/herdr-gateway-monitor.{service,timer}`: systemd user timer (every
+  5m) appending JSON to `~/.local/share/herdr-engineering/gateway-monitor.log`.
+- The gate appends a `contention` line to
+  `state/build-gates/telemetry.jsonl` whenever a build has to wait (ts/slots/
+  max_load/load_core/busy_pids), so `--slots`/`--max-load` can be tuned from
+  real data.
+
+**Tuning guidance** (revisit after a few days of real traffic):
+- frequent contention **and** high load/core → gate too loose; raise load
+  guard or lower slots.
+- frequent contention **but** idle host → gate too conservative; raise slots.
+- Contention counts: `grep -c '"event": *"contention"' state/build-gates/telemetry.jsonl`
