@@ -1,0 +1,30 @@
+---
+# Read-only fleet status: report each host's herdr-eng version, build-gate
+# extension checksum, and fabric-agent service state. Makes NO changes.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/fleet-status.yml
+#   ansible-playbook -i inventory/hosts.yml playbooks/fleet-status.yml -l <host>
+- name: "HerdR Engineering fleet status (read-only fingerprint report)"
+  hosts: herdr_fleet
+  gather_facts: false
+  become: "{{ herdr_engineering_become | default((ansible_user | default(lookup('env', 'USER'), true)) != 'root') }}"
+  environment:
+    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_env.HOME | default('~', true) }}/.local/bin:{{ ansible_env.PATH | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
+  vars:
+    herdr_engineering_repo_root: "{{ playbook_dir }}/../.."
+  tasks:
+    - name: "Gather facts as the connection user (no become)"
+      ansible.builtin.setup:
+      become: false
+
+    - name: "Record the fleet user's home + uid"
+      ansible.builtin.set_fact:
+        fleet_home: "{{ ansible_env.HOME }}"
+        fleet_user: "{{ ansible_user_id }}"
+
+    - name: "Gather host version/registration fingerprint"
+      ansible.builtin.include_tasks: ../tasks/fleet-fingerprint.yml
+
+    - name: "Report per-host version fingerprint"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} | herdr-eng={{ fp_herdr_version.stdout | default('MISSING') }} | build-gate={{ fp_buildgate_md5.stdout | default('MISSING') }} | agent={{ fp_agent.stdout_lines | last | default('unknown') }}"

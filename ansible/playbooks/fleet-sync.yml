@@ -1,0 +1,51 @@
+---
+# Fleet sync: converge the version-sensitive HerdR Engineering pieces on one
+# or every fleet host so they stay in sync with the controller checkout and
+# the public repo (origin/main).
+#
+# Syncs (idempotent, converge-only — never disruptive to running agents):
+#   - herdr-eng           -> pulled from the public repo origin/main and
+#                            pip-installed into ~/.venvs/herdr-engineering
+#                            (fabric-agent.yml)
+#   - fabric.env + auto-registration agent service (fabric-agent.yml)
+#   - pi build-gate extension build-gate.ts (pi-build-gate.yml)
+#   - version-parity fingerprint report (this playbook)
+#
+# JOIN a new site:     ansible-playbook -i inventory/hosts.yml \
+#                          playbooks/fleet-sync.yml -l <newhost>
+# SELF-UPDATE fleet:   ansible-playbook -i inventory/hosts.yml \
+#                          playbooks/fleet-sync.yml
+#
+# See the fleet-sync skill (skills/fleet-sync/SKILL.md) and
+# docs/operations/fleet-lifecycle.md.
+- name: "HerdR Engineering fleet sync (converge herdr-eng + agent + build-gate)"
+  hosts: herdr_fleet
+  gather_facts: false
+  become: "{{ herdr_engineering_become | default((ansible_user | default(lookup('env', 'USER'), true)) != 'root') }}"
+  environment:
+    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_env.HOME | default('~', true) }}/.local/bin:{{ ansible_env.PATH | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
+  vars:
+    herdr_engineering_repo_root: "{{ playbook_dir }}/../.."
+    fabric_agent_gateway_url: "http://dev.lan:29999"
+  tasks:
+    - name: "Gather facts as the connection user (no become)"
+      ansible.builtin.setup:
+      become: false
+
+    - name: "Record the fleet user's home + uid for paths/ownership"
+      ansible.builtin.set_fact:
+        fleet_home: "{{ ansible_env.HOME }}"
+        fleet_user: "{{ ansible_user_id }}"
+
+    - name: "Converge herdr-eng + fabric auto-registration agent"
+      ansible.builtin.include_tasks: ../tasks/fabric-agent.yml
+
+    - name: "Converge pi build-gate extension"
+      ansible.builtin.include_tasks: ../tasks/pi-build-gate.yml
+
+    - name: "Gather host version/registration fingerprint"
+      ansible.builtin.include_tasks: ../tasks/fleet-fingerprint.yml
+
+    - name: "Report per-host version fingerprint"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} | herdr-eng={{ fp_herdr_version.stdout | default('MISSING') }} | build-gate={{ fp_buildgate_md5.stdout | default('MISSING') }} | agent={{ fp_agent.stdout_lines | last | default('unknown') }}"

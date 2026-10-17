@@ -1,0 +1,27 @@
+---
+# Gather a version/registration fingerprint for the current host (no changes).
+# Requires fleet_home / fleet_user to be set (see playbook preamble).
+# Registers:
+#   fp_herdr_version, fp_buildgate_md5, fp_agent
+- name: "Capture herdr-eng version fingerprint"
+  ansible.builtin.command: "{{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng --version"
+  register: fp_herdr_version
+  changed_when: false
+  ignore_errors: true
+
+- name: "Capture build-gate extension checksum"
+  ansible.builtin.command: >-
+    python3 -c "import hashlib,os;
+    p=os.path.expanduser('{{ fleet_home }}/.pi/agent/extensions/build-gate.ts');
+    print(hashlib.md5(open(p,'rb').read()).hexdigest() if os.path.exists(p) else 'MISSING')"
+  register: fp_buildgate_md5
+  changed_when: false
+  ignore_errors: true
+
+- name: "Capture fabric-agent service state"
+  ansible.builtin.command: >-
+    sh -c "systemctl --user is-active herdr-eng-fabric-agent.service 2>/dev/null ||
+           launchctl print gui/$(id -u)/herdr-eng-fabric-agent 2>/dev/null | grep -q 'state = running' && echo active || echo inactive"
+  register: fp_agent
+  changed_when: false
+  ignore_errors: true
