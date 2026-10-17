@@ -1,0 +1,29 @@
+# Deploy the pi build-gate extension on EVERY fleet host (spec: build-storm
+# prevention). The extension routes heavy agent builds (`cargo check
+# --workspace ...`, `tsc`) through `herdr-eng build-coordinate`, so all pi
+# sessions on a host contend for a bounded number of build slots instead of
+# each launching a full-workspace build at once (the "build storm" that
+# CPU-starved a 24-core host at load 27-46).
+#
+# Runs as the fleet (connection) user (become: false). The gate binary
+# (`herdr-eng build-coordinate`) is already provisioned fleet-wide by
+# fabric-agent.yml; the extension resolves it from PATH at pi load time and
+# no-ops gracefully (builds pass through) if it is absent — it can never break
+# a build, only coordinate it. Tuning is per-host via env vars documented in
+# the extension header (HERDR_BUILD_GATE_SLOTS/MAX_LOAD/WAIT/DISABLE).
+- name: "Deploy pi build-gate extension"
+  become: false
+  block:
+    - name: "Ensure the per-user pi extensions directory exists"
+      ansible.builtin.file:
+        path: "{{ fleet_home }}/.pi/agent/extensions"
+        state: directory
+        mode: "0755"
+        owner: "{{ fleet_user }}"
+
+    - name: "Install build-gate.ts (idempotent copy from the controller repo)"
+      ansible.builtin.copy:
+        src: "{{ herdr_engineering_repo_root }}/deploy/pi-build-gate/build-gate.ts"
+        dest: "{{ fleet_home }}/.pi/agent/extensions/build-gate.ts"
+        mode: "0644"
+        owner: "{{ fleet_user }}"

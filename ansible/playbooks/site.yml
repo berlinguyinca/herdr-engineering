@@ -138,3 +138,13 @@
     # ----------------------------------------------------------------------
     - name: "Deploy dev-fabric auto-registration agent (all fleet hosts)"
       ansible.builtin.include_tasks: ../tasks/fabric-agent.yml
+
+    # ----------------------------------------------------------------------
+    # Build-storm prevention (all fleet hosts): install the pi build-gate
+    # extension so heavy agent builds (cargo check --workspace / tsc) are
+    # routed through `herdr-eng build-coordinate`, bounding concurrent builds
+    # host-wide. No-ops gracefully if herdr-eng is missing; tuning per host via
+    # HERDR_BUILD_GATE_* env vars. See ansible/tasks/pi-build-gate.yml.
+    # ----------------------------------------------------------------------
+    - name: "Deploy pi build-gate extension (all fleet hosts)"
+      ansible.builtin.include_tasks: ../tasks/pi-build-gate.yml
