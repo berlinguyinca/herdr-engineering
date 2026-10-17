@@ -62,6 +62,32 @@ def test_all_slots_busy_raises_timeout(gate_dir):
     os.close(fd)
 
 
+def test_contention_records_telemetry(gate_dir):
+    """When a build has to wait for a slot, a telemetry line is appended so
+    the gate's --slots/--max-load can be tuned from real contention data."""
+    import json as _json
+    gate = BuildGate(state_dir=gate_dir, slots=1)
+    fd, _ = gate._try_acquire(0, ["hold"])  # occupy the only slot
+    try:
+        with pytest.raises(TimeoutError):
+            gate.acquire(["b"], max_load=0, wait_seconds=0.2)
+        tele = gate_dir / "telemetry.jsonl"
+        assert tele.exists()
+        lines = tele.read_text().strip().splitlines()
+        assert lines, "expected at least one contention telemetry line"
+        rec = _json.loads(lines[-1])
+        assert rec["event"] == "contention"
+        assert rec["slots"] == 1
+        assert "load_core" in rec
+        assert "ts" in rec
+        assert rec["busy_pids"]  # the held slot's pid is recorded
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def test_holds_slot_across_exec(gate_dir):
     """The flock must survive execvp so it's held for the child's lifetime."""
     env = dict(os.environ, HERDR_ENGINEERING_STATE=str(gate_dir))

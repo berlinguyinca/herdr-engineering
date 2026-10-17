@@ -1,0 +1,24 @@
+# HerdR Engineering dev-fabric gateway monitor (spec: build-storm fixes).
+#
+# Persistent systemd USER service that runs scripts/monitor-fabric-gateway.sh
+# every 5 minutes and appends its one-line JSON to ~/.local/share/herdr-engineering/
+# gateway-monitor.log. It is the "keep the store small / gateway idle" guard
+# for the 2026-10-16 build-storm + lease-bloat fixes: if the gateway stops
+# being healthy, the lease store grows past 1MB, or the host load/core
+# exceeds 3.0, the service logs a DEGRADED line (exit code 1) that an
+# external watchdog can alert on.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp scripts/herdr-gateway-monitor.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now herdr-gateway-monitor.timer
+#   # inspect: tail -f ~/.local/share/herdr-engineering/gateway-monitor.log
+[Unit]
+Description=HerdR Engineering dev-fabric gateway monitor
+
+[Service]
+Type=oneshot
+ExecStart=%h/IdeaProjects/herdr-engineering/scripts/monitor-fabric-gateway.sh --json
+StandardOutput=append:%h/.local/share/herdr-engineering/gateway-monitor.log
+StandardError=append:%h/.local/share/herdr-engineering/gateway-monitor.log

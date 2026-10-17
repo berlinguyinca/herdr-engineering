@@ -145,6 +145,13 @@ class BuildGate:
                 ]
                 if progress:
                     progress(holders)
+                self._telemetry({
+                    "event": "contention",
+                    "slots": self.slots,
+                    "max_load": max_load,
+                    "busy_pids": [h.get("pid") for h in holders if h],
+                    "load_core": _load_per_core(),
+                })
                 reported = True
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -152,6 +159,23 @@ class BuildGate:
                     f"{wait_seconds:.0f}s "
                     f"(slots={self.slots}, holders={holders!r})")
             time.sleep(0.5)
+
+    def _telemetry(self, payload: dict) -> None:
+        """Append one JSON line to ``{dir}/telemetry.jsonl`` (best-effort).
+
+        Feeds data-driven tuning of ``--slots``/``--max-load``: over time this
+        records how often builds had to wait for a slot and how loaded the host
+        was, so an operator can tell whether the gate is too conservative
+        (high wait frequency, mostly free slots) or not conservative enough
+        (constant contention, load/core still high).
+        """
+        try:
+            payload["ts"] = _now_iso()
+            payload["host"] = _hostname()
+            with open(self.dir / "telemetry.jsonl", "a") as f:
+                f.write(json.dumps(payload, sort_keys=True) + "\n")
+        except OSError:
+            pass
 
     def status(self) -> list[dict]:
         """Report current slot occupancy for diagnostics.
