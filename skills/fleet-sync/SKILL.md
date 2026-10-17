@@ -36,6 +36,17 @@ parity. Everything is idempotent and non-disruptive to running agents.
   gitignored). The controller holds the union; each host self-enrolls via
   `scripts/install.sh`.
 
+## Working directory (important)
+
+This skill orchestrates the **herdr-engineering repo**'s own scripts and
+ansible playbooks — it does not bundle them. Run it from the controller's
+repo checkout, e.g. `/home/wohlgemuth/IdeaProjects/herdr-engineering`, and
+resolve every path below relative to that repo root. If you don't know where
+the checkout is, locate it first (`find ~ -name 'fleet-join.sh' 2>/dev/null`)
+and `cd` there before running anything. The controller is the machine that
+holds the ansible inventory (`ansible/inventory/hosts.yml`) and SSH keys to
+the fleet.
+
 ## Operations
 
 ### 1. Join a new site (onboard a machine)
