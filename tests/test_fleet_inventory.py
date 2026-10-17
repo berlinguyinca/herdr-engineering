@@ -1,7 +1,7 @@
 """Tests for the private fleet-inventory helper (scripts/fleet_inventory.py)."""
 from pathlib import Path
 
-from scripts.fleet_inventory import add_host, list_hosts, write_host_vars
+from scripts.fleet_inventory import add_host, list_hosts, remove_host, write_host_vars
 
 BASE = """# Private fleet inventory
 all:
@@ -49,6 +49,19 @@ def test_list_hosts(tmp_path):
     inv.write_text(BASE)
     hosts = list_hosts(inv)
     assert set(hosts) == {"fry", "beast", "mac"}
+
+
+def test_remove_host(tmp_path):
+    inv = tmp_path / "hosts.yml"
+    inv.write_text(BASE)
+    assert remove_host(inv, "fry") is True
+    assert set(list_hosts(inv)) == {"beast", "mac"}
+    # removing an absent host is a no-op (returns False, unchanged)
+    assert remove_host(inv, "fry") is False
+    assert set(list_hosts(inv)) == {"beast", "mac"}
+    # removing from a different group still works (macos)
+    assert remove_host(inv, "mac") is True
+    assert list_hosts(inv) == ["beast"]
 
 
 def test_write_host_vars(tmp_path):

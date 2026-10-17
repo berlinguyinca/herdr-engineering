@@ -39,6 +39,25 @@ def add_host(inventory: Path, host: str, os_name: str = "linux") -> bool:
     return True
 
 
+def remove_host(inventory: Path, host: str) -> bool:
+    """Remove `host` from any fleet group. Returns True if it was present.
+
+    Leaves any private host_vars/<host>.yml in place so re-joining later is
+    trivial (connection details are preserved).
+    """
+    with inventory.open() as fh:
+        data = yaml.safe_load(fh) or {}
+    removed = False
+    for group in data.get("all", {}).get("children", {}).get("herdr_fleet", {}).get("children", {}).values():
+        hosts = (group.get("hosts") or {})
+        if host in hosts:
+            del hosts[host]
+            removed = True
+    if removed:
+        _write(inventory, data)
+    return removed
+
+
 def list_hosts(inventory: Path) -> list[str]:
     with inventory.open() as fh:
         data = yaml.safe_load(fh) or {}
@@ -76,6 +95,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="fleet_inventory.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    r = sub.add_parser("remove")
+    r.add_argument("--inventory", required=True)
+    r.add_argument("--host", required=True)
+
     a = sub.add_parser("add")
     a.add_argument("--inventory", required=True)
     a.add_argument("--host", required=True)
@@ -92,6 +115,10 @@ def main(argv=None) -> int:
     v.add_argument("--interpreter", default="/usr/bin/python3")
 
     args = ap.parse_args(argv)
+    if args.cmd == "remove":
+        removed = remove_host(Path(args.inventory), args.host)
+        print(f"{'removed' if removed else 'not present'}: {args.host}")
+        return 0
     if args.cmd == "add":
         added = add_host(Path(args.inventory), args.host, args.os)
         print(f"{'added' if added else 'already present'}: {args.host}")
