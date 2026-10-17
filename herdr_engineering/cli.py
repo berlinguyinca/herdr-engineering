@@ -149,6 +149,16 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="skip the fleet-sync provisioning playbook")
     pj.add_argument("--json", action="store_true")
     pj.set_defaults(func=_cmd_fleet_join)
+    pu = fsub.add_parser("update", help="self-update controller + every host, then "
+                                        "report parity (one command)")
+    pu.add_argument("--host", default=None, help="update only this host (default: all)")
+    pu.add_argument("--gateway", default="http://dev.lan:29999",
+                    help="fabric gateway URL the agent registers with")
+    pu.add_argument("--no-pull", action="store_true", help="skip controller git pull")
+    pu.add_argument("--no-reinstall", action="store_true",
+                    help="skip controller local pip reinstall")
+    pu.add_argument("--json", action="store_true")
+    pu.set_defaults(func=_cmd_fleet_update)
     ps = fsub.add_parser("status", help="read-only fleet version/registration status")
     ps.add_argument("--json", action="store_true")
     ps.set_defaults(func=_cmd_fleet_status)
@@ -560,6 +570,31 @@ def _cmd_fleet_join(args) -> int:
         if report.get("errors"):
             for e in report["errors"]:
                 print(f"  !! {e}")
+    return 0 if report.get("ok") else 1
+
+
+def _cmd_fleet_update(args) -> int:
+    from .fleet import fleet_update
+    report = fleet_update(
+        host=args.host,
+        gateway=args.gateway,
+        pull_controller=not args.no_pull,
+        reinstall_local=not args.no_reinstall,
+    )
+    if args.json:
+        _print_json(report)
+    else:
+        print(f"herdr-eng fleet update ({report['target']})")
+        for step, detail in report.get("steps", {}).items():
+            ok = detail.get("ok", detail.get("rc") == 0)
+            print(f"  [{'ok' if ok else 'warn':>4}] {step}: rc={detail.get('rc')}")
+        print("  --- fleet parity ---")
+        for h in report.get("status", {}).get("hosts", []):
+            print(f"  {h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
+                  f"agent={h['agent']}")
+        fs = report.get("steps", {}).get("fleet_sync", {})
+        if fs.get("rc") != 0 and fs.get("stderr"):
+            print(f"  !! {fs['stderr']}")
     return 0 if report.get("ok") else 1
 
 

@@ -130,6 +130,44 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
     return report
 
 
+def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:29999",
+                 inventory: Path | None = None, pull_controller: bool = True,
+                 reinstall_local: bool = True) -> dict:
+    """Self-update the whole fleet (controller + all reachable hosts) to the
+    current version, then report parity. One command.
+
+    Returns a JSON-serializable report.
+    """
+    root = repo_root()
+    inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
+    report: dict = {"target": host or "all inventory hosts", "steps": {}, "ok": False}
+
+    # 1) bring the controller checkout + local herdr-eng up to date
+    if pull_controller and (root / ".git").exists():
+        rc, out, err = _run(["git", "-C", str(root), "pull", "--ff-only", "--quiet"], timeout=120)
+        report["steps"]["controller_pull"] = {"rc": rc, "stderr": err.strip()[-200:] or None}
+    if reinstall_local and (root / "pyproject.toml").exists():
+        rc, out, err = _run([sys.executable, "-m", "pip", "install", "--quiet",
+                             "--upgrade", str(root)], timeout=300)
+        report["steps"]["controller_reinstall"] = {"rc": rc,
+                                                    "stderr": err.strip()[-200:] or None}
+
+    # 2) converge the fleet (all hosts or a single --host)
+    playbook = root / "ansible" / "playbooks" / "fleet-sync.yml"
+    cmd = ["ansible-playbook", "-i", str(inv), str(playbook),
+           "-e", f"fabric_agent_gateway_url={gateway}"]
+    if host:
+        cmd += ["-l", host]
+    rc, out, err = _run(cmd, timeout=1800)
+    report["steps"]["fleet_sync"] = {"ok": rc == 0, "rc": rc,
+                                      "stderr": err.strip()[-400:] or None}
+
+    # 3) report parity
+    report["status"] = fleet_status(inventory=inv)
+    report["ok"] = rc == 0
+    return report
+
+
 def fleet_status(*, inventory: Path | None = None) -> dict:
     """Read-only per-host version/registration fingerprint."""
     root = repo_root()
@@ -139,11 +177,17 @@ def fleet_status(*, inventory: Path | None = None) -> dict:
     lines = [l for l in out.splitlines() if " | " in l and "herdr-eng=" in l]
     hosts = []
     for ln in lines:
-        # e.g. "beast | herdr-eng=herdr-eng 0.1.0 | build-gate=<md5> | agent=inactive"
+        # ansible emits the fingerprint as a debug msg, e.g.
+        #   "msg": "beast | herdr-eng=herdr-eng 0.1.0 | build-gate=<md5> | agent=inactive"
         parts = [p.strip() for p in ln.split("|")]
         if len(parts) >= 4:
-            hosts.append({"host": parts[0],
-                          "herdr_eng": parts[1].replace("herdr-eng=", ""),
-                          "build_gate": parts[2].replace("build-gate=", "")[:12],
-                          "agent": parts[3].replace("agent=", "")})
+            def _clean(s: str) -> str:
+                # drop ansible's leading '"msg": "...' wrapper and trailing quote
+                if '"msg":' in s:
+                    s = s.split('"msg":')[-1].strip().strip('"').strip()
+                return s.strip().rstrip('"').strip()
+            hosts.append({"host": _clean(parts[0]),
+                          "herdr_eng": _clean(parts[1]).replace("herdr-eng=", ""),
+                          "build_gate": _clean(parts[2]).replace("build-gate=", "")[:12],
+                          "agent": _clean(parts[3]).replace("agent=", "")})
     return {"rc": rc, "hosts": hosts, "stderr": err.strip()[-300:] or None}

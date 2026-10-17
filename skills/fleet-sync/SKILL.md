@@ -81,16 +81,20 @@ provisioned), `--json` (machine-readable report).
 > `scripts/install.sh` then `scripts/fabric-agent.sh --gateway <url>`, and run
 > `herdr-eng fleet join --no-attach` from the controller once it's reachable.
 
-### 2. Self-update the whole fleet
+### 2. Self-update the whole fleet — ONE command
 
 ```bash
-herdr-eng fleet status    # shows parity (see below)
-scripts/fleet-self-update.sh            # update controller + every host
-scripts/fleet-self-update.sh --host <h> # update just one host
+herdr-eng fleet update             # controller + every reachable host
+herdr-eng fleet update --host <h>  # just one host
+herdr-eng fleet update --json
 ```
 
-`fleet-self-update.sh` pulls the controller checkout, reinstalls local herdr-eng,
-runs `fleet-sync.yml` across the fleet, then `fleet-status.yml` for parity.
+`fleet update` pulls the controller checkout, reinstalls local herdr-eng, runs
+`fleet-sync.yml` across the fleet (or `--host <h>`), then reports version
+parity. Flags: `--no-pull`, `--no-reinstall`, `--gateway <url>`. The older
+script path is `scripts/fleet-self-update.sh`.
+
+`herdr-eng fleet status` (below) is the read-only parity check.
 
 ### 3. Status / parity
 
@@ -121,7 +125,7 @@ ansible-playbook -i ansible/inventory/hosts.yml \
 
 ## Files
 
-- `herdr_engineering/fleet.py` (the one-command engine) + `herdr-eng fleet join/status` CLI
+- `herdr_engineering/fleet.py` (the one-command engine) + `herdr-eng fleet join/update/status` CLI
 - `herdr_engineering/herdr_adapter.py` (`add_machine` → `herdr machine add`)
 - `scripts/fleet-join.sh`, `scripts/fleet-self-update.sh`, `scripts/fleet-sync-status.sh`
 - `scripts/fleet_inventory.py` (private inventory mutation helper)

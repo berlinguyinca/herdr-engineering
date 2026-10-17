@@ -15,6 +15,8 @@ def _fake_repo(tmp_path):
     )
     (tmp_path / "ansible" / "playbooks").mkdir(parents=True)
     (tmp_path / "ansible" / "tasks").mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='herdr-engineering'\n")
     return tmp_path
 
 
@@ -86,6 +88,40 @@ def test_fleet_join_idempotent_inventory(mock_run, tmp_path, monkeypatch):
         r2 = fleet.fleet_join(ssh_target="newbox", label="newbox")
     assert r1["steps"]["inventory"]["added"] is True
     assert r2["steps"]["inventory"]["added"] is False  # already present
+
+
+@patch("herdr_engineering.fleet._run")
+@patch("herdr_engineering.fleet.fleet_status")
+def test_fleet_update_pulls_converges_reports(mock_status, mock_run, tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(repo))
+    mock_status.return_value = {"rc": 0, "hosts": []}
+    mock_run.return_value = (0, "ok", "")
+
+    rep = fleet.fleet_update(host="beast")
+
+    # controller pull + local reinstall + fleet-sync playbook all invoked
+    cmds = [c[0][0] for c in mock_run.call_args_list]
+    assert any("git" in c and "pull" in c for c in cmds)
+    assert any("pip" in c and "install" in c for c in cmds)
+    sync_cmd = next(c for c in cmds if any("fleet-sync.yml" in str(a) for a in c))
+    assert "-l" in sync_cmd and sync_cmd[sync_cmd.index("-l") + 1] == "beast"
+    assert rep["ok"] is True
+    assert rep["status"] == {"rc": 0, "hosts": []}
+
+
+@patch("herdr_engineering.fleet._run")
+def test_fleet_update_skips_local_when_flagged(mock_run, tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(repo))
+    mock_run.return_value = (0, "ok", "")
+
+    fleet.fleet_update(host=None, pull_controller=False, reinstall_local=False)
+    cmds = [c[0][0] for c in mock_run.call_args_list]
+    # only the fleet-sync playbook should run
+    assert not any("git" in c for c in cmds)
+    assert not any("pip" in c for c in cmds)
+    assert any(any("fleet-sync.yml" in str(a) for a in c) for c in cmds)
 
 
 def test_repo_root_uses_env(tmp_path, monkeypatch):
