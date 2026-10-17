@@ -14,6 +14,7 @@ Everything is idempotent and non-disruptive to running agents.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -119,8 +120,9 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
         adapter = NativeHerdrAdapter(herdr_bin=herdr_bin)
         leases = adapter.devfabric_list()
         registered = any(
-            (str(l.get("machine_id", "")) == host or str(l.get("target", {})).find(host) >= 0)
-            for l in leases)
+            (str(lease.get("machine_id", "")) == host
+             or str(lease.get("target", {})).find(host) >= 0)
+            for lease in leases)
         report["registered"] = bool(registered)
         report["steps"]["verify"] = {"registered": bool(registered), "leases": len(leases)}
     except Exception as exc:
@@ -142,44 +144,114 @@ def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:2999
     inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     report: dict = {"target": host or "all inventory hosts", "steps": {}, "ok": False}
 
-    # 1) bring the controller checkout + local herdr-eng up to date
-    if pull_controller and (root / ".git").exists():
-        rc, out, err = _run(["git", "-C", str(root), "pull", "--ff-only", "--quiet"], timeout=120)
-        report["steps"]["controller_pull"] = {"rc": rc, "stderr": err.strip()[-200:] or None}
-    if reinstall_local and (root / "pyproject.toml").exists():
-        rc, out, err = _run([sys.executable, "-m", "pip", "install", "--quiet",
-                             "--upgrade", str(root)], timeout=300)
-        report["steps"]["controller_reinstall"] = {"rc": rc,
-                                                    "stderr": err.strip()[-200:] or None}
+    def step(name: str, cmd: list[str], timeout: int) -> tuple[bool, str]:
+        rc, out, err = _run(cmd, timeout=timeout)
+        report["steps"][name] = {"ok": rc == 0, "rc": rc,
+                                "stderr": err.strip()[-1000:] or None}
+        return rc == 0, out.strip()
 
-    # 2) converge the fleet (all hosts or a single --host)
+    # Never silently deploy a dirty, divergent, or failed controller update.
+    if pull_controller:
+        ok, dirty = step("controller_clean", ["git", "-C", str(root), "status",
+                                               "--porcelain"], 30)
+        if not ok or dirty:
+            report["steps"]["controller_clean"]["ok"] = False
+            report["error"] = "Controller checkout must be clean before updating"
+            return report
+        ok, branch = step("controller_branch", ["git", "-C", str(root),
+                                                "branch", "--show-current"], 30)
+        if not ok or branch != "main":
+            report["error"] = "Controller must be on main"
+            return report
+        ok, _ = step("controller_fetch", ["git", "-C", str(root),
+                                           "fetch", "origin", "main"], 120)
+        if not ok:
+            return report
+        ok, ahead = step("controller_ancestry", ["git", "-C", str(root),
+                                                "rev-list", "--count", "origin/main..HEAD"], 30)
+        if not ok or ahead != "0":
+            report["error"] = "Controller has unpublished commits; refusing automatic update"
+            return report
+        ok, _ = step("controller_pull", ["git", "-C", str(root), "pull",
+                                          "--ff-only", "origin", "main"], 120)
+        if not ok:
+            return report
+    if reinstall_local:
+        ok, _ = step("controller_reinstall", [sys.executable, "-m", "pip", "install",
+                                               "--quiet", "--upgrade", str(root)], 300)
+        if not ok:
+            return report
+
+    from .config import load_config
+    cleanup = load_config().get("build_cleanup", {})
+    roots = cleanup.get("roots", []) if isinstance(cleanup, dict) else []
+    enabled = (isinstance(cleanup, dict) and cleanup.get("enabled") is True
+               and isinstance(roots, list) and bool(roots)
+               and all(isinstance(path, str) and path.strip() for path in roots))
+    installer = root / "scripts" / "build-cleanup.sh"
+    if enabled and installer.exists():
+        ok, _ = step("controller_cleanup", ["bash", str(installer)], 120)
+        if not ok:
+            return report
+
+    elif not enabled and sys.platform.startswith("linux"):
+        loaded, value, _ = _run(["systemctl", "--user", "show",
+                                 "herdr-eng-build-cleanup.service",
+                                 "-p", "LoadState", "--value"], timeout=30)
+        if loaded == 0 and value.strip() == "loaded":
+            ok, _ = step("controller_cleanup_disabled", ["systemctl", "--user", "disable",
+                         "--now", "herdr-eng-build-cleanup.service"], 120)
+            if not ok:
+                return report
+
+    timer_installer = root / "scripts" / "fleet-auto-update.sh"
+    if timer_installer.exists():
+        enabled, _, _ = _run(["systemctl", "--user", "is-enabled", "--quiet",
+                              "herdr-eng-fleet-update.timer"], timeout=30)
+        if enabled == 0:
+            ok, _ = step("controller_update_timer", ["bash", str(timer_installer)], 120)
+            if not ok:
+                return report
+
     playbook = root / "ansible" / "playbooks" / "fleet-sync.yml"
     cmd = ["ansible-playbook", "-i", str(inv), str(playbook),
            "-e", f"fabric_agent_gateway_url={gateway}"]
     if host:
         cmd += ["-l", host]
-    rc, out, err = _run(cmd, timeout=1800)
-    report["steps"]["fleet_sync"] = {"ok": rc == 0, "rc": rc,
-                                      "stderr": err.strip()[-400:] or None}
-
-    # 3) report parity
-    report["status"] = fleet_status(inventory=inv)
-    report["ok"] = rc == 0
+    ok, out = step("fleet_sync", cmd, 1800)
+    # Ansible usually puts host/task failures in stdout, not stderr.
+    report["steps"]["fleet_sync"]["stdout"] = out[-4000:]
+    report["status"] = fleet_status(inventory=inv, host=host)
+    revision_rc, revision, _ = _run(["git", "-C", str(root), "rev-parse", "HEAD"], timeout=30)
+    revision = revision.strip()
+    hosts = report["status"].get("hosts", [])
+    valid_revision = revision_rc == 0 and re.fullmatch(r"[0-9a-f]{40,64}", revision) is not None
+    mismatched = [entry["host"] for entry in hosts
+                  if revision_rc != 0 or entry.get("revision") != revision]
+    report["steps"]["revision_parity"] = {
+        "ok": valid_revision and bool(hosts) and not mismatched, "expected_revision": revision,
+        "mismatched_hosts": mismatched,
+    }
+    report["ok"] = (ok and report["status"].get("rc") == 0
+                    and report["steps"]["revision_parity"]["ok"])
     return report
 
 
-def fleet_status(*, inventory: Path | None = None) -> dict:
+def fleet_status(*, inventory: Path | None = None, host: str | None = None) -> dict:
     """Read-only per-host version/registration fingerprint."""
     root = repo_root()
     inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     playbook = root / "ansible" / "playbooks" / "fleet-status.yml"
-    rc, out, err = _run(["ansible-playbook", "-i", str(inv), str(playbook)], timeout=300)
-    lines = [l for l in out.splitlines() if " | " in l and "herdr-eng=" in l]
+    cmd = ["ansible-playbook", "-i", str(inv), str(playbook)]
+    if host:
+        cmd += ["-l", host]
+    rc, out, err = _run(cmd, timeout=300)
+    lines = [line for line in out.splitlines() if " | " in line and "herdr-eng=" in line]
     hosts = []
-    for ln in lines:
+    for line in lines:
         # ansible emits the fingerprint as a debug msg, e.g.
         #   "msg": "beast | herdr-eng=herdr-eng 0.1.0 | build-gate=<md5> | agent=inactive"
-        parts = [p.strip() for p in ln.split("|")]
+        parts = [p.strip() for p in line.split("|")]
         if len(parts) >= 4:
             def _clean(s: str) -> str:
                 # drop ansible's leading '"msg": "...' wrapper and trailing quote
@@ -189,5 +261,7 @@ def fleet_status(*, inventory: Path | None = None) -> dict:
             hosts.append({"host": _clean(parts[0]),
                           "herdr_eng": _clean(parts[1]).replace("herdr-eng=", ""),
                           "build_gate": _clean(parts[2]).replace("build-gate=", "")[:12],
-                          "agent": _clean(parts[3]).replace("agent=", "")})
+                          "agent": _clean(parts[3]).replace("agent=", ""),
+                          "revision": _clean(parts[4]).removeprefix("revision=") if len(parts) > 4 else "unknown",
+                          "cleanup": _clean(parts[5]).removeprefix("cleanup=") if len(parts) > 5 else "unknown"})
     return {"rc": rc, "hosts": hosts, "stderr": err.strip()[-300:] or None}

@@ -57,3 +57,13 @@ notifications:
 security:
   allow_public_listeners: false
   persist_hidden_reasoning: false
+
+# Optional Linux companion: scripts/build-cleanup.sh installs the user service.
+# Only runs while a same-user local `herdr server` exists. Explicit roots required.
+build_cleanup:
+  enabled: false
+  roots: []  # e.g. [~/IdeaProjects]
+  interval_seconds: 900
+  high_water_percent: 85
+  low_water_percent: 80
+  min_age_hours: 24

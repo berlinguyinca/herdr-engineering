@@ -92,3 +92,7 @@ fleet scale of 14+ concurrent full-workspace cargo builds, starve the CPU.
 > starting once load/core is high; it does not stop already-running ones. If
 > you see contention + sustained high load after deployment, pin
 > `HERDR_BUILD_GATE_SLOTS` to a lower value and/or lower `HERDR_BUILD_GATE_MAX_LOAD`.
+
+Rust cache maintenance uses the same per-host state directory and a shared build
+lock. See [automatic Rust build-cache cleanup](build-cleanup.md) for configuration,
+process checks, and the optional Herdr server companion.

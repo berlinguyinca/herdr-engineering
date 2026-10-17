@@ -17,6 +17,14 @@ from .errors import InvalidError
 
 DEFAULTS: dict[str, Any] = {
     "version": 1,
+    "build_cleanup": {
+        "enabled": False,
+        "roots": [],
+        "interval_seconds": 900,
+        "high_water_percent": 85,
+        "low_water_percent": 80,
+        "min_age_hours": 24,
+    },
     "herdr": {"capability_cache_ttl_seconds": 30},
     "web": {"private_only": True, "host": "127.0.0.1", "port": 8787},
     "artifacts": {

@@ -1,0 +1,13 @@
+[Unit]
+Description=HerdR Engineering unattended fleet update
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO__
+Environment=__REPO_ENV__
+Environment=__PATH_ENV__
+ExecStart=/usr/bin/env __PYTHON__ -m herdr_engineering.fleet_autoupdate
+TimeoutStartSec=1h
+Nice=10
+IOSchedulingClass=idle
+UMask=0077

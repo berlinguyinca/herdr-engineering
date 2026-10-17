@@ -139,6 +139,9 @@
     - name: "Deploy dev-fabric auto-registration agent (all fleet hosts)"
       ansible.builtin.include_tasks: ../tasks/fabric-agent.yml
 
+    - name: "Converge the host cleanup companion and preserve its policy"
+      ansible.builtin.include_tasks: ../tasks/build-cleanup.yml
+
     # ----------------------------------------------------------------------
     # Build-storm prevention (all fleet hosts): install the pi build-gate
     # extension so heavy agent builds (cargo check --workspace / tsc) are

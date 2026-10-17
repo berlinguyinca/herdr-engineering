@@ -1,0 +1,52 @@
+---
+# Package provisioning precedes this include. Preserve the host's explicit
+# cleanup policy: fleet updates never invent allowed roots or opt hosts in.
+- name: "Deploy Rust build-cache cleanup companion"
+  become: false
+  when: ansible_facts['system'] == 'Linux'
+  environment:
+    HOME: "{{ fleet_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+  block:
+    - name: "Read the host's cleanup opt-in policy"
+      ansible.builtin.command:
+        argv:
+          - "{{ fleet_home }}/.venvs/herdr-engineering/bin/python"
+          - -c
+          - |
+            import json
+            from pathlib import Path
+            from herdr_engineering.config import load_config
+            policy = load_config([Path.home() / '.config/herdr-engineering/config.yaml'])['build_cleanup']
+            roots = policy.get('roots', []) if isinstance(policy, dict) else []
+            enabled = isinstance(policy, dict) and policy.get('enabled') is True
+            print(json.dumps(enabled and isinstance(roots, list) and bool(roots)
+                             and all(isinstance(root, str) and bool(root.strip()) for root in roots)))
+      register: build_cleanup_policy
+      changed_when: false
+      check_mode: false
+
+    - name: "Create the cleanup user unit directory"
+      ansible.builtin.file:
+        path: "{{ fleet_home }}/.config/systemd/user"
+        state: directory
+        mode: "0755"
+
+    - name: "Install the cleanup companion with this host's executable"
+      ansible.builtin.copy:
+        content: >-
+          {{ lookup('file', herdr_engineering_repo_root ~ '/scripts/herdr-eng-build-cleanup.service')
+             | replace('__HERDR_ENG__', '"' ~ ((fleet_home ~ '/.venvs/herdr-engineering/bin/herdr-eng')
+               | replace('\\', '\\\\') | replace('"', '\\"') | replace('%', '%%')) ~ '"') }}
+        dest: "{{ fleet_home }}/.config/systemd/user/herdr-eng-build-cleanup.service"
+        mode: "0644"
+
+    # Restart after package updates even when the unit text is unchanged.
+    # Disabled/absent policy also stops a companion left by an earlier opt-in.
+    - name: "Apply the existing cleanup policy and reload updated code"
+      ansible.builtin.systemd_service:
+        name: herdr-eng-build-cleanup.service
+        scope: user
+        daemon_reload: true
+        enabled: "{{ build_cleanup_policy.stdout | from_json | bool }}"
+        state: "{{ 'restarted' if (build_cleanup_policy.stdout | from_json | bool) else 'stopped' }}"

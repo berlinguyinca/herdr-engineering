@@ -197,3 +197,49 @@ The CoreDNS + gateway containers are removed; the `herdr-state` named volume
 - **Leases self-heal.** A stopped or crashed host's leases expire via the
   gateway's probe loop and its `dev:<port>` ports are reused; a restarted
   agent re-registers them.
+
+## Daily unattended updates (controller only)
+
+After committing and publishing local changes, enable the controller's timer:
+
+```bash
+scripts/fleet-auto-update.sh
+systemctl --user list-timers herdr-eng-fleet-update.timer
+```
+
+The timer runs daily with up to 30 minutes of jitter and catches missed runs
+when the user service manager starts. It uses this checkout's virtualenv and
+private inventory; install it on the controller only, not every fleet host.
+`HERDR_ENG_PYTHON` selects another controller virtualenv when installing.
+
+Automatic updates require a clean `main` checkout, fetch `origin/main`, reject
+unpublished/divergent commits, and fast-forward before reinstalling. Ignored
+private inventory is retained. Pull/install/deployment failures return nonzero;
+a lock prevents overlapping scheduled runs. SSH authentication must remain valid
+for unattended access. Hosts requiring an interactive Tailscale SSH check will
+fail that deployment and be retried by a later scheduled run.
+
+Fleet sync refreshes the fabric agent and Pi build gate. On Linux, it also
+installs/restarts the Rust cleanup companion according to each machine's existing
+`~/.config/herdr-engineering/config.yaml`. Cleanup remains disabled without both
+explicit opt-in and allowed roots; updates never infer deletion roots. macOS
+currently reports cleanup as unsupported. The controller refreshes its enabled
+cleanup companion and already-enabled update timer after package updates.
+
+Inspect update results and installed revisions:
+
+```bash
+journalctl --user -u herdr-eng-fleet-update.service
+herdr-eng fleet status
+herdr-eng build-cleanup status
+```
+
+The update service emits a JSON report with step failures and revision mismatches.
+`fleet status` now includes source revision and cleanup service state. The legacy
+`scripts/fleet-self-update.sh` delegates to the same guarded updater.
+
+Disable unattended updates with:
+
+```bash
+systemctl --user disable --now herdr-eng-fleet-update.timer
+```

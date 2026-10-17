@@ -1,0 +1,14 @@
+[Unit]
+Description=HerdR Engineering Rust build-cache maintenance
+
+[Service]
+Environment="HERDR_ENGINEERING_CONFIG=%h/.config/herdr-engineering/config.yaml"
+ExecStart=__HERDR_ENG__ build-cleanup watch
+Restart=on-failure
+RestartSec=30
+Nice=19
+IOSchedulingClass=idle
+UMask=0077
+
+[Install]
+WantedBy=default.target

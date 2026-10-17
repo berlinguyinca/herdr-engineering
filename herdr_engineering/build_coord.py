@@ -218,7 +218,7 @@ class BuildGate:
         return out
 
 
-def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,
+def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,
               wait_seconds: float = 0.0, json_out: bool = False,
               state_dir: Path | None = None,
               bypass_on_timeout: bool = False) -> int:
@@ -295,3 +295,33 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
             print(f"build-coordinate: could not exec {cmd[0]}: {exc}",
                   file=sys.stderr)
         return 127
+
+
+def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,
+              wait_seconds: float = 0.0, json_out: bool = False,
+              state_dir: Path | None = None,
+              bypass_on_timeout: bool = False) -> int:
+    """Hold a maintenance read lock for the entire build, even on slot bypass.
+
+    Cleanup takes the exclusive side of this lock. The inheritable descriptor
+    survives exec just like the build slot; kernel teardown releases both.
+    """
+    maintenance_fd = None
+    if cmd and _HAS_FCNTL:
+        directory = Path(state_dir) if state_dir is not None else _default_state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        maintenance_fd = os.open(directory / "build-maintenance.lock",
+                                 os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fcntl.flock(maintenance_fd, fcntl.LOCK_SH)
+            os.set_inheritable(maintenance_fd, True)
+        except BaseException:
+            os.close(maintenance_fd)
+            raise
+    try:
+        return _run_gated(cmd, slots=slots, max_load=max_load,
+                          wait_seconds=wait_seconds, json_out=json_out,
+                          state_dir=state_dir, bypass_on_timeout=bypass_on_timeout)
+    finally:
+        if maintenance_fd is not None:
+            os.close(maintenance_fd)

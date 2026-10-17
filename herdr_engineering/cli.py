@@ -31,6 +31,15 @@ def _build_parser() -> argparse.ArgumentParser:
                         version=f"herdr-eng {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p = sub.add_parser("build-cleanup", help="reclaim stale Rust build caches")
+    cleanup_sub = p.add_subparsers(dest="cleanup_command", required=True)
+    for action in ("run", "watch", "status"):
+        cp = cleanup_sub.add_parser(action)
+        cp.add_argument("--root", action="append", default=None,
+                        help="allowed project root (repeatable; otherwise use config)")
+        cp.add_argument("--dry-run", action="store_true")
+        cp.set_defaults(func=_cmd_build_cleanup)
+
     # build-coordinate ----------------------------------------------------
     # Cross-agent single-flight build gate: bound concurrent cargo/tsc builds
     # across ALL agents on a host so they can't create a CPU build-storm.
@@ -588,10 +597,13 @@ def _cmd_fleet_update(args) -> int:
         for step, detail in report.get("steps", {}).items():
             ok = detail.get("ok", detail.get("rc") == 0)
             print(f"  [{'ok' if ok else 'warn':>4}] {step}: rc={detail.get('rc')}")
+        if report.get("error"):
+            print(f"  !! {report["error"]}")
         print("  --- fleet parity ---")
         for h in report.get("status", {}).get("hosts", []):
             print(f"  {h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
-                  f"agent={h['agent']}")
+                  f"agent={h['agent']} revision={h.get('revision', 'unknown')} "
+                  f"cleanup={h.get('cleanup', 'unknown')}")
         fs = report.get("steps", {}).get("fleet_sync", {})
         if fs.get("rc") != 0 and fs.get("stderr"):
             print(f"  !! {fs['stderr']}")
@@ -606,9 +618,10 @@ def _cmd_fleet_status(args) -> int:
     else:
         for h in status.get("hosts", []):
             print(f"{h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
-                  f"agent={h['agent']}")
+                  f"agent={h['agent']} revision={h.get('revision', 'unknown')} "
+                  f"cleanup={h.get('cleanup', 'unknown')}")
         if not status.get("hosts"):
-            print("no hosts reported (playbook rc=%s)" % status.get("rc"))
+            print(f"no hosts reported (playbook rc={status.get("rc")})")
     return 0 if status.get("rc") == 0 else 1
 
 
@@ -1324,6 +1337,11 @@ def _cmd_build_coordinate(args) -> int:
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout)
+
+
+def _cmd_build_cleanup(args) -> int:
+    from .build_maintenance import command
+    return command(args)
 
 
 def _cmd_dev_agent(args) -> int:

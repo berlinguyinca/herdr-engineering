@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily HerdR Engineering fleet update
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+Unit=herdr-eng-fleet-update.service
+
+[Install]
+WantedBy=timers.target

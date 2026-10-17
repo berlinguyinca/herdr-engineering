@@ -40,6 +40,9 @@
     - name: "Converge herdr-eng + fabric auto-registration agent"
       ansible.builtin.include_tasks: ../tasks/fabric-agent.yml
 
+    - name: "Converge the host cleanup companion and preserve its policy"
+      ansible.builtin.include_tasks: ../tasks/build-cleanup.yml
+
     - name: "Converge pi build-gate extension"
       ansible.builtin.include_tasks: ../tasks/pi-build-gate.yml
 
@@ -48,4 +51,4 @@
 
     - name: "Report per-host version fingerprint"
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} | herdr-eng={{ fp_herdr_version.stdout | default('MISSING') }} | build-gate={{ fp_buildgate_md5.stdout | default('MISSING') }} | agent={{ fp_agent.stdout_lines | last | default('unknown') }}"
+        msg: "{{ inventory_hostname }} | herdr-eng={{ fp_herdr_version.stdout | default('MISSING') }} | build-gate={{ fp_buildgate_md5.stdout | default('MISSING') }} | agent={{ fp_agent.stdout_lines | last | default('unknown') }} | revision={{ fp_revision.stdout | default('MISSING', true) }} | cleanup={{ fp_cleanup.stdout | default('unknown', true) }}"

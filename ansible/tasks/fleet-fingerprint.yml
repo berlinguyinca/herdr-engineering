@@ -2,7 +2,7 @@
 # Gather a version/registration fingerprint for the current host (no changes).
 # Requires fleet_home / fleet_user to be set (see playbook preamble).
 # Registers:
-#   fp_herdr_version, fp_buildgate_md5, fp_agent
+#   fp_herdr_version, fp_buildgate_md5, fp_agent, fp_revision, fp_cleanup
 - name: "Capture herdr-eng version fingerprint"
   # become: false — must read the FLEET user's venv/services, not root's.
   become: false
@@ -39,3 +39,30 @@
   register: fp_agent
   changed_when: false
   ignore_errors: true
+
+- name: "Capture installed source revision"
+  become: false
+  ansible.builtin.command:
+    argv:
+      - git
+      - -C
+      - "{{ fleet_home }}/herdr-engineering-repo"
+      - rev-parse
+      - HEAD
+  register: fp_revision
+  changed_when: false
+  failed_when: false
+
+- name: "Capture cleanup companion state"
+  become: false
+  ansible.builtin.shell: |
+    if [ "{{ ansible_facts['system'] }}" = Linux ]; then
+      XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active --quiet \
+        herdr-eng-build-cleanup.service 2>/dev/null && echo active || echo inactive
+    else
+      echo unsupported
+    fi
+  args:
+    executable: /bin/bash
+  register: fp_cleanup
+  changed_when: false
