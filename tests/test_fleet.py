@@ -20,6 +20,17 @@ def _fake_repo(tmp_path):
     return tmp_path
 
 
+def test_devfabric_list_unwraps_leases():
+    from herdr_engineering.herdr_adapter import NativeHerdrAdapter
+    ad = NativeHerdrAdapter()
+    ad._run_json = lambda *a, **k: {"leases": [{"target": {"machine_id": "beast"}}]}
+    assert ad.devfabric_list() == [{"target": {"machine_id": "beast"}}]
+    ad._run_json = lambda *a, **k: [{"id": "x"}]
+    assert ad.devfabric_list() == [{"id": "x"}]
+    ad._run_json = lambda *a, **k: {"leases": []}
+    assert ad.devfabric_list() == []
+
+
 @patch("herdr_engineering.fleet._run")
 def test_fleet_join_attaches_provisions_verifies(mock_run, tmp_path, monkeypatch):
     repo = _fake_repo(tmp_path)
