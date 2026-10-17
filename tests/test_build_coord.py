@@ -17,6 +17,7 @@ from herdr_engineering.build_coord import (
     BuildGate,
     _load_per_core,
     _default_state_dir,
+    _default_slots,
     run_gated,
 )
 
@@ -28,6 +29,17 @@ def gate_dir(tmp_path):
 
 def test_load_per_core_is_positive():
     assert _load_per_core() >= 0.0
+
+
+def test_default_slots_scales_with_cores():
+    """Default slot count is max(2, cores-4): floors at 2 on small hosts,
+    scales with core count on high-performance hosts."""
+    import os as _os
+    cores = _os.cpu_count() or 4
+    assert _default_slots() == max(2, cores - 4)
+    assert _default_slots() >= 2  # never below 2
+    # On any real host the default should not collapse to 1.
+    assert _default_slots() >= 2
 
 
 def test_default_state_dir_respects_env(monkeypatch, tmp_path):

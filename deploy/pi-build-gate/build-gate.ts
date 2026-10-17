@@ -18,7 +18,8 @@
  *
  * Config (env):
  *   HERDR_BUILD_GATE_DISABLE=1  disable gating entirely
- *   HERDR_BUILD_GATE_SLOTS=N    max concurrent builds host-wide (default 2)
+ *   HERDR_BUILD_GATE_SLOTS=N    max concurrent builds host-wide (default: auto =
+ *                               max(2, cpu_cores-4); omit to let herdr-eng choose)
  *   HERDR_BUILD_GATE_MAX_LOAD=F back off while 1-min load/core exceeds this (default 3.0)
  *   HERDR_BUILD_GATE_WAIT=S     seconds to wait for a slot before running ungated (default 900)
  */
@@ -57,10 +58,21 @@ const HERDR_ENG: string | null = (() => {
 })();
 
 function envNum(name: string, fallback: number): number {
+
 	const raw = process.env[name];
 	if (raw === undefined || raw === "") return fallback;
 	const n = Number(raw);
 	return Number.isFinite(n) ? n : fallback;
+}
+
+// Slots are adaptive in herdr-eng (`--slots` auto = max(2, cores-4)), so we
+// only pin them when the operator explicitly set HERDR_BUILD_GATE_SLOTS;
+// otherwise omit the flag and let herdr-eng scale with the host's core count.
+function slotsFlag(): string {
+
+	const raw = process.env.HERDR_BUILD_GATE_SLOTS;
+	if (raw === undefined || raw === "" || !Number.isFinite(Number(raw))) return "";
+	return ` --slots ${raw}`;
 }
 
 function shouldGate(command: string): boolean {
@@ -88,15 +100,15 @@ export default function (pi: ExtensionAPI) {
 		const cmd = event.input.command as string | undefined;
 		if (!cmd || !shouldGate(cmd)) return;
 
-		const slots = envNum("HERDR_BUILD_GATE_SLOTS", 2);
 		const maxLoad = envNum("HERDR_BUILD_GATE_MAX_LOAD", 3.0);
 		const wait = envNum("HERDR_BUILD_GATE_WAIT", 900);
 
 		// Wrap the original command using the absolute gate path. Shell
 		// operators (`|`, `&&`, redirection) still apply to the gate's output,
-		// so pipelines keep working.
+		// so pipelines keep working. --slots is omitted unless the operator
+		// pinned HERDR_BUILD_GATE_SLOTS, so herdr-eng scales slots with cores.
 		event.input.command =
-			`${HERDR_ENG} build-coordinate --slots ${slots} ` +
+			`${HERDR_ENG} build-coordinate${slotsFlag()} ` +
 			`--max-load ${maxLoad} --wait ${wait} --bypass-on-timeout -- ${cmd}`;
 	});
 }

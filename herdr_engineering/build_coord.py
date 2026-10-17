@@ -56,6 +56,18 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
+def _default_slots() -> int:
+    """Adaptive build-slot count: ``max(2, cores - 4)``.
+
+    On small hosts this floors at 2 (enough to keep ordinary iteration
+    responsive while still bounding the storm). On high-performance hosts it
+    scales with core count so legitimate parallel builds aren't throttled. It
+    is always overridable via ``--slots`` / ``HERDR_BUILD_GATE_SLOTS``.
+    """
+    cores = os.cpu_count() or 4
+    return max(2, cores - 4)
+
+
 def _load_per_core() -> float:
     """One-minute load average divided by CPU count (0.0 when unknown)."""
     try:
@@ -70,9 +82,9 @@ def _load_per_core() -> float:
 class BuildGate:
     """Flock-based, per-host slot gate for build commands."""
 
-    def __init__(self, state_dir: Path | str | None = None, slots: int = 2) -> None:
+    def __init__(self, state_dir: Path | str | None = None, slots: int | None = None) -> None:
         self.dir = Path(state_dir) if state_dir else _default_state_dir()
-        self.slots = max(1, int(slots))
+        self.slots = max(1, int(slots if slots is not None else _default_slots()))
         self.dir.mkdir(parents=True, exist_ok=True)
 
     def _slot_path(self, index: int) -> Path:
@@ -206,7 +218,7 @@ class BuildGate:
         return out
 
 
-def run_gated(cmd: list[str], *, slots: int = 2, max_load: float = 1.5,
+def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5,
               wait_seconds: float = 0.0, json_out: bool = False,
               state_dir: Path | None = None,
               bypass_on_timeout: bool = False) -> int:

@@ -37,8 +37,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("build-coordinate",
                        help="run a build command under the per-host build gate "
                             "(prevents CPU build-storms from concurrent agents)")
-    p.add_argument("--slots", type=int, default=2,
-                   help="max concurrent builds host-wide (default 2)")
+    p.add_argument("--slots", type=int, default=None,
+                   help="max concurrent builds host-wide (default: auto = "
+                        "max(2, cpu_cores-4); e.g. 20 on 24 cores)")
     p.add_argument("--max-load", type=float, default=1.5,
                    help="back off while 1-min load per core exceeds this (0=off)")
     p.add_argument("--wait", type=float, default=0.0,
@@ -1199,12 +1200,13 @@ def _cmd_build_coordinate(args) -> int:
     autonomous agents on a host, so N agents can't each launch a full-workspace
     build at once and CPU-starve the machine (the "build storm").
     """
-    from .build_coord import BuildGate, run_gated
+    from .build_coord import BuildGate, _default_slots, run_gated
 
+    slots = args.slots if args.slots is not None else _default_slots()
     if getattr(args, "status", False):
-        gate = BuildGate(slots=args.slots)
+        gate = BuildGate(slots=slots)
         if args.json:
-            _print_json({"slots": args.slots, "occupancy": gate.status()})
+            _print_json({"slots": slots, "occupancy": gate.status()})
         else:
             for entry in gate.status():
                 if entry["held"]:
@@ -1219,7 +1221,7 @@ def _cmd_build_coordinate(args) -> int:
     cmd = args.command
     if cmd and cmd[0] == "--":  # argparse REMAINDER keeps a leading `--`
         cmd = cmd[1:]
-    return run_gated(cmd, slots=args.slots, max_load=args.max_load,
+    return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout)
 

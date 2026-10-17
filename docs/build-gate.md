@@ -20,7 +20,10 @@ dev-fabric gateway and the machine became unresponsive.
    **ungated** (never fails/hangs the agent) if no slot frees within `--wait`,
    making the gate best-effort coordination.
 
-   Defaults: `slots=2`, `max-load=3.0`, `wait=900s`, `bypass-on-timeout`.
+   Defaults: `slots` = **auto** (`max(2, cpu_cores-4)`), `max-load=3.0`,
+   `wait=900s`, `bypass-on-timeout`. The auto slot count scales with the
+   host: 2 on small hosts, more on high-performance hosts (e.g. **20 on 24
+   cores**). Override with `--slots` / `HERDR_BUILD_GATE_SLOTS`.
 
 2. **Pi build-gate extension** (`deploy/pi-build-gate/build-gate.ts`) — hooks
    pi's `tool_call` event and rewrites heavy build commands
@@ -78,6 +81,14 @@ fleet scale of 14+ concurrent full-workspace cargo builds, starve the CPU.
 
 **Tuning guidance** (revisit after a few days of real traffic):
 - frequent contention **and** high load/core → gate too loose; raise load
-  guard or lower slots.
+  guard or lower slots (e.g. pin `HERDR_BUILD_GATE_SLOTS=2`).
 - frequent contention **but** idle host → gate too conservative; raise slots.
 - Contention counts: `grep -c '"event": *"contention"' state/build-gates/telemetry.jsonl`
+
+> **Note on adaptive slots vs the load guard.** The auto default (`cores-4`)
+> is permissive on big hosts (20 on 24 cores). If every build is a full-
+> workspace `cargo check` using `-j nproc`, 20 concurrent builds will still
+> saturate the CPU — the `--max-load` guard only stops *new* builds from
+> starting once load/core is high; it does not stop already-running ones. If
+> you see contention + sustained high load after deployment, pin
+> `HERDR_BUILD_GATE_SLOTS` to a lower value and/or lower `HERDR_BUILD_GATE_MAX_LOAD`.
