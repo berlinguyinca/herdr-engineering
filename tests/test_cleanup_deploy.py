@@ -78,5 +78,14 @@ def test_fingerprint_reports_revision_and_cleanup_state(filename):
 def test_fabric_installer_runs_from_remote_checkout():
     # Linux installer resolves its unit relative to its own scripts directory.
     content = (ROOT / 'ansible/tasks/fabric-agent.yml').read_text()
-    assert "'/herdr-engineering-repo/scripts/fabric-agent.sh'" in content
+    assert "fabric-agent.sh" in content and "/scripts/" in content
     assert 'fabric-agent-macos.sh' in content
+
+
+def test_deployment_checkout_can_be_separate_from_active_development():
+    fabric = (ROOT / 'ansible/tasks/fabric-agent.yml').read_text()
+    fingerprint = (ROOT / 'ansible/tasks/fleet-fingerprint.yml').read_text()
+    assert 'HERDR_ENGINEERING_CHECKOUT' in fabric
+    assert 'herdr_engineering_checkout' in fabric
+    assert 'herdr_engineering_checkout' in fingerprint
+    assert 'REPO="$HERDR_ENGINEERING_CHECKOUT"' in fabric

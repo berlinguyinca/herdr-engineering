@@ -46,7 +46,7 @@
     argv:
       - git
       - -C
-      - "{{ fleet_home }}/herdr-engineering-repo"
+      - "{{ herdr_engineering_checkout | default(fleet_home ~ '/herdr-engineering-repo') }}"
       - rev-parse
       - HEAD
   register: fp_revision

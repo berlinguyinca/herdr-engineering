@@ -30,7 +30,8 @@
       ansible.builtin.shell: |
         set -e
         VENV="$HOME/.venvs/herdr-engineering"
-        REPO="$HOME/herdr-engineering-repo"
+        REPO="$HERDR_ENGINEERING_CHECKOUT"
+        mkdir -p "$(dirname "$REPO")"
         if [ ! -d "$REPO/.git" ]; then
           git clone --depth 1 \
             https://github.com/berlinguyinca/herdr-engineering.git "$REPO"
@@ -59,6 +60,7 @@
       args:
         executable: /bin/bash
       environment:
+        HERDR_ENGINEERING_CHECKOUT: "{{ herdr_engineering_checkout | default(fleet_home ~ '/herdr-engineering-repo') }}"
         HOME: "{{ fleet_home }}"
         USER: "{{ fleet_user }}"
         XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
@@ -71,8 +73,9 @@
       ansible.builtin.command:
         argv:
           - /bin/bash
-          - "{{ (fleet_home ~ '/herdr-engineering-repo/scripts/fabric-agent-macos.sh') if ansible_facts['system'] == 'Darwin' else (fleet_home ~ '/herdr-engineering-repo/scripts/fabric-agent.sh') }}"
+          - "{{ herdr_engineering_checkout | default(fleet_home ~ '/herdr-engineering-repo') }}/scripts/{{ 'fabric-agent-macos.sh' if ansible_facts['system'] == 'Darwin' else 'fabric-agent.sh' }}"
       environment:
+        HERDR_ENGINEERING_CHECKOUT: "{{ herdr_engineering_checkout | default(fleet_home ~ '/herdr-engineering-repo') }}"
         HOME: "{{ fleet_home }}"
         USER: "{{ fleet_user }}"
         XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"

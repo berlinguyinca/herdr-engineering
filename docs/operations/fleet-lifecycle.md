@@ -243,3 +243,14 @@ Disable unattended updates with:
 ```bash
 systemctl --user disable --now herdr-eng-fleet-update.timer
 ```
+
+If the default `~/herdr-engineering-repo` checkout contains development work,
+keep it intact and select a separate, absolute deployment path in the private
+`ansible/inventory/host_vars/<host>.yml`:
+
+```yaml
+herdr_engineering_checkout: /home/your-user/.local/share/herdr-engineering/fleet-checkout
+```
+
+Fleet provisioning creates and updates that checkout, and revision reporting uses
+the same path. Existing feature branches and unpublished commits are preserved.
