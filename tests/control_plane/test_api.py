@@ -33,8 +33,8 @@ class Client:
 
 
 @pytest.fixture()
-def server():
-    repo = ControlPlaneRepo()
+def server(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
     svr = ControlPlaneServer(repo)
     thread = threading.Thread(target=svr.serve, daemon=True)
     thread.start()
@@ -277,12 +277,12 @@ def test_native_dispatch_requires_identity_and_preserves_observed_status(server)
     assert json.loads(raw)["error"] == "unsupported_action"
 
 
-def test_api_delivers_original_message_once_and_returns_native_receipt():
+def test_api_delivers_original_message_once_and_returns_native_receipt(acknowledged_sink):
     received = []
     def dispatch(session, text, artifacts):
         received.append((session["session_id"], text))
         return {"status": "delivered", "receipt": {"ok": True}}
-    repo = ControlPlaneRepo()
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
     sid = repo.create_session()
     svr = ControlPlaneServer(repo, dispatcher=dispatch)
     thread = threading.Thread(target=svr.serve, daemon=True)
@@ -325,3 +325,27 @@ def test_default_native_dispatch_checks_conversation_before_prompt(monkeypatch):
     with pytest.raises(InvalidError, match="identity changed"):
         ControlPlaneServer._dispatch_native_message(None, record, "do not deliver", [])
     assert len(calls) == 3  # snapshot+prompt, then only the mismatched snapshot
+
+
+def test_message_without_durable_sink_returns_unavailable_without_dispatch():
+    calls = []
+    def dispatch(*args):
+        calls.append(args)
+        return {"status": "delivered"}
+    repo = ControlPlaneRepo()
+    sid = repo.create_session()
+    svr = ControlPlaneServer(repo, dispatcher=dispatch)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    try:
+        client = Client(svr.port)
+        status, raw = client.post(f"/api/v1/sessions/{sid}/messages",
+                                  {"message": "hello", "operation_id": "requires-durability"})
+        assert status == 503
+        assert json.loads(raw)["error"] == "receipt_persistence_unavailable"
+        assert calls == []
+        assert repo.get_session(sid)["messages"] == 0
+        assert client.get("/api/v1/health")[0] == 200
+    finally:
+        svr.shutdown()

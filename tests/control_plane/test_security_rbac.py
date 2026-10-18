@@ -41,9 +41,9 @@ API_KEYS = {
 
 
 @pytest.fixture
-def server():
+def server(acknowledged_sink):
     """ControlPlaneServer on 127.0.0.1:0 with role-scoped API keys."""
-    repo = ControlPlaneRepo()
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
     srv = ControlPlaneServer(repo, host="127.0.0.1", port=0,
                              api_keys=API_KEYS)
     t = threading.Thread(target=srv.serve, daemon=True)

@@ -230,9 +230,9 @@ def test_message_is_queued_without_dispatcher_and_replay_does_not_send():
     assert restored.send_message(sid, "hello", operation_id="operation-one", dispatcher=unexpected) == first
 
 
-def test_message_delivery_is_acknowledged_once_and_payload_reuse_rejected():
+def test_message_delivery_is_acknowledged_once_and_payload_reuse_rejected(acknowledged_sink):
     import pytest
-    r = repo.ControlPlaneRepo()
+    r = repo.ControlPlaneRepo(sink=acknowledged_sink)
     sid = r.create_session()
     observed = []
     def deliver(session, text, artifacts):
@@ -251,8 +251,8 @@ def test_message_delivery_is_acknowledged_once_and_payload_reuse_rejected():
     assert len(observed) == 1
 
 
-def test_transport_failure_never_counts_as_delivered():
-    r = repo.ControlPlaneRepo()
+def test_transport_failure_never_counts_as_delivered(acknowledged_sink):
+    r = repo.ControlPlaneRepo(sink=acknowledged_sink)
     sid = r.create_session()
     def broken(*args):
         raise OSError("unreachable")
@@ -280,10 +280,10 @@ def test_legacy_session_collision_is_refused_without_overwriting_first_host():
     assert r.get_session("w1:p1")["host_id"] == "bender"
 
 
-def test_identity_survives_ingest_and_durable_event_replay():
+def test_identity_survives_ingest_and_durable_event_replay(acknowledged_sink):
     from herdr_engineering.control_plane.bridge import _reconstruct_from_events
     from herdr_engineering.control_plane.ingest import IngestService
-    r = repo.ControlPlaneRepo()
+    r = repo.ControlPlaneRepo(sink=acknowledged_sink)
     rec = IngestService(r).ingest({
         "entity_type": "session", "entity_id": "herdr:beast:eng:w1%3Ap1",
         "event_type": "session.updated", "payload": {
@@ -376,8 +376,8 @@ def test_required_receipt_cannot_race_telemetry_stream_sequence():
     assert [e["sequence"] for e in r.stream("session", sid)] == [0, 1, 2]
 
 
-def test_message_audit_keeps_redacted_text_but_transport_receives_original():
-    r = repo.ControlPlaneRepo()
+def test_message_audit_keeps_redacted_text_but_transport_receives_original(acknowledged_sink):
+    r = repo.ControlPlaneRepo(sink=acknowledged_sink)
     sid = r.create_session()
     received = []
     def deliver(session, text, artifacts):
