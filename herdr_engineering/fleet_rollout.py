@@ -863,8 +863,50 @@ def _progress_signature(plan):
     return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
 
 
+def _online_stall_budget(plan, previous, limit):
+    budgets = dict(previous.get("onlineProgress", {}))
+    stalled = None
+    for host, host_state in plan["hosts"].items():
+        if _offline_failure(host_state):
+            continue
+        for session_id, session in host_state["sessions"].items():
+            key = host + "/" + session_id
+            if session["status"] == "complete":
+                budgets.pop(key, None)
+                continue
+            if _offline_failure(session):
+                continue
+            # Isolate this session so sibling progress cannot conceal its stall.
+            signature = _progress_signature(
+                {
+                    "hosts": {
+                        host: {
+                            "status": "online",
+                            "sessions": {session_id: session},
+                        }
+                    }
+                }
+            )
+            prior = budgets.get(key, {})
+            unchanged = (
+                prior.get("unchangedPasses", 0) + 1 if prior.get("signature") == signature else 0
+            )
+            budgets[key] = {"signature": signature, "unchangedPasses": unchanged}
+            if unchanged >= limit and stalled is None:
+                stalled = f"{key}: no meaningful progress for {unchanged} unchanged online passes; review required"
+    return budgets, stalled
+
+
 def run_rollout(
-    store, rollout_id, *, interval_seconds=30, max_passes=None, reconcile=None, sleep=None, now=None
+    store,
+    rollout_id,
+    *,
+    interval_seconds=30,
+    max_passes=None,
+    max_unchanged_online_passes=8,
+    reconcile=None,
+    sleep=None,
+    now=None,
 ):
     """Reconcile one pinned rollout unattended; never select or create a release.
 
@@ -880,6 +922,8 @@ def run_rollout(
         raise ValueError("interval-seconds must be between 1 and 3600")
     if max_passes is not None and (type(max_passes) is not int or max_passes < 1):
         raise ValueError("max-passes must be a positive integer")
+    if type(max_unchanged_online_passes) is not int or not 1 <= max_unchanged_online_passes <= 1000:
+        raise ValueError("max-unchanged-online-passes must be an integer between 1 and 1000")
     reconcile = reconcile or apply_rollout
     sleep = sleep or time.sleep
     now = now or (lambda: datetime.now(UTC))
@@ -908,6 +952,7 @@ def run_rollout(
                 reason=None,
                 startedAt=now().isoformat(),
                 intervalSeconds=interval_seconds,
+                maxUnchangedOnlinePasses=max_unchanged_online_passes,
             )
             while True:
                 plan = reconcile(store, rollout_id)
@@ -921,18 +966,24 @@ def run_rollout(
                 )
                 delay = min(cap, interval_seconds * 2 ** min(unchanged, 12))
                 blocker = _automatic_blocker(plan)
+                online_budgets, stall = _online_stall_budget(
+                    plan, previous, max_unchanged_online_passes
+                )
                 status = (
                     "complete"
                     if plan["status"] == "complete"
                     else "blocked"
                     if blocker
+                    else "stalled"
+                    if stall
                     else "max_passes"
                     if max_passes is not None and passes >= max_passes
                     else "running"
                 )
                 plan = record(
                     status=status,
-                    reason=blocker,
+                    reason=blocker or stall,
+                    onlineProgress=online_budgets,
                     passes=previous.get("passes", 0) + 1,
                     signature=signature,
                     unchangedPasses=unchanged,

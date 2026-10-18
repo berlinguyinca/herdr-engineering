@@ -186,6 +186,7 @@ def _build_parser() -> argparse.ArgumentParser:
         if action == "run":
             rp.add_argument("--interval-seconds", type=int, default=30, help="initial retry interval, 1..3600 (backoff caps at max(interval, 300))")
             rp.add_argument("--max-passes", type=int, default=None, help="stop after this many passes; omit to retry offline hosts until complete")
+            rp.add_argument("--max-unchanged-online-passes", type=int, default=8, help="stop for review after this many unchanged online passes per session (1..1000)")
         rp.set_defaults(func=_cmd_fleet_rollout)
 
     # artifacts ------------------------------------------------------------
@@ -646,7 +647,7 @@ def _cmd_fleet_rollout(args) -> int:
         elif args.rollout_command == "apply":
             report = apply_rollout(store, args.id)
         elif args.rollout_command == "run":
-            report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes)
+            report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes, max_unchanged_online_passes=args.max_unchanged_online_passes)
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError) as exc:

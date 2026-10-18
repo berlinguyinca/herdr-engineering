@@ -60,6 +60,18 @@ progress resets it. The interval accepts 1–3600 seconds, and the delay cap is 
 larger of the interval and 300 seconds. Attempts and replacement busy-operation
 IDs do not count as progress. `--max-passes` limits passes for this invocation.
 
+Online sessions have a separate durable no-progress ceiling: after **8 unchanged
+online passes following the initial observation**, the controller stops with
+`runner.status=stalled` and identifies the session requiring review. This covers
+permanently busy preparation and resumed missions that never produce useful work.
+The counter is per session, so another agent's progress cannot hide a stall, and
+controller restart does not reset it. The mission is neither canceled nor killed.
+`--max-unchanged-online-passes N` configures the threshold from 1 to 1000 (default 8).
+Offline observations do not consume or reset the budget; offline-only rollouts can
+keep retrying until reconnection. Verified named future waits remain accepted.
+After correcting the reported cause, rerun the same pinned rollout; fresh meaningful
+evidence resets that session's budget.
+
 A dedicated per-rollout lock prevents two unattended controllers, including while
 one sleeps. `status` exposes the saved runner status, total pass count, last pass,
 next retry and stop reason without probing or modifying anything. Ctrl-C records
@@ -74,7 +86,7 @@ transport failures keep retrying with bounded backoff. This distinguishes waitin
 for a returning workstation from repeating an unclassified failure forever.
 
 Exit code 0 means all recorded hosts and sessions verified; code 2 means pending,
-blocked or max-passes work remains; code 1 indicates an invalid plan or local
+blocked, stalled or max-passes work remains; code 1 indicates an invalid plan or local
 execution error. Ctrl-C exits 130 after persisting state. `status` remains read-only.
 
 Per-host work is serial so one rollout does not create a fleet build storm.

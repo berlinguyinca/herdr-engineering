@@ -1258,3 +1258,94 @@ def test_changed_custom_reference_rejects_otherwise_valid_foreground_proof(tmp_p
     result = apply(store, plan, wire)
     assert result["hosts"]["bender"]["status"] == "blocked"
     assert not wire.mutations
+
+
+def test_online_busy_ceiling_survives_controller_restart(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore
+
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    wire.offline.clear()
+    wire.rows["beast"]["reply"]["data"]["missions"] = []
+    original = wire.maintenance
+    attempts = []
+
+    def permanently_busy(target, root, instance, request):
+        if target["host"] == "bender" and request["action"] == "prepare":
+            attempts.append(request["operationId"])
+            return {
+                "maintenance": {
+                    "operationId": request["operationId"],
+                    "action": "prepare",
+                    "status": "skipped",
+                    "result": {"status": "busy"},
+                }
+            }
+        return original(target, root, instance, request)
+
+    wire.maintenance = permanently_busy
+    first = run_with_wire(store, plan, wire, clock, max_passes=3)
+    assert first["runner"]["status"] == "max_passes"
+    result = run_with_wire(RolloutStore(store.root), plan, wire, clock, max_passes=20)
+    assert result["runner"]["status"] == "stalled"
+    assert "8 unchanged online passes" in result["runner"]["reason"]
+    assert len(attempts) == 9 and result["runner"]["passes"] == 9
+    assert wire.rows["bender"]["reply"]["data"]["missions"][0]["status"] == "BLOCKED"
+
+
+def test_online_awaiting_progress_stops_even_when_other_host_is_offline(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    result = run_with_wire(store, plan, wire, clock, max_passes=20)
+    assert result["runner"]["status"] == "stalled"
+    assert result["runner"]["passes"] == 9
+    assert len([r for r in wire.calls if r["action"] == "resume"]) == 1
+    assert result["hosts"]["beast"]["status"] == "pending"
+
+
+def test_offline_only_retry_remains_exempt_until_reconnect(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    wire.offline.add("bender")
+    for row in wire.rows.values():
+        row["reply"]["data"]["missions"] = []
+    original = clock.sleep
+
+    def reconnect_after_ceiling(seconds):
+        original(seconds)
+        if len(clock.delays) == 12:
+            wire.offline.clear()
+
+    clock.sleep = reconnect_after_ceiling
+    result = run_with_wire(store, plan, wire, clock, max_passes=20)
+    assert result["runner"]["status"] == "complete"
+    assert result["runner"]["passes"] == 13
+
+
+def test_named_future_wait_does_not_consume_online_stall_budget(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    wire.rows["bender"]["reply"]["data"]["missions"][0]["namedWait"] = {
+        "action": "provider probe",
+        "nextActionAt": "2099-01-01T00:00:00Z",
+        "deadline": None,
+    }
+    result = run_with_wire(store, plan, wire, clock, max_passes=12)
+    assert result["runner"]["status"] == "max_passes"
+    assert result["hosts"]["bender"]["status"] == "complete"
+
+
+def test_online_stall_ceiling_is_configurable_and_validated(tmp_path):
+    from herdr_engineering.cli import _build_parser
+    from herdr_engineering.fleet_rollout import run_rollout
+
+    args = _build_parser().parse_args(
+        ["fleet", "rollout", "run", "--id", "a" * 32, "--max-unchanged-online-passes", "2"]
+    )
+    assert args.max_unchanged_online_passes == 2
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    result = run_with_wire(store, plan, wire, clock, max_passes=10, max_unchanged_online_passes=2)
+    assert result["runner"]["status"] == "stalled" and result["runner"]["passes"] == 3
+    with pytest.raises(ValueError):
+        run_rollout(store, plan["id"], max_unchanged_online_passes=0)
