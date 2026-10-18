@@ -15,6 +15,14 @@ def test_rollout_commands_are_registered():
     assert args.rollout_command == "plan"
 
 
+def _remote_argv(command):
+    import shlex
+
+    prefix = 'PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" exec '
+    assert command.startswith(prefix)
+    return shlex.split(command[len(prefix) :])
+
+
 class Wire:
     def __init__(self):
         self.offline = {"beast"}
@@ -130,7 +138,6 @@ def setup_rollout(tmp_path):
 
 
 def apply(store, plan, wire):
-    import shlex
     import subprocess
 
     from herdr_engineering.fleet_rollout import PiTransport, apply_rollout
@@ -138,7 +145,7 @@ def apply(store, plan, wire):
     def runner(argv, **kwargs):
         # Exercise production command construction and JSON decoding at the subprocess seam.
         host = argv[-2]
-        remote = shlex.split(argv[-1])
+        remote = _remote_argv(argv[-1])
         if remote[0] == "herdr":
             assert remote[-2:] == ["api", "snapshot"]
             reply = {"result": {"snapshot": {"agents": wire.native({"host": host})}}}
@@ -259,7 +266,6 @@ def test_status_is_read_only_and_plan_is_immutable(tmp_path):
 
 
 def test_ssh_transport_quotes_json_and_rejects_bad_targets(tmp_path):
-    import shlex
     import subprocess
 
     from herdr_engineering.fleet_rollout import PiTransport
@@ -268,7 +274,7 @@ def test_ssh_transport_quotes_json_and_rejects_bad_targets(tmp_path):
 
     def runner(argv, **kwargs):
         calls.append(argv)
-        remote = shlex.split(argv[-1])
+        remote = _remote_argv(argv[-1])
         assert remote[:3] == [
             "node",
             "/home/a b/releases/cli/scripts/pi-engineering.ts",
@@ -945,7 +951,6 @@ def test_run_rejects_invalid_bounds_before_contact(tmp_path, interval, max_passe
 def test_native_inventory_uses_frozen_host_transport_without_central_registration(
     monkeypatch, local
 ):
-    import shlex
     import subprocess
 
     import herdr_engineering.fleet_rollout as module
@@ -977,7 +982,7 @@ def test_native_inventory_uses_frozen_host_transport_without_central_registratio
 
     def runner(argv, **kwargs):
         calls.append(argv)
-        native = argv if local else shlex.split(argv[-1])
+        native = argv if local else _remote_argv(argv[-1])
         assert native == ["herdr", "--session", "engineering", "api", "snapshot"]
         if not local:
             assert argv[-2] == "alice@bender.example"
@@ -1012,3 +1017,61 @@ def test_native_host_errors_cannot_be_reported_as_empty_inventory(monkeypatch, r
     )
     with pytest.raises(ValueError, match="native"):
         transport.native({"host": "bender", "sshTarget": "bender", "port": 22, "local": False})
+
+
+@pytest.mark.parametrize("executable", ["herdr", "node"])
+def test_remote_transport_resolves_user_bins_without_evaluating_argv(tmp_path, executable):
+    import os
+    import subprocess
+
+    from herdr_engineering.fleet_rollout import PiTransport
+
+    user_bin = tmp_path / ".local/bin"
+    user_bin.mkdir(parents=True)
+    executable_path = user_bin / executable
+    executable_path.write_text(
+        '#!/usr/bin/python3\nimport json, sys\nprint(json.dumps({"argv": sys.argv[1:]}))\n'
+    )
+    executable_path.chmod(0o700)
+    marker = tmp_path / "shell-injection-ran"
+    payload = [
+        f"$( : > {marker})",
+        f"`: > {marker}`",
+        "literal $HOME",
+        "apostrophe' and spaces",
+        "; exit 9",
+    ]
+    commands = []
+
+    def runner(argv, **kwargs):
+        commands.append(argv)
+        # Execute only the generated remote shell command in an isolated test HOME.
+        # No ssh invocation, network access, or actual HerdR/Pi processes.
+        env = {**os.environ, "HOME": str(tmp_path), "PATH": str(tmp_path / "empty-path")}
+        return subprocess.run(["/bin/sh", "-c", argv[-1]], env=env, **kwargs)
+
+    transport = PiTransport(runner=runner)
+    target = {"host": "beast", "sshTarget": "alice@beast", "port": 22, "local": False}
+    reply = transport._json(target, [executable, *payload])
+    assert reply["argv"] == payload
+    assert not marker.exists()
+    assert commands[0][-1].startswith(
+        'PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" exec '
+    )
+
+
+def test_transport_stderr_diagnostics_are_bounded_and_do_not_expose_secrets():
+    import subprocess
+
+    from herdr_engineering.fleet_rollout import PiTransport
+
+    secret = "sk-private-token-123456"
+    stderr = f"/bin/sh: 1: herdr: not found\nAuthorization: Bearer {secret}\n" + "x" * 10000
+    transport = PiTransport(
+        runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 127, "", stderr)
+    )
+    with pytest.raises(ConnectionError) as error:
+        transport.native({"host": "beast", "sshTarget": "beast", "port": 22, "local": False})
+    assert "herdr" in str(error.value) and "not found" in str(error.value)
+    assert secret not in str(error.value) and "Authorization" not in str(error.value)
+    assert len(str(error.value)) < 300
