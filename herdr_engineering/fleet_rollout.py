@@ -44,6 +44,8 @@ def _target(target):
         raise ValueError("invalid SSH port")
     if type(target["local"]) is not bool:
         raise ValueError("invalid local target")
+    if target.get("session") is not None:
+        _identifier(target["session"])
 
 
 class RolloutStore:
@@ -152,7 +154,7 @@ class PiTransport:
             )
         ]
 
-    def _json(self, target, argv):
+    def _json(self, target, argv, *, allow_failed_receipt=False):
         _target(target)
         command = (
             argv
@@ -169,12 +171,27 @@ class PiTransport:
             ]
         )
         result = self.runner(command, capture_output=True, text=True, timeout=45)
-        if result.returncode:
-            raise ConnectionError(f"control transport failed (exit {result.returncode})")
         try:
-            return json.loads(result.stdout)
+            reply = json.loads(result.stdout)
         except (ValueError, TypeError) as exc:
+            if result.returncode:
+                raise ConnectionError(
+                    f"control transport failed (exit {result.returncode})"
+                ) from exc
             raise ValueError("invalid control JSON") from exc
+        if result.returncode:
+            data = (
+                reply.get("data") if isinstance(reply, dict) and reply.get("ok") is True else reply
+            )
+            receipt = data.get("maintenance") if isinstance(data, dict) else None
+            if not (
+                allow_failed_receipt
+                and result.returncode == 1
+                and isinstance(receipt, dict)
+                and receipt.get("status") == "failed"
+            ):
+                raise ConnectionError(f"control transport failed (exit {result.returncode})")
+        return reply
 
     def sessions(self, target, root):
         return self._json(
@@ -194,6 +211,7 @@ class PiTransport:
                 "--request-json",
                 json.dumps(request, separators=(",", ":")),
             ],
+            allow_failed_receipt=True,
         )
         # CLI may return the wire envelope; accept only a successful typed reply.
         if isinstance(reply, dict) and "ok" in reply:
@@ -206,12 +224,8 @@ class PiTransport:
 
 
 def inventory_targets(inventory, host=None):
-    expected = fleet.list_hosts(inventory)
-    if host is not None:
-        if host not in expected:
-            raise ValueError("host is not in expected inventory")
-        expected = [host]
-    # Resolve Ansible host/group vars once, then freeze the transport destination.
+    # Use Ansible's resolved fleet group closure, including direct and nested hosts.
+    # Resolve connection variables once, then freeze the transport destination.
     result = subprocess.run(
         ["ansible-inventory", "-i", str(inventory), "--list"],
         capture_output=True,
@@ -219,7 +233,27 @@ def inventory_targets(inventory, host=None):
         timeout=30,
         check=True,
     )
-    variables = json.loads(result.stdout).get("_meta", {}).get("hostvars", {})
+    resolved = json.loads(result.stdout)
+    visited = set()
+
+    def hosts_in(group):
+        if group in visited:
+            return set()
+        visited.add(group)
+        node = resolved.get(group)
+        if not isinstance(node, dict):
+            raise ValueError("missing resolved fleet inventory group: " + str(group))
+        found = set(node.get("hosts") or [])
+        for child in node.get("children") or []:
+            found.update(hosts_in(child))
+        return found
+
+    expected = sorted(hosts_in("herdr_fleet"))
+    if host is not None:
+        if host not in expected:
+            raise ValueError("host is not in expected inventory")
+        expected = [host]
+    variables = resolved.get("_meta", {}).get("hostvars", {})
     targets = []
     for name in expected:
         _identifier(name)
@@ -232,6 +266,8 @@ def inventory_targets(inventory, host=None):
             "port": int(var.get("ansible_port", 22)),
             "local": var.get("ansible_connection") == "local",
         }
+        if var.get("herdr_session") is not None:
+            target["session"] = var["herdr_session"]
         _target(target)
         targets.append(target)
     return targets
@@ -331,6 +367,27 @@ def _operation(plan, state, key, action, fields, transport, target, root, save):
     return receipt
 
 
+def _retryable_skip(receipt):
+    result = receipt.get("result") or {}
+    return receipt["status"] == "skipped" and (
+        result.get("status") == "busy" or result.get("code") == "STALE_MISSION_FENCE"
+    )
+
+
+def _archive_operation(state, key):
+    state.setdefault("retryReceipts", []).append(state["operations"].pop(key))
+
+
+def _receipt_reason(receipt):
+    result = receipt.get("result") or {}
+    return str(
+        receipt.get("error")
+        or result.get("reason")
+        or result.get("code")
+        or "maintenance skipped without a retryable outcome"
+    )[:500]
+
+
 def _session(plan, state, transport, target, root, save):
     descriptor, data = _live(_rows(transport, target, root), state["sessionId"], state["pid"])
     state["instanceId"] = descriptor["instanceId"]
@@ -366,7 +423,12 @@ def _session(plan, state, transport, target, root, save):
             save,
         )
         if receipt["status"] != "succeeded":
-            state["status"] = "pending" if receipt["status"] == "running" else "blocked"
+            if _retryable_skip(receipt):
+                _archive_operation(state, "reload")
+                state["status"] = "pending"
+            else:
+                state["status"] = "pending" if receipt["status"] == "running" else "blocked"
+                state["error"] = _receipt_reason(receipt)
             return
         descriptor, data = _live(_rows(transport, target, root), state["sessionId"], state["pid"])
         state["instanceId"] = descriptor["instanceId"]
@@ -390,13 +452,16 @@ def _session(plan, state, transport, target, root, save):
         )
         if mission.get("operatorPaused") is True or mission["status"] in (
             "DONE",
+            "COMPLETE",
             "COMPLETED",
             "CANCELED",
             "CANCELLED",
         ):
             outcome["status"] = "preserved"
             continue
-        if mission.get("resumeEligible") is True:
+        if mission.get("resumeEligible") is True or "resume:" + mission_id in state.get(
+            "operations", {}
+        ):
             if (
                 type(mission.get("revision")) is not int
                 or type(mission.get("resumptionGeneration")) is not int
@@ -420,8 +485,12 @@ def _session(plan, state, transport, target, root, save):
             )
             outcome["receipt"] = receipt
             if receipt["status"] == "skipped":
-                # Refresh operator intent on the next apply, never infer it from a skipped receipt.
-                outcome["status"] = "pending"
+                if _retryable_skip(receipt):
+                    _archive_operation(state, "resume:" + mission_id)
+                    outcome["status"] = "pending"
+                else:
+                    outcome["status"] = "blocked"
+                    outcome["error"] = _receipt_reason(receipt)
                 continue
             if receipt["status"] != "succeeded":
                 outcome["status"] = "pending" if receipt["status"] == "running" else "blocked"
@@ -455,6 +524,13 @@ def _session(plan, state, transport, target, root, save):
             outcome["status"] = "awaiting_progress"
     if set(outcomes) - {m["id"] for m in missions}:
         state["status"] = "owned_mission_missing"
+    elif any(m.get("status") == "blocked" for m in outcomes.values()):
+        state["status"] = "blocked"
+        state["error"] = "; ".join(
+            m.get("error", "mission maintenance failed")
+            for m in outcomes.values()
+            if m.get("status") == "blocked"
+        )
     else:
         state["status"] = (
             "complete"
@@ -480,6 +556,10 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
             host_state.pop("error", None)
             try:
                 if not host_state.get("sourceRoot"):
+                    if inventory_targets(Path(plan["inventory"]), host) != [target]:
+                        raise ValueError(
+                            "inventory destination changed since planning; refusing staging"
+                        )
                     report = stage(plan["revision"], host=host, inventory=Path(plan["inventory"]))
                     host_state["staging"] = report
                     save()
@@ -507,18 +587,28 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                 if not isinstance(native, list):
                     raise ValueError("invalid native inventory")
                 agents = [a for a in native if str(a.get("agent", "")).lower() == "pi"]
-                identities = [_conversation(a) for a in agents]
+                identified = []
+                coverage_errors = []
+                for agent in agents:
+                    try:
+                        identified.append((agent, _conversation(agent)))
+                    except ValueError as exc:
+                        coverage_errors.append(
+                            {"terminalId": agent.get("terminal_id"), "error": str(exc)}
+                        )
+                host_state["coverageErrors"] = coverage_errors
+                identities = [session_id for _, session_id in identified]
                 if len(identities) != len(set(identities)):
                     raise ValueError("ambiguous native conversation identity")
                 rows = _rows(transport, target, root)
                 if not agents:
                     raise ValueError("no native Pi sessions; expected coverage unverified")
                 if set(host_state["sessions"]) - set(identities):
-                    raise ValueError(
-                        "previously discovered session is missing from native inventory"
+                    coverage_errors.append(
+                        {"error": "previously discovered session is missing from native inventory"}
                     )
-                session_errors = []
-                for agent, session_id in zip(agents, identities, strict=True):
+                session_errors = [error["error"] for error in coverage_errors]
+                for agent, session_id in identified:
                     state = host_state["sessions"].setdefault(
                         session_id,
                         {"sessionId": session_id, "native": agent, "status": "discovered"},
@@ -538,10 +628,12 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     finally:
                         save()
                 host_state["status"] = (
-                    "complete"
-                    if all(s["status"] == "complete" for s in host_state["sessions"].values())
-                    else "blocked"
+                    "blocked"
                     if session_errors
+                    or any(s["status"] == "blocked" for s in host_state["sessions"].values())
+                    else "complete"
+                    if host_state["sessions"]
+                    and all(s["status"] == "complete" for s in host_state["sessions"].values())
                     else "pending"
                 )
                 if session_errors:

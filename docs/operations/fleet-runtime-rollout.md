@@ -18,11 +18,16 @@ herdr-eng fleet rollout plan --pi-revision FULL_COMMIT_SHA --host bender
 # Optional: --inventory /absolute/path/hosts.yml --state /private/state/directory
 ```
 
-Planning reads the Ansible inventory and resolves host connection variables. It
+Planning resolves the full Ansible `herdr_fleet` group closure, including direct
+hosts and recursively nested groups, and freezes host connection variables. It
 writes an immutable host/release plan and returns its `id` as JSON; it does not
 install code or contact agents. Host names must match the saved native HerdR
 machine names. SSH transport uses the frozen `ansible_host`, `ansible_user`, and
 `ansible_port`; configured SSH aliases and keys must already work in batch mode.
+Set `herdr_session` in a host's inventory variables to select and freeze a named
+HerdR server session; otherwise the saved machine's default scope is used. Before
+staging, the resolved target is checked against the plan; changed addresses, users,
+ports or named sessions block deployment and require a new reviewed plan.
 Custom Ansible-only connection plugins, become, and password prompts are not
 supported by the Pi control transport.
 
@@ -44,6 +49,12 @@ state; it never probes, stages, resumes, or rewrites state.
 Per-host work is serial so one rollout does not create a fleet build storm.
 Transport calls have timeouts; a stopped controller resumes from durable state.
 Requests are saved before sending and receipts are saved atomically with fsync.
+Typed failed receipts emitted with CLI exit code 1 are recorded as failures. A
+skipped `busy` outcome or `STALE_MISSION_FENCE` code proves no mutation occurred:
+its receipt is archived and the next pass can create one fresh request using the
+latest mission fences. Other skipped outcomes remain explicitly blocked until
+refreshed state proves operator intent or a terminal mission; they do not generate
+unbounded fresh recovery operations.
 Uncertain deliveries reuse the original operation ID and payload. A replacement
 runtime instance in the same process polls the same durable receipt.
 
@@ -59,7 +70,10 @@ Every planned host must have staged the exact selected release and expose comple
 native session coverage. Each Pi agent must have an exact native conversation
 reference that matches one reachable control descriptor. Missing references,
 duplicate conversations, missing sessions, and PID changes block activation;
-terminal titles and working directories are never used as identity guesses.
+terminal titles and working directories are never used as identity guesses. An
+agent lacking a native conversation reference is retained as a coverage error,
+while independently identified siblings can continue. Such a host cannot be
+reported complete.
 
 The coordinator verifies both the loaded runtime commit and the stable Host commit
 against the pinned SHA. A successful reload receipt alone is insufficient. Mission
