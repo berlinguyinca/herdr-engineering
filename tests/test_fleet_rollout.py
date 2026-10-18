@@ -1222,3 +1222,39 @@ def test_foreground_process_query_uses_frozen_host_and_named_session():
     assert PiTransport(runner=runner).process_info(target, "pane-1")["foreground_processes"] == [
         {"pid": 42}
     ]
+
+
+@pytest.mark.parametrize(
+    "value", ["/sessions/reporting-rollout-20261013.jsonl", "reporting-rollout-20261013.jsonl"]
+)
+def test_custom_transcript_reference_uses_stable_foreground_proof(tmp_path, value):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    native = foreground_fixture(wire)
+    native["agent_session"] = {"kind": "path", "source": "pi", "value": value}
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]["sessions"]["bender-conversation"]
+    assert state["status"] == "awaiting_progress"
+    assert state["identityProof"]["source"] == "verified_foreground_pid"
+    assert state["native"]["agent_session"] == native["agent_session"]
+
+
+def test_changed_custom_reference_rejects_otherwise_valid_foreground_proof(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    original = foreground_fixture(wire)
+    original["agent_session"] = {"kind": "path", "value": "/sessions/custom.jsonl"}
+    calls = 0
+
+    def native(target):
+        nonlocal calls
+        calls += 1
+        row = copy.deepcopy(original)
+        if calls > 1:
+            row["agent_session"]["value"] = "/sessions/replacement.jsonl"
+        return [row]
+
+    wire.native = native
+    result = apply(store, plan, wire)
+    assert result["hosts"]["bender"]["status"] == "blocked"
+    assert not wire.mutations

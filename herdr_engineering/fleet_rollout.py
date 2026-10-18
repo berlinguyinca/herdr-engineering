@@ -340,7 +340,12 @@ def inventory_targets(inventory, host=None):
 def _conversation(agent):
     reference = agent.get("agent_session")
     value = reference.get("value") if isinstance(reference, dict) else None
-    if isinstance(value, str) and IDENTIFIER.fullmatch(value):
+    if (
+        isinstance(value, str)
+        and reference.get("kind") != "path"
+        and not value.endswith(".jsonl")
+        and IDENTIFIER.fullmatch(value)
+    ):
         return value
     # Native Pi file references contain timestamp_UUID.jsonl; never use cwd/title heuristics.
     if isinstance(value, str):
@@ -382,7 +387,15 @@ def _foreground_identity(transport, target, agent, rows):
         or any(fresh[0].get(key) != agent.get(key) for key in ("terminal_id", *tokens))
     ):
         raise ValueError("native pane identity changed during foreground verification")
-    if fresh[0].get("agent_session") is not None and _conversation(fresh[0]) != session_id:
+    if fresh[0].get("agent_session") != agent.get("agent_session"):
+        raise ValueError("native conversation reference changed during foreground verification")
+    try:
+        native_session_id = _conversation(fresh[0])
+    except ValueError:
+        # Stable custom transcript references carry no parseable conversation ID.
+        # Only the already-verified process/control identity establishes the target.
+        native_session_id = None
+    if native_session_id is not None and native_session_id != session_id:
         raise ValueError("fresh native conversation disagrees with foreground identity")
     return session_id, {
         "source": "verified_foreground_pid",
@@ -709,10 +722,10 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                 coverage_errors = []
                 for agent in agents:
                     try:
-                        if agent.get("agent_session") is None:
-                            session_id, proof = _foreground_identity(transport, target, agent, rows)
-                        else:
+                        try:
                             session_id, proof = _conversation(agent), None
+                        except ValueError:
+                            session_id, proof = _foreground_identity(transport, target, agent, rows)
                         identified.append((agent, session_id, proof))
                     except (
                         ValueError,

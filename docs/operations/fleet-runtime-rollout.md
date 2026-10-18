@@ -100,10 +100,12 @@ cross-rollout rollback: a rollback is a separately reviewed pinned release plan.
 Every planned host must have staged the exact selected release and expose complete
 native session coverage. Each Pi agent must have an exact native conversation
 reference that matches one reachable control descriptor. When the native reference
-is absent, the controller can instead read that pane's foreground processes on the
+is absent or contains a custom transcript filename without a conversation ID,
+the controller can instead read that pane's foreground processes on the
 same host and require exactly one matching live Pi PID. The control response must
 attest the descriptor's PID, conversation and instance; a fresh native snapshot
-must retain the same pane, terminal and revision/state sequence. The proof is
+must retain the same pane, terminal, revision/state sequence and native reference.
+Custom transcript files are never opened or inferred from their names. The proof is
 recorded separately as `verified_foreground_pid`, without modifying native identity.
 
 Duplicate conversations, ambiguous foreground processes, stale/unreachable control
