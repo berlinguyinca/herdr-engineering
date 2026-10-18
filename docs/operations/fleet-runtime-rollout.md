@@ -21,11 +21,13 @@ herdr-eng fleet rollout plan --pi-revision FULL_COMMIT_SHA --host bender
 Planning resolves the full Ansible `herdr_fleet` group closure, including direct
 hosts and recursively nested groups, and freezes host connection variables. It
 writes an immutable host/release plan and returns its `id` as JSON; it does not
-install code or contact agents. Host names must match the saved native HerdR
-machine names. SSH transport uses the frozen `ansible_host`, `ansible_user`, and
+install code or contact agents. Native HerdR inventory is read on each target
+workstation through the same frozen local/SSH transport used for Pi control; no
+controller-side saved machine registration is required. SSH transport uses the
+frozen `ansible_host`, `ansible_user`, and
 `ansible_port`; configured SSH aliases and keys must already work in batch mode.
 Set `herdr_session` in a host's inventory variables to select and freeze a named
-HerdR server session; otherwise the saved machine's default scope is used. Before
+HerdR server session; otherwise that target host's default server scope is used. Before
 staging, the resolved target is checked against the plan; changed addresses, users,
 ports or named sessions block deployment and require a new reviewed plan.
 Custom Ansible-only connection plugins, become, and password prompts are not

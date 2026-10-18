@@ -132,21 +132,17 @@ def setup_rollout(tmp_path):
 def apply(store, plan, wire):
     import shlex
     import subprocess
-    from types import SimpleNamespace
 
     from herdr_engineering.fleet_rollout import PiTransport, apply_rollout
-
-    class Adapter:
-        def list_agents(self, machine=None, session=None):
-            return [
-                SimpleNamespace(to_dict=lambda row=row: row)
-                for row in wire.native({"host": machine})
-            ]
 
     def runner(argv, **kwargs):
         # Exercise production command construction and JSON decoding at the subprocess seam.
         host = argv[-2]
         remote = shlex.split(argv[-1])
+        if remote[0] == "herdr":
+            assert remote[-2:] == ["api", "snapshot"]
+            reply = {"result": {"snapshot": {"agents": wire.native({"host": host})}}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(reply), "")
         assert remote[0] == "node"
         root = remote[1].removesuffix("/scripts/pi-engineering.ts")
         if remote[3] == "list":
@@ -170,7 +166,7 @@ def apply(store, plan, wire):
         return apply_rollout(
             store,
             plan["id"],
-            transport=PiTransport(runner=runner, adapter=Adapter()),
+            transport=PiTransport(runner=runner),
             stage=wire.stage,
         )
 
@@ -943,3 +939,76 @@ def test_run_rejects_invalid_bounds_before_contact(tmp_path, interval, max_passe
     store, plan = setup_rollout(tmp_path)
     with pytest.raises(ValueError):
         run_rollout(store, plan["id"], interval_seconds=interval, max_passes=max_passes)
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_native_inventory_uses_frozen_host_transport_without_central_registration(
+    monkeypatch, local
+):
+    import shlex
+    import subprocess
+
+    import herdr_engineering.fleet_rollout as module
+
+    class UnregisteredController:
+        def list_agents(self, **kwargs):
+            raise AssertionError("controller only knows beast; must query actual target")
+
+    monkeypatch.setattr(
+        module, "NativeHerdrAdapter", lambda: UnregisteredController(), raising=False
+    )
+    target = {
+        "host": "bender",
+        "sshTarget": "alice@bender.example",
+        "port": 2222,
+        "local": local,
+        "session": "engineering",
+    }
+    raw = {
+        "agent": "pi",
+        "terminal_id": "terminal-7",
+        "pane_id": "pane-2",
+        "revision": 12,
+        "agent_session": {"kind": "path", "source": "pi", "value": "/sessions/exact.jsonl"},
+        "agent_status": "working",
+        "future_identity_field": {"owner": "retained"},
+    }
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        native = argv if local else shlex.split(argv[-1])
+        assert native == ["herdr", "--session", "engineering", "api", "snapshot"]
+        if not local:
+            assert argv[-2] == "alice@bender.example"
+            assert argv[argv.index("-p") + 1] == "2222"
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"result": {"snapshot": {"agents": [raw]}}}), ""
+        )
+
+    agents = module.PiTransport(runner=runner).native(target)
+    assert len(calls) == 1
+    assert all(agents[0][key] == value for key, value in raw.items())
+    assert agents[0]["machine"] == "bender" and agents[0]["session"] == "engineering"
+
+
+@pytest.mark.parametrize(
+    "reply", [{"ok": False, "error": "missing session"}, {"result": {"snapshot": {}}}]
+)
+def test_native_host_errors_cannot_be_reported_as_empty_inventory(monkeypatch, reply):
+    import subprocess
+
+    import herdr_engineering.fleet_rollout as module
+
+    class UnregisteredController:
+        def list_agents(self, **kwargs):
+            raise AssertionError("central machine routing forbidden")
+
+    monkeypatch.setattr(
+        module, "NativeHerdrAdapter", lambda: UnregisteredController(), raising=False
+    )
+    transport = module.PiTransport(
+        runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, json.dumps(reply), "")
+    )
+    with pytest.raises(ValueError, match="native"):
+        transport.native({"host": "bender", "sshTarget": "bender", "port": 22, "local": False})

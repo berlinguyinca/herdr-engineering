@@ -22,7 +22,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import fleet
-from .herdr_adapter import NativeHerdrAdapter
 
 CAPABILITIES = {
     "runtime.describe",
@@ -146,16 +145,29 @@ def create_rollout(store, revision, targets, *, inventory):
 class PiTransport:
     """Explicit argv locally; one shell-quoted argv through SSH remotely."""
 
-    def __init__(self, runner=None, adapter=None):
+    def __init__(self, runner=None):
         self.runner = runner or subprocess.run
-        self.adapter = adapter or NativeHerdrAdapter()
 
     def native(self, target):
+        # Inventory and Pi control must address the same frozen physical host.
+        # Controller-side saved machine aliases are not a fleet identity registry.
+        argv = ["herdr"]
+        if target.get("session") is not None:
+            argv.extend(["--session", target["session"]])
+        reply = self._json(target, argv + ["api", "snapshot"])
+        result = reply.get("result") if isinstance(reply, dict) else None
+        snapshot = result.get("snapshot") if isinstance(result, dict) else None
+        agents = snapshot.get("agents") if isinstance(snapshot, dict) else None
+        if (
+            not isinstance(reply, dict)
+            or reply.get("ok") is False
+            or not isinstance(agents, list)
+            or any(not isinstance(agent, dict) for agent in agents)
+        ):
+            raise ValueError("native host snapshot unavailable or missing agent inventory")
         return [
-            a.to_dict()
-            for a in self.adapter.list_agents(
-                machine=None if target["local"] else target["host"], session=target.get("session")
-            )
+            {**agent, "machine": target["host"], "session": target.get("session")}
+            for agent in agents
         ]
 
     def _json(self, target, argv, *, allow_failed_receipt=False):
