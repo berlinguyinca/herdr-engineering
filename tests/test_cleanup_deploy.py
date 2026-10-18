@@ -71,7 +71,8 @@ def test_deployment_policy_uses_machine_config_without_mutating_it(tmp_path, pol
 def test_fingerprint_reports_revision_and_cleanup_state(filename):
     playbook = yaml.safe_load((ROOT / "ansible/playbooks" / filename).read_text())[0]
     report = playbook["tasks"][-1]["ansible.builtin.debug"]["msg"]
-    assert "revision=" in report and "fp_revision.stdout" in report
+    assert "revision=" in report and "fp_revision" in report
+    assert "pi-revision=" in report and "pi-path=" in report
     assert "cleanup=" in report and "fp_cleanup.stdout" in report
 
 
@@ -87,5 +88,9 @@ def test_deployment_checkout_can_be_separate_from_active_development():
     fingerprint = (ROOT / 'ansible/tasks/fleet-fingerprint.yml').read_text()
     assert 'HERDR_ENGINEERING_CHECKOUT' in fabric
     assert 'herdr_engineering_checkout' in fabric
-    assert 'herdr_engineering_checkout' in fingerprint
-    assert 'REPO="$HERDR_ENGINEERING_CHECKOUT"' in fabric
+    assert '/herdr/releases/{{ herdr_engineering_revision }}' in fabric
+    assert 'stage-release.py' in fabric
+    assert '--describe' in fingerprint
+    assert "fp_release.rc == 0" in fingerprint
+    assert "fp_pi_release.rc == 0" in fingerprint
+    assert 'pull --ff-only' not in fabric

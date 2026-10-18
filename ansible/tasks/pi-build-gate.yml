@@ -21,9 +21,10 @@
         mode: "0755"
         owner: "{{ fleet_user }}"
 
-    - name: "Install build-gate.ts (idempotent copy from the controller repo)"
+    - name: "Install build-gate.ts (copy from the selected installed release)"
       ansible.builtin.copy:
-        src: "{{ herdr_engineering_repo_root }}/deploy/pi-build-gate/build-gate.ts"
+        src: "{{ herdr_engineering_checkout }}/deploy/pi-build-gate/build-gate.ts"
+        remote_src: true
         dest: "{{ fleet_home }}/.pi/agent/extensions/build-gate.ts"
         mode: "0644"
         owner: "{{ fleet_user }}"
