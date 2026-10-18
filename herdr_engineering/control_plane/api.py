@@ -466,6 +466,8 @@ def _make_handler(server):
                     parts[4], body.get("message", ""), body.get("artifact_ids"),
                     operation_id=body.get("operation_id"), dispatcher=server.dispatcher)
                 status = {"delivered": 200, "queued": 202}.get(receipt["status"], 502)
+                if receipt.get("error") in {"receipt_persistence_unavailable", "receipt_persistence_failed"}:
+                    status = 503
                 return self._json({"ok": receipt["status"] == "delivered", **receipt}, status)
             if resource == "sessions" and len(parts) == 6 and parts[5] == "actions":
                 s = r.get_session(parts[4])

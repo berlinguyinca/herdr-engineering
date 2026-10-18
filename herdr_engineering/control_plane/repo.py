@@ -250,6 +250,10 @@ class ControlPlaneRepo:
                       "status": "queued", "mission_progress_verified": False,
                       "durable": self._sink is not None,
                       "text": redact_payload(message), "artifact_ids": list(artifact_ids)}
+            if dispatcher is not None and not callable(getattr(self._sink, "record_required", None)):
+                result.update(status="failed", error="receipt_persistence_unavailable",
+                              durable=False)
+                return result
             try:
                 self.record_event("session", session_id, "SessionCommandQueued",
                                   dict(result), session_id=session_id, require_durable=True)
