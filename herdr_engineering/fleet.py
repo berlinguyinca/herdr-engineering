@@ -13,6 +13,8 @@ Everything is idempotent and non-disruptive to running agents.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -53,11 +55,66 @@ def _run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return 124, "", "timed out"
+    except OSError as exc:
+        return 127, "", str(exc)
     return proc.returncode, proc.stdout, proc.stderr
 
 
 class FleetError(Exception):
     pass
+
+
+def _expected_hosts(inventory: Path, host: str | None) -> list[str]:
+    """Read the private static inventory; never infer coverage from responders."""
+    import yaml
+    try:
+        data = yaml.safe_load(inventory.read_text())
+    except yaml.YAMLError as exc:
+        raise FleetError(f"Invalid fleet inventory: {exc}") from exc
+    group = data.get("all", {}).get("children", {}).get("herdr_fleet", {})
+    def walk(node: dict) -> set[str]:
+        result = set((node.get("hosts") or {}).keys())
+        for child in (node.get("children") or {}).values():
+            result.update(walk(child or {}))
+        return result
+    hosts = walk(group)
+    if not hosts or (host is not None and host not in hosts):
+        raise FleetError("Inventory must contain the exact requested host(s) in herdr_fleet")
+    return [host] if host else sorted(hosts)
+
+
+def _is_revision(value: str) -> bool:
+    return re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is not None
+
+
+def _parity(status: dict, expected: list[str], revision: str,
+            pi_revision: str | None = None, *, pi_only: bool = False,
+            expected_build_gate: str | None = None) -> dict:
+    entries = status.get("hosts", [])
+    actual = [entry.get("host") for entry in entries]
+    missing = sorted(set(expected) - set(actual))
+    unexpected = sorted(set(actual) - set(expected))
+    duplicates = sorted({name for name in actual if actual.count(name) > 1})
+    invalid, mismatched = [], []
+    for entry in entries:
+        if not pi_only and entry.get("revision") != revision:
+            mismatched.append(entry["host"])
+        components_ok = pi_only or (
+            re.fullmatch(r"herdr-eng\s+\S+", entry.get("herdr_eng", "")) is not None
+            and re.fullmatch(r"[0-9a-f]{32}", entry.get("build_gate", "")) is not None
+            and entry.get("agent") == "active"
+            and (expected_build_gate is None or entry.get("build_gate") == expected_build_gate))
+        if pi_revision and (entry.get("pi_revision") != pi_revision
+                            or not entry.get("pi_path", "").startswith("/")):
+            components_ok = False
+        if not components_ok:
+            invalid.append(entry["host"])
+    return {"ok": status.get("rc") == 0 and bool(expected)
+            and not (missing or unexpected or duplicates or mismatched or invalid),
+            "expected_revision": revision, "expected_hosts": expected,
+            "missing_hosts": missing, "unexpected_hosts": unexpected,
+            "duplicate_hosts": duplicates, "mismatched_hosts": mismatched,
+            "invalid_hosts": invalid}
 
 
 def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "linux",
@@ -134,7 +191,8 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
 
 def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:29999",
                  inventory: Path | None = None, pull_controller: bool = True,
-                 reinstall_local: bool = True) -> dict:
+                 reinstall_local: bool = True, revision: str | None = None,
+                 pi_revision: str | None = None) -> dict:
     """Self-update the whole fleet (controller + all reachable hosts) to the
     current version, then report parity. One command.
 
@@ -150,14 +208,24 @@ def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:2999
                                 "stderr": err.strip()[-1000:] or None}
         return rc == 0, out.strip()
 
-    # Never silently deploy a dirty, divergent, or failed controller update.
+    try:
+        expected_hosts = _expected_hosts(inv, host)
+    except (OSError, ValueError, AttributeError, FleetError) as exc:
+        report["error"] = str(exc)
+        return report
+    if (revision is not None and not _is_revision(revision)) or (
+            pi_revision is not None and not _is_revision(pi_revision)):
+        report["error"] = "Release revisions must be full immutable commit IDs"
+        return report
+
+    # Even --no-pull must not label modified source with its clean commit ID.
+    ok, dirty = step("controller_clean", ["git", "-C", str(root), "status",
+                                           "--porcelain"], 30)
+    if not ok or dirty:
+        report["steps"]["controller_clean"]["ok"] = False
+        report["error"] = "Controller checkout must be clean before updating"
+        return report
     if pull_controller:
-        ok, dirty = step("controller_clean", ["git", "-C", str(root), "status",
-                                               "--porcelain"], 30)
-        if not ok or dirty:
-            report["steps"]["controller_clean"]["ok"] = False
-            report["error"] = "Controller checkout must be clean before updating"
-            return report
         ok, branch = step("controller_branch", ["git", "-C", str(root),
                                                 "branch", "--show-current"], 30)
         if not ok or branch != "main":
@@ -172,10 +240,31 @@ def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:2999
         if not ok or ahead != "0":
             report["error"] = "Controller has unpublished commits; refusing automatic update"
             return report
-        ok, _ = step("controller_pull", ["git", "-C", str(root), "pull",
-                                          "--ff-only", "origin", "main"], 120)
+        if revision is None:
+            ok, revision = step("select_revision", ["git", "-C", str(root),
+                                                   "rev-parse", "origin/main^{commit}"], 30)
+            if not ok or not _is_revision(revision):
+                report["error"] = "Cannot resolve an immutable controller revision"
+                return report
+        ok, _ = step("controller_pull", ["git", "-C", str(root), "merge",
+                                          "--ff-only", revision], 120)
         if not ok:
             return report
+    ok, controller_revision = step("controller_revision", ["git", "-C", str(root),
+                                                            "rev-parse", "HEAD"], 30)
+    if not ok or not _is_revision(controller_revision):
+        report["error"] = "Cannot attest controller revision"
+        return report
+    if revision is not None and controller_revision != revision:
+        report["error"] = "Controller must match the selected release before deployment"
+        return report
+    revision = controller_revision
+    report["revision"] = revision
+    try:
+        gate_checksum = hashlib.md5((root / "deploy/pi-build-gate/build-gate.ts").read_bytes()).hexdigest()
+    except OSError as exc:
+        report["error"] = f"Cannot attest selected build gate: {exc}"
+        return report
     if reinstall_local:
         ok, _ = step("controller_reinstall", [sys.executable, "-m", "pip", "install",
                                                "--quiet", "--upgrade", str(root)], 300)
@@ -205,7 +294,7 @@ def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:2999
                 return report
 
     timer_installer = root / "scripts" / "fleet-auto-update.sh"
-    if timer_installer.exists():
+    if timer_installer.exists() and sys.platform.startswith("linux"):
         enabled, _, _ = _run(["systemctl", "--user", "is-enabled", "--quiet",
                               "herdr-eng-fleet-update.timer"], timeout=30)
         if enabled == 0:
@@ -214,24 +303,18 @@ def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:2999
                 return report
 
     playbook = root / "ansible" / "playbooks" / "fleet-sync.yml"
-    cmd = ["ansible-playbook", "-i", str(inv), str(playbook),
-           "-e", f"fabric_agent_gateway_url={gateway}"]
+    variables = {"fabric_agent_gateway_url": gateway, "herdr_engineering_revision": revision}
+    if pi_revision:
+        variables["pi_engineering_revision"] = pi_revision
+    cmd = ["ansible-playbook", "-i", str(inv), str(playbook), "-e", json.dumps(variables)]
     if host:
         cmd += ["-l", host]
     ok, out = step("fleet_sync", cmd, 1800)
     # Ansible usually puts host/task failures in stdout, not stderr.
     report["steps"]["fleet_sync"]["stdout"] = out[-4000:]
     report["status"] = fleet_status(inventory=inv, host=host)
-    revision_rc, revision, _ = _run(["git", "-C", str(root), "rev-parse", "HEAD"], timeout=30)
-    revision = revision.strip()
-    hosts = report["status"].get("hosts", [])
-    valid_revision = revision_rc == 0 and re.fullmatch(r"[0-9a-f]{40,64}", revision) is not None
-    mismatched = [entry["host"] for entry in hosts
-                  if revision_rc != 0 or entry.get("revision") != revision]
-    report["steps"]["revision_parity"] = {
-        "ok": valid_revision and bool(hosts) and not mismatched, "expected_revision": revision,
-        "mismatched_hosts": mismatched,
-    }
+    report["steps"]["revision_parity"] = _parity(
+        report["status"], expected_hosts, revision, pi_revision, expected_build_gate=gate_checksum)
     report["ok"] = (ok and report["status"].get("rc") == 0
                     and report["steps"]["revision_parity"]["ok"])
     return report
@@ -260,8 +343,34 @@ def fleet_status(*, inventory: Path | None = None, host: str | None = None) -> d
                 return s.strip().rstrip('"').strip()
             hosts.append({"host": _clean(parts[0]),
                           "herdr_eng": _clean(parts[1]).replace("herdr-eng=", ""),
-                          "build_gate": _clean(parts[2]).replace("build-gate=", "")[:12],
+                          "build_gate": _clean(parts[2]).replace("build-gate=", ""),
                           "agent": _clean(parts[3]).replace("agent=", ""),
                           "revision": _clean(parts[4]).removeprefix("revision=") if len(parts) > 4 else "unknown",
-                          "cleanup": _clean(parts[5]).removeprefix("cleanup=") if len(parts) > 5 else "unknown"})
+                          "cleanup": _clean(parts[5]).removeprefix("cleanup=") if len(parts) > 5 else "unknown",
+                          "pi_revision": _clean(parts[6]).removeprefix("pi-revision=") if len(parts) > 6 else "unknown",
+                          "pi_path": _clean(parts[7]).removeprefix("pi-path=") if len(parts) > 7 else ""})
     return {"rc": rc, "hosts": hosts, "stderr": err.strip()[-300:] or None}
+
+
+def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None) -> dict:
+    """Install/register a pinned Pi package; never reload or restart live sessions."""
+    root = repo_root()
+    inv = inventory or root / "ansible" / "inventory" / "hosts.yml"
+    report: dict = {"ok": False, "revision": revision, "host": host}
+    if not _is_revision(revision):
+        return {**report, "error": "Pi revision must be a full immutable commit ID"}
+    try:
+        expected = _expected_hosts(inv, host)
+    except (OSError, ValueError, AttributeError, FleetError) as exc:
+        return {**report, "error": str(exc)}
+    cmd = ["ansible-playbook", "-i", str(inv),
+           str(root / "ansible" / "playbooks" / "pi-runtime-stage.yml"), "-l", host,
+           "-e", json.dumps({"pi_engineering_revision": revision})]
+    rc, out, err = _run(cmd, timeout=1800)
+    status = fleet_status(inventory=inv, host=host)
+    parity = _parity(status, expected, revision, revision, pi_only=True)
+    ok = rc == 0 and parity["ok"]
+    return {**report, "ok": ok, "rc": rc,
+            "sourceRoot": status["hosts"][0]["pi_path"] if ok else None,
+            "stdout": out[-4000:], "stderr": err[-1000:], "status": status,
+            "hosts": status.get("hosts", []), "parity": parity}

@@ -1,0 +1,20 @@
+---
+- name: "Require supported fleet platform"
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['system'] in ['Linux', 'Darwin']
+    fail_msg: "Managed runtime deployment supports Linux and macOS only"
+
+- name: "Create managed fleet release directory"
+  become: false
+  ansible.builtin.file:
+    path: "{{ fleet_home }}/.local/share/herdr-engineering"
+    state: directory
+    mode: "0700"
+
+- name: "Install bounded immutable-release staging helper"
+  become: false
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../files/stage-release.py"
+    dest: "{{ fleet_home }}/.local/share/herdr-engineering/stage-release.py"
+    mode: "0700"

@@ -1,0 +1,20 @@
+---
+# Package staging only. Activation and mission recovery require exact session
+# control operations from the durable fleet rollout coordinator.
+- name: "Stage a pinned Pi Engineering runtime"
+  hosts: herdr_fleet
+  gather_facts: false
+  become: false
+  environment:
+    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_env.HOME | default('~', true) }}/.local/bin:{{ ansible_env.PATH | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
+  tasks:
+    - name: "Gather connection user facts"
+      ansible.builtin.setup:
+
+    - name: "Record connection user paths"
+      ansible.builtin.set_fact:
+        fleet_home: "{{ ansible_env.HOME }}"
+        fleet_user: "{{ ansible_user_id }}"
+
+    - name: "Stage selected Pi release"
+      ansible.builtin.include_tasks: ../tasks/pi-runtime.yml

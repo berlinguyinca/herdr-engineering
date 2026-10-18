@@ -1,14 +1,15 @@
 ---
 # Fleet sync: converge the version-sensitive HerdR Engineering pieces on one
 # or every fleet host so they stay in sync with the controller checkout and
-# the public repo (origin/main).
+# one selected immutable revision.
 #
 # Syncs (idempotent, converge-only — never disruptive to running agents):
-#   - herdr-eng           -> pulled from the public repo origin/main and
+#   - herdr-eng           -> fetched at the selected exact commit and
 #                            pip-installed into ~/.venvs/herdr-engineering
 #                            (fabric-agent.yml)
 #   - fabric.env + auto-registration agent service (fabric-agent.yml)
 #   - pi build-gate extension build-gate.ts (pi-build-gate.yml)
+#   - optional pi-engineering package staging (never session activation)
 #   - version-parity fingerprint report (this playbook)
 #
 # JOIN a new site:     ansible-playbook -i inventory/hosts.yml \
@@ -46,9 +47,13 @@
     - name: "Converge pi build-gate extension"
       ansible.builtin.include_tasks: ../tasks/pi-build-gate.yml
 
+    - name: "Stage the selected Pi runtime when requested"
+      ansible.builtin.include_tasks: ../tasks/pi-runtime.yml
+      when: pi_engineering_revision is defined
+
     - name: "Gather host version/registration fingerprint"
       ansible.builtin.include_tasks: ../tasks/fleet-fingerprint.yml
 
     - name: "Report per-host version fingerprint"
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} | herdr-eng={{ fp_herdr_version.stdout | default('MISSING') }} | build-gate={{ fp_buildgate_md5.stdout | default('MISSING') }} | agent={{ fp_agent.stdout_lines | last | default('unknown') }} | revision={{ fp_revision.stdout | default('MISSING', true) }} | cleanup={{ fp_cleanup.stdout | default('unknown', true) }}"
+        msg: "{{ inventory_hostname }} | herdr-eng={{ fp_herdr_version.stdout | default('MISSING') }} | build-gate={{ fp_buildgate_md5.stdout | default('MISSING') }} | agent={{ fp_agent.stdout_lines | last | default('unknown') }} | revision={{ fp_revision | default('MISSING', true) }} | cleanup={{ fp_cleanup.stdout | default('unknown', true) }} | pi-revision={{ fp_pi_revision }} | pi-path={{ fp_pi_path }}"

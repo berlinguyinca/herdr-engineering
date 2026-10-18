@@ -1,0 +1,26 @@
+---
+- name: "Require an exact Pi Engineering release"
+  ansible.builtin.assert:
+    that:
+      - pi_engineering_revision is defined
+      - pi_engineering_revision is match('^(?:[0-9a-f]{40}|[0-9a-f]{64})$')
+    fail_msg: "pi_engineering_revision must be a full immutable commit ID"
+
+- name: "Prepare managed deployment helper"
+  ansible.builtin.include_tasks: stage-helper.yml
+
+- name: "Stage Pi dependencies and register the immutable package"
+  become: false
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ fleet_home }}/.local/share/herdr-engineering/stage-release.py"
+      - --kind
+      - pi
+      - --home
+      - "{{ fleet_home }}"
+      - --revision
+      - "{{ pi_engineering_revision }}"
+  register: pi_runtime_staging
+  changed_when: true
+  when: not ansible_check_mode

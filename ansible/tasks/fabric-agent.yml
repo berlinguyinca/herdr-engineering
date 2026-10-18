@@ -7,7 +7,7 @@
 # listeners.
 #
 # Runs as the fleet (connection) user (become: false). herdr-eng is
-# provisioned when missing (shallow clone of the public repo + user venv).
+# provisioned in managed immutable release directories plus a user venv.
 # The gateway control URL is written to the machine-local
 # ~/.config/herdr-engineering/fabric.env (a tailnet URL, not a secret).
 - name: "Deploy dev-fabric auto-registration agent"
@@ -26,48 +26,38 @@
         mode: "0600"
         content: "HERDR_ENGINEERING_FABRIC_URL={{ fabric_agent_gateway_url }}\n"
 
-    - name: "Provision/refresh herdr-eng (public repo clone + user venv, kept current)"
-      ansible.builtin.shell: |
-        set -e
-        VENV="$HOME/.venvs/herdr-engineering"
-        REPO="$HERDR_ENGINEERING_CHECKOUT"
-        mkdir -p "$(dirname "$REPO")"
-        if [ ! -d "$REPO/.git" ]; then
-          git clone --depth 1 \
-            https://github.com/berlinguyinca/herdr-engineering.git "$REPO"
-          echo "cloned"
-        else
-          [ -z "$(git -C "$REPO" status --porcelain)" ] || {
-            echo "Remote herdr-engineering checkout has local changes; refusing update" >&2
-            exit 1
-          }
-          [ "$(git -C "$REPO" branch --show-current)" = main ] || {
-            echo "Remote herdr-engineering checkout must be on main" >&2
-            exit 1
-          }
-          git -C "$REPO" fetch --quiet origin main
-          [ "$(git -C "$REPO" rev-list --count origin/main..HEAD)" = 0 ] || {
-            echo "Remote checkout has unpublished commits; refusing update" >&2
-            exit 1
-          }
-          git -C "$REPO" pull --ff-only --quiet origin main
-        fi
-        [ -d "$VENV" ] || python3 -m venv "$VENV"
-        before="$("$VENV/bin/pip" show herdr-engineering 2>/dev/null | awk '/^Version:/{print $2}')"
-        "$VENV/bin/pip" install --quiet --upgrade "$REPO"
-        after="$("$VENV/bin/pip" show herdr-engineering 2>/dev/null | awk '/^Version:/{print $2}')"
-        if [ "$before" != "$after" ]; then echo "installed $before -> $after"; fi
-      args:
-        executable: /bin/bash
-      environment:
-        HERDR_ENGINEERING_CHECKOUT: "{{ herdr_engineering_checkout | default(fleet_home ~ '/herdr-engineering-repo') }}"
-        HOME: "{{ fleet_home }}"
-        USER: "{{ fleet_user }}"
-        XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
-        PATH: "{{ fleet_home }}/.venvs/herdr-engineering/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{{ fleet_home }}/.local/bin"
+    - name: "Select the controller release once for direct playbook invocations"
+      ansible.builtin.set_fact:
+        herdr_engineering_revision: "{{ lookup('pipe', 'git -C ' ~ (herdr_engineering_repo_root | quote) ~ ' rev-parse HEAD') }}"
+      run_once: true
+      when: herdr_engineering_revision is not defined
+
+    - name: "Require an immutable HerdR release"
+      ansible.builtin.assert:
+        that:
+          - herdr_engineering_revision is match('^(?:[0-9a-f]{40}|[0-9a-f]{64})$')
+
+    - name: "Prepare managed deployment helper"
+      ansible.builtin.include_tasks: stage-helper.yml
+
+    - name: "Install the selected HerdR release without touching developer checkouts"
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ fleet_home }}/.local/share/herdr-engineering/stage-release.py"
+          - --kind
+          - herdr
+          - --home
+          - "{{ fleet_home }}"
+          - --revision
+          - "{{ herdr_engineering_revision }}"
       register: fabric_agent_provision
-      changed_when: "'installed' in fabric_agent_provision.stdout or 'cloned' in fabric_agent_provision.stdout"
+      changed_when: true
       when: not ansible_check_mode
+
+    - name: "Use the immutable checkout for companion installation"
+      ansible.builtin.set_fact:
+        herdr_engineering_checkout: "{{ fleet_home }}/.local/share/herdr-engineering/herdr/releases/{{ herdr_engineering_revision }}"
 
     - name: "Install/enable the agent service from the refreshed checkout"
       ansible.builtin.command:
