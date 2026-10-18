@@ -174,7 +174,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pr = fsub.add_parser("rollout", help="durable Pi runtime update and mission recovery")
     rsub = pr.add_subparsers(dest="rollout_command", required=True)
-    for action in ("plan", "apply", "status"):
+    for action in ("plan", "apply", "run", "status"):
         rp = rsub.add_parser(action)
         rp.add_argument("--state", default=None, help="private rollout state directory")
         if action == "plan":
@@ -183,6 +183,9 @@ def _build_parser() -> argparse.ArgumentParser:
             rp.add_argument("--inventory", default=None)
         else:
             rp.add_argument("--id", required=True, help="rollout ID printed by plan")
+        if action == "run":
+            rp.add_argument("--interval-seconds", type=int, default=30, help="initial retry interval, 1..3600 (backoff caps at max(interval, 300))")
+            rp.add_argument("--max-passes", type=int, default=None, help="stop after this many passes; omit to retry offline hosts until complete")
         rp.set_defaults(func=_cmd_fleet_rollout)
 
     # artifacts ------------------------------------------------------------
@@ -627,7 +630,13 @@ def _cmd_fleet_rollout(args) -> int:
     from pathlib import Path
 
     from .fleet import repo_root
-    from .fleet_rollout import RolloutStore, apply_rollout, create_rollout, inventory_targets
+    from .fleet_rollout import (
+        RolloutStore,
+        apply_rollout,
+        create_rollout,
+        inventory_targets,
+        run_rollout,
+    )
 
     store = RolloutStore(Path(args.state) if args.state else None)
     try:
@@ -636,13 +645,17 @@ def _cmd_fleet_rollout(args) -> int:
             report = create_rollout(store, args.pi_revision, inventory_targets(inventory, args.host), inventory=inventory)
         elif args.rollout_command == "apply":
             report = apply_rollout(store, args.id)
+        elif args.rollout_command == "run":
+            report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes)
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError) as exc:
         _print_json({"error": str(exc)})
         return 1
     _print_json(report)
-    return 0 if args.rollout_command != "apply" or report["status"] == "complete" else 2
+    if report.get("runner", {}).get("status") == "interrupted" and args.rollout_command == "run":
+        return 130
+    return 0 if args.rollout_command not in ("apply", "run") or report["status"] == "complete" else 2
 
 
 def _cmd_fleet_status(args) -> int:

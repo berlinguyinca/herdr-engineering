@@ -38,13 +38,38 @@ herdr-eng fleet rollout apply --id ROLLOUT_ID
 herdr-eng fleet rollout status --id ROLLOUT_ID
 ```
 
-`apply` executes one bounded, serial reconciliation pass. Repeat the same command
-to poll in-flight receipts, retry offline hosts, and observe progress. A service or
-scheduler may run it periodically; overlapping applies are refused by a private
-file lock. Exit code 0 means all recorded hosts and sessions verified; code 2
-means pending/blocked work remains, and code 1 indicates an invalid plan or local
-execution error. `status` only reads the saved JSON and reports the last observed
-state; it never probes, stages, resumes, or rewrites state.
+`apply` executes one bounded, serial reconciliation pass. For unattended updates,
+run the durable controller against the **existing reviewed rollout ID**:
+
+```sh
+herdr-eng fleet rollout run --id ROLLOUT_ID --interval-seconds 30
+# Optional finite run, useful for canaries or a supervised batch:
+herdr-eng fleet rollout run --id ROLLOUT_ID --interval-seconds 30 --max-passes 10
+```
+
+`run` repeats reconciliation until complete or operator attention is required.
+Offline workstations retry the same release automatically when they reconnect.
+Unchanged evidence doubles the delay from 30 seconds up to five minutes; actual
+progress resets it. The interval accepts 1–3600 seconds, and the delay cap is the
+larger of the interval and 300 seconds. Attempts and replacement busy-operation
+IDs do not count as progress. `--max-passes` limits passes for this invocation.
+
+A dedicated per-rollout lock prevents two unattended controllers, including while
+one sleeps. `status` exposes the saved runner status, total pass count, last pass,
+next retry and stop reason without probing or modifying anything. Ctrl-C records
+`interrupted` and releases the lock. Restarting the same command and state directory
+retains release selection, operation IDs and scheduled backoff. The command can
+run under an existing process supervisor; it does not install or enable a service.
+
+Bootstrap requirements, missing identity/coverage, rejected activation and unknown
+failures stop the automatic controller with `runner.status=blocked` and a reason.
+Correct the reported issue and explicitly rerun the command. Recognized offline
+transport failures keep retrying with bounded backoff. This distinguishes waiting
+for a returning workstation from repeating an unclassified failure forever.
+
+Exit code 0 means all recorded hosts and sessions verified; code 2 means pending,
+blocked or max-passes work remains; code 1 indicates an invalid plan or local
+execution error. Ctrl-C exits 130 after persisting state. `status` remains read-only.
 
 Per-host work is serial so one rollout does not create a fleet build storm.
 Transport calls have timeouts; a stopped controller resumes from durable state.
@@ -75,7 +100,9 @@ agent lacking a native conversation reference is retained as a coverage error,
 while independently identified siblings can continue. Such a host cannot be
 reported complete.
 
-The coordinator verifies both the loaded runtime commit and the stable Host commit
+Already-current settled runtimes are inspected without preparation or draining, so
+idle, paused and terminal sessions keep accepting future work. The coordinator
+verifies both the loaded runtime commit and the stable Host commit
 against the pinned SHA. A successful reload receipt alone is insufficient. Mission
 resume requests carry the original mission ID, revision and resumption generation.
 Explicitly paused and terminal missions are preserved. Eligible existing missions
@@ -115,6 +142,8 @@ pauses survive maintenance and do not count as a mission recovery failure.
 transport through a subprocess fixture: two hosts, offline recovery, controller
 restart and lost replies, exact replay, old loaded code, stable Host mismatch,
 operator pause, busy preparation, duplicate/stale identities, missing native
-coverage, corrupt receipts, progress regression and expired waits. These tests do
+coverage, corrupt receipts, progress regression and expired waits. Runner tests
+cover reconnect, durable restart/backoff, interruption, duplicate controllers and
+explicit operator-attention stops. These tests do
 not constitute a live multi-workstation rollout; validate a canary before fleet
 activation.
