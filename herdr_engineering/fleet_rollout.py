@@ -7,15 +7,18 @@ IDs; it never starts a new mission or sends an instruction to the model.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
+import math
 import os
 import re
 import shlex
 import subprocess
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import fleet
@@ -64,9 +67,10 @@ class RolloutStore:
         return self.root / (rollout_id + ".json")
 
     @contextmanager
-    def lock(self):
+    def lock(self, *, runner_id=None):
         self._directory()
-        fd = os.open(self.root / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        name = ".lock" if runner_id is None else ".run-" + self._path(runner_id).stem + ".lock"
+        fd = os.open(self.root / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             yield
@@ -662,3 +666,158 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
         )
         save()
         return plan
+
+
+def _offline_failure(state):
+    staging = state.get("staging") or {}
+    evidence = " ".join(
+        str(value)
+        for value in (
+            state.get("error", ""),
+            staging.get("error", ""),
+            staging.get("stdout", ""),
+            staging.get("stderr", ""),
+        )
+    ).lower()
+    return staging.get("rc") in (4, 124, 255) or any(
+        marker in evidence
+        for marker in (
+            "offline",
+            "unreachable",
+            "timed out",
+            "connection refused",
+            "no route to host",
+            "could not resolve hostname",
+            "control transport failed (exit 255)",
+        )
+    )
+
+
+def _automatic_blocker(plan):
+    for host, host_state in plan["hosts"].items():
+        if host_state["status"] == "blocked":
+            return f"{host}: {host_state.get('error', 'host requires operator attention')}"
+        if host_state.get("error") and not _offline_failure(host_state):
+            return f"{host}: {host_state['error']}"
+        for session_id, session in host_state["sessions"].items():
+            if session["status"] not in ("complete", "pending", "awaiting_progress", "discovered"):
+                return f"{host}/{session_id}: {session['status']}: {session.get('error', 'operator attention required')}"
+            if session.get("error") and not _offline_failure(session):
+                return f"{host}/{session_id}: {session['error']}"
+    return None
+
+
+def _progress_signature(plan):
+    # Attempts, archived busy receipts and fresh operation IDs are not progress.
+    evidence = {}
+    for host, state in plan["hosts"].items():
+        evidence[host] = {
+            "status": state["status"],
+            "error": state.get("error"),
+            "coverage": state.get("coverageErrors"),
+            "sessions": {
+                session_id: {
+                    "status": session["status"],
+                    "error": session.get("error"),
+                    "loaded": session.get("loaded"),
+                    "missions": {
+                        mission_id: {
+                            key: mission.get(key) for key in ("status", "error", "evidence")
+                        }
+                        for mission_id, mission in session.get("missions", {}).items()
+                    },
+                }
+                for session_id, session in state["sessions"].items()
+            },
+        }
+    return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
+
+
+def run_rollout(
+    store, rollout_id, *, interval_seconds=30, max_passes=None, reconcile=None, sleep=None, now=None
+):
+    """Reconcile one pinned rollout unattended; never select or create a release.
+
+    The runner lock spans sleeps, while each pass retains apply's short state lock.
+    Durable evidence/backoff survives controller restart. Terminal attention stops
+    are explicit; unreachable hosts keep retrying with a capped delay.
+    """
+    if (
+        type(interval_seconds) not in (int, float)
+        or not math.isfinite(interval_seconds)
+        or not 1 <= interval_seconds <= 3600
+    ):
+        raise ValueError("interval-seconds must be between 1 and 3600")
+    if max_passes is not None and (type(max_passes) is not int or max_passes < 1):
+        raise ValueError("max-passes must be a positive integer")
+    reconcile = reconcile or apply_rollout
+    sleep = sleep or time.sleep
+    now = now or (lambda: datetime.now(UTC))
+    cap = max(300, interval_seconds)
+
+    def record(**fields):
+        with store.lock():
+            latest = store.read(rollout_id)
+            latest.setdefault("runner", {}).update(fields)
+            store.write(latest)
+            return latest
+
+    with store.lock(runner_id=rollout_id):
+        plan = store.read(rollout_id)
+        passes = 0
+        try:
+            previous = plan.get("runner", {})
+            if previous.get("nextAttemptAt"):
+                remaining = (
+                    datetime.fromisoformat(previous["nextAttemptAt"]) - now()
+                ).total_seconds()
+                if remaining > 0:
+                    sleep(min(remaining, cap))
+            record(
+                status="running",
+                reason=None,
+                startedAt=now().isoformat(),
+                intervalSeconds=interval_seconds,
+            )
+            while True:
+                plan = reconcile(store, rollout_id)
+                passes += 1
+                previous = plan.get("runner", {})
+                signature = _progress_signature(plan)
+                unchanged = (
+                    previous.get("unchangedPasses", 0) + 1
+                    if signature == previous.get("signature")
+                    else 0
+                )
+                delay = min(cap, interval_seconds * 2 ** min(unchanged, 12))
+                blocker = _automatic_blocker(plan)
+                status = (
+                    "complete"
+                    if plan["status"] == "complete"
+                    else "blocked"
+                    if blocker
+                    else "max_passes"
+                    if max_passes is not None and passes >= max_passes
+                    else "running"
+                )
+                plan = record(
+                    status=status,
+                    reason=blocker,
+                    passes=previous.get("passes", 0) + 1,
+                    signature=signature,
+                    unchangedPasses=unchanged,
+                    lastPassAt=now().isoformat(),
+                    nextAttemptAt=(now() + timedelta(seconds=delay)).isoformat()
+                    if status in ("running", "max_passes")
+                    else None,
+                )
+                if status != "running":
+                    return plan
+                sleep(delay)
+        except KeyboardInterrupt:
+            return record(
+                status="interrupted",
+                reason="interrupted; existing release and operation IDs retained",
+            )
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            return record(status="blocked", reason=str(exc)[:1000], nextAttemptAt=None)

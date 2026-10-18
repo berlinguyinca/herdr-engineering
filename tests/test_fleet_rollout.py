@@ -87,7 +87,7 @@ class Wire:
         if self.corrupt:
             return {"unexpected": "object"}
         row = copy.deepcopy(self.rows[target["host"]])
-        if self.progress:
+        if self.progress and row["reply"]["data"]["missions"]:
             row["reply"]["data"]["missions"][0]["lastMeaningfulProgressAt"] = "2026-10-17T22:00:00Z"
         return [row]
 
@@ -777,3 +777,169 @@ def test_already_current_runtime_is_never_drained(mission_state, tmp_path):
     assert result["hosts"]["bender"]["sessions"]["bender-conversation"]["status"] == (
         "bootstrap_required" if mission_state == "bootstrap" else "complete"
     )
+
+
+class RunClock:
+    def __init__(self):
+        from datetime import UTC, datetime
+
+        self.value = datetime(2026, 10, 18, tzinfo=UTC)
+        self.delays = []
+
+    def now(self):
+        return self.value
+
+    def sleep(self, seconds):
+        from datetime import timedelta
+
+        self.delays.append(seconds)
+        self.value += timedelta(seconds=seconds)
+
+
+def run_with_wire(store, plan, wire, clock, **kwargs):
+    from herdr_engineering.fleet_rollout import run_rollout
+
+    return run_rollout(
+        store,
+        plan["id"],
+        reconcile=lambda store, rollout_id: apply(store, plan, wire),
+        now=clock.now,
+        sleep=clock.sleep,
+        **kwargs,
+    )
+
+
+def test_run_cli_supports_bounded_unattended_mode():
+    from herdr_engineering.cli import _build_parser
+
+    args = _build_parser().parse_args(
+        [
+            "fleet",
+            "rollout",
+            "run",
+            "--id",
+            "a" * 32,
+            "--interval-seconds",
+            "30",
+            "--max-passes",
+            "5",
+        ]
+    )
+    assert args.rollout_command == "run" and args.max_passes == 5
+
+
+def test_run_reconnects_offline_host_on_second_pass(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    for row in wire.rows.values():
+        row["reply"]["data"]["missions"] = []
+    old_sleep = clock.sleep
+
+    def reconnect(seconds):
+        old_sleep(seconds)
+        wire.offline.clear()
+
+    clock.sleep = reconnect
+    result = run_with_wire(store, plan, wire, clock, interval_seconds=30, max_passes=3)
+    assert result["status"] == "complete"
+    assert result["runner"]["status"] == "complete" and result["runner"]["passes"] == 2
+    assert clock.delays == [30]
+    assert result["revision"] == SHA
+
+
+def test_run_restart_preserves_operation_ids_and_backoff(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore
+
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    first = run_with_wire(store, plan, wire, clock, interval_seconds=30, max_passes=1)
+    assert first["runner"]["status"] == "max_passes"
+    operation = first["hosts"]["bender"]["sessions"]["bender-conversation"]["operations"][
+        "resume:M1"
+    ]["request"]
+    mutation_count = len(wire.mutations)
+    wire.progress = True
+    wire.offline.clear()
+    wire.rows["beast"]["reply"]["data"]["missions"] = []
+    result = run_with_wire(
+        RolloutStore(store.root), plan, wire, clock, interval_seconds=30, max_passes=1
+    )
+    assert result["status"] == "complete"
+    assert result["runner"]["passes"] == 2
+    assert (
+        result["hosts"]["bender"]["sessions"]["bender-conversation"]["operations"]["resume:M1"][
+            "request"
+        ]
+        == operation
+    )
+    assert len(wire.mutations) == mutation_count + 2
+    assert clock.delays == [30]
+
+
+def test_run_backoff_caps_without_treating_attempt_counts_as_progress(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    wire.offline.add("bender")
+    result = run_with_wire(store, plan, wire, clock, interval_seconds=30, max_passes=6)
+    assert result["runner"]["status"] == "max_passes"
+    assert clock.delays == [30, 60, 120, 240, 300]
+    assert result["runner"]["nextAttemptAt"]
+
+
+@pytest.mark.parametrize("blocker", ["bootstrap", "unknown"])
+def test_run_stops_on_operator_attention_without_sleep(tmp_path, blocker):
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    if blocker == "bootstrap":
+        wire.rows["bender"]["reply"]["data"]["runtime"]["capabilities"] = []
+    else:
+        wire.stage = lambda *a, **k: {"ok": False, "error": "dependency install failed"}
+    result = run_with_wire(store, plan, wire, clock, interval_seconds=30, max_passes=10)
+    assert result["runner"]["status"] == "blocked"
+    assert result["runner"]["reason"]
+    assert not clock.delays
+
+
+def test_run_interruption_is_durable_and_releases_exclusive_runner(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    wire.offline.add("bender")
+
+    def interrupted(seconds):
+        raise KeyboardInterrupt
+
+    clock.sleep = interrupted
+    result = run_with_wire(store, plan, wire, clock, interval_seconds=30, max_passes=3)
+    assert result["runner"]["status"] == "interrupted"
+    assert store.read(plan["id"])["runner"]["status"] == "interrupted"
+    clock.sleep = RunClock.sleep.__get__(clock)
+    result = run_with_wire(store, plan, wire, clock, interval_seconds=30, max_passes=1)
+    assert result["runner"]["status"] == "max_passes"
+
+
+def test_second_runner_is_rejected_even_between_passes(tmp_path):
+    from herdr_engineering.fleet_rollout import run_rollout
+
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    wire.offline.add("bender")
+    old_sleep = clock.sleep
+
+    def competing(seconds):
+        with pytest.raises(BlockingIOError):
+            run_rollout(store, plan["id"], max_passes=1)
+        old_sleep(seconds)
+
+    clock.sleep = competing
+    run_with_wire(store, plan, wire, clock, interval_seconds=30, max_passes=2)
+
+
+@pytest.mark.parametrize(
+    "interval,max_passes", [(0, 1), (3601, 1), (float("nan"), 1), (30, 0), (30, -1)]
+)
+def test_run_rejects_invalid_bounds_before_contact(tmp_path, interval, max_passes):
+    from herdr_engineering.fleet_rollout import run_rollout
+
+    store, plan = setup_rollout(tmp_path)
+    with pytest.raises(ValueError):
+        run_rollout(store, plan["id"], interval_seconds=interval, max_passes=max_passes)
