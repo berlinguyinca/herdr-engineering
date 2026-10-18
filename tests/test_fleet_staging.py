@@ -201,24 +201,23 @@ def test_herdr_attestation_refuses_replaced_installed_distribution(repository, t
 
 def test_macos_companion_receives_pinned_release_path():
     import yaml
-    from jinja2 import Environment
     root = Path(__file__).resolve().parents[1]
     tasks = yaml.safe_load((root / 'ansible/tasks/fabric-agent.yml').read_text())[0]['block']
     command = next(task['ansible.builtin.command'] for task in tasks
                    if task.get('register') == 'fabric_agent_result')
+    # This is a deployment configuration contract. Rendering belongs to Ansible;
+    # the Python test suite must run with only the declared project dependencies.
     argv = command['argv']
-    selected = '/home/operator/.local/share/herdr-engineering/herdr/releases/' + 'a' * 40
-    context = {'herdr_engineering_checkout': selected, 'fleet_home': '/home/operator',
-               'ansible_facts': {'system': 'Darwin'}}
-    env = Environment()
-    if isinstance(argv, str):
-        # Ansible natively evaluates this list expression; compile the expression
-        # rather than treating its result as a shell string.
-        argv = env.compile_expression(argv.strip()[2:-2])(**context)
-    else:
-        argv = [env.from_string(arg).render(context) for arg in argv]
-    assert '--repo' in argv
-    assert argv[argv.index('--repo') + 1] == selected
+    assert isinstance(argv, str)
+    expression = ' '.join(argv.split())
+    assert "herdr_engineering_checkout ~ '/scripts/'" in expression
+    assert "('fabric-agent-macos.sh' if ansible_facts['system'] == 'Darwin' else 'fabric-agent.sh')" in expression
+    assert expression.endswith(
+        "+ (['--repo', herdr_engineering_checkout] if ansible_facts['system'] == 'Darwin' else []) }}")
+    checkout = next(task['ansible.builtin.set_fact']['herdr_engineering_checkout']
+                    for task in tasks
+                    if 'herdr_engineering_checkout' in task.get('ansible.builtin.set_fact', {}))
+    assert checkout == "{{ fleet_home }}/.local/share/herdr-engineering/herdr/releases/{{ herdr_engineering_revision }}"
 
 
 def test_distribution_probe_reads_actual_target_interpreter_metadata(tmp_path):
