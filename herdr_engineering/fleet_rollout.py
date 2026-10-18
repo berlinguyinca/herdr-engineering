@@ -499,12 +499,20 @@ def _session(plan, state, transport, target, root, save):
         waiting = mission.get("namedWait") or {}
         valid_wait = False
         try:
+            next_action = datetime.fromisoformat(waiting["nextActionAt"].replace("Z", "+00:00"))
+            deadline = waiting.get("deadline")
+            deadline_at = (
+                datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+                if deadline is not None
+                else None
+            )
+            now = datetime.now(UTC)
             valid_wait = bool(
                 waiting.get("action")
-                and datetime.fromisoformat(waiting["nextActionAt"].replace("Z", "+00:00"))
-                > datetime.now(UTC)
+                and next_action > now
+                and (deadline_at is None or now < deadline_at and next_action <= deadline_at)
             )
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, ValueError, TypeError, AttributeError):
             pass
         advanced = False
         try:
