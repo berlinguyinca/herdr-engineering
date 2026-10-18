@@ -15,6 +15,7 @@ import json
 import os
 import queue
 import secrets
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -85,7 +86,7 @@ class ControlPlaneServer:
 
     def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
                  port=0, web_root=None, source=None, allow_open=False,
-                 rustfs=None):
+                 rustfs=None, dispatcher=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -99,6 +100,7 @@ class ControlPlaneServer:
         other and are encrypted end-to-end via WireGuard.
         """
         self.repo = repo
+        self.dispatcher = dispatcher or self._dispatch_native_message
         if source is not None:
             from .bridge import load_into
             load_into(repo, source)
@@ -137,6 +139,34 @@ class ControlPlaneServer:
         self._httpd = None
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    def _dispatch_native_message(self, record, message, artifact_ids):
+        from ..errors import InvalidError, UnsupportedError
+        from ..herdr_adapter import NativeHerdrAdapter
+
+        if artifact_ids:
+            raise UnsupportedError("native prompt attachment delivery is not implemented")
+        target = record.get("terminal_id")
+        conversation = record.get("agent_session")
+        if not target or not conversation or not record.get("host_id"):
+            raise InvalidError("native terminal, conversation and host identity are required")
+        adapter = NativeHerdrAdapter()
+        machine = record.get("machine")
+        if not machine and record["host_id"] not in {socket.gethostname(), socket.getfqdn()}:
+            resolved = adapter.resolve_machine(record["host_id"])
+            if resolved is None:
+                raise InvalidError("remote host has no explicit native machine route")
+            machine = resolved.id
+        server = record.get("herdr_session")
+        if not server:
+            raise InvalidError("named HerdR server identity is required")
+        agents = adapter.list_agents(machine=machine, session=server)
+        matches = [agent for agent in agents if agent.terminal_id == target]
+        if len(matches) != 1 or matches[0].agent_session != conversation:
+            raise InvalidError("native session identity changed; refresh before delivery")
+        if matches[0].interactive_ready is False or matches[0].launch_pending:
+            raise InvalidError("native agent is not ready for prompt delivery")
+        return adapter.send_input(target, message, machine=machine, session=server)
 
     def _health(self):
         """Repo stats + deployment context (source backend, image version/commit)."""
@@ -432,16 +462,18 @@ def _make_handler(server):
                 s = r.get_session(parts[4])
                 if s is None:
                     return self._json({"error": "session not found"}, 404)
-                r.send_message(parts[4],
-                               redact_payload(body.get("message", "")),
-                               body.get("artifact_ids"))
-                return self._json({"ok": True})
+                receipt = r.send_message(
+                    parts[4], body.get("message", ""), body.get("artifact_ids"),
+                    operation_id=body.get("operation_id"), dispatcher=server.dispatcher)
+                status = {"delivered": 200, "queued": 202}.get(receipt["status"], 502)
+                return self._json({"ok": receipt["status"] == "delivered", **receipt}, status)
             if resource == "sessions" and len(parts) == 6 and parts[5] == "actions":
                 s = r.get_session(parts[4])
                 if s is None:
                     return self._json({"error": "session not found"}, 404)
-                r.session_action(parts[4], body.get("action"))
-                return self._json({"ok": True})
+                receipt = r.session_action(parts[4], body.get("action"),
+                                           operation_id=body.get("operation_id"))
+                return self._json({"ok": False, **receipt}, 501)
             if resource == "token-usage" and len(parts) == 4:
                 rows = body.get("records") if isinstance(body.get("records"), list) else [body]
                 for row in rows[:500]:

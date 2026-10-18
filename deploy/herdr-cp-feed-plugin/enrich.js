@@ -61,22 +61,30 @@ async function runJson(cmd, args) {
   }
 }
 
+function serverArgs(env) {
+  const name = env.HERDR_SESSION_NAME || env.HERDR_SESSION;
+  return name ? ["--session", name] : [];
+}
+
 // Pane info from `herdr pane get`. Returns { agent, cwd, summary } or null.
 export async function paneDetail(env, paneId) {
   const bin = herdrBin(env);
-  const v = await runJson(bin, ["pane", "get", paneId]);
+  const v = await runJson(bin, [...serverArgs(env), "pane", "get", paneId]);
   const pane = v?.result?.pane || v?.pane;
   if (!pane) return null;
   const cwd = pane.cwd || pane.foreground_cwd || null;
   const summary = pane.terminal_title_stripped || pane.terminal_title || null;
-  return { agent: pane.agent || null, cwd, summary };
+  return { agent: pane.agent || null, cwd, summary,
+    terminal_id: pane.terminal_id, agent_session: pane.agent_session,
+    revision: pane.revision, interactive_ready: pane.interactive_ready,
+    launch_pending: pane.launch_pending, state_change_seq: pane.state_change_seq };
 }
 
 // Foreground process info from `herdr pane process-info --pane <id>`.
 // Returns { pid, cmdline } of the first foreground process, else null.
 export async function processDetail(env, paneId) {
   const bin = herdrBin(env);
-  const v = await runJson(bin, ["pane", "process-info", "--pane", paneId]);
+  const v = await runJson(bin, [...serverArgs(env), "pane", "process-info", "--pane", paneId]);
   const pi = v?.result?.process_info || v?.process_info;
   if (!pi) return null;
   const procs = Array.isArray(pi.foreground_processes)
@@ -111,7 +119,7 @@ export function attachCommand(env, host, ws) {
 export function mergeDetail(envelope, detail) {
   if (!envelope || envelope.entity_type !== "session" || !detail) return envelope;
   const payload = { ...(envelope.payload || {}) };
-  for (const k of ["agent_role", "cwd", "branch", "pid", "cmdline", "summary", "attach"]) {
+  for (const k of ["agent_role", "cwd", "branch", "pid", "cmdline", "summary", "attach", "terminal_id", "agent_session", "revision", "interactive_ready", "launch_pending", "state_change_seq"]) {
     const v = detail[k];
     if (v !== undefined && v !== null && v !== "") {
       if (k === "agent_role" && payload.agent_role) continue; // prefer existing
@@ -124,17 +132,27 @@ export function mergeDetail(envelope, detail) {
 // Fetch live detail for a session envelope and merge it in. Best-effort.
 export async function enrichSession(env, envelope) {
   if (!envelope || envelope.entity_type !== "session") return envelope;
-  const paneId = envelope.entity_id;
+  const paneId = envelope.payload?.pane_id || envelope.entity_id;
+  const server = envelope.payload?.herdr_session;
+  // New namespaced records with unknown server routing are telemetry-only.
+  if (envelope.entity_id.startsWith("herdr:") && !server) return envelope;
+  const routedEnv = server ? { ...env, HERDR_SESSION_NAME: server } : env;
   const ws = envelope.payload?.mission_id;
   const host = envelope.payload?.host_id;
   const [pane, proc] = await Promise.all([
-    paneDetail(env, paneId).catch(() => null),
-    processDetail(env, paneId).catch(() => null),
+    paneDetail(routedEnv, paneId).catch(() => null),
+    processDetail(routedEnv, paneId).catch(() => null),
   ]);
   const cwd = pane?.cwd || proc?.cwd || null;
   const branch = await branchDetail(env, cwd).catch(() => null);
   const detail = {
     agent_role: pane?.agent,
+    terminal_id: pane?.terminal_id,
+    agent_session: pane?.agent_session,
+    revision: pane?.revision,
+    interactive_ready: pane?.interactive_ready,
+    launch_pending: pane?.launch_pending,
+    state_change_seq: pane?.state_change_seq,
     cwd,
     summary: pane?.summary,
     pid: proc?.pid,

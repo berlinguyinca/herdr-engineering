@@ -13,11 +13,15 @@ durable Postgres/RustFS path (Phase 1 async stores) is bridged in deployment.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import threading
 import time
+from uuid import uuid4
 
 from .ids import new_id
 from .inspector import InspectorStore
+from .redact import redact_payload
 
 _STAGES = {
     "planning", "specification", "ready", "implementation", "testing",
@@ -64,6 +68,8 @@ class ControlPlaneRepo:
     def __init__(self, *, now=None, sink=None):
         """``sink`` is an optional durable writer (e.g. DurableEventSink) called
         with each recorded event so ingestion survives a restart."""
+        self._command_lock = threading.RLock()
+        self._event_lock = threading.RLock()
         self._sink = sink
         self._now = now or (lambda: time.time())
         self._missions = {}
@@ -195,27 +201,83 @@ class ControlPlaneRepo:
             out = [s for s in out if s["status"] == status]
         return _sort_by(out, "created_at", reverse=True)
 
-    def session_action(self, session_id, action):
+    def session_action(self, session_id, action, *, operation_id=None):
         if action not in _SESSION_ACTIONS:
             raise ValueError(f"unknown session action: {action}")
-        s = self._sessions.get(session_id)
-        if s is None:
+        if session_id not in self._sessions:
             raise KeyError(session_id)
-        s["status"] = "active" if action != "stop" else "stopped"
-        s["updated_at"] = self._stamp()
-        self.record_event("session", session_id, "SessionAction",
-                          {"action": action}, session_id=session_id)
+        # Native prompt delivery cannot implement lifecycle transitions or
+        # approve mission decisions. Preserve observed state until telemetry
+        # confirms a supported operation, instead of pretending to resume.
+        result = {"operation_id": operation_id or f"command_{uuid4().hex}",
+                  "action": action, "status": "failed",
+                  "error": "unsupported_action"}
+        self.record_event("session", session_id, "SessionActionRejected",
+                          result, session_id=session_id)
+        return result
 
-    def send_message(self, session_id, message, artifact_ids=None):
-        s = self._sessions.get(session_id)
-        if s is None:
-            raise KeyError(session_id)
-        s["messages"] += 1
-        s["updated_at"] = self._stamp()
-        self.record_event(
-            "session", session_id, "SessionMessageSent",
-            {"text": message, "artifact_ids": artifact_ids or []},
-            session_id=session_id)
+    def send_message(self, session_id, message, artifact_ids=None, *,
+                     operation_id=None, dispatcher=None):
+        """Record submission before transport, and only count acknowledged delivery.
+
+        Replayed operation IDs return their last receipt even if it is still
+        queued: a crash during a non-idempotent native prompt has an unknown
+        outcome and must never trigger automatic duplicate submission.
+        """
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("message must be a nonempty string")
+        artifact_ids = [] if artifact_ids is None else artifact_ids
+        if not isinstance(artifact_ids, list) or not all(isinstance(a, str) for a in artifact_ids):
+            raise ValueError("artifact_ids must be a list of strings")
+        operation_id = f"command_{uuid4().hex}" if operation_id is None else operation_id
+        if not isinstance(operation_id, str) or not operation_id.strip() or len(operation_id) > 200:
+            raise ValueError("invalid operation_id")
+        fingerprint = hashlib.sha256(json.dumps(
+            [session_id, message, artifact_ids], ensure_ascii=False).encode()).hexdigest()
+        with self._command_lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            for event in reversed(self.stream("session", session_id)):
+                if event["event_type"] not in {"SessionCommandQueued", "SessionCommandSettled"}:
+                    continue
+                receipt = _payload(event)
+                if receipt.get("operation_id") == operation_id:
+                    if receipt.get("fingerprint") != fingerprint:
+                        raise ValueError("operation_id already used for a different message")
+                    return _deep_copy(receipt)
+            result = {"operation_id": operation_id, "fingerprint": fingerprint,
+                      "status": "queued", "mission_progress_verified": False,
+                      "durable": self._sink is not None,
+                      "text": redact_payload(message), "artifact_ids": list(artifact_ids)}
+            try:
+                self.record_event("session", session_id, "SessionCommandQueued",
+                                  dict(result), session_id=session_id, require_durable=True)
+            except Exception:
+                result.update(status="failed", error="receipt_persistence_failed")
+                return result
+            if dispatcher is None:
+                return result
+            try:
+                delivery = dispatcher(_deep_copy(session), message, list(artifact_ids))
+                if not isinstance(delivery, dict) or delivery.get("status") != "delivered":
+                    raise ValueError("transport did not acknowledge delivery")
+                result["status"] = "delivered"
+                result["delivery"] = redact_payload(delivery)
+            except Exception as exc:
+                result.update(status="failed", error="transport_error",
+                              detail=redact_payload(str(exc)))
+            try:
+                self.record_event("session", session_id, "SessionCommandSettled",
+                                  _deep_copy(result), session_id=session_id, require_durable=True)
+            except Exception:
+                # The durable queued receipt prevents resending after restart.
+                result.update(status="queued", error="receipt_settlement_unknown")
+                return result
+            if result["status"] == "delivered":
+                session["messages"] += 1
+                session["updated_at"] = self._stamp()
+            return result
 
     def record_tool_call(self, session_id, tool, detail=""):
         s = self._sessions.get(session_id)
@@ -414,11 +476,22 @@ class ControlPlaneRepo:
     def upsert_session(self, session_id, *, host_id=None, mission_id=None,
                        agent_role="", model="", status="active",
                        cwd=None, branch=None, pid=None, cmdline=None,
-                       summary=None, attach=None, source="herdr"):
+                       summary=None, attach=None, source="herdr", pane_id=None,
+                       terminal_id=None, herdr_session=None, machine=None,
+                       agent_session=None, revision=None, interactive_ready=None,
+                       launch_pending=None, state_change_seq=None):
         stamp = self._stamp()
         existing = self._sessions.get(session_id)
+        if (existing is not None and host_id is not None
+                and existing.get("host_id") not in (None, host_id)):
+            raise ValueError("session host collision; emit a host-namespaced session ID")
         detail = {"cwd": cwd, "branch": branch, "pid": pid,
-                  "cmdline": cmdline, "summary": summary, "attach": attach}
+                  "cmdline": cmdline, "summary": summary, "attach": attach,
+                  "pane_id": pane_id, "terminal_id": terminal_id,
+                  "herdr_session": herdr_session, "machine": machine,
+                  "agent_session": agent_session, "revision": revision,
+                  "interactive_ready": interactive_ready, "launch_pending": launch_pending,
+                  "state_change_seq": state_change_seq}
         if existing is None:
             rec = {"session_id": session_id, "mission_id": mission_id,
                    "host_id": host_id, "agent_role": agent_role,
@@ -455,7 +528,9 @@ class ControlPlaneRepo:
                           {k: existing[k] for k in (
                               "host_id", "mission_id", "agent_role", "model",
                               "status", "cwd", "branch", "pid", "cmdline",
-                              "summary", "attach") if existing.get(k) is not None},
+                              "summary", "attach", "pane_id", "terminal_id", "herdr_session",
+                              "machine", "agent_session", "revision", "interactive_ready",
+                              "launch_pending", "state_change_seq") if existing.get(k) is not None},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)
@@ -934,33 +1009,38 @@ class ControlPlaneRepo:
 
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
-                     mission_id=None, session_id=None):
-        key = (entity_type, entity_id)
-        stream = self._events.setdefault(key, [])
-        seq = len(stream)
-        ev = {
-            "event_id": new_id("event"),
-            "schema_version": 1,
-            "source_timestamp": self._stamp(),
-            "ingest_timestamp": self._stamp(),
-            "entity_type": entity_type, "entity_id": entity_id,
-            "mission_id": mission_id, "session_id": session_id,
-            "sequence": seq, "event_type": event_type,
-            "payload": payload or {},
-        }
-        stream.append(ev)
-        self._event_order.append((entity_type, entity_id, seq))
-        if self._sink is not None:
-            try:
-                self._sink.record(ev)
-            except Exception:
-                pass  # a sink must never break event recording
-        for listener in self._listeners:
-            try:
-                listener(_copy(ev))
-            except Exception:
-                pass  # a listener must never break event recording
-        return _copy(ev)
+                     mission_id=None, session_id=None, require_durable=False):
+        with self._event_lock:
+            key = (entity_type, entity_id)
+            stream = self._events.setdefault(key, [])
+            seq = len(stream)
+            ev = {
+                "event_id": new_id("event"),
+                "schema_version": 1,
+                "source_timestamp": self._stamp(),
+                "ingest_timestamp": self._stamp(),
+                "entity_type": entity_type, "entity_id": entity_id,
+                "mission_id": mission_id, "session_id": session_id,
+                "sequence": seq, "event_type": event_type,
+                "payload": payload or {},
+            }
+            if require_durable and self._sink is not None:
+                # Command side effects require persistence before submission. A
+                # legacy best-effort sink cannot establish this prerequisite.
+                self._sink.record_required(ev)
+            stream.append(ev)
+            self._event_order.append((entity_type, entity_id, seq))
+            if self._sink is not None and not require_durable:
+                try:
+                    self._sink.record(ev)
+                except Exception:
+                    pass  # a sink must never break event recording
+            for listener in self._listeners:
+                try:
+                    listener(_copy(ev))
+                except Exception:
+                    pass  # a listener must never break event recording
+            return _copy(ev)
 
     def mission_timeline(self, mission_key):
         """Build a per-mission timeline from mission events, CI runs, reviews

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .errors import (
@@ -51,11 +51,16 @@ class AgentState:
     terminal_id: str | None = None
     terminal_title: str | None = None
 
+    agent_session: dict[str, Any] | None = None
+    revision: int | None = None
+    interactive_ready: bool | None = None
+    launch_pending: bool | None = None
+    state_change_seq: int | None = None
+    machine: str | None = None
+    session: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
-        return {"agent": self.agent, "status": self.status, "cwd": self.cwd,
-                "pane_id": self.pane_id, "tab_id": self.tab_id,
-                "workspace_id": self.workspace_id, "terminal_id": self.terminal_id,
-                "terminal_title": self.terminal_title}
+        return asdict(self)
 
 
 @dataclass
@@ -221,13 +226,32 @@ class NativeHerdrAdapter:
         return self._run_json(args)
 
     # -- snapshot ----------------------------------------------------------
-    def snapshot(self) -> dict[str, Any]:
-        return self._run_json(["api", "snapshot"])
+    @staticmethod
+    def _routing(machine: str | None, session: str | None) -> list[str]:
+        args = []
+        for flag, value in (("--machine", machine), ("--session", session)):
+            if value is not None:
+                if not isinstance(value, str) or not value.strip() or value.startswith("-"):
+                    raise InvalidError(f"invalid {flag} routing value")
+                args += [flag, value]
+        return args
 
-    def list_agents(self) -> list[AgentState]:
-        snap = self.snapshot()
+    def snapshot(self, machine: str | None = None,
+                 session: str | None = None) -> dict[str, Any]:
+        snap = self._run_json(self._routing(machine, session) + ["api", "snapshot"])
+        if (not isinstance(snap, dict) or snap.get("ok") is False
+                or not isinstance(snap.get("result", {}).get("snapshot"), dict)):
+            raise InvalidError("native snapshot unavailable or malformed")
+        return snap
+
+    def list_agents(self, machine: str | None = None,
+                    session: str | None = None) -> list[AgentState]:
+        snap = self.snapshot(machine=machine, session=session)
+        inventory = snap["result"]["snapshot"].get("agents")
+        if not isinstance(inventory, list):
+            raise InvalidError("native snapshot omitted the agent inventory")
         agents = []
-        for a in snap.get("result", {}).get("snapshot", {}).get("agents", []):
+        for a in inventory:
             agents.append(AgentState(
                 agent=a.get("agent", ""),
                 status=a.get("agent_status", "unknown"),
@@ -236,7 +260,12 @@ class NativeHerdrAdapter:
                 tab_id=a.get("tab_id"),
                 workspace_id=a.get("workspace_id"),
                 terminal_id=a.get("terminal_id"),
-                terminal_title=a.get("terminal_title")))
+                terminal_title=a.get("terminal_title"),
+                agent_session=a.get("agent_session"), revision=a.get("revision"),
+                interactive_ready=a.get("interactive_ready"),
+                launch_pending=a.get("launch_pending"),
+                state_change_seq=a.get("state_change_seq"),
+                machine=machine, session=session))
         return agents
 
     def list_workspaces(self) -> list[Workspace]:
@@ -274,12 +303,24 @@ class NativeHerdrAdapter:
         return {"path": path, "branch": branch, "output": out}
 
     # -- input ---------------------------------------------------------------
-    def send_input(self, session_or_pane: str, text: str, machine: str | None = None) -> str:
-        """Send permitted input to a session/pane. Explicit and auditable."""
-        args = ["--session", session_or_pane] if not session_or_pane.startswith(("w", "t")) else []
-        if machine:
-            return self.machine_targeted(machine, ["--session", session_or_pane, text])
-        return self._run(args + ["type", text])
+    def send_input(self, target: str, text: str, machine: str | None = None,
+                   session: str | None = None) -> dict[str, Any]:
+        """Submit a native prompt; delivery does not establish mission progress.
+
+        ``session`` selects the named HerdR server, ``target`` selects an agent
+        within it. Neither is inferred from a control-plane record ID.
+        """
+        if not isinstance(target, str) or not target.strip():
+            raise InvalidError("an explicit native agent target is required")
+        if not isinstance(text, str) or not text.strip():
+            raise InvalidError("prompt text is required")
+        result = self._run_json(self._routing(machine, session)
+                                + ["agent", "prompt", "--", target, text])
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise InvalidError("native prompt did not acknowledge delivery")
+        return {"status": "delivered", "target": target, "machine": machine,
+                "session": session, "mission_progress_verified": False,
+                "receipt": result}
 
 
 class _SubprocessRunner:

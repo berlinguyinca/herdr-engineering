@@ -234,14 +234,15 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
             for k in ("cwd", "branch", "pid", "cmdline", "summary", "attach"):
                 if p.get(k):
                     s[k] = p[k]
-            if etype == "SessionAction":
-                action = p.get("action")
-                if action in ("stop", "terminate"):
-                    s["status"] = "stopped"
-                elif action:
-                    s["status"] = "active"
-            elif p.get("status"):
+            for k in ("pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
+                      "revision", "interactive_ready", "launch_pending", "state_change_seq"):
+                if p.get(k) is not None:
+                    s[k] = p[k]
+            # Command receipts are transport state, never observed agent state.
+            if etype in {"SessionStarted", "SessionUpdated"} and p.get("status"):
                 s["status"] = p["status"]
+            if etype == "SessionCommandSettled" and p.get("status") == "delivered":
+                s["messages"] = (s.get("messages") or 0) + 1
             if "messagesent" in etype.lower() or etype == "SessionMessage":
                 s["messages"] = (s.get("messages") or 0) + 1
             if "toolcalled" in etype.lower() or etype == "SessionToolCall":

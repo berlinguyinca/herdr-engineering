@@ -91,7 +91,10 @@ class IngestService:
             cwd=payload.get("cwd"), branch=payload.get("branch"),
             pid=payload.get("pid"), cmdline=payload.get("cmdline"),
             summary=payload.get("summary"), attach=payload.get("attach"),
-            source=source)
+            source=source,
+            **{k: payload.get(k) for k in (
+                "pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
+                "revision", "interactive_ready", "launch_pending", "state_change_seq")})
 
     def _ingest_mission(self, entity_id, event_type, payload,
                         source="herdr") -> dict:

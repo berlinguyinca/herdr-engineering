@@ -26,7 +26,7 @@ class FakeConn:
 
 
 def fake_run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def test_sink_persists_repo_events():
@@ -87,3 +87,20 @@ def test_sink_record_never_raises_on_store_error():
     sink = DurableEventSink(conn=None, run=None, events_table="fabric_events")
     # no dsn, no conn -> _ensure_store raises -> record() must swallow it
     sink.record({"event_type": "X", "entity_type": "h", "entity_id": "1"})
+
+
+def test_required_command_receipt_propagates_database_failure_before_delivery():
+    class FailingConn(FakeConn):
+        async def fetchrow(self, sql, *args):
+            raise OSError("database unavailable")
+    sink = DurableEventSink(conn=FailingConn(), run=fake_run)
+    repo = ControlPlaneRepo(sink=sink)
+    sid = repo.create_session()
+    calls = []
+    def deliver(*args):
+        calls.append(args)
+        return {"status": "delivered"}
+    receipt = repo.send_message(sid, "hello", dispatcher=deliver)
+    assert receipt["error"] == "receipt_persistence_failed"
+    assert calls == []
+    assert repo.get_session(sid)["messages"] == 0

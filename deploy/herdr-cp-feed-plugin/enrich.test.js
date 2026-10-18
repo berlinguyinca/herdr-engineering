@@ -102,3 +102,27 @@ test("attachCommand prefixes ssh for a remote host", () => {
   assert.ok(cmd.startsWith("ssh beast && "));
   assert.ok(cmd.endsWith("herdr workspace focus wG"));
 });
+
+test("namespaced telemetry queries its native pane on the named server", async () => {
+  const { enrichSession } = await import("./enrich.js");
+  const { readFileSync, rmSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "herdr-native-"));
+  const binary = join(dir, "herdr.mjs");
+  const log = join(dir, "args.jsonl");
+  writeFileSync(binary, `#!/usr/bin/env node
+import {appendFileSync} from 'node:fs';
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2))+'\\n');
+console.log(JSON.stringify({ok:true,result:{pane:{terminal_id:'terminal-1',revision:5,agent_session:{source:'integration',agent:'pi',kind:'path',value:'/tmp/conversation.jsonl'}}}}));
+`);
+  chmodSync(binary, 0o755);
+  try {
+    const envelope = { entity_type: "session", entity_id: "herdr:beast:eng:w1%3Ap1", payload: { pane_id: "w1:p1", host_id: "beast", herdr_session: "eng" } };
+    const result = await enrichSession({ HERDR_BIN: binary, HERDR_SESSION_NAME: "eng" }, envelope);
+    const args = readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
+    assert.ok(args.some(a => JSON.stringify(a) === JSON.stringify(["--session", "eng", "pane", "get", "w1:p1"])));
+    assert.ok(args.every(a => !a.includes(envelope.entity_id)));
+    assert.equal(result.payload.terminal_id, "terminal-1");
+    assert.equal(result.payload.agent_session.value, "/tmp/conversation.jsonl");
+    assert.equal(result.payload.revision, 5);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -110,7 +110,7 @@ test("pane.agent_detected emits session.started with the agent role", () => {
   );
   const s = out.find((e) => e.entity_type === "session");
   assert.ok(s);
-  assert.equal(s.entity_id, "wK:p1");
+  assert.equal(s.entity_id, `herdr:${HOST}:unknown:wK%3Ap1`);
   assert.equal(s.event_type, "session.started");
   assert.equal(s.payload.host_id, HOST);
   assert.equal(s.payload.mission_id, "wK");
@@ -276,4 +276,16 @@ test("resolveUrl defaults to the dev.lan control plane", () => {
 test("resolveUrl honors HERDR_CP_URL env", () => {
   assert.equal(resolveUrl(env({ HERDR_CP_URL: "http://100.104.39.6" })),
     "http://100.104.39.6");
+});
+
+test("sessions on different hosts and named servers cannot collide", () => {
+  const base = { HERDR_PLUGIN_EVENT: "pane.agent_detected", HERDR_PANE_ID: "w1:p1", HERDR_SESSION_NAME: "eng" };
+  const a = mapEvent(base, { host: "bender" }).find(e => e.entity_type === "session");
+  const b = mapEvent(base, { host: "beast" }).find(e => e.entity_type === "session");
+  const c = mapEvent({ ...base, HERDR_SESSION_NAME: "other" }, { host: "beast" }).find(e => e.entity_type === "session");
+  assert.equal(a.entity_id, "herdr:bender:eng:w1%3Ap1");
+  assert.notEqual(a.entity_id, b.entity_id);
+  assert.notEqual(b.entity_id, c.entity_id);
+  assert.equal(b.payload.pane_id, "w1:p1");
+  assert.equal(b.payload.herdr_session, "eng");
 });
