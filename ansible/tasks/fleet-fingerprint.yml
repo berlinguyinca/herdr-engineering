@@ -40,18 +40,41 @@
   changed_when: false
   ignore_errors: true
 
-- name: "Capture installed source revision"
+- name: "Capture verified installed HerdR release"
   become: false
   ansible.builtin.command:
     argv:
-      - git
-      - -C
-      - "{{ herdr_engineering_checkout | default(fleet_home ~ '/herdr-engineering-repo') }}"
-      - rev-parse
-      - HEAD
-  register: fp_revision
+      - python3
+      - "{{ fleet_home }}/.local/share/herdr-engineering/stage-release.py"
+      - --kind
+      - herdr
+      - --home
+      - "{{ fleet_home }}"
+      - --describe
+  register: fp_release
   changed_when: false
   failed_when: false
+
+- name: "Capture verified installed Pi release (separate from loaded sessions)"
+  become: false
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ fleet_home }}/.local/share/herdr-engineering/stage-release.py"
+      - --kind
+      - pi
+      - --home
+      - "{{ fleet_home }}"
+      - --describe
+  register: fp_pi_release
+  changed_when: false
+  failed_when: false
+
+- name: "Decode valid installed release attestations"
+  ansible.builtin.set_fact:
+    fp_revision: "{{ (fp_release.stdout | from_json).get('revision', 'MISSING') if fp_release.rc == 0 else 'MISSING' }}"
+    fp_pi_revision: "{{ (fp_pi_release.stdout | from_json).get('revision', 'MISSING') if fp_pi_release.rc == 0 else 'MISSING' }}"
+    fp_pi_path: "{{ (fp_pi_release.stdout | from_json).get('sourceRoot', '') if fp_pi_release.rc == 0 else '' }}"
 
 - name: "Capture cleanup companion state"
   become: false

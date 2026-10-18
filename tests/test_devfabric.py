@@ -221,14 +221,15 @@ def test_renew_and_mark_only_renews_when_healthy(tmp_path):
     r.renew_and_mark(lease.id, ok=False, error="refused")
     assert lease.expires_at == before
     # healthy -> renewal
-    import time; time.sleep(0.02)
+    import time
+
+    time.sleep(0.02)
     r.renew_and_mark(lease.id, ok=True)
     assert lease.expires_at > before
 
 
 def test_persist_is_dirty_aware(tmp_path):
     """persist() writes only when something changed (batched probe path)."""
-    import json
     r = DevServiceRegistry(store_path=tmp_path / "leases.json")
     lease = r.register(target_machine_id="m", target_host="127.0.0.1", target_port=8080)
     first_mtime = r.store_path.stat().st_mtime

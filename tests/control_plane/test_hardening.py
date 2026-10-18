@@ -107,9 +107,10 @@ def test_export_is_json_serializable():
 
 
 # ------------------------------------------------------------- auth roles
-def test_viewer_cannot_mutate():
-    repo = ControlPlaneRepo()
-    svr = ControlPlaneServer(repo, api_keys={"op-1": "operator", "view-1": "viewer"})
+def test_viewer_cannot_mutate(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    svr = ControlPlaneServer(repo, api_keys={"op-1": "operator", "view-1": "viewer"},
+                             dispatcher=lambda *args: {"status": "delivered"})
     thread = threading.Thread(target=svr.serve, daemon=True)
     thread.start()
     svr.wait_until_ready()

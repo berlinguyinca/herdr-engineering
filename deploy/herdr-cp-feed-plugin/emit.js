@@ -146,13 +146,15 @@ function missionEnvelope(ws, eventType, info, { stage, purpose } = {}) {
   };
 }
 
-function sessionEnvelope(pane, eventType, { host, ws, role, status } = {}) {
+function sessionEnvelope(pane, eventType, { host, ws, role, status, server, serverKey } = {}) {
   return {
     entity_type: "session",
-    entity_id: pane,
+    entity_id: ["herdr", host, serverKey, pane].map(encodeURIComponent).join(":"),
     event_type: eventType,
     payload: {
       host_id: host,
+      pane_id: pane,
+      herdr_session: server,
       mission_id: ws,
       agent_role: role ?? "",
       status: status ?? "active",
@@ -172,6 +174,10 @@ export function mapEvent(env, ctx = {}) {
   const pane = env.HERDR_PANE_ID;
   const ev = eventJson(env);
   const envCtx = contextJson(env);
+  const server = env.HERDR_SESSION_NAME || env.HERDR_SESSION || envCtx.session_name || null;
+  // An unknown server remains unusable for commands. Its config directory
+  // still separates telemetry from distinct named servers on the same host.
+  const serverKey = server || env.HERDR_PLUGIN_CONFIG_DIR || "unknown";
   const info = (id) => (ctx.info && ctx.info[id])
     || workspaceInfo(env, id, envCtx);
   const role = () => agentRole(ev, envCtx);
@@ -215,6 +221,8 @@ export function mapEvent(env, ctx = {}) {
       out.push(
         sessionEnvelope(pane, "session.started", {
           host,
+          server,
+          serverKey,
           ws,
           role: role(),
         }),
@@ -223,15 +231,19 @@ export function mapEvent(env, ctx = {}) {
       out.push(
         sessionEnvelope(pane, "session.updated", {
           host,
+          server,
+          serverKey,
           ws,
           role: role(),
-          status: ev.status ?? "active",
+          status: ev.agent_status ?? ev.status ?? "active",
         }),
       );
     } else if (event === "pane.exited" || event === "pane.closed") {
       out.push(
         sessionEnvelope(pane, "session.terminated", {
           host,
+          server,
+          serverKey,
           ws,
           role: role(),
           status: "stopped",

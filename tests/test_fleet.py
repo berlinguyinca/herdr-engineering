@@ -1,10 +1,14 @@
 """Tests for the one-command fleet onboarding (herdr_engineering/fleet.py)."""
+import hashlib
 from unittest.mock import patch
 
 from herdr_engineering import fleet
 
 REVISION = "a" * 40
-STATUS = {"rc": 0, "hosts": [{"host": "beast", "revision": REVISION}]}
+GATE_CHECKSUM = hashlib.md5(b"test gate").hexdigest()
+STATUS = {"rc": 0, "hosts": [
+    {"host": host, "revision": REVISION, "herdr_eng": "herdr-eng 0.1.0",
+     "build_gate": GATE_CHECKSUM, "agent": "active"} for host in ["fry", "mac"]]}
 
 
 def _success(cmd, **kwargs):
@@ -29,6 +33,8 @@ def _fake_repo(tmp_path):
     )
     (tmp_path / "ansible" / "playbooks").mkdir(parents=True)
     (tmp_path / "ansible" / "tasks").mkdir(parents=True)
+    (tmp_path / "deploy/pi-build-gate").mkdir(parents=True)
+    (tmp_path / "deploy/pi-build-gate/build-gate.ts").write_text("test gate")
     (tmp_path / ".git").mkdir()
     (tmp_path / "pyproject.toml").write_text("[project]\nname='herdr-engineering'\n")
     return tmp_path
@@ -120,28 +126,28 @@ def test_fleet_join_idempotent_inventory(mock_run, tmp_path, monkeypatch):
 def test_fleet_update_pulls_converges_reports(mock_status, mock_run, tmp_path, monkeypatch):
     repo = _fake_repo(tmp_path)
     monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(repo))
-    mock_status.return_value = STATUS
+    mock_status.return_value = {**STATUS, "hosts": STATUS["hosts"][:1]}
     mock_run.return_value = (0, "ok", "")
 
     mock_run.side_effect = _success
 
-    rep = fleet.fleet_update(host="beast")
+    rep = fleet.fleet_update(host="fry")
 
     # controller pull + local reinstall + fleet-sync playbook all invoked
     cmds = [c[0][0] for c in mock_run.call_args_list]
-    assert any("git" in c and "pull" in c for c in cmds)
+    assert any("git" in c and "merge" in c for c in cmds)
     assert any("pip" in c and "install" in c for c in cmds)
     sync_cmd = next(c for c in cmds if any("fleet-sync.yml" in str(a) for a in c))
-    assert "-l" in sync_cmd and sync_cmd[sync_cmd.index("-l") + 1] == "beast"
+    assert "-l" in sync_cmd and sync_cmd[sync_cmd.index("-l") + 1] == "fry"
     assert rep["ok"] is True
-    assert rep["status"] == STATUS
+    assert rep["status"] == mock_status.return_value
 
 
 @patch("herdr_engineering.fleet._run")
 def test_fleet_update_skips_local_when_flagged(mock_run, tmp_path, monkeypatch):
     repo = _fake_repo(tmp_path)
     monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(repo))
-    mock_run.return_value = (0, "ok", "")
+    mock_run.side_effect = _success
 
     fleet.fleet_update(host=None, pull_controller=False, reinstall_local=False)
     cmds = [c[0][0] for c in mock_run.call_args_list]
@@ -247,7 +253,7 @@ def test_update_rejects_unpublished_commits(tmp_path, monkeypatch):
 def test_update_rejects_reported_revision_mismatch(tmp_path, monkeypatch):
     repo = _fake_repo(tmp_path)
     monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
-    monkeypatch.setattr(fleet, '_run', lambda *args, **kwargs: (0, 'a' * 40, ''))
+    monkeypatch.setattr(fleet, '_run', _success)
     monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: {
         'rc': 0, 'hosts': [{'host': 'example', 'revision': 'b' * 40}]})
     result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
@@ -258,7 +264,7 @@ def test_update_rejects_reported_revision_mismatch(tmp_path, monkeypatch):
 def test_update_empty_host_report_is_failure(tmp_path, monkeypatch):
     repo = _fake_repo(tmp_path)
     monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
-    monkeypatch.setattr(fleet, '_run', lambda *args, **kwargs: (0, 'a' * 40, ''))
+    monkeypatch.setattr(fleet, '_run', _success)
     monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: {'rc': 0, 'hosts': []})
     assert not fleet.fleet_update(pull_controller=False, reinstall_local=False)['ok']
 
@@ -271,8 +277,137 @@ def test_update_stops_disabled_local_cleanup(tmp_path, monkeypatch):
     calls = []
     def run(cmd, **kwargs):
         calls.append(cmd)
-        return (0, 'loaded', '') if 'show' in cmd else (0, 'a' * 40, '')
+        return (0, 'loaded', '') if 'show' in cmd else _success(cmd, **kwargs)
     monkeypatch.setattr(fleet, '_run', run)
     monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: {'rc': 0, 'hosts': []})
     fleet.fleet_update(pull_controller=False, reinstall_local=False)
     assert ['systemctl', '--user', 'disable', '--now', 'herdr-eng-build-cleanup.service'] in calls
+
+
+def test_update_missing_inventory_host_is_failure(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    monkeypatch.setattr(fleet, '_run', _success)
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: {'rc': 0, 'hosts': [
+        {'host': 'fry', 'revision': REVISION, 'herdr_eng': 'herdr-eng 0.1.0',
+         'build_gate': GATE_CHECKSUM, 'agent': 'active'}]})
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert not result['ok']
+    assert result['steps']['revision_parity']['missing_hosts'] == ['mac']
+
+
+def test_update_missing_components_is_failure(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    monkeypatch.setattr(fleet, '_run', _success)
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: {'rc': 0, 'hosts': [
+        {'host': name, 'revision': REVISION} for name in ['fry', 'mac']]})
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert not result['ok']
+    assert result['steps']['revision_parity']['invalid_hosts'] == ['fry', 'mac']
+
+
+def test_update_pins_selected_revision_before_deployment(tmp_path, monkeypatch):
+    import json
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return _success(cmd, **kwargs)
+    monkeypatch.setattr(fleet, '_run', run)
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: STATUS)
+    fleet.fleet_update(host='fry', pull_controller=False, reinstall_local=False)
+    cmd = next(c for c in calls if 'ansible-playbook' in c)
+    variables = json.loads(cmd[cmd.index('-e') + 1])
+    assert variables['herdr_engineering_revision'] == REVISION
+    assert calls.index(next(c for c in calls if 'rev-parse' in c)) < calls.index(cmd)
+
+
+def test_stage_pi_returns_verified_source_root(tmp_path, monkeypatch):
+    import json
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    calls = []
+    monkeypatch.setattr(fleet, '_run', lambda cmd, **kw: (calls.append(cmd) or (0, '', '')))
+    source = '/home/operator/.local/share/herdr-engineering/pi/releases/' + REVISION
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kw: {'rc': 0, 'hosts': [
+        {'host': 'fry', 'pi_revision': REVISION, 'pi_path': source}]})
+    result = fleet.stage_pi_runtime(REVISION, host='fry')
+    assert result['ok']
+    assert result['sourceRoot'] == source
+    assert json.loads(calls[0][calls[0].index('-e') + 1]) == {'pi_engineering_revision': REVISION}
+    assert not any('pull' in cmd or 'pip' in cmd or 'restart' in cmd for cmd in calls)
+
+
+def test_stage_pi_offline_or_failed_install_is_not_success(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    monkeypatch.setattr(fleet, '_run', lambda cmd, **kw: (4, '', 'host unreachable'))
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kw: {'rc': 4, 'hosts': []})
+    result = fleet.stage_pi_runtime(REVISION, host='fry')
+    assert not result['ok']
+    assert result['sourceRoot'] is None
+    assert result['parity']['missing_hosts'] == ['fry']
+
+
+def test_stage_pi_rejects_host_patterns_and_moving_refs(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    monkeypatch.setattr(fleet, '_run', lambda *a, **kw: (_ for _ in ()).throw(AssertionError('must not run')))
+    assert not fleet.stage_pi_runtime('main', host='fry')['ok']
+    assert not fleet.stage_pi_runtime(REVISION, host='all')['ok']
+
+
+def test_update_no_pull_still_refuses_dirty_selected_source(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    calls = []
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return (0, ' M source.py', '') if 'status' in cmd else _success(cmd, **kw)
+    monkeypatch.setattr(fleet, '_run', run)
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kw: STATUS)
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert not result['ok']
+    assert not any('ansible-playbook' in cmd for cmd in calls)
+
+
+def test_fleet_status_retains_full_gate_and_pi_attestation(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    output = ('"msg": "fry | herdr-eng=herdr-eng 0.1.0 | build-gate=' + 'b' * 32
+              + ' | agent=active | revision=' + REVISION + ' | cleanup=inactive | pi-revision='
+              + REVISION + ' | pi-path=/home/user/release"')
+    monkeypatch.setattr(fleet, '_run', lambda *a, **kw: (0, output, ''))
+    result = fleet.fleet_status()
+    assert result['hosts'][0]['build_gate'] == 'b' * 32
+    assert result['hosts'][0]['pi_revision'] == REVISION
+    assert result['hosts'][0]['pi_path'] == '/home/user/release'
+
+
+def test_update_wrong_build_gate_fails_parity(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    monkeypatch.setattr(fleet, '_run', _success)
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kw: {'rc': 0, 'hosts': [
+        {**entry, 'build_gate': '0' * 32} for entry in STATUS['hosts']]})
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert not result['ok']
+    assert result['steps']['revision_parity']['invalid_hosts'] == ['fry', 'mac']
+
+
+def test_update_selected_pi_revision_is_required_on_each_host(tmp_path, monkeypatch):
+    import json
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    calls = []
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return _success(cmd, **kw)
+    monkeypatch.setattr(fleet, '_run', run)
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kw: STATUS)
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False, pi_revision=REVISION)
+    assert not result['ok']
+    cmd = next(c for c in calls if 'ansible-playbook' in c)
+    assert json.loads(cmd[cmd.index('-e') + 1])['pi_engineering_revision'] == REVISION

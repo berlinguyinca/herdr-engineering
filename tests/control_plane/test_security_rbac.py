@@ -41,9 +41,9 @@ API_KEYS = {
 
 
 @pytest.fixture
-def server():
+def server(acknowledged_sink):
     """ControlPlaneServer on 127.0.0.1:0 with role-scoped API keys."""
-    repo = ControlPlaneRepo()
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
     srv = ControlPlaneServer(repo, host="127.0.0.1", port=0,
                              api_keys=API_KEYS)
     t = threading.Thread(target=srv.serve, daemon=True)
@@ -210,19 +210,19 @@ def test_operator_can_run_session_action(server):
     sid = repo.create_session()
     status, parsed, _ = _post(base_url, f"/api/v1/sessions/{sid}/actions",
                               body={"action": "stop"}, key="op-key")
-    assert status == 200
-    assert parsed["ok"] is True
-    assert repo.get_session(sid)["status"] == "stopped"
+    assert status == 501  # authorized, but native lifecycle command is unsupported
+    assert parsed["error"] == "unsupported_action"
+    assert repo.get_session(sid)["status"] == "active"
 
 
 def test_operator_can_send_message(server):
     base_url, repo = server
     sid = repo.create_session()
     status, parsed, _ = _post(base_url, f"/api/v1/sessions/{sid}/messages",
-                              body={"text": "hello"}, key="op-key")
-    assert status == 200
-    assert parsed["ok"] is True
-    assert repo.get_session(sid)["messages"] == 1
+                              body={"message": "hello"}, key="op-key")
+    assert status == 502  # authorized, but this synthetic record has no native identity
+    assert parsed["status"] == "failed"
+    assert repo.get_session(sid)["messages"] == 0
 
 
 def test_operator_can_ingest(server):
