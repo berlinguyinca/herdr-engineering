@@ -77,8 +77,13 @@ class DurableEventSink:
     def record(self, ev: dict) -> None:
         """Persist one event. Best-effort: never raises, never breaks the repo."""
         try:
-            self._ensure_store()
-            self._run(self._store.append(_dict_to_event(ev)))
+            self.record_required(ev)
         except Exception:
             log.exception("durable sink failed to persist event %s",
                           ev.get("event_id"))
+
+    def record_required(self, ev: dict) -> None:
+        """Persist a command receipt, propagating failure before side effects."""
+        self._ensure_store()
+        if not self._run(self._store.append(_dict_to_event(ev))):
+            raise RuntimeError("durable event insert was not acknowledged")
