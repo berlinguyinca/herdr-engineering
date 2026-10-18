@@ -147,8 +147,11 @@ def apply(store, plan, wire):
         host = argv[-2]
         remote = _remote_argv(argv[-1])
         if remote[0] == "herdr":
-            assert remote[-2:] == ["api", "snapshot"]
-            reply = {"result": {"snapshot": {"agents": wire.native({"host": host})}}}
+            if "process-info" in remote:
+                reply = {"result": {"process_info": wire.process_info({"host": host}, remote[-1])}}
+            else:
+                assert remote[-2:] == ["api", "snapshot"]
+                reply = {"result": {"snapshot": {"agents": wire.native({"host": host})}}}
             return subprocess.CompletedProcess(argv, 0, json.dumps(reply), "")
         assert remote[0] == "node"
         root = remote[1].removesuffix("/scripts/pi-engineering.ts")
@@ -1075,3 +1078,147 @@ def test_transport_stderr_diagnostics_are_bounded_and_do_not_expose_secrets():
     assert "herdr" in str(error.value) and "not found" in str(error.value)
     assert secret not in str(error.value) and "Authorization" not in str(error.value)
     assert len(str(error.value)) < 300
+
+
+def foreground_fixture(wire):
+    native = {
+        "agent": "pi",
+        "pane_id": "pane-1",
+        "terminal_id": "terminal-1",
+        "revision": 8,
+        "state_change_seq": 3,
+        "agent_session": None,
+    }
+    wire.native = lambda target: [copy.deepcopy(native)]
+    row = wire.rows["bender"]
+    row["reply"]["data"].update(
+        pid=row["descriptor"]["pid"],
+        instanceId=row["descriptor"]["instanceId"],
+        sessionId=row["descriptor"]["sessionId"],
+    )
+    wire.process_info = lambda target, pane: {
+        "pane_id": pane,
+        "foreground_process_group_id": 42,
+        "foreground_processes": [{"pid": 42, "name": "pi"}],
+        "shell_pid": 40,
+    }
+    return native
+
+
+def test_missing_native_reference_uses_verified_foreground_pid_without_mutating_native(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    original = foreground_fixture(wire)
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]["sessions"]["bender-conversation"]
+    assert state["status"] == "awaiting_progress"
+    assert state["native"]["agent_session"] is None
+    assert original["agent_session"] is None
+    assert state["identityProof"]["source"] == "verified_foreground_pid"
+    assert state["identityProof"]["pid"] == 42
+    assert state["identityProof"]["paneId"] == "pane-1"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "foreign_worker",
+        "multiple",
+        "changed_terminal",
+        "changed_revision",
+        "unreachable",
+        "stale_control",
+        "missing_revision",
+        "changed_state_seq",
+    ],
+)
+def test_foreground_pid_fallback_rejects_unproved_identity(tmp_path, failure):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    original = foreground_fixture(wire)
+    if failure == "foreign_worker":
+        wire.process_info = lambda *a: {
+            "pane_id": "pane-1",
+            "foreground_processes": [{"pid": 999, "name": "worker"}],
+        }
+    elif failure == "multiple":
+        wire.process_info = lambda *a: {
+            "pane_id": "pane-1",
+            "foreground_processes": [{"pid": 42}, {"pid": 43}],
+        }
+        sessions = wire.sessions
+        second = copy.deepcopy(wire.rows["bender"])
+        second["descriptor"].update(
+            pid=43, instanceId="another-instance", sessionId="another-conversation"
+        )
+        wire.sessions = lambda *a: sessions(*a) + [second]
+    elif failure == "missing_revision":
+        original.pop("revision")
+        original.pop("state_change_seq")
+    elif failure in ("changed_terminal", "changed_revision", "changed_state_seq"):
+        calls = 0
+
+        def native(target):
+            nonlocal calls
+            calls += 1
+            row = copy.deepcopy(original)
+            if calls > 1:
+                key = {
+                    "changed_terminal": "terminal_id",
+                    "changed_revision": "revision",
+                    "changed_state_seq": "state_change_seq",
+                }[failure]
+                row[key] = "replacement" if failure == "changed_terminal" else 9
+            return [row]
+
+        wire.native = native
+    elif failure == "unreachable":
+        wire.rows["bender"]["reachable"] = False
+    else:
+        wire.rows["bender"]["reply"]["data"]["pid"] = 999
+    result = apply(store, plan, wire)
+    assert result["hosts"]["bender"]["status"] == "blocked"
+    assert result["hosts"]["bender"]["coverageErrors"]
+    assert not wire.mutations
+
+
+def test_foreground_process_query_uses_frozen_host_and_named_session():
+    import subprocess
+
+    from herdr_engineering.fleet_rollout import PiTransport
+
+    target = {
+        "host": "bender",
+        "sshTarget": "alice@bender",
+        "port": 22,
+        "local": False,
+        "session": "engineering",
+    }
+
+    def runner(argv, **kwargs):
+        assert argv[-2] == "alice@bender"
+        assert _remote_argv(argv[-1]) == [
+            "herdr",
+            "--session",
+            "engineering",
+            "pane",
+            "process-info",
+            "--pane",
+            "pane-1",
+        ]
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps(
+                {
+                    "result": {
+                        "process_info": {"pane_id": "pane-1", "foreground_processes": [{"pid": 42}]}
+                    }
+                }
+            ),
+            "",
+        )
+
+    assert PiTransport(runner=runner).process_info(target, "pane-1")["foreground_processes"] == [
+        {"pid": 42}
+    ]

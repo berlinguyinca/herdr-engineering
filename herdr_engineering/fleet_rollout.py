@@ -198,6 +198,24 @@ class PiTransport:
             for agent in agents
         ]
 
+    def process_info(self, target, pane_id):
+        _identifier(pane_id)
+        argv = ["herdr"]
+        if target.get("session") is not None:
+            argv.extend(["--session", target["session"]])
+        reply = self._json(target, argv + ["pane", "process-info", "--pane", pane_id])
+        result = reply.get("result") if isinstance(reply, dict) else None
+        info = result.get("process_info") if isinstance(result, dict) else None
+        if (
+            not isinstance(reply, dict)
+            or reply.get("ok") is False
+            or not isinstance(info, dict)
+            or info.get("pane_id") != pane_id
+            or not isinstance(info.get("foreground_processes"), list)
+        ):
+            raise ValueError("native pane process identity unavailable or mismatched")
+        return info
+
     def _json(self, target, argv, *, allow_failed_receipt=False):
         _target(target)
         command = (
@@ -333,6 +351,48 @@ def _conversation(agent):
         if match:
             return match[1]
     raise ValueError("native Pi session lacks an exact conversation reference; bootstrap required")
+
+
+def _foreground_identity(transport, target, agent, rows):
+    pane = _identifier(agent.get("pane_id"))
+    terminal = _identifier(agent.get("terminal_id"))
+    tokens = ("revision", "state_change_seq")
+    if not any(type(agent.get(key)) is int and agent[key] >= 0 for key in tokens):
+        raise ValueError("native pane has no revision token for identity verification")
+    info = transport.process_info(target, pane)
+    pids = {
+        process["pid"]
+        for process in info["foreground_processes"]
+        if isinstance(process, dict) and type(process.get("pid")) is int and process["pid"] > 0
+    }
+    candidates = [
+        row for row in rows if row.get("reachable") is True and row["descriptor"].get("pid") in pids
+    ]
+    if len(candidates) != 1:
+        raise ValueError("foreground PID does not identify exactly one live Pi control instance")
+    descriptor = candidates[0]["descriptor"]
+    session_id = _identifier(descriptor.get("sessionId"))
+    descriptor, data = _live(candidates, session_id, descriptor.get("pid"))
+    if any(data.get(key) != descriptor[key] for key in ("pid", "instanceId", "sessionId")):
+        raise ValueError("foreground control identity attestation is stale or mismatched")
+    fresh = [row for row in transport.native(target) if row.get("pane_id") == pane]
+    if (
+        len(fresh) != 1
+        or fresh[0].get("agent") != agent.get("agent")
+        or any(fresh[0].get(key) != agent.get(key) for key in ("terminal_id", *tokens))
+    ):
+        raise ValueError("native pane identity changed during foreground verification")
+    if fresh[0].get("agent_session") is not None and _conversation(fresh[0]) != session_id:
+        raise ValueError("fresh native conversation disagrees with foreground identity")
+    return session_id, {
+        "source": "verified_foreground_pid",
+        "pid": descriptor["pid"],
+        "instanceId": descriptor["instanceId"],
+        "paneId": pane,
+        "terminalId": terminal,
+        "revision": agent.get("revision"),
+        "stateChangeSeq": agent.get("state_change_seq"),
+    }
 
 
 def _rows(transport, target, root):
@@ -644,20 +704,33 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                 if not isinstance(native, list):
                     raise ValueError("invalid native inventory")
                 agents = [a for a in native if str(a.get("agent", "")).lower() == "pi"]
+                rows = _rows(transport, target, root)
                 identified = []
                 coverage_errors = []
                 for agent in agents:
                     try:
-                        identified.append((agent, _conversation(agent)))
-                    except ValueError as exc:
+                        if agent.get("agent_session") is None:
+                            session_id, proof = _foreground_identity(transport, target, agent, rows)
+                        else:
+                            session_id, proof = _conversation(agent), None
+                        identified.append((agent, session_id, proof))
+                    except (
+                        ValueError,
+                        ConnectionError,
+                        OSError,
+                        subprocess.SubprocessError,
+                    ) as exc:
                         coverage_errors.append(
-                            {"terminalId": agent.get("terminal_id"), "error": str(exc)}
+                            {
+                                "terminalId": agent.get("terminal_id"),
+                                "error": "native conversation identity unverified: "
+                                + str(exc)[:500],
+                            }
                         )
                 host_state["coverageErrors"] = coverage_errors
-                identities = [session_id for _, session_id in identified]
+                identities = [session_id for _, session_id, _ in identified]
                 if len(identities) != len(set(identities)):
                     raise ValueError("ambiguous native conversation identity")
-                rows = _rows(transport, target, root)
                 if not agents:
                     raise ValueError("no native Pi sessions; expected coverage unverified")
                 if set(host_state["sessions"]) - set(identities):
@@ -665,12 +738,14 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                         {"error": "previously discovered session is missing from native inventory"}
                     )
                 session_errors = [error["error"] for error in coverage_errors]
-                for agent, session_id in identified:
+                for agent, session_id, identity_proof in identified:
                     state = host_state["sessions"].setdefault(
                         session_id,
                         {"sessionId": session_id, "native": agent, "status": "discovered"},
                     )
                     state.pop("error", None)
+                    if identity_proof is not None:
+                        state["identityProof"] = identity_proof
                     try:
                         descriptor, _ = _live(rows, session_id)
                         if "pid" not in state:

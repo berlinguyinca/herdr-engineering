@@ -99,12 +99,18 @@ cross-rollout rollback: a rollback is a separately reviewed pinned release plan.
 
 Every planned host must have staged the exact selected release and expose complete
 native session coverage. Each Pi agent must have an exact native conversation
-reference that matches one reachable control descriptor. Missing references,
-duplicate conversations, missing sessions, and PID changes block activation;
-terminal titles and working directories are never used as identity guesses. An
-agent lacking a native conversation reference is retained as a coverage error,
-while independently identified siblings can continue. Such a host cannot be
-reported complete.
+reference that matches one reachable control descriptor. When the native reference
+is absent, the controller can instead read that pane's foreground processes on the
+same host and require exactly one matching live Pi PID. The control response must
+attest the descriptor's PID, conversation and instance; a fresh native snapshot
+must retain the same pane, terminal and revision/state sequence. The proof is
+recorded separately as `verified_foreground_pid`, without modifying native identity.
+
+Duplicate conversations, ambiguous foreground processes, stale/unreachable control
+instances, reused panes and PID changes block activation. Terminal titles, working
+directories and recent session files are never identity evidence. An agent whose
+identity cannot be proved remains a coverage error while independently identified
+siblings continue; the host cannot be reported complete.
 
 Already-current settled runtimes are inspected without preparation or draining, so
 idle, paused and terminal sessions keep accepting future work. The coordinator
