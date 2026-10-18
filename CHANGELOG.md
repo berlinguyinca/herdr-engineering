@@ -5,6 +5,18 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fleet mission recovery
+- Added pinned Pi runtime staging and `fleet rollout plan/apply/run/status` with
+  durable operation IDs, offline retries, bounded online stall detection, loaded
+  build checks and preservation of operator pauses.
+- Native discovery and control share the frozen target workstation. Missing
+  conversation references can be verified against the foreground PID and live
+  private Pi control instance without reading transcripts.
+- Fleet parity now requires complete inventory coverage and installed provenance;
+  macOS companion installation preserves the selected release.
+- Session messages use real native delivery with durable receipts. Unsupported
+  lifecycle actions and delivery without durable storage fail explicitly.
+
 ### Added
 - `herdr-eng session run --project P -- <cmd>` injects `OPENAI_BASE_URL` / `OPENAI_API_KEY` (a
   per-session or reused per-project key) plus service-URL hints into a session's environment,

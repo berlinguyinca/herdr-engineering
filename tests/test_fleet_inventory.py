@@ -1,5 +1,4 @@
 """Tests for the private fleet-inventory helper (scripts/fleet_inventory.py)."""
-from pathlib import Path
 
 from scripts.fleet_inventory import add_host, list_hosts, remove_host, write_host_vars
 

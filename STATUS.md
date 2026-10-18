@@ -1,5 +1,20 @@
 # Implementation Status
 
+## Fleet mission recovery hardening (2026-10-17)
+
+Pinned runtime staging, exact live-session discovery, durable maintenance receipts,
+and unattended rollout reconciliation are implemented. See
+[`docs/operations/fleet-runtime-rollout.md`](docs/operations/fleet-runtime-rollout.md).
+Completion requires loaded Host/runtime provenance and mission progress or a valid
+named wait; installing files or changing a dashboard status is insufficient.
+
+Native message delivery requires acknowledged durable receipt storage. Unsupported
+session lifecycle actions are refused rather than displayed as successful. Existing
+sessions that lack the maintenance Host need controlled bootstrap; ambiguous old
+cancellations remain named repair cases. No live fleet upgrade or mission restart
+was performed during implementation. The historical release evidence below is
+separate from this rollout readiness work.
+
 **Overall:** All 18 numbered specs (0010–0180) are implemented as a thin,
 curated integration layer over native Herdr. Implementation is COMPLETE.
 Live validation that requires the external fleet/browser/CI instances is

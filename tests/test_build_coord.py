@@ -5,19 +5,17 @@ single-flight bounding of concurrent builds, load-aware backoff, and release on
 child exit.
 """
 import os
-import sys
 import subprocess
-import tempfile
+import sys
 import time
-from pathlib import Path
 
 import pytest
 
 from herdr_engineering.build_coord import (
     BuildGate,
-    _load_per_core,
-    _default_state_dir,
     _default_slots,
+    _default_state_dir,
+    _load_per_core,
     run_gated,
 )
 
@@ -104,10 +102,9 @@ def test_holds_slot_across_exec(gate_dir):
     """The flock must survive execvp so it's held for the child's lifetime."""
     env = dict(os.environ, HERDR_ENGINEERING_STATE=str(gate_dir))
     script = (
-        "import sys; sys.path.insert(0, %r); "
+        "import sys; sys.path.insert(0, '/home/wohlgemuth/IdeaProjects/herdr-engineering'); "
         "from herdr_engineering.build_coord import run_gated; "
         "sys.exit(run_gated(['sleep', '2'], slots=2, max_load=0))"
-        % "/home/wohlgemuth/IdeaProjects/herdr-engineering"
     )
     proc = subprocess.Popen([sys.executable, "-c", script], env=env)
     child_dir = gate_dir / "build-gates"  # child stores under HERDR_ENGINEERING_STATE/build-gates
@@ -130,6 +127,7 @@ def test_bypass_on_timeout_runs_ungated(tmp_path):
     """When all slots stay busy past --wait, bypass-on-timeout runs the build
     ungated instead of failing (best-effort coordination)."""
     import subprocess
+
     from herdr_engineering.build_coord import BuildGate
 
     state = tmp_path / "state"
@@ -138,12 +136,11 @@ def test_bypass_on_timeout_runs_ungated(tmp_path):
     fd, _ = gate._try_acquire(0, ["hold"])
     try:
         script = (
-            "import sys; sys.path.insert(0, %r); "
+            "import sys; sys.path.insert(0, '/home/wohlgemuth/IdeaProjects/herdr-engineering'); "
             "from herdr_engineering.build_coord import run_gated; "
             "sys.exit(run_gated(['python3', '-c', 'print(\"BYPA$$ED\")'], "
             "slots=1, max_load=0, wait_seconds=0.5, "
-            "bypass_on_timeout=True, state_dir=%r))"
-            % ("/home/wohlgemuth/IdeaProjects/herdr-engineering", str(state))
+            f"bypass_on_timeout=True, state_dir={str(state)!r}))"
         )
         out = subprocess.run(
             [sys.executable, "-c", script],
