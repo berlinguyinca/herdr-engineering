@@ -30,6 +30,10 @@ Set `herdr_session` in a host's inventory variables to select and freeze a named
 HerdR server session; otherwise that target host's default server scope is used. Before
 staging, the resolved target is checked against the plan; changed addresses, users,
 ports or named sessions block deployment and require a new reviewed plan.
+Remote native and Pi commands prepend `~/.local/bin`, `/opt/homebrew/bin`, and
+`/usr/local/bin` to the noninteractive SSH PATH, using a fixed shell prefix and
+individually quoted arguments. Failed transports report only known stderr error
+categories; arbitrary logs and possible credentials are withheld.
 Custom Ansible-only connection plugins, become, and password prompts are not
 supported by the Pi control transport.
 

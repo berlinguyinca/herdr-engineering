@@ -31,6 +31,7 @@ CAPABILITIES = {
 }
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+REMOTE_EXEC_PREFIX = 'PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" exec '
 
 
 def _identifier(value):
@@ -142,6 +143,33 @@ def create_rollout(store, revision, targets, *, inventory):
     return plan
 
 
+def _stderr_diagnostic(stderr):
+    # Extract only known diagnostic categories, never echo arbitrary remote logs.
+    # Even unexpected secret-bearing stderr therefore stays out of durable state.
+    text = str(stderr or "")[:8192].lower()
+    if not text:
+        return ""
+    for command in ("herdr", "node"):
+        if re.search(r"\b" + command + r": (?:command )?not found\b", text):
+            return f"; stderr: {command}: not found"
+    for diagnostic in (
+        "command not found",
+        "permission denied",
+        "no such file or directory",
+        "connection refused",
+        "could not resolve hostname",
+        "no route to host",
+        "connection timed out",
+        "operation timed out",
+        "host key verification failed",
+        "connection closed",
+        "connection reset",
+    ):
+        if diagnostic in text:
+            return "; stderr: " + diagnostic
+    return "; stderr: unrecognized output withheld"
+
+
 class PiTransport:
     """Explicit argv locally; one shell-quoted argv through SSH remotely."""
 
@@ -183,7 +211,7 @@ class PiTransport:
                 str(target["port"]),
                 "--",
                 target["sshTarget"],
-                shlex.join(argv),
+                REMOTE_EXEC_PREFIX + shlex.join(argv),
             ]
         )
         result = self.runner(command, capture_output=True, text=True, timeout=45)
@@ -192,7 +220,7 @@ class PiTransport:
         except (ValueError, TypeError) as exc:
             if result.returncode:
                 raise ConnectionError(
-                    f"control transport failed (exit {result.returncode})"
+                    f"control transport failed (exit {result.returncode}){_stderr_diagnostic(result.stderr)}"
                 ) from exc
             raise ValueError("invalid control JSON") from exc
         if result.returncode:
@@ -206,7 +234,9 @@ class PiTransport:
                 and isinstance(receipt, dict)
                 and receipt.get("status") == "failed"
             ):
-                raise ConnectionError(f"control transport failed (exit {result.returncode})")
+                raise ConnectionError(
+                    f"control transport failed (exit {result.returncode}){_stderr_diagnostic(result.stderr)}"
+                )
         return reply
 
     def sessions(self, target, root):
