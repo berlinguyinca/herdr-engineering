@@ -400,7 +400,10 @@ def _session(plan, state, transport, target, root, save):
         not isinstance(m, dict) or not m.get("id") for m in missions
     ):
         raise ValueError("missing owned mission inventory")
-    if not state.get("prepared"):
+    activation_needed = (
+        runtime.get("commit") != plan["revision"] or runtime.get("pending") is not False
+    )
+    if activation_needed and not state.get("prepared"):
         receipt = _operation(plan, state, "prepare", "prepare", {}, transport, target, root, save)
         if receipt["status"] == "skipped" and receipt.get("result", {}).get("status") == "busy":
             state["status"] = "pending"
@@ -410,7 +413,7 @@ def _session(plan, state, transport, target, root, save):
             state["status"] = "pending" if receipt["status"] == "running" else "blocked"
             return
         state["prepared"] = True
-    if runtime.get("commit") != plan["revision"] or runtime.get("pending") is not False:
+    if activation_needed:
         receipt = _operation(
             plan,
             state,
