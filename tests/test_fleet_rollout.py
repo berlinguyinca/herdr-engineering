@@ -756,3 +756,24 @@ def test_named_wait_allows_no_deadline_or_covering_future_deadline(tmp_path, dea
     }
     result = apply(store, plan, wire)
     assert result["hosts"]["bender"]["sessions"]["bender-conversation"]["status"] == "complete"
+
+
+@pytest.mark.parametrize("mission_state", ["idle", "paused", "COMPLETE", "bootstrap"])
+def test_already_current_runtime_is_never_drained(mission_state, tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    data = wire.rows["bender"]["reply"]["data"]
+    data["runtime"]["commit"] = SHA
+    if mission_state == "idle":
+        data["missions"] = []
+    elif mission_state == "paused":
+        data["missions"][0]["operatorPaused"] = True
+    elif mission_state == "bootstrap":
+        data["runtime"]["hostCommit"] = "b" * 40
+    else:
+        data["missions"][0]["status"] = mission_state
+    result = apply(store, plan, wire)
+    assert not wire.calls
+    assert result["hosts"]["bender"]["sessions"]["bender-conversation"]["status"] == (
+        "bootstrap_required" if mission_state == "bootstrap" else "complete"
+    )
