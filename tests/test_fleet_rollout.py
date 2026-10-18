@@ -727,3 +727,32 @@ def test_failed_process_without_valid_failed_receipt_remains_transport_error(cod
         transport.maintenance(
             target, "/release", "instance", {"operationId": "op", "action": "prepare"}
         )
+
+
+@pytest.mark.parametrize("deadline", ["2000-01-01T00:00:00Z", "2098-01-01T00:00:00Z", "invalid"])
+def test_named_wait_requires_valid_future_deadline_covering_next_action(tmp_path, deadline):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.rows["bender"]["reply"]["data"]["missions"][0]["namedWait"] = {
+        "action": "probe",
+        "nextActionAt": "2099-01-01T00:00:00Z",
+        "deadline": deadline,
+    }
+    result = apply(store, plan, wire)
+    assert (
+        result["hosts"]["bender"]["sessions"]["bender-conversation"]["status"]
+        == "awaiting_progress"
+    )
+
+
+@pytest.mark.parametrize("deadline", [None, "2099-01-02T00:00:00Z"])
+def test_named_wait_allows_no_deadline_or_covering_future_deadline(tmp_path, deadline):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.rows["bender"]["reply"]["data"]["missions"][0]["namedWait"] = {
+        "action": "probe",
+        "nextActionAt": "2099-01-01T00:00:00Z",
+        "deadline": deadline,
+    }
+    result = apply(store, plan, wire)
+    assert result["hosts"]["bender"]["sessions"]["bender-conversation"]["status"] == "complete"
