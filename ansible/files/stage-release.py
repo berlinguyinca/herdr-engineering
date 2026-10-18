@@ -118,6 +118,22 @@ def registration(home, release):
     return settings, before, value
 
 
+def verify_herdr_distribution(home, release, runner):
+    """Attest the package actually installed in the service interpreter.
+
+    Receipts and a clean checkout alone cannot detect a later pip/uv reinstall.
+    PEP 610 direct_url.json must identify this exact immutable local release.
+    """
+    python = home / '.venvs/herdr-engineering/bin/python'
+    origin = json.loads(runner([str(python), '-I', '-c',
+        "import importlib.metadata; "
+        "print(importlib.metadata.distribution('herdr-engineering').read_text('direct_url.json') or '{}')"]))
+    if (origin.get('url') != release.as_uri()
+            or not isinstance(origin.get('dir_info'), dict)
+            or origin['dir_info'].get('editable', False)):
+        raise RuntimeError('Installed HerdR distribution does not match the selected immutable release')
+
+
 def _stage(home, revision, kind, repository, runner):
     validate_revision(revision)
     home = home.expanduser().resolve()
@@ -140,6 +156,7 @@ def _stage(home, revision, kind, repository, runner):
             if not (venv / 'bin/python').exists():
                 runner(['python3', '-m', 'venv', str(venv)])
             runner([str(venv / 'bin/python'), '-m', 'pip', 'install', '--quiet', '--upgrade', str(release)])
+            verify_herdr_distribution(home, release, runner)
         verify_checkout(release, revision, runner)
         result = {'revision': revision, 'sourceRoot': str(release)}
         atomic_json(receipt, result)
@@ -189,6 +206,8 @@ def describe(home, kind, runner=run):
             sources = [entry if isinstance(entry, str) else entry.get('source') for entry in packages]
             if str(release) not in sources or not (release / 'node_modules').is_dir():
                 return None
+        else:
+            verify_herdr_distribution(home, release, runner)
         return result
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
         return None

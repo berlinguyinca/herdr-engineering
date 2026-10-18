@@ -61,9 +61,10 @@
 
     - name: "Install/enable the agent service from the refreshed checkout"
       ansible.builtin.command:
-        argv:
-          - /bin/bash
-          - "{{ herdr_engineering_checkout | default(fleet_home ~ '/herdr-engineering-repo') }}/scripts/{{ 'fabric-agent-macos.sh' if ansible_facts['system'] == 'Darwin' else 'fabric-agent.sh' }}"
+        argv: >-
+          {{ ['/bin/bash', herdr_engineering_checkout ~ '/scripts/' ~
+               ('fabric-agent-macos.sh' if ansible_facts['system'] == 'Darwin' else 'fabric-agent.sh')]
+             + (['--repo', herdr_engineering_checkout] if ansible_facts['system'] == 'Darwin' else []) }}
       environment:
         HERDR_ENGINEERING_CHECKOUT: "{{ herdr_engineering_checkout | default(fleet_home ~ '/herdr-engineering-repo') }}"
         HOME: "{{ fleet_home }}"
