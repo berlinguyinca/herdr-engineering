@@ -150,6 +150,8 @@ def test_herdr_install_uses_managed_exact_source(repository, tmp_path):
     calls = []
     def installer(cmd, **kwargs):
         calls.append(cmd)
+        if '-c' in cmd:
+            return json.dumps({'url': (home / '.local/share/herdr-engineering/herdr/releases' / sha).as_uri(), 'dir_info': {}})
         if '-m' in cmd and ('venv' in cmd or 'pip' in cmd):
             return ''
         return install_ok(cmd, **kwargs)
@@ -174,3 +176,70 @@ def test_staging_lock_refuses_concurrent_install(repository, tmp_path):
         with pytest.raises(BlockingIOError):
             stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
     assert stage.describe_pi(home, runner=install_ok) is None
+
+
+def test_herdr_attestation_refuses_replaced_installed_distribution(repository, tmp_path):
+    stage = module()
+    repo, sha = repository
+    home = tmp_path / 'home'
+    installed_origin = {}
+    def installer(cmd, **kwargs):
+        if '-m' in cmd and 'pip' in cmd:
+            installed_origin.update({'url': Path(cmd[-1]).as_uri(), 'dir_info': {}})
+            return ''
+        if '-m' in cmd and 'venv' in cmd:
+            return ''
+        if '-c' in cmd:
+            return json.dumps(installed_origin)
+        return install_ok(cmd, **kwargs)
+    result = stage.stage_herdr(home, sha, repository=str(repo), runner=installer)
+    assert stage.describe(home, 'herdr', runner=installer) == result
+    installed_origin.update({'url': 'https://github.com/berlinguyinca/herdr-engineering.git',
+                             'vcs_info': {'vcs': 'git', 'commit_id': 'f' * 40}})
+    assert stage.describe(home, 'herdr', runner=installer) is None
+
+
+def test_macos_companion_receives_pinned_release_path():
+    import yaml
+    from jinja2 import Environment
+    root = Path(__file__).resolve().parents[1]
+    tasks = yaml.safe_load((root / 'ansible/tasks/fabric-agent.yml').read_text())[0]['block']
+    command = next(task['ansible.builtin.command'] for task in tasks
+                   if task.get('register') == 'fabric_agent_result')
+    argv = command['argv']
+    selected = '/home/operator/.local/share/herdr-engineering/herdr/releases/' + 'a' * 40
+    context = {'herdr_engineering_checkout': selected, 'fleet_home': '/home/operator',
+               'ansible_facts': {'system': 'Darwin'}}
+    env = Environment()
+    if isinstance(argv, str):
+        # Ansible natively evaluates this list expression; compile the expression
+        # rather than treating its result as a shell string.
+        argv = env.compile_expression(argv.strip()[2:-2])(**context)
+    else:
+        argv = [env.from_string(arg).render(context) for arg in argv]
+    assert '--repo' in argv
+    assert argv[argv.index('--repo') + 1] == selected
+
+
+def test_distribution_probe_reads_actual_target_interpreter_metadata(tmp_path):
+    import sys
+    stage = module()
+    home = tmp_path / 'home'
+    venv = home / '.venvs/herdr-engineering'
+    subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(venv)], check=True)
+    python = venv / 'bin/python'
+    site = Path(subprocess.check_output([str(python), '-I', '-c',
+        "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True).strip())
+    distribution = site / 'herdr_engineering-0.1.0.dist-info'
+    distribution.mkdir()
+    (distribution / 'METADATA').write_text('Metadata-Version: 2.1\nName: herdr-engineering\nVersion: 0.1.0\n')
+    release = home / '.local/share/herdr-engineering/herdr/releases' / ('a' * 40)
+    metadata = distribution / 'direct_url.json'
+    metadata.write_text(json.dumps({'url': release.as_uri(), 'dir_info': {}}))
+    stage.verify_herdr_distribution(home, release, stage.run)
+    metadata.write_text(json.dumps({'url': (tmp_path / 'different-source').as_uri(), 'dir_info': {}}))
+    with pytest.raises(RuntimeError, match='distribution does not match'):
+        stage.verify_herdr_distribution(home, release, stage.run)
+    metadata.unlink()
+    with pytest.raises(RuntimeError, match='distribution does not match'):
+        stage.verify_herdr_distribution(home, release, stage.run)
