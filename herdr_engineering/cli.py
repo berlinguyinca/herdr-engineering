@@ -172,6 +172,19 @@ def _build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--json", action="store_true")
     ps.set_defaults(func=_cmd_fleet_status)
 
+    pr = fsub.add_parser("rollout", help="durable Pi runtime update and mission recovery")
+    rsub = pr.add_subparsers(dest="rollout_command", required=True)
+    for action in ("plan", "apply", "status"):
+        rp = rsub.add_parser(action)
+        rp.add_argument("--state", default=None, help="private rollout state directory")
+        if action == "plan":
+            rp.add_argument("--pi-revision", required=True, help="full immutable Pi commit SHA")
+            rp.add_argument("--host", default=None)
+            rp.add_argument("--inventory", default=None)
+        else:
+            rp.add_argument("--id", required=True, help="rollout ID printed by plan")
+        rp.set_defaults(func=_cmd_fleet_rollout)
+
     # artifacts ------------------------------------------------------------
     p = sub.add_parser("artifacts", help="shared artifact workspace (spec 0080)")
     asub = p.add_subparsers(dest="artifacts_command", required=True)
@@ -608,6 +621,28 @@ def _cmd_fleet_update(args) -> int:
         if fs.get("rc") != 0 and fs.get("stderr"):
             print(f"  !! {fs['stderr']}")
     return 0 if report.get("ok") else 1
+
+
+def _cmd_fleet_rollout(args) -> int:
+    from pathlib import Path
+
+    from .fleet import repo_root
+    from .fleet_rollout import RolloutStore, apply_rollout, create_rollout, inventory_targets
+
+    store = RolloutStore(Path(args.state) if args.state else None)
+    try:
+        if args.rollout_command == "plan":
+            inventory = Path(args.inventory) if args.inventory else repo_root() / "ansible/inventory/hosts.yml"
+            report = create_rollout(store, args.pi_revision, inventory_targets(inventory, args.host), inventory=inventory)
+        elif args.rollout_command == "apply":
+            report = apply_rollout(store, args.id)
+        else:
+            report = store.read(args.id)
+    except (OSError, ValueError, RuntimeError) as exc:
+        _print_json({"error": str(exc)})
+        return 1
+    _print_json(report)
+    return 0 if args.rollout_command != "apply" or report["status"] == "complete" else 2
 
 
 def _cmd_fleet_status(args) -> int:
