@@ -154,11 +154,25 @@ def apply(store, plan, wire):
         else:
             assert remote[3] == "maintenance"
             reply = wire.maintenance({"host": host}, root, remote[4], json.loads(remote[6]))
-        return subprocess.CompletedProcess(argv, 0, json.dumps(reply), "")
+        return subprocess.CompletedProcess(
+            argv,
+            getattr(wire, "returncode", 0) if remote[3] == "maintenance" else 0,
+            json.dumps(reply),
+            "",
+        )
 
-    return apply_rollout(
-        store, plan["id"], transport=PiTransport(runner=runner, adapter=Adapter()), stage=wire.stage
-    )
+    from unittest.mock import patch
+
+    with patch(
+        "herdr_engineering.fleet_rollout.inventory_targets",
+        side_effect=lambda inventory, host: [plan["hosts"][host]["target"]],
+    ):
+        return apply_rollout(
+            store,
+            plan["id"],
+            transport=PiTransport(runner=runner, adapter=Adapter()),
+            stage=wire.stage,
+        )
 
 
 def test_two_hosts_offline_restart_and_progress(tmp_path):
@@ -494,3 +508,222 @@ def test_one_stale_session_does_not_starve_other_sessions_on_host(tmp_path):
     result = apply(store, plan, wire)
     assert result["hosts"]["bender"]["sessions"]["second-conversation"]["status"] == "complete"
     assert result["hosts"]["bender"]["sessions"]["bender-conversation"]["status"] == "blocked"
+
+
+def test_exit_one_failed_receipt_is_persisted_and_does_not_retry(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.returncode = 1
+
+    def failed_prepare(target, root, instance, request):
+        wire.calls.append(copy.deepcopy(request))
+        return {
+            "maintenance": {
+                "operationId": request["operationId"],
+                "action": request["action"],
+                "status": "failed",
+                "error": "cannot checkpoint active task",
+            }
+        }
+
+    wire.maintenance = failed_prepare
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]["sessions"]["bender-conversation"]
+    assert state["operations"]["prepare"]["receipt"]["status"] == "failed"
+    assert state["status"] == "blocked"
+    apply(store, plan, wire)
+    assert len(wire.calls) == 1
+
+
+def test_unidentified_agent_does_not_block_identified_sibling(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    native = wire.native
+    wire.native = lambda target: (
+        [{"agent": "pi", "terminal_id": "unknown", "agent_session": None}] + native(target)
+    )
+    result = apply(store, plan, wire)
+    host = result["hosts"]["bender"]
+    assert host["sessions"]["bender-conversation"]["status"] == "awaiting_progress"
+    assert host["status"] == "blocked"
+    assert host["coverageErrors"][0]["terminalId"] == "unknown"
+    assert "conversation" in host["coverageErrors"][0]["error"]
+
+
+def test_complete_mission_is_preserved_without_progress_or_resume(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    mission = wire.rows["bender"]["reply"]["data"]["missions"][0]
+    mission["status"] = "COMPLETE"
+    mission["resumeEligible"] = False
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]["sessions"]["bender-conversation"]
+    assert state["status"] == "complete"
+    assert state["missions"]["M1"]["status"] == "preserved"
+    assert not any(r["action"] == "resume" for r in wire.calls)
+
+
+def test_skipped_resume_is_explicitly_blocked_without_new_operation(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    original = wire.maintenance
+
+    def stale_resume(target, root, instance, request):
+        if request["action"] == "resume":
+            wire.calls.append(copy.deepcopy(request))
+            return {
+                "maintenance": {
+                    "operationId": request["operationId"],
+                    "action": "resume",
+                    "status": "skipped",
+                    "result": {"reason": "mission revision changed"},
+                }
+            }
+        return original(target, root, instance, request)
+
+    wire.maintenance = stale_resume
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]["sessions"]["bender-conversation"]
+    assert state["status"] == "blocked"
+    assert state["missions"]["M1"]["status"] == "blocked"
+    assert "revision changed" in state["missions"]["M1"]["error"]
+    wire.rows["bender"]["reply"]["data"]["missions"][0]["revision"] += 1
+    apply(store, plan, wire)
+    assert len([r for r in wire.calls if r["action"] == "resume"]) == 1
+    wire.rows["bender"]["reply"]["data"]["missions"][0]["operatorPaused"] = True
+    result = apply(store, plan, wire)
+    assert result["hosts"]["bender"]["sessions"]["bender-conversation"]["status"] == "complete"
+
+
+def test_inventory_includes_direct_and_deep_hosts_and_named_session(tmp_path, monkeypatch):
+    import subprocess
+
+    from herdr_engineering.fleet_rollout import inventory_targets
+
+    inventory = tmp_path / "hosts.yml"
+    inventory.write_text(
+        "all:\n  children:\n    herdr_fleet:\n      hosts:\n        direct: {}\n      children:\n        nested:\n          children:\n            leaf:\n              hosts:\n                deep: {}\n"
+    )
+    resolved = {
+        "herdr_fleet": {"hosts": ["direct"], "children": ["nested"]},
+        "nested": {"children": ["leaf"]},
+        "leaf": {"hosts": ["deep"]},
+        "_meta": {"hostvars": {"deep": {"ansible_host": "deep.example", "herdr_session": "work"}}},
+    }
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, json.dumps(resolved), ""),
+    )
+    targets = inventory_targets(inventory)
+    assert {t["host"] for t in targets} == {"direct", "deep"}
+    assert next(t for t in targets if t["host"] == "deep")["session"] == "work"
+
+
+def test_changed_inventory_destination_blocks_before_stage(tmp_path, monkeypatch):
+    import herdr_engineering.fleet_rollout as module
+
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    stages = []
+    monkeypatch.setattr(
+        module,
+        "inventory_targets",
+        lambda inventory, host: [{**plan["hosts"][host]["target"], "sshTarget": "different-host"}],
+    )
+    result = module.apply_rollout(
+        store, plan["id"], transport=wire, stage=lambda *a, **kw: stages.append(kw)
+    )
+    assert not stages
+    assert result["hosts"]["bender"]["status"] == "blocked"
+    assert "destination changed" in result["hosts"]["bender"]["error"]
+
+
+@pytest.mark.parametrize("action", ["resume", "reload"])
+def test_busy_maintenance_retries_once_next_pass_with_new_operation(tmp_path, action):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    original = wire.maintenance
+    busy = True
+    attempts = []
+
+    def sometimes_busy(target, root, instance, request):
+        if request["action"] == action:
+            attempts.append(request["operationId"])
+            if busy:
+                return {
+                    "maintenance": {
+                        "operationId": request["operationId"],
+                        "action": action,
+                        "status": "skipped",
+                        "result": {"status": "busy", "reason": "active work"},
+                    }
+                }
+        return original(target, root, instance, request)
+
+    wire.maintenance = sometimes_busy
+    first = apply(store, plan, wire)
+    assert len(attempts) == 1
+    assert first["hosts"]["bender"]["sessions"]["bender-conversation"]["status"] in (
+        "pending",
+        "awaiting_progress",
+    )
+    busy = False
+    second = apply(store, plan, wire)
+    assert len(attempts) == 2 and attempts[0] != attempts[1]
+    assert (
+        second["hosts"]["bender"]["sessions"]["bender-conversation"]["status"]
+        == "awaiting_progress"
+    )
+
+
+def test_stale_fence_code_retries_with_fresh_revision_and_generation(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    original = wire.maintenance
+    requests = []
+
+    def stale_once(target, root, instance, request):
+        if request["action"] == "resume":
+            requests.append(copy.deepcopy(request))
+            if len(requests) == 1:
+                return {
+                    "maintenance": {
+                        "operationId": request["operationId"],
+                        "action": "resume",
+                        "status": "skipped",
+                        "result": {"status": "skipped", "code": "STALE_MISSION_FENCE"},
+                    }
+                }
+        return original(target, root, instance, request)
+
+    wire.maintenance = stale_once
+    apply(store, plan, wire)
+    mission = wire.rows["bender"]["reply"]["data"]["missions"][0]
+    mission.update(revision=3, resumptionGeneration=1)
+    result = apply(store, plan, wire)
+    assert len(requests) == 2 and requests[0]["operationId"] != requests[1]["operationId"]
+    assert requests[1]["expectedRevision"] == 3
+    assert requests[1]["expectedResumptionGeneration"] == 1
+    assert (
+        result["hosts"]["bender"]["sessions"]["bender-conversation"]["status"]
+        == "awaiting_progress"
+    )
+
+
+@pytest.mark.parametrize(
+    "code,output", [(1, "bad json"), (255, "{}"), (1, '{"maintenance":{"status":"succeeded"}}')]
+)
+def test_failed_process_without_valid_failed_receipt_remains_transport_error(code, output):
+    import subprocess
+
+    from herdr_engineering.fleet_rollout import PiTransport
+
+    transport = PiTransport(
+        runner=lambda argv, **kw: subprocess.CompletedProcess(argv, code, output, "failed")
+    )
+    target = {"host": "box", "sshTarget": "box", "port": 22, "local": False}
+    with pytest.raises(ConnectionError):
+        transport.maintenance(
+            target, "/release", "instance", {"operationId": "op", "action": "prepare"}
+        )
