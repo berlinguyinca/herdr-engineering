@@ -96,3 +96,7 @@ fleet scale of 14+ concurrent full-workspace cargo builds, starve the CPU.
 Rust cache maintenance uses the same per-host state directory and a shared build
 lock. See [automatic Rust build-cache cleanup](build-cleanup.md) for configuration,
 process checks, and the optional Herdr server companion.
+
+## Checking it
+
+The `build-gate` skill (`skills/build-gate/`) wraps this check: `bash skills/build-gate/scripts/status.sh` reports whether `herdr-eng` is on PATH, whether the extension is installed, live slot occupancy and host load, and exits nonzero when gating is not active.
