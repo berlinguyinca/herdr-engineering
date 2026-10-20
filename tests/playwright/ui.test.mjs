@@ -621,18 +621,30 @@ test('same-group freshness transitions relabel activity and freeze waiting clock
 
 test('recorded history requests time out and retry without blocking live missions or late navigation', async()=>{
  await withApp(async({page,base})=>{
-  let records=0, held;
-  await page.route('**/api/v1/missions',r=>{records++;if(records===1){held=r;return;}return r.continue();});
+  let records=0, held, releaseRetries;
+  const retriesAllowed = new Promise(resolve => { releaseRetries = resolve; });
+  await page.route('**/api/v1/missions', async r=>{
+   records++;
+   if(records===1){held=r;return;}
+   // Initial SSE replay can retry immediately after the 15s abort. Keep that
+   // successful response from clearing the error before we observe it.
+   await retriesAllowed;
+   return r.continue();
+  });
   await page.route('**/api/v1/mission-activity',r=>r.fulfill({json:{activities:[liveProjection()]}}));
-  await page.clock.install();await page.goto(`${base}/#/missions`);
-  await page.locator('.mc-row').first().waitFor();
-  await page.clock.runFor(16000);await page.waitForFunction(()=>document.querySelector('.ml-connection').textContent.includes('Recorded history could not refresh'));
-  await page.clock.runFor(15000);await page.waitForTimeout(60);
-  assert.ok(records>=2);await page.locator('[data-filter=history]').click();
-  await page.locator('.mc-title').filter({hasText:'Alpha'}).waitFor();
-  await page.evaluate(()=>{location.hash='#/hosts';});await page.waitForFunction(()=>document.querySelector('#view h1')?.textContent==='Hosts');
-  await held.fulfill({json:{missions:[]}}).catch(()=>{});
-  assert.equal(await page.locator('#view h1').innerText(),'Hosts');
+  try {
+   await page.clock.install();await page.goto(`${base}/#/missions`);
+   await page.locator('.mc-row').first().waitFor();
+   await page.clock.runFor(16000);await page.waitForFunction(()=>document.querySelector('.ml-connection').textContent.includes('Recorded history could not refresh'));
+   releaseRetries();
+   await page.clock.runFor(15000);
+   await page.locator('[data-filter=history]').click();
+   await page.locator('.mc-title').filter({hasText:'Alpha'}).waitFor();
+   assert.ok(records>=2);
+   await page.evaluate(()=>{location.hash='#/hosts';});await page.waitForFunction(()=>document.querySelector('#view h1')?.textContent==='Hosts');
+   await held.fulfill({json:{missions:[]}}).catch(()=>{});
+   assert.equal(await page.locator('#view h1').innerText(),'Hosts');
+  } finally { releaseRetries(); }
  },{BURST:'0'});
 });
 
