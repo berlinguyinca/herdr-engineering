@@ -175,6 +175,7 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
+        h["capabilities"] = ["mission_activity_v1"]
         return h
 
     # ------------------------------------------------------- SSE plumbing
@@ -346,7 +347,12 @@ def _make_handler(server):
             r = server.repo
             if resource == "health":
                 return self._json(server._health())
+            if resource == "mission-activity" and len(parts) == 4:
+                return self._json({"activities": r.mission_activity.list_summaries(),
+                                   "server_time": r._stamp()})
             if resource == "missions":
+                if len(parts) == 6 and parts[5] == "activity":
+                    return self._json({"activity": r.mission_activity.get(parts[4])})
                 if len(parts) > 5 and parts[5] == "timeline":
                     return self._json({"timeline": r.mission_timeline(parts[4])})
                 if len(parts) > 4:
@@ -508,7 +514,7 @@ def _make_handler(server):
                 # Inspector envelopes are redacted per field by the store: the
                 # blanket key-hint redaction would mangle ``input_tokens`` and
                 # ``passed``.
-                if isinstance(body, dict) and body.get("entity_type") == "inspector":
+                if isinstance(body, dict) and body.get("entity_type") in ("inspector", "mission_activity"):
                     entity = server.ingest.ingest(body)
                 else:
                     entity = server.ingest.ingest(redact_payload(body))

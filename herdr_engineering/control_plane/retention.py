@@ -9,6 +9,7 @@ in-memory RustFS stand-in) are pruned after a longer TTL.
 from __future__ import annotations
 
 import datetime as _dt
+from collections import deque
 
 
 def _parse(iso: str) -> _dt.datetime:
@@ -35,17 +36,28 @@ def apply_retention(repo, *, telemetry_ttl_hours=24, events_ttl_days=30,
             repo._telemetry.pop(host_id, None)
 
     cutoff_ev = now_dt - _dt.timedelta(days=events_ttl_days)
-    for key, stream in list(repo._events.items()):
-        kept = [e for e in stream if _parse(e["source_timestamp"]) >= cutoff_ev]
-        removed["events"] += len(stream) - len(kept)
-        if kept:
-            repo._events[key] = kept
-        else:
-            repo._events.pop(key, None)
-    # drop chronological index entries pointing at pruned events
-    repo._event_order = [(t, i, s) for (t, i, s) in repo._event_order
-                         if (t, i) in repo._events and
-                         s < len(repo._events[(t, i)])]
+    with repo._event_lock:
+        survivors = {}
+        for key, stream in list(repo._events.items()):
+            kept = []
+            for event in stream:
+                keep = _parse(event["source_timestamp"]) >= cutoff_ev
+                # Match occurrences, not offsets: two distinct durable events
+                # may share a sequence and only one may have expired.
+                survivors.setdefault((*key, event["sequence"]), deque()).append(keep)
+                if keep:
+                    kept.append(event)
+            removed["events"] += len(stream) - len(kept)
+            if kept:
+                repo._events[key] = kept
+            else:
+                repo._events.pop(key, None)
+        order = []
+        for reference in repo._event_order:
+            occurrences = survivors.get(reference)
+            if occurrences and occurrences.popleft():
+                order.append(reference)
+        repo._event_order = order
 
     cutoff_art = now_dt - _dt.timedelta(days=artifact_ttl_days)
     for aid in list(repo._blobs.keys()):

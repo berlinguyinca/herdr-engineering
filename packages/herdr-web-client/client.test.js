@@ -113,3 +113,16 @@ test('getTests requests /api/v1/tests', async () => {
   assert.equal(calls[0], '/api/v1/tests');
   assert.deepEqual(r.adapters, ['pytest']);
 });
+
+test('mission activity GETs encode exact namespaces and forward cancellation', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    calls.push({url, opts}); return {ok: true, text: async () => '{}'};
+  }});
+  const signal = new AbortController().signal;
+  await client.listMissionActivity({signal});
+  await client.missionActivity('pi:MSN/1', {signal});
+  assert.equal(calls[0].url, '/api/v1/mission-activity');
+  assert.equal(calls[1].url, '/api/v1/missions/pi%3AMSN%2F1/activity');
+  assert.ok(calls.every(c => c.opts.method === 'GET' && c.opts.signal === signal));
+});

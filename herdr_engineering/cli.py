@@ -424,6 +424,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--migrations", default=None,
                     help="migrations dir (default: bundled deploy/control-plane)")
     p2.set_defaults(func=_cmd_cp_worker)
+    p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
+    p2.add_argument("--control-plane", default=os.environ.get("HERDR_CP_URL", "http://dev.lan"))
+    p2.add_argument("--host-id", default=socket.gethostname())
+    p2.add_argument("--control-dir", default=None,
+                    help="native Pi control directory (default: Pi runtime directory)")
+    p2.add_argument("--interval", type=float, default=5.0)
+    p2.add_argument("--once", action="store_true")
+    p2.set_defaults(func=_cmd_cp_mission_feed)
     p2 = csub.add_parser("llm-proxy",
                          help="OpenAI-compatible fabric gateway: project keys, token accounting")
     p2.add_argument("--host", default="127.0.0.1")
@@ -439,6 +447,15 @@ def _build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------
 # Command handlers
 # --------------------------------------------------------------------------
+def _cmd_cp_mission_feed(args) -> int:
+    from pathlib import Path
+
+    from .mission_activity_feed import run_feed
+    return run_feed(args.control_plane, host_id=args.host_id,
+                    control_dir=Path(args.control_dir) if args.control_dir else None,
+                    interval=args.interval, once=args.once)
+
+
 def _cmd_cp_llm_proxy(args) -> int:
     """Serve the fabric LLM gateway. The upstream key is read from a file named by
     FABRIC_LLM_UPSTREAM_KEY_FILE or, failing that, the FABRIC_LLM_UPSTREAM_KEY env

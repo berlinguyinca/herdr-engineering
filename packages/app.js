@@ -9,6 +9,7 @@ import { defineComponents } from './herdr-web-components/index.js';
 import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
 import { statusForStage, statusLabel, tokenVar } from './herdr-web-components/status.js';
 import { mountInspector } from './inspector-view.js';
+import { mountMissionActivity } from './mission-live-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -76,9 +77,16 @@ const ROUTES = {
 
 // The agent inspector owns a per-session stream; dispose it whenever the view changes.
 let disposeInspector = null;
+let disposeMissionActivity = null;
+let refreshMissionHistory = null;
+let renderRevision = 0;
+const onMissionPage = () => /^#\/missions(?:\/|$)/.test(window.location.hash);
 const onSessionPage = () => /^#\/herd\/session\//.test(window.location.hash);
 
 async function render() {
+  const revision = ++renderRevision;
+  refreshMissionHistory = null;
+  if (disposeMissionActivity) { disposeMissionActivity(); disposeMissionActivity = null; }
   if (disposeInspector) { disposeInspector(); disposeInspector = null; }
   const { parts } = route();
   const seg = parts.length ? parts.join('/') : 'overview';
@@ -89,8 +97,9 @@ async function render() {
   });
   root.innerHTML = '<herdr-spinner label="Loading"></herdr-spinner>';
   try {
-    await ROUTES[match || '/overview'](parts);
+    await ROUTES[match || '/overview'](parts, revision);
   } catch (err) {
+    if (revision !== renderRevision) return;
     root.innerHTML = `<herdr-error message="${esc(err.message || 'request failed')}"></herdr-error>`;
   }
 }
@@ -230,25 +239,57 @@ async function viewOverview() {
 }
 
 async function viewMissions() {
-  const { missions } = await client.listMissions();
-  if (!missions.length) { root.innerHTML = '<herdr-empty message="No missions yet"></herdr-empty>'; return; }
-  root.innerHTML = '<h1>Missions</h1><div class="hd-grid">' + missions.map((m) => `
-    <div class="hd-card">
-      <div class="hd-card__title"><a href="#/missions/${esc(missionKey(m))}">${esc(m.title)}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${esc(m.status)}"></herdr-status></div>
-      <div class="hd-card__sub">${esc(missionSubtitle(m, m.sessions ? m.sessions.length : 0))}</div>
-      <div class="hd-card__sub">created ${formatTimestamp(m.created_at)}</div>
-      <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
-    </div>`).join('') + '</div>';
+  root.innerHTML = '<h1>Missions</h1><h2>Live Pi missions</h2><div id="live-missions"></div><h2>Recorded missions</h2><div id="recorded-missions"><herdr-spinner label="Loading recorded missions"></herdr-spinner></div>';
+  disposeMissionActivity = mountMissionActivity(document.getElementById('live-missions'), client);
+  const recorded = document.getElementById('recorded-missions');
+  let pending = false;
+  refreshMissionHistory = async () => {
+    if (pending || !recorded.isConnected || document.hidden) return;
+    pending = true;
+    try {
+      const { missions } = await client.listMissions();
+      if (!recorded.isConnected) return;
+      recorded.innerHTML = missions.length ? '<div class="hd-grid">' + missions.map((m) => `
+        <div class="hd-card">
+          <div class="hd-card__title"><a href="#/missions/${encodeURIComponent(missionKey(m))}">${esc(m.title)}</a></div>
+          <div style="margin:6px 0"><herdr-status stage="${esc(m.status)}"></herdr-status></div>
+          <div class="hd-card__sub">${esc(missionSubtitle(m, m.sessions ? m.sessions.length : 0))}</div>
+          <div class="hd-card__sub">created ${formatTimestamp(m.created_at)}</div>
+          <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
+        </div>`).join('') + '</div>' : '<herdr-empty message="No recorded missions yet"></herdr-empty>';
+    } catch (error) {
+      if (recorded.isConnected) recorded.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
+    } finally { pending = false; }
+  };
+  await refreshMissionHistory();
 }
 
-async function viewMission(parts) {
-  const m = await client.getMission(parts[1]);
+async function viewMission(parts, revision) {
+  const key = decodeURIComponent(parts[1]);
+  let m;
+  try { m = await client.getMission(key); }
+  catch (error) { if (error.status !== 404 || !key.startsWith('pi:')) throw error; }
+  if (revision !== renderRevision) return;
+  if (key.startsWith('pi:') && !m) {
+    root.innerHTML = '<h1>Pi mission activity</h1><div id="live-mission-detail"></div>';
+    disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
+    return;
+  }
   if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
-  const sessions = m.sessions.length;
-  const scope = m.purpose || m.cwd || m.title;
-  root.innerHTML = `
-    <h1>${esc(m.title)}</h1>
+  root.innerHTML = `<h1>${esc(m.title)}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-history"></div>`;
+  if (key.startsWith('pi:')) disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
+  const history = document.getElementById('mission-history');
+  let pending = false;
+  const refreshHistory = async (initial) => {
+    if (pending || !history.isConnected || document.hidden) return;
+    pending = true;
+    try {
+      const m = initial || await client.getMission(key);
+      const sessions = (m.sessions || []).length;
+      const scope = m.purpose || m.cwd || m.title;
+      const [sessionsHtml, streamHtml] = await Promise.all([missionSessions(m), streamList('mission', missionKey(m))]);
+      if (revision !== renderRevision || !history.isConnected) return;
+      history.innerHTML = `<h2>Recorded mission</h2>
     <div style="margin:8px 0"><herdr-status stage="${esc(m.status)}"></herdr-status>
       <span class="hd-card__sub"> · <herdr-ident kind="mission" id="${esc(m.mission_id)}"></herdr-ident></span></div>
     <div class="hd-card" style="margin-top:10px">
@@ -263,19 +304,23 @@ async function viewMission(parts) {
     </div>
     <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
     <h3 style="margin-top:20px">Sessions</h3>
-    ${await missionSessions(m)}
+    ${sessionsHtml}
     <h3 style="margin-top:20px">Timeline</h3>
     <herdr-timeline id="mission-timeline"></herdr-timeline>
     <h3 style="margin-top:20px">Event stream</h3>
-    <div id="mission-stream">${await streamList('mission', missionKey(m))}</div>`;
-    // Timeline (UI-009): merged mission events + CI/PR data. On error render
-    // the empty state — never throw from the view.
-    try {
-      const { timeline } = await client.missionTimeline(missionKey(m));
-      document.getElementById('mission-timeline').items = timeline || [];
-    } catch {
-      document.getElementById('mission-timeline').items = [];
-    }
+    <div id="mission-stream">${streamHtml}</div>`;
+
+      const timelineElement = history.querySelector('#mission-timeline');
+      try {
+        const { timeline } = await client.missionTimeline(missionKey(m));
+        timelineElement.items = timeline || [];
+      } catch { timelineElement.items = []; }
+    } catch (error) {
+      if (history.isConnected) history.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
+    } finally { pending = false; }
+  };
+  if (key.startsWith('pi:')) refreshMissionHistory = refreshHistory;
+  await refreshHistory(m);
 }
 
 async function missionSessions(m) {
@@ -587,6 +632,15 @@ const LIVE_REFRESH_MS = 5000;
 connectEvents({
   url: '/api/v1/events/stream',
   onEvent: () => {
+    // Mission telemetry owns its polling; SSE must not reset worker inspection.
+    if (onMissionPage() && (disposeMissionActivity || decodeURIComponent(route().parts[1] || '').startsWith('pi:'))) {
+      // Refresh recorded lifecycle data separately so disclosures stay open.
+      if (refreshMissionHistory && !liveTimer) liveTimer = setTimeout(() => {
+        liveTimer = null;
+        refreshMissionHistory?.();
+      }, LIVE_REFRESH_MS);
+      return;
+    }
     // The session page streams its own detail; a full re-render would reset it.
     // Only the (cheap) generic event list below the inspector is refreshed there.
     if (onSessionPage()) {

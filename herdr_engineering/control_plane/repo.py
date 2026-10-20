@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from .ids import new_id
 from .inspector import InspectorStore
+from .mission_activity import MissionActivityStore
 from .redact import redact_payload
 
 _STAGES = {
@@ -88,6 +89,7 @@ class ControlPlaneRepo:
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_env(persist=self._persist_inspector)
+        self.mission_activity = MissionActivityStore(now=self._now)
 
     def _persist_inspector(self, ev):
         """Mirror low-volume inspector summaries to the existing durable sink only
@@ -1017,7 +1019,7 @@ class ControlPlaneRepo:
         with self._event_lock:
             key = (entity_type, entity_id)
             stream = self._events.setdefault(key, [])
-            seq = len(stream)
+            seq = max((e.get("sequence", -1) for e in stream), default=-1) + 1
             ev = {
                 "event_id": new_id("event"),
                 "schema_version": 1,
@@ -1102,11 +1104,23 @@ class ControlPlaneRepo:
 
     def recent_events(self, limit=50):
         out = []
-        for etype, eid, seq in reversed(self._event_order):
-            ev = self._events[(etype, eid)][seq]
-            out.append(_copy(ev))
-            if len(out) >= limit:
-                break
+        by_sequence = {}
+        with self._event_lock:
+            for etype, eid, seq in reversed(self._event_order):
+                key = (etype, eid)
+                if key not in by_sequence:
+                    # Restore may contain gaps AND duplicate sequence numbers.
+                    # Stable stream order disambiguates each chronological occurrence.
+                    buckets = {}
+                    for ev in self._events.get(key, []):
+                        buckets.setdefault(ev.get("sequence"), []).append(ev)
+                    by_sequence[key] = buckets
+                candidates = by_sequence[key].get(seq, [])
+                if not candidates:
+                    continue
+                out.append(_copy(candidates.pop()))
+                if len(out) >= limit:
+                    break
         return out
 
     # ------------------------------------------- LLM usage, keys, custom models
