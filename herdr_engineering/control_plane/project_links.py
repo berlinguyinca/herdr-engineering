@@ -101,6 +101,15 @@ def _project_mapping():
         return {}, "error", "Project repository mapping could not be read or is invalid."
 
 
+def project_for_repository(repository):
+    """Apply the bounded shared-project mapping, defaulting to forge identity."""
+    identity = canonical_repository(repository)
+    if identity is None:
+        return None
+    mapping, _, _ = _project_mapping()
+    return mapping.get(identity, identity)
+
+
 def _mission_ref(record):
     mission_id, source = record.get("mission_id"), record.get("source", "herdr")
     if (not isinstance(mission_id, str) or not mission_id or ":" in mission_id

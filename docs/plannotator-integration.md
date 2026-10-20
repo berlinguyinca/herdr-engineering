@@ -19,7 +19,7 @@ Install the official Plannotator CLI and make it available on PATH. The integrat
 was verified with version **0.28.24**, including an actual fixture plan review and
 its upstream JSON result. No JavaScript runtime is needed for the release binary.
 
-The `herdr-plannotator` entry point is installed with this package. Run from the project workspace:
+The `herdr-plannotator` entry point is installed with this package. It discovers the canonical origin repository and full HEAD commit from the actual project workspace, applies shared-project overrides, and preserves explicit flags. Mission/session associations remain explicit. Inherited Git directory/config overrides cannot redirect that discovery. Run from the project workspace:
 
 ```bash
 herdr-plannotator plan \

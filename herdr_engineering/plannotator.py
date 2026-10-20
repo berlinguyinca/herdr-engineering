@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+from .control_plane.project_links import canonical_repository, project_for_repository
 from .control_plane.reviews import MAX_TEXT, safe_review_url
 from .session_env import _post
 
@@ -46,6 +47,45 @@ def _read_json(path, limit=MAX_TEXT * 2):
     return value
 
 
+
+def _git_context(workdir):
+    # A launcher may run inside another Git operation. Inherited GIT_DIR,
+    # GIT_WORK_TREE, alternate indexes or injected config must not redirect
+    # identity discovery away from the explicitly selected review directory.
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    def read(*args):
+        try:
+            value = subprocess.check_output(
+                ["git", *args], cwd=workdir, env=env, text=True,
+                stderr=subprocess.DEVNULL, timeout=5).strip()
+            return value if len(value) <= 4096 else None
+        except (subprocess.SubprocessError, OSError, UnicodeError):
+            return None
+    head = read("rev-parse", "HEAD")
+    if not isinstance(head, str) or not re.fullmatch(r"[a-fA-F0-9]{40}|[a-fA-F0-9]{64}", head):
+        head = None
+    origin = canonical_repository(read("config", "--local", "--get", "remote.origin.url"))
+    return origin, head
+
+
+def _review_identity(workdir, repository, project_id, revision):
+    origin, head = _git_context(workdir)
+    if repository is None:
+        repository = origin
+    else:
+        normalized = canonical_repository(repository)
+        # A short explicit name only gains a forge when it identifies the
+        # actual origin; never silently move a different override to that host.
+        if normalized is None and origin:
+            candidate = canonical_repository(repository, forge_host=origin.split("/", 1)[0])
+            if candidate == origin:
+                normalized = origin
+        repository = normalized or repository
+    if project_id is None:
+        project_id = project_for_repository(repository)
+    return repository, project_id, head if revision is None else revision
+
+
 def run_review(*, kind, cwd, control_plane, plan_file=None, repository=None,
                project_id=None, revision=None, mission_id=None, session_id=None,
                title=None, url_host=None, binary="plannotator", post=_post):
@@ -64,13 +104,7 @@ def run_review(*, kind, cwd, control_plane, plan_file=None, repository=None,
             plan = stream.read(MAX_TEXT + 1)
         if len(plan) > MAX_TEXT:
             raise ValueError("plan exceeds the review size limit")
-    if revision is None:
-        try:
-            revision = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=workdir, text=True,
-                stderr=subprocess.DEVNULL, timeout=5).strip()
-        except (subprocess.SubprocessError, OSError):
-            pass
+    repository, project_id, revision = _review_identity(workdir, repository, project_id, revision)
     rid, instance = f"rev_{uuid4().hex}", uuid4().hex
     binding = {"instance_id": instance, "revision": revision,
                "plan_digest": hashlib.sha256(plan.encode()).hexdigest() if plan is not None else None}
@@ -96,7 +130,7 @@ def run_review(*, kind, cwd, control_plane, plan_file=None, repository=None,
         # must not be inherited by that process tree.
         for key in list(env):
             upper = key.upper()
-            if any(part in upper for part in ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY", "AUTHORIZATION", "CREDENTIAL")) or upper.endswith("_KEY"):
+            if upper.startswith("GIT_") or any(part in upper for part in ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY", "AUTHORIZATION", "CREDENTIAL")) or upper.endswith("_KEY"):
                 env.pop(key)
         env["PLANNOTATOR_READY_FILE"] = str(ready)
         env["PLANNOTATOR_PORT"] = "0"

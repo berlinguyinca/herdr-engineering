@@ -94,3 +94,73 @@ def test_replay_private_receipt_is_idempotent_and_removes_only_after_ack(tmp_pat
     replay_receipt(saved, "http://fixture", post=lambda *args: calls.append(args))
     assert calls[0][1] == "/api/v1/reviews/rev_fixture/result"
     assert not saved.exists()
+
+
+def git_fixture(path, origin):
+    import subprocess
+    path.mkdir()
+    clean = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=path, env=clean,
+                                       stderr=subprocess.DEVNULL, text=True).strip()
+    git("init")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+        "commit", "--allow-empty", "-m", "fixture")
+    git("remote", "add", "origin", origin)
+    return git("rev-parse", "HEAD")
+
+
+def test_auto_identity_uses_actual_git_cwd_and_shared_project_mapping(tmp_path, monkeypatch):
+    from herdr_engineering.plannotator import _review_identity
+    target, other = tmp_path / "actual", tmp_path / "other"
+    sha = git_fixture(target, "git@github.com:Owner/Backend.git")
+    git_fixture(other, "https://gitlab.com/unrelated/project.git")
+    mapping = tmp_path / "projects.json"
+    mapping.write_text(json.dumps({"github.com/owner/backend": "shared-product"}))
+    monkeypatch.setenv("HERDR_ENGINEERING_PROJECT_REPOS_FILE", str(mapping))
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://evil.example/wrong/repository")
+    assert _review_identity(target, None, None, None) == ("github.com/owner/backend", "shared-product", sha)
+
+
+def test_explicit_identity_overrides_preserved_and_matching_short_name_resolved(tmp_path, monkeypatch):
+    from herdr_engineering.plannotator import _review_identity
+    target = tmp_path / "actual"
+    sha = git_fixture(target, "https://github.com/Owner/App.git")
+    monkeypatch.delenv("HERDR_ENGINEERING_PROJECT_REPOS_FILE", raising=False)
+    assert _review_identity(target, "Owner/App", None, None) == ("github.com/owner/app", "github.com/owner/app", sha)
+    assert _review_identity(target, "Owner/Different", None, None) == ("Owner/Different", None, sha)
+    assert _review_identity(target, "https://gitlab.com/other/app.git", "custom-product", "explicit-commit") == (
+        "gitlab.com/other/app", "custom-product", "explicit-commit")
+
+
+def test_no_git_context_gracefully_keeps_explicit_values(tmp_path, monkeypatch):
+    from herdr_engineering.plannotator import _review_identity
+    monkeypatch.delenv("HERDR_ENGINEERING_PROJECT_REPOS_FILE", raising=False)
+    assert _review_identity(tmp_path, None, None, None) == (None, None, None)
+    assert _review_identity(tmp_path, "owner/repo", "custom-project", "explicit-commit") == (
+        "owner/repo", "custom-project", "explicit-commit")
+
+
+def test_launcher_registers_discovered_identity_without_flags(tmp_path, monkeypatch):
+    target = tmp_path / "actual"
+    sha = git_fixture(target, "https://github.com/Owner/App.git")
+    monkeypatch.delenv("HERDR_ENGINEERING_PROJECT_REPOS_FILE", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    calls = []
+    run_review(kind="code", cwd=target, control_plane="http://herdr", binary=fake_cli(tmp_path),
+               post=lambda base, path, body: calls.append((path, body)))
+    assert calls[0][1]["repository"] == "github.com/owner/app"
+    assert calls[0][1]["project_id"] == "github.com/owner/app"
+    assert calls[0][1]["revision"] == sha
+    assert calls[0][1]["mission_id"] is None
+    assert calls[0][1]["session_id"] is None
+
+
+def test_git_executable_unavailable_is_optional_metadata(tmp_path, monkeypatch):
+    from herdr_engineering.plannotator import _review_identity
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert _review_identity(tmp_path, None, None, None) == (None, None, None)
