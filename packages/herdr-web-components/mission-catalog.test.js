@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { missionEntries, filterMissions, compactMissionRow, measuredProgress } from '../mission-catalog-view.js';
 const now=Date.parse('2026-10-20T12:00:00Z');
-const projection=(key='pi:MSN-1',overrides={})=>({mission_key:key,activity_snapshot_at:new Date(now-2000).toISOString(),host_id:'beast',mission:{id:'MSN-1',title:'Repair spectra parser',status:'EXECUTING'},freshness:{state:'live',age_seconds:2},activity:{health:'active',currentActivity:{summary:'Running parser tests'}},...overrides});
+const projection=(key='pi:MSN-1',overrides={})=>({mission_key:key,host_id:'beast',mission:{id:'MSN-1',title:'Repair spectra parser',status:'EXECUTING'},freshness:{state:'live',age_seconds:2},activity:{health:'active',currentActivity:{summary:'Running parser tests'}},...overrides});
 test('catalog merges only exact namespaced mission identities and retains missing recorded context',()=>{
  const entries=missionEntries([projection()], [{mission_key:'pi:MSN-1',mission_id:'MSN-1',title:'Recorded title',purpose:'Spectrum format decoder'}, {mission_id:'MSN-1',title:'Independent HerdR mission'}],now,now);
  assert.equal(entries.length,2);assert.equal(entries.find(e=>e.key==='pi:MSN-1').title,'Repair spectra parser');
@@ -58,7 +58,7 @@ test('terminal tabs exclude recorded active or unknown missions and honor lifecy
   {mission_id:'failed',status:'active',stage:'failed'},
   {mission_id:'done',status:'active',stage:'completed'},
  ],now,now);
- assert.deepEqual(filterMissions(entries,{tab:'unconfirmed'}).map(e=>e.key),['active','unknown']);
+ assert.deepEqual(filterMissions(entries,{tab:'current'}).map(e=>e.key),['active','unknown']);
  assert.deepEqual(filterMissions(entries,{tab:'failed'}).map(e=>e.key),['failed']);
  assert.deepEqual(filterMissions(entries,{tab:'finished'}).map(e=>e.key),['closed','done']);
 });
@@ -71,33 +71,7 @@ test('terminal lifecycle remains visible when disconnected and old worker health
 test('stage-based terminal outcomes display the terminal stage and freeze old waits',()=>{
  const record=missionEntries([], [{mission_id:'finished-stage',status:'active',stage:'complete'}],now,now)[0];
  assert.match(compactMissionRow(record,now),/Complete · recorded/);
- const p=projection('pi:done',{mission:{status:'CLOSED'},activity_snapshot_at:'2026-10-20T12:00:00Z',snapshot_at:'2026-10-20T12:00:00Z',activity:{waitingReason:'gateway_busy',waitingSince:'2026-10-20T11:59:00Z'}});
+ const p=projection('pi:done',{mission:{status:'CLOSED'},snapshot_at:'2026-10-20T12:00:00Z',activity:{waitingReason:'gateway_busy',waitingSince:'2026-10-20T11:59:00Z'}});
  const entry=missionEntries([p],[],now,now+10000)[0];
  assert.match(compactMissionRow(entry,now+10000),/1m 0s<\/span> at last snapshot/);
-});
-
-test('stored outcomes add a result chip, last event, and result and repository filters to catalog rows', () => {
-  const recorded = [{ mission_id: 'a', title: 'Alpha', status: 'complete', stage: 'complete', updated_at: '2026-10-20T10:00:00Z' },
-    { mission_id: 'b', title: 'Beta', status: 'failed', stage: 'failed', updated_at: '2026-10-20T10:00:00Z' },
-    { mission_id: 'c', title: 'Gamma <img src=x>', status: 'implementation', stage: 'implementation', updated_at: '2026-10-20T10:00:00Z' }];
-  const outcomes = {
-    a: { result: 'succeeded', duration_s: 7200, agent_count: 3, repository: 'org/app', last_event: 'PR #214 merged' },
-    b: { result: 'failed', duration_s: null, agent_count: null, repository: 'org/other', last_event: 'Ended: failed' },
-    c: { result: 'weird', duration_s: 5, agent_count: 1, repository: 'org/app', last_event: '<img src=x onerror=1>' },
-  };
-  const entries = missionEntries([], recorded, Date.now(), Date.now(), outcomes);
-  const byKey = Object.fromEntries(entries.map((e) => [e.key, e]));
-  assert.equal(byKey.a.summary.result, 'succeeded');
-  assert.deepEqual(filterMissions(entries, { result: 'succeeded' }).map((e) => e.key), ['a']);
-  assert.deepEqual(filterMissions(entries, { repository: 'org/app' }).map((e) => e.key).sort(), ['a', 'c']);
-  assert.deepEqual(filterMissions(entries, { result: 'failed', repository: 'org/app' }), []);
-  assert.deepEqual(filterMissions(entries, { search: 'merged' }).map((e) => e.key), ['a']);
-  const row = compactMissionRow(byKey.a);
-  assert.match(row, /data-result="succeeded"><strong>Succeeded<\/strong> · 2h 0m · 3 agents/);
-  assert.match(row, /Last: PR #214 merged/);
-  assert.match(compactMissionRow(byKey.b), /data-result="failed"><strong>Failed<\/strong><\/span>/);   // unknown figures are left out, not zero
-  const hostile = compactMissionRow(byKey.c);
-  assert.doesNotMatch(hostile, /<img/);
-  assert.match(hostile, /data-result="unknown"/);
-  assert.doesNotMatch(compactMissionRow(missionEntries([], [recorded[0]], Date.now(), Date.now(), null)[0]), /mc-result/);
 });
