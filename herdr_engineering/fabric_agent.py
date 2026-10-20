@@ -100,7 +100,7 @@ def _scan_linux() -> dict[int, dict[str, Any]]:
         log.warning("ss scan failed: %s", exc)
         return {}
     result: dict[int, dict[str, Any]] = {}
-    proc_re = re.compile(r'\(\("([^"]+)",pid=')
+    proc_re = re.compile(r'\(\("([^"]+)",pid=(\d+)')
     for line in out.splitlines():
         parts = line.split()
         if len(parts) < 5:
@@ -111,6 +111,7 @@ def _scan_linux() -> dict[int, dict[str, Any]]:
                                   {"addrs": set(), "process": None})
         if entry["process"] is None and proc:
             entry["process"] = proc.group(1)
+            entry["pid"] = int(proc.group(2))
         entry["addrs"].add(_host_of(local))
     return result
 
@@ -138,6 +139,8 @@ def _scan_macos() -> dict[int, dict[str, Any]]:
         entry = result.setdefault(port, {"addrs": set(), "process": None})
         if entry["process"] is None and proc:
             entry["process"] = proc
+            if parts[1].isdigit():
+                entry["pid"] = int(parts[1])
         entry["addrs"].add(_host_of(name))
     return result
 
@@ -149,6 +152,36 @@ def _port_of(addr: str) -> int:
         return int(port)
     except ValueError:
         return -1
+
+
+def _listener_project(pid: int | None, *, timeout: float = 2.0) -> str | None:
+    """Best-effort working-directory basename, never command arguments or paths.
+
+    PID is used locally only. A cwd is a context hint, not proof of a repository
+    or application name. Missing access/process races leave it unknown.
+    """
+    if type(pid) is not int or pid <= 0:
+        return None
+    try:
+        if os.uname().sysname == "Darwin":
+            exe = shutil.which("lsof")
+            if not exe:
+                return None
+            result = subprocess.run([exe, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                                    capture_output=True, text=True, timeout=timeout)
+            paths = [line[1:] for line in result.stdout.splitlines()
+                     if line.startswith("n/")]
+            if len(paths) != 1:
+                return None
+            path = paths[0]
+        else:
+            path = os.readlink(f"/proc/{pid}/cwd")
+        name = Path(path).name
+        if not name or not all(ch.isprintable() for ch in name):
+            return None
+        return name[:120]
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _host_of(addr: str) -> str:
@@ -329,6 +362,8 @@ class FabricAgent:
         self._store: dict[str, dict[str, Any]] = self._load_store()
         self._forwards: dict[int, AgentForwarder] = {}
         self._warned_unleased: set[int] = set()
+        self._cp_last_report: dict[str, float] = {}
+        self._cp_unavailable: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         # Restore forwarders for loopback-only services survived a restart.
         for port_s, entry in self._store.items():
@@ -351,8 +386,7 @@ class FabricAgent:
         # fleet Services page is fully populated across agent restarts (a
         # restart re-heartbeats these leases; it does not re-adopt them, so
         # without this the pre-existing leases would never surface).
-        for entry in self._store.values():
-            self._report_service(entry, "healthy")
+        self._report_services()
 
     # -- store ----------------------------------------------------------
 
@@ -486,7 +520,7 @@ class FabricAgent:
             entry = self._adopt(port, listeners[port])
             if entry:
                 registered.append(entry["label"])
-                self._report_service(entry, "healthy")
+                self._cp_unavailable.pop(entry["label"], None)
 
         # 3) keepalive: heartbeat leases that are due; if the gateway dropped
         # one (restart or TTL lapse), transparently re-register the same
@@ -497,7 +531,12 @@ class FabricAgent:
                    if now - e.get("last_hb", 0.0) >= self.cfg.heartbeat_ttl / 2
                    and e.get("lease_id")]
         for port_s, entry in due:
+            entry["source_port"] = int(port_s)
             self._keepalive(port_s, entry)
+
+        # Reporting must never delay the next lease's gateway heartbeat. It has
+        # its own slower cadence and a bounded batch/failure budget.
+        self._report_services(listeners)
 
         # 4) surface listeners that look like dev services but hold no lease
         # (probe failed, gateway rejected, no forwarder possible): warn once per
@@ -639,6 +678,8 @@ class FabricAgent:
                 "fwd_port": fwd.port if fwd is not None else None,
                 "label": label,
                 "process": process,
+                "project": None,
+                "source_port": port,
                 "last_hb": time.monotonic(),
             }
         log.info("auto-registered %s -> dev port %s",
@@ -655,13 +696,52 @@ class FabricAgent:
         port = entry.get("external_port")
         url = entry.get("url")
         desc = f"{kind} service on {host}"
+        if entry.get("project"):
+            desc += f", working directory {entry['project']}"
+        if entry.get("source_port"):
+            desc += f", listener port {entry['source_port']}"
         if port:
             desc += f" (port {port})"
         if url:
             desc += f", reachable at {url}"
         return desc
 
-    def _report_service(self, entry: dict[str, Any], status: str) -> None:
+    def _report_services(self, listeners: dict[int, dict[str, Any]] | None = None) -> None:
+        """At most 4 reports/2 seconds per cycle; live reports at least 5 min apart.
+
+        A control-plane outage stops the batch on its first failure. Successful
+        reports rotate behind older entries, so recovery drains fairly.
+        """
+        if not self.cfg.control_plane_url:
+            return
+        now = time.monotonic()
+        deadline = now + 2.0
+        pending = [(entry, "unavailable") for entry in self._cp_unavailable.values()]
+        pending += [(entry, "healthy") for entry in sorted(
+            self._store.values(), key=lambda e: self._cp_last_report.get(e["label"], 0.0))
+            if now - self._cp_last_report.get(entry["label"], -300.0) >= 300.0]
+        for entry, status in pending[:4]:
+            if time.monotonic() >= deadline:
+                break
+            if status == "healthy" and listeners is not None:
+                info = listeners.get(entry.get("source_port"), {})
+                entry["project"] = _listener_project(
+                    info.get("pid"), timeout=min(1.0, deadline - time.monotonic()))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            label = entry["label"]
+            if not self._report_service(entry, status,
+                                        heartbeat=status == "healthy" and label in self._cp_last_report,
+                                        timeout=min(1.0, remaining)):
+                break
+            self._cp_last_report[label] = time.monotonic()
+            if status == "unavailable":
+                self._cp_unavailable.pop(label, None)
+                self._cp_last_report.pop(label, None)
+
+    def _report_service(self, entry: dict[str, Any], status: str,
+                        *, heartbeat: bool = False, timeout: float = 2.0) -> bool:
         """Best-effort report of a discovered service to the control plane.
 
         Emits a ``service`` envelope to ``{control_plane_url}/api/v1/ingest`` so
@@ -672,7 +752,7 @@ class FabricAgent:
         of duplicating. Best-effort: a down control plane is never fatal.
         """
         if not self.cfg.control_plane_url:
-            return
+            return False
         payload = {
             "service_name": entry.get("label") or "",
             "host_id": self._machine,
@@ -681,12 +761,15 @@ class FabricAgent:
             "status": status,
             "owner": entry.get("process") or "",
             "description": self._describe_service(entry, self._machine),
+            "project": entry.get("project"),
+            "source_port": entry.get("source_port"),
         }
         body = {
             "entity_type": "service",
             "entity_id": entry.get("lease_id")
                 or f"{self._machine}:{entry.get('external_port')}",
-            "event_type": ("service.registered" if status == "healthy"
+            "event_type": ("service.heartbeat" if heartbeat
+                           else "service.registered" if status == "healthy"
                             else "service.unavailable"),
             "payload": payload,
         }
@@ -695,11 +778,13 @@ class FabricAgent:
             req = urllib.request.Request(
                 url, data=json.dumps(body).encode(),
                 headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=5):
+            with urllib.request.urlopen(req, timeout=timeout):
                 pass
+            return True
         except Exception as exc:  # control plane down: never break the agent
             log.warning("control-plane report failed for %s: %s",
                         entry.get("label"), exc)
+            return False
 
     def _release(self, port_s: str) -> None:
         entry = self._store.pop(port_s, None)
@@ -717,7 +802,10 @@ class FabricAgent:
         # Mirror the lifecycle into the control plane so the service leaves the
         # fleet UI when the app stops.
         if entry:
-            self._report_service(entry, "unavailable")
+            self._cp_unavailable[entry["label"]] = entry
+            # Bound retry memory during a prolonged control-plane outage.
+            if len(self._cp_unavailable) > 1000:
+                self._cp_unavailable.pop(next(iter(self._cp_unavailable)))
 
     # -- run loop ---------------------------------------------------------
 
