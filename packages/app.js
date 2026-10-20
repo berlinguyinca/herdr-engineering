@@ -10,6 +10,7 @@ import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-comp
 import { statusForStage, statusLabel, tokenVar } from './herdr-web-components/status.js';
 import { mountInspector } from './inspector-view.js';
 import { mountMissionActivity } from './mission-live-view.js';
+import { mountServices, renderServiceDetails } from './services-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -79,6 +80,7 @@ const ROUTES = {
 let disposeInspector = null;
 let disposeMissionActivity = null;
 let refreshMissionHistory = null;
+let servicesView = null;
 let renderRevision = 0;
 const onMissionPage = () => /^#\/missions(?:\/|$)/.test(window.location.hash);
 const onSessionPage = () => /^#\/herd\/session\//.test(window.location.hash);
@@ -86,6 +88,7 @@ const onSessionPage = () => /^#\/herd\/session\//.test(window.location.hash);
 async function render() {
   const revision = ++renderRevision;
   refreshMissionHistory = null;
+  if (servicesView) { servicesView.dispose(); servicesView = null; }
   if (disposeMissionActivity) { disposeMissionActivity(); disposeMissionActivity = null; }
   if (disposeInspector) { disposeInspector(); disposeInspector = null; }
   const { parts } = route();
@@ -432,45 +435,17 @@ async function copyText(text, btn) {
   setTimeout(() => { btn.textContent = original; }, 1200);
 }
 
-async function viewServices() {
+async function viewServices(_parts, revision) {
   const { services } = await client.listServices();
-  if (!services.length) { root.innerHTML = '<herdr-empty message="No services registered"></herdr-empty>'; return; }
-  const all = route().query.get('all') === '1';
-  const healthy = services.filter((s) => s.status !== 'unavailable');
-  const shown = all ? services : healthy;
-  const hidden = services.length - healthy.length;
-  root.innerHTML = `
-    <h1>Services</h1>
-    <div style="margin:10px 0;font-size:13px">
-      ${shown.length} accessible` + (hidden > 0 ? ` · ${hidden} unavailable ` : '') + `
-      ${all
-        ? `<a href="#/services" class="hd-btn" style="margin-left:8px">Hide unavailable</a>`
-        : hidden > 0
-          ? `<a href="#/services?all=1" class="hd-btn" style="margin-left:8px">Show unavailable (${hidden})</a>`
-          : ''}
-    </div>
-    <div class="hd-grid">` + shown.map((svc) => `
-      <div class="hd-card">
-        <div class="hd-card__title"><a href="#/services/${esc(svc.service_id)}">${esc(svc.service_name)}</a></div>
-        <div class="hd-card__sub">${esc(svc.description || '')}</div>
-        <div style="margin:6px 0"><herdr-status stage="${esc(svc.status)}"></herdr-status></div>
-        <div class="hd-card__sub"><a href="${esc(svc.url)}" target="_blank" rel="noopener">${esc(svc.url)}</a></div>
-      </div>`).join('') + '</div>';
+  if (revision !== renderRevision) return;
+  servicesView = mountServices(root, client, services, { showAll: route().query.get('all') === '1' });
 }
 
-async function viewService(parts) {
-  const svc = await client.request(`/api/v1/services/${esc(parts[1])}`);
+async function viewService(parts, revision) {
+  const svc = await client.request(`/api/v1/services/${encodeURIComponent(decodeURIComponent(parts[1]))}`);
+  if (revision !== renderRevision) return;
   if (!svc || svc.error) { root.innerHTML = '<herdr-error message="Service not found"></herdr-error>'; return; }
-  root.innerHTML = `
-    <h1>${esc(svc.service_name)}</h1>
-    <p class="muted" style="margin:8px 0;max-width:60ch">${esc(svc.description || '')}</p>
-    <div style="margin:8px 0"><herdr-status stage="${esc(svc.status)}"></herdr-status></div>
-    <div class="hd-grid">
-      <herdr-metric label="Host" value="${esc(svc.host_id)}"></herdr-metric>
-      <herdr-metric label="Port" value="${esc(svc.port)}"></herdr-metric>
-      ${svc.owner ? `<herdr-metric label="Process" value="${esc(svc.owner)}"></herdr-metric>` : ''}
-    </div>
-    <p>URL: <a href="${esc(svc.url)}" target="_blank" rel="noopener">${esc(svc.url)}</a></p>`;
+  root.innerHTML = renderServiceDetails(svc);
 }
 
 async function viewHosts() {
@@ -632,6 +607,10 @@ const LIVE_REFRESH_MS = 5000;
 connectEvents({
   url: '/api/v1/events/stream',
   onEvent: () => {
+    if (servicesView) {
+      if (!liveTimer) liveTimer = setTimeout(() => { liveTimer = null; servicesView?.refresh(); }, LIVE_REFRESH_MS);
+      return;
+    }
     // Mission telemetry owns its polling; SSE must not reset worker inspection.
     if (onMissionPage() && (disposeMissionActivity || decodeURIComponent(route().parts[1] || '').startsWith('pi:'))) {
       // Refresh recorded lifecycle data separately so disclosures stay open.
