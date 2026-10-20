@@ -109,3 +109,22 @@ test("publisher bounds remembered records and retries a rejected update", async 
   await publish({}, [b]);
   assert.equal((await publish({}, [a])).posted, 1);
 });
+
+test("unchanged terminal sessions never heartbeat but changed terminal evidence still publishes", async () => {
+  for (const status of ["finished", "stopped", "failed", " CRASHED ", "completed", "closed"]) {
+    let stamp = 0;
+    const publish = createSnapshotPublisher({ now: () => stamp, fetcher: async () => ({ ok: true }) });
+    const row = { entity_id: "terminal", payload: { status, commit_sha: "a".repeat(40) } };
+    assert.equal((await publish({}, [row])).posted, 1);
+    stamp = 300001;
+    assert.equal((await publish({}, [row])).unchanged, 1);
+    stamp = 30 * 86400000;
+    assert.equal((await publish({}, [row])).unchanged, 1);
+    row.payload.commit_sha = "b".repeat(40);
+    assert.equal((await publish({}, [row])).posted, 1);
+    row.payload.status = "working";
+    assert.equal((await publish({}, [row])).posted, 1);
+    stamp += 300000;
+    assert.equal((await publish({}, [row])).posted, 1);
+  }
+});

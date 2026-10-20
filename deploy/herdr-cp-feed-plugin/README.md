@@ -110,7 +110,9 @@ collection is limited to 8 servers, 128 sessions and a 20-second work budget.
 The loop runs a new pass 30 seconds after the preceding pass finishes. It sends
 changed sessions immediately and unchanged sessions at most once every five
 minutes, retaining at most 256 sent records. Failed or missing observations do
-not mark previously seen sessions finished.
+not mark previously seen sessions finished. Unchanged terminal sessions do not
+heartbeat, so finished/failed notices do not repeat while their record remains
+in the bounded cache; a changed terminal record is still published.
 
 Install all runtime files together: `herdr-plugin.toml`, `package.json`,
 `emit.js`, `enrich.js`, `git-metadata.js`, and `snapshot.js`. The snapshot

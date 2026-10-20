@@ -7,6 +7,11 @@ import { herdrBin } from "./enrich.js";
 import { hostIdentity, resolveUrl } from "./emit.js";
 import { gitMetadata } from "./git-metadata.js";
 
+const TERMINAL_STATES = new Set([
+  "failed", "error", "crashed", "finished", "complete", "completed", "closed",
+  "stopped", "canceled", "cancelled", "succeeded", "done", "archived", "merged",
+]);
+
 function query(binary, args) {
   return new Promise(resolve => {
     execFile(binary, args, { timeout: 5000, maxBuffer: 512 * 1024 }, (error, stdout) => {
@@ -88,7 +93,8 @@ export function createSnapshotPublisher({ fetcher = fetch, now = Date.now, maxEn
     for (const envelope of envelopes) {
       const body = JSON.stringify(envelope);
       const previous = sent.get(envelope.entity_id);
-      if (previous?.body === body && now() - previous.at < 300000) { unchanged++; continue; }
+      const terminal = TERMINAL_STATES.has(String(envelope.payload?.status || "").trim().toLowerCase());
+      if (previous?.body === body && (terminal || now() - previous.at < 300000)) { unchanged++; continue; }
       try {
         const response = await fetcher(`${resolveUrl(env)}/api/v1/ingest`, {
           method: "POST", headers, body,
