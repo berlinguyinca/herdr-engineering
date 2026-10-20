@@ -60,3 +60,13 @@ test('old host and service statuses remain qualified observations', () => {
   assert.match(renderOverviewSection('hosts',data,{hosts:{loaded:true}},now,now),/Last reported healthy/);
   assert.match(renderOverviewSection('services',data,{services:{loaded:true}},now,now),/Reported healthy/);
 });
+
+test('integration lifecycle changes appear without heartbeat or synchronization noise',()=>{
+  const types=['PlannotatorReviewCompleted','PlannotatorReviewFailed','CIPipelineFinished','CIPipelineFailed','PlannotatorReviewStarted','PlannotatorReviewHeartbeat','CISyncCompleted'];
+  const events=types.map(event_type=>({event_type}));
+  assert.equal(meaningfulEvents(events).length,4);
+  const html=renderOverviewSection('activity',{events},{activity:{loaded:true}},now,now);
+  assert.match(html,/Review completed/);assert.match(html,/Review failed/);
+  assert.match(html,/CI run finished/);assert.match(html,/CI run failed/);
+  assert.doesNotMatch(html,/heartbeat|sync|Started/);
+});

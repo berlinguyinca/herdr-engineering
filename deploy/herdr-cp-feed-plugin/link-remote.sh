@@ -23,7 +23,7 @@ fi
 # Copy plugin source (this script lives inside the plugin directory).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$DEST"
-for f in herdr-plugin.toml emit.js; do
+for f in herdr-plugin.toml package.json emit.js enrich.js git-metadata.js snapshot.js; do
   if [ -f "$SCRIPT_DIR/$f" ]; then
     cp "$SCRIPT_DIR/$f" "$DEST/$f"
   else

@@ -12,6 +12,7 @@ import { mountInspector } from './inspector-view.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
+import { mountIntegrations } from './integrations-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { mountServices, renderServiceDetails } from './services-view.js';
@@ -45,6 +46,8 @@ const NAV = [
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Sessions' },
   { path: '/services', label: 'Services' },
+  { path: '/ci', label: 'CI' },
+  { path: '/reviews', label: 'Reviews' },
   { path: '/hosts', label: 'Hosts' },
   { path: '/activity', label: 'Activity' },
   { path: '/analytics', label: 'Analytics' },
@@ -63,6 +66,8 @@ function route() {
 
 const ROUTES = {
   '/overview': viewOverview,
+  '/ci': viewIntegrations,
+  '/reviews': viewIntegrations,
   '/topology': viewTopology,
   '/missions': viewMissions,
   '/missions/:id': viewMission,
@@ -237,11 +242,29 @@ async function viewOverview() {
   dashboardView = mountOverview(document.getElementById('overview-dashboard'), client);
 }
 
+async function viewIntegrations(parts) {
+  const query = route().query;
+  dashboardView = mountIntegrations(root, client, {
+    kind: parts[0], tab: query.get('tab') || 'current', search: query.get('search') || '',
+    repository: query.get('repository') || '', mission: query.get('mission') || '', session: query.get('session') || '',
+  });
+}
+
 async function viewMissions() {
   root.innerHTML = '<h1>Missions</h1><div id="live-missions"></div>';
   const catalog = mountMissionCatalog(document.getElementById('live-missions'), client, {tab: route().query.get('tab') || 'current', status: route().query.get('status') || 'all'});
   disposeMissionActivity = catalog.dispose;
   refreshMissionHistory = catalog.refreshRecorded;
+}
+
+function relatedIntegrationLinks(record, kind, id) {
+  const context = new URLSearchParams({[kind]: id});
+  const repository = typeof record.repository === 'string' ? record.repository : '';
+  const revision = typeof record.revision === 'string' ? record.revision : '';
+  const ci = new URLSearchParams();
+  if (repository) ci.set('repository', repository);
+  if (revision) ci.set('search', revision);
+  return `<nav class="hd-inline" aria-label="Related reviews and builds" style="margin:14px 0;font-size:13px"><a href="#/reviews?${esc(context)}">Related reviews</a><a href="#/ci?${esc(context)}">Related CI</a>${ci.size ? `<a href="#/ci?${esc(ci)}">CI for this ${revision ? 'revision' : 'repository'}</a>` : ''}</nav>`;
 }
 
 async function viewMission(parts, revision) {
@@ -251,12 +274,12 @@ async function viewMission(parts, revision) {
   catch (error) { if (error.status !== 404 || !key.startsWith('pi:')) throw error; }
   if (revision !== renderRevision) return;
   if (key.startsWith('pi:') && !m) {
-    root.innerHTML = '<a href="#/missions">← Missions</a><h1>Pi mission</h1><div id="live-mission-detail"></div>';
+    root.innerHTML = `<a href="#/missions">← Missions</a><h1>Pi mission</h1>${relatedIntegrationLinks({},'mission',key)}<div id="live-mission-detail"></div>`;
     disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
     return;
   }
   if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-history"></div>`;
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}${relatedIntegrationLinks(m,'mission',key)}<div id="mission-history"></div>`;
   if (key.startsWith('pi:')) disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
   const history = document.getElementById('mission-history');
   let pending = false;
@@ -337,6 +360,7 @@ async function viewSession(parts, revision) {
       <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} session · recorded inspection remains available.` : 'Session status reflects the last report; it is not a live process check.'}</p>
       ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
+      ${relatedIntegrationLinks(s,'session',s.session_id)}
       <details class="hd-card sd-details" id="session-details"><summary>Session details and attachment</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}${attach ? `<div class="hd-inline"><code style="flex:1;overflow-wrap:anywhere">${esc(attach)}</code><button class="hd-btn" id="copy-attach">Copy attach command</button></div>` : ''}</details>
       <h2>Inspection</h2><div id="inspector-host"></div>
       ${!terminal ? `<details class="hd-card sd-details"><summary>Send a message</summary><form id="msg-form" class="hd-inline"><input id="msg-input" aria-label="Message to session" placeholder="Steer the session…" style="flex:1;min-width:0;padding:8px"><button type="submit" class="hd-btn">Send</button></form></details>` : ''}

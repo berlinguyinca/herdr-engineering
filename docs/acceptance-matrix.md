@@ -111,9 +111,11 @@ unit-tested; only live convergence/validation is pending.
 - [x] Screenshots/recordings are linked as artifacts. **Live-verified** —
       screenshot published as `art_ed96509c7f0e4cbb8c58` (PNG) to the artifact
       workspace; regression test `test_playwright_capture_publishes_artifact`.
-- [ ] Plannotator review opens through the adopted integration. **BLOCKED_EXTERNAL** —
-      `PlannotatorAdapter` preserves review identity/decision/evidence; live
-      review target not reachable.
+- [x] Plannotator review opens through the adopted integration. Verified upstream
+      v0.28.24 dynamic ready URL and fixture-only decision through authenticated
+      HTTP and an acknowledged durable sink. Native Reviews shows outcomes and
+      lazy-loaded plan/feedback; receipts survive replay. Host launcher installation
+      and reachable runtime hostname are required on each review-owning host.
 
 ## Shared artifacts
 
@@ -217,29 +219,15 @@ unit-tested; only live convergence/validation is pending.
 
 ## CI
 
-- [x] Woodpecker/Pileated repositories/pipelines are visible. **Live-verified**
-      against the real instance (Woodpecker 3.18.1 behind an OAuth2 proxy):
-      `herdr-eng ci repos` → 23 repos; `ci pipelines --repo berlinguyinca/autospec`
-      → 11 pipelines with status/branch/commit; `ci pipeline … 12` → full detail
-      with workflows→tasks (the API is addressed by numeric repo id, resolved
-      from `owner/name`). The `/api/v0/` path assumed earlier was wrong — the
-      real base is `/api/`, and trailing slashes 301 to the SPA.
-- [x] Pipeline/step drill-down is visible; raw step logs are honest-degraded.
-      **Live-verified**: `ci pipeline` flattens `workflows[].children[]` into
-      tasks with `state` + `exit_code` (e.g. `rust-validate` exit 2,
-      `rust-workspace-test` exit 101). Woodpecker 3.x streams raw logs over
-      WebSocket with no REST log endpoint, and the OAuth2 proxy only forwards an
-      interactive browser session (not a bearer token) on the upgrade — so
-      `ci logs` returns an explicit "not available via the API" note plus a web
-      UI link rather than guessing. `ci debug` builds a bounded Debug-with-Pi
-      handoff from the failing tasks.
-- [x] Queue and runner state is visible. **Live-verified**: `ci agents` → 8
-      runner agents (name/version/backend/capacity/last_contact); the agent
-      auth `token` in the raw payload is stripped (never surfaced). The
-      pipeline list carries pending/running entries (the queue).
-- [x] Commit/branch/worktree correlation is correct. Correlator tested.
-- [x] Stale/unavailable CI is shown explicitly rather than guessed.
-- [x] Optional retry/cancel controls respect upstream auth/permissions.
+- [x] Native CI page and Overview summary show repository/project-grouped runs with Current / Failed / Finished tabs, refresh progress, explicit authentication/partial/stale states and provider links.
+- [x] Authenticated Woodpecker v3.18.1 reads verified on 2026-10-20: 116 repositories, 414 recent runs, 43 runners. Server-side PAT only; no browser credential.
+- [x] Pipeline/workflow/step drilldown and bounded, redacted stored REST logs. Correction to September evidence: v3.18.1 supports REST logs and live SSE; the former WebSocket-only claim was incorrect.
+- [x] Retry/cancel use verified POST routes with operator access, deployment opt-in and upstream push permission. HTTP contracts tested; destructive/execution actions are not fired against live jobs as connectivity tests.
+- [x] Explicit Debug with Pi dispatch uses the existing native session messaging path and durable operation receipts; no competing orchestrator.
+- [x] Repository identity includes forge origin; shared-project overrides support separate repositories. Only explicit full commit identities establish mission/session correlations; missing producer evidence remains unlinked.
+- [x] Runner inventory degrades independently of repository monitoring. Queue/wait is observed from pipeline state, never invented queue position.
+- [x] Routine polling is quiet; terminal transitions emit events only after a repository baseline. First-seen historical runs do not generate notifications.
+
 
 ## Multi-agent comparison
 

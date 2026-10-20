@@ -5,6 +5,6 @@
   "type": "module",
   "description": "Native herdr plugin: emit workspace/agent lifecycle events to the HerdR control plane",
   "scripts": {
-    "test": "node --test emit.test.js"
+    "test": "node --test *.test.js"
   }
 }

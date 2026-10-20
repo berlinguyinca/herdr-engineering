@@ -58,6 +58,8 @@ jobs:
         run: npm ci
       - name: Install python deps
         run: python -m pip install -e .[dev]
+      - name: Native session producer contracts
+        run: node --test deploy/herdr-cp-feed-plugin/*.test.js
       - name: Install chromium
         run: npx playwright install --with-deps chromium
       - name: Run UI tests

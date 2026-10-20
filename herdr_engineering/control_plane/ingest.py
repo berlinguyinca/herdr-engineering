@@ -12,6 +12,24 @@ from __future__ import annotations
 
 import re
 
+from .project_links import canonical_repository
+
+
+def _git_identity(payload):
+    """Only explicit forge identity and a dedicated full commit SHA link CI."""
+    fields = ("repository_id", "forge_url", "repository_url", "repo_url", "clone_url")
+    advertised = [payload[k] for k in fields if payload.get(k) is not None]
+    identities = {canonical_repository(value, forge_host=payload.get("forge_host"))
+                  for value in advertised}
+    if None in identities or len(identities) > 1:
+        raise ValueError("repository identity must identify one explicit forge repository")
+    commit_sha = payload.get("commit_sha")
+    if commit_sha is not None:
+        if not isinstance(commit_sha, str) or not re.fullmatch(r"(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})", commit_sha):
+            raise ValueError("commit_sha must be a full 40 or 64 character hexadecimal commit")
+        commit_sha = commit_sha.lower()
+    return {"repository_id": next(iter(identities), None), "commit_sha": commit_sha}
+
 
 class IngestService:
     """Translates lifecycle event envelopes into idempotent repo mutations."""
@@ -40,6 +58,10 @@ class IngestService:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", source):
             raise ValueError("invalid source")
 
+        # Provider-owned observations and review outcomes have dedicated,
+        # authenticated adapters; generic telemetry cannot forge those streams.
+        if entity_type in {"plannotator_review", "ci_pipeline"}:
+            raise ValueError("provider-owned entity type is not accepted by generic ingestion")
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":
                 raise ValueError("invalid mission activity event_type")
@@ -96,7 +118,7 @@ class IngestService:
             cwd=payload.get("cwd"), branch=payload.get("branch"),
             pid=payload.get("pid"), cmdline=payload.get("cmdline"),
             summary=payload.get("summary"), attach=payload.get("attach"),
-            source=source,
+            source=source, **_git_identity(payload),
             **{k: payload.get(k) for k in (
                 "pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
                 "revision", "interactive_ready", "launch_pending", "state_change_seq")})
@@ -112,7 +134,7 @@ class IngestService:
         return self.repo.upsert_mission(
             entity_id, title=payload.get("title") or "",
             purpose=payload.get("purpose") or "", stage=stage,
-            cwd=payload.get("cwd"), source=source)
+            cwd=payload.get("cwd"), source=source, **_git_identity(payload))
 
     def _ingest_service(self, entity_id, event_type, payload) -> dict:
         """A ``service`` envelope maps idempotently to a (host, name) service.

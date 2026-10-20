@@ -928,3 +928,115 @@ test('inspector HTTP cursor catches events received before its baseline even whe
   }finally{gates.forEach(release=>release());}
  },{BURST:'0',INSPECTOR_SEED:'0'});
 });
+
+test('CI catalog keeps filters and step inspection through refresh and shows stale authentication failures',async()=>{
+  await withApp(async({page,base})=>{
+    const errors=[];page.on('pageerror',e=>errors.push(e.message));
+    let reads=0,authError=false,logReads=0;
+    const created=new Date(Date.now()-65000).toISOString();
+    const running={repository:'lab/spectra',project_id:'spectra',run_number:42,state:'running',branch:'main',revision:'abcdef123456',created_at:created,url:'https://ci.example/lab/spectra/42'};
+    const failed={...running,run_number:41,state:'failure',finished_at:new Date().toISOString()};
+    await page.route('**/api/v1/ci',r=>{reads++;return r.fulfill({json:{available:!authError,status:authError?'auth_error':'connected',stale:authError,last_success_at:created,repos:[{repository:'lab/spectra'}],pipelines:{'lab/spectra':[running,failed]},agents:[]}});});
+    await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{...running,tasks:[{id:1,name:'Compile',state:'success'},{id:2,name:'Test spectra',state:'running'}]}}}));
+    await page.route('**/api/v1/ci/log?*',r=>{logReads++;return r.fulfill({json:{available:true,log:`<script>unsafe()</script>\nChecking spectrum ${logReads}`,checked_at:new Date().toISOString()}});});
+    await page.goto(`${base}/#/ci`);
+    await page.getByRole('button',{name:'Run #42',exact:true}).click();
+    await page.getByRole('button',{name:'Test spectra running'}).click();
+    await page.waitForFunction(()=>document.querySelector('.ig-log')?.textContent.includes('Checking spectrum'));
+    assert.equal(await page.locator('.ig-log script').count(),0);
+    assert.equal(await page.locator('[data-ci-action]').count(),0);
+    const search=page.getByRole('searchbox',{name:'Search runs'});await search.fill('spectra');await search.focus();
+    const before=logReads;authError=true;
+    await page.waitForFunction(()=>document.body.innerText.includes('Woodpecker authentication failed'),{},{timeout:12000});
+    assert.ok(reads>=2);assert.ok(logReads>before);
+    assert.equal(await search.inputValue(),'spectra');assert.equal(await search.evaluate(e=>e===document.activeElement),true);
+    assert.equal(await page.locator('[data-step="2"]').getAttribute('aria-pressed'),'true');
+    assert.match(await bodyText(page),/Showing last received records/);
+    await page.getByRole('tab',{name:/^Failed/}).click();
+    await page.getByRole('button',{name:'Run #41',exact:true}).waitFor();
+    assert.equal(await page.getByRole('button',{name:'Run #42',exact:true}).count(),0);
+    await page.setViewportSize({width:390,height:844});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+    assert.deepEqual(errors,[]);
+  },{BURST:'0'});
+});
+
+test('Reviews groups decisions and preserves plan inspection with safe upstream links',async()=>{
+  await withApp(async({page,base})=>{
+    const errors=[];page.on('pageerror',e=>errors.push(e.message));
+    let reads=0,detailReads=0;
+    const reviews=[
+      {review_id:'plan-1',title:'Improve parser',kind:'plan',status:'awaiting_review',project_id:'spectra',repository:'lab/api',updated_at:'2026-10-20T12:00:00Z',review_url:'https://review.example/one',mission_id:'pi:mission'},
+      {review_id:'code-1',title:'Revise decoder',kind:'code',status:'changes_requested',project_id:'spectra',repository:'lab/web',feedback:'Add empty-input validation',review_url:'javascript:alert(1)'},
+      {review_id:'old-1',title:'Approved parser',kind:'plan',status:'approved',repository:'lab/api'},
+    ];
+    await page.route('**/api/v1/reviews',r=>{reads++;return r.fulfill({json:{available:true,reviews,checked_at:new Date().toISOString()}});});
+    await page.route('**/api/v1/reviews/plan-1',r=>{detailReads++;return r.fulfill({json:{...reviews[0],plan:`## Plan\nRead <script>unsafe()</script> safely. Detail ${detailReads}`}});});
+    await page.goto(`${base}/#/reviews`);
+    await page.getByText('Improve parser',{exact:true}).waitFor();
+    const external=page.getByRole('link',{name:'Open in Plannotator'});
+    assert.equal(await external.getAttribute('href'),'https://review.example/one');
+    assert.equal(await external.getAttribute('rel'),'noopener noreferrer');
+    assert.equal(detailReads,0);
+    await page.getByText('Plan and feedback',{exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('.ig-log')?.textContent.includes('Detail 1'));
+    const before=reads;
+    await page.waitForTimeout(5500);
+    assert.ok(reads>before);assert.equal(await page.locator('details[data-review-details]').evaluate(e=>e.open),true);
+    assert.equal(await page.locator('.ig-log script').count(),0);assert.equal(detailReads,1);
+    reviews[0].updated_at='2026-10-20T12:01:00Z';
+    await page.waitForFunction(()=>document.querySelector('.ig-log')?.textContent.includes('Detail 2'),{},{timeout:12000});
+    assert.equal(detailReads,2);
+    await page.getByRole('tab',{name:/^Changes requested/}).click();
+    await page.getByText('Revise decoder',{exact:true}).waitFor();
+    assert.equal(await page.getByRole('link',{name:'Open in Plannotator'}).count(),0);
+    await page.getByRole('tab',{name:/^Finished/}).click();
+    await page.getByText('Approved parser',{exact:true}).waitFor();
+    await page.getByRole('searchbox',{name:'Search reviews'}).fill('missing project');
+    assert.match(await bodyText(page),/No reviews match this view/);
+    await page.setViewportSize({width:390,height:844});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+    assert.deepEqual(errors,[]);
+  },{BURST:'0'});
+});
+
+test('failed CI run sends debugging context only to an explicitly chosen active Pi session',async()=>{
+  await withApp(async({page,base})=>{
+    const posts=[];
+    const failed={provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure'};
+    await page.route('**/api/v1/ci',r=>r.fulfill({json:{available:true,status:'connected',pipelines:{'lab/spectra':[failed]}}}));
+    await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{repository:'7',number:42,status:'failure',commit:'a'.repeat(40),tasks:[{id:1,name:'Tests',state:'failure'}]}}}));
+    await page.route('**/api/v1/sessions',r=>r.fulfill({json:{sessions:[{session_id:'chosen',agent_role:'pi',status:'active',title:'Parser agent',host_id:'beast',terminal_id:'term_1',herdr_session:'default',agent_session:{agent:'pi'}},{session_id:'closed',agent_role:'pi',status:'closed'},{session_id:'other',agent_role:'codex',status:'active'}]}}));
+    await page.route('**/api/v1/ci/debug',r=>{posts.push(r.request().postDataJSON());if(posts.length===1)return r.abort('failed');return r.fulfill({json:{ok:true,status:'delivered'}});});
+    await page.addInitScript(()=>{
+      Object.defineProperty(crypto,'randomUUID',{value:undefined,configurable:true});
+      const original=EventTarget.prototype.addEventListener;
+      window.integrationListeners=[];
+      EventTarget.prototype.addEventListener=function(type,callback,options){
+        if(this.id==='view' && ['click','change','toggle'].includes(type))window.integrationListeners.push({type,signal:options?.signal});
+        return original.call(this,type,callback,options);
+      };
+    });
+    await page.goto(`${base}/#/ci?tab=failed`);
+    await page.getByRole('button',{name:'Run #42',exact:true}).waitFor();
+    await page.evaluate(()=>{window.location.hash='/reviews';});
+    await page.getByRole('heading',{name:'Reviews',exact:true}).waitFor();
+    assert.equal(await page.evaluate(()=>window.integrationListeners.slice(0,3).every(l=>l.signal?.aborted)),true);
+    await page.evaluate(()=>{window.location.hash='/ci?tab=failed';});
+    await page.getByRole('button',{name:'Run #42',exact:true}).click();
+    await page.getByText('Debug with Pi',{exact:true}).click();
+    const select=page.getByRole('combobox',{name:'Target Pi session'});
+    await select.waitFor();assert.equal(await select.locator('option').count(),2);
+    assert.equal(await page.getByRole('button',{name:'Send to Pi',exact:true}).isDisabled(),true);
+    assert.equal(posts.length,0);
+    await select.selectOption('chosen');
+    await page.getByRole('button',{name:'Send to Pi',exact:true}).click();
+    await page.getByText('Delivery unconfirmed; retry checks the same operation.',{exact:true}).waitFor();
+    assert.equal(posts.length,1);
+    await page.getByRole('button',{name:'Send to Pi',exact:true}).click();
+    await page.getByText('Debugging context delivered to the selected Pi session.',{exact:true}).waitFor();
+    assert.equal(posts.length,2);assert.equal(posts[1].operation_id,posts[0].operation_id);assert.equal(posts[0].session_id,'chosen');assert.equal(posts[0].repository,'7');
+    assert.equal(posts[0].number,42);assert.match(posts[0].operation_id,/^[0-9a-f-]{36}$/);
+    assert.match(await page.locator('.ig-inspector').innerText(),/Run #42/);
+  },{BURST:'0'});
+});

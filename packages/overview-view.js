@@ -4,6 +4,7 @@ import { formatDuration } from './herdr-web-components/format.js';
 import { missionEntries } from './mission-catalog-view.js';
 import { recordOutcome } from './record-state.js';
 import { serviceState } from './services-view.js';
+import { integrationEntries } from './integrations-view.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -40,6 +41,8 @@ const eventLabels = {
   MissionCompleted:'Mission finished', MissionCancelled:'Mission canceled',
   SessionStarted:'Session started', SessionTerminated:'Session stopped', SessionFailed:'Session failed',
   HostUnavailable:'Host unavailable', ArtifactRegistered:'Artifact saved',
+  PlannotatorReviewCompleted:'Review completed', PlannotatorReviewFailed:'Review failed',
+  CIPipelineFinished:'CI run finished', CIPipelineFailed:'CI run failed',
 };
 function eventLabel(event) {
   if (eventLabels[event.event_type]) return eventLabels[event.event_type];
@@ -62,7 +65,7 @@ const empty = label => `<p class="ov-note">${esc(label)}</p>`;
 function availability(keys, states) {
   return keys.map(key => {
     const state = states[key];
-    const label = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Sessions',services:'Services',hosts:'Hosts',activity:'Recent activity',health:'Control plane'}[key];
+    const label = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Sessions',services:'Services',hosts:'Hosts',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews'}[key];
     if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: Could not refresh.${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
     if (!state?.loaded) return `<p class="ov-note" role="status">Loading ${esc(label.toLowerCase())}…</p>`;
     return '';
@@ -96,6 +99,17 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
       <p class="ov-note">Latest reported state; an open record does not confirm a worker is running.</p>
       ${s.current.length ? `<ul class="ov-list">${s.current.slice(0,5).map(session=>`<li class="ov-row"><div>${link(`#/herd/session/${encodeURIComponent(session.session_id)}`,short(session.title || session.summary || session.agent_role || 'Agent session'))}<p>${esc(short(session.cwd || session.branch || session.model || 'Workspace not reported'))}</p></div><span class="ov-tag">Last reported ${esc(human(session.status) || 'unknown')}<br>${esc(session.host_id || 'Host unknown')} · ${ageMarkup(session.last_activity || session.updated_at,now)}</span></li>`).join('')}</ul>` : empty('No open session records.')}
       ${s.current.length > 5 ? empty(`Showing 5 of ${s.current.length} open records.`) : ''}${historyLinks('herd',s)}` : ''}`;
+  }
+  if (section === 'ci' || section === 'reviews') {
+    const isCi=section==='ci', snapshot=data[section], entries=integrationEntries(snapshot,section);
+    const current=entries.filter(e=>e.tab==='current'), attention=entries.filter(e=>e.tab===(isCi?'failed':'changes'));
+    const ready=states[section]?.loaded;
+    const title=isCi?'CI builds':'Plan and code reviews';
+    return `<div class="ov-heading"><h2>${title}</h2>${link(`#/${section}`,isCi?'All CI →':'All reviews →')}</div>${availability([section],states)}${ready ? `
+      ${isCi && snapshot.available===false && !entries.length ? `<p class="ov-warning">${esc(snapshot.status==='auth_error'?'Woodpecker authentication needs attention.':snapshot.status==='not_configured'?'Woodpecker is not configured.':'CI reports are unavailable.')}</p>` : `<div class="ov-metrics">${metric(current.length,isCi?'Queued / running / unknown':'Awaiting review',`#/${section}`)}${metric(attention.length,isCi?'Failed':'Changes requested',`#/${section}?tab=${isCi?'failed':'changes'}`)}</div>`}
+      ${snapshot.stale ? '<p class="ov-warning">Showing stale reports. Open the catalog for connection details.</p>' : ''}
+      ${current.length ? `<ul class="ov-list">${current.slice(0,3).map(e=>`<li class="ov-row"><div>${link(`#/${section}?search=${encodeURIComponent(e.record.repository || e.record.review_id || '')}`,short(e.record.title || e.record.repository || (isCi?'CI run':'Review')))}<p>${esc(isCi?`Run #${e.record.run_number} · ${e.record.branch || 'Branch not reported'}`:e.record.repository || 'Repository not reported')}</p></div><span class="ov-tag">${esc(human(e.record.state || e.record.status) || 'Status unknown')}</span></li>`).join('')}</ul>` : ''}
+      <p class="ov-note">${isCi?'Recent pipeline window; inspect steps, output and provider refresh progress.':'Review decisions and revision links stay with Plannotator.'}</p>` : ''}`;
   }
   if (section === 'services') {
     const s=model.services;
@@ -131,7 +145,7 @@ const styles = `<style>
 export function mountOverview(container, client) {
   let disposed=false, clock=null, received=Date.now();
   const data={}, states={}, controllers=new Map(), timers=new Map(), signatures=new Map();
-  const panels=['missions','sessions','services','hosts','activity','health'];
+  const panels=['missions','sessions','ci','reviews','services','hosts','activity','health'];
   const sources={
     projections:signal=>client.listMissionActivity({signal}),
     missions:signal=>client.listMissions(undefined,{signal}),
@@ -140,6 +154,8 @@ export function mountOverview(container, client) {
     hosts:signal=>client.listHosts({signal}),
     activity:signal=>client.activity(50,{signal}),
     health:signal=>client.health({signal}),
+    ci:signal=>client.getCi({signal}),
+    reviews:signal=>client.listReviews({signal}),
   };
   container.innerHTML=`${styles}<p class="ov-intro">Current work, recent reports, and changes that matter. Finished, closed, and failed records stay in their respective tabs.</p><div class="ov-layout">${panels.filter(key=>key!=='health').map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
   function draw() {
@@ -172,8 +188,9 @@ export function mountOverview(container, client) {
       const response=await sources[key](controller.signal);
       if(disposed || controller.signal.aborted)return;
       const field={projections:'activities',activity:'events'}[key] || key;
-      if (key === 'health' ? !response || typeof response.status !== 'string' : !Array.isArray(response?.[field])) throw new Error('Invalid response');
-      data[key==='activity' ? 'events' : key]=key==='health' ? response : records(response?.[field]);
+      const objectSource=['health','ci','reviews'].includes(key);
+      if (objectSource ? !response || (key==='health' ? typeof response.status!=='string' : key==='ci' ? typeof response.available!=='boolean' : !Array.isArray(response.reviews)) : !Array.isArray(response?.[field])) throw new Error('Invalid response');
+      data[key==='activity' ? 'events' : key]=objectSource ? response : records(response?.[field]);
       if(key==='projections')received=Date.now();
       states[key]={loaded:true,error:false};
       draw();

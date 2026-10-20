@@ -15,9 +15,10 @@
 
 import os from "node:os";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, normalize } from "node:path";
 import { execFile } from "node:child_process";
 import { statSync } from "node:fs";
+import { gitMetadata } from "./git-metadata.js";
 
 // Locate the herdr CLI. Prefer PATH; fall back to the per-user install dir that
 // herdr commonly lives in (and that the non-interactive plugin env may miss).
@@ -41,7 +42,7 @@ export function herdrBin(env = {}) {
 
 function run(cmd, args, cwd) {
   return new Promise((resolve) => {
-    execFile(cmd, args, { cwd, timeout: 5000 },
+    execFile(cmd, args, { cwd, timeout: 5000, maxBuffer: 128 * 1024 },
       (err, stdout) => {
         if (err) return resolve(null);
         const out = String(stdout || "").trim();
@@ -64,6 +65,23 @@ async function runJson(cmd, args) {
 function serverArgs(env) {
   const name = env.HERDR_SESSION_NAME || env.HERDR_SESSION;
   return name ? ["--session", name] : [];
+}
+
+// Native hooks can identify their server by socket instead of session name.
+// Resolve only an exact, unique live registry entry; pane IDs and cwd are not
+// unique across servers and must never establish a command route.
+export async function resolveSessionEnv(env) {
+  if (env.HERDR_SESSION_NAME || env.HERDR_SESSION) return env;
+  const socket = env.HERDR_SOCKET_PATH;
+  if (typeof socket !== "string" || socket.length > 4096 || !isAbsolute(socket) || /[\x00-\x1f]/.test(socket)) return env;
+  const registry = await runJson(herdrBin(env), ["session", "list", "--json"]);
+  if (!Array.isArray(registry?.sessions) || registry.sessions.length > 32) return env;
+  const matches = registry.sessions.filter(row => row?.running === true
+    && typeof row.name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(row.name)
+    && typeof row.socket_path === "string" && isAbsolute(row.socket_path)
+    && normalize(row.socket_path) === normalize(socket));
+  if (matches.length !== 1 || registry.sessions.filter(row => row?.running === true && row.name === matches[0].name).length !== 1) return env;
+  return { ...env, HERDR_SESSION_NAME: matches[0].name };
 }
 
 // Pane info from `herdr pane get`. Returns { agent, cwd, summary } or null.
@@ -119,7 +137,7 @@ export function attachCommand(env, host, ws) {
 export function mergeDetail(envelope, detail) {
   if (!envelope || envelope.entity_type !== "session" || !detail) return envelope;
   const payload = { ...(envelope.payload || {}) };
-  for (const k of ["agent_role", "cwd", "branch", "pid", "cmdline", "summary", "attach", "terminal_id", "agent_session", "revision", "interactive_ready", "launch_pending", "state_change_seq"]) {
+  for (const k of ["agent_role", "cwd", "branch", "pid", "cmdline", "summary", "attach", "terminal_id", "agent_session", "revision", "interactive_ready", "launch_pending", "state_change_seq", "repository_id", "commit_sha"]) {
     const v = detail[k];
     if (v !== undefined && v !== null && v !== "") {
       if (k === "agent_role" && payload.agent_role) continue; // prefer existing
@@ -144,8 +162,12 @@ export async function enrichSession(env, envelope) {
     processDetail(routedEnv, paneId).catch(() => null),
   ]);
   const cwd = pane?.cwd || proc?.cwd || null;
-  const branch = await branchDetail(env, cwd).catch(() => null);
+  const [branch, repository] = await Promise.all([
+    branchDetail(env, cwd).catch(() => null),
+    gitMetadata(cwd).catch(() => ({})),
+  ]);
   const detail = {
+    ...repository,
     agent_role: pane?.agent,
     terminal_id: pane?.terminal_id,
     agent_session: pane?.agent_session,

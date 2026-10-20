@@ -14,6 +14,7 @@ dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
 herdr-eng = "herdr_engineering.cli:main"
+herdr-plannotator = "herdr_engineering.plannotator:main"
 
 [tool.ruff]
 line-length = 100
