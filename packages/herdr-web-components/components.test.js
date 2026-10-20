@@ -68,3 +68,9 @@ test('mission attention transitions retain an actionable status label', () => {
   assert.equal(statusForStage('crashed').label, 'Crashed');
   assert.equal(statusForStage('crashed').token, '--status-failed');
 });
+
+test('duration rounding carries into minutes and hours instead of showing 60 seconds',()=>{
+  assert.equal(formatDuration(299999),'5m 0s');
+  assert.equal(formatDuration(3599999),'1h 0m');
+  assert.equal(formatDuration(59999),'1m 0s');
+});

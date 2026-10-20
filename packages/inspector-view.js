@@ -190,8 +190,10 @@ export function mountInspector(host, client, sessionId) {
     url: client.inspectorStreamUrl(sessionId),
     onEvent: (f) => {
       if (disposed) return;
-      if (f.type === 'connected') {            // first connect and every reconnect: resync
-        if (st.loaded || st.data) load();
+      if (f.type === 'connected') {
+        // The first snapshot may predate the subscription. Resync on every
+        // connection; reqId prevents that older response replacing newer data.
+        load();
         return;
       }
       if (f.type === 'gap') { load(); return; }
