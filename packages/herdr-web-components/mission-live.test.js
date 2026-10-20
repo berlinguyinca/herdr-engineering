@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { missionCard, missionDetail, freshnessAt } from '../mission-live-view.js';
+import { missionCard, missionDetail, freshnessAt, missionHealth } from '../mission-live-view.js';
 const now = Date.parse('2026-10-20T12:00:00Z');
 const projection = {
   mission_key: 'pi:MSN-1', host_id: 'beast', instance_id: 'pi-1', session_id: 'native-123',
@@ -29,6 +29,7 @@ test('freshness ages on the client and disconnection never implies stalled or cr
 test('detail escapes and bounds output and does not guess Herdr session links', () => {
   const html = missionDetail(projection, now);
   assert.match(html, /&lt;script&gt;/); assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /flash → metabolomics\/qwen3.8/);
   assert.match(html, /native-123/); assert.doesNotMatch(html, /#\/herd\/session/);
   const long = structuredClone(projection); long.activity.workerDetails[0].lastOutputPreview = 'x'.repeat(20000);
   assert.ok(missionDetail(long, now).length < 17000);
@@ -83,4 +84,78 @@ test('active mission health excludes finished attempts while preserving current 
   assert.match(missionCard(p, now), /Live telemetry · stalled<\/div>/);
   p.activity.health = 'failed';
   assert.match(missionCard(p, now), /Live telemetry · failed<\/div>/);
+});
+
+test('detail prioritizes current work and keeps finished attempts in collapsed history', () => {
+  const p = structuredClone(projection);
+  p.activity.workerDetails.unshift({workerId: 'finished-attempt', state: 'completed', endedAt: '2026-10-20T11:00:00Z'});
+  const html = missionDetail(p, now);
+  const header = html.slice(0, html.indexOf('</article>'));
+  assert.match(header, /1 current · 1 finished/);
+  assert.doesNotMatch(header, /finished-attempt|reviewer|ml-workers-summary/);
+  assert.ok(html.indexOf('data-worker="reviewer"') < html.indexOf('data-disclosure="worker-history"'));
+  assert.match(html, /<details[^>]*data-disclosure="worker-history"[^>]*><summary>Worker history · 1/);
+  assert.equal((html.match(/data-worker="finished-attempt"/g) || []).length, 1);
+});
+
+test('detail reveals the complete brief and diagnostics on demand and omits empty panels', () => {
+  const p = structuredClone(projection);
+  p.mission.title = 'A mission with a very long prompt '.repeat(50);
+  p.activity.currentObjective = 'A detailed objective '.repeat(30);
+  const html = missionDetail(p, now);
+  const header = html.slice(0, html.indexOf('</article>'));
+  assert.ok(header.length < 3000);
+  assert.ok(!header.includes(p.mission.title));
+  assert.ok(html.includes(p.mission.title));
+  assert.ok(html.includes(p.activity.currentObjective));
+  assert.match(html, /data-disclosure="brief"/);
+  assert.match(html, /data-disclosure="diagnostics"/);
+  assert.doesNotMatch(header, /native-123|Mission revision/);
+  for (const title of ['Changed files', 'Tests and review', 'Retries and recovery', 'Errors and blockers', 'Recent activity']) assert.ok(!html.includes(title), title);
+});
+
+test('actual blockers and failing tests are open by default while supporting records stay collapsed', () => {
+  const p = structuredClone(projection);
+  p.activity.health = 'blocked';
+  p.activity.reason = 'Build cannot reach registry';
+  p.activity.errors = [{example: 'Registry refused connection', count: 2}];
+  p.activity.tests = {failed: 1, passed: 2, failures: ['assertion failed']};
+  p.activity.changes = {changedFiles: ['src/main.js']};
+  const html = missionDetail(p, now);
+  assert.match(html, /<details[^>]*data-disclosure="blockers"[^>]* open>/);
+  assert.match(html, /<details[^>]*data-disclosure="tests"[^>]* open>/);
+  assert.match(html, /<details[^>]*data-disclosure="changes"[^>]*><summary>/);
+  assert.match(html, /Registry refused connection/);
+});
+
+test('workflow fractional weights display without floating point noise', () => {
+  const p = structuredClone(projection);
+  p.activity.workflowProgress = {completed: 2.4000000000000004, total: 7, basis: 'weighted_dag'};
+  assert.match(missionDetail(p, now), /2\.4 \/ 7 completed/);
+  assert.doesNotMatch(missionDetail(p, now), /2\.4000000000000004/);
+});
+
+
+test('detail keeps freshness and output primary while diagnostic clocks remain inspectable', () => {
+  const p = structuredClone(projection);
+  p.activity.lastOutputAt = '2026-10-20T11:59:50Z';
+  p.activity.currentActivityStartedAt = '2026-10-20T11:58:00Z';
+  const html = missionDetail(p, now);
+  const header = html.slice(0, html.indexOf('</article>'));
+  assert.match(header, /Last output/);
+  assert.match(header, /Report age/);
+  assert.doesNotMatch(header, /Activity elapsed|Last progress|Heartbeat age/);
+  assert.match(html.slice(html.indexOf('data-disclosure="diagnostics"')), /Activity elapsed/);
+  assert.equal(missionHealth(p.activity, p.mission), 'stalled');
+});
+
+
+test('terminal lifecycle moves cached running workers into recorded history', () => {
+  const p = structuredClone(projection);
+  p.mission.status = 'COMPLETE';
+  const html = missionDetail(p, now);
+  const header = html.slice(0, html.indexOf('</article>'));
+  assert.match(header, /0 current · 1 recorded/);
+  assert.match(html, /data-detail-workers>Last recorded workers/);
+  assert.ok(html.indexOf('data-disclosure="worker-history"') < html.indexOf('data-worker="reviewer"'));
 });

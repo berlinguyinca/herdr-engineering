@@ -25,7 +25,7 @@ export function freshnessAt(p, received, now = Date.now()) {
   if (state === 'live' && (p.connection === 'updating' || f.state === 'updating')) state = 'updating';
   return { state, age: seconds };
 }
-function worstHealth(a, mission) {
+export function missionHealth(a = {}, mission = {}) {
   // Lifecycle is authoritative after completion or a pause. Failed attempts
   // remain inspectable, but cannot override a running replacement worker.
   const status = text(mission.status).toUpperCase();
@@ -49,6 +49,13 @@ function progress(a) {
   }
   return '<div class="muted">Progress unknown · no acceptance measurements reported</div>';
 }
+const count = value => Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
+const terminalMission = m => ['COMPLETE', 'COMPLETED', 'FAILED', 'CANCELED', 'CANCELLED'].includes(text(m.status).toUpperCase());
+const finishedWorker = (w, m = {}) => terminalMission(m) || Boolean(w.endedAt) || ['completed', 'complete', 'failed', 'canceled', 'cancelled', 'stopped', 'aborted'].includes(text(w.state).toLowerCase());
+const shortTitle = value => value.length > 180 ? `${value.slice(0, 177).trimEnd()}…` : value;
+function disclosure(key, title, body, open = false) {
+  return `<details class="hd-card ml-disclosure" data-disclosure="${esc(key)}"${open ? ' open' : ''}><summary>${esc(title)}</summary>${body}</details>`;
+}
 function model(w) { return [w.route, w.model].filter(Boolean).join(' → ') || 'Model not reported'; }
 function freshnessLabel(f, health) {
   if (f.state === 'updating') return `Updating telemetry · current details unavailable · last reported ${health}`;
@@ -56,51 +63,71 @@ function freshnessLabel(f, health) {
 }
 export function missionCard(p, now = Date.now(), detail = false) {
   const a = p.activity || {}, m = p.mission || {};
-  const health = worstHealth(a, m), f = freshnessAt(p, now, now);
+  const health = missionHealth(a, m), f = freshnessAt(p, now, now);
+  const workers = records(a.workerDetails), finished = workers.filter(w => finishedWorker(w, m)).length;
   return `<article class="hd-card ml-card" data-mission-key="${esc(p.mission_key)}">
-    <div class="hd-card__title">${detail ? esc(m.title || m.id) : `<a href="#/missions/${encodeURIComponent(p.mission_key)}">${esc(m.title || m.id)}</a>`}</div>
+    <div class="hd-card__title${detail ? ' ml-detail-title' : ''}">${detail ? esc(shortTitle(m.title || m.id || 'Untitled mission')) : `<a href="#/missions/${encodeURIComponent(p.mission_key)}">${esc(m.title || m.id)}</a>`}</div>
     <div class="ml-freshness" data-freshness data-health="${esc(health)}" data-state="${f.state}">${esc(freshnessLabel(f, health))}</div>
-    <div class="muted">Pi · ${esc(p.host_id || 'Host unknown')} · ${esc(p.mission_key)} · ${esc(m.status || 'State unknown')}</div>
+    <div class="muted">Pi · ${esc(p.host_id || 'Host unknown')} · ${detail ? '' : `${esc(p.mission_key)} · `}${esc(m.status || 'State unknown')}</div>
     <p><strong data-activity-label>${f.state === 'live' ? 'Activity' : 'Last known activity'}:</strong> ${esc(a.currentActivity?.summary || 'No current activity reported')}</p>
-    ${a.currentObjective ? row('Objective', a.currentObjective) : ''}
+    ${!detail && a.currentObjective ? row('Objective', a.currentObjective) : ''}
     <div class="muted" data-evidence-label>${f.state === 'live' ? 'Current reported measurements' : 'Last recorded measurements'}</div>
     ${progress(a)}
-    ${a.workflowProgress?.basis === 'weighted_dag' && Number.isFinite(a.workflowProgress.completed) && Number.isFinite(a.workflowProgress.total) && a.workflowProgress.total > 0 ? row('Workflow tasks', `${a.workflowProgress.completed} / ${a.workflowProgress.total} completed`) : ''}
-    <div class="ml-clocks">${clock('Activity elapsed', a.currentActivityStartedAt, now)}${clock('Last output', a.lastOutputAt, now)}${clock('Last progress', a.lastMeaningfulProgressAt, now)}${clock('Heartbeat age', a.lastHeartbeatAt, now)}<span>Report age <span data-report-age>${duration(f.age)}</span></span></div>
+    ${a.workflowProgress?.basis === 'weighted_dag' && Number.isFinite(a.workflowProgress.completed) && Number.isFinite(a.workflowProgress.total) && a.workflowProgress.total > 0 ? row('Workflow tasks', `${count(a.workflowProgress.completed)} / ${count(a.workflowProgress.total)} completed`) : ''}
+    <div class="ml-clocks">${detail ? a.lastOutputAt ? clock('Last output', a.lastOutputAt, now) : '<span>No output reported</span>' : `${clock('Activity elapsed', a.currentActivityStartedAt, now)}${clock('Last output', a.lastOutputAt, now)}${clock('Last progress', a.lastMeaningfulProgressAt, now)}${clock('Heartbeat age', a.lastHeartbeatAt, now)}`}<span>Report age <span data-report-age>${duration(f.age)}</span></span></div>
     ${row('Waiting', human(a.waitingReason))}${a.waitingSince ? `<div class="ml-clocks">${clock('Waiting for', a.waitingSince, now)}</div>` : ''}
     <div class="muted" data-workers-label>${f.state === 'live' ? 'Workers' : 'Last recorded workers'}</div>
-    ${records(a.workerDetails).length ? `<div class="ml-workers-summary">${records(a.workerDetails).slice(0, 100).map(w => `<div>${esc(w.workerId)} · ${esc(w.health || w.state || 'unknown')} · ${esc(model(w))}</div>`).join('')}</div>` : '<div class="muted">Worker detail not reported</div>'}
+    ${detail ? `<div>${workers.length - finished} current · ${finished} ${terminalMission(m) ? 'recorded' : 'finished'}</div>` : records(a.workerDetails).length ? `<div class="ml-workers-summary">${records(a.workerDetails).slice(0, 100).map(w => `<div>${esc(w.workerId)} · ${esc(w.health || w.state || 'unknown')} · ${esc(model(w))}</div>`).join('')}</div>` : '<div class="muted">Worker detail not reported</div>'}
     ${row('Next action', a.nextAction)}
   </article>`;
 }
-function section(title, items, render) {
-  return `<section class="hd-card"><h3>${esc(title)}</h3>${items.length ? items.map(render).join('') : '<p class="muted">No data reported</p>'}</section>`;
-}
 export function missionDetail(p, now = Date.now()) {
-  const a = p.activity || {};
-  const current = freshnessAt(p, now, now).state === 'live';
-  const workers = records(a.workerDetails).slice(0, 100).map(w => `<details class="hd-card ml-worker" data-worker="${esc(w.workerId)}">
-    <summary>${esc(w.workerId)} · ${esc(w.health || w.state || 'unknown')} · ${esc(w.currentActivity || 'No current activity reported')}</summary>
-    ${row('Task', w.taskId)}${row('Model / route', model(w))}${row('Serving node', w.node)}${row('Host', w.host)}
-    ${row('Waiting reason', human(w.waitingReason))}
-    <div class="ml-clocks">${clock('Worker elapsed', w.startedAt, now, w.endedAt)}${clock('Activity elapsed', w.currentActivityStartedAt, now, w.endedAt)}${clock('Last output', w.lastOutputAt, now)}${clock('Last progress', w.lastMeaningfulProgressAt, now)}${clock('Heartbeat age', w.lastHeartbeatAt, now)}</div>
-    ${w.inferenceWaitMs != null ? row('Inference wait', duration(w.inferenceWaitMs / 1000)) : ''}
-    ${row('Route fallbacks', w.fallbacks)}${row('Repeated errors', w.repeatedErrors)}${row('Repeated cycles', w.repeatedCycles)}
-    <h4>Captured tool output</h4><pre>${esc(bounded(w.lastOutputPreview) || 'No captured output reported')}</pre>
-  </details>`).join('');
+  const a = p.activity || {}, m = p.mission || {};
+  const current = freshnessAt(p, now, now).state === 'live' && !terminalMission(m);
+  const health = missionHealth(a, m);
+  const workers = records(a.workerDetails).slice(0, 100);
+  const currentWorkers = workers.filter(w => !finishedWorker(w, m));
+  const history = workers.filter(w => finishedWorker(w, m));
+  // Attempt identity stays stable if a worker moves from current work into history.
+  const keys = new Map();
+  const renderWorker = w => {
+    const identity = JSON.stringify([w.workerId, w.taskId, w.startedAt]);
+    const occurrence = keys.get(identity) || 0;
+    keys.set(identity, occurrence + 1);
+    return `<details class="hd-card ml-worker" data-worker="${esc(w.workerId)}" data-disclosure="${esc(`worker:${identity}:${occurrence}`)}">
+      <summary><span>${esc(w.workerId)} · ${esc(w.health || w.state || 'unknown')}</span><span class="ml-worker-activity">${esc(w.currentActivity || 'No current activity reported')}</span></summary>
+      ${row('Task', w.taskId)}${row('Model / route', model(w))}${row('Serving node', w.node)}${row('Host', w.host)}
+      ${row('Waiting reason', human(w.waitingReason))}
+      <div class="ml-clocks">${clock('Worker elapsed', w.startedAt, now, w.endedAt)}${clock('Activity elapsed', w.currentActivityStartedAt, now, w.endedAt)}${clock('Last output', w.lastOutputAt, now)}${clock('Last progress', w.lastMeaningfulProgressAt, now)}${clock('Heartbeat age', w.lastHeartbeatAt, now)}</div>
+      ${w.inferenceWaitMs != null ? row('Inference wait', duration(w.inferenceWaitMs / 1000)) : ''}
+      ${row('Route fallbacks', w.fallbacks)}${row('Repeated errors', w.repeatedErrors)}${row('Repeated cycles', w.repeatedCycles)}
+      <h4>Captured tool output</h4><pre>${esc(bounded(w.lastOutputPreview) || 'No captured output reported')}</pre>
+    </details>`;
+  };
   const tests = a.tests, review = a.review;
+  const changes = list(a.changes?.changedFiles).slice(0, 100);
+  const recovery = records(a.recovery).slice(-30);
+  const errors = records(a.errors).slice(-30);
+  const events = records(a.activity).slice(-50).reverse();
+  const blocked = ['blocked', 'stalled', 'failed'].includes(health) || health.startsWith('paused:');
   return `${missionCard(p, now, true)}
-    <div class="hd-card">${row('Native Pi session', p.session_id)}${row('Pi instance', p.instance_id)}${row('Activity snapshot time', p.activity_snapshot_at || p.snapshot_at)}${row('Mission revision', p.mission_revision)}${row('Activity revision', p.activity_revision)}</div>
-    <h2 data-detail-workers>${current ? 'Workers' : 'Last recorded workers'}</h2>${workers || '<p class="muted">No worker detail reported</p>'}
-    <section class="hd-card"><h3>Tests and review</h3>${tests ? row('Tests', `${tests.running ? 'Running' : 'Last result'} · ${tests.passed ?? 0} passed · ${tests.failed ?? 0} failed · ${tests.completed ?? 0} / ${tests.total ?? 0} completed`) : '<p class="muted">No tests reported</p>'}${review ? row('Review', `${human(review.status)} · ${review.blockingOpen ?? 0} open blockers`) : ''}${row('Completion', human(a.completionStatus))}${list(tests?.failures).slice(0, 50).map(f => `<pre>${esc(bounded(f, 2048))}</pre>`).join('')}${records(review?.findings).slice(0, 50).map(f => row(`${f.severity} · ${f.status}`, f.summary)).join('')}</section>
-    ${section('Changed files', list(a.changes?.changedFiles).slice(0, 100), file => `<div><code>${esc(file)}</code></div>`)}
-    ${section('Retries and recovery', records(a.recovery).slice(-30), r => row(`Attempt ${r.attempt} · ${r.status}`, r.summary || r.action))}
-    ${section('Errors and blockers', records(a.errors).slice(-30), e => row(`${e.count ?? 1} occurrences`, e.example))}
-    ${section('Recent activity', records(a.activity).slice(-50).reverse(), e => `<div class="ml-log">${row(e.at, `${e.workerId ? `${e.workerId} · ` : ''}${e.summary || human(e.type)}`)}${e.command ? `<code>${esc(bounded(e.command, 2048))}</code>` : ''}</div>`)}
-    ${row('Reason', a.reason)}${row('Recovery', a.action)}`;
+    ${errors.length || a.reason ? disclosure('blockers', 'Errors and blockers', `${row('Reason', a.reason)}${errors.map(e => row(`${e.count ?? 1} occurrences`, e.example)).join('')}${row('Recovery', a.action)}`, blocked) : ''}
+    ${disclosure('brief', 'Mission brief', `<div class="ml-brief">${row('Full title', m.title || m.id)}${row('Objective', a.currentObjective)}</div>`)}
+    <h2 data-detail-workers>${current ? 'Workers' : 'Last recorded workers'}</h2>
+    ${currentWorkers.length ? currentWorkers.map(renderWorker).join('') : '<p class="muted">No current worker activity reported.</p>'}
+    ${history.length ? disclosure('worker-history', `Worker history · ${history.length}`, history.map(renderWorker).join('')) : ''}
+    ${tests || review || a.completionStatus ? disclosure('tests', 'Tests and review', `${tests ? row('Tests', `${tests.running ? 'Running' : 'Last result'} · ${tests.passed ?? 0} passed · ${tests.failed ?? 0} failed · ${tests.completed ?? 0} / ${tests.total ?? 0} completed`) : ''}${review ? row('Review', `${human(review.status)} · ${review.blockingOpen ?? 0} open blockers`) : ''}${row('Completion', human(a.completionStatus))}${list(tests?.failures).slice(0, 50).map(f => `<pre>${esc(bounded(f, 2048))}</pre>`).join('')}${records(review?.findings).slice(0, 50).map(f => row(`${f.severity} · ${f.status}`, f.summary)).join('')}`, (tests?.failed > 0 || review?.blockingOpen > 0)) : ''}
+    ${changes.length ? disclosure('changes', `Changed files · ${changes.length}`, changes.map(file => `<div><code>${esc(file)}</code></div>`).join('')) : ''}
+    ${recovery.length || a.action && !a.reason && !errors.length ? disclosure('recovery', 'Retries and recovery', `${recovery.map(r => row(`Attempt ${r.attempt} · ${r.status}`, r.summary || r.action)).join('')}${row('Recovery', a.action)}`) : ''}
+    ${events.length ? disclosure('activity', `Recent activity · ${events.length}`, events.map(e => `<div class="ml-log">${row(e.at, `${e.workerId ? `${e.workerId} · ` : ''}${e.summary || human(e.type)}`)}${e.command ? `<code>${esc(bounded(e.command, 2048))}</code>` : ''}</div>`).join('')) : ''}
+    ${disclosure('diagnostics', 'Telemetry details', `<div class="ml-clocks">${clock('Activity elapsed', a.currentActivityStartedAt, now)}${clock('Last progress', a.lastMeaningfulProgressAt, now)}${clock('Heartbeat age', a.lastHeartbeatAt, now)}</div>${row('Mission ID', p.mission_key)}${row('Native Pi session', p.session_id)}${row('Pi instance', p.instance_id)}${row('Activity snapshot time', p.activity_snapshot_at || p.snapshot_at)}${row('Mission revision', p.mission_revision)}${row('Activity revision', p.activity_revision)}`)}`;
 }
 const styles = `<style>
 .ml-card .hd-card__title a{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.ml-detail-title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ml-disclosure>summary{cursor:pointer;font-weight:600}.ml-disclosure[open]>summary{margin-bottom:12px}
+.ml-brief{white-space:pre-wrap}.ml-worker-activity{display:block;font-size:.85rem;font-weight:400;margin-top:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ml-worker[open] .ml-worker-activity{-webkit-line-clamp:unset}
 .ml-card{overflow-wrap:anywhere}.ml-card p{margin:10px 0}.ml-freshness{font-weight:600;margin:6px 0;color:var(--status-active)}
 .ml-freshness[data-state=updating],.ml-freshness[data-state=stale],.ml-freshness[data-state=disconnected]{color:var(--status-blocked)}
 .ml-freshness[data-health=stalled],.ml-freshness[data-health=failed]{color:var(--status-failed,var(--text))}
@@ -115,8 +142,18 @@ const styles = `<style>
 export function mountMissionActivity(container, client, missionKey) {
   let disposed = false, controller = null, pollTimer = null, clockTimer = null, failures = 0;
   let projections = [], received = Date.now(), lastJson = '', fetchError = false;
+  const disclosureStates = new Map();
+  const explicitlyClosed = new Set();
   container.innerHTML = `${styles}<div class="ml-connection muted"></div><div class="ml-content"><p>Loading mission activity…</p></div>`;
   const content = container.querySelector('.ml-content'), connection = container.querySelector('.ml-connection');
+  const rememberDisclosureChoice = event => {
+    const summary = event.target.closest('summary');
+    const disclosure = summary?.parentElement;
+    if (!disclosure?.matches('details[data-disclosure]')) return;
+    if (disclosure.open) explicitlyClosed.add(disclosure.dataset.disclosure);
+    else explicitlyClosed.delete(disclosure.dataset.disclosure);
+  };
+  content.addEventListener('click', rememberDisclosureChoice);
   const tick = () => {
     if (disposed || document.hidden) return;
     const now = Date.now();
@@ -138,16 +175,36 @@ export function mountMissionActivity(container, client, missionKey) {
       el.querySelector('[data-evidence-label]').textContent = f.state === 'live' ? 'Current reported measurements' : 'Last recorded measurements';
       el.querySelector('[data-workers-label]').textContent = f.state === 'live' ? 'Workers' : 'Last recorded workers';
       const workerHeading = content.querySelector('[data-detail-workers]');
-      if (workerHeading) workerHeading.textContent = f.state === 'live' ? 'Workers' : 'Last recorded workers';
+      if (workerHeading) workerHeading.textContent = f.state === 'live' && !terminalMission(p.mission || {}) ? 'Workers' : 'Last recorded workers';
     });
     connection.textContent = fetchError ? 'Activity connection interrupted · showing last known data; retrying automatically.' : '';
   };
   const redraw = () => {
-    const open = new Set([...content.querySelectorAll('details[open]')].map(el => el.dataset.worker));
+    const inspectedCurrentWorkers = new Set([...content.querySelectorAll('.ml-worker[open]')]
+      .filter(el => !el.closest('[data-disclosure="worker-history"]'))
+      .map(el => el.dataset.disclosure));
+    content.querySelectorAll('details[data-disclosure]').forEach(el => disclosureStates.set(el.dataset.disclosure, el.open));
+    const focused = document.activeElement?.closest('details[data-disclosure]');
+    const focusKey = content.contains(focused) ? focused.dataset.disclosure : null;
+    const focusOffset = focusKey ? focused.getBoundingClientRect().top : null;
+    const scrollY = window.scrollY;
     content.innerHTML = projections.length
       ? missionKey ? missionDetail(projections[0], Date.now()) : `<div class="hd-grid">${projections.map(p => missionCard(p)).join('')}</div>`
       : `<p class="muted">${missionKey ? 'No live telemetry reported for this Pi mission.' : 'No Pi mission activity reported yet.'}</p>`;
-    content.querySelectorAll('details').forEach(el => { el.open = open.has(el.dataset.worker); });
+    let restoreFocus;
+    content.querySelectorAll('details[data-disclosure]').forEach(el => {
+      if (disclosureStates.has(el.dataset.disclosure)) el.open = disclosureStates.get(el.dataset.disclosure);
+      if (el.dataset.disclosure === focusKey) restoreFocus = el;
+    });
+    if (!explicitlyClosed.has('worker-history')) {
+      content.querySelectorAll('[data-disclosure="worker-history"] .ml-worker').forEach(el => {
+        if (inspectedCurrentWorkers.has(el.dataset.disclosure)) el.closest('[data-disclosure="worker-history"]').open = true;
+      });
+    }
+    if (restoreFocus) {
+      restoreFocus.querySelector('summary')?.focus({preventScroll: true});
+      window.scrollBy(0, restoreFocus.getBoundingClientRect().top - focusOffset);
+    } else window.scrollTo(window.scrollX, scrollY);
     tick();
   };
   const poll = async () => {
@@ -181,5 +238,5 @@ export function mountMissionActivity(container, client, missionKey) {
   };
   document.addEventListener('visibilitychange', visibility);
   visibility();
-  return () => { disposed = true; controller?.abort(); clearTimeout(pollTimer); clearInterval(clockTimer); document.removeEventListener('visibilitychange', visibility); };
+  return () => { disposed = true; controller?.abort(); clearTimeout(pollTimer); clearInterval(clockTimer); document.removeEventListener('visibilitychange', visibility); content.removeEventListener('click', rememberDisclosureChoice); };
 }

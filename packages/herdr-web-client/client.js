@@ -47,9 +47,9 @@ export class HerdrClient {
   }
 
   // -- missions -----------------------------------------------------------
-  listMissions(status) {
+  listMissions(status, { signal } = {}) {
     const q = status ? `?status=${encodeURIComponent(status)}` : '';
-    return this.request(`/api/v1/missions${q}`);
+    return this.request(`/api/v1/missions${q}`, { signal });
   }
 
   getMission(id) {

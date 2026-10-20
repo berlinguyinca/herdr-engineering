@@ -126,3 +126,10 @@ test('mission activity GETs encode exact namespaces and forward cancellation', a
   assert.equal(calls[1].url, '/api/v1/missions/pi%3AMSN%2F1/activity');
   assert.ok(calls.every(c => c.opts.method === 'GET' && c.opts.signal === signal));
 });
+
+test('listMissions preserves status filtering while forwarding cancellation', async () => {
+ const controller=new AbortController();let request;
+ const client=new HerdrClient('',{fetchImpl:async(url,opts)=>{request={url,opts};return{ok:true,status:200,text:async()=>'{}'};}});
+ await client.listMissions('in progress',{signal:controller.signal});
+ assert.equal(request.url,'/api/v1/missions?status=in%20progress');assert.equal(request.opts.signal,controller.signal);
+});
