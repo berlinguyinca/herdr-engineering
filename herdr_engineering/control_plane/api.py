@@ -377,7 +377,13 @@ def _make_handler(server):
                     s = r.get_service(parts[4])
                     return self._json(s) if s else self._json(
                         {"error": "not found"}, 404)
-                return self._json({"services": r.list_services()})
+                services = r.list_services()
+                summary = {state: sum(s["lifecycle"]["state"] == state for s in services)
+                           for state in ("current", "unavailable", "archived", "unknown")}
+                summary["total"] = len(services)
+                if _q(self.path, "include_archived") in {"false", "0"}:
+                    services = [s for s in services if not s["lifecycle"]["archived"]]
+                return self._json({"services": services, "summary": summary})
             if resource == "hosts":
                 if len(parts) > 5 and parts[5] == "telemetry":
                     return self._json({"samples": r.list_telemetry(parts[4])})

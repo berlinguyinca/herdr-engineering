@@ -23,6 +23,14 @@ from .ids import new_id
 from .inspector import InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
+from .service_catalog import (
+    normalize_project,
+    normalize_source_port,
+    service_catalog,
+    service_lifecycle,
+    track_availability,
+    validate_archive_days,
+)
 
 _STAGES = {
     "planning", "specification", "ready", "implementation", "testing",
@@ -66,7 +74,7 @@ def describe_service(*, service_name=None, host_id=None, port=None,
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
-    def __init__(self, *, now=None, sink=None):
+    def __init__(self, *, now=None, sink=None, service_archive_days=7):
         """``sink`` is an optional durable writer (e.g. DurableEventSink) called
         with each recorded event so ingestion survives a restart."""
         self._command_lock = threading.RLock()
@@ -76,6 +84,7 @@ class ControlPlaneRepo:
         self._missions = {}
         self._sessions = {}
         self._services = {}
+        self._service_archive_days = validate_archive_days(service_archive_days)
         self._hosts = {}
         self._artifacts = {}
         self._blobs = {}  # artifact_id -> bytes (in-memory RustFS stand-in)
@@ -298,30 +307,35 @@ class ControlPlaneRepo:
     # -------------------------------------------------------------- services
     def register_service(self, service_name, host_id, port,
                          session_id=None, status="healthy", route=None,
-                         description=None, owner=None):
+                         description=None, owner=None, project=None, source_port=None):
+        project = normalize_project(project)
+        source_port = normalize_source_port(source_port)
         svcid = new_id("service")
         rec = {
             "service_id": svcid, "service_name": service_name,
             "host_id": host_id, "port": port, "session_id": session_id,
             "status": status, "route": route, "owner": owner,
+            "project": project, "source_port": source_port,
             "created_at": self._stamp(), "updated_at": self._stamp(),
             "url": route or f"http://{host_id}:{port}",
         }
         rec["description"] = (description or "").strip() or describe_service(
             service_name=service_name, host_id=host_id, port=port,
             owner=owner, route=rec["url"])
+        track_availability(rec, status, rec["created_at"])
         self._services[svcid] = rec
         self.record_event("service", svcid, "ServiceRegistered",
                           {"service_name": service_name, "host_id": host_id,
                            "port": port, "route": route, "status": status,
                            "description": rec["description"],
-                           "owner": owner},
+                           "owner": owner, "project": project, "source_port": source_port,
+                           "unavailable_since": rec.get("unavailable_since")},
                           session_id=session_id)
         return svcid
 
     def upsert_service(self, host_id, service_name, port, *,
                        session_id=None, status="healthy", route=None,
-                       description=None, owner=None):
+                       description=None, owner=None, project=None, source_port=None):
         """Idempotent service registration keyed by ``(host_id, service_name)``.
 
         Re-invoking (e.g. on every web start or repeated ingest) updates the
@@ -335,12 +349,17 @@ class ControlPlaneRepo:
             if (rec.get("host_id") == host_id
                     and rec.get("service_name") == service_name):
                 rec["port"] = port
+                track_availability(rec, status, self._stamp())
                 rec["status"] = status
                 rec["session_id"] = session_id
                 rec["route"] = route if route is not None else rec.get("route")
                 rec["url"] = route or f"http://{host_id}:{port}"
                 if owner is not None:
                     rec["owner"] = owner
+                if project is not None:
+                    rec["project"] = normalize_project(project)
+                if source_port is not None:
+                    rec["source_port"] = normalize_source_port(source_port)
                 provided = (description or "").strip()
                 rec["description"] = provided or rec.get("description") \
                     or describe_service(
@@ -353,13 +372,16 @@ class ControlPlaneRepo:
                                    "host_id": host_id, "port": port,
                                    "route": rec["route"], "status": status,
                                    "description": rec["description"],
-                                   "owner": rec.get("owner")},
+                                   "owner": rec.get("owner"),
+                                   "project": rec.get("project"),
+                                   "source_port": rec.get("source_port"),
+                                   "unavailable_since": rec.get("unavailable_since")},
                                   session_id=session_id)
                 return svcid
         return self.register_service(service_name, host_id, port,
                                      session_id=session_id, status=status,
                                      route=route, description=description,
-                                     owner=owner)
+                                     owner=owner, project=project, source_port=source_port)
 
     def _ensure_service_desc(self, rec):
         """Guarantee ``rec`` carries a non-empty human description.
@@ -379,19 +401,35 @@ class ControlPlaneRepo:
         s = self._services.get(service_id)
         if s is None:
             return None
-        return _copy(self._ensure_service_desc(s))
+        return self._service_projection(s)
 
-    def list_services(self):
-        return _sort_by([_copy(self._ensure_service_desc(s))
-                         for s in self._services.values()],
-                        "created_at", reverse=True)
+    def _service_projection(self, record):
+        result = _copy(self._ensure_service_desc(record))
+        result["project"] = normalize_project(result.get("project"))
+        result["source_port"] = normalize_source_port(result.get("source_port"))
+        result["catalog"] = service_catalog(result, self._sessions.get(result.get("session_id")))
+        result["lifecycle"] = service_lifecycle(
+            result, self._now(), archive_after_days=self._service_archive_days)
+        return result
+
+    def list_services(self, *, include_archived=True):
+        services = [self._service_projection(s) for s in self._services.values()]
+        return _sort_by([s for s in services if include_archived
+                         or not s["lifecycle"]["archived"]], "created_at", reverse=True)
 
     def mark_service_unavailable(self, service_id):
         s = self._services.get(service_id)
         if s is None:
             return False
+        if s.get("status") == "unavailable":
+            return True
+        track_availability(s, "unavailable", self._stamp())
         s["status"] = "unavailable"
         s["updated_at"] = self._stamp()
+        self.record_event("service", service_id, "ServiceUnavailable",
+                          {"status": "unavailable",
+                           "unavailable_since": s["unavailable_since"]},
+                          session_id=s.get("session_id"))
         return True
 
     # ---------------------------------------------------------------- hosts

@@ -42,6 +42,18 @@ def _seed(repo):
                       {"cwd": "/home/user/work", "status": "active",
                        "attach": f"herdr workspace focus {m1}"},
                       mission_id=m1, session_id=s1)
+    if os.environ.get("SERVICES_SEED") == "1":
+        repo.register_service("Spectra API", "beast", 18012, owner="python",
+                              project="metabolomics", source_port=8080,
+                              description="Parse experimental spectra")
+        repo.register_service("Inactive parser", "beast", 18013, status="unavailable")
+        archived = repo.register_service("Archived parser", "beast", 18014,
+                                         status="unavailable")
+        repo._services[archived]["unavailable_since"] = "2020-01-01T00:00:00+00:00"
+        stale = repo.register_service("Stale healthy parser", "beast", 18016)
+        repo._services[stale]["updated_at"] = "2020-01-01T00:00:00+00:00"
+        repo.register_service("Unsafe <script>window.catalogXss=true</script>", "beast", 18015,
+                              route="javascript:alert(1)")
     # Non-herdr-sourced mission: keyed by mission_key 'pi:MSN-PI1' (UI-008).
     repo.upsert_mission("MSN-PI1", title="Pi mission", purpose="from pi",
                        stage="implementation", source="pi")

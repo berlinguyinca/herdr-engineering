@@ -135,6 +135,8 @@ class IngestService:
             route=payload.get("route"),
             description=payload.get("description"),
             owner=payload.get("owner"),
+            project=payload.get("project"),
+            source_port=payload.get("source_port"),
         )
         return {"entity_type": "service", "entity_id": svcid,
                 "event_type": event_type}

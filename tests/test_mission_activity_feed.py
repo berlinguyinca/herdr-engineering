@@ -4,6 +4,7 @@ import http.server
 import json
 import os
 import socket
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -19,7 +20,7 @@ INSTANCE = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 @contextlib.contextmanager
 def native_session(tmp_path):
     # AF_UNIX paths have a small OS limit, independent of pytest test names.
-    with tempfile.TemporaryDirectory(prefix='pi-feed-') as directory:
+    with tempfile.TemporaryDirectory(prefix='pi-feed-', dir='/tmp') as directory:
         root = Path(directory)
         root.chmod(0o700)
         project = tmp_path / 'project'
@@ -379,3 +380,37 @@ def test_private_activity_records_never_cross_http_transport(tmp_path, private_t
         assert activity['activity'] == [{'type': 'running_test', 'summary': 'Testing thinking-related UI', 'at': STAMP}]
         assert activity.get('currentActivity') is None
         assert activity['workerDetails'][0]['lastOutputPreview'] == 'Test named thinking passed'
+
+
+@pytest.mark.skipif(sys.platform not in {'linux', 'darwin'}, reason='requires supported Unix peer credentials')
+def test_real_socket_peer_credentials_accept_only_actual_uid_and_pid(monkeypatch):
+    with contextlib.ExitStack() as stack:
+        client, peer = socket.socketpair()
+        stack.enter_context(client)
+        stack.enter_context(peer)
+        feed._verify_peer(client, os.getpid())
+        with pytest.raises(ValueError, match='peer identity mismatch'):
+            feed._verify_peer(client, os.getpid() + 1)
+        actual_uid = os.getuid()
+        monkeypatch.setattr(feed.os, 'getuid', lambda: actual_uid + 1)
+        with pytest.raises(ValueError, match='peer identity mismatch'):
+            feed._verify_peer(client, os.getpid())
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='requires Darwin libc getpeereid')
+def test_darwin_closed_socket_cannot_supply_peer_proof():
+    client = socket.socket(socket.AF_UNIX)
+    client.close()
+    with pytest.raises(OSError, match='credentials unavailable'):
+        feed._verify_peer(client, os.getpid())
+
+
+def test_unknown_platform_fails_closed_without_peer_credentials(monkeypatch):
+    monkeypatch.delattr(feed.socket, 'SO_PEERCRED', raising=False)
+    monkeypatch.setattr(feed.sys, 'platform', 'unsupported')
+    with contextlib.ExitStack() as stack:
+        client, peer = socket.socketpair()
+        stack.enter_context(client)
+        stack.enter_context(peer)
+        with pytest.raises(ValueError, match='peer proof unavailable'):
+            feed._verify_peer(client, os.getpid())

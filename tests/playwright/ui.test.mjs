@@ -516,3 +516,46 @@ test('Pi detail lifecycle history refreshes on real SSE without replacing live i
     assert.match(await page.locator('#mission-timeline').innerText(), /complete|stopped/i);
   }, {BURST: '0'});
 });
+
+
+test('service catalog filters, archive inspection and groups survive live refresh on mobile', async () => {
+  await withApp(async ({page,base}) => {
+    const errors=[];
+    page.on('pageerror',e=>errors.push(e.message));
+    await page.setViewportSize({width:390,height:844});
+    await page.goto(`${base}/#/services`);
+    await page.locator('#sc-search').waitFor();
+    assert.match(await page.locator('#sc-counts').innerText(), /1.*Archived/s);
+    assert.equal(await page.locator('.sc-row').filter({hasText:'Archived parser'}).count(),0);
+    assert.equal(await page.locator('.sc-row').filter({hasText:'Inactive parser'}).count(),0);
+    await page.locator('[data-filter=unknown]').click();
+    assert.equal(await page.locator('.sc-row').count(),1);
+    assert.match(await page.locator('.sc-row').innerText(), /Stale healthy parser/);
+    assert.match(await page.locator('.sc-health').innerText(), /Unknown/);
+    await page.locator('[data-filter=archived]').click();
+    assert.equal(await page.locator('.sc-row').count(),1);
+    assert.match(await page.locator('.sc-row').innerText(), /Archived parser/);
+    await page.locator('[data-filter=current]').click();
+    await page.locator('#sc-search').fill('spectra 8080');
+    assert.equal(await page.locator('.sc-row').count(),1);
+    assert.match(await page.locator('.sc-row').innerText(), /Parse experimental spectra/);
+    await page.locator('#sc-expand').click();
+    await page.waitForTimeout(6000);
+    assert.equal(await page.locator('#sc-search').inputValue(),'spectra 8080');
+    assert.equal(await page.locator('.sc-group[open]').count(),1);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+    await page.locator('#sc-search').fill('');
+    await page.locator('#sc-archived').check();
+    await page.locator('#sc-host').selectOption('beast');
+    await page.locator('#sc-expand').click();
+    const archived=page.locator('.sc-row').filter({hasText:'Archived parser'});
+    assert.equal(await archived.count(),1);
+    assert.equal(await page.locator('a[href^="javascript:"]').count(),0);
+    assert.equal(await page.evaluate(()=>window.catalogXss),undefined);
+    await archived.locator('.sc-name').click();
+    await page.locator('.sc-detail').waitFor();
+    assert.match(await bodyText(page), /Archived services are hidden/);
+    assert.match(await bodyText(page), /Unavailable since/);
+    assert.deepEqual(errors,[]);
+  }, {SERVICES_SEED:'1',BURST:'1',BURST_GAP:'1'});
+});
