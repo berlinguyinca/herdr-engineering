@@ -107,11 +107,11 @@ export function renderServiceDetails(s) {
     <p>${endpoint(s)}</p>`;
 }
 
-export function mountServices(root, client, initial, {showAll = false} = {}) {
+export function mountServices(root, client, initial, {showAll = false, status} = {}) {
   let services = initial;
   let disposed = false;
   let pending = false;
-  const state = {search:'',host:'',status:showAll?'all':'current',archived:false,group:'project'};
+  const state = {search:'',host:'',status:['current','unavailable','unknown','all','archived'].includes(status)?status:showAll?'all':'current',archived:status==='archived',group:'project'};
   const openGroups = new Map();
   root.innerHTML = `${styles}<h1>Services</h1>
     <p class="sc-intro">Explore what is running across the fleet. Services are grouped by reported project or service type; each entry shows its purpose, host and ports.</p>
@@ -127,7 +127,7 @@ export function mountServices(root, client, initial, {showAll = false} = {}) {
     <div class="sc-toolbar"><span id="sc-result" role="status"></span><div><button class="hd-btn" id="sc-expand">Expand groups</button> <button class="hd-btn" id="sc-collapse">Collapse groups</button></div></div>
     <p id="sc-error" role="status" class="sc-meta"></p><div id="sc-results"></div>`;
   const el = id => root.querySelector(`#sc-${id}`);
-  el('status').value = state.status;
+  el('status').value = state.status; el('archived').checked = state.archived;
   function draw() {
     const counts = {current:0,unavailable:0,archived:0,unknown:0};
     services.forEach(s=>counts[serviceState(s)]++);

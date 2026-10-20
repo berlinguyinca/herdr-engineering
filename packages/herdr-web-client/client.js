@@ -69,27 +69,27 @@ export class HerdrClient {
   }
 
   // -- sessions -----------------------------------------------------------
-  listSessions(status) {
+  listSessions(status, { signal } = {}) {
     const q = status ? `?status=${encodeURIComponent(status)}` : '';
-    return this.request(`/api/v1/sessions${q}`);
+    return this.request(`/api/v1/sessions${q}`, { signal });
   }
 
-  getSession(id) {
-    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`);
+  getSession(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
   }
 
   // -- services / hosts ---------------------------------------------------
-  listServices() {
-    return this.request('/api/v1/services');
+  listServices({ signal } = {}) {
+    return this.request('/api/v1/services', { signal });
   }
 
-  listHosts() {
-    return this.request('/api/v1/hosts');
+  listHosts({ signal } = {}) {
+    return this.request('/api/v1/hosts', { signal });
   }
 
   // -- activity / analytics ------------------------------------------------
-  activity(limit = 50) {
-    return this.request(`/api/v1/activity?limit=${limit}`);
+  activity(limit = 50, { signal } = {}) {
+    return this.request(`/api/v1/activity?limit=${limit}`, { signal });
   }
 
   analytics(kind = 'missions') {
@@ -152,7 +152,7 @@ export class HerdrClient {
   }
 
   // -- health / self-observability -----------------------------------------
-  health() {
-    return this.request('/api/v1/health');
+  health({ signal } = {}) {
+    return this.request('/api/v1/health', { signal });
   }
 }

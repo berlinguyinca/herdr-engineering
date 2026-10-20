@@ -33,7 +33,7 @@ const ROUTES = [
   ['/overview', 'Overview'],
   ['/activity', 'Activity'],
   ['/analytics', 'Analytics'],
-  ['/missions', 'Finished / recorded'],
+  ['/missions', 'Finished'],
   ['/herd', 'Sessions'],
   ['/hosts', 'beast'],
   ['/services', 'web service on beast'],
@@ -154,7 +154,7 @@ test('overview survives a heavy event burst without rate limiting', async () => 
 test('pi-sourced mission detail renders by mission_key', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/missions`);
-    await page.locator('[data-filter=history]').click();
+    await page.locator('[data-filter=recorded]').click();
     // Recorded missions remain available through their history group.
     // The href encodes the complete namespace; the hash router decodes it once.
     await page.waitForSelector('a[href="#/missions/pi%3AMSN-PI1"]', { timeout: 15000 });
@@ -349,7 +349,7 @@ test('recorded mission history remains inspectable with advancing report ages an
     page.on('request', req => { if (req.method() !== 'GET') writes.push(req.url()); });
     await page.clock.install();
     await page.goto(`${base}/#/missions`);
-    await page.locator('[data-filter="history"]').click();
+    await page.locator('[data-filter="recorded"]').click();
     const record = page.locator('.mc-row[data-mission-key="pi:MSN-PI1"]');
     await record.waitFor();
     assert.match(await record.innerText(), /Recorded/);
@@ -390,7 +390,7 @@ test('current mission groups lead the list and details inspect workers without g
     assert.match(await bodyText(page), /Live telemetry · stalled/);
     assert.match(await bodyText(page), /1 current/);
     assert.equal(await page.locator('[data-group=attention]').evaluate(el => el.open), true);
-    assert.equal(await page.locator('[data-group=history]').evaluate(el => el.open), false);
+    assert.equal(await page.locator('#mc-tab-finished').getAttribute('aria-selected'), 'false');
     await page.getByRole('link', {name: 'Live Pi mission', exact: true}).click();
     await page.waitForSelector('[data-worker="reviewer"]');
     await page.locator('[data-worker="reviewer"] summary').click();
@@ -572,7 +572,7 @@ test('mission catalog stays compact, searchable and keyboard stable across chang
   await page.clock.install();await page.goto(`${base}/#/missions`);
   await page.locator('.mc-row[data-mission-key="pi:MSN-live"]').waitFor();
   assert.equal(await page.locator('[data-group=lastknown]').evaluate(e=>e.open),false);
-  assert.equal(await page.locator('[data-group=history]').evaluate(e=>e.open),false);
+  assert.equal(await page.locator('#mc-tab-finished').getAttribute('aria-selected'),'false');
   assert.ok(await page.evaluate(()=>document.documentElement.scrollHeight)<1500);
   assert.ok((await page.locator('.mc-row[data-mission-key="pi:MSN-live"]').boundingBox()).height<230);
   assert.doesNotMatch(await bodyText(page),/private-worker-/);
@@ -638,7 +638,7 @@ test('recorded history requests time out and retry without blocking live mission
    await page.clock.runFor(16000);await page.waitForFunction(()=>document.querySelector('.ml-connection').textContent.includes('Recorded history could not refresh'));
    releaseRetries();
    await page.clock.runFor(15000);
-   await page.locator('[data-filter=history]').click();
+   await page.locator('[data-filter=recorded]').click();
    await page.locator('.mc-title').filter({hasText:'Alpha'}).waitFor();
    assert.ok(records>=2);
    await page.evaluate(()=>{location.hash='#/hosts';});await page.waitForFunction(()=>document.querySelector('#view h1')?.textContent==='Hosts');
@@ -677,5 +677,177 @@ test('mission detail preserves explicit disclosure state and an inspected worker
   await page.locator('[data-disclosure=worker-history] > summary').click();
   phase=3;await page.clock.runFor(5500);await page.waitForTimeout(50);
   assert.equal(await page.locator('[data-disclosure=worker-history]').evaluate(e=>e.open),false);
+ },{BURST:'0'});
+});
+
+test('leaving session detail cancels its initial read and cannot overwrite the next page',async()=>{
+ await withApp(async({page,base})=>{
+  let held, started;
+  const seen=new Promise(resolve=>{started=resolve;});
+  await page.route('**/api/v1/sessions/late-session',r=>{held=r;started();});
+  await page.goto(`${base}/#/herd/session/late-session`);await seen;
+  const canceled=page.waitForEvent('requestfailed',{predicate:r=>r.url().endsWith('/api/v1/sessions/late-session'),timeout:5000});
+  await page.evaluate(()=>{location.hash='#/hosts';});
+  await canceled;
+  await page.waitForFunction(()=>document.querySelector('#view h1')?.textContent==='Hosts');
+  await held.fulfill({json:{session_id:'late-session',agent_role:'Late session',status:'active'}}).catch(()=>{});
+  assert.equal(await page.locator('#view h1').innerText(),'Hosts');
+ },{BURST:'0'});
+});
+
+test('mission outcome tabs isolate terminal records and query links survive real SSE refresh',async()=>{
+ await withApp(async({page,base})=>{
+  const records=[{mission_id:'open-record',title:'Recorded open',status:'active',stage:'planning'},
+   {mission_id:'closed-record',title:'Recorded closed',status:'active',stage:'closed'}];
+  const projections=[liveProjection({mission_key:'pi:running',mission:{id:'running',title:'Running mission',status:'EXECUTING'},activity:{health:'active'}}),
+   liveProjection({mission_key:'pi:failure',mission:{id:'failure',title:'Failed mission',status:'FAILED'}}),
+   liveProjection({mission_key:'pi:done',mission:{id:'done',title:'Finished mission',status:'COMPLETE'},freshness:{state:'disconnected',age_seconds:400}}),
+   liveProjection({mission_key:'pi:closed',mission:{id:'closed',title:'Closed mission',status:'CLOSED'}})];
+  let reads=0, refreshed;const nextRead=new Promise(resolve=>{refreshed=resolve;});
+  await page.route('**/api/v1/missions',r=>{reads++;if(refreshed){const done=refreshed;refreshed=null;done();}return r.fulfill({json:{missions:records}});});
+  await page.route('**/api/v1/mission-activity',r=>r.fulfill({json:{activities:projections}}));
+  await page.clock.install();await page.goto(`${base}/#/missions`);
+  await page.waitForFunction(()=>document.querySelector('#mc-tab-current')?.innerText.includes('2'));
+  assert.match(await page.locator('#mc-tab-failed').innerText(),/1/);assert.match(await page.locator('#mc-tab-finished').innerText(),/3/);
+  assert.equal(await page.locator('[data-mission-key="pi:failure"]').count(),0);
+  assert.equal(await page.locator('[data-mission-key="pi:done"]').count(),0);
+  await page.locator('#mc-tab-current').focus();await page.keyboard.press('ArrowRight');
+  assert.equal(await page.locator('#mc-tab-failed').getAttribute('aria-selected'),'true');
+  assert.equal(await page.locator('.mc-row').count(),1);
+  await page.keyboard.press('End');assert.equal(await page.locator('#mc-tab-finished').getAttribute('aria-selected'),'true');
+  assert.equal(await page.locator('.mc-row').count(),3);assert.match(await page.locator('[data-mission-key="closed-record"]').innerText(),/Closed/);
+  await page.goto(`${base}/#/missions?tab=failed&status=attention`);
+  await page.locator('[data-mission-key="pi:failure"]').waitFor();
+  await page.locator('#mc-search').fill('Failed mission');
+  await page.evaluate(()=>{window.missionCatalogBefore=document.getElementById('live-missions');});
+  const countBefore=reads;const afterEvent=new Promise(resolve=>{refreshed=resolve;});
+  const response=await fetch(`${base}/api/v1/ingest`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entity_type:'mission',entity_id:'MSN-PI1',event_type:'MissionUpdated',source:'pi',payload:{title:'Pi mission',stage:'implementation'}})});
+  assert.equal(response.status,200);
+  await page.clock.runFor(6000);await afterEvent;
+  await page.waitForFunction(()=>document.querySelector('.mc-row'));
+  assert.ok(reads>countBefore);
+  assert.equal(await page.evaluate(()=>window.missionCatalogBefore===document.getElementById('live-missions')),true);
+  assert.equal(await page.locator('#mc-search').inputValue(),'Failed mission');
+  assert.equal(await page.locator('#mc-tab-failed').getAttribute('aria-selected'),'true');
+  await page.setViewportSize({width:390,height:844});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+ },{BURST:'0'});
+});
+
+test('empty mission sources finish loading and mission query filters stay selected',async()=>{
+ await withApp(async({page,base})=>{
+  let empty=true;
+  await page.route('**/api/v1/missions',r=>r.fulfill({json:{missions:[]}}));
+  await page.route('**/api/v1/mission-activity',r=>r.fulfill({json:{activities:empty?[]:[liveProjection()]}}));
+  await page.goto(`${base}/#/missions`);
+  await page.waitForFunction(()=>document.querySelector('#mc-tab-current')?.innerText.trim()==='Current 0');
+  assert.match(await page.locator('#mc-tab-failed').innerText(),/0/);assert.match(await page.locator('#mc-tab-finished').innerText(),/0/);
+  assert.doesNotMatch(await page.locator('#view').innerText(),/Loading|0\+/);
+  empty=false;await page.goto(`${base}/#/missions?tab=current&status=attention`);
+  await page.locator('.mc-row').waitFor();
+  assert.equal(await page.locator('#mc-status').inputValue(),'attention');
+  await page.locator('#mc-search').fill('Live');assert.equal(await page.locator('#mc-status').inputValue(),'attention');
+ },{BURST:'0'});
+});
+
+test('sessions tabs keep closed records separate, retain filters and encode exact detail IDs',async()=>{
+ await withApp(async({page,base})=>{
+  const id='herdr:beast:%2Frepo:w1:p3';const now=new Date().toISOString();
+  const closed={session_id:id,agent_role:'Closed stage',status:'active',stage:'closed',cwd:'/work/repo',host_id:'beast',updated_at:now};
+  const sessions=[...Array.from({length:25},(_,i)=>({session_id:`open-${i}`,agent_role:`pi ${i}`,status:'active',host_id:'beast',cwd:'/work/parser',updated_at:now})),
+   {session_id:'failed',agent_role:'Failed agent',status:'failed',host_id:'beast',updated_at:now},closed,
+   ...['stopped','closed','completed'].map(status=>({session_id:status,agent_role:status,status,updated_at:now}))];
+  let reads=0,next;const refreshed=new Promise(resolve=>{next=resolve;});
+  await page.route('**/api/v1/sessions',r=>{reads++;if(reads>1)next();return r.fulfill({json:{sessions:sessions.map(s=>({...s,summary:`Report ${reads}`}))}});});
+  await page.route('**/api/v1/missions',r=>r.fulfill({json:{missions:[]}}));
+  await page.route(`**/api/v1/sessions/${encodeURIComponent(id)}`,r=>r.fulfill({json:closed}));
+  let eventId,eventsSeen;const eventRead=new Promise(resolve=>{eventsSeen=resolve;});
+  await page.route('**/api/v1/events?*',r=>{eventId=new URL(r.request().url()).searchParams.get('entity_id');eventsSeen();return r.fulfill({json:{events:[]}});});
+  const writes=[],errors=[];page.on('request',r=>{if(r.method()!=='GET')writes.push(r.url());});page.on('pageerror',e=>errors.push(e.message));
+  await page.clock.install();await page.goto(`${base}/#/herd`);
+  await page.waitForFunction(()=>document.querySelector('#ss-tab-current [data-count]')?.textContent==='25');
+  assert.equal(await page.locator('.ss-row').count(),20);await page.locator('#ss-next').click();assert.equal(await page.locator('.ss-row').count(),5);
+  await page.locator('#ss-tab-current').focus();await page.keyboard.press('ArrowRight');
+  assert.equal(await page.locator('#ss-tab-failed').getAttribute('aria-selected'),'true');assert.equal(await page.locator('.ss-row').count(),1);
+  await page.keyboard.press('End');assert.equal(await page.locator('#ss-tab-finished').getAttribute('aria-selected'),'true');assert.equal(await page.locator('.ss-row').count(),4);
+  await page.locator('#ss-tab-current').click();await page.locator('#ss-search').fill('open-1');
+  await page.locator('[data-session-link]').first().focus();
+  const focused=await page.evaluate(()=>document.activeElement.closest('[data-session-id]').dataset.sessionId);
+  await page.clock.runFor(5500);await refreshed;
+  await page.waitForFunction(()=>document.querySelector('.ss-summary')?.textContent.includes('Report 2'));
+  assert.equal(await page.locator('#ss-search').inputValue(),'open-1');
+  assert.equal(await page.evaluate(()=>document.activeElement.closest('[data-session-id]')?.dataset.sessionId),focused);
+  await page.locator('#ss-search').fill('');await page.locator('#ss-tab-finished').click();await page.locator('#ss-search').fill('Closed stage');
+  await page.locator('[data-session-link]').click();await page.locator('#session-details').waitFor();await eventRead;
+  assert.equal(eventId,id);assert.match(await page.locator('#view').innerText(),/Finished session/);assert.doesNotMatch(await page.locator('.sd-head').innerText(),/reported active/);
+  assert.equal(await page.locator('#msg-form').count(),0);assert.equal(await page.locator('#session-details').evaluate(el=>el.open),false);
+  await page.locator('#session-details > summary').click();assert.ok((await page.locator('#session-details').innerText()).includes(id));
+  await page.setViewportSize({width:390,height:844});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  assert.deepEqual(writes,[]);assert.deepEqual(errors,[]);
+ },{BURST:'0'});
+});
+
+test('overview keeps healthy panels through partial errors and links to the exact outcome and service filters',async()=>{
+ await withApp(async({page,base})=>{
+  let liveReads=0;
+  const sessions=[{session_id:'open',agent_role:'Parser',status:'active',updated_at:new Date().toISOString()},
+   {session_id:'failed',agent_role:'Broken parser',status:'failed'},{session_id:'closed',status:'stopped'}];
+  await page.route('**/api/v1/sessions',r=>r.fulfill({json:{sessions}}));
+  await page.route('**/api/v1/missions',r=>r.fulfill({json:{missions:[{mission_id:'closed',status:'closed',title:'Closed mission'}]}}));
+  await page.route('**/api/v1/mission-activity',r=>++liveReads===1?r.fulfill({status:503,json:{error:'temporarily unavailable'}}):r.fulfill({json:{activities:[liveProjection({activity:{health:'active'}})]}}));
+  await page.route('**/api/v1/health',r=>r.fulfill({status:503,json:{error:'health unavailable'}}));
+  await page.clock.install();await page.goto(`${base}/#/overview`);
+  await page.waitForFunction(()=>document.querySelector('[data-overview=sessions]')?.textContent.includes('1Open session records'));
+  await page.waitForFunction(()=>document.querySelector('[data-overview=missions]')?.textContent.includes('Could not refresh'));
+  assert.equal(await page.locator('#view h1').innerText(),'Overview');
+  assert.equal(await page.locator('[data-overview=missions] a[href*="status=attention"] strong').innerText(),'—');assert.match(await page.locator('[data-overview=sessions]').innerText(),/Parser/);
+  assert.doesNotMatch(await page.locator('[data-overview=sessions] .ov-list').innerText(),/Broken parser/);
+  await page.clock.runFor(5500);
+  await page.waitForFunction(()=>document.querySelector('[data-overview=missions] a[href*="status=running"] strong')?.textContent==='1');
+  await page.locator('a[href="#/herd?tab=failed"]').click();await page.locator('#ss-tab-failed[aria-selected=true]').waitFor();assert.equal(await page.locator('.ss-row').count(),1);
+  await page.goto(`${base}/#/overview`);await page.locator('a[href="#/missions?tab=finished"]').waitFor();await page.locator('a[href="#/missions?tab=finished"]').click();
+  await page.locator('#mc-tab-finished[aria-selected=true]').waitFor();await page.locator('.mc-row').waitFor();assert.match(await page.locator('.mc-row').innerText(),/Closed mission/);
+  await page.goto(`${base}/#/overview`);await page.locator('a[href="#/services?status=unavailable"]').waitFor();await page.locator('a[href="#/services?status=unavailable"]').click();
+  await page.locator('#sc-status').waitFor();assert.equal(await page.locator('#sc-status').inputValue(),'unavailable');
+  await page.setViewportSize({width:390,height:844});await page.goto(`${base}/#/overview`);await page.locator('[data-overview=sessions] .ov-row').waitFor();
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+ },{BURST:'0',SERVICE_CATALOG:'1'});
+});
+
+test('sessions retain keyboard focus when refreshed records leave the filter and stop reads hidden or after navigation',async()=>{
+ await withApp(async({page,base})=>{
+  let reads=0;
+  await page.route('**/api/v1/sessions',r=>{reads++;return r.fulfill({json:{sessions:[
+   {session_id:'first',agent_role:'agent',status:'active',summary:reads===1?'needlecontext':'removed'},
+   {session_id:'second',agent_role:'agent',status:'active',summary:reads<=2?'needlecontext':'removed'}]}});});
+  await page.route('**/api/v1/missions',r=>r.fulfill({json:{missions:[]}}));
+  await page.clock.install();await page.goto(`${base}/#/herd`);await page.locator('.ss-row').first().waitFor();
+  await page.locator('#ss-search').fill('needlecontext');await page.locator('[data-session-id=first] [data-session-link]').focus();
+  await page.clock.runFor(5500);await page.waitForFunction(()=>document.querySelectorAll('.ss-row').length===1);
+  assert.equal(await page.evaluate(()=>document.activeElement.closest('[data-session-id]')?.dataset.sessionId),'second');
+  await page.clock.runFor(5500);await page.waitForFunction(()=>document.querySelectorAll('.ss-row').length===0);
+  assert.equal(await page.evaluate(()=>document.activeElement.id),'ss-search');
+  const before=reads;
+  await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,get:()=>true});document.dispatchEvent(new Event('visibilitychange'));});
+  await page.clock.runFor(16000);assert.equal(reads,before);
+  await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,get:()=>false});document.dispatchEvent(new Event('visibilitychange'));});
+  await page.waitForFunction(()=>document.querySelector('#ss-result')?.textContent.includes('0 matching'));
+  await page.evaluate(()=>{location.hash='#/hosts';});await page.locator('#view h1').filter({hasText:'Hosts'}).waitFor();
+  const after=reads;await page.clock.runFor(16000);assert.equal(reads,after);
+ },{BURST:'0'});
+});
+
+test('session inspection renders before optional mission context and cancels that context on navigation',async()=>{
+ await withApp(async({page,base})=>{
+  let held,ready;const requested=new Promise(resolve=>{ready=resolve;});
+  await page.route('**/api/v1/sessions/context-session',r=>r.fulfill({json:{session_id:'context-session',agent_role:'Context agent',status:'active',mission_id:'some-mission'}}));
+  await page.route('**/api/v1/missions',r=>{held=r;ready();});
+  await page.goto(`${base}/#/herd/session/context-session`);await requested;
+  await page.locator('#session-details').waitFor();assert.match(await page.locator('#view h1').innerText(),/Context agent/);
+  assert.match(await page.locator('#session-mission').innerText(),/not resolved/);
+  const canceled=page.waitForEvent('requestfailed',{predicate:r=>r.url().endsWith('/api/v1/missions'),timeout:5000});
+  await page.evaluate(()=>{location.hash='#/hosts';});await canceled;await page.locator('#view h1').filter({hasText:'Hosts'}).waitFor();
+  await held.fulfill({json:{missions:[{mission_id:'some-mission',title:'Late mission',sessions:[{session_id:'context-session'}]}]}}).catch(()=>{});
+  assert.equal(await page.locator('#view h1').innerText(),'Hosts');
  },{BURST:'0'});
 });

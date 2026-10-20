@@ -11,6 +11,9 @@ import { statusForStage, statusLabel, tokenVar } from './herdr-web-components/st
 import { mountInspector } from './inspector-view.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
+import { mountOverview } from './overview-view.js';
+import { mountSessionsView, sessionEntries } from './sessions-view.js';
+import { recordOutcome, statusOutcome } from './record-state.js';
 import { mountServices, renderServiceDetails } from './services-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
@@ -82,13 +85,17 @@ let disposeInspector = null;
 let disposeMissionActivity = null;
 let refreshMissionHistory = null;
 let servicesView = null;
+let dashboardView = null;
+let sessionRequest = null;
 let renderRevision = 0;
-const onMissionPage = () => /^#\/missions(?:\/|$)/.test(window.location.hash);
-const onSessionPage = () => /^#\/herd\/session\//.test(window.location.hash);
+const onMissionPage = () => route().parts[0] === 'missions';
+const onSessionPage = () => route().parts[0] === 'herd' && route().parts[1] === 'session';
 
 async function render() {
   const revision = ++renderRevision;
   refreshMissionHistory = null;
+  if (dashboardView) { dashboardView.dispose(); dashboardView = null; }
+  if (sessionRequest) { sessionRequest.abort(); sessionRequest = null; }
   if (servicesView) { servicesView.dispose(); servicesView = null; }
   if (disposeMissionActivity) { disposeMissionActivity(); disposeMissionActivity = null; }
   if (disposeInspector) { disposeInspector(); disposeInspector = null; }
@@ -226,25 +233,13 @@ async function viewTopology() {
 }
 
 async function viewOverview() {
-  const [health, missions, sessions, hosts] = await Promise.all([
-    client.health(), client.listMissions(), client.listSessions(), client.listHosts(),
-  ]);
-  const active = sessions.sessions.filter((s) => s.status === 'active').length;
-  root.innerHTML = `
-    <h1>Overview</h1>
-    <div class="hd-grid">
-      <herdr-metric label="Missions" value="${missions.missions.length}"></herdr-metric>
-      <herdr-metric label="Active sessions" value="${active}"></herdr-metric>
-      <herdr-metric label="Hosts" value="${hosts.hosts.length}"></herdr-metric>
-      <herdr-metric label="Events ingested" value="${health.events.ingested}"></herdr-metric>
-    </div>
-    <h3 style="margin-top:20px">Recent activity</h3>
-    ${await activityList(10)}`;
+  root.innerHTML = '<h1>Overview</h1><div id="overview-dashboard"></div>';
+  dashboardView = mountOverview(document.getElementById('overview-dashboard'), client);
 }
 
 async function viewMissions() {
   root.innerHTML = '<h1>Missions</h1><div id="live-missions"></div>';
-  const catalog = mountMissionCatalog(document.getElementById('live-missions'), client);
+  const catalog = mountMissionCatalog(document.getElementById('live-missions'), client, {tab: route().query.get('tab') || 'current', status: route().query.get('status') || 'all'});
   disposeMissionActivity = catalog.dispose;
   refreshMissionHistory = catalog.refreshRecorded;
 }
@@ -309,91 +304,74 @@ async function missionSessions(m) {
   const t = titles(await missionTitles());
   return list.map((s) => `
     <div class="hd-card">
-      <div class="hd-card__title"><a href="#/herd/session/${esc(s.session_id)}">${esc(s.agent_role || 'agent session')}</a></div>
+      <div class="hd-card__title"><a href="#/herd/session/${esc(encodeURIComponent(s.session_id))}">${esc(s.agent_role || 'agent session')}</a></div>
       <div style="margin:6px 0"><herdr-status stage="${esc(s.status)}"></herdr-status></div>
       <div class="hd-card__sub">${esc(sessionSummary(s, t))}</div>
     </div>`).join('');
 }
 
 async function viewSessions() {
-  const { sessions } = await client.listSessions();
-  if (!sessions.length) { root.innerHTML = '<herdr-empty message="No sessions yet"></herdr-empty>'; return; }
-  const t = titles(await missionTitles());
-  root.innerHTML = '<h1>Sessions</h1><div class="hd-grid">' + sessions.map((s) => `
-    <div class="hd-card">
-      <div class="hd-card__title"><a href="#/herd/session/${esc(s.session_id)}">${esc(s.agent_role || 'agent session')}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${esc(s.status)}"></herdr-status></div>
-      <div class="hd-card__sub">${esc(sessionSummary(s, t))}</div>
-    </div>`).join('') + '</div>';
+  dashboardView = mountSessionsView(root, client, {tab: route().query.get('tab') || 'current'});
 }
 
-async function viewSession(parts) {
-  const s = await client.getSession(parts[parts.length - 1]);
-  if (!s) { root.innerHTML = '<herdr-error message="Session not found"></herdr-error>'; return; }
-  const t = titles(await missionTitles());
-  const missionTitle = s.mission_id ? (t[s.mission_id] || s.mission_id) : '—';
-  const attach = s.attach || (s.host_id && s.mission_id
-    ? `ssh ${s.host_id} && herdr workspace focus ${s.mission_id}` : '');
-  const rows = [
-    ['What it is doing', s.summary],
-    ['Directory (cwd)', s.cwd],
-    ['Git branch', s.branch],
-    ['PID', s.pid],
-    ['Command line', s.cmdline],
-  ].filter(([, v]) => v);
-  root.innerHTML = `
-    <h1>${esc(s.agent_role || 'Agent session')}</h1>
-    <div style="margin:8px 0"><herdr-status stage="${esc(s.status)}"></herdr-status>
-      <span class="hd-card__sub"> · <herdr-ident kind="session" id="${esc(s.session_id)}"></herdr-ident></span></div>
-    <div class="hd-grid">
-      <herdr-metric label="Agent role" value="${esc(s.agent_role || '—')}"></herdr-metric>
-      <herdr-metric label="Model" value="${esc(s.model || '—')}"></herdr-metric>
-      <herdr-metric label="Mission" value="${esc(missionTitle)}"></herdr-metric>
-      <herdr-metric label="Host" value="${esc(s.host_id || '—')}"></herdr-metric>
-    </div>
-    ${rows.length ? `<div class="hd-card" style="margin-top:12px">
-      <div class="hd-card__sub">Operational detail</div>
-      ${rows.map(([k, v]) => `
-        <div style="margin-top:8px">
-          <div class="hd-card__sub">${esc(k)}</div>
-          <div><code>${esc(v)}</code></div>
-        </div>`).join('')}
-      ${attach ? `<div style="margin-top:10px">
-        <div class="hd-card__sub">Attach</div>
-        <div class="hd-inline">
-          <code style="flex:1">${esc(attach)}</code>
-          <button class="hd-btn" id="copy-attach">Copy</button>
-        </div>
-      </div>` : ''}
-    </div>` : ''}
-    <h3 style="margin-top:20px">Send a message</h3>
-    <div class="hd-card">
-      <form id="msg-form" class="hd-inline">
-        <input id="msg-input" placeholder="steer the session…" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm)">
-        <button type="submit" class="hd-btn">Send</button>
-      </form>
-    </div>
-    <div id="inspector-host"></div>
-    <h3 style="margin-top:20px">Event stream</h3>
-    <div id="session-stream">${await streamList('session', s.session_id)}</div>`;
-  disposeInspector = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
-
-  const copyBtn = document.getElementById('copy-attach');
-  if (copyBtn) {
-    copyBtn.addEventListener('click', () => copyText(attach, copyBtn));
-  }
-  document.getElementById('msg-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const input = document.getElementById('msg-input');
-    if (!input.value.trim()) return;
-    try {
-      await client.sendMessage(s.session_id, input.value.trim());
-      input.value = '';
-      document.getElementById('session-stream').innerHTML = await streamList('session', s.session_id);
-    } catch (err) {
-      alert(err.message);
+async function viewSession(parts, revision) {
+  const id = decodeURIComponent(parts[parts.length - 1]);
+  const controller = new AbortController();
+  sessionRequest = controller;
+  const deadline = setTimeout(() => controller.abort(), 15000);
+  try {
+    const s = await client.getSession(id, {signal: controller.signal});
+    if (revision !== renderRevision || controller.signal.aborted) return;
+    if (!s) { root.innerHTML = '<herdr-error message="Session not found"></herdr-error>'; return; }
+    const outcome = recordOutcome(s);
+    const terminal = outcome === 'failed' || outcome === 'finished';
+    const reportedStatus = terminal && statusOutcome(s.status) !== outcome ? s.stage : s.status;
+    const clip = value => typeof value === 'string' ? value.slice(0, 180) : '';
+    const project = typeof s.cwd === 'string' ? s.cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
+    const attach = typeof s.attach === 'string' ? s.attach : '';
+    const fields = [['Session ID',s.session_id],['Last reported status',s.status],['Stage',s.stage],['Directory',s.cwd],['Git branch',s.branch],['PID',s.pid],['Command line',s.cmdline],['Model',s.model],['Last reported',formatTimestamp(s.updated_at)]].filter(([,v])=>v != null && v !== '');
+    root.innerHTML = `<style>.sd-head{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:14px 0}.sd-meta{color:var(--text-secondary);line-height:1.6;overflow-wrap:anywhere}.sd-details{margin:14px 0;overflow-wrap:anywhere}.sd-details summary{cursor:pointer;font-weight:600}.sd-details dl{display:grid;grid-template-columns:minmax(100px,auto) minmax(0,1fr);gap:8px 16px}.sd-details dt{color:var(--text-secondary)}.sd-details dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.sd-title{overflow-wrap:anywhere}@media(max-width:600px){.sd-details dl{display:block}.sd-details dd{margin:4px 0 12px}}</style>
+      <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Sessions</a>
+      <h1 class="sd-title">${esc(clip(s.agent_role) || 'Agent session')}${project ? ` · ${esc(clip(project))}` : ''}</h1>
+      <div class="sd-head"><strong>${esc(reportedStatus ? `Last reported ${String(reportedStatus).replaceAll('_',' ').toLowerCase()}` : 'Status unknown')} · ${esc(formatTimestamp(s.updated_at))}</strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
+      <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} session · recorded inspection remains available.` : 'Session status reflects the last report; it is not a live process check.'}</p>
+      ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
+      ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
+      <details class="hd-card sd-details" id="session-details"><summary>Session details and attachment</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}${attach ? `<div class="hd-inline"><code style="flex:1;overflow-wrap:anywhere">${esc(attach)}</code><button class="hd-btn" id="copy-attach">Copy attach command</button></div>` : ''}</details>
+      <h2>Inspection</h2><div id="inspector-host"></div>
+      ${!terminal ? `<details class="hd-card sd-details"><summary>Send a message</summary><form id="msg-form" class="hd-inline"><input id="msg-input" aria-label="Message to session" placeholder="Steer the session…" style="flex:1;min-width:0;padding:8px"><button type="submit" class="hd-btn">Send</button></form></details>` : ''}
+      <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream"><span class="muted">Loading recorded events…</span></div></details>`;
+    disposeInspector = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
+    const missionElement = document.getElementById('session-mission');
+    if (missionElement) {
+      const contextController = new AbortController();
+      sessionRequest = contextController;
+      const contextDeadline = setTimeout(() => contextController.abort(), 15000);
+      client.listMissions(undefined, {signal: contextController.signal}).then(response => {
+        if (revision !== renderRevision || !missionElement.isConnected || contextController.signal.aborted) return;
+        const match = sessionEntries([s], response.missions || [])[0]?.mission;
+        if (match) missionElement.innerHTML = `Mission: <a href="#/missions/${esc(encodeURIComponent(match.key))}">${esc(clip(match.title))}</a>`;
+      }).catch(() => { /* The unconfirmed association stays explicit. */ }).finally(() => {
+        clearTimeout(contextDeadline);
+        if (sessionRequest === contextController) sessionRequest = null;
+      });
     }
-  });
+    const stream = document.getElementById('session-stream');
+    streamList('session',s.session_id).then(html=>{if(stream.isConnected && revision===renderRevision)stream.innerHTML=html;}).catch(()=>{if(stream.isConnected)stream.innerHTML='<span class="muted">Recorded events could not load.</span>';});
+    const copyBtn = document.getElementById('copy-attach');
+    if (copyBtn) copyBtn.addEventListener('click',()=>copyText(attach,copyBtn));
+    document.getElementById('msg-form')?.addEventListener('submit',async event=>{
+      event.preventDefault();const input=document.getElementById('msg-input');if(!input.value.trim())return;
+      try {await client.sendMessage(s.session_id,input.value.trim());input.value='';const html=await streamList('session',s.session_id);if(stream.isConnected)stream.innerHTML=html;}
+      catch(error){if(stream.isConnected)alert(error.message);}
+    });
+  } catch (error) {
+    if (revision !== renderRevision) return;
+    throw new Error(controller.signal.aborted ? 'Session details could not load. Try again.' : error.message);
+  } finally {
+    clearTimeout(deadline);
+    if (sessionRequest === controller) sessionRequest = null;
+  }
 }
 
 async function copyText(text, btn) {
@@ -415,7 +393,7 @@ async function copyText(text, btn) {
 async function viewServices(_parts, revision) {
   const { services } = await client.listServices();
   if (revision !== renderRevision) return;
-  servicesView = mountServices(root, client, services, { showAll: route().query.get('all') === '1' });
+  servicesView = mountServices(root, client, services, { showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
 }
 
 async function viewService(parts, revision) {
@@ -558,7 +536,7 @@ function stageBars(byStage) {
 
 async function streamList(entityType, entityId) {
   const { events } = await client.request(
-    `/api/v1/events?entity_type=${entityType}&entity_id=${entityId}`);
+    `/api/v1/events?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}`);
   if (!events.length) return '<herdr-empty message="No events for this entity yet"></herdr-empty>';
   const t = titles(await missionTitles());
   return events.map((e) => {
@@ -584,6 +562,8 @@ const LIVE_REFRESH_MS = 5000;
 connectEvents({
   url: '/api/v1/events/stream',
   onEvent: () => {
+    // Overview and Sessions own polling; SSE must preserve filters and focus.
+    if (dashboardView) return;
     if (servicesView) {
       if (!liveTimer) liveTimer = setTimeout(() => { liveTimer = null; servicesView?.refresh(); }, LIVE_REFRESH_MS);
       return;
@@ -602,7 +582,7 @@ connectEvents({
     if (onSessionPage()) {
       const el = document.getElementById('session-stream');
       if (el && !liveTimer) {
-        const sid = decodeURIComponent(window.location.hash.split('/').pop());
+        const sid = decodeURIComponent(route().parts.at(-1) || '');
         liveTimer = setTimeout(async () => {
           liveTimer = null;
           if (!onSessionPage()) return;
