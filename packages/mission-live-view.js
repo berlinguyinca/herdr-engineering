@@ -100,6 +100,7 @@ export function missionDetail(p, now = Date.now()) {
     ${row('Reason', a.reason)}${row('Recovery', a.action)}`;
 }
 const styles = `<style>
+.ml-card .hd-card__title a{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .ml-card{overflow-wrap:anywhere}.ml-card p{margin:10px 0}.ml-freshness{font-weight:600;margin:6px 0;color:var(--status-active)}
 .ml-freshness[data-state=updating],.ml-freshness[data-state=stale],.ml-freshness[data-state=disconnected]{color:var(--status-blocked)}
 .ml-freshness[data-health=stalled],.ml-freshness[data-health=failed]{color:var(--status-failed,var(--text))}
