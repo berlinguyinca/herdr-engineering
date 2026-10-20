@@ -1,0 +1,107 @@
+--- a/packages/app.js
++++ b/packages/app.js
+@@ -228,6 +228,7 @@
+       <div style="margin:6px 0"><herdr-status stage="${esc(m.status)}"></herdr-status></div>
+       <div class="hd-card__sub">${esc(missionSubtitle(m, m.sessions ? m.sessions.length : 0))}</div>
+       <div class="hd-card__sub">created ${formatTimestamp(m.created_at)}</div>
++      <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
+     </div>`).join('') + '</div>';
+ }
+ 
+@@ -250,6 +251,7 @@
+       <herdr-metric label="Stage" value="${esc(m.stage)}"></herdr-metric>
+       <herdr-metric label="Created" value="${esc(formatTimestamp(m.created_at))}"></herdr-metric>
+     </div>
++    <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
+     <h3 style="margin-top:20px">Sessions</h3>
+     ${await missionSessions(m)}
+     <h3 style="margin-top:20px">Event stream</h3>
+--- a/packages/herdr-web-components/components.js
++++ b/packages/herdr-web-components/components.js
+@@ -4,7 +4,7 @@
+ // system tokens. Every stateful component renders loading / empty / error /
+ // data states. Status is never color-alone (label + icon always present).
+ import { statusForStage, tokenVar } from './status.js';
+-import { formatBytes } from './format.js';
++import { formatBytes, formatDuration } from './format.js';
+ import { escapeHtml, shortenId } from './util.js';
+ 
+ const ICON = {
+@@ -14,6 +14,8 @@
+   attention: '!',
+   blocked: '⊘',
+   failed: '✕',
++  crashed: '✕',
++  stalled: '!',
+   planning: '◈',
+   unknown: '?',
+ };
+@@ -108,3 +110,32 @@
+ }
+ 
+ 
++
++// A local clock for report freshness, never a liveness inference or emitter.
++export class HerdrMissionActivity extends HTMLElement {
++  static observedAttributes = ['updated-at', 'source'];
++
++  connectedCallback() {
++    this.render();
++    clearInterval(this.timer);
++    this.timer = setInterval(() => this.render(), 1000);
++  }
++
++  disconnectedCallback() {
++    clearInterval(this.timer);
++    this.timer = null;
++  }
++
++  attributeChangedCallback() { this.render(); }
++
++  render() {
++    const stamp = Date.parse(this.getAttribute('updated-at') || '');
++    const age = Number.isFinite(stamp)
++      ? `${formatDuration(Math.max(0, Date.now() - stamp))} ago`
++      : 'unavailable';
++    this.innerHTML = `<span class="hd-card__sub">Last reported change: ${escapeHtml(age)}</span>`
++      + (this.getAttribute('source') === 'pi'
++        ? '<div class="hd-card__sub">Finished, crashed, or stalled updates only. Inspect the Pi mission for live worker activity.</div>'
++        : '');
++  }
++}
+--- a/packages/herdr-web-components/index.js
++++ b/packages/herdr-web-components/index.js
+@@ -1,7 +1,7 @@
+ // herdr-web-components — register all components for browser use.
+ import {
+   HerdrStatus, HerdrSpinner, HerdrEmpty, HerdrError,
+-  HerdrIdent, HerdrMetric,
++  HerdrIdent, HerdrMetric, HerdrMissionActivity,
+ } from './components.js';
+ import { HerdrAppShell } from './app-shell.js';
+ 
+@@ -12,6 +12,7 @@
+   'herdr-error': HerdrError,
+   'herdr-ident': HerdrIdent,
+   'herdr-metric': HerdrMetric,
++  'herdr-mission-activity': HerdrMissionActivity,
+   'herdr-app-shell': HerdrAppShell,
+ };
+ 
+@@ -24,4 +25,4 @@
+   return registry;
+ }
+ 
+-export { HerdrStatus, HerdrSpinner, HerdrEmpty, HerdrError, HerdrIdent, HerdrMetric, HerdrAppShell };
++export { HerdrStatus, HerdrSpinner, HerdrEmpty, HerdrError, HerdrIdent, HerdrMetric, HerdrMissionActivity, HerdrAppShell };
+--- a/packages/herdr-web-components/status.js
++++ b/packages/herdr-web-components/status.js
+@@ -15,6 +15,8 @@
+   attention: { token: '--status-attention', label: 'Needs attention' },
+   blocked: { token: '--status-blocked', label: 'Blocked' },
+   failed: { token: '--status-failed', label: 'Failed' },
++  crashed: { token: '--status-failed', label: 'Crashed' },
++  stalled: { token: '--status-attention', label: 'Stalled' },
+   critical: { token: '--status-failed', label: 'Critical' },
+   planning: { token: '--status-planning', label: 'Planning' },
+   specification: { token: '--status-planning', label: 'Specification' },
