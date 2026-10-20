@@ -143,7 +143,7 @@ export function mountMissionCatalog(container, client, {tab = 'current'} = {}) {
     if(disposed)return;
     const all=entries(), selected=filterMissions(all,state);
     const counts=Object.fromEntries(GROUPS.map(([key])=>[key,all.filter(e=>e.group===key).length]));
-    const signature=JSON.stringify([state,all.map(e=>[e.key,e.group,e.freshness?.state,e.projection,e.recorded])]);
+    const signature=JSON.stringify([state,liveLoaded,recordedLoaded,all.map(e=>[e.key,e.group,e.freshness?.state,e.projection,e.recorded])]);
     connection.textContent=[liveError,recordedError].filter(Boolean).join(' ');
     if(!force && signature===lastSignature)return;
     lastSignature=signature;
