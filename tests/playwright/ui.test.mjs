@@ -804,7 +804,7 @@ test('overview keeps healthy panels through partial errors and links to the exac
   assert.doesNotMatch(await page.locator('[data-overview=sessions] .ov-list').innerText(),/Broken parser/);
   await page.clock.runFor(5500);
   await page.waitForFunction(()=>document.querySelector('[data-overview=missions] a[href*="status=running"] strong')?.textContent==='1');
-  await page.locator('a[href="#/herd?tab=failed"]').click();await page.locator('#ss-tab-failed[aria-selected=true]').waitFor();assert.equal(await page.locator('.ss-row').count(),1);
+  await page.locator('a[href="#/herd?tab=failed"]').click();await page.locator('#ss-tab-failed[aria-selected=true]').waitFor();await page.locator('.ss-row').waitFor();assert.equal(await page.locator('.ss-row').count(),1);
   await page.goto(`${base}/#/overview`);await page.locator('a[href="#/missions?tab=finished"]').waitFor();await page.locator('a[href="#/missions?tab=finished"]').click();
   await page.locator('#mc-tab-finished[aria-selected=true]').waitFor();await page.locator('.mc-row').waitFor();assert.match(await page.locator('.mc-row').innerText(),/Closed mission/);
   await page.goto(`${base}/#/overview`);await page.locator('a[href="#/services?status=unavailable"]').waitFor();await page.locator('a[href="#/services?status=unavailable"]').click();
@@ -886,5 +886,45 @@ test('inspector resynchronizes events written between the initial snapshot and s
    assert.equal(await page.locator('.hd-ins__row').count(),60);
    assert.match(await page.locator('#ins-list').innerText(),/gap-59/);
   }finally{releaseSnapshot();releaseStream();}
+ },{BURST:'0',INSPECTOR_SEED:'0'});
+});
+
+test('inspector HTTP cursor catches events received before its baseline even when newer stream rows arrive later',async()=>{
+ await withApp(async({page,base})=>{
+  const hash=await sessionHash(base),sid=hash.split('/').pop();
+  await postInspector(base,sid,[{kind:'capabilities',reasoning:'none',streaming_tools:true}]);
+  const gates=[];let baselineReady,deltaReady,baselineRevision,reads=0;
+  const baselines=new Promise(resolve=>{baselineReady=resolve;});
+  const delta=new Promise(resolve=>{deltaReady=resolve;});
+  await page.addInitScript(()=>{
+   const Native=window.EventSource;window.inspectorBuffered=[];
+   window.EventSource=class extends Native{
+    constructor(url,options){super(url,options);if(String(url).includes('/inspector/stream'))this.addEventListener('message',event=>{
+     try{if(JSON.parse(event.data).type==='event'){event.stopImmediatePropagation();window.inspectorBuffered.push(()=>this.onmessage(event));}}catch{}
+    });}
+   };
+  });
+  await page.route('**/inspector?*',async r=>{
+   const requestIndex=++reads;
+   if(requestIndex>2){deltaReady(Number(new URL(r.request().url()).searchParams.get('since_rev')));return r.continue();}
+   const response=await r.fetch();const json=await response.json();if(requestIndex===2)baselineRevision=json.rev;let release;
+   const gate=new Promise(resolve=>{release=resolve;});gates[requestIndex-1]=release;
+   if(gates.filter(Boolean).length===2)baselineReady();
+   await gate;return r.fulfill({json}).catch(()=>{});
+  });
+  try{
+   await page.clock.install();await page.goto(`${base}/${hash}`);await baselines;
+   await postInspector(base,sid,Array.from({length:60},(_,i)=>({kind:'message',role:'assistant',text:`cursor-${i}`})));
+   await page.waitForFunction(()=>window.inspectorBuffered.length===60);
+   await page.evaluate(()=>window.inspectorBuffered.slice(0,50).forEach(deliver=>deliver()));
+   gates[1]();await page.clock.runFor(250);
+   await page.waitForFunction(()=>document.querySelectorAll('#ins-bar .hd-ins__badge').length>0);
+   await page.evaluate(()=>window.inspectorBuffered.slice(50).forEach(deliver=>deliver()));
+   await page.clock.runFor(2200);const cursor=await delta;
+   assert.equal(cursor,baselineRevision,'stream rows cannot advance the HTTP synchronization cursor past unseen events');
+   await page.waitForFunction(()=>document.querySelectorAll('.hd-ins__row').length===60,null,{timeout:5000});
+   assert.match(await page.locator('#ins-list').innerText(),/cursor-0/);
+   assert.match(await page.locator('#ins-list').innerText(),/cursor-59/);
+  }finally{gates.forEach(release=>release());}
  },{BURST:'0',INSPECTOR_SEED:'0'});
 });
