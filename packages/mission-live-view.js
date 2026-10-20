@@ -1,7 +1,6 @@
 // Read-only Pi mission telemetry. Clocks redraw locally; polling never creates
 // activity events, attention notifications, or session control operations.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
-import { skeleton } from './motion.js';
 
 const list = (value) => Array.isArray(value) ? value : [];
 const records = (value) => list(value).filter(item => item && typeof item === 'object' && !Array.isArray(item));
@@ -140,13 +139,12 @@ const styles = `<style>
 .ml-log{border-bottom:1px solid var(--border-subtle);padding:6px 0}.ml-content h3{margin-top:0}.ml-content{min-width:0}.ml-content .hd-grid{align-items:start}
 </style>`;
 
-// onStatus(ok, message) reports each poll to the page's freshness chip (the page owns the chip).
-export function mountMissionActivity(container, client, missionKey, { onStatus = () => {} } = {}) {
+export function mountMissionActivity(container, client, missionKey) {
   let disposed = false, controller = null, pollTimer = null, clockTimer = null, failures = 0;
   let projections = [], received = Date.now(), lastJson = '', fetchError = false;
   const disclosureStates = new Map();
   const explicitlyClosed = new Set();
-  container.innerHTML = `${styles}<div class="ml-connection muted"></div><div class="ml-content">${skeleton('mission activity', { rows: 2, height: 64 })}</div>`;
+  container.innerHTML = `${styles}<div class="ml-connection muted"></div><div class="ml-content"><p>Loading mission activity…</p></div>`;
   const content = container.querySelector('.ml-content'), connection = container.querySelector('.ml-connection');
   const rememberDisclosureChoice = event => {
     const summary = event.target.closest('summary');
@@ -220,13 +218,11 @@ export function mountMissionActivity(container, client, missionKey, { onStatus =
       if (disposed || activeController.signal.aborted) return;
       projections = missionKey ? (response.activity ? [response.activity] : []) : records(response.activities);
       received = Date.now(); failures = 0; fetchError = false;
-      onStatus(true);
       const json = JSON.stringify(projections);
       if (json !== lastJson) { lastJson = json; redraw(); } else tick();
     } catch (error) {
       if (disposed || (activeController.signal.aborted && !timedOut)) return;
       failures++; fetchError = true;
-      onStatus(false, timedOut ? 'timed out' : error?.message || 'request failed');
       if (!projections.length) content.innerHTML = '<p class="muted">Mission activity unavailable. Retrying automatically.</p>';
       tick();
     } finally {
