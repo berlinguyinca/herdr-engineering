@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.herdr.mission-feed</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.venvs/herdr-engineering/bin/python</string>
+    <string>-m</string><string>herdr_engineering.cli</string>
+    <string>control-plane</string><string>mission-feed</string>
+    <string>--control-plane</string><string>http://dev.lan</string>
+    <string>--host-id</string><string>__HOST_ID__</string>
+    <string>--interval</string><string>5</string>
+  </array>
+  <key>WorkingDirectory</key><string>__HOME__/.local/share/herdr-engineering/mission-feed/current</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key><string>__HOME__/.local/share/herdr-engineering/mission-feed/current</string>
+    <key>PI_ENGINEERING_CONTROL_DIR</key><string>__CONTROL_DIR__</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>__HOME__/.local/state/herdr-engineering/mission-feed.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.local/state/herdr-engineering/mission-feed-error.log</string>
+</dict>
+</plist>

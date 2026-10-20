@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -16,6 +17,7 @@ import signal
 import socket
 import stat
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -128,6 +130,28 @@ def discover(root: Path) -> list[dict]:
     return descriptors
 
 
+def _verify_peer(client: socket.socket, expected_pid: int) -> None:
+    if hasattr(socket, 'SO_PEERCRED'):
+        pid, uid, _ = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    elif sys.platform == 'darwin':
+        # Darwin exposes getpeereid(2) in libc even when Python omits its wrapper.
+        # SDK unistd.h uses uint32_t uid_t/gid_t; sys/un.h defines LOCAL_PEERPID=2.
+        # Do not decode platform-dependent xucred structs or trust descriptor UID.
+        getpeereid = ctypes.CDLL(None, use_errno=True).getpeereid
+        getpeereid.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)]
+        getpeereid.restype = ctypes.c_int
+        uid_value, gid_value = ctypes.c_uint32(), ctypes.c_uint32()
+        if getpeereid(client.fileno(), ctypes.byref(uid_value), ctypes.byref(gid_value)) != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, 'native peer credentials unavailable')
+        uid = uid_value.value
+        pid = client.getsockopt(0, 2)
+    else:
+        raise ValueError('native peer proof unavailable')
+    if uid != os.getuid() or pid != expected_pid:
+        raise ValueError('native peer identity mismatch')
+
+
 def _request(descriptor: dict, request: dict, timeout: float) -> dict:
     path = Path(descriptor['socketPath'])
     _private(path.parent, 'directory', 0o700)
@@ -136,20 +160,7 @@ def _request(descriptor: dict, request: dict, timeout: float) -> dict:
     with socket.socket(socket.AF_UNIX) as client:
         client.settimeout(timeout)
         client.connect(str(path))
-        if hasattr(socket, 'SO_PEERCRED'):
-            pid, uid, _ = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-            if uid != os.getuid() or pid != descriptor['pid']:
-                raise ValueError('native peer identity mismatch')
-        elif hasattr(client, 'getpeereid'):
-            uid, _ = client.getpeereid()
-            if uid != os.getuid():
-                raise ValueError('native peer identity mismatch')
-            # macOS LOCAL_PEERPID supplies the PID omitted by getpeereid.
-            pid = client.getsockopt(0, 2)
-            if pid != descriptor['pid']:
-                raise ValueError('native peer PID mismatch')
-        else:
-            raise ValueError('native peer proof unavailable')
+        _verify_peer(client, descriptor['pid'])
         client.sendall(json.dumps(request).encode() + b'\n')
         body = bytearray()
         while b'\n' not in body:

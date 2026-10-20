@@ -22,7 +22,7 @@ Run a single collection pass with:
 herdr-eng control-plane mission-feed --control-plane http://dev.lan --host-id "$(hostname)" --once
 ```
 
-The JSON result reports accepted projections and fixed rejection/error categories, never arbitrary server response bodies or credentials. Only one daemon instance runs per user. SIGTERM stops collection gracefully. Linux peer credential validation is supported; validate macOS peer-credential availability before enabling the service there.
+The JSON result reports accepted projections and fixed rejection/error categories, never arbitrary server response bodies or credentials. Only one daemon instance runs per user. SIGTERM stops collection gracefully. Linux validates `SO_PEERCRED`. macOS validates the real socket UID through libc `getpeereid` and the PID through `LOCAL_PEERPID`, including Python builds without a `socket.getpeereid` wrapper. Missing or failed credential checks reject the source.
 
 ## Recovery and verification
 
@@ -31,3 +31,36 @@ The October 2026 rollout encountered an existing stopped database. Recovery pres
 Before cutover, compare replayed entity IDs and meaningful status, title, process, model, and association fields with the live API. Export and backfill the final live delta before replacing the old web process. Keep backups and rollback image provenance private under `~/.local/state/herdr-engineering/rollouts/`.
 
 After cutover, verify real Pi projections, namespaced mission navigation, worker detail, local age updates, updating/stale/disconnected states, and absence of telemetry events in the ordinary activity feed. Restarting the collector must not restart or resume Pi missions. Rollback stops the collector first, then restores the previous web image and assets; it does not delete database rows or volumes.
+
+
+## Additional hosts and macOS
+
+Use the same immutable published collector revision on each host. The control directory
+must match the directory actually used by that host's Pi sessions. On Linux, a user
+systemd unit may inherit `XDG_RUNTIME_DIR` while terminal Pi sessions use `/tmp`.
+Set `PI_ENGINEERING_CONTROL_DIR` in a unit drop-in to the proven native directory;
+never merge arbitrary project snapshots or weaken directory/peer checks.
+
+For macOS, render `deploy/mission-feed/com.herdr.mission-feed.plist` with absolute
+`__HOME__`, the inventory `__HOST_ID__`, and `__CONTROL_DIR__` values using
+`plistlib.load` / `plistlib.dump` (so paths are XML escaped). Install it as
+`~/Library/LaunchAgents/com.herdr.mission-feed.plist`, mode 0600. Create the
+`~/.local/state/herdr-engineering` log directory, then use
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.herdr.mission-feed.plist`.
+The template defaults to `http://dev.lan`; replace that argument for another server.
+If authentication is enabled, provide `HERDR_CP_API_KEY` privately in the rendered
+plist's environment; never commit the rendered file or credentials.
+
+macOS's long default temporary directory can exceed Pi's Unix socket path limit.
+Use a short same-user directory such as `/tmp/pi-engineering-501`, created with
+mode 0700, and export that exact `PI_ENGINEERING_CONTROL_DIR` in the Pi launcher's
+or user's shell environment as well as the collector plist. Do not change global
+`TMPDIR`. Existing Pi sessions keep their original environment until the operator
+normally reloads or starts a new session; installing the collector does not restart
+them. `launchctl print gui/$(id -u)/com.herdr.mission-feed` verifies the collector.
+
+Stage newer Pi output capture with the repository's immutable
+`ansible/files/stage-release.py --kind pi --revision <full-published-commit>` workflow.
+It preserves unrelated settings and running processes. Rich output becomes available
+when a session loads that release and produces tool output; old sessions and old
+snapshots must continue to show unavailable/last-known evidence honestly.
