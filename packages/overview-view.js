@@ -138,7 +138,7 @@ export function mountOverview(container, client) {
     sessions:signal=>client.listSessions(undefined,{signal}),
     services:signal=>client.listServices({signal}),
     hosts:signal=>client.listHosts({signal}),
-    activity:signal=>client.activity(8,{signal}),
+    activity:signal=>client.activity(50,{signal}),
     health:signal=>client.health({signal}),
   };
   container.innerHTML=`${styles}<p class="ov-intro">Current work, recent reports, and changes that matter. Finished, closed, and failed records stay in their respective tabs.</p><div class="ov-layout">${panels.filter(key=>key!=='health').map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
@@ -172,6 +172,7 @@ export function mountOverview(container, client) {
       const response=await sources[key](controller.signal);
       if(disposed || controller.signal.aborted)return;
       const field={projections:'activities',activity:'events'}[key] || key;
+      if (key === 'health' ? !response || typeof response.status !== 'string' : !Array.isArray(response?.[field])) throw new Error('Invalid response');
       data[key==='activity' ? 'events' : key]=key==='health' ? response : records(response?.[field]);
       if(key==='projections')received=Date.now();
       states[key]={loaded:true,error:false};

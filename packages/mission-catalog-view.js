@@ -121,11 +121,11 @@ const styles = `<style>
 @media(max-width:650px){.mc-row{grid-template-columns:minmax(0,1fr);gap:8px}.mc-controls label{min-width:130px;flex:1}.mc-status{gap:3px}.mc-counts button{padding:8px}.mc-group>summary span{margin-left:4px}}
 </style>`;
 
-export function mountMissionCatalog(container, client, {tab = 'current'} = {}) {
+export function mountMissionCatalog(container, client, {tab = 'current', status = 'all'} = {}) {
   let disposed = false, projections = [], recorded = [], received = Date.now();
   let liveController = null, pollTimer = null, clockTimer = null, recordedTimer = null, recordedController = null;
   let failures = 0, liveError = '', recordedError = '', lastSignature = '', lastClassification = '', liveLoaded = false, recordedLoaded = false;
-  const state = {search:'',host:'',status:'all',tab:TABS.some(([key])=>key===tab)?tab:'current'};
+  const state = {search:'',host:'',status:tab==='current'&&GROUPS.some(([key])=>key===status&&currentGroup(key))?status:'all',tab:TABS.some(([key])=>key===tab)?tab:'current'};
   const opened = new Map(), limits = new Map();
   container.innerHTML = `${styles}<p class="mc-intro">See what needs attention and what is running. Use Failed and Finished to inspect terminal missions; current records keep their telemetry quality visible.</p>
     <div class="mc-tabs" id="mc-tabs" role="tablist" aria-label="Mission outcome"></div><div class="mc-counts" id="mc-counts"></div><div class="mc-controls">
@@ -134,6 +134,7 @@ export function mountMissionCatalog(container, client, {tab = 'current'} = {}) {
       <label>Show<select id="mc-status"><option value="all">All groups</option>${GROUPS.filter(([key])=>currentGroup(key)).map(([key,label])=>`<option value="${key}">${label}</option>`).join('')}</select></label>
     </div><p id="mc-result" class="mc-meta" role="status">Loading missions…</p><p class="ml-connection mc-meta" role="status"></p><div id="mc-groups" role="tabpanel" aria-labelledby="mc-tab-current"></div>`;
   const el = name => container.querySelector(`#mc-${name}`);
+  el('status').value = state.status;
   const connection = container.querySelector('.ml-connection');
   const entries = () => missionEntries(projections, recorded, received);
   function capture() {
