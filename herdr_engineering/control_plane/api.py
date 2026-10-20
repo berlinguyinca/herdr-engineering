@@ -112,6 +112,9 @@ class ControlPlaneServer:
         from .ingest import IngestService
         self.ingest = IngestService(repo)
         self._limiter = _RateLimiter()
+        # Fleet telemetry has a separate bounded budget so bursts cannot starve
+        # dashboard reads or operator commands from the same host/proxy IP.
+        self._ingest_limiter = _RateLimiter(max_requests=6000)
         # Fail-closed (Spec §104): never default a blank/missing role to
         # "operator". Keep roles verbatim after strip; empty/None/unknown
         # roles are treated as "viewer" (read-only) by `_require`.
@@ -309,18 +312,26 @@ def _make_handler(server):
 
         def _rate_limit(self):
             # Skip SSE streams: they are long-lived connections, not bursts.
-            if self.path.split("?")[0].rstrip("/").endswith("/events/stream"):
+            path = self.path.split("?")[0]
+            if self.command == "GET" and path.rstrip("/").endswith("/events/stream"):
                 return None
-            if server._limiter.allow(self.client_address[0]):
+            limiter = (server._ingest_limiter
+                       if self.command == "POST" and path == "/api/v1/ingest"
+                       else server._limiter)
+            if limiter.allow(self.client_address[0]):
                 return None
             self.send_response(429)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", str(server._limiter.window))
+            self.send_header("Retry-After", str(limiter.window))
+            # The rejected POST body is unread. Close rather than interpreting
+            # its bytes as another request on this HTTP/1.1 connection.
+            self.send_header("Connection", "close")
+            self.close_connection = True
             payload = json.dumps({"error": "too many requests"}).encode()
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
-            return None
+            return True
 
         def _route_api(self):
             path = self.path.split("?")[0]

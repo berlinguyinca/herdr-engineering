@@ -248,3 +248,68 @@ def test_health_reports_postgres_when_source_present():
     h = svr._health()
     assert h["source"] == "postgres"
     assert h["version"] == "0.1.0"
+
+
+@pytest.fixture()
+def rate_limited_server(acknowledged_sink):
+    from herdr_engineering.control_plane.api import _RateLimiter
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    server = ControlPlaneServer(repo)
+    server._limiter = _RateLimiter(max_requests=2, window_seconds=60)
+    server._ingest_limiter = _RateLimiter(max_requests=2, window_seconds=60)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    server.wait_until_ready()
+    yield server, repo
+    server.shutdown()
+
+
+def _rate_request(server, path, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(f'http://127.0.0.1:{server.port}{path}', data=data,
+                                     headers={'Content-Type': 'application/json'})
+    try:
+        response = urllib.request.urlopen(request, timeout=5)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        return response.code, response.headers, response.read()
+
+
+def _rate_service(index):
+    return {'entity_type': 'service', 'entity_id': f'web-{index}',
+            'event_type': 'service.heartbeat',
+            'payload': {'service_name': f'web-{index}', 'host_id': 'host',
+                        'port': 8000 + index}}
+
+
+def test_rate_rejected_ingest_does_not_mutate_or_emit_events(rate_limited_server):
+    server, repo = rate_limited_server
+    for index in range(2):
+        assert _rate_request(server, '/api/v1/ingest', _rate_service(index))[0] == 200
+    status, headers, body = _rate_request(server, '/api/v1/ingest', _rate_service(2))
+    assert status == 429
+    assert headers['Retry-After'] == '60'
+    assert json.loads(body) == {'error': 'too many requests'}
+    # Shutdown joins request handlers before checking the lack of side effects.
+    server.shutdown()
+    assert len(repo.list_services()) == 2
+    assert len(repo.recent_events(limit=100)) == 2
+
+
+def test_rate_ingest_burst_does_not_consume_health_or_ui_budget(rate_limited_server):
+    server, _ = rate_limited_server
+    for index in range(3):
+        assert _rate_request(server, '/api/v1/ingest', _rate_service(index))[0] == (
+            200 if index < 2 else 429)
+    assert _rate_request(server, '/api/v1/health')[0] == 200
+    assert _rate_request(server, '/api/v1/services')[0] == 200
+    assert _rate_request(server, '/api/v1/health')[0] == 429
+
+
+def test_rate_ui_burst_does_not_consume_ingest_budget(rate_limited_server):
+    server, _ = rate_limited_server
+    assert _rate_request(server, '/api/v1/health')[0] == 200
+    assert _rate_request(server, '/api/v1/services')[0] == 200
+    assert _rate_request(server, '/api/v1/health')[0] == 429
+    assert _rate_request(server, '/api/v1/ingest', _rate_service(0))[0] == 200
