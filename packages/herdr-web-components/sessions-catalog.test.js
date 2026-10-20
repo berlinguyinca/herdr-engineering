@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {sessionEntries, selectSessions, sessionReport, compactSessionRow} from '../sessions-view.js';
 
 const now = Date.parse('2026-10-21T12:00:00Z');
-test('session tabs follow explicit outcomes, retaining old and unknown reports in Unconfirmed', () => {
+test('session tabs follow explicit outcomes, retaining old and unknown reports in Current', () => {
   const entries = sessionEntries([
     {session_id:'old',status:'active',updated_at:'2020-01-01'},
     {session_id:'unknown',status:'unrecognized'},
@@ -11,14 +11,14 @@ test('session tabs follow explicit outcomes, retaining old and unknown reports i
     {session_id:'stopped',status:'stopped'},
     {session_id:'failed',status:'crashed'},
   ]);
-  assert.deepEqual(selectSessions(entries,{tab:'unconfirmed'}).map(e=>e.id).sort(),['old','unknown']);
+  assert.deepEqual(selectSessions(entries).map(e=>e.id).sort(),['old','unknown']);
   assert.deepEqual(selectSessions(entries,{tab:'finished'}).map(e=>e.id).sort(),['closed','stopped']);
   assert.equal(selectSessions(entries,{tab:'failed'})[0].id,'failed');
   assert.match(sessionReport(entries.find(e=>e.id==='old').record,now),/Last reported active/);
   assert.doesNotMatch(sessionReport(entries.find(e=>e.id==='old').record,now),/running|live/i);
 });
 test('search combines project, model, host and role without exposing process commands', () => {
-  const entries=sessionEntries([{session_id:'a',updated_at:new Date().toISOString(),cwd:'/work/project/',model:'qwen3',agent_role:'planner',host_id:'beast',status:'active',cmdline:'secretcommand'}]);
+  const entries=sessionEntries([{session_id:'a',cwd:'/work/project/',model:'qwen3',agent_role:'planner',host_id:'beast',status:'active',cmdline:'secretcommand'}]);
   assert.equal(entries[0].project,'project');
   assert.equal(selectSessions(entries,{search:'project qwen beast planner',host:'beast'}).length,1);
   assert.equal(selectSessions(entries,{search:'secretcommand'}).length,0);
