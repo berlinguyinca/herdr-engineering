@@ -59,3 +59,28 @@ test('updating frames never relabel cached work as current activity', () => {
   assert.match(html, /Last recorded workers/);
   assert.doesNotMatch(html, /Live telemetry/);
 });
+
+test('mission lifecycle takes precedence over obsolete worker health', () => {
+  for (const [status, expected] of [['COMPLETE', 'complete'], ['FAILED', 'failed'], ['CANCELED', 'canceled'], ['PAUSED_INFRASTRUCTURE', 'paused: infrastructure'], ['PAUSED', 'paused']]) {
+    const p = structuredClone(projection);
+    p.mission.status = status;
+    p.activity.health = 'stalled';
+    p.activity.workerDetails = [{workerId: 'old-attempt', state: 'failed', health: 'failed', endedAt: '2026-10-20T11:00:00Z'}];
+    assert.ok(missionCard(p, now).includes(`Live telemetry · ${expected}</div>`), status);
+  }
+});
+
+test('active mission health excludes finished attempts while preserving current stalls', () => {
+  const p = structuredClone(projection);
+  p.activity.workerDetails = [
+    {workerId: 'old-failed', state: 'failed', health: 'failed'},
+    {workerId: 'old-complete', state: 'completed', health: 'stalled'},
+    {workerId: 'ended-running', state: 'running', health: 'failed', endedAt: '2026-10-20T11:00:00Z'},
+    {workerId: 'retry', state: 'running', health: 'active'},
+  ];
+  assert.match(missionCard(p, now), /Live telemetry · active<\/div>/);
+  p.activity.workerDetails.push({workerId: 'current-stall', state: 'waiting', health: 'stalled'});
+  assert.match(missionCard(p, now), /Live telemetry · stalled<\/div>/);
+  p.activity.health = 'failed';
+  assert.match(missionCard(p, now), /Live telemetry · failed<\/div>/);
+});

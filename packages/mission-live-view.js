@@ -25,9 +25,20 @@ export function freshnessAt(p, received, now = Date.now()) {
   if (state === 'live' && (p.connection === 'updating' || f.state === 'updating')) state = 'updating';
   return { state, age: seconds };
 }
-function worstHealth(a) {
+function worstHealth(a, mission) {
+  // Lifecycle is authoritative after completion or a pause. Failed attempts
+  // remain inspectable, but cannot override a running replacement worker.
+  const status = text(mission.status).toUpperCase();
+  if (status === 'COMPLETE') return 'complete';
+  if (status === 'FAILED') return 'failed';
+  if (status === 'CANCELED') return 'canceled';
+  if (status === 'PAUSED' || status.startsWith('PAUSED_')) {
+    return status === 'PAUSED' ? 'paused' : `paused: ${human(status.slice(7).toLowerCase())}`;
+  }
   const ranks = ['failed', 'stalled', 'blocked', 'slow', 'waiting', 'active', 'complete'];
-  const health = [a.health, ...records(a.workerDetails).map(w => w.health || (w.state === 'failed' ? 'failed' : null))];
+  const currentWorkers = records(a.workerDetails).filter(w =>
+    !w.endedAt && ['running', 'waiting', 'stalled', 'blocked'].includes(w.state));
+  const health = [a.health, ...currentWorkers.map(w => w.health || (w.state === 'running' ? 'active' : w.state))];
   return ranks.find(h => health.includes(h)) || 'unknown';
 }
 function progress(a) {
@@ -45,7 +56,7 @@ function freshnessLabel(f, health) {
 }
 export function missionCard(p, now = Date.now(), detail = false) {
   const a = p.activity || {}, m = p.mission || {};
-  const health = worstHealth(a), f = freshnessAt(p, now, now);
+  const health = worstHealth(a, m), f = freshnessAt(p, now, now);
   return `<article class="hd-card ml-card" data-mission-key="${esc(p.mission_key)}">
     <div class="hd-card__title">${detail ? esc(m.title || m.id) : `<a href="#/missions/${encodeURIComponent(p.mission_key)}">${esc(m.title || m.id)}</a>`}</div>
     <div class="ml-freshness" data-freshness data-health="${esc(health)}" data-state="${f.state}">${esc(freshnessLabel(f, health))}</div>
