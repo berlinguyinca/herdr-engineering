@@ -139,6 +139,17 @@
     - name: "Deploy dev-fabric auto-registration agent (all fleet hosts)"
       ansible.builtin.include_tasks: ../tasks/fabric-agent.yml
 
+    # ----------------------------------------------------------------------
+    # Dev-fabric systemd completion (all fleet hosts): installs the origin
+    # enroll-sync watcher unit, enables lingering, and converges enable+start
+    # for both fabric units -- so every attached host's fabric components are
+    # under systemd (auto-start at boot, restart on failure) with zero manual
+    # steps. Runs after fabric-agent.yml so herdr-eng is already provisioned
+    # and the agent unit is already installed.
+    # ----------------------------------------------------------------------
+    - name: "Converge dev-fabric systemd units (all fleet hosts)"
+      ansible.builtin.include_tasks: ../tasks/fabric-systemd.yml
+
     - name: "Converge the host cleanup companion and preserve its policy"
       ansible.builtin.include_tasks: ../tasks/build-cleanup.yml
 
