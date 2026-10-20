@@ -14,12 +14,12 @@ Worker inspection includes captured activity, provider/model routes, waits, outp
 2. Build a uniquely tagged image from the published commit and replace only `control-plane-web` with the same environment, network, and persistent services. Preserve PostgreSQL/RustFS volumes and active Pi processes.
 3. Verify `/api/v1/health` advertises `mission_activity_v1`, and the bulk/detail GET routes work. The collector refuses to publish to older servers, whose generic ingest fallback would otherwise turn unknown telemetry into ordinary events.
 4. Place the published collector checkout at `~/.local/share/herdr-engineering/mission-feed/releases/<full-commit>` and atomically point `current` to it. The service uses that source with the existing Python environment, so unrelated native services need no package replacement or restart.
-5. Install `deploy/mission-feed/herdr-eng-mission-feed.service` into `~/.config/systemd/user/`, reload the user manager, and enable/start that unit. The control-plane URL, host id and (only when keys are enabled) `ingest.api_key` come from the central fleet config through `~/.config/herdr-engineering/host.json` (`herdr-eng fleet join`); no env file is used.
+5. Install `deploy/mission-feed/herdr-eng-mission-feed.service` into `~/.config/systemd/user/`, reload the user manager, and enable/start that unit. Its default server is `http://dev.lan`; an optional private `~/.config/herdr-engineering/mission-feed.env` can override `HERDR_MISSION_FEED_URL` and provide `HERDR_CP_API_KEY`.
 
 Run a single collection pass with:
 
 ```bash
-herdr-eng control-plane mission-feed --once      # URL and host id from host.json
+herdr-eng control-plane mission-feed --control-plane http://dev.lan --host-id "$(hostname)" --once
 ```
 
 The JSON result reports accepted projections and fixed rejection/error categories, never arbitrary server response bodies or credentials. Only one daemon instance runs per user. SIGTERM stops collection gracefully. Linux validates `SO_PEERCRED`. macOS validates the real socket UID through libc `getpeereid` and the PID through `LOCAL_PEERPID`, including Python builds without a `socket.getpeereid` wrapper. Missing or failed credential checks reject the source.
@@ -47,9 +47,9 @@ For macOS, render `deploy/mission-feed/com.herdr.mission-feed.plist` with absolu
 `~/Library/LaunchAgents/com.herdr.mission-feed.plist`, mode 0600. Create the
 `~/.local/state/herdr-engineering` log directory, then use
 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.herdr.mission-feed.plist`.
-The control plane, host id and (when keys are enabled) the ingest key come from
-`~/.config/herdr-engineering/host.json` and the central fleet config it points at;
-put no URL or credential in the plist.
+The template defaults to `http://dev.lan`; replace that argument for another server.
+If authentication is enabled, provide `HERDR_CP_API_KEY` privately in the rendered
+plist's environment; never commit the rendered file or credentials.
 
 macOS's long default temporary directory can exceed Pi's Unix socket path limit.
 Use a short same-user directory such as `/tmp/pi-engineering-501`, created with
