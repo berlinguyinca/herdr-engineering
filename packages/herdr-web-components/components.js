@@ -4,7 +4,7 @@
 // system tokens. Every stateful component renders loading / empty / error /
 // data states. Status is never color-alone (label + icon always present).
 import { statusForStage, tokenVar } from './status.js';
-import { formatBytes } from './format.js';
+import { formatBytes, formatDuration } from './format.js';
 import { escapeHtml, shortenId } from './util.js';
 
 const ICON = {
@@ -14,6 +14,8 @@ const ICON = {
   attention: '!',
   blocked: '⊘',
   failed: '✕',
+  crashed: '✕',
+  stalled: '!',
   planning: '◈',
   unknown: '?',
 };
@@ -108,3 +110,32 @@ export class HerdrMetric extends HTMLElement {
 }
 
 
+
+// A local clock for report freshness, never a liveness inference or emitter.
+export class HerdrMissionActivity extends HTMLElement {
+  static observedAttributes = ['updated-at', 'source'];
+
+  connectedCallback() {
+    this.render();
+    clearInterval(this.timer);
+    this.timer = setInterval(() => this.render(), 1000);
+  }
+
+  disconnectedCallback() {
+    clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  attributeChangedCallback() { this.render(); }
+
+  render() {
+    const stamp = Date.parse(this.getAttribute('updated-at') || '');
+    const age = Number.isFinite(stamp)
+      ? `${formatDuration(Math.max(0, Date.now() - stamp))} ago`
+      : 'unavailable';
+    this.innerHTML = `<span class="hd-card__sub">Last reported change: ${escapeHtml(age)}</span>`
+      + (this.getAttribute('source') === 'pi'
+        ? '<div class="hd-card__sub">Finished, crashed, or stalled updates only. Inspect the Pi mission for live worker activity.</div>'
+        : '');
+  }
+}

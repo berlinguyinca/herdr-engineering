@@ -238,6 +238,7 @@ async function viewMissions() {
       <div style="margin:6px 0"><herdr-status stage="${esc(m.status)}"></herdr-status></div>
       <div class="hd-card__sub">${esc(missionSubtitle(m, m.sessions ? m.sessions.length : 0))}</div>
       <div class="hd-card__sub">created ${formatTimestamp(m.created_at)}</div>
+      <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
     </div>`).join('') + '</div>';
 }
 
@@ -260,6 +261,7 @@ async function viewMission(parts) {
       <herdr-metric label="Stage" value="${esc(m.stage)}"></herdr-metric>
       <herdr-metric label="Created" value="${esc(formatTimestamp(m.created_at))}"></herdr-metric>
     </div>
+    <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
     <h3 style="margin-top:20px">Sessions</h3>
     ${await missionSessions(m)}
     <h3 style="margin-top:20px">Timeline</h3>

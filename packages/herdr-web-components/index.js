@@ -1,7 +1,7 @@
 // herdr-web-components — register all components for browser use.
 import {
   HerdrStatus, HerdrSpinner, HerdrEmpty, HerdrError,
-  HerdrIdent, HerdrMetric,
+  HerdrIdent, HerdrMetric, HerdrMissionActivity,
 } from './components.js';
 import { HerdrAppShell } from './app-shell.js';
 import { HerdrTimeline } from './timeline.js';
@@ -13,6 +13,7 @@ const registry = {
   'herdr-error': HerdrError,
   'herdr-ident': HerdrIdent,
   'herdr-metric': HerdrMetric,
+  'herdr-mission-activity': HerdrMissionActivity,
   'herdr-app-shell': HerdrAppShell,
   'herdr-timeline': HerdrTimeline,
 };
@@ -26,4 +27,4 @@ export function defineComponents() {
   return registry;
 }
 
-export { HerdrStatus, HerdrSpinner, HerdrEmpty, HerdrError, HerdrIdent, HerdrMetric, HerdrAppShell, HerdrTimeline };
+export { HerdrStatus, HerdrSpinner, HerdrEmpty, HerdrError, HerdrIdent, HerdrMetric, HerdrMissionActivity, HerdrAppShell, HerdrTimeline };
