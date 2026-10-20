@@ -190,8 +190,10 @@ export function mountInspector(host, client, sessionId) {
     url: client.inspectorStreamUrl(sessionId),
     onEvent: (f) => {
       if (disposed) return;
-      if (f.type === 'connected') {            // first connect and every reconnect: resync
-        if (st.loaded || st.data) load();
+      if (f.type === 'connected') {
+        // The first snapshot may predate the subscription. Resync on every
+        // connection; reqId prevents that older response replacing newer data.
+        load();
         return;
       }
       if (f.type === 'gap') { load(); return; }
@@ -199,7 +201,8 @@ export function mountInspector(host, client, sessionId) {
       const kinds = VIEW_KINDS[st.view];
       if (!st.q && !st.agent && (!kinds || kinds.includes(f.event.kind)) && st.data) {
         mergeEntry(st.events, f.event, cap());
-        st.rev = Math.max(st.rev, f.event.rev || 0);
+        // Only HTTP snapshots advance the synchronization cursor. A later
+        // streamed row does not prove earlier rows were received.
         scheduleRender();
       }
       refreshSoon();

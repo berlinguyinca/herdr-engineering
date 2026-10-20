@@ -23,7 +23,7 @@ export function formatBytes(n) {
 export function formatDuration(ms) {
   if (ms == null || Number.isNaN(ms)) return '—';
   if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
-  const s = ms / 1000;
+  const s = Math.round(ms / 1000);
   if (s < 60) return `${Math.round(s)}s`;
   const m = Math.floor(s / 60);
   const remS = Math.round(s % 60);

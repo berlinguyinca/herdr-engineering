@@ -56,7 +56,7 @@ export function telemetryHealth(summary, telemetry) {
   if (age != null && age > STALE_AFTER_S) {
     return { state: 'stale', text: `No telemetry for ${formatDuration(age * 1000)} — the agent may be idle, restarting or disconnected.` };
   }
-  return { state: 'live', text: 'Live' };
+  return { state: 'live', text: 'Recent inspector data' };
 }
 
 function badge(text, cls = '') {
@@ -66,7 +66,7 @@ function badge(text, cls = '') {
 export function renderSummaryBar(data) {
   const s = data.summary;
   const health = telemetryHealth(s, data.telemetry);
-  const parts = [badge(health.state === 'live' ? '● live' : health.text, `hd-ins__badge--${health.state}`)];
+  const parts = [badge(health.state === 'live' ? `● ${health.text}` : health.text, `hd-ins__badge--${health.state}`)];
   if (s) {
     if (s.running_tools.length) parts.push(badge(`${s.running_tools.length} tool${s.running_tools.length > 1 ? 's' : ''} running`, 'hd-ins__badge--run'));
     const failed = s.tests.filter((t) => t.status === 'failed').length;

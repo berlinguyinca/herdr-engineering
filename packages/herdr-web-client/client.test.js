@@ -133,3 +133,26 @@ test('listMissions preserves status filtering while forwarding cancellation', as
  await client.listMissions('in progress',{signal:controller.signal});
  assert.equal(request.url,'/api/v1/missions?status=in%20progress');assert.equal(request.opts.signal,controller.signal);
 });
+
+test('dashboard reads preserve filters and forward cancellation signals', async () => {
+  const calls=[]; const controller=new AbortController();
+  const client=new HerdrClient('', {fetchImpl: async (url,opts)=>{
+    calls.push({url,opts}); return {ok:true,status:200,text:async()=> '{}'};
+  }});
+  await client.listSessions('active',{signal:controller.signal});
+  await client.listServices({signal:controller.signal});
+  await client.listHosts({signal:controller.signal});
+  await client.health({signal:controller.signal});
+  await client.activity(8,{signal:controller.signal});
+  assert.deepEqual(calls.map(x=>x.url), ['/api/v1/sessions?status=active','/api/v1/services','/api/v1/hosts','/api/v1/health','/api/v1/activity?limit=8']);
+  assert.ok(calls.every(x=>x.opts.signal===controller.signal));
+});
+
+test('session detail reads encode the exact source ID and support cancellation',async()=>{
+ const controller=new AbortController();let call;
+ const client=new HerdrClient('',{fetchImpl:async(url,opts)=>{call={url,opts};return{ok:true,text:async()=> '{}'};}});
+ const id='herdr:beast:%2Fwork%2Frepo:w1:p3';
+ await client.getSession(id,{signal:controller.signal});
+ assert.equal(call.url,`/api/v1/sessions/${encodeURIComponent(id)}`);
+ assert.equal(call.opts.signal,controller.signal);
+});
