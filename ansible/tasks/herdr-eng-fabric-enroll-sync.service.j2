@@ -1,0 +1,31 @@
+# HerdR dev-fabric origin auto-enrollment watcher.
+#
+# Persistent systemd USER unit installed by the fleet bootstrap at host
+# attach (ansible/tasks/fabric-systemd.yml). Reads every origin.json in the
+# fleet-origins dir and keeps them all registered with the CENTRAL fabric
+# gateway (which serves them fleet-wide on dev.lan and self-renews healthy
+# leases via its probe loop). A new project's origin.json landing in
+# fleet-origins (or being committed, with --git-pull) is enrolled within an
+# interval -- no restart, no manual step. Removed manifests are reaped.
+#
+# The gateway control URL is read from ~/.config/herdr-engineering/fabric.env
+# (HERDR_ENGINEERING_FABRIC_URL), the same file the fabric agent uses.
+# Machine-local, no secrets (a tailnet URL, not a credential).
+#
+# Uninstall:
+#   systemctl --user disable --now herdr-eng-fabric-enroll-sync.service
+#   rm -f ~/.config/systemd/user/herdr-eng-fabric-enroll-sync.service
+#   systemctl --user daemon-reload
+[Unit]
+Description=HerdR dev-fabric origin auto-enrollment watcher
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-%h/.config/herdr-engineering/fabric.env
+ExecStart={{ herdr_eng_binary }} devfabric enroll-sync --dir {{ fleet_origins_dir }} --watch --interval 30 --git-pull
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

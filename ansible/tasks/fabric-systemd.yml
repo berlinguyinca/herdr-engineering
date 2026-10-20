@@ -1,0 +1,125 @@
+# Dev-fabric systemd USER units at host attach (spec 0110 + enroll-sync watcher).
+#
+# Included from site.yml right after tasks/fabric-agent.yml, which provisions
+# herdr-eng (immutable staged release + shared venv) and installs the fabric
+# AGENT unit via scripts/fabric-agent.sh. This block completes the attach:
+#   - installs the origin enroll-sync WATCHER unit (previously hand-crafted
+#     per host -- no automation at all)
+#   - enables lingering so user units start at boot with no login session
+#   - converges enable+start state for both fabric units
+#
+# Runs as the FLEET user (user-scoped units -- never root). Graceful when
+# herdr-eng is unavailable: everything is skipped with a diagnostic and the
+# bootstrap itself never breaks.
+#
+# The agent unit file is owned by scripts/fabric-agent.sh (this block does NOT
+# re-write it -- two writers would fight over the file and flap restarts);
+# this block only converges its running/enabled state.
+- name: "Dev-fabric systemd units (enroll-sync watcher + lingering + state)"
+  become: false
+  environment:
+    HOME: "{{ fleet_home }}"
+    USER: "{{ fleet_user }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+    PATH: "{{ fleet_home }}/.venvs/herdr-engineering/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{{ fleet_home }}/.local/bin"
+  block:
+    - name: "Resolve herdr-eng binary path"
+      ansible.builtin.shell: |
+        # Venv first: stage-release.py always installs the pinned release
+        # into the shared ~/.venvs/herdr-engineering (the stable location).
+        for c in "{{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng" \
+                 "$(command -v herdr-eng 2>/dev/null || true)" \
+                 "{{ fleet_home }}/.local/bin/herdr-eng"; do
+          [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; exit 0; }
+        done
+        printf 'not-found\n'
+      register: herdr_eng_resolve
+      changed_when: false
+      check_mode: no
+
+    - name: "Fabric systemd skipped: herdr-eng unavailable"
+      ansible.builtin.debug:
+        msg: >-
+          herdr-eng not found on {{ inventory_hostname }} -- enroll-sync
+          unit, lingering and unit-state convergence skipped. Fix herdr-eng
+          provisioning (tasks/fabric-agent.yml) and re-run the bootstrap.
+      when: herdr_eng_resolve.stdout | trim == 'not-found'
+
+    - name: "Set herdr-eng binary + fleet-origins facts"
+      ansible.builtin.set_fact:
+        herdr_eng_binary: "{{ herdr_eng_resolve.stdout | trim }}"
+        fleet_origins_dir: "{{ fleet_home }}/.local/share/herdr-engineering/fleet-origins"
+      when: herdr_eng_resolve.stdout | trim != 'not-found'
+
+    - name: "Ensure fleet-origins directory"
+      ansible.builtin.file:
+        path: "{{ fleet_origins_dir }}"
+        state: directory
+        mode: "0750"
+      when: herdr_eng_resolve.stdout | trim != 'not-found'
+
+    - name: "Write fabric gateway URL env file (only if absent; never overwrites)"
+      ansible.builtin.copy:
+        dest: "{{ fleet_home }}/.config/herdr-engineering/fabric.env"
+        content: "HERDR_ENGINEERING_FABRIC_URL={{ fabric_agent_gateway_url }}\n"
+        force: false
+        mode: "0600"
+      when: herdr_eng_resolve.stdout | trim != 'not-found'
+
+    - name: "Install fabric enroll-sync systemd user unit"
+      ansible.builtin.template:
+        src: herdr-eng-fabric-enroll-sync.service.j2
+        dest: "{{ fleet_home }}/.config/systemd/user/herdr-eng-fabric-enroll-sync.service"
+        mode: "0644"
+      register: enroll_sync_unit
+      when: herdr_eng_resolve.stdout | trim != 'not-found'
+
+    - name: "Reload user systemd if the enroll-sync unit changed"
+      ansible.builtin.systemd:
+        daemon_reload: true
+        scope: user
+      when:
+        - herdr_eng_resolve.stdout | trim != 'not-found'
+        - enroll_sync_unit is changed
+
+    - name: "Restart enroll-sync if the unit changed"
+      ansible.builtin.systemd:
+        name: herdr-eng-fabric-enroll-sync.service
+        state: restarted
+        scope: user
+      when:
+        - herdr_eng_resolve.stdout | trim != 'not-found'
+        - enroll_sync_unit is changed
+
+    - name: "Enable lingering (user units run at boot, no login session needed)"
+      ansible.builtin.shell: |
+        # Note: `show-user -p Lingering --value` prints nothing on some
+        # systemd builds, so probe the full property dump instead.
+        if loginctl show-user '{{ fleet_user }}' 2>/dev/null | grep -q '^Linger=yes'; then
+          echo already
+        else
+          loginctl enable-linger '{{ fleet_user }}'
+          echo enabled
+        fi
+      register: linger_result
+      changed_when: "'enabled' in linger_result.stdout"
+      become: true
+      when:
+        - herdr_eng_resolve.stdout | trim != 'not-found'
+        - fleet_user != 'root'
+
+    - name: "Enable + start fabric agent (state only; fabric-agent.sh owns the unit file)"
+      ansible.builtin.systemd:
+        name: herdr-eng-fabric-agent.service
+        state: started
+        enabled: true
+        scope: user
+      when: herdr_eng_resolve.stdout | trim != 'not-found'
+
+    - name: "Enable + start fabric enroll-sync (user unit)"
+      ansible.builtin.systemd:
+        name: herdr-eng-fabric-enroll-sync.service
+        state: started
+        enabled: true
+        scope: user
+      when: herdr_eng_resolve.stdout | trim != 'not-found'
