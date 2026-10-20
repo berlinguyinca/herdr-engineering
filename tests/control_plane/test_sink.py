@@ -104,3 +104,59 @@ def test_required_command_receipt_propagates_database_failure_before_delivery():
     assert receipt["error"] == "receipt_persistence_failed"
     assert calls == []
     assert repo.get_session(sid)["messages"] == 0
+
+
+def test_sink_reconnects_a_closed_database_connection(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    class ClosedConn(FakeConn):
+        def is_closed(self):
+            return True
+
+        async def fetchrow(self, sql, *args):
+            raise OSError("connection is closed")
+
+    old = ClosedConn()
+    replacement = FakeConn()
+    connects = []
+
+    async def connect(dsn):
+        connects.append(dsn)
+        return replacement
+
+    monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(connect=connect))
+    sink = DurableEventSink(dsn="postgresql://fixture", conn=old, run=fake_run)
+    event = {"event_id": "recovered-event", "entity_type": "mission",
+             "entity_id": "m1", "event_type": "MissionUpdated", "payload": {}}
+    sink.record_required(event)
+    sink.record_required({**event, "event_id": "next-event", "sequence": 1})
+    assert connects == ["postgresql://fixture"]
+    assert old.inserts == []
+    assert [row[0] for row in replacement.inserts] == ["recovered-event", "next-event"]
+
+
+def test_sink_serializes_connection_recovery_and_concurrent_writes(monkeypatch):
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    replacement = FakeConn()
+    connects = []
+
+    async def connect(dsn):
+        connects.append(dsn)
+        await asyncio.sleep(0.02)
+        return replacement
+
+    monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(connect=connect))
+    sink = DurableEventSink(dsn="postgresql://fixture", run=fake_run)
+
+    def write(index):
+        sink.record_required({"event_id": f"event-{index}", "entity_type": "mission",
+                              "entity_id": "m1", "event_type": "Updated", "sequence": index})
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(write, range(8)))
+    assert connects == ["postgresql://fixture"]
+    assert len(replacement.inserts) == 8

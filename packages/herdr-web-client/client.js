@@ -19,7 +19,7 @@ export class HerdrClient {
     this.fetch = fetchImpl;
   }
 
-  async request(path, { method = 'GET', body } = {}) {
+  async request(path, { method = 'GET', body, signal } = {}) {
     const url = `${this.base}${path}`;
     const headers = { Accept: 'application/json' };
     let payload;
@@ -31,7 +31,7 @@ export class HerdrClient {
     // invocation" if it is invoked as a method (receiver = this client),
     // so extract it to a local first (this === undefined).
     const doFetch = this.fetch;
-    const res = await doFetch(url, { method, headers, body: payload });
+    const res = await doFetch(url, { method, headers, body: payload, signal });
     const text = await res.text();
     let json;
     try {
@@ -54,6 +54,14 @@ export class HerdrClient {
 
   getMission(id) {
     return this.request(`/api/v1/missions/${encodeURIComponent(id)}`);
+  }
+
+  listMissionActivity({ signal } = {}) {
+    return this.request('/api/v1/mission-activity', { signal });
+  }
+
+  missionActivity(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/activity`, { signal });
   }
 
   missionTimeline(id) {

@@ -1,0 +1,19 @@
+[Unit]
+Description=HerdR read-only Pi mission telemetry collector
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/herdr-engineering/mission-feed/current
+Environment=PYTHONPATH=%h/.local/share/herdr-engineering/mission-feed/current
+Environment=HERDR_MISSION_FEED_URL=http://dev.lan
+EnvironmentFile=-%h/.config/herdr-engineering/mission-feed.env
+ExecStart=%h/.venvs/herdr-engineering/bin/python -m herdr_engineering.cli control-plane mission-feed --control-plane ${HERDR_MISSION_FEED_URL} --host-id %H --interval 5
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

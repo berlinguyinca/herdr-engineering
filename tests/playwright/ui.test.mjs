@@ -155,9 +155,8 @@ test('pi-sourced mission detail renders by mission_key', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/missions`);
     // The list must render the pi mission card before we can click it.
-    // esc() only HTML-escapes (colons are kept as-is), so the href carries the
-    // raw mission_key; the hash router decodes it on click.
-    await page.waitForSelector('a[href="#/missions/pi:MSN-PI1"]', { timeout: 15000 });
+    // The href encodes the complete namespace; the hash router decodes it once.
+    await page.waitForSelector('a[href="#/missions/pi%3AMSN-PI1"]', { timeout: 15000 });
     await page.click('a:has-text("Pi mission")');
     // Detail route uses the mission_key, not the bare mission_id (UI-005).
     await page.waitForFunction(
@@ -183,8 +182,7 @@ test('pi-sourced mission detail renders by mission_key', async () => {
 
 test('mission detail renders the timeline', async () => {
   await withApp(async ({ page, base }) => {
-    // Plain-colon hash (what the missions page links use); the app
-    // URL-encodes it itself when fetching /api/v1/missions/{id}.
+    // Legacy plain-colon bookmarks remain valid; the app encodes the API path.
     await page.goto(`${base}/#/missions/pi:MSN-PI1`);
     // Merged timeline (UI-009): stage events + test run + merged PR.
     await page.waitForSelector('herdr-timeline .hd-timeline__item', { timeout: 15000 });
@@ -365,8 +363,156 @@ test('mission report ages advance without events or notification requests', asyn
     assert.doesNotMatch(await activity.innerText(), /stalled for|No activity/);
     await page.locator('herdr-status').first().evaluate((el) => el.setAttribute('stage', 'stalled'));
     assert.match(await page.locator('herdr-status').first().innerText(), /Stalled/);
-    await page.locator('a[href="#/missions/pi:MSN-PI1"]').click();
+    await page.locator('a[href="#/missions/pi%3AMSN-PI1"]').click();
     await page.locator('herdr-mission-activity[source="pi"]').waitFor();
     assert.deepEqual(writes, [], 'local clocks never emit notifications');
   }, { BURST: '0' });
+});
+
+function liveProjection(overrides = {}) {
+  const now = new Date().toISOString();
+  return {
+    contract_version: 1, mission_key: 'pi:MSN-live', host_id: 'beast', instance_id: 'pi-instance', session_id: 'native-pi-session',
+    observed_at: now, snapshot_at: now, connection: 'connected',
+    mission: { id: 'MSN-live', title: 'Live Pi mission', status: 'EXECUTING' },
+    freshness: { state: 'live', age_seconds: 2, stale_after_seconds: 30, disconnect_after_seconds: 120 },
+    activity: { health: 'active', currentActivity: { summary: 'Running authentication tests' }, currentActivityStartedAt: now,
+      acceptanceCoverage: { completed: 1, total: 4 }, lastOutputAt: now, lastHeartbeatAt: now,
+      workerDetails: [{ workerId: 'reviewer', health: 'stalled', state: 'running', route: 'flash', model: 'metabolomics/qwen3.8', currentActivity: 'Waiting for model', lastOutputPreview: '<script>window.outputExecuted=true</script>\n4 tests passed' }],
+      changes: { changedFiles: ['src/auth.ts'] }, tests: { passed: 4, failed: 0, completed: 4, total: 6, running: true },
+      activity: [{ at: now, summary: 'Started authentication suite' }],
+    }, ...overrides,
+  };
+}
+
+test('live Pi missions lead the list and details inspect workers without guessing session links', async () => {
+  await withApp(async ({page, base}) => {
+    let bulk = 0, detail = 0;
+    await page.clock.install();
+    await page.route('**/api/v1/mission-activity', r => { bulk++; return r.fulfill({json: {activities: [liveProjection()], server_time: new Date().toISOString()}}); });
+    await page.route('**/api/v1/missions/pi%3AMSN-live/activity', r => { detail++; return r.fulfill({json: {activity: liveProjection()}}); });
+    await page.goto(`${base}/#/missions`);
+    await page.waitForSelector('[data-mission-key="pi:MSN-live"]');
+    assert.match(await bodyText(page), /Live telemetry · stalled/);
+    assert.match(await bodyText(page), /flash → metabolomics\/qwen3.8/);
+    const headings = await page.locator('#view h2').allTextContents();
+    assert.deepEqual(headings, ['Live Pi missions', 'Recorded missions']);
+    await page.getByRole('link', {name: 'Live Pi mission', exact: true}).click();
+    await page.waitForSelector('[data-worker="reviewer"]');
+    await page.locator('[data-worker="reviewer"] summary').click();
+    assert.match(await bodyText(page), /4 tests passed/);
+    assert.equal(await page.evaluate(() => window.outputExecuted), undefined);
+    assert.equal(await page.locator('#view a[href*="/herd/session/"]').count(), 0);
+    assert.match(await bodyText(page), /src\/auth.ts/);
+    assert.equal(bulk, 1); assert.equal(detail, 1);
+    await page.clock.runFor(5500);
+    await page.waitForTimeout(40);
+    assert.equal(detail, 2);
+    await page.waitForFunction(() => document.querySelector('[data-worker]')?.open);
+    assert.equal(await page.locator('[data-worker="reviewer"]').evaluate(el => el.open), true);
+  }, {BURST: '0'});
+});
+
+test('live activity clocks advance without requests, polls pause hidden and clean up on navigation', async () => {
+  await withApp(async ({page, base}) => {
+    let calls = 0, writes = 0;
+    page.on('request', req => { if (req.method() !== 'GET') writes++; });
+    await page.route('**/api/v1/mission-activity', r => { calls++; return r.fulfill({json: {activities: [liveProjection()], server_time: new Date().toISOString()}}); });
+    await page.clock.install();
+    await page.goto(`${base}/#/missions`);
+    await page.waitForSelector('[data-report-age]');
+    await page.clock.runFor(3000);
+    assert.ok(parseInt(await page.locator('[data-report-age]').textContent(), 10) >= 4);
+    assert.equal(calls, 1);
+    await page.evaluate(() => { Object.defineProperty(document, 'hidden', {configurable: true, value: true}); document.dispatchEvent(new Event('visibilitychange')); });
+    await page.clock.runFor(40000); assert.equal(calls, 1);
+    await page.evaluate(() => { Object.defineProperty(document, 'hidden', {configurable: true, value: false}); document.dispatchEvent(new Event('visibilitychange')); });
+    await page.waitForFunction(() => document.querySelector('[data-freshness]')?.textContent.includes('Live telemetry'));
+    await page.waitForTimeout(30); assert.equal(calls, 2);
+    await page.evaluate(() => { location.hash = '#/hosts'; });
+    await page.waitForFunction(() => document.querySelector('#view h1')?.textContent === 'Hosts');
+    await page.clock.runFor(20000); assert.equal(calls, 2); assert.equal(writes, 0);
+  }, {BURST: '0'});
+});
+
+test('telemetry failures retain last known activity and age to disconnected without false crash', async () => {
+  await withApp(async ({page, base}) => {
+    let calls = 0;
+    await page.route('**/api/v1/mission-activity', r => ++calls === 1
+      ? r.fulfill({json: {activities: [liveProjection()], server_time: new Date().toISOString()}})
+      : r.fulfill({status: 503, json: {error: 'unavailable'}}));
+    await page.clock.install(); await page.goto(`${base}/#/missions`);
+    await page.waitForSelector('[data-report-age]');
+    await page.clock.runFor(6000);
+    await page.waitForFunction(() => document.querySelector('.ml-connection')?.textContent.includes('interrupted'));
+    await page.clock.runFor(130000);
+    assert.match(await bodyText(page), /Disconnected telemetry · current state unknown/);
+    assert.match(await bodyText(page), /Running authentication tests/);
+    assert.doesNotMatch(await page.locator('#live-missions').innerText(), /crashed/i);
+    assert.ok(calls < 12, `backoff bounds requests: ${calls}`);
+  }, {BURST: '0'});
+});
+
+test('mission polling is single flight and late responses cannot replace a new route', async () => {
+  await withApp(async ({page, base}) => {
+    let calls = 0, held;
+    await page.route('**/api/v1/mission-activity', r => { calls++; held = r; });
+    await page.clock.install(); await page.goto(`${base}/#/missions`);
+    await page.waitForFunction(() => document.querySelector('#live-missions'));
+    await page.waitForTimeout(50);
+    await page.clock.runFor(10000); assert.equal(calls, 1);
+    await page.evaluate(() => { location.hash = '#/hosts'; });
+    await page.waitForFunction(() => document.querySelector('#view h1')?.textContent === 'Hosts');
+    await held.fulfill({json: {activities: [liveProjection()]}}).catch(() => {});
+    await page.clock.runFor(30000);
+    assert.equal(calls, 1);
+    assert.equal(await page.locator('#view h1').textContent(), 'Hosts');
+    assert.equal(await page.locator('[data-mission-key]').count(), 0);
+  }, {BURST: '0'});
+});
+
+test('updating revisions retain labeled last-known evidence and freeze elapsed work', async () => {
+  await withApp(async ({page, base}) => {
+    let calls = 0;
+    const p = liveProjection({mission_revision: 1, activity_revision: 1});
+    p.activity_snapshot_at = p.snapshot_at;
+    await page.route('**/api/v1/missions/pi%3AMSN-live/activity', r => {
+      calls++;
+      return r.fulfill({json: {activity: calls === 1 ? p : {...p, connection: 'updating', mission_revision: 2,
+        freshness: {...p.freshness, state: 'updating', age_seconds: 0}}}});
+    });
+    await page.clock.install(); await page.goto(`${base}/#/missions/pi%3AMSN-live`);
+    await page.waitForSelector('[data-worker]');
+    await page.clock.runFor(6000);
+    await page.waitForFunction(() => document.querySelector('[data-freshness]')?.dataset.state === 'updating');
+    assert.match(await bodyText(page), /Updating telemetry · current details unavailable/);
+    assert.match(await bodyText(page), /Last recorded measurements/);
+    const elapsed = page.locator('.ml-card [data-clock]').first();
+    const value = await elapsed.textContent();
+    await page.clock.runFor(6000);
+    assert.equal(await elapsed.textContent(), value);
+    assert.match(await bodyText(page), /Activity elapsed at last snapshot/);
+    assert.doesNotMatch(await bodyText(page), /Live telemetry/);
+  }, {BURST: '0'});
+});
+
+test('Pi detail lifecycle history refreshes on real SSE without replacing live inspection', async () => {
+  await withApp(async ({page, base}) => {
+    const p = liveProjection({mission_key: 'pi:MSN-PI1', mission: {id: 'MSN-PI1', title: 'Pi mission', status: 'EXECUTING'}});
+    await page.route('**/api/v1/missions/pi%3AMSN-PI1/activity', r => r.fulfill({json: {activity: p}}));
+    await page.goto(`${base}/#/missions/pi%3AMSN-PI1`);
+    await page.waitForSelector('[data-worker="reviewer"]');
+    await page.locator('[data-worker="reviewer"] summary').click();
+    await page.evaluate(() => { window.livePaneBefore = document.querySelector('#live-mission-detail'); });
+    const response = await fetch(`${base}/api/v1/ingest`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+      source: 'pi', entity_type: 'mission', entity_id: 'MSN-PI1', event_type: 'MissionStopped', payload: {title: 'Pi mission', stage: 'complete'},
+    })});
+    assert.equal(response.status, 200);
+    await page.waitForFunction(() => document.querySelector('#mission-history herdr-status')?.getAttribute('stage') === 'complete', null, {timeout: 12000});
+    assert.equal(await page.evaluate(() => window.livePaneBefore === document.querySelector('#live-mission-detail')), true);
+    assert.equal(await page.locator('[data-worker="reviewer"]').evaluate(el => el.open), true);
+    assert.match(await page.locator('#mission-stream').innerText(), /complete|stopped/i);
+    await page.waitForFunction(() => /complete|stopped/i.test(document.querySelector('#mission-timeline')?.innerText || ''), null, {timeout: 5000});
+    assert.match(await page.locator('#mission-timeline').innerText(), /complete|stopped/i);
+  }, {BURST: '0'});
 });

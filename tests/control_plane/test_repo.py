@@ -387,3 +387,42 @@ def test_message_audit_keeps_redacted_text_but_transport_receives_original(ackno
     assert received == ["set token=super-secret-value"]
     assert "super-secret-value" not in result["text"]
     assert "set " in result["text"]
+
+
+def test_recent_events_after_sparse_durable_restore_preserves_order_and_limits():
+    r = repo.ControlPlaneRepo()
+    r.import_state({'events': {
+        'session|one': [
+            {'sequence': 100, 'event_type': 'old'},
+            {'sequence': 900, 'event_type': 'new'},
+        ],
+        'session|two': [{'sequence': 8000, 'event_type': 'other'}],
+    }, 'event_order': [('session', 'one', 100), ('session', 'two', 8000),
+                       ('session', 'one', 900)]})
+    assert [e['event_type'] for e in r.recent_events(2)] == ['new', 'other']
+    assert [e['event_type'] for e in r.recent_events(10)] == ['new', 'other', 'old']
+    r.record_event('session', 'one', 'fresh')
+    assert [e['event_type'] for e in r.recent_events(2)] == ['fresh', 'new']
+
+
+def test_recent_events_preserves_distinct_events_with_duplicate_durable_sequences():
+    r = repo.ControlPlaneRepo()
+    r.import_state({'events': {
+        'mission|one': [
+            {'sequence': 0, 'event_id': 'first'},
+            {'sequence': 0, 'event_id': 'second'},
+            {'sequence': 500, 'event_id': 'third'},
+            {'sequence': 500, 'event_id': 'fourth'},
+        ],
+        'host|two': [{'sequence': 80, 'event_id': 'other'}],
+    }, 'event_order': [('mission', 'one', 0), ('host', 'two', 80),
+                       ('mission', 'one', 0), ('mission', 'one', 500),
+                       ('mission', 'one', 500)]})
+    assert [e['event_id'] for e in r.recent_events(10)] == [
+        'fourth', 'third', 'second', 'other', 'first']
+    assert [e['event_id'] for e in r.recent_events(2)] == ['fourth', 'third']
+    assert len({e['event_id'] for e in r.recent_events(10)}) == 5
+    r.record_event('mission', 'one', 'new')
+    assert r.recent_events(1)[0]['sequence'] == 501
+    assert [e['event_id'] for e in r.recent_events(10)[1:]] == [
+        'fourth', 'third', 'second', 'other', 'first']

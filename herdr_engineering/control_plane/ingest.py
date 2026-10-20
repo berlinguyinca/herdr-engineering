@@ -40,6 +40,11 @@ class IngestService:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", source):
             raise ValueError("invalid source")
 
+        if entity_type == "mission_activity":
+            if event_type != "mission_activity.snapshot":
+                raise ValueError("invalid mission activity event_type")
+            result = self.repo.mission_activity.ingest(entity_id, payload, source=source)
+            return {"entity_type": entity_type, "entity_id": entity_id, **result}
         if entity_type == "host":
             return self._ingest_host(entity_id, event_type, payload)
         if entity_type == "session":

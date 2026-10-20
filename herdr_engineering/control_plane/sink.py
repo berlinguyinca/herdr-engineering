@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import threading
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
@@ -67,9 +68,12 @@ class DurableEventSink:
         self._run = run
         self._events_table = events_table
         self._store = EventStore(conn, table=events_table)
+        self._write_lock = threading.RLock()
 
     def _ensure_store(self) -> None:
-        if self._store._conn is None and self._dsn:
+        conn = self._store._conn
+        closed = getattr(conn, "is_closed", None)
+        if self._dsn and (conn is None or (callable(closed) and closed())):
             import asyncpg
             self._conn = self._run(asyncpg.connect(self._dsn))
             self._store = EventStore(self._conn, table=self._events_table)
@@ -84,6 +88,9 @@ class DurableEventSink:
 
     def record_required(self, ev: dict) -> None:
         """Persist a command receipt, propagating failure before side effects."""
-        self._ensure_store()
-        if not self._run(self._store.append(_dict_to_event(ev))):
-            raise RuntimeError("durable event insert was not acknowledged")
+        # The synchronous web server has concurrent request threads; asyncpg
+        # permits one operation per connection, including reconnection.
+        with self._write_lock:
+            self._ensure_store()
+            if not self._run(self._store.append(_dict_to_event(ev))):
+                raise RuntimeError("durable event insert was not acknowledged")
