@@ -1,15 +1,10 @@
 """Read-time service context and reversible archival; event history stays intact."""
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import re
 from datetime import datetime
 from pathlib import PurePath
-from urllib.parse import quote
-
-from .project_links import canonical_repository, project_for_repository
 
 INACTIVE = {"unavailable", "stopped", "dead"}
 ARCHIVE_AFTER_DAYS = 7
@@ -47,14 +42,7 @@ def service_lifecycle(record, now, *, archive_after_days=ARCHIVE_AFTER_DAYS):
     since_stamp = _timestamp(since)
     archived = (status in INACTIVE and since_stamp is not None
                 and now - since_stamp >= archive_after_days * 86400)
-    # An operator may retire silent records (POST /api/v1/services/retire). A later
-    # report from the service itself lifts the retirement, like any archive.
-    retired_at = _timestamp(record.get("retired_at"))
-    retired = retired_at is not None and (last_stamp is None or last_stamp <= retired_at)
-    if retired and not archived:
-        archived = True
-        state, reason = "archived", "Retired by an operator; a new report restores it. History retained"
-    elif archived:
+    if archived:
         state, reason = "archived", f"Unavailable for at least {archive_after_days:g} days; history retained"
     elif status in INACTIVE:
         state, reason = "unavailable", "Reporter marked this service unavailable"
@@ -79,131 +67,6 @@ def normalize_project(value):
 
 def normalize_source_port(value):
     return value if type(value) is int and 0 < value <= 65535 else None
-
-
-def service_listener_id(host_id, pid, start, source_port):
-    """Physical listener identity is independent of display names and routes."""
-    if (not isinstance(host_id, str) or not host_id or len(host_id) > 300
-            or type(pid) is not int or pid < 1 or not isinstance(start, str) or not start
-            or len(start) > 300 or any(ord(char) < 32 for char in host_id + start)
-            or normalize_source_port(source_port) is None):
-        raise ValueError("listener identity requires host, positive PID, process birth and physical port")
-    encoded = json.dumps([host_id, pid, start, source_port], separators=(",", ":"), ensure_ascii=False).encode()
-    return "listener_" + hashlib.sha256(encoded).hexdigest()[:32]
-
-
-def normalize_service_observation(payload, now, previous=None):
-    state = payload.get("state")
-    observed_at = payload.get("observed_at")
-    stamp = _timestamp(observed_at)
-    # Match the UI clock-skew allowance; future evidence must not revive later.
-    if stamp is None or stamp > now + 5:
-        raise ValueError("metadata observation requires a valid timezone-aware timestamp")
-    if state not in {"observed", "missing", "unconfirmed"}:
-        raise ValueError("metadata state must be observed, missing or unconfirmed")
-    if state == "missing" and payload.get("scan_complete") is not True:
-        raise ValueError("listener absence requires a complete OS listener scan")
-    previous_stamp = _timestamp((previous or {}).get("observed_at"))
-    if previous_stamp is not None and stamp < previous_stamp:
-        raise ValueError("metadata observation is older than the current observation")
-    return {"state": state, "observed_at": observed_at, "stale_after_seconds": 90}
-
-
-def normalize_service_git(repository_id, commit_sha):
-    identity = canonical_repository(repository_id) if repository_id is not None else None
-    if repository_id is not None and identity is None:
-        raise ValueError("service repository must be an explicit forge identity")
-    if commit_sha is not None and (not isinstance(commit_sha, str)
-            or not re.fullmatch(r"(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})", commit_sha)):
-        raise ValueError("service commit_sha must be a full hexadecimal commit")
-    return {"repository_id": identity, "commit_sha": commit_sha.lower() if identity and commit_sha else None}
-
-
-def normalize_service_ownership(value):
-    """Allowlisted observation metadata; descriptive labels never prove ownership."""
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        return {"kind": "invalid"}
-    allowed = ("kind", "host_id", "session_id", "herdr_session", "pane_id", "terminal_id",
-               "listener_start", "shell_start", "observed_at", "unit")
-    result = {key: value[key] for key in allowed
-              if isinstance(value.get(key), str) and 0 < len(value[key]) <= 300
-              and all(ord(char) >= 32 for char in value[key])}
-    for key in ("listener_pid", "shell_pid"):
-        if type(value.get(key)) is int and value[key] > 0:
-            result[key] = value[key]
-    chain = value.get("ancestor_pids")
-    if isinstance(chain, list) and 1 <= len(chain) <= 64 and all(type(pid) is int and pid > 0 for pid in chain):
-        result["ancestor_pids"] = list(chain)
-    return result or {"kind": "invalid"}
-
-
-def _observed_service_ownership(record, session=None):
-    unknown = {"scope": "unassigned", "scope_reason": "No verified HerdR launch or system-service ownership", "ownership": None}
-    proof = normalize_service_ownership(record.get("ownership"))
-    if proof and proof.get("kind") == "system_unit":
-        if (proof.get("host_id") == record.get("host_id") and proof.get("listener_pid")
-                and proof.get("listener_start") and _timestamp(proof.get("observed_at")) is not None
-                and re.fullmatch(r"[A-Za-z0-9_.@:-]+\.service", proof.get("unit", ""))):
-            return {"scope": "system", "scope_reason": "Observed in a system service unit", "ownership": proof}
-        return unknown
-    if not session or session.get("session_id") != record.get("session_id"):
-        return unknown
-    fields = ("host_id", "herdr_session", "pane_id", "terminal_id")
-    if (any(not isinstance(session.get(key), str) or not session[key] for key in fields)
-            or session["host_id"] != record.get("host_id")):
-        return unknown
-    expected = "herdr:" + ":".join(quote(session[key], safe="") for key in ("host_id", "herdr_session", "pane_id"))
-    if session["session_id"] != expected:
-        return unknown
-    if proof is not None:
-        chain = proof.get("ancestor_pids", [])
-        if (proof.get("kind") != "herdr_process_ancestry"
-                or any(proof.get(key) != session.get(key) for key in (*fields, "session_id"))
-                or not chain or len(set(chain)) != len(chain)
-                or chain[0] != proof.get("listener_pid") or chain[-1] != proof.get("shell_pid")
-                or not proof.get("listener_start") or not proof.get("shell_start")
-                or _timestamp(proof.get("observed_at")) is None):
-            return unknown
-        return {"scope": "herdr", "scope_reason": "Listener descends from this native HerdR pane", "ownership": proof}
-    return {"scope": "unassigned", "scope_reason": "Session association has no verified launch or process ancestry proof",
-            "ownership": None}
-
-
-def _verified_origin(record):
-    receipt = record.get("verified_origin")
-    proof = normalize_service_ownership(record.get("ownership"))
-    if (not isinstance(receipt, dict) or receipt.get("kind") != "herdr_launch_origin"
-            or receipt.get("service_id") != record.get("service_id")
-            or receipt.get("host_id") != record.get("host_id")
-            or receipt.get("session_id") != record.get("session_id")
-            or not proof or proof.get("kind") != "herdr_process_ancestry"
-            or not isinstance(receipt.get("ownership"), dict)
-            or any(receipt["ownership"].get(key) != proof.get(key) for key in (
-                "kind", "host_id", "session_id", "herdr_session", "pane_id", "terminal_id",
-                "listener_pid", "listener_start", "shell_pid", "shell_start"))
-            or _timestamp(receipt.get("verified_at")) is None):
-        return None
-    return receipt
-
-
-def capture_service_origin(record, session, stamp):
-    """Only the control plane creates receipts after validating native identity."""
-    observed = _observed_service_ownership(record, session)
-    if observed["scope"] == "herdr":
-        return {"kind": "herdr_launch_origin", "service_id": record["service_id"],
-                "host_id": record["host_id"], "session_id": record["session_id"],
-                "ownership": observed["ownership"], "verified_at": stamp}
-    return _verified_origin(record)
-
-
-def service_ownership(record, session=None):
-    receipt = _verified_origin(record)
-    if receipt:
-        return {"scope": "herdr", "scope_reason": "Launch origin verified by HerdR; retained for this process instance",
-                "ownership": receipt["ownership"]}
-    return _observed_service_ownership(record, session)
 
 
 def service_catalog(record, session=None):
@@ -236,15 +99,7 @@ def service_catalog(record, session=None):
     if source_port is None:
         match = re.search(r"\(port (\d{1,5})\)$", name)
         source_port = int(match[1]) if match and 0 < int(match[1]) <= 65535 else None
-    try:
-        git = normalize_service_git(record.get("repository_id"), record.get("commit_sha"))
-    except ValueError:
-        git = {"repository_id": None, "commit_sha": None}
-    return dict(**service_ownership(record, session), **git,
-                metadata_observation=record.get("metadata_observation"),
-                endpoint_scope=record.get("endpoint_scope"),
-                project_id=project_for_repository(git["repository_id"]),
-                category=category, label=label, purpose=purpose,
+    return dict(category=category, label=label, purpose=purpose,
                 project=project or None, project_source=project_source, source_port=source_port)
 
 
