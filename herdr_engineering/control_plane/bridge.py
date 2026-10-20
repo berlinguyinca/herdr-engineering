@@ -18,6 +18,8 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from .service_catalog import normalize_project, normalize_source_port, track_availability
+
 
 def _iso(value: Any):
     if isinstance(value, _dt.datetime):
@@ -277,14 +279,22 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 svc["service_name"] = p["service_name"]
             if p.get("port") is not None:
                 svc["port"] = p["port"]
-            if p.get("session_id"):
-                svc["session_id"] = p["session_id"]
+            if p.get("session_id") or ev.get("session_id"):
+                svc["session_id"] = p.get("session_id") or ev["session_id"]
             if p.get("route"):
                 svc["route"] = p["route"]
             if p.get("description"):
                 svc["description"] = p["description"]
             if p.get("owner"):
                 svc["owner"] = p["owner"]
+            status = "unavailable" if "unavailable" in etype.lower() else p.get("status", svc["status"])
+            track_availability(svc, status, ts)
+            if "unavailable_since" in p:
+                svc["unavailable_since"] = p["unavailable_since"]
+            if "project" in p:
+                svc["project"] = normalize_project(p["project"])
+            if "source_port" in p:
+                svc["source_port"] = normalize_source_port(p["source_port"])
             if p.get("status"):
                 svc["status"] = p["status"]
             svc["status"] = "unavailable" if "unavailable" in etype.lower() \
@@ -391,7 +401,32 @@ def load_into(repo, source: DurableSource) -> dict:
     for hid, h in rhosts.items():
         _overlay(hosts.setdefault(hid, h), h)
     for svcid, s in rservices.items():
-        _overlay(services.setdefault(svcid, s), s)
+        base = services.setdefault(svcid, s)
+        # The event sink writes fabric_events, not the structured service table.
+        # A stale table row must not hide a later outage or a healthy return.
+        try:
+            event_at = _dt.datetime.fromisoformat(s["updated_at"])
+            row_at = _dt.datetime.fromisoformat(base["updated_at"])
+            event_is_newer = bool(event_at.tzinfo and row_at.tzinfo and event_at >= row_at)
+        except (ValueError, TypeError, KeyError):
+            event_is_newer = False
+        had_since = "unavailable_since" in base
+        row_since = base.get("unavailable_since")
+        _overlay(base, s)
+        if not event_is_newer:
+            if had_since:
+                base["unavailable_since"] = row_since
+            else:
+                base.pop("unavailable_since", None)
+        if event_is_newer:
+            for key in ("status", "updated_at", "unavailable_since"):
+                if key in s:
+                    base[key] = s[key]
+            for key in ("port", "route", "owner", "description", "session_id", "project", "source_port"):
+                if s.get(key) not in (None, "", 0):
+                    base[key] = s[key]
+            if s.get("route") or (s.get("host_id") and s.get("port")):
+                base["url"] = s["url"]
     # Artifacts have no structured table; the event log is their only durable
     # source. Payload bytes are not in the event (they live in the object
     # store) so only metadata is rebuilt here.

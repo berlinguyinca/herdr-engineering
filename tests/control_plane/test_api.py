@@ -349,3 +349,22 @@ def test_message_without_durable_sink_returns_unavailable_without_dispatch():
         assert client.get("/api/v1/health")[0] == 200
     finally:
         svr.shutdown()
+
+
+def test_services_archive_filter_is_optional_and_detail_history_remains(server):
+    c, repo = server
+    clock = [1_800_000_000]
+    repo._now = lambda: clock[0]
+    sid = repo.register_service('old web', 'host', 8000, status='unavailable')
+    clock[0] += 8 * 86400
+    _, _, body = c.get('/api/v1/services')
+    data = json.loads(body)
+    assert len(data['services']) == 1
+    assert data['summary']['archived'] == 1
+    _, _, body = c.get('/api/v1/services?include_archived=false')
+    data = json.loads(body)
+    assert data['services'] == []
+    assert data['summary']['total'] == 1
+    status, _, body = c.get(f'/api/v1/services/{sid}')
+    assert status == 200
+    assert json.loads(body)['lifecycle']['archived'] is True
