@@ -39,6 +39,21 @@ _STAGES = {
 _SESSION_ACTIONS = {"steer", "approve", "interrupt", "resume", "stop"}
 
 
+
+def _session_mission_identity(mission_id, source):
+    if mission_id is None:
+        return {"mission_key": None, "mission_source": None}
+    if not isinstance(mission_id, str) or not mission_id:
+        raise ValueError("mission_id must be a non-empty string")
+    if ":" in mission_id:
+        namespace, raw_id = mission_id.split(":", 1)
+        if not raw_id or ":" in raw_id or (source != "herdr" and namespace != source):
+            raise ValueError("mission identity conflicts with its source")
+        return {"mission_key": mission_id, "mission_source": namespace}
+    return {"mission_key": mission_id if source == "herdr" else f"{source}:{mission_id}",
+            "mission_source": source}
+
+
 def _name_prefix(service_name):
     """First token of a ``<kind> on <host> (port <n>)``-style service label.
 
@@ -188,18 +203,19 @@ class ControlPlaneRepo:
     def create_session(self, mission_id=None, agent_role="", model="",
                        source="herdr"):
         sid = new_id("session")
+        binding = _session_mission_identity(mission_id, source)
         rec = {
-            "session_id": sid, "mission_id": mission_id, "agent_role": agent_role,
+            "session_id": sid, "mission_id": mission_id, "agent_role": agent_role, **binding,
             "model": model, "status": "active", "created_at": self._stamp(),
             "updated_at": self._stamp(), "messages": 0, "tool_calls": 0,
         }
         self._sessions[sid] = rec
         if mission_id:
-            key = self._resolve_mission_key(mission_id, source=source)
+            key = binding["mission_key"]
             if key in self._missions:
                 self._missions[key]["sessions"].append(sid)
         self.record_event("session", sid, "SessionCreated",
-                          {"mission_id": mission_id, "agent_role": agent_role},
+                          {"mission_id": mission_id, "agent_role": agent_role, **binding},
                           mission_id=mission_id, session_id=sid)
         return sid
 
@@ -523,19 +539,24 @@ class ControlPlaneRepo:
                        summary=None, attach=None, source="herdr", pane_id=None,
                        terminal_id=None, herdr_session=None, machine=None,
                        agent_session=None, revision=None, interactive_ready=None,
-                       launch_pending=None, state_change_seq=None):
+                       launch_pending=None, state_change_seq=None,
+                       repository_id=None, commit_sha=None):
         stamp = self._stamp()
         existing = self._sessions.get(session_id)
         if (existing is not None and host_id is not None
                 and existing.get("host_id") not in (None, host_id)):
             raise ValueError("session host collision; emit a host-namespaced session ID")
-        detail = {"cwd": cwd, "branch": branch, "pid": pid,
+        binding = (_session_mission_identity(mission_id, source)
+                   if mission_id is not None or existing is None else
+                   {field: existing.get(field) for field in ("mission_key", "mission_source")})
+        detail = {"cwd": cwd, "branch": branch, "pid": pid, **binding,
                   "cmdline": cmdline, "summary": summary, "attach": attach,
                   "pane_id": pane_id, "terminal_id": terminal_id,
                   "herdr_session": herdr_session, "machine": machine,
                   "agent_session": agent_session, "revision": revision,
                   "interactive_ready": interactive_ready, "launch_pending": launch_pending,
-                  "state_change_seq": state_change_seq}
+                  "state_change_seq": state_change_seq,
+                  "repository_id": repository_id, "commit_sha": commit_sha}
         if existing is None:
             rec = {"session_id": session_id, "mission_id": mission_id,
                    "host_id": host_id, "agent_role": agent_role,
@@ -544,7 +565,7 @@ class ControlPlaneRepo:
                    "messages": 0, "tool_calls": 0, **detail}
             self._sessions[session_id] = rec
             if mission_id:
-                key = self._resolve_mission_key(mission_id, source=source)
+                key = binding["mission_key"]
                 if key in self._missions:
                     self._missions[key]["sessions"].append(session_id)
             self.record_event("session", session_id, "SessionStarted",
@@ -558,29 +579,39 @@ class ControlPlaneRepo:
             existing["host_id"] = host_id
         if mission_id is not None:
             existing["mission_id"] = mission_id
+            # Explicit reassignment replaces reverse membership; a heartbeat
+            # without a mission identity cannot change its namespace.
+            for key, mission in self._missions.items():
+                members = mission["sessions"]
+                if session_id in members and key != binding["mission_key"]:
+                    members.remove(session_id)
+                if key == binding["mission_key"] and session_id not in members:
+                    members.append(session_id)
         if agent_role:
             existing["agent_role"] = agent_role
         if model:
             existing["model"] = model
         existing["status"] = status
+        if repository_id is not None and repository_id != existing.get("repository_id") and commit_sha is None:
+            existing["commit_sha"] = None
         for k, v in detail.items():
             if v is not None:
                 existing[k] = v
         # Carry the full identity state in the delta so event-sourced
         # hydration (bridge._reconstruct_from_events) can rebuild the record.
         self.record_event("session", session_id, "SessionUpdated",
-                          {k: existing[k] for k in (
-                              "host_id", "mission_id", "agent_role", "model",
+                          {"commit_sha": existing.get("commit_sha"), **{k: existing[k] for k in (
+                              "host_id", "mission_id", "mission_key", "mission_source", "agent_role", "model",
                               "status", "cwd", "branch", "pid", "cmdline",
                               "summary", "attach", "pane_id", "terminal_id", "herdr_session",
                               "machine", "agent_session", "revision", "interactive_ready",
-                              "launch_pending", "state_change_seq") if existing.get(k) is not None},
+                              "launch_pending", "state_change_seq", "repository_id", "commit_sha") if existing.get(k) is not None}},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)
 
     def upsert_mission(self, mission_id, *, title, purpose="", stage="active",
-                       cwd=None, source="herdr"):
+                       cwd=None, source="herdr", repository_id=None, commit_sha=None):
         if ":" in source or ":" in mission_id:
             raise ValueError(
                 "mission source and mission_id must not contain ':'")
@@ -592,12 +623,16 @@ class ControlPlaneRepo:
             rec = {"mission_id": mission_id, "title": title,
                    "purpose": purpose, "stage": stage, "status": stage,
                    "cwd": cwd, "source": source, "mission_key": key,
-                   "created_at": stamp, "updated_at": stamp, "sessions": []}
+                   "repository_id": repository_id, "commit_sha": commit_sha,
+                   "created_at": stamp, "updated_at": stamp,
+                   "sessions": [sid for sid, session in self._sessions.items()
+                                if session.get("mission_key") == key]}
             self._missions[key] = rec
             self.record_event("mission", key, "MissionStarted",
                               {"title": title, "purpose": purpose,
                                "stage": stage, "cwd": cwd,
-                               "source": source},
+                               "source": source, "repository_id": repository_id,
+                               "commit_sha": commit_sha},
                               mission_id=mission_id)
             return _copy(rec)
         existing["updated_at"] = stamp
@@ -607,6 +642,11 @@ class ControlPlaneRepo:
             existing["purpose"] = purpose
         if cwd:
             existing["cwd"] = cwd
+        if repository_id is not None and repository_id != existing.get("repository_id") and commit_sha is None:
+            existing["commit_sha"] = None
+        for field, value in (("repository_id", repository_id), ("commit_sha", commit_sha)):
+            if value is not None:
+                existing[field] = value
         if stage:
             existing["stage"] = existing["status"] = stage
         self.record_event("mission", key, "MissionUpdated",
@@ -614,7 +654,9 @@ class ControlPlaneRepo:
                            "purpose": existing["purpose"],
                            "stage": existing["stage"],
                            "status": existing["status"],
-                           "cwd": existing.get("cwd")},
+                           "cwd": existing.get("cwd"), "source": source,
+                           "repository_id": existing.get("repository_id"),
+                           "commit_sha": existing.get("commit_sha")},
                           mission_id=mission_id)
         return _copy(existing)
 
@@ -1053,7 +1095,7 @@ class ControlPlaneRepo:
 
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
-                     mission_id=None, session_id=None, require_durable=False):
+                     mission_id=None, session_id=None, require_durable=False, publish=True):
         with self._event_lock:
             key = (entity_type, entity_id)
             stream = self._events.setdefault(key, [])
@@ -1079,11 +1121,12 @@ class ControlPlaneRepo:
                     self._sink.record(ev)
                 except Exception:
                     pass  # a sink must never break event recording
-            for listener in self._listeners:
-                try:
-                    listener(_copy(ev))
-                except Exception:
-                    pass  # a listener must never break event recording
+            if publish:
+                for listener in self._listeners:
+                    try:
+                        listener(_copy(ev))
+                    except Exception:
+                        pass  # a listener must never break event recording
             return _copy(ev)
 
     def mission_timeline(self, mission_key):

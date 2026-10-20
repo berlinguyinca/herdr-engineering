@@ -31,7 +31,7 @@ import os from "node:os";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { enrichSession } from "./enrich.js";
+import { enrichSession, resolveSessionEnv } from "./enrich.js";
 
 export const CONTROL_PLANE_DEFAULT = "http://dev.lan";
 
@@ -304,7 +304,7 @@ function resolveContext(env, envelopes) {
 }
 
 async function main() {
-  const env = process.env;
+  const env = await resolveSessionEnv(process.env).catch(() => process.env);
   const host = hostIdentity(env);
   const base = mapEvent(env, { host });
   const info = resolveContext(env, base);

@@ -75,8 +75,57 @@ slows the herdr host. `send()` never throws to herdr.
 
 ```sh
 cd deploy/herdr-cp-feed-plugin
-node --test emit.test.js
+npm test
 ```
+
+## Current session snapshots
+
+The event hooks enrich sessions with canonical Git repository identity and a
+full commit SHA from the owning pane's local checkout. Credentials in origin
+URLs are removed. Git commands never contact the remote forge. Metadata is
+cached for 30 seconds per directory, with 128 entries, 1.5-second command
+timeouts and 4 KiB output limits. Native session revisions remain separate.
+
+Hooks that supply `HERDR_SOCKET_PATH` can resolve their named server through
+an exact, unique match in `herdr session list --json`. Unknown server routes
+remain telemetry-only.
+
+For already-running sessions or hosts whose hooks omit the server route, run
+the snapshot companion on each owning host:
+
+```sh
+node snapshot.js --once --dry-run
+HERDR_CP_URL=http://dev.lan node snapshot.js --once
+HERDR_CP_URL=http://dev.lan node snapshot.js --loop 30
+```
+
+The dry run prints counts and sends nothing. The companion discovers running
+named servers from Herdr's registry, reads their structured snapshots, and
+publishes sessions with native terminal identity. It does not start, stop or
+steer sessions. Missing conversation identity or readiness is never invented.
+An optional `HERDR_CP_API_KEY` is sent only as the API key header; supply it
+through the service's private environment configuration, not command arguments.
+Redirects are rejected. Each pass reports failures and truncation explicitly;
+collection is limited to 8 servers, 128 sessions and a 20-second work budget.
+The loop runs a new pass 30 seconds after the preceding pass finishes. It sends
+changed sessions immediately and unchanged sessions at most once every five
+minutes, retaining at most 256 sent records. Failed or missing observations do
+not mark previously seen sessions finished.
+
+Install all runtime files together: `herdr-plugin.toml`, `package.json`,
+`emit.js`, `enrich.js`, `git-metadata.js`, and `snapshot.js`. The snapshot
+companion can run under systemd or launchd independently of native Herdr and
+Pi processes; deploying it requires no native session restart.
+
+The `herdr-cp-sessions.service` template expects the complete runtime bundle at
+`~/.local/share/herdr-cp-feed-plugin-current` (a symlink to an immutable release
+is suitable). Install the unit in `~/.config/systemd/user/` and configure any
+host overrides in `~/.config/herdr-engineering/session-feed.env`, mode `0600`.
+Supported environment values include `HOSTNAME` for the existing control-plane
+host ID, `HERDR_CP_URL`, `HERDR_BIN`, and optional `HERDR_CP_API_KEY`. On macOS,
+use launchd to run the same command with the installed Node executable; a
+private wrapper can load the same environment file before execution. Activate
+the companion only after the receiving backend supports these payload fields.
 
 ## Files
 

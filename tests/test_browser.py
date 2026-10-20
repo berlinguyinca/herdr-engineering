@@ -50,10 +50,25 @@ def test_playwright_capture_publishes_artifact(tmp_path):
 
 
 def test_plannotator_review_lifecycle():
-    p = PlannotatorAdapter()
+    from unittest.mock import Mock
+
+    import pytest
+
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    from herdr_engineering.control_plane.reviews import ReviewService
+    repo = ControlPlaneRepo(sink=Mock())
+    service = ReviewService(repo)
+    p = PlannotatorAdapter(store=service)
     review = p.request_review(repository="r", session_id="s", candidate_id="c")
-    assert review.status == "requested"
-    resolved = p.resolve(review.id, "approved", comment="lgtm")
-    assert resolved.status == "approved"
-    assert "lgtm" in resolved.comments
-    assert p.get(review.id).decision == "approved"
+    assert review.status == "starting"
+    with pytest.raises(ValueError, match="Decide in Plannotator"):
+        p.resolve(review.id, "approved", comment="lgtm")
+    row = service.get(review.id)
+    service.complete(review.id, {
+        "instance_id": row["instance_id"], "revision": None, "plan_digest": None,
+        "result": {"decision": "approved", "feedback": "lgtm"},
+    })
+    # A fresh adapter reads the durable repository rather than a private dict.
+    fresh = PlannotatorAdapter(store=ReviewService(repo))
+    assert fresh.get(review.id).decision == "approved"
+    assert "lgtm" in fresh.get(review.id).comments

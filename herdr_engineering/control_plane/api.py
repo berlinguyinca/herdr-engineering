@@ -21,7 +21,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from ..version import __version__
 from .redact import redact_payload
@@ -100,6 +100,9 @@ class ControlPlaneServer:
         other and are encrypted end-to-end via WireGuard.
         """
         self.repo = repo
+        from .ci_monitor import CIMonitor
+        self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
+                                    repo.record_event("ci_pipeline", key, event, row))
         self.dispatcher = dispatcher or self._dispatch_native_message
         if source is not None:
             from .bridge import load_into
@@ -178,7 +181,7 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
-        h["capabilities"] = ["mission_activity_v1"]
+        h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1"]
         return h
 
     # ------------------------------------------------------- SSE plumbing
@@ -214,6 +217,7 @@ class ControlPlaneServer:
         self._ready.wait(timeout=timeout)
 
     def shutdown(self):
+        self.ci_monitor.close()
         if self._httpd:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -301,6 +305,13 @@ def _make_handler(server):
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
+            if path.startswith(("/api/v1/ci/", "/api/v1/reviews")):
+                origin = self.headers.get("Origin")
+                if origin and (urlsplit(origin).netloc != self.headers.get("Host")
+                               or urlsplit(origin).scheme not in {"http", "https"}):
+                    return self._deny(403, "cross-origin integration mutation refused")
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                    return self._deny(415, "integration mutations require application/json")
             min_role = ("ingest" if path == "/api/v1/ingest"
                        else "operator")
             err = self._require(min_role)
@@ -351,6 +362,10 @@ def _make_handler(server):
                 return self._send_json(404, {"error": "not found"})
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})
+            except RuntimeError:
+                if resource == "reviews":
+                    return self._send_json(503, {"error": "Review persistence is unavailable; no launch or decision was acknowledged."})
+                return self._send_json(503, {"error": "Integration service is unavailable."})
             except Exception as exc:  # never drop a connection: surface 500
                 return self._send_json(500, {"error": str(exc)})
 
@@ -458,7 +473,32 @@ def _make_handler(server):
                 return self._json({"endpoint": "POST /api/v1/ingest",
                                    "entities": ["host", "session", "mission"]})
             if resource == "ci":
-                return self._json(_ci_view())
+                what = parts[4] if len(parts) > 4 else ""
+                if what == "pipeline":
+                    return self._json(server.ci_monitor.detail(
+                        _q(self.path, "repository"), _q(self.path, "number")))
+                if what == "log":
+                    return self._json(server.ci_monitor.log(
+                        _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step")))
+                if what:
+                    return self._json({"error": "not found"}, 404)
+                from .project_links import annotate_ci
+                return self._json(annotate_ci(server.ci_monitor.snapshot(), r))
+            if resource == "reviews":
+                from .reviews import ReviewService
+                reviews = ReviewService(r)
+                if len(parts) > 4:
+                    record = reviews.get(parts[4])
+                    return self._json(record) if record else self._json({"error": "not found"}, 404)
+                rows = reviews.list_reviews()
+                offset = max(0, _qint(self.path, "offset", 0))
+                limit = min(500, max(1, _qint(self.path, "limit", 500)))
+                summaries = [{key: value for key, value in row.items()
+                              if key not in {"plan", "feedback", "receipt", "instance_id"}}
+                             for row in rows[offset:offset + limit]]
+                return self._json({"available": True, "reviews": summaries,
+                                   "total": len(rows), "has_more": offset + limit < len(rows),
+                                   "offset": offset, "checked_at": r._stamp()})
             if resource == "tests":
                 return self._json(_tests_view())
             return self._json({"error": "not found"}, 404)
@@ -476,6 +516,41 @@ def _make_handler(server):
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
             body = self._read_json() or {}
+            if resource == "ci" and len(parts) == 5 and parts[4] == "debug":
+                from ..errors import HerdrEngineeringError
+                from .ci_debug import debug_ci
+                try:
+                    receipt = debug_ci(server.ci_monitor, r, server.dispatcher,
+                                       body.get("repository"), body.get("number"),
+                                       body.get("session_id"), body.get("operation_id"))
+                except HerdrEngineeringError as exc:
+                    return self._json({"error": exc.message}, exc.http_status)
+                status = {"delivered": 200, "queued": 202}.get(receipt.get("status"), 502)
+                if receipt.get("error") in {"receipt_persistence_unavailable", "receipt_persistence_failed"}:
+                    status = 503
+                return self._json(receipt, status)
+            if resource == "ci" and len(parts) == 5 and parts[4] == "actions":
+                try:
+                    return self._json(server.ci_monitor.action(
+                        body.get("repository"), body.get("number"), body.get("action")))
+                except PermissionError as exc:
+                    return self._json({"error": str(exc)}, 403)
+                except Exception as exc:
+                    from ..errors import HerdrEngineeringError
+                    if isinstance(exc, HerdrEngineeringError):
+                        return self._json({"error": exc.message}, exc.http_status)
+                    raise
+            if resource == "reviews":
+                from .reviews import ReviewService
+                reviews = ReviewService(r)
+                if len(parts) == 4:
+                    return self._json(reviews.register(body), 201)
+                if len(parts) == 6:
+                    operation = {"heartbeat": reviews.heartbeat, "result": reviews.complete,
+                                 "failure": reviews.fail}.get(parts[5])
+                    if operation:
+                        return self._json(operation(parts[4], body))
+                return self._json({"error": "not found"}, 404)
             if resource == "hosts" and len(parts) == 6 and parts[5] == "telemetry":
                 if not body:
                     return self._json({"error": "empty body"}, 400)
@@ -782,26 +857,11 @@ def _sse_frame(event: dict) -> bytes:
 
 
 def _ci_view() -> dict[str, Any]:
-    """CI view: available flag + repos + recent pipelines. Fail-closed."""
-    from ..ci import WoodpeckerProvider
-    try:
-        provider = WoodpeckerProvider()
-        avail = provider.available
-        if not avail:
-            return {"available": False, "repos": [], "pipelines": {}}
-        repos = provider.repos()
-        pipelines = {}
-        for repo in repos[:10]:
-            try:
-                rows = provider.pipelines(repo)
-                pipelines[repo] = [v.to_dict() if hasattr(v, "to_dict")
-                                   else v for v in rows]
-            except Exception:
-                pipelines[repo] = []
-        return {"available": True, "repos": repos, "pipelines": pipelines}
-    except Exception as exc:
-        return {"available": False, "repos": [], "pipelines": {},
-                "error": str(exc)}
+    """Legacy synchronous CLI view; HTTP clients use the server's shared monitor."""
+    from .ci_monitor import CIMonitor
+    monitor = CIMonitor()
+    monitor.refresh()
+    return monitor.snapshot(start=False)
 
 
 def _tests_view() -> dict[str, Any]:

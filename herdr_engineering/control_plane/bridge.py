@@ -201,8 +201,11 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
             h["status"] = "unavailable" if "unavailable" in etype.lower() else "healthy"
             h["updated_at"] = ts
         elif et == "mission":
+            source = p.get("source") or (eid.split(":", 1)[0] if ":" in eid else "herdr")
+            mission_id = eid.removeprefix(source + ":") if source != "herdr" else eid
             m = missions.setdefault(eid, {
-                "mission_id": eid, "title": eid, "purpose": "",
+                "mission_id": mission_id, "mission_key": eid, "source": source,
+                "title": eid, "purpose": "",
                 "stage": "active", "status": "active", "created_at": ts,
                 "updated_at": ts, "sessions": [], "cwd": None,
             })
@@ -212,6 +215,9 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 m["purpose"] = p["purpose"]
             if p.get("cwd"):
                 m["cwd"] = p["cwd"]
+            for field in ("repository_id", "commit_sha"):
+                if field in p:
+                    m[field] = p[field]
             if etype == "MissionStageChanged" and p.get("to"):
                 m["stage"] = m["status"] = p["to"]
             elif p.get("stage"):
@@ -237,8 +243,9 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 if p.get(k):
                     s[k] = p[k]
             for k in ("pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
-                      "revision", "interactive_ready", "launch_pending", "state_change_seq"):
-                if p.get(k) is not None:
+                      "revision", "interactive_ready", "launch_pending", "state_change_seq",
+                      "repository_id", "commit_sha", "mission_key", "mission_source"):
+                if p.get(k) is not None or (k == "commit_sha" and k in p):
                     s[k] = p[k]
             # Command receipts are transport state, never observed agent state.
             if etype in {"SessionStarted", "SessionUpdated"} and p.get("status"):
@@ -302,7 +309,7 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
             svc["url"] = svc["route"] or f"http://{svc['host_id']}:{svc['port']}"
             svc["updated_at"] = ts
     for sid, s in sessions.items():
-        mid = s.get("mission_id")
+        mid = s.get("mission_key", s.get("mission_id"))
         if mid and mid in missions and sid not in missions[mid]["sessions"]:
             missions[mid]["sessions"].append(sid)
     return missions, sessions, hosts, services, artifacts
@@ -433,8 +440,12 @@ def load_into(repo, source: DurableSource) -> dict:
     artifacts: dict = {}
     for aid, a in rartifacts.items():
         artifacts[aid] = a
+    # Rebuild membership after overlaying event-proven session bindings. A
+    # stale structured row must not leave an association in another namespace.
+    for mission in missions.values():
+        mission["sessions"] = []
     for sid, s in sessions.items():
-        mid = s.get("mission_id")
+        mid = s.get("mission_key", s.get("mission_id"))
         if mid in missions and sid not in missions[mid]["sessions"]:
             missions[mid]["sessions"].append(sid)
 

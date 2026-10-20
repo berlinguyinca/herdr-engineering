@@ -1,0 +1,16 @@
+# Opt-in server-side Woodpecker credential; never supplied to the browser.
+# docker compose -f compose.yaml -f compose.integrations.yaml up -d control-plane-web
+services:
+  control-plane-web:
+    environment:
+      HERDR_ENGINEERING_CI_URL: "${HERDR_ENGINEERING_CI_URL:-https://ci.metabolomics.us}"
+      HERDR_ENGINEERING_CI_TOKEN_FILE: /run/secrets/woodpecker-token
+      # Operator actions still require verified upstream push permission.
+      HERDR_ENGINEERING_CI_ACTIONS: "${HERDR_ENGINEERING_CI_ACTIONS:-0}"
+    volumes:
+      - type: bind
+        source: "${HERDR_ENGINEERING_CI_TOKEN_HOST_FILE:-${HOME}/.config/herdr-engineering/ci-token}"
+        target: /run/secrets/woodpecker-token
+        read_only: true
+        bind:
+          create_host_path: false

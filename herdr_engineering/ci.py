@@ -1,19 +1,21 @@
-"""Woodpecker / Pileated CI integration (spec 0130).
-
-Provider-neutral CIEvent view. Woodpecker/Pileated remain execution authority.
-Missing/stale provider data displays as stale/unavailable, never inferred
-success. Control actions (retry/cancel) are capability-gated and authorized.
-"""
+"""Bounded Woodpecker 3.x REST integration; CI remains execution authority."""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
+import re
+import socket
+import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
-from .errors import PermissionError_Engineering, UnreachableError
+from .errors import InvalidError, PermissionError_Engineering, UnreachableError
 
 
 @dataclass
@@ -30,214 +32,332 @@ class PipelineView:
     url: str | None = None
     can_retry: bool = False
     can_cancel: bool = False
+    started_at: str | None = None
+    ref: str | None = None
+    forge_url: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items()}
+        return dict(self.__dict__)
 
 
 _TOKEN_FILE = os.path.join("~", ".config", "herdr-engineering", "ci-token")
+_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+_MAX_LOG_CHARS = 64 * 1024
+_TERMINAL_STATES = {"success", "failure", "error", "killed", "declined", "skipped", "canceled"}
+_ACTIVE_STATES = {"pending", "running", "blocked"}
+
+
+class CIProviderError(UnreachableError):
+    """Safe provider failure: never contains upstream bodies or credentials."""
+
+    def __init__(self, reason: str, status_code: int | None = None):
+        self.reason = reason
+        self.status_code = status_code
+        messages = {
+            "authentication": "CI authentication failed; check the configured token and proxy access.",
+            "permission": "CI account lacks permission for this resource.",
+            "rate_limited": "CI request rate limit reached; retry later.",
+            "not_found": "CI resource was not found.",
+            "timeout": "CI request timed out.",
+            "redirect": "CI redirected the API request; check the configured endpoint and proxy access.",
+            "invalid_response": "CI returned an invalid API response.",
+            "response_too_large": "CI response exceeded the safe size limit.",
+            "unavailable": "CI service is unavailable.",
+        }
+        details = {"reason": reason}
+        if status_code is not None:
+            details["status_code"] = status_code
+        super().__init__(messages.get(reason, messages["unavailable"]), details=details)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib otherwise forwards Authorization to a redirect destination.
+        raise CIProviderError("redirect", code)
+
+
+def _timestamp(value: Any) -> str | None:
+    if value in (None, "", 0):
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(value, UTC).isoformat().replace("+00:00", "Z")
+        except (ValueError, OverflowError, OSError):
+            return None
+    if isinstance(value, str):
+        return value  # preserve older ISO timestamp contracts
+    return None
+
+
+def _positive_id(value: Any) -> str:
+    text = str(value)
+    if not text.isascii() or not text.isdigit() or int(text) < 1:
+        raise InvalidError("CI resource IDs and pipeline numbers must be positive integers")
+    return text
+
+
+def _items(data: Any) -> list[dict[str, Any]]:
+    if data is None:
+        return []
+    rows = data.get("items") if isinstance(data, dict) else data
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise CIProviderError("invalid_response")
+    return rows
 
 
 class WoodpeckerProvider:
-    """Woodpecker 3.x provider over its REST API (``/api/...").
+    """Woodpecker v3.18.1 API with server-side bearer credentials.
 
-    Verified against a live Woodpecker 3.18.1 instance (2026-09-24): the API
-    is addressed by *numeric repository id* — ``GET /api/repos``,
-    ``GET /api/repos/{id}``, ``GET /api/repos/{id}/pipelines``,
-    ``GET /api/repos/{id}/pipelines/{number}`` — and the 3.x pipeline detail
-    exposes ``workflows[].children[]`` (tasks) rather than a ``steps`` array.
-    Logs are streamed over WebSocket (no REST log endpoint); behind the
-    OAuth2 proxy that stream needs an interactive session, so ``step_log``
-    returns ``None`` rather than guess.
-
-    If no endpoint/token is configured, the provider runs in "offline" mode
-    and reports state as stale/unavailable (never guessed success), which is
-    the required safe degraded behavior. The token is a secret: it is read
-    from ``HERDR_ENGINEERING_CI_TOKEN`` or the machine-local file
-    ``~/.config/herdr-engineering/ci-token`` — never from the repo.
+    Discovery uses /api/user/repos (the /api/repos list is admin-only).
+    Stored logs are REST JSON entries with base64 data; live logs use SSE.
+    `available` indicates configuration only; successful reads establish health.
     """
 
     def __init__(self, base_url: str | None = None, token: str | None = None,
                  client=None) -> None:
         self.base_url = (base_url or os.environ.get("HERDR_ENGINEERING_CI_URL")
-                         or "https://ci.metabolomics.us")
+                         or "https://ci.metabolomics.us").rstrip("/")
         self.token = token or os.environ.get("HERDR_ENGINEERING_CI_TOKEN") \
             or self._read_token_file()
-        self._client = client
+        self._client = client or urllib.request.build_opener(_NoRedirect())
         self._repo_id_cache: dict[str, str] = {}
 
     @staticmethod
     def _read_token_file() -> str | None:
-        path = os.path.expanduser(_TOKEN_FILE)
+        path = os.path.expanduser(os.environ.get("HERDR_ENGINEERING_CI_TOKEN_FILE") or _TOKEN_FILE)
         try:
             with open(path) as f:
-                tok = f.read().strip()
-            return tok or None
-        except OSError:
+                tok = f.read(16385).strip()
+            return tok if tok and len(tok) <= 16384 else None
+        except (OSError, UnicodeError):
             return None
 
     @property
     def available(self) -> bool:
-        return bool(self.token) and self.base_url.startswith("https://")
+        url = urllib.parse.urlsplit(self.base_url)
+        return (bool(self.token) and url.scheme == "https" and bool(url.hostname)
+                and not url.username and not url.password and not url.query and not url.fragment)
 
-    def _get(self, path: str, raw: bool = False):
+    def _request(self, path: str, *, method: str = "GET", raw: bool = False,
+                 log_preview: bool = False):
         if not self.available:
             return None
-        url = self.base_url.rstrip("/") + path
-        req = urllib.request.Request(url, headers={
-            "Authorization": f"Bearer {self.token}",
-            "Accept": "application/json"})
+        req = urllib.request.Request(self.base_url + path, method=method, headers={
+            "Authorization": f"Bearer {self.token}", "Accept": "application/json"})
         try:
-            opener = self._client.urlopen if self._client is not None else urllib.request.urlopen
+            opener = getattr(self._client, "urlopen", None) or self._client.open
             with opener(req, timeout=15) as resp:
-                body = resp.read()
-                return body.decode("utf-8", "replace") if raw else json.loads(body)
-        except Exception as exc:
-            raise UnreachableError(f"CI API unreachable: {exc}", target=url)
+                # Read enough overlap to redact a credential crossing the preview
+                # boundary, while keeping download reads independent of log size.
+                limit = _MAX_LOG_CHARS + len(self.token or "") if log_preview else _MAX_RESPONSE_BYTES
+                body = resp.read(limit + 1)
+                if log_preview:
+                    headers = getattr(resp, "headers", {})
+                    if "text/html" in headers.get("Content-Type", "").lower():
+                        raise CIProviderError("invalid_response")
+                    text = self._redact(body.decode("utf-8", "replace"))
+                    truncated = len(body) > limit or len(text) > _MAX_LOG_CHARS
+                    return text[:_MAX_LOG_CHARS] + (
+                        "\n[log truncated; open CI for the full log]" if truncated else "")
+                if len(body) > limit:
+                    raise CIProviderError("response_too_large")
+                if raw:
+                    return body.decode("utf-8", "replace")
+                if not body and method != "GET":
+                    return None
+                return json.loads(body)
+        except CIProviderError:
+            raise
+        except urllib.error.HTTPError as exc:
+            reason = {401: "authentication", 403: "permission", 404: "not_found",
+                      429: "rate_limited"}.get(exc.code, "unavailable")
+            if 300 <= exc.code < 400:
+                reason = "redirect"
+            exc.close()
+            raise CIProviderError(reason, exc.code) from None
+        except TimeoutError:
+            raise CIProviderError("timeout") from None
+        except urllib.error.URLError as exc:
+            reason = "timeout" if isinstance(exc.reason, (TimeoutError, socket.timeout)) else "unavailable"
+            raise CIProviderError(reason) from None
+        except (ValueError, UnicodeError):
+            raise CIProviderError("invalid_response") from None
+        except OSError:
+            raise CIProviderError("unavailable") from None
+
+    def _get(self, path: str, raw: bool = False):
+        return self._request(path, raw=raw)
+
+    @staticmethod
+    def _page_path(path: str, page: int, per_page: int) -> str:
+        if not 1 <= page <= 1000 or not 1 <= per_page <= 100:
+            raise InvalidError("CI pagination must use page 1–1000 and per_page 1–100")
+        # Keep the default endpoint compatible with existing CLI/test clients.
+        return path if (page, per_page) == (1, 50) else path + "?" + urllib.parse.urlencode(
+            {"page": page, "perPage": per_page})
 
     def _repo_id(self, repository: str) -> str:
-        """Resolve ``owner/name`` (or bare name, or numeric id) to the numeric
-        repo id this Woodpecker build addresses resources by."""
+        if not isinstance(repository, str) or not repository.strip():
+            raise InvalidError("CI repository must be its numeric ID or owner/name")
         repo = repository.strip()
-        if repo.isdigit():
-            return repo
+        if repo.isascii() and repo.isdigit():
+            return _positive_id(repo)
         if repo in self._repo_id_cache:
             return self._repo_id_cache[repo]
-        data = self._get("/api/repos")
-        if not data:
-            raise UnreachableError(
-                f"cannot resolve repo {repository!r}: CI API offline",
-                target=self.base_url)
-        items = data if isinstance(data, list) else data.get("items", [])
-        for item in items:
-            full = item.get("full_name") or \
-                f"{item.get('owner', '')}/{item.get('name', '')}"
-            if full == repo or item.get("name") == repo:
-                self._repo_id_cache[repo] = str(item.get("id"))
-                return str(item.get("id"))
-        raise UnreachableError(
-            f"repo {repository!r} not found in CI", target=self.base_url)
+        matches = [row for row in self.repos()
+                   if row["repository"] == repo or row["name"] == repo]
+        if len(matches) > 1:
+            raise InvalidError("CI repository name is ambiguous; use owner/name or the numeric ID")
+        if not matches:
+            raise CIProviderError("not_found")
+        rid = _positive_id(matches[0]["id"])
+        self._repo_id_cache[repo] = rid
+        return rid
 
-    def repos(self) -> list[dict[str, Any]]:
-        """List CI repositories (Woodpecker 3.x ``GET /api/repos``)."""
-        data = self._get("/api/repos")
-        if data is None:
-            return []
-        items = data if isinstance(data, list) else data.get("items", [])
+    def repos(self, *, page: int = 1, per_page: int = 50) -> list[dict[str, Any]]:
+        # Compatibility parameters are accepted, but this endpoint is a full
+        # snapshot: v3.18 ignores page/perPage. Consumers must deduplicate IDs.
+        rows = _items(self._get("/api/user/repos"))
+        if len(rows) > 1000:
+            raise CIProviderError("response_too_large")
         out = []
-        for item in items:
+        for item in rows:
+            full = item.get("full_name") or f"{item.get('owner', '')}/{item.get('name', '')}"
             out.append({
-                "id": item.get("id"),
-                "repository": item.get("full_name")
-                              or f"{item.get('owner', '')}/{item.get('name', '')}",
+                "id": item.get("id"), "repository": full,
                 "owner": item.get("owner"), "name": item.get("name"),
-                "private": item.get("private", False),
-                "active": item.get("active", True),
-                "default_branch": item.get("default_branch"),
-                "clone_url": item.get("clone_url"),
+                "private": item.get("private", False), "active": item.get("active", True),
+                "default_branch": item.get("default_branch"), "clone_url": item.get("clone_url"),
                 "forge_url": item.get("forge_url"),
             })
+        counts = Counter(row["repository"] for row in out)
+        self._repo_id_cache = {
+            row["repository"]: str(row["id"]) for row in out
+            if counts[row["repository"]] == 1 and str(row["id"]).isascii()
+            and str(row["id"]).isdigit() and int(row["id"]) > 0
+        }
         return out
 
     def agents(self) -> list[dict[str, Any]]:
-        """List CI runner agents (Woodpecker 3.x ``GET /api/agents``).
+        """Admin-only runner inventory, with credential fields excluded."""
+        rows = _items(self._get("/api/agents"))
+        keys = ("id", "name", "version", "backend", "platform", "capacity", "last_contact", "last_work")
+        return [{key: item.get(key) for key in keys} for item in rows[:100]]
 
-        The raw payload includes each agent's auth ``token``; we strip it —
-        secrets are never surfaced in the CI view.
-        """
-        data = self._get("/api/agents")
-        if data is None:
-            return []
-        items = data if isinstance(data, list) else data.get("items", [])
-        out = []
-        for item in items:
-            out.append({
-                "id": item.get("id"), "name": item.get("name"),
-                "version": item.get("version"), "backend": item.get("backend"),
-                "platform": item.get("platform"),
-                "capacity": item.get("capacity"),
-                "last_contact": item.get("last_contact"),
-                "last_work": item.get("last_work"),
-            })
-        return out
-
-    def pipelines(self, repository: str) -> list[PipelineView]:
-        """List pipelines for a repo (Woodpecker 3.x ``/api/repos/{id}/pipelines``)."""
-        if not self.available:
-            return []  # offline/stale: empty view, never fake success, never raise
+    def permissions(self, repository: str) -> dict[str, bool]:
         rid = self._repo_id(repository)
-        data = self._get(f"/api/repos/{rid}/pipelines")
-        if data is None:
-            return []  # offline/stale: empty view, never fake success
-        items = data if isinstance(data, list) else data.get("items", [])
-        views = []
-        for item in items:
-            views.append(PipelineView(
-                pipeline_id=str(item.get("id", "")), run_number=item.get("number", 0),
-                repository=repository, revision=item.get("commit", ""),
-                branch=item.get("branch"), state=item.get("status", "unknown"),
-                event=item.get("event", "pipeline"),
-                created_at=item.get("created"), finished_at=item.get("finished"),
-                url=item.get("url"), can_retry=False, can_cancel=False))
-        return views
+        data = self._get(f"/api/repos/{rid}/permissions")
+        if not isinstance(data, dict):
+            raise CIProviderError("invalid_response")
+        return {key: data.get(key) is True for key in ("pull", "push", "admin")}
+
+    def capabilities(self, repository: str, state: str) -> dict[str, bool]:
+        try:
+            allowed = self.permissions(repository)["push"]
+        except CIProviderError:
+            allowed = False
+        return {"can_retry": allowed and state in _TERMINAL_STATES,
+                "can_cancel": allowed and state in _ACTIVE_STATES}
+
+    def pipelines(self, repository: str, *, page: int = 1, per_page: int = 50) -> list[PipelineView]:
+        if not self.available:
+            return []
+        rid = self._repo_id(repository)
+        rows = _items(self._get(self._page_path(f"/api/repos/{rid}/pipelines", page, per_page)))
+        return [PipelineView(
+            pipeline_id=str(item.get("id", "")), run_number=item.get("number", 0),
+            repository=repository, revision=item.get("commit", ""), branch=item.get("branch"),
+            state=item.get("status", "unknown"), event=item.get("event", "pipeline"),
+            created_at=_timestamp(item.get("created")), started_at=_timestamp(item.get("started")),
+            finished_at=_timestamp(item.get("finished")), ref=item.get("ref"),
+            url=f"{self.base_url}/repos/{rid}/pipeline/{item.get('number', 0)}",
+            forge_url=item.get("forge_url")) for item in rows[:per_page]]
 
     def pipeline(self, repository: str, number: int) -> dict[str, Any] | None:
-        """Pipeline detail; 3.x exposes workflows[].children[] (tasks), which we
-        flatten into a ``tasks`` list (name, state, exit_code)."""
         if not self.available:
             return None
         rid = self._repo_id(repository)
+        number = _positive_id(number)
         data = self._get(f"/api/repos/{rid}/pipelines/{number}")
-        if data is None:
-            return None
+        if not isinstance(data, dict):
+            raise CIProviderError("invalid_response")
         tasks = []
         for wf in data.get("workflows", []) or []:
             for child in wf.get("children", []) or []:
                 tasks.append({
-                    "id": child.get("id"), "name": child.get("name"),
-                    "state": child.get("state"),
-                    "exit_code": child.get("exit_code"),
-                    "type": child.get("type"),
+                    "id": child.get("id"), "name": child.get("name"), "state": child.get("state"),
+                    "exit_code": child.get("exit_code"), "type": child.get("type"),
                     "workflow": wf.get("name"), "workflow_id": wf.get("id"),
+                    "started": child.get("started"), "finished": child.get("finished"),
+                    "started_at": _timestamp(child.get("started")),
+                    "finished_at": _timestamp(child.get("finished")),
+                    "error": self._redact(str(child.get("error") or ""))[:2000],
                 })
+        keys = ("id", "number", "status", "branch", "event", "commit", "author", "message",
+                "title", "created", "started", "finished", "ref", "forge_url")
         return {
-            "id": data.get("id"), "number": data.get("number"),
-            "status": data.get("status"), "branch": data.get("branch"),
-            "event": data.get("event"), "commit": data.get("commit"),
-            "author": data.get("author"), "message": data.get("message"),
-            "title": data.get("title"), "created": data.get("created"),
-            "finished": data.get("finished"), "repository": repository,
-            "tasks": tasks,
+            **{key: data.get(key) for key in keys}, "repository": repository, "tasks": tasks,
+            "created_at": _timestamp(data.get("created")),
+            "started_at": _timestamp(data.get("started")),
+            "finished_at": _timestamp(data.get("finished")),
+            "url": f"{self.base_url}/repos/{rid}/pipeline/{number}",
+            **self.capabilities(rid, data.get("status", "unknown")),
         }
 
-    def step_log(self, repository: str, number: int, step: str) -> str | None:
-        """Raw log of one pipeline step.
+    def _redact(self, text: str) -> str:
+        if self.token:
+            text = text.replace(self.token, "[redacted]")
+        return re.sub(r"(?i)(authorization\s*[:=]\s*|bearer\s+)[^\s]+", r"\1[redacted]", text)
 
-        Woodpecker 3.x has no REST log endpoint — logs stream over WebSocket,
-        which the OAuth2 proxy only accepts for an interactive browser session
-        (a bearer token is not forwarded on the upgrade). We attempt the REST
-        form and return ``None`` when it is unavailable (SPA shell / offline)
-        rather than guess; the CLI says so and points at the web UI.
-        """
+    def step_log(self, repository: str, number: int, step: str) -> str | None:
+        """Decode bounded stored log entries. Numeric step IDs avoid name ambiguity."""
         if not self.available:
             return None
         rid = self._repo_id(repository)
-        path = (f"/api/repos/{rid}/pipelines/{number}/"
-                f"steps/{urllib.parse.quote(step, safe='')}/log")
-        data = self._get(path, raw=True)
-        if data is None:
-            return None
-        if data.lstrip()[:1] in ("<", "{"):
-            return None  # SPA shell or JSON envelope: not raw log text
-        return data
+        number = _positive_id(number)
+        step_id = str(step)
+        if not step_id.isascii() or not step_id.isdigit():
+            detail = self.pipeline(repository, number)
+            matches = [row for row in detail["tasks"] if row.get("name") == step]
+            if len(matches) != 1:
+                raise InvalidError("Use a numeric CI step ID; the step name is missing or ambiguous")
+            step_id = str(matches[0]["id"])
+        step_id = _positive_id(step_id)
+        path = f"/api/repos/{rid}/logs/{number}/{step_id}"
+        try:
+            rows = _items(self._get(path))
+        except CIProviderError as exc:
+            if exc.reason != "response_too_large":
+                raise
+            return self._request(path + "/download", raw=True, log_preview=True)
+        parts = []
+        remaining = _MAX_LOG_CHARS
+        truncated = False
+        for row in rows:
+            try:
+                encoded = row.get("data")
+                # Go encodes a nil []byte log payload as JSON null.
+                text = base64.b64decode("" if encoded is None else encoded, validate=True).decode("utf-8", "replace")
+            except (ValueError, TypeError, binascii.Error):
+                raise CIProviderError("invalid_response") from None
+            text = self._redact(text)
+            parts.append(text[:remaining])
+            remaining -= len(text) + 1
+            if remaining < 0:
+                truncated = True
+                break
+        output = "\n".join(parts)
+        return output + ("\n[log truncated; open CI for the full log]" if truncated else "")
 
     def retry(self, repository: str, pipeline_id: str, authorized: bool = False) -> bool:
+        """Restart a pipeline by its run number (legacy parameter name retained)."""
         if not authorized:
             raise PermissionError_Engineering("CI retry requires authorization")
         if not self.available:
             raise UnreachableError("CI provider offline")
         rid = self._repo_id(repository)
-        self._get(f"/api/repos/{rid}/pipelines/{pipeline_id}/rebuild", raw=True)
+        number = _positive_id(pipeline_id)
+        self._request(f"/api/repos/{rid}/pipelines/{number}", method="POST")
         return True
 
     def cancel(self, repository: str, pipeline_id: str, authorized: bool = False) -> bool:
@@ -245,54 +365,43 @@ class WoodpeckerProvider:
             raise PermissionError_Engineering("CI cancel requires authorization")
         if not self.available:
             raise UnreachableError("CI provider offline")
+        rid = self._repo_id(repository)
+        number = _positive_id(pipeline_id)
+        self._request(f"/api/repos/{rid}/pipelines/{number}/cancel", method="POST")
         return True
 
     def debug_with_pi_handoff(self, repository: str, pipeline: PipelineView,
                               failing_step: str, log_summary: str,
                               artifact_refs: list[dict] | None = None) -> dict[str, Any]:
-        """Create a 'Debug with Pi' handoff (bounded structured context)."""
         return {
-            "handoff_type": "debug-with-pi",
-            "repository": repository,
-            "pipeline_id": pipeline.pipeline_id,
-            "revision": pipeline.revision,
-            "failing_step": failing_step,
-            "log_summary": log_summary[:4000],
-            "artifact_refs": artifact_refs or [],
-            "target_owner": "pi-engineering",
+            "handoff_type": "debug-with-pi", "repository": repository,
+            "pipeline_id": pipeline.pipeline_id, "run_number": pipeline.run_number,
+            "revision": pipeline.revision, "failing_step": failing_step[:2000],
+            "log_summary": self._redact(log_summary)[:4000],
+            "artifact_refs": (artifact_refs or [])[:20], "target_owner": "pi-engineering",
         }
 
     def debug_with_pi(self, repository: str, number: int) -> dict[str, Any]:
-        """Build a bounded 'Debug with Pi' handoff from a pipeline's failing
-        tasks. Logs are not inlined (they stream over WebSocket, unavailable
-        to a bearer token); the handoff carries the failing task names + exit
-        codes and a link to the web UI where a human can read the full log."""
+        """Prepare bounded debugging context; dispatch remains the Pi caller's job."""
         detail = self.pipeline(repository, number)
         if detail is None:
             return {"ok": False, "error": f"pipeline {number} not found for {repository}"}
-        failing = [t for t in detail.get("tasks", []) if t.get("state") == "failure"]
+        failing = [t for t in detail.get("tasks", []) if t.get("state") in {"failure", "error", "killed"}]
         lines = [f"pipeline #{number} {detail.get('status')} "
                  f"({detail.get('event')} on {detail.get('branch')}, "
-                 f"commit {str(detail.get('commit',''))[:12]})"]
-        for t in failing:
-            lines.append(f"  FAILED {t.get('name')} (exit {t.get('exit_code')}) "
-                         f"[workflow {t.get('workflow')}, task {t.get('id')}]")
+                 f"commit {str(detail.get('commit', ''))[:12]})"]
+        for task in failing[:10]:
+            lines.append(f"FAILED {task.get('name')} (exit {task.get('exit_code')}) "
+                         f"[workflow {task.get('workflow')}, task {task.get('id')}]")
         if not failing:
-            lines.append("  (no failed tasks reported)")
-        lines.append("note: step logs stream over WebSocket and are not available "
-                     "to a bearer token; open the web UI link for the full log.")
+            lines.append("(no failed tasks reported)")
+        lines.append("Inspect stored step logs in HerdR or the linked CI run.")
         return {
             "ok": True,
             "handoff": self.debug_with_pi_handoff(
-                repository=repository,
-                pipeline=PipelineView(pipeline_id=str(detail.get("id")),
-                                      run_number=number, repository=repository,
-                                      revision=str(detail.get("commit", "")),
-                                      branch=detail.get("branch"),
-                                      state=detail.get("status", "unknown")),
-                failing_step=", ".join(t.get("name", "?") for t in failing) or "(none)",
-                log_summary="\n".join(lines),
-            ),
-            "view_in_web_ui": (f"{self.base_url.rstrip('/')}/{repository}/"
-                               f"pipelines/{number}"),
+                repository, PipelineView(str(detail.get("id")), number, repository,
+                                         str(detail.get("commit", ""))),
+                ", ".join(t.get("name", "?") for t in failing) or "(none)", "\n".join(lines)),
+            "view_in_web_ui": detail.get("url") or (
+                f"{self.base_url}/{repository}/pipelines/{number}"),
         }

@@ -99,33 +99,46 @@ class ReviewRecord:
 
 
 class PlannotatorAdapter:
-    """Review integration adapter (Plannotator remains review authority)."""
+    """Durable control-plane client; Plannotator remains decision authority."""
 
-    def __init__(self, store=None) -> None:
-        self._store = store or {}
-        self._reviews: dict[str, ReviewRecord] = {}
+    def __init__(self, store=None, *, control_plane=None) -> None:
+        import os
+        self._store = store
+        self.control_plane = (control_plane or
+                              os.environ.get("HERDR_ENGINEERING_CONTROL_PLANE_URL") or
+                              "http://dev.lan")
 
-    def request_review(self, *, repository: str | None = None,
-                       session_id: str | None = None,
-                       candidate_id: str | None = None,
-                       evidence_links: list[str] | None = None) -> ReviewRecord:
-        import uuid
-        rid = f"rev_{uuid.uuid4().hex[:16]}"
-        review = ReviewRecord(id=rid, repository=repository, session_id=session_id,
-                              candidate_id=candidate_id,
-                              evidence_links=evidence_links or [])
-        self._reviews[rid] = review
-        return review
+    @staticmethod
+    def _record(row):
+        return ReviewRecord(
+            id=row["review_id"], repository=row.get("repository"),
+            session_id=row.get("session_id"), candidate_id=row.get("candidate_id"),
+            status=row["status"], decision=row.get("decision"),
+            comments=[row["feedback"]] if row.get("feedback") else [],
+            evidence_links=[row["review_url"]] if row.get("review_url") else [],
+        )
 
-    def resolve(self, review_id: str, decision: str, comment: str | None = None) -> ReviewRecord:
-        review = self._reviews.get(review_id)
-        if review is None:
-            raise KeyError(review_id)
-        review.status = decision
-        review.decision = decision
-        if comment:
-            review.comments.append(comment)
-        return review
+    def request_review(self, *, repository=None, session_id=None, candidate_id=None,
+                       evidence_links=None, **metadata):
+        from uuid import uuid4
 
-    def get(self, review_id: str) -> ReviewRecord | None:
-        return self._reviews.get(review_id)
+        from .session_env import _post
+        payload = dict(metadata, repository=repository, session_id=session_id,
+                       candidate_id=candidate_id)
+        payload.setdefault("instance_id", uuid4().hex)
+        if evidence_links:
+            payload.setdefault("review_url", evidence_links[0])
+        row = (self._store.register(payload) if self._store is not None else
+               _post(self.control_plane, "/api/v1/reviews", payload))
+        return self._record(row.get("review", row))
+
+    def resolve(self, review_id, decision, comment=None):
+        raise ValueError("Decide in Plannotator; the host launcher reports its JSON result to HerdR")
+
+    def get(self, review_id):
+        from urllib.parse import quote
+
+        from .session_env import _get
+        row = (self._store.get(review_id) if self._store is not None else
+               _get(self.control_plane, "/api/v1/reviews/" + quote(review_id, safe="")))
+        return self._record(row.get("review", row)) if row else None

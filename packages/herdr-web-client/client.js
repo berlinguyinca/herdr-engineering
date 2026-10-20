@@ -143,8 +143,38 @@ export class HerdrClient {
   }
 
   // -- ci / test runs (leaf types for the topology view) -------------------
-  getCi() {
-    return this.request('/api/v1/ci');
+  getCi({ signal } = {}) {
+    return this.request('/api/v1/ci', { signal });
+  }
+
+  getCiPipeline(repository, number, { signal } = {}) {
+    const query = new URLSearchParams({ repository, number: String(number) });
+    return this.request(`/api/v1/ci/pipeline?${query}`, { signal });
+  }
+
+  getCiLog(repository, number, step, { signal } = {}) {
+    const query = new URLSearchParams({ repository, number: String(number), step: String(step) });
+    return this.request(`/api/v1/ci/log?${query}`, { signal });
+  }
+
+  ciAction(repository, number, action, { signal } = {}) {
+    return this.request('/api/v1/ci/actions', {
+      method: 'POST', body: { repository, number, action }, signal,
+    });
+  }
+
+  debugCi(repository, number, sessionId, operationId, { signal } = {}) {
+    return this.request('/api/v1/ci/debug', {
+      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId }, signal,
+    });
+  }
+
+  getReview(id, { signal } = {}) {
+    return this.request(`/api/v1/reviews/${encodeURIComponent(id)}`, { signal });
+  }
+
+  listReviews({ signal } = {}) {
+    return this.request('/api/v1/reviews', { signal });
   }
 
   getTests() {

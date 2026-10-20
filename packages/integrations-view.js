@@ -1,0 +1,304 @@
+// CI and reviews retain their upstream authority; this view presents observations.
+import {escapeHtml as esc} from './herdr-web-components/util.js';
+import {formatDuration} from './herdr-web-components/format.js';
+import {safeServiceUrl} from './services-view.js';
+import {recordOutcome} from './record-state.js';
+
+const text = value => typeof value === 'string' ? value : '';
+const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
+const short = (value, max=180) => text(value).replace(/\s+/g,' ').trim().slice(0,max);
+const stateOf = record => text(record.state || record.status || record.decision).toLowerCase().replaceAll('-','_');
+const human = value => text(value).replaceAll('_',' ');
+export function integrationTimestamp(value) {
+  if (typeof value==='number') return value > 0 ? (value < 1e12 ? value*1000 : value) : 0;
+  return value ? Date.parse(value) || 0 : 0;
+}
+export function integrationOutcome(record, kind='ci') {
+  const state=stateOf(record);
+  if (kind==='reviews' && ['changes_requested','request_changes','rejected','annotated','denied'].includes(state)) return 'changes';
+  if (['failure','failed','error','killed','timed_out','crashed'].includes(state)) return 'failed';
+  if (['success','passed','finished','complete','completed','canceled','cancelled','skipped','declined','approved','closed','resolved'].includes(state)) return 'finished';
+  return 'current';
+}
+export function integrationEntries(data={},kind='ci') {
+  const list=kind==='reviews' ? records(data.reviews) : Object.entries(data.pipelines || {}).flatMap(([repository,runs])=>records(runs).map(r=>({...r,repository:r.repository || repository})));
+  return list.map(record=>({record,
+    id:kind==='reviews' ? String(record.review_id || record.id || '') : `${record.provider_repo_id || record.repository_id || record.repository}#${record.run_number}`,
+    tab:integrationOutcome(record,kind),
+    project:short(record.project_id || record.project || record.repository) || 'Project not reported',
+    search:[record.title,record.repository,record.repository_id,record.project_id,record.project,record.branch,record.revision,record.run_number,record.review_id,record.status,record.state,record.mission_id,record.session_id].filter(v=>v!=null).join(' ').toLowerCase(),
+  })).sort((a,b)=>integrationTimestamp(b.record.updated_at || b.record.created_at)-integrationTimestamp(a.record.updated_at || a.record.created_at));
+}
+export function selectIntegrations(entries,{tab='current',search='',repository='',mission='',session=''}={}) {
+  const terms=search.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  return entries.filter(e=>e.tab===tab && (!repository || e.record.repository===repository || e.record.repository_id===repository)
+    && (!mission || (e.record.mission_key || e.record.mission_id)===mission || records(e.record.related_missions).some(r=>(r.mission_key || r.mission_id)===mission))
+    && (!session || e.record.session_id===session || records(e.record.related_sessions).some(r=>r.session_id===session)) && terms.every(t=>e.search.includes(t)));
+}
+const age = (value,label='Updated') => {
+  const stamp=integrationTimestamp(value);
+  return stamp ? `${esc(label)} <span data-integration-time="${stamp}">${esc(formatDuration(Math.max(0,Date.now()-stamp)))}</span> ago` : `${esc(label)} time not reported`;
+};
+function elapsed(record) {
+  const start=integrationTimestamp(record.started_at || record.started || record.created_at);
+  if (!start) return 'Duration not reported';
+  const end=integrationTimestamp(record.finished_at || record.finished);
+  if(integrationOutcome(record)!=='current' && !end)return 'Finish time not reported';
+  const label=['pending','blocked','queued','waiting'].includes(stateOf(record)) ? 'Waiting' : 'Elapsed';
+  return `${label} ${end ? esc(formatDuration(Math.max(0,end-start))) : `<span data-integration-time="${start}">${esc(formatDuration(Math.max(0,Date.now()-start)))}</span>`}`;
+}
+const external = (url,label) => {
+  const safe=safeServiceUrl(url);
+  return safe ? `<a href="${esc(safe)}" target="_blank" rel="noopener noreferrer">${esc(label)} ↗</a>` : '';
+};
+export function integrationHealth(data,kind='ci') {
+  if (!data) return `<p class="ig-note" role="status">Loading ${kind==='ci'?'CI runs':'reviews'}…</p>`;
+  const labels={not_configured:'Woodpecker is not configured. Add a CI token to the server configuration.',auth_error:'Woodpecker authentication failed. The server credential needs attention.',unavailable:'Woodpecker could not be reached.',partial:'Some CI repositories could not refresh.',syncing:'Discovering CI repositories and runs…'};
+  const error=kind==='ci' ? labels[data.status] || (data.available===false ? 'CI data is unavailable.' : '') : data.error;
+  const progress=data.progress;
+  const total=Number(progress?.total),completed=Number(progress?.completed);
+  const measured=Number.isFinite(total) && total>0 && Number.isFinite(completed);
+  return `${error ? `<p class="ig-warning" role="status">${esc(error)}${data.stale ? ' Showing last received records.' : ''}</p>` : ''}
+    ${kind==='ci' && Object.keys(data.repo_errors || {}).length ? `<details class="ig-runners"><summary>Repository refresh issues</summary>${Object.entries(data.repo_errors).map(([repo,message])=>`<p>${esc(short(repo))}: ${esc(short(message,300))}</p>`).join('')}</details>` : ''}
+    ${data.project_mapping_error ? `<p class="ig-warning">${esc(short(data.project_mapping_error,300))} Using repository groups.</p>` : ''}
+    ${data.error && kind==='ci' ? `<p class="ig-note">${esc(short(data.error,400))}</p>` : ''}
+    ${data.refreshing || data.status==='syncing' ? `<div class="ig-sync" role="status"><span>${progress?.current ? `Checking ${esc(short(progress.current))}` : 'Refreshing CI reports…'}${measured ? ` · ${Math.min(completed,total)} of ${total}` : ''}</span>${measured ? `<progress value="${Math.min(Math.max(0,completed),total)}" max="${total}" aria-label="Repositories checked"></progress>` : ''}</div>` : ''}
+    <p class="ig-note">${age(data.last_success_at || (kind==='reviews' ? data.checked_at || data.updated_at : null),kind==='ci'?'Last successful refresh':'Reviews checked')}${data.stale ? ' · Reports are stale' : ''} · Refreshes automatically while visible</p>`;
+}
+export function integrationRow(entry,kind='ci') {
+  const r=entry.record;
+  const status=human(stateOf(r)) || 'status unknown';
+  const title=short(r.title) || (kind==='ci' ? `Run #${r.run_number ?? 'unknown'}` : `${r.kind==='code'?'Code':'Plan'} review`);
+  return `<article class="ig-row" data-entry="${esc(entry.id)}"><div class="ig-main">
+    ${kind==='ci' ? `<button type="button" class="ig-title" data-run="${esc(entry.id)}">${esc(title)}</button>` : `<strong class="ig-title">${esc(title)}</strong>`}
+    <p class="ig-note">${esc(short(r.repository)||'Repository not reported')}${r.branch ? ` · ${esc(short(r.branch,80))}` : ''}${r.revision ? ` · <code>${esc(short(r.revision,12))}</code>` : ''}</p>
+    ${kind==='reviews' ? `<div class="ig-links">${entry.tab==='current' ? external(r.review_url || r.url,'Open in Plannotator') : '<span class="ig-note">Recorded review</span>'}${r.mission_key || r.mission_id ? `<a href="#/missions/${esc(encodeURIComponent(r.mission_key || r.mission_id))}">Mission</a>` : ''}${r.session_id ? `<a href="#/herd/session/${esc(encodeURIComponent(r.session_id))}">Session</a>` : ''}</div>${r.summary ? `<p class="ig-summary">${esc(short(r.summary))}</p>` : ''}${r.stale ? '<p class="ig-warning">Review launcher report is stale; open upstream to check its state.</p>' : ''}<details class="ig-review-details" data-review-details="${esc(entry.id)}"><summary>Plan and feedback</summary>${r._detailsError ? `<p class="ig-warning" role="status">${esc(r._detailsError)}</p>` : ''}${r.plan ? `<pre class="ig-log">${esc(text(r.plan).slice(0,50000))}${text(r.plan).length>50000?'\n… Plan display truncated.':''}</pre>` : ''}${r.feedback ? `<p class="ig-review-feedback">${esc(text(r.feedback).slice(0,10000))}</p>` : ''}${!r.plan && !r.feedback ? `<p class="ig-note">${r._detailsLoaded?'No plan text or feedback was recorded.':r._detailsError?'Close and reopen to retry.':'Loading review details…'}</p>` : ''}</details>` : ''}
+    </div><div class="ig-state"><strong class="${['failed','changes'].includes(entry.tab)?'ig-warning':''}">${esc(status)}</strong><span>${kind==='ci' ? elapsed(r) : age(r.updated_at || r.created_at)}</span>${kind==='reviews' ? `<span>${esc(r.kind==='code'?'Code review':'Plan review')}</span>` : ''}</div></article>`;
+}
+export function newOperationId() {
+  const bytes=crypto.getRandomValues(new Uint8Array(16));
+  bytes[6]=(bytes[6]&15)|64;bytes[8]=(bytes[8]&63)|128;
+  const hex=[...bytes].map(byte=>byte.toString(16).padStart(2,'0')).join('');
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+export function pipelineDetails(detail, summary={}) {
+  return {...summary,...detail,repository:summary.repository || detail.repository,
+    run_number:detail.run_number ?? detail.number ?? summary.run_number,
+    revision:detail.revision ?? detail.commit ?? summary.revision,
+    state:detail.state ?? detail.status ?? summary.state};
+}
+export function activePiSessions(sessions) {
+  return records(sessions).filter(s=>text(s.session_id) && /(^|[\s/_-])pi($|[\s/_-])/i.test(text(s.agent_role))
+    && ['active','running','working','idle','waiting','ready','busy'].includes(text(s.status).toLowerCase())
+    && !['failed','finished'].includes(recordOutcome(s))
+    && s.agent_session && typeof s.agent_session==='object' && !Array.isArray(s.agent_session)
+    && ['pi','integration'].includes(s.agent_session.agent || s.agent_session.source)
+    && text(s.host_id) && text(s.terminal_id) && text(s.herdr_session)
+    && s.interactive_ready!==false && !s.launch_pending);
+}
+export function renderPipeline(pipeline,{loading=false,error='',log=null,logError='',step='',actionMessage='',debugSessions=null,debugSessionId='',debugMessage=''}={}) {
+  if (!pipeline) return loading ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">Select a run to inspect its steps and logs.</p>';
+  const tasks=records(pipeline.tasks);
+  const completed=tasks.filter(t=>integrationOutcome(t)!=='current').length;
+  return `<div class="ig-heading"><h2>Run #${esc(pipeline.run_number ?? '')}</h2><button type="button" class="hd-btn" data-close-inspector>Close</button></div>
+    <p class="ig-note">${esc(pipeline.repository || '')} · ${esc(human(stateOf(pipeline)) || 'Status unknown')} · ${elapsed(pipeline)}</p>
+    <div class="ig-links">${external(pipeline.url,'Open in Woodpecker')}${pipeline.can_retry ? '<button class="hd-btn" type="button" data-ci-action="retry">Retry run</button>' : ''}${pipeline.can_cancel ? '<button class="hd-btn" type="button" data-ci-action="cancel">Cancel run</button>' : ''}</div>
+    ${error ? `<p class="ig-warning" role="status">${esc(error)} Showing the last received details.</p>` : ''}${actionMessage ? `<p role="status" class="ig-note">${esc(actionMessage)}</p>` : ''}
+    ${integrationOutcome(pipeline)==='failed' ? `<details class="ig-debug" data-debug-disclosure><summary>Debug with Pi</summary><p class="ig-note">Send the failed revision, step details and bounded log output to a Pi session you choose.</p>${debugSessions===null ? '<p class="ig-note">Open this section to load active Pi sessions.</p>' : `<label class="ig-note">Target Pi session<select data-debug-session aria-label="Target Pi session"><option value="">Choose a session…</option>${debugSessions.map(s=>`<option value="${esc(s.session_id)}" ${s.session_id===debugSessionId?'selected':''}>${esc(short(s.title || s.summary || s.cwd || s.session_id,100))}${s.host_id?` · ${esc(short(s.host_id,60))}`:''}</option>`).join('')}</select></label>${!debugSessions.length ? '<p class="ig-note">No active Pi sessions with verified messaging are available.</p>' : ''}<button type="button" class="hd-btn" data-debug-send ${!debugSessionId?'disabled':''}>Send to Pi</button>`}${debugMessage ? `<p class="ig-note" role="status">${esc(debugMessage)}</p>` : ''}</details>` : ''}
+    ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress><div class="ig-steps">${tasks.map(t=>`<button type="button" data-step="${esc(String(t.id))}" aria-pressed="${String(t.id)===step}"><span>${esc(short(t.name) || `Step ${t.id}`)}${t.workflow ? `<small>${esc(short(t.workflow))}</small>` : ''}</span><span>${esc(human(stateOf(t)) || 'unknown')}</span></button>`).join('')}</div>` : (!Array.isArray(pipeline.tasks) && loading && !error ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
+    ${step ? `<h3>Step log</h3>${logError ? `<p class="ig-warning" role="status">${esc(logError)}</p>` : ''}${log===null ? '<p class="ig-note" role="status">Loading step output…</p>' : `<p class="ig-note">${age(log.checked_at,'Log checked')}${log.truncated?' · Output truncated':''}</p>${log.available===false ? `<p class="ig-note">${esc(log.error || 'Log output is not available yet.')}</p>` : `<pre class="ig-log" tabindex="0" aria-label="Step output">${esc(text(log.log)) || 'No output reported yet.'}</pre>`}`}` : ''}`;
+}
+
+const styles=`<style>
+.ig-intro,.ig-note{color:var(--text-secondary);font-size:12px;line-height:1.6}.ig-intro{font-size:13px;max-width:85ch}.ig-note{margin:7px 0}.ig-warning{color:var(--status-attention);font-size:13px;line-height:1.6;overflow-wrap:anywhere}.ig-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0}.ig-tabs button{font:inherit;padding:10px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);cursor:pointer}.ig-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.ig-tabs strong{margin-left:6px}.ig-controls{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}.ig-controls label{display:flex;flex-direction:column;gap:6px;font-size:13px}.ig-controls label:first-child{flex:1;min-width:160px}.ig-controls input,.ig-controls select{padding:9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}.ig-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:18px}.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr) minmax(280px,1fr)}.ig-group,.ig-inspector{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);min-width:0;overflow-wrap:anywhere}.ig-group{margin-bottom:12px}.ig-group h2{font-size:14px;margin:0;padding:12px 16px}.ig-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;padding:14px 16px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ig-main{min-width:0}.ig-title{font-size:14px;font-weight:600;line-height:1.5;text-align:left}.ig-title:is(button){border:0;padding:0;background:none;color:var(--accent);cursor:pointer;font-family:inherit}.ig-title:is(button):hover{text-decoration:underline}.ig-state{display:flex;flex-direction:column;gap:5px;font-size:12px;line-height:1.5;max-width:170px}.ig-state strong{font-weight:500}.ig-state span{color:var(--text-secondary)}.ig-links{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;align-items:center}.ig-debug{font-size:12px;margin:16px 0}.ig-debug summary{cursor:pointer;font-weight:600}.ig-debug select{display:block;padding:8px;max-width:100%;width:100%;margin:6px 0 10px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm)}.ig-debug button:disabled{opacity:.45;cursor:default}.ig-review-details{margin-top:12px;font-size:12px}.ig-review-details summary{cursor:pointer}.ig-review-feedback{white-space:pre-wrap;overflow-wrap:anywhere}.ig-summary{font-size:12px;line-height:1.6;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ig-pages,.ig-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.ig-pages[hidden]{display:none}.ig-pages button:disabled{opacity:.45;cursor:default}.ig-pages{justify-content:flex-start;font-size:12px;margin:18px 0}.ig-inspector{padding:16px;align-self:start}.ig-heading h2{font-size:17px;margin:0}.ig-inspector h3{font-size:14px}.ig-sync{display:flex;flex-direction:column;gap:5px;font-size:12px}.ig-sync progress,.ig-inspector progress{width:100%;height:6px;accent-color:var(--accent)}.ig-steps{display:flex;flex-direction:column;margin:12px 0}.ig-steps button{font:inherit;display:flex;justify-content:space-between;gap:12px;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;cursor:pointer;font-size:12px;overflow-wrap:anywhere}.ig-steps button[aria-pressed=true]{border-color:var(--accent)}.ig-steps small{display:block;color:var(--text-secondary);margin-top:4px}.ig-log{max-height:400px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:12px}.ig-runners{margin:16px 0;color:var(--text-secondary);font-size:12px}.ig-runners summary{cursor:pointer}.ig-empty{padding:22px;color:var(--text-secondary);font-size:13px}
+@media(max-width:900px){.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}}@media(max-width:550px){.ig-row{grid-template-columns:minmax(0,1fr);gap:8px}.ig-state{max-width:none}.ig-tabs button{padding:9px 12px}}
+</style>`;
+
+export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',mission='',session=''}={}) {
+  const isCi=kind==='ci';
+  const tabs=isCi ? [['current','Current'],['failed','Failed'],['finished','Finished']] : [['current','Current'],['changes','Changes requested'],['failed','Failed'],['finished','Finished']];
+  const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,mission,session,page:0,group:'project'};
+  let disposed=false,data=null,error='',selected=null,pipeline=null,detailError='',log=null,logError='',step='',actionMessage='';
+  let timer=null,clock=null,signature='',detailSignature='';
+  let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='';
+  const pending=new Map();
+  const listenerController=new AbortController();
+  const reviewCache=new Map();
+  const title=isCi?'CI':'Reviews';
+  container.innerHTML=`${styles}<h1>${title}</h1><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
+    <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
+    <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
+    <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
+    ${repository || mission || session ? `<p class="ig-note">Filtered to ${esc(repository || mission || session)} · <a href="#/${kind}">Clear context</a></p>` : ''}
+    <p class="ig-note" data-ig-count></p><div class="ig-layout"><section id="ig-results" role="tabpanel" aria-labelledby="ig-tab-${state.tab}"></section><aside class="ig-inspector" aria-label="Pipeline inspector" hidden></aside></div>
+    <div class="ig-pages"><button type="button" class="hd-btn" data-page="previous">Previous</button><span data-ig-page></span><button type="button" class="hd-btn" data-page="next">Next</button></div><div data-ig-runners></div>${!isCi ? '<details class="ig-runners"><summary>Start a review</summary><p>Start Plannotator from the project workspace with <code>herdr-plannotator --help</code>. Its review link and upstream decision appear here when the launcher is connected to this control plane.</p></details>' : ''}`;
+  const el=selector=>container.querySelector(selector);
+  const reviewVersion=record=>JSON.stringify([record.updated_at,record.status,record.decision]);
+  const entries=()=>integrationEntries(kind==='reviews' && data ? {...data,reviews:records(data.reviews).map(summary=>{
+    const cached=reviewCache.get(String(summary.review_id));
+    return cached && cached.version===reviewVersion(summary) ? {...cached.record,...summary,_detailsError:cached.error,_detailsLoaded:!!cached.record} : summary;
+  })} : data||{},kind);
+  function replace(element,html) {
+    const focused=document.activeElement;
+    const focusKey=element.contains(focused) ? ['data-run','data-step','data-close-inspector','data-ci-action'].find(k=>focused.hasAttribute(k)) : null;
+    const focusValue=focusKey ? focused.getAttribute(focusKey) : null;
+    const reviewFocus=element.contains(focused) && focused.tagName==='SUMMARY' ? focused.closest('[data-review-details]')?.dataset.reviewDetails : null;
+    const linkFocus=element.contains(focused) && focused.tagName==='A' ? focused.getAttribute('href') : null;
+    const debugOpen=element.querySelector('[data-debug-disclosure]')?.open;
+    const debugFocus=element.contains(focused) && focused.closest('[data-debug-disclosure]') ? (focused.hasAttribute('data-debug-session')?'select':focused.tagName==='SUMMARY'?'summary':focused.hasAttribute('data-debug-send')?'button':null) : null;
+    const openReviews=new Set([...element.querySelectorAll('[data-review-details][open]')].map(e=>e.dataset.reviewDetails));
+    const logElement=element.querySelector('.ig-log');
+    const logScroll=logElement?.scrollTop;
+    const atEnd=logElement && logElement.scrollHeight-logElement.clientHeight-logElement.scrollTop<8;
+    element.innerHTML=html;
+    for(const review of element.querySelectorAll('[data-review-details]'))review.open=openReviews.has(review.dataset.reviewDetails);
+    if(focusKey)[...element.querySelectorAll(`[${focusKey}]`)].find(e=>e.getAttribute(focusKey)===focusValue)?.focus({preventScroll:true});
+    const debug=element.querySelector('[data-debug-disclosure]');if(debug && debugOpen)debug.open=true;
+    if(debugFocus)debug?.querySelector(debugFocus)?.focus({preventScroll:true});
+    if(reviewFocus)[...element.querySelectorAll('[data-review-details]')].find(e=>e.dataset.reviewDetails===reviewFocus)?.querySelector('summary')?.focus({preventScroll:true});
+    if(linkFocus)[...element.querySelectorAll('a')].find(e=>e.getAttribute('href')===linkFocus)?.focus({preventScroll:true});
+    const nextLog=element.querySelector('.ig-log');
+    if(nextLog && logScroll!=null)nextLog.scrollTop=atEnd?nextLog.scrollHeight:logScroll;
+  }
+  function tick() {
+    for(const element of container.querySelectorAll('[data-integration-time]')) element.textContent=formatDuration(Math.max(0,Date.now()-Number(element.dataset.integrationTime)));
+  }
+  function draw() {
+    if(disposed)return;
+    el('[data-ig-error]').textContent=error;
+    const health=integrationHealth(data,kind);
+    const healthElement=el('[data-ig-health]');
+    const healthKey=JSON.stringify([data?.status,data?.refreshing,data?.progress,data?.last_success_at,data?.checked_at,data?.error,data?.stale,data?.repo_errors,data?.project_mapping_error]);
+    if(healthElement.dataset.signature!==healthKey){healthElement.dataset.signature=healthKey;const issuesOpen=healthElement.querySelector('details')?.open;healthElement.innerHTML=health;if(issuesOpen && healthElement.querySelector('details'))healthElement.querySelector('details').open=true;}
+    const all=entries(),filtered=selectIntegrations(all,state),pageSize=20;
+    state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
+    const nextSignature=JSON.stringify([state,data,[...reviewCache]]);
+    if(signature!==nextSignature) {
+      signature=nextSignature;
+      for(const [key] of tabs) {
+        const button=el(`[data-tab="${key}"]`),active=state.tab===key;
+        button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;
+        button.querySelector('strong').textContent=data ? all.filter(e=>selectIntegrations([e],{...state,tab:key,search:''}).length).length : '…';
+      }
+      const groups=new Map();
+      for(const entry of filtered.slice(state.page*pageSize,(state.page+1)*pageSize)) {
+        const group=state.group==='project'?entry.project:'Most recent';
+        if(!groups.has(group))groups.set(group,[]);groups.get(group).push(entry);
+      }
+      const result=el('#ig-results');result.setAttribute('aria-labelledby',`ig-tab-${state.tab}`);
+      replace(result,[...groups].map(([name,rows])=>`<div class="ig-group"><h2>${esc(name)}</h2>${rows.map(e=>integrationRow(e,kind)).join('')}</div>`).join('') || `<div class="ig-group ig-empty">${!data ? 'Waiting for reports…' : isCi && data.available===false && !all.length ? 'No CI reports available. Connection details are shown above.' : `No ${state.tab==='current'?'current ':''}${isCi?'runs':'reviews'} match this view.`}</div>`);
+      el('[data-ig-count]').textContent=data ? `${filtered.length} matching ${isCi?'runs':'reviews'}${isCi?' in the recent pipeline window':data.has_more?` · Showing the latest ${records(data.reviews).length}${Number.isFinite(data.total)?` of ${data.total}`:''} reviews; older records are outside this window`:''}` : '';
+      el('.ig-pages').hidden=filtered.length<=pageSize;
+      el('[data-ig-page]').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(filtered.length/pageSize))}`;
+      el('[data-page="previous"]').disabled=state.page===0;el('[data-page="next"]').disabled=(state.page+1)*pageSize>=filtered.length;
+      if(isCi) {
+        const runners=records(data?.agents);
+        const runnersOpen=el('[data-ig-runners]').querySelector('details')?.open;
+        el('[data-ig-runners]').innerHTML=`<details class="ig-runners"><summary>Runner capacity · ${runners.length ? `${runners.length} reported` : 'not available'}</summary>${data?.agents_error ? `<p>${esc(short(data.agents_error,300))}</p>` : ''}${runners.map(r=>`<p>${esc(short(r.name)||'Unnamed runner')} · ${esc(short(r.platform))}${r.capacity!=null ? ` · Capacity ${esc(r.capacity)}` : ''}</p>`).join('') || '<p>The provider has not supplied runner capacity. Repository runs can still be inspected.</p>'}</details>`;
+        if(runnersOpen)el('[data-ig-runners]').querySelector('details').open=true;
+      }
+    }
+    const inspector=el('.ig-inspector');inspector.hidden=!selected;
+    if(selected) {
+      const next=JSON.stringify([pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage]);
+      if(detailSignature!==next){detailSignature=next;replace(inspector,renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage}));}
+    }
+    tick();
+  }
+  async function request(key,fn,accept,onError) {
+    if(disposed || document.hidden || pending.has(key))return;
+    const controller=new AbortController();pending.set(key,controller);
+    let timeout=false;const deadline=setTimeout(()=>{timeout=true;controller.abort();},15000);
+    try {const response=await fn(controller.signal);if(!disposed && !controller.signal.aborted)accept(response);}
+    catch(err){if(!disposed && (!controller.signal.aborted || timeout))onError(err);}
+    finally {clearTimeout(deadline);if(pending.get(key)===controller)pending.delete(key);draw();}
+  }
+  function refreshDetail() {
+    if(!selected)return;
+    const key=selected.id,selectedStep=step;
+    request('pipeline',signal=>client.getCiPipeline(selected.providerId,selected.number,{signal}),response=>{
+      if(selected?.id!==key)return;
+      if(!response?.pipeline)throw new Error('Pipeline response is unavailable');
+      pipeline=pipelineDetails(response.pipeline,{...pipeline,repository:selected.repository,run_number:selected.number});detailError='';
+    },()=>{if(selected?.id===key)detailError='Pipeline details could not refresh.';});
+    if(selectedStep)request('log',signal=>client.getCiLog(selected.providerId,selected.number,selectedStep,{signal}),response=>{
+      if(selected?.id===key && step===selectedStep){log=response;logError='';}
+    },()=>{if(selected?.id===key && step===selectedStep)logError='Step output could not refresh.';});
+  }
+  function refresh() {
+    request('list',signal=>isCi ? client.getCi({signal}) : client.listReviews({signal}),response=>{
+      if(!response || (isCi ? typeof response.available!=='boolean' : !Array.isArray(response.reviews)))throw new Error('Invalid integration response');
+      data=response;error='';
+    },()=>{error=`${title} could not refresh.${data?' Showing last received records.':' Retrying automatically.'}`;});
+    refreshDetail();
+  }
+  function cancelDetail() {for(const key of ['pipeline','log','debug-sessions']){pending.get(key)?.abort();pending.delete(key);}}
+  container.addEventListener('click',async event=>{
+    if(disposed)return;
+    const button=event.target.closest('button');if(!button)return;
+    if(button.dataset.tab){state.tab=button.dataset.tab;state.page=0;draw();}
+    if(button.dataset.page){state.page+=button.dataset.page==='next'?1:-1;draw();}
+    if(button.hasAttribute('data-run')) {
+      const entry=entries().find(e=>e.id===button.dataset.run);if(!entry)return;
+      if(selected?.id===entry.id){el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});return;}
+      cancelDetail();selected={id:entry.id,repository:entry.record.repository,providerId:entry.record.provider_repo_id || entry.record.repository,number:entry.record.run_number};pipeline=entry.record;debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';draw();refreshDetail();
+      el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});
+    }
+    if(button.hasAttribute('data-close-inspector')){cancelDetail();selected=null;pipeline=null;draw();}
+    if(button.hasAttribute('data-step')){pending.get('log')?.abort();pending.delete('log');step=button.dataset.step;log=null;logError='';draw();refreshDetail();}
+    if(button.hasAttribute('data-debug-send') && selected && debugSessionId && !pending.has('debug')) {
+      const target={...selected},sessionId=debugSessionId;
+      if(!debugOperationId)debugOperationId=newOperationId();
+      const operationId=debugOperationId;debugMessage='Sending debugging context to Pi…';draw();
+      request('debug',signal=>client.debugCi(target.providerId,target.number,sessionId,operationId,{signal}),response=>{
+        if(selected?.id!==target.id || debugSessionId!==sessionId)return;
+        debugMessage=response.status==='delivered'?'Debugging context delivered to the selected Pi session.':response.status==='queued'?'Debugging context queued for delivery.':response.error || 'Pi did not receive the debugging context.';
+      },err=>{if(selected?.id===target.id && debugSessionId===sessionId)debugMessage=err.status===403?'Sending to Pi requires operator access.':'Delivery unconfirmed; retry checks the same operation.';});
+    }
+    if(button.dataset.ciAction && selected && !pending.has('action')) {
+      const target={...selected};actionMessage='Sending action to Woodpecker…';draw();
+      request('action',signal=>client.ciAction(target.providerId,target.number,button.dataset.ciAction,{signal}),()=>{if(selected?.id===target.id)actionMessage='Action accepted by Woodpecker.';refresh();},err=>{if(selected?.id===target.id)actionMessage=err.status===403?'This action requires operator access.':'Woodpecker did not accept the action.';});
+    }
+  },{signal:listenerController.signal});
+  container.addEventListener('toggle',event=>{
+    if(disposed)return;
+    if(!event.target.open){const cached=reviewCache.get(event.target.dataset.reviewDetails);if(cached?.error)reviewCache.delete(event.target.dataset.reviewDetails);return;}
+    if(event.target.hasAttribute?.('data-review-details')) {
+      const id=event.target.dataset.reviewDetails,summary=records(data?.reviews).find(r=>String(r.review_id)===id);
+      if(!summary || summary.plan || summary.feedback)return;
+      const version=reviewVersion(summary),cached=reviewCache.get(id);
+      if(cached?.version===version && (cached.record || cached.loading || cached.error))return;
+      if(pending.has(`review:${id}`))return;
+      if(!reviewCache.has(id) && reviewCache.size>=30)reviewCache.delete(reviewCache.keys().next().value);
+      const cache={version,record:null,error:'',loading:true};reviewCache.set(id,cache);
+      request(`review:${id}`,signal=>client.getReview(id,{signal}),response=>{
+        if(reviewCache.get(id)!==cache)return;
+        const detail=response?.review || response;
+        if(!detail || String(detail.review_id)!==id)throw new Error('Invalid review detail');
+        cache.record=detail;cache.loading=false;cache.error='';
+      },()=>{if(reviewCache.get(id)===cache){cache.error='Review details could not load.';cache.loading=false;}});
+      return;
+    }
+    if(!event.target.hasAttribute?.('data-debug-disclosure') || debugSessions!==null || !selected)return;
+    const key=selected.id;debugMessage='Loading active Pi sessions…';
+    request('debug-sessions',signal=>client.listSessions(undefined,{signal}),response=>{
+      if(selected?.id!==key)return;
+      debugSessions=activePiSessions(response.sessions);debugMessage='';
+    },()=>{if(selected?.id===key){debugSessions=[];debugMessage='Pi sessions could not load. Reopen this run to retry.';}});
+  },{capture:true,signal:listenerController.signal});
+  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
+  container.querySelector('.ig-tabs').addEventListener('keydown',event=>{
+    if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
+    const index=tabs.findIndex(([key])=>key===state.tab);
+    state.tab=tabs[event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:tabs.length-1))%tabs.length][0];state.page=0;event.preventDefault();draw();el(`[data-tab="${state.tab}"]`).focus();
+  });
+  el('[data-ig-search]').addEventListener('input',event=>{state.search=event.target.value;state.page=0;draw();});
+  el('[data-ig-group]').addEventListener('change',event=>{state.group=event.target.value;draw();});
+  function visibility() {
+    clearInterval(timer);clearInterval(clock);
+    if(document.hidden){for(const [key,controller] of pending){if(['debug','action'].includes(key))continue;controller.abort();pending.delete(key);}for(const cached of reviewCache.values())cached.loading=false;return;}
+    refresh();for(const disclosure of container.querySelectorAll('details[open]'))disclosure.dispatchEvent(new Event('toggle'));timer=setInterval(refresh,5000);clock=setInterval(tick,1000);
+  }
+  draw();document.addEventListener('visibilitychange',visibility);visibility();
+  return {refresh,dispose(){disposed=true;listenerController.abort();clearInterval(timer);clearInterval(clock);for(const controller of pending.values())controller.abort();pending.clear();document.removeEventListener('visibilitychange',visibility);}};
+}
