@@ -146,6 +146,19 @@ class IngestService:
         process) ride along when present; the repo always ensures a
         description so every service is self-explanatory.
         """
+        metadata = {key: payload[key] for key in ("ownership", "session_id") if key in payload}
+        identity_fields = ("repository_id", "forge_url", "repository_url", "repo_url", "clone_url")
+        if any(key in payload for key in (*identity_fields, "commit_sha")):
+            git = _git_identity(payload)
+            if any(key in payload for key in identity_fields):
+                metadata["repository_id"] = git["repository_id"]
+            if "commit_sha" in payload:
+                metadata["commit_sha"] = git["commit_sha"]
+        if event_type in {"service.metadata", "service.listener_observed"}:
+            observer = self.repo.observe_service_metadata if event_type == "service.metadata" else self.repo.observe_service_listener
+            row = observer(entity_id, {**payload, **metadata})
+            return {"entity_type": "service", "entity_id": entity_id, "event_type": event_type,
+                    "metadata_observation": row.get("metadata_observation")}
         status = ("unavailable" if "unavailable" in event_type.lower()
                   else payload.get("status", "healthy"))
         svcid = self.repo.upsert_service(
@@ -153,12 +166,12 @@ class IngestService:
             payload.get("service_name") or entity_id,
             int(payload["port"]) if payload.get("port") is not None else 0,
             status=status,
-            session_id=payload.get("session_id"),
             route=payload.get("route"),
             description=payload.get("description"),
             owner=payload.get("owner"),
             project=payload.get("project"),
             source_port=payload.get("source_port"),
+            **metadata,
         )
         return {"entity_type": "service", "entity_id": svcid,
                 "event_type": event_type}

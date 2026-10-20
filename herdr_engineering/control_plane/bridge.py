@@ -273,6 +273,14 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 a["original_filename"] = p["filename"]
             a["updated_at"] = ts
         elif et == "service":
+            if etype == "ServiceMetadataObserved":
+                svc = services.setdefault(eid, {"service_id": eid,
+                    "created_at": p.get("service_created_at"), "updated_at": p.get("service_updated_at")})
+                for key in ("host_id", "source_port", "ownership", "session_id", "verified_origin",
+                            "repository_id", "commit_sha", "listener_identity", "metadata_observation", "metadata_updated_at"):
+                    if key in p:
+                        svc[key] = p[key]
+                continue
             svc = services.setdefault(eid, {
                 "service_id": eid, "service_name": eid, "host_id": None,
                 "port": 0, "session_id": None, "route": None,
@@ -286,8 +294,18 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 svc["service_name"] = p["service_name"]
             if p.get("port") is not None:
                 svc["port"] = p["port"]
-            if p.get("session_id") or ev.get("session_id"):
-                svc["session_id"] = p.get("session_id") or ev["session_id"]
+            if "session_id" in p:
+                svc["session_id"] = p["session_id"]
+            elif ev.get("session_id"):
+                svc["session_id"] = ev["session_id"]
+            if "ownership" in p:
+                svc["ownership"] = p["ownership"]
+            if "verified_origin" in p:
+                svc["verified_origin"] = p["verified_origin"]
+            for field in ("repository_id", "commit_sha", "listener_identity", "metadata_observation", "metadata_updated_at",
+                          "discovery_source", "endpoint_scope"):
+                if field in p:
+                    svc[field] = p[field]
             if p.get("route"):
                 svc["route"] = p["route"]
             if p.get("description"):
@@ -306,7 +324,7 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 svc["status"] = p["status"]
             svc["status"] = "unavailable" if "unavailable" in etype.lower() \
                 else svc["status"]
-            svc["url"] = svc["route"] or f"http://{svc['host_id']}:{svc['port']}"
+            svc["url"] = None if svc.get("endpoint_scope") == "local_only" else (svc["route"] or f"http://{svc['host_id']}:{svc['port']}")
             svc["updated_at"] = ts
     for sid, s in sessions.items():
         mid = s.get("mission_key", s.get("mission_id"))
@@ -363,11 +381,16 @@ def load_into(repo, source: DurableSource) -> dict:
         services[svcid] = {
             "service_id": svcid, "service_name": row.get("service_name"),
             "host_id": row.get("host_id"), "port": row.get("port"),
-            "session_id": row.get("session_id"),
+            "session_id": row.get("session_id"), "ownership": row.get("ownership"),
+            "repository_id": row.get("repository_id"), "commit_sha": row.get("commit_sha"),
+            "verified_origin": row.get("verified_origin"), "metadata_updated_at": row.get("metadata_updated_at"),
+            "metadata_observation": row.get("metadata_observation"), "listener_identity": row.get("listener_identity"),
+            "source_port": row.get("source_port"), "discovery_source": row.get("discovery_source"),
+            "endpoint_scope": row.get("endpoint_scope"),
             "status": row.get("status") or "healthy",
             "created_at": _iso(row.get("created_at")),
             "updated_at": _iso(row.get("updated_at") or row.get("created_at")),
-            "url": f"http://{row.get('host_id')}:{row.get('port')}",
+            "url": None if row.get("endpoint_scope") == "local_only" else f"http://{row.get('host_id')}:{row.get('port')}",
         }
 
     hosts: dict = {}
@@ -419,7 +442,18 @@ def load_into(repo, source: DurableSource) -> dict:
             event_is_newer = False
         had_since = "unavailable_since" in base
         row_since = base.get("unavailable_since")
+        try:
+            metadata_is_newer = bool(s.get("metadata_updated_at") and (
+                not base.get("metadata_updated_at") or
+                _dt.datetime.fromisoformat(s["metadata_updated_at"]) >= _dt.datetime.fromisoformat(base["metadata_updated_at"])))
+        except (TypeError, ValueError):
+            metadata_is_newer = False
         _overlay(base, s)
+        if metadata_is_newer:
+            for key in ("ownership", "session_id", "verified_origin", "repository_id", "commit_sha",
+                        "listener_identity", "metadata_observation", "metadata_updated_at"):
+                if key in s:
+                    base[key] = s[key]
         if not event_is_newer:
             if had_since:
                 base["unavailable_since"] = row_since

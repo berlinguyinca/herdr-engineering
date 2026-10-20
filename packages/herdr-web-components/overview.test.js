@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { overviewModel, renderOverviewSection, meaningfulEvents } from '../overview-view.js';
 
 const now = Date.parse('2026-10-20T12:00:00Z');
-const live = (key, status = 'EXECUTING', health = 'active') => ({mission_key:key, mission:{id:key,title:'Decode spectra',status},freshness:{state:'live',age_seconds:1},activity:{health,currentActivity:{summary:'Reading spectra'}}});
+const live = (key, status = 'EXECUTING', health = 'active') => ({mission_key:key,activity_snapshot_at:new Date(now-1000).toISOString(), mission:{id:key,title:'Decode spectra',status},freshness:{state:'live',age_seconds:1},activity:{health,currentActivity:{summary:'Reading spectra'}}});
 test('overview merges exact mission namespaces and excludes terminal work from current counts', () => {
-  const model = overviewModel({projections:[live('pi:same'),live('pi:failed','FAILED'),live('pi:done','COMPLETE')],missions:[{mission_id:'same',status:'active'},{mission_id:'old',status:'closed'}],sessions:[{session_id:'one',status:'active'},{session_id:'two',status:'stopped'},{session_id:'three',status:'failed'}]},now,now);
-  assert.equal(model.missions.current.length,2);
+  const model = overviewModel({projections:[live('pi:same'),live('pi:failed','FAILED'),live('pi:done','COMPLETE')],missions:[{mission_id:'same',status:'active'},{mission_id:'old',status:'closed'}],sessions:[{session_id:'one',status:'active',updated_at:new Date(now).toISOString()},{session_id:'two',status:'stopped'},{session_id:'three',status:'failed'}]},now,now);
+  assert.equal(model.missions.current.length,1);
   assert.equal(model.missions.running.length,1);
   assert.equal(model.missions.failed.length,1);
   assert.equal(model.missions.finished.length,2);
@@ -18,10 +18,10 @@ test('stale mission reports do not count as running or current attention', () =>
   const model = overviewModel({projections:[live('pi:stalled','EXECUTING','stalled')]},now,now+180000);
   assert.equal(model.missions.attention.length,0);
   assert.equal(model.missions.running.length,0);
-  assert.equal(model.missions.lastknown.length,1);
+  assert.equal(model.missions.unconfirmed.length,1);
 });
 test('sections work independently with missing data and keep failures visible beside retained records', () => {
-  const data={sessions:[{session_id:'one',title:'Parser',status:'active',updated_at:'2026-10-19T12:00:00Z'}]};
+  const data={sessions:[{session_id:'one',title:'Parser',status:'active',updated_at:'2026-10-20T11:59:00Z'}]};
   const html=renderOverviewSection('sessions',data,{sessions:{loaded:true,error:true}},now,now);
   assert.match(html,/Parser/);assert.match(html,/Could not refresh/);assert.match(html,/Last reported active/);
   assert.doesNotMatch(html,/Reported healthy|Currently running/);
@@ -54,9 +54,9 @@ test('overview suppresses telemetry noise and bounds untrusted summaries', () =>
   assert.doesNotMatch(html,/<script>|private-id|HostHeartbeat|ServiceRegistered/);assert.ok(html.length<6000);
 });
 test('old host and service statuses remain qualified observations', () => {
-  const data={hosts:[{host_id:'beast',status:'healthy',last_seen:'2026-10-19T12:00:00Z'}],services:[{service_id:'service',status:'healthy',lifecycle:{state:'current'}},{service_id:'old',lifecycle:{archived:true}}]};
+  const data={hosts:[{host_id:'beast',status:'healthy',last_seen:'2026-10-19T12:00:00Z'}],services:[{service_id:'service',status:'healthy',lifecycle:{state:'current'}},{service_id:'old',catalog:{scope:'herdr'},lifecycle:{archived:true}}]};
   const model=overviewModel(data,now,now);
-  assert.equal(model.services.current,1);assert.equal(model.services.archived,1);
+  assert.equal(model.services.current,0);assert.equal(model.services.archived,1);
   assert.match(renderOverviewSection('hosts',data,{hosts:{loaded:true}},now,now),/Last reported healthy/);
   assert.match(renderOverviewSection('services',data,{services:{loaded:true}},now,now),/Reported healthy/);
 });

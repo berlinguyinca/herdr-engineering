@@ -30,11 +30,26 @@ from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402
 def _seed(repo):
     m1 = repo.create_mission("Alpha", purpose="first mission")
     m2 = repo.create_mission("Beta", purpose="second mission")
+    # Model a listener whose process ancestry was observed inside a native pane.
+    native = "herdr:beast:ui-service-fixture:svc%3Ap1"
+    repo.upsert_session(native, host_id="beast", agent_role="service-runner",
+                        herdr_session="ui-service-fixture", pane_id="svc:p1",
+                        terminal_id="term_service_fixture", cwd="/work/metabolomics")
+    launch = {"kind": "herdr_process_ancestry", "host_id": "beast", "session_id": native,
+              "herdr_session": "ui-service-fixture", "pane_id": "svc:p1",
+              "terminal_id": "term_service_fixture", "listener_pid": 4242, "shell_pid": 4141,
+              "ancestor_pids": [4242, 4141], "listener_start": "fixture-listener-start",
+              "shell_start": "fixture-shell-start", "observed_at": repo._stamp()}
+
+    def owned_service(name, port, **options):
+        return repo.register_service(name, "beast", port, session_id=native,
+                                     ownership=launch, **options)
+
     s1 = repo.create_session(mission_id=m1, agent_role="pi", model="gpt-4o")
     repo.upsert_host("beast", "beast", "100.96.156.65")
     repo.upsert_host("bender", "bender", "100.104.39.6")
     repo.upsert_host("mac.lan", "macbook-pro", "100.84.185.100")
-    repo.register_service("web", "beast", 8080, session_id=s1)
+    owned_service("web", 8080)
     repo.register_service("gateway", "bender", 9000)
     repo.record_event("mission", m1, "MissionStarted",
                       {"stage": "ready", "title": "Alpha"}, mission_id=m1)
@@ -43,16 +58,16 @@ def _seed(repo):
                        "attach": f"herdr workspace focus {m1}"},
                       mission_id=m1, session_id=s1)
     if os.environ.get("SERVICES_SEED") == "1":
-        repo.register_service("Spectra API", "beast", 18012, owner="python",
+        owned_service("Spectra API", 18012, owner="python",
                               project="metabolomics", source_port=8080,
                               description="Parse experimental spectra")
-        repo.register_service("Inactive parser", "beast", 18013, status="unavailable")
-        archived = repo.register_service("Archived parser", "beast", 18014,
+        owned_service("Inactive parser", 18013, status="unavailable")
+        archived = owned_service("Archived parser", 18014,
                                          status="unavailable")
         repo._services[archived]["unavailable_since"] = "2020-01-01T00:00:00+00:00"
-        stale = repo.register_service("Stale healthy parser", "beast", 18016)
+        stale = owned_service("Stale healthy parser", 18016)
         repo._services[stale]["updated_at"] = "2020-01-01T00:00:00+00:00"
-        repo.register_service("Unsafe <script>window.catalogXss=true</script>", "beast", 18015,
+        owned_service("Unsafe <script>window.catalogXss=true</script>", 18015,
                               route="javascript:alert(1)")
     # Non-herdr-sourced mission: keyed by mission_key 'pi:MSN-PI1' (UI-008).
     repo.upsert_mission("MSN-PI1", title="Pi mission", purpose="from pi",

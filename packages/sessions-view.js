@@ -1,7 +1,7 @@
 // Session records describe the last observation, not a live process check.
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration} from './herdr-web-components/format.js';
-import {recordOutcome,statusOutcome} from './record-state.js';
+import {recordOutcome,statusOutcome,recordVisibility} from './record-state.js';
 
 const text = value => typeof value === 'string' ? value.trim() : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -9,11 +9,7 @@ const short = (value, max=160) => {
   const normalized=text(value).replace(/\s+/g,' ');
   return normalized.length>max ? `${normalized.slice(0,max)}…` : normalized;
 };
-const tabs = [['current','Current'],['failed','Failed'],['finished','Finished']];
-const tabFor = record => {
-  const outcome=recordOutcome(record);
-  return outcome==='unknown' ? 'current' : outcome;
-};
+const tabs = [['current','Current'],['unconfirmed','Unconfirmed'],['failed','Failed'],['finished','Finished']];
 const missionKey = mission => text(mission.mission_key) || (text(mission.mission_id)
   ? `${text(mission.source) && mission.source!=='herdr' ? `${mission.source}:` : ''}${mission.mission_id}` : '');
 
@@ -32,13 +28,13 @@ function associatedMission(session, missions) {
   return {key:missionKey(mission),title:text(mission.title)||text(mission.mission_id)};
 }
 
-export function sessionEntries(sessions, missions=[]) {
+export function sessionEntries(sessions, missions=[], now=Date.now()) {
   const available=records(missions);
   return records(sessions).filter(s=>text(s.session_id)).map(record=> {
     const project=text(record.cwd).split(/[\\/]/).filter(Boolean).at(-1) || 'Project not reported';
     const mission=associatedMission(record,available);
     const id=record.session_id, host=text(record.host_id), role=text(record.agent_role)||'Agent session';
-    return {record,id,host,role,project,mission,tab:tabFor(record),
+    return {record,id,host,role,project,mission,tab:recordVisibility(record,now),
       search:[id,host,role,project,text(record.cwd),text(record.branch),text(record.model),text(record.summary),
         text(record.status),text(record.mission_id),mission?.title].filter(Boolean).join(' ').toLocaleLowerCase()};
   }).sort((a,b)=> {
@@ -88,7 +84,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   let disposed=false,sessions=[],missions=[],loaded=false,sessionError='',missionError='',lastSignature='',hostSignature='';
   let sessionRequest=null,missionRequest=null;
   container.innerHTML=`${styles}<h1>Sessions</h1>
-    <p class="ss-intro">Find an agent by project, host or model. Current contains open and unknown session records; Failed and Finished keep previous work together. Status reflects the last report, not a live process check.</p>
+    <p class="ss-intro">Find an agent by project, host or model. Current shows open sessions reported in the last 15 minutes. Older or missing reports move to Unconfirmed automatically; Failed and Finished retain previous work.</p>
     <div class="ss-tabs" role="tablist" aria-label="Session outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ss-controls"><label class="ss-search">Search sessions<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
       <label>Host<select id="ss-host"><option value="">All hosts</option></select></label>
@@ -103,7 +99,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     const all=entries(), selected=selectSessions(all,state);
     state.page=Math.min(state.page,Math.max(0,Math.ceil(selected.length/pageSize)-1));
     el('error').textContent=[sessionError,missionError].filter(Boolean).join(' ');
-    const signature=JSON.stringify([state,sessions,missions,loaded]);
+    const signature=JSON.stringify([state,sessions,missions,loaded,all.map(e=>e.tab)]);
     if(signature===lastSignature)return;
     lastSignature=signature;
     const focused=document.activeElement;
@@ -124,7 +120,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     for(const entry of visible){const label=state.group==='project'?entry.project:'Recent reports';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(entry);}
     el(`panel-${state.tab}`).innerHTML=visible.length ? [...groups].map(([name,rows])=>`<div class="ss-group"><h2>${esc(name)}</h2>${rows.map(e=>compactSessionRow(e)).join('')}</div>`).join('')
       : `<p class="ss-empty">${loaded?'No sessions match this tab and these filters.':'Loading sessions…'}</p>`;
-    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} sessions · ${all.length} total records${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}` : 'Loading sessions…';
+    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} sessions${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}` : 'Loading sessions…';
     el('page').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`;
     el('previous').disabled=state.page===0;el('next').disabled=(state.page+1)*pageSize>=selected.length;
     if(focusId){
@@ -165,7 +161,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   function visibility(){if(document.hidden){sessionRequest?.abort();missionRequest?.abort();}else refresh();}
   document.addEventListener('visibilitychange',visibility);
   const poll=setInterval(()=>request('sessions'),5000), contextPoll=setInterval(()=>request('missions'),30000);
-  const clock=setInterval(()=>{if(disposed||document.hidden)return;const byId=new Map(entries().map(e=>[e.id,e]));container.querySelectorAll('[data-session-id]').forEach(row=>{const entry=byId.get(row.dataset.sessionId);if(entry)row.querySelector('[data-report]').textContent=sessionReport(entry.record);});},1000);
+  const clock=setInterval(()=>{if(disposed||document.hidden)return;draw();const byId=new Map(entries().map(e=>[e.id,e]));container.querySelectorAll('[data-session-id]').forEach(row=>{const entry=byId.get(row.dataset.sessionId);if(entry)row.querySelector('[data-report]').textContent=sessionReport(entry.record);});},1000);
   draw();refresh();
   return {refresh,dispose(){disposed=true;sessionRequest?.abort();missionRequest?.abort();clearInterval(poll);clearInterval(contextPoll);clearInterval(clock);document.removeEventListener('visibilitychange',visibility);container.removeEventListener('click',click);container.removeEventListener('keydown',keydown);container.removeEventListener('input',controls);container.removeEventListener('change',controls);}};
 }

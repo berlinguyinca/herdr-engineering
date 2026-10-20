@@ -142,6 +142,28 @@ export class HerdrClient {
     return `${this.base}/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector/stream`;
   }
 
+  // -- GitHub project and issue inventory ---------------------------------
+  getGithub({ page, per_page, search, signal } = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries({ page, per_page, search })) {
+      if (value != null) query.set(key, String(value));
+    }
+    return this.request(`/api/v1/github${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  getGithubIssues(repository, { tab, search, page, per_page, signal } = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries({ repository, tab, search, page, per_page })) {
+      if (value != null && !(key === 'repository' && value === '')) query.set(key, String(value));
+    }
+    return this.request(`/api/v1/github/issues${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  getGithubIssue(repository, number, { signal } = {}) {
+    const query = new URLSearchParams({ repository, number: String(number) });
+    return this.request(`/api/v1/github/issue?${query}`, { signal });
+  }
+
   // -- ci / test runs (leaf types for the topology view) -------------------
   getCi({ signal } = {}) {
     return this.request('/api/v1/ci', { signal });

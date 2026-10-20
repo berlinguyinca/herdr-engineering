@@ -2,8 +2,8 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { formatDuration } from './herdr-web-components/format.js';
 import { missionEntries } from './mission-catalog-view.js';
-import { recordOutcome } from './record-state.js';
-import { serviceState } from './services-view.js';
+import { recordOutcome, recordVisibility } from './record-state.js';
+import { serviceState, serviceScope } from './services-view.js';
 import { integrationEntries } from './integrations-view.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
@@ -16,8 +16,9 @@ const human = value => text(value).toLowerCase().replaceAll('_', ' ');
 const link = (path, label) => `<a href="${esc(path)}">${esc(label)}</a>`;
 const stamp = value => Date.parse(value) || 0;
 const recent = (a,b) => stamp(b.updated_at || b.last_seen) - stamp(a.updated_at || a.last_seen);
-const countByOutcome = list => ({
-  current:list.filter(item => !['failed','finished'].includes(recordOutcome(item))),
+const countByOutcome = (list,now) => ({
+  current:list.filter(item => recordVisibility(item,now) === 'current'),
+  unconfirmed:list.filter(item => recordVisibility(item,now) === 'unconfirmed'),
   failed:list.filter(item => recordOutcome(item) === 'failed'),
   finished:list.filter(item => recordOutcome(item) === 'finished'),
 });
@@ -26,13 +27,14 @@ export function overviewModel(data = {}, received = Date.now(), now = Date.now()
   const entries = missionEntries(data.projections, data.missions, received, now);
   const missions = {
     current:entries.filter(e => e.tab === 'current'),
+    unconfirmed:entries.filter(e => e.tab === 'unconfirmed'),
     failed:entries.filter(e => e.tab === 'failed'),
     finished:entries.filter(e => e.tab === 'finished'),
   };
   for (const group of ['attention','running','lastknown','recorded']) missions[group] = missions.current.filter(e => e.group === group);
-  const sessions = countByOutcome(records(data.sessions).sort(recent));
+  const sessions = countByOutcome(records(data.sessions).sort(recent),now);
   const services = {current:0,unavailable:0,archived:0,unknown:0};
-  for (const service of records(data.services)) services[serviceState(service)]++;
+  for (const service of records(data.services)) if (serviceScope(service) === 'herdr') services[serviceState(service,now)]++;
   return {missions,sessions,services,hosts:records(data.hosts).sort((a,b)=>text(a.host_name || a.host_id).localeCompare(text(b.host_name || b.host_id)))};
 }
 
@@ -72,7 +74,7 @@ function availability(keys, states) {
   }).join('');
 }
 function historyLinks(base, counts) {
-  return `<nav class="ov-history" aria-label="${base === 'missions' ? 'Mission' : 'Session'} history">${link(`#/${base}?tab=failed`,`${counts.failed.length} failed`)}${link(`#/${base}?tab=finished`,`${counts.finished.length} finished / closed`)}</nav>`;
+  return `<nav class="ov-history" aria-label="${base === 'missions' ? 'Mission' : 'Session'} history">${link(`#/${base}?tab=unconfirmed`,`${counts.unconfirmed.length} unconfirmed`)}${link(`#/${base}?tab=failed`,`${counts.failed.length} failed`)}${link(`#/${base}?tab=finished`,`${counts.finished.length} finished / closed`)}</nav>`;
 }
 function missionRow(entry) {
   const activity = entry.projection?.activity || {};
@@ -87,18 +89,18 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
     const ready = states.projections?.loaded || states.missions?.loaded;
     const rows = [...m.attention,...m.running].slice(0,5);
     return `<div class="ov-heading"><h2>Current missions</h2>${link('#/missions','All missions →')}</div>${availability(['projections','missions'],states)}
-      ${ready ? `<div class="ov-metrics">${metric(states.projections?.loaded ? m.attention.length : '—','Need attention','#/missions?tab=current&status=attention')}${metric(states.projections?.loaded ? m.running.length : '—','Running with live reports','#/missions?tab=current&status=running')}${metric(states.projections?.loaded ? m.lastknown.length : '—','Updating / last known','#/missions?tab=current&status=lastknown')}</div>
+      ${ready ? `<div class="ov-metrics">${metric(states.projections?.loaded ? m.attention.length : '—','Need attention','#/missions?tab=current&status=attention')}${metric(states.projections?.loaded ? m.running.length : '—','Running with live reports','#/missions?tab=current&status=running')}</div>
       ${rows.length ? `<ul class="ov-list">${rows.map(e=>missionRow(e)).join('')}</ul>` : empty(states.projections?.loaded ? 'No missions currently report running or needing attention.' : 'Current mission activity is unavailable.')}
-      <p class="ov-note">${m.current.length} known open mission records${m.recorded.length ? ` · ${m.recorded.length} without live telemetry` : ''}. ${rows.length < m.attention.length+m.running.length ? 'Showing 5; open All missions for the rest.' : 'Live evidence determines running and attention counts.'}</p>
+      <p class="ov-note">${m.current.length} missions with current reports${m.recorded.length ? ` · ${m.recorded.length} recorded without live activity` : ''}. ${rows.length < m.attention.length+m.running.length ? 'Showing 5; open All missions for the rest.' : 'Live evidence determines running and attention counts.'}</p>
       ${historyLinks('missions',m)}${!states.projections?.loaded || !states.missions?.loaded ? empty('Partial mission totals: waiting for both live reports and recorded missions.') : ''}` : ''}`;
   }
   if (section === 'sessions') {
     const s = model.sessions;
     return `<div class="ov-heading"><h2>Sessions</h2>${link('#/herd','All sessions →')}</div>${availability(['sessions'],states)}${states.sessions?.loaded ? `
-      <div class="ov-metrics">${metric(s.current.length,'Open session records','#/herd?tab=current')}</div>
-      <p class="ov-note">Latest reported state; an open record does not confirm a worker is running.</p>
-      ${s.current.length ? `<ul class="ov-list">${s.current.slice(0,5).map(session=>`<li class="ov-row"><div>${link(`#/herd/session/${encodeURIComponent(session.session_id)}`,short(session.title || session.summary || session.agent_role || 'Agent session'))}<p>${esc(short(session.cwd || session.branch || session.model || 'Workspace not reported'))}</p></div><span class="ov-tag">Last reported ${esc(human(session.status) || 'unknown')}<br>${esc(session.host_id || 'Host unknown')} · ${ageMarkup(session.last_activity || session.updated_at,now)}</span></li>`).join('')}</ul>` : empty('No open session records.')}
-      ${s.current.length > 5 ? empty(`Showing 5 of ${s.current.length} open records.`) : ''}${historyLinks('herd',s)}` : ''}`;
+      <div class="ov-metrics">${metric(s.current.length,'Recently reported sessions','#/herd?tab=current')}</div>
+      <p class="ov-note">Open sessions reported in the last 15 minutes. Older reports are available in Unconfirmed.</p>
+      ${s.current.length ? `<ul class="ov-list">${s.current.slice(0,5).map(session=>`<li class="ov-row"><div>${link(`#/herd/session/${encodeURIComponent(session.session_id)}`,short(session.title || session.summary || session.agent_role || 'Agent session'))}<p>${esc(short(session.cwd || session.branch || session.model || 'Workspace not reported'))}</p></div><span class="ov-tag">Last reported ${esc(human(session.status) || 'unknown')}<br>${esc(session.host_id || 'Host unknown')} · ${ageMarkup(session.last_activity || session.updated_at,now)}</span></li>`).join('')}</ul>` : empty('No recently reported open sessions.')}
+      ${s.current.length > 5 ? empty(`Showing 5 of ${s.current.length} current sessions.`) : ''}${historyLinks('herd',s)}` : ''}`;
   }
   if (section === 'ci' || section === 'reviews') {
     const isCi=section==='ci', snapshot=data[section], entries=integrationEntries(snapshot,section);
@@ -113,9 +115,9 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   }
   if (section === 'services') {
     const s=model.services;
-    return `<div class="ov-heading"><h2>Services</h2>${link('#/services','Service catalog →')}</div>${availability(['services'],states)}${states.services?.loaded ? `
-      <div class="ov-metrics">${metric(s.current,'Reported healthy','#/services')}${metric(s.unavailable,'Unavailable','#/services?status=unavailable')}</div>
-      <p class="ov-note">${s.unknown} with unknown status · ${s.archived} archived. Service groups and discovered endpoints are in the catalog.</p>` : ''}`;
+    return `<div class="ov-heading"><h2>HerdR services</h2>${link('#/services','Service catalog →')}</div>${availability(['services'],states)}${states.services?.loaded ? `
+      <div class="ov-metrics">${metric(s.current,'Reported healthy','#/services')}</div>
+      <p class="ov-note">${link('#/services?status=unavailable',`${s.unavailable} unavailable`)} · ${link('#/services?status=unknown',`${s.unknown} unconfirmed`)} · ${link('#/services?status=archived',`${s.archived} archived`)}. History remains in the catalog. ${link('#/system-services','System and unassigned services →')}</p>` : ''}`;
   }
   if (section === 'hosts') {
     return `<div class="ov-heading"><h2>Hosts</h2>${link('#/hosts','All hosts →')}</div>${availability(['hosts'],states)}${states.hosts?.loaded ? `
