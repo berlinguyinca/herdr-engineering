@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Read native named-server snapshots without changing any session lifecycle.
 import { execFile } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { herdrBin } from "./enrich.js";
@@ -145,6 +146,6 @@ export async function main(args = process.argv.slice(2), env = process.env) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   main().catch(() => { process.stderr.write("Native session snapshot collector failed.\n"); process.exitCode = 1; });
 }
