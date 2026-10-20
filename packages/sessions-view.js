@@ -108,6 +108,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     lastSignature=signature;
     const focused=document.activeElement;
     const focusId=focused?.closest('[data-session-id]')?.dataset.sessionId;
+    const focusIndex=[...container.querySelectorAll('[data-session-id]')].findIndex(row=>row.dataset.sessionId===focusId);
     const focusMission=focused?.hasAttribute('data-mission-link');
     const scroll={x:window.scrollX,y:window.scrollY};
     for(const [key] of tabs) {
@@ -126,7 +127,12 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     el('result').textContent=loaded ? `${selected.length} matching ${state.tab} sessions · ${all.length} total records${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}` : 'Loading sessions…';
     el('page').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`;
     el('previous').disabled=state.page===0;el('next').disabled=(state.page+1)*pageSize>=selected.length;
-    if(focusId){const row=[...container.querySelectorAll('[data-session-id]')].find(n=>n.dataset.sessionId===focusId);row?.querySelector(focusMission?'[data-mission-link]':'[data-session-link]')?.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);}
+    if(focusId){
+      const rows=[...container.querySelectorAll('[data-session-id]')];
+      const row=rows.find(n=>n.dataset.sessionId===focusId)||rows[Math.min(Math.max(focusIndex,0),rows.length-1)];
+      const target=(focusMission?row?.querySelector('[data-mission-link]'):null)||row?.querySelector('[data-session-link]')||el('search');
+      target.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);
+    }
   }
   function chooseTab(key){if(!tabs.some(([candidate])=>candidate===key))return;state.tab=key;state.page=0;draw();}
   function click(event){const button=event.target.closest('[data-tab]');if(button){chooseTab(button.dataset.tab);return;}if(event.target===el('previous')){state.page=Math.max(0,state.page-1);draw();}if(event.target===el('next')){state.page++;draw();}}
