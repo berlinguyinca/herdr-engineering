@@ -851,3 +851,40 @@ test('session inspection renders before optional mission context and cancels tha
   assert.equal(await page.locator('#view h1').innerText(),'Hosts');
  },{BURST:'0'});
 });
+
+test('inspector resynchronizes events written between the initial snapshot and stream subscription',async()=>{
+ await withApp(async({page,base})=>{
+  const hash=await sessionHash(base),sid=hash.split('/').pop();
+  let releaseSnapshot,releaseStream,snapshotReady,snapshotDone;
+  const snapshotAllowed=new Promise(resolve=>{releaseSnapshot=resolve;});
+  const streamAllowed=new Promise(resolve=>{releaseStream=resolve;});
+  const captured=new Promise(resolve=>{snapshotReady=resolve;});
+  const fulfilled=new Promise(resolve=>{snapshotDone=resolve;});
+  let reads=0;
+  await page.addInitScript(()=>{
+   const Native=window.EventSource;
+   window.EventSource=class extends Native{
+    constructor(url,options){super(url,options);if(String(url).includes('/inspector/stream'))this.addEventListener('message',event=>{
+     try{if(JSON.parse(event.data).type==='connected')window.inspectorConnected=true;}catch{}
+    });}
+   };
+  });
+  await page.route('**/inspector?*',async r=>{
+   reads++;
+   if(reads!==1)return r.continue();
+   const response=await r.fetch();const json=await response.json();snapshotReady(json);
+   await snapshotAllowed;await r.fulfill({json}).catch(()=>{});snapshotDone();
+  });
+  await page.route('**/inspector/stream',async r=>{await streamAllowed;return r.continue().catch(()=>{});});
+  try{
+   await page.goto(`${base}/${hash}`);const initial=await captured;assert.equal(initial.events.length,0);
+   await postInspector(base,sid,Array.from({length:60},(_,i)=>({kind:'message',role:'assistant',text:`gap-${i}`})));
+   releaseStream();await page.waitForFunction(()=>window.inspectorConnected===true);
+   await page.waitForFunction(()=>document.querySelectorAll('.hd-ins__row').length===60,null,{timeout:5000});
+   assert.ok(reads>=2,'a connected stream must resynchronize even while its initial snapshot is pending');
+   releaseSnapshot();await fulfilled;await page.evaluate(()=>new Promise(requestAnimationFrame));
+   assert.equal(await page.locator('.hd-ins__row').count(),60);
+   assert.match(await page.locator('#ins-list').innerText(),/gap-59/);
+  }finally{releaseSnapshot();releaseStream();}
+ },{BURST:'0',INSPECTOR_SEED:'0'});
+});
