@@ -10,6 +10,7 @@ import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-comp
 import { statusForStage, statusLabel, tokenVar } from './herdr-web-components/status.js';
 import { mountInspector } from './inspector-view.js';
 import { mountMissionActivity } from './mission-live-view.js';
+import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountServices, renderServiceDetails } from './services-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
@@ -242,29 +243,10 @@ async function viewOverview() {
 }
 
 async function viewMissions() {
-  root.innerHTML = '<h1>Missions</h1><h2>Live Pi missions</h2><div id="live-missions"></div><h2>Recorded missions</h2><div id="recorded-missions"><herdr-spinner label="Loading recorded missions"></herdr-spinner></div>';
-  disposeMissionActivity = mountMissionActivity(document.getElementById('live-missions'), client);
-  const recorded = document.getElementById('recorded-missions');
-  let pending = false;
-  refreshMissionHistory = async () => {
-    if (pending || !recorded.isConnected || document.hidden) return;
-    pending = true;
-    try {
-      const { missions } = await client.listMissions();
-      if (!recorded.isConnected) return;
-      recorded.innerHTML = missions.length ? '<div class="hd-grid">' + missions.map((m) => `
-        <div class="hd-card">
-          <div class="hd-card__title"><a href="#/missions/${encodeURIComponent(missionKey(m))}">${esc(m.title)}</a></div>
-          <div style="margin:6px 0"><herdr-status stage="${esc(m.status)}"></herdr-status></div>
-          <div class="hd-card__sub">${esc(missionSubtitle(m, m.sessions ? m.sessions.length : 0))}</div>
-          <div class="hd-card__sub">created ${formatTimestamp(m.created_at)}</div>
-          <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
-        </div>`).join('') + '</div>' : '<herdr-empty message="No recorded missions yet"></herdr-empty>';
-    } catch (error) {
-      if (recorded.isConnected) recorded.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
-    } finally { pending = false; }
-  };
-  await refreshMissionHistory();
+  root.innerHTML = '<h1>Missions</h1><div id="live-missions"></div>';
+  const catalog = mountMissionCatalog(document.getElementById('live-missions'), client);
+  disposeMissionActivity = catalog.dispose;
+  refreshMissionHistory = catalog.refreshRecorded;
 }
 
 async function viewMission(parts, revision) {
@@ -274,12 +256,12 @@ async function viewMission(parts, revision) {
   catch (error) { if (error.status !== 404 || !key.startsWith('pi:')) throw error; }
   if (revision !== renderRevision) return;
   if (key.startsWith('pi:') && !m) {
-    root.innerHTML = '<h1>Pi mission activity</h1><div id="live-mission-detail"></div>';
+    root.innerHTML = '<a href="#/missions">← Missions</a><h1>Pi mission</h1><div id="live-mission-detail"></div>';
     disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
     return;
   }
   if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
-  root.innerHTML = `<h1>${esc(m.title)}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-history"></div>`;
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-history"></div>`;
   if (key.startsWith('pi:')) disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
   const history = document.getElementById('mission-history');
   let pending = false;
@@ -292,26 +274,21 @@ async function viewMission(parts, revision) {
       const scope = m.purpose || m.cwd || m.title;
       const [sessionsHtml, streamHtml] = await Promise.all([missionSessions(m), streamList('mission', missionKey(m))]);
       if (revision !== renderRevision || !history.isConnected) return;
-      history.innerHTML = `<h2>Recorded mission</h2>
+      const open = new Map([...history.querySelectorAll('details[data-history-panel]')].map(el => [el.dataset.historyPanel, el.open]));
+      history.innerHTML = `<h2>Recorded history</h2>
     <div style="margin:8px 0"><herdr-status stage="${esc(m.status)}"></herdr-status>
-      <span class="hd-card__sub"> · <herdr-ident kind="mission" id="${esc(m.mission_id)}"></herdr-ident></span></div>
-    <div class="hd-card" style="margin-top:10px">
-      <div class="hd-card__sub">Scope</div>
-      <div style="font-size:1.05em;margin-top:4px">${esc(scope || 'No scope recorded for this mission.')}</div>
-      ${m.cwd && m.cwd !== scope ? `<div class="hd-card__sub" style="margin-top:8px"><code>${esc(m.cwd)}</code></div>` : ''}
-    </div>
-    <div class="hd-grid" style="margin-top:12px">
-      <herdr-metric label="Sessions" value="${sessions}"></herdr-metric>
-      <herdr-metric label="Stage" value="${esc(m.stage)}"></herdr-metric>
-      <herdr-metric label="Created" value="${esc(formatTimestamp(m.created_at))}"></herdr-metric>
-    </div>
+      <span class="hd-card__sub"> · ${sessions} sessions · ${esc(m.stage || 'Stage not recorded')} · created ${esc(formatTimestamp(m.created_at))}</span></div>
     <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
-    <h3 style="margin-top:20px">Sessions</h3>
-    ${sessionsHtml}
-    <h3 style="margin-top:20px">Timeline</h3>
-    <herdr-timeline id="mission-timeline"></herdr-timeline>
-    <h3 style="margin-top:20px">Event stream</h3>
-    <div id="mission-stream">${streamHtml}</div>`;
+    <details class="hd-card" data-history-panel="brief"><summary>Recorded mission brief</summary>
+      <p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.title || '')}</p>
+      <div class="hd-card__sub">Scope</div><p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(scope || 'No scope recorded for this mission.')}</p>
+      ${m.cwd && m.cwd !== scope ? `<p style="overflow-wrap:anywhere"><code>${esc(m.cwd)}</code></p>` : ''}
+      <herdr-ident kind="mission" id="${esc(m.mission_id)}"></herdr-ident>
+    </details>
+    <details class="hd-card" data-history-panel="sessions"><summary>Recorded sessions · ${sessions}</summary>${sessionsHtml}</details>
+    <details class="hd-card" data-history-panel="timeline"><summary>Timeline</summary><herdr-timeline id="mission-timeline"></herdr-timeline></details>
+    <details class="hd-card" data-history-panel="events"><summary>Event stream</summary><div id="mission-stream">${streamHtml}</div></details>`;
+      history.querySelectorAll('details[data-history-panel]').forEach(el => { if (open.has(el.dataset.historyPanel)) el.open = open.get(el.dataset.historyPanel); });
 
       const timelineElement = history.querySelector('#mission-timeline');
       try {
