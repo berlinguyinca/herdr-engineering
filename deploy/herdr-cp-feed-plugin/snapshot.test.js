@@ -1,5 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { collectSnapshot, createSnapshotPublisher, publishSnapshot } from "./snapshot.js";
 
 const server = name => ({ name, running: true, socket_path: `/sessions/${name}/herdr.sock` });
@@ -127,4 +132,22 @@ test("unchanged terminal sessions never heartbeat but changed terminal evidence 
     stamp += 300000;
     assert.equal((await publish({}, [row])).posted, 1);
   }
+});
+
+test("collector entrypoint runs through the deployment current symlink", t => {
+  const dir = mkdtempSync(join(tmpdir(), "herdr-snapshot-entry-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const binary = join(dir, "herdr");
+  writeFileSync(binary, `#!${process.execPath}\nconsole.log(JSON.stringify({sessions:[]}));\n`);
+  chmodSync(binary, 0o755);
+  const entry = join(dir, "snapshot.js");
+  symlinkSync(fileURLToPath(new URL("./snapshot.js", import.meta.url)), entry);
+  const result = execFileSync(process.execPath, [entry, "--once", "--dry-run"], {
+    encoding: "utf8", env: { ...process.env, HERDR_BIN: binary }, timeout: 5000,
+  });
+  const summary = JSON.parse(result);
+  assert.equal(summary.sessions, 0);
+  assert.equal(summary.errors, 0);
+  assert.equal(summary.posted, 0);
+  assert.equal(summary.dry_run, true);
 });
