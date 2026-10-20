@@ -33,7 +33,7 @@ const ROUTES = [
   ['/overview', 'Overview'],
   ['/activity', 'Activity'],
   ['/analytics', 'Analytics'],
-  ['/missions', 'Alpha'],
+  ['/missions', 'Finished / recorded'],
   ['/herd', 'Sessions'],
   ['/hosts', 'beast'],
   ['/services', 'web service on beast'],
@@ -154,7 +154,8 @@ test('overview survives a heavy event burst without rate limiting', async () => 
 test('pi-sourced mission detail renders by mission_key', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/missions`);
-    // The list must render the pi mission card before we can click it.
+    await page.locator('[data-filter=history]').click();
+    // Recorded missions remain available through their history group.
     // The href encodes the complete namespace; the hash router decodes it once.
     await page.waitForSelector('a[href="#/missions/pi%3AMSN-PI1"]', { timeout: 15000 });
     await page.click('a:has-text("Pi mission")');
@@ -174,6 +175,7 @@ test('pi-sourced mission detail renders by mission_key', async () => {
       const el = document.getElementById('mission-stream');
       return el && !el.innerHTML.includes('No events for this entity yet');
     }, null, { timeout: 15000 });
+    await page.locator('[data-history-panel=events] > summary').click();
     const streamText = await page.locator('#mission-stream').innerText();
     assert.ok(streamText.includes('MissionStageChanged'),
       `stage event missing from stream:\n${streamText.slice(0, 400)}`);
@@ -184,6 +186,7 @@ test('mission detail renders the timeline', async () => {
   await withApp(async ({ page, base }) => {
     // Legacy plain-colon bookmarks remain valid; the app encodes the API path.
     await page.goto(`${base}/#/missions/pi:MSN-PI1`);
+    await page.locator('[data-history-panel=timeline] > summary').click();
     // Merged timeline (UI-009): stage events + test run + merged PR.
     await page.waitForSelector('herdr-timeline .hd-timeline__item', { timeout: 15000 });
     const kinds = await page.evaluate(() =>
@@ -340,32 +343,23 @@ test('inspector: a slow response for the previous tab never overwrites the curre
   }, { BURST: '0' });
 });
 
-test('mission report ages advance without events or notification requests', async () => {
+test('recorded mission history remains inspectable with advancing report ages and no writes', async () => {
   await withApp(async ({ page, base }) => {
     const writes = [];
-    const requests = [];
-    page.on('request', (req) => {
-      requests.push(req.url());
-      if (req.method() !== 'GET') writes.push(req.url());
-    });
+    page.on('request', req => { if (req.method() !== 'GET') writes.push(req.url()); });
+    await page.clock.install();
     await page.goto(`${base}/#/missions`);
-    const activity = page.locator('herdr-mission-activity[source="pi"]').first();
-    await activity.waitFor({ timeout: 10000 });
-    // Let the initial SSE replay finish its existing trailing refresh.
-    await page.waitForTimeout(600);
-    await activity.evaluate((el) => el.setAttribute('updated-at', new Date(Date.now() - 20000).toISOString()));
-    const before = await activity.innerText();
-    const requestCount = requests.length;
-    await page.waitForFunction((text) => document.querySelector('herdr-mission-activity[source="pi"]')?.innerText !== text, before);
-    assert.equal(requests.length, requestCount, 'clock refreshes do not poll the backend');
-    assert.match(await activity.innerText(), /Last reported change: 2\ds ago/);
-    assert.match(await activity.innerText(), /Finished, crashed, or stalled updates only/);
-    assert.doesNotMatch(await activity.innerText(), /stalled for|No activity/);
-    await page.locator('herdr-status').first().evaluate((el) => el.setAttribute('stage', 'stalled'));
-    assert.match(await page.locator('herdr-status').first().innerText(), /Stalled/);
-    await page.locator('a[href="#/missions/pi%3AMSN-PI1"]').click();
-    await page.locator('herdr-mission-activity[source="pi"]').waitFor();
-    assert.deepEqual(writes, [], 'local clocks never emit notifications');
+    await page.locator('[data-filter="history"]').click();
+    const record = page.locator('.mc-row[data-mission-key="pi:MSN-PI1"]');
+    await record.waitFor();
+    assert.match(await record.innerText(), /Recorded/);
+    assert.doesNotMatch(await record.innerText(), /Live telemetry/);
+    const before = await record.locator('[data-recorded-age]').innerText();
+    await page.clock.runFor(3000);
+    assert.notEqual(await record.locator('[data-recorded-age]').innerText(), before);
+    await record.locator('.mc-title').click();
+    await page.locator('#mission-history').waitFor();
+    assert.deepEqual(writes, []);
   }, { BURST: '0' });
 });
 
@@ -385,7 +379,7 @@ function liveProjection(overrides = {}) {
   };
 }
 
-test('live Pi missions lead the list and details inspect workers without guessing session links', async () => {
+test('current mission groups lead the list and details inspect workers without guessing session links', async () => {
   await withApp(async ({page, base}) => {
     let bulk = 0, detail = 0;
     await page.clock.install();
@@ -394,15 +388,16 @@ test('live Pi missions lead the list and details inspect workers without guessin
     await page.goto(`${base}/#/missions`);
     await page.waitForSelector('[data-mission-key="pi:MSN-live"]');
     assert.match(await bodyText(page), /Live telemetry · stalled/);
-    assert.match(await bodyText(page), /flash → metabolomics\/qwen3.8/);
-    const headings = await page.locator('#view h2').allTextContents();
-    assert.deepEqual(headings, ['Live Pi missions', 'Recorded missions']);
+    assert.match(await bodyText(page), /1 current/);
+    assert.equal(await page.locator('[data-group=attention]').evaluate(el => el.open), true);
+    assert.equal(await page.locator('[data-group=history]').evaluate(el => el.open), false);
     await page.getByRole('link', {name: 'Live Pi mission', exact: true}).click();
     await page.waitForSelector('[data-worker="reviewer"]');
     await page.locator('[data-worker="reviewer"] summary').click();
     assert.match(await bodyText(page), /4 tests passed/);
     assert.equal(await page.evaluate(() => window.outputExecuted), undefined);
     assert.equal(await page.locator('#view a[href*="/herd/session/"]').count(), 0);
+    await page.locator('[data-disclosure=changes] > summary').click();
     assert.match(await bodyText(page), /src\/auth.ts/);
     assert.equal(bulk, 1); assert.equal(detail, 1);
     await page.clock.runFor(5500);
@@ -446,6 +441,7 @@ test('telemetry failures retain last known activity and age to disconnected with
     await page.clock.runFor(6000);
     await page.waitForFunction(() => document.querySelector('.ml-connection')?.textContent.includes('interrupted'));
     await page.clock.runFor(130000);
+    await page.locator('[data-filter=lastknown]').click();
     assert.match(await bodyText(page), /Disconnected telemetry · current state unknown/);
     assert.match(await bodyText(page), /Running authentication tests/);
     assert.doesNotMatch(await page.locator('#live-missions').innerText(), /crashed/i);
@@ -487,7 +483,8 @@ test('updating revisions retain labeled last-known evidence and freeze elapsed w
     await page.waitForFunction(() => document.querySelector('[data-freshness]')?.dataset.state === 'updating');
     assert.match(await bodyText(page), /Updating telemetry · current details unavailable/);
     assert.match(await bodyText(page), /Last recorded measurements/);
-    const elapsed = page.locator('.ml-card [data-clock]').first();
+    await page.locator('[data-disclosure=diagnostics] > summary').click();
+    const elapsed = page.locator('[data-disclosure=diagnostics] [data-clock]').first();
     const value = await elapsed.textContent();
     await page.clock.runFor(6000);
     assert.equal(await elapsed.textContent(), value);
@@ -503,6 +500,8 @@ test('Pi detail lifecycle history refreshes on real SSE without replacing live i
     await page.goto(`${base}/#/missions/pi%3AMSN-PI1`);
     await page.waitForSelector('[data-worker="reviewer"]');
     await page.locator('[data-worker="reviewer"] summary').click();
+    await page.locator('[data-history-panel=events] > summary').click();
+    await page.locator('[data-history-panel=timeline] > summary').click();
     await page.evaluate(() => { window.livePaneBefore = document.querySelector('#live-mission-detail'); });
     const response = await fetch(`${base}/api/v1/ingest`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
       source: 'pi', entity_type: 'mission', entity_id: 'MSN-PI1', event_type: 'MissionStopped', payload: {title: 'Pi mission', stage: 'complete'},
@@ -511,6 +510,8 @@ test('Pi detail lifecycle history refreshes on real SSE without replacing live i
     await page.waitForFunction(() => document.querySelector('#mission-history herdr-status')?.getAttribute('stage') === 'complete', null, {timeout: 12000});
     assert.equal(await page.evaluate(() => window.livePaneBefore === document.querySelector('#live-mission-detail')), true);
     assert.equal(await page.locator('[data-worker="reviewer"]').evaluate(el => el.open), true);
+    assert.equal(await page.locator('[data-history-panel=events]').evaluate(el=>el.open),true);
+    assert.equal(await page.locator('[data-history-panel=timeline]').evaluate(el=>el.open),true);
     assert.match(await page.locator('#mission-stream').innerText(), /complete|stopped/i);
     await page.waitForFunction(() => /complete|stopped/i.test(document.querySelector('#mission-timeline')?.innerText || ''), null, {timeout: 5000});
     assert.match(await page.locator('#mission-timeline').innerText(), /complete|stopped/i);
@@ -558,4 +559,111 @@ test('service catalog filters, archive inspection and groups survive live refres
     assert.match(await bodyText(page), /Unavailable since/);
     assert.deepEqual(errors,[]);
   }, {SERVICES_SEED:'1',BURST:'1',BURST_GAP:'1'});
+});
+
+
+test('mission catalog stays compact, searchable and keyboard stable across changed live snapshots', async () => {
+ await withApp(async ({page,base})=>{
+  let calls=0;
+  const current=liveProjection();current.mission.title='Repair the parser '+ 'long objective '.repeat(100)+'SEARCH_TAIL';
+  current.activity.workerDetails=Array.from({length:40},(_,i)=>({workerId:'private-worker-'+i,state:'running',health:'active'}));
+  const stale=Array.from({length:35},(_,i)=>liveProjection({mission_key:'pi:old-'+i,mission:{id:'old-'+i,title:'Disconnected mission '+i,status:'EXECUTING'},connection:'disconnected',freshness:{state:'disconnected',age_seconds:200}}));
+  await page.route('**/api/v1/mission-activity',r=>{calls++;return r.fulfill({json:{activities:[{...current,activity:{...current.activity,currentActivity:{summary:'Running parser tests '+calls}}},...stale]}});});
+  await page.clock.install();await page.goto(`${base}/#/missions`);
+  await page.locator('.mc-row[data-mission-key="pi:MSN-live"]').waitFor();
+  assert.equal(await page.locator('[data-group=lastknown]').evaluate(e=>e.open),false);
+  assert.equal(await page.locator('[data-group=history]').evaluate(e=>e.open),false);
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollHeight)<1500);
+  assert.ok((await page.locator('.mc-row[data-mission-key="pi:MSN-live"]').boundingBox()).height<230);
+  assert.doesNotMatch(await bodyText(page),/private-worker-/);
+  await page.locator('#mc-search').fill('SEARCH_TAIL');
+  assert.equal(await page.locator('.mc-row').count(),1);
+  await page.evaluate(()=>{window.catalogSearch=document.querySelector('#mc-search');});
+  await page.clock.runFor(5500);await page.waitForTimeout(50);
+  assert.equal(await page.locator('#mc-search').inputValue(),'SEARCH_TAIL');
+  assert.equal(await page.evaluate(()=>document.activeElement===window.catalogSearch),true);
+  await page.locator('.mc-title').focus();
+  await page.clock.runFor(5500);await page.waitForTimeout(50);
+  assert.equal(await page.evaluate(()=>document.activeElement.classList.contains('mc-title')),true);
+  await page.locator('#mc-search').fill('');
+  await page.locator('[data-group=lastknown] > summary').click();
+  await page.locator('[data-more=lastknown]').focus();
+  await page.clock.runFor(5500);await page.waitForTimeout(50);
+  assert.equal(await page.evaluate(()=>document.activeElement.dataset.more),'lastknown');
+  await page.locator('[data-more=lastknown]').click();
+  assert.equal(await page.locator('[data-group=lastknown] .mc-row').count(),20);
+  await page.locator('[data-group=lastknown] > summary').click();
+  await page.clock.runFor(5500);await page.waitForTimeout(50);
+  assert.equal(await page.locator('[data-group=lastknown]').evaluate(e=>e.open),false);
+  assert.equal(await page.evaluate(()=>document.activeElement.tagName),'SUMMARY');
+  await page.setViewportSize({width:390,height:844});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  assert.ok(calls>=5);
+ },{BURST:'0'});
+});
+
+test('same-group freshness transitions relabel activity and freeze waiting clocks', async()=>{
+ await withApp(async({page,base})=>{
+  const p=liveProjection();p.activity={health:'unknown',currentActivity:{summary:'Waiting for a report'},waitingReason:'gateway_busy',waitingSince:new Date(Date.now()-10000).toISOString()};
+  let calls=0;
+  await page.route('**/api/v1/mission-activity',r=>++calls===1?r.fulfill({json:{activities:[p]}}):r.fulfill({status:503,json:{error:'offline'}}));
+  await page.clock.install();await page.goto(`${base}/#/missions`);
+  await page.locator('[data-filter=lastknown]').click();
+  await page.locator('.mc-row').waitFor();
+  assert.match(await page.locator('.mc-activity').innerText(),/^Activity:/);
+  await page.clock.runFor(32000);await page.waitForTimeout(50);
+  assert.match(await page.locator('.mc-activity').innerText(),/^Last known activity:/);
+  assert.match(await page.locator('.mc-wait').innerText(),/at last snapshot/);
+  const age=await page.locator('[data-wait-age]').innerText();
+  await page.clock.runFor(10000);assert.equal(await page.locator('[data-wait-age]').innerText(),age);
+ },{BURST:'0'});
+});
+
+test('recorded history requests time out and retry without blocking live missions or late navigation', async()=>{
+ await withApp(async({page,base})=>{
+  let records=0, held;
+  await page.route('**/api/v1/missions',r=>{records++;if(records===1){held=r;return;}return r.continue();});
+  await page.route('**/api/v1/mission-activity',r=>r.fulfill({json:{activities:[liveProjection()]}}));
+  await page.clock.install();await page.goto(`${base}/#/missions`);
+  await page.locator('.mc-row').first().waitFor();
+  await page.clock.runFor(16000);await page.waitForFunction(()=>document.querySelector('.ml-connection').textContent.includes('Recorded history could not refresh'));
+  await page.clock.runFor(15000);await page.waitForTimeout(60);
+  assert.ok(records>=2);await page.locator('[data-filter=history]').click();
+  await page.locator('.mc-title').filter({hasText:'Alpha'}).waitFor();
+  await page.evaluate(()=>{location.hash='#/hosts';});await page.waitForFunction(()=>document.querySelector('#view h1')?.textContent==='Hosts');
+  await held.fulfill({json:{missions:[]}}).catch(()=>{});
+  assert.equal(await page.locator('#view h1').innerText(),'Hosts');
+ },{BURST:'0'});
+});
+
+test('mission detail preserves explicit disclosure state and an inspected worker moving into history',async()=>{
+ await withApp(async({page,base})=>{
+  let phase=0;
+  const p=liveProjection();
+  await page.route('**/api/v1/missions/pi%3AMSN-live/activity',r=>{
+   const value=structuredClone(p);value.activity.currentActivity.summary='phase '+phase;
+   if(phase>=2){value.activity.workerDetails[0].state='completed';value.activity.workerDetails[0].endedAt=new Date().toISOString();}
+   return r.fulfill({json:{activity:value}});
+  });
+  await page.clock.install();await page.goto(`${base}/#/missions/pi%3AMSN-live`);
+  await page.locator('[data-worker=reviewer]').waitFor();
+  await page.locator('[data-disclosure=brief] > summary').click();
+  await page.locator('[data-disclosure=diagnostics] > summary').click();
+  await page.locator('[data-worker=reviewer] > summary').click();
+  await page.evaluate(()=>{window.stableWorker=document.querySelector('[data-worker=reviewer]');});
+  await page.clock.runFor(5500);await page.waitForTimeout(50);
+  assert.equal(await page.evaluate(()=>window.stableWorker===document.querySelector('[data-worker=reviewer]')),true);
+  phase=1;await page.clock.runFor(5500);await page.waitForTimeout(50);
+  assert.equal(await page.locator('[data-disclosure=brief]').evaluate(e=>e.open),true);
+  assert.equal(await page.locator('[data-disclosure=diagnostics]').evaluate(e=>e.open),true);
+  await page.locator('[data-disclosure=brief] > summary').click();
+  phase=2;await page.clock.runFor(5500);await page.waitForTimeout(50);
+  assert.equal(await page.locator('[data-disclosure=brief]').evaluate(e=>e.open),false);
+  assert.equal(await page.locator('[data-disclosure=worker-history]').evaluate(e=>e.open),true);
+  assert.equal(await page.locator('[data-worker=reviewer]').isVisible(),true);
+  assert.equal(await page.locator('[data-worker=reviewer]').evaluate(e=>e.open),true);
+  await page.locator('[data-disclosure=worker-history] > summary').click();
+  phase=3;await page.clock.runFor(5500);await page.waitForTimeout(50);
+  assert.equal(await page.locator('[data-disclosure=worker-history]').evaluate(e=>e.open),false);
+ },{BURST:'0'});
 });
