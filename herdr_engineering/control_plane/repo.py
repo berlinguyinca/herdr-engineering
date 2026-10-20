@@ -24,10 +24,16 @@ from .inspector import InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
 from .service_catalog import (
+    INACTIVE,
+    capture_service_origin,
     normalize_project,
+    normalize_service_git,
+    normalize_service_observation,
+    normalize_service_ownership,
     normalize_source_port,
     service_catalog,
     service_lifecycle,
+    service_listener_id,
     track_availability,
     validate_archive_days,
 )
@@ -36,6 +42,7 @@ _STAGES = {
     "planning", "specification", "ready", "implementation", "testing",
     "review", "repair", "validation", "pr", "complete", "failed", "cancelled",
 }
+_SERVICE_UNSET = object()
 _SESSION_ACTIONS = {"steer", "approve", "interrupt", "resume", "stop"}
 
 
@@ -323,7 +330,9 @@ class ControlPlaneRepo:
     # -------------------------------------------------------------- services
     def register_service(self, service_name, host_id, port,
                          session_id=None, status="healthy", route=None,
-                         description=None, owner=None, project=None, source_port=None):
+                         description=None, owner=None, project=None, source_port=None, ownership=None,
+                         repository_id=None, commit_sha=None):
+        git = normalize_service_git(repository_id, commit_sha)
         project = normalize_project(project)
         source_port = normalize_source_port(source_port)
         svcid = new_id("service")
@@ -332,9 +341,12 @@ class ControlPlaneRepo:
             "host_id": host_id, "port": port, "session_id": session_id,
             "status": status, "route": route, "owner": owner,
             "project": project, "source_port": source_port,
+            "ownership": normalize_service_ownership(ownership), **git,
+            "metadata_updated_at": self._stamp(),
             "created_at": self._stamp(), "updated_at": self._stamp(),
             "url": route or f"http://{host_id}:{port}",
         }
+        rec["verified_origin"] = capture_service_origin(rec, self._sessions.get(session_id), rec["created_at"])
         rec["description"] = (description or "").strip() or describe_service(
             service_name=service_name, host_id=host_id, port=port,
             owner=owner, route=rec["url"])
@@ -345,59 +357,179 @@ class ControlPlaneRepo:
                            "port": port, "route": route, "status": status,
                            "description": rec["description"],
                            "owner": owner, "project": project, "source_port": source_port,
+                           "ownership": rec["ownership"], "session_id": session_id, **git,
+                           "verified_origin": rec["verified_origin"], "metadata_updated_at": rec["metadata_updated_at"],
                            "unavailable_since": rec.get("unavailable_since")},
                           session_id=session_id)
         return svcid
 
-    def upsert_service(self, host_id, service_name, port, *,
-                       session_id=None, status="healthy", route=None,
-                       description=None, owner=None, project=None, source_port=None):
-        """Idempotent service registration keyed by ``(host_id, service_name)``.
+    def upsert_service(self, host_id, service_name, port, **kwargs):
+        # Serialize health and metadata observations across the two reporters.
+        with self._event_lock:
+            return self._upsert_service(host_id, service_name, port, **kwargs)
 
-        Re-invoking (e.g. on every web start or repeated ingest) updates the
-        record in place instead of creating a duplicate, so restarts and
-        heartbeats never accumulate service rows. Records ``ServiceRegistered``
-        the first time and ``ServiceUpdated`` thereafter. A human ``description``
-        is always present: an explicit one wins, otherwise it is derived from
-        the name/host/port/process so every service is self-explanatory.
-        """
+    def _upsert_service(self, host_id, service_name, port, *,
+                       session_id=_SERVICE_UNSET, status="healthy", route=None,
+                       description=None, owner=None, project=None, source_port=None,
+                       ownership=_SERVICE_UNSET, repository_id=_SERVICE_UNSET, commit_sha=_SERVICE_UNSET):
+        """Legacy heartbeats preserve omitted metadata; explicit observations replace it."""
+        explicit = any(value is not _SERVICE_UNSET for value in (session_id, ownership, repository_id, commit_sha))
         for svcid, rec in self._services.items():
-            if (rec.get("host_id") == host_id
-                    and rec.get("service_name") == service_name):
-                rec["port"] = port
-                track_availability(rec, status, self._stamp())
-                rec["status"] = status
-                rec["session_id"] = session_id
-                rec["route"] = route if route is not None else rec.get("route")
-                rec["url"] = route or f"http://{host_id}:{port}"
-                if owner is not None:
-                    rec["owner"] = owner
-                if project is not None:
-                    rec["project"] = normalize_project(project)
-                if source_port is not None:
-                    rec["source_port"] = normalize_source_port(source_port)
-                provided = (description or "").strip()
-                rec["description"] = provided or rec.get("description") \
-                    or describe_service(
-                        service_name=service_name, host_id=host_id,
-                        port=port, owner=owner or rec.get("owner"),
-                        route=rec["route"])
-                rec["updated_at"] = self._stamp()
-                self.record_event("service", svcid, "ServiceUpdated",
-                                  {"service_name": service_name,
-                                   "host_id": host_id, "port": port,
-                                   "route": rec["route"], "status": status,
-                                   "description": rec["description"],
-                                   "owner": rec.get("owner"),
-                                   "project": rec.get("project"),
-                                   "source_port": rec.get("source_port"),
-                                   "unavailable_since": rec.get("unavailable_since")},
-                                  session_id=session_id)
-                return svcid
-        return self.register_service(service_name, host_id, port,
-                                     session_id=session_id, status=status,
-                                     route=route, description=description,
-                                     owner=owner, project=project, source_port=source_port)
+            if (rec.get("host_id") != host_id or rec.get("service_name") != service_name
+                    or rec.get("discovery_source") == "native_listener"):
+                continue
+            inactive = str(status).lower() in INACTIVE
+            clear = ownership is None and not inactive
+            old_repository = rec.get("repository_id")
+            resolved_repository = (None if clear else old_repository) if repository_id is _SERVICE_UNSET else repository_id
+            resolved_commit = (None if clear or resolved_repository != old_repository else rec.get("commit_sha")) if commit_sha is _SERVICE_UNSET else commit_sha
+            resolved_session = (None if clear else rec.get("session_id")) if session_id is _SERVICE_UNSET else session_id
+            resolved_ownership = rec.get("ownership") if ownership is _SERVICE_UNSET else ownership
+            if inactive and ownership is None:
+                resolved_ownership = rec.get("ownership")
+                resolved_session = resolved_session or rec.get("session_id")
+                if repository_id in (_SERVICE_UNSET, None) and commit_sha in (_SERVICE_UNSET, None):
+                    resolved_repository, resolved_commit = old_repository, rec.get("commit_sha")
+            git = normalize_service_git(resolved_repository, resolved_commit)
+            rec["port"] = port
+            track_availability(rec, status, self._stamp())
+            rec.update(status=status, session_id=resolved_session,
+                       ownership=normalize_service_ownership(resolved_ownership), **git)
+            rec["route"] = route if route is not None else rec.get("route")
+            rec["url"] = rec["route"] or f"http://{host_id}:{port}"
+            if owner is not None:
+                rec["owner"] = owner
+            if project is not None:
+                rec["project"] = normalize_project(project)
+            if source_port is not None:
+                rec["source_port"] = normalize_source_port(source_port)
+            provided = (description or "").strip()
+            rec["description"] = provided or rec.get("description") or describe_service(
+                service_name=service_name, host_id=host_id, port=port,
+                owner=owner or rec.get("owner"), route=rec["route"])
+            rec["updated_at"] = self._stamp()
+            if explicit:
+                rec["metadata_updated_at"] = rec["updated_at"]
+                rec["verified_origin"] = capture_service_origin(rec, self._sessions.get(resolved_session), rec["updated_at"])
+            self.record_event("service", svcid, "ServiceUpdated", {
+                key: _deep_copy(rec.get(key)) for key in (
+                    "service_name", "host_id", "port", "route", "status", "description", "owner",
+                    "project", "source_port", "ownership", "session_id", "repository_id", "commit_sha",
+                    "verified_origin", "unavailable_since", "metadata_updated_at", "listener_identity", "metadata_observation")},
+                session_id=resolved_session)
+            return svcid
+        values = {key: None if value is _SERVICE_UNSET else value for key, value in (
+            ("session_id", session_id), ("ownership", ownership), ("repository_id", repository_id), ("commit_sha", commit_sha))}
+        return self.register_service(service_name, host_id, port, status=status,
+            route=route, description=description, owner=owner, project=project, source_port=source_port, **values)
+
+    def observe_service_metadata(self, service_id, payload):
+        with self._event_lock:
+            return self._observe_service_metadata(service_id, payload)
+
+    def _observe_service_metadata(self, service_id, payload):
+        """Observe ownership only; never create a listener or refresh its health."""
+        rec = self._services.get(service_id)
+        if rec is None:
+            raise KeyError(service_id)
+        if (payload.get("host_id") != rec.get("host_id")
+                or normalize_source_port(payload.get("source_port")) is None
+                or payload["source_port"] != rec.get("source_port")):
+            raise ValueError("metadata must match the existing service host and source port")
+        if rec.get("discovery_source") == "native_listener":
+            raise ValueError("native listener records require service.listener_observed")
+        observation = normalize_service_observation(payload, self._now(), rec.get("metadata_observation"))
+        state = observation["state"]
+        candidate = _deep_copy(rec)
+        if state == "observed":
+            pid, start = payload.get("listener_pid"), payload.get("listener_start")
+            if (type(pid) is not int or pid < 1 or not isinstance(start, str) or not start
+                    or len(start) > 300 or any(ord(char) < 32 for char in start)):
+                raise ValueError("metadata requires a positive listener PID and process birth identity")
+            instance = {"pid": pid, "start": start}
+            old = rec.get("listener_identity") or {
+                "pid": (rec.get("ownership") or {}).get("listener_pid"),
+                "start": (rec.get("ownership") or {}).get("listener_start")}
+            changed = instance != old
+            proof = normalize_service_ownership(payload.get("ownership")) if "ownership" in payload else (None if changed else rec.get("ownership"))
+            if proof is not None and (proof.get("kind") not in {"herdr_process_ancestry", "system_unit"}
+                    or proof.get("host_id") != rec["host_id"] or proof.get("listener_pid") != pid
+                    or proof.get("listener_start") != start):
+                raise ValueError("ownership proof must match the observed listener instance")
+            clear = changed or ("ownership" in payload and proof is None)
+            candidate.update(listener_identity=instance, ownership=proof,
+                session_id=payload.get("session_id", (proof or {}).get("session_id") or (None if clear else rec.get("session_id"))))
+            repository = payload.get("repository_id", None if clear else rec.get("repository_id"))
+            commit = payload.get("commit_sha", None if clear or repository != rec.get("repository_id") else rec.get("commit_sha"))
+            candidate.update(normalize_service_git(repository, commit))
+            candidate["verified_origin"] = capture_service_origin(candidate,
+                self._sessions.get(candidate.get("session_id")), self._stamp())
+        candidate["metadata_observation"] = observation
+        candidate["metadata_updated_at"] = self._stamp()
+        fields = ("host_id", "source_port", "ownership", "session_id", "verified_origin", "repository_id",
+                  "commit_sha", "listener_identity", "metadata_observation", "metadata_updated_at")
+        self.record_event("service", service_id, "ServiceMetadataObserved", {
+            **{key: _deep_copy(candidate.get(key)) for key in fields},
+            "service_updated_at": rec.get("updated_at"), "service_created_at": rec.get("created_at")},
+            session_id=candidate.get("session_id"), publish=False)
+        rec.update({key: candidate.get(key) for key in fields if key not in {"host_id", "source_port"}})
+        return self.get_service(service_id)
+
+    def observe_service_listener(self, service_id, payload):
+        """Observe an unforwarded native listener without operating the dev fabric."""
+        with self._event_lock:
+            return self._observe_service_listener(service_id, payload)
+
+    def _observe_service_listener(self, service_id, payload):
+        host, pid, birth, port = (payload.get(key) for key in (
+            "host_id", "listener_pid", "listener_start", "source_port"))
+        if service_id != service_listener_id(host, pid, birth, port):
+            raise ValueError("listener advertisement must target its physical instance ID")
+        existing = self._services.get(service_id)
+        if existing is not None and existing.get("discovery_source") != "native_listener":
+            raise ValueError("listener advertisements cannot alter a fabric-managed service")
+        observation = normalize_service_observation(payload, self._now(),
+            existing.get("metadata_observation") if existing else None)
+        stamp = self._stamp()
+        if observation["state"] in {"missing", "unconfirmed"}:
+            if existing is None:
+                raise KeyError(service_id)
+            candidate = _deep_copy(existing)
+            candidate["status"] = "unknown"
+        else:
+            candidate = _deep_copy(existing) if existing else {
+                "service_id": service_id, "host_id": host, "source_port": port, "port": port,
+                "discovery_source": "native_listener", "endpoint_scope": "local_only",
+                "route": None, "url": None, "created_at": stamp,
+                "listener_identity": {"pid": pid, "start": birth}, "unavailable_since": None}
+            advertised = payload.get("ownership")
+            proof = normalize_service_ownership(advertised) if advertised is not None else candidate.get("ownership")
+            if (not proof or proof.get("kind") != "herdr_process_ancestry"
+                    or proof.get("host_id") != host or proof.get("listener_pid") != pid
+                    or proof.get("listener_start") != birth):
+                raise ValueError("new listener requires verified native HerdR process ancestry")
+            candidate.update(ownership=proof, session_id=proof.get("session_id"))
+            candidate["verified_origin"] = capture_service_origin(candidate,
+                self._sessions.get(candidate.get("session_id")), stamp)
+            if candidate["verified_origin"] is None:
+                raise ValueError("listener native ownership could not be verified")
+            candidate.update(normalize_service_git(payload.get("repository_id", candidate.get("repository_id")),
+                payload.get("commit_sha", None if payload.get("repository_id", candidate.get("repository_id")) != candidate.get("repository_id") else candidate.get("commit_sha"))))
+            def label(key, fallback):
+                value = payload.get(key)
+                return value[:200] if isinstance(value, str) and value and all(ord(c) >= 32 for c in value) else fallback
+            candidate["owner"] = label("owner", candidate.get("owner"))
+            candidate["service_name"] = label("service_name", candidate.get("service_name") or f"App on {host} (port {port})")
+            candidate["description"] = f"{candidate.get('owner') or 'Application'} listener on {host}, observed port {port}; no shared route"
+            if "project" in payload:
+                candidate["project"] = normalize_project(payload["project"])
+            candidate["status"] = "healthy"
+        candidate.update(updated_at=stamp, metadata_updated_at=stamp, metadata_observation=observation,
+                         endpoint_scope="local_only", route=None, url=None)
+        self.record_event("service", service_id, "ServiceListenerObserved", _deep_copy(candidate),
+                          session_id=candidate.get("session_id"), publish=False)
+        self._services[service_id] = candidate
+        return self.get_service(service_id)
 
     def _ensure_service_desc(self, rec):
         """Guarantee ``rec`` carries a non-empty human description.
@@ -424,6 +556,8 @@ class ControlPlaneRepo:
         result["project"] = normalize_project(result.get("project"))
         result["source_port"] = normalize_source_port(result.get("source_port"))
         result["catalog"] = service_catalog(result, self._sessions.get(result.get("session_id")))
+        for field in ("repository_id", "commit_sha", "project_id"):
+            result[field] = result["catalog"][field]
         result["lifecycle"] = service_lifecycle(
             result, self._now(), archive_after_days=self._service_archive_days)
         return result
@@ -434,6 +568,10 @@ class ControlPlaneRepo:
                          or not s["lifecycle"]["archived"]], "created_at", reverse=True)
 
     def mark_service_unavailable(self, service_id):
+        with self._event_lock:
+            return self._mark_service_unavailable(service_id)
+
+    def _mark_service_unavailable(self, service_id):
         s = self._services.get(service_id)
         if s is None:
             return False

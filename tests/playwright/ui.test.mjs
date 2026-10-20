@@ -412,7 +412,12 @@ test('live activity clocks advance without requests, polls pause hidden and clea
   await withApp(async ({page, base}) => {
     let calls = 0, writes = 0;
     page.on('request', req => { if (req.method() !== 'GET') writes++; });
-    await page.route('**/api/v1/mission-activity', r => { calls++; return r.fulfill({json: {activities: [liveProjection()], server_time: new Date().toISOString()}}); });
+    await page.route('**/api/v1/mission-activity', async r => {
+      calls++;
+      // Browser time advances while hidden; model a newly collected snapshot on resume.
+      const stamp = await page.evaluate(() => new Date().toISOString());
+      return r.fulfill({json: {activities: [liveProjection({snapshot_at: stamp, observed_at: stamp})], server_time: stamp}});
+    });
     await page.clock.install();
     await page.goto(`${base}/#/missions`);
     await page.waitForSelector('[data-report-age]');
@@ -441,7 +446,7 @@ test('telemetry failures retain last known activity and age to disconnected with
     await page.clock.runFor(6000);
     await page.waitForFunction(() => document.querySelector('.ml-connection')?.textContent.includes('interrupted'));
     await page.clock.runFor(130000);
-    await page.locator('[data-filter=lastknown]').click();
+    await page.locator('#mc-tab-unconfirmed').click();
     assert.match(await bodyText(page), /Disconnected telemetry · current state unknown/);
     assert.match(await bodyText(page), /Running authentication tests/);
     assert.doesNotMatch(await page.locator('#live-missions').innerText(), /crashed/i);
@@ -526,13 +531,16 @@ test('service catalog filters, archive inspection and groups survive live refres
     await page.setViewportSize({width:390,height:844});
     await page.goto(`${base}/#/services`);
     await page.locator('#sc-search').waitFor();
-    assert.match(await page.locator('#sc-counts').innerText(), /1.*Archived/s);
+    assert.equal(await page.locator('#sc-history').evaluate(el=>el.open),false);
+    assert.equal(await page.locator('.sc-row').filter({hasText:'gateway'}).count(),0);
+    await page.locator('#sc-history > summary').click();
+    assert.match(await page.locator('#sc-history-counts').innerText(), /1.*Archived/s);
     assert.equal(await page.locator('.sc-row').filter({hasText:'Archived parser'}).count(),0);
     assert.equal(await page.locator('.sc-row').filter({hasText:'Inactive parser'}).count(),0);
     await page.locator('[data-filter=unknown]').click();
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Stale healthy parser/);
-    assert.match(await page.locator('.sc-health').innerText(), /Unknown/);
+    assert.match(await page.locator('.sc-health').innerText(), /Unconfirmed/);
     await page.locator('[data-filter=archived]').click();
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Archived parser/);
@@ -571,10 +579,16 @@ test('mission catalog stays compact, searchable and keyboard stable across chang
   await page.route('**/api/v1/mission-activity',r=>{calls++;return r.fulfill({json:{activities:[{...current,activity:{...current.activity,currentActivity:{summary:'Running parser tests '+calls}}},...stale]}});});
   await page.clock.install();await page.goto(`${base}/#/missions`);
   await page.locator('.mc-row[data-mission-key="pi:MSN-live"]').waitFor();
-  assert.equal(await page.locator('[data-group=lastknown]').evaluate(e=>e.open),false);
+  assert.equal(await page.locator('[data-group=lastknown]').count(),0);
+  assert.match(await page.locator('#mc-tab-unconfirmed').innerText(),/35/);
   assert.equal(await page.locator('#mc-tab-finished').getAttribute('aria-selected'),'false');
   assert.ok(await page.evaluate(()=>document.documentElement.scrollHeight)<1500);
-  assert.ok((await page.locator('.mc-row[data-mission-key="pi:MSN-live"]').boundingBox()).height<230);
+  // The independent history response may replace this row while it is measured.
+  await page.waitForFunction(()=>{
+    const row=document.querySelector('.mc-row[data-mission-key="pi:MSN-live"]');
+    const height=row?.getBoundingClientRect().height;
+    return height>0&&height<230;
+  });
   assert.doesNotMatch(await bodyText(page),/private-worker-/);
   await page.locator('#mc-search').fill('SEARCH_TAIL');
   assert.equal(await page.locator('.mc-row').count(),1);
@@ -586,7 +600,8 @@ test('mission catalog stays compact, searchable and keyboard stable across chang
   await page.clock.runFor(5500);await page.waitForTimeout(50);
   assert.equal(await page.evaluate(()=>document.activeElement.classList.contains('mc-title')),true);
   await page.locator('#mc-search').fill('');
-  await page.locator('[data-group=lastknown] > summary').click();
+  await page.locator('#mc-tab-unconfirmed').click();
+  await page.locator('[data-group=lastknown][open]').waitFor();
   await page.locator('[data-more=lastknown]').focus();
   await page.clock.runFor(5500);await page.waitForTimeout(50);
   assert.equal(await page.evaluate(()=>document.activeElement.dataset.more),'lastknown');
@@ -608,7 +623,7 @@ test('same-group freshness transitions relabel activity and freeze waiting clock
   let calls=0;
   await page.route('**/api/v1/mission-activity',r=>++calls===1?r.fulfill({json:{activities:[p]}}):r.fulfill({status:503,json:{error:'offline'}}));
   await page.clock.install();await page.goto(`${base}/#/missions`);
-  await page.locator('[data-filter=lastknown]').click();
+  await page.locator('#mc-tab-unconfirmed').click();
   await page.locator('.mc-row').waitFor();
   assert.match(await page.locator('.mc-activity').innerText(),/^Activity:/);
   await page.clock.runFor(32000);await page.waitForTimeout(50);
@@ -697,8 +712,9 @@ test('leaving session detail cancels its initial read and cannot overwrite the n
 
 test('mission outcome tabs isolate terminal records and query links survive real SSE refresh',async()=>{
  await withApp(async({page,base})=>{
-  const records=[{mission_id:'open-record',title:'Recorded open',status:'active',stage:'planning'},
-   {mission_id:'closed-record',title:'Recorded closed',status:'active',stage:'closed'}];
+  const records=[{mission_id:'open-record',title:'Recorded open',status:'active',stage:'planning',updated_at:new Date().toISOString()},
+   {mission_id:'closed-record',title:'Recorded closed',status:'active',stage:'closed'},
+   {mission_id:'unknown-record',title:'Unconfirmed record',status:'active'}];
   const projections=[liveProjection({mission_key:'pi:running',mission:{id:'running',title:'Running mission',status:'EXECUTING'},activity:{health:'active'}}),
    liveProjection({mission_key:'pi:failure',mission:{id:'failure',title:'Failed mission',status:'FAILED'}}),
    liveProjection({mission_key:'pi:done',mission:{id:'done',title:'Finished mission',status:'COMPLETE'},freshness:{state:'disconnected',age_seconds:400}}),
@@ -712,6 +728,9 @@ test('mission outcome tabs isolate terminal records and query links survive real
   assert.equal(await page.locator('[data-mission-key="pi:failure"]').count(),0);
   assert.equal(await page.locator('[data-mission-key="pi:done"]').count(),0);
   await page.locator('#mc-tab-current').focus();await page.keyboard.press('ArrowRight');
+  assert.equal(await page.locator('#mc-tab-unconfirmed').getAttribute('aria-selected'),'true');
+  assert.match(await page.locator('.mc-row').innerText(),/Unconfirmed record/);
+  await page.keyboard.press('ArrowRight');
   assert.equal(await page.locator('#mc-tab-failed').getAttribute('aria-selected'),'true');
   assert.equal(await page.locator('.mc-row').count(),1);
   await page.keyboard.press('End');assert.equal(await page.locator('#mc-tab-finished').getAttribute('aria-selected'),'true');
@@ -755,6 +774,7 @@ test('sessions tabs keep closed records separate, retain filters and encode exac
   const id='herdr:beast:%2Frepo:w1:p3';const now=new Date().toISOString();
   const closed={session_id:id,agent_role:'Closed stage',status:'active',stage:'closed',cwd:'/work/repo',host_id:'beast',updated_at:now};
   const sessions=[...Array.from({length:25},(_,i)=>({session_id:`open-${i}`,agent_role:`pi ${i}`,status:'active',host_id:'beast',cwd:'/work/parser',updated_at:now})),
+   {session_id:'stale-open',agent_role:'Old open',status:'active',updated_at:new Date(Date.now()-16*60000).toISOString()},
    {session_id:'failed',agent_role:'Failed agent',status:'failed',host_id:'beast',updated_at:now},closed,
    ...['stopped','closed','completed'].map(status=>({session_id:status,agent_role:status,status,updated_at:now}))];
   let reads=0,next;const refreshed=new Promise(resolve=>{next=resolve;});
@@ -768,6 +788,9 @@ test('sessions tabs keep closed records separate, retain filters and encode exac
   await page.waitForFunction(()=>document.querySelector('#ss-tab-current [data-count]')?.textContent==='25');
   assert.equal(await page.locator('.ss-row').count(),20);await page.locator('#ss-next').click();assert.equal(await page.locator('.ss-row').count(),5);
   await page.locator('#ss-tab-current').focus();await page.keyboard.press('ArrowRight');
+  assert.equal(await page.locator('#ss-tab-unconfirmed').getAttribute('aria-selected'),'true');
+  assert.match(await page.locator('.ss-row').innerText(),/Old open/);
+  await page.keyboard.press('ArrowRight');
   assert.equal(await page.locator('#ss-tab-failed').getAttribute('aria-selected'),'true');assert.equal(await page.locator('.ss-row').count(),1);
   await page.keyboard.press('End');assert.equal(await page.locator('#ss-tab-finished').getAttribute('aria-selected'),'true');assert.equal(await page.locator('.ss-row').count(),4);
   await page.locator('#ss-tab-current').click();await page.locator('#ss-search').fill('open-1');
@@ -797,7 +820,7 @@ test('overview keeps healthy panels through partial errors and links to the exac
   await page.route('**/api/v1/mission-activity',r=>++liveReads===1?r.fulfill({status:503,json:{error:'temporarily unavailable'}}):r.fulfill({json:{activities:[liveProjection({activity:{health:'active'}})]}}));
   await page.route('**/api/v1/health',r=>r.fulfill({status:503,json:{error:'health unavailable'}}));
   await page.clock.install();await page.goto(`${base}/#/overview`);
-  await page.waitForFunction(()=>document.querySelector('[data-overview=sessions]')?.textContent.includes('1Open session records'));
+  await page.waitForFunction(()=>document.querySelector('[data-overview=sessions]')?.textContent.includes('1Recently reported sessions'));
   await page.waitForFunction(()=>document.querySelector('[data-overview=missions]')?.textContent.includes('Could not refresh'));
   assert.equal(await page.locator('#view h1').innerText(),'Overview');
   assert.equal(await page.locator('[data-overview=missions] a[href*="status=attention"] strong').innerText(),'—');assert.match(await page.locator('[data-overview=sessions]').innerText(),/Parser/);
@@ -818,8 +841,8 @@ test('sessions retain keyboard focus when refreshed records leave the filter and
  await withApp(async({page,base})=>{
   let reads=0;
   await page.route('**/api/v1/sessions',r=>{reads++;return r.fulfill({json:{sessions:[
-   {session_id:'first',agent_role:'agent',status:'active',summary:reads===1?'needlecontext':'removed'},
-   {session_id:'second',agent_role:'agent',status:'active',summary:reads<=2?'needlecontext':'removed'}]}});});
+   {session_id:'first',agent_role:'agent',status:'active',updated_at:new Date().toISOString(),summary:reads===1?'needlecontext':'removed'},
+   {session_id:'second',agent_role:'agent',status:'active',updated_at:new Date().toISOString(),summary:reads<=2?'needlecontext':'removed'}]}});});
   await page.route('**/api/v1/missions',r=>r.fulfill({json:{missions:[]}}));
   await page.clock.install();await page.goto(`${base}/#/herd`);await page.locator('.ss-row').first().waitFor();
   await page.locator('#ss-search').fill('needlecontext');await page.locator('[data-session-id=first] [data-session-link]').focus();

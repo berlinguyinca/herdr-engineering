@@ -176,3 +176,48 @@ test('CI mutation uses explicit action POST with the provider run number',async(
   assert.equal(sent.url,'/api/v1/ci/actions');assert.equal(sent.opts.method,'POST');
   assert.deepEqual(JSON.parse(sent.opts.body),{repository:'owner/repo',number:42,action:'retry'});
 });
+
+test('GitHub inventory reads encode filters and pass cancellation without mutations', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    calls.push({ url, opts });
+    return { ok: true, status: 200, text: async () => '{}' };
+  }});
+  const signal = new AbortController().signal;
+  await client.getGithub({ signal });
+  await client.getGithub({ page: 2, per_page: 25, search: 'a&b / c', signal });
+  await client.getGithubIssues('github.com/owner/repo', {
+    tab: 'blocked', search: 'status = broken & needs love', page: 3, per_page: 20, signal,
+  });
+  await client.getGithubIssues('', { signal });
+  await client.getGithubIssue('github.com/owner/repo', 42, { signal });
+  assert.equal(calls[0].url, '/api/v1/github');
+  assert.deepEqual(Object.fromEntries(new URL(calls[1].url, 'http://test').searchParams), {
+    page: '2', per_page: '25', search: 'a&b / c',
+  });
+  assert.deepEqual(Object.fromEntries(new URL(calls[2].url, 'http://test').searchParams), {
+    repository: 'github.com/owner/repo', tab: 'blocked', search: 'status = broken & needs love',
+    page: '3', per_page: '20',
+  });
+  assert.equal(calls[3].url, '/api/v1/github/issues');
+  assert.deepEqual(Object.fromEntries(new URL(calls[4].url, 'http://test').searchParams), {
+    repository: 'github.com/owner/repo', number: '42',
+  });
+  for (const { opts } of calls) {
+    assert.equal(opts.signal, signal);
+    assert.equal(opts.method, 'GET');
+    assert.equal(opts.body, undefined);
+  }
+});
+
+test('GitHub failures retain the shared structured error contract', async () => {
+  const client = new HerdrClient('', { fetchImpl: async () => ({
+    ok: false, status: 503, text: async () => '{"error":"Integration service is unavailable."}',
+  }) });
+  await assert.rejects(client.getGithub(), (error) => {
+    assert.ok(error instanceof ApiError);
+    assert.equal(error.status, 503);
+    assert.equal(error.message, 'Integration service is unavailable.');
+    return true;
+  });
+});

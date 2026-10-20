@@ -1,0 +1,16 @@
+[Unit]
+Description=HerdR read-only service ownership observations
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=-%h/.config/herdr-engineering/fabric.env
+EnvironmentFile=-%h/.config/herdr-engineering/service-metadata.env
+ExecStart=%h/.local/share/herdr-service-metadata/current/venv/bin/python -m herdr_engineering.service_metadata_feed --loop 30
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

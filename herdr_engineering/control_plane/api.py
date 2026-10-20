@@ -14,6 +14,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import secrets
 import socket
 import threading
@@ -21,7 +22,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
 from .redact import redact_payload
@@ -86,7 +87,7 @@ class ControlPlaneServer:
 
     def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
                  port=0, web_root=None, source=None, allow_open=False,
-                 rustfs=None, dispatcher=None):
+                 rustfs=None, dispatcher=None, github_monitor=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -103,6 +104,10 @@ class ControlPlaneServer:
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row))
+        if github_monitor is None:
+            from ..github import GitHubMonitor
+            github_monitor = GitHubMonitor()
+        self.github_monitor = github_monitor
         self.dispatcher = dispatcher or self._dispatch_native_message
         if source is not None:
             from .bridge import load_into
@@ -181,7 +186,7 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
-        h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1"]
+        h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1", "github_v1"]
         return h
 
     # ------------------------------------------------------- SSE plumbing
@@ -218,6 +223,7 @@ class ControlPlaneServer:
 
     def shutdown(self):
         self.ci_monitor.close()
+        self.github_monitor.close()
         if self._httpd:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -361,13 +367,20 @@ def _make_handler(server):
             except KeyError:
                 return self._send_json(404, {"error": "not found"})
             except ValueError as exc:
-                return self._send_json(400, {"error": str(exc)})
-            except RuntimeError:
+                message = "Invalid GitHub query." if resource == "github" else str(exc)
+                return self._send_json(400, {"error": message})
+            except RuntimeError as exc:
+                if resource == "github":
+                    from ..github import GitHubError
+                    if isinstance(exc, GitHubError):
+                        status = {"not_found": 404, "permission": 403, "rate_limited": 429}.get(exc.reason, 503)
+                        return self._send_json(status, {"error": str(exc), "reason": exc.reason})
                 if resource == "reviews":
                     return self._send_json(503, {"error": "Review persistence is unavailable; no launch or decision was acknowledged."})
                 return self._send_json(503, {"error": "Integration service is unavailable."})
             except Exception as exc:  # never drop a connection: surface 500
-                return self._send_json(500, {"error": str(exc)})
+                message = "GitHub service is unavailable." if resource == "github" else str(exc)
+                return self._send_json(500, {"error": message})
 
         def _api_get(self, parts, resource):
             r = server.repo
@@ -472,6 +485,18 @@ def _make_handler(server):
             if resource == "ingest":
                 return self._json({"endpoint": "POST /api/v1/ingest",
                                    "entities": ["host", "session", "mission"]})
+            if resource == "github":
+                what = parts[4] if len(parts) == 5 else ""
+                if len(parts) > 5 or (len(parts) == 5 and what not in {"issues", "issue"}):
+                    return self._json({"error": "not found"}, 404)
+                query = _github_query(self.path, what)
+                if what == "issues":
+                    repository = query.pop("repository", None)
+                    return self._json(server.github_monitor.issues(repository_id=repository, **query))
+                if what == "issue":
+                    return self._json(server.github_monitor.issue_detail(
+                        query["repository"], query["number"]))
+                return self._json(server.github_monitor.repositories(**query))
             if resource == "ci":
                 what = parts[4] if len(parts) > 4 else ""
                 if what == "pipeline":
@@ -885,3 +910,43 @@ def _qint(path, key, default):
         return int(v) if v is not None else default
     except ValueError:
         return default
+
+
+def _github_query(path, kind):
+    """Bound local dashboard filters; never forward arbitrary upstream paths."""
+    values = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=20)
+    allowed = {"repository", "number"} if kind == "issue" else {"page", "per_page", "search"}
+    if kind == "issues":
+        allowed |= {"repository", "tab"}
+    if values.keys() - allowed or any(len(items) != 1 for items in values.values()):
+        raise ValueError("invalid GitHub query")
+    query = {key: items[0] for key, items in values.items()}
+    repository = query.get("repository")
+    if repository is not None:
+        name = repository.removeprefix("github.com/")
+        if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}", name)
+                or name.split("/")[1] in {".", ".."}):
+            raise ValueError("invalid GitHub repository")
+        query["repository"] = "github.com/" + name.lower()
+    integer_fields = {"number": (None, 2147483647)} if kind == "issue" else {
+        "page": (1, 1000000), "per_page": (50, 100)}
+    for key, (default, maximum) in integer_fields.items():
+        value = query.get(key, default)
+        if value is None or not re.fullmatch(r"[0-9]{1,10}", str(value)):
+            raise ValueError("invalid GitHub pagination or issue number")
+        number = int(value)
+        if not 1 <= number <= maximum:
+            raise ValueError("invalid GitHub pagination or issue number")
+        query[key] = number
+    if kind == "issue":
+        if not repository:
+            raise ValueError("GitHub repository required")
+        return query
+    query.setdefault("search", "")
+    if len(query["search"]) > 300 or any(ord(char) < 32 or ord(char) == 127 for char in query["search"]):
+        raise ValueError("invalid GitHub search")
+    if kind == "issues":
+        query.setdefault("tab", "all")
+        if query["tab"] not in {"all", "autospec", "preparation", "in_progress", "blocked"}:
+            raise ValueError("invalid GitHub issue tab")
+    return query

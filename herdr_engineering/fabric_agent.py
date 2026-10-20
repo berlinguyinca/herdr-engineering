@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import select
 import shutil
 import socket
 import subprocess
@@ -45,8 +46,11 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from .errors import HerdrEngineeringError
 
@@ -87,33 +91,61 @@ _IGNORED_PROCESSES: frozenset[str] = frozenset({
 # Listener scanning (per-OS, best effort, no dependencies)
 # ---------------------------------------------------------------------------
 
+class ListenerInventory(dict):
+    """Dict-compatible listener scan with explicit completeness for absence checks."""
+
+    def __init__(self, *args, complete=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.complete = complete
+
+
+def _apply_listener_pids(result, owners, unknown):
+    for port, entry in result.items():
+        pids = owners.get(port, set())
+        if len(pids) == 1 and port not in unknown:
+            entry["pid"] = next(iter(pids))
+        elif len(pids) > 1 or (pids and port in unknown):
+            entry["pid_ambiguous"] = True
+    return result
+
+
 def _scan_linux() -> dict[int, dict[str, Any]]:
     """Parse ``ss -ltnpH`` into {port: {"addrs": set, "process": str|None}}."""
     exe = shutil.which("ss")
     if exe is None:
         log.warning("ss not found; listener scan disabled on this host")
-        return {}
+        return ListenerInventory()
     try:
-        out = subprocess.run([exe, "-ltnpH"], capture_output=True, text=True,
-                             timeout=10).stdout
+        scan = subprocess.run([exe, "-ltnpH"], capture_output=True, text=True, timeout=10)
+        out = scan.stdout
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("ss scan failed: %s", exc)
-        return {}
-    result: dict[int, dict[str, Any]] = {}
-    proc_re = re.compile(r'\(\("([^"]+)",pid=(\d+)')
+        return ListenerInventory()
+    result = ListenerInventory(complete=getattr(scan, "returncode", 0) == 0)
+    owners, unknown = {}, set()
+    proc_re = re.compile(r'\("([^"]+)",pid=(\d+)')
     for line in out.splitlines():
         parts = line.split()
+        if not parts:
+            continue
         if len(parts) < 5:
+            result.complete = False
             continue
         local = parts[3]
-        proc = proc_re.search(line)
-        entry = result.setdefault(_port_of(local),
-                                  {"addrs": set(), "process": None})
-        if entry["process"] is None and proc:
-            entry["process"] = proc.group(1)
-            entry["pid"] = int(proc.group(2))
+        processes = proc_re.findall(line)
+        port = _port_of(local)
+        if not 0 < port <= 65535:
+            result.complete = False
+            continue
+        entry = result.setdefault(port, {"addrs": set(), "process": None})
+        if entry["process"] is None and processes:
+            entry["process"] = processes[0][0]
+        pids = {int(pid) for _, pid in processes if int(pid) > 0}
+        owners.setdefault(port, set()).update(pids)
+        if not pids or len(re.findall(r'\("[^"]+"', line)) > len(processes):
+            unknown.add(port)
         entry["addrs"].add(_host_of(local))
-    return result
+    return _apply_listener_pids(result, owners, unknown)
 
 
 def _scan_macos() -> dict[int, dict[str, Any]]:
@@ -121,28 +153,38 @@ def _scan_macos() -> dict[int, dict[str, Any]]:
     exe = shutil.which("lsof")
     if exe is None:
         log.warning("lsof not found; listener scan disabled on this host")
-        return {}
+        return ListenerInventory()
     try:
-        out = subprocess.run([exe, "-nP", "-iTCP", "-sTCP:LISTEN"],
-                             capture_output=True, text=True, timeout=15).stdout
+        scan = subprocess.run([exe, "-nP", "-iTCP", "-sTCP:LISTEN"],
+                              capture_output=True, text=True, timeout=15)
+        out = scan.stdout
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("lsof scan failed: %s", exc)
-        return {}
-    result: dict[int, dict[str, Any]] = {}
+        return ListenerInventory()
+    result = ListenerInventory(complete=getattr(scan, "returncode", 0) == 0)
+    owners, unknown = {}, set()
     for line in out.splitlines()[1:]:
         parts = line.split()
+        if not parts:
+            continue
         if len(parts) < 9:
+            result.complete = False
             continue
         name = parts[8]  # e.g. "127.0.0.1:5678", "*:8080", "[::1]:8080"
         port = _port_of(name)
+        if not 0 < port <= 65535:
+            result.complete = False
+            continue
         proc = parts[0] or None
         entry = result.setdefault(port, {"addrs": set(), "process": None})
         if entry["process"] is None and proc:
             entry["process"] = proc
-            if parts[1].isdigit():
-                entry["pid"] = int(parts[1])
+        if parts[1].isdigit() and int(parts[1]) > 0:
+            owners.setdefault(port, set()).add(int(parts[1]))
+        else:
+            unknown.add(port)
         entry["addrs"].add(_host_of(name))
-    return result
+    return _apply_listener_pids(result, owners, unknown)
 
 
 def _port_of(addr: str) -> int:
@@ -154,12 +196,8 @@ def _port_of(addr: str) -> int:
         return -1
 
 
-def _listener_project(pid: int | None, *, timeout: float = 2.0) -> str | None:
-    """Best-effort working-directory basename, never command arguments or paths.
-
-    PID is used locally only. A cwd is a context hint, not proof of a repository
-    or application name. Missing access/process races leave it unknown.
-    """
+def _listener_cwd(pid: int | None, *, timeout: float = 2.0) -> str | None:
+    """PID-scoped cwd stays local; never use it as ownership evidence."""
     if type(pid) is not int or pid <= 0:
         return None
     try:
@@ -169,19 +207,245 @@ def _listener_project(pid: int | None, *, timeout: float = 2.0) -> str | None:
                 return None
             result = subprocess.run([exe, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
                                     capture_output=True, text=True, timeout=timeout)
-            paths = [line[1:] for line in result.stdout.splitlines()
-                     if line.startswith("n/")]
-            if len(paths) != 1:
-                return None
-            path = paths[0]
+            paths = [line[1:] for line in result.stdout.splitlines() if line.startswith("n/")]
+            path = paths[0] if len(paths) == 1 else None
         else:
             path = os.readlink(f"/proc/{pid}/cwd")
-        name = Path(path).name
-        if not name or not all(ch.isprintable() for ch in name):
-            return None
-        return name[:120]
+        return path if path and os.path.isabs(path) and len(path) <= 4096 else None
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def _listener_project(pid: int | None, *, timeout: float = 2.0) -> str | None:
+    path = _listener_cwd(pid, timeout=timeout)
+    name = Path(path).name if path else ""
+    return name[:120] if name and all(ch.isprintable() for ch in name) else None
+
+
+@lru_cache(maxsize=1)
+def _linux_boot_identity():
+    with open("/proc/sys/kernel/random/boot_id") as stream:
+        value = stream.read(80).strip()
+    if not re.fullmatch(r"[a-fA-F0-9-]{36}", value):
+        raise ValueError("host boot identity unavailable")
+    return value
+
+
+def _process_identity(pid, *, timeout=0.2):
+    """Read parent/start identity only; never capture argv or environment."""
+    if type(pid) is not int or pid <= 0:
+        return None
+    try:
+        if os.uname().sysname == "Darwin":
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "ppid=", "-o", "lstart="],
+                                    capture_output=True, text=True, timeout=timeout)
+            parts = result.stdout.strip().split(maxsplit=1)
+            return {"parent_pid": int(parts[0]), "start": parts[1]} if len(parts) == 2 else None
+        with open(f"/proc/{pid}/stat") as stream:
+            parts = stream.read(4096).rsplit(")", 1)[1].split()
+        return {"parent_pid": int(parts[1]), "start": f"{_linux_boot_identity()}:{parts[19]}"}
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def _system_unit(pid):
+    if os.uname().sysname == "Darwin":
+        return None  # No launchd ownership is inferred from process names.
+    try:
+        with open(f"/proc/{pid}/cgroup") as stream:
+            text = stream.read(4096)
+        units = re.findall(r"/system\.slice/([A-Za-z0-9_.@:-]+\.service)(?:/|$)", text, re.MULTILINE)
+        return units[0] if len(set(units)) == 1 else None
+    except OSError:
+        return None
+
+
+class ListenerOwnership:
+    """Bounded native-pane root inventory plus fresh process ancestry checks."""
+
+    def __init__(self, host):
+        self.host = host
+        self._roots = []
+        self._expires = 0.0
+
+    @staticmethod
+    def _json(args, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {}
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=min(0.5, remaining))
+            if result.returncode or len(result.stdout) > 1024 * 1024:
+                return {}
+            data = json.loads(result.stdout)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return {}
+
+    def _refresh(self, deadline):
+        self._roots = []
+        self._expires = time.monotonic() + 20
+        executable = shutil.which("herdr")
+        if not executable:
+            return
+        inventory = self._json([executable, "session", "list", "--json"], deadline)
+        sessions = inventory.get("sessions")
+        if not isinstance(sessions, list):
+            return
+        for session in sessions[:8]:
+            if not isinstance(session, dict):
+                continue
+            if time.monotonic() >= deadline:
+                break
+            name = session.get("name")
+            if (session.get("running") is not True or not isinstance(name, str)
+                    or not name or name.startswith("-") or len(name) > 200):
+                continue
+            prefix = [executable, "--session", name]
+            data = self._json(prefix + ["api", "snapshot"], deadline)
+            result = data.get("result")
+            snapshot = result.get("snapshot") if isinstance(result, dict) else None
+            panes = snapshot.get("panes", []) if isinstance(snapshot, dict) else []
+            if not isinstance(panes, list):
+                continue
+            for pane in panes[:128]:
+                if not isinstance(pane, dict):
+                    continue
+                if time.monotonic() >= deadline:
+                    break
+                pane_id, terminal = pane.get("pane_id"), pane.get("terminal_id")
+                if not all(isinstance(value, str) and value and not value.startswith("-")
+                           and len(value) <= 200 for value in (pane_id, terminal)):
+                    continue
+                process = self._json(prefix + ["pane", "process-info", "--pane", pane_id], deadline)
+                result = process.get("result")
+                info = result.get("process_info") if isinstance(result, dict) else None
+                if not isinstance(info, dict) or info.get("pane_id") != pane_id:
+                    continue
+                shell = info.get("shell_pid")
+                identity = _process_identity(shell, timeout=max(0.01, min(0.2, deadline - time.monotonic())))
+                if identity is None:
+                    continue
+                self._roots.append({"host_id": self.host, "herdr_session": name,
+                    "pane_id": pane_id, "terminal_id": terminal, "shell_pid": shell,
+                    "shell_start": identity["start"],
+                    "session_id": "herdr:" + ":".join(quote(value, safe="") for value in (self.host, name, pane_id))})
+
+    def classify(self, pid, *, timeout=0.75):
+        if type(pid) is not int or pid <= 0 or timeout <= 0:
+            return None
+        deadline = time.monotonic() + min(1.0, timeout)
+        initial = _process_identity(pid, timeout=max(0.01, min(0.2, deadline - time.monotonic())))
+        if initial is None:
+            return None
+        if time.monotonic() >= self._expires:
+            self._refresh(deadline)
+        chain, current, observed = [], pid, {}
+        while current > 1 and len(chain) < 64 and time.monotonic() < deadline:
+            if current in chain:
+                return None
+            chain.append(current)
+            identity = _process_identity(current, timeout=max(0.01, min(0.2, deadline - time.monotonic())))
+            if identity is None:
+                return None
+            observed[current] = dict(identity)
+            roots = [root for root in self._roots if root["shell_pid"] == current]
+            if roots:
+                if len(roots) != 1 or identity["start"] != roots[0]["shell_start"]:
+                    return None
+                for ancestor, expected in observed.items():
+                    if time.monotonic() >= deadline or _process_identity(
+                            ancestor, timeout=max(0.01, min(0.2, deadline - time.monotonic()))) != expected:
+                        return None
+                if observed[pid] != initial:
+                    return None
+                return {**roots[0], "kind": "herdr_process_ancestry", "listener_pid": pid,
+                        "listener_start": initial["start"], "ancestor_pids": chain,
+                        "observed_at": datetime.now(UTC).isoformat()}
+            current = identity["parent_pid"]
+        # Reparented/detached containers lack launch proof and stay unassigned;
+        # a genuine system cgroup is separate evidence for the System view.
+        unit = _system_unit(pid)
+        if unit and _process_identity(pid) == initial:
+            return {"kind": "system_unit", "host_id": self.host, "unit": unit,
+                    "listener_pid": pid, "listener_start": initial["start"],
+                    "observed_at": datetime.now(UTC).isoformat()}
+        return None
+
+
+class ListenerGitMetadata:
+    """Small checkout cache keyed by actual listener identity, never its agent."""
+
+    def __init__(self):
+        self._cache = {}
+
+    @staticmethod
+    def _git(executable, cwd, args, deadline):
+        if deadline <= time.monotonic():
+            return None
+        env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+        env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        process = None
+        try:
+            process = subprocess.Popen([executable, *args], cwd=cwd, env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            raw = bytearray()
+            while len(raw) <= 4096:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                    return None
+                chunk = os.read(process.stdout.fileno(), 4097 - len(raw))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            if len(raw) > 4096 or process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
+                return None
+            return raw.decode("utf-8").strip()
+        except (OSError, UnicodeError, subprocess.SubprocessError):
+            return None
+        finally:
+            if process:
+                if process.poll() is None:
+                    process.kill()
+                try:
+                    process.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    pass
+                process.stdout.close()
+
+    def read(self, pid, ownership, *, timeout=0.5):
+        if (not isinstance(ownership, dict) or ownership.get("kind") != "herdr_process_ancestry"
+                or ownership.get("listener_pid") != pid or timeout <= 0):
+            return {}
+        deadline = time.monotonic() + min(timeout, 1.0)
+        identity = _process_identity(pid, timeout=min(0.2, timeout))
+        if not identity or identity["start"] != ownership.get("listener_start"):
+            return {}
+        cwd = _listener_cwd(pid, timeout=max(0.01, min(0.2, deadline - time.monotonic())))
+        if not cwd:
+            return {}
+        key = (pid, identity["start"], cwd)
+        cached = self._cache.get(key)
+        if cached and time.monotonic() - cached[0] < 30:
+            return dict(cached[1])
+        result = {}
+        executable = shutil.which("git")
+        if executable:
+            from .control_plane.project_links import canonical_repository
+            origin = canonical_repository(self._git(executable, cwd,
+                ["config", "--local", "--get", "remote.origin.url"], deadline))
+            head = self._git(executable, cwd, ["rev-parse", "--verify", "HEAD"], deadline) if origin else None
+            remaining = max(0.01, min(0.2, deadline - time.monotonic()))
+            if (origin and isinstance(head, str) and re.fullmatch(r"(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})", head)
+                    and time.monotonic() < deadline
+                    and _process_identity(pid, timeout=remaining) == identity
+                    and _listener_cwd(pid, timeout=remaining) == cwd):
+                result = {"repository_id": origin, "commit_sha": head.lower()}
+        self._cache.pop(key, None)
+        self._cache[key] = (time.monotonic(), result)
+        while len(self._cache) > 128:
+            self._cache.pop(next(iter(self._cache)))
+        return dict(result)
 
 
 def _host_of(addr: str) -> str:
@@ -359,6 +623,8 @@ class FabricAgent:
         self._client = client
         self.cfg = config
         self._machine = socket.gethostname()
+        self._ownership = ListenerOwnership(self._machine)
+        self._git_metadata = ListenerGitMetadata()
         self._store: dict[str, dict[str, Any]] = self._load_store()
         self._forwards: dict[int, AgentForwarder] = {}
         self._warned_unleased: set[int] = set()
@@ -387,6 +653,9 @@ class FabricAgent:
         # restart re-heartbeats these leases; it does not re-adopt them, so
         # without this the pre-existing leases would never surface).
         self._report_services()
+        # Keep recorded launch history until a fresh scan observes the current
+        # listener; that scan must not wait for the normal heartbeat interval.
+        self._cp_last_report.clear()
 
     # -- store ----------------------------------------------------------
 
@@ -725,8 +994,23 @@ class FabricAgent:
                 break
             if status == "healthy" and listeners is not None:
                 info = listeners.get(entry.get("source_port"), {})
+                previous_origin = entry.get("ownership") or {}
+                observed = self._ownership.classify(
+                    info.get("pid"), timeout=max(0.0, min(0.75, deadline - time.monotonic())))
+                # A pane may end while its child keeps serving. Retain already
+                # observed origin only for the exact same process birth identity.
+                if ((observed or {}).get("kind") != "herdr_process_ancestry"
+                        and previous_origin.get("kind") == "herdr_process_ancestry"
+                        and previous_origin.get("listener_pid") == info.get("pid")):
+                    current = _process_identity(info.get("pid"), timeout=max(0.01, min(0.2, deadline - time.monotonic())))
+                    if current and current["start"] == previous_origin.get("listener_start"):
+                        observed = previous_origin
+                entry["ownership"] = observed
+                metadata = self._git_metadata.read(info.get("pid"), entry["ownership"],
+                    timeout=max(0.0, min(0.5, deadline - time.monotonic())))
+                entry.update(repository_id=metadata.get("repository_id"), commit_sha=metadata.get("commit_sha"))
                 entry["project"] = _listener_project(
-                    info.get("pid"), timeout=min(1.0, deadline - time.monotonic()))
+                    info.get("pid"), timeout=max(0.01, min(0.2, deadline - time.monotonic())))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -763,8 +1047,12 @@ class FabricAgent:
             "description": self._describe_service(entry, self._machine),
             "project": entry.get("project"),
             "source_port": entry.get("source_port"),
+            "ownership": entry.get("ownership"),
+            "session_id": (entry.get("ownership") or {}).get("session_id"),
+            "repository_id": entry.get("repository_id"), "commit_sha": entry.get("commit_sha"),
         }
         body = {
+            "source": "fabric-agent",
             "entity_type": "service",
             "entity_id": entry.get("lease_id")
                 or f"{self._machine}:{entry.get('external_port')}",

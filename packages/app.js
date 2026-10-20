@@ -7,15 +7,16 @@ import { formatTimestamp } from './herdr-web-components/format.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
 import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
-import { statusForStage, statusLabel, tokenVar } from './herdr-web-components/status.js';
 import { mountInspector } from './inspector-view.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
+import { mountGithub } from './github-view.js';
+import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
-import { mountServices, renderServiceDetails } from './services-view.js';
+import { mountServices, mountServiceDetails } from './services-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -46,6 +47,8 @@ const NAV = [
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Sessions' },
   { path: '/services', label: 'Services' },
+  { path: '/system-services', label: 'System services' },
+  { path: '/github', label: 'Projects' },
   { path: '/ci', label: 'CI' },
   { path: '/reviews', label: 'Reviews' },
   { path: '/hosts', label: 'Hosts' },
@@ -66,6 +69,7 @@ function route() {
 
 const ROUTES = {
   '/overview': viewOverview,
+  '/github': viewGithub,
   '/ci': viewIntegrations,
   '/reviews': viewIntegrations,
   '/topology': viewTopology,
@@ -74,6 +78,7 @@ const ROUTES = {
   '/herd': viewSessions,
   '/herd/session/:id': viewSession,
   '/services': viewServices,
+  '/system-services': viewServices,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/hosts/:id': viewHost,
@@ -122,124 +127,17 @@ async function render() {
 
 // ------------------------------------------------------------- views
 // ------------------------------------------------------------- topology
-// Fleet tree: hosts -> sessions / services / CI runs / test adapters, with
-// a recent-activity leaf. Reuses the existing /api/v1 data + CI/tests views.
-// Status dots/badges reuse the theme's semantic tokens (theme.css + status.js)
-// so the tree stays consistent with the rest of the control plane.
-function treeRow(label, sub, href, status, accent) {
-  const link = href ? `<a href="${href}">${label}</a>` : esc(label);
-  const st = status ? statusForStage(status) : null;
-  const dotColor = st ? tokenVar(st.token) : (accent || 'var(--text-muted)');
-  const dot = `<span class="tp-dot" style="background:${dotColor}"></span>`;
-  const b = st
-    ? `<span class="tp-badge" style="color:${tokenVar(st.token)};border-color:${tokenVar(st.token)}">${esc(statusLabel(status))}</span>`
-    : '';
-  const subHtml = sub ? `<span class="tp-sub">${esc(sub)}</span>` : '';
-  return `<div class="tp-row">${dot}${link}${subHtml}${b}</div>`;
-}
-
 async function viewTopology() {
-  const [hostsR, sessR, svcR, actR, ciR, testsR] = await Promise.all([
-    client.listHosts(), client.listSessions(), client.listServices(),
-    client.activity(30), client.getCi(), client.getTests(),
-  ]);
-  const hosts = hostsR.hosts || [];
-  const sessions = sessR.sessions || [];
-  const services = svcR.services || [];
-  const events = actR.events || [];
-  const ci = ciR || {};
-  const tests = testsR || {};
-  const t = titles(await missionTitles());
-
-  const hostBlocks = hosts.map((h) => {
-    const hs = sessions.filter((s) => s.host_id === h.host_id);
-    const hsvc = services.filter((s) => s.host_id === h.host_id);
-    const sRows = hs.length ? hs.slice(0, 12).map((s) =>
-      treeRow(sessionSummary(s) || s.session_id, '',
-              `#/herd/session/${esc(s.session_id)}`, s.status,
-              'var(--status-active)')).join('')
-      : '<div class="tp-hint">no sessions</div>';
-    const svRows = hsvc.length ? hsvc.slice(0, 12).map((s) =>
-      treeRow(s.service_name, s.route || '', s.route ? s.route : undefined,
-              s.status, 'var(--accent)')).join('')
-      : '';
-    return `<details class="tp tp-host"><summary>
-        ${esc(h.host_name)}
-        <span class="tp-sub">${esc(h.tailnet_ip || '')} · <herdr-status stage="${esc(h.status)}"></herdr-status></span>
-      </summary>
-      <div class="tp-kids">
-        <div class="tp-h">Sessions (${hs.length})</div>${sRows}
-        ${svRows ? `<div class="tp-h">Services (${hsvc.length})</div>${svRows}` : ''}
-      </div>
-    </details>`;
-  }).join('');
-
-  const ciLeaves = ci.available
-    ? Object.entries(ci.pipelines || {}).map(([repo, runs]) =>
-        `<details class="tp tp-ci"><summary>${esc(repo)}</summary><div class="tp-kids">` +
-        ((runs || []).length ? (runs || []).slice(0, 8).map((r) =>
-            treeRow(`#${r.run_number}`, r.branch || '', r.url, r.state,
-                    'var(--status-pr)')).join('')
-          : '<div class="tp-hint">no runs</div>') +
-        `</div></details>`).join('')
-    : '<div class="tp-row"><span class="tp-dot" style="background:var(--text-muted)"></span>CI <span class="tp-sub">not configured / unavailable</span></div>';
-
-  const testLeaves = (tests.adapters || []).length
-    ? (tests.adapters || []).map((a) =>
-        treeRow(a, 'adapter', undefined, undefined, 'var(--status-testing)')).join('')
-    : '<div class="tp-hint">no adapters discovered</div>';
-
-  const actLeaves = events.slice(0, 8).map((e) => {
-    const d = describeEvent(e, { missionTitles: t });
-    return treeRow(d.title, `${d.kind} · ${formatTimestamp(e.source_timestamp)}`,
-                    undefined, undefined, 'var(--text-muted)');
-  }).join('') || '<div class="tp-hint">no activity</div>';
-
-  root.innerHTML = `
-    <style>
-      .tp{margin:2px 0}
-      .tp summary{display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;
-        padding:7px 10px;border-radius:var(--radius);background:var(--surface);
-        border:1px solid var(--border-subtle);color:var(--text);font-weight:600;
-        font-size:.86rem;transition:background var(--motion-fast),border-color var(--motion-fast)}
-      .tp summary::-webkit-details-marker{display:none}
-      .tp summary::before{content:'';width:8px;height:8px;border-radius:2px;flex:none;
-        border:1px solid var(--text-muted);opacity:.5;transition:transform var(--motion-fast)}
-      .tp summary:hover{background:var(--surface-hover);border-color:var(--border)}
-      .tp[open] summary::before{background:var(--tp-accent,var(--accent));
-        border-color:var(--tp-accent,var(--accent));transform:rotate(45deg)}
-      .tp-host summary{--tp-accent:var(--status-planning)}
-      .tp-ci summary{--tp-accent:var(--status-pr)}
-      .tp-tests summary{--tp-accent:var(--status-testing)}
-      .tp-act summary{--tp-accent:var(--text-muted)}
-      .tp-kids{margin-left:13px;padding-left:13px;border-left:1px solid var(--border);margin-top:2px}
-      .tp-h{color:var(--text-muted);font-size:.68rem;font-weight:700;letter-spacing:.07em;
-        text-transform:uppercase;margin:12px 0 4px}
-      .tp-hint{color:var(--text-muted);font-size:.76rem;padding:3px 8px}
-      .tp-row{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--radius-sm);
-        color:var(--text);font-size:.82rem}
-      .tp-row a{color:inherit;text-decoration:none}
-      .tp-row:hover{background:var(--surface-hover)}
-      .tp-row:hover a{color:var(--accent);text-decoration:underline}
-      .tp-dot{width:7px;height:7px;border-radius:50%;flex:none}
-      .tp-sub{color:var(--text-muted);font-size:.74rem;margin-left:auto;text-align:right;
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
-      .tp-badge{flex:none;font-size:.62rem;font-weight:700;padding:1px 7px;border-radius:99px;
-        background:color-mix(in srgb, currentColor 9%, var(--surface));border:1px solid}
-      .tp-count{color:var(--text-muted);font-weight:600;font-size:.74rem;margin-left:auto}
-    </style>
-    <h1>Topology</h1>
-    <div class="hd-card muted">${hosts.length} hosts · ${sessions.length} sessions · ${services.length} services · ${(ci.repos || []).length} CI repos · ${(tests.adapters || []).length} test adapters</div>
-    <div class="tp-kids">${hostBlocks}
-      <details class="tp tp-ci" open><summary>CI runs<span class="tp-count">${(ci.repos || []).length || ''}</span></summary><div class="tp-kids">${ciLeaves}</div></details>
-      <details class="tp tp-tests" open><summary>Test adapters<span class="tp-count">${(tests.adapters || []).length || ''}</span></summary><div class="tp-kids">${testLeaves}</div></details>
-      <details class="tp tp-act" open><summary>Recent activity<span class="tp-count">${events.length || ''}</span></summary><div class="tp-kids">${actLeaves}</div></details>
-    </div>`;
+  dashboardView = mountTopology(root, client, {status: route().query.get('status') || 'current'});
 }
 
 async function viewOverview() {
   root.innerHTML = '<h1>Overview</h1><div id="overview-dashboard"></div>';
   dashboardView = mountOverview(document.getElementById('overview-dashboard'), client);
+}
+
+async function viewGithub() {
+  dashboardView = mountGithub(root, client);
 }
 
 async function viewIntegrations(parts) {
@@ -417,14 +315,14 @@ async function copyText(text, btn) {
 async function viewServices(_parts, revision) {
   const { services } = await client.listServices();
   if (revision !== renderRevision) return;
-  servicesView = mountServices(root, client, services, { showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
+  servicesView = mountServices(root, client, services, { scope: _parts[0] === 'system-services' ? 'system' : 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
 }
 
 async function viewService(parts, revision) {
   const svc = await client.request(`/api/v1/services/${encodeURIComponent(decodeURIComponent(parts[1]))}`);
   if (revision !== renderRevision) return;
   if (!svc || svc.error) { root.innerHTML = '<herdr-error message="Service not found"></herdr-error>'; return; }
-  root.innerHTML = renderServiceDetails(svc);
+  dashboardView = mountServiceDetails(root, client, svc);
 }
 
 async function viewHosts() {

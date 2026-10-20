@@ -1,14 +1,14 @@
 // A compact, read-only mission catalog. Stale telemetry is never current work.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { freshnessAt, missionHealth } from './mission-live-view.js';
-import { recordOutcome, statusOutcome } from './record-state.js';
+import { recordOutcome, statusOutcome, recordVisibility, reportFreshness, reportTimestamp } from './record-state.js';
 
 const text = value => typeof value === 'string' ? value : '';
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const short = (value, max) => text(value).replace(/\s+/g, ' ').trim().slice(0, max);
 const human = value => text(value).replaceAll('_', ' ').toLowerCase();
 const isTerminal = entry => entry.outcome === 'failed' || entry.outcome === 'finished';
-const TABS = [['current', 'Current'], ['failed', 'Failed'], ['finished', 'Finished']];
+const TABS = [['current', 'Current'], ['unconfirmed', 'Unconfirmed'], ['failed', 'Failed'], ['finished', 'Finished']];
 const duration = seconds => {
   if (!Number.isFinite(seconds)) return 'unknown';
   const s = Math.max(0, Math.floor(seconds));
@@ -23,7 +23,7 @@ const GROUPS = [
   ['failed', 'Failed', 'Missions that reported a failed outcome.'],
   ['finished', 'Finished', 'Completed, closed, stopped and canceled missions.'],
 ];
-const currentGroup = key => key !== 'failed' && key !== 'finished';
+const currentGroup = key => ['attention','running','recorded'].includes(key);
 
 export function measuredProgress(activity = {}) {
   const c = activity.acceptanceCoverage;
@@ -51,13 +51,27 @@ export function missionEntries(projections, recorded, received, now = Date.now()
     const outcome = recordOutcome(lifecycle);
     const stageSuppliesOutcome = (outcome === 'failed' || outcome === 'finished') && statusOutcome(lifecycle.status) !== outcome;
     const status = text(stageSuppliesOutcome ? lifecycle.stage : lifecycle.status || lifecycle.stage).toUpperCase();
-    const freshness = p ? freshnessAt(p, received, now) : null;
+    let freshness = p ? freshnessAt(p, received, now) : null;
+    if (p) {
+      const timestamp = p.activity_snapshot_at ?? p.snapshot_at;
+      const deadline = (p.freshness?.stale_after_seconds ?? 30) * 1000;
+      const sourceState = reportFreshness(timestamp, now, deadline);
+      const sourceAt = reportTimestamp(timestamp);
+      if (sourceState !== 'current') freshness = {
+        state:sourceState === 'stale' && freshness.state !== 'disconnected' ? 'stale' : 'disconnected',
+        age:Number.isFinite(sourceAt) && sourceAt <= now ? (now-sourceAt)/1000 : Infinity,
+      };
+    }
     const health = p ? missionHealth(a, mission) : human(status) || 'unknown';
-    const tab = outcome === 'unknown' ? 'current' : outcome;
-    let group = tab === 'current' ? 'recorded' : tab;
-    if (p && tab === 'current') {
-      if (freshness.state !== 'live' || health === 'unknown') group = 'lastknown';
-      else group = ['failed', 'stalled', 'blocked', 'slow'].includes(health) || health.startsWith('paused') ? 'attention' : 'running';
+    let tab = recordVisibility(lifecycle, now);
+    let group = ['failed','finished'].includes(tab) ? tab : 'recorded';
+    if (p && !['failed','finished'].includes(tab)) {
+      tab = 'unconfirmed';
+      group = 'lastknown';
+      if (outcome === 'current' && freshness.state === 'live' && health !== 'unknown') {
+        tab = 'current';
+        group = ['failed', 'stalled', 'blocked', 'slow'].includes(health) || health.startsWith('paused') ? 'attention' : 'running';
+      }
     }
     return {...entry, title, status, health, freshness, outcome, tab, group, host: text(p?.host_id || record.host_id),
       search: [title, entry.key, mission.id, a.currentObjective, a.currentActivity?.summary, a.waitingReason,
@@ -127,7 +141,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
   let failures = 0, liveError = '', recordedError = '', lastSignature = '', lastClassification = '', liveLoaded = false, recordedLoaded = false;
   const state = {search:'',host:'',status:tab==='current'&&GROUPS.some(([key])=>key===status&&currentGroup(key))?status:'all',tab:TABS.some(([key])=>key===tab)?tab:'current'};
   const opened = new Map(), limits = new Map();
-  container.innerHTML = `${styles}<p class="mc-intro">See what needs attention and what is running. Use Failed and Finished to inspect terminal missions; current records keep their telemetry quality visible.</p>
+  container.innerHTML = `${styles}<p class="mc-intro">See what needs attention and what is running. Current shows missions with recent reports. Older and missing reports move to Unconfirmed; Failed and Finished retain their outcomes.</p>
     <div class="mc-tabs" id="mc-tabs" role="tablist" aria-label="Mission outcome"></div><div class="mc-counts" id="mc-counts"></div><div class="mc-controls">
       <label class="mc-search">Search missions<input id="mc-search" type="search" placeholder="Title, objective, activity or mission ID"></label>
       <label>Host<select id="mc-host"><option value="">All hosts</option></select></label>
@@ -143,8 +157,8 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
   function draw(force = false) {
     if(disposed)return;
     const all=entries(), selected=filterMissions(all,state);
-    const counts=Object.fromEntries(GROUPS.map(([key])=>[key,all.filter(e=>e.group===key).length]));
-    const signature=JSON.stringify([state,liveLoaded,recordedLoaded,all.map(e=>[e.key,e.group,e.freshness?.state,e.projection,e.recorded])]);
+    const counts=Object.fromEntries(GROUPS.map(([key])=>[key,all.filter(e=>e.tab===state.tab&&e.group===key).length]));
+    const signature=JSON.stringify([state,liveLoaded,recordedLoaded,all.map(e=>[e.key,e.tab,e.group,e.freshness?.state,e.projection,e.recorded])]);
     connection.textContent=[liveError,recordedError].filter(Boolean).join(' ');
     if(!force && signature===lastSignature)return;
     lastSignature=signature;
@@ -160,8 +174,8 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     el('counts').innerHTML=GROUPS.filter(([key])=>currentGroup(key)).map(([key,label])=>`<button type="button" data-filter="${key}" aria-pressed="${state.status===key}"><strong>${countLabel(counts[key])}</strong>${label}</button>`).join('');
     const hosts=[...new Set(all.map(e=>e.host).filter(Boolean))].sort();
     el('host').innerHTML='<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');el('host').value=state.host;
-    el('result').textContent=liveLoaded||recordedLoaded?`${selected.length} of ${all.length} received missions${liveLoaded&&recordedLoaded?'':' · partial results (+): waiting for remaining source'} · live activity refreshes every 5 seconds`:'Loading missions…';
-    el('groups').innerHTML=GROUPS.filter(([key])=>(state.tab==='current'?currentGroup(key):state.tab===key)&&(state.status==='all'||state.status===key)).map(([key,label,note])=>{
+    el('result').textContent=liveLoaded||recordedLoaded?`${selected.length} matching ${state.tab} missions${liveLoaded&&recordedLoaded?'':' · partial results (+): waiting for remaining source'} · live activity refreshes every 5 seconds`:'Loading missions…';
+    el('groups').innerHTML=GROUPS.filter(([key])=>(state.tab==='current'?currentGroup(key):state.tab==='unconfirmed'?['lastknown','recorded'].includes(key):state.tab===key)&&(state.status==='all'||state.status===key)).map(([key,label,note])=>{
       const rows=selected.filter(e=>e.group===key), limit=limits.get(key)||10;
       const open=opened.has(key)?opened.get(key):Boolean(state.tab!=='current'||state.search || state.status!=='all'||key==='attention'||key==='running');
       return `<details class="mc-group" data-group="${key}" ${open?'open':''}><summary>${label}<span>${rows.length}</span></summary><p class="mc-note">${note}</p>
@@ -171,19 +185,24 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     el('groups').querySelectorAll('details').forEach(d=>d.addEventListener('toggle',()=>{if(d.isConnected)opened.set(d.dataset.group,d.open);}));
     if(focusKey){
       let target;
-      if(focusKey.mission)target=[...el('groups').querySelectorAll('[data-mission-key]')].find(row=>row.dataset.missionKey===focusKey.mission)?.querySelector('.mc-title');
+      if(focusKey.mission) {
+        target=[...el('groups').querySelectorAll('[data-mission-key]')].find(row=>row.dataset.missionKey===focusKey.mission)?.querySelector('.mc-title');
+        const destination=all.find(entry=>entry.key===focusKey.mission)?.tab;
+        if(!target && destination)target=el('tabs').querySelector(`[data-tab="${destination}"]`);
+      }
       else if(focusKey.more)target=el('groups').querySelector(`[data-more="${focusKey.more}"]`) || el('groups').querySelector(`[data-group="${focusKey.more}"] > summary`);
       else if(focusKey.isSummary)target=el('groups').querySelector(`[data-group="${focusKey.group}"] > summary`);
       else if(focusKey.tab)target=el('tabs').querySelector(`[data-tab="${focusKey.tab}"]`);
       else if(focusKey.filter)target=el('counts').querySelector(`[data-filter="${focusKey.filter}"]`);
-      if(target){const group=target.closest('details');if(group&&!focusKey.isSummary){group.open=true;opened.set(group.dataset.group,true);}target.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);}
+      if(!target && !focused.isConnected)target=el('search');
+      if(target){const group=target.closest('details');if(group&&!group.open&&!focusKey.isSummary)target=group.querySelector('summary');target.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);}
     }
   }
   function tick() {
     if(disposed||document.hidden)return;
     const all=entries(), byKey=new Map(all.map(e=>[e.key,e]));
     // Reclassify once when evidence ages out; never leave an old stall counted current.
-    const classification=JSON.stringify(all.map(e=>[e.key,e.group,e.freshness?.state]));
+    const classification=JSON.stringify(all.map(e=>[e.key,e.tab,e.group,e.freshness?.state]));
     if(lastClassification!==classification){lastClassification=classification;draw();}
     const now=Date.now();
     el('groups').querySelectorAll('[data-mission-key]').forEach(row=>{

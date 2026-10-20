@@ -1,0 +1,13 @@
+# Opt-in server-side GitHub credential; never supplied to the browser.
+# Add this override only after creating a private token file.
+services:
+  control-plane-web:
+    environment:
+      HERDR_ENGINEERING_GITHUB_TOKEN_FILE: /run/secrets/github-token
+    volumes:
+      - type: bind
+        source: "${HERDR_ENGINEERING_GITHUB_TOKEN_HOST_FILE:-${HOME}/.config/herdr-engineering/github-token}"
+        target: /run/secrets/github-token
+        read_only: true
+        bind:
+          create_host_path: false
