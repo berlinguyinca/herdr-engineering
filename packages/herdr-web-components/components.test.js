@@ -61,3 +61,10 @@ test('shortenId keeps short ids and abbreviates long ones', () => {
   const short = shortenId(long);
   assert.ok(short.length < long.length);
 });
+
+test('mission attention transitions retain an actionable status label', () => {
+  assert.equal(statusForStage('stalled').label, 'Stalled');
+  assert.equal(statusForStage('stalled').token, '--status-attention');
+  assert.equal(statusForStage('crashed').label, 'Crashed');
+  assert.equal(statusForStage('crashed').token, '--status-failed');
+});

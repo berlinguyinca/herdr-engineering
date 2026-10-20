@@ -15,6 +15,8 @@ export const STATUS_META = Object.freeze({
   attention: { token: '--status-attention', label: 'Needs attention' },
   blocked: { token: '--status-blocked', label: 'Blocked' },
   failed: { token: '--status-failed', label: 'Failed' },
+  crashed: { token: '--status-failed', label: 'Crashed' },
+  stalled: { token: '--status-attention', label: 'Stalled' },
   critical: { token: '--status-failed', label: 'Critical' },
   planning: { token: '--status-planning', label: 'Planning' },
   specification: { token: '--status-planning', label: 'Specification' },

@@ -341,3 +341,32 @@ test('inspector: a slow response for the previous tab never overwrites the curre
     assert.ok(text.includes('make the parser faster') && !text.includes('make build'), text.slice(0, 300));
   }, { BURST: '0' });
 });
+
+test('mission report ages advance without events or notification requests', async () => {
+  await withApp(async ({ page, base }) => {
+    const writes = [];
+    const requests = [];
+    page.on('request', (req) => {
+      requests.push(req.url());
+      if (req.method() !== 'GET') writes.push(req.url());
+    });
+    await page.goto(`${base}/#/missions`);
+    const activity = page.locator('herdr-mission-activity[source="pi"]').first();
+    await activity.waitFor({ timeout: 10000 });
+    // Let the initial SSE replay finish its existing trailing refresh.
+    await page.waitForTimeout(600);
+    await activity.evaluate((el) => el.setAttribute('updated-at', new Date(Date.now() - 20000).toISOString()));
+    const before = await activity.innerText();
+    const requestCount = requests.length;
+    await page.waitForFunction((text) => document.querySelector('herdr-mission-activity[source="pi"]')?.innerText !== text, before);
+    assert.equal(requests.length, requestCount, 'clock refreshes do not poll the backend');
+    assert.match(await activity.innerText(), /Last reported change: 2\ds ago/);
+    assert.match(await activity.innerText(), /Finished, crashed, or stalled updates only/);
+    assert.doesNotMatch(await activity.innerText(), /stalled for|No activity/);
+    await page.locator('herdr-status').first().evaluate((el) => el.setAttribute('stage', 'stalled'));
+    assert.match(await page.locator('herdr-status').first().innerText(), /Stalled/);
+    await page.locator('a[href="#/missions/pi:MSN-PI1"]').click();
+    await page.locator('herdr-mission-activity[source="pi"]').waitFor();
+    assert.deepEqual(writes, [], 'local clocks never emit notifications');
+  }, { BURST: '0' });
+});
