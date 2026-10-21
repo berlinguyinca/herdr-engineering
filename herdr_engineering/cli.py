@@ -2073,7 +2073,7 @@ def _cmd_cp_web(args) -> int:
             auth._lookup = boto_group_lookup(auth.pool_id, auth.region)
         except ValueError as exc:
             raise SystemExit(f"--collab-cognito-*: {exc}") from exc
-        if sink is not None and source is None:
+        if sink is not None and source is None and not args.collab_only:   # the file log is hydrated below
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
         collab = CollabService(auth, sink=sink, public_config=public)
