@@ -47,6 +47,9 @@ MAX_BODY = 64 * 1024
 _KEY_RE = re.compile(r"^[A-Za-z0-9._:\-]{1,128}$")
 _MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
+INVITE_TTL = 7 * 24 * 3600.0
+MAX_OPEN_INVITES = 50
 _FEED_TYPES = frozenset({"message", "member_added", "member_removed",
                          "agent_granted", "agent_revoked"})
 
@@ -123,7 +126,7 @@ class CollabService:
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
-                 max_streams_per_principal: int = 5):
+                 max_streams_per_principal: int = 5, public_config: dict | None = None):
         self.auth = authenticator
         self._sink = sink
         self._now = now or time.time
@@ -145,6 +148,10 @@ class CollabService:
         self._hits: dict[str, list[float]] = defaultdict(list)
         self._streams: dict[str, int] = defaultdict(int)
         self._denied_at: dict[tuple, float] = {}
+        self.public_config = dict(public_config or {})
+        self._email_user: dict[str, str] = {}   # email -> user id (linked at sign-in)
+        self._user_email: dict[str, str] = {}
+        self._invites: dict[str, dict] = {}
         self.stats = defaultdict(int)
 
     # ------------------------------------------------------------ plumbing
@@ -205,6 +212,11 @@ class CollabService:
                 self._seq = ev["sequence"]
                 self._log.append(ev)
                 self._apply(ev)
+            known = {ev["payload"].get(k) for ev in parsed
+                     for k in ("actor_user_id", "subject_user_id", "user_id", "owner_user_id")}
+            mark = getattr(self.auth, "mark_known", None)
+            if mark:
+                mark({u for u in known if isinstance(u, str)})
             return len(parsed)
 
     # --------------------------------------------------------- state fold
@@ -247,6 +259,19 @@ class CollabService:
             self._rooms[p["room_id"]]["grants"][p["agent_id"]] = {
                 "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
             self._agent_projects[p["agent_id"]].add(p["project_id"])
+        elif t == "identity_linked":
+            old = self._user_email.get(p["user_id"])
+            if old:
+                self._email_user.pop(old, None)
+            self._user_email[p["user_id"]] = p["email"]
+            self._email_user[p["email"]] = p["user_id"]
+        elif t == "invite_created":
+            self._invites[p["invite_id"]] = {
+                "room_id": p["room_id"], "email": p["email"], "role": p["role"],
+                "inviter": p["actor_user_id"], "expires_at": p["expires_at_epoch"], "open": True}
+        elif t == "invite_closed":
+            if p["invite_id"] in self._invites:
+                self._invites[p["invite_id"]]["open"] = False
         elif t == "message":
             self._idem[(p["sender_key"], p["room_id"], p["idempotency_key"])] = (p["fingerprint"], seq)
 
@@ -449,7 +474,8 @@ class CollabService:
                 m = self._member(room, pr.id)
                 out["role"] = m["role"]
                 if m["role"] == "owner":
-                    out["members"] = [{"user_id": u, "role": v["role"]} for u, v in room["members"].items()]
+                    out["members"] = [{"user_id": u, "role": v["role"], "email": self._user_email.get(u)}
+                                      for u, v in room["members"].items() if self._member(room, u)]
             return out
 
     def add_member(self, pr: Principal, room_id: str, body: dict) -> dict:
@@ -484,6 +510,103 @@ class CollabService:
             self._commit("member_removed", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, subject_user_id=uid,
                 action="member.remove", outcome="allowed", project_ids=[room["project_id"]],
+                resource_id=room_id))
+        return {"ok": True}
+
+    # -- people: link email at sign-in, invite by email
+    def me(self, pr: Principal) -> dict:
+        self._require_user(pr)
+        return {"user_id": pr.id, "email": self._user_email.get(pr.id)}
+
+    def link_identity(self, pr: Principal, body: dict) -> dict:
+        """Record the verified email of the signed-in user and activate pending invites."""
+        self._require_user(pr)
+        verify = getattr(self.auth, "verify_id_token", None)
+        token = body.get("id_token")
+        email = verify(token, user=pr.id) if verify and isinstance(token, str) else None
+        if not email:
+            raise CollabError(400, "a valid id_token for this user with a verified email is required")
+        with self._lock:
+            if self._user_email.get(pr.id) != email:
+                self._commit("identity_linked", {"actor_user_id": pr.id, "actor_agent_id": None,
+                                                 "user_id": pr.id, "email": email})
+            self._deliver_pending(pr.id, email)
+        return {"user_id": pr.id, "email": email}
+
+    def _deliver_pending(self, user: str, email: str) -> None:
+        for iid, inv in list(self._invites.items()):
+            if not inv["open"] or inv["email"] != email:
+                continue
+            room = self._rooms.get(inv["room_id"])
+            if self._now() >= inv["expires_at"] or room is None:
+                self._commit("invite_closed", {"actor_user_id": user, "actor_agent_id": None,
+                                               "invite_id": iid, "reason": "expired"})
+                continue
+            if not self._member(room, user):
+                self._commit("member_added", {
+                    "actor_user_id": inv["inviter"], "actor_agent_id": None,
+                    "project_id": room["project_id"], "room_id": inv["room_id"],
+                    "subject_user_id": user, "role": inv["role"], "expires_at": None,
+                    "action": "member.add", "outcome": "allowed",
+                    "project_ids": [room["project_id"]], "resource_id": inv["room_id"]})
+            self._commit("invite_closed", {"actor_user_id": user, "actor_agent_id": None,
+                                           "invite_id": iid, "reason": "accepted"})
+
+    def invite_by_email(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """Invite a person by email. The reply is identical whether they were added now
+        or the invitation is pending, so it reveals nothing about who has signed in."""
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "member.invite")
+            email, role = body.get("email"), body.get("role")
+            if (not isinstance(email, str) or len(email) > 320
+                    or not _EMAIL_RE.match(email.strip())):
+                raise CollabError(400, "a valid email is required")
+            email = email.strip().lower()
+            if role not in INVITABLE_ROLES:
+                raise CollabError(400, "invalid role")
+            reply = {"status": "invited", "email": email, "role": role}
+            user = self._email_user.get(email)
+            if user and self.auth.exists(user):
+                if self._member(room, user):
+                    raise CollabError(409, "already a member")
+                self._commit("member_added", self._actor(
+                    pr, project_id=room["project_id"], room_id=room_id, subject_user_id=user,
+                    role=role, expires_at=None, action="member.add", outcome="allowed",
+                    project_ids=[room["project_id"]], resource_id=room_id))
+                return reply
+            open_here = [i for i in self._invites.values()
+                         if i["open"] and i["room_id"] == room_id and self._now() < i["expires_at"]]
+            if any(i["email"] == email for i in open_here):
+                return reply  # already pending: idempotent
+            if len(open_here) >= MAX_OPEN_INVITES:
+                raise CollabError(429, "too many pending invitations for this room")
+            self._commit("invite_created", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, invite_id=ids.new_id("grant"),
+                email=email, role=role, expires_at_epoch=self._now() + INVITE_TTL,
+                action="member.invite", outcome="allowed", project_ids=[room["project_id"]],
+                resource_id=room_id))
+        return reply
+
+    def list_invites(self, pr: Principal, room_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            self._authorize(pr, room_id, "invite", "invite.list")
+            return {"invites": [
+                {"invite_id": i, "email": v["email"], "role": v["role"], "expires_at": v["expires_at"]}
+                for i, v in self._invites.items()
+                if v["open"] and v["room_id"] == room_id and self._now() < v["expires_at"]]}
+
+    def cancel_invite(self, pr: Principal, room_id: str, invite_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "invite.cancel")
+            inv = self._invites.get(invite_id)
+            if not inv or inv["room_id"] != room_id or not inv["open"]:
+                raise CollabError(404, "not found")
+            self._commit("invite_closed", self._actor(
+                pr, invite_id=invite_id, reason="cancelled", room_id=room_id,
+                action="invite.cancel", outcome="allowed", project_ids=[room["project_id"]],
                 resource_id=room_id))
         return {"ok": True}
 
@@ -739,9 +862,13 @@ class CollabService:
         try:
             if parts == ["agents", "enrollment", "complete"] and method == "POST":
                 return 201, self.complete_enrollment(body)
+            if parts == ["config"] and method == "GET":
+                return 200, self.public_config  # public identifiers only; no auth needed
             pr = self.authenticate(authorization, device)
             n = len(parts)
             if method == "GET":
+                if parts == ["me"]:
+                    return 200, self.me(pr)
                 if parts == ["rooms"]:
                     return 200, self.list_rooms(pr)
                 if parts == ["audit"]:
@@ -753,12 +880,16 @@ class CollabService:
                         return 200, self.get_room(pr, rid)
                     if parts[2:] == ["agents"]:
                         return 200, self.list_room_agents(pr, rid)
+                    if parts[2:] == ["invites"]:
+                        return 200, self.list_invites(pr, rid)
                     if parts[2:] == ["events"]:
                         return 200, self.read_events(pr, rid, _int(query, "cursor", 0),
                                                      _int(query, "limit", 100, 1, 200))
                     if parts[2:] == ["events", "stream"]:
                         return self.open_stream(pr, rid, _int(query, "cursor", 0))
             elif method == "POST":
+                if parts == ["me"]:
+                    return 200, self.link_identity(pr, body)
                 if parts == ["projects"]:
                     return 201, self.create_project(pr, body)
                 if n == 3 and parts[0] == "projects" and parts[2] == "rooms":
@@ -775,6 +906,10 @@ class CollabService:
                     rid = parts[1]
                     if parts[2:] == ["members"]:
                         return 201, self.add_member(pr, rid, body)
+                    if parts[2:] == ["invites"]:
+                        return 201, self.invite_by_email(pr, rid, body)
+                    if n == 5 and parts[2] == "invites" and parts[4] == "cancel":
+                        return 200, self.cancel_invite(pr, rid, parts[3])
                     if n == 5 and parts[2] == "members" and parts[4] == "remove":
                         return 200, self.remove_member(pr, rid, parts[3])
                     if parts[2:] == ["agents"]:

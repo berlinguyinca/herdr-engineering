@@ -436,6 +436,13 @@ def _build_parser() -> argparse.ArgumentParser:
                          "this user pool (e.g. us-west-2_GjtcM0PCp); needs --collab-cognito-client")
     p2.add_argument("--collab-cognito-client", action="append", default=[],
                     help="allowed Cognito app client id (repeatable)")
+    p2.add_argument("--collab-cognito-web-client", default=None,
+                    help="app client used by the browser page (Hosted UI, PKCE); also allowed as a token client")
+    p2.add_argument("--collab-cognito-domain", default=None,
+                    help="Cognito Hosted UI base URL, e.g. https://<prefix>.auth.us-west-2.amazoncognito.com")
+    p2.add_argument("--collab-public-url", default=None,
+                    help="the https URL users open (must equal a registered callback URL), e.g. "
+                         "https://bender.tail0c50da.ts.net:9447/")
     p2.add_argument("--collab-cognito-group", default="local.dev",
                     help="required cognito:groups membership (default: local.dev)")
     p2.add_argument("--collab-require-https", action="store_true",
@@ -2029,9 +2036,20 @@ def _cmd_cp_web(args) -> int:
             raise SystemExit("use either --collab-cognito-pool or --collab-users-file, not both")
         from .control_plane.collab import CollabService
         from .control_plane.collab_cognito import CognitoAuthenticator, boto_group_lookup
+        clients = list(args.collab_cognito_client)
+        public = {}
+        if args.collab_cognito_web_client:
+            if not (args.collab_cognito_domain and args.collab_public_url
+                    and args.collab_public_url.startswith("https://")):
+                raise SystemExit("--collab-cognito-web-client needs --collab-cognito-domain and an "
+                                 "https:// --collab-public-url")
+            clients.append(args.collab_cognito_web_client)
+            public = {"client_id": args.collab_cognito_web_client,
+                      "hosted_ui_domain": args.collab_cognito_domain.rstrip("/"),
+                      "public_url": args.collab_public_url}
         try:
             auth = CognitoAuthenticator(pool_id=args.collab_cognito_pool,
-                                        client_ids=args.collab_cognito_client,
+                                        client_ids=clients,
                                         required_group=args.collab_cognito_group)
             auth._lookup = boto_group_lookup(auth.pool_id, auth.region)
         except ValueError as exc:
@@ -2039,7 +2057,7 @@ def _cmd_cp_web(args) -> int:
         if sink is not None and source is None:
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
-        collab = CollabService(auth, sink=sink)
+        collab = CollabService(auth, sink=sink, public_config=public)
     elif args.collab_users_file:
         from pathlib import Path
 

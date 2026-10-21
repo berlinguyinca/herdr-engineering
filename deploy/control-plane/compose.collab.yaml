@@ -1,6 +1,7 @@
 # Collaboration network (HCN) overlay for control-plane-web; layered on by deploy.sh
 # only when ~/.config/herdr-engineering/collab-enabled exists. The identifiers below
-# are public (they ship in the BinView web bundle); no secret is configured here.
+# are public (pool, app clients, hosted-UI domain, callback URL); no secret is configured here.
+# Moving hosts: change --collab-public-url and the app client's callback/logout URLs together.
 # Publish over HTTPS with: deploy/control-plane/collab-tailscale-serve.sh up <port> <https-port>
 services:
   control-plane-web:
@@ -20,4 +21,10 @@ services:
       - "6mcn0idau4b5uhtkd1b2g6c9qg"
       - "--collab-cognito-group"
       - "local.dev"
+      - "--collab-cognito-web-client"
+      - "6pccn6slplfe3u30g49fuqbqtv"
+      - "--collab-cognito-domain"
+      - "https://us-west-2gjtcm0pcp.auth.us-west-2.amazoncognito.com"
+      - "--collab-public-url"
+      - "https://bender.tail0c50da.ts.net:9447/"
       - "--collab-require-https"
