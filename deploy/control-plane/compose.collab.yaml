@@ -34,6 +34,8 @@ services:
       - "/app/packages"
       - "--collab-log-file"
       - "/data/collab.jsonl"
+      - "--collab-sync-dir"
+      - "/sync"
       - "--collab-cognito-pool"
       - "us-west-2_GjtcM0PCp"
       - "--collab-cognito-client"
@@ -52,7 +54,10 @@ services:
       - /tmp:size=16m,mode=1777
     volumes:
       - ${HERDR_COLLAB_DATA_DIR:?run deploy.sh}:/data
-    networks: [collab]            # not on the control-plane network: cannot reach postgres/rustfs
+      - ${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/sync:ro   # Cognito keys + members, written by collab-sync.sh
+    # Internal network: no route out at all (keys and group membership arrive as files), and not on
+    # the control-plane network, so it cannot reach postgres/rustfs.
+    networks: [collab]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: 256
@@ -88,7 +93,7 @@ services:
       - ${HERDR_COLLAB_CERT_DIR:?set HERDR_COLLAB_CERT_DIR in the env file}:/etc/acme:ro
     ports:
       - "${HERDR_COLLAB_EDGE_BIND:-127.0.0.1:18444}:8443"
-    networks: [collab]
+    networks: [collab, edge]      # edge: the bridge the published port lives on
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: 128
@@ -98,4 +103,6 @@ services:
       options: {max-size: "10m", max-file: "3"}
 
 networks:
-  collab: {}
+  collab:
+    internal: true
+  edge: {}
