@@ -4,7 +4,42 @@ Status: P1 foundation, **off by default**. Spec package:
 `docs/specs/herdr-collaboration-network-2026-10-21/`; reuse map in `audit.md`;
 decisions in `docs/adr/ADR-0007-collaboration-network-foundation.md`.
 
-## Enable (pilot, two users)
+## Enable with BinView Cognito (recommended)
+Users sign in with the BinView user pool; only members of one Cognito group get in.
+```bash
+herdr-eng control-plane web --host 127.0.0.1 --port 18766 --pg-dsn "$DSN" \
+  --collab-cognito-pool us-west-2_GjtcM0PCp \
+  --collab-cognito-client 6mcn0idau4b5uhtkd1b2g6c9qg \
+  --collab-cognito-group local.dev
+```
+* Install the extra: `pip install 'herdr-engineering[collab]'` (PyJWT + cryptography).
+* Clients send the Cognito **access** token (`Authorization: Bearer …`). ID tokens,
+  other app clients, other pools and users outside the group are 401. The user id is
+  the token's `username`.
+* The group `local.dev` exists (created 2026-10-21; to recreate: `aws cognito-idp create-group
+  --user-pool-id us-west-2_GjtcM0PCp --group-name local.dev --region us-west-2`). Add people with `aws cognito-idp admin-add-user-to-group`.
+* Group removal takes effect within ~60 s when the host has AWS credentials allowing
+  `cognito-idp:AdminListGroupsForUser`; without them it waits for the token to expire
+  (about an hour). Open streams end when the token expires.
+* MFA is a pool setting and the pool currently has MFA **OFF**; enforcing it is a
+  decision for the pool owners, not something this server can do.
+* A person can be invited to a room once they have signed in to this server once
+  (or when the lookup above is available).
+
+## TLS on the tailnet
+Keep the server on loopback and let Tailscale terminate TLS (real Let's Encrypt
+certificate, tailnet-only, no Funnel):
+```bash
+deploy/control-plane/collab-tailscale-serve.sh up 18766 9447   # https://<host>.<tailnet>.ts.net:9447
+deploy/control-plane/collab-tailscale-serve.sh down 9447
+```
+Pick a free HTTPS port: on bender 443 (another service) and IPv4 8443 are taken.
+Because the server binds 127.0.0.1, `--collab-tls-terminated` is not needed. Verified
+live on bender: valid certificate, plain HTTP refused, same-origin POST accepted,
+cross-origin POST 403. Behind the proxy the rate limiter keys on `X-Forwarded-For`
+(trusted only from a loopback peer).
+
+## Enable (pilot, static tokens)
 ```bash
 # user_id -> sha256(token). Generate a token and hash it (give the user the token,
 # store only the digest):  T=$(openssl rand -hex 24); printf %s "$T" | sha256sum

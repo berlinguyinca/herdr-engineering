@@ -88,7 +88,8 @@ class ControlPlaneServer:
     def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
                  port=0, web_root=None, source=None, allow_open=False,
                  rustfs=None, dispatcher=None, github_monitor=None,
-                 collab=None, collab_tls_terminated=False):
+                 collab=None, collab_tls_terminated=False,
+                 collab_require_https=False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -145,12 +146,14 @@ class ControlPlaneServer:
         # HCN (feature-flagged, off by default). Bearer credentials must never
         # cross a network in clear text, so a non-loopback bind needs an explicit
         # assertion that TLS is terminated in front of this server.
-        if collab is not None and not _is_loopback(host) and not collab_tls_terminated:
+        if (collab is not None and not _is_loopback(host)
+                and not (collab_tls_terminated or collab_require_https)):
             raise ValueError(
                 "refusing to enable collaboration on non-loopback address "
                 f"{host!r} without collab_tls_terminated (bearer credentials "
                 "require TLS)")
         self.collab = collab
+        self.collab_require_https = collab_require_https
         if collab is not None:
             collab.hydrate(repo.take_collab_replay())
         self.host = host
@@ -357,8 +360,13 @@ def _make_handler(server):
             service = server.collab
             if service is None:
                 return self._deny(404, "not found")
-            if self._rate_limit():
+            if self._rate_limit(self._proxied_client()):
                 return None
+            # On a shared plain-HTTP listener, refuse collaboration unless the request
+            # came through the TLS-terminating proxy (`tailscale serve` sets this header).
+            if (server.collab_require_https
+                    and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
+                return self._deny(400, "collaboration is only served over https")
             if self.command == "POST":
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
@@ -422,7 +430,14 @@ def _make_handler(server):
                 frames.close()
             return None
 
-        def _rate_limit(self):
+        def _proxied_client(self):
+            """Behind `tailscale serve` every peer is 127.0.0.1; key the limiter on the
+            forwarded address, but only trust it from a loopback peer (the proxy)."""
+            peer = self.client_address[0]
+            fwd = self.headers.get("X-Forwarded-For", "").split(",")[-1].strip()
+            return fwd[:64] if fwd and _is_loopback(peer) else peer
+
+        def _rate_limit(self, key=None):
             # Skip SSE streams: they are long-lived connections, not bursts.
             path = self.path.split("?")[0]
             if self.command == "GET" and path.rstrip("/").endswith("/events/stream"):
@@ -430,7 +445,7 @@ def _make_handler(server):
             limiter = (server._ingest_limiter
                        if self.command == "POST" and path == "/api/v1/ingest"
                        else server._limiter)
-            if limiter.allow(self.client_address[0]):
+            if limiter.allow(key or self.client_address[0]):
                 return None
             self.send_response(429)
             self.send_header("Content-Type", "application/json")

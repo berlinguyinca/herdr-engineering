@@ -65,6 +65,7 @@ def _digest(value: str) -> str:
 class UserAuthenticator(Protocol):
     """Resolves a human bearer token to a user id. Replace with OIDC/MFA later."""
 
+    def verify(self, token: str) -> tuple[str, float | None] | None: ...
     def user_for(self, token: str) -> str | None: ...
     def exists(self, user_id: str) -> bool: ...
 
@@ -75,6 +76,10 @@ class StaticTokenAuthenticator:
     def __init__(self, users: dict[str, str]):
         self._users = dict(users)
         self._disabled: set[str] = set()
+
+    def verify(self, token: str) -> tuple[str, float | None] | None:
+        uid = self.user_for(token)
+        return (uid, None) if uid else None
 
     def user_for(self, token: str) -> str | None:
         digest = _digest(token)
@@ -92,10 +97,11 @@ class StaticTokenAuthenticator:
 
 
 class Principal:
-    __slots__ = ("kind", "id", "owner", "digest")
+    __slots__ = ("kind", "id", "owner", "digest", "exp")
 
-    def __init__(self, kind: str, id: str, owner: str, digest: str | None = None):
-        self.kind, self.id, self.owner, self.digest = kind, id, owner, digest
+    def __init__(self, kind: str, id: str, owner: str, digest: str | None = None,
+                 exp: float | None = None):
+        self.kind, self.id, self.owner, self.digest, self.exp = kind, id, owner, digest, exp
 
     @property
     def key(self) -> str:
@@ -252,11 +258,11 @@ class CollabService:
             self.stats["auth_failures"] += 1
             raise CollabError(401, "unauthorized")
         if scheme == "Bearer":
-            uid = self.auth.user_for(token)
-            if uid is None:
+            got = self.auth.verify(token)
+            if got is None:
                 self.stats["auth_failures"] += 1
                 raise CollabError(401, "unauthorized")
-            return Principal("user", uid, uid)
+            return Principal("user", got[0], got[0], exp=got[1])
         if scheme == "Agent":
             digest = _digest(token)
             with self._lock:
@@ -287,7 +293,9 @@ class CollabService:
         """Re-check a long-lived stream's principal (revocation / expiry / owner loss)."""
         with self._lock:
             if pr.kind == "user":
-                return self.auth.exists(pr.id)
+                # An open stream ends when its token expires (the client re-opens
+                # with a fresh one) or when the user loses access.
+                return (pr.exp is None or self._now() < pr.exp) and self.auth.exists(pr.id)
             a = self._agents.get(pr.id)
             return bool(a and a["status"] == "active" and self._now() < a["expires_at"]
                         and self._by_cred.get(a["cred_digest"]) == pr.id

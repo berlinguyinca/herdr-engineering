@@ -33,6 +33,9 @@ PROJECT="${HERDR_CP_PROJECT:-herdr-control-plane}"
 ENV_FILE="${HERDR_CP_ENV_FILE:-$HOME/.config/herdr-engineering/control-plane.env}"
 HEALTH_URL="${HERDR_CP_HEALTH_URL:-}"
 STATE_DIR="$HOME/.local/state/herdr-engineering/deploys"
+# Collaboration network (HCN) is opt-in per host: it is layered on only when this
+# marker file exists, so an ordinary deploy never switches it on elsewhere.
+COLLAB_MARKER="$HOME/.config/herdr-engineering/collab-enabled"
 
 [ -r "$ENV_FILE" ] || { echo "env file not readable: $ENV_FILE (see generate-env.sh)" >&2; exit 1; }
 [ "$FETCH" = 1 ] && git -C "$REPO" fetch -q origin
@@ -55,13 +58,18 @@ WORK="$(mktemp -d)"
 cleanup() { git -C "$REPO" worktree remove --force "$WORK" >/dev/null 2>&1 || rm -rf "$WORK"; }
 trap cleanup EXIT
 git -C "$REPO" worktree add -q --detach "$WORK" "$FULL"
+COLLAB_FILES=()
+if [ -e "$COLLAB_MARKER" ]; then
+  COLLAB_FILES=(-f "$WORK/deploy/control-plane/compose.collab.yaml")
+  echo "collaboration network: enabled (marker $COLLAB_MARKER)"
+fi
 
 if [ "$DRY" = 1 ]; then
   echo "[dry-run] would build herdr-engineering:$TAG and recreate control-plane-web"
   HERDR_CP_ENV_FILE="$ENV_FILE" HERDR_CP_IMAGE_TAG="$TAG" docker compose --env-file "$ENV_FILE" \
     -p "$PROJECT" -f "$WORK/deploy/control-plane/compose.yaml" \
     -f "$WORK/deploy/control-plane/compose.integrations.yaml" \
-    -f "$WORK/deploy/control-plane/compose.github.yaml" config --quiet
+    -f "$WORK/deploy/control-plane/compose.github.yaml" "${COLLAB_FILES[@]}" config --quiet
   echo "[dry-run] compose configuration is valid"
   exit 0
 fi
@@ -74,7 +82,7 @@ compose() {
     docker compose --env-file "$ENV_FILE" -p "$PROJECT" \
     -f "$WORK/deploy/control-plane/compose.yaml" \
     -f "$WORK/deploy/control-plane/compose.integrations.yaml" \
-    -f "$WORK/deploy/control-plane/compose.github.yaml" \
+    -f "$WORK/deploy/control-plane/compose.github.yaml" "${COLLAB_FILES[@]}" \
     up -d --no-deps --no-build control-plane-web
 }
 
