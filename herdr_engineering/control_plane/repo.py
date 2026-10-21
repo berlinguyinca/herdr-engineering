@@ -109,7 +109,8 @@ def _clean_inventory(raw):
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
-    def __init__(self, *, now=None, sink=None, service_archive_days=7, host_aliases=None):
+    def __init__(self, *, now=None, sink=None, service_archive_days=7, host_aliases=None,
+                 inspector_limits=None):
         """``sink`` is an optional durable writer (e.g. DurableEventSink) called
         with each recorded event so ingestion survives a restart.
 
@@ -138,7 +139,7 @@ class ControlPlaneRepo:
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
         # Agent inspector (spec 0200): bounded per-session detail projection.
-        self.inspector = InspectorStore.from_env(persist=self._persist_inspector)
+        self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
 
     def _persist_inspector(self, ev):

@@ -14,7 +14,6 @@ import hmac
 import http.client
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -69,7 +68,8 @@ class ProxyState:
     """Key and custom-model tables, refreshed from the control plane."""
 
     def __init__(self, control: ControlPlaneClient, upstream: str, upstream_key: str,
-                 refresh_seconds: float = 10.0):
+                 refresh_seconds: float = 10.0, max_inflight: int = DEFAULT_MAX_INFLIGHT,
+                 wait_seconds: float = DEFAULT_QUEUE_WAIT_SECONDS):
         self.control, self.upstream, self.upstream_key = control, upstream.rstrip("/"), upstream_key
         self.refresh_seconds = refresh_seconds
         self._keys: dict[str, dict] = {}
@@ -77,9 +77,7 @@ class ProxyState:
         self._lock = threading.Lock()
         self._slots: dict[str, threading.BoundedSemaphore] = {}
         self._inflight: dict[str, int] = {}
-        self.configure_limits(
-            max_inflight=int(os.environ.get("HERDR_LLM_PROXY_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT)),
-            wait_seconds=float(os.environ.get("HERDR_LLM_PROXY_QUEUE_WAIT_SECONDS", DEFAULT_QUEUE_WAIT_SECONDS)))
+        self.configure_limits(max_inflight=max_inflight, wait_seconds=wait_seconds)
         self._last = 0.0
 
     def refresh(self, force: bool = False) -> None:
@@ -342,8 +340,10 @@ def make_handler(state: ProxyState):
     return Handler
 
 
-def serve(host: str, port: int, control_url: str, upstream: str, upstream_key: str):
-    state = ProxyState(ControlPlaneClient(control_url), upstream, upstream_key)
+def serve(host: str, port: int, control_url: str, upstream: str, upstream_key: str, *,
+          max_inflight: int = DEFAULT_MAX_INFLIGHT, wait_seconds: float = DEFAULT_QUEUE_WAIT_SECONDS):
+    state = ProxyState(ControlPlaneClient(control_url), upstream, upstream_key,
+                       max_inflight=max_inflight, wait_seconds=wait_seconds)
     state.refresh(force=True)
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
     httpd.daemon_threads = True

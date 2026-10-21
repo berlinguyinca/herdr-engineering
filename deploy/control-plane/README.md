@@ -30,26 +30,47 @@ Compose project (spec 0190). It is the structured-state backbone the unified
   host networking for the gateway + CoreDNS), this project only needs the
   services to reach each other, so they resolve by service name.
 
-## Usage
+## Configuration and deploy
+
+All configuration, secrets included, lives in the **central fleet config**,
+`~/.config/herdr-engineering/fleet-config.yaml` (mode 0600, never in git). There is
+no `.env` to write or maintain.
 
 ```bash
-# 1) generate ./.env with randomly generated strong credentials (0600)
-./generate-env.sh
+# 1) once: create the central file (prompts for the public URL, LLM and CI
+#    address/keys and the host list; generates Postgres/MinIO credentials and API keys)
+herdr-eng fleet config init
 
-# 2) bring the stack up (refuses to start until .env provides the secrets)
-docker compose up -d --build
+# 2) deploy: validates the file, renders the variables docker compose itself needs
+#    (image passwords, ports, bind address) into a transient 0600 file that is removed
+#    on exit, builds the image from a git ref, and recreates control-plane-web
+deploy/control-plane/deploy.sh --dry-run        # validate and print the plan
+deploy/control-plane/deploy.sh                  # --ref, --no-fetch, --fleet-config PATH
 
-# verify migrations applied
-docker compose exec postgres psql -U "$HERDR_CP_PG_USER" -d herdr -c '\dt'
-
-# apply migrations / run one pass from the host (needs asyncpg + reachable db)
+# apply migrations / run one pass from the host (needs asyncpg + reachable db; the DSN
+# is control_plane.pg_dsn of the central file)
 herdr-eng control-plane migrate
 herdr-eng control-plane worker --once
 ```
 
-`.env` is generated once, kept on the host, and is git-ignored. Regenerate
-fresh credentials anytime with `rm .env && ./generate-env.sh` (this rotates
-the DB + object-store passwords).
+The web, worker and llm-proxy containers mount the central file read-only at
+`/etc/herdr/fleet-config.yaml` and are started with `--fleet-config`; they read no
+configuration from the environment. Do not run `docker compose up` by hand: the
+substitution variables only exist while `deploy.sh` runs. Compose refuses to start
+without them, and DB/object-store ports stay loopback-only.
+
+Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
+`host_aliases`, `api_keys`, `rustfs_*`/`minio_*`, `self_host`, `web_port`,
+`ci_actions` (true enables CI retry/cancel), `inspector_limits` (`max_events`,
+`max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
+`sensitive_role`, `store_reasoning`) and `llm_proxy` (`max_inflight`,
+`queue_wait_seconds`). `control_plane.compose` is the mapping `deploy.sh` renders
+for compose itself (e.g. `HERDR_CP_WEB_BIND`, `HERDR_CP_WEB_PUBLIC_PORT`,
+`HERDR_CP_PG_PORT`, `GATEWAY_TAILNET_IP`).
+
+Note: the file is bind-mounted, so an edit that replaces it (every `fleet join` or
+`fleet config token` does) is visible to the containers only after the next
+`deploy.sh` run.
 
 ## Web UI + API (`control-plane-web` service)
 
@@ -67,19 +88,20 @@ open http://127.0.0.1:8080/
 **Auth-free within dev.lan.** The Tailnet is the trust boundary: all machines
 belong to each other and are encrypted end-to-end (WireGuard), so the web UI
 needs no per-user API keys. The host port is bound to the Tailnet interface via
-`HERDR_CP_WEB_BIND` in `.env` (default `127.0.0.1` = loopback-only), so it is
+`control_plane.compose.HERDR_CP_WEB_BIND` in the central file (default `127.0.0.1` = loopback-only), so it is
 reachable from any dev.lan machine but **not** from a plain LAN / `0.0.0.0`:
 
 ```bash
-# expose on dev.lan: set HERDR_CP_WEB_BIND to this machine's Tailscale IP
-HERDR_CP_WEB_BIND="$(tailscale ip -4)" ./generate-env.sh
-docker compose up -d --build
+# expose on dev.lan: answer "web bind address" with this machine's Tailscale IP
+# (`tailscale ip -4`) in `herdr-eng fleet config init`, or set
+# control_plane.compose.HERDR_CP_WEB_BIND in the central file, then
+./deploy.sh
 # any dev.lan machine:
 curl http://dev.lan:8080/api/v1/health          # 200
 ```
 
 The web container runs with `--allow-open` (explicit acknowledgment that the
-Tailnet replaces API keys). **Do not** change `HERDR_CP_WEB_BIND` to `0.0.0.0`
+Tailnet replaces API keys). **Do not** change the web bind address to `0.0.0.0`
 or drop the Tailnet-IP mapping — that would expose an unauthenticated admin API
 beyond the tailnet.
 
@@ -105,9 +127,10 @@ herdr-eng control-plane worker             # run the bounded background worker
 herdr-eng control-plane worker --once      # run a single pass and exit
 ```
 
-On the host the DSN defaults to `postgresql://herdr:herdr@127.0.0.1:5432/herdr`
+On the host without a central file the DSN defaults to the local development database `postgresql://herdr@127.0.0.1:5432/herdr` (password from `PGPASSWORD` or `~/.pgpass`)
 (port 5432 is exposed by the compose project). Override via the
-`control_plane:` block in the config or `HERDR_ENGINEERING_CONFIG`.
+`control_plane:` block in the config or `HERDR_ENGINEERING_CONFIG`; with a central
+file its `control_plane.pg_dsn` wins.
 
 ## LLM keys for sessions
 

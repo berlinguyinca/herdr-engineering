@@ -5,6 +5,20 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Central fleet config: deploy and servers
+- `deploy/control-plane/deploy.sh` renders the compose variables from the central
+  fleet file into a transient 0600 env file (removed on exit, even on failure),
+  mounts the file read-only at `/etc/herdr/fleet-config.yaml` and refuses to run
+  when it is missing or invalid. `generate-env.sh`, `.env.example` and the
+  Woodpecker/GitHub token-file compose overrides are removed.
+- The control-plane web, worker and llm-proxy read configuration only from the
+  fleet file (`--fleet-config`): Postgres DSN, host aliases, RustFS/MinIO,
+  `control_plane.ci_actions`, `control_plane.inspector_limits`,
+  `control_plane.llm_proxy`, `llm.upstream_key`. The `HERDR_CP_*`,
+  `HERDR_INSPECTOR_*`, `HERDR_LLM_PROXY_*`, `HERDR_ENGINEERING_CI_ACTIONS` and
+  `FABRIC_LLM_UPSTREAM_KEY(_FILE)` variables no longer have any effect.
+- `deploy-fleet-agents.sh` copies no env or secrets and skips hosts without `host.json`.
+
 ### Collaboration network foundation (HCN P1, flag off by default)
 - Added `control_plane/collab.py` and `/api/v1/collab/*`: per-user bearer auth,
   two-user rooms with owner/contributor/viewer/guest roles, device-bound agent

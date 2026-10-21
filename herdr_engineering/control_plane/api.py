@@ -96,7 +96,7 @@ class ControlPlaneServer:
                  port=0, web_root=None, source=None, allow_open=False,
                  rustfs=None, dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
-                 collab_require_https=False, fleet_config=None):
+                 collab_require_https=False, fleet_config=None, ci_actions=False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -112,7 +112,8 @@ class ControlPlaneServer:
         self.repo = repo
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
-                                    repo.record_event("ci_pipeline", key, event, row))
+                                    repo.record_event("ci_pipeline", key, event, row),
+                                    actions_enabled=ci_actions)
         if github_monitor is None:
             from ..github import GitHubMonitor
             github_monitor = GitHubMonitor()

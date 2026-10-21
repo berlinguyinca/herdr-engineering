@@ -191,6 +191,8 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     web_bind = ask("web_bind", "web bind address", default="127.0.0.1")
     web_port = ask("web_port", "web public port", default="80")
     pg_port = str(a.get("pg_port") or "5432")
+    # fabric-gateway (host network) binds this address; compose requires it to be set.
+    gateway_ip = str(a.get("gateway_tailnet_ip") or "127.0.0.1")
     hosts = _collect_hosts(a, prompt)
 
     pg_user, pg_pass = f"herdr_{secrets.token_hex(4)}", secrets.token_hex(16)
@@ -210,6 +212,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
                 "api_keys": {api_key: "operator", ingest_key: "ingest", agent_key: "agent"},
                 "rustfs_endpoint": "http://rustfs:9000",
                 "rustfs_bucket": bucket,
+                "ci_actions": False,  # true lets operators retry/cancel CI pipelines from the UI
                 "minio_user": minio_user,
                 "minio_password": minio_pass,
                 "compose": {
@@ -220,6 +223,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
                     "HERDR_CP_WEB_BIND": web_bind,
                     "HERDR_CP_WEB_PUBLIC_PORT": web_port,
                     "HERDR_CP_PG_PORT": pg_port,
+                    "GATEWAY_TAILNET_IP": gateway_ip,
                     "HERDR_CP_PG_DSN": dsn,
                     "HERDR_CP_RUSTFS_BUCKET": bucket,
                     "HERDR_CP_HOST_ALIASES": str(a.get("host_aliases") or ""),
