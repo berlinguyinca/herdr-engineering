@@ -121,4 +121,12 @@ def test_installer_renders_explicit_checkout_and_interpreter_without_enabling(tm
              str(unit_dir / "herdr-eng-fleet-update.timer")],
             capture_output=True, text=True,
         )
-        assert validation.returncode == 0, validation.stderr
+        # Environment-gated: `systemd-analyze --user` needs a user manager it
+        # can initialize (bus/runtime dir). On hosts where that is unavailable
+        # it fails with "Failed to initialize manager" / "Failed to lookup
+        # RuntimeDirectory" even for valid units -- skip the verification
+        # there; the rendered-unit assertions above still run.
+        stderr = validation.stderr or ""
+        if "Failed to initialize manager" in stderr or "Failed to lookup RuntimeDirectory" in stderr:
+            pytest.skip("user systemd manager unavailable for systemd-analyze verify")
+        assert validation.returncode == 0, stderr
