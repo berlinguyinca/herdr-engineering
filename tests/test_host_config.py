@@ -10,6 +10,9 @@ from herdr_engineering.host_config import (
     HostConfigUnavailable,
     load_host_config,
 )
+from herdr_engineering.host_config import (
+    host_config as _REAL_HOST_CONFIG,  # noqa: E402  (before the conftest stub)
+)
 
 TOKEN = "placeholder-value-one"
 VALUES = {"ingest": {"api_key": "placeholder-ing-upper"}, "ci": {"url": "https://ci.test", "token": "placeholder-ci-upper"}}
@@ -149,3 +152,114 @@ def test_memoised_accessor_loads_once(tmp_path, monkeypatch):
     assert hc.host_config() is hc.host_config()
     assert len(calls) == 1
     hc.reset_host_config()
+
+
+def test_redirect_is_not_followed_and_keeps_cache(tmp_path):
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    hits = []
+
+    class Target(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            hits.append(dict(self.headers))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    target = HTTPServer(("127.0.0.1", 0), Target)
+
+    class Redirector(BaseHTTPRequestHandler):
+        def _go(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_port}/elsewhere")
+            self.end_headers()
+        do_GET = do_POST = _go  # noqa: N815
+
+        def log_message(self, *a):
+            pass
+
+    redir = HTTPServer(("127.0.0.1", 0), Redirector)
+    for s in (target, redir):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    try:
+        home = _home(tmp_path)
+        load_host_config(home=home, fetch=Fetch())  # populate the cache
+        (home / HOST_JSON_REL).write_text(json.dumps({
+            "control_plane_url": f"http://127.0.0.1:{redir.server_port}",
+            "host_id": "h1", "token": TOKEN}))
+        cfg = load_host_config(home=home)  # real default fetch
+        assert cfg.revision == "r1"  # fell back to the cache
+        assert (home / CACHE_REL).exists()  # a 3xx is not a revocation
+        assert hits == []  # the redirect target was never contacted
+        (home / CACHE_REL).unlink()
+        with pytest.raises(HostConfigUnavailable) as e:
+            load_host_config(home=home)
+        assert TOKEN not in str(e.value) and hits == []
+    finally:
+        redir.shutdown()
+        target.shutdown()
+
+
+def test_dev_agent_exits_2_without_host_config(capsys):
+    from herdr_engineering.cli import main as cli_main
+    assert cli_main(["devfabric", "agent", "--once"]) == 2
+    err = capsys.readouterr().err
+    assert "no host configuration" in err and "Traceback" not in err
+
+
+def test_control_plane_source_serves_fetched_or_cached_values(tmp_path, monkeypatch):
+    """Providers read ci/github/fabric/llm from a real HostConfig installed as the
+    source (home= + fetch= injection, not the conftest stub)."""
+    from herdr_engineering import host_config as hc
+    from herdr_engineering.ci import WoodpeckerProvider
+    from herdr_engineering.fabric import gateway_url_from_config, read_fabric_token
+    from herdr_engineering.github import GitHubProvider
+
+    values = {"ci": {"url": "https://ci.src.test", "token": "placeholder-ci-short"},
+              "github": {"token": "placeholder-gh-short"},
+              "fabric": {"url": "http://fab.src.test:29999", "token": "placeholder-fab-short"},
+              "llm": {"upstream_url": "https://llm.src.test"}}
+    home = _home(tmp_path)
+    load_host_config(home=home, fetch=Fetch(get=(200, {"revision": "r9", "values": values})))
+    # second load comes from the cache (control plane unreachable)
+    cfg = load_host_config(home=home, fetch=Fetch(exc=OSError("down")))
+    monkeypatch.setattr(hc, "host_config", _REAL_HOST_CONFIG)
+    hc.install_source(lambda: cfg)
+    try:
+        p = WoodpeckerProvider()
+        assert (p.base_url, p.token) == ("https://ci.src.test", "placeholder-ci-short")
+        assert GitHubProvider().available
+        assert gateway_url_from_config({}) == "http://fab.src.test:29999"
+        assert read_fabric_token() == "placeholder-fab-short"
+        assert hc.host_value("llm.upstream_url") == "https://llm.src.test"
+    finally:
+        hc.reset_host_config()
+
+
+def test_install_fleet_host_config_reads_the_fleet_file(tmp_path, monkeypatch):
+    """The control-plane web process answers host_config() from the fleet file."""
+    from herdr_engineering import fleet_config_cli as fcc
+    from herdr_engineering import host_config as hc
+    from herdr_engineering.cli import _install_fleet_host_config
+    from herdr_engineering.fleet_config import FleetConfigStore
+    from herdr_engineering.github import GitHubProvider
+
+    path = fcc.init_config(tmp_path / "fleet.yaml", {
+        "public_url": "https://cp.test", "llm_upstream_url": "https://llm.test",
+        "llm_upstream_key": "k", "ci_url": "https://ci.test", "ci_token": "ci-t",
+        "github_token": "gh-t", "fabric_url": "http://fab:29999", "hosts": {"h": ["ci"]}},
+        prompt=lambda *_: "", secret_prompt=lambda *_: "")
+    monkeypatch.setattr(hc, "host_config", _REAL_HOST_CONFIG)
+    _install_fleet_host_config(FleetConfigStore(path))
+    try:
+        cfg = hc.host_config()
+        assert cfg.get("ci.token") == "ci-t" and cfg.get("fabric.url") == "http://fab:29999"
+        assert cfg.get("github.token") == "gh-t" and cfg.get("llm.upstream_url") == "https://llm.test"
+        assert cfg.get("agent.api_key") and cfg.get("ingest.api_key")
+        assert GitHubProvider().available
+    finally:
+        hc.reset_host_config()

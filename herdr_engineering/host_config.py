@@ -10,8 +10,8 @@ Neither the token nor any configuration value is ever put in an exception
 message or log line.
 
 Dotted-key vocabulary (shared with the JS plugin and pi-engineering):
-ingest.api_key, ci.url, ci.token, llm.upstream_url, llm.upstream_key,
-inspector.enabled, inspector.reasoning, host.aliases, github.token,
+ingest.api_key, agent.api_key, ci.url, ci.token, llm.upstream_url,
+llm.upstream_key, inspector.enabled, inspector.reasoning, github.token,
 fabric.url, fabric.token.
 """
 from __future__ import annotations
@@ -61,6 +61,16 @@ class HostConfig:
         return f"HostConfig(host_id={self.host_id!r}, revision={self.revision!r})"
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the token must go only to host.json's URL."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
 def _default_fetch(url: str, *, token: str, timeout: float, method: str = "GET",
                    body: dict | None = None) -> tuple[int, Any]:
     """(status, parsed JSON or None). HTTP errors return their status; network
@@ -71,7 +81,7 @@ def _default_fetch(url: str, *, token: str, timeout: float, method: str = "GET",
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
             raw = resp.read(4 * 1024 * 1024)
             status = resp.status
     except urllib.error.HTTPError as exc:

@@ -534,3 +534,47 @@ def test_fleet_config_routes_404_without_store(server):
     c, _ = server
     assert c.get("/api/v1/fleet/config")[0] == 404
     assert c.get("/api/v1/fleet/config/status")[0] == 404
+
+
+@pytest.fixture()
+def keyed_server(acknowledged_sink):
+    svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink),
+                             api_keys={"opkey": "operator", "ingkey": "ingest", "agentkey": "agent"})
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    yield svr.port
+    svr.shutdown()
+
+
+def _post_as(port, path, body, key):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json", "X-API-Key": key})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def test_agent_role_may_post_ingest_and_host_tool_routes(keyed_server):
+    port = keyed_server
+    ev = {"entity_type": "host", "entity_id": "bender", "event_type": "host.registered",
+          "payload": {"host_name": "bender", "tailnet_ip": "100.104.39.6"}}
+    assert _post_as(port, "/api/v1/ingest", ev, "agentkey") == 200
+    # reaches the handler (not 401/403): the body is invalid or the entity absent
+    for path in ("/api/v1/llm/keys", "/api/v1/llm/keys/k1/revoke", "/api/v1/reviews",
+                 "/api/v1/reviews/r1/result", "/api/v1/reviews/r1/heartbeat",
+                 "/api/v1/reviews/r1/failure"):
+        assert _post_as(port, path, {}, "agentkey") not in (401, 403), path
+
+
+def test_agent_role_is_refused_everywhere_else(keyed_server):
+    port = keyed_server
+    for path in ("/api/v1/services/retire", "/api/v1/llm/models", "/api/v1/llm/models/m/delete",
+                 "/api/v1/sessions/s1/messages", "/api/v1/sessions/s1/actions",
+                 "/api/v1/hosts/h1/telemetry", "/api/v1/reviews/r1/other"):
+        assert _post_as(port, path, {}, "agentkey") == 403, path
+    # ingest stays ingest-only
+    assert _post_as(port, "/api/v1/llm/keys", {}, "ingkey") == 403
+    assert _post_as(port, "/api/v1/services/retire", {}, "opkey") != 403

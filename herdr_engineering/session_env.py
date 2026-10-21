@@ -49,7 +49,7 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 def _control_plane_token() -> str | None:
     from .host_config import host_value
-    tok = host_value("ingest.api_key")
+    tok = host_value("agent.api_key")
     if tok:
         return str(tok).strip()
     try:

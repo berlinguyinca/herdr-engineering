@@ -661,7 +661,6 @@ def _cmd_machines(args) -> int:
 
 def _cmd_fleet_join(args) -> int:
     from pathlib import Path
-
     from .fleet import fleet_join
     report = fleet_join(
         ssh_target=args.ssh_target,
@@ -693,7 +692,6 @@ def _cmd_fleet_join(args) -> int:
 
 def _cmd_fleet_config(args) -> int:
     from pathlib import Path
-
     from . import fleet_config_cli as fcc
     from .fleet_config import FleetConfigError, load_fleet_config
     cmd = args.fleet_config_command
@@ -781,7 +779,6 @@ def _cmd_fleet_rollout(args) -> int:
 
 def _cmd_fleet_drift(args) -> int:
     import urllib.request
-
     from .fleet import plan_version_sync
     from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
     try:
@@ -1674,10 +1671,14 @@ def _cmd_dev_agent(args) -> int:
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
     from .fabric_agent import AgentConfig, FabricAgent
-    from .host_config import control_plane_url_or
+    from .host_config import HostConfigUnavailable, control_plane_url_or, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        host_config()
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
     try:
         cfg = load_config()
     except InvalidError as exc:
@@ -2184,7 +2185,7 @@ def _install_fleet_host_config(store) -> None:
     def source():
         cfg = store.current()
         values = {}
-        for name in ("ingest", "github", "ci", "llm", "fabric", "inspector", "host"):
+        for name in ("ingest", "agent", "github", "ci", "llm", "fabric", "inspector"):
             try:
                 values[name] = cfg.section(name)
             except FleetConfigError:
