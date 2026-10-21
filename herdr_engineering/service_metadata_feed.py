@@ -10,6 +10,7 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import OrderedDict, defaultdict
 from datetime import UTC, datetime
@@ -44,6 +45,13 @@ class MetadataClient:
         self.url = base_url.rstrip("/")
         self.key = api_key
         self.http = urllib.request.build_opener(_NoRedirect())
+        self.auth_rejected = False
+
+    def retarget(self, url, api_key):
+        if url:
+            self.url = url.rstrip("/")
+        if api_key is not None:
+            self.key = api_key
 
     def request(self, route, body=None):
         # This observer has no gateway client and no lease mutation endpoints.
@@ -59,8 +67,13 @@ class MetadataClient:
         if self.key:
             headers["X-API-Key"] = self.key
         request = urllib.request.Request(self.url + route, data=raw, headers=headers)
-        with self.http.open(request, timeout=3) as response:
-            content = response.read(MAX_BYTES + 1)
+        try:
+            with self.http.open(request, timeout=3) as response:
+                content = response.read(MAX_BYTES + 1)
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                self.auth_rejected = True
+            raise
         if len(content) > MAX_BYTES:
             raise ValueError("control-plane reply too large")
         result = json.loads(content)
@@ -445,6 +458,9 @@ def main(argv=None):
                                    host_id=args.host_id or cfg.host_id, state_file=args.state_file)
     except (OSError, ValueError):
         parser.exit(1, "Service metadata observer configuration is unavailable or invalid.\n")
+    refresher = None
+    if args.loop is not None and not args.dry_run:
+        refresher = _hc.ConfigRefresher(cfg)
     stop = threading.Event()
     previous = {}
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -455,6 +471,12 @@ def main(argv=None):
             print(json.dumps(summary), flush=True)
             if args.loop is None:
                 return 1 if summary["errors"] else 0
+            if refresher is not None:
+                try:
+                    refresher.sync(feed.client, follow_url=not args.control_plane,
+                                   follow_key=not args.api_key_file)
+                except HostConfigUnavailable as exc:
+                    return exit_unavailable(exc)
             stop.wait(args.loop)
     finally:
         for sig, handler in previous.items():
