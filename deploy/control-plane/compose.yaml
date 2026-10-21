@@ -47,7 +47,7 @@ services:
     restart: unless-stopped
     # SECURITY: credentials come from ./.env (see ./generate-env.sh).
     # Compose refuses to start until HERDR_CP_PG_USER/PASSWORD are present.
-    env_file: .env
+    env_file: ${HERDR_CP_ENV_FILE:-.env}
     environment:
       POSTGRES_USER: "${HERDR_CP_PG_USER}"
       POSTGRES_PASSWORD: "${HERDR_CP_PG_PASSWORD}"
@@ -76,7 +76,7 @@ services:
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
     # SECURITY: credentials come from ./.env (see ./generate-env.sh).
-    env_file: .env
+    env_file: ${HERDR_CP_ENV_FILE:-.env}
     environment:
       MINIO_ROOT_USER: "${HERDR_CP_MINIO_USER}"
       MINIO_ROOT_PASSWORD: "${HERDR_CP_MINIO_PASSWORD}"
@@ -100,7 +100,7 @@ services:
       # `docker compose build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`.
       args:
         GIT_COMMIT: ${HERDR_CP_GIT_COMMIT:-dev}
-    image: herdr-engineering:0.1.0
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-0.1.0}
     container_name: herdr-cp-web
     restart: unless-stopped
     depends_on:
@@ -111,7 +111,7 @@ services:
     # to the Tailnet interface (HERDR_CP_WEB_BIND), so only Tailnet clients can
     # reach it — never a plain LAN/`0.0.0.0` exposure. `--allow-open` is the
     # explicit acknowledgment that the Tailnet boundary replaces API keys.
-    env_file: .env
+    env_file: ${HERDR_CP_ENV_FILE:-.env}
     environment:
       HERDR_CP_WEB_HOST: "0.0.0.0"
       # alias=canonical,... folds one machine reporting under two names into one host
@@ -155,7 +155,7 @@ services:
         condition: service_healthy
       rustfs:
         condition: service_healthy
-    env_file: .env
+    env_file: ${HERDR_CP_ENV_FILE:-.env}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       # Bundle the SQL migrations into the worker image so it can apply them
