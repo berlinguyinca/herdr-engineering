@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudePlugins, piPackages, toolVersions, createInventoryReporter, hostLoad, createLoadReporter } from "./inventory.js";
+import { probePath, claudePlugins, piPackages, toolVersions, createInventoryReporter, hostLoad, createLoadReporter } from "./inventory.js";
 
 function fakeHome() {
   const home = mkdtempSync(join(tmpdir(), "inv-"));
@@ -57,4 +57,12 @@ test("load reporter heartbeats at most every ttl", () => {
   assert.equal(r("h").payload.cpu, 1);
   t = 50; assert.equal(r("h"), null);
   t = 150; assert.ok(r("h"));
+});
+
+test("probe PATH adds user bin dirs, newest nvm node first, without dropping the service PATH", () => {
+  const p = probePath({ PATH: "/usr/bin:/bin" }, "/home/u", () => ["v20.20.2", "v22.23.2", "v20.9.0", "notes"]).split(":");
+  assert.deepEqual(p.slice(0, 4), ["/home/u/.local/bin", "/home/u/.nvm/versions/node/v22.23.2/bin",
+    "/home/u/.nvm/versions/node/v20.20.2/bin", "/home/u/.nvm/versions/node/v20.9.0/bin"]);
+  assert.ok(p.includes("/usr/bin") && p.includes("/bin"));
+  assert.equal(new Set(p).size, p.length);
 });

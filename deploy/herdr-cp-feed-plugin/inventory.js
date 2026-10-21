@@ -2,16 +2,29 @@
 // the dashboard can show fleet drift. Everything is best-effort: a missing tool
 // is simply absent from the report, never an error.
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { homedir, loadavg, cpus, totalmem, freemem } from "node:os";
 import { statfsSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const VERSION = /\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?/;
 
-function run(binary, args, exec = execFile) {
+// Service managers hand us a minimal PATH, but agent CLIs often live in user
+// directories (npm global bins under nvm, ~/.local/bin, Homebrew). Search those
+// too, newest nvm node first so a CLI's `#!/usr/bin/env node` finds a modern one.
+export function probePath(env = process.env, home = homedir(), list = readdirSync) {
+  const nvm = join(home, ".nvm", "versions", "node");
+  let versions = [];
+  try { versions = list(nvm); } catch { /* no nvm */ }
+  const newest = versions.filter(v => /^v\d+\.\d+\.\d+$/.test(v))
+    .sort((a, b) => b.localeCompare(a, undefined, { numeric: true })).map(v => join(nvm, v, "bin"));
+  const dirs = [join(home, ".local", "bin"), ...newest, "/opt/homebrew/bin", "/usr/local/bin"];
+  return [...new Set([...dirs, ...String(env.PATH ?? "").split(":").filter(Boolean)])].join(":");
+}
+
+function run(binary, args, exec = execFile, env) {
   return new Promise(resolve => {
-    exec(binary, args, { timeout: 5000, maxBuffer: 64 * 1024 }, (error, stdout) => {
+    exec(binary, args, { timeout: 5000, maxBuffer: 64 * 1024, ...(env ? { env } : {}) }, (error, stdout) => {
       resolve(error ? null : String(stdout));
     });
   });
@@ -27,8 +40,10 @@ export async function toolVersions({ exec = execFile } = {}) {
     node: ["node", ["--version"]],
   };
   const out = {};
+  const env = { ...process.env, PATH: probePath() };
   await Promise.all(Object.entries(probes).map(async ([name, [bin, args]]) => {
-    const text = await run(bin, args, exec);
+    // node is reported as the interpreter this service itself runs under.
+    const text = await run(bin, args, exec, name === "node" ? undefined : env);
     const match = text && text.match(VERSION);
     if (match) out[name] = match[0];
   }));
