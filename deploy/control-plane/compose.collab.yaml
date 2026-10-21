@@ -44,17 +44,20 @@ services:
     restart: unless-stopped
     depends_on:
       - control-plane-web
+    # Runs as the owner of the certbot files (0600): with all capabilities dropped,
+    # root could not read them.
+    user: "${HERDR_COLLAB_CERT_UID:-1000}:${HERDR_COLLAB_CERT_UID:-1000}"
     read_only: true
     tmpfs:
-      - /run
-      - /var/cache/nginx
+      - /run:uid=${HERDR_COLLAB_CERT_UID:-1000}
+      - /var/cache/nginx:uid=${HERDR_COLLAB_CERT_UID:-1000}
     volumes:
-      - ./collab-edge/nginx.conf:/etc/nginx/nginx.conf:ro
+      # deploy.sh installs this to a stable path (the build worktree is temporary)
+      - ${HERDR_COLLAB_EDGE_CONF:?run deploy.sh}:/etc/nginx/nginx.conf:ro
       - ${HERDR_COLLAB_CERT_DIR:?set HERDR_COLLAB_CERT_DIR in the env file}:/etc/acme:ro
     ports:
       - "127.0.0.1:18444:8443"
     cap_drop: [ALL]
-    cap_add: [NET_BIND_SERVICE, CHOWN, SETUID, SETGID]
     security_opt: ["no-new-privileges:true"]
     logging:
       driver: json-file
