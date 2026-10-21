@@ -46,7 +46,8 @@ echo "rolling $REF = $SHA to hosts in $HOSTS_FILE"
 
 run() { # run <target> <command...>   ("local" runs here)
   local target="$1"; shift
-  if [ "$target" = local ]; then bash -c "$*"; else ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" "$*"; fi
+  # -n / </dev/null: nothing here may read the hosts file the outer loop is iterating.
+  if [ "$target" = local ]; then bash -c "$*" </dev/null; else ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" "$*"; fi
 }
 put() { # put <target> <src> <dest-dir>
   if [ "$1" = local ]; then cp "$2" "$3/"; else scp -q -o BatchMode=yes "$2" "$1:$3/"; fi
