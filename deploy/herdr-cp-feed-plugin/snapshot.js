@@ -112,7 +112,11 @@ export function createSnapshotPublisher({ fetcher = fetch, now = Date.now, maxEn
           redirect: "error", signal: AbortSignal.timeout(2000),
         });
         await response.body?.cancel();
-        if (!response.ok) return { posted, unchanged, errors: 1 };
+        if (!response.ok) {
+          const failure = { posted, unchanged, errors: 1 };
+          if (response.status === 401 || response.status === 403) failure.authRejected = true;
+          return failure;
+        }
         sent.delete(envelope.entity_id);
         sent.set(envelope.entity_id, { body, at: now() });
         while (sent.size > Math.max(1, maxEntries)) sent.delete(sent.keys().next().value);
@@ -128,34 +132,41 @@ export async function publishSnapshot(target, envelopes, fetcher = fetch) {
   return createSnapshotPublisher({ fetcher })(target, envelopes);
 }
 
-export async function main(args = process.argv.slice(2), env = process.env) {
+export const CONFIG_REFRESH_MS = 300000;
+
+// Returns the process exit code. Deps are injectable for tests.
+export async function main(args = process.argv.slice(2), env = process.env, deps = {}) {
+  const { loadConfig = loadHostConfig, collect = collectSnapshot, fetcher = fetch, now = Date.now,
+    sleep = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {}),
+    refreshMs = CONFIG_REFRESH_MS, inventoryEnvelope = createInventoryReporter(),
+    loadEnvelope = createLoadReporter() } = deps;
   const dryRun = args.includes("--dry-run");
   const loopIndex = args.indexOf("--loop");
   const interval = loopIndex < 0 ? null : Number(args[loopIndex + 1]);
   if (loopIndex >= 0 && (!Number.isFinite(interval) || interval < 30 || interval > 3600)) {
     throw new Error("--loop requires an interval between 30 and 3600 seconds");
   }
-  let hostConfig = null;
-  if (!dryRun) {
-    try { hostConfig = await loadHostConfig(); }
+  const toTarget = cfg => ({ url: cfg?.url, apiKey: cfg?.apiKey });
+  let target = toTarget(null);
+  let loadedAt = now();
+  // A refresh failure that is not transient (revoked token) ends the process.
+  const refresh = async () => {
+    try { target = toTarget(await loadConfig()); loadedAt = now(); return true; }
     catch (error) {
       if (!(error instanceof HostConfigUnavailable)) throw error;
       process.stderr.write(`${error.message}\n`);
-      process.exitCode = 2;
-      return;
+      return false;
     }
-  }
-  const target = { url: hostConfig?.url, apiKey: hostConfig?.apiKey };
+  };
+  if (!dryRun && !(await refresh())) return 2;
   const controller = new AbortController();
-  const publish = createSnapshotPublisher();
-  const inventoryEnvelope = createInventoryReporter();
-  const loadEnvelope = createLoadReporter();
+  const publish = createSnapshotPublisher({ fetcher, now });
   const stop = () => controller.abort();
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
     do {
-      const result = await collectSnapshot(env);
+      const result = await collect(env);
       // Fleet version inventory rides the same publisher; it is throttled by TTL.
       const inventory = await inventoryEnvelope(hostIdentity(env)).catch(() => null);
       if (inventory) result.envelopes.push(inventory);
@@ -166,14 +177,19 @@ export async function main(args = process.argv.slice(2), env = process.env) {
         unchanged: delivery.unchanged,
         errors: result.summary.errors + delivery.errors, dry_run: dryRun }) + "\n");
       if (interval === null || controller.signal.aborted) break;
-      await delay(interval * 1000, undefined, { signal: controller.signal }).catch(() => {});
+      if (!dryRun && (delivery.authRejected || now() - loadedAt >= refreshMs)) {
+        if (!(await refresh())) return 2;
+      }
+      await sleep(interval * 1000, controller.signal);
     } while (!controller.signal.aborted);
   } finally {
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
   }
+  return 0;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
-  main().catch(() => { process.stderr.write("Native session snapshot collector failed.\n"); process.exitCode = 1; });
+  main().then(code => { process.exitCode = code; })
+    .catch(() => { process.stderr.write("Native session snapshot collector failed.\n"); process.exitCode = 1; });
 }

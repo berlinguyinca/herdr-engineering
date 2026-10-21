@@ -143,3 +143,23 @@ test("3xx is not followed and keeps the cache (real server)", async () => {
     cp.close(); target.close();
   }
 });
+
+test("get(): missing section, null value and non-object node fall back", async () => {
+  const home = makeHome();
+  const body = { revision: "r1", values: { ingest: { api_key: VALUE, nothing: null }, scalar: "text" } };
+  const cfg = await loadHostConfig({ home, fetch: async () => ok(body) });
+  assert.equal(cfg.get("absent.key", "fb"), "fb");
+  assert.equal(cfg.get("ingest.nothing", "fb"), "fb");
+  assert.equal(cfg.get("scalar.key", "fb"), "fb");
+  assert.equal(cfg.get("nodot", "fb"), "fb");
+  assert.equal(cfg.get("ingest.api_key", "fb"), VALUE);
+});
+
+test("array values are malformed and fall back to the cache", async () => {
+  const home = makeHome();
+  await loadHostConfig({ home, fetch: recorder(() => ok(GOOD)).fetch });
+  const cfg = await loadHostConfig({ home, fetch: async () => ok({ revision: "r2", values: [1, 2] }) });
+  assert.equal(cfg.revision, "r1");
+  const empty = makeHome();
+  await assert.rejects(loadHostConfig({ home: empty, fetch: async () => ok({ revision: "r2", values: [] }) }), HostConfigUnavailable);
+});
