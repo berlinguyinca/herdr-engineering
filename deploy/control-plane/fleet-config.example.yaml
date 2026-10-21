@@ -1,0 +1,47 @@
+# Central fleet configuration. Copy to ~/.config/herdr-engineering/fleet-config.yaml
+# on the control-plane host and chmod 600. NEVER commit the real file.
+# Every REDACTED value is a placeholder. The revision is computed, not authored.
+version: 1
+
+sections:
+  # Read only by the control-plane web process; never served to a host.
+  control_plane:
+    roles: [control-plane]          # must not be "all"
+    values:
+      pg_dsn: "postgresql://REDACTED:REDACTED@postgres:5432/REDACTED"
+      host_aliases: {}              # e.g. {bender: "bender.example.test"}
+      api_keys: ["REDACTED"]
+      rustfs_endpoint: "http://rustfs:9000"
+      rustfs_access_key: "REDACTED"
+      rustfs_secret_key: "REDACTED"
+      rustfs_bucket: "REDACTED"
+
+  llm:
+    roles: [builder]
+    values:
+      upstream_url: "https://llm.example.test"
+      upstream_key: "REDACTED"
+
+  ci:
+    roles: [builder, ci]
+    values:
+      url: "https://ci.example.test"
+      token: "REDACTED"
+
+  inspector:
+    roles: [all]
+    values:
+      enabled: true
+      reasoning: false
+
+hosts:
+  # token_sha256 is the sha256 hex of the host's random token (the token itself
+  # lives only in that host's host.json). Each hash must be unique.
+  bender:
+    roles: [builder]
+    token_sha256: "REDACTED_64_HEX_CHARS"
+    overrides:                      # optional, deep-merged over a section
+      inspector: {reasoning: true}
+  mac:
+    roles: []                       # empty roles: only "all" sections
+    token_sha256: "REDACTED_64_HEX_CHARS"
