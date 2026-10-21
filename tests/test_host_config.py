@@ -263,3 +263,197 @@ def test_install_fleet_host_config_reads_the_fleet_file(tmp_path, monkeypatch):
         assert GitHubProvider().available
     finally:
         hc.reset_host_config()
+
+
+# ---------------------------------------------------------------- refresher
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+class FakeClient:
+    def __init__(self):
+        self.url, self.key, self.auth_rejected = "http://old", "old-key", False
+
+    def retarget(self, url, api_key):
+        if url:
+            self.url = url
+        if api_key is not None:
+            self.key = api_key
+
+
+def _cfg(key, source="fetch", url="http://cp"):
+    return HostConfig(url, "h1", "r", {"ingest": {"api_key": key}}, source)
+
+
+def _refresher(loader, clock=None, err=None, initial=None):
+    from herdr_engineering.host_config import ConfigRefresher
+    return ConfigRefresher(initial or _cfg("old-key"), loader=loader, interval=300,
+                           clock=clock or Clock(), err=err)
+
+
+def test_rotated_key_used_after_interval_and_not_before(capsys):
+    clock, calls = Clock(), []
+    r = _refresher(lambda: calls.append(1) or _cfg("new-key"), clock)
+    c = FakeClient()
+    clock.t = 299
+    r.sync(c)
+    assert c.key == "old-key" and not calls
+    clock.t = 300
+    r.sync(c)
+    assert c.key == "new-key" and len(calls) == 1
+    clock.t = 400
+    r.sync(c)
+    assert len(calls) == 1  # the timer advanced
+
+
+def test_auth_rejection_forces_refresh_before_interval():
+    clock, calls = Clock(), []
+    r = _refresher(lambda: calls.append(1) or _cfg("new-key"), clock)
+    c = FakeClient()
+    c.auth_rejected = True
+    r.sync(c)
+    assert c.key == "new-key" and c.auth_rejected is False
+
+
+def test_revoked_ends_with_exit_2_and_cache_deleted(tmp_path, monkeypatch, capsys):
+    from herdr_engineering import host_config as hc
+    from herdr_engineering import service_metadata_feed as smf
+    home = _home(tmp_path)
+    load_host_config(home=home, fetch=Fetch())
+    assert (home / CACHE_REL).exists()
+    monkeypatch.setattr(hc.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(hc, "host_config", lambda: _cfg("old-key"))
+    monkeypatch.setattr(hc, "_default_fetch", lambda *a, **k: (401, None))
+    monkeypatch.setattr(smf.ServiceMetadataFeed, "run_once",
+                        lambda self, dry_run=False: {"errors": 0})
+    import herdr_engineering.host_config as hcm
+    real = hcm.ConfigRefresher.__init__
+
+    def tiny(self, initial, **kw):  # refresh on the first pass
+        real(self, initial, **{**kw, "interval": 0.0})
+    monkeypatch.setattr(hcm.ConfigRefresher, "__init__", tiny)
+    monkeypatch.setattr(hcm, "resolve_control_plane", lambda x=None: "http://cp")
+    monkeypatch.setattr(smf, "resolve_control_plane", lambda x=None: "http://cp")
+    assert smf.main(["--loop", "30"]) == 2
+    err = capsys.readouterr().err
+    assert "rejected this host's token" in err and TOKEN not in err
+    assert not (home / CACHE_REL).exists()
+
+
+def test_transient_failure_without_cache_keeps_old_key_and_signals_once():
+    import io
+    clock, err = Clock(), io.StringIO()
+
+    def down():
+        raise HostConfigUnavailable("control plane unreachable and no cached configuration exists")
+    r = _refresher(down, clock, err)
+    c = FakeClient()
+    for t in (300, 600, 900):
+        clock.t = t
+        r.sync(c)
+    assert c.key == "old-key"
+    assert err.getvalue().count("\n") == 1  # one line per outage
+    assert "old-key" not in err.getvalue() and TOKEN not in err.getvalue()
+
+
+def test_cache_fallback_does_not_overwrite_a_fresh_key_and_signal_resets():
+    import io
+    clock, err = Clock(), io.StringIO()
+    answers = [_cfg("rotated"), _cfg("stale-cached", "cache"), _cfg("stale-cached", "cache"),
+               _cfg("rotated-2")]
+    r = _refresher(lambda: answers.pop(0), clock, err)
+    c = FakeClient()
+    for t in (300, 600, 900, 1200):
+        clock.t = t
+        r.sync(c)
+        if t == 300:
+            assert c.key == "rotated"
+        if t in (600, 900):
+            assert c.key == "rotated"
+    assert c.key == "rotated-2"
+    assert err.getvalue().count("\n") == 1  # outage 600-900 only, once
+    assert "stale-cached" not in err.getvalue()
+
+
+def test_auth_rejected_stale_refresh_does_not_advance_timer():
+    clock, calls = Clock(), []
+    r = _refresher(lambda: calls.append(1) or _cfg("cached", "cache"), clock)
+    c = FakeClient()
+    clock.t = 100
+    c.auth_rejected = True
+    r.sync(c)  # forced, stale: timer must not advance
+    assert len(calls) == 1 and c.key == "old-key"
+    clock.t = 300  # 300 since the original load -> periodic refresh is due
+    r.sync(c)
+    assert len(calls) == 2
+    clock.t = 301  # periodic stale refresh DID advance the timer
+    r.sync(c)
+    assert len(calls) == 2
+
+
+def test_revoked_propagates_from_refresher():
+    clock = Clock()
+
+    def revoked():
+        raise HostConfigUnavailable("revoked", revoked=True)
+    r = _refresher(revoked, clock)
+    clock.t = 300
+    with pytest.raises(HostConfigUnavailable) as e:
+        r.sync(FakeClient())
+    assert e.value.revoked
+
+
+def test_401_sets_revoked_flag_and_other_failures_do_not(tmp_path):
+    home = _home(tmp_path)
+    with pytest.raises(HostConfigUnavailable) as e:
+        load_host_config(home=home, fetch=Fetch(get=(401, None)))
+    assert e.value.revoked is True
+    with pytest.raises(HostConfigUnavailable) as e:
+        load_host_config(home=home, fetch=Fetch(exc=OSError()))
+    assert e.value.revoked is False
+
+
+def test_load_marks_source_and_non_dict_cache_values_are_no_cache(tmp_path):
+    home = _home(tmp_path)
+    assert load_host_config(home=home, fetch=Fetch()).source == "fetch"
+    assert load_host_config(home=home, fetch=Fetch(exc=OSError())).source == "cache"
+    cache = home / CACHE_REL
+    cache.write_text(json.dumps({"host_id": "h1", "revision": "r", "values": ["x"]}))
+    with pytest.raises(HostConfigUnavailable):
+        load_host_config(home=home, fetch=Fetch(exc=OSError()))
+
+
+def test_mission_feed_sees_401_403_as_auth_rejection():
+    import urllib.error
+
+    from herdr_engineering.mission_activity_feed import MissionActivityFeed
+    feed = MissionActivityFeed("http://127.0.0.1:9", host_id="h")
+
+    class Op:
+        def open(self, req, timeout=0):
+            raise urllib.error.HTTPError(req.full_url, 403, "no", {}, None)
+    feed._http = Op()
+    with pytest.raises(OSError):
+        feed._http_json("/api/v1/ingest", {"a": 1})
+    assert feed.auth_rejected is True
+    feed.retarget("http://new/", "k2")
+    assert feed.url == "http://new" and feed.api_key == "k2"
+
+
+def test_mission_feed_loop_exits_2_when_revoked(tmp_path, monkeypatch, capsys):
+    from herdr_engineering import host_config as hc
+    from herdr_engineering import mission_activity_feed as maf
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    def revoked():
+        raise HostConfigUnavailable("token rejected", revoked=True)
+    r = hc.ConfigRefresher(_cfg("k"), loader=revoked, interval=0.0)
+    monkeypatch.setattr(maf.MissionActivityFeed, "run_once",
+                        lambda self: {"capable": True, "errors": 0})
+    assert maf.run_feed("http://cp", host_id="h", control_dir=tmp_path, interval=1,
+                        api_key=None, refresher=r) == 2
+    assert "token rejected" in capsys.readouterr().err

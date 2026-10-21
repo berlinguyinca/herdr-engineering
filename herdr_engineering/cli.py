@@ -510,6 +510,7 @@ def _cmd_cp_mission_feed(args) -> int:
     from pathlib import Path
 
     from .host_config import (
+        ConfigRefresher,
         HostConfigUnavailable,
         exit_unavailable,
         host_config,
@@ -519,11 +520,13 @@ def _cmd_cp_mission_feed(args) -> int:
     try:
         url = resolve_control_plane(args.control_plane)
         host_id = args.host_id or host_config().host_id
+        refresher = None if args.once else ConfigRefresher(host_config())
     except HostConfigUnavailable as exc:
         return exit_unavailable(exc)
     return run_feed(url, host_id=host_id,
                     control_dir=Path(args.control_dir) if args.control_dir else None,
-                    interval=args.interval, once=args.once)
+                    interval=args.interval, once=args.once, refresher=refresher,
+                    follow_url=not args.control_plane)
 
 
 def _cmd_cp_llm_proxy(args) -> int:
