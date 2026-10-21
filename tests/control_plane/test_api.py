@@ -393,3 +393,144 @@ def test_retire_endpoint_is_a_dry_run_unless_told_otherwise(server):
     assert json.loads(c.get(f'/api/v1/services/{sid}')[2])['lifecycle']['archived'] is True
     status, _ = c.post('/api/v1/services/retire', {'older_than_days': 0})
     assert status == 400
+
+
+# ------------------------------------------------------------ fleet config
+import hashlib  # noqa: E402
+import os  # noqa: E402
+
+import yaml  # noqa: E402
+
+from herdr_engineering.fleet_config import FleetConfigStore  # noqa: E402
+
+_FC_SECRET = "sk-fleet-secret-value"
+
+
+def _fc_sha(t):
+    return hashlib.sha256(t.encode()).hexdigest()
+
+
+def _fc_doc(extra=""):
+    return {
+        "version": 1,
+        "sections": {
+            "llm": {"roles": ["builder"], "values": {"key": _FC_SECRET + extra}},
+            "ci": {"roles": ["ci"], "values": {"token": "ci-only"}},
+            "control_plane": {"roles": ["control-plane"], "values": {"pg_dsn": "postgres://u:pw@h/db"}},
+        },
+        "hosts": {
+            "bender": {"roles": ["builder"], "token_sha256": _fc_sha("tok-bender")},
+            "beast": {"roles": ["ci"], "token_sha256": _fc_sha("tok-beast")},
+        },
+    }
+
+
+def _fc_write(path, doc):
+    path.write_text(yaml.safe_dump(doc))
+    os.chmod(path, 0o600)
+
+
+def _fc_req(port, method, path, headers=None, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    h = dict(headers or {})
+    if data is not None:
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+@pytest.fixture()
+def fc_server(tmp_path, acknowledged_sink):
+    path = tmp_path / "fleet.yaml"
+    _fc_write(path, _fc_doc())
+    store = FleetConfigStore(path)
+    svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink),
+                             api_keys={"opkey": "operator", "viewkey": "viewer"},
+                             fleet_config=store)
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    yield svr.port, path, store
+    svr.shutdown()
+
+
+def test_fleet_config_requires_valid_host_token(fc_server):
+    port, _, _ = fc_server
+    for hdrs in ({}, {"X-Host-Token": "nope"}, {"X-API-Key": "opkey"}):
+        status, _, body = _fc_req(port, "GET", "/api/v1/fleet/config", hdrs)
+        assert status == 401
+        assert json.loads(body) == {"error": "unauthorized"}
+
+
+def test_fleet_config_returns_scoped_slice_no_store_header(fc_server):
+    port, _, _ = fc_server
+    status, headers, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "tok-bender"})
+    assert status == 200
+    assert headers["Cache-Control"] == "no-store"
+    data = json.loads(body)
+    assert data["values"] == {"llm": {"key": _FC_SECRET}}
+    assert len(data["revision"]) == 12
+    assert "control_plane" not in data["values"] and "ci" not in data["values"]
+
+
+def test_applied_revision_shows_in_status(fc_server):
+    port, _, store = fc_server
+    rev = store.current().revision
+    status, _, _ = _fc_req(port, "POST", "/api/v1/fleet/config/applied",
+                           {"X-Host-Token": "tok-bender"}, {"host_id": "bender", "revision": rev})
+    assert status == 200
+    # token of another host cannot report for bender
+    status, _, _ = _fc_req(port, "POST", "/api/v1/fleet/config/applied",
+                           {"X-Host-Token": "tok-beast"}, {"host_id": "bender", "revision": "x"})
+    assert status == 401
+    status, _, body = _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "viewkey"})
+    assert status == 200
+    data = json.loads(body)
+    assert data["revision"] == rev and data["last_error"] is None
+    hosts = {h["id"]: h for h in data["hosts"]}
+    assert hosts["bender"]["applied_revision"] == rev
+    assert hosts["bender"]["roles"] == ["builder"]
+    assert hosts["beast"]["applied_revision"] is None
+    # status needs the normal API key
+    assert _fc_req(port, "GET", "/api/v1/fleet/config/status")[0] == 401
+    assert _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-Host-Token": "tok-bender"})[0] == 401
+
+
+def test_broken_edit_keeps_last_good_revision(fc_server):
+    port, path, store = fc_server
+    good = store.current().revision
+    path.write_text("version: 1\nsections: [broken")
+    os.chmod(path, 0o600)
+    os.utime(path, (os.stat(path).st_atime + 5, os.stat(path).st_mtime + 5))
+    status, _, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "tok-bender"})
+    assert status == 200
+    assert json.loads(body)["revision"] == good
+    _, _, sbody = _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "viewkey"})
+    s = json.loads(sbody)
+    assert s["revision"] == good and s["last_error"]
+    # a valid edit afterwards is picked up and clears the error
+    _fc_write(path, _fc_doc("-v2"))
+    os.utime(path, (os.stat(path).st_atime + 10, os.stat(path).st_mtime + 10))
+    _, _, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "tok-bender"})
+    assert json.loads(body)["revision"] != good
+    assert json.loads(_fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "viewkey"})[2])["last_error"] is None
+
+
+def test_status_never_contains_secret_values(fc_server):
+    port, path, _ = fc_server
+    path.write_text(f"version: 1\nsections: [{_FC_SECRET}")
+    os.chmod(path, 0o600)
+    os.utime(path, (os.stat(path).st_atime + 5, os.stat(path).st_mtime + 5))
+    _, _, body = _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "opkey"})
+    text = body.decode()
+    for needle in (_FC_SECRET, "ci-only", "postgres://", _fc_sha("tok-bender"), "tok-bender"):
+        assert needle not in text
+
+
+def test_fleet_config_routes_404_without_store(server):
+    c, _ = server
+    assert c.get("/api/v1/fleet/config")[0] == 404
+    assert c.get("/api/v1/fleet/config/status")[0] == 404
