@@ -4,9 +4,9 @@
 
 Flagged (off by default) two-user collaboration spine on the existing control plane:
 `herdr_engineering/control_plane/collab.py`, `tests/control_plane/test_collab.py`
-(57 tests: tenant isolation, forged identity, revocation incl. dropped streams and
+(63 tests: tenant isolation, forged identity, revocation incl. dropped streams, full durable-source restart and
 restart, guest denial, idempotency, no leakage into legacy event surfaces).
-Regression: 1148 passed, 2 skipped, 1 xfailed; one failure,
+Regression: 1154 passed, 2 skipped, 1 xfailed; one failure,
 `tests/test_devfabric_lease_lifecycle.py::test_persist_merges_concurrent_external_lease`,
 is a pre-existing flake (14/25 failures on a checkout without this code).
 Blocked on user decisions before real-user enablement: SSO/MFA provider, data

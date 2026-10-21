@@ -133,10 +133,12 @@ class CollabService:
         self._rooms: dict[str, dict] = {}
         self._agents: dict[str, dict] = {}
         self._by_cred: dict[str, str] = {}      # credential digest -> agent id
+        self._agent_projects: dict[str, set] = defaultdict(set)  # projects an agent was ever granted into
         self._pending: dict[str, dict] = {}     # enrollment code digest -> record
         self._idem: dict[tuple, tuple] = {}     # (principal, room, key) -> (fingerprint, seq)
         self._hits: dict[str, list[float]] = defaultdict(list)
         self._streams: dict[str, int] = defaultdict(int)
+        self._denied_at: dict[tuple, float] = {}
         self.stats = defaultdict(int)
 
     # ------------------------------------------------------------ plumbing
@@ -184,9 +186,16 @@ class CollabService:
                         continue
                 parsed.append({**r, "payload": p, "sequence": int(r["sequence"])})
             parsed.sort(key=lambda e: e["sequence"])
+            expected = self._seq + 1
             for ev in parsed:
-                if ev["sequence"] <= self._seq:
-                    continue
+                # A gap or duplicate means the log is not the one this service wrote
+                # (e.g. started empty over existing rows). Replaying it could drop a
+                # revocation, so fail closed instead of guessing.
+                if ev["sequence"] != expected:
+                    raise ValueError(
+                        f"collab log is not contiguous: expected sequence {expected}, "
+                        f"found {ev['sequence']}")
+                expected += 1
                 self._seq = ev["sequence"]
                 self._log.append(ev)
                 self._apply(ev)
@@ -231,6 +240,7 @@ class CollabService:
         elif t == "agent_granted":
             self._rooms[p["room_id"]]["grants"][p["agent_id"]] = {
                 "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
+            self._agent_projects[p["agent_id"]].add(p["project_id"])
         elif t == "message":
             self._idem[(p["sender_key"], p["room_id"], p["idempotency_key"])] = (p["fingerprint"], seq)
 
@@ -267,7 +277,7 @@ class CollabService:
                 if reason:
                     self.stats["auth_failures"] += 1
                     self._audit_denied(Principal("agent", aid, agent["owner"]), "auth.agent", reason,
-                                       resource_id=aid, project_ids=self._user_projects(agent["owner"]))
+                                       resource_id=aid, agent_id=aid)
                     raise CollabError(401, "unauthorized")
                 return Principal("agent", aid, agent["owner"], digest)
         self.stats["auth_failures"] += 1
@@ -336,14 +346,24 @@ class CollabService:
         return room, first
 
     def _audit_denied(self, pr: Principal, action: str, reason: str, *, room_id=None,
-                      resource_id=None, project_ids=()) -> None:
+                      resource_id=None, project_ids=(), agent_id=None) -> None:
         # Only authenticated principals are logged: anonymous failures are counted,
-        # never persisted, so unauthenticated traffic cannot grow the log.
+        # never persisted, so unauthenticated traffic cannot grow the log. A retry
+        # loop (e.g. a revoked bridge) is persisted at most once a minute per
+        # (principal, action, reason, room); the rest is only counted.
+        now = self._now()
+        gate = (pr.key, action, reason, room_id)
+        if now - self._denied_at.get(gate, -1e18) < 60:
+            self.stats["audit_throttled"] += 1
+            return
+        if len(self._denied_at) > 10_000:
+            self._denied_at = {k: t for k, t in self._denied_at.items() if now - t < 60}
+        self._denied_at[gate] = now
         try:
             self._commit("audit_denied", self._actor(pr, action=action, outcome="denied",
                                                      reason=reason, room_id=room_id,
                                                      resource_id=resource_id or room_id,
-                                                     project_ids=list(project_ids)))
+                                                     project_ids=list(project_ids), agent_id=agent_id))
         except CollabError:
             pass
 
@@ -469,7 +489,7 @@ class CollabService:
             self._commit("enrollment_started", self._actor(
                 pr, code_digest=_digest(code), device_id=device, harness_type=harness,
                 expires_at_epoch=expires, action="agent.enroll.start", outcome="allowed",
-                project_ids=self._user_projects(pr.id), resource_id=None))
+                project_ids=[], resource_id=None))
         return {"code": code, "expires_at": expires}
 
     def complete_enrollment(self, body: dict) -> dict:
@@ -493,7 +513,7 @@ class CollabService:
                 "instance_id": instance if isinstance(instance, str) else None,
                 "secret_digest": _digest(cred), "expires_at_epoch": expires,
                 "action": "agent.enroll", "outcome": "allowed",
-                "project_ids": self._user_projects(rec["owner"]), "resource_id": aid})
+                "project_ids": [], "resource_id": aid})
         return {"agent_id": aid, "credential": cred, "expires_at": expires}
 
     def rotate_credential(self, pr: Principal) -> dict:
@@ -505,7 +525,7 @@ class CollabService:
             self._commit("credential_rotated", self._actor(
                 pr, agent_id=pr.id, secret_digest=_digest(cred), expires_at_epoch=expires,
                 action="agent.rotate", outcome="allowed",
-                project_ids=self._user_projects(pr.owner), resource_id=pr.id))
+                project_ids=[], resource_id=pr.id))
         return {"agent_id": pr.id, "credential": cred, "expires_at": expires}
 
     def revoke_agent(self, pr: Principal, agent_id: str) -> dict:
@@ -517,8 +537,7 @@ class CollabService:
             rooms = [r for r, room in self._rooms.items() if agent_id in room["grants"]]
             self._commit("agent_revoked", self._actor(
                 pr, agent_id=agent_id, room_ids=rooms, action="agent.revoke", outcome="allowed",
-                project_ids=sorted({self._rooms[r]["project_id"] for r in rooms}
-                                   | set(self._user_projects(pr.id))), resource_id=agent_id))
+                project_ids=[], resource_id=agent_id))
         return {"ok": True}
 
     def grant_agent(self, pr: Principal, room_id: str, body: dict) -> dict:
@@ -650,7 +669,13 @@ class CollabService:
             out, more = [], False
             for ev in self._log:
                 p = ev["payload"]
-                if ev["sequence"] <= cursor or project_id not in p.get("project_ids", ()) or "action" not in p:
+                if ev["sequence"] <= cursor or "action" not in p:
+                    continue
+                # Agent lifecycle events carry no project: they appear in a project's
+                # audit only if that agent has (or had) a grant in one of its rooms.
+                aid = p.get("agent_id")
+                if not (project_id in p.get("project_ids", ())
+                        or (aid and project_id in self._agent_projects.get(aid, ()))):
                     continue
                 if len(out) >= limit:
                     more = True
@@ -669,13 +694,17 @@ class CollabService:
             self._authorize(pr, room_id, "read", "events.stream")
             if self._streams[pr.key] >= self.max_streams:
                 raise CollabError(429, "too many streams")
-            self._streams[pr.key] += 1
         return Stream(self, pr, room_id, cursor)
 
     def pump(self, stream: Stream, max_seconds: float = 3600.0):
         """Yield frames; re-authorizes on every tick and closes on any loss of access."""
         started = time.monotonic()
         cursor = stream.cursor
+        with self._lock:
+            if self._streams[stream.principal.key] >= self.max_streams:
+                yield {"type": "closed", "reason": "too_many_streams"}
+                return
+            self._streams[stream.principal.key] += 1
         try:
             yield {"type": "connected", "cursor": cursor}
             while time.monotonic() - started < max_seconds:

@@ -791,3 +791,124 @@ def test_rotation_closes_streams_opened_with_the_old_credential(env):
             break
     assert f == {"type": "closed", "reason": "access_revoked"}
     conn.close()
+
+
+# ------------------------------------------------ audit scope / hardening
+def test_audit_does_not_reveal_agents_that_never_entered_the_project(env):
+    api = env.api
+    project, room = make_room(api)
+    invite(api, room, "bob")
+    bob_agent = enroll(api, "bob")           # Bob is in Alice's room but keeps his agent out of it
+    api.call("POST", f"{BASE}/agent/rotate", {}, agent=bob_agent)
+    api.call("POST", f"{BASE}/agents/{bob_agent['agent_id']}/revoke", {}, user="bob")
+    api.call("POST", f"{BASE}/rooms/{room}/messages",
+             {"text": "x", "idempotency_key": "k"}, agent=bob_agent)  # denied, revoked
+    s, log = api.call("GET", f"{BASE}/audit?project_id={project}", user="alice")
+    assert s == 200 and bob_agent["agent_id"] not in json.dumps(log)
+
+
+def test_disabled_user_loses_everything(env):
+    api = env.api
+    _, room = make_room(api)
+    invite(api, room, "bob")
+    agent = enroll(api, "bob")
+    grant(api, room, agent, owner="bob")
+    conn, resp = api.stream(f"{BASE}/rooms/{room}/events/stream?cursor=0", user="bob")
+    assert resp.status == 200
+    env.svc.auth.disable("bob")
+    assert events(api, room, user="bob")[0] == 401
+    assert say(api, room, "x", "k", agent=agent)[0] == 401
+    while True:
+        f = read_frame(resp)
+        if f is None or f.get("type") == "closed":
+            break
+    assert f == {"type": "closed", "reason": "access_revoked"}
+    conn.close()
+
+
+def test_denial_audit_is_throttled_for_retry_loops(env):
+    api = env.api
+    project, room = make_room(api)
+    agent = enroll(api, "alice")
+    grant(api, room, agent)
+    api.call("POST", f"{BASE}/agents/{agent['agent_id']}/revoke", {}, user="alice")
+    for i in range(6):
+        assert say(api, room, "x", f"k{i}", agent=agent)[0] == 401
+    s, log = api.call("GET", f"{BASE}/audit?project_id={project}", user="alice")
+    assert [e["action"] for e in log["events"]].count("auth.agent") == 1
+    assert env.svc.stats["audit_throttled"] == 5
+
+
+def test_unopened_stream_does_not_consume_a_slot(env):
+    api = env.api
+    _, room = make_room(api)
+    pr = env.svc.authenticate(f"Bearer {TOKENS['alice']}", None)
+    for _ in range(20):
+        env.svc.open_stream(pr, room, 0)  # opened but never pumped (e.g. response write failed)
+    assert env.svc.open_stream(pr, room, 0) is not None
+
+
+def test_hydrate_rejects_gaps_and_duplicates(env):
+    _, room = make_room(env.api)
+    rows = list(env.sink.events)
+    fresh = lambda: CollabService(StaticTokenAuthenticator({}), now=env.clock)  # noqa: E731
+    with pytest.raises(ValueError, match="contiguous"):
+        fresh().hydrate(rows[1:])                 # missing first row
+    with pytest.raises(ValueError, match="contiguous"):
+        fresh().hydrate(rows + [rows[-1]])        # duplicate sequence
+    assert fresh().hydrate(rows) == len(rows)
+
+
+def test_full_restart_path_through_durable_source(env):
+    """sink rows -> DurableSource(DB-shaped rows) -> load_into -> ControlPlaneServer(collab)."""
+    from datetime import datetime
+
+    api = env.api
+    _, room = make_room(api)
+    invite(api, room, "bob")
+    a = enroll(api, "alice")
+    grant(api, room, a)
+    say(api, room, "history-marker", "k1", agent=a)
+    api.call("POST", f"{BASE}/agents/{a['agent_id']}/revoke", {}, user="alice")
+    api.call("POST", f"{BASE}/rooms/{room}/members/bob/remove", {}, user="alice")
+
+    def db_row(ev):  # asyncpg shape: jsonb as str, timestamptz as datetime
+        return {**ev, "payload": json.dumps(ev["payload"]),
+                "source_timestamp": datetime.fromisoformat(ev["source_timestamp"]),
+                "ingest_timestamp": datetime.fromisoformat(ev["ingest_timestamp"])}
+
+    class Source:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def missions(self):
+            return []
+
+        sessions = services = hosts = missions
+
+        def events(self):
+            return self.rows
+
+    svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in TOKENS.items()}),
+                        sink=env.sink, now=env.clock)
+    repo = ControlPlaneRepo()
+    srv = ControlPlaneServer(repo, host="127.0.0.1", port=0, collab=svc,
+                             api_keys={"op": "operator"},
+                             source=Source([db_row(e) for e in env.sink.events]))
+    t = threading.Thread(target=srv.serve, daemon=True)
+    t.start()
+    srv.wait_until_ready()
+    try:
+        api2 = Api(srv.port)
+        assert say(api2, room, "x", "k2", agent=a)[0] == 401          # revoked stays revoked
+        assert events(api2, room, user="bob")[0] == 404               # removal stays removed
+        texts = [e.get("text") for e in events(api2, room, user="alice")[1]["events"]]
+        assert "history-marker" in texts                              # history survived
+        s, act = api2.call("GET", "/api/v1/activity", headers={"X-API-Key": "op"})
+        assert "history-marker" not in json.dumps(act)
+        assert repo.recent_events(100) == []
+        # and the restarted service keeps appending with contiguous sequences
+        assert say(api2, room, "after restart", "k3", user="alice")[0] == 201
+    finally:
+        srv.shutdown()
+        t.join(timeout=5)

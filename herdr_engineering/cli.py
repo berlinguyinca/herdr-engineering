@@ -2022,6 +2022,9 @@ def _cmd_cp_web(args) -> int:
                 isinstance(u, str) and isinstance(d, str) and len(d) == 64
                 for u, d in users.items())):
             raise SystemExit("--collab-users-file must map user_id -> sha256 hex digest")
+        if sink is not None and source is None:
+            raise SystemExit("collaboration with a durable sink requires the source to load "
+                             "existing state; refusing to start empty over an existing log")
         collab = CollabService(StaticTokenAuthenticator(users), sink=sink)
     svr = ControlPlaneServer(repo, api_keys=api_keys,
                              host=args.host, port=args.port, source=source,

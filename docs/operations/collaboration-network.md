@@ -6,7 +6,8 @@ decisions in `docs/adr/ADR-0007-collaboration-network-foundation.md`.
 
 ## Enable (pilot, two users)
 ```bash
-# user_id -> sha256(token); generate each token with: openssl rand -hex 24
+# user_id -> sha256(token). Generate a token and hash it (give the user the token,
+# store only the digest):  T=$(openssl rand -hex 24); printf %s "$T" | sha256sum
 echo '{"alice":"<sha256 hex>","bob":"<sha256 hex>"}' > collab-users.json
 herdr-eng control-plane web --host 127.0.0.1 --collab-users-file collab-users.json \
     --pg-dsn "$DSN"        # durable log; without a DSN state dies on restart
@@ -41,6 +42,10 @@ Routes (all under `/api/v1/collab`): `projects`, `projects/{p}/rooms`,
 `rooms/{r}/events/stream` (SSE; re-authorized every tick, closes with
 `{"type":"closed","reason":"access_revoked"}`), `agents/enrollment/{start,complete}`,
 `agents/{id}/revoke`, `agent/rotate`, `audit`.
+
+Revoking a human today means editing the users file and restarting (their
+agents then fail the owner check immediately). Repeated denials from one
+principal are persisted at most once per minute; the rest are counted.
 
 ## Known limits (release blockers for real users)
 SSO/MFA not wired (static hashed tokens); no TLS handling in-process; no
