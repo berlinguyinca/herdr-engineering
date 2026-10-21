@@ -457,3 +457,168 @@ def test_mission_feed_loop_exits_2_when_revoked(tmp_path, monkeypatch, capsys):
     assert maf.run_feed("http://cp", host_id="h", control_dir=tmp_path, interval=1,
                         api_key=None, refresher=r) == 2
     assert "token rejected" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------- F1 review fixes
+def test_auth_rejection_only_from_the_ingest_post():
+    import io
+    import urllib.error
+
+    from herdr_engineering.mission_activity_feed import MissionActivityFeed
+    from herdr_engineering.service_metadata_feed import MetadataClient
+
+    def boom(code):
+        class Op:
+            def open(self, req, timeout=0):
+                raise urllib.error.HTTPError(req.full_url, code, "no", {}, io.BytesIO(b""))
+        return Op()
+
+    feed = MissionActivityFeed("http://127.0.0.1:9", host_id="h")
+    feed._http = boom(401)
+    with pytest.raises(OSError):
+        feed._http_json("/api/v1/health")
+    assert feed.auth_rejected is False
+    with pytest.raises(OSError):
+        feed._http_json("/api/v1/ingest", {"a": 1})
+    assert feed.auth_rejected is True
+
+    client = MetadataClient("http://127.0.0.1:9", "k")
+    for code in (401, 403):
+        client.http = boom(code)
+        with pytest.raises(OSError):
+            client.request("/api/v1/services")
+        assert client.auth_rejected is False
+        with pytest.raises(OSError):
+            client.request("/api/v1/ingest", {"a": 1})
+        assert client.auth_rejected is True
+        client.auth_rejected = False
+    client.retarget("http://new.test/", "k2")
+    assert client.url == "http://new.test" and client.key == "k2"
+
+
+def test_forced_refresh_floor_prevents_a_storm():
+    clock, calls = Clock(), []
+    r = _refresher(lambda: calls.append(1) or _cfg("cached", "cache"), clock)
+    c = FakeClient()
+    for t in (1, 2, 10, 29):
+        clock.t = t
+        c.auth_rejected = True
+        r.sync(c)
+    assert len(calls) == 1  # one forced refresh inside the 30 s floor
+    clock.t = 31
+    c.auth_rejected = True
+    r.sync(c)
+    assert len(calls) == 2  # the pending rejection retried once the floor passed
+
+
+def test_fully_explicit_service_metadata_runs_without_host_config(tmp_path, monkeypatch, capsys):
+    from herdr_engineering import service_metadata_feed as smf
+    keyfile = tmp_path / "key"
+    keyfile.write_text("file-key\n")
+    assert smf.main(["--control-plane", "http://127.0.0.1:9", "--host-id", "h",
+                     "--api-key-file", str(keyfile), "--once", "--dry-run",
+                     "--state-file", str(tmp_path / "s.json")]) in (0, 1)
+    assert "no host configuration" not in capsys.readouterr().err
+
+
+def test_explicit_values_are_not_followed_after_refresh():
+    clock = Clock()
+    r = _refresher(lambda: _cfg("rotated", url="http://central"), clock)
+    c = FakeClient()
+    clock.t = 300
+    r.sync(c, follow_url=False, follow_key=False)
+    assert (c.url, c.key) == ("http://old", "old-key")
+    clock.t = 600
+    r.sync(c, follow_url=False, follow_key=True)
+    assert (c.url, c.key) == ("http://old", "rotated")
+
+
+def test_fully_explicit_mission_feed_runs_without_host_config(monkeypatch, capsys):
+    from herdr_engineering import mission_activity_feed as maf
+    from herdr_engineering.cli import main as cli_main
+    seen = {}
+    monkeypatch.setattr(maf, "run_feed", lambda url, **kw: seen.update(url=url, **kw) or 0)
+    assert cli_main(["control-plane", "mission-feed", "--control-plane", "http://x:1",
+                     "--host-id", "h"]) == 0
+    assert seen["url"] == "http://x:1" and seen["host_id"] == "h" and seen["refresher"] is None
+    assert "no host configuration" not in capsys.readouterr().err
+
+
+# ------------------------------------------------------------ fabric agent
+def _agent_setup(monkeypatch, tmp_path, live, loader_cfgs):
+    """Run `devfabric agent` with a fake FabricAgent so the loop is observable."""
+    from herdr_engineering import cli as climod
+    from herdr_engineering import fabric, fabric_agent
+    from herdr_engineering import host_config as hc
+
+    clock = Clock()
+    log = {"clients": [], "cps": [], "clock": clock}
+
+    class FakeAgent:
+        def __init__(self, client, config):
+            self.client, self.cfg = client, config
+            log["clients"].append((client.gateway_url, client.token))
+
+        def retarget(self, client, cp):
+            self.client = client
+            log["clients"].append((client.gateway_url, client.token))
+            log["cps"].append(cp)
+
+        def scan_once(self):
+            return {}
+
+        def stop(self):
+            pass
+
+        def run(self, after_cycle=None, **kw):
+            for _ in range(len(loader_cfgs)):
+                log["clock"].t += 400  # each pass is past the refresh interval
+                after_cycle()
+
+    monkeypatch.setattr(fabric_agent, "FabricAgent", FakeAgent)
+    monkeypatch.setattr(fabric, "tailnet_ipv4", lambda: "100.1.1.1")
+    monkeypatch.setattr(hc, "host_config", lambda: live)
+    items = list(loader_cfgs)
+
+    def loader():
+        r = items.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+    real_init = hc.ConfigRefresher.__init__
+
+    def init(self, initial, **kw):
+        real_init(self, initial, loader=loader, interval=300, clock=clock)
+    monkeypatch.setattr(hc.ConfigRefresher, "__init__", init)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return climod, log
+
+
+def _fab(url, token, source="fetch"):
+    return HostConfig("http://cp", "h", "r", {"fabric": {"url": url, "token": token}}, source)
+
+
+def test_fabric_agent_follows_rotated_token_and_url(monkeypatch, tmp_path):
+    live = _fab("http://gw1:29999", "tok1")
+    climod, log = _agent_setup(monkeypatch, tmp_path, live, [_fab("http://gw1:29999", "tok2")])
+    assert climod.main(["devfabric", "agent"]) == 0
+    assert log["clients"][0] == ("http://gw1:29999", "tok1")
+    assert log["clients"][-1] == ("http://gw1:29999", "tok2")
+
+
+def test_fabric_agent_cache_fallback_and_transient_keep_live_config(monkeypatch, tmp_path):
+    live = _fab("http://gw1:29999", "tok1")
+    climod, log = _agent_setup(monkeypatch, tmp_path, live, [
+        _fab("http://stale:29999", "stale", "cache"),
+        HostConfigUnavailable("unreachable and no cached configuration exists")])
+    assert climod.main(["devfabric", "agent"]) == 0
+    assert log["clients"] == [("http://gw1:29999", "tok1")]  # never rebuilt
+
+
+def test_fabric_agent_revoked_exits_2(monkeypatch, tmp_path, capsys):
+    live = _fab("http://gw1:29999", "tok1")
+    climod, log = _agent_setup(monkeypatch, tmp_path, live,
+                               [HostConfigUnavailable("token rejected", revoked=True)])
+    assert climod.main(["devfabric", "agent"]) == 2
+    err = capsys.readouterr().err
+    assert "token rejected" in err and "tok1" not in err

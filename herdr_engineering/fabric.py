@@ -696,7 +696,7 @@ class FabricClient:
         return self._req("GET", "/healthz")
 
 
-def gateway_url_from_config(config: dict[str, Any]) -> str | None:
+def gateway_url_from_config(config: dict[str, Any], *, fabric_url: str | None = None) -> str | None:
     """Control-plane URL for the fabric gateway from config.
 
     ``fabric.gateway_url`` may be the full control URL (http://host:port) or
@@ -706,7 +706,8 @@ def gateway_url_from_config(config: dict[str, Any]) -> str | None:
     fabric = config.get("fabric") or {}
     # The central host config (fabric.url) wins over the local config file.
     from .host_config import host_value
-    base = host_value("fabric.url") or fabric.get("gateway_url")
+    base = (fabric_url if fabric_url is not None else host_value("fabric.url")) \
+        or fabric.get("gateway_url")
     if not base:
         return None
     base = base.rstrip("/")
