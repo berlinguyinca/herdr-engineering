@@ -16,7 +16,7 @@ AGENTS = ROOT / "deploy" / "deploy-fleet-agents.sh"
 ANSWERS = {
     "public_url": "https://cp.example.test", "llm_upstream_url": "https://llm.example.test",
     "llm_upstream_key": "llm-secret-key-0001", "ci_url": "https://ci.example.test",
-    "ci_token": "ci-secret-token-0002", "web_bind": "127.0.0.1", "web_port": "8080",
+    "ci_token": "ci-secret-token-0002", "web_bind": "127.0.0.1", "web_port": "8080", "gateway_tailnet_ip": "127.0.0.1",
     "github_token": "gh-secret-token-0003", "hosts": {"bender": ["builder"]},
 }
 
@@ -91,9 +91,12 @@ def test_deploy_dry_run_renders_env_from_central_file_and_removes_it(env):
     assert "control-plane.env" not in r.stdout + r.stderr
     # dry-run does not even write the env file, and leaves no temp dir behind
     assert not (env["home"] / ".config").exists()
-    assert "rendering" not in r.stdout or "dry-run" in r.stdout
-    leftovers = [p for p in Path(os.environ.get("TMPDIR", "/tmp")).glob("herdr-cp-env.*")]
-    assert not leftovers
+    assert "rendered the compose variables" in r.stdout
+    # the transient 0700 dir the dry-run rendered into is gone (stub docker is a no-op)
+    compose_calls = [ln for ln in env["log"].read_text().splitlines() if "--env-file" in ln]
+    assert compose_calls and " config -q" in compose_calls[0]
+    path = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("envfile ")][0].split()[1]
+    assert not os.path.exists(path) and not os.path.exists(os.path.dirname(path))
 
 
 def test_deploy_refuses_when_central_file_missing(env):
@@ -206,3 +209,14 @@ exit 0
     assert "test -s" in calls and "host.json" in calls
     assert "mkdir" not in calls and "ln -sfn" not in calls  # nothing rolled to that host
     assert r.returncode != 0  # a skipped host is a failed roll
+
+
+def test_dry_run_fails_when_compose_map_is_missing(env):
+    data = yaml.safe_load(env["central"].read_text())
+    del data["sections"]["control_plane"]["values"]["compose"]
+    env["central"].unlink()
+    fcc.write_private_file(env["central"], yaml.safe_dump(data, sort_keys=False))
+    r = deploy(env, "--dry-run")
+    assert r.returncode != 0 and "invalid" in r.stderr
+    for secret in env["secrets"]:
+        assert secret not in r.stdout + r.stderr

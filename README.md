@@ -463,7 +463,7 @@ macOS convergence is a documented `BLOCKED_EXTERNAL` item pending a fleet run.
 | dev service not forwarding | `herdr-eng devfabric list` (lease active?) then run `herdr-eng devfabric serve <lease>` |
 | config not taking effect | `herdr-eng doctor --json` shows the config file in use; precedence is machine-local < repo < `$HERDR_ENGINEERING_CONFIG` |
 | stale dev port | `herdr-eng devfabric reconcile` expires stale leases |
-| `ci` says offline / stale | set the operator token: `~/.config/herdr-engineering/ci-token` (chmod 600) or `HERDR_ENGINEERING_CI_TOKEN`; the token is a secret and never lives in the repo. Without it the view is explicitly stale, never guessed |
+| `ci` says offline / stale | set the CI token: it is `ci.token` in the central fleet config (`herdr-eng fleet config init` asks for it); the token is a secret and never lives in the repo. Without it the view is explicitly stale, never guessed |
 | `ci logs` returns no log text | expected on this Woodpecker 3.x instance: logs stream over WebSocket (no REST endpoint) and the OAuth2 proxy doesn't forward a bearer token on the upgrade. Use the `view_in_web_ui` link it prints; `ci debug` still gives the failing tasks + exit codes |
 | `dev:<port>` unreachable from other hosts | is the gateway up? `herdr-eng devfabric gateway` on the gateway host; point commands at it with `HERDR_ENGINEERING_FABRIC_URL=http://<gateway>:29999` (or `fabric.gateway_url` in config); the app must be bound to the tailnet interface or `0.0.0.0` |
 

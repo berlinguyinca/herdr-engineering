@@ -85,10 +85,29 @@ if [ -e "$COLLAB_MARKER" ]; then
   echo "collaboration network: enabled (marker $COLLAB_MARKER)"
 fi
 
+# Transient compose variables: 0600 file in a 0700 directory, gone on any exit.
+ENV_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/herdr-cp-env.XXXXXX")"
+ENV_FILE="$ENV_DIR/compose.env"
+herdr_eng fleet config render-compose --path "$CENTRAL" --out "$ENV_FILE" >/dev/null
+chmod 600 "$ENV_FILE"
+
+COMPOSE_FILES=(-f "$WORK/deploy/control-plane/compose.yaml" "${COLLAB_FILES[@]}")
+
 if [ "$DRY" = 1 ]; then
-  # Safest dry-run: validate the file and print the plan; never write the env file.
-  echo "[dry-run] would run: herdr-eng fleet config render-compose --path <central> --out <0600 file in a 0700 temp dir>"
-  echo "[dry-run] the rendered env file is passed to docker compose as --env-file and removed on exit"
+  echo "[dry-run] rendered the compose variables to a 0600 file in a 0700 temp dir (removed on exit)"
+  if docker compose version >/dev/null 2>&1; then
+    # -q prints nothing on success; errors are withheld so no value can leak.
+    if HERDR_CP_FLEET_CONFIG_FILE="$CENTRAL" HERDR_CP_IMAGE_TAG="$TAG" HERDR_CP_GIT_COMMIT="$SHA" \
+        docker compose --env-file "$ENV_FILE" -p "$PROJECT" "${COMPOSE_FILES[@]}" config -q >/dev/null 2>&1; then
+      echo "[dry-run] docker compose config: valid"
+    else
+      echo "[dry-run] docker compose config FAILED (details withheld; they could contain values)" >&2
+      exit 1
+    fi
+  else
+    echo "[dry-run] docker compose not available: skipped offline compose validation"
+  fi
+  echo "[dry-run] would run: herdr-eng fleet config render-compose --path <central> --out <file>"
   echo "[dry-run] control-plane-web, worker and llm-proxy mount the central file read-only at $MOUNT_TARGET"
   echo "[dry-run] would build herdr-engineering:$TAG and recreate control-plane-web"
   exit 0
@@ -96,12 +115,6 @@ fi
 
 PREVIOUS_IMAGE="$(docker inspect -f '{{.Config.Image}}' herdr-cp-web 2>/dev/null || true)"
 echo "currently running: ${PREVIOUS_IMAGE:-nothing}"
-
-# Transient compose variables: 0600 file in a 0700 directory, gone on any exit.
-ENV_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/herdr-cp-env.XXXXXX")"
-ENV_FILE="$ENV_DIR/compose.env"
-herdr_eng fleet config render-compose --path "$CENTRAL" --out "$ENV_FILE" >/dev/null
-chmod 600 "$ENV_FILE"
 
 if [ -z "$HEALTH_URL" ]; then
   # The UI is published on HERDR_CP_WEB_BIND:HERDR_CP_WEB_PUBLIC_PORT.
@@ -116,7 +129,7 @@ docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMI
 compose() {
   HERDR_CP_FLEET_CONFIG_FILE="$CENTRAL" HERDR_CP_IMAGE_TAG="$1" HERDR_CP_GIT_COMMIT="$SHA" \
     docker compose --env-file "$ENV_FILE" -p "$PROJECT" \
-    -f "$WORK/deploy/control-plane/compose.yaml" "${COLLAB_FILES[@]}" \
+    "${COMPOSE_FILES[@]}" \
     up -d --no-deps --no-build control-plane-web
 }
 

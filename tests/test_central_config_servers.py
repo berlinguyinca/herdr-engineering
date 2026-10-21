@@ -15,7 +15,7 @@ from herdr_engineering.control_plane.repo import ControlPlaneRepo
 ANSWERS = {
     "public_url": "https://cp.example.test", "llm_upstream_url": "https://llm.example.test",
     "llm_upstream_key": "llm-secret-key", "ci_url": "https://ci.example.test",
-    "ci_token": "ci-secret-token", "web_bind": "127.0.0.1", "web_port": "8080",
+    "ci_token": "ci-secret-token", "web_bind": "127.0.0.1", "web_port": "8080", "gateway_tailnet_ip": "127.0.0.1",
     "hosts": {"bender": ["builder"]},
 }
 

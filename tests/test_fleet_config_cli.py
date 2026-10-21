@@ -3,6 +3,7 @@ import json
 import os
 import re
 import stat
+from pathlib import Path
 
 import pytest
 import yaml
@@ -13,7 +14,7 @@ from herdr_engineering.fleet_config import FleetConfigError, load_fleet_config
 ANSWERS = {
     "public_url": "https://cp.example.test", "llm_upstream_url": "https://llm.example.test",
     "llm_upstream_key": "llm-secret-key", "ci_url": "https://ci.example.test",
-    "ci_token": "ci-secret-token", "web_bind": "127.0.0.1", "web_port": "8080",
+    "ci_token": "ci-secret-token", "web_bind": "127.0.0.1", "web_port": "8080", "gateway_tailnet_ip": "127.0.0.1",
     "hosts": {"bender": ["builder"], "mac": ["host"]},
 }
 
@@ -77,7 +78,7 @@ def test_init_writes_0600_and_validates(tmp_path):
     cfg = load_fleet_config(p)
     assert set(cfg.status()["hosts"]) == {"bender", "mac"}
     env = fcc.compose_env(cfg)
-    assert len(env["HERDR_CP_PG_PASSWORD"]) == 32 and env["FABRIC_LLM_UPSTREAM_KEY"] == "llm-secret-key"
+    assert len(env["HERDR_CP_PG_PASSWORD"]) == 32 and cfg.section("llm")["upstream_key"] == "llm-secret-key"
     assert env["HERDR_CP_WEB_PUBLIC_PORT"] == "8080"
     assert fcc.validate_config(p)["hosts"] == 2
 
@@ -215,3 +216,107 @@ def test_init_generates_ingest_key_in_both_places_and_host_sections(tmp_path):
     served = cfg.slice_for("mac")  # a roleless-ish host still gets the "all" sections
     assert {"ingest", "agent", "fabric", "inspector"} <= set(served)
     assert "github" not in served and "control_plane" not in served
+
+
+# ----------------------------------------------------- gateway ip / compose map / in place
+
+def _answers_without_gateway():
+    a = dict(ANSWERS)
+    del a["gateway_tailnet_ip"]
+    return a
+
+
+def test_init_prompts_for_gateway_ip_defaulting_to_tailscale(tmp_path, monkeypatch):
+    monkeypatch.setattr(fcc, "_tailscale_ip", lambda: "100.64.0.7")
+    seen = []
+
+    def prompt(label):
+        seen.append(label)
+        return ""  # accept the default
+    p = fcc.init_config(tmp_path / "f.yaml", _answers_without_gateway(), prompt=prompt,
+                        secret_prompt=no_prompt)
+    assert any("gateway tailnet IP" in s and "[100.64.0.7]" in s for s in seen)
+    assert fcc.compose_env(load_fleet_config(p))["GATEWAY_TAILNET_IP"] == "100.64.0.7"
+
+
+def test_init_asks_explicitly_when_tailscale_is_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(fcc, "_tailscale_ip", lambda: None)
+    with pytest.raises(FleetConfigError, match="gateway_tailnet_ip is required"):
+        fcc.init_config(tmp_path / "a.yaml", _answers_without_gateway(), prompt=lambda _l: "",
+                        secret_prompt=no_prompt)
+    p = fcc.init_config(tmp_path / "b.yaml", _answers_without_gateway(), prompt=lambda _l: "100.9.9.9",
+                        secret_prompt=no_prompt)
+    assert fcc.compose_env(load_fleet_config(p))["GATEWAY_TAILNET_IP"] == "100.9.9.9"
+
+
+def test_tailscale_ip_takes_first_line_and_tolerates_failure(monkeypatch):
+    import subprocess as sp
+
+    class R:
+        returncode, stdout = 0, "100.1.1.1\n100.1.1.2\n"
+    monkeypatch.setattr(sp, "run", lambda *a, **k: R())
+    assert fcc._tailscale_ip() == "100.1.1.1"
+    R.returncode = 1
+    assert fcc._tailscale_ip() is None
+
+    def boom(*a, **k):
+        raise FileNotFoundError
+    monkeypatch.setattr(sp, "run", boom)
+    assert fcc._tailscale_ip() is None
+
+
+def test_gateway_bind_has_no_duplicate_for_loopback(tmp_path):
+    p = make(tmp_path)
+    assert fcc.compose_env(load_fleet_config(p))["GATEWAY_BIND"] == "127.0.0.1"
+    a = dict(ANSWERS, gateway_tailnet_ip="100.64.0.7")
+    q = fcc.init_config(tmp_path / "t.yaml", a, prompt=no_prompt, secret_prompt=no_prompt)
+    assert fcc.compose_env(load_fleet_config(q))["GATEWAY_BIND"] == "127.0.0.1,100.64.0.7"
+
+
+def test_init_compose_map_holds_only_what_compose_substitutes(tmp_path):
+    p = make(tmp_path)
+    keys = set(yaml.safe_load(p.read_text())["sections"]["control_plane"]["values"]["compose"])
+    assert keys == set(fcc.COMPOSE_REQUIRED)
+
+
+def _rewrite(path, mutate):
+    data = yaml.safe_load(path.read_text())
+    mutate(data["sections"]["control_plane"]["values"])
+    path.unlink()
+    fcc.write_private_file(path, yaml.safe_dump(data, sort_keys=False))
+
+
+def test_validate_requires_compose_map_and_names_missing_keys_only(tmp_path):
+    p = make(tmp_path)
+    secret = yaml.safe_load(p.read_text())["sections"]["control_plane"]["values"]["compose"]["HERDR_CP_PG_PASSWORD"]
+    _rewrite(p, lambda v: v["compose"].pop("HERDR_CP_WEB_BIND"))
+    with pytest.raises(FleetConfigError) as e:
+        fcc.validate_config(p)
+    assert "HERDR_CP_WEB_BIND" in str(e.value) and secret not in str(e.value)
+    _rewrite(p, lambda v: v.pop("compose"))
+    with pytest.raises(FleetConfigError, match="compose"):
+        fcc.validate_config(p)
+
+
+def test_example_file_matches_what_the_code_requires():
+    ex = yaml.safe_load((Path(__file__).resolve().parents[1] / "deploy/control-plane/fleet-config.example.yaml").read_text())
+    vals = ex["sections"]["control_plane"]["values"]
+    assert set(vals["compose"]) >= set(fcc.COMPOSE_REQUIRED)
+    assert "minio_user" in vals and "minio_password" in vals and "ci_actions" in vals
+    assert "rustfs_access_key" not in vals and "rustfs_secret_key" not in vals
+
+
+def test_set_host_writes_in_place_keeping_inode_and_mode(tmp_path):
+    p = make(tmp_path)
+    before = os.stat(p)
+    fcc.set_host(p, "bender", "a" * 64)
+    after = os.stat(p)
+    assert (after.st_ino, after.st_dev) == (before.st_ino, before.st_dev)
+    assert mode(p) == 0o600
+    assert load_fleet_config(p).status()["hosts"]["bender"] == ["builder"]
+    assert yaml.safe_load(p.read_text())["hosts"]["bender"]["token_sha256"] == "a" * 64
+    backups = list(tmp_path.glob("fleet-config.yaml.bak-*"))
+    assert len(backups) == 1 and mode(backups[0]) == 0o600
+    # a second write still keeps the inode
+    fcc.set_host(p, "mac", "b" * 64)
+    assert os.stat(p).st_ino == before.st_ino

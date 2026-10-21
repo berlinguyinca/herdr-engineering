@@ -241,7 +241,7 @@ services:
       - "--control-port"
       - "29999"
       - "--bind"
-      - "127.0.0.1,${GATEWAY_TAILNET_IP:?set gateway_tailnet_ip when running fleet config init}"
+      - "${GATEWAY_BIND:?run deploy.sh (derived from GATEWAY_TAILNET_IP)}"
       - "--url-base"
       - "dev.lan"
       # The container entrypoint is always PID 1, so a stale gateway.lock from
@@ -251,7 +251,7 @@ services:
     healthcheck:
       # The gateway's control API binds the tailnet IP (not loopback), so
       # probe that address (substituted from the rendered env file).
-      test: ["CMD", "curl", "-fsS", "http://${GATEWAY_TAILNET_IP}:29999/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://${GATEWAY_TAILNET_IP:?run deploy.sh}:29999/healthz"]
       interval: 15s
       timeout: 3s
       retries: 3
