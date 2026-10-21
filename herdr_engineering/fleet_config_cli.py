@@ -117,11 +117,12 @@ def _quote_env_value(value: str) -> str:
     """Quote for docker compose ``env_file``.
 
     Single quotes are literal (no interpolation, no escapes, raw newlines allowed),
-    so they carry any value that has no single quote. A value with a single quote
+    so they carry any value that has no single quote and does not end in a
+    backslash (compose rejects ``'abc\\'``). A value with a single quote
     is double-quoted instead: ``\\`` ``"`` ``$`` get a backslash and a newline
     becomes ``\\n``.
     """
-    if "'" not in value:
+    if "'" not in value and not value.endswith("\\"):
         return f"'{value}'"
     esc = (value.replace("\\", "\\\\").replace('"', '\\"')
            .replace("$", "\\$").replace("\n", "\\n"))

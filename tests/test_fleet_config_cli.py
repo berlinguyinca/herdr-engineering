@@ -49,6 +49,7 @@ def parse_env_file(text):
             c = text[i]
             if q == "'":
                 if c == "'":
+                    assert not (val and val[-1] == "\\"), "compose rejects a single-quoted value ending in a backslash"
                     i += 1
                     break
                 val.append(c)
@@ -104,7 +105,7 @@ def test_mint_token_hash_roundtrip():
 
 
 NASTY = ["pa$$word", "a'b\"c", "line1\nline2", "back\\slash # not comment", "$(rm -rf) ${HOME}",
-         "'", "plain", "x\n'y\"$z\\"]
+         "'", "plain", "abc\\", "\\", "x\n'y\"$z\\"]
 
 
 @pytest.mark.parametrize("value", NASTY)
