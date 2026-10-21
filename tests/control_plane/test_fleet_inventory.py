@@ -62,3 +62,26 @@ def test_heartbeat_load_becomes_a_telemetry_sample_and_list_stays_bounded():
     latest = repo.list_telemetry("bender", limit=1)[0]
     assert latest["mem_pct"] == 50 and latest["disk_pct"] == 61
     assert len(repo.list_telemetry("bender", limit=10_000)) == 500
+
+
+def test_host_alias_folds_a_duplicate_machine_into_its_canonical_name():
+    repo = ControlPlaneRepo(host_aliases={"Gerts-MacBook-Pro.local": "mac.lan"})
+    svc = IngestService(repo)
+    svc.ingest({"entity_type": "host", "entity_id": "mac.lan", "event_type": "host.heartbeat",
+                "payload": {"host_name": "mac.lan"}})
+    svc.ingest({"entity_type": "host", "entity_id": "Gerts-MacBook-Pro.local",
+                "event_type": "host.heartbeat", "payload": {"host_name": "Gerts-MacBook-Pro.local"}})
+    sid = repo.register_service("web", "Gerts-MacBook-Pro.local", 8011)
+    repo.upsert_session("s1", host_id="Gerts-MacBook-Pro.local")
+    assert [h["host_id"] for h in repo.list_hosts()] == ["mac.lan"]
+    assert repo.get_host("Gerts-MacBook-Pro.local")["host_id"] == "mac.lan"
+    assert repo.get_service(sid)["host_id"] == "mac.lan"
+    assert repo.get_session("s1")["host_id"] == "mac.lan"
+    assert repo.host_analytics()["total"] == 1
+
+
+def test_alias_alone_is_presented_under_the_canonical_name():
+    repo = ControlPlaneRepo(host_aliases={"old": "new"})
+    IngestService(repo).ingest({"entity_type": "host", "entity_id": "old",
+                                "event_type": "host.heartbeat", "payload": {"host_name": "old"}})
+    assert [(h["host_id"], h["host_name"]) for h in repo.list_hosts()] == [("new", "new")]

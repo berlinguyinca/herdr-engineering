@@ -417,6 +417,9 @@ def _make_handler(server):
                     return self._json(s) if s else self._json(
                         {"error": "not found"}, 404)
                 services = r.list_services()
+                host_filter = _q(self.path, "host_id")
+                if host_filter:
+                    services = [s for s in services if s.get("host_id") == host_filter]
                 summary = {state: sum(s["lifecycle"]["state"] == state for s in services)
                            for state in ("current", "unavailable", "archived", "unknown")}
                 summary["total"] = len(services)

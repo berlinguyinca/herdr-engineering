@@ -109,9 +109,14 @@ def _clean_inventory(raw):
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
-    def __init__(self, *, now=None, sink=None, service_archive_days=7):
+    def __init__(self, *, now=None, sink=None, service_archive_days=7, host_aliases=None):
         """``sink`` is an optional durable writer (e.g. DurableEventSink) called
-        with each recorded event so ingestion survives a restart."""
+        with each recorded event so ingestion survives a restart.
+
+        ``host_aliases`` maps an alternate host name to the canonical one (one
+        machine that reports under two names). Stored records keep what was
+        reported; every read presents the canonical name."""
+        self._host_aliases = {str(k): str(v) for k, v in (host_aliases or {}).items() if k and v and k != v}
         self._command_lock = threading.RLock()
         self._event_lock = threading.RLock()
         self._sink = sink
@@ -239,11 +244,19 @@ class ControlPlaneRepo:
                           mission_id=mission_id, session_id=sid)
         return sid
 
+    def _canonical_host(self, host_id):
+        return self._host_aliases.get(host_id, host_id)
+
+    def _present_host_id(self, record):
+        if record and record.get("host_id") in self._host_aliases:
+            record["host_id"] = self._host_aliases[record["host_id"]]
+        return record
+
     def get_session(self, session_id):
-        return _copy(self._sessions.get(session_id))
+        return self._present_host_id(_copy(self._sessions.get(session_id)))
 
     def list_sessions(self, status=None):
-        out = [_copy(s) for s in self._sessions.values()]
+        out = [self._present_host_id(_copy(s)) for s in self._sessions.values()]
         if status:
             out = [s for s in out if s["status"] == status]
         return _sort_by(out, "created_at", reverse=True)
@@ -573,7 +586,7 @@ class ControlPlaneRepo:
             result[field] = result["catalog"][field]
         result["lifecycle"] = service_lifecycle(
             result, self._now(), archive_after_days=self._service_archive_days)
-        return result
+        return self._present_host_id(result)
 
     def list_services(self, *, include_archived=True):
         services = [self._service_projection(s) for s in self._services.values()]
@@ -613,11 +626,34 @@ class ControlPlaneRepo:
         return hid
 
     def get_host(self, host_id):
-        return _copy(self._hosts.get(host_id))
+        return self._merged_hosts().get(self._canonical_host(host_id))
+
+    def _merged_hosts(self):
+        """Hosts keyed by canonical id; an alias contributes its freshest report."""
+        merged = {}
+        for hid, rec in self._hosts.items():
+            if hid in self._host_aliases:
+                continue
+            merged[hid] = _copy(rec)
+        for alias, canonical in self._host_aliases.items():
+            rec = self._hosts.get(alias)
+            if rec is None:
+                continue
+            base = merged.get(canonical)
+            if base is None:
+                base = merged[canonical] = _copy(rec)
+                base["host_id"] = base["host_name"] = canonical
+                continue
+            if (rec.get("last_seen") or "") > (base.get("last_seen") or ""):
+                for key in ("last_seen", "status", "cpu", "mem"):
+                    if rec.get(key) is not None:
+                        base[key] = rec[key]
+            if rec.get("inventory") and not base.get("inventory"):
+                base["inventory"] = _copy(rec["inventory"])
+        return merged
 
     def list_hosts(self):
-        return _sort_by([_copy(h) for h in self._hosts.values()],
-                        "host_name")
+        return _sort_by(list(self._merged_hosts().values()), "host_name")
 
     def fleet_inventory(self):
         """Host x component version matrix with drift against the fleet reference.
@@ -1529,9 +1565,9 @@ class ControlPlaneRepo:
         return {"models": usage, "total_sessions": len(self._sessions)}
 
     def host_analytics(self):
-        healthy = sum(1 for h in self._hosts.values()
-                      if h["status"] == "healthy")
-        total = len(self._hosts)
+        hosts = self._merged_hosts().values()
+        healthy = sum(1 for h in hosts if h["status"] == "healthy")
+        total = len(hosts)
         return {"total": total, "healthy": healthy,
                 "unavailable": total - healthy}
 

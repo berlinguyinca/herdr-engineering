@@ -1939,6 +1939,12 @@ def _self_report_services(repo, *, host_id, web_port, dsn=None,
     repo.upsert_service(host_id, "worker", 0, status="healthy")
 
 
+def _parse_host_aliases(raw: str) -> dict[str, str]:
+    """``alias=canonical,alias2=canonical2`` -> mapping; malformed pairs are ignored."""
+    pairs = (item.split("=", 1) for item in raw.split(",") if "=" in item)
+    return {a.strip(): c.strip() for a, c in pairs if a.strip() and c.strip()}
+
+
 def _cmd_cp_web(args) -> int:
     """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
 
@@ -1959,7 +1965,7 @@ def _cmd_cp_web(args) -> int:
     # ingested event persists to Postgres instead of dying with the in-memory
     # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
     sink = DurableEventSink(dsn=dsn) if dsn else None
-    repo = ControlPlaneRepo(sink=sink)
+    repo = ControlPlaneRepo(sink=sink, host_aliases=_parse_host_aliases(os.environ.get("HERDR_CP_HOST_ALIASES", "")))
     if args.seed_demo:
         _seed_demo(repo)
     rustfs = _maybe_rustfs_client()
