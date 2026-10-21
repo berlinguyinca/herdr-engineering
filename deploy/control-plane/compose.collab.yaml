@@ -21,3 +21,6 @@ services:
       - "--collab-cognito-group"
       - "local.dev"
       - "--collab-require-https"
+      # the command list is replaced, not merged: keep the central config flag
+      - "--fleet-config"
+      - "/etc/herdr/fleet-config.yaml"

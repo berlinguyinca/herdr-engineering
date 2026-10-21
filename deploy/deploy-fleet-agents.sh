@@ -9,6 +9,10 @@
 # symlink is switched and the service restarted. If the service is not active a few
 # seconds later the previous release is put back. Hosts come from
 # ~/.config/herdr-engineering/fleet-hosts.txt (see fleet-hosts.example.txt).
+#
+# Copies no env and no secrets. A host's configuration is its own
+# ~/.config/herdr-engineering/host.json (installed by `herdr-eng fleet join <host>`);
+# a host without it is skipped with a hint, and the run exits non-zero.
 set -euo pipefail
 
 REF="origin/main"; ONLY=""; DRY=0; FETCH=1
@@ -18,7 +22,7 @@ while [ $# -gt 0 ]; do
     --hosts) ONLY="${2:?}"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --no-fetch) FETCH=0; shift ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -72,7 +76,13 @@ while IFS='|' read -r name target manager; do
   case "$name" in ''|\#*) continue ;; esac
   if [ -n "$ONLY" ] && ! printf ',%s,' "$ONLY" | grep -q ",$name,"; then continue; fi
   echo "== $name ($manager)"
-  if [ "$DRY" = 1 ]; then echo "   [dry-run] would install plugin + feed release $REL"; continue; fi
+  if [ "$DRY" = 1 ]; then echo "   [dry-run] would check host.json, then install plugin + feed release $REL"; continue; fi
+
+  # ---- host credentials: nothing is rolled to a host that cannot fetch its config ----
+  if ! run "$target" 'test -s "$HOME/.config/herdr-engineering/host.json"'; then
+    echo "   host.json missing on $name: run  herdr-eng fleet join $name  first; skipping" >&2
+    failed=1; continue
+  fi
 
   # ---- snapshot plugin ----
   base='$HOME/.local/share/herdr-cp-feed-plugin-releases'

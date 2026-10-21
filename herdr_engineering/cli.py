@@ -424,6 +424,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("migrate", help="apply versioned SQL migrations")
     p2.add_argument("--migrations", default=None,
                     help="migrations dir (default: bundled deploy/control-plane)")
+    p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
+                    help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_migrate)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
@@ -436,9 +438,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="comma list of key=role (viewer|operator) pairs "
                          "(Spec §104); e.g. k1=viewer,k2=operator")
     p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
-                    help="central fleet config file; when it exists it is served to hosts "
-                         "and its control_plane section replaces the HERDR_CP_PG_DSN, "
-                         "HERDR_CP_HOST_ALIASES, HERDR_CP_API_KEYS and RustFS/MinIO env vars")
+                    help="central fleet config file: the only source of configuration. "
+                         "It is served to hosts, and its control_plane section supplies the "
+                         "Postgres DSN, host aliases, API keys, RustFS/MinIO, CI-actions "
+                         "and inspector settings")
     p2.add_argument("--pg-dsn", default=None,
                     help="optional Postgres DSN to hydrate the repo from "
                          "durable state on startup (Spec §106)")
@@ -481,6 +484,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="run a single pass and exit")
     p2.add_argument("--migrations", default=None,
                     help="migrations dir (default: bundled deploy/control-plane)")
+    p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
+                    help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_worker)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
     p2.add_argument("--control-plane", default=None,
@@ -497,7 +502,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--port", type=int, default=8088)
     p2.add_argument("--control-plane", default="http://control-plane-web:8080",
                     help="control-plane base URL")
-    p2.add_argument("--upstream", default="https://llm.metabolomics.us")
+    p2.add_argument("--upstream", default=None,
+                    help="upstream base URL (default: llm.upstream_url from the fleet config)")
+    p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
+                    help="central fleet config file: llm.upstream_key/upstream_url and "
+                         "control_plane.llm_proxy tuning (the only source of configuration)")
     p2.set_defaults(func=_cmd_cp_llm_proxy)
 
     return parser
@@ -537,19 +546,35 @@ def _cmd_cp_mission_feed(args) -> int:
 
 
 def _cmd_cp_llm_proxy(args) -> int:
-    """Serve the fabric LLM gateway. The upstream key is read from a file named by
-    FABRIC_LLM_UPSTREAM_KEY_FILE or, failing that, the FABRIC_LLM_UPSTREAM_KEY env
-    var — never from argv."""
-    from .llm_proxy import serve
-    key = os.environ.get("FABRIC_LLM_UPSTREAM_KEY", "")
-    key_file = os.environ.get("FABRIC_LLM_UPSTREAM_KEY_FILE")
-    if key_file:
-        with open(key_file) as fh:
-            key = fh.read().strip()
-    if not key:
-        print("FABRIC_LLM_UPSTREAM_KEY (or _FILE) is required", file=sys.stderr)
+    """Serve the fabric LLM gateway. Everything it needs comes from the central
+    fleet file (llm.upstream_key / upstream_url, control_plane.llm_proxy tuning);
+    the key is never taken from argv or the environment."""
+    from pathlib import Path
+
+    from .fleet_config import FleetConfigError, load_fleet_config
+    from .llm_proxy import DEFAULT_MAX_INFLIGHT, DEFAULT_QUEUE_WAIT_SECONDS, serve
+    path = Path(args.fleet_config).expanduser()
+    try:
+        cfg = load_fleet_config(path)
+        llm = cfg.section("llm")
+        try:
+            tuning = cfg.section("control_plane").get("llm_proxy") or {}
+        except FleetConfigError:
+            tuning = {}
+        if not isinstance(tuning, dict):
+            raise FleetConfigError("control_plane.llm_proxy must be a mapping")
+        max_inflight = int(tuning.get("max_inflight", DEFAULT_MAX_INFLIGHT))
+        wait_seconds = float(tuning.get("queue_wait_seconds", DEFAULT_QUEUE_WAIT_SECONDS))
+    except (FleetConfigError, OSError, ValueError, TypeError) as exc:
+        print(f"--fleet-config {path}: {exc}", file=sys.stderr)
         return 2
-    httpd = serve(args.host, args.port, args.control_plane, args.upstream, key)
+    key = str(llm.get("upstream_key") or "")
+    upstream = args.upstream or str(llm.get("upstream_url") or "")
+    if not key or not upstream:
+        print("fleet config llm.upstream_key and llm.upstream_url are required", file=sys.stderr)
+        return 2
+    httpd = serve(args.host, args.port, args.control_plane, upstream, key,
+                  max_inflight=max_inflight, wait_seconds=wait_seconds)
     print(f"llm-proxy listening on {args.host}:{httpd.server_address[1]}", flush=True)
     try:
         httpd.serve_forever()
@@ -2040,14 +2065,29 @@ def _cp_migrations_dir() -> str:
     return str(pkg.parent / "deploy" / "control-plane" / "migrations")
 
 
-def _cp_config() -> dict:
+def _cp_config(fleet_config_path=None) -> dict:
+    """Control-plane settings: config.yaml defaults, with the Postgres DSN taken
+    from the central fleet file's control_plane section when that file exists."""
+    from pathlib import Path
+
     from .config import load_config
     from .control_plane.db import control_plane_config
+    from .fleet_config import FleetConfigError, load_fleet_config
     try:
         cfg = load_config()
     except Exception:
         cfg = {}
-    return control_plane_config(cfg)
+    out = control_plane_config(cfg)
+    if fleet_config_path:
+        path = Path(fleet_config_path).expanduser()
+        if path.exists():
+            try:
+                dsn = load_fleet_config(path).section("control_plane").get("pg_dsn")
+            except FleetConfigError as exc:
+                raise SystemExit(f"--fleet-config: {exc}") from None
+            if dsn:
+                out["postgres_dsn"] = str(dsn)
+    return out
 
 
 async def _cp_connect(dsn: str):
@@ -2062,7 +2102,7 @@ def _cmd_cp_migrate(args) -> int:
     migrations = args.migrations or _cp_migrations_dir()
 
     async def _run():
-        conn = await _cp_connect(_cp_config()["postgres_dsn"])
+        conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
         try:
             return await Migrator(conn).apply(migrations)
         finally:
@@ -2101,6 +2141,14 @@ def _self_report_services(repo, *, host_id, web_port, dsn=None,
     repo.upsert_service(host_id, "worker", 0, status="healthy")
 
 
+def _host_aliases_from(cp: dict) -> dict[str, str]:
+    """control_plane.host_aliases: a mapping, or the ``alias=canonical,...`` string."""
+    raw = cp.get("host_aliases") or {}
+    if isinstance(raw, dict):
+        return {str(a): str(c) for a, c in raw.items() if a and c}
+    return _parse_host_aliases(str(raw))
+
+
 def _parse_host_aliases(raw: str) -> dict[str, str]:
     """``alias=canonical,alias2=canonical2`` -> mapping; malformed pairs are ignored."""
     pairs = (item.split("=", 1) for item in raw.split(",") if "=" in item)
@@ -2128,21 +2176,22 @@ def _cmd_cp_web(args) -> int:
         merged = {str(k): str(v) for k, v in file_keys.items()}
         merged.update(api_keys or {})
         api_keys = merged or None
-    # In the compose stack the DSN is supplied via the HERDR_CP_PG_DSN env var
-    # (from env_file: .env) so the password never appears in process args. With a
-    # fleet config the control_plane section replaces the environment.
-    dsn = args.pg_dsn or (cp.get("pg_dsn") if fleet_store is not None else os.environ.get("HERDR_CP_PG_DSN"))
-    host_aliases = str(cp.get("host_aliases") or "") if fleet_store is not None \
-        else os.environ.get("HERDR_CP_HOST_ALIASES", "")
+    # The Postgres DSN comes from the fleet file's control_plane section (the
+    # mounted central file), so the password never appears in process args or env.
+    dsn = args.pg_dsn or cp.get("pg_dsn")
+    inspector_limits = cp.get("inspector_limits") or {}
+    if not isinstance(inspector_limits, dict):
+        raise SystemExit("fleet config control_plane.inspector_limits must be a mapping")
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
     # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
     sink = DurableEventSink(dsn=dsn) if dsn else None
-    repo = ControlPlaneRepo(sink=sink, host_aliases=_parse_host_aliases(host_aliases))
+    repo = ControlPlaneRepo(sink=sink, host_aliases=_host_aliases_from(cp),
+                            inspector_limits=inspector_limits)
     if args.seed_demo:
         _seed_demo(repo)
-    rustfs = _maybe_rustfs_client(cp if fleet_store is not None else None)
+    rustfs = _maybe_rustfs_client(cp)
     collab = None
     if args.collab_cognito_pool:
         if args.collab_users_file:
@@ -2179,16 +2228,15 @@ def _cmd_cp_web(args) -> int:
                              rustfs=rustfs, collab=collab,
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
-                             fleet_config=fleet_store)
+                             fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True)
     # Self-report the control-plane stack so the Services page has real data.
     try:
         _self_report_services(
             repo,
-            host_id=os.environ.get("HERDR_CP_SELF_HOST") or socket.gethostname(),
-            web_port=args.port or os.environ.get("HERDR_CP_WEB_PORT", "8080"),
+            host_id=cp.get("self_host") or socket.gethostname(),
+            web_port=args.port or cp.get("web_port") or 8080,
             dsn=dsn,
-            rustfs_endpoint=(cp.get("rustfs_endpoint") if fleet_store is not None
-                             else os.environ.get("HERDR_CP_RUSTFS_ENDPOINT")),
+            rustfs_endpoint=cp.get("rustfs_endpoint"),
         )
     except Exception:
         logging.exception("self-report of stack services failed")
@@ -2243,27 +2291,19 @@ def _load_cp_fleet_config(path_arg):
 def _maybe_rustfs_client(cp=None):
     """Build an S3/RustFS client for artifact payloads, or None if not wired.
 
-    Configured via HERDR_CP_RUSTFS_ENDPOINT (default http://rustfs:9000) and
-    HERDR_CP_RUSTFS_BUCKET (default herdr-artifacts); the MinIO credentials come
-    from HERDR_CP_MINIO_USER / HERDR_CP_MINIO_PASSWORD when set, else the fixed
-    dev creds. Returns None when no endpoint is reachable/configured so the web
-    server still starts with the in-memory stand-in.
+    Configured by the fleet file's control_plane section: rustfs_endpoint,
+    rustfs_bucket (default herdr-artifacts), rustfs_region (default us-east-1),
+    minio_user and minio_password (default the fixed dev creds). Returns None
+    when there is no endpoint so the web server still starts with the
+    in-memory stand-in.
     """
     from .control_plane.rustfs import RustFSClient
-    if cp is not None:
-        # Fleet config replaces the environment: rustfs_endpoint, rustfs_bucket,
-        # rustfs_region, minio_user, minio_password (same defaults as the env path).
-        endpoint = cp.get("rustfs_endpoint")
-        bucket = cp.get("rustfs_bucket", "herdr-artifacts")
-        region = cp.get("rustfs_region", "us-east-1")
-        access_key = cp.get("minio_user", "herdr")
-        secret_key = cp.get("minio_password", "herdr")
-    else:
-        endpoint = os.environ.get("HERDR_CP_RUSTFS_ENDPOINT")
-        bucket = os.environ.get("HERDR_CP_RUSTFS_BUCKET", "herdr-artifacts")
-        region = os.environ.get("HERDR_CP_RUSTFS_REGION", "us-east-1")
-        access_key = os.environ.get("HERDR_CP_MINIO_USER", "herdr")
-        secret_key = os.environ.get("HERDR_CP_MINIO_PASSWORD", "herdr")
+    cp = cp or {}
+    endpoint = cp.get("rustfs_endpoint")
+    bucket = cp.get("rustfs_bucket", "herdr-artifacts")
+    region = cp.get("rustfs_region", "us-east-1")
+    access_key = cp.get("minio_user", "herdr")
+    secret_key = cp.get("minio_password", "herdr")
     if not endpoint:
         return None
     client = RustFSClient(endpoint=endpoint, bucket=bucket, region=region,
@@ -2343,7 +2383,7 @@ def _cmd_cp_worker(args) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     async def _run():
-        conn = await _cp_connect(_cp_config()["postgres_dsn"])
+        conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
         try:
             migrations = args.migrations or _cp_migrations_dir()
             await Migrator(conn).apply(migrations)

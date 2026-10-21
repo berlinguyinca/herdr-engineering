@@ -190,6 +190,6 @@ def test_cp_web_sources_control_plane_section(tmp_path, monkeypatch):
             pass
     import herdr_engineering.control_plane.rustfs as rfs
     monkeypatch.setattr(rfs, "RustFSClient", Fake)
-    monkeypatch.setenv("HERDR_CP_RUSTFS_ENDPOINT", "http://env:1")
+    monkeypatch.setenv("HERDR_CP_RUSTFS_ENDPOINT", "http://env:1")  # ignored: file only
     cli._maybe_rustfs_client(cp)
     assert seen["endpoint"] == "http://rfs:9000" and seen["access_key"] == "u"
