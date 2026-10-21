@@ -431,6 +431,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="enable the collaboration network (HCN, off by default): JSON "
                          "file mapping user_id -> sha256(token) hex. Pilot authenticator "
                          "only; replace with SSO before real use (ADR-0007).")
+    p2.add_argument("--collab-cognito-pool", default=None,
+                    help="authenticate collaboration users with Cognito access tokens from "
+                         "this user pool (e.g. us-west-2_GjtcM0PCp); needs --collab-cognito-client")
+    p2.add_argument("--collab-cognito-client", action="append", default=[],
+                    help="allowed Cognito app client id (repeatable)")
+    p2.add_argument("--collab-cognito-group", default="dev",
+                    help="required cognito:groups membership (default: dev)")
     p2.add_argument("--collab-tls-terminated", action="store_true",
                     help="assert TLS is terminated in front of this server; required to "
                          "enable collaboration on a non-loopback bind")
@@ -2013,7 +2020,23 @@ def _cmd_cp_web(args) -> int:
         _seed_demo(repo)
     rustfs = _maybe_rustfs_client()
     collab = None
-    if args.collab_users_file:
+    if args.collab_cognito_pool:
+        if args.collab_users_file:
+            raise SystemExit("use either --collab-cognito-pool or --collab-users-file, not both")
+        from .control_plane.collab import CollabService
+        from .control_plane.collab_cognito import CognitoAuthenticator, boto_group_lookup
+        try:
+            auth = CognitoAuthenticator(pool_id=args.collab_cognito_pool,
+                                        client_ids=args.collab_cognito_client,
+                                        required_group=args.collab_cognito_group)
+            auth._lookup = boto_group_lookup(auth.pool_id, auth.region)
+        except ValueError as exc:
+            raise SystemExit(f"--collab-cognito-*: {exc}") from exc
+        if sink is not None and source is None:
+            raise SystemExit("collaboration with a durable sink requires the source to load "
+                             "existing state; refusing to start empty over an existing log")
+        collab = CollabService(auth, sink=sink)
+    elif args.collab_users_file:
         from pathlib import Path
 
         from .control_plane.collab import CollabService, StaticTokenAuthenticator
