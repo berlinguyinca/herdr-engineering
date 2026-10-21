@@ -120,6 +120,20 @@ export function createModelResolver({ queryProcess, env = process.env, home = ho
       const file = sessionId && sessionFile(sessionId, join(home, ".pi", "agent", "sessions"), { list });
       const text = file && read(file);
       model = text ? piModel(text) : null;
+    } else if (pane.agent === "claude") {
+      // Claude Code records pid -> sessionId in ~/.claude/sessions/<pid>.json.
+      let evidence = pane.agent_session;
+      if (!evidence) {
+        const info = await queryProcess(server, pane.pane_id).catch(() => null);
+        const pids = (info?.result?.process_info?.foreground_processes ?? []).map(p => p?.pid).filter(Number.isInteger);
+        for (const pid of pids) {
+          try {
+            const sessionId = JSON.parse(read(join(home, ".claude", "sessions", `${pid}.json`)) ?? "").sessionId;
+            if (typeof sessionId === "string") { evidence = { kind: "id", value: sessionId }; break; }
+          } catch { /* not a claude process */ }
+        }
+      }
+      model = sessionModel("claude", evidence, { home, read });
     } else {
       model = sessionModel(pane.agent, pane.agent_session, { home, read });
     }

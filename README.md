@@ -317,6 +317,40 @@ Deployed on **bender**, the control-plane stack serves the HerdR UI at
   `tailscale serve --https=443 http://127.0.0.1:8080` on bender (gives an HTTPS
   URL) — the app itself does not do TLS termination.
 
+#### Repeatable deploys
+
+Deploys go through scripts, not hand-built compose overrides. Secrets stay in a
+host-local 0600 env file (`~/.config/herdr-engineering/control-plane.env`, or
+`HERDR_CP_ENV_FILE`); nothing secret is committed.
+
+```bash
+# control-plane web: build from a ref, recreate only control-plane-web,
+# wait for /api/v1/health to report the commit, roll back on failure.
+# Writes a receipt to ~/.local/state/herdr-engineering/deploys/<sha>.json
+deploy/control-plane/deploy.sh --dry-run            # show what would happen
+deploy/control-plane/deploy.sh --ref origin/main
+
+# per-host plugin + ownership feed (hosts listed in
+# ~/.config/herdr-engineering/fleet-hosts.txt, see deploy/fleet-hosts.example.txt)
+deploy/deploy-fleet-agents.sh --dry-run
+deploy/deploy-fleet-agents.sh --ref origin/main [--hosts bender,beast]
+
+# which hosts run different claude/codex/pi/plugin versions (suggestions only)
+herdr-eng fleet drift --control-plane http://dev.lan
+```
+
+The ownership feed is Linux-only (it reads `/proc`), so launchd hosts get the
+plugin but not the feed. Stale `unknown` services can be retired in bulk; this
+only records a reversible event (a new report restores the service). Dry-run is
+the default:
+
+```bash
+curl -XPOST -H 'X-API-Key: $OPERATOR_KEY' -d '{"older_than_days":7,"states":["unknown"]}' \
+  http://dev.lan/api/v1/services/retire             # dry run: counts only
+curl -XPOST -H 'X-API-Key: $OPERATOR_KEY' -d '{"older_than_days":7,"states":["unknown"],"dry_run":false}' \
+  http://dev.lan/api/v1/services/retire
+```
+
 Note: the web hydrates from Postgres **once at startup**, so it reflects a
 snapshot of durable state; live updates flow over SSE. Restart the web to
 re-hydrate after external writes.

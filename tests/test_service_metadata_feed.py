@@ -418,4 +418,4 @@ def test_registered_work_reserves_budget_for_dynamic_discovery(setup):
 
 def test_feed_asks_only_for_its_own_hosts_services(setup):
     setup.feed.collect()
-    assert setup.client.service_routes == ["/api/v1/services?host_id=host"]
+    assert setup.client.service_routes == ["/api/v1/services?host_id=host&fields=feed"]
