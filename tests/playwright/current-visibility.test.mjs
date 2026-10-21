@@ -166,7 +166,8 @@ test('service ownership separates catalogs and keeps secondary current and histo
   assert.match(await page.locator('#sc-history-summary').innerText(),/^0 /);
   assert.equal(await page.locator('#services a[href="#/system-services"]').count(),1);
   await page.evaluate(()=>window.openSystem());
-  assert.equal(await page.locator('#services [data-service-id]').count(),2);
+  assert.equal(await page.locator('#services [data-service-id]').count(),1);
+  assert.equal(await page.locator('#services [data-service-id="system"]').count(),1);
   assert.equal(await page.locator('#services [data-service-id="owned"]').count(),0);
   assert.match(await page.locator('#sc-history-summary').innerText(),/^1 /);
   await page.locator('#sc-status').selectOption('unavailable');

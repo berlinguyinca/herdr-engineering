@@ -91,3 +91,17 @@ test('cleanTitle strips pasted-prompt markers', async () => {
   assert.equal(cleanTitle('# Pi Engineering — Fault-Tolerant'), 'Pi Engineering — Fault-Tolerant');
   assert.equal(cleanTitle('Plain title'), 'Plain title');
 });
+
+test('snoozed attention missions leave the count and rows, and can be brought back', () => {
+  const projections = [live('pi:stuck', 'EXECUTING', 'stalled')];
+  const states = { projections: { loaded: true }, missions: { loaded: true } };
+  const base = renderOverviewSection('missions', { projections, missions: [] }, states, now, now);
+  assert.match(base, /<strong>1<\/strong><span>Need attention/);
+  assert.match(base, /data-snooze="pi:stuck"/);
+  const snoozed = renderOverviewSection('missions', { projections, missions: [], snoozed: new Map([['pi:stuck', now + 1000]]) }, states, now, now);
+  assert.match(snoozed, /<strong>0<\/strong><span>Need attention/);
+  assert.match(snoozed, /1 snoozed for 24 hours/);
+  assert.doesNotMatch(snoozed, /data-snooze="pi:stuck"/);
+  const expired = renderOverviewSection('missions', { projections, missions: [], snoozed: new Map([['pi:stuck', now - 1]]) }, states, now, now);
+  assert.match(expired, /data-snooze="pi:stuck"/);
+});
