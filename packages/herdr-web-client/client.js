@@ -46,6 +46,16 @@ export class HerdrClient {
     return json;
   }
 
+  // Fleet config revision/drift status; null when the server has no fleet config (404).
+  async getFleetConfigStatus({ signal } = {}) {
+    try {
+      return await this.request('/api/v1/fleet/config/status', { signal });
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return null;
+      throw err;
+    }
+  }
+
   // -- missions -----------------------------------------------------------
   listMissions(status, { signal } = {}) {
     const q = status ? `?status=${encodeURIComponent(status)}` : '';
