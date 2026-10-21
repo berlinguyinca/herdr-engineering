@@ -507,6 +507,15 @@ usage (including streaming) is recorded against the project: `GET /api/v1/analyt
 and never receive the lab key. The gateway is not exposed beyond the fabric. It uses the public
 HTTPS API only; the `upstream` link role (specs repo, spec 63) will replace this path.
 
+**Gateway identity and backpressure.** All projects share the one lab key, so the proxy tells the
+gateway who is calling: `X-InferWeave-Client-ID` is always `herdr:<project>`, and
+`X-InferWeave-Session-ID` / `X-InferWeave-Agent-ID` (or `X-Session-Id`) pass through when they match
+`[A-Za-z0-9-_.:/]{1,128}` (the session falls back to `<project>:<key_id>`). Without this every request
+shared the gateway's single default session/agent bucket (4 active, 12 queued). Each project is also
+capped at `HERDR_LLM_PROXY_MAX_INFLIGHT` concurrent requests (default 32, `0` disables); a request that
+cannot get a slot within `HERDR_LLM_PROXY_QUEUE_WAIT_SECONDS` (default 10) gets `429` with
+`Retry-After` and `error.type: proxy_backpressure`, without reaching the gateway.
+
 A revoked key stops working within 10 s (the proxy reloads its key table every 10 s; an unknown key forces a reload at most every 2 s).
 
 Mint a key and an env file for a project (the key is never printed):
