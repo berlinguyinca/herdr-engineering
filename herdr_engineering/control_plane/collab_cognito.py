@@ -148,6 +148,32 @@ class CognitoAuthenticator:
         return ok
 
 
+class SyncedDirectory:
+    """Cognito JWKS and group membership read from files a host-side job refreshes.
+
+    Lets the public container run with no AWS credentials and no outbound network at all.
+    Fail closed: membership older than ``max_age`` seconds raises, so nobody new is admitted
+    (and a known user is denied after the grace window) if the sync stops.
+    """
+
+    def __init__(self, directory: str, group: str, *, max_age: float = 600.0,
+                 now: Callable[[], float] = time.time):
+        self.dir, self.group, self.max_age, self._now = directory, group, max_age, now
+
+    def _load(self, name: str) -> dict:
+        with open(f"{self.dir}/{name}", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def jwks(self) -> dict:
+        return self._load("jwks.json")
+
+    def groups(self, user: str) -> list[str] | None:
+        data = self._load("members.json")
+        if self._now() - float(data["updated"]) > self.max_age:
+            raise RuntimeError("group membership sync is stale")
+        return [self.group] if user in data["groups"].get(self.group, []) else []
+
+
 def boto_group_lookup(pool_id: str, region: str) -> Callable[[str], list[str] | None]:
     """Group lookup through AdminListGroupsForUser (needs cognito-idp:AdminListGroupsForUser)."""
     import boto3

@@ -450,6 +450,10 @@ def _build_parser() -> argparse.ArgumentParser:
                          "internet-facing proxy here, never at the main port")
     p2.add_argument("--collab-public-host", default=None,
                     help="bind address for --collab-public-port (default: --host)")
+    p2.add_argument("--collab-sync-dir", default=None,
+                    help="read Cognito JWKS (jwks.json) and group members (members.json) from this "
+                         "directory, refreshed by a host job, instead of calling AWS: the "
+                         "container then needs no credentials and no outbound network")
     p2.add_argument("--collab-only", action="store_true",
                     help="serve ONLY the public collaboration surface on --collab-public-port: no "
                          "dashboard, no operator API, no database (events go to --collab-log-file)")
@@ -2070,7 +2074,14 @@ def _cmd_cp_web(args) -> int:
             auth = CognitoAuthenticator(pool_id=args.collab_cognito_pool,
                                         client_ids=clients,
                                         required_group=args.collab_cognito_group)
-            auth._lookup = boto_group_lookup(auth.pool_id, auth.region)
+            if args.collab_sync_dir:
+                from .control_plane.collab_cognito import SyncedDirectory
+                directory = SyncedDirectory(args.collab_sync_dir, args.collab_cognito_group)
+                auth._fetch = directory.jwks
+                auth._lookup = directory.groups
+                auth._recheck = 15.0
+            else:
+                auth._lookup = boto_group_lookup(auth.pool_id, auth.region)
         except ValueError as exc:
             raise SystemExit(f"--collab-cognito-*: {exc}") from exc
         if sink is not None and source is None and not args.collab_only:   # the file log is hydrated below

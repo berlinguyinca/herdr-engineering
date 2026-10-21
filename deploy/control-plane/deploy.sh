@@ -69,6 +69,8 @@ if [ -e "$COLLAB_MARKER" ]; then
   export HERDR_COLLAB_DATA_DIR="$HOME/.local/share/herdr-engineering/collab"
   mkdir -p "$HERDR_COLLAB_DATA_DIR"
   chmod 700 "$HERDR_COLLAB_DATA_DIR"
+  export HERDR_COLLAB_SYNC_DIR="$HOME/.local/share/herdr-engineering/collab-sync"
+  "$WORK/deploy/control-plane/collab-sync.sh" install   # keys + membership files and the 1-minute timer
   EDGE_SERVICE=(collab-public collab-edge)
   echo "collaboration network: enabled (marker $COLLAB_MARKER)"
 fi
