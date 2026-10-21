@@ -89,7 +89,8 @@ class ControlPlaneServer:
                  port=0, web_root=None, source=None, allow_open=False,
                  rustfs=None, dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
-                 collab_require_https=False, public_port=None, public_host=None):
+                 collab_require_https=False, public_port=None, public_host=None,
+                 collab_only=False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -158,6 +159,9 @@ class ControlPlaneServer:
         # it is the only one an internet-facing proxy should be pointed at.
         if public_port is not None and collab is None:
             raise ValueError("a public collaboration listener needs collab enabled")
+        self.collab_only = collab_only
+        if collab_only and public_port is None:
+            raise ValueError("collab-only mode needs the public collaboration port")
         self.public_port = public_port
         self.public_host = public_host or host
         self._public_httpd = None
@@ -226,6 +230,14 @@ class ControlPlaneServer:
 
     # ------------------------------------------------------------- server
     def serve(self):
+        if self.collab_only:
+            # No operator listener at all: this process serves the public collab surface only.
+            self._httpd = _DaemonThreadingServer(
+                (self.public_host, self.public_port), _make_handler(self, public=True))
+            self.public_port = self.port = self._httpd.server_address[1]
+            self._ready.set()
+            self._httpd.serve_forever()
+            return
         self._httpd = _DaemonThreadingServer(
             (self.host, self.port), _make_handler(self))
         self.port = self._httpd.server_address[1]

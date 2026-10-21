@@ -66,7 +66,10 @@ if [ -e "$COLLAB_MARKER" ]; then
   mkdir -p "$EDGE_DIR"
   install -m 0644 "$WORK/deploy/control-plane/collab-edge/nginx.conf" "$EDGE_DIR/nginx.conf"
   export HERDR_COLLAB_EDGE_CONF="$EDGE_DIR/nginx.conf"
-  EDGE_SERVICE=(collab-edge)
+  export HERDR_COLLAB_DATA_DIR="$HOME/.local/share/herdr-engineering/collab"
+  mkdir -p "$HERDR_COLLAB_DATA_DIR"
+  chmod 700 "$HERDR_COLLAB_DATA_DIR"
+  EDGE_SERVICE=(collab-public collab-edge)
   echo "collaboration network: enabled (marker $COLLAB_MARKER)"
 fi
 

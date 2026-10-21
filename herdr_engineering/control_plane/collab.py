@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import threading
@@ -120,6 +121,36 @@ class Stream:
 
     def __init__(self, service: CollabService, principal: Principal, room_id: str, cursor: int):
         self.service, self.principal, self.room_id, self.cursor = service, principal, room_id, cursor
+
+
+class FileEventLog:
+    """Append-only JSON-lines event log for a collab-only deployment (no database).
+
+    Same sink contract as the durable Postgres sink: ``record_required`` must have
+    reached stable storage before it returns, or raise.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+
+    def load(self) -> list[dict]:
+        rows = []
+        with open(self.path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        return rows
+
+    def record_required(self, event: dict) -> None:
+        data = (json.dumps(event, separators=(",", ":")) + "\n").encode("utf-8")
+        with self._lock:
+            os.write(self._fd, data)
+            os.fsync(self._fd)
+
+    record = record_required
 
 
 class CollabService:
