@@ -150,3 +150,20 @@ def test_errors_do_not_leak_values(tmp_path):
 def test_missing_file(tmp_path):
     with pytest.raises(FleetConfigError):
         load_fleet_config(tmp_path / "absent.yaml")
+
+
+def test_non_json_date_value_rejected_without_leak(tmp_path):
+    text = yaml.safe_dump(base()) + ""
+    text = text.replace("region: us", "region: us\n      since: 2026-10-21")
+    assert "since: 2026-10-21" in text
+    with pytest.raises(FleetConfigError) as e:
+        load_fleet_config(write(tmp_path, None, text=text))
+    assert "2026" not in str(e.value) and "JSON" in str(e.value)
+
+
+def test_mixed_key_types_rejected_without_leak(tmp_path):
+    d = base()
+    d["sections"]["common"]["values"]["m"] = {1: "a", "b": SECRET}
+    with pytest.raises(FleetConfigError) as e:
+        load_fleet_config(write(tmp_path, d))
+    assert SECRET not in str(e.value)
