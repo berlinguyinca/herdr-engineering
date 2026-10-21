@@ -251,6 +251,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="run the per-host forwarder and block (no gateway needed)")
     p2.add_argument("--bind", default="127.0.0.1",
                     help="forwarder bind address for --serve (default 127.0.0.1)")
+    p2.add_argument("--require-gateway", action="store_true",
+                    help="fail (nonzero exit) if the gateway is not reachable "
+                         "instead of silently falling back to the local registry")
     p2.set_defaults(func=_cmd_dev_enroll)
     p2 = dsub.add_parser("enroll-sync", help="auto-enroll every origin manifest in a "
                     "dir (watch for new projects); see the fabric-enroll skill")
@@ -267,6 +270,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--git-pull", action="store_true",
                     help="if --dir is a git repo, 'git pull --ff-only' before "
                          "each sync (auto-pick-up committed origin.json files)")
+    p2.add_argument("--require-gateway", action="store_true",
+                    help="fail (nonzero exit) if the gateway is not reachable "
+                         "instead of silently falling back to the local registry")
     p2.set_defaults(func=_cmd_dev_enroll_sync)
     p2 = dsub.add_parser("heartbeat", help="renew a lease")
     p2.add_argument("lease_id"); p2.set_defaults(func=_cmd_dev_heartbeat)
@@ -799,6 +805,27 @@ def _local_fabric_client():
         return None  # gateway down: degrade to local mode, never break registration
 
 
+def _gateway_configured_or_reachable() -> bool:
+    """True when a gateway URL is configured (env HERDR_ENGINEERING_FABRIC_URL
+    or fabric.gateway_url in config) OR a gateway is currently reachable.
+    Used to warn about silent local-registry degradation (issue #77b)."""
+    from .config import load_config
+    from .errors import InvalidError
+    from .fabric import FabricClient, gateway_url_from_config
+    try:
+        url = gateway_url_from_config(load_config())
+    except InvalidError:
+        url = None
+    if url:
+        return True  # configured (even if currently unreachable)
+    # Not configured: check if one is somehow reachable (e.g. via env override)
+    try:
+        FabricClient("http://127.0.0.1:29999").healthz()
+        return True
+    except Exception:
+        return False
+
+
 def _resolve_target_host(host: str, port: int) -> str:
     """Resolve 'auto'/'local' to this machine's tailnet IP (so the gateway can
     route back to us). Verifies the local target is listening. Explicit hosts
@@ -1049,6 +1076,22 @@ def _cmd_dev_enroll_sync(args) -> int:
     from .devfabric import DevServiceRegistry, forwarder_for
     reg = DevServiceRegistry()
     client = _local_fabric_client()
+    if client is None:
+        # --require-gateway: fail hard instead of silently degrading (issue #77b).
+        if getattr(args, "require_gateway", False):
+            _print_json({"ok": False, "error": "--require-gateway set but the "
+                        "gateway is not reachable; refusing to fall back to "
+                        "the local registry"})
+            return 1
+        if _gateway_configured_or_reachable():
+            import sys as _sys
+            print(
+                "WARNING: enrolling via the LOCAL registry while a gateway "
+                "URL is configured or reachable. Origins will NOT be visible "
+                "to other hosts on the dev.lan fabric. Start the gateway or "
+                "set --require-gateway to make this a hard error.",
+                file=_sys.stderr,
+            )
     try:
         _load_origin_manifests(args.dir)  # validate early
     except ValueError as exc:
@@ -1229,9 +1272,29 @@ def _cmd_dev_enroll(args) -> int:
         })
         return 0
 
+    # --require-gateway: the caller explicitly wants the central gateway; do not
+    # silently degrade to the local registry (issue #77b).
+    if getattr(args, "require_gateway", False):
+        _print_json({"ok": False, "error": "--require-gateway set but the gateway "
+                    "is not reachable; refusing to fall back to the local registry"})
+        return 1
+
     # Local mode: apply (re)routes by closing any stale lease for the target,
     # then register fresh (preferred_port keeps the origin port stable).
     reg = DevServiceRegistry()
+
+    # Issue #77b: a gateway URL is configured/reachable but we fell back to the
+    # local registry — this is a footgun (the origin won't be visible to the
+    # fleet). Print a loud warning so the operator notices.
+    if _gateway_configured_or_reachable():
+        import sys as _sys
+        print(
+            "WARNING: enrolling via the LOCAL registry while a gateway URL is "
+            "configured or reachable. The origin will NOT be visible to other "
+            "hosts on the dev.lan fabric. Start the gateway or set "
+            "--require-gateway to make this a hard error.",
+            file=_sys.stderr,
+        )
     stale = next((cand for cand in reg.active_leases()
                   if cand.target_machine_id == machine and cand.target_host == c_host
                   and cand.target_port == c_port), None)

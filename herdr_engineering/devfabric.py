@@ -412,13 +412,19 @@ class DevServiceForwarder:
     Private-only: when ``private_only`` is set (the default), the bind address
     must be loopback or a private address (RFC1918, link-local, CGNAT, or the
     Tailscale range). Public bind addresses are refused.
+
+    Issue #76: every per-connection step is bounded (connect, peek, pipe) and
+    worker failures are non-fatal — a dead or stuck worker can never hold the
+    accept/route path or starve subsequent requests.
     """
 
     def __init__(self, lease: DevServiceLease, bind_host: str = "127.0.0.1",
-                 private_only: bool = True) -> None:
+                 private_only: bool = True,
+                 inactivity_timeout: float = 30.0) -> None:
         self.lease = lease
         self.bind_host = bind_host
         self.private_only = private_only
+        self.inactivity_timeout = inactivity_timeout
         self._listener: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
         self._stopping = threading.Event()
@@ -451,37 +457,40 @@ class DevServiceForwarder:
         return self
 
     def _proxy(self, client: socket.socket) -> None:
+        """Route ONE connection to the lease target (bounded; issue #76).
+
+        Failures here are per-connection and non-fatal: log, close the client
+        socket and return. The accept loop is a separate thread, so no worker
+        can ever wedge the forwarder.
+        """
         target = None
         try:
+            # Bounded dial (was already 5s, kept explicit).
             target = socket.create_connection(
                 (self.lease.target_host, self.lease.target_port), timeout=5)
-
-            def _pump(src: socket.socket, dst: socket.socket) -> None:
-                try:
-                    while True:
-                        data = src.recv(65536)
-                        if not data:
-                            break
-                        dst.sendall(data)
-                except OSError:
-                    pass
-                finally:
-                    try:
-                        dst.shutdown(socket.SHUT_WR)
-                    except OSError:
-                        pass
-
-            t1 = threading.Thread(target=_pump, args=(client, target), daemon=True)
-            t2 = threading.Thread(target=_pump, args=(target, client), daemon=True)
-            t1.start()
-            t2.start()
-            t1.join()
-            t2.join()
-        except OSError:
-            pass  # target unreachable: drop the connection, lease stays registered
+            proxy_pair(
+                client, target,
+                inactivity_timeout=self.inactivity_timeout,
+            )
+        except OSError as exc:
+            # Target unreachable: fail the client cleanly (502 when it is an
+            # HTTP client) instead of silently resetting; lease stays
+            # registered. (Issue #76: a down backend must not hang a request.)
+            _log_devfabric("devfabric", "WARNING",
+                           "forwarder backend unreachable for %s:%s: %s",
+                           self.lease.target_host, self.lease.target_port, exc)
+            _send_http_502(client)
+        except Exception as exc:  # never let a worker die unlogged (issue #76b)
+            _log_devfabric("devfabric", "ERROR",
+                           "forwarder connection worker failed for %s:%s: %r",
+                           self.lease.target_host, self.lease.target_port, exc)
         finally:
             for s in (client, target):
                 if s is not None:
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
                     try:
                         s.close()
                     except OSError:
@@ -501,21 +510,30 @@ class DevServiceForwarder:
         return self._listener is not None
 
 
-def proxy_pair(client: socket.socket, target: socket.socket) -> None:
+def proxy_pair(client: socket.socket, target: socket.socket,
+               inactivity_timeout: float = 30.0) -> None:
     """Bidirectionally pump bytes between two sockets until either closes.
 
     Protocol-transparent: HTTP/HTTPS/WebSocket/SSE/HMR/generic TCP all flow
     through the same byte pipe. Used by both DevServiceForwarder (per-host
     mode) and the fabric gateway router.
+
+    Issue #76: the pipe is BOUNDED. Each direction arms an ``inactivity_timeout``
+    on ``recv`` (re-armed after every op); a peer that accepts the TCP
+    handshake but never reads or responds ends the pipe in both directions
+    after the timeout instead of blocking the worker forever. Both directions
+    are joined with a bounded ``join`` so a leaked pump cannot hang the caller,
+    and both sockets are shut down and closed when the pipe ends.
     """
     def _pump(src: socket.socket, dst: socket.socket) -> None:
         try:
+            src.settimeout(inactivity_timeout)
             while True:
                 data = src.recv(65536)
                 if not data:
                     break
                 dst.sendall(data)
-        except OSError:
+        except (OSError, TimeoutError, ValueError):
             pass
         finally:
             try:
@@ -527,8 +545,53 @@ def proxy_pair(client: socket.socket, target: socket.socket) -> None:
     t2 = threading.Thread(target=_pump, args=(target, client), daemon=True)
     t1.start()
     t2.start()
-    t1.join()
-    t2.join()
+    # Bounded joins (issue #76c): once the activity deadline passes, give up
+    # waiting on any leaked pump — daemon threads cannot hold the accept/route
+    # path.
+    deadline = inactivity_timeout + 10.0
+    t1.join(timeout=deadline)
+    t2.join(timeout=deadline)
+    for s in (client, target):
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _log_devfabric(component: str, level: str, msg: str, *args) -> None:
+    """Best-effort structured log line for devfabric data-path events."""
+    import logging
+    try:
+        logging.getLogger(component).log(
+            getattr(logging, level, logging.INFO), msg, *args)
+    except Exception:
+        pass
+
+
+def _send_http_502(client: socket.socket, reason: str = "backend unavailable") -> None:
+    """Send a short HTTP 502 so HTTP clients fail cleanly instead of seeing a
+    raw TCP reset. Best effort: non-HTTP clients just get a close."""
+    body = f"{reason}\n".encode()
+    head = (
+        b"HTTP/1.1 502 Bad Gateway\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Connection: close\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n"
+    )
+    try:
+        client.settimeout(2.0)
+        client.sendall(head + body)
+    except OSError:
+        pass
+    finally:
+        try:
+            client.settimeout(None)
+        except OSError:
+            pass
 
 
 # -- Same-origin app edge (path-routing forwarder) ---------------------------
@@ -603,11 +666,27 @@ def match_target(path: str | None, routes, fallback_host: str, fallback_port: in
 
 
 def prefixed_pipe(client: socket.socket, target: socket.socket,
-                  client_prefix: bytes = b"") -> None:
+                  client_prefix: bytes = b"", inactivity_timeout: float = 30.0,
+                  connect_timeout: float = 5.0) -> None:
     """Like :func:`proxy_pair`, but first flushes ``client_prefix`` (the bytes
-    already read while peeking) into the client->target direction."""
+    already read while peeking) into the client->target direction.
+
+    Issue #76: the pipe MUST be bounded. A connection whose peer accepts the
+    TCP handshake but never reads or responds (e.g. a wedged or crashed
+    backend) used to block the worker thread forever inside ``recv``/``sendall``
+    — and because the forwarder's accept/route path is single-threaded, that
+    one stuck worker wedged the whole forwarder. Now:
+
+    * each pump direction has an ``inactivity_timeout`` on ``recv``; a peer that
+      sends nothing (or whose ``sendall`` cannot drain) for that long ends the
+      pipe in both directions. ``timeout`` is re-armed after every operation.
+    * ``connect_timeout`` bounds the initial ``target.connect_ex``.
+    * both directions are joined with a bounded ``join`` so a leaked pump can
+      never hang the caller (pumps are daemon threads).
+    """
     def _pump(src: socket.socket, dst: socket.socket, prefix: bytes = b"") -> None:
         try:
+            src.settimeout(inactivity_timeout)
             if prefix:
                 dst.sendall(prefix)
             while True:
@@ -615,7 +694,7 @@ def prefixed_pipe(client: socket.socket, target: socket.socket,
                 if not data:
                     break
                 dst.sendall(data)
-        except OSError:
+        except (OSError, TimeoutError, ValueError):
             pass
         finally:
             try:
@@ -627,8 +706,20 @@ def prefixed_pipe(client: socket.socket, target: socket.socket,
     t2 = threading.Thread(target=_pump, args=(target, client), daemon=True)
     t1.start()
     t2.start()
-    t1.join()
-    t2.join()
+    # Bounded joins: once one direction is done, give the other a grace period,
+    # then move on. Pumps are daemon threads, so an unjoinable pump cannot
+    # hold the accept/route path (issue #76c).
+    t1.join(timeout=inactivity_timeout + connect_timeout + 10.0)
+    t2.join(timeout=inactivity_timeout + connect_timeout + 10.0)
+    for s in (client, target):
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            s.close()
+        except OSError:
+            pass
 
 
 def _read_head(sock: socket.socket) -> tuple[bytes, bytes]:
@@ -701,18 +792,42 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
 
 
 def route_and_pipe(client: socket.socket, routes, fallback_host: str,
-                   fallback_port: int) -> None:
+                   fallback_port: int, inactivity_timeout: float = 30.0,
+                   peek_timeout: float = 5.0) -> None:
     """Peek the first request line, pick the target (longest-prefix route match,
     else fallback), and byte-pipe. The peeked bytes are replayed first, so the
-    target sees the original request intact."""
-    path, buffered = _peek_request_path(client)
-    host, port = match_target(path, routes, fallback_host, fallback_port)
-    target = socket.create_connection((host, port), timeout=5)
+    target sees the original request intact.
+
+    Issue #76: both the peek and the full pipe are bounded, and per-connection
+    failures are non-fatal (log + close the client; never hang). A client that
+    connects but never sends a full request line gives up its worker after
+    ``peek_timeout`` (falling back to the catch-all target) instead of holding
+    it forever; a backend that accepts but never reads ends the pipe after
+    ``inactivity_timeout``.
+    """
     try:
-        prefixed_pipe(client, target, client_prefix=buffered)
+        path, buffered = _peek_request_path(client, timeout=peek_timeout)
+        host, port = match_target(path, routes, fallback_host, fallback_port)
+        try:
+            target = socket.create_connection((host, port), timeout=5)
+        except OSError as exc:
+            _log_devfabric("devfabric", "WARNING",
+                           "route_and_pipe: target %s:%s unreachable: %s",
+                           host, port, exc)
+            _send_http_502(client)
+            return
+        prefixed_pipe(client, target, client_prefix=buffered,
+                      inactivity_timeout=inactivity_timeout)
+    except Exception as exc:  # worker failures must be non-fatal (issue #76b)
+        _log_devfabric("devfabric", "ERROR",
+                       "route_and_pipe worker failed: %r", exc)
     finally:
         try:
-            target.close()
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            client.close()
         except OSError:
             pass
 
