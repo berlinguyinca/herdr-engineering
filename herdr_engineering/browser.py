@@ -102,11 +102,9 @@ class PlannotatorAdapter:
     """Durable control-plane client; Plannotator remains decision authority."""
 
     def __init__(self, store=None, *, control_plane=None) -> None:
-        import os
+        from .host_config import control_plane_url_or
         self._store = store
-        self.control_plane = (control_plane or
-                              os.environ.get("HERDR_ENGINEERING_CONTROL_PLANE_URL") or
-                              "http://dev.lan")
+        self.control_plane = control_plane or control_plane_url_or("http://dev.lan")
 
     @staticmethod
     def _record(row):

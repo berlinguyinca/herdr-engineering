@@ -110,14 +110,15 @@ def test_missing_durable_sink_is_not_accepted_as_a_persisted_review():
     assert service.get("review-one") is None
 
 
-def test_host_launcher_uses_authenticated_http_routes(tmp_path, monkeypatch, acknowledged_sink):
+def test_host_launcher_uses_authenticated_http_routes(tmp_path, monkeypatch, acknowledged_sink,
+                                                      fake_host_config):
     import threading
 
     from herdr_engineering.control_plane.api import ControlPlaneServer
     from herdr_engineering.plannotator import run_review
     from herdr_engineering.session_env import _get
 
-    monkeypatch.setenv("HERDR_ENGINEERING_CONTROL_PLANE_KEY", "fixture-private-key")
+    fake_host_config({"ingest": {"api_key": "placeholder-private-value"}})
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     executable = tmp_path / "plannotator"
     executable.write_text("#!/usr/bin/python3\n" + '''import json,os,time
@@ -128,7 +129,7 @@ print(json.dumps({'decision':'annotated','feedback':'Add the missing test'}))
 ''')
     executable.chmod(0o700)
     repo = ControlPlaneRepo(sink=acknowledged_sink)
-    server = ControlPlaneServer(repo, api_key="fixture-private-key")
+    server = ControlPlaneServer(repo, api_key="placeholder-private-value")
     thread = threading.Thread(target=server.serve, daemon=True)
     thread.start()
     server.wait_until_ready()

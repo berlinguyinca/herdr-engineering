@@ -10,7 +10,9 @@ sections:
     values:
       pg_dsn: "postgresql://REDACTED:REDACTED@postgres:5432/REDACTED"
       host_aliases: {}              # e.g. {bender: "bender.example.test"}
-      api_keys: ["REDACTED"]
+      api_keys:                     # key: role (viewer | operator | ingest)
+        "REDACTED": operator
+        "REDACTED_INGEST": ingest   # the same value as ingest.api_key below
       rustfs_endpoint: "http://rustfs:9000"
       rustfs_access_key: "REDACTED"
       rustfs_secret_key: "REDACTED"
@@ -28,11 +30,33 @@ sections:
       url: "https://ci.example.test"
       token: "REDACTED"
 
+  github:
+    roles: [ci]
+    values:
+      token: "REDACTED"
+
+  # Posted by every host's feeds as the control-plane API key (role ingest).
+  ingest:
+    roles: [all]
+    values:
+      api_key: "REDACTED_INGEST"
+
+  fabric:
+    roles: [all]
+    values:
+      url: "https://fabric.example.test"
+      token: "REDACTED"
+
   inspector:
     roles: [all]
     values:
-      enabled: true
-      reasoning: false
+      enabled: false
+      reasoning: "off"
+
+  host:
+    roles: [all]
+    values:
+      aliases: ""                   # e.g. "bender=bender.example.test"
 
 hosts:
   # token_sha256 is the sha256 hex of the host's random token (the token itself
@@ -41,7 +65,7 @@ hosts:
     roles: [builder]
     token_sha256: "REDACTED_64_HEX_CHARS"
     overrides:                      # optional, deep-merged over a section
-      inspector: {reasoning: true}
+      inspector: {reasoning: "on"}
   mac:
     roles: []                       # empty roles: only "all" sections
     token_sha256: "REDACTED_64_HEX_CHARS"

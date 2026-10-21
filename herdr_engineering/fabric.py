@@ -37,7 +37,8 @@ _FABRIC_TOKEN_FILE = os.path.join("~", ".config", "herdr-engineering", "fabric-t
 
 
 def read_fabric_token() -> str | None:
-    tok = os.environ.get("HERDR_ENGINEERING_FABRIC_TOKEN")
+    from .host_config import host_value
+    tok = host_value("fabric.token")
     if tok:
         return tok
     try:
@@ -703,9 +704,9 @@ def gateway_url_from_config(config: dict[str, Any]) -> str | None:
     default control port. Empty/absent means "no remote gateway" (local mode).
     """
     fabric = config.get("fabric") or {}
-    # The environment variable wins: it lets operators point at a gateway
-    # without editing config (secret-free; the URL is not a credential).
-    base = os.environ.get("HERDR_ENGINEERING_FABRIC_URL") or fabric.get("gateway_url")
+    # The central host config (fabric.url) wins over the local config file.
+    from .host_config import host_value
+    base = host_value("fabric.url") or fabric.get("gateway_url")
     if not base:
         return None
     base = base.rstrip("/")

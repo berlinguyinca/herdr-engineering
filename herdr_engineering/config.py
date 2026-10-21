@@ -43,8 +43,8 @@ DEFAULTS: dict[str, Any] = {
     },
     # Fabric gateway (spec 0110 component #3): the fleet front door that gives
     # every lease a stable dev:<port> address. gateway_url empty = local mode
-    # (no gateway process running). Token is a secret: env
-    # HERDR_ENGINEERING_FABRIC_TOKEN or ~/.config/herdr-engineering/fabric-token.
+    # (no gateway process running). Token is a secret: the
+    # central host config (fabric.token) or ~/.config/herdr-engineering/fabric-token.
     "fabric": {
         "enabled": True,
         "gateway_url": "",
@@ -60,14 +60,14 @@ DEFAULTS: dict[str, Any] = {
         "agent_ephemeral_min": 32768,
         # The auto-registration agent reports every discovered service to this
         # control-plane base URL (e.g. http://dev.lan) so leases show up on the
-        # fleet Services page. Empty = reporting disabled. Overridable via env
-        # HERDR_ENGINEERING_CONTROL_PLANE_URL.
+        # fleet Services page. Empty = reporting disabled. Defaults to the
+        # control_plane_url in host.json.
         "control_plane_url": "",
     },
     # LLM env injection for sessions started via `herdr-eng session run`: a
     # per-project gateway key goes into the session's environment only.
     # key_mode: "session" = mint per session, revoke at end; "project" = reuse a
-    # cached project key. inject:false (or HERDR_ENGINEERING_LLM_INJECT=0) opts out.
+    # cached project key. inject:false opts out.
     "llm": {
         "inject": True,
         "key_mode": "session",

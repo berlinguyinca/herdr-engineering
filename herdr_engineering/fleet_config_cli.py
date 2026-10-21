@@ -196,6 +196,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     pg_user, pg_pass = f"herdr_{secrets.token_hex(4)}", secrets.token_hex(16)
     minio_user, minio_pass = f"herdr_{secrets.token_hex(4)}", secrets.token_hex(16)
     api_key = secrets.token_urlsafe(32)
+    ingest_key = secrets.token_urlsafe(32)  # control-plane key (role ingest) every host posts events with
     dsn = f"postgresql://{pg_user}:{pg_pass}@postgres:5432/herdr"
     bucket = "herdr-artifacts"
     data = {
@@ -205,7 +206,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
                 "public_url": public_url,
                 "pg_dsn": dsn,
                 "host_aliases": str(a.get("host_aliases") or ""),
-                "api_keys": {api_key: "operator"},
+                "api_keys": {api_key: "operator", ingest_key: "ingest"},
                 "rustfs_endpoint": "http://rustfs:9000",
                 "rustfs_bucket": bucket,
                 "minio_user": minio_user,
@@ -225,8 +226,14 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
                     "HERDR_ENGINEERING_CI_URL": ci_url,
                 },
             }},
+            "ingest": {"roles": ["all"], "values": {"api_key": ingest_key}},
             "llm": {"roles": ["builder"], "values": {"upstream_url": llm_url, "upstream_key": llm_key}},
             "ci": {"roles": ["builder", "ci"], "values": {"url": ci_url, "token": ci_token}},
+            "github": {"roles": ["ci"], "values": {"token": str(a.get("github_token") or "")}},
+            "fabric": {"roles": ["all"], "values": {"url": str(a.get("fabric_url") or ""),
+                                                    "token": str(a.get("fabric_token") or "")}},
+            "inspector": {"roles": ["all"], "values": {"enabled": False, "reasoning": "off"}},
+            "host": {"roles": ["all"], "values": {"aliases": str(a.get("host_aliases") or "")}},
         },
         "hosts": {hid: {"roles": roles, "token_sha256": mint_host_token()[1], "overrides": {}}
                   for hid, roles in hosts.items()},

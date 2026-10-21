@@ -27,10 +27,11 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from .host_config import control_plane_url_or
+
 DEFAULT_CONTROL_PLANE = "http://dev.lan"
 DEFAULT_GATEWAY = "http://dev.lan:8088/v1"
 KEY_FILE = "~/.config/herdr-engineering/control-plane-key"
-OPT_OUT_ENV = "HERDR_ENGINEERING_LLM_INJECT"
 SECRET_ENV = ("OPENAI_API_KEY",)
 
 
@@ -47,9 +48,10 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def _control_plane_token() -> str | None:
-    tok = os.environ.get("HERDR_ENGINEERING_CONTROL_PLANE_KEY")
+    from .host_config import host_value
+    tok = host_value("ingest.api_key")
     if tok:
-        return tok.strip()
+        return str(tok).strip()
     try:
         path = os.path.expanduser(KEY_FILE)
         if os.stat(path).st_mode & 0o077:
@@ -176,13 +178,12 @@ def llm_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     s.setdefault("key_mode", "session")
     s["control_plane_url"] = (s["control_plane_url"]
                               or (cfg.get("fabric") or {}).get("control_plane_url")
-                              or os.environ.get("HERDR_ENGINEERING_CONTROL_PLANE_URL")
-                              or DEFAULT_CONTROL_PLANE)
+                              or control_plane_url_or(DEFAULT_CONTROL_PLANE))
     return s
 
 
 def injection_enabled(cfg: dict[str, Any], *, cli_disable: bool = False) -> bool:
-    if cli_disable or os.environ.get(OPT_OUT_ENV, "").strip().lower() in ("0", "false", "no", "off"):
+    if cli_disable:
         return False
     return str(llm_settings(cfg).get("inject", True)).lower() not in ("false", "0", "no", "off")
 

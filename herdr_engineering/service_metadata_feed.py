@@ -7,7 +7,6 @@ import json
 import os
 import select
 import signal
-import socket
 import subprocess
 import threading
 import time
@@ -17,12 +16,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
+from . import host_config as _hc
 from .fabric_agent import (
     ListenerGitMetadata,
     ListenerOwnership,
     _process_identity,
     scan_listening_ports,
 )
+from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
 
 MAX_BYTES = 4 * 1024 * 1024
 MAX_RECORDS = 4096
@@ -416,12 +417,13 @@ class ServiceMetadataFeed:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--control-plane", default=os.environ.get("HERDR_ENGINEERING_CONTROL_PLANE_URL")
-                        or os.environ.get("HERDR_CP_URL", "http://dev.lan"))
-    parser.add_argument("--host-id", default=os.environ.get("HERDR_SERVICE_METADATA_HOST") or socket.gethostname())
+    parser.add_argument("--control-plane", default=None,
+                        help="control plane URL (default: host.json control_plane_url)")
+    parser.add_argument("--host-id", default=None, help="host id (default: host.json host_id)")
     parser.add_argument("--state-file", default=str(Path(os.environ.get("HERDR_ENGINEERING_STATE",
                         str(Path.home() / ".local/share/herdr-engineering/state"))) / "fabric-agent.json"))
-    parser.add_argument("--api-key-file", default=os.environ.get("HERDR_SERVICE_METADATA_API_KEY_FILE"))
+    parser.add_argument("--api-key-file", default=None,
+                        help="read the ingest key from this file (default: ingest.api_key)")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--loop", type=float)
     parser.add_argument("--dry-run", action="store_true")
@@ -429,14 +431,18 @@ def main(argv=None):
     if args.loop is not None and (not 30 <= args.loop <= 3600 or args.once):
         parser.error("--loop requires 30–3600 seconds and cannot be combined with --once")
     try:
-        key = os.environ.get("HERDR_CP_API_KEY")
+        cfg = _hc.host_config()
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    try:
+        key = cfg.api_key
         if args.api_key_file:
             with Path(args.api_key_file).expanduser().open() as stream:
                 key = stream.read(8193).strip()
         if key and len(key) > 8192:
             raise ValueError("invalid API key file")
-        feed = ServiceMetadataFeed(MetadataClient(args.control_plane, key),
-                                   host_id=args.host_id, state_file=args.state_file)
+        feed = ServiceMetadataFeed(MetadataClient(resolve_control_plane(args.control_plane), key),
+                                   host_id=args.host_id or cfg.host_id, state_file=args.state_file)
     except (OSError, ValueError):
         parser.exit(1, "Service metadata observer configuration is unavailable or invalid.\n")
     stop = threading.Event()
