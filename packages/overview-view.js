@@ -76,10 +76,12 @@ function availability(keys, states) {
 function historyLinks(base, counts) {
   return `<nav class="ov-history" aria-label="${base === 'missions' ? 'Mission' : 'Session'} history">${link(`#/${base}?tab=unconfirmed`,`${counts.unconfirmed.length} unconfirmed`)}${link(`#/${base}?tab=failed`,`${counts.failed.length} failed`)}${link(`#/${base}?tab=finished`,`${counts.finished.length} finished / closed`)}</nav>`;
 }
-function missionRow(entry) {
+const SNOOZE_MS = 24 * 3600 * 1000;
+const snoozedUntil = (data, key) => (data.snoozed instanceof Map ? data.snoozed.get(key) : 0) || 0;
+function missionRow(entry, canSnooze = false) {
   const activity = entry.projection?.activity || {};
   const detail = activity.waitingReason ? `Waiting: ${human(activity.waitingReason)}` : activity.currentActivity?.summary;
-  return `<li class="ov-row"><div>${link(`#/missions/${encodeURIComponent(entry.key)}`,short(entry.title))}<p>${esc(short(detail || (entry.group === 'attention' ? entry.health : 'Activity not reported')))}</p></div><span class="ov-tag ${entry.group === 'attention' ? 'ov-alert' : ''}">${esc(human(entry.health))}${entry.host ? ` · ${esc(entry.host)}` : ''}</span></li>`;
+  return `<li class="ov-row"><div>${link(`#/missions/${encodeURIComponent(entry.key)}`,short(entry.title))}<p>${esc(short(detail || (entry.group === 'attention' ? entry.health : 'Activity not reported')))}</p></div><span class="ov-tag ${entry.group === 'attention' ? 'ov-alert' : ''}">${esc(human(entry.health))}${entry.host ? ` · ${esc(entry.host)}` : ''}${canSnooze ? `<br><button type="button" class="ov-snooze" data-snooze="${esc(entry.key)}" title="Hide from this list for 24 hours">Snooze 24h</button>` : ''}</span></li>`;
 }
 
 export function renderOverviewSection(section, data = {}, states = {}, received = Date.now(), now = Date.now()) {
@@ -87,11 +89,14 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   if (section === 'missions') {
     const m = model.missions;
     const ready = states.projections?.loaded || states.missions?.loaded;
-    const rows = [...m.attention,...m.running].slice(0,5);
+    const awake = m.attention.filter(e => snoozedUntil(data, e.key) <= now);
+    const snoozedCount = m.attention.length - awake.length;
+    const rows = [...awake,...m.running].slice(0,5);
     return `<div class="ov-heading"><h2>Current missions</h2>${link('#/missions','All missions →')}</div>${availability(['projections','missions'],states)}
-      ${ready ? `<div class="ov-metrics">${metric(states.projections?.loaded ? m.attention.length : '—','Need attention','#/missions?tab=current&status=attention')}${metric(states.projections?.loaded ? m.running.length : '—','Running with live reports','#/missions?tab=current&status=running')}</div>
-      ${rows.length ? `<ul class="ov-list">${rows.map(e=>missionRow(e)).join('')}</ul>` : empty(states.projections?.loaded ? 'No missions currently report running or needing attention.' : 'Current mission activity is unavailable.')}
-      <p class="ov-note">${m.current.length} missions with current reports${m.recorded.length ? ` · ${m.recorded.length} recorded without live activity` : ''}. ${rows.length < m.attention.length+m.running.length ? 'Showing 5; open All missions for the rest.' : 'Live evidence determines running and attention counts.'}</p>
+      ${ready ? `<div class="ov-metrics">${metric(states.projections?.loaded ? awake.length : '—','Need attention','#/missions?tab=current&status=attention')}${metric(states.projections?.loaded ? m.running.length : '—','Running with live reports','#/missions?tab=current&status=running')}</div>
+      ${snoozedCount ? `<p class="ov-note">${snoozedCount} snoozed for 24 hours. <button type="button" class="ov-snooze" data-snooze-clear>Show them again</button></p>` : ''}
+      ${rows.length ? `<ul class="ov-list">${rows.map(e=>missionRow(e, e.group === 'attention')).join('')}</ul>` : empty(states.projections?.loaded ? 'No missions currently report running or needing attention.' : 'Current mission activity is unavailable.')}
+      <p class="ov-note">${m.current.length} missions with current reports${m.recorded.length ? ` · ${m.recorded.length} recorded without live activity` : ''}. ${rows.length < awake.length+m.running.length ? 'Showing 5; open All missions for the rest.' : 'Live evidence determines running and attention counts.'}</p>
       ${historyLinks('missions',m)}${!states.projections?.loaded || !states.missions?.loaded ? empty('Partial mission totals: waiting for both live reports and recorded missions.') : ''}` : ''}`;
   }
   if (section === 'sessions') {
@@ -118,7 +123,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
     const s=model.services;
     return `<div class="ov-heading"><h2>HerdR services</h2>${link('#/services','Service catalog →')}</div>${availability(['services'],states)}${states.services?.loaded ? `
       <div class="ov-metrics">${metric(s.current,'Reported healthy','#/services')}</div>
-      <p class="ov-note">${link('#/services?status=unavailable',`${s.unavailable} unavailable`)} · ${link('#/services?status=unknown',`${s.unknown} unconfirmed`)} · ${link('#/services?status=archived',`${s.archived} archived`)}. History remains in the catalog. ${link('#/system-services','System and unassigned services →')}</p>` : ''}`;
+      <p class="ov-note">${link('#/services?status=unavailable',`${s.unavailable} unavailable`)} · ${link('#/services?status=unknown',`${s.unknown} unconfirmed`)} · ${link('#/services?status=archived',`${s.archived} archived`)}. History remains in the catalog. ${link('#/local-services','Local services →')} · ${link('#/system-services','System services →')}</p>` : ''}`;
   }
   if (section === 'fleet') {
     const hosts=model.hosts, fleet=data.fleet || {}, sum=fleet.summary || {};
@@ -150,13 +155,26 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
 }
 
 const styles = `<style>
-.ov-sub{font-size:13px;margin:14px 0 0}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;overflow-wrap:anywhere}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:1/-1}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:14px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:10px 13px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:25px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:16px;padding:11px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.5}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:4px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:16px;border-top:1px solid var(--border-subtle);padding-top:12px;margin-top:12px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
+.ov-sub{font-size:13px;margin:14px 0 0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;overflow-wrap:anywhere}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:1/-1}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:14px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:10px 13px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:25px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:16px;padding:11px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.5}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:4px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:16px;border-top:1px solid var(--border-subtle);padding-top:12px;margin-top:12px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
 @media(max-width:750px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
 </style>`;
 
+const SNOOZE_KEY = 'herdr.snoozedMissions';
+function loadSnoozed(now = Date.now()) {
+  const map = new Map();
+  try {
+    const raw = JSON.parse(localStorage.getItem(SNOOZE_KEY) || '{}');
+    for (const [key, until] of Object.entries(raw)) if (Number.isFinite(until) && until > now) map.set(key, until);
+  } catch { /* storage unavailable: snooze simply lasts until reload */ }
+  return map;
+}
+function saveSnoozed(map) {
+  try { localStorage.setItem(SNOOZE_KEY, JSON.stringify(Object.fromEntries(map))); } catch { /* ignore */ }
+}
+
 export function mountOverview(container, client) {
   let disposed=false, clock=null, received=Date.now();
-  const data={}, states={}, controllers=new Map(), timers=new Map(), signatures=new Map();
+  const data={snoozed:loadSnoozed()}, states={}, controllers=new Map(), timers=new Map(), signatures=new Map();
   const panels=['missions','fleet','sessions','ci','reviews','services','hosts','activity','health'];
   const sources={
     projections:signal=>client.listMissionActivity({signal}),
@@ -220,6 +238,13 @@ export function mountOverview(container, client) {
     if(document.hidden){for(const controller of controllers.values())controller.abort();return;}
     draw();refresh();clock=setInterval(draw,1000);
   }
+  container.addEventListener('click',event=>{
+    const button=event.target.closest?.('.ov-snooze');
+    if(!button)return;
+    if(button.hasAttribute('data-snooze'))data.snoozed.set(button.dataset.snooze,Date.now()+SNOOZE_MS);
+    else data.snoozed.clear();
+    saveSnoozed(data.snoozed);signatures.delete('missions');draw();
+  });
   document.addEventListener('visibilitychange',visibility);visibility();
   return {refresh,dispose(){disposed=true;clearInterval(clock);for(const timer of timers.values())clearTimeout(timer);for(const controller of controllers.values())controller.abort();document.removeEventListener('visibilitychange',visibility);}};
 }

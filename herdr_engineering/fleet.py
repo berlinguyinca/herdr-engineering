@@ -374,3 +374,45 @@ def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None)
             "sourceRoot": status["hosts"][0]["pi_path"] if ok else None,
             "stdout": out[-4000:], "stderr": err[-1000:], "status": status,
             "hosts": status.get("hosts", []), "parity": parity}
+
+
+# ---- version drift plan -----------------------------------------------------
+# Hosts report tool and plugin versions to the control plane; this turns the
+# resulting matrix into per-host actions. It only *describes* what to run: the
+# updaters differ per machine (nvm, Homebrew, pinned releases) and a wrong
+# global install is hard to undo, so nothing here executes remotely.
+_UPDATERS = {
+    "claude": "npm install -g @anthropic-ai/claude-code@{version}",
+    "codex": "npm install -g @openai/codex@{version}",
+    "pi": "pi-engineering-update   # moves pi-engineering; pi itself follows its own release channel",
+    "herdr-eng": "herdr-eng fleet update --host {host}",
+}
+
+
+def plan_version_sync(matrix: dict) -> list[dict]:
+    """One entry per (host, component) that differs from the fleet reference."""
+    plan = []
+    for component in matrix.get("components", []):
+        reference = component.get("reference")
+        if not reference or reference == "dev":  # dev checkouts have no version to sync to
+            continue
+        name = component["name"]
+        for host, cell in sorted(component.get("hosts", {}).items()):
+            state = cell.get("state")
+            if state == "ok":
+                continue
+            entry = {"host": host, "component": name, "group": component.get("group"),
+                     "state": state, "current": cell.get("version"), "target": reference}
+            if component.get("group") == "plugins" and name.startswith("claude:"):
+                plugin = name.split(":", 1)[1]
+                entry["command"] = (f"claude plugin update {plugin}" if state == "drifted"
+                                    else f"claude plugin install {plugin}")
+            elif name in _UPDATERS and state in {"drifted", "missing"}:
+                entry["command"] = _UPDATERS[name].format(version=reference, host=host)
+            elif name == "node":
+                entry["command"] = None
+                entry["note"] = "node differs per service manager; align it only if a tool needs it"
+            else:
+                entry["command"] = None
+            plan.append(entry)
+    return plan

@@ -48,6 +48,7 @@ const NAV = [
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Sessions' },
   { path: '/services', label: 'Services' },
+  { path: '/local-services', label: 'Local services' },
   { path: '/system-services', label: 'System services' },
   { path: '/github', label: 'Projects' },
   { path: '/ci', label: 'CI' },
@@ -80,6 +81,7 @@ const ROUTES = {
   '/herd/session/:id': viewSession,
   '/services': viewServices,
   '/system-services': viewServices,
+  '/local-services': viewServices,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/hosts/:id': viewHost,
@@ -316,7 +318,7 @@ async function copyText(text, btn) {
 async function viewServices(_parts, revision) {
   const { services } = await client.listServices();
   if (revision !== renderRevision) return;
-  servicesView = mountServices(root, client, services, { scope: _parts[0] === 'system-services' ? 'system' : 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
+  servicesView = mountServices(root, client, services, { scope: ({'system-services':'system','local-services':'local'})[_parts[0]] || 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
 }
 
 async function viewService(parts, revision) {

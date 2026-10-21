@@ -171,6 +171,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ps = fsub.add_parser("status", help="read-only fleet version/registration status")
     ps.add_argument("--json", action="store_true")
     ps.set_defaults(func=_cmd_fleet_status)
+    pd = fsub.add_parser("drift", help="show tool/plugin versions that differ across hosts, with suggested fixes")
+    pd.add_argument("--control-plane", default=None,
+                    help="control plane URL (default: HERDR_CP_URL or http://dev.lan)")
+    pd.add_argument("--host", help="only this host")
+    pd.add_argument("--json", action="store_true")
+    pd.set_defaults(func=_cmd_fleet_drift)
 
     pr = fsub.add_parser("rollout", help="durable Pi runtime update and mission recovery")
     rsub = pr.add_subparsers(dest="rollout_command", required=True)
@@ -680,6 +686,36 @@ def _cmd_fleet_rollout(args) -> int:
     if report.get("runner", {}).get("status") == "interrupted" and args.rollout_command == "run":
         return 130
     return 0 if args.rollout_command not in ("apply", "run") or report["status"] == "complete" else 2
+
+
+def _cmd_fleet_drift(args) -> int:
+    import urllib.request
+    from .fleet import plan_version_sync
+    base = (args.control_plane or os.environ.get("HERDR_CP_URL") or "http://dev.lan").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/api/v1/fleet/inventory", timeout=10) as response:
+            matrix = json.loads(response.read(4 * 1024 * 1024))
+    except (OSError, ValueError) as exc:
+        print(f"could not read fleet inventory from {base}: {exc}", file=sys.stderr)
+        return 1
+    plan = [e for e in plan_version_sync(matrix) if not args.host or e["host"] == args.host]
+    if args.json:
+        _print_json({"hosts": [h["host"] for h in matrix.get("hosts", [])], "plan": plan})
+        return 0
+    if not plan:
+        print("all reporting hosts match the fleet reference")
+        return 0
+    for host in sorted({e["host"] for e in plan}):
+        print(f"{host}")
+        for e in (x for x in plan if x["host"] == host):
+            have = e["current"] or "not installed"
+            print(f"  {e['component']:28} {have:>14} -> {e['target']}")
+            if e.get("command"):
+                print(f"      suggested: {e['command']}")
+            elif e.get("note"):
+                print(f"      note: {e['note']}")
+    print("\nSuggestions only; nothing was run.")
+    return 0
 
 
 def _cmd_fleet_status(args) -> int:
