@@ -5,7 +5,8 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { herdrBin } from "./enrich.js";
-import { hostIdentity, resolveUrl } from "./emit.js";
+import { hostIdentity } from "./emit.js";
+import { loadHostConfig, HostConfigUnavailable } from "./host-config.js";
 import { gitMetadata } from "./git-metadata.js";
 import { createInventoryReporter, createLoadReporter } from "./inventory.js";
 import { createModelResolver } from "./session-model.js";
@@ -95,10 +96,10 @@ export async function collectSnapshot(env, { queryNative = query, metadata = git
 
 export function createSnapshotPublisher({ fetcher = fetch, now = Date.now, maxEntries = 256 } = {}) {
   const sent = new Map();
-  return async function publish(env, envelopes) {
+  return async function publish({ url, apiKey } = {}, envelopes) {
     let posted = 0, unchanged = 0;
     const headers = { "Content-Type": "application/json" };
-    if (env.HERDR_CP_API_KEY) headers["X-API-Key"] = env.HERDR_CP_API_KEY;
+    if (apiKey) headers["X-API-Key"] = apiKey;
     // Stop at the first failure rather than multiplying timeouts during outages.
     for (const envelope of envelopes) {
       const body = JSON.stringify(envelope);
@@ -106,7 +107,7 @@ export function createSnapshotPublisher({ fetcher = fetch, now = Date.now, maxEn
       const terminal = TERMINAL_STATES.has(String(envelope.payload?.status || "").trim().toLowerCase());
       if (previous?.body === body && (terminal || now() - previous.at < 300000)) { unchanged++; continue; }
       try {
-        const response = await fetcher(`${resolveUrl(env)}/api/v1/ingest`, {
+        const response = await fetcher(`${url}/api/v1/ingest`, {
           method: "POST", headers, body,
           redirect: "error", signal: AbortSignal.timeout(2000),
         });
@@ -123,8 +124,8 @@ export function createSnapshotPublisher({ fetcher = fetch, now = Date.now, maxEn
   };
 }
 
-export async function publishSnapshot(env, envelopes, fetcher = fetch) {
-  return createSnapshotPublisher({ fetcher })(env, envelopes);
+export async function publishSnapshot(target, envelopes, fetcher = fetch) {
+  return createSnapshotPublisher({ fetcher })(target, envelopes);
 }
 
 export async function main(args = process.argv.slice(2), env = process.env) {
@@ -134,6 +135,17 @@ export async function main(args = process.argv.slice(2), env = process.env) {
   if (loopIndex >= 0 && (!Number.isFinite(interval) || interval < 30 || interval > 3600)) {
     throw new Error("--loop requires an interval between 30 and 3600 seconds");
   }
+  let hostConfig = null;
+  if (!dryRun) {
+    try { hostConfig = await loadHostConfig(); }
+    catch (error) {
+      if (!(error instanceof HostConfigUnavailable)) throw error;
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 2;
+      return;
+    }
+  }
+  const target = { url: hostConfig?.url, apiKey: hostConfig?.apiKey };
   const controller = new AbortController();
   const publish = createSnapshotPublisher();
   const inventoryEnvelope = createInventoryReporter();
@@ -149,7 +161,7 @@ export async function main(args = process.argv.slice(2), env = process.env) {
       if (inventory) result.envelopes.push(inventory);
       const load = loadEnvelope(hostIdentity(env));
       if (load) result.envelopes.push(load);
-      const delivery = dryRun ? { posted: 0, unchanged: 0, errors: 0 } : await publish(env, result.envelopes);
+      const delivery = dryRun ? { posted: 0, unchanged: 0, errors: 0 } : await publish(target, result.envelopes);
       process.stdout.write(JSON.stringify({ ...result.summary, posted: delivery.posted,
         unchanged: delivery.unchanged,
         errors: result.summary.errors + delivery.errors, dry_run: dryRun }) + "\n");

@@ -74,14 +74,14 @@ test("missing native registry reports failure without inventing stopped sessions
 
 test("publication uses private key header and stops on first rejected write", async () => {
   const calls = [];
-  const result = await publishSnapshot({ HERDR_CP_URL: "http://control.test", HERDR_CP_API_KEY: "fixture-key" }, [{ n: 1 }, { n: 2 }], async (url, options) => {
+  const result = await publishSnapshot({ url: "http://control.test", apiKey: "placeholder-fixture-value" }, [{ n: 1 }, { n: 2 }], async (url, options) => {
     calls.push({ url, options });
     return { ok: false, body: { cancel: async () => {} } };
   });
   assert.deepEqual(result, { posted: 0, unchanged: 0, errors: 1 });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "http://control.test/api/v1/ingest");
-  assert.equal(calls[0].options.headers["X-API-Key"], "fixture-key");
+  assert.equal(calls[0].options.headers["X-API-Key"], "placeholder-fixture-value");
   assert.equal(calls[0].options.redirect, "error");
 });
 
@@ -161,4 +161,21 @@ test("a resolved model is reported on the session payload", async () => {
     resolveModel: async (serverName, p) => `${serverName}/${p.agent}-model`,
   });
   assert.equal(result.envelopes[0].payload.model, "eng/pi-model");
+});
+
+test("main exits 2 with a stderr message when the host has no config", () => {
+  const home = mkdtempSync(join(tmpdir(), "snap-home-"));
+  const script = fileURLToPath(new URL("./snapshot.js", import.meta.url));
+  let failure;
+  try { execFileSync(process.execPath, [script, "--once"], { env: { PATH: process.env.PATH, HOME: home }, stdio: "pipe" }); }
+  catch (error) { failure = error; }
+  assert.equal(failure?.status, 2);
+  assert.match(String(failure.stderr), /host config unavailable/);
+});
+
+test("the plugin never reads HERDR_CP_URL or HERDR_CP_API_KEY", async () => {
+  const { readFileSync } = await import("node:fs");
+  for (const f of ["emit.js", "snapshot.js", "host-config.js", "inventory.js", "enrich.js"]) {
+    assert.doesNotMatch(readFileSync(new URL(`./${f}`, import.meta.url), "utf8"), /HERDR_CP_(URL|API_KEY)/, f);
+  }
 });

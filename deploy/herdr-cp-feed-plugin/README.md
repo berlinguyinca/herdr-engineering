@@ -37,18 +37,14 @@ The mapping is a pure function (`mapEvent` in `emit.js`) — unit-tested in
    herdr session. It must be linked on **each** host you want tracked (bender,
    beast, macbook-pro, …).
 
-3. Point the plugin at the control plane. Resolution order:
-   1. a file named `cp-url` in the plugin config dir
-      (`herdr plugin config-dir herdr.cp-feed` prints it), or
-   2. the `HERDR_CP_URL` environment variable on the herdr server process, or
-   3. default `http://dev.lan` (works when split-DNS is configured fleet-wide).
-
-   Example using the config file:
-
-   ```sh
-   CFG=$(herdr plugin config-dir herdr.cp-feed)
-   echo -n "http://dev.lan" > "$CFG/cp-url"
-   ```
+3. Join the host to the control plane. The plugin reads
+   `~/.config/herdr-engineering/host.json` (written by `herdr-eng fleet join`),
+   then fetches its configuration (control-plane URL, ingest API key, ...) from
+   `GET /api/v1/fleet/config` and caches it in
+   `~/.cache/herdr-engineering/fleet-config.json` (mode 0600) so it keeps working
+   while the control plane is unreachable. A revoked token (HTTP 401) deletes
+   the cache. Redirects are never followed. `HERDR_CP_URL`, `HERDR_CP_API_KEY`
+   and the `cp-url` config file are no longer read.
 
 4. Restart the herdr server (or it picks the plugin up on the next session
    restore) and watch events flow:
@@ -95,16 +91,17 @@ the snapshot companion on each owning host:
 
 ```sh
 node snapshot.js --once --dry-run
-HERDR_CP_URL=http://dev.lan node snapshot.js --once
-HERDR_CP_URL=http://dev.lan node snapshot.js --loop 30
+node snapshot.js --once
+node snapshot.js --loop 30
 ```
 
 The dry run prints counts and sends nothing. The companion discovers running
 named servers from Herdr's registry, reads their structured snapshots, and
 publishes sessions with native terminal identity. It does not start, stop or
 steer sessions. Missing conversation identity or readiness is never invented.
-An optional `HERDR_CP_API_KEY` is sent only as the API key header; supply it
-through the service's private environment configuration, not command arguments.
+The ingest API key comes from the central config (`ingest.api_key`) and is sent
+only as the API key header. If the host config is unavailable the snapshot
+companion prints `host config unavailable: ...` to stderr and exits 2.
 Redirects are rejected. Each pass reports failures and truncation explicitly;
 collection is limited to 8 servers, 128 sessions and a 20-second work budget.
 The loop runs a new pass 30 seconds after the preceding pass finishes. It sends
@@ -115,7 +112,7 @@ heartbeat, so finished/failed notices do not repeat while their record remains
 in the bounded cache; a changed terminal record is still published.
 
 Install all runtime files together: `herdr-plugin.toml`, `package.json`,
-`emit.js`, `enrich.js`, `git-metadata.js`, `inventory.js`, `session-model.js`, and `snapshot.js`. The snapshot
+`emit.js`, `enrich.js`, `git-metadata.js`, `host-config.js`, `inventory.js`, `session-model.js`, and `snapshot.js`. The snapshot
 companion can run under systemd or launchd independently of native Herdr and
 Pi processes; deploying it requires no native session restart.
 
@@ -124,7 +121,7 @@ The `herdr-cp-sessions.service` template expects the complete runtime bundle at
 is suitable). Install the unit in `~/.config/systemd/user/` and configure any
 host overrides in `~/.config/herdr-engineering/session-feed.env`, mode `0600`.
 Supported environment values include `HOSTNAME` for the existing control-plane
-host ID, `HERDR_CP_URL`, `HERDR_BIN`, and optional `HERDR_CP_API_KEY`. On macOS,
+host ID and `HERDR_BIN`; the control-plane URL and key are never set here. On macOS,
 use launchd to run the same command with the installed Node executable; a
 private wrapper can load the same environment file before execution. Activate
 the companion only after the receiving backend supports these payload fields.
@@ -132,6 +129,7 @@ the companion only after the receiving backend supports these payload fields.
 ## Files
 
 - `herdr-plugin.toml` — herdr manifest: startup hook + `[[events]]` subscriptions.
+- `host-config.js` — central host-config client (host.json + cached fleet config).
 - `emit.js` — the emitter (`mapEvent` mapping + `resolveUrl` + best-effort `send`).
 - `emit.test.js` — unit tests for the mapping and URL resolution.
 - `package.json` — marks the dir as an ES module + `npm test` wrapper.

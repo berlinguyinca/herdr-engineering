@@ -2,18 +2,16 @@
 # Link the herdr-cp-feed plugin to a control plane from a fresh host.
 #
 # Usage (run ON the target host, or via ssh):
-#   ./link-remote.sh [CONTROL_PLANE_URL] [PLUGIN_DEST]
+#   ./link-remote.sh [PLUGIN_DEST]
 #
-#   CONTROL_PLANE_URL  default: http://100.104.39.6  (bender tailnet IP:80)
-#                      use http://dev.lan where split-DNS resolves it
 #   PLUGIN_DEST        default: ~/.local/share/herdr-cp-feed-plugin
 #
 # This copies the plugin directory into a stable location, points the plugin
-# at the control plane via its config-dir cp-url file, and links it with herdr.
+# and links it with herdr. The plugin finds the control plane through
+# ~/.config/herdr-engineering/host.json (written by `herdr-eng fleet join`).
 set -euo pipefail
 
-CP_URL="${1:-http://100.104.39.6}"
-DEST="${2:-$HOME/.local/share/herdr-cp-feed-plugin}"
+DEST="${1:-$HOME/.local/share/herdr-cp-feed-plugin}"
 
 if ! command -v herdr >/dev/null 2>&1; then
   echo "ERROR: herdr binary not found on this host. Install herdr first." >&2
@@ -23,7 +21,7 @@ fi
 # Copy plugin source (this script lives inside the plugin directory).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$DEST"
-for f in herdr-plugin.toml package.json emit.js enrich.js git-metadata.js inventory.js session-model.js snapshot.js; do
+for f in herdr-plugin.toml package.json emit.js enrich.js git-metadata.js host-config.js inventory.js session-model.js snapshot.js; do
   if [ -f "$SCRIPT_DIR/$f" ]; then
     cp "$SCRIPT_DIR/$f" "$DEST/$f"
   else
@@ -34,7 +32,6 @@ done
 chmod +x "$DEST/emit.js" 2>/dev/null || true
 
 echo "Plugin copied to: $DEST"
-echo "Control-plane URL: $CP_URL"
 
 # Link with herdr.
 if herdr plugin link "$DEST" >/tmp/herdr-cp-link.log 2>&1; then
@@ -44,12 +41,9 @@ else
   cat /tmp/herdr-cp-link.log >&2
 fi
 
-# Point the plugin at the control plane via its config-dir cp-url file.
-PLUGIN_ID="herdr.cp-feed"
-CFG_DIR="$HOME/.config/herdr/plugins/config/$PLUGIN_ID"
-mkdir -p "$CFG_DIR"
-printf '%s\n' "$CP_URL" > "$CFG_DIR/cp-url"
-echo "Wrote control-plane URL to: $CFG_DIR/cp-url"
+if [ ! -f "$HOME/.config/herdr-engineering/host.json" ]; then
+  echo "NOTE: no host.json yet; run \`herdr-eng fleet join\` for this host on the control-plane host." >&2
+fi
 
 echo
 echo "Done. Verify with: herdr plugin list"
