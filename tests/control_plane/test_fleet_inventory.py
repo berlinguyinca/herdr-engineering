@@ -49,3 +49,16 @@ def test_inventory_survives_event_replay():
               for e in repo.stream("host", "bender")]
     hosts = _reconstruct_from_events({"host:bender": events})[2]
     assert hosts["bender"]["inventory"]["tools"] == {"claude": "2.1.0"}
+
+
+def test_heartbeat_load_becomes_a_telemetry_sample_and_list_stays_bounded():
+    repo = ControlPlaneRepo()
+    svc = IngestService(repo)
+    for i in range(600):
+        svc.ingest({"entity_type": "host", "entity_id": "bender", "event_type": "host.heartbeat",
+                    "payload": {"host_name": "bender", "cpu": i % 100, "mem": 50, "disk": 61}})
+    svc.ingest({"entity_type": "host", "entity_id": "bender", "event_type": "host.heartbeat",
+                "payload": {"cpu": True}})
+    latest = repo.list_telemetry("bender", limit=1)[0]
+    assert latest["mem_pct"] == 50 and latest["disk_pct"] == 61
+    assert len(repo.list_telemetry("bender", limit=10_000)) == 500

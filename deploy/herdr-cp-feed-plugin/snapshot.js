@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { herdrBin } from "./enrich.js";
 import { hostIdentity, resolveUrl } from "./emit.js";
 import { gitMetadata } from "./git-metadata.js";
-import { createInventoryReporter } from "./inventory.js";
+import { createInventoryReporter, createLoadReporter } from "./inventory.js";
 
 const TERMINAL_STATES = new Set([
   "failed", "error", "crashed", "finished", "complete", "completed", "closed",
@@ -129,6 +129,7 @@ export async function main(args = process.argv.slice(2), env = process.env) {
   const controller = new AbortController();
   const publish = createSnapshotPublisher();
   const inventoryEnvelope = createInventoryReporter();
+  const loadEnvelope = createLoadReporter();
   const stop = () => controller.abort();
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
@@ -138,6 +139,8 @@ export async function main(args = process.argv.slice(2), env = process.env) {
       // Fleet version inventory rides the same publisher; it is throttled by TTL.
       const inventory = await inventoryEnvelope(hostIdentity(env)).catch(() => null);
       if (inventory) result.envelopes.push(inventory);
+      const load = loadEnvelope(hostIdentity(env));
+      if (load) result.envelopes.push(load);
       const delivery = dryRun ? { posted: 0, unchanged: 0, errors: 0 } : await publish(env, result.envelopes);
       process.stdout.write(JSON.stringify({ ...result.summary, posted: delivery.posted,
         unchanged: delivery.unchanged,

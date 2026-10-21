@@ -341,6 +341,7 @@ async function viewHosts() {
       <div class="hd-card__title"><a href="#/hosts/${esc(h.host_id)}">${esc(h.host_name)}</a></div>
       <div style="margin:6px 0"><herdr-status stage="${fresh ? esc(h.status) : 'stalled'}"></herdr-status></div>
       <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code> · ` : ''}${fresh ? 'seen' : '<strong>no report since</strong>'} ${h.last_seen ? formatTimestamp(h.last_seen) : 'never'}</div>
+      ${Number.isFinite(h.cpu) || Number.isFinite(h.mem) ? `<div class="hd-card__sub">${[Number.isFinite(h.cpu) ? `CPU ${h.cpu}%` : '', Number.isFinite(h.mem) ? `memory ${h.mem}%` : ''].filter(Boolean).join(' · ')}</div>` : ''}
     </div>`; }).join('') + `</div>
     <h2 style="margin-top:24px">Fleet versions</h2>
     <p class="hd-card__sub"><a href="#/hosts${driftedOnly ? '' : '?drift=1'}">${driftedOnly ? 'Show all components' : 'Show only components that differ'}</a></p>
@@ -354,10 +355,11 @@ async function viewHost(parts) {
   try {
     const { samples } = await client.request(`/api/v1/hosts/${esc(parts[1])}/telemetry?limit=1`);
     if (samples && samples.length) {
-      const s = samples[0];
-      cpu = (s.cpu ?? s.cpu_pct) ?? '—';
-      mem = (s.mem ?? s.mem_pct) ?? '—';
-      disk = s.disk_pct ?? '—';
+      const s = samples[samples.length - 1];
+      const pct = (v) => (Number.isFinite(v) ? `${v}%` : '—');
+      cpu = pct(s.cpu ?? s.cpu_pct);
+      mem = pct(s.mem ?? s.mem_pct);
+      disk = pct(s.disk_pct);
       seen = formatTimestamp(s.at ?? h.last_seen);
     }
   } catch { /* telemetry optional */ }

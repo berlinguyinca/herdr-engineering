@@ -3,7 +3,8 @@
 // is simply absent from the report, never an error.
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, loadavg, cpus, totalmem, freemem } from "node:os";
+import { statfsSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const VERSION = /\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?/;
@@ -83,5 +84,30 @@ export function createInventoryReporter({ collect = collectInventory, ttlMs = 60
     last = now();
     return { entity_type: "host", entity_id: host, event_type: "host.inventory",
              payload: { host_name: host, inventory } };
+  };
+}
+
+// Coarse host load for the Hosts page: percentages, rounded, no process detail.
+export function hostLoad({ load = loadavg, ncpu = () => cpus().length, total = totalmem,
+  free = freemem, statfs = statfsSync, path = homedir() } = {}) {
+  const out = {};
+  const n = Math.max(1, ncpu());
+  out.cpu = Math.min(100, Math.round((load()[0] / n) * 100));
+  const t = total();
+  if (t > 0) out.mem = Math.round(((t - free()) / t) * 100);
+  try {
+    const fs = statfs(path);
+    if (fs.blocks > 0) out.disk = Math.round((1 - fs.bavail / fs.blocks) * 100);
+  } catch { /* unsupported filesystem */ }
+  return out;
+}
+
+export function createLoadReporter({ load = hostLoad, ttlMs = 120_000, now = Date.now } = {}) {
+  let last = null;
+  return function maybeLoadEnvelope(host) {
+    if (last !== null && now() - last < ttlMs) return null;
+    last = now();
+    return { entity_type: "host", entity_id: host, event_type: "host.heartbeat",
+             payload: { host_name: host, ...load() } };
   };
 }

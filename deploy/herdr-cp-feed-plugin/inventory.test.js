@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudePlugins, piPackages, toolVersions, createInventoryReporter } from "./inventory.js";
+import { claudePlugins, piPackages, toolVersions, createInventoryReporter, hostLoad, createLoadReporter } from "./inventory.js";
 
 function fakeHome() {
   const home = mkdtempSync(join(tmpdir(), "inv-"));
@@ -40,4 +40,21 @@ test("reporter throttles by TTL", async () => {
   t = 500; assert.equal(await r("h"), null);
   t = 1500; assert.ok(await r("h"));
   assert.equal(calls, 2);
+});
+
+test("host load is whole percentages and tolerates a missing statfs", () => {
+  const load = hostLoad({ load: () => [2, 0, 0], ncpu: () => 8, total: () => 1000, free: () => 250,
+    statfs: () => ({ blocks: 100, bavail: 40 }) });
+  assert.deepEqual(load, { cpu: 25, mem: 75, disk: 60 });
+  const noDisk = hostLoad({ load: () => [20, 0, 0], ncpu: () => 4, total: () => 1000, free: () => 1000,
+    statfs: () => { throw new Error("nope"); } });
+  assert.deepEqual(noDisk, { cpu: 100, mem: 0 });
+});
+
+test("load reporter heartbeats at most every ttl", () => {
+  let t = 0;
+  const r = createLoadReporter({ load: () => ({ cpu: 1 }), ttlMs: 100, now: () => t });
+  assert.equal(r("h").payload.cpu, 1);
+  t = 50; assert.equal(r("h"), null);
+  t = 150; assert.ok(r("h"));
 });

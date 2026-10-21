@@ -96,12 +96,20 @@ class IngestService:
     def _ingest_host(self, entity_id, event_type, payload) -> dict:
         status = ("unavailable" if "unavailable" in event_type.lower()
                   else "healthy")
-        return self.repo.upsert_host(
+        host = self.repo.upsert_host(
             entity_id,
             payload.get("host_name") or payload.get("name") or entity_id,
             payload.get("tailnet_ip") or payload.get("ip"),
             cpu=payload.get("cpu"), mem=payload.get("mem"), status=status,
             inventory=payload.get("inventory"))
+        sample = {k: payload[k] for k in ("cpu", "mem", "disk")
+                  if isinstance(payload.get(k), (int, float))
+                  and not isinstance(payload.get(k), bool)}
+        if sample:
+            self.repo.record_telemetry(entity_id, {
+                "cpu_pct": sample.get("cpu"), "mem_pct": sample.get("mem"),
+                "disk_pct": sample.get("disk")})
+        return host
 
     def _ingest_session(self, entity_id, event_type, payload,
                         source="herdr") -> dict:

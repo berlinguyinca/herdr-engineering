@@ -679,7 +679,9 @@ class ControlPlaneRepo:
     def record_telemetry(self, host_id, sample):
         """Record a telemetry sample (cpu/mem/disk/network/gpu) for a host."""
         rec = {"host_id": host_id, "at": self._stamp(), **dict(sample or {})}
-        self._telemetry.setdefault(host_id, []).append(rec)
+        samples = self._telemetry.setdefault(host_id, [])
+        samples.append(rec)
+        del samples[:-500]  # a day of 2-minute samples is plenty; keep memory bounded
         return True
 
     def list_telemetry(self, host_id, limit=100):
