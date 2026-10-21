@@ -2105,15 +2105,14 @@ def _cmd_cp_web(args) -> int:
                              collab_only=args.collab_only)
     # Self-report the control-plane stack so the Services page has real data.
     try:
-        if args.collab_only:
-            raise RuntimeError("collab-only: no stack to report")
-        _self_report_services(
-            repo,
-            host_id=os.environ.get("HERDR_CP_SELF_HOST") or socket.gethostname(),
-            web_port=args.port or os.environ.get("HERDR_CP_WEB_PORT", "8080"),
-            dsn=dsn,
-            rustfs_endpoint=os.environ.get("HERDR_CP_RUSTFS_ENDPOINT"),
-        )
+        if not args.collab_only:   # collab-only has no stack to report
+            _self_report_services(
+                repo,
+                host_id=os.environ.get("HERDR_CP_SELF_HOST") or socket.gethostname(),
+                web_port=args.port or os.environ.get("HERDR_CP_WEB_PORT", "8080"),
+                dsn=dsn,
+                rustfs_endpoint=os.environ.get("HERDR_CP_RUSTFS_ENDPOINT"),
+            )
     except Exception:
         logging.exception("self-report of stack services failed")
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
