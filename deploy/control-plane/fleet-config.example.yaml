@@ -13,6 +13,7 @@ sections:
       api_keys:                     # key: role (viewer | operator | ingest)
         "REDACTED": operator
         "REDACTED_INGEST": ingest   # the same value as ingest.api_key below
+        "REDACTED_AGENT": agent     # the same value as agent.api_key below (ingest + LLM keys + reviews)
       rustfs_endpoint: "http://rustfs:9000"
       rustfs_access_key: "REDACTED"
       rustfs_secret_key: "REDACTED"
@@ -41,6 +42,12 @@ sections:
     values:
       api_key: "REDACTED_INGEST"
 
+  # Used by host-side tools (session run, review bridge): role agent.
+  agent:
+    roles: [all]
+    values:
+      api_key: "REDACTED_AGENT"
+
   fabric:
     roles: [all]
     values:
@@ -52,11 +59,6 @@ sections:
     values:
       enabled: false
       reasoning: "off"
-
-  host:
-    roles: [all]
-    values:
-      aliases: ""                   # e.g. "bender=bender.example.test"
 
 hosts:
   # token_sha256 is the sha256 hex of the host's random token (the token itself

@@ -27,6 +27,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from ..version import __version__
 from .redact import redact_payload
 
+# Routes a host-side tool (session run, plannotator bridge) may POST with the
+# narrow `agent` role, besides /api/v1/ingest. Nothing else.
+_AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
+                        r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
 # back to "dev" in a local checkout / un-stamped image.
 _COMMIT = os.environ.get("HERDR_ENGINEERING_COMMIT", "dev")
@@ -294,7 +298,8 @@ def _make_handler(server):
 
             Role model (Spec §104): viewer = read-only; operator = read +
             mutate; ingest = read + POST /api/v1/ingest only (read-only
-            everywhere else). Unknown roles are treated as viewer (fail-closed
+            everywhere else); agent = ingest plus exactly the host-side tool routes
+            (LLM key mint/revoke, review create/result). Unknown roles are treated as viewer (fail-closed
             for mutations).
 
             The return value MUST be truthy on refusal: callers do
@@ -312,9 +317,12 @@ def _make_handler(server):
                 if (role == "ingest" and self.command == "POST"
                         and path == "/api/v1/ingest"):
                     return None
+                if (role == "agent" and self.command == "POST"
+                        and (path == "/api/v1/ingest" or _AGENT_POST.match(path))):
+                    return None
                 return self._deny(403, "read-only")
             if min_role == "ingest":
-                if role in ("operator", "ingest"):
+                if role in ("operator", "ingest", "agent"):
                     return None
                 return self._deny(403, "read-only")
             return None

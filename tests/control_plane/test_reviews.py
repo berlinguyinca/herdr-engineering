@@ -118,7 +118,7 @@ def test_host_launcher_uses_authenticated_http_routes(tmp_path, monkeypatch, ack
     from herdr_engineering.plannotator import run_review
     from herdr_engineering.session_env import _get
 
-    fake_host_config({"ingest": {"api_key": "fixture-private-key"}})
+    fake_host_config({"agent": {"api_key": "fixture-private-key"}})
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     executable = tmp_path / "plannotator"
     executable.write_text("#!/usr/bin/python3\n" + '''import json,os,time
