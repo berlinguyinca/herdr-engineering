@@ -87,7 +87,8 @@ class ControlPlaneServer:
 
     def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
                  port=0, web_root=None, source=None, allow_open=False,
-                 rustfs=None, dispatcher=None, github_monitor=None):
+                 rustfs=None, dispatcher=None, github_monitor=None,
+                 collab=None, collab_tls_terminated=False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -141,6 +142,17 @@ class ControlPlaneServer:
                 f"non-loopback address {host!r}; configure --api-keys / "
                 "HERDR_CP_API_KEYS, or pass --allow-open to trust the "
                 "Tailnet boundary (Spec §104)")
+        # HCN (feature-flagged, off by default). Bearer credentials must never
+        # cross a network in clear text, so a non-loopback bind needs an explicit
+        # assertion that TLS is terminated in front of this server.
+        if collab is not None and not _is_loopback(host) and not collab_tls_terminated:
+            raise ValueError(
+                "refusing to enable collaboration on non-loopback address "
+                f"{host!r} without collab_tls_terminated (bearer credentials "
+                "require TLS)")
+        self.collab = collab
+        if collab is not None:
+            collab.hydrate(repo.take_collab_replay())
         self.host = host
         self.port = port
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
@@ -187,6 +199,8 @@ class ControlPlaneServer:
         h["version"] = __version__
         h["commit"] = _COMMIT
         h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1", "github_v1"]
+        if self.collab is not None:
+            h["capabilities"].append("collab_v1")
         return h
 
     # ------------------------------------------------------- SSE plumbing
@@ -300,6 +314,8 @@ def _make_handler(server):
 
         # ------------------------------------------------------------ routes
         def do_GET(self):
+            if self._is_collab_path():
+                return self._collab()
             err = self._require("viewer")
             if err:
                 return err
@@ -308,6 +324,8 @@ def _make_handler(server):
             return self._serve_static()
 
         def do_POST(self):
+            if self._is_collab_path():
+                return self._collab()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -326,6 +344,83 @@ def _make_handler(server):
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._send_json(404, {"error": "not found"})
+
+        # --------------------------------------------------- collaboration (HCN)
+        def _is_collab_path(self):
+            path = self.path.split("?")[0]
+            return path == "/api/v1/collab" or path.startswith("/api/v1/collab/")
+
+        def _collab(self):
+            """HCN routes bypass the legacy X-API-Key gate on purpose: legacy keys are
+            shared secrets with no identity, so they grant nothing here. Authentication
+            is per-user / per-agent (collab.authenticate)."""
+            service = server.collab
+            if service is None:
+                return self._deny(404, "not found")
+            if self._rate_limit():
+                return None
+            if self.command == "POST":
+                origin = self.headers.get("Origin")
+                if origin and (urlsplit(origin).netloc != self.headers.get("Host")
+                               or urlsplit(origin).scheme not in {"http", "https"}):
+                    return self._deny(403, "cross-origin mutation refused")
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                    return self._deny(415, "mutations require application/json")
+            body = {}
+            if self.command == "POST":
+                from .collab import MAX_BODY
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > MAX_BODY:
+                    return self._deny(413, "request body too large")
+                if length:
+                    try:
+                        body = json.loads(self.rfile.read(length))
+                    except ValueError:
+                        return self._json({"error": "invalid JSON body"}, 400)
+                    if not isinstance(body, dict):
+                        return self._json({"error": "JSON object required"}, 400)
+            split = urlsplit(self.path)
+            parts = [unquote(seg) for seg in split.path.split("/")[4:] if seg]
+            query = {k: v[0] for k, v in parse_qs(split.query).items()}
+            try:
+                result = service.dispatch(self.command, parts, query, body,
+                                          self.headers.get("Authorization", ""),
+                                          self.headers.get("X-Herdr-Device"))
+            except Exception:
+                return self._json({"error": "internal error"}, 500)  # never echo internals
+            if isinstance(result, tuple):
+                return self._json(result[1], result[0])
+            return self._collab_sse(service, result)
+
+        def _collab_sse(self, service, stream):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.connection.settimeout(30)
+            except OSError:
+                pass
+            last = time.monotonic()
+            frames = service.pump(stream, max_seconds=_MAX_SSE_SECONDS)
+            try:
+                for frame in frames:
+                    if frame is None:
+                        if time.monotonic() - last < 15:
+                            continue
+                        self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        self.wfile.write(_raw_frame(frame))
+                    self.wfile.flush()
+                    last = time.monotonic()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                pass
+            finally:
+                frames.close()
+            return None
 
         def _rate_limit(self):
             # Skip SSE streams: they are long-lived connections, not bursts.
@@ -459,6 +554,8 @@ def _make_handler(server):
                     # per-entity stream: /api/v1/events?entity_type=mission&entity_id=m1
                     etype = _q(self.path, "entity_type")
                     eid = _q(self.path, "entity_id")
+                    if etype and etype.startswith("collab"):
+                        return self._json({"error": "not found"}, 404)  # HCN has its own authenticated API
                     if not etype or not eid:
                         return self._json(
                             {"error": "entity_type and entity_id required"}, 400)

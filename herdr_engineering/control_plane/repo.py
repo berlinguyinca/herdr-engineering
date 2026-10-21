@@ -136,6 +136,7 @@ class ControlPlaneRepo:
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
+        self._collab_replay = []  # durable HCN events diverted out of the shared streams
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_env(persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
@@ -1614,8 +1615,18 @@ class ControlPlaneRepo:
         for key in [k for k in self._events if k[0] == "inspector"]:
             durable.extend(self._events.pop(key))
         self._event_order = [t for t in self._event_order if t[0] != "inspector"]
+        # HCN events are private to the collaboration service: they must never sit
+        # in the shared streams that /activity and the global SSE feed expose.
+        for key in [k for k in self._events if k[0] == "collab"]:
+            self._collab_replay.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != "collab"]
         if durable:
             self.inspector.hydrate(durable)
+
+    def take_collab_replay(self):
+        """Hand the diverted durable HCN events to the collaboration service (once)."""
+        out, self._collab_replay = self._collab_replay, []
+        return out
 
     # --------------------------------------------------------------- health
     def health(self):

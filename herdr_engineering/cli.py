@@ -427,6 +427,13 @@ def _build_parser() -> argparse.ArgumentParser:
                          "non-loopback bind. ONLY safe when the host port is "
                          "bound to the Tailnet interface / `tailscale serve` "
                          "(Tailnet = trust boundary). Refused without this flag.")
+    p2.add_argument("--collab-users-file", default=None,
+                    help="enable the collaboration network (HCN, off by default): JSON "
+                         "file mapping user_id -> sha256(token) hex. Pilot authenticator "
+                         "only; replace with SSO before real use (ADR-0007).")
+    p2.add_argument("--collab-tls-terminated", action="store_true",
+                    help="assert TLS is terminated in front of this server; required to "
+                         "enable collaboration on a non-loopback bind")
     p2.set_defaults(func=_cmd_cp_web)
     p2 = csub.add_parser("worker", help="run the bounded background worker")
     p2.add_argument("--interval", type=float, default=30.0,
@@ -2005,10 +2012,22 @@ def _cmd_cp_web(args) -> int:
     if args.seed_demo:
         _seed_demo(repo)
     rustfs = _maybe_rustfs_client()
+    collab = None
+    if args.collab_users_file:
+        from pathlib import Path
+
+        from .control_plane.collab import CollabService, StaticTokenAuthenticator
+        users = json.loads(Path(args.collab_users_file).read_text(encoding="utf-8"))
+        if (not isinstance(users, dict) or not users or not all(
+                isinstance(u, str) and isinstance(d, str) and len(d) == 64
+                for u, d in users.items())):
+            raise SystemExit("--collab-users-file must map user_id -> sha256 hex digest")
+        collab = CollabService(StaticTokenAuthenticator(users), sink=sink)
     svr = ControlPlaneServer(repo, api_keys=api_keys,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root, allow_open=args.allow_open,
-                             rustfs=rustfs)
+                             rustfs=rustfs, collab=collab,
+                             collab_tls_terminated=args.collab_tls_terminated)
     # Self-report the control-plane stack so the Services page has real data.
     try:
         _self_report_services(

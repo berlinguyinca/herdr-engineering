@@ -5,6 +5,16 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Collaboration network foundation (HCN P1, flag off by default)
+- Added `control_plane/collab.py` and `/api/v1/collab/*`: per-user bearer auth,
+  two-user rooms with owner/contributor/viewer/guest roles, device-bound agent
+  enrollment with revocable, rotating credentials, owner-attenuated agent grants,
+  idempotent auditable messages, cursor replay and a per-room SSE that
+  re-authorizes every tick. State is event-sourced into the existing
+  `fabric_events` sink and kept out of the shared event streams.
+- Enable with `control-plane web --collab-users-file`; see
+  `docs/operations/collaboration-network.md` and ADR-0007.
+
 ### Fleet mission recovery
 - Added pinned Pi runtime staging and `fleet rollout plan/apply/run/status` with
   durable operation IDs, offline retries, bounded online stall detection, loaded
