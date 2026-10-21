@@ -963,6 +963,65 @@ def _spec_from_manifest(m: dict) -> dict:
     }
 
 
+def heartbeat_local_leases(reg, state: dict) -> None:
+    """Renew every locally-held lease (the --serve renewal loop, #89).
+
+    Loud about the two ways a renewal can silently lose the origin: the
+    lease is MISSING from the registry (clobbered or pruned by another
+    process — the next sync re-enrolls it), and the lease LAPSED between
+    cycles (expired while the forwarder still held the port — fleet-wide
+    unreachable until this renewal). The lapsed lease is still renewed.
+    """
+    from .devfabric import _now_iso, _parse_time
+    now = _parse_time(_now_iso())
+    for key, st in state.items():
+        lid = st["lease_id"]
+        lease = reg.get(lid)
+        lapsed = lease is not None and _parse_time(lease.expires_at) < now
+        renewed = reg.heartbeat(lid)
+        if renewed is None:
+            logging.getLogger("herdr.cli").warning(
+                "lease %s missing from the registry while the forwarder "
+                "still serves it (clobbered or pruned); the next sync will "
+                "re-enroll it", lid)
+        elif lapsed:
+            logging.getLogger("herdr.cli").warning(
+                "lease %s lapsed (expired while the forwarder held the "
+                "port); renewed now", lid)
+
+
+def _ensure_origin_forwarder(fwd: dict, key: str, lease, bind: str):
+    """Keep the per-origin forwarder running (local --serve mode). Returns an
+    error string when (re)starting failed, else None.
+
+    Restarts only when the lease identity or its 1:1 target moved — a
+    routes-only drift needs no restart (OriginEdge reads lease.routes per
+    connection). A failed start leaves the slot empty (None) so the NEXT
+    sync retries instead of remembering the failure for the life of the
+    process (#90).
+    """
+    from .devfabric import forwarder_for
+    cur = fwd.get(key)
+    if cur is not None:
+        same = (cur.lease.id == lease.id
+                and cur.lease.target_host == lease.target_host
+                and cur.lease.target_port == lease.target_port
+                and cur.lease.external_port == lease.external_port)
+        if same:
+            return None  # routes-only drift: the edge picks it up per-connection
+        try:
+            cur.stop()
+        except Exception:
+            pass
+        fwd.pop(key, None)
+    try:
+        fwd[key] = forwarder_for(lease, bind_host=bind).start()
+        return None
+    except Exception as exc:  # noqa: BLE001 - report; next sync retries
+        fwd[key] = None  # slot stays retryable
+        return str(exc)
+
+
 def _enroll_origin(spec: dict, client, reg, bind: str = "127.0.0.1"):
     """Register one origin (spec): gateway if reachable (it forwards fleet-wide),
     else the local registry. Idempotent via a STABLE lease_id (re-register
@@ -995,19 +1054,27 @@ def _enroll_origin(spec: dict, client, reg, bind: str = "127.0.0.1"):
                "note": "the gateway forwards the origin automatically"}
         return out, lease
     # Local: register with the stable lease_id (idempotent — renews the same
-    # lease/port); re-apply routes by closing the stale lease if they differ.
+    # lease/port). Route drift updates the lease IN PLACE (same id, same
+    # external port) instead of close+re-register — the churn path re-
+    # allocated the port (landing elsewhere when the old forwarder still
+    # OS-binds it) and left the CLI with a stale origin; a running edge
+    # picks up the new routes per connection (#90).
     existing = reg.get(stable_id)
-    changed = existing is None or not _routes_equal(existing.routes, routes)
-    if not changed:
+    if existing is not None and _routes_equal(existing.routes, routes):
         lease = existing
+        changed = False
+    elif existing is not None:
+        lease = reg.update_routes(stable_id, routes)
+        if lease.state != "active":
+            lease = reg.heartbeat(stable_id) or lease
+        changed = True
     else:
-        if existing is not None:
-            reg.close(existing.id)
         lease = reg.register(
             target_machine_id=spec["machine"], target_host=c_host,
             target_port=c_port, protocol=spec["protocol"],
             owner_repository=spec["repo"], label=spec["label"],
             routes=routes, preferred_port=origin_port, lease_id=stable_id)
+        changed = True
     out = {"ok": True, "via": "local", "changed": changed, "lease_id": lease.id,
            "origin": f"http://dev:{lease.external_port}",
            "local_origin": f"http://{bind}:{lease.external_port}",
@@ -1113,11 +1180,10 @@ def _cmd_dev_enroll_sync(args) -> int:
 
     def _heartbeat_local():
         if client is None:
-            for key, st in state.items():
-                try:
-                    reg.heartbeat(st["lease_id"])
-                except Exception:
-                    pass
+            try:
+                heartbeat_local_leases(reg, state)
+            except Exception:
+                pass
 
     def sync_once() -> list:
         if args.git_pull:
@@ -1153,15 +1219,9 @@ def _cmd_dev_enroll_sync(args) -> int:
                 else lease.external_port
             state[key] = {"sig": sig, "lease_id": lid, "port": port}
             if args.serve and client is None:
-                cur = fwd.get(key)
-                if cur is not None and state[key]["sig"] != sig:
-                    _stop_fwd(key)
-                if key not in fwd:
-                    try:
-                        fwd[key] = forwarder_for(lease, bind_host=args.bind).start()
-                    except Exception as exc:  # noqa: BLE001 - e.g. port in use
-                        fwd[key] = None
-                        out["serve_error"] = str(exc)
+                serve_err = _ensure_origin_forwarder(fwd, key, lease, args.bind)
+                if serve_err is not None:
+                    out["serve_error"] = serve_err
         for key in list(state):  # reap removed manifests
             if key not in specs:
                 _stop_fwd(key)
