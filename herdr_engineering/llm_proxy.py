@@ -14,6 +14,8 @@ import hmac
 import http.client
 import json
 import logging
+import os
+import re
 import threading
 import time
 import urllib.error
@@ -26,6 +28,19 @@ log = logging.getLogger("herdr.llm_proxy")
 FORWARDED_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models")
 MISS_RELOAD_SECONDS = 2.0
 MAX_BODY = 16 * 1024 * 1024
+# Gateway admission buckets requests by user+client+session+agent and rejects metadata
+# over 128 bytes or outside this set with a 400, so only forward values it accepts.
+_META_OK = re.compile(r"^[A-Za-z0-9\-_.:/]{1,128}$")
+_IDENTITY_HEADERS = {"x-inferweave-client-id", "x-inferweave-session-id", "x-inferweave-agent-id",
+                     "x-session-id"}
+DEFAULT_MAX_INFLIGHT = 32  # per project; the gateway's whole admission ceiling is 128
+DEFAULT_QUEUE_WAIT_SECONDS = 10.0
+
+
+def _meta(value: str | None) -> str | None:
+    return value if value is not None and _META_OK.match(value) else None
+
+
 HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
                "proxy-authorization", "proxy-authenticate", "content-length", "host", "accept-encoding",
                "authorization"}
@@ -60,6 +75,11 @@ class ProxyState:
         self._keys: dict[str, dict] = {}
         self._models: dict[str, dict] = {}
         self._lock = threading.Lock()
+        self._slots: dict[str, threading.BoundedSemaphore] = {}
+        self._inflight: dict[str, int] = {}
+        self.configure_limits(
+            max_inflight=int(os.environ.get("HERDR_LLM_PROXY_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT)),
+            wait_seconds=float(os.environ.get("HERDR_LLM_PROXY_QUEUE_WAIT_SECONDS", DEFAULT_QUEUE_WAIT_SECONDS)))
         self._last = 0.0
 
     def refresh(self, force: bool = False) -> None:
@@ -92,6 +112,37 @@ class ProxyState:
                 self.refresh(force=True)
         return None
 
+    def configure_limits(self, max_inflight: int, wait_seconds: float) -> None:
+        """Per-project concurrent request cap (0 disables) and how long a request may wait for a slot."""
+        with self._lock:
+            self.max_inflight, self.wait_seconds = max(0, max_inflight), max(0.0, wait_seconds)
+            self._slots, self._inflight = {}, {}
+
+    def acquire(self, project: str) -> bool:
+        """Take a slot for ``project``; False when none frees up within the wait. Always pair with release()."""
+        if not self.max_inflight:
+            return True
+        with self._lock:
+            sem = self._slots.setdefault(project, threading.BoundedSemaphore(self.max_inflight))
+        if not sem.acquire(timeout=self.wait_seconds):
+            return False
+        with self._lock:
+            self._inflight[project] = self._inflight.get(project, 0) + 1
+        return True
+
+    def release(self, project: str) -> None:
+        if not self.max_inflight:
+            return
+        with self._lock:
+            sem = self._slots.get(project)
+            self._inflight[project] = max(0, self._inflight.get(project, 0) - 1)
+        if sem is not None:
+            sem.release()
+
+    def inflight(self, project: str) -> int:
+        with self._lock:
+            return self._inflight.get(project, 0)
+
     def route(self, model: str | None) -> tuple[str, str | None, str | None]:
         """(base_url, bearer, upstream model name) for ``model``."""
         with self._lock:
@@ -114,6 +165,7 @@ def _usage_of(obj: dict) -> dict:
 def make_handler(state: ProxyState):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        state = None  # set below; lets tests and operators reach the limits
 
         def log_message(self, *args):  # no request lines with keys/paths in logs
             pass
@@ -164,7 +216,45 @@ def make_handler(state: ProxyState):
                 return self._json(400, {"error": "json object required"})
             return self._forward(key, raw, body)
 
+        def _identity_headers(self, key: dict) -> dict:
+            """Who the gateway should admit this request as.
+
+            Every project shares ONE upstream key, so without these all projects and
+            sessions land in the gateway's single "default" session/agent bucket
+            (4 active / 12 queued) and one stalled model starves the rest. The client
+            is always the project (never taken from the caller); session and agent
+            pass through when well-formed, else the session falls back to the key.
+            """
+            project = _meta(f"herdr:{key['project']}") or "herdr"
+            session = (_meta(self.headers.get("X-InferWeave-Session-ID")) or _meta(self.headers.get("X-Session-Id"))
+                       or _meta(f"{key['project']}:{key.get('key_id', '')}") or "herdr")
+            out = {"X-InferWeave-Client-ID": project, "X-InferWeave-Session-ID": session}
+            agent = _meta(self.headers.get("X-InferWeave-Agent-ID"))
+            if agent:
+                out["X-InferWeave-Agent-ID"] = agent
+            return out
+
         def _forward(self, key: dict, raw: bytes, body: dict | None):
+            project = key["project"]
+            if not state.acquire(project):
+                wait = max(1, int(state.wait_seconds))
+                payload = json.dumps({"error": {
+                    "type": "proxy_backpressure", "code": "project_inflight_cap",
+                    "message": f"project {project} has {state.max_inflight} requests in flight; retry shortly",
+                    "retry_after_ms": wait * 1000}}).encode()
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", str(wait))
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            try:
+                return self._forward_slotted(key, raw, body)
+            finally:
+                state.release(project)
+
+        def _forward_slotted(self, key: dict, raw: bytes, body: dict | None):
             started = time.monotonic()
             model = body.get("model") if body else None
             base, bearer, upstream_model = state.route(model)
@@ -179,7 +269,9 @@ def make_handler(state: ProxyState):
                 raw = json.dumps(body).encode()
             parts = urlsplit(base + self.path)
             conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in HOP_HEADERS and k.lower() not in _IDENTITY_HEADERS}
+            headers.update(self._identity_headers(key))
             headers["Content-Length"] = str(len(raw))
             if bearer:
                 headers["Authorization"] = f"Bearer {bearer}"
@@ -246,6 +338,7 @@ def make_handler(state: ProxyState):
             except Exception as exc:  # accounting must never fail the request
                 log.warning("token report failed: %s", exc)
 
+    Handler.state = state
     return Handler
 
 
