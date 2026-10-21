@@ -1,5 +1,23 @@
 # Implementation Status
 
+## Herdr System Intelligence (spec 2026-10-20, P0)
+
+**P0 audit: COMPLETE** — see
+[`docs/specs/herdr-system-graph-20261020/10-p0-audit.md`](docs/specs/herdr-system-graph-20261020/10-p0-audit.md).
+
+- 9/9 spec-09 "must verify" items checked on disk / via GitHub API (2026-10-21, bender).
+- Reuse confirmed: `ControlPlaneIngest.ts` (pi→herdr ingest), `mission_activity_feed.py`,
+  Postgres+RustFS control plane with SSE `/api/v1/events/stream`, 29-state mission lifecycle,
+  InferWeave topology contracts, Ansible fleet inventory.
+- Gaps (new work): graph canvas rendering, envelope correlation/trace fields, GitHub
+  webhooks, Pi↔InferWeave trace correlation.
+- Open question: "Libre WebUI" named in the spec does not exist under any verified name;
+  P5 target surface decision needed (herdr dashboard tab vs PI WEB plugin).
+- Baselines: herdr-engineering `pytest` **1081 passed, 4 skipped, 1 xfailed** (219 s);
+  pi-engineering `npm run test:unit` **4181 passed, 0 failed** (248 s); inferweave
+  workspace parses (368 crates).
+- ETA P1–P6: ~3–4 weeks single-contributor (medium confidence; reuse map in audit).
+
 ## Fleet mission recovery hardening (2026-10-17)
 
 Pinned runtime staging, exact live-session discovery, durable maintenance receipts,
