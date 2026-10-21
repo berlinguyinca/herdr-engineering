@@ -111,8 +111,28 @@ export function mountCollab(root) {
     };
   }
 
-  const mcpCommand = (cfg, a) => `claude mcp add --transport http herdr-collab ${new URL('/mcp', cfg.public_url).href} `
-    + `--header "Authorization: Agent ${a.credential}" --header "X-Herdr-Device: ${a.device_id}"`;
+  // One credential, shown once, in the format each client wants. Secrets only ever go through textContent.
+  const connectSnippets = (cfg, a) => {
+    const url = new URL('/mcp', cfg.public_url).href;
+    const auth = `Agent ${a.credential}`;
+    return [
+      ['Claude Code', `claude mcp add --transport http herdr-collab ${url} --header "Authorization: ${auth}" --header "X-Herdr-Device: ${a.device_id}"`,
+        'Run once in a terminal. Check with: claude mcp list'],
+      ['Codex', `# add to ~/.codex/config.toml\n[mcp_servers.herdr-collab]\nurl = "${url}"\nhttp_headers = { "Authorization" = "${auth}", "X-Herdr-Device" = "${a.device_id}" }`,
+        'Needs a Codex version with streamable-HTTP MCP support. Restart Codex afterwards.'],
+      ['Pi and other MCP clients', JSON.stringify({ mcpServers: { 'herdr-collab': { type: 'http', url, headers: { Authorization: auth, 'X-Herdr-Device': a.device_id } } } }, null, 2),
+        `Any client that speaks MCP over streamable HTTP works. If yours has no config file, give it the URL ${url} and the two headers above.`],
+    ];
+  };
+
+  const HOW_TO = `<details open><summary><strong>How to connect your AI tools</strong></summary>
+    <ol>
+      <li>Press <em>Connect an AI agent</em> below. You get a private credential, shown once.</li>
+      <li>Copy the snippet for your tool (Claude Code, Codex, Pi or any MCP client) and install it.</li>
+      <li>Open a room, and under <em>Your agents in this room</em> add the agent. Until you do, it can see nothing.</li>
+      <li>The agent can then list rooms, read messages and post, as you, in those rooms only. Everything it reads from others is untrusted text, and it cannot run commands on your machine through this connection.</li>
+      <li>Lost the credential or no longer need it? <em>Revoke</em> it here; it stops working immediately. Credentials expire after 30 days.</li>
+    </ol></details>`;
 
   async function renderAgents(cfg) {
     const box = document.getElementById('hcn-agents');
@@ -120,16 +140,17 @@ export function mountCollab(root) {
     const { agents } = await api.agents();
     const live = agents.filter((a) => a.status === 'active');
     box.innerHTML = `${live.length ? `<ul>${live.map((a) => `<li>${esc(a.harness_type)} <small>${esc(a.agent_id)} · expires ${esc(new Date(a.expires_at * 1000).toLocaleDateString())} · ${a.rooms.length ? `in ${esc(a.rooms.map((r) => r.name).join(', '))}` : 'not in any room yet'}</small> <button type="button" data-revoke="${esc(a.agent_id)}">Revoke</button></li>`).join('')}</ul>` : '<p class="empty">No connected agents.</p>'}
-      <button id="hcn-connect" type="button">Connect Claude Code or another MCP client</button>
+      ${HOW_TO}
+      <button id="hcn-connect" type="button">Connect an AI agent</button>
       <div id="hcn-connect-out" role="status"></div>`;
     box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { await api.revokeAgent(b.dataset.revoke); renderAgents(cfg); }; });
     document.getElementById('hcn-connect').onclick = async () => {
       const a = await api.connectAgent();
       const out = document.getElementById('hcn-connect-out');
-      out.innerHTML = `<p>Run this once in a terminal. It is shown only now and acts as you in the rooms you add it to, so keep it private:</p>
-        <pre style="white-space:pre-wrap;word-break:break-all"></pre>
-        <p>Then add the agent to a room from that room's page. Revoke it here at any time.</p>`;
-      out.querySelector('pre').textContent = mcpCommand(cfg, a);   // textContent: never parsed as HTML
+      out.innerHTML = `<p>Shown only now. It acts as you in the rooms you add it to, so keep it private. Pick your tool:</p>
+        ${connectSnippets(cfg, a).map(([name, , note], i) => `<h3>${esc(name)}</h3><pre data-snippet="${i}" style="white-space:pre-wrap;word-break:break-all"></pre><p><small>${esc(note)}</small></p>`).join('')}
+        <p>Then add the agent to a room from that room's page.</p>`;
+      connectSnippets(cfg, a).forEach(([, text], i) => { out.querySelector(`[data-snippet="${i}"]`).textContent = text; });   // textContent: never parsed as HTML
     };
   }
 
