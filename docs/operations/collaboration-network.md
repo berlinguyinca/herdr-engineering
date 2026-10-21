@@ -10,14 +10,14 @@ Users sign in with the BinView user pool; only members of one Cognito group get 
 herdr-eng control-plane web --host 127.0.0.1 --port 18766 --pg-dsn "$DSN" \
   --collab-cognito-pool us-west-2_GjtcM0PCp \
   --collab-cognito-client 6mcn0idau4b5uhtkd1b2g6c9qg \
-  --collab-cognito-group dev
+  --collab-cognito-group local.dev
 ```
 * Install the extra: `pip install 'herdr-engineering[collab]'` (PyJWT + cryptography).
 * Clients send the Cognito **access** token (`Authorization: Bearer …`). ID tokens,
   other app clients, other pools and users outside the group are 401. The user id is
   the token's `username`.
-* Create the group once (it does not exist yet): `aws cognito-idp create-group
-  --user-pool-id us-west-2_GjtcM0PCp --group-name dev --region us-west-2`, then add people.
+* The group `local.dev` exists (created 2026-10-21; to recreate: `aws cognito-idp create-group
+  --user-pool-id us-west-2_GjtcM0PCp --group-name local.dev --region us-west-2`). Add people with `aws cognito-idp admin-add-user-to-group`.
 * Group removal takes effect within ~60 s when the host has AWS credentials allowing
   `cognito-idp:AdminListGroupsForUser`; without them it waits for the token to expire
   (about an hour). Open streams end when the token expires.

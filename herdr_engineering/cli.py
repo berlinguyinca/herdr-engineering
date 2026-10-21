@@ -436,8 +436,12 @@ def _build_parser() -> argparse.ArgumentParser:
                          "this user pool (e.g. us-west-2_GjtcM0PCp); needs --collab-cognito-client")
     p2.add_argument("--collab-cognito-client", action="append", default=[],
                     help="allowed Cognito app client id (repeatable)")
-    p2.add_argument("--collab-cognito-group", default="dev",
-                    help="required cognito:groups membership (default: dev)")
+    p2.add_argument("--collab-cognito-group", default="local.dev",
+                    help="required cognito:groups membership (default: local.dev)")
+    p2.add_argument("--collab-require-https", action="store_true",
+                    help="serve collaboration only for requests forwarded by a TLS proxy "
+                         "(X-Forwarded-Proto: https); other listeners on this server stay "
+                         "plain. Satisfies the non-loopback TLS requirement.")
     p2.add_argument("--collab-tls-terminated", action="store_true",
                     help="assert TLS is terminated in front of this server; required to "
                          "enable collaboration on a non-loopback bind")
@@ -2053,7 +2057,8 @@ def _cmd_cp_web(args) -> int:
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root, allow_open=args.allow_open,
                              rustfs=rustfs, collab=collab,
-                             collab_tls_terminated=args.collab_tls_terminated)
+                             collab_tls_terminated=args.collab_tls_terminated,
+                             collab_require_https=args.collab_require_https)
     # Self-report the control-plane stack so the Services page has real data.
     try:
         _self_report_services(

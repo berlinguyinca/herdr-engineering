@@ -1,0 +1,23 @@
+# Collaboration network (HCN) overlay for control-plane-web; layered on by deploy.sh
+# only when ~/.config/herdr-engineering/collab-enabled exists. The identifiers below
+# are public (they ship in the BinView web bundle); no secret is configured here.
+# Publish over HTTPS with: deploy/control-plane/collab-tailscale-serve.sh up <port> <https-port>
+services:
+  control-plane-web:
+    command:
+      - "control-plane"
+      - "web"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--web-root"
+      - "/app/packages"
+      - "--allow-open"
+      - "--collab-cognito-pool"
+      - "us-west-2_GjtcM0PCp"
+      - "--collab-cognito-client"
+      - "6mcn0idau4b5uhtkd1b2g6c9qg"
+      - "--collab-cognito-group"
+      - "local.dev"
+      - "--collab-require-https"

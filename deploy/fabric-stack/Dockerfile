@@ -30,7 +30,7 @@ WORKDIR /app
 # Install the package (no dev deps). [build-system] is setuptools.
 COPY pyproject.toml README.md LICENSE ./
 COPY herdr_engineering/ ./herdr_engineering/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[collab]"
 
 # Build-free frontend assets (ES modules + Web Components, no bundler). Copied
 # into the image so the control-plane web is self-contained; serve via

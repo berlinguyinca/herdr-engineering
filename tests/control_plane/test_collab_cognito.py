@@ -183,3 +183,24 @@ def test_rate_limit_is_per_forwarded_client_behind_the_proxy(acknowledged_sink):
     finally:
         srv.shutdown()
         t.join(timeout=5)
+
+
+def test_require_https_refuses_plain_requests_but_serves_proxied_ones(acknowledged_sink):
+    svc = CollabService(auth(), sink=acknowledged_sink)
+    srv = ControlPlaneServer(ControlPlaneRepo(), host="0.0.0.0", port=0, collab=svc,
+                             allow_open=True, collab_require_https=True)   # no tls-terminated assertion needed
+    t = threading.Thread(target=srv.serve, daemon=True)
+    t.start()
+    srv.wait_until_ready()
+    try:
+        api = Api(srv.port)
+        plain = api.call("GET", f"{BASE}/rooms", headers=bearer(token("alice")))
+        assert plain[0] == 400
+        ok = api.call("GET", f"{BASE}/rooms", headers={**bearer(token("alice")),
+                                                       "X-Forwarded-Proto": "https"})
+        assert ok[0] == 200
+        # the rest of the server is untouched by the flag
+        assert api.call("GET", "/api/v1/health")[0] == 200
+    finally:
+        srv.shutdown()
+        t.join(timeout=5)
