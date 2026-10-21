@@ -15,6 +15,7 @@ import json
 import re
 import secrets
 import stat
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -162,3 +163,72 @@ def load_fleet_config(path: Path) -> FleetConfig:
         where = f" at line {mark.line + 1}" if mark else ""
         raise FleetConfigError(f"{path} is not valid YAML{where}") from None
     return _parse(data)
+
+
+class FleetConfigStore:
+    """Serves the last good FleetConfig, reloading when the file changes.
+
+    A failed reload keeps the previous config and records ``last_error`` (a short
+    message that never contains configuration values). The first load must
+    succeed.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._applied: dict[str, str] = {}
+        self.last_error: str | None = None
+        self._sig: tuple | None = None
+        self._config = load_fleet_config(self.path)
+        self._sig = self._signature()
+
+    def _signature(self) -> tuple | None:
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_mode)
+
+    def reload(self) -> bool:
+        """Reload now. True when a new config was adopted; False otherwise."""
+        with self._lock:
+            return self._reload_locked()
+
+    def _reload_locked(self) -> bool:
+        sig = self._signature()
+        try:
+            new = load_fleet_config(self.path)
+        except FleetConfigError as exc:
+            self.last_error = str(exc)[:200]
+            self._sig = sig
+            return False
+        self._sig = sig
+        self.last_error = None
+        changed = new.revision != self._config.revision
+        self._config = new
+        return changed
+
+    def current(self) -> FleetConfig:
+        with self._lock:
+            if self._signature() != self._sig:
+                self._reload_locked()
+            return self._config
+
+    def record_applied(self, host_id: str, revision: str) -> None:
+        with self._lock:
+            self._applied[host_id] = revision
+
+    def applied(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._applied)
+
+    def status(self) -> dict:
+        cfg = self.current()
+        applied = self.applied()
+        base = cfg.status()
+        return {
+            "revision": base["revision"],
+            "last_error": self.last_error,
+            "hosts": [{"id": h, "roles": roles, "applied_revision": applied.get(h)}
+                      for h, roles in base["hosts"].items()],
+        }

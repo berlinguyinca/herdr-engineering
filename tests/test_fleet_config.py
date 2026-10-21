@@ -167,3 +167,29 @@ def test_mixed_key_types_rejected_without_leak(tmp_path):
     with pytest.raises(FleetConfigError) as e:
         load_fleet_config(write(tmp_path, d))
     assert SECRET not in str(e.value)
+
+
+def test_cp_web_sources_control_plane_section(tmp_path, monkeypatch):
+    from herdr_engineering import cli
+    data = base()
+    data["sections"]["control_plane"]["values"].update(
+        {"rustfs_endpoint": "http://rfs:9000", "minio_user": "u", "minio_password": "p"})
+    f = tmp_path / "fc.yaml"
+    f.write_text(yaml.safe_dump(data))
+    f.chmod(0o600)
+    store, cp = cli._load_cp_fleet_config(str(f))
+    assert store is not None and cp["pg_dsn"].startswith("postgres://")
+    assert cli._load_cp_fleet_config(str(tmp_path / "missing.yaml")) == (None, {})
+    seen = {}
+
+    class Fake:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+        def ensure_bucket(self):
+            pass
+    import herdr_engineering.control_plane.rustfs as rfs
+    monkeypatch.setattr(rfs, "RustFSClient", Fake)
+    monkeypatch.setenv("HERDR_CP_RUSTFS_ENDPOINT", "http://env:1")
+    cli._maybe_rustfs_client(cp)
+    assert seen["endpoint"] == "http://rfs:9000" and seen["access_key"] == "u"

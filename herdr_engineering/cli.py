@@ -411,6 +411,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--api-keys", default=None,
                     help="comma list of key=role (viewer|operator) pairs "
                          "(Spec §104); e.g. k1=viewer,k2=operator")
+    p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
+                    help="central fleet config file; when it exists it is served to hosts "
+                         "and its control_plane section replaces the HERDR_CP_PG_DSN, "
+                         "HERDR_CP_HOST_ALIASES, HERDR_CP_API_KEYS and RustFS/MinIO env vars")
     p2.add_argument("--pg-dsn", default=None,
                     help="optional Postgres DSN to hydrate the repo from "
                          "durable state on startup (Spec §106)")
@@ -2010,19 +2014,30 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.repo import ControlPlaneRepo
     from .control_plane.sink import DurableEventSink
 
+    fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
+    if fleet_store is not None:
+        file_keys = cp.get("api_keys") or {}
+        if not isinstance(file_keys, dict):
+            raise SystemExit("fleet config control_plane.api_keys must be a mapping of key -> role")
+        merged = {str(k): str(v) for k, v in file_keys.items()}
+        merged.update(api_keys or {})
+        api_keys = merged or None
     # In the compose stack the DSN is supplied via the HERDR_CP_PG_DSN env var
-    # (from env_file: .env) so the password never appears in process args.
-    dsn = args.pg_dsn or os.environ.get("HERDR_CP_PG_DSN")
+    # (from env_file: .env) so the password never appears in process args. With a
+    # fleet config the control_plane section replaces the environment.
+    dsn = args.pg_dsn or (cp.get("pg_dsn") if fleet_store is not None else os.environ.get("HERDR_CP_PG_DSN"))
+    host_aliases = str(cp.get("host_aliases") or "") if fleet_store is not None \
+        else os.environ.get("HERDR_CP_HOST_ALIASES", "")
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
     # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
     sink = DurableEventSink(dsn=dsn) if dsn else None
-    repo = ControlPlaneRepo(sink=sink, host_aliases=_parse_host_aliases(os.environ.get("HERDR_CP_HOST_ALIASES", "")))
+    repo = ControlPlaneRepo(sink=sink, host_aliases=_parse_host_aliases(host_aliases))
     if args.seed_demo:
         _seed_demo(repo)
-    rustfs = _maybe_rustfs_client()
+    rustfs = _maybe_rustfs_client(cp if fleet_store is not None else None)
     collab = None
     if args.collab_cognito_pool:
         if args.collab_users_file:
@@ -2058,7 +2073,8 @@ def _cmd_cp_web(args) -> int:
                              web_root=args.web_root, allow_open=args.allow_open,
                              rustfs=rustfs, collab=collab,
                              collab_tls_terminated=args.collab_tls_terminated,
-                             collab_require_https=args.collab_require_https)
+                             collab_require_https=args.collab_require_https,
+                             fleet_config=fleet_store)
     # Self-report the control-plane stack so the Services page has real data.
     try:
         _self_report_services(
@@ -2066,7 +2082,8 @@ def _cmd_cp_web(args) -> int:
             host_id=os.environ.get("HERDR_CP_SELF_HOST") or socket.gethostname(),
             web_port=args.port or os.environ.get("HERDR_CP_WEB_PORT", "8080"),
             dsn=dsn,
-            rustfs_endpoint=os.environ.get("HERDR_CP_RUSTFS_ENDPOINT"),
+            rustfs_endpoint=(cp.get("rustfs_endpoint") if fleet_store is not None
+                             else os.environ.get("HERDR_CP_RUSTFS_ENDPOINT")),
         )
     except Exception:
         logging.exception("self-report of stack services failed")
@@ -2082,7 +2099,25 @@ def _cmd_cp_web(args) -> int:
     return 0
 
 
-def _maybe_rustfs_client():
+def _load_cp_fleet_config(path_arg):
+    """Return (FleetConfigStore, control_plane section) or (None, {}) when no file exists."""
+    from pathlib import Path
+
+    from .fleet_config import FleetConfigError, FleetConfigStore
+    if not path_arg:
+        return None, {}
+    path = Path(path_arg).expanduser()
+    if not path.exists():
+        return None, {}
+    try:
+        store = FleetConfigStore(path)
+        cp = store.current().section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    return store, cp
+
+
+def _maybe_rustfs_client(cp=None):
     """Build an S3/RustFS client for artifact payloads, or None if not wired.
 
     Configured via HERDR_CP_RUSTFS_ENDPOINT (default http://rustfs:9000) and
@@ -2092,13 +2127,22 @@ def _maybe_rustfs_client():
     server still starts with the in-memory stand-in.
     """
     from .control_plane.rustfs import RustFSClient
-    endpoint = os.environ.get("HERDR_CP_RUSTFS_ENDPOINT")
+    if cp is not None:
+        # Fleet config replaces the environment: rustfs_endpoint, rustfs_bucket,
+        # rustfs_region, minio_user, minio_password (same defaults as the env path).
+        endpoint = cp.get("rustfs_endpoint")
+        bucket = cp.get("rustfs_bucket", "herdr-artifacts")
+        region = cp.get("rustfs_region", "us-east-1")
+        access_key = cp.get("minio_user", "herdr")
+        secret_key = cp.get("minio_password", "herdr")
+    else:
+        endpoint = os.environ.get("HERDR_CP_RUSTFS_ENDPOINT")
+        bucket = os.environ.get("HERDR_CP_RUSTFS_BUCKET", "herdr-artifacts")
+        region = os.environ.get("HERDR_CP_RUSTFS_REGION", "us-east-1")
+        access_key = os.environ.get("HERDR_CP_MINIO_USER", "herdr")
+        secret_key = os.environ.get("HERDR_CP_MINIO_PASSWORD", "herdr")
     if not endpoint:
         return None
-    bucket = os.environ.get("HERDR_CP_RUSTFS_BUCKET", "herdr-artifacts")
-    region = os.environ.get("HERDR_CP_RUSTFS_REGION", "us-east-1")
-    access_key = os.environ.get("HERDR_CP_MINIO_USER", "herdr")
-    secret_key = os.environ.get("HERDR_CP_MINIO_PASSWORD", "herdr")
     client = RustFSClient(endpoint=endpoint, bucket=bucket, region=region,
                           access_key=access_key, secret_key=secret_key)
     try:

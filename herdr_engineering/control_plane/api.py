@@ -82,6 +82,9 @@ class _RateLimiter:
             return True
 
 
+_FLEET_CONFIG_PATH = "/api/v1/fleet/config"
+
+
 class ControlPlaneServer:
     """Structured control-plane API + SSE + static web server."""
 
@@ -89,7 +92,7 @@ class ControlPlaneServer:
                  port=0, web_root=None, source=None, allow_open=False,
                  rustfs=None, dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
-                 collab_require_https=False):
+                 collab_require_https=False, fleet_config=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -152,6 +155,7 @@ class ControlPlaneServer:
                 "refusing to enable collaboration on non-loopback address "
                 f"{host!r} without collab_tls_terminated (bearer credentials "
                 "require TLS)")
+        self.fleet_config = fleet_config
         self.collab = collab
         self.collab_require_https = collab_require_https
         if collab is not None:
@@ -319,6 +323,8 @@ def _make_handler(server):
         def do_GET(self):
             if self._is_collab_path():
                 return self._collab()
+            if self._path_only() == _FLEET_CONFIG_PATH:
+                return self._fleet_config_get()
             err = self._require("viewer")
             if err:
                 return err
@@ -329,6 +335,8 @@ def _make_handler(server):
         def do_POST(self):
             if self._is_collab_path():
                 return self._collab()
+            if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
+                return self._fleet_config_applied()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -347,6 +355,46 @@ def _make_handler(server):
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._send_json(404, {"error": "not found"})
+
+        # ------------------------------------------------ fleet config (hosts)
+        def _path_only(self):
+            return self.path.split("?")[0].rstrip("/")
+
+        def _fleet_host(self):
+            """Host id owning the X-Host-Token, or None. Never reveals why."""
+            store = server.fleet_config
+            token = self.headers.get("X-Host-Token", "")
+            return store.current().host_for_token(token) if token else None
+
+        def _fleet_config_get(self):
+            """Host endpoints bypass the X-API-Key gate on purpose: the per-host
+            token is their credential, and an operator key grants no host slice."""
+            store = server.fleet_config
+            if store is None:
+                return self._deny(404, "not found")
+            host = self._fleet_host()
+            if host is None:
+                return self._deny(401, "unauthorized")
+            cfg = store.current()
+            return self._json({"revision": cfg.revision, "values": cfg.slice_for(host)})
+
+        def _fleet_config_applied(self):
+            store = server.fleet_config
+            if store is None:
+                return self._deny(404, "not found")
+            host = self._fleet_host()
+            if host is None:
+                return self._deny(401, "unauthorized")
+            try:
+                body = self._read_json()
+            except ValueError as exc:
+                return self._deny(400, str(exc))
+            if (not isinstance(body, dict) or body.get("host_id") != host
+                    or not isinstance(body.get("revision"), str)
+                    or not body["revision"] or len(body["revision"]) > 64):
+                return self._deny(401, "unauthorized")
+            store.record_applied(host, body["revision"])
+            return self._json({"ok": True})
 
         # --------------------------------------------------- collaboration (HCN)
         def _is_collab_path(self):
@@ -540,6 +588,10 @@ def _make_handler(server):
                     # catalog projection is most of the bytes of a large inventory.
                     services = [{k: s.get(k) for k in _FEED_SERVICE_FIELDS} for s in services]
                 return self._json({"services": services, "summary": summary})
+            if resource == "fleet" and parts[4:] == ["config", "status"]:
+                if server.fleet_config is None:
+                    return self._json({"error": "not found"}, 404)
+                return self._json(server.fleet_config.status())
             if resource == "fleet" and len(parts) == 5 and parts[4] == "inventory":
                 return self._json(r.fleet_inventory())
             if resource == "hosts":
