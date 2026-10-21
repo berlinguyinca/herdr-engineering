@@ -18,6 +18,7 @@ import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
 import { renderFleetMatrix } from './fleet-view.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
+import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -56,6 +57,7 @@ const NAV = [
   { path: '/hosts', label: 'Hosts' },
   { path: '/activity', label: 'Activity' },
   { path: '/analytics', label: 'Analytics' },
+  { path: '/collab', label: 'Collaboration' },
 ];
 
 const SHELL = document.getElementById('shell');
@@ -72,6 +74,7 @@ function route() {
 const ROUTES = {
   '/overview': viewOverview,
   '/github': viewGithub,
+  '/collab': viewCollab,
   '/ci': viewIntegrations,
   '/reviews': viewIntegrations,
   '/topology': viewTopology,
@@ -137,6 +140,10 @@ async function viewTopology() {
 async function viewOverview() {
   root.innerHTML = '<h1>Overview</h1><div id="overview-dashboard"></div>';
   dashboardView = mountOverview(document.getElementById('overview-dashboard'), client);
+}
+
+async function viewCollab() {
+  dashboardView = mountCollab(root);
 }
 
 async function viewGithub() {
@@ -544,4 +551,4 @@ window.addEventListener('hashchange', () => {
   if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
   lastLiveRender = Date.now(); render();
 });
-render();
+completeSignInIfRedirected().finally(() => render());

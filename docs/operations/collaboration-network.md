@@ -26,6 +26,16 @@ herdr-eng control-plane web --host 127.0.0.1 --port 18766 --pg-dsn "$DSN" \
 * A person can be invited to a room once they have signed in to this server once
   (or when the lookup above is available).
 
+## Web page (invite people from the browser)
+Open `https://<host>:9447/#/collab`, sign in with your BinView account (Cognito Hosted
+UI, authorization code + PKCE; the password never reaches this server or page), then
+create rooms, chat, and **invite by email**. The page links your verified email to your
+account at sign-in, so invitations work by email: if the person has signed in before they
+are added at once, otherwise the invitation is pending (7 days) and activates on their
+first sign-in. Either way the owner sees the same reply. The invitee must still be in
+the `local.dev` group. Browser sign-in uses its own app client, `herdr-collab-web`
+(public client, code flow only, one callback URL). Tokens live in sessionStorage only.
+
 ## TLS on the tailnet
 Keep the server on loopback and let Tailscale terminate TLS (real Let's Encrypt
 certificate, tailnet-only, no Funnel):
