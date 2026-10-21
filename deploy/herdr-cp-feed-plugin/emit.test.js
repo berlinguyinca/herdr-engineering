@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,7 +13,6 @@ import {
   hostIdentity,
   sessionJsonPath,
   workspaceInfo,
-  CONTROL_PLANE_DEFAULT,
 } from "./emit.js";
 
 const HOST = os.hostname();
@@ -269,13 +268,17 @@ test("sessionJsonPath is derived from the plugin config dir", () => {
 // ---------------------------------------------------------------------------
 // URL resolution
 // ---------------------------------------------------------------------------
-test("resolveUrl defaults to the dev.lan control plane", () => {
-  assert.equal(resolveUrl(env({})), CONTROL_PLANE_DEFAULT);
+test("resolveUrl reads host.json, not env", () => {
+  const home = mkdtempSync(join(tmpdir(), "cp-home-"));
+  mkdirSync(join(home, ".config", "herdr-engineering"), { recursive: true });
+  writeFileSync(join(home, ".config", "herdr-engineering", "host.json"),
+    JSON.stringify({ control_plane_url: "http://cp.example/", host_id: "h", token: "t" }));
+  assert.equal(resolveUrl(env({ HOME: home, HERDR_CP_URL: "http://ignored.test" })), "http://cp.example");
 });
 
-test("resolveUrl honors HERDR_CP_URL env", () => {
-  assert.equal(resolveUrl(env({ HERDR_CP_URL: "http://100.104.39.6" })),
-    "http://100.104.39.6");
+test("resolveUrl is null when the host has not joined", () => {
+  const home = mkdtempSync(join(tmpdir(), "cp-home-"));
+  assert.equal(resolveUrl(env({ HOME: home, HERDR_CP_URL: "http://ignored.test" })), null);
 });
 
 test("sessions on different hosts and named servers cannot collide", () => {

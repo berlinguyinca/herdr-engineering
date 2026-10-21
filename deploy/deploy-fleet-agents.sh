@@ -30,7 +30,7 @@ HOSTS_FILE="${HERDR_FLEET_HOSTS:-$HOME/.config/herdr-engineering/fleet-hosts.txt
 [ "$FETCH" = 1 ] && git -C "$REPO" fetch -q origin
 FULL="$(git -C "$REPO" rev-parse --verify "$REF^{commit}")"; SHA="${FULL:0:12}"
 REL="fleet-$SHA"
-PLUGIN_FILES="herdr-plugin.toml package.json emit.js enrich.js git-metadata.js inventory.js session-model.js snapshot.js"
+PLUGIN_FILES="herdr-plugin.toml package.json emit.js enrich.js git-metadata.js host-config.js inventory.js session-model.js snapshot.js"
 
 WORK="$(mktemp -d)"
 cleanup() { git -C "$REPO" worktree remove --force "$WORK/src" >/dev/null 2>&1 || true; rm -rf "$WORK"; }
