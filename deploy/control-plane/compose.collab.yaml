@@ -1,21 +1,39 @@
-# Collaboration network (HCN) overlay for control-plane-web; layered on by deploy.sh
-# only when ~/.config/herdr-engineering/collab-enabled exists. The identifiers below
-# are public (pool, app clients, hosted-UI domain, callback URL); no secret is configured here.
+# Collaboration network (HCN) overlay; layered on by deploy.sh only when
+# ~/.config/herdr-engineering/collab-enabled exists. No secret is configured here:
+# every identifier below (pool, app clients, hosted-UI domain, URL) is public.
+#
+# Isolation model
+#   * The dashboard / operator API (control-plane-web) is NOT touched by this overlay: it stays
+#     bound to the tailnet interface and has no collaboration surface.
+#   * collab-public is the only thing the internet reaches. It is its own container from the same
+#     image, started with --collab-only: no Postgres or object-store credentials, no docker
+#     socket, no host mounts except its own data volume, no operator API, a read-only root
+#     filesystem, no capabilities, non-root, resource limits, and a network of its own.
+#   * collab-edge (nginx) terminates TLS, rate-limits and allowlists routes in front of it.
 # Moving hosts: change --collab-public-url and the app client's callback/logout URLs together.
-# Internet access: collab-edge below + one SNI line in the host's shared TLS front.
-# Tailnet-only alternative: deploy/control-plane/collab-tailscale-serve.sh
+name: herdr-control-plane
+
 services:
-  control-plane-web:
+  collab-public:
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-0.1.0}
+    container_name: herdr-collab-public
+    restart: unless-stopped
+    # Deliberately no env_file / environment: nothing from the control-plane stack's secrets.
+    user: "${HERDR_COLLAB_CERT_UID:-1000}:${HERDR_COLLAB_CERT_UID:-1000}"   # owner of the data dir below
     command:
       - "control-plane"
       - "web"
+      - "--collab-only"
       - "--host"
+      - "127.0.0.1"
+      - "--collab-public-port"
+      - "8081"
+      - "--collab-public-host"
       - "0.0.0.0"
-      - "--port"
-      - "8080"
       - "--web-root"
       - "/app/packages"
-      - "--allow-open"
+      - "--collab-log-file"
+      - "/data/collab.jsonl"
       - "--collab-cognito-pool"
       - "us-west-2_GjtcM0PCp"
       - "--collab-cognito-client"
@@ -28,22 +46,35 @@ services:
       - "https://us-west-2gjtcm0pcp.auth.us-west-2.amazoncognito.com"
       - "--collab-public-url"
       - "https://localdev.mcp.metabolomics.us/"
-      - "--collab-public-port"
-      - "8081"
-      - "--collab-public-host"
-      - "0.0.0.0"
       - "--collab-require-https"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    volumes:
+      - ${HERDR_COLLAB_DATA_DIR:?run deploy.sh}:/data
+    networks: [collab]            # not on the control-plane network: cannot reach postgres/rustfs
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request as u,sys; r=u.Request('http://127.0.0.1:8081/api/v1/collab/config',headers={'X-Forwarded-Proto':'https'}); sys.exit(0 if u.urlopen(r,timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
 
-  # Public edge. Only the shared SNI front on this host talks to it (loopback port);
-  # it reaches control-plane-web's collab-only listener (8081, never published).
-  # Certificates come from the host's certbot lineage (renewed by its timer, whose
-  # deploy hook also reloads this container).
+  # Public edge: the only container that publishes a port. Certificates come from the host's
+  # certbot lineage (renewed by its timer, whose deploy hook also reloads this container).
   collab-edge:
     image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
     container_name: herdr-collab-edge
     restart: unless-stopped
     depends_on:
-      - control-plane-web
+      - collab-public
     # Runs as the owner of the certbot files (0600): with all capabilities dropped,
     # root could not read them.
     user: "${HERDR_COLLAB_CERT_UID:-1000}:${HERDR_COLLAB_CERT_UID:-1000}"
@@ -56,9 +87,15 @@ services:
       - ${HERDR_COLLAB_EDGE_CONF:?run deploy.sh}:/etc/nginx/nginx.conf:ro
       - ${HERDR_COLLAB_CERT_DIR:?set HERDR_COLLAB_CERT_DIR in the env file}:/etc/acme:ro
     ports:
-      - "127.0.0.1:18444:8443"
+      - "${HERDR_COLLAB_EDGE_BIND:-127.0.0.1:18444}:8443"
+    networks: [collab]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 128m
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
+
+networks:
+  collab: {}

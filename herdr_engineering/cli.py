@@ -450,6 +450,11 @@ def _build_parser() -> argparse.ArgumentParser:
                          "internet-facing proxy here, never at the main port")
     p2.add_argument("--collab-public-host", default=None,
                     help="bind address for --collab-public-port (default: --host)")
+    p2.add_argument("--collab-only", action="store_true",
+                    help="serve ONLY the public collaboration surface on --collab-public-port: no "
+                         "dashboard, no operator API, no database (events go to --collab-log-file)")
+    p2.add_argument("--collab-log-file", default=None,
+                    help="append-only JSON-lines collaboration event log (required with --collab-only)")
     p2.add_argument("--collab-require-https", action="store_true",
                     help="serve collaboration only for requests forwarded by a TLS proxy "
                          "(X-Forwarded-Proto: https); other listeners on this server stay "
@@ -2023,14 +2028,23 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.sink import DurableEventSink
 
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
+    if args.collab_only:
+        if not (args.collab_log_file and args.collab_public_port and args.collab_cognito_pool):
+            raise SystemExit("--collab-only needs --collab-log-file, --collab-public-port and "
+                             "--collab-cognito-pool")
+        if args.pg_dsn or os.environ.get("HERDR_CP_PG_DSN"):
+            raise SystemExit("--collab-only must not be given database credentials")
     # In the compose stack the DSN is supplied via the HERDR_CP_PG_DSN env var
     # (from env_file: .env) so the password never appears in process args.
-    dsn = args.pg_dsn or os.environ.get("HERDR_CP_PG_DSN")
+    dsn = None if args.collab_only else (args.pg_dsn or os.environ.get("HERDR_CP_PG_DSN"))
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
     # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
     sink = DurableEventSink(dsn=dsn) if dsn else None
+    if args.collab_only:
+        from .control_plane.collab import FileEventLog
+        sink = FileEventLog(args.collab_log_file)
     repo = ControlPlaneRepo(sink=sink, host_aliases=_parse_host_aliases(os.environ.get("HERDR_CP_HOST_ALIASES", "")))
     if args.seed_demo:
         _seed_demo(repo)
@@ -2063,6 +2077,8 @@ def _cmd_cp_web(args) -> int:
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
         collab = CollabService(auth, sink=sink, public_config=public)
+        if args.collab_only:
+            collab.hydrate(sink.load())
     elif args.collab_users_file:
         from pathlib import Path
 
@@ -2078,14 +2094,19 @@ def _cmd_cp_web(args) -> int:
         collab = CollabService(StaticTokenAuthenticator(users), sink=sink)
     svr = ControlPlaneServer(repo, api_keys=api_keys,
                              host=args.host, port=args.port, source=source,
-                             web_root=args.web_root, allow_open=args.allow_open,
+                             web_root=args.web_root,
+                             # collab-only has no operator listener, so nothing is left open
+                             allow_open=args.allow_open or args.collab_only,
                              rustfs=rustfs, collab=collab,
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
                              public_port=args.collab_public_port,
-                             public_host=args.collab_public_host)
+                             public_host=args.collab_public_host,
+                             collab_only=args.collab_only)
     # Self-report the control-plane stack so the Services page has real data.
     try:
+        if args.collab_only:
+            raise RuntimeError("collab-only: no stack to report")
         _self_report_services(
             repo,
             host_id=os.environ.get("HERDR_CP_SELF_HOST") or socket.gethostname(),

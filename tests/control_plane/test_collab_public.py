@@ -178,3 +178,51 @@ def test_revoked_connection_is_cut_off_over_mcp(stack):
     assert api.call("POST", f"{BASE}/agents/{a['agent_id']}/revoke", {}, user="alice")[0] == 200
     assert rpc(stack.pub, "tools/list", agent=a)[0] == 401
     assert say(api, room, "x", "k", agent=a)[0] == 401
+
+
+# ---- collab-only deployment: its own process, no database, file-backed log ----
+
+def _only_server(tmp_path, log):
+    from herdr_engineering.control_plane.collab import FileEventLog
+    web = tmp_path / "web"
+    web.mkdir(exist_ok=True)
+    (web / "collab.html").write_text("<html>")
+    sink = FileEventLog(str(log))
+    svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in TOKENS.items()}), sink=sink)
+    svc.hydrate(sink.load())
+    srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=svc,
+                             allow_open=True, public_port=0, public_host="127.0.0.1",
+                             web_root=web, collab_require_https=True, collab_only=True)
+    t = threading.Thread(target=srv.serve, daemon=True)
+    t.start()
+    srv.wait_until_ready()
+    return srv, svc, t
+
+
+def test_collab_only_serves_public_surface_and_survives_restart(tmp_path):
+    log = tmp_path / "collab.jsonl"
+    srv, svc, t = _only_server(tmp_path, log)
+    try:
+        api = Api(srv.public_port)
+        s, _ = api.call("GET", "/api/v1/hosts", headers=H)
+        assert s == 404                                  # operator API does not exist here
+        s, body = api.call("POST", f"{BASE}/agents/connect", {"harness_type": "claude-code"},
+                           user="alice", headers=H)
+        assert s == 201
+        agent_id = body.get("agent_id") or body.get("id")
+    finally:
+        srv.shutdown()
+        t.join(timeout=5)
+    assert log.stat().st_mode & 0o077 == 0               # log is private to its owner
+    srv2, svc2, t2 = _only_server(tmp_path, log)
+    try:
+        s, mine = Api(srv2.public_port).call("GET", f"{BASE}/agents", user="alice", headers=H)
+        assert s == 200 and agent_id in json.dumps(mine)  # state replayed from the file
+    finally:
+        srv2.shutdown()
+        t2.join(timeout=5)
+
+
+def test_collab_only_requires_public_port():
+    with pytest.raises(ValueError):
+        ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab_only=True)
