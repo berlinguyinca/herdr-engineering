@@ -49,7 +49,8 @@ services:
       - /run
       - /var/cache/nginx
     volumes:
-      - ./collab-edge/nginx.conf:/etc/nginx/nginx.conf:ro
+      # deploy.sh installs this to a stable path (the build worktree is temporary)
+      - ${HERDR_COLLAB_EDGE_CONF:?run deploy.sh}:/etc/nginx/nginx.conf:ro
       - ${HERDR_COLLAB_CERT_DIR:?set HERDR_COLLAB_CERT_DIR in the env file}:/etc/acme:ro
     ports:
       - "127.0.0.1:18444:8443"

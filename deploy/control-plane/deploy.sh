@@ -59,8 +59,14 @@ cleanup() { git -C "$REPO" worktree remove --force "$WORK" >/dev/null 2>&1 || rm
 trap cleanup EXIT
 git -C "$REPO" worktree add -q --detach "$WORK" "$FULL"
 COLLAB_FILES=()
+EDGE_SERVICE=()
 if [ -e "$COLLAB_MARKER" ]; then
   COLLAB_FILES=(-f "$WORK/deploy/control-plane/compose.collab.yaml")
+  EDGE_DIR="$HOME/.config/herdr-engineering/collab-edge"
+  mkdir -p "$EDGE_DIR"
+  install -m 0644 "$WORK/deploy/control-plane/collab-edge/nginx.conf" "$EDGE_DIR/nginx.conf"
+  export HERDR_COLLAB_EDGE_CONF="$EDGE_DIR/nginx.conf"
+  EDGE_SERVICE=(collab-edge)
   echo "collaboration network: enabled (marker $COLLAB_MARKER)"
 fi
 
@@ -83,7 +89,7 @@ compose() {
     -f "$WORK/deploy/control-plane/compose.yaml" \
     -f "$WORK/deploy/control-plane/compose.integrations.yaml" \
     -f "$WORK/deploy/control-plane/compose.github.yaml" "${COLLAB_FILES[@]}" \
-    up -d --no-deps --no-build control-plane-web
+    up -d --no-deps --no-build control-plane-web "${EDGE_SERVICE[@]}"
 }
 
 healthy_commit() {
