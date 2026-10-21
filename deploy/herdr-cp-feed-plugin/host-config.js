@@ -18,9 +18,11 @@ const APPLIED_PATH = "/api/v1/fleet/config/applied";
 const JOIN_HINT = "run `herdr-eng fleet join` for this host on the control-plane host";
 
 export class HostConfigUnavailable extends Error {
-  constructor(reason) {
+  // revoked is true only for HTTP 401 (machine-readable; carries no secret).
+  constructor(reason, { revoked = false } = {}) {
     super(`host config unavailable: ${reason}`);
     this.name = "HostConfigUnavailable";
+    this.revoked = revoked;
   }
 }
 
@@ -54,14 +56,14 @@ function readCache(path, hostId) {
   try {
     const data = JSON.parse(readFileSync(path, "utf8"));
     if (data.host_id !== hostId) return null;
-    if (typeof data.revision !== "string" || !data.values || typeof data.values !== "object") return null;
+    if (typeof data.revision !== "string" || !data.values || typeof data.values !== "object" || Array.isArray(data.values)) return null;
     return { revision: data.revision, values: data.values };
   } catch { return null; }
 }
 
-function build(url, hostId, revision, values) {
+function build(url, hostId, revision, values, source) {
   return {
-    url, hostId, revision, values,
+    url, hostId, revision, values, source,
     apiKey: values?.ingest?.api_key ?? null,
     get(dottedKey, fallback) {
       const i = dottedKey.indexOf(".");
@@ -95,7 +97,7 @@ export async function loadHostConfig({ home = homedir(), fetch = globalThis.fetc
   if (status === 401) {
     try { unlinkSync(cachePath); } catch { /* none */ }
     throw new HostConfigUnavailable(
-      `the control plane rejected this host's token (revoked or unknown); cached configuration was discarded; ${JOIN_HINT}`);
+      `the control plane rejected this host's token (revoked or unknown); cached configuration was discarded; ${JOIN_HINT}`, { revoked: true });
   }
   if (status === 200 && payload && typeof payload.revision === "string"
       && payload.values && typeof payload.values === "object" && !Array.isArray(payload.values)) {
@@ -108,12 +110,12 @@ export async function loadHostConfig({ home = homedir(), fetch = globalThis.fetc
         body: JSON.stringify({ host_id: hostId, revision }),
       });
     } catch { /* best effort */ }
-    return build(url, hostId, revision, values);
+    return build(url, hostId, revision, values, "fetch");
   }
   if (status !== null && status >= 400 && status < 500) {
     throw new HostConfigUnavailable(`the control plane refused the configuration request (HTTP ${status})`);
   }
   const cached = readCache(cachePath, hostId);   // unreachable, 3xx, 5xx or malformed
   if (!cached) throw new HostConfigUnavailable(`control plane at ${url} unreachable and no cached configuration exists`);
-  return build(url, hostId, cached.revision, cached.values);
+  return build(url, hostId, cached.revision, cached.values, "cache");
 }
