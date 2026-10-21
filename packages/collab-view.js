@@ -50,8 +50,10 @@ export function mountCollab(root) {
     window.location.assign(authorizeUrl(cfg, cfg.public_url, state, challenge));
   }
 
+  let lastCfg = null;
   async function start() {
     const cfg = await loadConfig();
+    lastCfg = cfg;
     if (!cfg) {
       root.innerHTML = '<h1>Collaboration</h1><p class="empty" role="status">The collaboration network is not enabled on this server.</p>';
       return;
@@ -73,7 +75,7 @@ export function mountCollab(root) {
     try {
       const tokens = store.get();
       const me = await api.link(tokens.id);   // records your verified email so others can invite you
-      await showRooms(me);
+      await showRooms(me, cfg);
     } catch (e) {
       if (e instanceof AuthError) { store.clear(); return start(); }
       root.innerHTML = `<h1>Collaboration</h1><p role="alert">${esc(e.message)}</p>
@@ -83,17 +85,19 @@ export function mountCollab(root) {
     }
   }
 
-  async function showRooms(me) {
+  async function showRooms(me, cfg = lastCfg) {
     dispose();
     const { rooms } = await api.rooms();
     root.innerHTML = `<h1>Collaboration</h1>
       <p>Signed in as <strong>${esc(me.email)}</strong> · <button id="hcn-out" type="button">Sign out</button></p>
       <h2>Your rooms</h2>
       ${rooms.length ? `<ul id="hcn-rooms">${rooms.map((r) => `<li><button type="button" data-room="${esc(r.room_id)}">${esc(r.name)}</button> <small>${esc(r.role)}</small></li>`).join('')}</ul>` : '<p class="empty">No rooms yet.</p>'}
+      <h2>Your AI agents</h2><div id="hcn-agents"></div>
       <h2>New room</h2>
       <form id="hcn-new"><label>Room name <input name="name" required maxlength="120"></label>
         <button type="submit">Create</button> <span id="hcn-new-msg" role="status"></span></form>`;
     document.getElementById('hcn-out').onclick = () => { store.clear(); start(); };
+    renderAgents(cfg);
     document.querySelectorAll('[data-room]').forEach((b) => { b.onclick = () => showRoom(me, b.dataset.room); });
     document.getElementById('hcn-new').onsubmit = async (ev) => {
       ev.preventDefault();
@@ -104,6 +108,28 @@ export function mountCollab(root) {
         const r = await api.createRoom(p.project_id, name);
         showRoom(me, r.room_id);
       } catch (e) { msg.textContent = e.message; }
+    };
+  }
+
+  const mcpCommand = (cfg, a) => `claude mcp add --transport http herdr-collab ${new URL('/mcp', cfg.public_url).href} `
+    + `--header "Authorization: Agent ${a.credential}" --header "X-Herdr-Device: ${a.device_id}"`;
+
+  async function renderAgents(cfg) {
+    const box = document.getElementById('hcn-agents');
+    if (!box) return;
+    const { agents } = await api.agents();
+    const live = agents.filter((a) => a.status === 'active');
+    box.innerHTML = `${live.length ? `<ul>${live.map((a) => `<li>${esc(a.harness_type)} <small>${esc(a.agent_id)} · expires ${esc(new Date(a.expires_at * 1000).toLocaleDateString())} · ${a.rooms.length ? `in ${esc(a.rooms.map((r) => r.name).join(', '))}` : 'not in any room yet'}</small> <button type="button" data-revoke="${esc(a.agent_id)}">Revoke</button></li>`).join('')}</ul>` : '<p class="empty">No connected agents.</p>'}
+      <button id="hcn-connect" type="button">Connect Claude Code or another MCP client</button>
+      <div id="hcn-connect-out" role="status"></div>`;
+    box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { await api.revokeAgent(b.dataset.revoke); renderAgents(cfg); }; });
+    document.getElementById('hcn-connect').onclick = async () => {
+      const a = await api.connectAgent();
+      const out = document.getElementById('hcn-connect-out');
+      out.innerHTML = `<p>Run this once in a terminal. It is shown only now and acts as you in the rooms you add it to, so keep it private:</p>
+        <pre style="white-space:pre-wrap;word-break:break-all"></pre>
+        <p>Then add the agent to a room from that room's page. Revoke it here at any time.</p>`;
+      out.querySelector('pre').textContent = mcpCommand(cfg, a);   // textContent: never parsed as HTML
     };
   }
 
@@ -118,6 +144,7 @@ export function mountCollab(root) {
       <p><button id="hcn-back" type="button">← Rooms</button> <small>You are ${esc(info.role)}</small></p>
       <div id="hcn-log" role="log" aria-live="polite" style="max-height:50vh;overflow:auto"></div>
       ${canPost ? '<form id="hcn-say"><input name="text" required maxlength="8000" aria-label="Message" style="width:70%"> <button type="submit">Send</button> <span id="hcn-say-msg" role="status"></span></form>' : '<p><small>Read-only access.</small></p>'}
+      ${canPost ? '<h2>Your agents in this room</h2><div id="hcn-grant"></div>' : ''}
       ${canInvite ? `<h2>People</h2><div id="hcn-people"></div>
         <form id="hcn-invite"><label>Invite by email <input name="email" type="email" required></label>
           <label>Access <select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
@@ -146,6 +173,21 @@ export function mountCollab(root) {
     await poll();
     timer = setInterval(poll, 3000);
 
+    const grantBox = document.getElementById('hcn-grant');
+    if (grantBox) {
+      const draw = async () => {
+        const { agents } = await api.agents();
+        const live = agents.filter((a) => a.status === 'active');
+        grantBox.innerHTML = live.length ? `<ul>${live.map((a) => {
+          const g = a.rooms.find((r) => r.room_id === roomId);
+          return `<li>${esc(a.harness_type)} <small>${esc(a.agent_id)}</small> ${g
+            ? `<small>${esc(g.actions.join('+'))}</small> <button type="button" data-g="${esc(a.agent_id)}" data-a="read">Make read-only</button>`
+            : `<button type="button" data-g="${esc(a.agent_id)}" data-a="read">Add (read)</button> <button type="button" data-g="${esc(a.agent_id)}" data-a="read,post">Add (read + post)</button>`}</li>`;
+        }).join('')}</ul>` : '<p class="empty">Connect an agent from the rooms page first.</p>';
+        grantBox.querySelectorAll('[data-g]').forEach((b) => { b.onclick = async () => { await api.grantAgent(roomId, b.dataset.g, b.dataset.a.split(',')); draw(); }; });
+      };
+      await draw();
+    }
     const sayForm = document.getElementById('hcn-say');
     if (sayForm) {
       sayForm.onsubmit = async (ev) => {

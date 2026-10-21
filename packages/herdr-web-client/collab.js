@@ -94,6 +94,12 @@ export class CollabApi {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/messages`,
       { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}` });
   }
+  agents() { return this.call('GET', '/agents'); }
+  connectAgent() { return this.call('POST', '/agents/connect', { harness_type: 'claude-code' }); }
+  revokeAgent(id) { return this.call('POST', `/agents/${encodeURIComponent(id)}/revoke`, {}); }
+  grantAgent(room, agentId, actions) {
+    return this.call('POST', `/rooms/${encodeURIComponent(room)}/agents`, { agent_id: agentId, actions });
+  }
   invite(id, email, role) { return this.call('POST', `/rooms/${encodeURIComponent(id)}/invites`, { email, role }); }
   invites(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/invites`); }
   cancelInvite(id, inviteId) {

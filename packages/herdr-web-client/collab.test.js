@@ -48,6 +48,17 @@ test('token store drops expired tokens and uses only the given storage', () => {
   assert.equal(tokenExpiry('garbage'), 0);
 });
 
+test('agent endpoints use the documented routes', async () => {
+  const calls = [];
+  const f = async (url, init) => { calls.push([init.method, url, init.body]); return { status: 200, ok: true, json: async () => ({}) }; };
+  const api = new CollabApi(() => ({ access: 'T' }), f);
+  await api.connectAgent(); await api.revokeAgent('agent_1'); await api.grantAgent('room_1', 'agent_1', ['read']);
+  assert.deepEqual(calls.map((c) => c.slice(0, 2)), [
+    ['POST', '/api/v1/collab/agents/connect'], ['POST', '/api/v1/collab/agents/agent_1/revoke'],
+    ['POST', '/api/v1/collab/rooms/room_1/agents']]);
+  assert.deepEqual(JSON.parse(calls[2][2]), { agent_id: 'agent_1', actions: ['read'] });
+});
+
 test('API wrapper sends the bearer token and turns 401 into AuthError', async () => {
   const calls = [];
   const f = async (url, init) => { calls.push([url, init]); return url.endsWith('/rooms') ? { status: 401, ok: false, json: async () => ({}) } : { status: 200, ok: true, json: async () => ({ ok: 1 }) }; };

@@ -126,12 +126,14 @@ class CollabService:
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
-                 max_streams_per_principal: int = 5, public_config: dict | None = None):
+                 max_streams_per_principal: int = 5, public_config: dict | None = None,
+                 remote_credential_ttl: float = 30 * 24 * 3600.0):
         self.auth = authenticator
         self._sink = sink
         self._now = now or time.time
         self.enrollment_ttl = enrollment_ttl
         self.credential_ttl = credential_ttl
+        self.remote_credential_ttl = remote_credential_ttl  # agents that connect over HTTP MCP
         self.stream_poll_seconds = stream_poll_seconds
         self.message_limit = message_limit
         self.max_streams = max_streams_per_principal
@@ -647,6 +649,50 @@ class CollabService:
                 "project_ids": [], "resource_id": aid})
         return {"agent_id": aid, "credential": cred, "expires_at": expires}
 
+    def connect_agent(self, pr: Principal, body: dict) -> dict:
+        """Create an agent for the signed-in user in one step (remote MCP clients).
+
+        The browser session already proves who the owner is, so no enrollment code is
+        needed. The credential is shown once, lives ``remote_credential_ttl``, grants
+        nothing until the owner adds the agent to a room, and is revocable at any time."""
+        self._require_user(pr)
+        label = _name(body.get("harness_type", "claude-code"), "harness_type")
+        cred = "hca_" + secrets.token_urlsafe(32)
+        device = "remote-" + secrets.token_hex(8)
+        expires = self._now() + self.remote_credential_ttl
+        aid = ids.new_id("agent")
+        with self._lock:
+            self._commit("agent_enrolled", {
+                "actor_user_id": pr.id, "actor_agent_id": None, "agent_id": aid,
+                "owner_user_id": pr.id, "code_digest": None, "device_id": device,
+                "harness_type": label, "instance_id": None, "secret_digest": _digest(cred),
+                "expires_at_epoch": expires, "action": "agent.connect", "outcome": "allowed",
+                "project_ids": [], "resource_id": aid})
+        return {"agent_id": aid, "credential": cred, "device_id": device, "expires_at": expires}
+
+    def list_my_agents(self, pr: Principal) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            out = []
+            for aid, a in self._agents.items():
+                if a["owner"] != pr.id:
+                    continue
+                rooms = [{"room_id": rid, "name": r["name"], "actions": g["actions"]}
+                         for rid, r in self._rooms.items() if (g := r["grants"].get(aid))]
+                out.append({"agent_id": aid, "harness_type": a["harness_type"], "status": a["status"],
+                            "expires_at": a["expires_at"], "rooms": rooms})
+        return {"agents": out}
+
+    def agent_rooms(self, pr: Principal) -> dict:
+        """Rooms an agent can currently use (for MCP); never lists rooms it has no access to."""
+        with self._lock:
+            out = []
+            for rid, room in self._rooms.items():
+                eff = self._effective(pr, room)
+                if eff and eff[0]:
+                    out.append({"room_id": rid, "name": room["name"], "actions": sorted(eff[0])})
+        return {"rooms": out}
+
     def rotate_credential(self, pr: Principal) -> dict:
         if not pr.is_agent:
             raise CollabError(403, "forbidden")
@@ -869,6 +915,8 @@ class CollabService:
             if method == "GET":
                 if parts == ["me"]:
                     return 200, self.me(pr)
+                if parts == ["agents"]:
+                    return 200, self.list_my_agents(pr)
                 if parts == ["rooms"]:
                     return 200, self.list_rooms(pr)
                 if parts == ["audit"]:
@@ -890,6 +938,8 @@ class CollabService:
             elif method == "POST":
                 if parts == ["me"]:
                     return 200, self.link_identity(pr, body)
+                if parts == ["agents", "connect"]:
+                    return 201, self.connect_agent(pr, body)
                 if parts == ["projects"]:
                     return 201, self.create_project(pr, body)
                 if n == 3 and parts[0] == "projects" and parts[2] == "rooms":

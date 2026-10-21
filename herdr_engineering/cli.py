@@ -445,6 +445,11 @@ def _build_parser() -> argparse.ArgumentParser:
                          "https://bender.tail0c50da.ts.net:9447/")
     p2.add_argument("--collab-cognito-group", default="local.dev",
                     help="required cognito:groups membership (default: local.dev)")
+    p2.add_argument("--collab-public-port", type=int, default=None,
+                    help="also serve ONLY collaboration (API, MCP, page) on this port; point the "
+                         "internet-facing proxy here, never at the main port")
+    p2.add_argument("--collab-public-host", default=None,
+                    help="bind address for --collab-public-port (default: --host)")
     p2.add_argument("--collab-require-https", action="store_true",
                     help="serve collaboration only for requests forwarded by a TLS proxy "
                          "(X-Forwarded-Proto: https); other listeners on this server stay "
@@ -2076,7 +2081,9 @@ def _cmd_cp_web(args) -> int:
                              web_root=args.web_root, allow_open=args.allow_open,
                              rustfs=rustfs, collab=collab,
                              collab_tls_terminated=args.collab_tls_terminated,
-                             collab_require_https=args.collab_require_https)
+                             collab_require_https=args.collab_require_https,
+                             public_port=args.collab_public_port,
+                             public_host=args.collab_public_host)
     # Self-report the control-plane stack so the Services page has real data.
     try:
         _self_report_services(
