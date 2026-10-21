@@ -370,6 +370,26 @@ def test_services_archive_filter_is_optional_and_detail_history_remains(server):
     assert json.loads(body)['lifecycle']['archived'] is True
     _, _, body = c.get('/api/v1/services?host_id=host')
     assert len(json.loads(body)['services']) == 1
+    _, _, body = c.get('/api/v1/services?host_id=host&fields=feed')
+    slim = json.loads(body)['services'][0]
+    assert set(slim) == {'service_id', 'service_name', 'host_id', 'source_port', 'session_id',
+                         'discovery_source', 'verified_origin', 'ownership', 'listener_identity'}
     _, _, body = c.get('/api/v1/services?host_id=other')
     data = json.loads(body)
     assert data['services'] == [] and data['summary']['total'] == 0  # summary follows the filter
+
+
+def test_retire_endpoint_is_a_dry_run_unless_told_otherwise(server):
+    c, repo = server
+    clock = [1_800_000_000]
+    repo._now = lambda: clock[0]
+    sid = repo.register_service('silent', 'host', 8000, status='healthy')
+    clock[0] += 9 * 86400
+    status, body = c.post('/api/v1/services/retire', {'older_than_days': 7})
+    data = json.loads(body)
+    assert status == 200 and data['dry_run'] is True and data['matched'] == 1 and data['retired'] == 0
+    status, body = c.post('/api/v1/services/retire', {'older_than_days': 7, 'dry_run': False})
+    assert json.loads(body)['retired'] == 1
+    assert json.loads(c.get(f'/api/v1/services/{sid}')[2])['lifecycle']['archived'] is True
+    status, _ = c.post('/api/v1/services/retire', {'older_than_days': 0})
+    assert status == 400

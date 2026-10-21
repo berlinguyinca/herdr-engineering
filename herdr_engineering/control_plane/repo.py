@@ -593,6 +593,32 @@ class ControlPlaneRepo:
         return _sort_by([s for s in services if include_archived
                          or not s["lifecycle"]["archived"]], "created_at", reverse=True)
 
+    def retire_services(self, *, older_than_days=7.0, states=("unknown",), dry_run=True, limit=5000):
+        """Archive services with no report for ``older_than_days`` (operator action).
+
+        Nothing is deleted: each record keeps its history and a later report from
+        the service lifts the retirement. ``dry_run`` only counts."""
+        with self._event_lock:
+            cutoff = float(older_than_days) * 86400
+            matched = []
+            for record in self._services.values():
+                view = self._service_projection(record)
+                life = view["lifecycle"]
+                if (life["state"] in states and not life["archived"]
+                        and (life["age_seconds"] is None or life["age_seconds"] >= cutoff)):
+                    matched.append(record)
+                    if len(matched) >= limit:
+                        break
+            if not dry_run:
+                stamp = self._stamp()
+                for record in matched:
+                    record["retired_at"] = stamp
+                    self.record_event("service", record["service_id"], "ServiceRetired",
+                                      {"retired_at": stamp, "older_than_days": float(older_than_days)})
+            return {"matched": len(matched), "retired": 0 if dry_run else len(matched),
+                    "dry_run": bool(dry_run), "older_than_days": float(older_than_days),
+                    "sample": [r["service_id"] for r in matched[:5]]}
+
     def mark_service_unavailable(self, service_id):
         with self._event_lock:
             return self._mark_service_unavailable(service_id)

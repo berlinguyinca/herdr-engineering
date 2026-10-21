@@ -187,7 +187,7 @@ class ServiceMetadataFeed:
             state = self._store()
             # Only this host's records matter, and the full fleet inventory can
             # outgrow the reply cap, which silently stops every observation.
-            query = urlencode({"host_id": self.host_id})
+            query = urlencode({"host_id": self.host_id, "fields": "feed"})
             services = self.client.request(f"/api/v1/services?{query}").get("services")
             if not isinstance(services, list) or len(services) > MAX_RECORDS:
                 raise ValueError("invalid service inventory")

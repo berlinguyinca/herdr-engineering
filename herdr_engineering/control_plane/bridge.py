@@ -275,6 +275,11 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 a["original_filename"] = p["filename"]
             a["updated_at"] = ts
         elif et == "service":
+            if etype == "ServiceRetired":
+                # An operator action, not a report: it must not refresh updated_at.
+                svc = services.setdefault(eid, {"service_id": eid, "created_at": ts, "updated_at": ts})
+                svc["retired_at"] = p.get("retired_at") or ts
+                continue
             if etype == "ServiceMetadataObserved":
                 svc = services.setdefault(eid, {"service_id": eid,
                     "created_at": p.get("service_created_at"), "updated_at": p.get("service_updated_at")})

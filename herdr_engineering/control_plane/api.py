@@ -425,6 +425,10 @@ def _make_handler(server):
                 summary["total"] = len(services)
                 if _q(self.path, "include_archived") in {"false", "0"}:
                     services = [s for s in services if not s["lifecycle"]["archived"]]
+                if _q(self.path, "fields") == "feed":
+                    # The ownership feed needs identity and proof only; the full
+                    # catalog projection is most of the bytes of a large inventory.
+                    services = [{k: s.get(k) for k in _FEED_SERVICE_FIELDS} for s in services]
                 return self._json({"services": services, "summary": summary})
             if resource == "fleet" and len(parts) == 5 and parts[4] == "inventory":
                 return self._json(r.fleet_inventory())
@@ -604,6 +608,18 @@ def _make_handler(server):
                 receipt = r.session_action(parts[4], body.get("action"),
                                            operation_id=body.get("operation_id"))
                 return self._json({"ok": False, **receipt}, 501)
+            if resource == "services" and len(parts) == 5 and parts[4] == "retire":
+                try:
+                    days = float(body.get("older_than_days", 7))
+                except (TypeError, ValueError):
+                    return self._json({"error": "older_than_days must be a number"}, 400)
+                states = body.get("states", ["unknown"])
+                if not (days >= 1 and isinstance(states, list)
+                        and set(states) <= {"unknown", "unavailable"}):
+                    return self._json({"error": "older_than_days >= 1 and states within unknown/unavailable"}, 400)
+                # Dry run unless the caller explicitly says dry_run=false.
+                return self._json(r.retire_services(
+                    older_than_days=days, states=tuple(states), dry_run=body.get("dry_run", True) is not False))
             if resource == "token-usage" and len(parts) == 4:
                 rows = body.get("records") if isinstance(body.get("records"), list) else [body]
                 for row in rows[:500]:
@@ -902,6 +918,10 @@ def _tests_view() -> dict[str, Any]:
         return {"adapters": explorer.adapters()}
     except Exception as exc:
         return {"adapters": [], "error": str(exc)}
+
+
+_FEED_SERVICE_FIELDS = ("service_id", "service_name", "host_id", "source_port", "session_id",
+                        "discovery_source", "verified_origin", "ownership", "listener_identity")
 
 
 def _q(path, key):

@@ -59,3 +59,17 @@ test("control dir honours override then XDG_RUNTIME_DIR", () => {
   assert.equal(controlDir({ PI_ENGINEERING_CONTROL_DIR: "/x" }), "/x");
   assert.equal(controlDir({ XDG_RUNTIME_DIR: "/run/user/1" }), "/run/user/1/pi-engineering");
 });
+
+test("claude pane resolves through ~/.claude/sessions/<pid>.json to the session log", async () => {
+  const home = mkdtempSync(join(tmpdir(), "c-"));
+  const id = "fafa9fca-ce02-48ee-bc10-6aff131ed49a";
+  mkdirSync(join(home, ".claude", "sessions"), { recursive: true });
+  writeFileSync(join(home, ".claude", "sessions", "777.json"), JSON.stringify({ pid: 777, sessionId: id }));
+  mkdirSync(join(home, ".claude", "projects", "-p"), { recursive: true });
+  writeFileSync(join(home, ".claude", "projects", "-p", `${id}.jsonl`),
+    '{"message":{"model":"claude-opus-5-5"}}\n{"message":{"model":"claude-sonnet-5-5"}}\n');
+  const resolve = createModelResolver({ home, queryProcess: async () =>
+    ({ result: { process_info: { foreground_processes: [{ pid: 5 }, { pid: 777 }] } } }) });
+  assert.equal(await resolve("default", { agent: "claude", pane_id: "w:p1", terminal_id: "t1" }), "claude-sonnet-5-5");
+  assert.equal(await resolve("default", { agent: "claude", pane_id: "w:p2", terminal_id: "t2" }) , "claude-sonnet-5-5");
+});
