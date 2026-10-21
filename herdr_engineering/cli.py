@@ -517,10 +517,17 @@ def _cmd_cp_mission_feed(args) -> int:
         resolve_control_plane,
     )
     from .mission_activity_feed import run_feed
+    from .host_config import host_config_or_none
     try:
         url = resolve_control_plane(args.control_plane)
-        host_id = args.host_id or host_config().host_id
-        refresher = None if args.once else ConfigRefresher(host_config())
+        if args.control_plane and args.host_id:
+            # Fully explicit: runs without host.json; only the ingest key (if
+            # any) follows the config.
+            live = host_config_or_none()
+        else:
+            live = host_config()
+        host_id = args.host_id or live.host_id
+        refresher = None if args.once or live is None else ConfigRefresher(live)
     except HostConfigUnavailable as exc:
         return exit_unavailable(exc)
     return run_feed(url, host_id=host_id,
@@ -1674,12 +1681,12 @@ def _cmd_dev_agent(args) -> int:
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
     from .fabric_agent import AgentConfig, FabricAgent
-    from .host_config import HostConfigUnavailable, control_plane_url_or, exit_unavailable, host_config
+    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
-        host_config()
+        live = host_config()
     except HostConfigUnavailable as exc:
         return exit_unavailable(exc)
     try:
@@ -1712,6 +1719,9 @@ def _cmd_dev_agent(args) -> int:
     # extra excluded ports + the dev-port window the agent will register.
     extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
         "agent_exclude_ports", []))
+    def control_plane_for(host_cfg):
+        return fabric_cfg.get("control_plane_url") or host_cfg.control_plane_url
+
     agent = FabricAgent(
         client=FabricClient(base),
         config=AgentConfig(
@@ -1722,16 +1732,31 @@ def _cmd_dev_agent(args) -> int:
             interval=args.interval,
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
-            control_plane_url=fabric_cfg.get("control_plane_url")
-                or control_plane_url_or(""),
+            control_plane_url=control_plane_for(live),
         ))
     if args.once:
         summary = agent.scan_once()
         agent.stop()
         _print_json({"ok": True, **summary})
         return 0
+    refresher = ConfigRefresher(live)
+    seen = {"fabric": (live.get("fabric.url"), live.get("fabric.token")), "cp": control_plane_for(live)}
+
+    def follow_config() -> None:
+        """Rebuild the gateway client / control-plane URL when a fresh fetch changed them."""
+        fresh = refresher.current()  # raises HostConfigUnavailable(revoked=True)
+        fab = (fresh.get("fabric.url"), fresh.get("fabric.token"))
+        cp = control_plane_for(fresh)
+        if fab == seen["fabric"] and cp == seen["cp"]:
+            return
+        new_base = gateway_url_from_config(cfg, fabric_url=fab[0] or "") or base
+        agent.retarget(FabricClient(new_base, fab[1] or None), cp)
+        seen["fabric"], seen["cp"] = fab, cp
+
     try:
-        agent.run()
+        agent.run(after_cycle=follow_config)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
     except KeyboardInterrupt:
         pass
     finally:

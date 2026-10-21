@@ -249,6 +249,7 @@ def control_plane_url_or(default: str = "") -> str:
 
 
 REFRESH_INTERVAL = 300.0
+FORCED_REFRESH_GAP = 30.0
 
 
 class ConfigRefresher:
@@ -262,11 +263,14 @@ class ConfigRefresher:
     one stderr line per outage. A refresh forced by an auth rejection that yields
     no fresh fetch does not advance the timer, so the next pass retries. A revoked
     token raises HostConfigUnavailable(revoked=True): the daemon must exit 2.
+    Forced refreshes are at least ``min_forced_gap`` seconds apart (a persistent
+    401/403 must not storm the control plane). Single-threaded by design: call it
+    only from the daemon's one loop thread.
     """
 
     def __init__(self, initial: HostConfig, *, loader: Callable[[], HostConfig] | None = None,
                  interval: float = REFRESH_INTERVAL, clock: Callable[[], float] = time.monotonic,
-                 err=None):
+                 err=None, min_forced_gap: float = FORCED_REFRESH_GAP):
         self._live = initial
         self._loader = loader
         self._interval = interval
@@ -275,12 +279,21 @@ class ConfigRefresher:
         self._loaded_at = clock()
         self._rejected = False
         self._outage = False
+        self._min_forced_gap = min_forced_gap
+        self._last_forced: float | None = None
 
     def note_auth_rejected(self) -> None:
         self._rejected = True
 
     def current(self) -> HostConfig:
-        forced, self._rejected = self._rejected, False
+        forced = self._rejected
+        if forced and self._last_forced is not None \
+                and self._clock() - self._last_forced < self._min_forced_gap:
+            forced = False  # too soon; the rejection stays pending
+        else:
+            self._rejected = False
+        if forced:
+            self._last_forced = self._clock()
         if forced or self._clock() - self._loaded_at >= self._interval:
             self._refresh(advance_on_stale=not forced)
         return self._live

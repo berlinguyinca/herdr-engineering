@@ -71,7 +71,7 @@ class MetadataClient:
             with self.http.open(request, timeout=3) as response:
                 content = response.read(MAX_BYTES + 1)
         except urllib.error.HTTPError as error:
-            if error.code in (401, 403):
+            if path == "/api/v1/ingest" and error.code in (401, 403):
                 self.auth_rejected = True
             raise
         if len(content) > MAX_BYTES:
@@ -443,12 +443,15 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.loop is not None and (not 30 <= args.loop <= 3600 or args.once):
         parser.error("--loop requires 30–3600 seconds and cannot be combined with --once")
+    fully_explicit = bool(args.control_plane and args.host_id and args.api_key_file)
     try:
         cfg = _hc.host_config()
     except HostConfigUnavailable as exc:
-        return exit_unavailable(exc)
+        if not fully_explicit:
+            return exit_unavailable(exc)
+        cfg = None  # every value is given explicitly: no host config needed
     try:
-        key = cfg.api_key
+        key = cfg.api_key if cfg else None
         if args.api_key_file:
             with Path(args.api_key_file).expanduser().open() as stream:
                 key = stream.read(8193).strip()
@@ -459,7 +462,7 @@ def main(argv=None):
     except (OSError, ValueError):
         parser.exit(1, "Service metadata observer configuration is unavailable or invalid.\n")
     refresher = None
-    if args.loop is not None and not args.dry_run:
+    if args.loop is not None and not args.dry_run and cfg is not None and not fully_explicit:
         refresher = _hc.ConfigRefresher(cfg)
     stop = threading.Event()
     previous = {}

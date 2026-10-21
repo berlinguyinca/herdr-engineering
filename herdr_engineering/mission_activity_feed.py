@@ -283,7 +283,7 @@ class MissionActivityFeed:
             with self._http.open(request, timeout=3) as response:
                 data = response.read(MAX_REPLY_BYTES + 1)
         except urllib.error.HTTPError as error:
-            if error.code in (401, 403):
+            if route == '/api/v1/ingest' and error.code in (401, 403):
                 self.auth_rejected = True
             raise
         if len(data) > MAX_REPLY_BYTES:
