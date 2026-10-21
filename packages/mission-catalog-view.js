@@ -1,4 +1,5 @@
 // A compact, read-only mission catalog. Stale telemetry is never current work.
+import { cleanTitle } from './herdr-web-components/util.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { freshnessAt, missionHealth } from './mission-live-view.js';
 import { recordOutcome, statusOutcome, recordVisibility, reportFreshness, reportTimestamp } from './record-state.js';
@@ -46,7 +47,7 @@ export function missionEntries(projections, recorded, received, now = Date.now()
   }
   return [...byKey.values()].map(entry => {
     const p = entry.projection, record = entry.recorded || {}, mission = p?.mission || {}, a = p?.activity || {};
-    const title = text(mission.title) || text(record.title) || text(mission.id) || entry.key;
+    const title = cleanTitle(text(mission.title) || text(record.title)) || text(mission.id) || entry.key;
     const lifecycle = p ? mission : record;
     const outcome = recordOutcome(lifecycle);
     const stageSuppliesOutcome = (outcome === 'failed' || outcome === 'finished') && statusOutcome(lifecycle.status) !== outcome;

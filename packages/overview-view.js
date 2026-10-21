@@ -2,7 +2,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { formatDuration } from './herdr-web-components/format.js';
 import { missionEntries } from './mission-catalog-view.js';
-import { recordOutcome, recordVisibility } from './record-state.js';
+import { recordOutcome, recordVisibility, reportFreshness } from './record-state.js';
 import { serviceState, serviceScope } from './services-view.js';
 import { integrationEntries } from './integrations-view.js';
 
@@ -111,6 +111,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
       ${isCi && snapshot.available===false && !entries.length ? `<p class="ov-warning">${esc(snapshot.status==='auth_error'?'Woodpecker authentication needs attention.':snapshot.status==='not_configured'?'Woodpecker is not configured.':'CI reports are unavailable.')}</p>` : `<div class="ov-metrics">${metric(current.length,isCi?'Queued / running / unknown':'Awaiting review',`#/${section}`)}${metric(attention.length,isCi?'Failed':'Changes requested',`#/${section}?tab=${isCi?'failed':'changes'}`)}</div>`}
       ${snapshot.stale ? '<p class="ov-warning">Showing stale reports. Open the catalog for connection details.</p>' : ''}
       ${current.length ? `<ul class="ov-list">${current.slice(0,3).map(e=>`<li class="ov-row"><div>${link(`#/${section}?search=${encodeURIComponent(e.record.repository || e.record.review_id || '')}`,short(e.record.title || e.record.repository || (isCi?'CI run':'Review')))}<p>${esc(isCi?`Run #${e.record.run_number} · ${e.record.branch || 'Branch not reported'}`:e.record.repository || 'Repository not reported')}</p></div><span class="ov-tag">${esc(human(e.record.state || e.record.status) || 'Status unknown')}</span></li>`).join('')}</ul>` : ''}
+      ${isCi && attention.length ? `<h3 class="ov-sub">Latest failures</h3><ul class="ov-list">${attention.slice(0,3).map(e=>`<li class="ov-row"><div>${link(`#/ci?search=${encodeURIComponent(e.record.repository || '')}`,short(e.record.repository || e.record.title || 'CI run'))}<p>${esc(`Run #${e.record.run_number} · ${e.record.branch || 'Branch not reported'}`)}</p></div><span class="ov-tag ov-alert">${esc(human(e.record.state || e.record.status) || 'failed')}</span></li>`).join('')}</ul>` : ''}
       <p class="ov-note">${isCi?'Recent pipeline window; inspect steps, output and provider refresh progress.':'Review decisions and revision links stay with Plannotator.'}</p>` : ''}`;
   }
   if (section === 'services') {
@@ -118,6 +119,15 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
     return `<div class="ov-heading"><h2>HerdR services</h2>${link('#/services','Service catalog →')}</div>${availability(['services'],states)}${states.services?.loaded ? `
       <div class="ov-metrics">${metric(s.current,'Reported healthy','#/services')}</div>
       <p class="ov-note">${link('#/services?status=unavailable',`${s.unavailable} unavailable`)} · ${link('#/services?status=unknown',`${s.unknown} unconfirmed`)} · ${link('#/services?status=archived',`${s.archived} archived`)}. History remains in the catalog. ${link('#/system-services','System and unassigned services →')}</p>` : ''}`;
+  }
+  if (section === 'fleet') {
+    const hosts=model.hosts, fleet=data.fleet || {}, sum=fleet.summary || {};
+    const stale=hosts.filter(h => reportFreshness(h.last_seen || h.updated_at,now) !== 'current');
+    const fresh=hosts.length-stale.length;
+    return `<div class="ov-heading"><h2>Fleet health</h2>${link('#/hosts','Hosts and versions →')}</div>${availability(['hosts'],states)}${states.hosts?.loaded ? `
+      <div class="ov-metrics">${metric(`${fresh} / ${hosts.length}`,'Hosts reporting now','#/hosts')}${metric(states.fleet?.loaded ? (sum.drifted ?? 0) : '—','Versions that differ','#/hosts?drift=1')}${metric(states.fleet?.loaded ? (sum.missing ?? 0) : '—','Not installed on a host','#/hosts?drift=1')}</div>
+      ${stale.length ? `<p class="ov-warning">No recent report from ${stale.map(h=>esc(h.host_name || h.host_id)).join(', ')}.</p>` : ''}
+      ${states.fleet?.loaded && !(fleet.hosts || []).length ? empty('No host has reported its tool and plugin versions yet.') : ''}` : ''}`;
   }
   if (section === 'hosts') {
     return `<div class="ov-heading"><h2>Hosts</h2>${link('#/hosts','All hosts →')}</div>${availability(['hosts'],states)}${states.hosts?.loaded ? `
@@ -140,20 +150,21 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
 }
 
 const styles = `<style>
-.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;overflow-wrap:anywhere}.ov-panel[data-overview=missions]{grid-column:1/-1}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:14px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:10px 13px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:25px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:16px;padding:11px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.5}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:4px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:16px;border-top:1px solid var(--border-subtle);padding-top:12px;margin-top:12px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
+.ov-sub{font-size:13px;margin:14px 0 0}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;overflow-wrap:anywhere}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:1/-1}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:14px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:10px 13px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:25px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:16px;padding:11px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.5}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:4px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:16px;border-top:1px solid var(--border-subtle);padding-top:12px;margin-top:12px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
 @media(max-width:750px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
 </style>`;
 
 export function mountOverview(container, client) {
   let disposed=false, clock=null, received=Date.now();
   const data={}, states={}, controllers=new Map(), timers=new Map(), signatures=new Map();
-  const panels=['missions','sessions','ci','reviews','services','hosts','activity','health'];
+  const panels=['missions','fleet','sessions','ci','reviews','services','hosts','activity','health'];
   const sources={
     projections:signal=>client.listMissionActivity({signal}),
     missions:signal=>client.listMissions(undefined,{signal}),
     sessions:signal=>client.listSessions(undefined,{signal}),
     services:signal=>client.listServices({signal}),
     hosts:signal=>client.listHosts({signal}),
+    fleet:signal=>client.request('/api/v1/fleet/inventory',{signal}),
     activity:signal=>client.activity(50,{signal}),
     health:signal=>client.health({signal}),
     ci:signal=>client.getCi({signal}),
@@ -190,8 +201,8 @@ export function mountOverview(container, client) {
       const response=await sources[key](controller.signal);
       if(disposed || controller.signal.aborted)return;
       const field={projections:'activities',activity:'events'}[key] || key;
-      const objectSource=['health','ci','reviews'].includes(key);
-      if (objectSource ? !response || (key==='health' ? typeof response.status!=='string' : key==='ci' ? typeof response.available!=='boolean' : !Array.isArray(response.reviews)) : !Array.isArray(response?.[field])) throw new Error('Invalid response');
+      const objectSource=['health','ci','reviews','fleet'].includes(key);
+      if (objectSource ? !response || (key==='health' ? typeof response.status!=='string' : key==='ci' ? typeof response.available!=='boolean' : key==='fleet' ? !Array.isArray(response.components) : !Array.isArray(response.reviews)) : !Array.isArray(response?.[field])) throw new Error('Invalid response');
       data[key==='activity' ? 'events' : key]=objectSource ? response : records(response?.[field]);
       if(key==='projections')received=Date.now();
       states[key]={loaded:true,error:false};
