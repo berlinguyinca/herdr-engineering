@@ -73,6 +73,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="stable machine-readable output")
     p.set_defaults(func=_cmd_doctor)
 
+    # agent-mine -----------------------------------------------------------
+    p = sub.add_parser("agent-mine", help="mine this host's agent transcripts into a redacted "
+                                          "JSON summary (fleet dashboard / HPC-ssh adoption)")
+    p.add_argument("--agents", default="claude,pi,codex,opencode")
+    p.add_argument("--days", type=int, default=45, help="0 = all time")
+    p.add_argument("--full", action="store_true", help="include truncated command bodies")
+    p.add_argument("--out", default="~/.cache/agent-mine")
+    p.add_argument("--limit", type=int, default=None, help="max files per agent (debug)")
+    p.add_argument("--json-summary", action="store_true",
+                   help="emit a compact JSON summary; skips the text report and TSV")
+    p.add_argument("--summary-out", default=None,
+                   help="with --json-summary, write the JSON to this file instead of stdout")
+    p.add_argument("--since", default=None,
+                   help="since-install date for the adoption-since metric")
+    p.set_defaults(func=_cmd_agent_mine)
+
     # llm-env --------------------------------------------------------------
     p = sub.add_parser("llm-env", help="mint a project key for the fabric LLM gateway and write "
                                        "an env file (OPENAI_BASE_URL / OPENAI_API_KEY)")
@@ -685,6 +701,12 @@ def _cmd_session_run(args) -> int:
 def _cmd_doctor(args) -> int:
     from .doctor import doctor_main
     return doctor_main(args)
+
+
+def _cmd_agent_mine(args) -> int:
+    from . import agent_mine
+    args.out = os.path.expanduser(args.out)
+    return agent_mine.agent_mine_main(args)
 
 
 def _cmd_pp_status(args) -> int:
