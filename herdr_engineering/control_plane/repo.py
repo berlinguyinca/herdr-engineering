@@ -93,6 +93,19 @@ def describe_service(*, service_name=None, host_id=None, port=None,
     return desc
 
 
+def _clean_inventory(raw):
+    """Keep only ``{tools: {name: str}, plugins: {name: str}}`` with bounded sizes."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for group in ("tools", "plugins"):
+        items = raw.get(group)
+        if isinstance(items, dict):
+            out[group] = {str(k)[:80]: str(v)[:80] for k, v in list(items.items())[:200]
+                          if v not in (None, "")}
+    return out if any(out.values()) else None
+
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
@@ -606,6 +619,42 @@ class ControlPlaneRepo:
         return _sort_by([_copy(h) for h in self._hosts.values()],
                         "host_name")
 
+    def fleet_inventory(self):
+        """Host x component version matrix with drift against the fleet reference.
+
+        The reference for a component is its most common version across hosts that
+        report it (ties go to the highest version string); a host that reports a
+        different value is ``drifted`` and one that does not report it is ``missing``.
+        """
+        hosts = [h for h in self.list_hosts() if h.get("inventory")]
+        names = sorted(h["host_name"] or h["host_id"] for h in hosts)
+        by_name = {h["host_name"] or h["host_id"]: h["inventory"] for h in hosts}
+        components = []
+        for group in ("tools", "plugins"):
+            keys = sorted({k for inv in by_name.values() for k in inv.get(group, {})})
+            for key in keys:
+                seen = {n: by_name[n].get(group, {}).get(key) for n in names}
+                counts = {}
+                for v in seen.values():
+                    if v:
+                        counts[v] = counts.get(v, 0) + 1
+                ref = max(counts, key=lambda v: (counts[v], v)) if counts else None
+                components.append({
+                    "group": group, "name": key, "reference": ref,
+                    "hosts": {n: {"version": v,
+                                  "state": ("missing" if not v else
+                                            "ok" if v == ref else "drifted")}
+                              for n, v in seen.items()},
+                    "drifted": sum(1 for v in seen.values() if v and v != ref),
+                    "missing": sum(1 for v in seen.values() if not v)})
+        return {"hosts": [{"host": n, "collected_at": by_name[n].get("collected_at")}
+                          for n in names],
+                "components": components,
+                "summary": {"hosts": len(names),
+                            "components": len(components),
+                            "drifted": sum(c["drifted"] for c in components),
+                            "missing": sum(c["missing"] for c in components)}}
+
     def record_heartbeat(self, host_id, tailnet_ip=None, cpu=None, mem=None):
         h = self._hosts.get(host_id)
         if h is None:
@@ -644,18 +693,22 @@ class ControlPlaneRepo:
     # after a restart reproduces exactly the same stable entities.
 
     def upsert_host(self, host_id, host_name, tailnet_ip, *,
-                    cpu=None, mem=None, status="healthy"):
+                    cpu=None, mem=None, status="healthy", inventory=None):
         stamp = self._stamp()
+        inventory = _clean_inventory(inventory)
         existing = self._hosts.get(host_id)
         if existing is None:
             rec = {"host_id": host_id, "host_name": host_name,
                    "tailnet_ip": tailnet_ip, "status": status,
                    "cpu": cpu, "mem": mem,
                    "last_seen": stamp, "created_at": stamp}
+            if inventory:
+                rec["inventory"] = {**inventory, "collected_at": stamp}
             self._hosts[host_id] = rec
             self.record_event("host", host_id, "HostRegistered",
                               {"host_name": host_name,
-                               "tailnet_ip": tailnet_ip})
+                               "tailnet_ip": tailnet_ip,
+                               **({"inventory": inventory} if inventory else {})})
             return _copy(rec)
         existing["host_name"] = host_name or existing["host_name"]
         existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
@@ -665,10 +718,13 @@ class ControlPlaneRepo:
             existing["cpu"] = cpu
         if mem is not None:
             existing["mem"] = mem
-        self.record_event("host", host_id, "HostHeartbeat",
-                          {"host_name": existing["host_name"],
-                           "tailnet_ip": existing["tailnet_ip"],
-                           "cpu": cpu, "mem": mem})
+        payload = {"host_name": existing["host_name"],
+                   "tailnet_ip": existing["tailnet_ip"],
+                   "cpu": cpu, "mem": mem}
+        if inventory:
+            existing["inventory"] = {**inventory, "collected_at": stamp}
+            payload["inventory"] = inventory
+        self.record_event("host", host_id, "HostHeartbeat", payload)
         return _copy(existing)
 
     def upsert_session(self, session_id, *, host_id=None, mission_id=None,

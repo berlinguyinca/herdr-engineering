@@ -198,6 +198,8 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 h["cpu"] = p["cpu"]
             if p.get("mem") is not None:
                 h["mem"] = p["mem"]
+            if isinstance(p.get("inventory"), dict):
+                h["inventory"] = {**p["inventory"], "collected_at": ts}
             h["status"] = "unavailable" if "unavailable" in etype.lower() else "healthy"
             h["updated_at"] = ts
         elif et == "mission":

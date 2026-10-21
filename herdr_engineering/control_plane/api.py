@@ -423,6 +423,8 @@ def _make_handler(server):
                 if _q(self.path, "include_archived") in {"false", "0"}:
                     services = [s for s in services if not s["lifecycle"]["archived"]]
                 return self._json({"services": services, "summary": summary})
+            if resource == "fleet" and len(parts) == 5 and parts[4] == "inventory":
+                return self._json(r.fleet_inventory())
             if resource == "hosts":
                 if len(parts) > 5 and parts[5] == "telemetry":
                     return self._json({"samples": r.list_telemetry(parts[4])})

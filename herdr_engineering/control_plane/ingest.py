@@ -100,7 +100,8 @@ class IngestService:
             entity_id,
             payload.get("host_name") or payload.get("name") or entity_id,
             payload.get("tailnet_ip") or payload.get("ip"),
-            cpu=payload.get("cpu"), mem=payload.get("mem"), status=status)
+            cpu=payload.get("cpu"), mem=payload.get("mem"), status=status,
+            inventory=payload.get("inventory"))
 
     def _ingest_session(self, entity_id, event_type, payload,
                         source="herdr") -> dict:

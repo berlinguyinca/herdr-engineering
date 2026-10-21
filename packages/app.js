@@ -15,7 +15,8 @@ import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
-import { recordOutcome, statusOutcome } from './record-state.js';
+import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
+import { renderFleetMatrix } from './fleet-view.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
@@ -326,14 +327,24 @@ async function viewService(parts, revision) {
 }
 
 async function viewHosts() {
-  const { hosts } = await client.listHosts();
+  const [{ hosts }, matrix] = await Promise.all([
+    client.listHosts(),
+    client.request('/api/v1/fleet/inventory').catch(() => ({ hosts: [], components: [] })),
+  ]);
   if (!hosts.length) { root.innerHTML = '<herdr-empty message="No hosts reporting"></herdr-empty>'; return; }
-  root.innerHTML = '<h1>Hosts</h1><div class="hd-grid">' + hosts.map((h) => `
-    <div class="hd-card">
+  const driftedOnly = route().query.get('drift') === '1';
+  const now = Date.now();
+  root.innerHTML = `<h1>Hosts</h1>
+    <div class="hd-grid">` + hosts.map((h) => {
+      const fresh = reportFreshness(h.last_seen, now) === 'current';
+      return `<div class="hd-card">
       <div class="hd-card__title"><a href="#/hosts/${esc(h.host_id)}">${esc(h.host_name)}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${esc(h.status)}"></herdr-status></div>
-      <div class="hd-card__sub"><code>${esc(h.tailnet_ip)}</code> · seen ${formatTimestamp(h.last_seen)}</div>
-    </div>`).join('') + '</div>';
+      <div style="margin:6px 0"><herdr-status stage="${fresh ? esc(h.status) : 'stalled'}"></herdr-status></div>
+      <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code> · ` : ''}${fresh ? 'seen' : '<strong>no report since</strong>'} ${h.last_seen ? formatTimestamp(h.last_seen) : 'never'}</div>
+    </div>`; }).join('') + `</div>
+    <h2 style="margin-top:24px">Fleet versions</h2>
+    <p class="hd-card__sub"><a href="#/hosts${driftedOnly ? '' : '?drift=1'}">${driftedOnly ? 'Show all components' : 'Show only components that differ'}</a></p>
+    ${renderFleetMatrix(matrix, { driftedOnly })}`;
 }
 
 async function viewHost(parts) {
