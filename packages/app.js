@@ -17,6 +17,7 @@ import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
 import { renderFleetMatrix } from './fleet-view.js';
+import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
@@ -329,19 +330,22 @@ async function viewService(parts, revision) {
 }
 
 async function viewHosts() {
-  const [{ hosts }, matrix] = await Promise.all([
+  const [{ hosts }, matrix, configStatus] = await Promise.all([
     client.listHosts(),
     client.request('/api/v1/fleet/inventory').catch(() => ({ hosts: [], components: [] })),
+    client.getFleetConfigStatus().catch(() => null),
   ]);
+  const cfg = indexConfigStatus(configStatus);
   if (!hosts.length) { root.innerHTML = '<herdr-empty message="No hosts reporting"></herdr-empty>'; return; }
   const driftedOnly = route().query.get('drift') === '1';
   const now = Date.now();
   root.innerHTML = `<h1>Hosts</h1>
+    ${configNotice(cfg)}
     <div class="hd-grid">` + hosts.map((h) => {
       const fresh = reportFreshness(h.last_seen, now) === 'current';
       return `<div class="hd-card">
       <div class="hd-card__title"><a href="#/hosts/${esc(h.host_id)}">${esc(h.host_name)}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${fresh ? esc(h.status) : 'stalled'}"></herdr-status></div>
+      <div style="margin:6px 0"><herdr-status stage="${fresh ? esc(h.status) : 'stalled'}"></herdr-status> ${configBadge(cfg, h)}</div>
       <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code> · ` : ''}${fresh ? 'seen' : '<strong>no report since</strong>'} ${h.last_seen ? formatTimestamp(h.last_seen) : 'never'}</div>
       ${Number.isFinite(h.cpu) || Number.isFinite(h.mem) ? `<div class="hd-card__sub">${[Number.isFinite(h.cpu) ? `CPU ${h.cpu}%` : '', Number.isFinite(h.mem) ? `memory ${h.mem}%` : ''].filter(Boolean).join(' · ')}</div>` : ''}
     </div>`; }).join('') + `</div>
