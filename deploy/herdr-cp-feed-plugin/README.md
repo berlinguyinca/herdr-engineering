@@ -115,7 +115,7 @@ heartbeat, so finished/failed notices do not repeat while their record remains
 in the bounded cache; a changed terminal record is still published.
 
 Install all runtime files together: `herdr-plugin.toml`, `package.json`,
-`emit.js`, `enrich.js`, `git-metadata.js`, and `snapshot.js`. The snapshot
+`emit.js`, `enrich.js`, `git-metadata.js`, `inventory.js`, `session-model.js`, and `snapshot.js`. The snapshot
 companion can run under systemd or launchd independently of native Herdr and
 Pi processes; deploying it requires no native session restart.
 
