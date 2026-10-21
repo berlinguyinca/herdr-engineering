@@ -156,8 +156,32 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="skip the herdr machine add step")
     pj.add_argument("--no-provision", action="store_true",
                     help="skip the fleet-sync provisioning playbook")
+    pj.add_argument("--roles", default=None,
+                    help="comma separated fleet-config roles (default: keep existing, else host)")
+    pj.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
+                    help="central fleet config file to add the host to")
+    pj.add_argument("--control-plane-url", default=None,
+                    help="control plane URL written to host.json (default: control_plane.public_url)")
+    pj.add_argument("--no-credentials", action="store_true",
+                    help="skip minting/installing the host's fleet-config token")
     pj.add_argument("--json", action="store_true")
     pj.set_defaults(func=_cmd_fleet_join)
+    pc = fsub.add_parser("config", help="central fleet configuration file tools")
+    csub = pc.add_subparsers(dest="fleet_config_command", required=True)
+    for name, hlp in (("init", "create a new fleet-config.yaml interactively"),
+                      ("validate", "validate the file (prints revision and host count only)"),
+                      ("token", "mint a fresh token for an existing host and install it"),
+                      ("render-compose", "write the compose env file (0600)")):
+        sp = csub.add_parser(name, help=hlp)
+        sp.add_argument("--path", default="~/.config/herdr-engineering/fleet-config.yaml")
+        if name == "token":
+            sp.add_argument("host", help="host id in the fleet config")
+            sp.add_argument("--target", default=None,
+                            help="ssh target (default: the host id); 'local' for this machine")
+            sp.add_argument("--control-plane-url", default=None)
+        if name == "render-compose":
+            sp.add_argument("--out", required=True, help="env file to write (0600)")
+        sp.set_defaults(func=_cmd_fleet_config)
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
     pu.add_argument("--host", default=None, help="update only this host (default: all)")
@@ -624,6 +648,7 @@ def _cmd_machines(args) -> int:
 
 
 def _cmd_fleet_join(args) -> int:
+    from pathlib import Path
     from .fleet import fleet_join
     report = fleet_join(
         ssh_target=args.ssh_target,
@@ -634,6 +659,9 @@ def _cmd_fleet_join(args) -> int:
         gateway=args.gateway,
         attach=not args.no_attach,
         provision=not args.no_provision,
+        fleet_config=None if args.no_credentials else Path(args.fleet_config).expanduser(),
+        roles=([r.strip() for r in args.roles.split(",") if r.strip()] if args.roles else None),
+        control_plane_url=args.control_plane_url,
     )
     if args.json:
         _print_json(report)
@@ -648,6 +676,33 @@ def _cmd_fleet_join(args) -> int:
             for e in report["errors"]:
                 print(f"  !! {e}")
     return 0 if report.get("ok") else 1
+
+
+def _cmd_fleet_config(args) -> int:
+    from pathlib import Path
+    from . import fleet_config_cli as fcc
+    from .fleet_config import FleetConfigError, load_fleet_config
+    cmd = args.fleet_config_command
+    path = Path(args.path).expanduser()
+    try:
+        if cmd == "init":
+            fcc.init_config(path, None)
+            print(f"wrote {path} (0600)")
+        elif cmd == "validate":
+            info = fcc.validate_config(path)
+            print(f"ok revision={info['revision']} hosts={info['hosts']}")
+        elif cmd == "token":
+            rep = fcc.issue_host_credentials(path, args.host, args.target or args.host,
+                                             control_plane_url=args.control_plane_url,
+                                             must_exist=True)
+            print(f"token for {rep['host']} installed on {rep['target']} (token: {rep['token']})")
+        elif cmd == "render-compose":
+            fcc.render_compose(load_fleet_config(path), Path(args.out).expanduser())
+            print(f"wrote {args.out} (0600)")
+    except FleetConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cmd_fleet_update(args) -> int:
