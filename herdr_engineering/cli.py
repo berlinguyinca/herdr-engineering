@@ -93,7 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="session (default): mint per session, revoke at end; "
                          "project: reuse the cached project key")
     p2.add_argument("--no-llm-env", action="store_true",
-                    help="opt out (also llm.inject: false / HERDR_ENGINEERING_LLM_INJECT=0)")
+                    help="opt out (also llm.inject: false in the local config)")
     p2.add_argument("--require-llm-env", action="store_true",
                     help="fail instead of starting without a key when the control plane is down")
     p2.add_argument("command", nargs=argparse.REMAINDER, help="-- command and args")
@@ -197,7 +197,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ps.set_defaults(func=_cmd_fleet_status)
     pd = fsub.add_parser("drift", help="show tool/plugin versions that differ across hosts, with suggested fixes")
     pd.add_argument("--control-plane", default=None,
-                    help="control plane URL (default: HERDR_CP_URL or http://dev.lan)")
+                    help="control plane URL (default: host.json control_plane_url)")
     pd.add_argument("--host", help="only this host")
     pd.add_argument("--json", action="store_true")
     pd.set_defaults(func=_cmd_fleet_drift)
@@ -483,8 +483,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="migrations dir (default: bundled deploy/control-plane)")
     p2.set_defaults(func=_cmd_cp_worker)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
-    p2.add_argument("--control-plane", default=os.environ.get("HERDR_CP_URL", "http://dev.lan"))
-    p2.add_argument("--host-id", default=socket.gethostname())
+    p2.add_argument("--control-plane", default=None,
+                    help="control plane URL (default: host.json control_plane_url)")
+    p2.add_argument("--host-id", default=None, help="host id (default: host.json host_id)")
     p2.add_argument("--control-dir", default=None,
                     help="native Pi control directory (default: Pi runtime directory)")
     p2.add_argument("--interval", type=float, default=5.0)
@@ -508,8 +509,19 @@ def _build_parser() -> argparse.ArgumentParser:
 def _cmd_cp_mission_feed(args) -> int:
     from pathlib import Path
 
+    from .host_config import (
+        HostConfigUnavailable,
+        exit_unavailable,
+        host_config,
+        resolve_control_plane,
+    )
     from .mission_activity_feed import run_feed
-    return run_feed(args.control_plane, host_id=args.host_id,
+    try:
+        url = resolve_control_plane(args.control_plane)
+        host_id = args.host_id or host_config().host_id
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    return run_feed(url, host_id=host_id,
                     control_dir=Path(args.control_dir) if args.control_dir else None,
                     interval=args.interval, once=args.once)
 
@@ -649,6 +661,7 @@ def _cmd_machines(args) -> int:
 
 def _cmd_fleet_join(args) -> int:
     from pathlib import Path
+
     from .fleet import fleet_join
     report = fleet_join(
         ssh_target=args.ssh_target,
@@ -680,6 +693,7 @@ def _cmd_fleet_join(args) -> int:
 
 def _cmd_fleet_config(args) -> int:
     from pathlib import Path
+
     from . import fleet_config_cli as fcc
     from .fleet_config import FleetConfigError, load_fleet_config
     cmd = args.fleet_config_command
@@ -767,8 +781,13 @@ def _cmd_fleet_rollout(args) -> int:
 
 def _cmd_fleet_drift(args) -> int:
     import urllib.request
+
     from .fleet import plan_version_sync
-    base = (args.control_plane or os.environ.get("HERDR_CP_URL") or "http://dev.lan").rstrip("/")
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+    try:
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
     try:
         with urllib.request.urlopen(f"{base}/api/v1/fleet/inventory", timeout=10) as response:
             matrix = json.loads(response.read(4 * 1024 * 1024))
@@ -1655,6 +1674,7 @@ def _cmd_dev_agent(args) -> int:
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
     from .fabric_agent import AgentConfig, FabricAgent
+    from .host_config import control_plane_url_or
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -1699,7 +1719,7 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=fabric_cfg.get("control_plane_url")
-                or os.environ.get("HERDR_ENGINEERING_CONTROL_PLANE_URL", ""),
+                or control_plane_url_or(""),
         ))
     if args.once:
         summary = agent.scan_once()
@@ -1837,8 +1857,8 @@ def _ci_provider():
 
 def _ci_offline() -> int:
     _print_json({"available": False, "repos": [], "pipelines": [],
-                 "note": "CI provider offline — set HERDR_ENGINEERING_CI_TOKEN "
-                         "(or ~/.config/herdr-engineering/ci-token). Stale view, "
+                 "note": "CI provider offline — ci.token is not in the central "
+                         "host config (see `herdr-eng fleet join`). Stale view, "
                          "never guessed success."})
     return 0
 
@@ -2072,6 +2092,7 @@ def _cmd_cp_web(args) -> int:
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
     if fleet_store is not None:
+        _install_fleet_host_config(fleet_store)
         file_keys = cp.get("api_keys") or {}
         if not isinstance(file_keys, dict):
             raise SystemExit("fleet config control_plane.api_keys must be a mapping of key -> role")
@@ -2152,6 +2173,24 @@ def _cmd_cp_web(args) -> int:
     finally:
         svr.shutdown()
     return 0
+
+
+def _install_fleet_host_config(store) -> None:
+    """The web process owns the fleet file, so its own ci/github/fabric/llm reads
+    (providers built via host_config) come straight from it, live on reload."""
+    from .fleet_config import FleetConfigError
+    from .host_config import HostConfig, install_source
+
+    def source():
+        cfg = store.current()
+        values = {}
+        for name in ("ingest", "github", "ci", "llm", "fabric", "inspector", "host"):
+            try:
+                values[name] = cfg.section(name)
+            except FleetConfigError:
+                continue
+        return HostConfig("", socket.gethostname(), cfg.revision, values)
+    install_source(source)
 
 
 def _load_cp_fleet_config(path_arg):

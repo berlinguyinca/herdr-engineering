@@ -90,13 +90,9 @@ def test_graphql_partial_errors_are_not_successful_empty_inventory():
         GitHubProvider(token="secret-token-value", client=Client(payload)).repositories_page()
 
 
-def test_private_token_file_is_required_and_never_serialized(tmp_path, monkeypatch):
-    path = tmp_path / "token"
-    path.write_text("secret-token-value")
-    monkeypatch.setenv("HERDR_ENGINEERING_GITHUB_TOKEN_FILE", str(path))
-    path.chmod(0o644)
+def test_token_comes_from_host_config_and_is_never_serialized(fake_host_config):
     assert not GitHubProvider().available
-    path.chmod(0o600)
+    fake_host_config({"github": {"token": "secret-token-value"}})
     provider = GitHubProvider()
     assert provider.available
     monitor = GitHubMonitor(provider_factory=lambda: Provider())

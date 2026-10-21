@@ -71,8 +71,6 @@ class _CP:
 @pytest.fixture
 def cp(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("HERDR_ENGINEERING_CONTROL_PLANE_KEY", raising=False)
-    monkeypatch.delenv(se.OPT_OUT_ENV, raising=False)
     c = _CP()
     yield c
     c.close()
@@ -113,12 +111,10 @@ def test_key_revoked_even_when_command_fails(cp):
     assert rc == 7 and cp.keys == {"k1": True}
 
 
-@pytest.mark.parametrize("how", ["flag", "config", "env"])
+@pytest.mark.parametrize("how", ["flag", "config"])
 def test_opt_out_mints_nothing(cp, tmp_path, monkeypatch, how):
     out = tmp_path / "env.json"
     cfg = _cfg(cp, inject=(how != "config"))
-    if how == "env":
-        monkeypatch.setenv(se.OPT_OUT_ENV, "0")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     rc = se.run_session(cfg, project="p", command=_dump_env_cmd(out), disable=(how == "flag"))
     assert rc == 0 and cp.keys == {}
@@ -160,9 +156,9 @@ def test_unreachable_control_plane_fails_open_without_leaking(tmp_path, monkeypa
     assert se.run_session(cfg, project="p", command=_dump_env_cmd(out), require=True) == 3
 
 
-def test_api_key_header_sent_and_redirects_not_followed(tmp_path, monkeypatch):
+def test_api_key_header_sent_and_redirects_not_followed(tmp_path, monkeypatch, fake_host_config):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("HERDR_ENGINEERING_CONTROL_PLANE_KEY", "operator-key")
+    fake_host_config({"ingest": {"api_key": "operator-key"}})
     c = _CP(require_key="operator-key")
     try:
         assert se.mint_key(c.url, "p")["key_id"] == "k1"

@@ -288,9 +288,10 @@ def test_backend_takeover_follows_disconnect_and_does_not_regress_time(tmp_path)
         thread.join(1)
 
 
-def test_once_cli_runner_uses_environment_key_without_leaking_it(tmp_path, monkeypatch, capsys):
+def test_once_cli_runner_uses_host_config_key_without_leaking_it(tmp_path, monkeypatch, capsys,
+                                                                  fake_host_config):
     monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'state'))
-    monkeypatch.setenv('HERDR_CP_API_KEY', 'private-api-key')
+    fake_host_config({'ingest': {'api_key': 'private-api-key'}})
     with native_session(tmp_path) as (root, _, _, _, _), api() as (url, posts):
         assert feed.run_feed(url, host_id='host', control_dir=root, once=True) == 0
         summary = capsys.readouterr().out

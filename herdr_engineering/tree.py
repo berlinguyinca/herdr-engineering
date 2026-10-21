@@ -65,7 +65,7 @@ def _leases() -> list[dict[str, Any]]:
         leases = []
     # Also pull leases from the live fabric gateway (the authoritative source
     # for dev:<port> services across the fleet). Merge, de-duped by lease id.
-    base = gateway_url_from_config(cfg) or os.environ.get("HERDR_ENGINEERING_FABRIC_URL")
+    base = gateway_url_from_config(cfg)
     if base:
         try:
             gw = FabricClient(base).list().get("leases") or []

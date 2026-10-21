@@ -197,3 +197,19 @@ def test_cli_validate_prints_no_values(tmp_path, capsys):
     assert main(["fleet", "config", "validate", "--path", str(p)]) == 0
     out = capsys.readouterr().out
     assert "revision=" in out and "hosts=2" in out and "llm-secret-key" not in out
+
+
+def test_init_generates_ingest_key_in_both_places_and_host_sections(tmp_path):
+    path = make(tmp_path)
+    cfg = load_fleet_config(path)
+    cp = cfg.section("control_plane")
+    ingest_key = cfg.section("ingest")["api_key"]
+    assert cp["api_keys"][ingest_key] == "ingest"
+    assert sorted(cp["api_keys"].values()) == ["ingest", "operator"]
+    assert cfg.section("github") == {"token": ""}
+    assert cfg.section("fabric") == {"url": "", "token": ""}
+    assert cfg.section("inspector") == {"enabled": False, "reasoning": "off"}
+    assert "aliases" in cfg.section("host")
+    served = cfg.slice_for("mac")  # a roleless-ish host still gets the "all" sections
+    assert {"ingest", "fabric", "inspector", "host"} <= set(served)
+    assert "github" not in served and "control_plane" not in served

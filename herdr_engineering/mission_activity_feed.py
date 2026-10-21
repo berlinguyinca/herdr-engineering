@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .control_plane.redact import redact_text
+from .host_config import host_value
 
 MAX_SESSIONS = 64
 MAX_MISSIONS = 20
@@ -390,12 +391,12 @@ class MissionActivityFeed:
 
 
 def run_feed(url: str, *, host_id: str, control_dir: Path | None = None,
-             interval: float = 5, once: bool = False) -> int:
+             interval: float = 5, once: bool = False, api_key: str | None = None) -> int:
     """One host process, bounded polling and interruptible graceful shutdown."""
     if not 1 <= interval <= 300:
         raise ValueError('interval must be between 1 and 300 seconds')
     collector = MissionActivityFeed(url, host_id=host_id, control_dir=control_dir,
-                                    api_key=os.environ.get('HERDR_CP_API_KEY', ''))
+                                    api_key=api_key if api_key is not None else (host_value('ingest.api_key') or ''))
     # Separate from Pi's directory: may start before the first Pi session exists.
     state = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'herdr-engineering'
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
