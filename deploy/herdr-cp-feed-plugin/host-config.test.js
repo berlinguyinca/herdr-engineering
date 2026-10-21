@@ -163,3 +163,18 @@ test("array values are malformed and fall back to the cache", async () => {
   const empty = makeHome();
   await assert.rejects(loadHostConfig({ home: empty, fetch: async () => ok({ revision: "r2", values: [] }) }), HostConfigUnavailable);
 });
+
+test("array values in the cache are ignored; only 401 sets revoked", async () => {
+  const home = makeHome();
+  mkdirSync(join(home, ".cache", "herdr-engineering"), { recursive: true });
+  writeFileSync(cachePath(home), JSON.stringify({ host_id: "h1", revision: "r1", values: [1] }));
+  const down = async () => { throw new TypeError("fetch failed"); };
+  await assert.rejects(loadHostConfig({ home, fetch: down }), err => err instanceof HostConfigUnavailable && err.revoked === false);
+  await assert.rejects(loadHostConfig({ home, fetch: async () => reply(401) }), err => err.revoked === true);
+});
+
+test("source is fetch on a live reply and cache on fallback", async () => {
+  const home = makeHome();
+  assert.equal((await loadHostConfig({ home, fetch: async () => ok(GOOD) })).source, "fetch");
+  assert.equal((await loadHostConfig({ home, fetch: async () => reply(503) })).source, "cache");
+});

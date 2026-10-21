@@ -149,13 +149,21 @@ export async function main(args = process.argv.slice(2), env = process.env, deps
   const toTarget = cfg => ({ url: cfg?.url, apiKey: cfg?.apiKey });
   let target = toTarget(null);
   let loadedAt = now();
-  // A refresh failure that is not transient (revoked token) ends the process.
-  const refresh = async () => {
-    try { target = toTarget(await loadConfig()); loadedAt = now(); return true; }
-    catch (error) {
+  // Only a fresh fetch replaces the live target. A cache fallback or a transient
+  // failure keeps the config already in memory; only a revoked token (401) ends
+  // the process. Returns false when the caller must exit 2.
+  let loaded = false;
+  const refresh = async ({ advanceOnStale = true } = {}) => {
+    try {
+      const cfg = await loadConfig();
+      if (cfg.source === "fetch" || !loaded) { target = toTarget(cfg); loaded = true; loadedAt = now(); }
+      else if (advanceOnStale) loadedAt = now();
+      return true;
+    } catch (error) {
       if (!(error instanceof HostConfigUnavailable)) throw error;
-      process.stderr.write(`${error.message}\n`);
-      return false;
+      if (error.revoked || !loaded) { process.stderr.write(`${error.message}\n`); return false; }
+      if (advanceOnStale) loadedAt = now();
+      return true;
     }
   };
   if (!dryRun && !(await refresh())) return 2;
@@ -178,7 +186,8 @@ export async function main(args = process.argv.slice(2), env = process.env, deps
         errors: result.summary.errors + delivery.errors, dry_run: dryRun }) + "\n");
       if (interval === null || controller.signal.aborted) break;
       if (!dryRun && (delivery.authRejected || now() - loadedAt >= refreshMs)) {
-        if (!(await refresh())) return 2;
+        // After an auth rejection, retry on the next pass if no fresh fetch came back.
+        if (!(await refresh({ advanceOnStale: !delivery.authRejected }))) return 2;
       }
       await sleep(interval * 1000, controller.signal);
     } while (!controller.signal.aborted);

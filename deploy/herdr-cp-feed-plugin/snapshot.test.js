@@ -252,3 +252,28 @@ test("loop: a transient refresh failure falls back to the cache and keeps runnin
   assert.equal(await main(["--loop", "100"], {}, h.deps), 0);
   assert.deepEqual(h.keysUsed, ["k1", "k1", "k1", "k1"]);
 });
+
+test("loop: refresh failing with no cache keeps the live key and exit code 0", async () => {
+  let h;
+  h = loopHarness({ passes: 8, fleet: n => {
+    if (n === 1) return { status: 200, body: cfgBody("k1") };
+    rmSync(cache(h.home), { force: true });
+    throw new TypeError("fetch failed");
+  }, ingest: () => ({ ok: true, status: 200 }) });
+  assert.equal(await main(["--loop", "100"], {}, h.deps), 0);
+  assert.deepEqual(new Set(h.keysUsed), new Set(["k1"]));
+  assert.equal(h.keysUsed.length, 8);
+});
+
+test("loop: a cache fallback never replaces a newer in-memory key", async () => {
+  let h;
+  h = loopHarness({ passes: 8, fleet: n => {
+    if (n === 1) return { status: 200, body: cfgBody("k1") };
+    if (n === 2) return { status: 200, body: cfgBody("k2") };
+    writeFileSync(cache(h.home), JSON.stringify({ host_id: "h1", revision: "k1", values: { ingest: { api_key: "k1" } } }));
+    throw new TypeError("fetch failed");
+  }, ingest: () => ({ ok: true, status: 200 }) });
+  assert.equal(await main(["--loop", "100"], {}, h.deps), 0);
+  assert.deepEqual(h.keysUsed, ["k1", "k1", "k1", "k1", "k2", "k2", "k2", "k2"]);
+  assert.equal(h.fleetCalls(), 3);
+});
