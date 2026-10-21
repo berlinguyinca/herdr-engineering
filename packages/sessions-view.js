@@ -65,8 +65,8 @@ export function compactSessionRow(entry,now=Date.now()) {
       ${entry.mission ? `<p class="ss-meta">Mission: <a data-mission-link href="#/missions/${esc(encodeURIComponent(entry.mission.key))}">${esc(short(entry.mission.title,130))}</a></p>` : text(s.mission_id) ? '<p class="ss-meta">Mission association not resolved; see session details.</p>' : ''}
       <p class="ss-meta">${esc(short(entry.id,64))}${text(s.branch) ? ` · Branch ${esc(short(s.branch,70))}` : ''}</p>
     </div>
-    <div class="ss-state"><strong data-report>${esc(sessionReport(s,now))}</strong><span>${esc(short(entry.host,90)||'Host not reported')}</span>
-      <span class="ss-meta">Model: ${esc(short(s.model,120)||'Not reported')}</span></div>
+    <div class="ss-state"><strong data-report>${esc(sessionReport(s,now))}</strong><span>${esc(short(entry.host,90)||'Host not reported')}</span>${text(s.model) ? `
+      <span class="ss-meta">Model: ${esc(short(s.model,120))}</span>` : ''}</div>
   </article>`;
 }
 
@@ -120,7 +120,8 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     for(const entry of visible){const label=state.group==='project'?entry.project:'Recent reports';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(entry);}
     el(`panel-${state.tab}`).innerHTML=visible.length ? [...groups].map(([name,rows])=>`<div class="ss-group"><h2>${esc(name)}</h2>${rows.map(e=>compactSessionRow(e)).join('')}</div>`).join('')
       : `<p class="ss-empty">${loaded?'No sessions match this tab and these filters.':'Loading sessions…'}</p>`;
-    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} sessions${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}` : 'Loading sessions…';
+    const noModel=loaded && selected.length>0 && !selected.some(e=>text(e.record.model));
+    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} sessions${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these sessions report which model they use':''}` : 'Loading sessions…';
     el('page').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`;
     el('previous').disabled=state.page===0;el('next').disabled=(state.page+1)*pageSize>=selected.length;
     if(focusId){

@@ -15,7 +15,7 @@ import urllib.request
 from collections import OrderedDict, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from .fabric_agent import (
     ListenerGitMetadata,
@@ -46,9 +46,10 @@ class MetadataClient:
 
     def request(self, route, body=None):
         # This observer has no gateway client and no lease mutation endpoints.
-        if route not in {"/api/v1/services", "/api/v1/ingest"}:
+        path = route.split("?", 1)[0]
+        if path not in {"/api/v1/services", "/api/v1/ingest"} or ("?" in route and path != "/api/v1/services"):
             raise ValueError("unsupported metadata transport route")
-        if (body is None) != (route == "/api/v1/services"):
+        if (body is None) != (path == "/api/v1/services"):
             raise ValueError("unsupported metadata transport method")
         raw = json.dumps(body, allow_nan=False).encode() if body is not None else None
         if raw is not None and len(raw) > 16384:
@@ -184,7 +185,10 @@ class ServiceMetadataFeed:
         deadline = self.clock() + 20
         try:
             state = self._store()
-            services = self.client.request("/api/v1/services").get("services")
+            # Only this host's records matter, and the full fleet inventory can
+            # outgrow the reply cap, which silently stops every observation.
+            query = urlencode({"host_id": self.host_id})
+            services = self.client.request(f"/api/v1/services?{query}").get("services")
             if not isinstance(services, list) or len(services) > MAX_RECORDS:
                 raise ValueError("invalid service inventory")
             listeners = scan_listening_ports()

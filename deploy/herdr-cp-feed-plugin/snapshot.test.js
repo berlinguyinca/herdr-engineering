@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collectSnapshot, createSnapshotPublisher, publishSnapshot } from "./snapshot.js";
 
+const collect = (env, options) => collectSnapshot(env, { resolveModel: async () => null, ...options });
+
 const server = name => ({ name, running: true, socket_path: `/sessions/${name}/herdr.sock` });
 const pane = (index = 0) => ({ pane_id: `w1:p${index}`, terminal_id: `term_${index}`, agent: "pi", cwd: "/work/real", agent_status: "idle", revision: 5 });
 
@@ -19,7 +21,7 @@ function reader(sessions, agents, calls = []) {
 
 test("snapshot uses explicit registry server and native identities, preserves terminal outcomes", async () => {
   const calls = [], directories = [];
-  const result = await collectSnapshot({ HERDR_BIN: "/fixture/herdr", HOSTNAME: "beast" }, {
+  const result = await collect({ HERDR_BIN: "/fixture/herdr", HOSTNAME: "beast" }, {
     queryNative: reader([server("eng")], [{ ...pane(), agent_status: "failed", foreground_cwd: "/work/foreground" }], calls),
     metadata: async cwd => { directories.push(cwd); return { repository_id: "github.com/team/app", commit_sha: "a".repeat(40) }; },
   });
@@ -36,16 +38,16 @@ test("snapshot uses explicit registry server and native identities, preserves te
 
 test("ambiguous servers and unverified or duplicate terminals never create session records", async () => {
   const common = { metadata: async () => ({}) };
-  const ambiguous = await collectSnapshot({}, { ...common, queryNative: reader([server("same"), server("same")], [pane()]) });
+  const ambiguous = await collect({}, { ...common, queryNative: reader([server("same"), server("same")], [pane()]) });
   assert.equal(ambiguous.envelopes.length, 0);
   assert.equal(ambiguous.summary.errors, 2);
-  const result = await collectSnapshot({}, { ...common, queryNative: reader([server("eng")], [pane(), pane(), { ...pane(1), terminal_id: null }]) });
+  const result = await collect({}, { ...common, queryNative: reader([server("eng")], [pane(), pane(), { ...pane(1), terminal_id: null }]) });
   assert.equal(result.envelopes.length, 0);
   assert.equal(result.summary.skipped, 3);
 });
 
 test("server and pane bounds report truncation rather than silently claiming full inventory", async () => {
-  const result = await collectSnapshot({}, {
+  const result = await collect({}, {
     queryNative: reader(Array.from({ length: 10 }, (_, n) => server(`s${n}`)), Array.from({ length: 140 }, (_, n) => pane(n))),
     metadata: async () => ({}),
   });
@@ -56,7 +58,7 @@ test("server and pane bounds report truncation rather than silently claiming ful
 
 test("elapsed collection budget reports partial inventory", async () => {
   let stamp = 0;
-  const result = await collectSnapshot({}, {
+  const result = await collect({}, {
     queryNative: reader([server("eng")], [pane(), pane(1)]), now: () => stamp,
     metadata: async () => { stamp += 20001; return {}; },
   });
@@ -65,7 +67,7 @@ test("elapsed collection budget reports partial inventory", async () => {
 });
 
 test("missing native registry reports failure without inventing stopped sessions", async () => {
-  const result = await collectSnapshot({}, { queryNative: async () => null });
+  const result = await collect({}, { queryNative: async () => null });
   assert.deepEqual(result.envelopes, []);
   assert.equal(result.summary.errors, 1);
 });
@@ -150,4 +152,13 @@ test("collector entrypoint runs through the deployment current symlink", t => {
   assert.equal(summary.errors, 0);
   assert.equal(summary.posted, 0);
   assert.equal(summary.dry_run, true);
+});
+
+test("a resolved model is reported on the session payload", async () => {
+  const result = await collectSnapshot({}, {
+    queryNative: reader([server("eng")], [pane()]),
+    metadata: async () => ({}),
+    resolveModel: async (serverName, p) => `${serverName}/${p.agent}-model`,
+  });
+  assert.equal(result.envelopes[0].payload.model, "eng/pi-model");
 });

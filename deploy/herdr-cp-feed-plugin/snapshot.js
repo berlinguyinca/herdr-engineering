@@ -7,6 +7,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { herdrBin } from "./enrich.js";
 import { hostIdentity, resolveUrl } from "./emit.js";
 import { gitMetadata } from "./git-metadata.js";
+import { createInventoryReporter, createLoadReporter } from "./inventory.js";
+import { createModelResolver } from "./session-model.js";
 
 const TERMINAL_STATES = new Set([
   "failed", "error", "crashed", "finished", "complete", "completed", "closed",
@@ -22,7 +24,12 @@ function query(binary, args) {
   });
 }
 
-export async function collectSnapshot(env, { queryNative = query, metadata = gitMetadata, now = Date.now } = {}) {
+let defaultModelResolver = null;
+
+export async function collectSnapshot(env, { queryNative = query, metadata = gitMetadata, now = Date.now, resolveModel } = {}) {
+  resolveModel ??= (defaultModelResolver ??= createModelResolver({
+    queryProcess: (server, paneId) => queryNative(herdrBin(env), ["--session", server, "pane", "process-info", "--pane", paneId]),
+  }));
   const summary = { servers: 0, sessions: 0, linked: 0, skipped: 0, errors: 0, truncated: false };
   const envelopes = [];
   const deadline = now() + 20000;
@@ -70,6 +77,8 @@ export async function collectSnapshot(env, { queryNative = query, metadata = git
         status: typeof pane.agent_status === "string" && pane.agent_status ? pane.agent_status : "unknown",
         cwd, ...identity,
       };
+      const model = await resolveModel(server.name, pane).catch(() => null);
+      if (model) payload.model = model;
       // Copy native evidence only; a session revision is never a Git revision.
       for (const key of ["revision", "state_change_seq", "interactive_ready", "launch_pending", "agent_session"]) {
         if (pane[key] !== undefined && pane[key] !== null) payload[key] = pane[key];
@@ -127,12 +136,19 @@ export async function main(args = process.argv.slice(2), env = process.env) {
   }
   const controller = new AbortController();
   const publish = createSnapshotPublisher();
+  const inventoryEnvelope = createInventoryReporter();
+  const loadEnvelope = createLoadReporter();
   const stop = () => controller.abort();
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
     do {
       const result = await collectSnapshot(env);
+      // Fleet version inventory rides the same publisher; it is throttled by TTL.
+      const inventory = await inventoryEnvelope(hostIdentity(env)).catch(() => null);
+      if (inventory) result.envelopes.push(inventory);
+      const load = loadEnvelope(hostIdentity(env));
+      if (load) result.envelopes.push(load);
       const delivery = dryRun ? { posted: 0, unchanged: 0, errors: 0 } : await publish(env, result.envelopes);
       process.stdout.write(JSON.stringify({ ...result.summary, posted: delivery.posted,
         unchanged: delivery.unchanged,

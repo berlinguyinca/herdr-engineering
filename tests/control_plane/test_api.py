@@ -368,3 +368,8 @@ def test_services_archive_filter_is_optional_and_detail_history_remains(server):
     status, _, body = c.get(f'/api/v1/services/{sid}')
     assert status == 200
     assert json.loads(body)['lifecycle']['archived'] is True
+    _, _, body = c.get('/api/v1/services?host_id=host')
+    assert len(json.loads(body)['services']) == 1
+    _, _, body = c.get('/api/v1/services?host_id=other')
+    data = json.loads(body)
+    assert data['services'] == [] and data['summary']['total'] == 0  # summary follows the filter

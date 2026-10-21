@@ -18,8 +18,9 @@ class Client:
         self.accept = True
 
     def request(self, route, body=None):
-        if route == "/api/v1/services":
+        if route.startswith("/api/v1/services"):
             assert body is None
+            self.service_routes = getattr(self, "service_routes", []) + [route]
             return {"services": copy.deepcopy(self.services)}
         assert route == "/api/v1/ingest"
         self.posts.append(copy.deepcopy(body))
@@ -205,6 +206,8 @@ def test_transport_refuses_gateway_routes_and_mutating_inventory_reads():
     with pytest.raises(ValueError):
         client.request("/api/v1/ingest")
     with pytest.raises(ValueError):
+        client.request("/api/v1/ingest?x=1", {})
+    with pytest.raises(ValueError):
         MetadataClient("https://user:secret@control.test")
 
 
@@ -222,7 +225,7 @@ def test_real_backend_accepts_observer_payload_without_lifecycle_or_lease_mutati
 
     class Backend:
         def request(self, route, body=None):
-            if route == "/api/v1/services":
+            if route.startswith("/api/v1/services"):
                 return {"services": repo.list_services()}
             assert route == "/api/v1/ingest" and body["event_type"] == "service.metadata"
             return {"ok": True, "entity": IngestService(repo).ingest(body)}
@@ -378,7 +381,7 @@ def test_dynamic_observation_round_trip_creates_local_only_then_retains_missing_
 
     class Backend:
         def request(self, route, body=None):
-            if route == "/api/v1/services":
+            if route.startswith("/api/v1/services"):
                 return {"services": repo.list_services()}
             assert route == "/api/v1/ingest" and body["event_type"] == "service.listener_observed"
             return {"ok": True, "entity": IngestService(repo).ingest(body)}
@@ -411,3 +414,8 @@ def test_registered_work_reserves_budget_for_dynamic_discovery(setup):
     _, summary = setup.feed.collect()
     assert summary["mapped"] == 1
     assert summary["listener_observed"] == 1
+
+
+def test_feed_asks_only_for_its_own_hosts_services(setup):
+    setup.feed.collect()
+    assert setup.client.service_routes == ["/api/v1/services?host_id=host"]
