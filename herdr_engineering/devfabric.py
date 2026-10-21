@@ -14,7 +14,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from .contracts import DevServiceLease
+from .contracts import DevServiceLease, Route
 from .errors import ConflictError
 
 _LO = 18000
@@ -60,6 +60,25 @@ def _os_port_free(port: int) -> bool:
         return True
     finally:
         s.close()
+
+
+def _route_key(r):
+    """(prefix, host, port) for a Route object or a raw route dict."""
+    if isinstance(r, dict):
+        return (r.get("prefix"), r.get("host"), r.get("port"))
+    return (getattr(r, "prefix", None), getattr(r, "host", None),
+            getattr(r, "port", None))
+
+
+def _routes_equal(a, b) -> bool:
+    """Order-insensitive route-list comparison (Route objects and/or dicts)."""
+    return sorted(_route_key(r) for r in (a or [])) == \
+        sorted(_route_key(r) for r in (b or []))
+
+
+def _normalize_routes(routes):
+    """Route objects or raw dicts (gateway registers pass dicts) -> [Route]."""
+    return [Route(**r) if isinstance(r, dict) else r for r in (routes or [])]
 
 
 def _parse_leases(data: dict) -> dict[str, DevServiceLease]:
@@ -201,6 +220,30 @@ class DevServiceRegistry:
 
     def _write_store(self) -> None:
         try:
+            # Cross-process guard (#89): if another process wrote the store
+            # since this instance last loaded it, merge their leases in
+            # BEFORE replacing the file. Per-lease last-write-wins by
+            # renewed_at (ties keep ours: the caller just changed it), so
+            # one process's persist can no longer clobber a lease another
+            # process just wrote (the whole-record rewrite race).
+            try:
+                mtime = self._path.stat().st_mtime
+            except OSError:
+                mtime = None
+            if (mtime is not None and self._loaded_mtime is not None
+                    and mtime != self._loaded_mtime):
+                try:
+                    external = _parse_leases(json.loads(self._path.read_text()))
+                except Exception:
+                    external = {}
+                for lid, ext in external.items():
+                    ours = self._leases.get(lid)
+                    if ours is None:
+                        self._leases[lid] = ext
+                    elif _parse_time(ext.renewed_at or ext.created_at) > \
+                            _parse_time(ours.renewed_at or ours.created_at):
+                        self._leases[lid] = ext
+                self._loaded_mtime = mtime
             payload = {"leases": [lease.to_dict() for lease in self._leases.values()]}
             tmp = self._path.with_suffix(".tmp")
             # Compact JSON (no indent) keeps the store small and the serialization
@@ -274,6 +317,12 @@ class DevServiceRegistry:
                 lease = self._leases[lease_id]
                 lease.renewed_at = now
                 lease.state = "active"
+                # Route drift on a stable lease id: apply IN PLACE (same id,
+                # same port) so a re-enroll with changed routes takes effect
+                # on the gateway too instead of silently keeping the stale
+                # routes (#90).
+                if routes is not None and not _routes_equal(lease.routes, routes):
+                    lease.routes = _normalize_routes(routes)
                 self._persist()
                 return lease
             # Port-matching is on by default: prefer target_port unless the
@@ -297,15 +346,48 @@ class DevServiceRegistry:
             self._persist()
             return lease
 
-    def heartbeat(self, lease_id: str) -> DevServiceLease | None:
+    def heartbeat(self, lease_id: str,
+                  expected_renewed_at: str | None = None) -> DevServiceLease | None:
+        """Renew a lease. With ``expected_renewed_at``, the renewal is issued
+        against a base the caller previously observed: if the record moved
+        under the caller (another process renewed or re-registered it), the
+        stale-base renewal is REFUSED — renewing from the old base would
+        clobber the newer state; the caller retries from a fresh read (#89)."""
         with self._lock:
             lease = self._leases.get(lease_id)
             if lease is None:
                 return None
+            if (expected_renewed_at is not None
+                    and lease.renewed_at != expected_renewed_at):
+                _log_devfabric("herdr.devfabric", "warning",
+                               "heartbeat for %s issued against a stale base "
+                               "(observed renewed_at %s, record has %s); "
+                               "skipped to avoid clobbering the newer state",
+                               lease_id, expected_renewed_at, lease.renewed_at)
+                return lease
             if lease.state in ("expired", "failed"):
                 lease.state = "active"
             lease.renewed_at = _now_iso()
             lease.expires_at = _add_seconds(lease.renewed_at, self._ttl)
+            self._persist()
+            return lease
+
+    def update_routes(self, lease_id: str, routes: list) -> DevServiceLease | None:
+        """Update a lease's routes IN PLACE: same lease id, same external
+        port, persisted (#90).
+
+        Replaces the close+re-register churn (fresh port allocation — which
+        can land somewhere else when the old forwarder still OS-binds the
+        preferred port — plus a forwarder restart and a stale printed
+        origin). A running OriginEdge reads ``lease.routes`` per connection,
+        so the change takes effect without a restart. Returns the updated
+        lease, or None if the id is unknown.
+        """
+        with self._lock:
+            lease = self._leases.get(lease_id)
+            if lease is None:
+                return None
+            lease.routes = _normalize_routes(routes)
             self._persist()
             return lease
 
