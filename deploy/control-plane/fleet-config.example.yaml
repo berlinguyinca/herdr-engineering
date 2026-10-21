@@ -15,9 +15,21 @@ sections:
         "REDACTED_INGEST": ingest   # the same value as ingest.api_key below
         "REDACTED_AGENT": agent     # the same value as agent.api_key below (ingest + LLM keys + reviews)
       rustfs_endpoint: "http://rustfs:9000"
-      rustfs_access_key: "REDACTED"
-      rustfs_secret_key: "REDACTED"
+      minio_user: "REDACTED"        # the object store's access key (what the web reads)
+      minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
+      ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # Variables docker compose itself substitutes; deploy.sh renders exactly this
+      # mapping into a transient 0600 env file. All keys below are required.
+      compose:
+        HERDR_CP_PG_USER: "REDACTED"          # same user as in pg_dsn
+        HERDR_CP_PG_PASSWORD: "REDACTED"      # same password as in pg_dsn
+        HERDR_CP_MINIO_USER: "REDACTED"       # same as minio_user
+        HERDR_CP_MINIO_PASSWORD: "REDACTED"   # same as minio_password
+        HERDR_CP_WEB_BIND: "127.0.0.1"        # tailnet IP to expose on dev.lan
+        HERDR_CP_WEB_PUBLIC_PORT: "80"
+        HERDR_CP_PG_PORT: "5432"              # loopback host port of postgres
+        GATEWAY_TAILNET_IP: "127.0.0.1"       # `tailscale ip -4`; 127.0.0.1 = loopback only
 
   llm:
     roles: [builder]

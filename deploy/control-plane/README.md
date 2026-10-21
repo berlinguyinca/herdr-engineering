@@ -44,7 +44,7 @@ herdr-eng fleet config init
 # 2) deploy: validates the file, renders the variables docker compose itself needs
 #    (image passwords, ports, bind address) into a transient 0600 file that is removed
 #    on exit, builds the image from a git ref, and recreates control-plane-web
-deploy/control-plane/deploy.sh --dry-run        # validate and print the plan
+deploy/control-plane/deploy.sh --dry-run        # validate, render to a temp dir, `docker compose config -q`
 deploy/control-plane/deploy.sh                  # --ref, --no-fetch, --fleet-config PATH
 
 # apply migrations / run one pass from the host (needs asyncpg + reachable db; the DSN
@@ -66,11 +66,13 @@ Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
 `sensitive_role`, `store_reasoning`) and `llm_proxy` (`max_inflight`,
 `queue_wait_seconds`). `control_plane.compose` is the mapping `deploy.sh` renders
 for compose itself (e.g. `HERDR_CP_WEB_BIND`, `HERDR_CP_WEB_PUBLIC_PORT`,
-`HERDR_CP_PG_PORT`, `GATEWAY_TAILNET_IP`).
+`HERDR_CP_PG_PORT`, `GATEWAY_TAILNET_IP`; all eight are required and `fleet config
+validate` names any that are missing). `fleet config init` asks for the gateway tailnet
+IP, defaulting to `tailscale ip -4`.
 
-Note: the file is bind-mounted, so an edit that replaces it (every `fleet join` or
-`fleet config token` does) is visible to the containers only after the next
-`deploy.sh` run.
+The file is bind-mounted as a single file, so the tools that edit it (`fleet join`,
+`fleet config token`) write it in place (same inode, after a dated backup); the
+containers see the update at once.
 
 ## Web UI + API (`control-plane-web` service)
 

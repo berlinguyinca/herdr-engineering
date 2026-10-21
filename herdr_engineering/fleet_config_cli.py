@@ -68,6 +68,25 @@ def write_private_file(path: Path, data: str | bytes, *, exclusive: bool = False
         raise
 
 
+def write_in_place(path: Path, data: str | bytes) -> None:
+    """Replace the content of an existing file WITHOUT changing its inode, so a
+    single-file bind mount of it (the control-plane container) sees the update.
+    Mode is forced to 0600. A reader may briefly see a torn file; the fleet-config
+    store keeps its last good copy in that case."""
+    raw = data.encode() if isinstance(data, str) else data
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        view = memoryview(raw)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 # --------------------------------------------------------------------------
 # tokens
 # --------------------------------------------------------------------------
@@ -96,8 +115,19 @@ def _compose_scalar(key: str, value: Any) -> str:
     raise FleetConfigError(f"control_plane.compose.{key}: value must be a string, number or bool")
 
 
+# Every variable compose.yaml substitutes with no default (or that deploy.sh reads).
+# Extra names are allowed (e.g. HERDR_LLM_PROXY_PORT); these must be present.
+COMPOSE_REQUIRED = ("HERDR_CP_PG_USER", "HERDR_CP_PG_PASSWORD", "HERDR_CP_MINIO_USER",
+                    "HERDR_CP_MINIO_PASSWORD", "HERDR_CP_WEB_BIND", "HERDR_CP_WEB_PUBLIC_PORT",
+                    "HERDR_CP_PG_PORT", "GATEWAY_TAILNET_IP")
+LOOPBACK = "127.0.0.1"
+
+
 def compose_env(cfg: FleetConfig) -> dict[str, str]:
-    """Validated ``control_plane.compose`` mapping (names and stringified values)."""
+    """Validated ``control_plane.compose`` mapping (names and stringified values).
+
+    Also derives GATEWAY_BIND (the gateway's --bind list): loopback plus the tailnet
+    address, or just loopback when they are the same, so no duplicate bind is emitted."""
     try:
         values = cfg.section(CONTROL_PLANE_SECTION)
     except FleetConfigError:
@@ -110,6 +140,11 @@ def compose_env(cfg: FleetConfig) -> dict[str, str]:
         if not isinstance(key, str) or not _ENV_NAME.match(key):
             raise FleetConfigError(f"control_plane.compose: {key!r} is not a valid environment variable name")
         out[key] = _compose_scalar(key, value)
+    missing = [k for k in COMPOSE_REQUIRED if not out.get(k)]
+    if missing:
+        raise FleetConfigError("control_plane.compose is missing required keys: " + ", ".join(missing))
+    ip = out["GATEWAY_TAILNET_IP"]
+    out["GATEWAY_BIND"] = LOOPBACK if ip == LOOPBACK else f"{LOOPBACK},{ip}"
     return out
 
 
@@ -154,6 +189,16 @@ def _ask(answers: dict, key: str, label: str, prompt: Callable, secret_prompt: C
     return reply
 
 
+def _tailscale_ip() -> str | None:
+    """First line of `tailscale ip -4`, or None when tailscale is absent or fails."""
+    try:
+        proc = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = proc.stdout.strip().splitlines() if proc.returncode == 0 else []
+    return lines[0].strip() or None if lines else None
+
+
 def _collect_hosts(answers: dict, prompt: Callable) -> dict[str, list[str]]:
     raw = answers.get("hosts")
     hosts: dict[str, list[str]] = {}
@@ -191,8 +236,10 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     web_bind = ask("web_bind", "web bind address", default="127.0.0.1")
     web_port = ask("web_port", "web public port", default="80")
     pg_port = str(a.get("pg_port") or "5432")
-    # fabric-gateway (host network) binds this address; compose requires it to be set.
-    gateway_ip = str(a.get("gateway_tailnet_ip") or "127.0.0.1")
+    # fabric-gateway (host network) binds this address: default to this machine's
+    # tailnet IP when tailscale answers, otherwise the operator must say.
+    gateway_ip = ask("gateway_tailnet_ip", "gateway tailnet IP (127.0.0.1 = loopback only)",
+                     default=_tailscale_ip())
     hosts = _collect_hosts(a, prompt)
 
     pg_user, pg_pass = f"herdr_{secrets.token_hex(4)}", secrets.token_hex(16)
@@ -224,11 +271,6 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
                     "HERDR_CP_WEB_PUBLIC_PORT": web_port,
                     "HERDR_CP_PG_PORT": pg_port,
                     "GATEWAY_TAILNET_IP": gateway_ip,
-                    "HERDR_CP_PG_DSN": dsn,
-                    "HERDR_CP_RUSTFS_BUCKET": bucket,
-                    "HERDR_CP_HOST_ALIASES": str(a.get("host_aliases") or ""),
-                    "FABRIC_LLM_UPSTREAM_KEY": llm_key,
-                    "HERDR_ENGINEERING_CI_URL": ci_url,
                 },
             }},
             "ingest": {"roles": ["all"], "values": {"api_key": ingest_key}},
@@ -255,14 +297,9 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
 # --------------------------------------------------------------------------
 
 def validate_config(path: Path) -> dict:
-    """Load, check compose renderability if a compose map exists. No values."""
+    """Load and require a renderable control_plane.compose map. Names only, no values."""
     cfg = load_fleet_config(_expand(path))
-    try:
-        has_compose = bool(cfg.section(CONTROL_PLANE_SECTION).get("compose"))
-    except FleetConfigError:
-        has_compose = False
-    if has_compose:
-        compose_env(cfg)
+    compose_env(cfg)
     return {"revision": cfg.revision, "hosts": len(cfg.status()["hosts"])}
 
 
@@ -300,7 +337,7 @@ def _backup(path: Path) -> Path | None:
 
 
 def set_host(path: Path, host_id: str, token_sha256: str, roles: list[str] | None = None) -> None:
-    """Add or replace ``host_id``'s hash in the file (backup first, validated, atomic)."""
+    """Add or replace ``host_id``'s hash in the file (backup first, validated, written in place so the inode survives)."""
     path = _expand(path)
     lock = path.with_name(path.name + ".lock")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -316,7 +353,7 @@ def set_host(path: Path, host_id: str, token_sha256: str, roles: list[str] | Non
         hosts[host_id] = entry
         _parse(data)
         _backup(path)
-        write_private_file(path, yaml.safe_dump(data, sort_keys=False))
+        write_in_place(path, yaml.safe_dump(data, sort_keys=False))
 
 
 def issue_host_credentials(config_path: Path, host_id: str, target: str, *,
