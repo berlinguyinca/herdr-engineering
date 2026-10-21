@@ -138,7 +138,10 @@ def _parse(data: Any) -> FleetConfig:
         if not isinstance(overrides, dict) or not all(isinstance(v, dict) for v in overrides.values()):
             raise FleetConfigError(f"host {host_id}: overrides must map section names to mappings")
         hosts[host_id] = {"roles": roles, "token_sha256": digest, "overrides": overrides}
-    return FleetConfig(sections, hosts)
+    try:
+        return FleetConfig(sections, hosts)
+    except (TypeError, ValueError):
+        raise FleetConfigError("values must be JSON-serializable") from None
 
 
 def load_fleet_config(path: Path) -> FleetConfig:
