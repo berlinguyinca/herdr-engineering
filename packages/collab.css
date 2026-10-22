@@ -265,3 +265,13 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-agentcard .hd-card__sub { line-height: 1.35; }
 .cx-event { background: var(--surface-2); border: 1px solid var(--border-subtle); }
 @media (prefers-reduced-motion: reduce) { .hd-card, .hd-btn, .cx-list li { transition: none; } .hd-grid > .hd-card:hover { transform: none; } }
+
+/* the dashboard stacks every adjacent card with a top margin; inside a grid or column set the grid's gap does that */
+.cx-cols > .hd-card, .hd-grid > .hd-card, .cx-stack > .hd-card { margin: 0; }
+.cx-ntitle { flex-wrap: nowrap; }
+.cx-ntitle .cx-nname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.cx-agentrow { display: grid !important; grid-template-columns: minmax(0, 1fr) auto; }
+.cx-agentrow .cx-pills { grid-column: 1; }
+.cx-agentrow > button { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
+.cx-agentrow .grow { grid-column: 1; }
+.cx-section h3, .cx-section h4 { margin: 18px 0 8px; }
