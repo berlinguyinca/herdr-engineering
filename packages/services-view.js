@@ -150,7 +150,7 @@ export function renderServiceDetails(s) {
     <p><strong>${stateLabel(s)}</strong> · ${esc(serviceReason(s))} Last report <span data-service-age>${esc(lastSeen(s))}</span>.</p>
     ${s.lifecycle?.archived ? '<p class="sc-intro">Archived services are hidden from the current catalog. A healthy report restores this service automatically; its history is retained.</p>' : ''}
     <dl class="sc-detail">${fields.map(([k,v])=>`<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>
-    <p>${endpoint(s)}</p>${reportedText(s.session_id) ? `<p><a data-owning-session href="#/herd/session/${esc(encodeURIComponent(s.session_id))}">Owning session →</a></p>` : ''}`;
+    <p>${endpoint(s)}</p>${reportedText(s.session_id) ? `<p><a data-owning-session href="#/herd/session/${esc(encodeURIComponent(s.session_id))}">Owning agent →</a></p>` : ''}`;
 }
 
 // Keep an open detail page honest even when the provider stops updating.

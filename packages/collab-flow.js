@@ -99,13 +99,13 @@ export function renderFlow(box, flow, { onNode, onEdge, prev = new Map() } = {})
     const live = n.fabric && n.fabric.status === 'active';
     const gone = n.status === 'removed';
     const sub = n.kind === 'agent' ? `${n.family || ''}${n.group ? ` · ${n.group}` : ''}${n.fabric ? ` · ${n.fabric.host || 'fabric'}` : ''}` : (n.role || '');
-    return `<g class="cx-flow-node${gone ? ' cx-flow-node--gone' : ''}" data-node="${esc(n.id)}" transform="translate(${n.x},${n.y})" tabindex="0" role="button" aria-label="${esc(n.name)}">
+    return `<g class="cx-flow-node${gone ? ' cx-flow-node--gone' : ''}" data-node="${esc(n.id)}" transform="translate(${n.x},${n.y})" tabindex="0" role="button" aria-label="${esc(n.fabric?.display_name || n.name)}">
       <rect width="${n.w}" height="${n.h}" rx="8" class="cx-flow-box"/>
       <circle cx="12" cy="${n.h / 2}" r="5" fill="${fam}"/>
-      ${n.kind === 'agent' && n.fabric ? `<circle cx="${n.w - 12}" cy="10" r="4" fill="${live ? 'var(--status-ok, #1a9b6c)' : 'var(--text-muted, #888)'}"><title>fabric session ${esc(n.fabric.status || '')}</title></circle>` : ''}
-      <text x="24" y="14" class="cx-flow-name">${esc(clip(n.kind === 'agent' ? `@${n.name}` : n.name, 20))}</text>
+      ${n.kind === 'agent' && n.fabric ? `<circle cx="${n.w - 12}" cy="10" r="4" fill="${live ? 'var(--status-ok, #1a9b6c)' : 'var(--text-muted, #888)'}"><title>fabric agent ${esc(n.fabric.status || '')}</title></circle>` : ''}
+      <text x="24" y="14" class="cx-flow-name">${esc(clip(n.fabric?.display_name || (n.kind === 'agent' ? `@${n.name}` : n.name), 20))}</text>
       <text x="24" y="27" class="cx-flow-sub">${esc(clip(sub, 26))}</text>
-      <title>${esc(n.name)}</title></g>`;
+      <title>${esc(n.fabric?.display_name || n.name)}</title></g>`;
   }).join('');
   box.innerHTML = `<div class="cx-flow-scroll"><svg class="cx-flow" viewBox="0 0 ${lay.width} ${lay.height}" width="${lay.width}" height="${lay.height}" role="img" aria-label="Flow of tasks between people and agents">${lay.idleLabel ? `<text x="${lay.idleLabel.x}" y="${lay.idleLabel.y}" class="cx-flow-sub">${esc(lay.idleLabel.text)}</text>` : ''}${edgeSvg}${nodeSvg}</svg></div>`;
   box.querySelectorAll('[data-node]').forEach((el) => {

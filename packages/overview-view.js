@@ -41,7 +41,7 @@ export function overviewModel(data = {}, received = Date.now(), now = Date.now()
 const eventLabels = {
   MissionStarted:'Mission started', MissionEnded:'Mission finished', MissionFailed:'Mission failed',
   MissionCompleted:'Mission finished', MissionCancelled:'Mission canceled',
-  SessionStarted:'Session started', SessionTerminated:'Session stopped', SessionFailed:'Session failed',
+  SessionStarted:'Agent started', SessionTerminated:'Agent stopped', SessionFailed:'Agent failed',
   HostUnavailable:'Host unavailable', ArtifactRegistered:'Artifact saved',
   PlannotatorReviewCompleted:'Review completed', PlannotatorReviewFailed:'Review failed',
   CIPipelineFinished:'CI run finished', CIPipelineFailed:'CI run failed',
@@ -51,7 +51,7 @@ function eventLabel(event) {
   if (['MissionUpdated','MissionStageChanged','SessionUpdated'].includes(event.event_type)) {
     const payload=event.payload || {};
     const outcome=recordOutcome({...payload,status:payload.to || payload.status});
-    if (outcome === 'failed' || outcome === 'finished') return `${event.event_type.startsWith('Session') ? 'Session' : 'Mission'} reported ${outcome}`;
+    if (outcome === 'failed' || outcome === 'finished') return `${event.event_type.startsWith('Session') ? 'Agent' : 'Mission'} reported ${outcome}`;
   }
   return null;
 }
@@ -67,14 +67,14 @@ const empty = label => `<p class="ov-note">${esc(label)}</p>`;
 function availability(keys, states) {
   return keys.map(key => {
     const state = states[key];
-    const label = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Sessions',services:'Services',hosts:'Hosts',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews'}[key];
+    const label = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Agents',services:'Services',hosts:'Hosts',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews'}[key];
     if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: Could not refresh.${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
     if (!state?.loaded) return `<p class="ov-note" role="status">Loading ${esc(label.toLowerCase())}…</p>`;
     return '';
   }).join('');
 }
 function historyLinks(base, counts) {
-  return `<nav class="ov-history" aria-label="${base === 'missions' ? 'Mission' : 'Session'} history">${link(`#/${base}?tab=unconfirmed`,`${counts.unconfirmed.length} unconfirmed`)}${link(`#/${base}?tab=failed`,`${counts.failed.length} failed`)}${link(`#/${base}?tab=finished`,`${counts.finished.length} finished / closed`)}</nav>`;
+  return `<nav class="ov-history" aria-label="${base === 'missions' ? 'Mission' : 'Agent'} history">${link(`#/${base}?tab=unconfirmed`,`${counts.unconfirmed.length} unconfirmed`)}${link(`#/${base}?tab=failed`,`${counts.failed.length} failed`)}${link(`#/${base}?tab=finished`,`${counts.finished.length} finished / closed`)}</nav>`;
 }
 const SNOOZE_MS = 24 * 3600 * 1000;
 const snoozedUntil = (data, key) => (data.snoozed instanceof Map ? data.snoozed.get(key) : 0) || 0;
@@ -101,11 +101,11 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   }
   if (section === 'sessions') {
     const s = model.sessions;
-    return `<div class="ov-heading"><h2>Sessions</h2>${link('#/herd','All sessions →')}</div>${availability(['sessions'],states)}${states.sessions?.loaded ? `
-      <div class="ov-metrics">${metric(s.current.length,'Recently reported sessions','#/herd?tab=current')}</div>
-      <p class="ov-note">Open sessions reported in the last 15 minutes. Older reports are available in Unconfirmed.</p>
-      ${s.current.length ? `<ul class="ov-list">${s.current.slice(0,5).map(session=>`<li class="ov-row"><div>${link(`#/herd/session/${encodeURIComponent(session.session_id)}`,short(session.title || session.summary || session.agent_role || 'Agent session'))}<p>${esc(short(session.cwd || session.branch || session.model || 'Workspace not reported'))}</p></div><span class="ov-tag">Last reported ${esc(human(session.status) || 'unknown')}<br>${esc(session.host_id || 'Host unknown')} · ${ageMarkup(session.last_activity || session.updated_at,now)}</span></li>`).join('')}</ul>` : empty('No recently reported open sessions.')}
-      ${s.current.length > 5 ? empty(`Showing 5 of ${s.current.length} current sessions.`) : ''}${historyLinks('herd',s)}` : ''}`;
+    return `<div class="ov-heading"><h2>Agents</h2>${link('#/herd','All agents →')}</div>${availability(['sessions'],states)}${states.sessions?.loaded ? `
+      <div class="ov-metrics">${metric(s.current.length,'Recently reported agents','#/herd?tab=current')}</div>
+      <p class="ov-note">Open agents reported in the last 15 minutes. Older reports are available in Unconfirmed.</p>
+      ${s.current.length ? `<ul class="ov-list">${s.current.slice(0,5).map(session=>`<li class="ov-row"><div>${link(`#/herd/session/${encodeURIComponent(session.session_id)}`,short(session.display_name || session.title || session.summary || session.agent_role || 'Agent'))}<p>${esc(short(session.cwd || session.branch || session.model || 'Workspace not reported'))}</p></div><span class="ov-tag">Last reported ${esc(human(session.status) || 'unknown')}<br>${esc(session.host_id || 'Host unknown')} · ${ageMarkup(session.last_activity || session.updated_at,now)}</span></li>`).join('')}</ul>` : empty('No recently reported open agents.')}
+      ${s.current.length > 5 ? empty(`Showing 5 of ${s.current.length} current agents.`) : ''}${historyLinks('herd',s)}` : ''}`;
   }
   if (section === 'ci' || section === 'reviews') {
     const isCi=section==='ci', snapshot=data[section], entries=integrationEntries(snapshot,section);

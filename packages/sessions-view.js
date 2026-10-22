@@ -33,9 +33,9 @@ export function sessionEntries(sessions, missions=[], now=Date.now()) {
   return records(sessions).filter(s=>text(s.session_id)).map(record=> {
     const project=text(record.cwd).split(/[\\/]/).filter(Boolean).at(-1) || 'Project not reported';
     const mission=associatedMission(record,available);
-    const id=record.session_id, host=text(record.host_id), role=text(record.agent_role)||'Agent session';
+    const id=record.session_id, host=text(record.host_id), role=text(record.display_name)||text(record.agent_role)||'Agent';
     return {record,id,host,role,project,mission,tab:recordVisibility(record,now),
-      search:[id,host,role,project,text(record.cwd),text(record.branch),text(record.model),text(record.summary),
+      search:[id,host,role,text(record.agent_handle),text(record.agent_role),project,text(record.cwd),text(record.branch),text(record.model),text(record.summary),
         text(record.status),text(record.mission_id),mission?.title].filter(Boolean).join(' ').toLocaleLowerCase()};
   }).sort((a,b)=> {
     const stamp=s=>Number.isFinite(Date.parse(s.record.updated_at)) ? Date.parse(s.record.updated_at) : 0;
@@ -62,7 +62,7 @@ export function compactSessionRow(entry,now=Date.now()) {
   return `<article class="ss-row" data-session-id="${esc(entry.id)}">
     <div class="ss-main"><a class="ss-title" data-session-link href="#/herd/session/${esc(encodeURIComponent(entry.id))}">${esc(short(entry.role,70))} · ${esc(short(entry.project,80))}</a>
       <p class="ss-summary">${esc(short(s.summary)||'Activity not reported.')}</p>
-      ${entry.mission ? `<p class="ss-meta">Mission: <a data-mission-link href="#/missions/${esc(encodeURIComponent(entry.mission.key))}">${esc(short(entry.mission.title,130))}</a></p>` : text(s.mission_id) ? '<p class="ss-meta">Mission association not resolved; see session details.</p>' : ''}
+      ${entry.mission ? `<p class="ss-meta">Mission: <a data-mission-link href="#/missions/${esc(encodeURIComponent(entry.mission.key))}">${esc(short(entry.mission.title,130))}</a></p>` : text(s.mission_id) ? '<p class="ss-meta">Mission association not resolved; see agent details.</p>' : ''}
       <p class="ss-meta">${esc(short(entry.id,64))}${text(s.branch) ? ` · Branch ${esc(short(s.branch,70))}` : ''}</p>
     </div>
     <div class="ss-state"><strong data-report>${esc(sessionReport(s,now))}</strong><span>${esc(short(entry.host,90)||'Host not reported')}</span>${text(s.model) ? `
@@ -83,13 +83,13 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   const pageSize=20;
   let disposed=false,sessions=[],missions=[],loaded=false,sessionError='',missionError='',lastSignature='',hostSignature='';
   let sessionRequest=null,missionRequest=null;
-  container.innerHTML=`${styles}<h1>Sessions</h1>
-    <p class="ss-intro">Find an agent by project, host or model. Current shows open sessions reported in the last 15 minutes. Older or missing reports move to Unconfirmed automatically; Failed and Finished retain previous work.</p>
-    <div class="ss-tabs" role="tablist" aria-label="Session outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
-    <div class="ss-controls"><label class="ss-search">Search sessions<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
+  container.innerHTML=`${styles}<h1>Agents</h1>
+    <p class="ss-intro">Find an agent by project, host or model. Current shows open agents reported in the last 15 minutes. Older or missing reports move to Unconfirmed automatically; Failed and Finished retain previous work.</p>
+    <div class="ss-tabs" role="tablist" aria-label="Agent outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
+    <div class="ss-controls"><label class="ss-search">Search agents<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
       <label>Host<select id="ss-host"><option value="">All hosts</option></select></label>
       <label>Group by<select id="ss-group"><option value="project">Project folder</option><option value="none">Recent reports</option></select></label></div>
-    <p class="ss-meta" id="ss-result" role="status">Loading sessions…</p><p class="ss-meta" id="ss-error" role="status"></p>
+    <p class="ss-meta" id="ss-result" role="status">Loading agents…</p><p class="ss-meta" id="ss-error" role="status"></p>
     ${tabs.map(([key])=>`<section id="ss-panel-${key}" role="tabpanel" aria-labelledby="ss-tab-${key}" ${state.tab===key?'':'hidden'}></section>`).join('')}
     <div class="ss-pages"><button type="button" class="hd-btn" id="ss-previous">Previous</button><span id="ss-page"></span><button type="button" class="hd-btn" id="ss-next">Next</button></div>`;
   const el=id=>container.querySelector(`#ss-${id}`);
@@ -119,9 +119,9 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     const visible=selected.slice(state.page*pageSize,(state.page+1)*pageSize),groups=new Map();
     for(const entry of visible){const label=state.group==='project'?entry.project:'Recent reports';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(entry);}
     el(`panel-${state.tab}`).innerHTML=visible.length ? [...groups].map(([name,rows])=>`<div class="ss-group"><h2>${esc(name)}</h2>${rows.map(e=>compactSessionRow(e)).join('')}</div>`).join('')
-      : `<p class="ss-empty">${loaded?'No sessions match this tab and these filters.':'Loading sessions…'}</p>`;
+      : `<p class="ss-empty">${loaded?'No agents match this tab and these filters.':'Loading agents…'}</p>`;
     const noModel=loaded && selected.length>0 && !selected.some(e=>text(e.record.model));
-    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} sessions${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these sessions report which model they use':''}` : 'Loading sessions…';
+    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} agents${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these agents report which model they use':''}` : 'Loading agents…';
     el('page').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`;
     el('previous').disabled=state.page===0;el('next').disabled=(state.page+1)*pageSize>=selected.length;
     if(focusId){
@@ -151,7 +151,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
       if(!Array.isArray(data?.[kind]))throw new Error('Invalid response');
       if(kind==='sessions'){sessions=records(data.sessions);loaded=true;sessionError='';}else{missions=records(data.missions);missionError='';}
     } catch {
-      if(!disposed&&!document.hidden){if(kind==='sessions')sessionError=loaded?'Session updates unavailable. Showing last received records.':'Sessions could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}
+      if(!disposed&&!document.hidden){if(kind==='sessions')sessionError=loaded?'Agent updates unavailable. Showing last received records.':'Agents could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}
     } finally {
       clearTimeout(timeout);
       if(kind==='sessions')sessionRequest=null;else missionRequest=null;

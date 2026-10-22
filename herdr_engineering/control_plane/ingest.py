@@ -60,7 +60,7 @@ class IngestService:
 
         # Provider-owned observations and review outcomes have dedicated,
         # authenticated adapters; generic telemetry cannot forge those streams.
-        if entity_type in {"plannotator_review", "ci_pipeline"}:
+        if entity_type in {"plannotator_review", "ci_pipeline", "agent_identity", "agent_summary"}:
             raise ValueError("provider-owned entity type is not accepted by generic ingestion")
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":

@@ -2403,6 +2403,7 @@ def _cmd_cp_web(args) -> int:
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
+                             summary_config=cp.get("agent_summaries") or {},
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,

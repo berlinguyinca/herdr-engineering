@@ -10,7 +10,7 @@ const text=value=>typeof value==='string'?value.trim():'';
 const records=value=>Array.isArray(value)?value.filter(v=>v && typeof v==='object' && !Array.isArray(v)):[];
 const short=(value,length=150)=>text(value).replace(/\s+/g,' ').slice(0,length);
 const human=value=>text(value).toLowerCase().replaceAll('_',' ');
-const TYPES={service:'Services',session:'Sessions',mission:'Missions',ci:'CI runs'};
+const TYPES={service:'Services',session:'Agents',mission:'Missions',ci:'CI runs'};
 const TABS=[['current','Current'],['unconfirmed','Unconfirmed'],['history','History'],['all','All records']];
 const history=new Set(['failed','finished','unavailable','archived']);
 const visible=outcome=>history.has(outcome)?'history':outcome==='current'?'current':'unconfirmed';
@@ -32,7 +32,7 @@ export function topologyEntries(data={},received={},now=Date.now()) {
   for(const s of records(data.sessions)) {
     if(!text(s.session_id))continue;
     const outcome=recordVisibility(s,now);
-    result.push(entry(s,'session',s.session_id,{outcome,visibility:visible(outcome),title:short(s.title||s.summary)||`${text(s.agent_role)||'Agent'} session`,status:outcome==='unconfirmed'?`Unconfirmed · last reported ${human(s.status)||'unknown'}`:`Last reported ${human(s.status)||outcome}`,stamp:s.last_seen_at||s.updated_at,href:`#/herd/session/${encodeURIComponent(s.session_id)}`}));
+    result.push(entry(s,'session',s.session_id,{outcome,visibility:visible(outcome),title:short(s.display_name||s.title||s.summary)||text(s.agent_role)||'Agent',status:outcome==='unconfirmed'?`Unconfirmed · last reported ${human(s.status)||'unknown'}`:`Last reported ${human(s.status)||outcome}`,stamp:s.last_seen_at||s.updated_at,href:`#/herd/session/${encodeURIComponent(s.session_id)}`}));
   }
   for(const m of missionEntries(data.projections,data.missions,received.projections||now,now)) {
     const record={...(m.recorded||{}),...(m.projection?.mission||{}),host_id:m.host};
@@ -80,7 +80,7 @@ export function topologyRow(row,now=Date.now()) {
   const r=row.record;
   const context=row.type==='service'?[row.categoryLabel,text(r.owner)&&`Process: ${r.owner}`,r.catalog?.source_port!=null?`Source :${r.catalog.source_port}`:null,r.port!=null?`${(r.catalog?.endpoint_scope==='local_only'||r.endpoint_scope==='local_only')?'Observed':'Exposed'} :${r.port}`:null,(r.catalog?.endpoint_scope==='local_only'||r.endpoint_scope==='local_only')?'Local only':null].filter(Boolean).join(' · '):row.type==='session'?[r.agent_role,r.branch,r.model].filter(Boolean).join(' · '):row.description;
   const workspace=row.type==='service'?text(r.catalog?.project):row.type==='session'?text(r.cwd):'';
-  const source=row.type==='service'?text(r.catalog?.project_source):'session cwd';
+  const source=row.type==='service'?text(r.catalog?.project_source):'agent cwd';
   return `<article class="tx-row" data-topology-entry="${esc(row.id)}"><div class="tx-main"><a data-entry-link href="${esc(row.href)}">${esc(short(row.title))}</a>${context?`<p>${esc(short(context,220))}</p>`:''}${workspace?`<p class="tx-context">Workspace: ${esc(short(workspace))}${source?` · ${esc(source)}`:''}</p>`:''}<div class="tx-links">${row.host?`<span>${esc(row.host)}</span>`:''}${row.endpoint?`<a href="${esc(row.endpoint)}" target="_blank" rel="noopener noreferrer">${row.type==='ci'?'Upstream run':'Open endpoint'} ↗</a>`:''}</div></div><div class="tx-state"><strong class="${row.attention?'tx-warning':''}">${esc(row.status)}</strong><span>Report ${age(row.stamp,now)}</span></div></article>`;
 }
 const counts=entries=>Object.keys(TYPES).map(type=>[type,entries.filter(e=>e.type===type).length]).filter(([,n])=>n);
@@ -98,12 +98,12 @@ export function mountTopology(container,client,{status='current'}={}) {
   let disposed=false,clock=null,lastSignature='',hostSignature='';
   const data={},received={},sourceStates={},requests=new Map(),timers=new Map(),opened=new Map(),limits=new Map();
   const listeners=new AbortController();
-  const sources={hosts:{label:'Hosts',field:'hosts',read:signal=>client.listHosts({signal})},sessions:{label:'Sessions',field:'sessions',read:signal=>client.listSessions(undefined,{signal})},services:{label:'Services',field:'services',read:signal=>client.listServices({signal})},missions:{label:'Recorded missions',field:'missions',read:signal=>client.listMissions(undefined,{signal})},projections:{label:'Live missions',field:'activities',read:signal=>client.listMissionActivity({signal})},ci:{label:'CI',read:signal=>client.getCi({signal})}};
+  const sources={hosts:{label:'Hosts',field:'hosts',read:signal=>client.listHosts({signal})},sessions:{label:'Agents',field:'sessions',read:signal=>client.listSessions(undefined,{signal})},services:{label:'Services',field:'services',read:signal=>client.listServices({signal})},missions:{label:'Recorded missions',field:'missions',read:signal=>client.listMissions(undefined,{signal})},projections:{label:'Live missions',field:'activities',read:signal=>client.listMissionActivity({signal})},ci:{label:'CI',read:signal=>client.getCi({signal})}};
   container.innerHTML=`${styles}<h1>Topology</h1><p class="tx-intro">Explore current work and services started through HerdR by host or confirmed project identity. Expand a group to inspect its records. Stopped, finished and unconfirmed records remain in their own views.</p><div data-tx-metrics class="tx-metrics"></div>
     <div class="tx-tabs" role="tablist" aria-label="Topology visibility">${TABS.map(([key,label])=>`<button type="button" id="tx-tab-${key}" role="tab" data-tx-tab="${key}" aria-controls="tx-results" aria-selected="${key===state.status}" tabindex="${key===state.status?0:-1}">${label}<small data-tab-count="${key}">…</small></button>`).join('')}</div>
     <div class="tx-controls"><label>Search topology<input type="search" data-tx-search placeholder="Service, project, agent, repository or host"></label><label>Group by<select data-tx-group><option value="host">Host</option><option value="project">Project / repository</option></select></label><label>Type<select data-tx-type><option value="">All types</option>${Object.entries(TYPES).map(([key,label])=>`<option value="${key}">${label}</option>`).join('')}</select></label><label>Host<select data-tx-host><option value="">All hosts</option></select></label></div>
     <div class="tx-toolbar"><p class="tx-note" data-tx-result role="status">Loading observations…</p><button type="button" class="hd-btn" data-tx-collapse>Collapse groups</button></div><div class="tx-feedback" data-tx-feedback role="status"></div><p class="tx-note" data-tx-policy></p><section id="tx-results" role="tabpanel" aria-labelledby="tx-tab-current"></section><div data-tx-more-groups></div>
-    <nav class="tx-footer" aria-label="Detailed catalogs"><a href="#/hosts">Hosts</a><a href="#/services">HerdR services</a><a href="#/system-services">System services</a><a href="#/herd">Sessions</a><a href="#/missions">Missions</a><a href="#/ci">CI</a><a href="#/reviews">Reviews</a></nav><p class="tx-note">Reports refresh independently every 5 seconds. A recent report does not prove a process is currently running.</p>`;
+    <nav class="tx-footer" aria-label="Detailed catalogs"><a href="#/hosts">Hosts</a><a href="#/services">HerdR services</a><a href="#/system-services">System services</a><a href="#/herd">Agents</a><a href="#/missions">Missions</a><a href="#/ci">CI</a><a href="#/reviews">Reviews</a></nav><p class="tx-note">Reports refresh independently every 5 seconds. A recent report does not prove a process is currently running.</p>`;
   const el=selector=>container.querySelector(selector);
   const allEntries=()=>topologyEntries(data,received);
   const isOpen=(key,otherwise=false)=>opened.has(key)?opened.get(key):otherwise;
