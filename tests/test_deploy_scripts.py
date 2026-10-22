@@ -425,12 +425,22 @@ def _seed_previous(e, commit, extra=None):
     return full, tag
 
 
+def _layout_commit():
+    """Oldest commit whose compose.yaml has the current deploy-layout marker: a valid
+    automatic-rollback target that differs from HEAD (the commit being deployed)."""
+    first = _git("log", "--format=%H", "-S", "x-herdr-deploy-layout: 2", "--",
+                 "deploy/control-plane/compose.yaml").splitlines()[-1]
+    if first == _git("rev-parse", "HEAD"):
+        pytest.skip("HEAD introduced the layout marker; no older layout-2 commit to roll back to")
+    return first
+
+
 def _worktrees():
     return _git("worktree", "list", "--porcelain")
 
 
 def test_forward_compose_failure_rolls_back_with_the_previous_commits_files(env):
-    prev_full, prev_tag = _seed_previous(env, "HEAD~1")
+    prev_full, prev_tag = _seed_previous(env, _layout_commit())
     env["env"]["FAIL_COMPOSE_TAGS"] = _head()
     r = deploy(env)
     assert r.returncode == 1, r.stderr
@@ -446,7 +456,7 @@ def test_forward_compose_failure_rolls_back_with_the_previous_commits_files(env)
 
 
 def test_unhealthy_new_commit_rolls_back_and_reports_healthy(env):
-    _, prev_tag = _seed_previous(env, "HEAD~1")
+    _, prev_tag = _seed_previous(env, _layout_commit())
     env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
     r = deploy(env)
     assert r.returncode == 1
@@ -454,7 +464,7 @@ def test_unhealthy_new_commit_rolls_back_and_reports_healthy(env):
 
 
 def test_failed_rollback_is_non_zero_and_honest(env):
-    prev_full, prev_tag = _seed_previous(env, "HEAD~1")
+    prev_full, prev_tag = _seed_previous(env, _layout_commit())
     env["env"]["FAIL_COMPOSE"] = "1"                # forward AND rollback compose fail
     r = deploy(env)
     assert r.returncode == 3
@@ -466,7 +476,7 @@ def test_failed_rollback_is_non_zero_and_honest(env):
 
 
 def test_unhealthy_rollback_is_non_zero_and_honest(env):
-    _, prev_tag = _seed_previous(env, "HEAD~1")
+    _, prev_tag = _seed_previous(env, _layout_commit())
     env["env"]["STUB_UNHEALTHY_TAGS"] = f"{_head()} {prev_tag}"
     r = deploy(env)
     assert r.returncode == 3 and "FAILED TO ROLL BACK" in r.stderr
@@ -486,13 +496,13 @@ def test_pre_feature_running_commit_gets_the_manual_recipe(env):
     env["env"]["FAIL_COMPOSE"] = "1"
     r = deploy(env)
     assert r.returncode == 1
-    assert "predates the directory-mounted central fleet config" in r.stdout + r.stderr
+    assert "predates the current deploy layout" in r.stdout + r.stderr
     assert "control-plane.env" in r.stderr and f"--ref {old_full}" in r.stderr
     assert len([ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]) == 1
 
 
 def test_success_writes_a_receipt_with_the_previous_commit_and_no_values(env):
-    prev_full, prev_tag = _seed_previous(env, "HEAD~1")
+    prev_full, prev_tag = _seed_previous(env, _layout_commit())
     r = deploy(env)
     assert r.returncode == 0, r.stderr
     receipt_path = env["home"] / f".local/state/herdr-engineering/deploys/{_head()}.json"
@@ -512,7 +522,7 @@ def _collab_ups(e):
 
 def test_changed_collab_slice_force_recreates_collab_public(env):
     _with_collab(env)
-    _seed_previous(env, "HEAD~1", {"collab_slice_sha256": "0" * 64})
+    _seed_previous(env, _layout_commit(), {"collab_slice_sha256": "0" * 64})
     collab = env["home"] / ".config/herdr-engineering/collab"
     r = deploy(env)
     assert r.returncode == 0, r.stderr
@@ -546,3 +556,22 @@ def test_link_remote_refuses_a_url_as_first_argument(env):
         assert r.returncode == 2, r.stderr
         assert "not a URL" in r.stderr
     assert not (ROOT / "http:").exists() and not list(env["home"].rglob("*cp.example.test*"))
+
+
+def test_recreated_services_have_no_relative_bind_mounts():
+    """deploy.sh runs compose from a temporary worktree: a relative bind source would
+    dangle (and be re-created empty by docker) after the worktree is removed."""
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    collab = yaml.safe_load((ROOT / "deploy/control-plane/compose.collab.yaml").read_text())
+    services = {n: doc["services"][n] for n in ("control-plane-web", "control-plane-worker", "llm-proxy")}
+    services.update(collab["services"])
+    for name, svc in services.items():
+        for vol in svc.get("volumes") or []:
+            src = vol if isinstance(vol, str) else vol.get("source", "")
+            assert not str(src).startswith("."), (name, src)
+    assert doc["x-herdr-deploy-layout"] == 2
+    worker = doc["services"]["control-plane-worker"]["command"]
+    assert worker[worker.index("--migrations") + 1] == "/app/control-plane/migrations"
+    dockerfile = (ROOT / "deploy/fabric-stack/Dockerfile").read_text()
+    assert "COPY deploy/control-plane/migrations/ ./control-plane/migrations/" in dockerfile
+    assert "COPY deploy/control-plane/config.yaml ./control-plane/config.yaml" in dockerfile

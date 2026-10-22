@@ -46,6 +46,11 @@
 # `docker compose up` by hand (the substitution variables would be missing).
 name: herdr-control-plane
 
+# Deploy layout marker: deploy.sh rolls back automatically only to a commit whose
+# compose.yaml carries this value (services it recreates have no relative bind
+# mounts and read the fleet config from mounted directories).
+x-herdr-deploy-layout: 2
+
 services:
   # ---- control plane (bridge network) -------------------------------------
   postgres:
@@ -157,19 +162,18 @@ services:
         condition: service_healthy
       rustfs:
         condition: service_healthy
+    # config.yaml defaults and the SQL migrations are baked into the image
+    # (/app/control-plane/): no relative bind mounts, which would resolve into
+    # deploy.sh's temporary worktree and dangle after it is removed.
     volumes:
       - ${HERDR_CP_FLEET_DIR:?run deploy.sh}:/etc/herdr/fleet:ro
-      - ./config.yaml:/app/config.yaml:ro
-      # Bundle the SQL migrations into the worker image so it can apply them
-      # on startup regardless of the working directory.
-      - ../../deploy/control-plane/migrations:/app/migrations:ro
     environment:
-      HERDR_ENGINEERING_CONFIG: /app/config.yaml
+      HERDR_ENGINEERING_CONFIG: /app/control-plane/config.yaml
     command:
       - "control-plane"
       - "worker"
       - "--migrations"
-      - "/app/migrations"
+      - "/app/control-plane/migrations"
       - "--fleet-config"
       - "/etc/herdr/fleet/fleet-config.yaml"
 
