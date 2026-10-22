@@ -81,6 +81,9 @@ def test_compose_is_pinned_bounded_private_and_outside_default_deploy(model):
     assert service['read_only'] is True
     assert doc['networks']['default']['external'] is True
     args = service['command']
+    # The server defaults to an 8 GiB cache, above this container's entire budget.
+    assert '--cache-ram' in args
+    assert 0 <= int(args[args.index('--cache-ram') + 1]) <= 256
     assert args[args.index('--alias') + 1] == 'qwen2.5-1.5b-instruct-q4_k_m'
     assert '--chat-template-kwargs' not in args
     assert args[args.index('--predict') + 1] == '350'

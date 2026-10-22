@@ -77,7 +77,7 @@ The stronger 1.5B model remains selected.
 
 ## Limits and deployment recommendation
 
-Enable only the explicit verified model endpoint, with four CPUs, **3 GiB**,
+Enable only the explicit verified model endpoint, with four CPUs, **3 GiB**, **256 MiB prompt cache**,
 output limit **350**, a **6,000-character** source budget and timeout **120 seconds**. Keep the single bounded worker,
 cache, debounce and retry behavior. Live deployment produced a 40.3-second
 summary for a longer retained conversation; another request exceeded the earlier
