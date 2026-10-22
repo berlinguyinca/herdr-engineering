@@ -70,11 +70,19 @@ The subsequent unmodified-service smoke took 9.142, 9.260 and 4.875 seconds,
 respectively. The database handoff correctly retained failed staging and pending
 repair; it never claimed production migration had completed.
 
+A bounded recheck of the 0.6B model with the final production payload still
+failed: all three completed dashboard runs put message labels in the completed-work
+field instead of tasks, and the first database case timed out after 45.06 seconds.
+The stronger 1.5B model remains selected.
+
 ## Limits and deployment recommendation
 
 Enable only the explicit verified model endpoint, with four CPUs, **3 GiB**,
-output limit **350**, and timeout **45 seconds**. Keep the single bounded worker,
-cache, debounce and retry behavior. A verified GPU endpoint may improve latency;
+output limit **350**, and timeout **90 seconds**. Keep the single bounded worker,
+cache, debounce and retry behavior. Live deployment produced a 40.3-second
+summary for a longer retained conversation; another request exceeded the earlier
+45-second budget. With a 90-second timeout, a larger request completed in
+84.5 seconds. The deployed timeout was increased to 90 seconds. A verified GPU endpoint may improve latency;
 no Nibbler GPU latency was measured here.
 
 These are short synthetic conversations, not the maximum 12,000-character input

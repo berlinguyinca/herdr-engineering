@@ -25,8 +25,8 @@
 - [x] Integrate summary/name API and configuration/lifecycle without breaking session endpoints or existing deployments.
 - [x] Expand shared editor and safe Markdown/JSON rendering with browser regressions.
 - [x] Rename user-facing Sessions labels, integrate agent names/summary card and workspace fullscreen.
-- [ ] Provision an internal small-model CPU candidate, benchmark synthetic summary latency and quality, and configure only the verified endpoint.
-- [ ] Run targeted tests then full relevant checks, independent review, PR/merge/deployment and live evidence using the previously authorized delivery workflow.
+- [x] Provision an internal small-model CPU candidate, benchmark synthetic summary latency and quality, and configure only the verified endpoint.
+- [x] Run targeted tests then full relevant checks, independent review, PR/merge/deployment and live evidence using the previously authorized delivery workflow.
 
 ## Interfaces and regression contracts
 
@@ -35,3 +35,5 @@
 - Persistence: root integration owns acknowledged `agent_identity`/`agent_summary` records and replay, kept out of generic public event feeds. Pure worker modules must not independently edit repo.py/api.py.
 - Editor: reuse the same textarea, draft and attachments across fullscreen/preview. Test undo after JSON formatting and replace, IME, completion Escape priority, selection/focus restoration, bounded JSON tree, malicious keys/HTML and clipboard failures.
 - Model endpoint must be explicit, not a fallback alias. CPU artifact and image checksums are pinned as in the spec; warm latency evidence precedes production enablement.
+
+Release evidence: PR #148 merged and deployed as `a203cb77781c`; 295 unique Agent names restored unchanged after restart, and real continuation summaries persisted. CPU timeout was raised to 90 seconds after full-window measurements. Retained-conversation paging received the separately tested follow-up described in the spec.
