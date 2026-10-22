@@ -95,7 +95,9 @@ def rig(svc, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_REMOTE_HOME", str(remote))
     r = runner.Runner(f"http://127.0.0.1:{srv.server_address[1]}", tmp_path / "state", str(bin_ / "herdr"),
                       str(bin_ / "ssh"), WORKER, "bender", say=lambda m: None)
-    yield type("Rig", (), dict(w=w, r=r, home=home, remote=remote, log=log))
+    have = {None: ["claude-code", "codex", "pi"], "beast": ["claude-code", "codex", "pi"]}     # per ssh target
+    monkeypatch.setattr(r, "installed_families", lambda target: list(have[target]))
+    yield type("Rig", (), dict(w=w, r=r, home=home, remote=remote, log=log, have=have))
     srv.shutdown()
 
 
@@ -132,6 +134,9 @@ def test_a_request_is_spread_round_robin_and_workers_start_in_herdr(rig):
     assert sum(line.startswith("--machine beast pane run") for line in runs) == 2
     # the owner granted these in a room they own: they work at once
     assert {a["name"] for a in rig.w.s.list_room_agents(rig.w.alice, rig.w.room)["agents"]} >= {"fleet-1", "fleet-4"}
+    # each agent is tied to the pane it runs in, so the dashboard can show it next to its fabric session
+    linked = {a["name"]: a["instance_id"] for a in rig.w.s.list_my_agents(rig.w.alice)["agents"] if a["name"].startswith("fleet-")}
+    assert set(linked) == set(hosts) and all(v and v.startswith(f"pane:{hosts[k]}:w") for k, v in linked.items())
 
 
 def test_the_rotation_continues_across_requests(rig):
@@ -266,3 +271,36 @@ def test_a_request_nobody_took_in_time_is_expired_not_started_late(rig):
 def runner_stale():
     from herdr_engineering.control_plane.collab import SPAWN_STALE
     return SPAWN_STALE
+
+
+def test_a_host_without_the_cli_is_never_handed_that_family(rig):
+    rig.have["beast"] = ["codex"]                              # beast has no claude
+    ask(rig)
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert done["status"] == "done" and {p["host"] for p in done["placements"]} == {"bender"}
+    hosts = {h["host"]: h["families"] for h in rig.w.s.list_fleet_hosts(rig.w.alice)["hosts"]}
+    assert hosts == {"bender": ["claude-code", "codex", "pi"], "beast": ["codex"]}
+
+
+def test_no_host_with_the_cli_finishes_with_a_reason_and_creates_nothing(rig):
+    rig.have[None], rig.have["beast"] = ["claude-code"], ["claude-code"]
+    before = len(rig.w.s.list_my_agents(rig.w.alice)["agents"])
+    ask(rig, harness_type="pi")
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert done["status"] == "done" and "pi installed" in done["error"] and done["placements"] == []
+    assert len(rig.w.s.list_my_agents(rig.w.alice)["agents"]) == before
+
+
+def test_the_agent_family_needs_no_cli(rig):
+    rig.have[None], rig.have["beast"] = [], []
+    ask(rig, harness_type="agent", count=2)
+    rig.r.once()
+    assert {p["status"] for p in rig.w.s.list_spawns(rig.w.alice)["spawns"][0]["placements"]} == {"started"}
+
+
+def test_family_commands_are_the_ones_proven_to_work():
+    cmds = runner.FAMILY_CMD
+    assert cmds["claude-code"] == "claude -p" and "--skip-git-repo-check" in cmds["codex"]
+    assert cmds["pi"].startswith("pi -p") and "-- \"Task from a room member: $(cat)\"" in cmds["pi"]

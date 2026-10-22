@@ -282,7 +282,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     if (!box || !operator) return;
     let hosts;
     try { hosts = (await api.fleetHosts()).hosts; } catch { return; }
-    const html = hosts.length ? `<ul class="cx-list">${hosts.map((h) => `<li><span class="grow"><b>${esc(h.host)}</b> ${pill(h.online ? 'online' : 'offline', h.online ? 'var(--status-ok)' : 'var(--text-muted)')}${h.kind === 'local' ? ' <span class="hd-ident">this machine</span>' : ''}</span><label class="cx-check"><input type="checkbox" data-auto="${esc(h.host)}"${h.auto_agents ? ' checked' : ''}> Automatic agents</label></li>`).join('')}</ul>` : '<div class="hd-empty">No hosts reported yet. The host runner reports every few seconds.</div>';
+    const html = hosts.length ? `<ul class="cx-list">${hosts.map((h) => `<li><span class="grow"><b>${esc(h.host)}</b> ${pill(h.online ? 'online' : 'offline', h.online ? 'var(--status-ok)' : 'var(--text-muted)')}${h.kind === 'local' ? ' <span class="hd-ident">this machine</span>' : ''}${h.online ? ` <span class="hd-ident">${h.families && h.families.length ? esc(h.families.join(', ')) : 'no agent CLIs found'}</span>` : ''}</span><label class="cx-check"><input type="checkbox" data-auto="${esc(h.host)}"${h.auto_agents ? ' checked' : ''}> Automatic agents</label></li>`).join('')}</ul>` : '<div class="hd-empty">No hosts reported yet. The host runner reports every few seconds.</div>';
     if (box.dataset.h === html) return;
     box.dataset.h = html; box.innerHTML = html;
     box.querySelectorAll('[data-auto]').forEach((c) => { c.onchange = async () => { try { await api.setFleetHost(c.dataset.auto, c.checked); } catch (e) { alert(e.message); } renderHosts(); }; });

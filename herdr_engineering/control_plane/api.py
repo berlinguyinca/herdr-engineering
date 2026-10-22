@@ -331,6 +331,21 @@ class ControlPlaneServer:
             self._httpd.server_close()
 
 
+def _fabric_session(repo, inst):
+    """The fabric session an agent's instance_id points at. Besides a full session id it may be
+    ``pane:<host>:<pane id>`` (what a host-side runner knows right after it opens a herdr pane, before
+    the pane's plugin has reported its server name); that resolves to the newest session on that pane."""
+    sess = repo.get_session(inst)
+    if sess or not inst.startswith("pane:"):
+        return sess
+    _, _, rest = inst.partition(":")
+    host, _, pane = rest.partition(":")
+    for cand in repo.list_sessions():                  # newest first
+        if cand.get("host_id") == host and cand.get("pane_id") == pane:
+            return cand
+    return None
+
+
 def _fabric_enriched_flow(repo, payload: bytes) -> bytes:
     """Dashboard side only: join the owner's own agents (instance_id = a fabric session id) to the
     sessions, hosts and missions this control plane knows. The collab service never sees fabric data."""
@@ -346,18 +361,48 @@ def _fabric_enriched_flow(repo, payload: bytes) -> bytes:
             inst = node.get("instance_id")
             if node.get("kind") != "agent" or not inst:
                 continue
-            sess = repo.get_session(inst)
+            sess = _fabric_session(repo, inst)
             if not sess:
                 node["fabric"] = {"session_id": inst, "status": "unknown"}
                 continue
             mission = repo.get_mission(sess.get("mission_id")) if sess.get("mission_id") else None
-            node["fabric"] = {"session_id": inst, "status": sess.get("status"), "host": sess.get("host_id"),
+            node["fabric"] = {"session_id": sess.get("session_id", inst), "status": sess.get("status"), "host": sess.get("host_id"),
                               "agent_role": sess.get("agent_role"), "mission_id": sess.get("mission_id"),
                               "mission_title": (mission or {}).get("title"), "cwd": sess.get("cwd"),
                               "branch": sess.get("branch")}
         return json.dumps(flow).encode()
     except Exception:           # the flow view must never break because fabric data is odd
         return payload
+
+
+def _with_collab_tasks(server, repo, mission_key, timeline):
+    """Add the collaboration tasks of agents linked to this mission's sessions to its timeline.
+    Dashboard side only (it asks the operator listener); statuses and names, never task text. Any
+    failure leaves the timeline as it was."""
+    if not server.collab_operator_url:
+        return timeline
+    try:
+        m = repo.get_mission(mission_key)
+        keys = {mission_key, (m or {}).get("mission_id"), (m or {}).get("mission_key")} - {None}
+        ids = []
+        for s in repo.list_sessions():
+            if s.get("mission_id") in keys:             # an agent may be linked by full id or by pane
+                ids += [s["session_id"], f"pane:{s.get('host_id')}:{s.get('pane_id')}"]
+        ids = ids[:100]
+        if not ids:
+            return timeline
+        req = urllib.request.Request(
+            server.collab_operator_url + "/api/v1/collab/fleet/task-activity",
+            data=json.dumps({"instance_ids": ids}).encode(), method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=3) as resp:   # noqa: S310 (operator-configured URL)
+            rows = json.loads(resp.read(1_000_000)).get("activity", [])
+        extra = [{"ts": r["updated_at"], "kind": "collab", "status": r["status"],
+                  "title": f"@{r['agent']} {r['direction']} a task in {r.get('room') or 'a room'} ({r['status']})",
+                  "ref": None, "entity_id": r["task_id"]} for r in rows]
+        return sorted(timeline + extra, key=lambda i: (i["ts"] or "", i["kind"], i["entity_id"] or ""))
+    except Exception:
+        return timeline
 
 
 _PUBLIC_STATIC = {
@@ -870,7 +915,8 @@ def _make_handler(server, public=False, operator=False):
                 if len(parts) == 6 and parts[5] == "activity":
                     return self._json({"activity": r.mission_activity.get(parts[4])})
                 if len(parts) > 5 and parts[5] == "timeline":
-                    return self._json({"timeline": r.mission_timeline(parts[4])})
+                    timeline = r.mission_timeline(parts[4])
+                    return self._json({"timeline": _with_collab_tasks(server, r, parts[4], timeline)})
                 if len(parts) > 4:
                     m = r.get_mission(parts[4])
                     return self._json(m) if m else self._json(

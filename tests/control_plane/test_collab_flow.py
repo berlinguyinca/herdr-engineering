@@ -154,3 +154,81 @@ def test_state_ends_when_access_is_lost_while_waiting(w):
     w.s.remove_member(w.alice, w.room, "carol")
     th.join(5)
     assert out.get("status") == 404
+
+
+# ------------------------------------------------ fabric timelines show collab tasks
+def test_task_activity_lists_only_the_callers_linked_agents_and_never_text(w):
+    a1, i1, a2, i2, root, sub = chain(w)
+    w.s.link_agent(w.alice, i1["agent_id"], {"instance_id": "herdr:b:s:1"})
+    w.s.link_agent(w.bob, i2["agent_id"], {"instance_id": "herdr:b:s:2"})
+    out = w.s.task_activity(w.alice, {"instance_ids": ["herdr:b:s:1", "herdr:b:s:2", "herdr:other"]})["activity"]
+    assert {(r["agent"], r["direction"], r["task_id"]) for r in out} == {
+        ("lead", "received", root), ("lead", "delegated", sub)}      # bob's agent is not alice's to look at
+    assert all(set(r) == {"instance_id", "agent", "direction", "task_id", "status", "updated_at", "room"} for r in out)
+    assert "ship it" not in json.dumps(out) and "parser" not in json.dumps(out)
+    assert w.s.task_activity(w.alice, {"instance_ids": []}) == {"activity": []}
+    for bad in (None, "x", ["a"] * 101, [1], [""], ["x" * 201]):
+        assert code(w.s.task_activity, w.alice, {"instance_ids": bad}) == 400
+
+
+def test_task_activity_is_not_offered_to_agents(w):
+    a1, *_ = chain(w)
+    assert code(w.s.task_activity, a1, {"instance_ids": []}) in (403, 404)
+
+
+def test_a_pane_reference_resolves_to_the_newest_session_on_that_pane():
+    from herdr_engineering.control_plane.api import _fabric_session
+
+    class Repo:
+        sessions = [{"session_id": "herdr:bender:new:p1", "host_id": "bender", "pane_id": "p1"},
+                    {"session_id": "herdr:bender:old:p1", "host_id": "bender", "pane_id": "p1"},
+                    {"session_id": "herdr:beast:x:p1", "host_id": "beast", "pane_id": "p1"}]
+
+        def get_session(self, sid):
+            return next((s for s in self.sessions if s["session_id"] == sid), None)
+
+        def list_sessions(self):
+            return self.sessions
+
+    assert _fabric_session(Repo(), "pane:bender:p1")["session_id"] == "herdr:bender:new:p1"
+    assert _fabric_session(Repo(), "pane:beast:p1")["session_id"] == "herdr:beast:x:p1"
+    assert _fabric_session(Repo(), "pane:beast:p9") is None
+    assert _fabric_session(Repo(), "herdr:bender:old:p1")["session_id"] == "herdr:bender:old:p1"
+    assert _fabric_session(Repo(), "elsewhere") is None
+
+
+def test_mission_timeline_gains_task_items_and_survives_the_service_being_down(monkeypatch):
+    import io
+    from types import SimpleNamespace
+
+    from herdr_engineering.control_plane import api
+
+    class Repo:
+        def get_mission(self, k):
+            return {"mission_id": "m1", "mission_key": "m1"}
+
+        def list_sessions(self):
+            return [{"session_id": "herdr:b:s:1", "mission_id": "m1", "host_id": "b", "pane_id": "p1"},
+                    {"session_id": "herdr:b:s:2", "mission_id": "other", "host_id": "b", "pane_id": "p2"}]
+
+    sent = {}
+
+    def fake_open(req, timeout):
+        sent.update(url=req.full_url, body=json.loads(req.data))
+        return io.BytesIO(json.dumps({"activity": [{"updated_at": "2026-10-22T10:00:00+00:00", "status": "done",
+                                                    "agent": "lead", "direction": "received", "room": "r",
+                                                    "task_id": "t1"}]}).encode())
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", fake_open)
+    server = SimpleNamespace(collab_operator_url="http://op")
+    base = [{"ts": "2026-10-22T09:00:00", "kind": "stage", "status": "active", "title": "s", "ref": None, "entity_id": "m1"}]
+    out = api._with_collab_tasks(server, Repo(), "m1", base)
+    assert [i["kind"] for i in out] == ["stage", "collab"] and out[1]["title"].startswith("@lead received a task in r")
+    assert sent["body"]["instance_ids"] == ["herdr:b:s:1", "pane:b:p1"] and sent["url"].endswith("/fleet/task-activity")
+
+    def boom(req, timeout):
+        raise OSError("down")
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", boom)
+    assert api._with_collab_tasks(server, Repo(), "m1", base) == base
+    assert api._with_collab_tasks(SimpleNamespace(collab_operator_url=None), Repo(), "m1", base) == base

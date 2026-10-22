@@ -43,12 +43,17 @@ REQUEST_DEADLINE = 480.0              # seconds one request may take; the system
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 HOST = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 SSH_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,126}$")
-FAMILY_CMD = {                       # task text arrives on stdin; the family's own non-interactive mode answers it
+# The task text arrives on stdin; the family's own non-interactive mode answers it.
+#   codex needs --skip-git-repo-check (a worker's directory is not a trusted repo).
+#   pi takes its prompt as an argument, never stdin; "--" ends its options and the fixed prefix means a
+#   task that starts with "@" or "-" can't be read as a file attachment or a flag.
+FAMILY_CMD = {
     "claude-code": "claude -p",
-    "codex": "codex exec -",
-    "pi": "pi -p",
+    "codex": "codex exec --skip-git-repo-check -",
+    "pi": 'pi -p --no-session -- "Task from a room member: $(cat)"',
     "agent": "",                     # no command: the worker acknowledges and reports
 }
+FAMILY_BIN = {"claude-code": "claude", "codex": "codex", "pi": "pi"}
 AGENT_DIR = "herdr-agents"
 
 
@@ -67,6 +72,7 @@ class Runner:
         self.host_id = host_id
         self.targets: dict[str, str | None] = {}          # host label -> ssh target (None = this machine)
         self.public_url = ""
+        self.families: dict[str, list[str]] = {}          # host label -> harness families it can start
 
     # ------------------------------------------------------------ the collab service (operator listener)
     def api(self, method: str, path: str, body: dict | None = None):
@@ -126,24 +132,39 @@ class Runner:
         except (OSError, ValueError):
             cache = {}
         now, up = time.time(), []
+        self.families = {}
         for host, target in self.targets.items():
             seen = cache.get(host)
-            if target is None:
-                alive = True
-            elif seen and now - seen["at"] < PROBE_EVERY:
+            if seen and now - seen["at"] < PROBE_EVERY:
                 alive = seen["ok"]
             else:
-                try:
-                    self.run(self.herdr_cmd(host, ["workspace", "list"]), timeout=15)
-                    alive = True
-                except Failure:
-                    alive = False
-                cache[host] = {"ok": alive, "at": now}
+                alive = True
+                if target is not None:
+                    try:
+                        self.run(self.herdr_cmd(host, ["workspace", "list"]), timeout=15)
+                    except Failure:
+                        alive = False
+                cache[host] = seen = {"ok": alive, "at": now,
+                                      "families": self.installed_families(target) if alive else []}
             if alive:
                 up.append(host)
+                self.families[host] = [f for f in seen.get("families", []) if f in FAMILY_BIN]
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         cache_file.write_text(json.dumps(cache))
         return up
+
+    def installed_families(self, target: str | None) -> list[str]:
+        """Which harness CLIs the host's own (interactive) shell can start: that shell is what a herdr pane
+        runs. A host without `claude` must not be handed claude agents that would fail every task."""
+        probe = "for c in claude codex pi; do command -v $c >/dev/null 2>&1 && echo $c; done"
+        argv = (["bash", "-lic", probe] if target is None
+                else [self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target, f"bash -lic '{probe}' 2>/dev/null"])
+        try:
+            out = self.run(argv, timeout=30)
+        except Failure:
+            return []
+        have = {line.strip() for line in out.splitlines()}
+        return [f for f, binary in FAMILY_BIN.items() if binary in have]
 
     # ------------------------------------------------------------ placing one agent
     def put(self, host: str, name: str, text: str, mode: int) -> None:
@@ -190,6 +211,10 @@ class Runner:
         line = (f'{"HERDR_AGENT_CMD=" + shlex.quote(cmd) + " " if cmd else ""}"$HOME/{AGENT_DIR}/worker.sh" '
                 f'"$HOME/{AGENT_DIR}/{name}.json"')
         self.run(self.herdr_cmd(host, ["pane", "run", pane, line]), timeout=30)
+        try:        # tie the agent to its pane so the dashboard can show it with the fabric session
+            self.ok("POST", f"agents/{agent['agent_id']}/link", {"instance_id": f"pane:{host}:{pane}"})
+        except Exception:
+            pass    # cosmetic: the agent works without the link
 
     # ------------------------------------------------------------ one request
     def pick_host(self, eligible: list[str]) -> str | None:
@@ -235,6 +260,10 @@ class Runner:
             count = int(spec["count"])
             if not 1 <= count <= MAX_AGENTS or spec["harness_type"] not in FAMILY_CMD:
                 raise Failure("refused: request outside the runner's limits")
+            eligible = [h for h in eligible if spec["harness_type"] not in FAMILY_BIN
+                        or spec["harness_type"] in self.families.get(h, [])]
+            if not eligible:
+                raise Failure(f"no host that accepts automatic agents has {FAMILY_BIN[spec['harness_type']]} installed")
             body = {"harness_type": spec["harness_type"], "name_prefix": spec["name_prefix"], "count": count}
             if spec.get("room_id"):
                 body.update(room_id=spec["room_id"], actions=spec["actions"],
@@ -274,7 +303,8 @@ class Runner:
             raise Failure("the service has no public https url to give agents")
         self.discover()
         up = self.reachable()
-        self.ok("POST", "fleet/hosts", {"hosts": [{"host": h, "kind": "local" if self.targets[h] is None else "machine"} for h in up]})
+        self.ok("POST", "fleet/hosts", {"hosts": [{"host": h, "kind": "local" if self.targets[h] is None else "machine",
+                                                    "families": self.families.get(h, [])} for h in up]})
         flags = {h["host"]: h["auto_agents"] for h in self.ok("GET", "fleet/hosts")["hosts"]}
         eligible = sorted(h for h in up if flags.get(h, True))
         for sp in self.ok("GET", "fleet/spawns?status=requested")["spawns"]:
