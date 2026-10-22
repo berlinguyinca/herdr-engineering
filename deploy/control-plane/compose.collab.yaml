@@ -28,7 +28,7 @@ services:
       - "/app/packages"
       - "--allow-open"
       - "--collab-operator-url"
-      - "http://${HERDR_CP_WEB_BIND:-127.0.0.1}:8082"
+      - "http://${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_COLLAB_OPERATOR_PORT:-9482}"
 
   collab-public:
     image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-0.1.0}
@@ -73,7 +73,7 @@ services:
       - "--collab-operator-email"
       - "${HERDR_COLLAB_OPERATOR_EMAIL:-}"
       - "--collab-operator-host"
-      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:8082"
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_COLLAB_OPERATOR_PORT:-9482}"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -119,7 +119,7 @@ services:
     ports:
       - "${HERDR_COLLAB_EDGE_BIND:-127.0.0.1:18444}:8443"
       # Operator listener, tailnet interface only (like the dashboard): no sign-in, local owner.
-      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:8082:8082"
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_COLLAB_OPERATOR_PORT:-9482}:8082"
     networks: [collab, edge]      # edge: the bridge the published port lives on
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
