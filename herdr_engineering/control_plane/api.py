@@ -58,6 +58,23 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
     request_queue_size = 256
 
 
+
+def _dashboard_host_ok(host_header, extra_hosts):
+    """A Host an attacker cannot make point here: an IP literal, localhost, or a configured name.
+    DNS rebinding needs a DNS name, so a bare name is refused unless the operator listed it."""
+    import ipaddress
+    host = host_header.strip().lower()
+    if host in extra_hosts:
+        return True
+    name = host[1:host.index("]")] if host.startswith("[") and "]" in host else host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if name == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return True
+
 def _content_length(raw):
     """Non-negative int, or None when the header is malformed (never raises)."""
     if raw is None or raw == "":
@@ -102,7 +119,8 @@ class ControlPlaneServer:
                  collab=None, collab_tls_terminated=False,
                  collab_require_https=False, public_port=None, public_host=None,
                  collab_only=False, operator_port=None, operator_user=None,
-                 operator_email=None, operator_hosts=(), collab_operator_url=None):
+                 operator_email=None, operator_hosts=(), collab_operator_url=None,
+                 collab_dashboard_hosts=()):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -182,6 +200,7 @@ class ControlPlaneServer:
         # Dashboard side: forward /api/v1/collab/* to the operator listener of the isolated
         # collab service, so the local owner needs no sign-in.
         self.collab_operator_url = collab_operator_url.rstrip("/") if collab_operator_url else None
+        self.collab_dashboard_hosts = frozenset(h.lower() for h in collab_dashboard_hosts)
         if collab_only and public_port is None:
             raise ValueError("collab-only mode needs the public collaboration port")
         self.public_port = public_port
@@ -526,6 +545,17 @@ def _make_handler(server, public=False, operator=False):
             err = self._require("operator")
             if err:
                 return err
+            # This path acts as the owner without any credential, so it needs the same browser
+            # defences as the operator listener: no DNS-rebound names, no cross-site writes.
+            if not _dashboard_host_ok(self.headers.get("Host", ""), server.collab_dashboard_hosts):
+                return self._deny(404, "not found")
+            if self.command == "POST":
+                origin = self.headers.get("Origin")
+                if origin and (urlsplit(origin).netloc != self.headers.get("Host")
+                               or urlsplit(origin).scheme not in {"http", "https"}):
+                    return self._deny(403, "cross-origin mutation refused")
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                    return self._deny(415, "mutations require application/json")
             from .collab import MAX_BODY
             length = _content_length(self.headers.get("Content-Length"))
             if self.command == "POST" and (length is None or length > MAX_BODY):

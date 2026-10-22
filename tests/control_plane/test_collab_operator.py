@@ -119,8 +119,8 @@ def test_dashboard_proxy_keeps_the_dashboards_own_access_control(stack, tmp_path
                                 collab_operator_url=f"http://127.0.0.1:{stack.only.operator_port}")
     t = start(locked)
     try:
-        assert call(locked.port, "GET", "/api/v1/collab/rooms", host="x")[0] in (401, 403)
-        assert call(locked.port, "GET", "/api/v1/collab/rooms", host="x",
+        assert call(locked.port, "GET", "/api/v1/collab/rooms", host="100.64.0.9")[0] in (401, 403)
+        assert call(locked.port, "GET", "/api/v1/collab/rooms", host="100.64.0.9",
                     headers={"X-API-Key": "k"})[0] == 200
     finally:
         locked.shutdown()
@@ -132,7 +132,7 @@ def test_dashboard_reports_unavailable_service_cleanly():
                               collab_operator_url="http://127.0.0.1:9")
     t = start(dash)
     try:
-        s, body = call(dash.port, "GET", "/api/v1/collab/rooms", host="x")
+        s, body = call(dash.port, "GET", "/api/v1/collab/rooms", host="100.64.0.9")
         assert s == 502 and "unavailable" in body["error"]
     finally:
         dash.shutdown()
@@ -143,3 +143,49 @@ def test_operator_listener_requires_collab_only_mode_and_hosts():
     with pytest.raises(ValueError):
         ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, operator_port=0,
                            operator_user="a", operator_hosts=["h"])
+
+
+# ---- review 2: the dashboard proxy must refuse what a browser on another site can send
+
+def _dash(stack, method, path, body=None, headers=None, raw=None):
+    conn = http.client.HTTPConnection("127.0.0.1", stack.dash.port, timeout=5)
+    conn.request(method, path, body=raw if raw is not None else (json.dumps(body) if body is not None else None),
+                 headers=headers or {})
+    r = conn.getresponse()
+    data = r.read()
+    conn.close()
+    return r.status, data
+
+
+def test_dashboard_proxy_refuses_cross_site_text_plain_post(stack):
+    before = call(stack.only.operator_port, "GET", "/api/v1/collab/projects")[1]
+    s, _ = _dash(stack, "POST", "/api/v1/collab/projects", raw=json.dumps({"name": "evil"}),
+                 headers={"Content-Type": "text/plain", "Origin": "https://evil.example"})
+    assert s in (403, 415)
+    assert call(stack.only.operator_port, "GET", "/api/v1/collab/projects")[1] == before
+
+
+def test_dashboard_proxy_refuses_cross_origin_even_with_json(stack):
+    s, _ = _dash(stack, "POST", "/api/v1/collab/projects", {"name": "evil"},
+                 headers={"Content-Type": "application/json", "Origin": "https://evil.example"})
+    assert s == 403
+
+
+def test_dashboard_proxy_refuses_non_json_content_type_without_origin(stack):
+    s, _ = _dash(stack, "POST", "/api/v1/collab/projects", raw="{}", headers={"Content-Type": "text/plain"})
+    assert s == 415
+
+
+def test_dashboard_proxy_refuses_dns_rebound_host(stack):
+    for host in ("rebind.evil.example", "rebind.evil.example:80"):
+        s, _ = _dash(stack, "GET", "/api/v1/collab/rooms", headers={"Host": host})
+        assert s == 404
+
+
+def test_dashboard_proxy_still_serves_ip_literal_host_and_same_origin(stack):
+    s, _ = _dash(stack, "POST", "/api/v1/collab/projects", {"name": "ok"},
+                 headers={"Host": "100.104.39.6", "Origin": "http://100.104.39.6",
+                          "Content-Type": "application/json"})
+    assert s == 201
+    s, _ = _dash(stack, "GET", "/api/v1/collab/rooms", headers={"Host": "[::1]:80"})
+    assert s == 200
