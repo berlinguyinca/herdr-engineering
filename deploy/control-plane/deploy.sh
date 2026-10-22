@@ -64,7 +64,13 @@ if [ -e "$COLLAB_MARKER" ]; then
   COLLAB_FILES=(-f "$WORK/deploy/control-plane/compose.collab.yaml")
   EDGE_DIR="$HOME/.config/herdr-engineering/collab-edge"
   mkdir -p "$EDGE_DIR"
-  install -m 0644 "$WORK/deploy/control-plane/collab-edge/nginx.conf" "$EDGE_DIR/nginx.conf"
+  # Write in place (same inode): the container bind-mounts this single file, and a replaced file
+  # would leave it reading the old config.
+  [ -e "$EDGE_DIR/nginx.conf" ] || install -m 0644 /dev/null "$EDGE_DIR/nginx.conf"
+  if ! cmp -s "$WORK/deploy/control-plane/collab-edge/nginx.conf" "$EDGE_DIR/nginx.conf"; then
+    cat "$WORK/deploy/control-plane/collab-edge/nginx.conf" > "$EDGE_DIR/nginx.conf"
+    EDGE_CONF_CHANGED=1
+  fi
   export HERDR_COLLAB_EDGE_CONF="$EDGE_DIR/nginx.conf"
   export HERDR_COLLAB_DATA_DIR="$HOME/.local/share/herdr-engineering/collab"
   mkdir -p "$HERDR_COLLAB_DATA_DIR"
@@ -95,6 +101,9 @@ compose() {
     -f "$WORK/deploy/control-plane/compose.integrations.yaml" \
     -f "$WORK/deploy/control-plane/compose.github.yaml" "${COLLAB_FILES[@]}" \
     up -d --no-deps --no-build control-plane-web "${EDGE_SERVICE[@]}"
+  if [ "${EDGE_CONF_CHANGED:-0}" = 1 ] && docker inspect herdr-collab-edge >/dev/null 2>&1; then
+    docker exec herdr-collab-edge nginx -s reload
+  fi
 }
 
 healthy_commit() {
