@@ -78,7 +78,7 @@ def test_dashboard_enrichment_joins_only_known_sessions_and_survives_junk():
     class Repo:
         def get_session(self, sid):
             return {"status": "active", "host_id": "host_1", "agent_role": "claude", "mission_id": "m1",
-                    "cwd": "/w", "branch": "main"} if sid == "herdr:b:s:1" else None
+                    "cwd": "/w", "branch": "main", "name": "helper-1", "parent_session_id": "herdr:b:s:0"} if sid == "herdr:b:s:1" else None
 
         def get_mission(self, mid):
             return {"title": "Parser"}
@@ -88,6 +88,7 @@ def test_dashboard_enrichment_joins_only_known_sessions_and_survives_junk():
                       {"kind": "agent", "id": "a:3", "instance_id": None}, {"kind": "person", "id": "u:x"}]}
     out = json.loads(_fabric_enriched_flow(Repo(), json.dumps(flow).encode()))
     assert out["nodes"][0]["fabric"]["mission_title"] == "Parser" and out["nodes"][0]["fabric"]["status"] == "active"
+    assert out["nodes"][0]["fabric"]["parent_session_id"] == "herdr:b:s:0" and out["nodes"][0]["fabric"]["name"] == "helper-1"
     assert out["nodes"][1]["fabric"]["status"] == "unknown"
     assert "fabric" not in out["nodes"][2] and "fabric" not in out["nodes"][3]
     assert _fabric_enriched_flow(Repo(), b"not json") == b"not json"

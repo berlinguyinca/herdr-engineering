@@ -724,7 +724,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         prev: flowSig,
         onNode: (n) => {
           const mine = flow.edges.filter((e) => e.from === n.id || e.to === n.id).map((e) => `${esc(flow.nodes.find((x) => x.id === e.from)?.name)} → ${esc(flow.nodes.find((x) => x.id === e.to)?.name)}: ${esc(Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}`);
-          const f = n.fabric ? `<br>Fabric session ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}` : '';
+          const f = n.fabric ? `<br>Fabric session ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}${n.fabric.parent_session_id ? ` · started by session ${esc(n.fabric.parent_session_id)}` : ''}` : '';
           showDetail(`<b>${esc(n.kind === 'agent' ? `@${n.name}` : n.name)}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}`);
         },
         onEdge: (e) => {
