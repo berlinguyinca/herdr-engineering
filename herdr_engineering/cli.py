@@ -465,6 +465,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--collab-operator-url", default=None,
                     help="dashboard: forward /api/v1/collab/* to the operator listener of the "
                          "isolated collab service (e.g. http://100.64.0.1:8082)")
+    p2.add_argument("--collab-dashboard-host", action="append", default=[],
+                    help="extra DNS name the dashboard may be reached by for collaboration "
+                         "(IP literals and localhost always work; repeatable; DNS-rebinding guard)")
     p2.add_argument("--collab-only", action="store_true",
                     help="serve ONLY the public collaboration surface on --collab-public-port: no "
                          "dashboard, no operator API, no database (events go to --collab-log-file)")
@@ -2130,7 +2133,8 @@ def _cmd_cp_web(args) -> int:
                              operator_user=args.collab_operator_user,
                              operator_email=args.collab_operator_email,
                              operator_hosts=args.collab_operator_host,
-                             collab_operator_url=args.collab_operator_url)
+                             collab_operator_url=args.collab_operator_url,
+                             collab_dashboard_hosts=args.collab_dashboard_host)
     # Self-report the control-plane stack so the Services page has real data.
     try:
         if not args.collab_only:   # collab-only has no stack to report
