@@ -51,8 +51,9 @@ agent_summaries:
   enabled: true
   endpoint: http://agent-summary-model:8080/v1
   model: qwen2.5-1.5b-instruct-q4_k_m
-  timeout_seconds: 90
+  timeout_seconds: 120
   max_output_tokens: 350
+  max_chars: 6000
 ```
 
 Deploy the application release after updating the configuration. The configuration
@@ -62,10 +63,13 @@ new conversation content is pending, or when inference is temporarily unavailabl
 The UI reports the model and source coverage; summaries cover the bounded retained
 conversation, not missing historical messages.
 
-The deployed CPU profile uses a 90-second timeout: one retained conversation took
-40.3 seconds, and a larger one completed in 84.5 seconds after exceeding the
-earlier 45-second budget. This is background work; cached summaries remain available while
-generation runs. Short synthetic benchmarks do not predict full-window latency.
+The deployed CPU profile uses a 6,000-character recent-conversation budget and a
+120-second timeout. Larger 12,000-character inputs produced 40.3- and 84.5-second
+runs, plus repeated timeouts during the live fleet audit. The smaller source
+window bounds inference work; the card explicitly reports partial coverage when
+messages are shortened. The conversation pane still loads retained messages
+independently. Cached summaries remain available while generation runs. Short
+synthetic benchmarks do not predict full-window latency.
 
 The endpoint is directly attached to this dedicated model. Do not substitute the
 shared gateway's unknown-model fallback: a misspelled alias could otherwise use an
