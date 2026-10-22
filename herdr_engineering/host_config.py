@@ -3,8 +3,10 @@
 A host holds only ``~/.config/herdr-engineering/host.json`` (control plane URL,
 host id, token). Everything else is fetched from ``GET /api/v1/fleet/config`` and
 cached in ``~/.cache/herdr-engineering/fleet-config.json`` (0600) so a host keeps
-working while the control plane is unreachable. A revoked token (HTTP 401)
-deletes the cache: a revoked host must not keep running on stale secrets.
+working while the control plane is unreachable or answers anything but 200/401
+(a 403/404 from a control plane without the fleet endpoint uses the cache too).
+A revoked token (HTTP 401) deletes the cache: a revoked host must not keep
+running on stale secrets.
 
 Neither the token nor any configuration value is ever put in an exception
 message or log line.
@@ -182,11 +184,15 @@ def load_host_config(*, home: Path | None = None, fetch: Callable | None = None,
         except Exception:
             pass
         return HostConfig(base, host_id, revision, values, "fetch")
-    if status is not None and 400 <= status < 500:
-        raise HostConfigUnavailable(
-            f"the control plane refused the configuration request (HTTP {status})")
-    cached = _read_cache(cache_path, host_id)  # unreachable, 5xx or malformed reply
+    # Only 401 revokes. 403/404/other refusals (a control plane that predates the
+    # fleet endpoint, or a rollback to one), 5xx, unreachable and malformed replies
+    # all fall back to the cache.
+    cached = _read_cache(cache_path, host_id)
     if cached is None:
+        if status is not None:
+            raise HostConfigUnavailable(
+                f"the control plane at {base} did not serve a configuration (HTTP {status}) "
+                "and no cached configuration exists")
         raise HostConfigUnavailable(
             f"control plane at {base} unreachable and no cached configuration exists")
     return HostConfig(base, host_id, cached[0], cached[1], "cache")

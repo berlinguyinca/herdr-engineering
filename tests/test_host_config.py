@@ -68,6 +68,22 @@ def test_unreachable_uses_cache(tmp_path, failure):
     assert cfg.revision == "r1" and cfg.get("ci.url") == "https://ci.test"
 
 
+@pytest.mark.parametrize("code", [403, 404, 400])
+def test_non_401_refusal_uses_and_keeps_the_cache(tmp_path, code):
+    # a pre-feature control plane (or a rollback) answers 404: a valid cache wins
+    home = _home(tmp_path)
+    load_host_config(home=home, fetch=Fetch())
+    cfg = load_host_config(home=home, fetch=Fetch(get=(code, None)))
+    assert cfg.source == "cache" and cfg.revision == "r1"
+    assert (home / CACHE_REL).exists()
+
+
+def test_404_without_cache_is_unavailable_not_revoked(tmp_path):
+    with pytest.raises(HostConfigUnavailable) as e:
+        load_host_config(home=_home(tmp_path), fetch=Fetch(get=(404, None)))
+    assert e.value.revoked is False and "HTTP 404" in str(e.value)
+
+
 def test_unreachable_no_cache_raises(tmp_path):
     with pytest.raises(HostConfigUnavailable):
         load_host_config(home=_home(tmp_path), fetch=Fetch(exc=OSError("nope")))
@@ -259,7 +275,8 @@ def test_install_fleet_host_config_reads_the_fleet_file(tmp_path, monkeypatch):
         cfg = hc.host_config()
         assert cfg.get("ci.token") == "ci-t" and cfg.get("fabric.url") == "http://fab:29999"
         assert cfg.get("github.token") == "gh-t" and cfg.get("llm.upstream_url") == "https://llm.test"
-        assert cfg.get("agent.api_key") and cfg.get("ingest.api_key")
+        # init keeps API keys off: both present but empty (no X-API-Key is sent)
+        assert cfg.get("agent.api_key") == "" and cfg.get("ingest.api_key") == ""
         assert GitHubProvider().available
     finally:
         hc.reset_host_config()
