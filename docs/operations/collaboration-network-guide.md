@@ -289,6 +289,32 @@ then redeploy. `cognito_group` (`local.dev`) becomes the auto-approve group.
   `Administrators`/`Managers` takes effect when their token expires (up to about an hour). To cut a person off
   at once, disable them on the dashboard.
 
+### 5.1e The box spawned agents run in (bubblewrap)
+Every task an agent started by the fleet runner receives is text a room member wrote, so it runs in a
+bubblewrap box (`collab-sandbox.sh`, installed next to `worker.sh` on each host):
+* The system (`/usr`, a few `/etc` files) is read-only. The home directory is an empty temp dir: no ssh keys,
+  cloud credentials, other agents' credential files or collab logs are visible.
+* The agent's work directory `~/herdr-agents/work/<name>/` is the **only** writable place. Anything else
+  fails with "Read-only file system". `..` and symlinks out of the work area are refused (exit 126).
+* Own process namespace, no capabilities, cleared environment, 1 GiB file-size limit, 1024 open files,
+  `/tmp` is a 256 MB tmpfs; a systemd scope caps tasks at 512 processes and 8 GiB memory (fork bombs stop there).
+* Each task also has a wall-clock timeout (`HERDR_TASK_TIMEOUT`, default 900 s).
+* No bubblewrap, no run: the runner offers a host no harness family unless `bwrap` works there, and the
+  script itself exits 126 rather than run unboxed. Install it with `apt install bubblewrap`.
+  `--no-sandbox` on the runner turns the box off (not recommended).
+
+**Audit log.** `~/herdr-agents/audit/<name>.log` on the host is a hash-chained JSONL file:
+`worker_start`, then per task `task_start` (task id, sha256 and size of the text, never the text) and
+`task_end` (status, exit code, seconds, output bytes, and the files the task added `+`, changed `~` or
+removed `-` in the work directory). Check it with `python3 ~/.local/share/herdr-engineering/collab-audit-verify.py <log>`:
+editing or deleting a line breaks the chain. A host that is itself compromised could rewrite the whole file,
+so ship the logs off the host if that matters.
+
+**What the box does not protect.** The network stays open (the harness has to reach its model), and the
+harness login (`~/.claude`, `~/.codex`, `~/.pi`) is readable, read-only, to the harness. So a task can send
+data it can see (the work directory, the login) to the internet. Agents are text-only by default; only
+start tool-enabled agents (`--allow-tools`) for people you trust. They run in the same box.
+
 ### 5.2 Removing people and agents
 * Remove from a room: **People → Remove**. Their access (and their agents' access) ends at once.
 * Remove from the group entirely (stops all sign-in): `aws cognito-idp admin-remove-user-from-group

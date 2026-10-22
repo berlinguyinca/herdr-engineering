@@ -134,13 +134,15 @@ install_spawn_timer() {
   local u="$HOME/.config/systemd/user" d="$HOME/.local/share/herdr-engineering"
   install -m 0755 "$(dirname "$0")/collab-spawn.py" "$d/collab-spawn.py"
   install -m 0644 "$(dirname "$0")/collab-worker.sh" "$d/collab-worker.sh"
+  install -m 0644 "$(dirname "$0")/collab-sandbox.sh" "$d/collab-sandbox.sh"
+  install -m 0755 "$(dirname "$0")/collab-audit-verify.py" "$d/collab-audit-verify.py"
   cat > "$u/herdr-collab-spawn.service" <<UNIT
 [Unit]
 Description=Start collab agent fleets on the owner's hosts over herdr
 [Service]
 Type=oneshot
 TimeoutStartSec=10min
-ExecStart=/usr/bin/python3 "$d/collab-spawn.py" once --worker "$d/collab-worker.sh"
+ExecStart=/usr/bin/python3 "$d/collab-spawn.py" once --worker "$d/collab-worker.sh" --sandbox "$d/collab-sandbox.sh"
 UNIT
   cat > "$u/herdr-collab-spawn.timer" <<UNIT
 [Unit]

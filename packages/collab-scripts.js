@@ -50,10 +50,68 @@ export function workerScript({ base }) {
 #   HERDR_AGENT_CMD='claude -p'   # task text arrives on stdin; its stdout becomes the result
 # Default does nothing but acknowledge. Task text is a request from a verified room member (or an agent
 # they started): it is never spliced into a shell command by this script.
+# Started by the host runner it also gets (set in the environment, never by a task):
+#   HERDR_SANDBOX=/path/collab-sandbox.sh   run every task inside that box: only the agent's own work
+#                                           directory is writable, nothing else on the host is visible
+#   HERDR_AUDIT=/path/NAME.log              append a hash-chained line per task: what ran, how it ended,
+#                                           and which files in the work directory it added, changed or removed
 ${PREAMBLE(base)}
 CMD="\${HERDR_AGENT_CMD:-cat >/dev/null; echo acknowledged}"
+SANDBOX="\${HERDR_SANDBOX:-}"; AUDIT="\${HERDR_AUDIT:-}"
+NAME=$(jget name); WORK="$HOME/herdr-agents/work/$NAME"
 TMP=$(mktemp -d); mkdir "$TMP/tasks"; trap 'rm -rf "$TMP" "$HDR"' EXIT
-echo "waiting for tasks as $(jget name)..."
+audit() {  # audit EVENT [key=value ...]: one line in $AUDIT, each carrying the hash of the line before it
+  [ -n "$AUDIT" ] || return 0
+  python3 - "$AUDIT" "$@" <<'PY' || true
+import hashlib, json, os, sys, time
+path, event, *kv = sys.argv[1:]
+prev = "0" * 64
+try:
+    with open(path, "rb") as fh:
+        fh.seek(0, 2)
+        fh.seek(max(0, fh.tell() - 16384))
+        last = fh.read().splitlines()[-1:]
+        if last:
+            prev = json.loads(last[0])["hash"]
+except (OSError, ValueError, KeyError):
+    pass
+rec = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event, "prev": prev}
+for a in kv:
+    k, _, v = a.partition("=")
+    rec[k] = v[:2000]
+rec["hash"] = hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+os.write(fd, (json.dumps(rec, sort_keys=True) + "\\n").encode())
+os.close(fd)
+PY
+}
+snap() {  # snap DIR OUT.json: every file in the work directory with its size and mtime
+  python3 - "$1" > "$2" <<'PY' || echo '{}' > "$2"
+import json, os, sys
+root, out = sys.argv[1], {}
+for d, _, files in os.walk(root):
+    for f in files:
+        p = os.path.join(d, f)
+        try:
+            st = os.lstat(p)
+            out[os.path.relpath(p, root)] = [st.st_size, int(st.st_mtime)]
+        except OSError:
+            pass
+print(json.dumps(out))
+PY
+}
+diffsnap() {  # diffsnap BEFORE AFTER: "+added ~changed -removed" names, at most 40
+  python3 - "$1" "$2" <<'PY' || true
+import json, sys
+a, b = (json.load(open(x)) for x in sys.argv[1:3])
+rows = [f"+{k}" for k in b if k not in a] + [f"~{k}" for k in b if k in a and a[k] != b[k]] + [f"-{k}" for k in a if k not in b]
+print(" ".join(rows[:40]) + (f" (+{len(rows) - 40} more)" if len(rows) > 40 else ""))
+PY
+}
+[ -z "$SANDBOX" ] || mkdir -p -m 0700 "$WORK"
+[ -z "$AUDIT" ] || mkdir -p -m 0700 "$(dirname "$AUDIT")"
+audit worker_start agent="$NAME" sandbox="\${SANDBOX:+yes}" cmd="\${HERDR_AGENT_CMD:-acknowledge}"
+echo "waiting for tasks as $NAME..."
 while :; do
   call tasks_wait '{"seconds":20}' > "$TMP/r.json" || { sleep 5; continue; }
   python3 - "$TMP/r.json" "$TMP" <<'PY'
@@ -68,9 +126,20 @@ PY
     [ -e "$f" ] || continue
     tid=$(basename "$f" .txt)
     call task_update "$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":"accepted"}))' "$tid")" >/dev/null || true
-    status=done
+    status=done; rc=0
+    audit task_start task_id="$tid" text_sha256="$(sha256sum "$f" | cut -d' ' -f1)" text_bytes="$(wc -c < "$f")"
+    [ -z "$SANDBOX" ] || snap "$WORK" "$TMP/before.json"
+    started=$(date +%s)
     # a harness whose model never answers must not stall this agent for ever
-    timeout "\${HERDR_TASK_TIMEOUT:-900}" bash -c "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || status=failed
+    if [ -n "$SANDBOX" ]; then
+      timeout "\${HERDR_TASK_TIMEOUT:-900}" "$SANDBOX" "$WORK" "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
+    else
+      timeout "\${HERDR_TASK_TIMEOUT:-900}" bash -c "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
+    fi
+    [ "$rc" -eq 0 ] || status=failed
+    changes=""
+    if [ -n "$SANDBOX" ]; then snap "$WORK" "$TMP/after.json"; changes=$(diffsnap "$TMP/before.json" "$TMP/after.json"); fi
+    audit task_end task_id="$tid" status="$status" exit="$rc" seconds="$(( $(date +%s) - started ))" output_bytes="$(wc -c < "$TMP/out.txt")" work_changes="$changes"
     args=$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":sys.argv[2],"result":open(sys.argv[3]).read()[:3500]}))' "$tid" "$status" "$TMP/out.txt")
     call task_update "$args" >/dev/null || true
     echo "$tid $status"

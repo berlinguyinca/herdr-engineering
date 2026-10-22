@@ -80,13 +80,16 @@ def trim(text: str, n: int = 200) -> str:
 
 class Runner:
     def __init__(self, url: str, state_dir: Path, herdr: str, ssh: str, worker: Path, host_id: str, say=print,
-                 allow_tools: bool = False):
+                 allow_tools: bool = False, sandbox: Path | None = None):
         self.url, self.state, self.herdr, self.ssh, self.say = url.rstrip("/"), state_dir, herdr, ssh, say
         self.worker_text = worker.read_text(encoding="utf-8")
         self.host_id = host_id
         self.targets: dict[str, str | None] = {}          # host label -> ssh target (None = this machine)
         self.public_url = ""
         self.cmds = FAMILY_CMD_TOOLS if allow_tools else FAMILY_CMD_TEXT_ONLY
+        # collab-sandbox.sh: every task then runs in a bubblewrap box where only the agent's own work directory
+        # is writable. With a sandbox, a host without a working bwrap is not offered any harness family.
+        self.sandbox_text = sandbox.read_text(encoding="utf-8") if sandbox else None
         self.families: dict[str, list[str]] = {}          # host label -> harness families it can start
 
     # ------------------------------------------------------------ the collab service (operator listener)
@@ -179,7 +182,8 @@ class Runner:
     def installed_families(self, target: str | None) -> list[str]:
         """Which harness CLIs the host's own (interactive) shell can start: that shell is what a herdr pane
         runs. A host without `claude` must not be handed claude agents that would fail every task."""
-        probe = "for c in claude codex pi; do command -v $c >/dev/null 2>&1 && echo $c; done"
+        probe = ("for c in claude codex pi; do command -v $c >/dev/null 2>&1 && echo $c; done; "
+                 "bwrap --ro-bind / / --unshare-pid --die-with-parent /usr/bin/true >/dev/null 2>&1 && echo bwrap")
         argv = (["bash", "-lic", probe] if target is None
                 else [self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target, f"bash -lic '{probe}' 2>/dev/null"])
         try:
@@ -187,6 +191,8 @@ class Runner:
         except Failure:
             return []
         have = {line.strip() for line in out.splitlines()}
+        if self.sandbox_text is not None and "bwrap" not in have:
+            return []                       # no box, no harness: never run task text unboxed
         return [f for f, binary in FAMILY_BIN.items() if binary in have]
 
     # ------------------------------------------------------------ placing one agent
@@ -221,6 +227,8 @@ class Runner:
         if host not in installed:
             base = "'" + self.public_url.replace("'", "'\\''") + "'"      # always single-quoted, like the dashboard's copy
             self.put(host, "worker.sh", self.worker_text.replace("'__HERDR_BASE__'", base), 0o700)
+            if self.sandbox_text is not None:
+                self.put(host, "collab-sandbox.sh", self.sandbox_text, 0o700)
             installed.add(host)
         self.put(host, f"{name}.json", json.dumps({k: agent[k] for k in ("agent_id", "name", "credential", "device_id", "expires_at")}) + "\n", 0o600)
         try:
@@ -231,7 +239,9 @@ class Runner:
         if not isinstance(pane, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}", pane):
             raise Failure("herdr returned an unexpected pane id")
         cmd = self.cmds[family]
-        line = (f'{"HERDR_AGENT_CMD=" + shlex.quote(cmd) + " " if cmd else ""}"$HOME/{AGENT_DIR}/worker.sh" '
+        boxed = (f'HERDR_SANDBOX="$HOME/{AGENT_DIR}/collab-sandbox.sh" HERDR_AUDIT="$HOME/{AGENT_DIR}/audit/{name}.log" '
+                 if self.sandbox_text is not None else "")
+        line = (f'{boxed}{"HERDR_AGENT_CMD=" + shlex.quote(cmd) + " " if cmd else ""}"$HOME/{AGENT_DIR}/worker.sh" '
                 f'"$HOME/{AGENT_DIR}/{name}.json"')
         self.run(self.herdr_cmd(host, ["pane", "run", pane, line]), timeout=30)
         try:        # tie the agent to its pane so the dashboard can show it with the fabric session
@@ -377,13 +387,17 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--herdr", default="herdr")
     ap.add_argument("--ssh", default="ssh")
     ap.add_argument("--worker", default=str(Path(__file__).with_name("collab-worker.sh")))
+    ap.add_argument("--sandbox", default=str(Path(__file__).with_name("collab-sandbox.sh")),
+                    help="the box every task runs in (default: collab-sandbox.sh next to this script)")
+    ap.add_argument("--no-sandbox", action="store_true", help="run tasks directly on the host (not recommended)")
     ap.add_argument("--allow-tools", action="store_true",
                     help="let agents use their harness's tools (shell, files, MCP) on task text from room members")
     args = ap.parse_args(argv)
     if not args.url or not HOST.fullmatch(args.host_id):
         ap.error("no dashboard URL (pass --url) or an invalid --host-id")
     r = Runner(args.url, Path(args.state_dir), args.herdr, args.ssh, Path(args.worker), args.host_id,
-               say=lambda m: print(f"collab-spawn: {m}", file=sys.stderr), allow_tools=args.allow_tools)
+               say=lambda m: print(f"collab-spawn: {m}", file=sys.stderr), allow_tools=args.allow_tools,
+               sandbox=None if args.no_sandbox else Path(args.sandbox))
     try:
         r.once()
     except Failure as exc:

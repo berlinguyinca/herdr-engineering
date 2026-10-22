@@ -365,3 +365,34 @@ def test_a_second_label_for_the_same_machine_is_not_a_second_host(rig, monkeypat
     monkeypatch.setattr(rig.r, "run", lambda argv, stdin=None, timeout=60.0: json.dumps(machines))
     rig.r.discover()
     assert sorted(rig.r.targets) == ["beast", "bender", "zed"]
+
+
+SANDBOX = ROOT / "deploy/control-plane/collab-sandbox.sh"
+
+
+def test_with_a_sandbox_the_box_is_installed_and_the_worker_is_started_inside_it(rig):
+    rig.r.sandbox_text = SANDBOX.read_text()
+    ask(rig)
+    rig.r.once()
+    for base in (rig.home, rig.remote):
+        box = base / "herdr-agents/collab-sandbox.sh"
+        assert box.read_text() == SANDBOX.read_text() and box.stat().st_mode & 0o777 == 0o700
+    runs = [line for line in calls(rig) if " pane run " in f" {line} "]
+    assert runs and all('HERDR_SANDBOX="$HOME/herdr-agents/collab-sandbox.sh"' in line
+                        and 'HERDR_AUDIT="$HOME/herdr-agents/audit/fleet-' in line for line in runs)
+
+
+def test_without_a_sandbox_nothing_is_installed_and_no_box_is_requested(rig):
+    assert rig.r.sandbox_text is None
+    ask(rig, count=2)
+    rig.r.once()
+    assert not (rig.home / "herdr-agents/collab-sandbox.sh").exists()
+    assert not any("HERDR_SANDBOX" in line for line in calls(rig))
+
+
+def test_a_host_without_working_bubblewrap_is_offered_no_family_when_sandboxed(monkeypatch, tmp_path):
+    r = runner.Runner("http://x", tmp_path, "h", "s", WORKER, "b", sandbox=SANDBOX)
+    probes = iter(["claude\ncodex\nbwrap\n", "claude\ncodex\n"])
+    monkeypatch.setattr(r, "run", lambda argv, **kw: next(probes))
+    assert r.installed_families(None) == ["claude-code", "codex"]
+    assert r.installed_families(None) == []                         # no bwrap: never run task text unboxed
