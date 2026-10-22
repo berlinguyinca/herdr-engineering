@@ -43,16 +43,28 @@ REQUEST_DEADLINE = 480.0              # seconds one request may take; the system
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 HOST = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 SSH_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,126}$")
-# The task text arrives on stdin; the family's own non-interactive mode answers it.
-#   codex needs --skip-git-repo-check (a worker's directory is not a trusted repo).
-#   pi takes its prompt as an argument, never stdin; "--" ends its options and the fixed prefix means a
-#   task that starts with "@" or "-" can't be read as a file attachment or a flag.
-FAMILY_CMD = {
+# The task text arrives on stdin; the family's own non-interactive mode answers it. A task is written by a room
+# member (or an agent they started), so by default every harness runs WITHOUT tools: it can answer, but it
+# cannot run commands, read the credential files of the other agents on this host, or reach connectors/MCP
+# servers configured for your account. `--allow-tools` lifts that for people who want agents that do real work.
+#   claude: --tools "" drops the built-ins; --strict-mcp-config with an empty config drops claude.ai connectors
+#           (Gmail, Drive...) that `claude -p` would otherwise load; slash commands and skills are off too.
+#   pi:     takes its prompt as an argument, never stdin; "--" ends its options and the fixed prefix means a task
+#           that starts with "@" or "-" can't be read as a file attachment or a flag.
+#   codex:  has no way to be run without file access (even read-only it can read any file), so it is only
+#           started with --allow-tools, and then with `--skip-git-repo-check` (a worker's cwd is not a repo).
+FAMILY_CMD_TEXT_ONLY = {
+    "claude-code": "claude -p --tools '' --strict-mcp-config --mcp-config '{\"mcpServers\":{}}' --disable-slash-commands",
+    "pi": 'pi -p --no-session --no-tools -- "Task from a room member: $(cat)"',
+    "agent": "",                     # no command: the worker acknowledges and reports
+}
+FAMILY_CMD_TOOLS = {
     "claude-code": "claude -p",
     "codex": "codex exec --skip-git-repo-check -",
     "pi": 'pi -p --no-session -- "Task from a room member: $(cat)"',
-    "agent": "",                     # no command: the worker acknowledges and reports
+    "agent": "",
 }
+FAMILY_CMD = FAMILY_CMD_TOOLS       # every family the runner knows; which are started depends on --allow-tools
 FAMILY_BIN = {"claude-code": "claude", "codex": "codex", "pi": "pi"}
 AGENT_DIR = "herdr-agents"
 
@@ -66,12 +78,14 @@ def trim(text: str, n: int = 200) -> str:
 
 
 class Runner:
-    def __init__(self, url: str, state_dir: Path, herdr: str, ssh: str, worker: Path, host_id: str, say=print):
+    def __init__(self, url: str, state_dir: Path, herdr: str, ssh: str, worker: Path, host_id: str, say=print,
+                 allow_tools: bool = False):
         self.url, self.state, self.herdr, self.ssh, self.say = url.rstrip("/"), state_dir, herdr, ssh, say
         self.worker_text = worker.read_text(encoding="utf-8")
         self.host_id = host_id
         self.targets: dict[str, str | None] = {}          # host label -> ssh target (None = this machine)
         self.public_url = ""
+        self.cmds = FAMILY_CMD_TOOLS if allow_tools else FAMILY_CMD_TEXT_ONLY
         self.families: dict[str, list[str]] = {}          # host label -> harness families it can start
 
     # ------------------------------------------------------------ the collab service (operator listener)
@@ -193,7 +207,7 @@ class Runner:
 
     def place(self, host: str, agent: dict, family: str, installed: set) -> None:
         name = agent["name"]
-        if not NAME.fullmatch(name) or family not in FAMILY_CMD:
+        if not NAME.fullmatch(name) or family not in self.cmds:
             raise Failure("refused: unexpected agent name or family")
         if host not in installed:
             base = "'" + self.public_url.replace("'", "'\\''") + "'"      # always single-quoted, like the dashboard's copy
@@ -207,7 +221,7 @@ class Runner:
             raise Failure("herdr returned an unexpected reply to workspace create") from None
         if not isinstance(pane, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}", pane):
             raise Failure("herdr returned an unexpected pane id")
-        cmd = FAMILY_CMD[family]
+        cmd = self.cmds[family]
         line = (f'{"HERDR_AGENT_CMD=" + shlex.quote(cmd) + " " if cmd else ""}"$HOME/{AGENT_DIR}/worker.sh" '
                 f'"$HOME/{AGENT_DIR}/{name}.json"')
         self.run(self.herdr_cmd(host, ["pane", "run", pane, line]), timeout=30)
@@ -260,6 +274,9 @@ class Runner:
             count = int(spec["count"])
             if not 1 <= count <= MAX_AGENTS or spec["harness_type"] not in FAMILY_CMD:
                 raise Failure("refused: request outside the runner's limits")
+            if spec["harness_type"] not in self.cmds:
+                raise Failure(f"{spec['harness_type']} agents are only started when the runner runs with --allow-tools: "
+                              "that CLI cannot be limited to text-only answers")
             eligible = [h for h in eligible if spec["harness_type"] not in FAMILY_BIN
                         or spec["harness_type"] in self.families.get(h, [])]
             if not eligible:
@@ -335,11 +352,13 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--herdr", default="herdr")
     ap.add_argument("--ssh", default="ssh")
     ap.add_argument("--worker", default=str(Path(__file__).with_name("collab-worker.sh")))
+    ap.add_argument("--allow-tools", action="store_true",
+                    help="let agents use their harness's tools (shell, files, MCP) on task text from room members")
     args = ap.parse_args(argv)
     if not args.url or not HOST.fullmatch(args.host_id):
         ap.error("no dashboard URL (pass --url) or an invalid --host-id")
     r = Runner(args.url, Path(args.state_dir), args.herdr, args.ssh, Path(args.worker), args.host_id,
-               say=lambda m: print(f"collab-spawn: {m}", file=sys.stderr))
+               say=lambda m: print(f"collab-spawn: {m}", file=sys.stderr), allow_tools=args.allow_tools)
     try:
         r.once()
     except Failure as exc:

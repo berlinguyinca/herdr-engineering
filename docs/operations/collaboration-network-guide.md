@@ -241,16 +241,23 @@ request stopped). herdr keeps the pane alive, so a worker survives the dashboard
   an unreachable one is left out. **Hosts** (same page) has an **Automatic agents** tick per host: untick it and that
   host never receives automatic agents (the choice survives restarts, and is re-read before every placement so un-ticking takes effect at once; it is per
   herdr label, so a second label for the same machine is a different host).
-* Per family the runner runs a fixed non-interactive command on each task: `claude -p`,
-  `codex exec --skip-git-repo-check -` (both checked on bender), and `pi -p --no-session -- "Task from a room member: $(cat)"`
-  (pi takes its prompt as an argument; the fixed prefix stops a task that starts with `@` or `-` being read as a file or
-  a flag; **not confirmed end to end**: pi's model call hung when this was tried, so check it on your fleet first).
-  The `agent` family only acknowledges. The runner also looks (once a minute, through the host's interactive shell,
+* **Agents started this way are text-only by default.** Task text is written by a room member, so the runner starts
+  each harness with no tools: `claude -p --tools '' --strict-mcp-config --mcp-config '{"mcpServers":{}}'
+  --disable-slash-commands` (no built-ins, and none of the claude.ai connectors such as Gmail or Drive that a plain
+  `claude -p` loads from your account) and `pi -p --no-session --no-tools -- "Task from a room member: $(cat)"` (pi
+  takes its prompt as an argument; the fixed prefix stops a task that starts with `@` or `-` being read as a file or a
+  flag). They can answer, but cannot run commands or read the credential files of the other agents on the
+  host. **codex is not started** in this mode, because it can read any file even in its read-only sandbox. To let
+  agents do real work, run the runner with `--allow-tools` (`systemctl --user edit herdr-collab-spawn` and add
+  `--allow-tools` to `ExecStart`): then `claude -p`, `codex exec --skip-git-repo-check -` and
+  `pi -p --no-session -- "Task from a room member: $(cat)"` run, with your account's full access, on text from anyone
+  you approved with *Receive tasks*. `claude` and `codex` were checked on bender; pi's prompt form follows its help but
+  its model call hung when tried, so **check pi on your fleet first**. The `agent` family only acknowledges. The runner also looks (once a minute, through the host's interactive shell,
   which is what a herdr pane runs) at which of `claude`, `codex` and `pi` each host has, shows that on the Hosts list,
   and never places a family on a host that lacks its CLI. A request no host can serve ends with that reason and
-  creates nothing. The command is in `collab-spawn.py`, never in the request. Note that an agent
+  creates nothing. The command is in `collab-spawn.py`, never in the request. With `--allow-tools`, an agent
   holding *Receive tasks* runs room members' task text through that harness as your account, and the workers on a host
-  share one account and can read each other's credential files: only start fleets you would trust with that.
+  share one account and can read each other's credential files: only start such fleets for people you would trust with that.
 * Limits: 20 agents per request, 3 requests in flight, 12 requests an hour, 60 agents per user. A request nobody
   takes within 15 minutes is *expired* (never started late) and one nobody finishes shows as *stalled*; an agent that
   could not be started is revoked and its credential file removed. Each agent is linked to the herdr pane it runs in

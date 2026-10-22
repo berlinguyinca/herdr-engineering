@@ -627,3 +627,12 @@ def test_someone_elses_pending_request_does_not_block_the_owners_agent_name(w):
     # the clash now surfaces where it matters: approving the second one
     assert code(w.s.decide_agent_request, w.alice, w.room, rq, {"decision": "approve"}) == 409
     w.s.decide_agent_request(w.alice, w.room, rq, {"decision": "deny"})
+
+
+def test_approve_all_with_two_pending_requests_of_one_name_approves_one_and_reports_the_other(w):
+    reqs = []
+    for _ in range(2):
+        info = w.s.connect_agent(w.bob, {"name": "twin"})
+        reqs.append(w.s.grant_agent(w.bob, w.room, {"agent_id": info["agent_id"], "actions": ["read"]})["request_id"])
+    out = w.s.approve_all_requests(w.alice, w.room, {"request_ids": reqs})
+    assert (out["approved"], out["skipped"]) == (1, 1) and "already in this room" in out["reasons"][0]
