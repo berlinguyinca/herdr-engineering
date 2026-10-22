@@ -32,6 +32,8 @@ services:
       - '8192'
       - --parallel
       - '1'
+      - --cache-ram
+      - '256'
       - --threads
       - '4'
       - --threads-batch
