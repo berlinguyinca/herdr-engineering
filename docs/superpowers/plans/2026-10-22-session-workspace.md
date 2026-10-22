@@ -14,7 +14,7 @@
 
 - No new dependencies.
 - No hidden reasoning or system/developer messages in transcript capture.
-- No live service restarts or trial prompts to running sessions.
+- Deployment is explicitly authorized after review and merge; preserve native agents and do not send trial prompts to running sessions.
 - Native attachment limitations remain explicit; never claim unsupported delivery.
 
 ## Task 1: Recording foundation
@@ -23,7 +23,7 @@ Files: `herdr_engineering/control_plane/inspector.py`, inspector tests and contr
 
 - [x] Add failing regression for `herdr:bender:default:w1Z%3ApF` ingest.
 - [x] Accept only validated canonical pane escapes and retain invalid-ID rejection.
-- [x] Persist redacted messages using existing sink; restore ordered bodies and replay identities, within limits. Exclude reasoning/tool bodies from persistence.
+- [x] Persist redacted messages using existing sink; restore ordered bodies and replay identities, within limits. Exclude hidden reasoning and system/developer instructions from persistence. Retain bounded redacted coding activity through acknowledged writes.
 - [x] Run inspector, sink, namespace and ingest tests.
 
 ## Task 2: Native transcript adapter

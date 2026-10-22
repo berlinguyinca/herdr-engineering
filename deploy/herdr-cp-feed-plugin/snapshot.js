@@ -11,6 +11,7 @@ import { gitMetadata } from "./git-metadata.js";
 import { createInventoryReporter, createLoadReporter } from "./inventory.js";
 import { createModelResolver } from "./session-model.js";
 import { createTranscriptCollector } from "./session-transcript.js";
+import { createSessionTracker } from "./session-helpers.js";
 
 const TERMINAL_STATES = new Set([
   "failed", "error", "crashed", "finished", "complete", "completed", "closed",
@@ -28,20 +29,31 @@ function query(binary, args) {
 
 let defaultModelResolver = null;
 let defaultTranscriptCollector = null;
+let defaultSessionTracker = null;
 
-export async function collectSnapshot(env, { queryNative = query, metadata = gitMetadata, now = Date.now, resolveModel, collectTranscript } = {}) {
+export async function collectSnapshot(env, { queryNative = query, metadata = gitMetadata, now = Date.now, resolveModel, collectTranscript, sessionTracker } = {}) {
+  const useDefaultCollector = !collectTranscript;
   collectTranscript ??= (defaultTranscriptCollector ??= createTranscriptCollector({env,
     queryProcess: (server, paneId) => queryNative(herdrBin(env), ["--session", server, "pane", "process-info", "--pane", paneId]),
   }));
+  if (sessionTracker === undefined && useDefaultCollector) sessionTracker = (defaultSessionTracker ??= createSessionTracker({collectTranscript}));
   resolveModel ??= (defaultModelResolver ??= createModelResolver({
     queryProcess: (server, paneId) => queryNative(herdrBin(env), ["--session", server, "pane", "process-info", "--pane", paneId]),
   }));
   const summary = { servers: 0, sessions: 0, linked: 0, skipped: 0, errors: 0, truncated: false };
   const envelopes = [];
+  const seen = new Set();
+  const drain = async () => {
+    if (!sessionTracker) return;
+    const retained = await sessionTracker.collect(seen).catch(() => ({envelopes:[], errors:1}));
+    envelopes.push(...retained.envelopes);
+    if (retained.truncated) summary.truncated = true;
+    summary.errors += retained.errors || 0;
+  };
   const deadline = now() + 20000;
   const binary = herdrBin(env);
   const registry = await queryNative(binary, ["session", "list", "--json"]);
-  if (!Array.isArray(registry?.sessions)) return { envelopes, summary: { ...summary, errors: 1 } };
+  if (!Array.isArray(registry?.sessions)) { summary.errors++; await drain(); return { envelopes, summary }; }
   const candidates = registry.sessions.filter(row => row?.running === true);
   if (candidates.length > 8) summary.truncated = true;
   const names = new Map();
@@ -97,9 +109,12 @@ export async function collectSnapshot(env, { queryNative = query, metadata = git
       const transcript = await collectTranscript(server.name, pane, sessionId).catch(() => ({status:"unavailable", envelopes:[]}));
       if (transcript.status) payload.transcript = {status:transcript.status, truncated:!!transcript.truncated};
       envelopes.push(...transcript.envelopes);
+      seen.add(sessionId);
+      if (transcript.identity) sessionTracker?.remember({sessionId, server:server.name, paneId:pane.pane_id, identity:transcript.identity});
       if (identity.repository_id && identity.commit_sha) summary.linked++;
     }
   }
+  await drain();
   return { envelopes, summary };
 }
 

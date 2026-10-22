@@ -24,12 +24,20 @@ The feed never selects a transcript by cwd or newest modification time. It needs
 
 On 2026-10-22 the supported `herdr integration install codex` command installed the missing native Codex SessionStart hook on bender. Existing hooks were verified preserved; configuration was privately backed up. The hook's exact-identity reporting was verified against an isolated Unix test socket. No prompts were sent and no active session or service was restarted. SessionStart reports apply when a session starts/resumes; this installation does not retroactively relabel a running pane.
 
-Tool output and file diffs retain the inspector's bounded in-memory storage policy and do not survive a control-plane restart. Public messages are durable only when a durable sink is configured. Physical retention of the append-only sink remains its existing deployment policy.
+Public messages, tool activity/output, file diffs and usage are retained through the acknowledged durable sink when configured. Redaction, per-event bounds, age retention and per-session limits apply before and after restart. Physical retention of the append-only sink remains its existing deployment policy.
 
 ## Local operation
 
 Worktree: `/home/wohlgemuth/IdeaProjects/herdr-session-workspace`, branch `feat/session-workspace`.
 
-The dashboard and native feed changes have not been deployed to `dev.lan`. Deploy the control plane and host feed from the same revision so the new recording status and ingestion acknowledgements agree. No database schema migration or added project dependency is required.
+Deploy the control plane and host feed from the same merged revision so recording status, durability acknowledgements and runtime imports agree. The fleet runtime bundle includes both transcript modules and installs native Codex/Claude/Pi reporting hooks without restarting those agents. No database schema migration or added project dependency is required.
 
 Validation uses the existing `npm test`, the feed's `npm test --prefix deploy/herdr-cp-feed-plugin`, Python control-plane tests, and Ruff. New browser tests exercise the real shared components and retain existing advanced-inspector timing coverage in an isolated harness with the real backend/client.
+
+## Release hardening
+
+Exact-ID lookup uses Codex UUIDv7 date buckets and resumable bounded traversal instead of abandoning established hosts with more than 2,048 log files. Native headers are bounded separately from message bodies. Linux Claude descriptors require matching queried PID, process start time, boot and PID namespace; Codex descendants require exact runtime/pane identity. Neither path joins by cwd or newest file.
+
+Explicit Codex parent headers populate helper conversations, nested attribution and activity. Known transcript bindings survive pane exit, pane reuse and collector restart, allowing the reader to drain final output. Native event hooks hand off exact bindings even for short sessions that disappear before a snapshot poll. A legacy session that was never observed with exact identity cannot be backfilled safely. Claude/Pi helper associations are shown only when explicitly reported.
+
+File references come from confirmed file-edit evidence; tool exit codes and usage deltas are normalized where the native format provides them. Missing evidence remains missing. Replay checkpoints and pending file-edit evidence are bounded private local state.

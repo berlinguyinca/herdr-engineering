@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { normalizeRecord, createTranscriptCollector } from './session-transcript.js';
+import { normalizeRecord, createTranscriptCollector, resolveTranscript } from './session-transcript.js';
 
 const id = '12345678-1234-1234-1234-123456789abc';
 function fixture(t, agent = 'codex') {
@@ -115,4 +115,166 @@ test('Codex analysis-channel tools remain visible while private messages and rea
   }
   assert.deepEqual(normalizeRecord('codex',{type:'response_item',payload:{type:'message',role:'assistant',channel:'analysis',content:[{type:'output_text',text:'private'}]}}),[]);
   assert.deepEqual(normalizeRecord('codex',{type:'response_item',payload:{type:'reasoning',channel:'analysis',summary:[{type:'summary_text',text:'private'}]}}),[]);
+});
+
+
+test('UUIDv7 Codex identity resolves its date bucket despite more than 2048 old logs', async t => {
+  const f=fixture(t);
+  const stamp=Date.parse('2026-10-22T10:00:00Z').toString(16).padStart(12,'0');
+  const nativeId=`${stamp.slice(0,8)}-${stamp.slice(8)}-7000-8000-123456789abc`;
+  const old=join(f.root,'2025','01','01'); mkdirSync(old,{recursive:true});
+  for(let i=0;i<2100;i++)writeFileSync(join(old,`old-${i}.jsonl`),'');
+  const current=join(f.root,'2026','10','22'); mkdirSync(current,{recursive:true});
+  const path=join(current,`rollout-2026-10-22T10-00-00-${nativeId}.jsonl`);
+  writeFileSync(path,lines([{type:'session_meta',payload:{id:nativeId,instructions:'x'.repeat(24000)}},message('current')]));
+  assert.equal(await resolveTranscript('codex',{kind:'id',value:nativeId},{home:f.home}),path);
+});
+
+test('fallback identity scans resume past 2048 entries and reject conflicting copies', async t => {
+  const f=fixture(t,'claude');
+  for(let i=0;i<2100;i++)writeFileSync(join(f.root,`irrelevant-${i}.jsonl`),'');
+  const project=join(f.root,'project'); mkdirSync(project);
+  const path=join(project,`${id}.jsonl`);writeFileSync(path,lines([{type:'user',sessionId:id,message:{role:'user',content:'found'}}]));
+  let found=null;
+  for(let attempt=0;attempt<4&&!found;attempt++)found=await resolveTranscript('claude',{kind:'id',value:id},{home:f.home});
+  assert.equal(found,path);
+  const duplicate=join(f.root,'duplicate');mkdirSync(duplicate);writeFileSync(join(duplicate,`${id}.jsonl`),'');
+  for(let attempt=0;attempt<4;attempt++)assert.equal(await resolveTranscript('claude',{kind:'id',value:id},{home:f.home}),null);
+});
+
+
+test('Codex tool results retain explicit process failures without guessing from prose', () => {
+  const result=output=>normalizeRecord('codex',{type:'response_item',payload:{type:'function_call_output',call_id:'c',output}})[0];
+  assert.equal(result('Process exited with code 2\nOutput: failed').is_error,true);
+  assert.equal(result('Process exited with code 0\nOutput: error example').is_error,false);
+  assert.equal(result('An error example in documentation').is_error,undefined);
+  assert.equal(result({exit_code:7,output:'bad'}).exit_code,7);
+});
+
+test('only successful explicit edit tool results produce file activity across restarts', async t => {
+  const f=fixture(t);
+  const call=(call_id,input)=>({type:'response_item',payload:{type:'custom_tool_call',call_id,name:'apply_patch',input}});
+  const output=(call_id,output)=>({type:'response_item',payload:{type:'custom_tool_call_output',call_id,output}});
+  writeFileSync(f.path,lines([call('good','*** Begin Patch\n*** Update File: src/a.js\n@@\n-old\n+new\n*** End Patch')]));
+  const first=await createTranscriptCollector({home:f.home})('d',f.pane,'s');
+  assert.equal(first.envelopes[0].payload.events.filter(e=>e.kind==='file').length,0);
+  first.envelopes[0].onPublished();
+  appendFileSync(f.path,lines([output('good','Success. Updated the following files:\nM src/a.js'),call('bad','*** Begin Patch\n*** Delete File: src/b.js\n*** End Patch'),output('bad','Process exited with code 1\nfailed')]));
+  const next=await createTranscriptCollector({home:f.home})('d',f.pane,'s');
+  const files=next.envelopes[0].payload.events.filter(e=>e.kind==='file');
+  assert.equal(files.length,1);assert.equal(files[0].path,'src/a.js');assert.equal(files[0].op,'edit');assert.match(files[0].diff,/\+new/);
+});
+
+test('native usage capture uses deltas and preserves model without private reasoning', async t => {
+  const f=fixture(t);
+  const usage=n=>({type:'event_msg',payload:{type:'token_count',info:{total_token_usage:{input_tokens:n,output_tokens:2,reasoning_output_tokens:1,cached_input_tokens:3,total_tokens:n+2},model_context_window:1000}}});
+  writeFileSync(f.path,lines([{type:'turn_context',payload:{model:'gpt-test'}},usage(10),usage(10),usage(15)]));
+  const a=await createTranscriptCollector({home:f.home})('d',f.pane,'s');
+  const events=a.envelopes[0].payload.events;
+  assert.equal(events.find(e=>e.kind==='model').model,'gpt-test');
+  assert.equal(events.filter(e=>e.kind==='usage').reduce((sum,e)=>sum+(e.input_tokens||0),0),15);
+  a.envelopes[0].onPublished();appendFileSync(f.path,lines([usage(18)]));
+  const b=await createTranscriptCollector({home:f.home})('d',f.pane,'s');
+  assert.equal(b.envelopes[0].payload.events[0].input_tokens,3);
+});
+
+
+test('private resolved identity and helper attribution survive pending retry',async t=>{
+  const f=fixture(t);writeFileSync(f.path,lines([{type:'session_meta',payload:{id}},message('helper')]));
+  const collect=createTranscriptCollector({home:f.home});
+  const attribution={agentId:'child',parentAgentId:'main'};
+  const result=await collect('d',f.pane,'s',attribution);
+  assert.equal(result.identity.value,f.path);assert.equal(result.identity.nativeId,id);
+  assert.equal(JSON.stringify(result).includes(f.path),false);
+  assert.equal(result.envelopes[0].payload.events[0].agent_id,'child');
+  assert.equal(result.envelopes[0].payload.events[0].parent_agent_id,'main');
+  assert.equal((await collect('d',f.pane,'s',attribution)).identity.nativeId,id);
+});
+
+test('a successful edit and its tool result stay together with one-event batch preference',async t=>{
+  const f=fixture(t,'pi');
+  writeFileSync(f.path,lines([{type:'message',message:{role:'assistant',content:[{type:'toolCall',id:'edit',name:'edit',arguments:{path:'a',oldText:'old',newText:'new'}}]}},{type:'message',message:{role:'toolResult',toolCallId:'edit',content:[{type:'text',text:'ok'}]}}]));
+  const collect=createTranscriptCollector({home:f.home,maxEvents:1});
+  const first=await collect('d',f.pane,'s');first.envelopes[0].onPublished();
+  const second=await collect('d',f.pane,'s');
+  assert.deepEqual(second.envelopes[0].payload.events.map(e=>e.kind),['tool','file']);
+});
+
+
+test('Codex descendant environment resolves only exact pane-bound primary identity',async t=>{
+  const f=fixture(t);writeFileSync(f.path,lines([{type:'session_meta',payload:{id,source:'cli'}},message('known')]));
+  const procRoot=join(f.home,'proc');
+  const process=(pid,children,environment='')=>{mkdirSync(join(procRoot,String(pid),'task',String(pid)),{recursive:true});writeFileSync(join(procRoot,String(pid),'task',String(pid),'children'),children);writeFileSync(join(procRoot,String(pid),'environ'),environment);};
+  process(42,'43',`CODEX_THREAD_ID=${id}\0HERDR_PANE_ID=w1:p0\0`);
+  process(43,'',`CODEX_THREAD_ID=${id}\0HERDR_PANE_ID=w1:p0\0`);
+  const options={home:f.home,procRoot,pids:[42],paneId:'w1:p0'};
+  assert.equal(await resolveTranscript('codex',null,options),f.path);
+  assert.equal(await resolveTranscript('codex',null,{...options,paneId:'other'}),null);
+  writeFileSync(join(procRoot,'43','environ'),'');
+  assert.equal(await resolveTranscript('codex',null,options),null,'root inherited environment is insufficient');
+  writeFileSync(join(procRoot,'43','environ'),`CODEX_THREAD_ID=${id}\0HERDR_PANE_ID=w1:p0\0`);
+  writeFileSync(f.path,lines([{type:'session_meta',payload:{id,source:{subagent:{thread_spawn:{parent_thread_id:'other'}}}}},message('helper')]));
+  assert.equal(await resolveTranscript('codex',null,options),null,'helper identity cannot become the parent pane');
+});
+
+
+test('large edit arguments still produce bounded confirmed file evidence',()=>{
+  const context={};
+  const call={type:'message',message:{role:'assistant',content:[{type:'toolCall',id:'large',name:'edit',arguments:{path:'large.txt',oldText:'a'.repeat(20000),newText:'b'.repeat(20000)}}]}};
+  normalizeRecord('pi',call,context);
+  const output=normalizeRecord('pi',{type:'message',message:{role:'toolResult',toolCallId:'large',content:'ok'}},context);
+  const file=output.find(e=>e.kind==='file');assert.equal(file.path,'large.txt');assert.ok(Buffer.byteLength(file.diff)<=16384);
+});
+
+test('repeated Claude assistant records do not inflate usage',()=>{
+  const context={};
+  const record={type:'assistant',message:{id:'same-message',role:'assistant',content:[{type:'text',text:'answer'}],usage:{input_tokens:10,output_tokens:2}}};
+  const first=normalizeRecord('claude',record,context);
+  const second=normalizeRecord('claude',record,context);
+  assert.equal([...first,...second].filter(e=>e.kind==='usage').reduce((n,e)=>n+e.input_tokens,0),10);
+});
+
+test('Claude PID descriptors require current process lifetime and boot namespace proof',async t=>{
+  const f=fixture(t,'claude');
+  writeFileSync(f.path,lines([{type:'user',sessionId:id,message:{role:'user',content:'recovered'}}]));
+  const procRoot=join(f.home,'proc');
+  mkdirSync(join(procRoot,'42','ns'),{recursive:true});
+  mkdirSync(join(procRoot,'sys','kernel','random'),{recursive:true});
+  writeFileSync(join(procRoot,'sys','kernel','random','boot_id'),'ebf8189c-f339-41b4-b420-32bf1a8ee69f\n');
+  symlinkSync('pid:[1234]',join(procRoot,'42','ns','pid'));
+  const fields=['S',...Array(18).fill('0'),'440839879','0'];
+  writeFileSync(join(procRoot,'42','stat'),`42 (claude name with ) parens) ${fields.join(' ')}\n`);
+  const descriptors=join(f.home,'.claude','sessions');mkdirSync(descriptors,{recursive:true});
+  const descriptor=join(descriptors,'42.json');
+  const evidence={pid:42,sessionId:id,procStart:'440839879',pidDomain:'linux:ebf8189cf33941b4b42032bf1a8ee69f:pid:[1234]'};
+  const options={home:f.home,procRoot,pids:[42],platform:'linux'};
+  writeFileSync(descriptor,JSON.stringify(evidence));
+  assert.equal(await resolveTranscript('claude',null,options),f.path);
+  for(const override of [{pid:43},{procStart:'440839878'},{procStart:null},{pidDomain:'linux:old-boot:pid:[1234]'},{pidDomain:'linux:ebf8189cf33941b4b42032bf1a8ee69f:pid:[9999]'}]) {
+    writeFileSync(descriptor,JSON.stringify({...evidence,...override}));
+    assert.equal(await resolveTranscript('claude',null,options),null,JSON.stringify(override));
+  }
+  writeFileSync(descriptor,JSON.stringify(evidence));
+  assert.equal(await resolveTranscript('claude',null,{...options,platform:'darwin'}),null);
+  assert.equal(await resolveTranscript('claude',null,{...options,pids:[43]}),null);
+  const collect=createTranscriptCollector({home:f.home,procRoot,queryProcess:async()=>({result:{process_info:{foreground_processes:[{pid:42}]}}})});
+  const captured=await collect('d',{...f.pane,agent_session:null},'s');
+  assert.equal(captured.envelopes[0].payload.events[0].text,'recovered');
+});
+
+
+test('large native metadata headers resolve fd, descendant, and private identity without exposing instructions',async t=>{
+  const f=fixture(t);writeFileSync(f.path,lines([{type:'session_meta',payload:{id,source:'cli',instructions:'private'.repeat(4000)}},message('public')]));
+  const procRoot=join(f.home,'proc');mkdirSync(join(procRoot,'42','fd'),{recursive:true});
+  symlinkSync(f.path,join(procRoot,'42','fd','7'));
+  assert.equal(await resolveTranscript('codex',null,{home:f.home,procRoot,pids:[42]}),f.path);
+  const captured=await createTranscriptCollector({home:f.home})('d',f.pane,'s');
+  assert.equal(captured.identity.nativeId,id);
+  assert.equal(JSON.stringify(captured.envelopes).includes('private'),false);
+  for(const [pid,children] of [[43,'44'],[44,'']]) {
+    mkdirSync(join(procRoot,String(pid),'task',String(pid)),{recursive:true});
+    writeFileSync(join(procRoot,String(pid),'task',String(pid),'children'),children);
+  }
+  writeFileSync(join(procRoot,'44','environ'),`CODEX_THREAD_ID=${id}\0HERDR_PANE_ID=w1:p0\0`);
+  assert.equal(await resolveTranscript('codex',null,{home:f.home,procRoot,pids:[43],paneId:'w1:p0'}),f.path);
 });

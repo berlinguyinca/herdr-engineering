@@ -359,7 +359,7 @@ def test_messages_and_summary_kinds_are_persisted_and_hydrate_after_restart():
     repo.inspector.set_prefs({"layout": "stacked"})
     persisted = [e for e in sink.events if e["entity_type"] == "inspector"]
     kinds = {e["payload"].get("kind") for e in persisted}
-    assert kinds == {"capabilities", "message", "association", "model", "test", None}   # None = preferences
+    assert kinds == {"capabilities", "message", "tool", "association", "model", "test", None}   # None = preferences
     assert "conversation survives restart" in json.dumps(persisted)
 
     restarted = ControlPlaneRepo()
@@ -879,14 +879,14 @@ def test_durable_messages_obey_body_ring_and_original_receive_retention_limits()
     assert another.query(SID)["events"] == []
 
 
-def test_message_durability_excludes_reasoning_system_and_tool_bodies():
+def test_message_durability_excludes_reasoning_and_system_bodies():
     rows = []
     store = InspectorStore(persist=rows.append)
     feed(store, {"kind": "capabilities", "reasoning": "full"},
          {"kind": "reasoning", "text": "private reasoning"},
          {"kind": "message", "role": "system", "text": "private instructions"},
-         tool("t", "start", args_preview="private command"),
-         tool("t", "end", output="private output"),
+         tool("t", "start", args_preview="observable command"),
+         tool("t", "end", output="observable output"),
          {"kind": "message", "role": "assistant", "text": "public response"})
     blob = json.dumps(rows)
     assert "public response" in blob
@@ -996,3 +996,116 @@ def test_http_failed_conversation_write_is_not_acknowledged(server):
     assert status >= 500
     assert server.repo.inspector.query(SID)["events"] == []
     assert server.repo.inspector.stats["accepted"] == 0
+
+
+def test_durable_activity_replays_tool_phases_files_usage_and_retry_ids():
+    rows = []
+    now = [time.time()]
+    store = InspectorStore(persist=rows.append, clock=lambda: now[0], limits={"max_body_bytes": 200})
+    secret = "ghp_" + "a" * 36
+    events = [
+        tool("c", "start", event_id="start", tool="bash", args_preview="cat .env",
+             agent_id="helper", parent_agent_id="main"),
+        {"kind": "message", "event_id": "message", "text": "working"},
+        tool("c", "update", event_id="update", output="token=" + secret),
+        tool("c", "end", event_id="end", output="token=" + secret + "\n" + "x" * 500,
+             exit_code=1, is_error=True),
+        {"kind": "file", "event_id": "file", "path": ".env", "op": "edit",
+         "diff": "+token=" + secret},
+        {"kind": "usage", "event_id": "usage", "input_tokens": 10, "output_tokens": 20},
+    ]
+    feed(store, *events)
+    assert len(rows) == len(events)
+    assert secret not in json.dumps(rows)
+    fresh = InspectorStore(clock=lambda: now[0])
+    # Equal receive timestamps still preserve mutation order, including interleaved messages.
+    assert fresh.hydrate(list(reversed(rows))) == len(events)
+    tool_entry = fresh.query(SID, "operator", view="tools")["events"][0]
+    assert tool_entry["data"]["status"] == "error"
+    assert tool_entry["data"]["exit_code"] == 1
+    assert tool_entry["agent_id"] == "helper" and tool_entry["parent_agent_id"] == "main"
+    assert tool_entry["redacted"] and tool_entry["truncated"]
+    assert len(tool_entry["data"]["output"].encode()) <= 200
+    assert fresh.query(SID, "viewer", view="tools")["events"][0]["data"]["withheld"]
+    file_entry = fresh.query(SID, "operator", view="files")["events"][0]
+    assert file_entry["redacted"] and secret not in file_entry["data"]["diff"]
+    assert fresh.query(SID, "viewer", view="files")["events"][0]["data"]["withheld"]
+    assert fresh.query(SID)["summary"]["usage"]["input_tokens"] == 10
+    assert feed(fresh, *events)["duplicates"] == len(events)
+
+
+@pytest.mark.parametrize("failed_kind", ["start", "update", "end", "file", "usage"])
+def test_activity_persistence_failure_is_retryable_without_partial_mutation(failed_kind):
+    class FlakySink:
+        fail = True
+        events = None
+
+        def __init__(self):
+            self.events = []
+
+        def record(self, event):
+            pytest.fail("activity must use acknowledged persistence")
+
+        def record_required(self, event):
+            if self.fail and event["payload"].get("event_id") == "failed":
+                raise OSError("database unavailable")
+            self.events.append(event)
+
+    sink = FlakySink()
+    store = ControlPlaneRepo(sink=sink).inspector
+    if failed_kind in ("update", "end"):
+        feed(store, tool("c", "start", event_id="start", output="before"))
+    event = (tool("c", failed_kind, output="after") if failed_kind in ("start", "update", "end")
+             else {"kind": "file", "path": "main.py", "diff": "+new"} if failed_kind == "file"
+             else {"kind": "usage", "input_tokens": 7})
+    event["event_id"] = "failed"
+    feed(store)
+    before = store.query(SID)["events"]
+    # Snapshot nested data before attempting the write.
+    before = json.loads(json.dumps(before))
+    with pytest.raises(RuntimeError, match="persistence"):
+        feed(store, event)
+    assert store.query(SID)["events"] == before
+    sink.fail = False
+    assert feed(store, event)["accepted"] == 1
+    assert feed(store, event)["duplicates"] == 1
+    fresh = InspectorStore()
+    fresh.hydrate(sink.events)
+    assert feed(fresh, event)["duplicates"] == 1
+    if failed_kind == "usage":
+        assert fresh.query(SID)["summary"]["usage"]["input_tokens"] == 7
+
+
+def test_replayed_tool_mutations_keep_original_age_and_do_not_flag_other_turns():
+    rows = []
+    now = [time.time()]
+    store = InspectorStore(persist=rows.append, clock=lambda: now[0])
+    feed(store, tool("c", "start", event_id="start", tool="bash"))
+    created = now[0]
+    now[0] += 30
+    feed(store, {"kind": "message", "event_id": "message", "text": "visible reply"})
+    now[0] += 30
+    feed(store, tool("c", "end", event_id="end", output="token=" + "ghp_" + "a" * 36))
+    fresh = InspectorStore(clock=lambda: now[0], limits={"retention_hours": 1})
+    fresh.hydrate(rows)
+    activity = fresh.query(SID, "operator", view="tools")["events"][0]
+    assert activity["redacted"]
+    assert activity["data"]["duration_ms"] == 60_000
+    assert fresh._sessions[SID].events[0]["recv"] == created
+    message = fresh.query(SID, view="conversation")["events"][0]
+    assert not message["redacted"]
+    now[0] = created + 3601
+    fresh.sweep()
+    assert fresh.query(SID, view="tools")["events"] == []
+    assert len(fresh.query(SID, view="conversation")["events"]) == 1
+
+
+def test_replay_restores_reused_tool_call_ids_as_distinct_entries():
+    rows = []
+    store = InspectorStore(persist=rows.append)
+    for index in range(2):
+        feed(store, tool("c", "start", event_id=f"start-{index}"),
+             tool("c", "end", event_id=f"end-{index}", output=str(index)))
+    fresh = InspectorStore()
+    fresh.hydrate(rows)
+    assert [e["data"]["output"] for e in fresh.query(SID, view="tools")["events"]] == ["1", "0"]

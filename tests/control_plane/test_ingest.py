@@ -251,11 +251,8 @@ def test_session_recording_status_and_explicit_parent_survive_updates_and_restor
 @pytest.mark.parametrize("metadata", [
     {"transcript": "recording"}, {"transcript": {"status": "invented"}},
     {"transcript": {"status": "recording", "truncated": "false"}},
-    {"parent_session_id": "helper"}, {"parent_session_id": "x" * 129},
-    {"parent_session_id": "../other"}, {"parent_session_id": "bad\nparent"},
-    {"parent_session_id": {"id": "parent"}},
 ])
-def test_invalid_session_workspace_metadata_does_not_mutate_session(metadata):
+def test_invalid_session_transcript_metadata_does_not_mutate_session(metadata):
     svc = make_svc()
     with pytest.raises(ValueError):
         svc.ingest({"entity_type": "session", "entity_id": "helper",

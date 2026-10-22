@@ -6,8 +6,8 @@ It is not a second event bus:
 
 * transport  = ``POST /api/v1/ingest`` with ``entity_type="inspector"``;
 * redaction  = :mod:`.redact` at the ingest boundary;
-* durability = the existing sink for redacted conversation and summaries;
-  reasoning, tool output and file diffs remain in bounded in-memory rings;
+* durability = the existing sink for bounded, redacted conversation, tool
+  activity, file diffs, usage and summaries; reasoning remains memory-only;
 * roles      = the server's viewer / operator / ingest roles.
 
 Reasoning is capability-dependent: it is accepted only when the emitter declared
@@ -30,8 +30,9 @@ KINDS = frozenset({
     "capabilities", "message", "reasoning", "tool", "file", "test", "usage",
     "association", "model", "lifecycle",
 })
-#: Bounded conversation bodies and summaries mirrored to the existing sink.
-DURABLE_KINDS = frozenset({"message", "capabilities", "association", "model", "lifecycle", "test"})
+#: Capture must be committed before acknowledging emitter checkpoints.
+REQUIRED_DURABLE_KINDS = frozenset({"message", "tool", "file", "usage"})
+DURABLE_KINDS = REQUIRED_DURABLE_KINDS | frozenset({"capabilities", "association", "model", "lifecycle", "test"})
 VIEWS = ("all", "conversation", "reasoning", "tools", "files", "tests", "usage")
 _VIEW_KINDS = {
     "conversation": {"message"},
@@ -409,6 +410,17 @@ class InspectorStore:
             "ts": _ts(ev.get("ts"), self._clock()),
         }
         flagged = bool(ev.get("sensitive"))
+        if kind == "file":
+            flagged = flagged or bool(_SENSITIVE_PATH.search(data.get("path") or ""))
+        elif kind == "tool":
+            live = sess.tools.get(data["call_id"])
+            flagged = flagged or self._cmd_sensitive(data) or bool(live and live["sensitive"])
+            if data["phase"] == "end" and "duration_ms" not in data and live and live.get("t0") is not None:
+                data["duration_ms"] = int((self._clock() - live["t0"]) * 1000)
+        if persist and kind in REQUIRED_DURABLE_KINDS and (
+                kind != "message" or data["role"] in ("user", "assistant")):
+            # Commit before any projection mutation, publication or retry-id update.
+            self._persist_detail(sess, kind, base, data, flagged, data["_flags"])
         sess.last_event = self._clock()
         sess.last_ingest = _now_iso()
         if sess.ended and kind == "lifecycle" and data.get("phase") in ("started", "restored", "restarted"):
@@ -451,8 +463,6 @@ class InspectorStore:
             dropped = data.get("dropped")
             if isinstance(dropped, int) and dropped > 0:
                 sess.client_dropped += dropped
-        if kind == "file":
-            flagged = flagged or bool(_SENSITIVE_PATH.search(data.get("path") or ""))
         self._store(sess, kind, base, data, flagged, persist)
         return "ok"
 
@@ -471,7 +481,7 @@ class InspectorStore:
 
     def _sanitize(self, kind: str, ev: dict) -> dict:
         d: dict = {}
-        flags = {"redacted": False, "truncated": False}
+        flags = {"redacted": bool(ev.get("redacted")), "truncated": bool(ev.get("truncated"))}
 
         def text(key: str, src: str | None = None, limit: int | None = None):
             val, trunc, red = self._text(ev.get(src or key), limit)
@@ -632,27 +642,8 @@ class InspectorStore:
             "sensitive": flagged, "redacted": flags["redacted"],
             "truncated": flags["truncated"], "data": data, "size": 0,
         }
-        if (persist and kind in DURABLE_KINDS and self._persist and
-                (kind != "message" or data["role"] in ("user", "assistant"))):
-            durable = {
-                "entity_type": "inspector", "entity_id": sess.session_id,
-                "event_type": f"inspector.{kind}", "session_id": sess.session_id,
-                "source_timestamp": base["ts"],
-                "payload": {**{k: v for k, v in data.items() if k != "failures"},
-                            "agent_id": base["agent_id"], "parent_agent_id": base["parent_agent_id"],
-                            "event_id": base["event_id"], "kind": kind, "sensitive": flagged,
-                            "redacted": entry["redacted"], "truncated": entry["truncated"],
-                            "_received_at": entry["recv"], "_sequence": entry["seq"]},
-            }
-            if kind == "message":
-                # The emitter advances its checkpoint on success. Commit before
-                # publishing or remembering the id so a failed write is retryable.
-                try:
-                    self._persist(durable)
-                except Exception as exc:
-                    raise RuntimeError("conversation persistence unavailable") from exc
-            else:
-                self._safe_persist(durable)
+        if persist and kind in DURABLE_KINDS - REQUIRED_DURABLE_KINDS:
+            self._persist_detail(sess, kind, base, data, flagged, flags)
         sess.next_seq += 1
         entry["size"] = self._size(data)
         sess.bytes += entry["size"]
@@ -660,6 +651,27 @@ class InspectorStore:
         sess.by_seq[entry["seq"]] = entry
         self._touch(sess, entry, account=False)
         return entry
+
+    def _persist_detail(self, sess: _Session, kind: str, base: dict, data: dict,
+                        flagged: bool, flags: dict) -> None:
+        if not self._persist:
+            return
+        durable = {
+            "entity_type": "inspector", "entity_id": sess.session_id,
+            "event_type": f"inspector.{kind}", "session_id": sess.session_id,
+            "source_timestamp": base["ts"],
+            "payload": {**{k: v for k, v in data.items() if k not in ("failures", "_flags")},
+                        "agent_id": base["agent_id"], "parent_agent_id": base["parent_agent_id"],
+                        "event_id": base["event_id"], "kind": kind, "sensitive": flagged,
+                        **flags, "_received_at": self._clock(), "_sequence": sess.rev},
+        }
+        if kind in REQUIRED_DURABLE_KINDS:
+            try:
+                self._persist(durable)
+            except Exception as exc:
+                raise RuntimeError("inspector persistence unavailable") from exc
+        else:
+            self._safe_persist(durable)
 
     def _touch(self, sess: _Session, entry: dict, *, account: bool = True) -> None:
         if account:
@@ -1005,7 +1017,7 @@ class InspectorStore:
 
     # ------------------------------------------------------------- hydrate
     def hydrate(self, events: list[dict]) -> int:
-        """Restore bounded conversation and summaries in original receive order."""
+        """Restore bounded capture and summaries in original receive/mutation order."""
         def received_at(ev):
             p = ev.get("payload")
             value = p.get("_received_at") if isinstance(p, dict) else None
@@ -1043,6 +1055,8 @@ class InspectorStore:
                     if p["kind"] == "message" and p.get("role") not in ("user", "assistant"):
                         continue
                     with self._lock:
+                        before_seq = (self._sessions[sid].next_seq
+                                      if isinstance(sid, str) and sid in self._sessions else 0)
                         result = self.ingest(sid, {**p, "ts": _iso_of(ev.get("source_timestamp")),
                                                   **({"phase": "end"} if p["kind"] == "test" else {})},
                                              persist=False)
@@ -1051,11 +1065,10 @@ class InspectorStore:
                         sess = self._sessions[sid]
                         # Replay keeps the server receive clock, never the untrusted source time.
                         recv = received_at(ev)
-                        if sess.events:
-                            entry = sess.events[-1]
-                            entry["recv"] = recv
-                            entry["redacted"] |= bool(p.get("redacted"))
-                            entry["truncated"] |= bool(p.get("truncated"))
+                        # Mutated tools retain their original creation age, even
+                        # with newer messages behind them. Flags are sanitized above.
+                        if sess.events and sess.next_seq > before_seq:
+                            sess.events[-1]["recv"] = recv
                         sess.last_event = recv
                         self._enforce(sess)
                 else:

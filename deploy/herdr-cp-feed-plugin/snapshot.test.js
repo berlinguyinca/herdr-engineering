@@ -306,3 +306,30 @@ test('publisher acknowledges transcript only after all events accepted and separ
   assert.equal((await publish({},[snapshot,transcript])).posted,1); assert.equal(acks,1);
   assert.equal((await publish({},[snapshot,transcript])).posted,0); assert.equal(acks,2);
 });
+
+test('snapshot remembers exact native transcript identity and adds retained activity without inflating sessions',async()=>{
+  const remembered=[],seen=[];
+  const native={agent:'codex',kind:'path',value:'/native/explicit.jsonl',nativeId:'native-id'};
+  const result=await collect({}, {
+    queryNative:reader([server('eng')],[pane()]),metadata:async()=>({}),
+    collectTranscript:async()=>({status:'recording',envelopes:[],identity:native}),
+    sessionTracker:{remember:value=>remembered.push(value),collect:async ids=>{seen.push(...ids);return {envelopes:[{entity_type:'inspector',payload:{events:[{kind:'message',text:'helper'}]}}]};}},
+  });
+  assert.equal(remembered.length,1);
+  assert.equal(remembered[0].identity,native);
+  assert.deepEqual(seen,[result.envelopes[0].entity_id]);
+  assert.equal(result.summary.sessions,1);
+  assert.equal(result.envelopes.length,2);
+  assert.equal(JSON.stringify(result.envelopes).includes('/native/explicit.jsonl'),false);
+});
+
+test('retained transcripts drain even when the native registry is unavailable',async()=>{
+  const activity={entity_type:'inspector',payload:{events:[]}};
+  const result=await collect({}, {
+    queryNative:async()=>null,
+    sessionTracker:{remember:()=>assert.fail('no identity'),collect:async seen=>{assert.equal(seen.size,0);return {envelopes:[activity]};}},
+  });
+  assert.equal(result.summary.sessions,0);
+  assert.equal(result.summary.errors,1);
+  assert.deepEqual(result.envelopes,[activity]);
+});

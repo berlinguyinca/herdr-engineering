@@ -15,13 +15,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import re
 import threading
 import time
 from uuid import uuid4
 
 from .ids import new_id
-from .inspector import InspectorStore
+from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
 from .service_catalog import (
@@ -151,7 +150,7 @@ class ControlPlaneRepo:
         self.mission_activity = MissionActivityStore(now=self._now)
 
     def _persist_inspector(self, ev):
-        """Persist inspector detail outside global streams; require message ACKs."""
+        """Persist inspector detail outside global streams; require capture ACKs."""
         if self._sink is None:
             return
         ev = dict(ev)
@@ -159,10 +158,10 @@ class ControlPlaneRepo:
         ev.setdefault("schema_version", 1)
         ev["ingest_timestamp"] = self._stamp()
         ev["sequence"] = int(time.time() * 1000)
-        if ev.get("event_type") == "inspector.message":
+        if ev.get("event_type") in {f"inspector.{kind}" for kind in REQUIRED_DURABLE_KINDS}:
             required = getattr(self._sink, "record_required", None)
             if not callable(required):
-                raise RuntimeError("conversation persistence requires an acknowledged sink")
+                raise RuntimeError("inspector persistence requires an acknowledged sink")
             required(ev)
         else:
             self._sink.record(ev)

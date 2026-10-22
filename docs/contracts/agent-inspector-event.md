@@ -76,11 +76,15 @@ Per-kind bodies (all fields optional unless stated):
   `incomplete: true`. Success is never inferred.
 - **Usage** `input/output/reasoning/cache_read_tokens` are *per-request* deltas
   (the server sums them); `context_tokens`/`context_window` are the current value.
-- **Durability:** bounded, redacted user/assistant message bodies, low-volume
+- **Durability:** bounded, redacted user/assistant message bodies, tool phases
+  (including arguments and output), file changes/diffs, usage deltas, low-volume
   summary kinds (`capabilities`, `association`, `model`, `lifecycle`, `test`
   results with up to 20 failure names) and preferences use the existing durable
-  sink. They never enter the global SSE stream. System messages, reasoning,
-  tool output and file diffs are not persisted; developer messages are rejected.
+  sink. They never enter the global SSE stream. System messages and reasoning
+  are not persisted; developer messages are rejected. Tool start/update/end
+  events replay in receive/mutation order into one entry per call, preserving
+  retry IDs, output bounds and access controls. Each update retains its bounded
+  latest tail; the read projection shows the most recent output for that call.
   Restored conversations preserve attribution, sensitivity/redaction/truncation
   flags and source timestamps, ordered by original server receive time and sequence.
   Receive-time age, per-session count/byte limits and global caps apply on replay;
@@ -88,9 +92,10 @@ Per-kind bodies (all fields optional unless stated):
   physical log retention separately from this bounded read projection.
   Persisted `event_id` keys restore a bounded retry window (at least 1024 events,
   or the configured ring event capacity when larger); older retries outside that
-  window may be accepted. With a sink configured, conversation messages are
+  window may be accepted. With a sink configured, conversation, tool, file and
+  usage events are
   acknowledged only after `record_required` succeeds; a failed write returns a
-  retryable server error and does not publish or deduplicate that message.
+  retryable server error and does not mutate, publish or deduplicate that event.
   Summary writes remain best-effort. Emitters should send
   `lifecycle: restored` plus fresh `association`/`capabilities` on reconnect.
 
