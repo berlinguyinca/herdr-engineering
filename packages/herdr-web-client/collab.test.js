@@ -88,3 +88,12 @@ test('API wrapper sends the bearer token and turns 401 into AuthError', async ()
   await assert.rejects(api.rooms(), AuthError);
   await assert.rejects(new CollabApi(() => null, f).rooms(), AuthError);
 });
+
+test('renaming an agent posts the new name to the documented route', async () => {
+  const calls = [];
+  const f = async (url, init) => { calls.push([init.method, url, init.body]); return { status: 200, ok: true, json: async () => ({}) }; };
+  const api = new CollabApi(() => ({ access: 'T' }), f);
+  await api.renameAgent('agent 1', 'architect');
+  assert.deepEqual(calls[0].slice(0, 2), ['POST', '/api/v1/collab/agents/agent%201/rename']);
+  assert.deepEqual(JSON.parse(calls[0][2]), { name: 'architect' });
+});
