@@ -75,8 +75,14 @@ test('client.getFleetConfigStatus gives up after its timeout', async () => {
     seen = init.signal;
     init.signal.addEventListener('abort', () => reject(init.signal.reason));
   }) });
-  const started = Date.now();
-  await assert.rejects(hang.getFleetConfigStatus({ timeoutMs: 50 }));
-  assert.ok(seen && seen.aborted);
-  assert.ok(Date.now() - started < 2000);
+  // AbortSignal.timeout's timer is unref'd in Node: keep the loop alive meanwhile.
+  const keepAlive = setTimeout(() => {}, 5000);
+  try {
+    const started = Date.now();
+    await assert.rejects(hang.getFleetConfigStatus({ timeoutMs: 50 }));
+    assert.ok(seen && seen.aborted);
+    assert.ok(Date.now() - started < 2000);
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });
