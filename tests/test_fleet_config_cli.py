@@ -19,6 +19,14 @@ ANSWERS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _private_home(tmp_path, monkeypatch):
+    """Never read the operator's real ~/.config (legacy token files, defaults)."""
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+
 def mode(p):
     return stat.S_IMODE(os.stat(p).st_mode)
 
@@ -513,6 +521,7 @@ def test_cli_init_from_env_and_answers_is_non_interactive_and_prints_no_values(t
                                        "web_port": "80", "hosts": {"bender": ["builder"]}}))
     answers.chmod(0o600)
     monkeypatch.setattr("sys.stdin", io.StringIO(""))   # any prompt would hit EOF
+    monkeypatch.setattr(fcc.getpass, "getpass", lambda *_a: "")   # the optional GitHub token
     target = tmp_path / "fleet" / "fleet-config.yaml"
     assert main(["fleet", "config", "init", "--path", str(target), "--from-env", str(env),
                  "--answers", str(answers)]) == 0
@@ -572,3 +581,98 @@ def test_gateway_ip_accepts_ipv4_and_brackets_ipv6_for_the_healthcheck(tmp_path)
     p6 = fcc.init_config(tmp_path / "b" / "fleet-config.yaml", dict(ANSWERS, gateway_tailnet_ip="fd7a:115c::1"),
                          prompt=no_prompt, secret_prompt=no_prompt)
     assert fcc.compose_env(load_fleet_config(p6))["GATEWAY_HEALTH_HOST"] == "[fd7a:115c::1]"
+
+
+# ---------------------------------- re-review I-A: legacy token files (github / ci)
+
+def _legacy_home(tmp_path, monkeypatch, github=None, ci=None):
+    home = tmp_path / "home"
+    d = home / ".config/herdr-engineering"
+    d.mkdir(parents=True)
+    if github is not None:
+        (d / "github-token").write_text(github)
+    if ci is not None:
+        (d / "ci-token").write_text(ci)
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+def test_import_falls_back_to_the_legacy_github_and_ci_token_files(tmp_path, monkeypatch):
+    _legacy_home(tmp_path, monkeypatch, github="placeholder-gh-legacy-one\n", ci="placeholder-ci-legacy-two\n")
+    env = _env_file(tmp_path, "HERDR_CP_PG_USER=u\n")
+    answers, report = fcc.import_env_file(env)
+    assert answers["github_token"] == "placeholder-gh-legacy-one"
+    assert answers["ci_token"] == "placeholder-ci-legacy-two"
+    assert report["tokens"] == {"github.token": "imported", "ci.token": "imported"}
+    assert "secret" not in json.dumps(report)
+
+
+def test_an_env_named_token_file_wins_over_the_legacy_default(tmp_path, monkeypatch):
+    _legacy_home(tmp_path, monkeypatch, github="placeholder-gh-legacy-one\n")
+    named = tmp_path / "gh"
+    named.write_text("placeholder-gh-named-three\n")
+    env = _env_file(tmp_path, f"HERDR_ENGINEERING_GITHUB_TOKEN_HOST_FILE={named}\n")
+    answers, report = fcc.import_env_file(env)
+    assert answers["github_token"] == "placeholder-gh-named-three"
+    assert report["tokens"]["github.token"] == "imported"
+
+
+def test_missing_github_token_is_reported(tmp_path, monkeypatch):
+    _legacy_home(tmp_path, monkeypatch)
+    answers, report = fcc.import_env_file(_env_file(tmp_path, "HERDR_CP_PG_USER=u\n"))
+    assert "github_token" not in answers
+    assert report["tokens"] == {"github.token": "missing", "ci.token": "missing"}
+
+
+def _cli_answers(tmp_path, **extra):
+    answers = tmp_path / "answers.yaml"
+    answers.write_text(yaml.safe_dump({"public_url": "https://cp.example.test",
+                                       "llm_upstream_url": "https://llm.example.test",
+                                       "llm_upstream_key": "placeholder-k-value", "ci_url": "https://ci.test",
+                                       "ci_token": "placeholder-t-value", "web_bind": "127.0.0.1",
+                                       "web_port": "80", "gateway_tailnet_ip": "127.0.0.1",
+                                       "hosts": {}, **extra}))
+    answers.chmod(0o600)
+    return answers
+
+
+def test_cli_from_env_imports_the_legacy_github_token_silently(tmp_path, monkeypatch, capsys):
+    import io
+    from herdr_engineering.cli import main
+    _legacy_home(tmp_path, monkeypatch, github="placeholder-gh-legacy-one\n")
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    monkeypatch.setattr(fcc.getpass, "getpass", lambda *_a: pytest.fail("prompted although imported"))
+    target = tmp_path / "f" / "fleet-config.yaml"
+    assert main(["fleet", "config", "init", "--path", str(target), "--from-env",
+                 str(_env_file(tmp_path, "HERDR_CP_PG_USER=u\n")), "--answers", str(_cli_answers(tmp_path))]) == 0
+    out = capsys.readouterr()
+    assert "github.token: imported" in out.err and "placeholder-gh-legacy-one" not in out.out + out.err
+    assert load_fleet_config(target).section("github")["token"] == "placeholder-gh-legacy-one"
+
+
+def test_cli_from_env_prompts_for_a_missing_github_token(tmp_path, monkeypatch, capsys):
+    from herdr_engineering.cli import main
+    _legacy_home(tmp_path, monkeypatch)
+    asked = []
+    monkeypatch.setattr(fcc.getpass, "getpass", lambda label: asked.append(label) or "placeholder-gh-typed-four")
+    target = tmp_path / "f" / "fleet-config.yaml"
+    assert main(["fleet", "config", "init", "--path", str(target), "--from-env",
+                 str(_env_file(tmp_path, "HERDR_CP_PG_USER=u\n")), "--answers", str(_cli_answers(tmp_path))]) == 0
+    out = capsys.readouterr()
+    assert "github.token: missing" in out.err and any("GitHub token" in a for a in asked)
+    assert "placeholder-gh-typed-four" not in out.out + out.err
+    assert load_fleet_config(target).section("github")["token"] == "placeholder-gh-typed-four"
+
+
+def test_cli_from_env_missing_github_token_without_terminal_stays_empty(tmp_path, monkeypatch, capsys):
+    from herdr_engineering.cli import main
+
+    def eof(*_a):
+        raise EOFError
+    _legacy_home(tmp_path, monkeypatch)
+    monkeypatch.setattr(fcc.getpass, "getpass", eof)
+    target = tmp_path / "f" / "fleet-config.yaml"
+    assert main(["fleet", "config", "init", "--path", str(target), "--from-env",
+                 str(_env_file(tmp_path, "HERDR_CP_PG_USER=u\n")), "--answers", str(_cli_answers(tmp_path))]) == 0
+    assert load_fleet_config(target).section("github")["token"] == ""
+    assert "github.token: missing" in capsys.readouterr().err
