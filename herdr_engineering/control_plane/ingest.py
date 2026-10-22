@@ -130,7 +130,8 @@ class IngestService:
             source=source, **_git_identity(payload),
             **{k: payload.get(k) for k in (
                 "pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
-                "revision", "interactive_ready", "launch_pending", "state_change_seq")})
+                "revision", "interactive_ready", "launch_pending", "state_change_seq",
+                "parent_session_id", "name")})
 
     def _ingest_mission(self, entity_id, event_type, payload,
                         source="herdr") -> dict:

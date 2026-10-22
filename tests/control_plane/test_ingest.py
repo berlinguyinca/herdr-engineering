@@ -191,3 +191,35 @@ def test_ingest_requires_entity_and_event():
         svc.ingest({})
     with pytest.raises(ValueError):
         svc.ingest({"entity_type": "host", "entity_id": "x"})
+
+
+def _session(svc, sid, event, **payload):
+    svc.ingest({"entity_type": "session", "entity_id": sid, "event_type": event,
+                "payload": {"host_id": "bender", **payload}})
+
+
+def test_session_keeps_its_parent_and_name_and_ignores_bad_ones():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    _session(svc, "bender:s0", "session.started", name="lead")
+    _session(svc, "bender:s1", "session.started", parent_session_id="bender:s0", name="helper-1")
+    _session(svc, "bender:s1", "session.updated", status="working")        # a later event without them keeps them
+    _session(svc, "bender:s2", "session.started", parent_session_id="bender:s2", name="x" * 500)
+    _session(svc, "bender:s3", "session.started", parent_session_id=["not", "a", "string"], name="bad\x00name")
+    got = {s["session_id"]: s for s in repo.list_sessions()}
+    assert (got["bender:s1"]["parent_session_id"], got["bender:s1"]["name"]) == ("bender:s0", "helper-1")
+    assert got["bender:s0"]["parent_session_id"] is None and got["bender:s0"]["name"] == "lead"
+    for sid in ("bender:s2", "bender:s3"):                                  # self-parent, oversize, wrong type, control chars
+        assert got[sid]["parent_session_id"] is None and got[sid]["name"] is None
+
+
+def test_parent_and_name_survive_rebuilding_from_the_event_log():
+    from herdr_engineering.control_plane.bridge import _reconstruct_from_events
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    _session(svc, "bender:s1", "session.started", parent_session_id="bender:s0", name="helper-1")
+    _session(svc, "bender:s1", "session.updated", status="working")
+    events = repo.stream("session", "bender:s1")
+    rebuilt = _reconstruct_from_events({"session:bender:s1": events})
+    sessions = next(x for x in rebuilt if isinstance(x, dict) and "bender:s1" in x)
+    assert sessions["bender:s1"]["parent_session_id"] == "bender:s0" and sessions["bender:s1"]["name"] == "helper-1"

@@ -246,7 +246,8 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                     s[k] = p[k]
             for k in ("pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
                       "revision", "interactive_ready", "launch_pending", "state_change_seq",
-                      "repository_id", "commit_sha", "mission_key", "mission_source"):
+                      "repository_id", "commit_sha", "mission_key", "mission_source",
+                      "parent_session_id", "name"):
                 if p.get(k) is not None or (k == "commit_sha" and k in p):
                     s[k] = p[k]
             # Command receipts are transport state, never observed agent state.
