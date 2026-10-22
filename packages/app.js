@@ -8,6 +8,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
 import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
 import { mountInspector } from './inspector-view.js';
+import { mountSessionWorkspace } from './session-workspace.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
@@ -271,10 +272,17 @@ async function viewSession(parts, revision) {
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       ${relatedIntegrationLinks(s,'session',s.session_id)}
       <details class="hd-card sd-details" id="session-details"><summary>Session details and attachment</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}${attach ? `<div class="hd-inline"><code style="flex:1;overflow-wrap:anywhere">${esc(attach)}</code><button class="hd-btn" id="copy-attach">Copy attach command</button></div>` : ''}</details>
-      <h2>Inspection</h2><div id="inspector-host"></div>
-      ${!terminal ? `<details class="hd-card sd-details"><summary>Send a message</summary><form id="msg-form" class="hd-inline"><input id="msg-input" aria-label="Message to session" placeholder="Steer the session…" style="flex:1;min-width:0;padding:8px"><button type="submit" class="hd-btn">Send</button></form></details>` : ''}
+      <div id="session-workspace-host"></div>
+      <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
       <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream"><span class="muted">Loading recorded events…</span></div></details>`;
-    disposeInspector = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
+    const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s);
+    let disposeAdvanced = null;
+    const advanced = document.getElementById('advanced-inspector');
+    advanced.addEventListener('toggle', () => {
+      if (advanced.open && !disposeAdvanced) disposeAdvanced = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
+      else if (!advanced.open && disposeAdvanced) { disposeAdvanced(); disposeAdvanced = null; document.getElementById('inspector-host').replaceChildren(); }
+    });
+    disposeInspector = () => { disposeWorkspace(); if (disposeAdvanced) disposeAdvanced(); };
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();
@@ -293,11 +301,6 @@ async function viewSession(parts, revision) {
     streamList('session',s.session_id).then(html=>{if(stream.isConnected && revision===renderRevision)stream.innerHTML=html;}).catch(()=>{if(stream.isConnected)stream.innerHTML='<span class="muted">Recorded events could not load.</span>';});
     const copyBtn = document.getElementById('copy-attach');
     if (copyBtn) copyBtn.addEventListener('click',()=>copyText(attach,copyBtn));
-    document.getElementById('msg-form')?.addEventListener('submit',async event=>{
-      event.preventDefault();const input=document.getElementById('msg-input');if(!input.value.trim())return;
-      try {await client.sendMessage(s.session_id,input.value.trim());input.value='';const html=await streamList('session',s.session_id);if(stream.isConnected)stream.innerHTML=html;}
-      catch(error){if(stream.isConnected)alert(error.message);}
-    });
   } catch (error) {
     if (revision !== renderRevision) return;
     throw new Error(controller.signal.aborted ? 'Session details could not load. Try again.' : error.message);

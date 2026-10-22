@@ -79,6 +79,12 @@ def test_public_listener_serves_only_collab_surfaces(stack):
     assert pub.call("POST", "/api/v1/sessions/s/messages", {"message": "x"}, headers=H)[0] == 404
 
 
+def test_public_listener_serves_shared_conversation_components(stack):
+    for name in ("conversation-composer.js", "conversation-markdown.js", "conversation.css"):
+        (stack.srv.web_root / name).write_text(f"/* {name} */")
+        assert stack.pub.call("GET", f"/{name}", headers=H)[0] == 200
+
+
 def test_public_static_carries_security_headers(stack):
     import http.client
     c = http.client.HTTPConnection("127.0.0.1", stack.srv.public_port, timeout=5)

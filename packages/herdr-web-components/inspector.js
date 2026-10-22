@@ -167,7 +167,7 @@ export function renderEvent(e, prefs = {}) {
     case 'file':
       title = `${esc(d.op)} <code>${esc(d.path)}</code>`;
       extra = d.additions != null || d.deletions != null ? `<span class="hd-ins__st"><span class="hd-diff__add">+${esc(d.additions ?? 0)}</span> <span class="hd-diff__del">−${esc(d.deletions ?? 0)}</span></span>` : '';
-      body = d.withheld ? withheld(d) : (d.diff ? `${renderDiff(d.diff)}${d.diff_more ? '<button class="hd-btn hd-ins__expand" data-seq="' + esc(e.seq) + '">Show full diff</button>' : ''}` : '');
+      body = d.withheld ? withheld(d) : (d.diff ? `${renderDiff(d.diff, {maxLines: prefs.diff_max_lines || 200})}${d.diff_more ? '<button class="hd-btn hd-ins__expand" data-seq="' + esc(e.seq) + '">Show full diff</button>' : ''}` : '');
       break;
     case 'test': {
       const st = d.status || 'running';

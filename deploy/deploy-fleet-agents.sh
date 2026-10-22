@@ -34,7 +34,7 @@ HOSTS_FILE="${HERDR_FLEET_HOSTS:-$HOME/.config/herdr-engineering/fleet-hosts.txt
 [ "$FETCH" = 1 ] && git -C "$REPO" fetch -q origin
 FULL="$(git -C "$REPO" rev-parse --verify "$REF^{commit}")"; SHA="${FULL:0:12}"
 REL="fleet-$SHA"
-PLUGIN_FILES="herdr-plugin.toml package.json emit.js enrich.js git-metadata.js host-config.js inventory.js session-model.js snapshot.js"
+PLUGIN_FILES="herdr-plugin.toml package.json emit.js enrich.js git-metadata.js host-config.js inventory.js session-model.js session-transcript.js session-helpers.js snapshot.js"
 
 WORK="$(mktemp -d)"
 cleanup() { git -C "$REPO" worktree remove --force "$WORK/src" >/dev/null 2>&1 || true; rm -rf "$WORK"; }
@@ -57,6 +57,83 @@ put() { # put <target> <src> <dest-dir>
   if [ "$1" = local ]; then cp "$2" "$3/"; else scp -q -o BatchMode=yes "$2" "$1:$3/"; fi
 }
 
+# This function runs on each owning host; native installers merge their own config.
+# Keep installer output private because config parse errors may contain credentials.
+install_native_hooks() {
+  PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+  export PATH
+  python3 - <<'HERDR_NATIVE_HOOKS'
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import tempfile
+
+home = Path.home()
+herdr = shutil.which("herdr")
+configs = (
+    ("codex", Path(os.environ.get("CODEX_HOME") or home / ".codex"),
+     ("config.toml", "hooks.json", "herdr-agent-state.sh")),
+    ("claude", Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude"),
+     ("settings.json", "hooks/herdr-agent-state.sh")),
+    ("pi", Path(os.environ.get("PI_CODING_AGENT_DIR") or home / ".pi/agent"),
+     ("extensions/herdr-agent-state.ts",)),
+)
+failed = False
+for agent, config, files in configs:
+    if not shutil.which(agent):
+        print(f"   {agent} hooks: runtime not installed, skipped", flush=True)
+        continue
+    required = config / "extensions" if agent == "pi" else config
+    if not herdr or not required.is_dir():
+        print(f"   {agent} hooks: FAILED (herdr or runtime configuration missing)", flush=True)
+        failed = True
+        continue
+    backups = home / ".local/state/herdr-engineering/hook-backups"
+    backups.mkdir(parents=True, mode=0o700, exist_ok=True)
+    backups.chmod(0o700)
+    backup = Path(tempfile.mkdtemp(prefix=f"{agent}-", dir=backups))
+    originals = {}
+    attempted = False
+    try:
+        for relative in files:
+            source = config / relative
+            if source.exists():
+                dest = backup / relative
+                dest.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                shutil.copyfile(source, dest)
+                dest.chmod(0o600)
+                originals[relative] = stat.S_IMODE(source.stat().st_mode)
+        # Record all originals before invoking the native installer. Its success
+        # means hooks are installed for the next start/resume, not live-reloaded.
+        log = backup / "install.log"
+        with log.open("w") as output:
+            log.chmod(0o600)
+            attempted = True
+            result = subprocess.run([herdr, "integration", "install", agent],
+                                    stdout=output, stderr=subprocess.STDOUT, timeout=60)
+        if result.returncode or not all((config / f).is_file() for f in files):
+            raise RuntimeError("native installer failed")
+    except Exception:
+        # Restore managed files only after an attempted installation. If copying
+        # originals failed, no installer has run and the runtime stays untouched.
+        if attempted:
+            for relative in files:
+                destination = config / relative
+                if relative in originals:
+                    shutil.copyfile(backup / relative, destination)
+                    destination.chmod(originals[relative])
+                elif destination.exists():
+                    destination.unlink()
+        print(f"   {agent} hooks: FAILED; private backup/log: {backup}", flush=True)
+        failed = True
+    else:
+        print(f"   {agent} hooks: installed; private backup/log: {backup}", flush=True)
+raise SystemExit(1 if failed else 0)
+HERDR_NATIVE_HOOKS
+}
+
 restart_cmd() { # restart_cmd <manager> <unit-or-label>
   case "$1" in
     systemd) echo "systemctl --user restart $2.service" ;;
@@ -76,13 +153,19 @@ while IFS='|' read -r name target manager; do
   case "$name" in ''|\#*) continue ;; esac
   if [ -n "$ONLY" ] && ! printf ',%s,' "$ONLY" | grep -q ",$name,"; then continue; fi
   echo "== $name ($manager)"
-  if [ "$DRY" = 1 ]; then echo "   [dry-run] would check host.json, then install plugin + feed release $REL"; continue; fi
+  if [ "$DRY" = 1 ]; then echo "   [dry-run] would check host.json, then install plugin + feed release $REL and native hooks for installed runtimes"; continue; fi
 
   # ---- host credentials: nothing is rolled to a host that cannot fetch its config ----
   if ! run "$target" 'test -s "$HOME/.config/herdr-engineering/host.json"'; then
     echo "   host.json missing on $name: run  herdr-eng fleet join $name  first; skipping" >&2
     failed=1; continue
   fi
+
+  # Run through bash even if the remote login shell differs. Quote the function
+  # as data so paths and the embedded Python cannot be interpreted by that shell.
+  hook_script="$(declare -f install_native_hooks); install_native_hooks"
+  hook_script="${hook_script//\'/\'\\\'\'}"
+  if ! run "$target" "bash -c '$hook_script'"; then failed=1; fi
 
   # ---- snapshot plugin ----
   base='$HOME/.local/share/herdr-cp-feed-plugin-releases'
