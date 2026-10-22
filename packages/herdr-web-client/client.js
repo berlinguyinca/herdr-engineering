@@ -212,6 +212,10 @@ export class HerdrClient {
     return this.request('/api/v1/ci/reports', { signal });
   }
 
+  getCiHistory({ signal } = {}) {
+    return this.request('/api/v1/ci/history', { signal });
+  }
+
   getCiPipeline(repository, number, { signal } = {}) {
     const query = new URLSearchParams({ repository, number: String(number) });
     return this.request(`/api/v1/ci/pipeline?${query}`, { signal });

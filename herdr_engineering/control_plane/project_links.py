@@ -159,6 +159,13 @@ def _related_records(repo):
     return indexes
 
 
+def annotate_ci_history(view, repo):
+    """Apply the same exact repository/commit associations to flat history."""
+    result = annotate_ci({**view, "pipelines": {"history": view.get("pipelines", [])}}, repo)
+    result["pipelines"] = result["pipelines"].get("history", [])
+    return result
+
+
 def annotate_ci(view, repo):
     """Return a copied CI snapshot with project metadata and exact commit links.
 

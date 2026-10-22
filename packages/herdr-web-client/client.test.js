@@ -260,3 +260,17 @@ test('CI report history reads use viewer GET and forward cancellation',async()=>
   await assert.rejects(request,{name:'AbortError'});
  } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 });
+
+test('CI heatmap history uses the viewer endpoint and supports cancellation',async()=>{
+ const calls=[];
+ const server=createServer((req,res)=>{calls.push({url:req.url,method:req.method});res.setHeader('Content-Type','application/json');res.end(JSON.stringify({repos:[],pipelines:[],coverage:{}}));});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try {
+  const client=new HerdrClient(`http://127.0.0.1:${server.address().port}`);
+  assert.deepEqual(await client.getCiHistory(),{repos:[],pipelines:[],coverage:{}});
+  assert.deepEqual(calls[0],{url:'/api/v1/ci/history',method:'GET'});
+  const controller=new AbortController();
+  const request=client.getCiHistory({signal:controller.signal});controller.abort();
+  await assert.rejects(request,{name:'AbortError'});
+ } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});

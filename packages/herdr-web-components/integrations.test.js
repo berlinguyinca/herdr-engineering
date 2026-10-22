@@ -94,3 +94,11 @@ test('CI scope filters use provider identity and exact branch and bounded dates'
  ]}});
  assert.deepEqual(selectIntegrations(entries,{tab:'all',repository:'7',branch:'main',days:7}).map(e=>e.record.run_number),[1]);
 });
+
+test('CI inspector entry identity distinguishes provider instances',()=>{
+ const entries=integrationEntries({pipelines:{history:[
+  {provider_url:'https://ci.one',provider_repo_id:17,run_number:42},
+  {provider_url:'https://ci.two',provider_repo_id:17,run_number:42},
+ ]}});
+ assert.notEqual(entries[0].id,entries[1].id);
+});

@@ -112,3 +112,18 @@ def test_report_upload_requires_operator_and_is_readable_by_viewer(server):
     assert data['scope']['complete'] is False
     assert request(server, 'ci/reports', {**body, 'xml': '<broken'}, key='write')[0] == 400
     assert request(server, 'ci/reports', ['bad'], key='write')[0] == 400
+
+
+def test_history_is_viewer_readable_flat_and_memory_only(server):
+    from tests.control_plane.test_ci_history import MemoryProvider, runs
+
+    server.ci_monitor.close()
+    server.ci_monitor = CIMonitor(provider_factory=lambda: MemoryProvider(runs(3)))
+    server.ci_monitor._history.refresh()
+    status, data = request(server, 'ci/history')
+    assert status == 200
+    assert isinstance(data['pipelines'], list)
+    assert data['scope']['memory_only'] is True
+    assert data['repos'][0]['provider_url'] == 'https://ci.example'
+    assert data['coverage']['17']['exhausted'] is True
+    assert request(server, 'ci/history', key='invalid')[0] == 401

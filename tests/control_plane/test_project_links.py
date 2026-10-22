@@ -217,3 +217,22 @@ def test_legacy_reverse_membership_alone_is_not_namespace_proof(monkeypatch):
     repo.get_mission = lambda key: mission
     row = annotate_ci(snapshot(), repo)["pipelines"]["org/frontend"][0]
     assert row["related_missions"] == []
+
+
+def test_flat_ci_history_keeps_exact_context_links_without_mutating_coverage():
+    from herdr_engineering.control_plane.project_links import annotate_ci_history
+    view = snapshot()
+    view['pipelines'] = [row for rows in view['pipelines'].values() for row in rows]
+    view['coverage'] = {'17': {'exhausted': True}}
+    original = copy.deepcopy(view)
+    result = annotate_ci_history(view, records(
+        sessions=[{'session_id': 's1', 'repository_id': 'github.com/org/frontend', 'commit_sha': SHA}],
+        missions=[{'mission_id': 'm1', 'source': 'pi', 'mission_key': 'pi:m1',
+                   'repository_id': 'github.com/org/frontend', 'commit_sha': SHA}]))
+    assert result['repos'][0]['repository_id'] == 'github.com/org/frontend'
+    assert result['pipelines'][0]['related_sessions'] == [{'session_id': 's1'}]
+    assert result['pipelines'][0]['related_missions'][0]['mission_key'] == 'pi:m1'
+    assert result['pipelines'][1]['related_sessions'] == []
+    assert result['pipelines'][1]['related_missions'] == []
+    assert result['coverage'] == original['coverage']
+    assert view == original
