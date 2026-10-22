@@ -1262,7 +1262,9 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"ok": True})
                 if what == "models" and len(parts) == 5:
                     r.upsert_custom_model(body.get("name"), body.get("base_url"),
-                                          body.get("upstream_model"), body.get("project"))
+                                          body.get("upstream_model"), body.get("project"),
+                                          fabric_model=body.get("fabric_model"),
+                                          context_window=body.get("context_window", 8192))
                     return self._json({"ok": True})
                 if what == "models" and len(parts) == 7 and parts[6] == "delete":
                     r.delete_custom_model(parts[5])

@@ -437,3 +437,166 @@ def test_prompt_marks_all_user_turns_unanswered_before_first_assistant(repo):
     source = json.loads(seen[0]['messages'][-1]['content'])
     assert source['latest_assistant_label'] is None
     assert source['unanswered_user_labels'] == ['m1', 'm2']
+
+
+@pytest.mark.parametrize('values', [
+    {'routing': 'unknown'}, {'routing': None}, {'routing': 'fabric'},
+    {'routing': 'fabric', 'api_key': ''}, {'api_key': None},
+    {'api_key': 'x' * 4097}, {'api_key': 'secret\r\nInjected: value'},
+    {'api_key': 'secret\x7f'}, {'api_key': 'secret secret'}, {'api_key': 'secreté'},
+])
+def test_fabric_config_rejects_invalid_credentials_without_echoing(values):
+    with pytest.raises(ValueError) as error:
+        AgentSummaryConfig(**values)
+    if values.get('api_key'):
+        assert values['api_key'] not in str(error.value)
+
+
+def test_fabric_credentials_are_excluded_from_repr_and_rotation_keeps_cache(repo):
+    feed(repo, msg('fix auth'))
+    first = make_service(repo, routing='fabric', api_key='first-secret')
+    second = make_service(repo, routing='fabric', api_key='second-secret')
+    direct = make_service(repo)
+    source = first.summary_source(SID)
+    assert 'first-secret' not in repr(first.config)
+    assert first._cache_key(source) == second._cache_key(source)
+    assert first._cache_key(source) != direct._cache_key(source)
+
+
+def test_fabric_service_includes_stable_conversation_affinity_only_for_fabric(repo):
+    seen = []
+    feed(repo, msg('fix auth'))
+    repo.inspector.ingest('other', {'events': [msg('other request')]})
+    service = make_service(repo, routing='fabric', api_key='project-secret',
+                           debounce_seconds=0,
+                           client=lambda payload, **kw: (seen.append(payload) or result()))
+    for sid in (SID, 'other', SID):
+        service.request(sid, force=True)
+        assert service.run_once()
+    identities = [p['metadata']['herdr_summary_session_id'] for p in seen]
+    assert identities[0] == identities[2] != identities[1]
+    assert identities[0] == service.summary_source(SID)['conversation_identity']
+    assert all('project-secret' not in json.dumps(payload) for payload in seen)
+    direct_seen = []
+    direct = make_service(repo, debounce_seconds=0,
+                          client=lambda payload, **kw: (direct_seen.append(payload) or result()))
+    direct.request(SID)
+    assert direct.run_once()
+    assert 'metadata' not in direct_seen[0]
+
+
+@pytest.fixture
+def summary_http_server():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    requests = []
+    response = {'redirect': None}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append({'path': self.path, 'headers': dict(self.headers),
+                             'body': json.loads(self.rfile.read(int(self.headers['Content-Length'])))})
+            if response['redirect']:
+                self.send_response(response['redirect'])
+                self.send_header('Location', '/redirect-target')
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'choices': [{'message': {
+                'content': json.dumps(result())}}]}).encode())
+
+        def do_GET(self):
+            requests.append({'path': self.path, 'headers': dict(self.headers)})
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f'http://127.0.0.1:{server.server_port}/v1', requests, response
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_fabric_http_transport_auth_affinity_and_metadata_removal(summary_http_server):
+    endpoint, requests, _ = summary_http_server
+    client = OpenAICompatibleSummaryClient(endpoint, routing='fabric', api_key='project-secret')
+    payload = {'model': 'agent-summary', 'metadata': {'herdr_summary_session_id': 'a' * 64}}
+    assert client(payload, timeout=2) == result()
+    captured = requests[0]
+    headers = {key.lower(): value for key, value in captured['headers'].items()}
+    assert headers['authorization'] == 'Bearer project-secret'
+    assert headers['x-herdr-require-registered-model'] == 'true'
+    assert headers['x-inferweave-session-id'] == 'a' * 64
+    assert headers['x-inferweave-agent-id'] == 'herdr-agent-summaries'
+    assert captured['body'] == {'model': 'agent-summary'}
+    assert payload['metadata']['herdr_summary_session_id'] == 'a' * 64
+    assert 'project-secret' not in repr(client)
+
+
+@pytest.mark.parametrize('status', [301, 302, 303, 307, 308])
+def test_fabric_http_never_follows_authenticated_redirects(summary_http_server, status):
+    endpoint, requests, response = summary_http_server
+    response['redirect'] = status
+    client = OpenAICompatibleSummaryClient(endpoint, routing='fabric', api_key='redirect-secret')
+    with pytest.raises(RuntimeError) as error:
+        client({'model': 'agent-summary', 'metadata': {
+            'herdr_summary_session_id': 'a' * 64}}, timeout=2)
+    assert len(requests) == 1
+    assert 'redirect-secret' not in str(error.value)
+    assert endpoint not in str(error.value)
+
+
+def test_direct_http_does_not_send_fabric_auth_or_headers(summary_http_server):
+    endpoint, requests, _ = summary_http_server
+    client = OpenAICompatibleSummaryClient(endpoint, api_key='unused-secret')
+    assert client({'model': 'small'}, timeout=2) == result()
+    headers = {key.lower(): value for key, value in requests[0]['headers'].items()}
+    assert 'authorization' not in headers
+    assert not any(key.startswith(('x-herdr-', 'x-inferweave-')) for key in headers)
+
+
+def test_service_constructs_authenticated_client(repo, summary_http_server):
+    endpoint, requests, _ = summary_http_server
+    feed(repo, msg('fix auth'))
+    service = AgentSummaryService(repo, AgentSummaryConfig(
+        enabled=True, endpoint=endpoint, model='agent-summary', routing='fabric',
+        api_key='service-secret', debounce_seconds=0))
+    service.request(SID)
+    assert service.run_once()
+    assert service.get(SID)['state'] == 'ready'
+    headers = {key.lower(): value for key, value in requests[0]['headers'].items()}
+    assert headers['authorization'] == 'Bearer service-secret'
+    assert headers['x-inferweave-session-id'] == service.summary_source(SID)['conversation_identity']
+
+
+@pytest.mark.parametrize('metadata', [None, {}, {'herdr_summary_session_id': 'bad\r\nheader'}])
+def test_fabric_rejects_missing_or_invalid_affinity_before_sending(summary_http_server, metadata):
+    endpoint, requests, _ = summary_http_server
+    client = OpenAICompatibleSummaryClient(endpoint, routing='fabric', api_key='project-secret')
+    with pytest.raises(ValueError, match='valid conversation identity'):
+        client({'model': 'agent-summary', 'metadata': metadata}, timeout=2)
+    assert requests == []
+
+
+def test_fabric_transport_errors_do_not_expose_credentials_or_response(monkeypatch):
+    client = OpenAICompatibleSummaryClient('http://localhost:8099/v1',
+                                           routing='fabric', api_key='private-project-key')
+
+    def fail(*args, **kwargs):
+        raise ValueError('private-project-key provider secret body')
+
+    monkeypatch.setattr(client._opener, 'open', fail)
+    with pytest.raises(RuntimeError) as error:
+        client({'model': 'agent-summary', 'metadata': {
+            'herdr_summary_session_id': 'a' * 64}}, timeout=2)
+    assert str(error.value) == 'fabric summary request failed'
+    assert error.value.__suppress_context__
