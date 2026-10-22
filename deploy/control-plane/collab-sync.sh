@@ -135,6 +135,7 @@ install_spawn_timer() {
   install -m 0755 "$(dirname "$0")/collab-spawn.py" "$d/collab-spawn.py"
   install -m 0644 "$(dirname "$0")/collab-worker.sh" "$d/collab-worker.sh"
   install -m 0644 "$(dirname "$0")/collab-sandbox.sh" "$d/collab-sandbox.sh"
+  install -m 0755 "$(dirname "$0")/collab-egress.py" "$d/collab-egress.py"
   install -m 0755 "$(dirname "$0")/collab-audit-verify.py" "$d/collab-audit-verify.py"
   cat > "$u/herdr-collab-spawn.service" <<UNIT
 [Unit]

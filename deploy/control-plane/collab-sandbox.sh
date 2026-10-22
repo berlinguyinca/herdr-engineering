@@ -12,6 +12,11 @@
 #     the environment is cleared, and limits on processes, open files and file size apply
 # The network is left open: the harness has to reach its model. That, plus the harness login being readable
 # to the harness, is what this does NOT protect: only start tool-enabled agents for people you trust.
+# With HERDR_EGRESS_SOCK set (helpers) the box has NO network of its own: a private network namespace with only
+# loopback, where a relay (collab-egress.py relay) on 127.0.0.1:HERDR_EGRESS_PORT (3128) hands every connection
+# to the runner's egress proxy on that unix socket, which tunnels only approved host:ports and adds bound API keys
+# itself. HTTPS_PROXY/HTTP_PROXY point at the relay; SVC_<NAME>_URL for each name in HERDR_EGRESS_SERVICES (comma
+# list). If the relay does not come up, the command does not run.
 # No bubblewrap, no run: this never falls back to running unboxed.
 set -euo pipefail
 
@@ -56,7 +61,40 @@ args+=(--bind "$WORK" "$WORK" --chdir "$WORK"
 # file-size and fd limits apply to everything in the box. A process cap (ulimit -u) would count every process
 # of this user, so the process and memory caps are a systemd scope instead (a fork bomb stops at the cap).
 ulimit -n 1024 -f "${HERDR_SANDBOX_FILE_KB:-1048576}" -c 0 2>/dev/null || true
-run=("$BWRAP" "${args[@]}" -- /usr/bin/env bash -c "$CMD")
+inner=(/usr/bin/env bash -c "$CMD")
+if [ -n "${HERDR_EGRESS_SOCK:-}" ]; then
+  no() { echo "collab-sandbox: $1; refusing to run" >&2; exit 126; }
+  RELAY="$(dirname "$0")/collab-egress.py"
+  PORT="${HERDR_EGRESS_PORT:-3128}"
+  [ -S "$HERDR_EGRESS_SOCK" ] || no "egress socket $HERDR_EGRESS_SOCK is not a socket"
+  [ -f "$RELAY" ] || no "the egress relay $RELAY is not installed"
+  case "$PORT" in ''|*[!0-9]*) no "HERDR_EGRESS_PORT must be a number" ;; esac
+  [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || no "HERDR_EGRESS_PORT must be 1024-65535"
+  url="http://127.0.0.1:$PORT"
+  args+=(--unshare-net --ro-bind "$RELAY" /run/herdr-egress/egress.py --ro-bind "$HERDR_EGRESS_SOCK" /run/herdr-egress/sock
+         --setenv HTTPS_PROXY "$url" --setenv HTTP_PROXY "$url" --setenv https_proxy "$url" --setenv http_proxy "$url"
+         --setenv NO_PROXY 127.0.0.1,localhost --setenv no_proxy 127.0.0.1,localhost)
+  IFS=',' read -r -a svcs <<< "${HERDR_EGRESS_SERVICES:-}"
+  for s in "${svcs[@]}"; do
+    [ -n "$s" ] || continue
+    [[ "$s" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || no "bad service name in HERDR_EGRESS_SERVICES"
+    n="${s^^}"
+    args+=(--setenv "SVC_${n//-/_}_URL" "$url/svc/$s")
+  done
+  # inside the box: start the relay (stdin stays the task's, output stays out of the result), wait until it listens,
+  # then run the command. The relay exits at once if it cannot reach the proxy; then the command never runs.
+  inner=(/usr/bin/env bash -c '
+    /usr/bin/python3 /run/herdr-egress/egress.py relay --sock /run/herdr-egress/sock --listen "127.0.0.1:$1" </dev/null >/dev/null 2>&1 &
+    relay=$!
+    for _ in $(seq 100); do
+      if (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then exec bash -c "$2"; fi
+      kill -0 "$relay" 2>/dev/null || break
+      sleep 0.1
+    done
+    echo "collab-sandbox: the egress relay did not come up; refusing to run" >&2
+    exit 126' collab-sandbox "$PORT" "$CMD")
+fi
+run=("$BWRAP" "${args[@]}" -- "${inner[@]}")
 if systemd-run --user --scope -q -p TasksMax=1000 true 2>/dev/null; then
   exec systemd-run --user --scope -q -p TasksMax="${HERDR_SANDBOX_TASKS:-512}" -p MemoryMax="${HERDR_SANDBOX_MEM:-8G}" -- "${run[@]}"
 fi
