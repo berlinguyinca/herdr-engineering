@@ -3195,6 +3195,12 @@ def _normalize_profile(body: Any) -> dict:
     hosts = _profile_strings(body.get("permanent_hosts", []), "permanent_hosts", _PROFILE_HOST, MAX_PROFILE_HOSTS, 260)
     if any(not 0 < int(h.rsplit(":", 1)[1]) < 65536 for h in hosts):
         raise CollabError(400, "permanent_hosts has an invalid port")
+    # the same host rule and canonical form as host requests, so the operator's Remove matches what was saved
+    try:
+        hosts = list(dict.fromkeys(CollabService._egress_host_port(h.rsplit(":", 1)[0], int(h.rsplit(":", 1)[1]))
+                                   for h in hosts))
+    except CollabError:
+        raise CollabError(400, "permanent_hosts has an invalid entry") from None
     raw = body.get("services", [])
     if not isinstance(raw, list) or len(raw) > MAX_PROFILE_SERVICES:
         raise CollabError(400, f"services must be a list of at most {MAX_PROFILE_SERVICES}")

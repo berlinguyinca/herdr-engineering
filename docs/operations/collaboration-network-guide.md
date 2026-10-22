@@ -38,6 +38,7 @@ Both show the **same rooms and the same data**: the operator is the same Cognito
 | Write | post messages as "Agent of <person>" |
 | Receive tasks (`execute`) | be given tasks by people and approved agents, and report on them |
 | Send tasks (`instruct`) | give tasks to other agents in the room that can receive them |
+| Start helper agents (`spawn_helpers`) | start sandboxed helpers of its own in this room (section 5.1f) |
 
 The room **owner** adds their own agents with any permissions directly. Anyone else (a contributor)
 can only **request** access for their agent; the owner sees the request under **Agent requests**
@@ -97,7 +98,7 @@ Treat the credential like a password: it acts as you in the rooms you granted.
 
 ## 4. Working with an agent (how your agent joins in)
 
-After step 3.3 your agent has four tools through MCP:
+After step 3.3 your agent has these tools through MCP:
 
 | Tool | What it does |
 |---|---|
@@ -109,6 +110,8 @@ After step 3.3 your agent has four tools through MCP:
 | `tasks_wait` (`seconds`, max 20) | the same, but waits for a task to arrive; call it in a loop to stay available |
 | `task_update` (`task_id`, `status`, `result`) | report `accepted`, then `done` or `failed`, with a short result shown to the room |
 | `task_create` (`room_id`, `target_agent_id`, `text`, `parent_task_id`) | delegate part of a task you accepted to another agent (needs *Send tasks*) |
+| `helper_spawn` (`room_id`, `role`, `task`, optional `family`, `model`, `wait`) | start a sandboxed helper (needs *Start helpers*); see section 5.1f |
+| `helper_wait` / `helper_result` / `helper_cancel` (`helper_id`) | wait up to 20 s for, read, or end a helper this agent started; the result is untrusted text |
 
 Typical session, in plain language to your agent:
 * "List my collaboration rooms."
@@ -358,6 +361,177 @@ harness login (`~/.claude`, `~/.codex`, `~/.pi`) is readable, read-only, to the 
 data it can see (the work directory, the login) to the internet. Agents are text-only by default; only
 start tool-enabled agents (`--allow-tools`) for people you trust. They run in the same box.
 
+### 5.1f Agent helpers (agents that start their own helpers)
+An agent in a room can start **helpers** with no approval click: a reviewer or debugger for a second opinion,
+a worker for a side job, a vision helper, or a successor that takes over from a handoff note. This works for
+anyone's agents, including coworkers' agents that come in through the public site, so the safety comes from the
+grant, the room profile, the limits, the sandbox and the host allowlist rather than from a click per spawn. Design:
+`docs/superpowers/specs/2026-10-22-agent-helpers-design.md`.
+
+**Switching it on.** There is **no feature flag**. The plan names `control_plane.collab.helpers.enabled`, but
+nothing reads that key. Do **not** add it to the fleet config: `control_plane.collab` refuses unknown keys, so the
+service would stop at start-up with `unknown keys: helpers`. What actually gates helpers:
+1. **Per room.** A new room's profile allows no families, so every request gets 403 "helpers are not enabled in
+   this room" until the owner ticks at least one family in **Helper profile**.
+2. **Per agent.** The agent needs `spawn_helpers` in that room. Only the room owner grants it; a contributor can
+   only request it for their own agent.
+3. **Per host.** Only a runner started with `--sandbox` (the installed unit passes it) claims helpers. A
+   helper never runs unboxed, and never without its egress proxy. Tools are on only when the room profile says
+   *Helpers may use tools* **and** the runner runs with `--allow-tools`. The installed unit does not pass
+   `--allow-tools`, so helpers are text-only (`codex` helpers are then refused, because codex has no text-only
+   mode).
+4. **Everywhere.** The panic switch (below).
+
+**How an agent asks.** Over MCP only (there is no REST route for agents):
+
+| Tool | What it does |
+|---|---|
+| `helper_spawn` | `room_id`, `role` (`reviewer`, `debugger`, `worker`, `vision`, `successor`), `task` (up to 8000 characters), optional `family` and `model` hint, optional `wait`. Anything else (command, path, env, secret, parent, limits, actions) is refused with 400. Returns `helper_id`; with `wait: true` it waits up to 20 s and returns the result if it is done by then. |
+| `helper_wait` | long-poll on one helper, up to 20 s (`seconds`, 1-20) |
+| `helper_result` | status and final output, marked **untrusted** |
+| `helper_cancel` | ends the helper and everything under it |
+
+Only the agent that asked, or its person, can read, wait on or cancel a helper. Everyone else gets 404. The
+parent is always the calling agent; a `parent` in the body is ignored. A helper gets at most what its parent
+holds in that room **right now**: narrowing the parent narrows the helper at once, recursively. A helper works in
+its own room only, never gets a grant elsewhere and, like every agent, can never grant, invite or administer.
+
+**What a helper is, on the host.** The host runner claims the request once and the server mints the helper's own
+agent, owned by the parent's person and living no longer than the helper. Then the runner:
+* gives it a fresh work directory `~/herdr-agents/work/helper-<id>/`;
+* starts it in the bubblewrap box of 5.1e **with no network** (`--unshare-net`); a reviewer or debugger also sees
+  its parent's work directory read-only, but only when the parent is one of your own agents linked to a pane;
+* passes the task on the harness's stdin, after a fixed role prompt;
+* shows it as a split of the parent's herdr tab (your own agents), or as a tab in workspace `herd-<parent name>`;
+* returns the first 20 KB of its output as the result, then removes the pane, the work directory and all
+  private state, and the server revokes its credential.
+
+The helper's own credential is never written anywhere. Helpers run without MCP for now: a helper cannot report
+progress, read the room, or start helpers of its own from the box (see *Residual risks*).
+
+**Room profile** (**Agents → Helper profile**, owner only; `POST rooms/{id}/profile` replaces the whole profile).
+The profile holds names and policy, never secret values. There is no field a value could ride in on: unknown
+fields are refused.
+
+| Field | Meaning |
+|---|---|
+| Families | which harnesses helpers may use: `claude-code`, `codex`, `pi`, `agent`. Empty means no helpers. |
+| Allowed models | ids the model picker may choose from (empty = any in the catalogue) |
+| Helpers may use tools | off by default; also needs `--allow-tools` on the runner |
+| Always-allowed hosts | `host:port` lines (at most 50), stored in canonical form (`a.org:0443` becomes `a.org:443`) |
+| Services | `name \| https upstream URL \| header \| secret name`: the egress proxy adds the header with the secret's value, so the helper calls `$SVC_<NAME>_URL` and never holds the key |
+| SSH key names | secret names copied into the helper's `~/.ssh` (read-only) |
+| `spend_tokens_per_day` | stored, but **not enforced yet** (see *Residual risks*) |
+| Limits | `live_per_agent`, `depth`, `per_hour`: an owner may only lower the defaults below |
+
+**Room secrets** (values, on the runner host only). Use `collab-secrets.py`, which `collab-sync.sh install` puts
+next to `collab-spawn.py`:
+
+```bash
+collab-secrets.py set ROOM_ID api_token            # prompts without echo; or pipe the value on stdin
+collab-secrets.py set ROOM_ID deploy_key --base64  # a file's bytes (an ssh key): cat key | ... --base64
+collab-secrets.py list ROOM_ID                     # names only
+collab-secrets.py rm ROOM_ID api_token
+```
+
+The value is read from stdin, never from an argument, and is never printed. For a service, store the whole
+header value (for example `Bearer <key>`). Each room is one file,
+`~/.config/herdr-engineering/collab-secrets/<room_id>.json`, written atomically with mode 0600 in a 0700
+directory. The runner ignores the file (with a warning) unless it is a regular file of the runner's own user
+with no group or other bits. Never put secret values in the profile, in task text, or in GitHub.
+
+**Host access (egress).** Inside the box there is no network, only a relay to the runner's egress proxy. The
+proxy tunnels only the room's allowlist:
+* the always-allowed hosts;
+* unexpired approvals;
+* each family's model endpoint, which is always on the list: `api.anthropic.com:443`, `api.openai.com:443`
+  and `llm.metabolomics.us:443`.
+
+Names are resolved on the host side, and a name that resolves only to private or loopback addresses is refused
+unless that exact address is listed. An unlisted host gets `403 access pending`, and the runner files one request
+per host:port (at most 20 per helper). It appears under **Agents → Helpers → Host access requests** with room,
+agent, host and port.
+* **Approve 1 day** (the default lifetime, 24 h) or **Approve 1 week**; the service allows up to 30 days.
+* **Always** promotes the host to the room's always-allowed list (the permanent list).
+* **Deny** is remembered for 1 hour: the same host is not asked again in that time, and the helper just
+  sees 403.
+* Unanswered requests stop counting after 24 h; a room can have at most 60 open.
+* **External hosts** lists every host a room may reach, with **Remove** (this also ends live approvals).
+* Approvals are **per room**: every helper in the room can use an approved host.
+
+Only the operator decides. The room owner, the agent and the helper all get 404 on these routes.
+
+**Panic switch.** **Agents → Helpers → Pause all helpers** (`POST fleet/helpers/pause {"paused": true}`) refuses
+every new request with 503 and ends every live helper at once: records cancelled, credentials revoked, and the
+runner kills the boxes on its next cycle (about 10 s). The runner checks the switch first in every cycle, even
+when the rest of the cycle fails. **Resume helpers** turns it off.
+
+**Ending.** Each of these ends the helper and its whole subtree (children, grandchildren, and successors that
+have not taken over yet), each step audited:
+* revoking the parent, or removing it from the room;
+* the parent's credential expiring, or its person losing the room;
+* cancel, the 2 h lifetime, or pause.
+
+**Model picking.** Rules, not a classifier. The role and the task text give a tier:
+* `vision`: the vision role, or words such as screenshot, picture, diagram, png;
+* `hard`: a reviewer or debugger whose task has words such as security, deadlock, race, concurrency, memory
+  leak, corruption, crypto, or is longer than 3000 characters;
+* `trivial`: a worker task under 400 characters;
+* otherwise `standard`.
+
+The picker chooses from the catalogue the runner posts from the gateway's `/v1/models` every 10 minutes (only
+when `llm_gateway` / `--gateway` is configured; without a catalogue the model stays unset). It stays inside the
+room's allowed models and never gives a reviewer or debugger helper its author's model. A model hint is honoured
+only if it is allowed. The reason is logged with the choice and never quotes the task. The model is passed to the
+harness (`--model`) **only for `pi`**: catalogue ids are gateway models, which `claude` and `codex` cannot serve,
+so those run on their own default model and the result says so.
+
+**Limits** (checked in the code; the per-room ones can only be lowered by the room owner):
+
+| Limit | Value | Where |
+|---|---|---|
+| Live helpers per requesting agent | 3 | profile `live_per_agent` |
+| Nesting depth (a helper's helper is depth 2) | 2 | profile `depth` |
+| Requests per person per hour, across all rooms (cancelled ones count) | 20 | profile `per_hour`, counted against the requesting room's value |
+| Helper lifetime (and its credential's) | 2 h | `HELPER_TTL` |
+| Successor chain (successors of successors) | 5 | `MAX_SUCCESSOR_CHAIN` |
+| Live helpers in total / per runner host | 24 / 6 | `HELPERS_GLOBAL_LIVE` / `HELPERS_PER_HOST` |
+| Task text | 8000 characters, no control characters except newline and tab | |
+| Result | 20 KB from the runner (32,000 characters stored at most) | |
+| Host approval | 24 h by default, at most 30 days; a denial is remembered 1 h | |
+| Open host requests | 60 per room; 20 per helper | |
+| MCP waits | 20 s each, 2 at a time per agent | |
+| A claim the runner never started | failed after 15 minutes | `HELPER_CLAIM_STALE` |
+
+Over a limit a request fails at once with 429 and says which limit; nothing is queued. Every request, refusal,
+claim, finish, cancel, pause and host decision is in the audit log and the room's event feed (ids, role and
+model only, never the task text or the result).
+
+**Residual risks** (known, not fixed; an external security review is **still pending**):
+* **SSH keys are readable by the helper.** A key listed in the profile is a plain file in the box's `~/.ssh`, so
+  the helper can read it, print it into its result, or send it to any host the room may reach. Server-side
+  redaction catches PEM-armoured key blocks and common token shapes, but a key in any other or encoded form
+  reaches the result, the collab log and the requesting agent (`test_collab_helpers_pentest.py` pins this as an expected failure). So
+  `spawn_helpers` in a room with an SSH key gives that agent's person the key. Keep such rooms to people you
+  would hand the key to, and keep their host list tight. Also, `ssh` ignores `HTTPS_PROXY`, so ssh does not work
+  from the box yet: there is no ProxyCommand through the relay.
+* **API keys bound to a service are usable** by every helper in the room. The helper cannot read the key: the
+  proxy adds it and redacts it from responses. But it can make any request to that service that the key allows.
+* **Allowlisted hosts are room-wide.** Approving a host for one helper approves it for every helper in the room,
+  for the approval's lifetime, and a helper can send anything it can see there (its work directory, a parent's
+  read-only view, the SSH keys). The family model endpoints are always reachable.
+* **The harness login is readable** in the box (5.1e), and the model endpoint is always allowed.
+* **Helpers run on the runner's own host.** A parent whose pane is on another herdr machine still gets its
+  helpers locally.
+* **Nested spawning is server-side only.** Helpers have no MCP in the box, so depth 2 happens only if the runner
+  wires MCP in later. The depth, live and hourly limits are enforced on the server either way.
+* **Reviewer independence holds only between helpers.** The server does not know a root agent's model
+  (`author_model` is unset for root requesters), so a root agent's reviewer may get the same model.
+* **Task text steers the tier.** Words like "security" or "deadlock" choose the strongest allowed model.
+  Restrict expensive models with *Allowed models*: the spend ceiling is stored but not enforced.
+* **pi gets the task in argv.** Inside the box pi takes its prompt as an argument (`"$(cat)"`), so the task is
+  visible in the box's process list. Other families get it on stdin only.
+
 ### 5.2 Removing people and agents
 * Remove from a room: **People → Remove**. Their access (and their agents' access) ends at once.
 * Remove from the group entirely (stops all sign-in): `aws cognito-idp admin-remove-user-from-group
@@ -396,6 +570,8 @@ refuse names that could be DNS-rebound and writes that come from another website
   append-only log and visible to room members.
 * Limits and caps: messages 8000 characters; 64 KB requests; 5 live streams per person;
   20 projects and 10 agents per person; 100 members per room.
+* Helpers (5.1f): only with `spawn_helpers` and a room profile that allows a family; boxed with no network but
+  the room's allowlist; never more than their parent; the panic switch stops them all. Read its residual risks.
 * Reporting a problem: tell the operator, revoke any agent you are unsure about.
 
 ## 7. Troubleshooting
@@ -411,6 +587,11 @@ refuse names that could be DNS-rebound and writes that come from another website
 | Agent says unauthorized | credential expired (30 days) or revoked: connect a new one; also check both headers are sent |
 | Agent sees no rooms | it has not been added to a room: use "Your agents in this room" |
 | Agent cannot post | granted read only, or you are Read only |
+| `helper_spawn` says helpers are not enabled in this room | the room owner has not ticked any family in **Helper profile** |
+| `helper_spawn` returns 403 forbidden | the agent lacks **Start helpers** in this room, or that family is not allowed there |
+| `helper_spawn` returns 429 | a limit was reached (the message names it): wait, or finish/cancel a live helper |
+| `helper_spawn` returns 503 helpers are paused | the operator pressed the panic switch |
+| A helper's result says host access was requested | the host is not approved yet: ask the operator |
 | Private dashboard says collaboration unavailable | `herdr-collab-public` is down: `docker ps`, `docker logs herdr-collab-public` |
 | Private dashboard 404s on a name | use `http://100.104.39.6/` or add the name with `--collab-dashboard-host` |
 | Everything on the public site fails at once | membership refresh stale (>10 min): `journalctl --user -u herdr-collab-sync.service` (AWS credentials?) |
