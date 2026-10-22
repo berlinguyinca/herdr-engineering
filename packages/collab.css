@@ -136,3 +136,9 @@
 
 .cx-embed .cx-tabs { margin-bottom: 16px; }
 .cx-embed .cx-room-layout { grid-template-columns: minmax(0, 1fr) 280px; }
+
+.cx-checks { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.cx-check { display: inline-flex; align-items: center; gap: 4px; font-size: .8125rem; color: var(--text-secondary); }
+.cx-check input:disabled + * , .cx-check:has(input:disabled) { opacity: .5; }
+textarea.cx-input { resize: vertical; font: inherit; }
+.cx-stack > .cx-field { flex: 0 0 auto; }          /* the row-wise 200px basis is a height inside a column */

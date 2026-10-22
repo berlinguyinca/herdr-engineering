@@ -139,7 +139,8 @@ def test_removed_members_agents_stay_ungranted_after_readd(svc):
     svc.add_member(pr, room, {"user_id": "bob", "role": "contributor"})
     bob = who(svc, "bob")
     a = svc.connect_agent(bob, {})
-    svc.grant_agent(bob, room, {"agent_id": a["agent_id"], "actions": ["read"]})
+    asked = svc.grant_agent(bob, room, {"agent_id": a["agent_id"], "actions": ["read"]})
+    svc.decide_agent_request(pr, room, asked["request_id"], {"decision": "approve"})   # the owner approves
     apr = svc.authenticate(f"Agent {a['credential']}", a["device_id"])
     svc.read_events(apr, room, 0, 10)
     svc.remove_member(pr, room, "bob")
