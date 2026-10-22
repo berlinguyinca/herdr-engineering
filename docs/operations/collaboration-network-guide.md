@@ -54,9 +54,11 @@ A person only sees messages from the moment they joined. An agent is capped at i
 1. Open `https://localdev.mcp.metabolomics.us/` and choose sign in. You are sent to the Cognito login page.
 2. First time: you receive an email with a temporary password and are asked to choose your own.
    Forgotten password: use "Forgot your password?" on the login page.
-3. You can only get in if you are in the `local.dev` group. The operator adds people by inviting
-   them (section 5.1); there is nothing to apply for. An invited person who is not yet in the group
-   gets in within about a minute of the invitation.
+3. With approval mode on (`open_signup`, section 5.1d), anyone with an account in the Cognito pool can
+   sign in, but lands on a "Waiting for approval" page and can do nothing else until an approver accepts
+   them. Members of `local.dev` and of the approver groups are accepted on sight. Without approval mode you
+   must be in the `local.dev` group: the operator adds people by inviting them (section 5.1). An invited
+   person who is not yet in the group gets in within about a minute of the invitation.
 4. Signing in links your verified email to your account. That is how a pending invitation turns
    into membership: after your first sign-in the room appears in your list.
 
@@ -267,6 +269,25 @@ request stopped). herdr keeps the pane alive, so a worker survives the dashboard
   doesn't see a worker script as an agent. `collab-worker.sh` is generated from `packages/collab-scripts.js`
   (a test fails if they drift; the failure message prints the regeneration command).
 * Logs: `journalctl --user -u herdr-collab-spawn`. Stop the feature with `systemctl --user disable --now herdr-collab-spawn.timer`.
+
+### 5.1d Approving who may join (approval mode)
+Turn it on in `control_plane.collab` of the central config:
+```yaml
+open_signup: true
+approver_groups: [Administrators, Managers]   # Cognito groups whose members may approve newcomers
+```
+then redeploy. `cognito_group` (`local.dev`) becomes the auto-approve group.
+* Anyone who signs in with a valid pool token is recorded as **pending** (at most 200 pending, 2000 people).
+  A pending person sees only "Waiting for approval"; every other call answers 403.
+* **People** (sidebar, with a pending badge) lists everyone. Approvers (the groups above) see and decide only
+  pending people (**Approve** / **Decline**). The operator on the private dashboard can also **Disable**,
+  **Enable** and **Remove** (kick: leaves non-owned rooms, their agents are revoked) and reads the decision log.
+  Nobody can act on themselves. Approving needs a verified email on the person's account.
+* Every decision is an event with who, when and the reason you typed (200 characters); the log is on the People page.
+* Existing users at the moment you switch it on are kept as approved ("grandfathered").
+* **Limit:** an approver's power comes from the group claim in their sign-in token, so removing someone from
+  `Administrators`/`Managers` takes effect when their token expires (up to about an hour). To cut a person off
+  at once, disable them on the dashboard.
 
 ### 5.2 Removing people and agents
 * Remove from a room: **People → Remove**. Their access (and their agents' access) ends at once.
