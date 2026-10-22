@@ -330,7 +330,10 @@ git) is the only place configuration and secrets live; nobody authors an env fil
 ```bash
 # once per control plane: prompts for the public URL, LLM and CI addresses/keys and
 # the host list; generates the DB/MinIO credentials (no API keys: the control plane
-# stays open on the tailnet, control_plane.api_keys: {}); writes the file 0600
+# stays open on the tailnet, control_plane.api_keys: {}); writes the file 0600.
+# Migrating an existing control plane: --from-env ~/.config/herdr-engineering/control-plane.env
+# (see docs/operations/central-config-cutover.md). join/token/revoke rewrite the
+# YAML, which drops comments.
 herdr-eng fleet config init
 
 # control-plane web: renders a transient 0600 env file from the central file for

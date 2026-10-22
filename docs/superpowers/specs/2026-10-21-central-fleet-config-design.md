@@ -63,6 +63,14 @@ not use environment variables for configuration.
   `X-API-Key`. Keyed mode is possible by hand-editing (or `init --with-api-keys`) but
   is not supported until the dashboard, llm-proxy and emit hook carry keys.
   `/api/v1/health` answers status, version and commit without a key in keyed mode.
+- `agent.api_key` is readable by every host (section `agent`, roles `[all]`) — a
+  documented trade-off (final review, 2026-10-21). The `agent` server role is
+  limited to event ingest, LLM project-key minting/revocation and review posting;
+  it cannot read reasoning, mutate sessions, retry CI or change configuration. A
+  leaked agent key therefore lets a tailnet peer post events, mint/revoke LLM keys
+  (spending lab tokens) and post reviews. Recommended follow-up: scope the `agent`
+  section to a role (e.g. `builder`) once every host that runs `session run` or the
+  review bridge carries it. While API keys are off (the default) the value is empty.
 
 ## Design (my calls, marked)
 
@@ -113,6 +121,22 @@ and reports variable names only. *(my call)*
 
 **Observability.** `/api/v1/fleet/config/status` (no values) lists current
 revision and each host's applied revision; the Hosts page shows a drift badge.
+
+## Known limitations (parked, final review 2026-10-21)
+
+- Overrides may name a section that does not exist (creates a partial section);
+  duplicate YAML keys are last-wins; the empty-token check runs after hashing.
+- No rate limit on failed host-token checks; applied revisions are kept in memory
+  only (lost on a web restart).
+- `os.link` errors during exclusive create are not wrapped; an interrupted remote
+  install can leave `host.json.new` behind.
+- The host cache is not bound to the control-plane URL; every start POSTs the
+  applied revision (the POST is awaited, up to the 3 s timeout); `config.py`
+  still expands `${VAR}` in the local config file.
+- The fleet endpoint body is capped at 4 MiB; a failed background refresh is silent
+  apart from one stderr line per outage.
+- Rewriting the central file (join/token/revoke) drops YAML comments.
+- The emit hook sends no API key (fine while keys are off).
 
 ## Left to the builder
 
