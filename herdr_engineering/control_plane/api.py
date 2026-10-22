@@ -286,6 +286,7 @@ class ControlPlaneServer:
 _PUBLIC_STATIC = {
     "/": ("collab.html", "text/html; charset=utf-8"),
     "/collab-app.js": ("collab-app.js", "text/javascript"),
+    "/collab.css": ("collab.css", "text/css"),
     "/collab-view.js": ("collab-view.js", "text/javascript"),
     "/herdr-web-client/collab.js": ("herdr-web-client/collab.js", "text/javascript"),
     "/herdr-web-components/util.js": ("herdr-web-components/util.js", "text/javascript"),
