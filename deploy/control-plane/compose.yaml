@@ -274,6 +274,11 @@ services:
     network_mode: host
     volumes:
       - ../fabric-stack/config.yaml:/app/config.yaml:ro
+      # Agent Mine fleet store: the private web UI's /api/agent-mine reads
+      # $HOME/.cache/agent-mine/fleet/ (the container runs as root, HOME=/root).
+      # Bind the controller's fleet store read-only so the dashboard can serve the
+      # per-site summaries written by playbooks/agent-mine.yml.
+      - ~/.cache/agent-mine:/root/.cache/agent-mine:ro
     environment:
       HERDR_ENGINEERING_CONFIG: /app/config.yaml
     command: ["web", "--host", "127.0.0.1", "--port", "8787"]
