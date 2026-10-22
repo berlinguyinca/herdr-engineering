@@ -106,6 +106,13 @@ def _clean_inventory(raw):
     return out if any(out.values()) else None
 
 
+def _label(value, forbidden=None):
+    """A short opaque label (session id or agent name) from an untrusted emitter, or None when it is not one."""
+    if not isinstance(value, str) or not value or len(value) > 128 or value == forbidden:
+        return None
+    return value if all(c.isprintable() for c in value) else None
+
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
@@ -800,7 +807,8 @@ class ControlPlaneRepo:
                        terminal_id=None, herdr_session=None, machine=None,
                        agent_session=None, revision=None, interactive_ready=None,
                        launch_pending=None, state_change_seq=None,
-                       repository_id=None, commit_sha=None):
+                       repository_id=None, commit_sha=None,
+                       parent_session_id=None, name=None):
         stamp = self._stamp()
         existing = self._sessions.get(session_id)
         if (existing is not None and host_id is not None
@@ -816,7 +824,8 @@ class ControlPlaneRepo:
                   "agent_session": agent_session, "revision": revision,
                   "interactive_ready": interactive_ready, "launch_pending": launch_pending,
                   "state_change_seq": state_change_seq,
-                  "repository_id": repository_id, "commit_sha": commit_sha}
+                  "repository_id": repository_id, "commit_sha": commit_sha,
+                  "parent_session_id": _label(parent_session_id, session_id), "name": _label(name)}
         if existing is None:
             rec = {"session_id": session_id, "mission_id": mission_id,
                    "host_id": host_id, "agent_role": agent_role,
@@ -865,7 +874,8 @@ class ControlPlaneRepo:
                               "status", "cwd", "branch", "pid", "cmdline",
                               "summary", "attach", "pane_id", "terminal_id", "herdr_session",
                               "machine", "agent_session", "revision", "interactive_ready",
-                              "launch_pending", "state_change_seq", "repository_id", "commit_sha") if existing.get(k) is not None}},
+                              "launch_pending", "state_change_seq", "repository_id", "commit_sha",
+                              "parent_session_id", "name") if existing.get(k) is not None}},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)
