@@ -46,7 +46,10 @@ otherwise. No step prints a secret.
    It prints `ok revision=... hosts=N`. It also checks that `pg_dsn`, `minio_*` and
    `compose.HERDR_CP_{PG,MINIO}_*` name the same credentials.
 
-3. **Dry-run the deploy.**
+3. **Dry-run the deploy.** With collab enabled, first check that
+   `~/.config/herdr-engineering/collab/` holds nothing but `collab-config.json`. That
+   directory is now mounted whole into collab-public, and `deploy.sh` refuses to run
+   if it holds anything else.
 
    ```bash
    deploy/control-plane/deploy.sh --dry-run
@@ -79,6 +82,18 @@ otherwise. No step prints a secret.
    ```bash
    git -C ~/IdeaProjects/herdr-engineering worktree add /tmp/herdr-rollback <previous-commit>
    /tmp/herdr-rollback/deploy/control-plane/deploy.sh --ref <previous-commit> --no-fetch
+   ```
+
+   The old `deploy.sh` recreates **only control-plane-web**. The worker and the
+   llm-proxy stay on the new image, still reading the central file's directory and
+   the llm slice, which remain on disk. To put them back on the old setup as well,
+   run the old commit's compose from the same worktree with the old env file:
+
+   ```bash
+   cd /tmp/herdr-rollback/deploy/control-plane
+   HERDR_CP_ENV_FILE=~/.config/herdr-engineering/control-plane.env HERDR_CP_IMAGE_TAG=<previous-sha12> \
+     docker compose --env-file ~/.config/herdr-engineering/control-plane.env -p herdr-control-plane \
+     -f compose.yaml up -d --no-deps --no-build control-plane-worker llm-proxy
    ```
 
    The previous commit is in the running image's tag (`docker inspect -f
