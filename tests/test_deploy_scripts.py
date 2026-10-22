@@ -49,7 +49,8 @@ def env(tmp_path):
     stub.write_text(f"""#!/usr/bin/env bash
 echo "docker $*" >> {log}
 if [ "$1" = compose ]; then
-  echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}}" >> {log}
+  echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}} llmdir=${{HERDR_LLM_SLICE_DIR:-}}" >> {log}
+  if [ -n "${{HERDR_LLM_SLICE_DIR:-}}" ]; then echo "llmslice $(cat "$HERDR_LLM_SLICE_DIR/llm-config.json" | tr -d '\n')" >> {log}; fi
   prev=""
   for a in "$@"; do
     if [ "$prev" = --env-file ]; then
@@ -151,6 +152,22 @@ def test_deploy_refuses_a_central_dir_holding_other_files(env):
     assert not env["log"].exists()
 
 
+def test_deploy_hands_llm_proxy_only_the_llm_slice(env):
+    env["env"]["FAIL_COMPOSE"] = "1"
+    deploy(env)
+    log = env["log"].read_text()
+    llmdir = env["home"] / ".config/herdr-engineering/llm-proxy"
+    assert f"llmdir={llmdir}" in log
+    assert sorted(os.listdir(llmdir)) == ["llm-config.json"]
+    assert stat.S_IMODE(os.stat(llmdir).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(llmdir / "llm-config.json").st_mode) == 0o600
+    data = yaml.safe_load(env["central"].read_text())
+    sliced = [ln for ln in log.splitlines() if ln.startswith("llmslice ")][0]
+    assert data["sections"]["control_plane"]["values"]["pg_dsn"] not in sliced
+    assert data["sections"]["ci"]["values"]["token"] not in sliced
+    assert data["sections"]["llm"]["values"]["upstream_key"] in sliced
+
+
 def test_trap_removes_env_file_on_failure(env):
     env["env"]["FAIL_COMPOSE"] = "1"
     r = deploy(env)
@@ -192,7 +209,9 @@ def test_compose_web_has_no_env_file_and_mounts_central_file_read_only():
     assert not [k for k in app_env if k.startswith("HERDR_CP_")]
     proxy = doc["services"]["llm-proxy"]
     assert "FABRIC_LLM_UPSTREAM_KEY" not in (proxy.get("environment") or {})
-    assert "--fleet-config" in proxy["command"]
+    assert proxy["command"][proxy["command"].index("--fleet-config") + 1] == "/etc/herdr/llm/llm-config.json"
+    # only the llm slice directory: never the central file's directory
+    assert proxy["volumes"] == ["${HERDR_LLM_SLICE_DIR:?run deploy.sh}:/etc/herdr/llm:ro"]
 
 
 def test_collab_overlay_reads_only_the_collab_slice():

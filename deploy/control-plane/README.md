@@ -57,7 +57,11 @@ herdr-eng control-plane worker --once
 ```
 
 The web and worker containers mount the central file's DIRECTORY read-only at
-`/etc/herdr/fleet/` and are started with `--fleet-config /etc/herdr/fleet/fleet-config.yaml`; they read no
+`/etc/herdr/fleet/` and are started with `--fleet-config /etc/herdr/fleet/fleet-config.yaml`.
+The llm-proxy gets only an llm slice (`fleet config render-llm`: the `llm` section and
+`control_plane.llm_proxy`, 0600, in `~/.config/herdr-engineering/llm-proxy/`, mounted
+read-only at `/etc/herdr/llm/`) and refuses to start on a file carrying anything else;
+the collab container likewise gets only `control_plane.collab`. They read no
 configuration from the environment. Do not run `docker compose up` by hand: the
 substitution variables only exist while `deploy.sh` runs. Compose refuses to start
 without them, and DB/object-store ports stay loopback-only.

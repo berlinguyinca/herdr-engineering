@@ -310,7 +310,9 @@ def test_llm_proxy_command_reads_key_url_and_tuning_from_fleet_file(tmp_path, mo
             raise KeyboardInterrupt
     import herdr_engineering.llm_proxy as lp
     monkeypatch.setattr(lp, "serve", lambda *a, **kw: (seen.update(a=a, kw=kw), Httpd())[1])
-    assert cli._cmd_cp_llm_proxy(_proxy_args(path)) == 0
+    slice_ = tmp_path / "llm-proxy" / "llm-config.json"
+    fcc.render_llm(fcc.load_fleet_config(path), slice_)
+    assert cli._cmd_cp_llm_proxy(_proxy_args(slice_)) == 0
     assert seen["a"][3] == "https://llm.example.test" and seen["a"][4] == "llm-secret-key"
     assert seen["kw"] == {"max_inflight": 4, "wait_seconds": 1.5}
 
@@ -380,3 +382,67 @@ def test_keyed_mode_still_serves_a_minimal_health_without_a_key(tmp_path, monkey
         assert status == 200 and set(_json.loads(body)) == {"status", "version", "commit"}
     finally:
         svr.shutdown()
+
+
+# ------------------------------------------------- I4: the llm-proxy gets a slice
+
+def _all_strings(node):
+    """Values plus mapping keys that are values (api_keys maps key -> role)."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, str) and v in ("operator", "ingest", "agent", "viewer"):
+                yield k
+            yield from _all_strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _all_strings(v)
+    elif isinstance(node, str):
+        yield node
+
+
+def test_llm_slice_carries_no_dsn_api_keys_or_tokens(tmp_path):
+    import os
+    import stat
+    path = fcc.init_config(tmp_path / "fleet" / "fleet-config.yaml",
+                           dict(ANSWERS, github_token="gh-secret-token", fabric_token="fab-secret-token"),
+                           with_api_keys=True)
+    data = yaml.safe_load(path.read_text())
+    data["sections"]["control_plane"]["values"]["llm_proxy"] = {"max_inflight": 4}
+    path.unlink()
+    fcc.write_private_file(path, yaml.safe_dump(data, sort_keys=False))
+    out = tmp_path / "llm-proxy" / "llm-config.json"
+    fcc.render_llm(fcc.load_fleet_config(path), out)
+    assert stat.S_IMODE(os.stat(out).st_mode) == 0o600
+    sl = yaml.safe_load(out.read_text())
+    assert set(sl["sections"]) == {"llm", "control_plane"} and sl["hosts"] == {}
+    assert sl["sections"]["control_plane"]["values"] == {"llm_proxy": {"max_inflight": 4}}
+    assert sl["sections"]["llm"]["values"] == data["sections"]["llm"]["values"]
+    text = out.read_text()
+    llm_values = set(_all_strings(data["sections"]["llm"]["values"]))
+    secrets = {s for name, sec in data["sections"].items() if name != "llm"
+               for s in _all_strings(sec["values"]) if len(s) >= 12 and s not in llm_values}
+    secrets |= {h["token_sha256"] for h in data["hosts"].values()}
+    assert data["sections"]["control_plane"]["values"]["pg_dsn"] in secrets
+    assert any(k in secrets for k in data["sections"]["control_plane"]["values"]["api_keys"])
+    for s in secrets:
+        assert s not in text
+
+
+def test_llm_proxy_refuses_the_central_file(tmp_path, capsys, old_env):
+    path = make_file(tmp_path)
+    assert cli._cmd_cp_llm_proxy(_proxy_args(path)) == 2
+    err = capsys.readouterr().err
+    assert "render-llm" in err and "llm-secret-key" not in err
+
+
+def test_llm_proxy_refuses_a_slice_with_extra_control_plane_keys(tmp_path, capsys, old_env):
+    import json as _json
+    path = make_file(tmp_path)
+    out = tmp_path / "s" / "llm-config.json"
+    fcc.render_llm(fcc.load_fleet_config(path), out)
+    data = _json.loads(out.read_text())
+    data["sections"]["control_plane"] = {"roles": ["control-plane"],
+                                         "values": {"llm_proxy": {}, "pg_dsn": "postgresql://x"}}
+    out.unlink()
+    fcc.write_private_file(out, _json.dumps(data))
+    assert cli._cmd_cp_llm_proxy(_proxy_args(out)) == 2

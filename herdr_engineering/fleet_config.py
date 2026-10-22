@@ -94,6 +94,9 @@ class FleetConfig:
             raise FleetConfigError(f"unknown section: {name}")
         return copy.deepcopy(self._sections[name]["values"])
 
+    def section_names(self) -> list[str]:
+        return list(self._sections)
+
     def status(self) -> dict:
         """Revision and host ids/roles. No values, no token hashes."""
         return {

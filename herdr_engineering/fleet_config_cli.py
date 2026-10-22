@@ -203,6 +203,53 @@ def render_collab(cfg: FleetConfig, out: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# llm slice (the llm-proxy container's only configuration)
+# --------------------------------------------------------------------------
+
+LLM_SECTION = "llm"
+LLM_PROXY_KEY = "llm_proxy"
+
+
+def llm_slice(cfg: FleetConfig) -> dict:
+    """A minimal fleet file holding only the ``llm`` section and
+    ``control_plane.llm_proxy`` (tuning): no DSN, no API keys, no host hashes."""
+    try:
+        llm = cfg.section(LLM_SECTION)
+    except FleetConfigError:
+        raise FleetConfigError("no llm section in the fleet config (llm.upstream_url / upstream_key)") from None
+    try:
+        tuning = cfg.section(CONTROL_PLANE_SECTION).get(LLM_PROXY_KEY)
+    except FleetConfigError:
+        tuning = None
+    if tuning is not None and not isinstance(tuning, dict):
+        raise FleetConfigError("control_plane.llm_proxy must be a mapping")
+    sections: dict[str, dict] = {LLM_SECTION: {"roles": ["builder"], "values": llm}}
+    if tuning:
+        sections[CONTROL_PLANE_SECTION] = {"roles": ["control-plane"],
+                                           "values": {LLM_PROXY_KEY: tuning}}
+    data = {"version": SCHEMA_VERSION, "sections": sections, "hosts": {}}
+    _parse(data)
+    return data
+
+
+def check_llm_slice(cfg: FleetConfig) -> None:
+    """Refuse anything but an llm slice (the llm-proxy must never get the central file)."""
+    extra = sorted(set(cfg.section_names()) - {LLM_SECTION, CONTROL_PLANE_SECTION})
+    cp_keys: set = set()
+    if CONTROL_PLANE_SECTION in cfg.section_names():
+        cp_keys = set(cfg.section(CONTROL_PLANE_SECTION)) - {LLM_PROXY_KEY}
+    if extra or cp_keys or cfg.status()["hosts"]:
+        raise FleetConfigError(
+            "the llm-proxy reads only the render-llm slice (llm + control_plane.llm_proxy); "
+            "this file carries more (mount the slice, not the central file)")
+
+
+def render_llm(cfg: FleetConfig, out: Path) -> None:
+    """Write the llm slice (JSON, valid YAML, 0600)."""
+    write_private_file(Path(out), json.dumps(llm_slice(cfg), indent=2, sort_keys=True) + "\n")
+
+
+# --------------------------------------------------------------------------
 # init
 # --------------------------------------------------------------------------
 

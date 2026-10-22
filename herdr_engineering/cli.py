@@ -177,7 +177,8 @@ def _build_parser() -> argparse.ArgumentParser:
                       ("token", "mint a fresh token for an existing host and install it"),
                       ("revoke", "remove a host (its token stops working); backup first"),
                       ("render-compose", "write the compose env file (0600)"),
-                      ("render-collab", "write the collab container's config slice (0600)")):
+                      ("render-collab", "write the collab container's config slice (0600)"),
+                      ("render-llm", "write the llm-proxy container's config slice (0600)")):
         sp = csub.add_parser(name, help=hlp)
         sp.add_argument("--path", default=FLEET_CONFIG_DEFAULT)
         if name == "init":
@@ -196,6 +197,9 @@ def _build_parser() -> argparse.ArgumentParser:
         if name == "render-collab":
             sp.add_argument("--out", required=True,
                             help="file to write (0600): only control_plane.collab")
+        if name == "render-llm":
+            sp.add_argument("--out", required=True,
+                            help="file to write (0600): only llm + control_plane.llm_proxy")
         sp.set_defaults(func=_cmd_fleet_config)
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
@@ -542,8 +546,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="control-plane base URL")
     p2.add_argument("--upstream", default=None,
                     help="upstream base URL (default: llm.upstream_url from the fleet config)")
-    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
-                    help="central fleet config file: llm.upstream_key/upstream_url and "
+    p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/llm-proxy/llm-config.json",
+                    help="the llm slice of the central fleet file (`fleet config render-llm`): llm.upstream_key/upstream_url and "
                          "control_plane.llm_proxy tuning (the only source of configuration)")
     p2.set_defaults(func=_cmd_cp_llm_proxy)
 
@@ -584,16 +588,19 @@ def _cmd_cp_mission_feed(args) -> int:
 
 
 def _cmd_cp_llm_proxy(args) -> int:
-    """Serve the fabric LLM gateway. Everything it needs comes from the central
-    fleet file (llm.upstream_key / upstream_url, control_plane.llm_proxy tuning);
-    the key is never taken from argv or the environment."""
+    """Serve the fabric LLM gateway. Everything it needs comes from the llm slice
+    of the central fleet file (`fleet config render-llm`: llm.upstream_key /
+    upstream_url, control_plane.llm_proxy tuning); it refuses a file carrying
+    anything else. The key is never taken from argv or the environment."""
     from pathlib import Path
 
     from .fleet_config import FleetConfigError, load_fleet_config
+    from .fleet_config_cli import check_llm_slice
     from .llm_proxy import DEFAULT_MAX_INFLIGHT, DEFAULT_QUEUE_WAIT_SECONDS, serve
     path = Path(args.fleet_config).expanduser()
     try:
         cfg = load_fleet_config(path)
+        check_llm_slice(cfg)
         llm = cfg.section("llm")
         try:
             tuning = cfg.section("control_plane").get("llm_proxy") or {}
@@ -791,6 +798,9 @@ def _cmd_fleet_config(args) -> int:
             print(f"wrote {args.out} (0600)")
         elif cmd == "render-collab":
             fcc.render_collab(load_fleet_config(path), Path(args.out).expanduser())
+            print(f"wrote {args.out} (0600)")
+        elif cmd == "render-llm":
+            fcc.render_llm(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")
     except FleetConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
