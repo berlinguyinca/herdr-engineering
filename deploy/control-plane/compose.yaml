@@ -257,7 +257,7 @@ services:
     healthcheck:
       # The gateway's control API binds the tailnet IP (not loopback), so
       # probe that address (substituted from the rendered env file).
-      test: ["CMD", "curl", "-fsS", "http://${GATEWAY_TAILNET_IP:?run deploy.sh}:29999/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://${GATEWAY_HEALTH_HOST:?run deploy.sh (derived from GATEWAY_TAILNET_IP)}:29999/healthz"]
       interval: 15s
       timeout: 3s
       retries: 3

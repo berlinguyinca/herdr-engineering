@@ -12,6 +12,14 @@
 set -euo pipefail
 
 DEST="${1:-$HOME/.local/share/herdr-cp-feed-plugin}"
+# The old interface took the control-plane URL first; refuse it instead of copying the
+# plugin into a directory named after a URL.
+case "$DEST" in
+  http:*|https:*|http*)
+    echo "ERROR: the first argument is the plugin destination, not a URL ($DEST)." >&2
+    echo "The control plane comes from ~/.config/herdr-engineering/host.json (herdr-eng fleet join)." >&2
+    exit 2 ;;
+esac
 
 if ! command -v herdr >/dev/null 2>&1; then
   echo "ERROR: herdr binary not found on this host. Install herdr first." >&2
