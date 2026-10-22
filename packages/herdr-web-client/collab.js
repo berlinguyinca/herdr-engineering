@@ -70,13 +70,14 @@ export class CollabApi {
   constructor(getTokens, fetchFn = (...a) => fetch(...a), base = '/api/v1/collab') {
     this.getTokens = getTokens; this.fetch = fetchFn; this.base = base;
   }
-  async call(method, path, body) {
+  async call(method, path, body, signal) {
     const t = this.getTokens();
     if (!t) throw new AuthError('signed out');
     const res = await this.fetch(this.base + path, {
       method,
       headers: { Authorization: `Bearer ${t.access}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined,
+      signal,
     });
     if (res.status === 401) throw new AuthError('session expired');
     const data = await res.json().catch(() => ({}));
@@ -97,6 +98,10 @@ export class CollabApi {
   agents() { return this.call('GET', '/agents'); }
   connectAgent(name) {
     return this.call('POST', '/agents/connect', { harness_type: 'claude-code', ...(name ? { name } : {}) });
+  }
+  // One long-poll for everything a room shows: returns {changed:false} after `wait` seconds of quiet.
+  state(room, since, cursor, wait, signal) {
+    return this.call('GET', `/rooms/${encodeURIComponent(room)}/state?since=${since}&cursor=${cursor}&wait=${wait}`, undefined, signal);
   }
   flow(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/flow`); }
   linkAgent(agentId, instanceId) { return this.call('POST', `/agents/${encodeURIComponent(agentId)}/link`, { instance_id: instanceId || null }); }

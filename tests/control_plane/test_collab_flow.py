@@ -91,3 +91,66 @@ def test_dashboard_enrichment_joins_only_known_sessions_and_survives_junk():
     assert out["nodes"][1]["fabric"]["status"] == "unknown"
     assert "fabric" not in out["nodes"][2] and "fabric" not in out["nodes"][3]
     assert _fabric_enriched_flow(Repo(), b"not json") == b"not json"
+
+
+# ----------------------------------------------------------- the single room long-poll
+def test_state_returns_everything_first_then_nothing_until_the_room_changes(w):
+    chain(w)
+    first = w.s.room_state(w.alice, w.room, -1, 0, 0)
+    assert first["changed"] is True and first["flow"]["nodes"] and first["tasks"] and first["agents"]
+    assert first["requests"] == []
+    again = w.s.room_state(w.alice, w.room, first["seq"], 0, 0)
+    assert again == {"seq": first["seq"], "changed": False}
+
+
+def test_state_wakes_for_its_own_room_only(w):
+    import threading
+    import time
+    base = w.s.room_state(w.alice, w.room, -1, 0, 0)["seq"]
+    got = {}
+
+    def waiter():
+        t0 = time.monotonic()
+        got["r"] = w.s.room_state(w.alice, w.room, base, 0, 8)
+        got["dt"] = time.monotonic() - t0
+
+    th = threading.Thread(target=waiter)
+    th.start()
+    time.sleep(0.4)
+    w.s.post_message(w.alice, w.room2, {"text": "other room", "idempotency_key": "k0"})      # must not wake it
+    time.sleep(0.4)
+    assert th.is_alive()
+    w.s.post_message(w.alice, w.room, {"text": "this room", "idempotency_key": "k1"})
+    th.join(5)
+    assert got["r"]["changed"] is True and [e["text"] for e in got["r"]["events"] if e["event_type"] == "message"][-1] == "this room"
+    assert got["dt"] < 4
+
+
+def test_state_is_authorised_capped_and_hides_what_a_guest_may_not_see(w):
+    assert code(w.s.room_state, w.mallory, w.room, -1, 0, 0) == 404
+    g = w.s.room_state(w.dave, w.room, -1, 0, 0)
+    assert g["agents"] == [] and g["flow"] is None and g["requests"] is None
+    assert w.s.room_state(w.carol, w.room, -1, 0, 0)["requests"] is None
+    w.s._state_waiters[w.alice.key] = w.s.MAX_STATE_WAITERS
+    assert code(w.s.room_state, w.alice, w.room, -1, 0, 0) == 429
+
+
+def test_state_ends_when_access_is_lost_while_waiting(w):
+    import threading
+    import time
+    seq = w.s.room_state(w.carol, w.room, -1, 0, 0)["seq"]
+    out = {}
+
+    def waiter():
+        try:
+            w.s.room_state(w.carol, w.room, seq, 0, 8)
+        except CollabError as e:
+            out["status"] = e.status
+
+    from herdr_engineering.control_plane.collab import CollabError
+    th = threading.Thread(target=waiter)
+    th.start()
+    time.sleep(0.4)
+    w.s.remove_member(w.alice, w.room, "carol")
+    th.join(5)
+    assert out.get("status") == 404

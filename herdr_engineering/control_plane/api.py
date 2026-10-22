@@ -336,6 +336,12 @@ def _fabric_enriched_flow(repo, payload: bytes) -> bytes:
     sessions, hosts and missions this control plane knows. The collab service never sees fabric data."""
     try:
         flow = json.loads(payload)
+        if "nodes" not in flow:                      # a room-state reply carries the flow under "flow"
+            if not isinstance(flow.get("flow"), dict):
+                return payload
+            enriched = json.loads(_fabric_enriched_flow(repo, json.dumps(flow["flow"]).encode()))
+            flow["flow"] = enriched
+            return json.dumps(flow).encode()
         for node in flow.get("nodes", []):
             inst = node.get("instance_id")
             if node.get("kind") != "agent" or not inst:
@@ -361,6 +367,7 @@ _PUBLIC_STATIC = {
     "/collab-view.js": ("collab-view.js", "text/javascript"),
     "/collab-scripts.js": ("collab-scripts.js", "text/javascript"),
     "/collab-flow.js": ("collab-flow.js", "text/javascript"),
+    "/collab-mention.js": ("collab-mention.js", "text/javascript"),
     "/guide": ("collab-guide.html", "text/html; charset=utf-8"),
     "/collab-guide.js": ("collab-guide.js", "text/javascript"),
     "/collab-guide.md": ("collab-guide.md", "text/markdown; charset=utf-8"),
@@ -689,7 +696,7 @@ def _make_handler(server, public=False, operator=False):
                 status, payload = exc.code, exc.read(2_000_000)
             except Exception:
                 return self._json({"error": "collaboration service unavailable"}, 502)
-            if status == 200 and self.command == "GET" and urlsplit(self.path).path.endswith("/flow"):
+            if status == 200 and self.command == "GET" and urlsplit(self.path).path.endswith(("/flow", "/state")):
                 payload = _fabric_enriched_flow(server.repo, payload)
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
