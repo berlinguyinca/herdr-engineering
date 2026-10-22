@@ -1,0 +1,64 @@
+---
+# Agent-transcript fleet mining (spec: HPC-ssh adoption dashboard).
+#
+# Runs `herdr-eng agent-mine` on every site and collects the REDACTED JSON
+# summary (aggregate counts only — NO command bodies, NO raw transcripts) for
+# each onto the controller at ~/.cache/agent-mine/fleet/<host>.json. That is the
+# data source for the /api/agent-mine dashboard panel. Only summary counts cross
+# the wire; transcripts never leave a site.
+#
+#   cd ansible && ansible-playbook -i inventory/hosts.yml playbooks/agent-mine.yml
+#
+# Overridable vars: herdr_agent_mine_agents (default "claude,pi,codex,opencode"),
+# herdr_agent_mine_days (default 45).
+- name: "HerdR Engineering agent-mine fleet fan-out (redacted summaries only)"
+  hosts: herdr_fleet
+  gather_facts: false
+  become: "{{ herdr_engineering_become | default((ansible_user | default(lookup('env', 'USER'), true)) != 'root') }}"
+  vars:
+    am_agents: "{{ herdr_agent_mine_agents | default('claude,pi,codex,opencode') }}"
+    am_days: "{{ herdr_agent_mine_days | default(45) | int }}"
+    controller_home: "{{ lookup('env', 'HOME') }}"
+    controller_fleet_dir: "{{ controller_home }}/.cache/agent-mine/fleet"
+  tasks:
+    - name: "Gather facts as the connection user (no become)"
+      ansible.builtin.setup:
+      become: false
+
+    - name: "Record the fleet user's home"
+      ansible.builtin.set_fact:
+        fleet_home: "{{ ansible_env.HOME }}"
+
+    - name: "Mine this host's transcripts into a redacted JSON summary"
+      # become: false — must read the FLEET user's transcript stores, not root's.
+      become: false
+      ansible.builtin.shell: |
+        export PATH="{{ fleet_home }}/.local/bin:{{ fleet_home }}/.venvs/herdr-engineering/bin:$PATH"
+        HERDR=$(command -v herdr-eng || true)
+        if [ -z "$HERDR" ] && [ -x "{{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng" ]; then
+          HERDR="{{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng"
+        fi
+        if [ -n "$HERDR" ] && [ -x "$HERDR" ]; then
+          "$HERDR" agent-mine --agents "{{ am_agents }}" --days {{ am_days }} --json-summary
+        else
+          echo "herdr-eng agent-mine not available on {{ inventory_hostname }}" >&2
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      register: am_summary
+      changed_when: false
+      failed_when: false
+
+    - name: "Store this site's redacted summary on the controller"
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        dest: "{{ controller_fleet_dir }}/{{ inventory_hostname }}.json"
+        content: "{{ am_summary.stdout }}"
+        mode: "0644"
+      when: am_summary.rc == 0 and (am_summary.stdout | length) > 0
+
+    - name: "Report agent-mine result for this host"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} | rc={{ am_summary.rc }} | summary_bytes={{ am_summary.stdout | default('') | length }}"

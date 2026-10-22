@@ -58,3 +58,18 @@ def test_per_agent_tool_mix():
     pa = s["per_agent"]["pi"]
     assert pa["events"] == 3
     assert pa["top_tools"][0][0] == "bash" and pa["top_tools"][0][1] == 2
+
+
+def test_fleet_rollup_aggregates_sites_and_skips_error_stubs():
+    s1 = agent_mine.build_summary(
+        ["pi"], [_ev("pi", "bash", "ssh gw@hive 'x'", ts="2026-10-22T00:00:00.000Z"),
+                 _ev("pi", "bash", "hpc-ssh.sh hive x")], {"pi": {"files": 1}}, 45, "2026-10-21")
+    s2 = agent_mine.build_summary(
+        ["claude"], [_ev("claude", "Bash", "ssh fry.fiehnlab 'x'")], {"claude": {"files": 1}}, 45, "2026-10-21")
+    r = agent_mine.fleet_rollup([s1, s2, {"error": "unavailable"}, None, "junk"])
+    assert r["sites"] == 2  # error stub + None + junk are skipped
+    assert r["hand_ssh_hpc"] == 2  # s1:1 + s2:1
+    assert r["hpc_ssh"] == 1  # s1:1 + s2:0
+    assert r["events"] == 3  # s1:2 + s2:1
+    assert r["adoption_pct"] == round(100.0 * 1 / 3, 1)
+    assert r["per_agent"].get("pi") == 2 and r["per_agent"].get("claude") == 1

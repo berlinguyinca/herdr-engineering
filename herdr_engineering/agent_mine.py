@@ -274,6 +274,45 @@ def build_summary(agents, events, stats, days, since_install):
     }
 
 
+def fleet_rollup(summaries):
+    """Aggregate a list of per-site summary dicts into a fleet-wide roll-up.
+
+    `summaries` is a list of the objects `build_summary` returns (one per site).
+    Entries that are not valid summaries (e.g. an {"error": ...} stub) are skipped.
+    """
+    hand = hpc = hand_s = hpc_s = events = 0
+    sites = 0
+    per_agent = collections.Counter()
+    for s in summaries:
+        if not isinstance(s, dict) or "hpc_ssh" not in s:
+            continue
+        sites += 1
+        h = s.get("hpc_ssh") or {}
+        hand += int(h.get("hand_ssh_hpc", 0) or 0)
+        hpc += int(h.get("hpc_ssh", 0) or 0)
+        hand_s += int(h.get("hand_ssh_hpc_since", 0) or 0)
+        hpc_s += int(h.get("hpc_ssh_since", 0) or 0)
+        events += int((s.get("totals") or {}).get("events", 0) or 0)
+        for a, info in (s.get("per_agent") or {}).items():
+            if isinstance(info, dict):
+                per_agent[a] += int(info.get("events", 0) or 0)
+
+    def pct(n, d):
+        return round(100.0 * n / (n + d), 1) if (n + d) else 0.0
+
+    return {
+        "sites": sites,
+        "events": events,
+        "hand_ssh_hpc": hand,
+        "hpc_ssh": hpc,
+        "adoption_pct": pct(hpc, hand),
+        "hand_ssh_hpc_since": hand_s,
+        "hpc_ssh_since": hpc_s,
+        "adoption_since_pct": pct(hpc_s, hand_s),
+        "per_agent": dict(per_agent),
+    }
+
+
 def run(agents, days, full, outdir, limit_files=None, json_summary=False, since_install=None, summary_out=None):
     os.makedirs(outdir, exist_ok=True)
     events = []
