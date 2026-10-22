@@ -112,9 +112,9 @@ def test_installer_renders_explicit_checkout_and_interpreter_without_enabling(tm
     assert '%%n $$here \\"quote\\"/.venv/bin/python" -m herdr_engineering.fleet_autoupdate' in service
     assert 'Environment="PATH=' in service
     timer = (unit_dir / "herdr-eng-fleet-update.timer").read_text()
-    assert "OnCalendar=daily" in timer
+    assert "OnCalendar=*-*-* 11:59:00" in timer
     assert "Persistent=true" in timer
-    assert "RandomizedDelaySec=30m" in timer
+    assert "RandomizedDelaySec=0" in timer
     if shutil.which("systemd-analyze"):
         validation = subprocess.run(
             ["systemd-analyze", "--user", "verify", str(unit_dir / "herdr-eng-fleet-update.service"),
