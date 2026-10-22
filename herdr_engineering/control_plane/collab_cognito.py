@@ -89,9 +89,40 @@ class CognitoAuthenticator:
         self._seen.add(user)
         return user, float(claims["exp"])
 
+    def verify_id_token(self, token: str, *, user: str) -> str | None:
+        """Verified, lower-cased email from an ID token that belongs to ``user``.
+
+        Used only to link a person's email to their (already authenticated) user id so
+        they can be invited by email. The ID token must be ours (signature, issuer,
+        audience in the client allowlist), unexpired, carry a verified email, and name
+        the same Cognito user as the access token that authenticated the request."""
+        import jwt
+        try:
+            header = jwt.get_unverified_header(token)
+            if header.get("alg") != "RS256" or not isinstance(header.get("kid"), str):
+                return None
+            key = self._key_for(header["kid"])
+            if key is None:
+                return None
+            claims = jwt.decode(token, key, algorithms=["RS256"], issuer=self.issuer,
+                                audience=list(self.client_ids),
+                                options={"require": ["exp", "iss", "aud", "sub"]})
+        except Exception:
+            return None
+        email = claims.get("email")
+        verified = claims.get("email_verified") in (True, "true")
+        if (claims.get("token_use") != "id" or not verified or not isinstance(email, str)
+                or (claims.get("cognito:username") or claims.get("sub")) != user):
+            return None
+        return email.strip().lower()
+
     def user_for(self, token: str) -> str | None:
         got = self.verify(token)
         return got[0] if got else None
+
+    def mark_known(self, user_ids) -> None:
+        """Users recorded in the collab log before this process started (restart safety)."""
+        self._seen.update(user_ids)
 
     def exists(self, user_id: str) -> bool:
         """Known and still in the group (stream/agent re-checks come through here)."""
@@ -115,6 +146,32 @@ class CognitoAuthenticator:
         ok = bool(groups) and self.required_group in groups
         self._checked[user] = (now, ok)
         return ok
+
+
+class SyncedDirectory:
+    """Cognito JWKS and group membership read from files a host-side job refreshes.
+
+    Lets the public container run with no AWS credentials and no outbound network at all.
+    Fail closed: membership older than ``max_age`` seconds raises, so nobody new is admitted
+    (and a known user is denied after the grace window) if the sync stops.
+    """
+
+    def __init__(self, directory: str, group: str, *, max_age: float = 600.0,
+                 now: Callable[[], float] = time.time):
+        self.dir, self.group, self.max_age, self._now = directory, group, max_age, now
+
+    def _load(self, name: str) -> dict:
+        with open(f"{self.dir}/{name}", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def jwks(self) -> dict:
+        return self._load("jwks.json")
+
+    def groups(self, user: str) -> list[str] | None:
+        data = self._load("members.json")
+        if self._now() - float(data["updated"]) > self.max_age:
+            raise RuntimeError("group membership sync is stale")
+        return [self.group] if user in data["groups"].get(self.group, []) else []
 
 
 def boto_group_lookup(pool_id: str, region: str) -> Callable[[str], list[str] | None]:

@@ -171,7 +171,8 @@ def _build_parser() -> argparse.ArgumentParser:
     for name, hlp in (("init", "create a new fleet-config.yaml interactively"),
                       ("validate", "validate the file (prints revision and host count only)"),
                       ("token", "mint a fresh token for an existing host and install it"),
-                      ("render-compose", "write the compose env file (0600)")):
+                      ("render-compose", "write the compose env file (0600)"),
+                      ("render-collab", "write the collab container's config slice (0600)")):
         sp = csub.add_parser(name, help=hlp)
         sp.add_argument("--path", default="~/.config/herdr-engineering/fleet-config.yaml")
         if name == "token":
@@ -181,6 +182,9 @@ def _build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--control-plane-url", default=None)
         if name == "render-compose":
             sp.add_argument("--out", required=True, help="env file to write (0600)")
+        if name == "render-collab":
+            sp.add_argument("--out", required=True,
+                            help="file to write (0600): only control_plane.collab")
         sp.set_defaults(func=_cmd_fleet_config)
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
@@ -467,8 +471,31 @@ def _build_parser() -> argparse.ArgumentParser:
                          "this user pool (e.g. us-west-2_GjtcM0PCp); needs --collab-cognito-client")
     p2.add_argument("--collab-cognito-client", action="append", default=[],
                     help="allowed Cognito app client id (repeatable)")
-    p2.add_argument("--collab-cognito-group", default="local.dev",
+    p2.add_argument("--collab-cognito-web-client", default=None,
+                    help="app client used by the browser page (Hosted UI, PKCE); also allowed as a token client")
+    p2.add_argument("--collab-cognito-domain", default=None,
+                    help="Cognito Hosted UI base URL, e.g. https://<prefix>.auth.us-west-2.amazoncognito.com")
+    p2.add_argument("--collab-public-url", default=None,
+                    help="the https URL users open (must equal a registered callback URL), e.g. "
+                         "https://bender.tail0c50da.ts.net:9447/")
+    p2.add_argument("--collab-cognito-group", default=None,
                     help="required cognito:groups membership (default: local.dev)")
+    p2.add_argument("--collab-public-port", type=int, default=None,
+                    help="also serve ONLY collaboration (API, MCP, page) on this port; point the "
+                         "internet-facing proxy here, never at the main port")
+    p2.add_argument("--collab-public-host", default=None,
+                    help="bind address for --collab-public-port (default: --host)")
+    p2.add_argument("--collab-sync-dir", default=None,
+                    help="read Cognito JWKS (jwks.json) and group members (members.json) from this "
+                         "directory, refreshed by a host job, instead of calling AWS: the "
+                         "container then needs no credentials and no outbound network")
+    p2.add_argument("--collab-only", action="store_true",
+                    help="serve ONLY the public collaboration surface on --collab-public-port: no "
+                         "dashboard, no operator API, no database (events go to --collab-log-file); "
+                         "unset --collab-cognito-* / --collab-public-url "
+                         "come from control_plane.collab in --fleet-config (the render-collab slice)")
+    p2.add_argument("--collab-log-file", default=None,
+                    help="append-only JSON-lines collaboration event log (required with --collab-only)")
     p2.add_argument("--collab-require-https", action="store_true",
                     help="serve collaboration only for requests forwarded by a TLS proxy "
                          "(X-Forwarded-Proto: https); other listeners on this server stay "
@@ -745,6 +772,9 @@ def _cmd_fleet_config(args) -> int:
             print(f"token for {rep['host']} installed on {rep['target']} (token: {rep['token']})")
         elif cmd == "render-compose":
             fcc.render_compose(load_fleet_config(path), Path(args.out).expanduser())
+            print(f"wrote {args.out} (0600)")
+        elif cmd == "render-collab":
+            fcc.render_collab(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")
     except FleetConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -2168,7 +2198,19 @@ def _cmd_cp_web(args) -> int:
 
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
-    if fleet_store is not None:
+    if args.collab_only:
+        # The public collab container is given only the collab slice of the central
+        # file (`fleet config render-collab`): no fleet endpoint, no API keys, no DSN.
+        if args.pg_dsn or set(cp) - {"collab"}:
+            raise SystemExit("--collab-only must not be given database credentials or other "
+                             "control-plane settings (mount the render-collab slice, not the "
+                             "central file)")
+        _apply_collab_config(args, cp)
+        if not (args.collab_log_file and args.collab_public_port and args.collab_cognito_pool):
+            raise SystemExit("--collab-only needs --collab-log-file, --collab-public-port and a "
+                             "Cognito pool (control_plane.collab.cognito_pool or --collab-cognito-pool)")
+        fleet_store = None
+    elif fleet_store is not None:
         _install_fleet_host_config(fleet_store)
         file_keys = cp.get("api_keys") or {}
         if not isinstance(file_keys, dict):
@@ -2176,9 +2218,11 @@ def _cmd_cp_web(args) -> int:
         merged = {str(k): str(v) for k, v in file_keys.items()}
         merged.update(api_keys or {})
         api_keys = merged or None
+    if args.collab_cognito_group is None:
+        args.collab_cognito_group = "local.dev"
     # The Postgres DSN comes from the fleet file's control_plane section (the
     # mounted central file), so the password never appears in process args or env.
-    dsn = args.pg_dsn or cp.get("pg_dsn")
+    dsn = None if args.collab_only else (args.pg_dsn or cp.get("pg_dsn"))
     inspector_limits = cp.get("inspector_limits") or {}
     if not isinstance(inspector_limits, dict):
         raise SystemExit("fleet config control_plane.inspector_limits must be a mapping")
@@ -2187,6 +2231,9 @@ def _cmd_cp_web(args) -> int:
     # ingested event persists to Postgres instead of dying with the in-memory
     # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
     sink = DurableEventSink(dsn=dsn) if dsn else None
+    if args.collab_only:
+        from .control_plane.collab import FileEventLog
+        sink = FileEventLog(args.collab_log_file)
     repo = ControlPlaneRepo(sink=sink, host_aliases=_host_aliases_from(cp),
                             inspector_limits=inspector_limits)
     if args.seed_demo:
@@ -2198,17 +2245,37 @@ def _cmd_cp_web(args) -> int:
             raise SystemExit("use either --collab-cognito-pool or --collab-users-file, not both")
         from .control_plane.collab import CollabService
         from .control_plane.collab_cognito import CognitoAuthenticator, boto_group_lookup
+        clients = list(args.collab_cognito_client)
+        public = {}
+        if args.collab_cognito_web_client:
+            if not (args.collab_cognito_domain and args.collab_public_url
+                    and args.collab_public_url.startswith("https://")):
+                raise SystemExit("--collab-cognito-web-client needs --collab-cognito-domain and an "
+                                 "https:// --collab-public-url")
+            clients.append(args.collab_cognito_web_client)
+            public = {"client_id": args.collab_cognito_web_client,
+                      "hosted_ui_domain": args.collab_cognito_domain.rstrip("/"),
+                      "public_url": args.collab_public_url}
         try:
             auth = CognitoAuthenticator(pool_id=args.collab_cognito_pool,
-                                        client_ids=args.collab_cognito_client,
+                                        client_ids=clients,
                                         required_group=args.collab_cognito_group)
-            auth._lookup = boto_group_lookup(auth.pool_id, auth.region)
+            if args.collab_sync_dir:
+                from .control_plane.collab_cognito import SyncedDirectory
+                directory = SyncedDirectory(args.collab_sync_dir, args.collab_cognito_group)
+                auth._fetch = directory.jwks
+                auth._lookup = directory.groups
+                auth._recheck = 15.0
+            else:
+                auth._lookup = boto_group_lookup(auth.pool_id, auth.region)
         except ValueError as exc:
             raise SystemExit(f"--collab-cognito-*: {exc}") from exc
-        if sink is not None and source is None:
+        if sink is not None and source is None and not args.collab_only:   # the file log is hydrated below
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
-        collab = CollabService(auth, sink=sink)
+        collab = CollabService(auth, sink=sink, public_config=public)
+        if args.collab_only:
+            collab.hydrate(sink.load())
     elif args.collab_users_file:
         from pathlib import Path
 
@@ -2224,20 +2291,26 @@ def _cmd_cp_web(args) -> int:
         collab = CollabService(StaticTokenAuthenticator(users), sink=sink)
     svr = ControlPlaneServer(repo, api_keys=api_keys,
                              host=args.host, port=args.port, source=source,
-                             web_root=args.web_root, allow_open=args.allow_open,
+                             web_root=args.web_root,
+                             # collab-only has no operator listener, so nothing is left open
+                             allow_open=args.allow_open or args.collab_only,
                              rustfs=rustfs, collab=collab,
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
-                             fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True)
+                             fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
+                             public_port=args.collab_public_port,
+                             public_host=args.collab_public_host,
+                             collab_only=args.collab_only)
     # Self-report the control-plane stack so the Services page has real data.
     try:
-        _self_report_services(
-            repo,
-            host_id=cp.get("self_host") or socket.gethostname(),
-            web_port=args.port or cp.get("web_port") or 8080,
-            dsn=dsn,
-            rustfs_endpoint=cp.get("rustfs_endpoint"),
-        )
+        if not args.collab_only:   # collab-only has no stack to report
+            _self_report_services(
+                repo,
+                host_id=cp.get("self_host") or socket.gethostname(),
+                web_port=args.port or cp.get("web_port") or 8080,
+                dsn=dsn,
+                rustfs_endpoint=cp.get("rustfs_endpoint"),
+            )
     except Exception:
         logging.exception("self-report of stack services failed")
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
@@ -2268,6 +2341,48 @@ def _install_fleet_host_config(store) -> None:
                 continue
         return HostConfig("", socket.gethostname(), cfg.revision, values)
     install_source(source)
+
+
+# control_plane.collab keys -> (argparse dest, kind). Read only by `web --collab-only`;
+# the dashboard never enables collaboration from the file.
+COLLAB_CONFIG_KEYS = {
+    "cognito_pool": ("collab_cognito_pool", str),
+    "cognito_clients": ("collab_cognito_client", list),
+    "cognito_group": ("collab_cognito_group", str),
+    "cognito_web_client": ("collab_cognito_web_client", str),
+    "cognito_domain": ("collab_cognito_domain", str),
+    "public_url": ("collab_public_url", str),
+}
+
+
+def _apply_collab_config(args, cp) -> None:
+    """Fill unset --collab-* flags from control_plane.collab (flags win; booleans OR)."""
+    collab = cp.get("collab") or {}
+    if not isinstance(collab, dict):
+        raise SystemExit("fleet config control_plane.collab must be a mapping")
+    unknown = sorted(set(collab) - set(COLLAB_CONFIG_KEYS))
+    if unknown:
+        raise SystemExit("fleet config control_plane.collab: unknown keys: " + ", ".join(unknown))
+    for key, (dest, kind) in COLLAB_CONFIG_KEYS.items():
+        if key not in collab:
+            continue
+        value = collab[key]
+        if kind is list:
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+                raise SystemExit(f"fleet config control_plane.collab.{key} must be a list of strings")
+            if not getattr(args, dest):
+                setattr(args, dest, list(value))
+        elif kind is bool:
+            if not isinstance(value, bool):
+                raise SystemExit(f"fleet config control_plane.collab.{key} must be true or false")
+            setattr(args, dest, bool(getattr(args, dest)) or value)
+        else:
+            if not isinstance(value, str) or not value:
+                raise SystemExit(f"fleet config control_plane.collab.{key} must be a non-empty string")
+            if getattr(args, dest) is None:
+                setattr(args, dest, value)
 
 
 def _load_cp_fleet_config(path_arg):

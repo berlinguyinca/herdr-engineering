@@ -51,13 +51,13 @@ def _render(tmp_path, mutate=None):
     return central, envfile
 
 
-def _config(central, envfile, *files, fmt=None):
+def _config(central, envfile, *files, fmt=None, extra_env=None):
     cmd = ["docker", "compose", "--env-file", str(envfile), "-p", "t"]
     for f in files:
         cmd += ["-f", str(CP / f)]
     cmd += ["config"] + (["--format", fmt] if fmt else ["-q"])
     env = dict(os.environ, HERDR_CP_FLEET_CONFIG_FILE=str(central), HERDR_CP_IMAGE_TAG="t",
-               HERDR_CP_GIT_COMMIT="t")
+               HERDR_CP_GIT_COMMIT="t", **(extra_env or {}))
     return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
 
 
@@ -68,12 +68,34 @@ def test_rendered_env_validates_against_compose_yaml(tmp_path):
 
 
 def test_rendered_env_validates_with_the_collab_overlay(tmp_path):
-    central, envfile = _render(tmp_path)
-    r = _config(central, envfile, "compose.yaml", "compose.collab.yaml")
+    # Updated in the origin/main merge: the overlay no longer overrides control-plane-web
+    # (collab moved to its own collab-public container), which reads only the
+    # render-collab slice; docker-level collab vars come from control_plane.compose.
+    central, envfile = _render(tmp_path, lambda c: c.update(HERDR_COLLAB_CERT_DIR=str(tmp_path / "acme")))
+    data = yaml.safe_load(central.read_text())
+    data["sections"]["control_plane"]["values"]["collab"] = {"cognito_pool": "us-west-2_TEST"}
+    central.unlink()
+    fcc.write_private_file(central, yaml.safe_dump(data, sort_keys=False))
+    fcc.render_compose(load_fleet_config(central), envfile)
+    slice_ = tmp_path / "collab-config.json"
+    fcc.render_collab(load_fleet_config(central), slice_)
+    extra = {"HERDR_COLLAB_CONFIG_FILE": str(slice_), "HERDR_COLLAB_DATA_DIR": str(tmp_path / "data"),
+             "HERDR_COLLAB_SYNC_DIR": str(tmp_path / "sync"),
+             "HERDR_COLLAB_EDGE_CONF": str(CP / "collab-edge" / "nginx.conf")}
+    r = _config(central, envfile, "compose.yaml", "compose.collab.yaml", extra_env=extra)
     assert r.returncode == 0, r.stderr
-    model = json.loads(_config(central, envfile, "compose.yaml", "compose.collab.yaml", fmt="json").stdout)
+    model = json.loads(_config(central, envfile, "compose.yaml", "compose.collab.yaml", fmt="json",
+                               extra_env=extra).stdout)
     cmd = model["services"]["control-plane-web"]["command"]
     assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/fleet-config.yaml"
+    assert not [a for a in cmd if a.startswith("--collab")]
+    pub = model["services"]["collab-public"]
+    assert pub["command"][pub["command"].index("--fleet-config") + 1] == "/etc/herdr/collab-config.yaml"
+    sources = {v["source"] for v in pub["volumes"]}
+    assert str(slice_) in sources and str(central) not in sources
+    assert not pub.get("environment")
+    edge = model["services"]["collab-edge"]
+    assert any(v["source"] == str(tmp_path / "acme") for v in edge["volumes"])
 
 
 def test_gateway_bind_single_for_loopback_and_pair_for_tailnet(tmp_path):

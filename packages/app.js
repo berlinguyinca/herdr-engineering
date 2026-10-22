@@ -19,6 +19,7 @@ import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js
 import { renderFleetMatrix } from './fleet-view.js';
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
+import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -57,6 +58,7 @@ const NAV = [
   { path: '/hosts', label: 'Hosts' },
   { path: '/activity', label: 'Activity' },
   { path: '/analytics', label: 'Analytics' },
+  { path: '/collab', label: 'Collaboration' },
 ];
 
 const SHELL = document.getElementById('shell');
@@ -73,6 +75,7 @@ function route() {
 const ROUTES = {
   '/overview': viewOverview,
   '/github': viewGithub,
+  '/collab': viewCollab,
   '/ci': viewIntegrations,
   '/reviews': viewIntegrations,
   '/topology': viewTopology,
@@ -138,6 +141,10 @@ async function viewTopology() {
 async function viewOverview() {
   root.innerHTML = '<h1>Overview</h1><div id="overview-dashboard"></div>';
   dashboardView = mountOverview(document.getElementById('overview-dashboard'), client);
+}
+
+async function viewCollab() {
+  dashboardView = mountCollab(root);
 }
 
 async function viewGithub() {
@@ -537,7 +544,12 @@ connectEvents({
     // LIVE_REFRESH_MS since the previous live refresh.
     const wait = Math.max(150, LIVE_REFRESH_MS - (Date.now() - lastLiveRender));
     liveTimer = setTimeout(() => {
+      liveTimer = null;
       lastLiveRender = Date.now();
+      // The event may have arrived while the view was still loading; a view that
+      // mounted since then owns its refresh (a full re-render would reset filters).
+      if (servicesView) { servicesView.refresh(); return; }
+      if (dashboardView) return;
       render();
     }, wait);
   },
@@ -548,4 +560,4 @@ window.addEventListener('hashchange', () => {
   if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
   lastLiveRender = Date.now(); render();
 });
-render();
+completeSignInIfRedirected().finally(() => render());

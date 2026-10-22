@@ -175,11 +175,93 @@ def test_compose_web_has_no_env_file_and_mounts_central_file_read_only():
     assert "--fleet-config" in proxy["command"]
 
 
-def test_collab_overlay_keeps_the_fleet_config_flag():
-    # a compose override replaces the whole command list
+def test_collab_overlay_reads_only_the_collab_slice():
+    # Updated in the origin/main merge: main moved collaboration out of control-plane-web
+    # into its own public container, so the overlay no longer overrides the dashboard's
+    # command. collab-public gets its settings from the render-collab slice via
+    # --fleet-config, never from the central file, the environment or inline ids.
     doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.collab.yaml").read_text())
-    cmd = doc["services"]["control-plane-web"]["command"]
-    assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/fleet-config.yaml"
+    assert "control-plane-web" not in doc["services"]
+    pub = doc["services"]["collab-public"]
+    cmd = pub["command"]
+    assert "--collab-only" in cmd
+    assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/collab-config.yaml"
+    for flag in ("--collab-cognito-pool", "--collab-cognito-client", "--collab-cognito-group",
+                 "--collab-cognito-web-client", "--collab-cognito-domain", "--collab-public-url"):
+        assert flag not in cmd, flag
+    assert "--collab-require-https" in cmd       # fixed: the public container never serves plain http
+    assert "environment" not in pub and "env_file" not in pub
+    vols = pub["volumes"]
+    assert any(v.endswith(":/etc/herdr/collab-config.yaml:ro") for v in vols)
+    assert not any("/etc/herdr/fleet-config.yaml" in v or "HERDR_CP_FLEET_CONFIG_FILE" in v for v in vols)
+    edge = doc["services"]["collab-edge"]
+    assert "environment" not in edge and "env_file" not in edge
+
+
+COLLAB = {"cognito_pool": "us-west-2_TESTPOOL", "cognito_clients": ["client-a"],
+          "cognito_group": "team.test"}
+
+
+def _with_collab(e, collab=COLLAB, cert_dir="/srv/acme"):
+    data = yaml.safe_load(e["central"].read_text())
+    cpv = data["sections"]["control_plane"]["values"]
+    if collab is not None:
+        cpv["collab"] = dict(collab)
+    if cert_dir is not None:
+        cpv["compose"]["HERDR_COLLAB_CERT_DIR"] = cert_dir
+    e["central"].unlink()
+    fcc.write_private_file(e["central"], yaml.safe_dump(data, sort_keys=False))
+    marker = e["home"] / ".config" / "herdr-engineering" / "collab-enabled"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+
+
+def _home_files(e):
+    return sorted(str(p.relative_to(e["home"])) for p in e["home"].rglob("*"))
+
+
+def test_collab_dry_run_renders_the_slice_and_touches_nothing(env):
+    _with_collab(env)
+    before = _home_files(env)
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "collaboration network: enabled" in r.stdout
+    assert "collab-public collab-edge" in r.stdout
+    assert _home_files(env) == before          # no edge conf, data dir, slice or timer installed
+    calls = [ln for ln in env["log"].read_text().splitlines() if " config -q" in ln]
+    assert calls and "compose.collab.yaml" in calls[0]
+    for secret in env["secrets"] - {"control_plane"}:   # a key name, not a value
+        assert secret not in r.stdout + r.stderr
+
+
+def test_collab_enabled_without_collab_settings_fails_clearly(env):
+    _with_collab(env, collab=None)
+    r = deploy(env, "--dry-run")
+    assert r.returncode != 0 and "control_plane.collab" in r.stderr
+
+
+def test_collab_enabled_without_cert_dir_fails_clearly(env):
+    _with_collab(env, cert_dir=None)
+    r = deploy(env, "--dry-run")
+    assert r.returncode != 0 and "HERDR_COLLAB_CERT_DIR" in r.stderr
+
+
+def test_collab_sync_reads_pool_and_group_from_the_slice_not_env(env):
+    _with_collab(env)
+    out = env["tmp"] / "slice.json"
+    fcc.render_collab(fcc.load_fleet_config(env["central"]), out)
+    bindir = env["tmp"] / "bin"
+    for name in ("curl", "aws"):
+        (bindir / name).write_text(f"#!/usr/bin/env bash\necho {name} \"$*\" >> {env['tmp']}/sync.log\nexit 1\n")
+        (bindir / name).chmod(0o755)
+    env["env"]["HERDR_COLLAB_POOL"] = "us-west-2_FROMENV"
+    sync = ROOT / "deploy" / "control-plane" / "collab-sync.sh"
+    r = run(sync, env, "once", "--config", str(out), "--dir", str(env["tmp"] / "sync"))
+    assert r.returncode != 0                     # the stub curl fails
+    log = (env["tmp"] / "sync.log").read_text()
+    assert "us-west-2_TESTPOOL" in log and "FROMENV" not in log
+    r = run(sync, env, "once", "--config", str(env["tmp"] / "missing.json"))
+    assert r.returncode != 0 and "control_plane.collab" in r.stderr
 
 
 def test_generate_env_script_is_gone():

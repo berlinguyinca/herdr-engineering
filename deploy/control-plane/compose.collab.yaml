@@ -1,26 +1,110 @@
-# Collaboration network (HCN) overlay for control-plane-web; layered on by deploy.sh
-# only when ~/.config/herdr-engineering/collab-enabled exists. The identifiers below
-# are public (they ship in the BinView web bundle); no secret is configured here.
-# Publish over HTTPS with: deploy/control-plane/collab-tailscale-serve.sh up <port> <https-port>
+# Collaboration network (HCN) overlay; layered on by deploy.sh only when
+# ~/.config/herdr-engineering/collab-enabled exists. No secret is configured here.
+#
+# Configuration comes from the central fleet file like everything else:
+#   * control_plane.collab (Cognito pool, app clients, group, hosted-UI domain, public URL;
+#     all public identifiers) - deploy.sh renders ONLY that mapping into a
+#     stable 0600 slice (`herdr-eng fleet config render-collab`) which collab-public mounts
+#     read-only and reads with --fleet-config. It never sees the central file itself.
+#   * control_plane.compose (optional keys HERDR_COLLAB_CERT_DIR, HERDR_COLLAB_CERT_UID,
+#     HERDR_COLLAB_EDGE_BIND) - what docker itself substitutes below, rendered by deploy.sh.
+#   * HERDR_COLLAB_{CONFIG_FILE,DATA_DIR,SYNC_DIR,EDGE_CONF} are paths deploy.sh exports.
+#
+# Isolation model
+#   * The dashboard / operator API (control-plane-web) is NOT touched by this overlay: it stays
+#     bound to the tailnet interface and has no collaboration surface.
+#   * collab-public is the only thing the internet reaches. It is its own container from the same
+#     image, started with --collab-only: no Postgres or object-store credentials, no docker
+#     socket, no host mounts except its own data volume, no operator API, a read-only root
+#     filesystem, no capabilities, non-root, resource limits, and a network of its own.
+#   * collab-edge (nginx) terminates TLS, rate-limits and allowlists routes in front of it.
+# Moving hosts: change control_plane.collab.public_url and the app client's callback/logout
+# URLs together.
+name: herdr-control-plane
+
 services:
-  control-plane-web:
+  collab-public:
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-0.1.0}
+    container_name: herdr-collab-public
+    restart: unless-stopped
+    # Deliberately no env_file / environment: nothing from the control-plane stack's secrets.
+    user: "${HERDR_COLLAB_CERT_UID:-1000}:${HERDR_COLLAB_CERT_UID:-1000}"   # owner of the data dir below
     command:
       - "control-plane"
       - "web"
+      - "--collab-only"
+      - "--collab-require-https"     # fixed property of the public container, not configuration
       - "--host"
+      - "127.0.0.1"
+      - "--collab-public-port"
+      - "8081"
+      - "--collab-public-host"
       - "0.0.0.0"
-      - "--port"
-      - "8080"
       - "--web-root"
       - "/app/packages"
-      - "--allow-open"
-      - "--collab-cognito-pool"
-      - "us-west-2_GjtcM0PCp"
-      - "--collab-cognito-client"
-      - "6mcn0idau4b5uhtkd1b2g6c9qg"
-      - "--collab-cognito-group"
-      - "local.dev"
-      - "--collab-require-https"
-      # the command list is replaced, not merged: keep the central config flag
+      - "--collab-log-file"
+      - "/data/collab.jsonl"
+      - "--collab-sync-dir"
+      - "/sync"
+      # pool, clients, group, web client, domain, public URL:
+      # control_plane.collab in the slice below
       - "--fleet-config"
-      - "/etc/herdr/fleet-config.yaml"
+      - "/etc/herdr/collab-config.yaml"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    volumes:
+      - ${HERDR_COLLAB_DATA_DIR:?run deploy.sh}:/data
+      - ${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/sync:ro   # Cognito keys + members, written by collab-sync.sh
+      - ${HERDR_COLLAB_CONFIG_FILE:?run deploy.sh}:/etc/herdr/collab-config.yaml:ro   # control_plane.collab only
+    # Internal network: no route out at all (keys and group membership arrive as files), and not on
+    # the control-plane network, so it cannot reach postgres/rustfs.
+    networks: [collab]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request as u,sys; r=u.Request('http://127.0.0.1:8081/api/v1/collab/config',headers={'X-Forwarded-Proto':'https'}); sys.exit(0 if u.urlopen(r,timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  # Public edge: the only container that publishes a port. Certificates come from the host's
+  # certbot lineage (renewed by its timer, whose deploy hook also reloads this container).
+  collab-edge:
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    container_name: herdr-collab-edge
+    restart: unless-stopped
+    depends_on:
+      - collab-public
+    # Runs as the owner of the certbot files (0600): with all capabilities dropped,
+    # root could not read them.
+    user: "${HERDR_COLLAB_CERT_UID:-1000}:${HERDR_COLLAB_CERT_UID:-1000}"
+    read_only: true
+    tmpfs:
+      - /run:uid=${HERDR_COLLAB_CERT_UID:-1000}
+      - /var/cache/nginx:uid=${HERDR_COLLAB_CERT_UID:-1000}
+    volumes:
+      # deploy.sh installs this to a stable path (the build worktree is temporary)
+      - ${HERDR_COLLAB_EDGE_CONF:?run deploy.sh}:/etc/nginx/nginx.conf:ro
+      - ${HERDR_COLLAB_CERT_DIR:?set control_plane.compose.HERDR_COLLAB_CERT_DIR in the central fleet config}:/etc/acme:ro
+    ports:
+      - "${HERDR_COLLAB_EDGE_BIND:-127.0.0.1:18444}:8443"
+    networks: [collab, edge]      # edge: the bridge the published port lives on
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+networks:
+  collab:
+    internal: true
+  edge: {}
