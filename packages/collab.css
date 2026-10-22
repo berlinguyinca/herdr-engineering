@@ -142,3 +142,18 @@
 .cx-check input:disabled + * , .cx-check:has(input:disabled) { opacity: .5; }
 textarea.cx-input { resize: vertical; font: inherit; }
 .cx-stack > .cx-field { flex: 0 0 auto; }          /* the row-wise 200px basis is a height inside a column */
+
+/* ---- flow of work */
+.cx-flow-scroll { overflow-x: auto; padding: 4px 0; }
+.cx-flow-box { fill: var(--surface-raised, var(--surface, #fff)); stroke: var(--border, #d0d4da); stroke-width: 1; }
+.cx-flow-node { cursor: pointer; }
+.cx-flow-node:hover .cx-flow-box, .cx-flow-node:focus .cx-flow-box { stroke: var(--accent, #1f7ae0); stroke-width: 2; outline: none; }
+.cx-flow-node--gone { opacity: 0.45; }
+.cx-flow-name { font: 600 11px var(--font-sans, system-ui, sans-serif); fill: var(--text, #1b1f24); }
+.cx-flow-sub { font: 10px var(--font-sans, system-ui, sans-serif); fill: var(--text-muted, #666); }
+.cx-flow-edge { cursor: pointer; opacity: 0.85; transition: stroke-width 0.3s; }
+.cx-flow-edge--live { stroke-dasharray: 7 6; animation: cx-flow-move 0.9s linear infinite; }
+.cx-flow-pulse { animation: cx-flow-pulse 1.2s ease-out 1; }
+@keyframes cx-flow-move { to { stroke-dashoffset: -26; } }
+@keyframes cx-flow-pulse { 0% { opacity: 1; filter: drop-shadow(0 0 6px currentColor); } 100% { opacity: 0.85; } }
+@media (prefers-reduced-motion: reduce) { .cx-flow-edge--live, .cx-flow-pulse { animation: none; } }

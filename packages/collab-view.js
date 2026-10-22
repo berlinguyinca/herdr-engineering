@@ -2,6 +2,7 @@
 // people by email. All remote text is untrusted: it is escaped, never interpreted.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { bundleScript, filesFromBulk, workerScript } from './collab-scripts.js';
+import { renderFlow } from './collab-flow.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
 } from './herdr-web-client/collab.js';
@@ -74,15 +75,16 @@ const GUIDE = `<div class="hd-card">
     <li><b>Revoke</b> it here any time; it stops working immediately. Credentials expire after 30 days.</li>
   </ol></div>`;
 
-export function mountCollab(root) {
+export function mountCollab(root, { fabricSessions = null } = {}) {
   let timer = null;
   let timer2 = null;
+  let timer3 = null;
   let cursor = 0;
   let lastCfg = null;
   let me = null;
   const standalone = root.dataset.standalone === '1';
   let current = '/rooms';   // in-dashboard navigation (the dashboard owns the URL hash)
-  const dispose = () => { clearInterval(timer); timer = null; clearInterval(timer2); timer2 = null; };
+  const dispose = () => { clearInterval(timer); timer = null; clearInterval(timer2); timer2 = null; clearInterval(timer3); timer3 = null; };
   const go = (path) => { if (standalone) { window.location.hash = path; } else { current = path; route(); } };
   const onHash = () => { if (store.get() && me) route(); };
   const $ = (id) => document.getElementById(id);
@@ -321,12 +323,22 @@ export function mountCollab(root) {
     if (!box) return;
     const { agents } = await api.agents();
     const live = agents.filter((a) => a.status === 'active');
+    // On the dashboard the owner can tie an agent to a running fabric session (the join key is the session id).
+    let sessions = null;
+    if (operator && fabricSessions) { try { const r = await fabricSessions(); sessions = Array.isArray(r) ? r : (r.sessions || []); } catch { sessions = null; } }
+    const sessionOptions = (cur) => {
+      const list = [...(sessions || [])];
+      if (cur && !list.some((x) => x.session_id === cur)) list.unshift({ session_id: cur, agent_role: 'linked', host_id: '' });
+      return list.map((x) => `<option value="${esc(x.session_id)}"${x.session_id === cur ? ' selected' : ''}>${esc(`${x.agent_role || 'session'} · ${x.host_id || ''} · ${String(x.cwd || x.session_id).split('/').filter(Boolean).pop()}`)}</option>`).join('');
+    };
     box.innerHTML = live.length ? `<div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack">
         <div class="cx-row cx-row--between"><span class="hd-card__title">@${esc(a.name || a.harness_type)}</span>${pill('Active', 'var(--status-ok)')}</div>
         <span class="hd-ident">${esc(a.agent_id)}</span>
         <span class="hd-card__sub">Expires ${esc(new Date(a.expires_at * 1000).toLocaleDateString())} · ${a.rooms.length ? `in ${esc(a.rooms.map((r) => r.name).join(', '))}` : 'not in any room yet'}</span>
+        ${sessions ? `<label class="cx-msg">Fabric session <select data-link="${esc(a.agent_id)}"><option value="">not linked</option>${sessionOptions(a.instance_id)}</select></label>` : ''}
         <div><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Revoke</button></div></div>`).join('')}</div>`
       : '<div class="hd-empty">No connected agents yet.</div>';
+    box.querySelectorAll('[data-link]').forEach((sel) => { sel.onchange = async () => { try { await api.linkAgent(sel.dataset.link, sel.value); } catch (e) { alert(e.message); } }; });
     box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { await api.revokeAgent(b.dataset.revoke); renderAgents(); }; });
   }
 
@@ -341,6 +353,7 @@ export function mountCollab(root) {
     let roomAgentList = [];
     frame('/rooms', `<button id="hcn-back" class="cx-back" type="button">← All rooms</button>
       <div class="cx-head"><div><h1>${esc(info.name)}</h1><p class="cx-sub">You are ${esc(roleLabel(info.role).toLowerCase())} in this room.</p></div>${pill(roleLabel(info.role), 'var(--accent)')}</div>
+      ${info.role === 'guest' ? '' : '<section class="hd-card cx-stack" aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>'}
       <div class="cx-room-layout">
         <section class="hd-card cx-chat" aria-label="Conversation">
           <div id="hcn-log" class="cx-log" role="log" aria-live="polite"><div class="hd-empty" id="hcn-empty">No messages yet.</div></div>
@@ -487,11 +500,36 @@ export function mountCollab(root) {
       const can = roomAgentList.filter((a) => a.actions.includes('execute'));
       sel.innerHTML = can.length ? can.map((a) => `<option value="${esc(a.agent_id)}">@${esc(a.name)}</option>`).join('') : '<option value="">No agent accepts tasks yet</option>';
     };
+    // ---- live flow: nodes are people/agents, edges are tasks; the dashboard adds fabric session state
+    let flowSig = new Map();
+    let lastFlow = null;
+    const showDetail = (html) => { const d = $('hcn-flow-detail'); if (d) d.innerHTML = html; };
+    const drawFlow = async () => {
+      const box = $('hcn-flow');
+      if (!box) return;
+      const flow = await api.flow(roomId);
+      lastFlow = flow;
+      if (!flow.nodes.length) { box.innerHTML = '<div class="hd-empty">No agents in this room yet.</div>'; return; }
+      flowSig = renderFlow(box, flow, {
+        prev: flowSig,
+        onNode: (n) => {
+          const mine = flow.edges.filter((e) => e.from === n.id || e.to === n.id).map((e) => `${esc(flow.nodes.find((x) => x.id === e.from)?.name)} → ${esc(flow.nodes.find((x) => x.id === e.to)?.name)}: ${esc(Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}`);
+          const f = n.fabric ? `<br>Fabric session ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}` : '';
+          showDetail(`<b>${esc(n.kind === 'agent' ? `@${n.name}` : n.name)}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}`);
+        },
+        onEdge: (e) => {
+          const ts = flow.tasks.filter((t) => t.from === e.from && t.to === e.to).slice(0, 5);
+          showDetail(ts.map((t) => `${taskChip(t.status)} ${esc(t.text)}`).join('<br>') || 'No recent tasks.');
+        },
+      });
+    };
+
     const refreshAgentPanels = async () => {
-      await Promise.all([drawRoomAgents(), drawMyAgents().catch(() => {}), canInvite ? drawRequests().catch(() => {}) : null, drawTasks().catch(() => {})]);
+      await Promise.all([drawRoomAgents(), drawMyAgents().catch(() => {}), canInvite ? drawRequests().catch(() => {}) : null, drawTasks().catch(() => {}), drawFlow().catch(() => {})]);
     };
     await refreshAgentPanels();
     clearInterval(timer2); timer2 = setInterval(refreshAgentPanels, 8000);
+    clearInterval(timer3); timer3 = setInterval(() => { drawFlow().catch(() => {}); }, 3000);
     const taskForm = $('hcn-task');
     if (taskForm) {
       taskForm.onsubmit = async (ev) => {

@@ -34,7 +34,7 @@ COUNT="\${1:-${Number(count)}}"
 OUT="\${HERDR_AGENT_DIR:-$HOME/herdr-agents}"
 umask 077; mkdir -p "$OUT"
 for i in $(seq 1 "$COUNT"); do
-  body=$(T="$TOKEN" python3 -c 'import os,sys,json;print(json.dumps({"token":os.environ["T"],"instance_id":sys.argv[1]}))' "$(hostname)-$$-$i")
+  body=$(T="$TOKEN" python3 -c 'import os,sys,json;print(json.dumps({"token":os.environ["T"],"instance_id":sys.argv[1]}))' "\${HERDR_INSTANCE_ID:-$(hostname)-$$-$i}")
   resp=$(curl -fsS -X POST "$BASE/api/v1/collab/agents/join" -H 'content-type: application/json' -d "$body")
   name=$(printf '%s' "$resp" | python3 -c 'import sys,json;print(json.load(sys.stdin)["name"])')
   printf '%s\\n' "$resp" > "$OUT/$name.json"

@@ -331,12 +331,36 @@ class ControlPlaneServer:
             self._httpd.server_close()
 
 
+def _fabric_enriched_flow(repo, payload: bytes) -> bytes:
+    """Dashboard side only: join the owner's own agents (instance_id = a fabric session id) to the
+    sessions, hosts and missions this control plane knows. The collab service never sees fabric data."""
+    try:
+        flow = json.loads(payload)
+        for node in flow.get("nodes", []):
+            inst = node.get("instance_id")
+            if node.get("kind") != "agent" or not inst:
+                continue
+            sess = repo.get_session(inst)
+            if not sess:
+                node["fabric"] = {"session_id": inst, "status": "unknown"}
+                continue
+            mission = repo.get_mission(sess.get("mission_id")) if sess.get("mission_id") else None
+            node["fabric"] = {"session_id": inst, "status": sess.get("status"), "host": sess.get("host_id"),
+                              "agent_role": sess.get("agent_role"), "mission_id": sess.get("mission_id"),
+                              "mission_title": (mission or {}).get("title"), "cwd": sess.get("cwd"),
+                              "branch": sess.get("branch")}
+        return json.dumps(flow).encode()
+    except Exception:           # the flow view must never break because fabric data is odd
+        return payload
+
+
 _PUBLIC_STATIC = {
     "/": ("collab.html", "text/html; charset=utf-8"),
     "/collab-app.js": ("collab-app.js", "text/javascript"),
     "/collab.css": ("collab.css", "text/css"),
     "/collab-view.js": ("collab-view.js", "text/javascript"),
     "/collab-scripts.js": ("collab-scripts.js", "text/javascript"),
+    "/collab-flow.js": ("collab-flow.js", "text/javascript"),
     "/herdr-web-client/collab.js": ("herdr-web-client/collab.js", "text/javascript"),
     "/herdr-web-components/util.js": ("herdr-web-components/util.js", "text/javascript"),
     "/herdr-design-system/theme.css": ("herdr-design-system/theme.css", "text/css"),
@@ -662,6 +686,8 @@ def _make_handler(server, public=False, operator=False):
                 status, payload = exc.code, exc.read(2_000_000)
             except Exception:
                 return self._json({"error": "collaboration service unavailable"}, 502)
+            if status == 200 and self.command == "GET" and urlsplit(self.path).path.endswith("/flow"):
+                payload = _fabric_enriched_flow(server.repo, payload)
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")

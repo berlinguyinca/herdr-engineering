@@ -19,7 +19,7 @@ H = {"X-Forwarded-Proto": "https"}
 def stack(acknowledged_sink, tmp_path):
     web = tmp_path / "web"
     web.mkdir()
-    for n in ("collab.html", "collab-app.js", "collab.css", "collab-view.js", "collab-scripts.js", "app.js", "index.html"):
+    for n in ("collab.html", "collab-app.js", "collab.css", "collab-view.js", "collab-scripts.js", "collab-flow.js", "app.js", "index.html"):
         (web / n).write_text(f"// {n}")
     svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in TOKENS.items()}),
                         sink=acknowledged_sink, public_config={"client_id": "c"})
