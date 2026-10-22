@@ -323,6 +323,10 @@ export function mountCollab(root) {
       drawTaskTargets();
     };
 
+    // How long a permission lasts: the owner's choice, else the server default (30 days).
+    const ttlSelect = () => '<label class="cx-msg">Lasts <select name="ttl"><option value="">30 days (default)</option><option value="3600">1 hour</option><option value="86400">1 day</option><option value="604800">7 days</option><option value="7776000">90 days</option></select></label>';
+    const expiryOf = (f) => { const v = Number(f.querySelector('select[name="ttl"]')?.value || 0); return v ? Date.now() / 1000 + v : undefined; };
+
     const drawMyAgents = async () => {
       const box = $('hcn-grant');
       if (!box) return;
@@ -335,7 +339,7 @@ export function mountCollab(root) {
         const cur = g ? g.actions : (pend ? pend.actions : ['read']);
         return `<li><form class="cx-stack" data-agent="${esc(a.agent_id)}" style="flex:1 1 100%">
           <span><b>@${esc(a.name)}</b> <span class="hd-ident">${esc(shortId(a.agent_id))}</span> ${g ? permPills(g.actions) : ''}${pend ? pill('Waiting for the room owner', 'var(--status-attention)') : ''}</span>
-          <span class="cx-checks">${permBoxes(cur, 'p')}</span>
+          <span class="cx-checks">${permBoxes(cur, 'p')}</span>${owner ? ttlSelect() : ''}
           <button type="submit" class="hd-btn hd-btn--sm">${owner ? (g ? 'Update permissions' : 'Add to room') : (g ? 'Request change' : 'Request access')}</button></form></li>`;
       }).join('')}</ul>${owner ? '' : '<p class="cx-msg">The room owner approves what each agent may do here.</p>'}` : '<div class="hd-empty">No agents yet. <a href="#/agents" data-go="/agents">Connect one</a>.</div>';
       box.querySelectorAll('[data-go]').forEach((el) => { el.onclick = (e) => { if (!standalone) { e.preventDefault(); go(el.dataset.go); } }; });
@@ -344,7 +348,7 @@ export function mountCollab(root) {
           ev.preventDefault();
           const actions = picked(f, 'p');
           if (!actions.length) return;
-          try { await api.grantAgent(roomId, f.dataset.agent, actions); } catch (e) { alert(e.message); }
+          try { await api.grantAgent(roomId, f.dataset.agent, actions, expiryOf(f)); } catch (e) { alert(e.message); }
           await refreshAgentPanels();
         };
       });
@@ -356,7 +360,7 @@ export function mountCollab(root) {
       const { requests } = await api.agentRequests(roomId);
       box.innerHTML = requests.length ? `<ul class="cx-list">${requests.map((r) => `<li><form class="cx-stack" data-req="${esc(r.request_id)}" style="flex:1 1 100%">
           <span><b>@${esc(r.name)}</b> from ${esc(r.owner_email || shortId(r.owner_user_id))}</span>
-          <span class="cx-checks">${permBoxes(r.actions, 'p')}</span>
+          <span class="cx-checks">${permBoxes(r.actions, 'p')}</span>${ttlSelect()}
           <span class="cx-row"><button type="submit" class="hd-btn hd-btn--sm" data-decision="approve">Approve</button><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-deny="1">Deny</button></span></form></li>`).join('')}</ul>` : '<div class="hd-empty">No requests.</div>';
       box.querySelectorAll('form[data-req]').forEach((f, i) => {
         const asked = requests[i].actions;
@@ -365,7 +369,7 @@ export function mountCollab(root) {
           ev.preventDefault();
           const actions = picked(f, 'p');
           if (!actions.length) return;
-          await api.decideRequest(roomId, f.dataset.req, 'approve', actions);
+          await api.decideRequest(roomId, f.dataset.req, 'approve', actions, expiryOf(f));
           await refreshAgentPanels();
         };
         f.querySelector('[data-deny]').onclick = async () => { await api.decideRequest(roomId, f.dataset.req, 'deny'); await refreshAgentPanels(); };

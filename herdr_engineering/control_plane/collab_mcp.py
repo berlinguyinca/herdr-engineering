@@ -96,10 +96,12 @@ def _inbox(service: CollabService, pr, wait: float) -> dict:
             _waiters[pr.id] = _waiters.get(pr.id, 0) + 1
     try:
         while True:
+            seen = service.seq                 # read before looking, so a commit in between wakes us
             out = service.task_inbox(pr)
-            if out["tasks"] or time.monotonic() >= deadline or not service.still_valid(pr):
+            left = deadline - time.monotonic()
+            if out["tasks"] or left <= 0 or not service.still_valid(pr):
                 break
-            time.sleep(1.0)
+            service.wait_for_change(seen, min(2.0, left))
     finally:
         if wait:
             with _waiters_lock:
