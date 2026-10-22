@@ -49,6 +49,7 @@ def env(tmp_path):
     stub.write_text(f"""#!/usr/bin/env bash
 echo "docker $*" >> {log}
 if [ "$1" = compose ]; then
+  echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}}" >> {log}
   prev=""
   for a in "$@"; do
     if [ "$prev" = --env-file ]; then
@@ -119,18 +120,35 @@ def test_deploy_refuses_when_central_file_invalid(env):
 def test_deploy_default_central_path_is_under_home(env):
     r = run(DEPLOY, env, "--no-fetch", "--ref", "HEAD", "--dry-run")
     assert r.returncode != 0
-    assert str(env["home"] / ".config/herdr-engineering/fleet-config.yaml") in r.stderr
+    assert str(env["home"] / ".config/herdr-engineering/fleet/fleet-config.yaml") in r.stderr
 
 
 def test_deploy_dry_run_prints_mount_and_no_secret_values(env):
     r = deploy(env, "--dry-run")
     assert r.returncode == 0, r.stderr
     out = r.stdout + r.stderr
-    assert "/etc/herdr/fleet-config.yaml" in out and "read-only" in out
+    assert "/etc/herdr/fleet/fleet-config.yaml" in out and "read-only" in out
     assert str(env["central"]) in out
     assert env["secrets"], "fixture must carry secrets to look for"
     for secret in env["secrets"]:
         assert secret not in out
+
+
+def test_deploy_mounts_the_resolved_directory_of_a_symlinked_central_file(env):
+    link = env["tmp"] / "legacy-fleet-config.yaml"
+    link.symlink_to(env["central"])
+    env["env"]["FAIL_COMPOSE"] = "1"
+    run(DEPLOY, env, "--no-fetch", "--ref", "HEAD", "--fleet-config", str(link))
+    lines = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composeenv ")]
+    assert lines and f"fleetdir={env['central'].parent} " in lines[0]
+
+
+def test_deploy_refuses_a_central_dir_holding_other_files(env):
+    (env["central"].parent / "control-plane.env").write_text("X=1\n")
+    r = deploy(env, "--dry-run")
+    assert r.returncode != 0
+    assert "must hold only fleet-config.yaml" in r.stderr and "control-plane.env" in r.stderr
+    assert not env["log"].exists()
 
 
 def test_trap_removes_env_file_on_failure(env):
@@ -166,8 +184,10 @@ def test_compose_web_has_no_env_file_and_mounts_central_file_read_only():
         assert "env_file" not in svc, name
     web = doc["services"]["control-plane-web"]
     assert "--fleet-config" in web["command"]
-    assert web["command"][web["command"].index("--fleet-config") + 1] == "/etc/herdr/fleet-config.yaml"
-    assert any(v.endswith(":/etc/herdr/fleet-config.yaml:ro") for v in web["volumes"])
+    assert web["command"][web["command"].index("--fleet-config") + 1] == "/etc/herdr/fleet/fleet-config.yaml"
+    # the DIRECTORY is mounted: a rename-replace of the file stays visible
+    assert "${HERDR_CP_FLEET_DIR:?run deploy.sh}:/etc/herdr/fleet:ro" in web["volumes"]
+    assert not any("fleet-config.yaml" in v for v in web["volumes"])
     app_env = web.get("environment") or {}
     assert not [k for k in app_env if k.startswith("HERDR_CP_")]
     proxy = doc["services"]["llm-proxy"]
@@ -185,15 +205,15 @@ def test_collab_overlay_reads_only_the_collab_slice():
     pub = doc["services"]["collab-public"]
     cmd = pub["command"]
     assert "--collab-only" in cmd
-    assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/collab-config.yaml"
+    assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/collab/collab-config.json"
     for flag in ("--collab-cognito-pool", "--collab-cognito-client", "--collab-cognito-group",
                  "--collab-cognito-web-client", "--collab-cognito-domain", "--collab-public-url"):
         assert flag not in cmd, flag
     assert "--collab-require-https" in cmd       # fixed: the public container never serves plain http
     assert "environment" not in pub and "env_file" not in pub
     vols = pub["volumes"]
-    assert any(v.endswith(":/etc/herdr/collab-config.yaml:ro") for v in vols)
-    assert not any("/etc/herdr/fleet-config.yaml" in v or "HERDR_CP_FLEET_CONFIG_FILE" in v for v in vols)
+    assert "${HERDR_COLLAB_CONFIG_DIR:?run deploy.sh}:/etc/herdr/collab:ro" in vols
+    assert not any("/etc/herdr/fleet" in v or "HERDR_CP_FLEET" in v for v in vols)
     edge = doc["services"]["collab-edge"]
     assert "environment" not in edge and "env_file" not in edge
 

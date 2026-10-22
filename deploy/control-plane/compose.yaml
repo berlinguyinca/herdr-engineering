@@ -34,10 +34,11 @@
 # which the gateway and CoreDNS require. See deploy/fabric-stack/README.md for
 # what those three do.
 #
-# CONFIGURATION: the central fleet file (~/.config/herdr-engineering/fleet-config.yaml,
-# created by `herdr-eng fleet config init`) is the only source. The web, worker and
-# llm-proxy containers get it as a read-only mount at /etc/herdr/fleet-config.yaml and
-# a --fleet-config flag; they read no configuration from the environment. The ${VAR}
+# CONFIGURATION: the central fleet file (~/.config/herdr-engineering/fleet/fleet-config.yaml,
+# created by `herdr-eng fleet config init`) is the only source. The web and worker
+# containers get its DIRECTORY as a read-only mount at /etc/herdr/fleet/ (a directory
+# mount sees a rename-replace; a single-file mount would keep the old inode) and a
+# --fleet-config flag; they read no configuration from the environment. The ${VAR}
 # substitutions below are for docker compose itself and third-party images only; they
 # come from an env file that deploy.sh renders from the central file, never authors.
 #
@@ -118,7 +119,7 @@ services:
     # No environment: the process reads only the mounted central file
     # (--fleet-config): Postgres DSN, host aliases, RustFS/MinIO, API keys, ...
     volumes:
-      - ${HERDR_CP_FLEET_CONFIG_FILE:?run deploy.sh}:/etc/herdr/fleet-config.yaml:ro
+      - ${HERDR_CP_FLEET_DIR:?run deploy.sh}:/etc/herdr/fleet:ro
     # The HerdR UI is served at dev.lan:<public-port> (default 80 = plain
     # http://dev.lan). Host bind is the Tailnet interface so only Tailnet
     # clients reach it; container keeps its internal 8080 listener.
@@ -138,7 +139,7 @@ services:
       - "/app/packages"
       - "--allow-open"
       - "--fleet-config"
-      - "/etc/herdr/fleet-config.yaml"
+      - "/etc/herdr/fleet/fleet-config.yaml"
 
   control-plane-worker:
     build:
@@ -155,7 +156,7 @@ services:
       rustfs:
         condition: service_healthy
     volumes:
-      - ${HERDR_CP_FLEET_CONFIG_FILE:?run deploy.sh}:/etc/herdr/fleet-config.yaml:ro
+      - ${HERDR_CP_FLEET_DIR:?run deploy.sh}:/etc/herdr/fleet:ro
       - ./config.yaml:/app/config.yaml:ro
       # Bundle the SQL migrations into the worker image so it can apply them
       # on startup regardless of the working directory.
@@ -168,7 +169,7 @@ services:
       - "--migrations"
       - "/app/migrations"
       - "--fleet-config"
-      - "/etc/herdr/fleet-config.yaml"
+      - "/etc/herdr/fleet/fleet-config.yaml"
 
   # ---- fabric LLM gateway (project keys + token accounting) --------------------
   # OpenAI-compatible forwarder: agents use a per-project key minted via
@@ -183,7 +184,7 @@ services:
     depends_on:
       - control-plane-web
     volumes:
-      - ${HERDR_CP_FLEET_CONFIG_FILE:?run deploy.sh}:/etc/herdr/fleet-config.yaml:ro
+      - ${HERDR_CP_FLEET_DIR:?run deploy.sh}:/etc/herdr/fleet:ro
     ports:
       - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_LLM_PROXY_PORT:-8088}:8088"
     command:
@@ -196,7 +197,7 @@ services:
       - "--control-plane"
       - "http://control-plane-web:8080"
       - "--fleet-config"
-      - "/etc/herdr/fleet-config.yaml"
+      - "/etc/herdr/fleet/fleet-config.yaml"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8088/healthz"]
       interval: 15s

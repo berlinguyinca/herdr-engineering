@@ -1,5 +1,8 @@
-# Central fleet configuration. Copy to ~/.config/herdr-engineering/fleet-config.yaml
-# on the control-plane host and chmod 600. NEVER commit the real file.
+# Central fleet configuration. Copy to ~/.config/herdr-engineering/fleet/fleet-config.yaml
+# on the control-plane host (the file must be ALONE in that 0700 directory: deploy.sh
+# mounts the directory into the containers) and chmod 600. NEVER commit the real file.
+# The tools that edit it (fleet join / config token / config revoke) rewrite the YAML,
+# which drops comments; keep notes elsewhere. Backups: ../fleet-backups/ (newest 10).
 # Every REDACTED value is a placeholder. The revision is computed, not authored.
 version: 1
 
