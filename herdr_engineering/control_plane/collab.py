@@ -63,6 +63,7 @@ PROJECT_ROLES = frozenset({"manager", "contributor"})
 
 MAX_TEXT = 8000
 MAX_BODY = 64 * 1024
+_PANE_LINK = re.compile(r"pane:[a-z0-9][a-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
 _MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")   # C0, DEL and C1 (8-bit CSI)
@@ -424,6 +425,7 @@ class CollabService:
                 "owner": p["owner_user_id"], "device_id": p["device_id"], "harness_type": p["harness_type"],
                 "instance_id": p.get("instance_id"), "status": "active",
                 "name": p.get("name") or _default_handle(p["harness_type"], p["agent_id"]),
+                "parent": p.get("parent_agent_id"), "join": p.get("join_digest"),
                 "cred_digest": p["secret_digest"], "expires_at": p["expires_at_epoch"]}
             self._by_cred[p["secret_digest"]] = p["agent_id"]
             self._agents_by_owner[p["owner_user_id"]].add(p["agent_id"])
@@ -434,7 +436,8 @@ class CollabService:
                 "id": p["join_id"], "owner": p["actor_user_id"], "family": p["harness_type"],
                 "prefix": p["name_prefix"], "max_uses": p["max_uses"], "uses": 0,
                 "expires_at": p["expires_at_epoch"], "room_id": p.get("room_id"),
-                "actions": list(p.get("actions") or []), "revoked": False, "created_at": p["created_at"]}
+                "actions": list(p.get("actions") or []), "revoked": False, "created_at": p["created_at"],
+                "parent": p.get("parent_agent_id")}
             self._joins_by_id[p["join_id"]] = p["join_digest"]
         elif t == "join_token_revoked":
             if p["join_id"] in self._joins_by_id:
@@ -494,7 +497,7 @@ class CollabService:
                 "spawn_id": p["spawn_id"], "owner": p["actor_user_id"], "harness_type": p["harness_type"],
                 "name_prefix": p["name_prefix"], "count": p["count"], "target_room_id": p.get("target_room_id"),
                 "actions": list(p.get("actions") or []), "expires_at": p.get("expires_at"),
-                "status": "requested", "created_epoch": p["created_epoch"], "claimed_epoch": None, "placements": [], "error": None}
+                "parent": p.get("parent_agent_id"), "status": "requested", "created_epoch": p["created_epoch"], "claimed_epoch": None, "placements": [], "error": None}
         elif t == "fleet_spawn_claimed":
             if p["spawn_id"] in self._spawns:
                 self._spawns[p["spawn_id"]].update(status="claimed", claimed_epoch=p["claimed_epoch"])
@@ -1076,6 +1079,16 @@ class CollabService:
                 "project_ids": [], "resource_id": aid})
         return {"agent_id": aid, "credential": cred, "expires_at": expires}
 
+    def _parent_for(self, owner: str, value: Any) -> str | None:
+        """The agent a new agent is started under (its helpers share its herdr tab): one of the owner's own
+        live agents, or nothing."""
+        if value is None:
+            return None
+        parent = self._agents.get(value) if isinstance(value, str) else None
+        if not parent or parent["status"] != "active" or parent["owner"] != owner:
+            raise CollabError(404, "parent agent not found")
+        return value
+
     def connect_agent(self, pr: Principal, body: dict) -> dict:
         """Create an agent for the signed-in user in one step (remote MCP clients).
 
@@ -1091,10 +1104,11 @@ class CollabService:
         aid = ids.new_id("agent")
         with self._lock:
             self._agent_slots(pr.id)
+            parent = self._parent_for(pr.id, body.get("parent_agent_id"))
             self._commit("agent_enrolled", {
                 "actor_user_id": pr.id, "actor_agent_id": None, "agent_id": aid,
                 "owner_user_id": pr.id, "code_digest": None, "device_id": device,
-                "harness_type": label, "instance_id": None, "name": handle,
+                "harness_type": label, "instance_id": None, "name": handle, "parent_agent_id": parent,
                 "secret_digest": _digest(cred),
                 "expires_at_epoch": expires, "action": "agent.connect", "outcome": "allowed",
                 "project_ids": [], "resource_id": aid})
@@ -1141,12 +1155,13 @@ class CollabService:
                 actions = _actions(body.get("actions"))
             self._throttle("jointoken:" + pr.id, 10, 3600.0, "join token")
             self._agent_slots(pr.id, count)
+            parent = self._parent_for(pr.id, body.get("parent_agent_id"))
             token, jid = "hcj_" + secrets.token_urlsafe(24), ids.new_id("collab")
             expires = self._now() + float(ttl)
             self._commit("join_token_created", self._actor(
                 pr, join_id=jid, join_digest=_digest(token), harness_type=family, name_prefix=prefix,
                 max_uses=count, expires_at_epoch=expires, room_id=room_id, actions=actions,
-                action="join.token.create", outcome="allowed", project_ids=[], resource_id=jid))
+                parent_agent_id=parent, action="join.token.create", outcome="allowed", project_ids=[], resource_id=jid))
         return {"join_id": jid, "token": token, "expires_at": expires, "max_uses": count,
                 "name_prefix": prefix, "harness_type": family, "room_id": room_id, "actions": actions}
 
@@ -1198,14 +1213,40 @@ class CollabService:
                 "actor_user_id": owner, "actor_agent_id": None, "agent_id": aid, "owner_user_id": owner,
                 "code_digest": None, "join_digest": digest, "device_id": device,
                 "harness_type": rec["family"], "name": name,
+                "parent_agent_id": rec.get("parent") if (self._agents.get(rec.get("parent")) or {}).get("status") == "active" else None,
                 "instance_id": instance if isinstance(instance, str) and len(instance) <= 120
                 and instance and not _NAME_BAD.search(instance) else None,
                 "secret_digest": _digest(cred), "expires_at_epoch": expires,
                 "action": "agent.join", "outcome": "allowed", "project_ids": [], "resource_id": aid})
             request_id = self._file_request(owner, rec["room_id"], aid, rec["actions"]) if rec["room_id"] else None
+        parent = self._agents.get(rec.get("parent")) if rec.get("parent") else None
         return {"agent_id": aid, "name": name, "credential": cred, "device_id": device, "expires_at": expires,
+                "harness_type": rec["family"], "name_prefix": rec["prefix"],
+                "parent": {"name": parent["name"], "instance_id": parent.get("instance_id")} if parent else None,
                 "room_id": rec["room_id"], "request_id": request_id,
                 "status": "pending" if request_id else "no access yet"}
+
+    def link_joined(self, body: dict) -> dict:
+        """Public, token-authenticated: the script that just registered an agent says which herdr pane it
+        put it in (`pane:HOST:PANE`), so the dashboard can show the agent with its session and keep their
+        names equal. Only for agents made by this very token, only while it is valid, and only that format."""
+        token, aid, inst = body.get("token"), body.get("agent_id"), body.get("instance_id")
+        if not isinstance(token, str) or not token.startswith("hcj_") or len(token) > 80 or not isinstance(aid, str):
+            raise CollabError(401, "unauthorized")
+        if not isinstance(inst, str) or not _PANE_LINK.fullmatch(inst):
+            raise CollabError(400, "instance_id must look like pane:HOST:PANE")
+        digest = _digest(token)
+        with self._lock:
+            rec, agent = self._joins.get(digest), self._agents.get(aid)
+            if (rec is None or rec["revoked"] or self._now() >= rec["expires_at"] or not agent
+                    or agent.get("join") != digest or agent["status"] != "active"):
+                self.stats["auth_failures"] += 1
+                raise CollabError(401, "unauthorized")
+            self._throttle("joinlink:" + digest, 120, 60.0, "join link")
+            self._commit("agent_linked", {"actor_user_id": rec["owner"], "actor_agent_id": None, "agent_id": aid,
+                                          "instance_id": inst, "action": "agent.link", "outcome": "allowed",
+                                          "project_ids": [], "resource_id": aid})
+        return {"agent_id": aid, "instance_id": inst}
 
     def _file_request(self, owner: str, room_id: str, agent_id: str, actions: list[str]) -> str | None:
         """Ask on a person's behalf (their token was used); None when the room no longer takes it."""
@@ -1252,7 +1293,8 @@ class CollabService:
             out = []
             try:
                 for name in self._agent_names(pr.id, prefix, count):
-                    info = self.connect_agent(pr, {"harness_type": family, "name": name})
+                    info = self.connect_agent(pr, {"harness_type": family, "name": name,
+                                                   **({"parent_agent_id": body["parent_agent_id"]} if body.get("parent_agent_id") else {})})
                     out.append({**info, "status": None})        # recorded first: credentials are never lost
                     if room_id is not None:
                         out[-1]["status"] = self.grant_agent(pr, room_id, {
@@ -1344,10 +1386,11 @@ class CollabService:
                 raise CollabError(429, "too many fleet starts in progress")
             self._agent_slots(pr.id, count)
             self._throttle("spawn:" + pr.id, 12, 3600.0, "fleet start")
+            parent = self._parent_for(pr.id, body.get("parent_agent_id"))
             sid = ids.new_id("collab")
             self._commit("fleet_spawn_requested", self._actor(
                 pr, spawn_id=sid, harness_type=family, name_prefix=prefix, count=count, target_room_id=room_id,
-                actions=actions, expires_at=expires, created_epoch=self._now()))
+                actions=actions, expires_at=expires, parent_agent_id=parent, created_epoch=self._now()))
             return self._spawn_view(self._spawns[sid])
 
     def _spawn_view(self, r: dict) -> dict:
@@ -1357,7 +1400,7 @@ class CollabService:
         return {"spawn_id": r["spawn_id"], "status": status, "harness_type": r["harness_type"],
                 "name_prefix": r["name_prefix"], "count": r["count"], "room_id": r["target_room_id"],
                 "actions": r["actions"], "placements": r["placements"], "error": r["error"],
-                "created_at": self._iso(r["created_epoch"])}
+                "parent_agent_id": r.get("parent"), "created_at": self._iso(r["created_epoch"])}
 
     def list_spawns(self, pr: Principal, status: str | None = None) -> dict:
         self._require_user(pr)
@@ -1695,7 +1738,9 @@ class CollabService:
                         "owner_email": self._user_email.get(a.get("owner")),
                         "actions": list(g["actions"]) if g else [],
                         "status": "active" if g and a.get("status") == "active" else "removed",
-                        "instance_id": a.get("instance_id") if a.get("owner") == pr.id else None}
+                        "instance_id": a.get("instance_id") if a.get("owner") == pr.id else None,
+                        "parent_agent_id": a.get("parent") if a.get("parent") in room["grants"] else None,
+                        "group": _herd_group(a.get("name", ""))}
                 return nodes[key]
 
             def user_node(uid: str) -> dict:
@@ -1721,9 +1766,11 @@ class CollabService:
                        "to": "a:" + t["target"], "status": self._task_status(t), "depth": t["depth"],
                        "parent_task_id": t["parent"], "updated_at": t["updated_at"], "text": t["text"][:140]}
                       for _, tid, t in rows[:self.FLOW_TASKS]]
+            spawns = [{"from": "a:" + n["parent_agent_id"], "to": n["id"]} for n in nodes.values()
+                      if n["kind"] == "agent" and n.get("parent_agent_id") and "a:" + n["parent_agent_id"] in nodes]
         return {"room_id": room_id, "seq": self._seq, "nodes": list(nodes.values()),
                 "edges": [{**e, "counts": dict(e["counts"])} for e in edges.values()],
-                "tasks": recent, "untrusted_text": True}
+                "spawns": spawns, "tasks": recent, "untrusted_text": True}
 
     def rename_agent(self, pr: Principal, agent_id: str, body: dict) -> dict:
         """Give an agent a new @name. The owner (or the dashboard operator) may; the name must stay unique
@@ -1757,8 +1804,11 @@ class CollabService:
         """Operator only: every live agent that is tied to a fabric session or herdr pane, so the host runner
         can keep their names in step with the herdr pane, tab and workspace labels."""
         with self._lock:
-            out = [{"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"], "instance_id": a["instance_id"]}
-                   for aid, a in self._agents.items() if a["status"] == "active" and a.get("instance_id")]
+            # only the operator's own agents: someone else's agent must not be able to point the runner at a pane
+            out = [{"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"], "instance_id": a["instance_id"],
+                    "parent_agent_id": a.get("parent")}
+                   for aid, a in self._agents.items()
+                   if a["status"] == "active" and a.get("instance_id") and a["owner"] == pr.id]
         return {"agents": out[:1000]}
 
     def link_agent(self, pr: Principal, agent_id: str, body: dict) -> dict:
@@ -2200,6 +2250,8 @@ class CollabService:
                 return 201, self.complete_enrollment(body)
             if parts == ["agents", "join"] and method == "POST":
                 return 201, self.redeem_join_token(body)         # the token IS the authentication
+            if parts == ["agents", "join-link"] and method == "POST":
+                return 200, self.link_joined(body)
             if parts == ["config"] and method == "GET":
                 return 200, self.public_config  # public identifiers only; no auth needed
             if operator is not None:
@@ -2374,6 +2426,12 @@ def _int(query: dict, key: str, default: int, lo: int = 0, hi: int = 2**62) -> i
     except (TypeError, ValueError):
         raise CollabError(400, f"invalid {key}") from None
     return min(hi, max(lo, value))
+
+
+def _herd_group(name: str) -> str | None:
+    """`worker-3` belongs to the herdr workspace `herd-worker`: the name prefix is the fleet."""
+    m = re.fullmatch(r"([a-z0-9][a-z0-9-]*?)-\d+", name or "")
+    return f"herd-{m.group(1)}" if m else None
 
 
 def _default_handle(harness: str, agent_id: str) -> str:

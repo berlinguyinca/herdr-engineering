@@ -283,6 +283,36 @@ their name equal to the herdr labels, in both directions, checked every cycle of
   `Fresh Name!` becomes `fresh-name`). If the name is taken, the web name stays and herdr is set back.
 * Both changed within one cycle: the web name wins. `names.json` in the runner's state directory holds the last agreed name.
 
+Layout and sync rules for fleets started by `join.sh --herdr` or the runner:
+* Workspace `herd-<prefix>`; one tab per top-level agent; helpers are panes split from the parent's tab.
+* The **pane** label always equals the agent name. A **tab** label follows the agent only for `pane:` links of agents
+  without a parent. The **workspace** label never follows an agent. `herdr:` fabric links sync the pane label only.
+* The web name wins a tie. `agent_links` (what the runner reads) lists only the operator's own agents.
+* **Trust note:** `POST agents/join-link` is public and token-authenticated. A holder of a valid join token can set
+  the pane link of the agents *that token created* (format `pane:HOST:PANE` only), which makes the runner rename that
+  pane on the operator's host. It cannot touch other agents' links. Revoke the token to stop it.
+* Spawning helpers is operator/user driven (dashboard form, runner). Agents cannot request spawns themselves.
+
+### 5.1c-3 One-command fleets (join.sh)
+
+The same token also works as a one-liner. The dashboard (*Add a fleet of agents*) shows it ready to paste; the
+token travels only in the `HERDR_JOIN_TOKEN` variable, never in the URL, and the script itself contains no secret:
+
+```bash
+curl -fsSL https://localdev.mcp.metabolomics.us/api/v1/collab/scripts/join.sh \
+  | HERDR_JOIN_TOKEN='hcj_...' bash -s -- --count 3 --start --herdr
+```
+
+Options: `--count N` (at most what the token allows), `--start` (run the workers in the background),
+`--herdr` (run them in herdr panes, implies `--start`), `--tools` (let the agent use tools; codex needs it),
+`--cmd 'CMD'` (your own command, task text on stdin), `--no-sandbox`, `--status`, `--stop`, `--help`.
+Without `--tools` the agent runs text-only. With bubblewrap installed the worker runs in the sandbox.
+
+**In herdr** the agents get a workspace `herd-<prefix>` with one tab per agent, named after it. Helpers started
+*under* an agent (pick "Started under" on the form) are splits of their parent's tab, named after themselves, and
+the room's flow graph draws a dashed line from parent to helper. Agents join the herdr link by telling the site their
+pane (`pane:HOST:PANE`); the host runner then keeps names in step as described in the operator guide.
+
 ### 5.1d Approving who may join (approval mode)
 Turn it on in `control_plane.collab` of the central config:
 ```yaml

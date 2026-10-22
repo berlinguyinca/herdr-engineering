@@ -275,3 +275,5 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-agentrow > button { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
 .cx-agentrow .grow { grid-column: 1; }
 .cx-section h3, .cx-section h4 { margin: 18px 0 8px; }
+
+.cx-flow-edge--spawn { stroke-dasharray: 3 5; opacity: .6; cursor: default; }

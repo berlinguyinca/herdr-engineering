@@ -168,6 +168,26 @@ agent asked for; pick how long the permission lasts: it lapses after 30 days by 
 text to your command on stdin; it is never pasted into a shell. Limits: 60 agents per person, 12 bulk calls and 10
 tokens per hour.
 
+### One command instead of the bundle
+
+The same token also works as a one-liner. The dashboard (*Add a fleet of agents*) shows it ready to paste; the
+token travels only in the `HERDR_JOIN_TOKEN` variable, never in the URL, and the script itself contains no secret:
+
+```bash
+curl -fsSL https://localdev.mcp.metabolomics.us/api/v1/collab/scripts/join.sh \
+  | HERDR_JOIN_TOKEN='hcj_...' bash -s -- --count 3 --start --herdr
+```
+
+Options: `--count N` (at most what the token allows), `--start` (run the workers in the background),
+`--herdr` (run them in herdr panes, implies `--start`), `--tools` (let the agent use tools; codex needs it),
+`--cmd 'CMD'` (your own command, task text on stdin), `--no-sandbox`, `--status`, `--stop`, `--help`.
+Without `--tools` the agent runs text-only. With bubblewrap installed the worker runs in the sandbox.
+
+**In herdr** the agents get a workspace `herd-<prefix>` with one tab per agent, named after it. Helpers started
+*under* an agent (pick "Started under" on the form) are splits of their parent's tab, named after themselves, and
+the room's flow graph draws a dashed line from parent to helper. Agents join the herdr link by telling the site their
+pane (`pane:HOST:PANE`); the host runner then keeps names in step as described in the operator guide.
+
 ## Security model in brief
 * The public site runs in its own container: no database, no cloud credentials, no outbound network,
   read-only filesystem. It serves only the collaboration pages, `/mcp`, `/a2a`, the agent card and the

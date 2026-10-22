@@ -9,7 +9,7 @@ const ROW_H = 46;
 const PAD = 16;
 const MAX_LEVEL = 4;
 const IDLE_ROWS = 8;                  // idle agents wrap into columns this tall instead of one long stack
-const STATUS_COLOR = { pending: 'var(--status-attention, #d89b1d)', accepted: 'var(--accent, #1f7ae0)', done: 'var(--status-ok, #1a9b6c)', failed: 'var(--status-danger, #c0392b)', cancelled: 'var(--text-muted, #888)', expired: 'var(--text-muted, #888)' };
+const STATUS_COLOR = { spawn: 'var(--text-muted, #888)', pending: 'var(--status-attention, #d89b1d)', accepted: 'var(--accent, #1f7ae0)', done: 'var(--status-ok, #1a9b6c)', failed: 'var(--status-danger, #c0392b)', cancelled: 'var(--text-muted, #888)', expired: 'var(--text-muted, #888)' };
 const FAMILY_COLOR = { 'claude-code': '#c96442', codex: '#10a37f', pi: '#6f5bd6' };
 const clip = (s, n) => (String(s).length > n ? `${String(s).slice(0, n - 1)}…` : String(s));
 
@@ -27,7 +27,8 @@ export function layoutFlow(flow) {
   const level = new Map();
   for (const n of flow.nodes) if (n.kind === 'person') level.set(n.id, 0);
   const incoming = new Map();
-  for (const e of flow.edges) { if (!incoming.has(e.to)) incoming.set(e.to, []); incoming.get(e.to).push(e.from); }
+  const spawns = (flow.spawns || []).map((e) => ({ ...e, counts: {}, spawn: true }));   // helper started under a parent agent
+  for (const e of [...flow.edges, ...spawns]) { if (!incoming.has(e.to)) incoming.set(e.to, []); incoming.get(e.to).push(e.from); }
   for (let pass = 0; pass < MAX_LEVEL + 1; pass += 1) {
     for (const n of flow.nodes) {
       if (n.kind !== 'agent') continue;
@@ -36,7 +37,7 @@ export function layoutFlow(flow) {
       if (!level.has(n.id) || want < level.get(n.id)) level.set(n.id, want);
     }
   }
-  const touched = new Set(flow.edges.flatMap((e) => [e.from, e.to]));
+  const touched = new Set([...flow.edges, ...spawns].flatMap((e) => [e.from, e.to]));
   const idle = flow.nodes.filter((n) => n.kind === 'agent' && !touched.has(n.id));
   const idleIds = new Set(idle.map((n) => n.id));
   const cols = new Map();
@@ -71,7 +72,7 @@ export function layoutFlow(flow) {
     totalCols += Math.ceil(idle.length / rows);
   }
   const width = PAD * 2 + Math.max(1, totalCols - 1) * COL_W + NODE_W;
-  const edges = flow.edges.filter((e) => placed.has(e.from) && placed.has(e.to)).map((e) => {
+  const edges = [...flow.edges, ...spawns].filter((e) => placed.has(e.from) && placed.has(e.to)).map((e) => {
     const a = placed.get(e.from); const b = placed.get(e.to);
     const self = a.id === b.id;
     const x1 = a.x + a.w; const y1 = a.y + a.h / 2; const x2 = b.x; const y2 = b.y + b.h / 2;
@@ -79,6 +80,7 @@ export function layoutFlow(flow) {
     const d = self ? `M${x1},${y1} c40,-24 40,24 0,0`
       : back ? `M${x1},${y1} C${x1 + 60},${y1} ${x2 - 60},${y2} ${x2},${y2}`
         : `M${x1},${y1} C${x1 + (x2 - x1) / 2},${y1} ${x1 + (x2 - x1) / 2},${y2} ${x2},${y2}`;
+    if (e.spawn) return { ...e, d, state: 'spawn', live: false, total: 0, width: 1.5, key: `${e.from}>${e.to}#spawn` };
     const st = edgeState(e.counts);
     return { ...e, d, ...st, width: 1.5 + Math.min(6, Math.log2(st.total + 1) * 1.5), key: `${e.from}>${e.to}` };
   });
@@ -91,12 +93,12 @@ const sig = (e) => `${e.state}:${e.total}:${e.last}`;
 export function renderFlow(box, flow, { onNode, onEdge, prev = new Map() } = {}) {
   const lay = layoutFlow(flow);
   const next = new Map(lay.edges.map((e) => [e.key, sig(e)]));
-  const edgeSvg = lay.edges.map((e) => `<path class="cx-flow-edge${e.live ? ' cx-flow-edge--live' : ''}${prev.size && prev.get(e.key) !== next.get(e.key) ? ' cx-flow-pulse' : ''}" data-edge="${esc(e.key)}" d="${e.d}" fill="none" stroke="${STATUS_COLOR[e.state]}" stroke-width="${e.width.toFixed(1)}" stroke-linecap="round"><title>${esc(Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}</title></path>`).join('');
+  const edgeSvg = lay.edges.map((e) => `<path class="cx-flow-edge${e.spawn ? ' cx-flow-edge--spawn' : ''}${e.live ? ' cx-flow-edge--live' : ''}${prev.size && prev.get(e.key) !== next.get(e.key) ? ' cx-flow-pulse' : ''}" data-edge="${esc(e.key)}" d="${e.d}" fill="none" stroke="${STATUS_COLOR[e.state]}" stroke-width="${e.width.toFixed(1)}" stroke-linecap="round"><title>${esc(e.spawn ? 'started under this agent (same herdr tab)' : Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}</title></path>`).join('');
   const nodeSvg = lay.nodes.map((n) => {
     const fam = n.kind === 'agent' ? (FAMILY_COLOR[n.family] || 'var(--text-muted, #888)') : 'var(--accent, #1f7ae0)';
     const live = n.fabric && n.fabric.status === 'active';
     const gone = n.status === 'removed';
-    const sub = n.kind === 'agent' ? `${n.family || ''}${n.fabric ? ` · ${n.fabric.host || 'fabric'}` : ''}` : (n.role || '');
+    const sub = n.kind === 'agent' ? `${n.family || ''}${n.group ? ` · ${n.group}` : ''}${n.fabric ? ` · ${n.fabric.host || 'fabric'}` : ''}` : (n.role || '');
     return `<g class="cx-flow-node${gone ? ' cx-flow-node--gone' : ''}" data-node="${esc(n.id)}" transform="translate(${n.x},${n.y})" tabindex="0" role="button" aria-label="${esc(n.name)}">
       <rect width="${n.w}" height="${n.h}" rx="8" class="cx-flow-box"/>
       <circle cx="12" cy="${n.h / 2}" r="5" fill="${fam}"/>

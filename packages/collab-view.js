@@ -1,7 +1,7 @@
 // Collaboration rooms: sign in with the BinView user pool, create rooms, chat, and invite
 // people by email. All remote text is untrusted: it is escaped, never interpreted.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
-import { bundleScript, filesFromBulk, workerScript } from './collab-scripts.js';
+import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
 import { applyMention, mentionAt, quiet, suggest } from './collab-mention.js';
 import {
@@ -343,13 +343,20 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     if (!box) return;
     const { rooms } = await api.rooms();
     const usable = rooms.filter((r) => ['owner', 'contributor'].includes(r.role));
+    let parents = [];
+    try { parents = (await api.agents()).agents.filter((a) => a.status === 'active' && /^pane:/.test(a.instance_id || '')); } catch { /* the form works without */ }
     box.innerHTML = `<form id="hcn-fleet-form" class="cx-stack">
         <div class="cx-row">
           <label class="cx-msg">Family <select name="family">${FAMILIES.map((f) => `<option>${esc(f)}</option>`).join('')}</select></label>
           <label class="cx-msg">Name prefix <input class="cx-input" name="prefix" maxlength="24" pattern="[a-z0-9]+(-[a-z0-9]+)*" value="worker" required></label>
           <label class="cx-msg">How many <input class="cx-input" name="count" type="number" min="1" max="50" value="5" required></label>
           <label class="cx-msg">Room <select name="room"><option value="">none yet</option>${usable.map((r) => `<option value="${esc(r.room_id)}">${esc(r.name)}</option>`).join('')}</select></label>
+          <label class="cx-msg">Started under <select name="parent"><option value="">no one (a tab of their own)</option>${parents.map((a) => `<option value="${esc(a.agent_id)}">@${esc(a.name)} (its tab)</option>`).join('')}</select></label>
         </div>
+        <span class="cx-checks">
+          <label class="cx-check"><input type="checkbox" name="run" checked> Start the workers right away</label>
+          <label class="cx-check"><input type="checkbox" name="inherdr" checked> Run in herdr: workspace <code>herd-PREFIX</code>, a tab per agent</label>
+          <label class="cx-check"><input type="checkbox" name="tools"> Let them use tools (shell, files) on task text</label></span>
         <span class="cx-checks">${permBoxes(['read', 'post', 'execute', 'instruct'], 'fp')}</span>
         ${operator ? `<label class="cx-check"><input type="radio" name="how" value="spawn" checked> Start them on my hosts (herdr, round robin): they keep running</label>
         <label class="cx-check"><input type="radio" name="how" value="direct"> From this dashboard (tailnet): create now, no token</label>
@@ -362,20 +369,22 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       const f = ev.target;
       const fd = new FormData(f);
       const room = fd.get('room');
+      const parent = fd.get('parent');
       const body = { harness_type: fd.get('family'), name_prefix: String(fd.get('prefix')).toLowerCase(), count: Number(fd.get('count')),
-        ...(room ? { room_id: room, actions: picked(f, 'fp') } : {}) };
+        ...(room ? { room_id: room, actions: picked(f, 'fp') } : {}), ...(parent ? { parent_agent_id: parent } : {}) };
+      const flags = [fd.get('run') || fd.get('inherdr') ? '--start' : '', fd.get('inherdr') ? '--herdr' : '', fd.get('tools') ? '--tools' : ''].filter(Boolean);
       const msg = $('hcn-fleet-msg');
       msg.textContent = '';
       try {
         if (fd.get('how') === 'spawn') {
-          await api.requestSpawn({ harness_type: body.harness_type, name_prefix: body.name_prefix, count: body.count, ...(room ? { room_id: room, actions: body.actions } : {}) });
+          await api.requestSpawn({ harness_type: body.harness_type, name_prefix: body.name_prefix, count: body.count, ...(room ? { room_id: room, actions: body.actions } : {}), ...(parent ? { parent_agent_id: parent } : {}) });
           $('hcn-fleet-out').innerHTML = '';
           msg.textContent = 'Requested. They start within a few seconds; progress is listed below.';
           await renderSpawns();
           return;
         }
         if (fd.get('how') === 'direct') showFleetFiles(await api.bulkConnect(body), body);
-        else showFleetScript(await api.createJoinToken(body), body);
+        else showFleetScript(await api.createJoinToken(body), body, flags);
         await renderAgents();
         await renderJoinTokens();
       } catch (e) { msg.textContent = e.message; msg.setAttribute('role', 'alert'); }
@@ -418,11 +427,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     });
   }
 
-  function showFleetScript(tok, body) {
+  function showFleetScript(tok, body, flags = []) {
     const base = lastCfg.public_url;
     const opts = { base, token: tok.token, count: tok.max_uses, prefix: tok.name_prefix };
+    const oneLiner = `curl -fsSL ${base.replace(/\/$/, '')}/api/v1/collab/scripts/join.sh | HERDR_JOIN_TOKEN=${shq(tok.token)} bash -s -- --count ${tok.max_uses}${flags.length ? ` ${flags.join(' ')}` : ''}`;
     fillScripts($('hcn-fleet-out'), [
-      { title: `1. Paste this in a terminal on each machine (registers up to ${tok.max_uses} agents)`, text: bundleScript(opts),
+      { title: `1. One line for each machine: registers ${tok.max_uses} ${tok.harness_type} agent${tok.max_uses === 1 ? '' : 's'}${flags.includes('--start') ? ' and starts them' : ''}`, text: oneLiner,
+        note: `Downloads the scripts from this site, registers the agents${body.room_id ? ' and asks for access to the room' : ''}${flags.includes('--herdr') ? `, and lays them out in herdr: workspace herd-${tok.name_prefix}, one tab per agent${body.parent_agent_id ? ', as splits of the parent agent\'s tab' : ''}` : ''}. The token works ${tok.max_uses} time${tok.max_uses === 1 ? '' : 's'} until ${new Date(tok.expires_at * 1000).toLocaleString()}. Later: replace the options with --status or --stop. Treat it like a password.` },
+      { title: 'Offline version (the same, as one pasted script)', text: bundleScript(opts),
         note: `The token works for ${tok.max_uses} agents until ${new Date(tok.expires_at * 1000).toLocaleString()}, then stops. It only creates agents with no access${body.room_id ? ' and files a request in the room' : ''}. Treat it like a password.` },
       { title: '2. Make an agent do work', text: `HERDR_AGENT_CMD='claude -p' ~/herdr-agents/worker.sh ~/herdr-agents/${tok.name_prefix}-1.json`,
         note: 'Waits for tasks, hands each task text to your command on stdin and reports its output. Without HERDR_AGENT_CMD it just acknowledges.' },
@@ -713,7 +725,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         onNode: (n) => {
           const mine = flow.edges.filter((e) => e.from === n.id || e.to === n.id).map((e) => `${esc(flow.nodes.find((x) => x.id === e.from)?.name)} → ${esc(flow.nodes.find((x) => x.id === e.to)?.name)}: ${esc(Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}`);
           const f = n.fabric ? `<br>Fabric session ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}` : '';
-          showDetail(`<b>${esc(n.kind === 'agent' ? `@${n.name}` : n.name)}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}`);
+          showDetail(`<b>${esc(n.kind === 'agent' ? `@${n.name}` : n.name)}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}`);
         },
         onEdge: (e) => {
           const ts = flow.tasks.filter((t) => t.from === e.from && t.to === e.to).slice(0, 5);

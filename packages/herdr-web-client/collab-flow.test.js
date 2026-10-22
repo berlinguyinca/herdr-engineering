@@ -43,3 +43,14 @@ test('dozens of idle agents wrap into short columns instead of one tall stack', 
   assert.equal(lay.idleLabel.text, 'Idle · 60');
   assert.equal(new Set(lay.nodes.map((n) => `${n.x},${n.y}`)).size, 61);   // nobody overlaps
 });
+
+test('an agent started under a parent sits one column right of it, is not idle, and gets a dashed spawn edge', () => {
+  const lay = layoutFlow({
+    nodes: [{ id: 'a:p', kind: 'agent', name: 'lead', family: 'claude-code' }, { id: 'a:c', kind: 'agent', name: 'helper-1', family: 'claude-code', group: 'herd-helper' }],
+    edges: [], spawns: [{ from: 'a:p', to: 'a:c' }],
+  });
+  const x = Object.fromEntries(lay.nodes.map((n) => [n.id, n.x]));
+  assert.equal(lay.idleLabel, null);
+  assert.ok(x['a:p'] < x['a:c']);
+  assert.deepEqual(lay.edges.map((e) => [e.key, e.state, e.spawn]), [['a:p>a:c#spawn', 'spawn', true]]);
+});

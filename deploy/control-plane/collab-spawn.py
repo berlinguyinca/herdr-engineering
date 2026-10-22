@@ -250,7 +250,35 @@ class Runner:
                   f'chmod {mode:o} "$HOME/{AGENT_DIR}/.{name}.new" && mv -f "$HOME/{AGENT_DIR}/.{name}.new" "$HOME/{AGENT_DIR}/{name}"')
         self.run([self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target, script], stdin=text, timeout=45)
 
-    def place(self, host: str, agent: dict, family: str, installed: set) -> None:
+    def herd_pane(self, host: str, name: str, prefix: str, parent_pane: str | None) -> tuple[str, str | None]:
+        """Where an agent lives in herdr: the workspace `herd-PREFIX` (made on first use), one TAB per agent
+        named after it, and an agent started under another agent as a SPLIT of its parent's tab. Returns
+        (pane id, tab id)."""
+        def pane_of(res):
+            p = res["pane"] if "pane" in res else res["root_pane"]
+            return p["pane_id"], p.get("tab_id")
+        try:
+            if parent_pane is not None:
+                panes, tabs, _ = self.herdr_state(host)
+                tab = tabs.get((panes.get(parent_pane) or {}).get("tab_id"), {})
+                direction = "right" if (tab.get("pane_count") or 1) <= 1 else "down"
+                res = json.loads(self.run(self.herdr_cmd(host, ["pane", "split", parent_pane, "--direction", direction, "--no-focus"]),
+                                          timeout=30))["result"]
+                return pane_of(res)
+            label = f"herd-{prefix}"
+            _, _, spaces = self.herdr_state(host)
+            ws = next((w for w in spaces.values() if w.get("label") == label), None)
+            if ws is None:                        # the first agent of a fleet uses the workspace's own first tab
+                res = json.loads(self.run(self.herdr_cmd(host, ["workspace", "create", "--label", label, "--no-focus"]),
+                                          timeout=30))["result"]
+            else:
+                res = json.loads(self.run(self.herdr_cmd(host, ["tab", "create", "--workspace", ws["workspace_id"], "--label", name, "--no-focus"]),
+                                          timeout=30))["result"]
+            return pane_of(res)
+        except (ValueError, KeyError, TypeError):
+            raise Failure("herdr returned an unexpected reply while laying out the agent") from None
+
+    def place(self, host: str, agent: dict, family: str, installed: set, prefix: str = "fleet", parent_pane: str | None = None) -> None:
         name = agent["name"]
         if not NAME.fullmatch(name) or family not in self.cmds:
             raise Failure("refused: unexpected agent name or family")
@@ -261,13 +289,7 @@ class Runner:
                 self.put(host, "collab-sandbox.sh", self.sandbox_text, 0o700)
             installed.add(host)
         self.put(host, f"{name}.json", json.dumps({k: agent[k] for k in ("agent_id", "name", "credential", "device_id", "expires_at")}) + "\n", 0o600)
-        try:
-            root = json.loads(self.run(self.herdr_cmd(host, ["workspace", "create", "--label", name, "--no-focus"]),
-                                       timeout=30))["result"]["root_pane"]
-            pane = root["pane_id"]
-        except (ValueError, KeyError, TypeError):
-            raise Failure("herdr returned an unexpected reply to workspace create") from None
-        tab = root.get("tab_id") if isinstance(root, dict) else None
+        pane, tab = self.herd_pane(host, name, prefix, parent_pane)
         if not isinstance(pane, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}", pane):
             raise Failure("herdr returned an unexpected pane id")
         cmd = self.cmds[family]
@@ -282,7 +304,7 @@ class Runner:
             pass    # cosmetic: the agent works without the link
         self.report_session(host, pane, family, name)
         try:        # the pane and tab carry the name too; the first sync cycle would do it, this just is not late
-            if isinstance(tab, str) and PANE_ID.fullmatch(tab):
+            if parent_pane is None and isinstance(tab, str) and PANE_ID.fullmatch(tab):
                 self.run(self.herdr_cmd(host, ["tab", "rename", tab, name]), timeout=20)
             self.run(self.herdr_cmd(host, ["pane", "rename", pane, name]), timeout=20)
             self.remember_name(agent["agent_id"], name)
@@ -363,14 +385,14 @@ class Runner:
         if not pane:
             return
         aid, name, base = agent["agent_id"], agent["name"], names.get(agent["agent_id"])
-        ws, tab = spaces.get(pane.get("workspace_id"), {}), tabs.get(pane.get("tab_id"), {})
-        # A workspace and tab that hold only this pane are the agent's own; a shared one is never relabelled.
-        own = ws.get("pane_count") == 1 and ws.get("tab_count") == 1 and ws.get("workspace_id") and tab.get("tab_id")
+        tab = tabs.get(pane.get("tab_id"), {})
         seen = {"pane": (label_name(pane.get("label")), pane.get("label"))}
-        if own:
+        # The tab of an agent the runner (or the join script) placed carries its name, unless the agent is a helper
+        # sharing its parent's tab. A tab the owner linked by hand (a fabric session) is never relabelled, and the
+        # workspace (`herd-PREFIX`, shared by the whole fleet) never follows one agent.
+        if str(agent.get("instance_id", "")).startswith("pane:") and not agent.get("parent_agent_id") and tab.get("tab_id"):
             default_tab = str(tab.get("number")) == str(tab.get("label"))
             seen["tab"] = (None if default_tab else label_name(tab.get("label")), tab.get("label"))
-            seen["workspace"] = (label_name(ws.get("label")), ws.get("label"))
         target = name
         if base is not None and name == base:                        # the web side did not move: follow herdr
             moved = next((v for v, _ in seen.values() if v and v != base), None)
@@ -381,7 +403,7 @@ class Runner:
                     self.say(f"names: {base} -> {moved} (renamed in herdr)")
                 except Failure as exc:
                     self.say(f"names: herdr label {moved!r} refused for {base}: {trim(exc)}; setting herdr back")
-        todo = [("pane", pane["pane_id"]), ("tab", tab.get("tab_id")), ("workspace", ws.get("workspace_id"))]
+        todo = [("pane", pane["pane_id"]), ("tab", tab.get("tab_id"))]
         for kind, ident in todo:
             if kind in seen and isinstance(ident, str) and PANE_ID.fullmatch(ident) and seen[kind][1] != target:
                 self.run(self.herdr_cmd(host, [kind, "rename", ident, target]), timeout=20)
@@ -442,6 +464,14 @@ class Runner:
             if spec.get("room_id"):
                 body.update(room_id=spec["room_id"], actions=spec["actions"],
                             **({"expires_at": spec["expires_at"]} if spec.get("expires_at") else {}))
+            parent_pane, parent_host = None, None
+            if spec.get("parent_agent_id"):
+                body["parent_agent_id"] = spec["parent_agent_id"]
+                link = next((a for a in self.ok("GET", "fleet/agent-links")["agents"] if a.get("agent_id") == spec["parent_agent_id"]), None)
+                target = link_target(link.get("instance_id")) if link else None
+                if not target or target[0] not in self.targets:
+                    raise Failure("the parent agent has no herdr pane on a host this runner can reach")
+                parent_host, parent_pane = target
             made = self.ok("POST", "agents/bulk", body)
             if made.get("error"):
                 error = trim(made["error"])
@@ -451,10 +481,10 @@ class Runner:
                 try:
                     if time.monotonic() > deadline:
                         raise Failure("ran out of time")
-                    host = self.pick_host(eligible) or ""
+                    host = parent_host or self.pick_host(eligible) or ""
                     if not host:
                         raise Failure("every host opted out meanwhile")
-                    self.place(host, agent, spec["harness_type"], installed)
+                    self.place(host, agent, spec["harness_type"], installed, spec["name_prefix"], parent_pane)
                     placements.append({"name": agent["name"], "host": host, "status": "started", "error": None})
                 except Exception as exc:                          # noqa: BLE001  (one agent must not strand the rest)
                     self.forget(host, agent)
