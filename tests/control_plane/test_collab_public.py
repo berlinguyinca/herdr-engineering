@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path  # noqa: E402
 
 import pytest
 
@@ -10,8 +11,18 @@ from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
 from herdr_engineering.control_plane.collab_mcp import UNTRUSTED
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
-from tests.control_plane.test_collab import BASE, TOKENS, Api, _digest, grant, invite, make_room, say
+from tests.control_plane.test_collab import (
+    BASE,
+    TOKENS,
+    Api,
+    _digest,
+    grant,
+    invite,
+    make_room,
+    say,
+)
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
 H = {"X-Forwarded-Proto": "https"}
 
 
@@ -19,7 +30,7 @@ H = {"X-Forwarded-Proto": "https"}
 def stack(acknowledged_sink, tmp_path):
     web = tmp_path / "web"
     web.mkdir()
-    for n in ("collab.html", "collab-app.js", "collab.css", "collab-view.js", "collab-scripts.js", "collab-flow.js", "app.js", "index.html"):
+    for n in ("collab.html", "collab-app.js", "collab.css", "collab-view.js", "collab-scripts.js", "collab-flow.js", "collab-guide.html", "collab-guide.js", "collab-guide.md", "app.js", "index.html"):
         (web / n).write_text(f"// {n}")
     svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in TOKENS.items()}),
                         sink=acknowledged_sink, public_config={"client_id": "c"})
@@ -227,3 +238,19 @@ def test_collab_only_serves_public_surface_and_survives_restart(tmp_path):
 def test_collab_only_requires_public_port():
     with pytest.raises(ValueError):
         ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab_only=True)
+
+
+def test_public_guide_is_served_and_names_no_private_infrastructure(stack):
+    import http.client
+    c = http.client.HTTPConnection("127.0.0.1", stack.srv.public_port, timeout=5)
+    for path, ctype in (("/guide", "text/html"), ("/collab-guide.js", "text/javascript"), ("/collab-guide.md", "text/markdown")):
+        c.request("GET", path, headers=H)
+        r = c.getresponse()
+        r.read()
+        assert r.status == 200 and r.getheader("Content-Type").startswith(ctype), path
+        assert "default-src 'none'" in r.getheader("Content-Security-Policy")
+    assert stack.main.call("GET", "/guide", headers=H)[0] in (401, 404)          # not on the dashboard listener
+    c.close()
+    text = (ROOT_DIR / "packages" / "collab-guide.md").read_text()
+    for bad in ("100.104", "tailnet", "192.168", "journalctl", "systemctl", "bender", "cubert", "herdr-cp"):
+        assert bad not in text, bad
