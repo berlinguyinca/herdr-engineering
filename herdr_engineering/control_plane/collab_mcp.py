@@ -55,7 +55,7 @@ def _text(payload: Any, *, untrusted: bool = False, is_error: bool = False) -> d
 def _call(service: CollabService, pr, name: str, args: dict) -> dict:
     import secrets
     if name == "rooms_list":
-        return _text(service.agent_rooms(pr))
+        return _text(service.agent_rooms(pr), untrusted=True)
     room = args.get("room_id")
     if not isinstance(room, str):
         raise CollabError(400, "room_id is required")
@@ -76,7 +76,7 @@ def _call(service: CollabService, pr, name: str, args: dict) -> dict:
         return _text({"posted": True, "sequence": out["event"]["sequence"],
                       "replayed": bool(out.get("replayed"))})
     if name == "agents_list":
-        return _text(service.list_room_agents(pr, room))
+        return _text(service.list_room_agents(pr, room), untrusted=True)
     raise CollabError(404, "unknown tool")
 
 
@@ -103,6 +103,8 @@ def handle(service: CollabService, message: Any, authorization: str, device: str
         return 200, _result(rid, {"tools": TOOLS})
     if method == "tools/call":
         params = message.get("params") or {}
+        if not isinstance(params, dict):
+            return 200, _error(rid, -32602, "invalid params")
         name, args = params.get("name"), params.get("arguments") or {}
         if not isinstance(name, str) or not isinstance(args, dict):
             return 200, _error(rid, -32602, "invalid params")

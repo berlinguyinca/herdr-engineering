@@ -293,7 +293,7 @@ def test_invite_permissions_and_validation(server):
                 {"email": "a@b.org", "role": "root"}, {"role": "viewer"}):
         assert api.call("POST", f"{BASE}/rooms/{room}/invites", bad, headers=h)[0] == 400
     assert api.call("POST", f"{BASE}/rooms/{room}/invites",
-                    {"email": "bob@example.org", "role": "viewer"}, headers=h)[0] == 409
+                    {"email": "bob@example.org", "role": "viewer"}, headers=h)[0] == 201   # same as pending: no oracle
 
 
 def test_cancelled_and_expired_invites_do_not_activate(server):

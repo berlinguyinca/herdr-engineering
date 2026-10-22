@@ -72,9 +72,11 @@ def test_rendered_env_validates_with_the_collab_overlay(tmp_path):
     # Updated in the origin/main merge: the overlay no longer overrides control-plane-web
     # (collab moved to its own collab-public container), which reads only the
     # render-collab slice; docker-level collab vars come from control_plane.compose.
-    central, envfile = _render(tmp_path, lambda c: c.update(HERDR_COLLAB_CERT_DIR=str(tmp_path / "acme")))
+    central, envfile = _render(tmp_path, lambda c: c.update(HERDR_COLLAB_CERT_DIR=str(tmp_path / "acme"),
+                                                            HERDR_COLLAB_OPERATOR_PORT="9555"))
     data = yaml.safe_load(central.read_text())
-    data["sections"]["control_plane"]["values"]["collab"] = {"cognito_pool": "us-west-2_TEST"}
+    data["sections"]["control_plane"]["values"]["collab"] = {"cognito_pool": "us-west-2_TEST",
+                                                             "operator_user": "owner-test"}
     central.unlink()
     fcc.write_private_file(central, yaml.safe_dump(data, sort_keys=False))
     fcc.render_compose(load_fleet_config(central), envfile)
@@ -89,14 +91,20 @@ def test_rendered_env_validates_with_the_collab_overlay(tmp_path):
                                extra_env=extra).stdout)
     cmd = model["services"]["control-plane-web"]["command"]
     assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/fleet/fleet-config.yaml"
-    assert not [a for a in cmd if a.startswith("--collab")]
+    # #111: the dashboard proxies collab to the operator listener on the tailnet bind
+    assert [a for a in cmd if a.startswith("--collab")] == ["--collab-operator-url"]
+    assert cmd[cmd.index("--collab-operator-url") + 1] == "http://127.0.0.1:9555"
     pub = model["services"]["collab-public"]
+    assert "--collab-operator-user" not in pub["command"]
+    assert pub["command"][pub["command"].index("--collab-operator-host") + 1] == "127.0.0.1:9555"
     assert pub["command"][pub["command"].index("--fleet-config") + 1] == "/etc/herdr/collab/collab-config.json"
     sources = {v["source"] for v in pub["volumes"]}
     assert str(slice_.parent) in sources and str(central.parent) not in sources
     assert not pub.get("environment")
     edge = model["services"]["collab-edge"]
     assert any(v["source"] == str(tmp_path / "acme") for v in edge["volumes"])
+    assert any(p.get("host_ip") == "127.0.0.1" and str(p.get("published")) == "9555"
+               and p.get("target") == 8082 for p in edge["ports"])
 
 
 def test_gateway_bind_single_for_loopback_and_pair_for_tailnet(tmp_path):
