@@ -1,5 +1,9 @@
 # Collaboration network (HCN) — operator guide
 
+> Current usage and operations (public site, private dashboard, agents, troubleshooting) are in
+> [collaboration-network-guide.md](collaboration-network-guide.md). This note is the P1 design record;
+> its host/port examples predate the isolated-container deployment in `deploy/control-plane/COLLAB.md`.
+
 Status: P1 foundation, **off by default**. Spec package:
 `docs/specs/herdr-collaboration-network-2026-10-21/`; reuse map in `audit.md`;
 decisions in `docs/adr/ADR-0007-collaboration-network-foundation.md`.
