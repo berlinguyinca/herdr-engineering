@@ -216,6 +216,31 @@ or **Deny**. **Agents in this room** shows every agent with its permissions and 
 Be most careful with *Receive tasks* (anyone who can chat can then make that agent work) and
 *Send tasks* (the agent can make other agents work).
 
+### 5.1c Fleets started on your own hosts (herdr)
+On the dashboard, **AI agents → Add a fleet of agents → Start them on my hosts** creates the agents and starts a
+worker for each one in its own herdr workspace, taking the hosts in turn (round robin, continuing where the last
+request stopped). herdr keeps the pane alive, so a worker survives the dashboard, the runner and your ssh session.
+
+* The collab container never starts anything. It records the request (`fleet_spawn_requested`); the host runner
+  (`herdr-collab-spawn.timer`, every ~10 s, installed by `collab-sync.sh install`) claims it exactly once, creates the
+  agents through the operator API (granted directly when you own the room), writes each credential to
+  `~/herdr-agents/NAME.json` (0600) on the chosen host over ssh stdin, and runs
+  `HERDR_AGENT_CMD=… ~/herdr-agents/worker.sh NAME.json` there with `herdr [--machine HOST] pane run`.
+  Credentials never appear in an argument list or a log.
+* Hosts are this machine plus the enabled machines in `herdr machine list`. Each is probed at most once a minute;
+  an unreachable one is left out. **Hosts** (same page) has an **Automatic agents** tick per host: untick it and that
+  host never receives automatic agents (the choice survives restarts, and is re-read before every placement so un-ticking takes effect at once; it is per
+  herdr label, so a second label for the same machine is a different host).
+* Per family the runner runs a fixed non-interactive command on each task: `claude -p`, `codex exec -`, `pi -p`;
+  the `agent` family only acknowledges. The command is in `collab-spawn.py`, never in the request. Note that an agent
+  holding *Receive tasks* runs room members' task text through that harness as your account, and the workers on a host
+  share one account and can read each other's credential files: only start fleets you would trust with that.
+* Limits: 20 agents per request, 3 requests in flight, 12 requests an hour, 60 agents per user. A request nobody
+  takes within 15 minutes is *expired* (never started late) and one nobody finishes shows as *stalled*; an agent that
+  could not be started is revoked and its credential file removed. `collab-worker.sh` is generated from `packages/collab-scripts.js`
+  (a test fails if they drift; the failure message prints the regeneration command).
+* Logs: `journalctl --user -u herdr-collab-spawn`. Stop the feature with `systemctl --user disable --now herdr-collab-spawn.timer`.
+
 ### 5.2 Removing people and agents
 * Remove from a room: **People → Remove**. Their access (and their agents' access) ends at once.
 * Remove from the group entirely (stops all sign-in): `aws cognito-idp admin-remove-user-from-group

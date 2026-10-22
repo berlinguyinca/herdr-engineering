@@ -65,6 +65,12 @@ MAX_TASK_DEPTH = 3               # human -> agent -> agent -> agent
 TASK_RATE = 20                   # new tasks per creator per 10 minutes
 MAX_OPEN_TASKS_PER_AGENT = 10
 MAX_PENDING_REQUESTS = 120       # open access requests per room (one family of agents fits)
+SPAWN_FAMILIES = ("claude-code", "codex", "pi", "agent")   # what the host runner knows how to start
+MAX_SPAWN_AGENTS = 20            # agents one fleet start may place on the owner's hosts
+MAX_OPEN_SPAWNS = 3              # requests waiting for, or held by, the runner
+SPAWN_STALE = 900.0              # a claimed start with no result after this long is shown as stalled
+FLEET_ONLINE = 60.0              # a host the runner has not mentioned for this long is offline
+_FLEET_HOST = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 MAX_JOIN_AGENTS = 50             # agents one join token / bulk call may create
 JOIN_TOKEN_MAX_TTL = 24 * 3600.0
 REQUEST_TTL = 7 * 24 * 3600.0
@@ -245,6 +251,9 @@ class CollabService:
         self._rooms_by_agent: dict[str, set] = defaultdict(set)
         self._housekept = 0.0
         self._room_seq: dict[str, int] = {}                  # room id -> sequence of its latest change
+        self._fleet_flags: dict[str, bool] = {}              # host -> may it receive automatic agents (default yes)
+        self._fleet_seen: dict[str, dict] = {}               # host -> what the host runner last reported (memory only)
+        self._spawns: dict[str, dict] = {}                   # spawn id -> request
         self._state_waiters: dict[str, int] = defaultdict(int)
         self._joins: dict[str, dict] = {}                    # token digest -> record
         self._joins_by_id: dict[str, str] = {}               # join id -> digest
@@ -443,6 +452,20 @@ class CollabService:
                 "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
             self._agent_projects[p["agent_id"]].add(p["project_id"])
             self._rooms_by_agent[p["agent_id"]].add(p["room_id"])
+        elif t == "fleet_host_set":
+            self._fleet_flags[p["host"]] = bool(p["auto_agents"])
+        elif t == "fleet_spawn_requested":
+            self._spawns[p["spawn_id"]] = {
+                "spawn_id": p["spawn_id"], "owner": p["actor_user_id"], "harness_type": p["harness_type"],
+                "name_prefix": p["name_prefix"], "count": p["count"], "target_room_id": p.get("target_room_id"),
+                "actions": list(p.get("actions") or []), "expires_at": p.get("expires_at"),
+                "status": "requested", "created_epoch": p["created_epoch"], "claimed_epoch": None, "placements": [], "error": None}
+        elif t == "fleet_spawn_claimed":
+            if p["spawn_id"] in self._spawns:
+                self._spawns[p["spawn_id"]].update(status="claimed", claimed_epoch=p["claimed_epoch"])
+        elif t == "fleet_spawn_done":
+            if p["spawn_id"] in self._spawns:
+                self._spawns[p["spawn_id"]].update(status="done", placements=list(p["placements"]), error=p.get("error"))
         elif t == "identity_linked":
             old = self._user_email.get(p["user_id"])
             if old:
@@ -1051,6 +1074,139 @@ class CollabService:
                     raise
                 return {"agents": out, "error": exc.message}
         return {"agents": out}
+
+    # ------------------------------------------------------------ fleets started on the owner's own hosts
+    # Dashboard owner only (the operator listener; the public site gets a 404). A host-side runner
+    # does the actual starting: this service only records what was asked and what happened, so the
+    # internet-facing container never gets a way to start anything.
+    def _require_host(self, value: Any) -> str:
+        if not isinstance(value, str) or not _FLEET_HOST.fullmatch(value):
+            raise CollabError(400, "invalid host name")
+        return value
+
+    def report_fleet_hosts(self, pr: Principal, body: dict) -> dict:
+        """The runner says which hosts it can reach right now (memory only; it re-reports every cycle)."""
+        self._require_user(pr)
+        hosts = body.get("hosts")
+        if not isinstance(hosts, list) or len(hosts) > 50:
+            raise CollabError(400, "hosts must be a list of at most 50")
+        now, seen = self._now(), {}
+        for h in hosts:
+            name = self._require_host(h.get("host") if isinstance(h, dict) else None)
+            seen[name] = {"kind": "local" if h.get("kind") == "local" else "machine", "seen": now}
+        with self._lock:
+            self._fleet_seen = seen
+        return {"ok": True}
+
+    def list_fleet_hosts(self, pr: Principal) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            now = self._now()
+            names = sorted(set(self._fleet_seen) | set(self._fleet_flags))
+            return {"hosts": [{"host": n, "kind": self._fleet_seen.get(n, {}).get("kind", "machine"),
+                               "auto_agents": self._fleet_flags.get(n, True),
+                               "online": now - self._fleet_seen.get(n, {}).get("seen", -1e18) < FLEET_ONLINE}
+                              for n in names]}
+
+    def set_fleet_host(self, pr: Principal, host: str, body: dict) -> dict:
+        """Mark a host "no automatic agents": fleets are never started on it."""
+        self._require_user(pr)
+        host = self._require_host(host)
+        if not isinstance(body.get("auto_agents"), bool):
+            raise CollabError(400, "auto_agents must be true or false")
+        with self._lock:
+            if len(self._fleet_flags) >= 200 and host not in self._fleet_flags:
+                raise CollabError(429, "too many hosts")
+            self._throttle("fleethost:" + pr.id, 60, 3600.0, "host setting")
+            self._commit("fleet_host_set", self._actor(pr, host=host, auto_agents=body["auto_agents"]))
+        return {"host": host, "auto_agents": body["auto_agents"]}
+
+    def request_spawn(self, pr: Principal, body: dict) -> dict:
+        """Ask for `count` agents to be started on the owner's hosts (round robin, skipping hosts that
+        opted out). Nothing runs until the runner claims the request; the room grant, if any, is the
+        owner's own choice made here."""
+        self._require_user(pr)
+        family = _name(body.get("harness_type", "claude-code"), "harness_type")
+        if family not in SPAWN_FAMILIES:
+            raise CollabError(400, f"harness_type must be one of {', '.join(SPAWN_FAMILIES)}")
+        prefix = _handle(body.get("name_prefix"))
+        if len(prefix) > 24:
+            raise CollabError(400, "name_prefix must be at most 24 characters")
+        count = body.get("count", 1)
+        if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= MAX_SPAWN_AGENTS:
+            raise CollabError(400, f"count must be 1-{MAX_SPAWN_AGENTS}")
+        room_id, actions = body.get("room_id"), []
+        expires = None
+        with self._lock:
+            if room_id is not None:
+                if not isinstance(room_id, str):
+                    raise CollabError(400, "invalid room_id")
+                self._authorize(pr, room_id, "grant_agent", "fleet.spawn")
+                actions = _actions(body.get("actions"))
+            if "expires_at" in body:
+                expires = self._grant_expiry(body)
+            if sum(1 for r in self._spawns.values() if r["owner"] == pr.id and r["status"] in ("requested", "claimed")
+                   and self._now() - r["created_epoch"] < SPAWN_STALE) >= MAX_OPEN_SPAWNS:
+                raise CollabError(429, "too many fleet starts in progress")
+            self._agent_slots(pr.id, count)
+            self._throttle("spawn:" + pr.id, 12, 3600.0, "fleet start")
+            sid = ids.new_id("collab")
+            self._commit("fleet_spawn_requested", self._actor(
+                pr, spawn_id=sid, harness_type=family, name_prefix=prefix, count=count, target_room_id=room_id,
+                actions=actions, expires_at=expires, created_epoch=self._now()))
+            return self._spawn_view(self._spawns[sid])
+
+    def _spawn_view(self, r: dict) -> dict:
+        status = r["status"]
+        if status in ("requested", "claimed") and self._now() - (r["claimed_epoch"] or r["created_epoch"]) > SPAWN_STALE:
+            status = "expired" if status == "requested" else "stalled"      # never taken / never finished: say so
+        return {"spawn_id": r["spawn_id"], "status": status, "harness_type": r["harness_type"],
+                "name_prefix": r["name_prefix"], "count": r["count"], "room_id": r["target_room_id"],
+                "actions": r["actions"], "placements": r["placements"], "error": r["error"],
+                "created_at": self._iso(r["created_epoch"])}
+
+    def list_spawns(self, pr: Principal, status: str | None = None) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            rows = [self._spawn_view(r) for r in self._spawns.values()
+                    if r["owner"] == pr.id and (status is None or r["status"] == status)]
+        rows.sort(key=lambda r: r["created_at"], reverse=True)
+        return {"spawns": rows[:50]}
+
+    def claim_spawn(self, pr: Principal, spawn_id: str) -> dict:
+        """The runner takes a request exactly once (a second claim is refused, so a restart cannot start it twice)."""
+        self._require_user(pr)
+        with self._lock:
+            r = self._spawns.get(spawn_id)
+            if r is None or r["owner"] != pr.id:
+                raise CollabError(404, "not found")
+            if r["status"] != "requested":
+                raise CollabError(409, "already claimed")
+            if self._now() - r["created_epoch"] > SPAWN_STALE:
+                raise CollabError(409, "expired: ask again")      # do not start something nobody is waiting for
+            self._commit("fleet_spawn_claimed", self._actor(pr, spawn_id=spawn_id, claimed_epoch=self._now()))
+            return {**self._spawn_view(self._spawns[spawn_id]), "expires_at": r["expires_at"]}
+
+    def finish_spawn(self, pr: Principal, spawn_id: str, body: dict) -> dict:
+        self._require_user(pr)
+        placed = body.get("placements")
+        if not isinstance(placed, list) or len(placed) > MAX_SPAWN_AGENTS:
+            raise CollabError(400, "placements must be a list")
+        clean = []
+        for x in placed:
+            if not isinstance(x, dict) or x.get("status") not in ("started", "failed"):
+                raise CollabError(400, "invalid placement")
+            clean.append({"name": _handle(x.get("name")), "host": self._require_host(x.get("host")),
+                          "status": x["status"], "error": str(x.get("error") or "")[:200] or None})
+        err = str(body["error"])[:200] if isinstance(body.get("error"), str) and body["error"] else None
+        with self._lock:
+            r = self._spawns.get(spawn_id)
+            if r is None or r["owner"] != pr.id:
+                raise CollabError(404, "not found")
+            if r["status"] != "claimed":
+                raise CollabError(409, "not claimed")
+            self._commit("fleet_spawn_done", self._actor(pr, spawn_id=spawn_id, placements=clean, error=err))
+            return self._spawn_view(self._spawns[spawn_id])
 
     def approve_all_requests(self, pr: Principal, room_id: str, body: dict) -> dict:
         """The owner approves several waiting requests at once; each is still capped at what its
@@ -1800,6 +1956,15 @@ class CollabService:
                     return 200, self.list_my_agents(pr)
                 if parts == ["agents", "join-tokens"]:
                     return 200, self.list_join_tokens(pr)
+                if parts[:1] == ["fleet"]:
+                    if operator is None:                  # dashboard owner only
+                        raise CollabError(404, "not found")
+                    if parts == ["fleet", "hosts"]:
+                        return 200, self.list_fleet_hosts(pr)
+                    if parts == ["fleet", "spawns"]:
+                        st = str(query["status"]) if "status" in query else None
+                        return 200, self.list_spawns(pr, st)
+                    raise CollabError(404, "not found")
                 if parts == ["tasks", "inbox"]:
                     return 200, self.task_inbox(pr)
                 if parts == ["rooms"]:
@@ -1839,6 +2004,20 @@ class CollabService:
                     return 201, self.create_join_token(pr, body)
                 if n == 4 and parts[:2] == ["agents", "join-tokens"] and parts[3] == "revoke":
                     return 200, self.revoke_join_token(pr, parts[2])
+                if parts[:1] == ["fleet"]:
+                    if operator is None:                  # dashboard owner only
+                        raise CollabError(404, "not found")
+                    if parts == ["fleet", "hosts"]:
+                        return 200, self.report_fleet_hosts(pr, body)
+                    if n == 3 and parts[1] == "hosts":
+                        return 200, self.set_fleet_host(pr, parts[2], body)
+                    if parts == ["fleet", "spawns"]:
+                        return 201, self.request_spawn(pr, body)
+                    if n == 4 and parts[1] == "spawns" and parts[3] == "claim":
+                        return 200, self.claim_spawn(pr, parts[2])
+                    if n == 4 and parts[1] == "spawns" and parts[3] == "done":
+                        return 200, self.finish_spawn(pr, parts[2], body)
+                    raise CollabError(404, "not found")
                 if parts == ["agents", "bulk"]:
                     if operator is None:                  # dashboard owner only: not offered to the public site
                         raise CollabError(404, "not found")

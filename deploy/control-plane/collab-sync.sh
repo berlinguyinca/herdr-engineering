@@ -128,6 +128,34 @@ certbot_dry_run() {   # proves the renewal path end to end against Let's Encrypt
   "$CERTBOT" renew --dry-run --non-interactive --cert-name "$CERT_NAME" --config-dir "$ACME/config" --work-dir "$ACME/work" --logs-dir "$ACME/logs"
 }
 
+# Starts the fleets the dashboard owner asks for on their own hosts, over herdr (see collab-spawn.py).
+# Its own short timer: a request should start within seconds, not at the next minute tick.
+install_spawn_timer() {
+  local u="$HOME/.config/systemd/user" d="$HOME/.local/share/herdr-engineering"
+  install -m 0755 "$(dirname "$0")/collab-spawn.py" "$d/collab-spawn.py"
+  install -m 0644 "$(dirname "$0")/collab-worker.sh" "$d/collab-worker.sh"
+  cat > "$u/herdr-collab-spawn.service" <<UNIT
+[Unit]
+Description=Start collab agent fleets on the owner's hosts over herdr
+[Service]
+Type=oneshot
+TimeoutStartSec=10min
+ExecStart=/usr/bin/python3 "$d/collab-spawn.py" once --worker "$d/collab-worker.sh"
+UNIT
+  cat > "$u/herdr-collab-spawn.timer" <<UNIT
+[Unit]
+Description=Look for collab agent fleets to start every 10 seconds
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=10s
+AccuracySec=1s
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now herdr-collab-spawn.timer
+}
+
 install_timer() {
   local u="$HOME/.config/systemd/user" bin="$HOME/.local/share/herdr-engineering/collab-sync.sh"
   mkdir -p "$u"; install -m 0755 "$0" "$bin"   # stable copy: deploy.sh runs from a temporary worktree
@@ -152,6 +180,7 @@ UNIT
   systemctl --user daemon-reload
   systemctl --user enable --now herdr-collab-sync.timer
   install_renew_timer
+  install_spawn_timer
 }
 
 case "$ACTION" in once) once ;; install) once; install_timer ;; renew-check) certbot_dry_run ;; *) echo "$USAGE" >&2; exit 2 ;; esac
