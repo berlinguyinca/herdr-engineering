@@ -333,3 +333,85 @@ test('retained transcripts drain even when the native registry is unavailable',a
   assert.equal(result.summary.errors,1);
   assert.deepEqual(result.envelopes,[activity]);
 });
+
+function repairFixture({changeAt,change,reportOk=true,agent='pi'}={}) {
+  const nativeId='11111111-1111-4111-8111-111111111111';
+  const initial={...pane(),agent},identity={agent,kind:'path',value:agent==='claude'?`/native/claude/${nativeId}.jsonl`:'/native/pi/session.jsonl',nativeId:null};
+  let proofs=0,reported=false;
+  const reports=[];
+  const queryNative=async(_binary,args)=>{
+    if(args[0]==='session')return {sessions:[server('eng')]};
+    if(args.includes('snapshot'))return {result:{snapshot:{agents:[initial]}}};
+    if(args.includes('get')) {
+      proofs++;
+      return {result:{pane:{...initial,...(changeAt && proofs>=changeAt && change==='terminal'?{terminal_id:'term_reused'}:{}),...(changeAt && proofs>=changeAt && change==='agent'?{agent:'claude'}:{}),...(reported?{agent_session:{agent,kind:agent==='claude'?'id':'path',value:agent==='claude'?nativeId:identity.value}}:{})}}};
+    }
+    if(args.includes('process-info'))return {result:{process_info:{foreground_processes:[{pid:changeAt && proofs>=changeAt && change==='pid'?99:42}]}}};
+    throw new Error('unexpected query');
+  };
+  const reportNative=async(binary,args)=>{reports.push({binary,args});reported=reportOk;return {ok:reportOk};};
+  return {reports,run:()=>collect({HERDR_BIN:'/fixture/herdr'}, {queryNative,metadata:async()=>({}),collectTranscript:async()=>({status:'recording',identity,envelopes:[]}),reportNative,now:()=>1700000000000})};
+}
+
+test('verified recovered identity is reported with a transparent source and read back before publication',async()=>{
+  const f=repairFixture();const result=await f.run();
+  assert.equal(f.reports.length,1);
+  assert.equal(f.reports[0].binary,'/fixture/herdr');
+  assert.deepEqual(f.reports[0].args.slice(0,9),['--session','eng','pane','report-agent-session','w1:p0','--source','herdr:engineering-transcript','--agent','pi']);
+  const args=f.reports[0].args;
+  assert.ok(Number.isSafeInteger(Number(args[args.indexOf('--seq')+1])));
+  assert.equal(args[args.indexOf('--agent-session-path')+1],'/native/pi/session.jsonl');
+  assert.deepEqual(result.envelopes[0].payload.agent_session,{agent:'pi',kind:'path',value:'/native/pi/session.jsonl'});
+  assert.equal(result.envelopes[0].payload.transcript.identity_repair,'repaired');
+});
+
+test('Claude recovery reports its verified transcript UUID as native identity',async()=>{
+  const f=repairFixture({agent:'claude'});const result=await f.run();
+  const args=f.reports[0].args;
+  assert.equal(args[args.indexOf('--agent-session-id')+1],'11111111-1111-4111-8111-111111111111');
+  assert.equal(result.envelopes[0].payload.agent_session.kind,'id');
+  assert.equal(result.envelopes[0].payload.transcript.identity_repair,'repaired');
+});
+
+test('native identity repair skips reused terminals, changed agents and changed foreground processes',async()=>{
+  for(const change of ['terminal','agent','pid']) {
+    const f=repairFixture({changeAt:2,change});const result=await f.run();
+    assert.equal(f.reports.length,0,change);
+    assert.equal(result.envelopes[0].payload.agent_session,undefined,change);
+    assert.equal(result.envelopes[0].payload.transcript.identity_repair,'binding_changed',change);
+  }
+});
+
+test('a rejected native identity report never claims that messaging was repaired',async()=>{
+  const f=repairFixture({reportOk:false});const result=await f.run();
+  assert.equal(f.reports.length,1);
+  assert.equal(result.envelopes[0].payload.agent_session,undefined);
+  assert.equal(result.envelopes[0].payload.transcript.identity_repair,'report_rejected');
+});
+
+test('post-report pane reuse is rejected before publishing a recovered native identity',async()=>{
+  const f=repairFixture({changeAt:3,change:'pid'});const result=await f.run();
+  assert.equal(f.reports.length,1);
+  assert.equal(result.envelopes[0].payload.agent_session,undefined);
+  assert.equal(result.envelopes[0].payload.transcript.identity_repair,'binding_changed');
+});
+
+test('already-known native identities are never reported or replaced',async()=>{
+  const existing={agent:'pi',kind:'id',value:'existing-identity'};
+  const result=await collect({}, {
+    queryNative:reader([server('eng')],[{...pane(),agent_session:existing}]),metadata:async()=>({}),
+    collectTranscript:async()=>({status:'recording',identity:{agent:'pi',kind:'path',value:'/native/session.jsonl'},envelopes:[]}),
+    reportNative:async()=>assert.fail('must preserve known native identity'),
+  });
+  assert.deepEqual(result.envelopes[0].payload.agent_session,existing);
+  assert.equal(result.envelopes[0].payload.transcript.identity_repair,undefined);
+});
+
+test('dry-run explicitly disables native identity metadata reports',async()=>{
+  let observed;
+  assert.equal(await main(['--dry-run'],{}, {
+    collect:async(_env,options)=>{observed=options;return {envelopes:[],summary:{errors:0}};},
+    inventoryEnvelope:async()=>null,loadEnvelope:()=>null,
+  }),0);
+  assert.equal(observed?.reportNative,false);
+});

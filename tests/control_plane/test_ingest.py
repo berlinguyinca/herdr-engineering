@@ -258,3 +258,14 @@ def test_invalid_session_transcript_metadata_does_not_mutate_session(metadata):
         svc.ingest({"entity_type": "session", "entity_id": "helper",
                     "event_type": "session.started", "payload": metadata})
     assert svc.repo.get_session("helper") is None
+
+
+def test_session_retains_validated_identity_repair_status():
+    svc = make_svc()
+    svc.ingest({"entity_type": "session", "entity_id": "helper", "event_type": "session.updated",
+                "payload": {"transcript": {"status": "recording", "identity_repair": "report_unverified"}}})
+    assert svc.repo.get_session("helper")["transcript"]["identity_repair"] == "report_unverified"
+    with pytest.raises(ValueError):
+        svc.ingest({"entity_type": "session", "entity_id": "bad", "event_type": "session.updated",
+                    "payload": {"transcript": {"status": "recording", "identity_repair": "invented"}}})
+    assert svc.repo.get_session("bad") is None

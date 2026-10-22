@@ -819,7 +819,12 @@ class ControlPlaneRepo:
                     "recording", "unsupported", "identity_unavailable", "unreadable", "unavailable") or
                     not isinstance(transcript.get("truncated", False), bool)):
                 raise ValueError("transcript requires a supported status and boolean truncated flag")
-            transcript = {"status": transcript["status"], "truncated": transcript.get("truncated", False)}
+            repair = transcript.get("identity_repair")
+            if repair is not None and repair not in (
+                    "repaired", "binding_changed", "identity_unavailable", "report_rejected", "report_unverified"):
+                raise ValueError("transcript identity_repair must be a supported status")
+            transcript = {"status": transcript["status"], "truncated": transcript.get("truncated", False),
+                          **({"identity_repair": repair} if repair is not None else {})}
         stamp = self._stamp()
         existing = self._sessions.get(session_id)
         if (existing is not None and host_id is not None
