@@ -5,7 +5,8 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { herdrBin } from "./enrich.js";
-import { hostIdentity, resolveUrl } from "./emit.js";
+import { hostIdentity } from "./emit.js";
+import { loadHostConfig, HostConfigUnavailable } from "./host-config.js";
 import { gitMetadata } from "./git-metadata.js";
 import { createInventoryReporter, createLoadReporter } from "./inventory.js";
 import { createModelResolver } from "./session-model.js";
@@ -95,10 +96,10 @@ export async function collectSnapshot(env, { queryNative = query, metadata = git
 
 export function createSnapshotPublisher({ fetcher = fetch, now = Date.now, maxEntries = 256 } = {}) {
   const sent = new Map();
-  return async function publish(env, envelopes) {
+  return async function publish({ url, apiKey } = {}, envelopes) {
     let posted = 0, unchanged = 0;
     const headers = { "Content-Type": "application/json" };
-    if (env.HERDR_CP_API_KEY) headers["X-API-Key"] = env.HERDR_CP_API_KEY;
+    if (apiKey) headers["X-API-Key"] = apiKey;
     // Stop at the first failure rather than multiplying timeouts during outages.
     for (const envelope of envelopes) {
       const body = JSON.stringify(envelope);
@@ -106,12 +107,16 @@ export function createSnapshotPublisher({ fetcher = fetch, now = Date.now, maxEn
       const terminal = TERMINAL_STATES.has(String(envelope.payload?.status || "").trim().toLowerCase());
       if (previous?.body === body && (terminal || now() - previous.at < 300000)) { unchanged++; continue; }
       try {
-        const response = await fetcher(`${resolveUrl(env)}/api/v1/ingest`, {
+        const response = await fetcher(`${url}/api/v1/ingest`, {
           method: "POST", headers, body,
           redirect: "error", signal: AbortSignal.timeout(2000),
         });
         await response.body?.cancel();
-        if (!response.ok) return { posted, unchanged, errors: 1 };
+        if (!response.ok) {
+          const failure = { posted, unchanged, errors: 1 };
+          if (response.status === 401 || response.status === 403) failure.authRejected = true;
+          return failure;
+        }
         sent.delete(envelope.entity_id);
         sent.set(envelope.entity_id, { body, at: now() });
         while (sent.size > Math.max(1, maxEntries)) sent.delete(sent.keys().next().value);
@@ -123,45 +128,77 @@ export function createSnapshotPublisher({ fetcher = fetch, now = Date.now, maxEn
   };
 }
 
-export async function publishSnapshot(env, envelopes, fetcher = fetch) {
-  return createSnapshotPublisher({ fetcher })(env, envelopes);
+export async function publishSnapshot(target, envelopes, fetcher = fetch) {
+  return createSnapshotPublisher({ fetcher })(target, envelopes);
 }
 
-export async function main(args = process.argv.slice(2), env = process.env) {
+export const CONFIG_REFRESH_MS = 300000;
+
+// Returns the process exit code. Deps are injectable for tests.
+export async function main(args = process.argv.slice(2), env = process.env, deps = {}) {
+  const { loadConfig = loadHostConfig, collect = collectSnapshot, fetcher = fetch, now = Date.now,
+    sleep = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {}),
+    refreshMs = CONFIG_REFRESH_MS, inventoryEnvelope = createInventoryReporter(),
+    loadEnvelope = createLoadReporter() } = deps;
   const dryRun = args.includes("--dry-run");
   const loopIndex = args.indexOf("--loop");
   const interval = loopIndex < 0 ? null : Number(args[loopIndex + 1]);
   if (loopIndex >= 0 && (!Number.isFinite(interval) || interval < 30 || interval > 3600)) {
     throw new Error("--loop requires an interval between 30 and 3600 seconds");
   }
+  const toTarget = cfg => ({ url: cfg?.url, apiKey: cfg?.apiKey });
+  let target = toTarget(null);
+  let loadedAt = now();
+  // Only a fresh fetch replaces the live target. A cache fallback or a transient
+  // failure keeps the config already in memory; only a revoked token (401) ends
+  // the process. Returns false when the caller must exit 2.
+  let loaded = false;
+  const refresh = async ({ advanceOnStale = true } = {}) => {
+    try {
+      const cfg = await loadConfig();
+      if (cfg.source === "fetch" || !loaded) { target = toTarget(cfg); loaded = true; loadedAt = now(); }
+      else if (advanceOnStale) loadedAt = now();
+      return true;
+    } catch (error) {
+      if (!(error instanceof HostConfigUnavailable)) throw error;
+      if (error.revoked || !loaded) { process.stderr.write(`${error.message}\n`); return false; }
+      if (advanceOnStale) loadedAt = now();
+      return true;
+    }
+  };
+  if (!dryRun && !(await refresh())) return 2;
   const controller = new AbortController();
-  const publish = createSnapshotPublisher();
-  const inventoryEnvelope = createInventoryReporter();
-  const loadEnvelope = createLoadReporter();
+  const publish = createSnapshotPublisher({ fetcher, now });
   const stop = () => controller.abort();
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
     do {
-      const result = await collectSnapshot(env);
+      const result = await collect(env);
       // Fleet version inventory rides the same publisher; it is throttled by TTL.
       const inventory = await inventoryEnvelope(hostIdentity(env)).catch(() => null);
       if (inventory) result.envelopes.push(inventory);
       const load = loadEnvelope(hostIdentity(env));
       if (load) result.envelopes.push(load);
-      const delivery = dryRun ? { posted: 0, unchanged: 0, errors: 0 } : await publish(env, result.envelopes);
+      const delivery = dryRun ? { posted: 0, unchanged: 0, errors: 0 } : await publish(target, result.envelopes);
       process.stdout.write(JSON.stringify({ ...result.summary, posted: delivery.posted,
         unchanged: delivery.unchanged,
         errors: result.summary.errors + delivery.errors, dry_run: dryRun }) + "\n");
       if (interval === null || controller.signal.aborted) break;
-      await delay(interval * 1000, undefined, { signal: controller.signal }).catch(() => {});
+      if (!dryRun && (delivery.authRejected || now() - loadedAt >= refreshMs)) {
+        // After an auth rejection, retry on the next pass if no fresh fetch came back.
+        if (!(await refresh({ advanceOnStale: !delivery.authRejected }))) return 2;
+      }
+      await sleep(interval * 1000, controller.signal);
     } while (!controller.signal.aborted);
   } finally {
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
   }
+  return 0;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
-  main().catch(() => { process.stderr.write("Native session snapshot collector failed.\n"); process.exitCode = 1; });
+  main().then(code => { process.exitCode = code; })
+    .catch(() => { process.stderr.write("Native session snapshot collector failed.\n"); process.exitCode = 1; });
 }

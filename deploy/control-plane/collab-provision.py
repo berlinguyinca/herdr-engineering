@@ -14,12 +14,15 @@ Safety rails (the log is written by an internet-facing container, so treat it as
   * a host-side ledger (outside every container mount) makes it idempotent and is the audit trail
   * failures are retried with a delay and a cap, never in a tight loop
 
-Environment: HERDR_COLLAB_OPERATOR_USER (required), HERDR_COLLAB_DATA_DIR, HERDR_COLLAB_POOL,
-HERDR_COLLAB_GROUP, HERDR_COLLAB_LEDGER_DIR, HERDR_COLLAB_AUTO_CREATE (default 1: create the
-Cognito user and let Cognito email them), HERDR_COLLAB_AUTO_DOMAINS (optional comma list).
+Configuration is flags only (no environment). collab-sync.sh passes --operator, --pool and
+--group from the collab slice (control_plane.collab.operator_user / cognito_pool /
+cognito_group) and --data-dir (the directory collab-public mounts at /data). Policy flags keep
+their defaults unless given: --ledger-dir, --no-auto-create (default: create the Cognito user
+and let Cognito email them), --domain (repeatable allow-list), --max-per-day, --dry-run.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -28,7 +31,7 @@ import subprocess
 import sys
 import time
 
-MAX_PER_DAY = 5            # override: HERDR_COLLAB_MAX_PER_DAY
+MAX_PER_DAY = 5            # override: --max-per-day
 MAX_ATTEMPTS_PER_RUN = 5   # aws calls are slow; a forged log must not stretch one run
 MAX_LOG_BYTES = 64 * 1024 * 1024
 RETRY_AFTER = 600.0
@@ -180,19 +183,28 @@ def run(*, log_path: str, ledger_path: str, operator: str, cognito, now: float |
 
 
 def main(argv: list[str]) -> int:
-    operator = os.environ.get("HERDR_COLLAB_OPERATOR_USER", "")
-    if not operator:
-        return 0                                     # no operator configured: nothing is automatic
     home = os.path.expanduser("~")
-    data = os.environ.get("HERDR_COLLAB_DATA_DIR", f"{home}/.local/share/herdr-engineering/collab")
-    ledger_dir = os.environ.get("HERDR_COLLAB_LEDGER_DIR", f"{home}/.local/share/herdr-engineering/collab-provision")
-    pool = os.environ.get("HERDR_COLLAB_POOL", "us-west-2_GjtcM0PCp")
-    group = os.environ.get("HERDR_COLLAB_GROUP", "local.dev")
-    domains = tuple(d.strip().lower() for d in os.environ.get("HERDR_COLLAB_AUTO_DOMAINS", "").split(",") if d.strip())
-    run(log_path=f"{data}/collab.jsonl", ledger_path=f"{ledger_dir}/ledger.jsonl", operator=operator,
-        cognito=AwsCognito(pool, group), auto_create=os.environ.get("HERDR_COLLAB_AUTO_CREATE", "1") != "0",
-        domains=domains, dry_run="--dry-run" in argv,
-        max_per_day=int(os.environ.get("HERDR_COLLAB_MAX_PER_DAY", MAX_PER_DAY)),
+    ap = argparse.ArgumentParser(prog="collab-provision.py", description=__doc__.splitlines()[0])
+    ap.add_argument("--operator", default="", help="control_plane.collab.operator_user; empty = do nothing")
+    ap.add_argument("--pool", default="", help="control_plane.collab.cognito_pool")
+    ap.add_argument("--group", default="local.dev", help="control_plane.collab.cognito_group")
+    ap.add_argument("--data-dir", default=f"{home}/.local/share/herdr-engineering/collab",
+                    help="collab-public's /data mount (holds collab.jsonl)")
+    ap.add_argument("--ledger-dir", default=f"{home}/.local/share/herdr-engineering/collab-provision")
+    ap.add_argument("--no-auto-create", dest="auto_create", action="store_false",
+                    help="never create a Cognito account; wait for the invitee to sign up")
+    ap.add_argument("--domain", action="append", default=[], help="allowed email domain (repeatable)")
+    ap.add_argument("--max-per-day", type=int, default=MAX_PER_DAY)
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args(argv)
+    if not args.operator:
+        return 0                                     # no operator configured: nothing is automatic
+    if not args.pool:
+        ap.error("--pool is required with --operator")
+    domains = tuple(d.strip().lower() for d in args.domain if d.strip())
+    run(log_path=f"{args.data_dir}/collab.jsonl", ledger_path=f"{args.ledger_dir}/ledger.jsonl",
+        operator=args.operator, cognito=AwsCognito(args.pool, args.group), auto_create=args.auto_create,
+        domains=domains, dry_run=args.dry_run, max_per_day=args.max_per_day,
         say=lambda m: print(f"collab-provision: {m}", file=sys.stderr))
     return 0
 

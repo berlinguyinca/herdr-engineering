@@ -38,6 +38,12 @@ RUN pip install --no-cache-dir ".[collab]"
 # package instead).
 COPY packages/ ./packages/
 
+# The control-plane worker's defaults and SQL migrations ship IN the image, so they
+# roll forward and back with the image tag (deploy.sh builds from a temporary
+# worktree; a relative bind mount would point into a directory that is deleted).
+COPY deploy/control-plane/config.yaml ./control-plane/config.yaml
+COPY deploy/control-plane/migrations/ ./control-plane/migrations/
+
 # Runtime state + config live here; both are provided at runtime by the stack
 # (state -> named volume, config -> bind-mount). Overridable per service.
 ENV HERDR_ENGINEERING_STATE=/state \

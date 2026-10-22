@@ -5,7 +5,9 @@ import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { collectSnapshot, createSnapshotPublisher, publishSnapshot } from "./snapshot.js";
+import { mkdirSync, existsSync } from "node:fs";
+import { collectSnapshot, createSnapshotPublisher, publishSnapshot, main } from "./snapshot.js";
+import { loadHostConfig } from "./host-config.js";
 
 const collect = (env, options) => collectSnapshot(env, { resolveModel: async () => null, ...options });
 
@@ -74,14 +76,14 @@ test("missing native registry reports failure without inventing stopped sessions
 
 test("publication uses private key header and stops on first rejected write", async () => {
   const calls = [];
-  const result = await publishSnapshot({ HERDR_CP_URL: "http://control.test", HERDR_CP_API_KEY: "fixture-key" }, [{ n: 1 }, { n: 2 }], async (url, options) => {
+  const result = await publishSnapshot({ url: "http://control.test", apiKey: "placeholder-fixture-value" }, [{ n: 1 }, { n: 2 }], async (url, options) => {
     calls.push({ url, options });
     return { ok: false, body: { cancel: async () => {} } };
   });
   assert.deepEqual(result, { posted: 0, unchanged: 0, errors: 1 });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "http://control.test/api/v1/ingest");
-  assert.equal(calls[0].options.headers["X-API-Key"], "fixture-key");
+  assert.equal(calls[0].options.headers["X-API-Key"], "placeholder-fixture-value");
   assert.equal(calls[0].options.redirect, "error");
 });
 
@@ -161,4 +163,127 @@ test("a resolved model is reported on the session payload", async () => {
     resolveModel: async (serverName, p) => `${serverName}/${p.agent}-model`,
   });
   assert.equal(result.envelopes[0].payload.model, "eng/pi-model");
+});
+
+test("main exits 2 with a stderr message when the host has no config", () => {
+  const home = mkdtempSync(join(tmpdir(), "snap-home-"));
+  const script = fileURLToPath(new URL("./snapshot.js", import.meta.url));
+  let failure;
+  try { execFileSync(process.execPath, [script, "--once"], { env: { PATH: process.env.PATH, HOME: home }, stdio: "pipe" }); }
+  catch (error) { failure = error; }
+  assert.equal(failure?.status, 2);
+  assert.match(String(failure.stderr), /host config unavailable/);
+});
+
+test("the plugin never reads HERDR_CP_URL or HERDR_CP_API_KEY", async () => {
+  const { readFileSync } = await import("node:fs");
+  for (const f of ["emit.js", "snapshot.js", "host-config.js", "inventory.js", "enrich.js"]) {
+    assert.doesNotMatch(readFileSync(new URL(`./${f}`, import.meta.url), "utf8"), /HERDR_CP_(URL|API_KEY)/, f);
+  }
+});
+
+// ---- --loop host-config refresh ------------------------------------------
+function loopHarness({ passes, fleet, ingest }) {
+  const home = mkdtempSync(join(tmpdir(), "loop-home-"));
+  mkdirSync(join(home, ".config", "herdr-engineering"), { recursive: true });
+  writeFileSync(join(home, ".config", "herdr-engineering", "host.json"),
+    JSON.stringify({ control_plane_url: "http://cp.test", host_id: "h1", token: "tok" }));
+  let clock = 0, pass = 0, fleetCalls = 0;
+  const keysUsed = [];
+  const fleetFetch = async (url, init) => {
+    if (url.endsWith("/applied")) return { status: 200, text: async () => "{}" };
+    fleetCalls++;
+    const r = fleet(fleetCalls);
+    return { status: r.status, text: async () => JSON.stringify(r.body ?? {}) };
+  };
+  const deps = {
+    loadConfig: () => loadHostConfig({ home, fetch: fleetFetch }),
+    collect: async () => ({ envelopes: [{ entity_id: `e${++pass}`, payload: { status: "idle" } }], summary: { errors: 0 } }),
+    fetcher: async (_url, options) => {
+      keysUsed.push(options.headers["X-API-Key"]);
+      return { ok: ingest(keysUsed.length).ok, status: ingest(keysUsed.length).status, body: { cancel: async () => {} } };
+    },
+    now: () => clock,
+    sleep: async ms => { clock += ms; if (pass >= passes) process.emit("SIGTERM"); },
+    refreshMs: 300000,
+    inventoryEnvelope: async () => null,
+    loadEnvelope: () => null,
+  };
+  return { home, deps, keysUsed, fleetCalls: () => fleetCalls };
+}
+const cfgBody = key => ({ revision: key, values: { ingest: { api_key: key } } });
+const cache = home => join(home, ".cache", "herdr-engineering", "fleet-config.json");
+
+test("loop: rotated ingest.api_key is used after the refresh interval, not before", async () => {
+  const h = loopHarness({ passes: 5, fleet: n => ({ status: 200, body: cfgBody(n === 1 ? "k1" : "k2") }), ingest: () => ({ ok: true, status: 200 }) });
+  // passes run at clock 0,100,200,300,400; the refresh is due when pass 4 ends (clock 300).
+  const code = await main(["--loop", "100"], {}, h.deps);
+  assert.equal(code, 0);
+  assert.deepEqual(h.keysUsed, ["k1", "k1", "k1", "k1", "k2"]);
+  assert.equal(h.fleetCalls(), 2);
+});
+
+test("loop: no refresh before the interval", async () => {
+  const h = loopHarness({ passes: 2, fleet: () => ({ status: 200, body: cfgBody("k1") }), ingest: () => ({ ok: true, status: 200 }) });
+  await main(["--loop", "100"], {}, h.deps);
+  assert.equal(h.fleetCalls(), 1);
+});
+
+test("loop: an ingest 401 triggers an immediate refresh", async () => {
+  const h = loopHarness({ passes: 2, fleet: n => ({ status: 200, body: cfgBody(n === 1 ? "old" : "new") }),
+    ingest: n => (n === 1 ? { ok: false, status: 401 } : { ok: true, status: 200 }) });
+  await main(["--loop", "100"], {}, h.deps);
+  assert.deepEqual(h.keysUsed, ["old", "new"]);
+  assert.equal(h.fleetCalls(), 2);
+});
+
+test("loop: a revoked token ends the loop with exit 2 and deletes the cache", async () => {
+  const h = loopHarness({ passes: 9, fleet: n => (n === 1 ? { status: 200, body: cfgBody("k1") } : { status: 401 }),
+    ingest: n => (n === 1 ? { ok: false, status: 403 } : { ok: true, status: 200 }) });
+  const code = await main(["--loop", "100"], {}, h.deps);
+  assert.equal(code, 2);
+  assert.equal(existsSync(cache(h.home)), false);
+  assert.equal(h.keysUsed.length, 1);
+});
+
+test("loop: a transient refresh failure falls back to the cache and keeps running", async () => {
+  const h = loopHarness({ passes: 4, fleet: n => (n === 1 ? { status: 200, body: cfgBody("k1") } : { status: 503 }),
+    ingest: () => ({ ok: true, status: 200 }) });
+  assert.equal(await main(["--loop", "100"], {}, h.deps), 0);
+  assert.deepEqual(h.keysUsed, ["k1", "k1", "k1", "k1"]);
+});
+
+test("loop: refresh failing with no cache keeps the live key and exit code 0", async () => {
+  let h;
+  h = loopHarness({ passes: 8, fleet: n => {
+    if (n === 1) return { status: 200, body: cfgBody("k1") };
+    rmSync(cache(h.home), { force: true });
+    throw new TypeError("fetch failed");
+  }, ingest: () => ({ ok: true, status: 200 }) });
+  assert.equal(await main(["--loop", "100"], {}, h.deps), 0);
+  assert.deepEqual(new Set(h.keysUsed), new Set(["k1"]));
+  assert.equal(h.keysUsed.length, 8);
+});
+
+test("loop: a cache fallback never replaces a newer in-memory key", async () => {
+  let h;
+  h = loopHarness({ passes: 8, fleet: n => {
+    if (n === 1) return { status: 200, body: cfgBody("k1") };
+    if (n === 2) return { status: 200, body: cfgBody("k2") };
+    writeFileSync(cache(h.home), JSON.stringify({ host_id: "h1", revision: "k1", values: { ingest: { api_key: "k1" } } }));
+    throw new TypeError("fetch failed");
+  }, ingest: () => ({ ok: true, status: 200 }) });
+  assert.equal(await main(["--loop", "100"], {}, h.deps), 0);
+  assert.deepEqual(h.keysUsed, ["k1", "k1", "k1", "k1", "k2", "k2", "k2", "k2"]);
+  assert.equal(h.fleetCalls(), 3);
+});
+
+test("an empty api key (open control plane) sends no X-API-Key header at all", async () => {
+  const calls = [];
+  await publishSnapshot({ url: "http://control.test", apiKey: "" }, [{ n: 1 }], async (url, options) => {
+    calls.push(options);
+    return { ok: true, body: { cancel: async () => {} } };
+  });
+  assert.equal(calls.length, 1);
+  assert.equal("X-API-Key" in calls[0].headers, false);
 });

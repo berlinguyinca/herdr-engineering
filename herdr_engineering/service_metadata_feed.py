@@ -7,22 +7,24 @@ import json
 import os
 import select
 import signal
-import socket
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import OrderedDict, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
+from . import host_config as _hc
 from .fabric_agent import (
     ListenerGitMetadata,
     ListenerOwnership,
     _process_identity,
     scan_listening_ports,
 )
+from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
 
 MAX_BYTES = 4 * 1024 * 1024
 MAX_RECORDS = 4096
@@ -43,6 +45,13 @@ class MetadataClient:
         self.url = base_url.rstrip("/")
         self.key = api_key
         self.http = urllib.request.build_opener(_NoRedirect())
+        self.auth_rejected = False
+
+    def retarget(self, url, api_key):
+        if url:
+            self.url = url.rstrip("/")
+        if api_key is not None:
+            self.key = api_key
 
     def request(self, route, body=None):
         # This observer has no gateway client and no lease mutation endpoints.
@@ -58,8 +67,13 @@ class MetadataClient:
         if self.key:
             headers["X-API-Key"] = self.key
         request = urllib.request.Request(self.url + route, data=raw, headers=headers)
-        with self.http.open(request, timeout=3) as response:
-            content = response.read(MAX_BYTES + 1)
+        try:
+            with self.http.open(request, timeout=3) as response:
+                content = response.read(MAX_BYTES + 1)
+        except urllib.error.HTTPError as error:
+            if path == "/api/v1/ingest" and error.code in (401, 403):
+                self.auth_rejected = True
+            raise
         if len(content) > MAX_BYTES:
             raise ValueError("control-plane reply too large")
         result = json.loads(content)
@@ -416,29 +430,40 @@ class ServiceMetadataFeed:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--control-plane", default=os.environ.get("HERDR_ENGINEERING_CONTROL_PLANE_URL")
-                        or os.environ.get("HERDR_CP_URL", "http://dev.lan"))
-    parser.add_argument("--host-id", default=os.environ.get("HERDR_SERVICE_METADATA_HOST") or socket.gethostname())
+    parser.add_argument("--control-plane", default=None,
+                        help="control plane URL (default: host.json control_plane_url)")
+    parser.add_argument("--host-id", default=None, help="host id (default: host.json host_id)")
     parser.add_argument("--state-file", default=str(Path(os.environ.get("HERDR_ENGINEERING_STATE",
                         str(Path.home() / ".local/share/herdr-engineering/state"))) / "fabric-agent.json"))
-    parser.add_argument("--api-key-file", default=os.environ.get("HERDR_SERVICE_METADATA_API_KEY_FILE"))
+    parser.add_argument("--api-key-file", default=None,
+                        help="read the ingest key from this file (default: ingest.api_key)")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--loop", type=float)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.loop is not None and (not 30 <= args.loop <= 3600 or args.once):
         parser.error("--loop requires 30–3600 seconds and cannot be combined with --once")
+    fully_explicit = bool(args.control_plane and args.host_id and args.api_key_file)
     try:
-        key = os.environ.get("HERDR_CP_API_KEY")
+        cfg = _hc.host_config()
+    except HostConfigUnavailable as exc:
+        if not fully_explicit:
+            return exit_unavailable(exc)
+        cfg = None  # every value is given explicitly: no host config needed
+    try:
+        key = cfg.api_key if cfg else None
         if args.api_key_file:
             with Path(args.api_key_file).expanduser().open() as stream:
                 key = stream.read(8193).strip()
         if key and len(key) > 8192:
             raise ValueError("invalid API key file")
-        feed = ServiceMetadataFeed(MetadataClient(args.control_plane, key),
-                                   host_id=args.host_id, state_file=args.state_file)
+        feed = ServiceMetadataFeed(MetadataClient(resolve_control_plane(args.control_plane), key),
+                                   host_id=args.host_id or cfg.host_id, state_file=args.state_file)
     except (OSError, ValueError):
         parser.exit(1, "Service metadata observer configuration is unavailable or invalid.\n")
+    refresher = None
+    if args.loop is not None and not args.dry_run and cfg is not None and not fully_explicit:
+        refresher = _hc.ConfigRefresher(cfg)
     stop = threading.Event()
     previous = {}
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -449,6 +474,12 @@ def main(argv=None):
             print(json.dumps(summary), flush=True)
             if args.loop is None:
                 return 1 if summary["errors"] else 0
+            if refresher is not None:
+                try:
+                    refresher.sync(feed.client, follow_url=not args.control_plane,
+                                   follow_key=not args.api_key_file)
+                except HostConfigUnavailable as exc:
+                    return exit_unavailable(exc)
             stop.wait(args.loop)
     finally:
         for sig, handler in previous.items():

@@ -257,9 +257,10 @@ per-user keys:
   `tailscale ip -4`), so it is reachable from any dev.lan machine but not from a
   plain LAN / `0.0.0.0`. The container runs `--allow-open` to acknowledge this
   boundary explicitly.
-- Postgres / MinIO credentials come from a git-ignored `.env` with **randomly
-  generated strong passwords** (`./generate-env.sh`); compose refuses to start
-  without them, and DB/object-store ports stay loopback-only.
+- Postgres / MinIO credentials are **randomly generated strong passwords** written
+  into the central fleet config by `herdr-eng fleet config init` (mode 0600, never
+  in git); `deploy.sh` hands compose only a transient rendering of them, and
+  DB/object-store ports stay loopback-only.
 - Secrets in event payloads/messages are **redacted at the API boundary**
   (never stored or rendered).
 - **Do not** set `HERDR_CP_WEB_BIND` to `0.0.0.0` — that would expose an
@@ -293,20 +294,23 @@ herdr-eng control-plane web --port 8080 --pg-dsn 'postgresql://herdr:herdr@127.0
 
 # full compose stack (postgres + rustfs(minio) + worker + web)
 #   the UI is served at http://dev.lan (port 80) on the Tailnet interface
-cd deploy/control-plane
-./generate-env.sh          # writes .env with strong random passwords (idempotent)
-docker compose up -d --build
+herdr-eng fleet config init            # once: writes the central file (0600) with generated secrets
+deploy/control-plane/deploy.sh         # renders compose variables from it, builds and rolls web
 # then open http://dev.lan/
 ```
 
 Deployed on **bender**, the control-plane stack serves the HerdR UI at
 `http://dev.lan` (Tailnet IP `:80`) with durable Postgres + MinIO:
 
-- `HERDR_CP_WEB_BIND=100.104.39.6` (Tailnet interface) + `HERDR_CP_WEB_PUBLIC_PORT=80`.
-- `HERDR_CP_PG_DSN` is generated into `.env`; the web reads it from the env (not
-  a `--pg-dsn` process arg) so the DB password never appears in `ps`/`docker inspect`.
-- Postgres host port defaults to `127.0.0.1:5432`; set `HERDR_CP_PG_PORT` to a
-  free loopback port (e.g. `15433`) when 5432 is already taken on the host.
+- The web bind address (the Tailnet interface, e.g. `100.104.39.6`) and public port
+  (`80`) are `control_plane.compose.HERDR_CP_WEB_BIND` / `HERDR_CP_WEB_PUBLIC_PORT`
+  in the central file (answers to `fleet config init`).
+- The Postgres DSN is `control_plane.pg_dsn` in the central file, which the web reads
+  from its read-only mount (not a `--pg-dsn` process arg, not the environment), so
+  the DB password never appears in `ps`/`docker inspect`.
+- Postgres host port defaults to `127.0.0.1:5432`; set
+  `control_plane.compose.HERDR_CP_PG_PORT` to a free loopback port (e.g. `15433`)
+  when 5432 is already taken on the host.
 - MinIO is pinned to `minio/minio:RELEASE.2025-09-07T16-13-09Z` (`minio:latest`
   is not always pullable); swap the image for a real RustFS image later —
   config-only.
@@ -319,19 +323,36 @@ Deployed on **bender**, the control-plane stack serves the HerdR UI at
 
 #### Repeatable deploys
 
-Deploys go through scripts, not hand-built compose overrides. Secrets stay in a
-host-local 0600 env file (`~/.config/herdr-engineering/control-plane.env`, or
-`HERDR_CP_ENV_FILE`); nothing secret is committed.
+Deploys go through scripts, not hand-built compose overrides. The **central
+fleet config** (`~/.config/herdr-engineering/fleet/fleet-config.yaml`, mode 0600, outside
+git) is the only place configuration and secrets live; nobody authors an env file.
 
 ```bash
-# control-plane web: build from a ref, recreate only control-plane-web,
-# wait for /api/v1/health to report the commit, roll back on failure.
-# Writes a receipt to ~/.local/state/herdr-engineering/deploys/<sha>.json
-deploy/control-plane/deploy.sh --dry-run            # show what would happen
-deploy/control-plane/deploy.sh --ref origin/main
+# once per control plane: prompts for the public URL, LLM and CI addresses/keys and
+# the host list; generates the DB/MinIO credentials (no API keys: the control plane
+# stays open on the tailnet, control_plane.api_keys: {}); writes the file 0600.
+# Migrating an existing control plane: --from-env ~/.config/herdr-engineering/control-plane.env
+# (see docs/operations/central-config-cutover.md). join/token/revoke rewrite the
+# YAML, which drops comments.
+herdr-eng fleet config init
+
+# control-plane web: renders a transient 0600 env file from the central file for
+# docker compose (deleted on exit, even on failure), builds from a ref, recreates
+# control-plane-web, control-plane-worker and llm-proxy on that tag with the central
+# file's directory mounted read-only at /etc/herdr/fleet/ (so edits by rename are
+# seen; llm-proxy gets only an llm slice), waits for /api/v1/health to report the
+# commit, and on failure rolls back to the previous receipt's commit with that
+# commit's compose files, reporting honestly whether it came back healthy. Refuses
+# to run when the file is missing or invalid or its directory holds anything else.
+# Writes a receipt (ref, commit, image, previous commit/image, collab slice hash,
+# time - no config values) to ~/.local/state/herdr-engineering/deploys/<sha>.json
+deploy/control-plane/deploy.sh --dry-run            # validate and show the plan
+deploy/control-plane/deploy.sh --ref origin/main    # --fleet-config PATH to override
 
 # per-host plugin + ownership feed (hosts listed in
-# ~/.config/herdr-engineering/fleet-hosts.txt, see deploy/fleet-hosts.example.txt)
+# ~/.config/herdr-engineering/fleet-hosts.txt, see deploy/fleet-hosts.example.txt).
+# Copies no env and no secrets; a host without ~/.config/herdr-engineering/host.json is
+# skipped with a hint to run `herdr-eng fleet join <host>` first.
 deploy/deploy-fleet-agents.sh --dry-run
 deploy/deploy-fleet-agents.sh --ref origin/main [--hosts bender,beast]
 
@@ -374,9 +395,10 @@ Teardown drops the schema, so the target database stays reusable and the real
 
 ```bash
 # create a dedicated throwaway database (default postgres user is a superuser)
-docker exec herdr-cp-postgres psql -U "$HERDR_CP_PG_USER" -d postgres -c 'CREATE DATABASE herdr_e2e'
+# (user and password are the ones inside control_plane.pg_dsn in the central file)
+docker exec herdr-cp-postgres psql -U "$PGUSER" -d postgres -c 'CREATE DATABASE herdr_e2e'
 # point the test at it and run just the live e2e suite
-HERDR_E2E_PG_DSN="postgresql://$HERDR_CP_PG_USER:$HERDR_CP_PG_PASSWORD@127.0.0.1:15433/herdr_e2e" \
+HERDR_E2E_PG_DSN="postgresql://$PGUSER:$PGPASSWORD@127.0.0.1:15433/herdr_e2e" \
   .venv/bin/pytest tests/control_plane/test_e2e_live_db.py
 ```
 
@@ -448,7 +470,7 @@ macOS convergence is a documented `BLOCKED_EXTERNAL` item pending a fleet run.
 | dev service not forwarding | `herdr-eng devfabric list` (lease active?) then run `herdr-eng devfabric serve <lease>` |
 | config not taking effect | `herdr-eng doctor --json` shows the config file in use; precedence is machine-local < repo < `$HERDR_ENGINEERING_CONFIG` |
 | stale dev port | `herdr-eng devfabric reconcile` expires stale leases |
-| `ci` says offline / stale | set the operator token: `~/.config/herdr-engineering/ci-token` (chmod 600) or `HERDR_ENGINEERING_CI_TOKEN`; the token is a secret and never lives in the repo. Without it the view is explicitly stale, never guessed |
+| `ci` says offline / stale | set the CI token: it is `ci.token` in the central fleet config (`herdr-eng fleet config init` asks for it); the token is a secret and never lives in the repo. Without it the view is explicitly stale, never guessed |
 | `ci logs` returns no log text | expected on this Woodpecker 3.x instance: logs stream over WebSocket (no REST endpoint) and the OAuth2 proxy doesn't forward a bearer token on the upgrade. Use the `view_in_web_ui` link it prints; `ci debug` still gives the failing tasks + exit codes |
 | `dev:<port>` unreachable from other hosts | is the gateway up? `herdr-eng devfabric gateway` on the gateway host; point commands at it with `HERDR_ENGINEERING_FABRIC_URL=http://<gateway>:29999` (or `fabric.gateway_url` in config); the app must be bound to the tailnet interface or `0.0.0.0` |
 
@@ -546,8 +568,8 @@ gateway who is calling: `X-InferWeave-Client-ID` is always `herdr:<project>`, an
 `X-InferWeave-Session-ID` / `X-InferWeave-Agent-ID` (or `X-Session-Id`) pass through when they match
 `[A-Za-z0-9-_.:/]{1,128}` (the session falls back to `<project>:<key_id>`). Without this every request
 shared the gateway's single default session/agent bucket (4 active, 12 queued). Each project is also
-capped at `HERDR_LLM_PROXY_MAX_INFLIGHT` concurrent requests (default 32, `0` disables); a request that
-cannot get a slot within `HERDR_LLM_PROXY_QUEUE_WAIT_SECONDS` (default 10) gets `429` with
+capped at `control_plane.llm_proxy.max_inflight` concurrent requests (default 32, `0` disables); a request that
+cannot get a slot within `control_plane.llm_proxy.queue_wait_seconds` (default 10) gets `429` with
 `Retry-After` and `error.type: proxy_backpressure`, without reaching the gateway.
 
 A revoked key stops working within 10 s (the proxy reloads its key table every 10 s; an unknown key forces a reload at most every 2 s).

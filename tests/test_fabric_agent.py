@@ -1013,6 +1013,22 @@ def test_the_agent_config_names_its_control_plane_and_tailnet_ip():
     assert cfg.fabric_names() == frozenset({"100.1.2.3", "dev.lan"})
 
 
+def test_retarget_moves_the_fabric_names_of_live_forwarders(tmp_path):
+    # Central fleet config: follow_config() retargets the agent when a refresh changes the
+    # control-plane URL. Forwarders already running must rewrite for the NEW host, not the old.
+    gw = _FakeGateway()
+    agent = _agent(tmp_path, gw, control_plane_url="http://old.lan")
+    fwd = fa.AgentForwarder("127.0.0.1", 1, fabric_names=agent.cfg.fabric_names())
+    agent._forwards[1] = fwd
+    try:
+        assert "old.lan" in fwd.fabric_names
+        agent.retarget(FabricClient(gw.url), "http://New.LAN:8080/")
+        assert fwd.fabric_names == frozenset({"127.0.0.1", "new.lan"})
+        assert agent.cfg.fabric_names() == fwd.fabric_names
+    finally:
+        gw.stop()
+
+
 def _untouched(request: bytes) -> bool:
     got, _r, _p = _through_forwarder({"dev.lan"}, request)
     return b"dev.lan" in got.lower() and b"127.0.0.1:" not in got.split(b"\r\n")[1]

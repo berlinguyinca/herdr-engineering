@@ -43,10 +43,10 @@ import socket
 import subprocess
 import threading
 import time
-import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -1215,8 +1215,20 @@ class FabricAgent:
 
     # -- run loop ---------------------------------------------------------
 
+    def retarget(self, client: Any, control_plane_url: str) -> None:
+        """Swap the gateway client / control-plane URL used from the next pass."""
+        self._client = client
+        self.cfg = replace(self.cfg, control_plane_url=control_plane_url)
+        # Live forwarders rewrite a Host naming the control-plane host (#117); a
+        # fleet-config refresh that moves it must reach them too, not only the
+        # forwarders created after it.
+        names = self.cfg.fabric_names()
+        for fwd in list(self._forwards.values()):
+            fwd.fabric_names = names
+
     def run(self, stop: threading.Event | None = None,
-            cycle_timeout: float = 300.0, poll: float = 5.0) -> None:
+            cycle_timeout: float = 300.0, poll: float = 5.0,
+            after_cycle: Callable[[], None] | None = None) -> None:
         """Main scan loop, guarded by a watchdog.
 
         If a single scan cycle fails to complete within ``cycle_timeout``
@@ -1239,6 +1251,8 @@ class FabricAgent:
                 # Updated even on a raised cycle; NOT updated when scan_once
                 # is itself wedged, so the watchdog can detect the stall.
                 self._cycle_last = time.monotonic()
+            if after_cycle is not None:
+                after_cycle()  # may raise HostConfigUnavailable (revoked): ends the run
             stop.wait(self.cfg.interval)
 
     def _watchdog(self, stop: threading.Event, cycle_timeout: float,

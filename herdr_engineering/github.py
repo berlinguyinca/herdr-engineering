@@ -8,14 +8,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
-import stat
 import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
-from pathlib import Path
 
 from .control_plane.project_links import canonical_repository, project_for_repository
 from .control_plane.redact import redact_text
@@ -66,21 +63,6 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _token_file():
-    path = Path(os.path.expanduser(os.environ.get("HERDR_ENGINEERING_GITHUB_TOKEN_FILE") or
-                                  "~/.config/herdr-engineering/github-token"))
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, "r") as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
-                return None
-            value = stream.read(16385).strip()
-            return value if len(value) <= 16384 else None
-    except (OSError, UnicodeError):
-        return None
-
-
 def _retry_at(headers):
     try:
         delay = headers.get("Retry-After")
@@ -94,7 +76,8 @@ def _retry_at(headers):
 
 class GitHubProvider:
     def __init__(self, *, token=None, client=None):
-        value = token if token is not None else _token_file()
+        from .host_config import host_value
+        value = token if token is not None else host_value("github.token")
         self._token = value if isinstance(value, str) and value and len(value) <= 16384 and all(32 < ord(c) < 127 for c in value) else None
         self._client = client or urllib.request.build_opener(_NoRedirect())
         self.rate_limit = None

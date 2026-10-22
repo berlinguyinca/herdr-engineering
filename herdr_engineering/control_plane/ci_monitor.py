@@ -6,7 +6,6 @@ run off the request path. Progress measures repositories checked, not job work.
 from __future__ import annotations
 
 import copy
-import os
 import threading
 import time
 from collections import Counter
@@ -47,8 +46,10 @@ def _dict(row):
 
 class CIMonitor:
     def __init__(self, *, provider_factory=None, interval=30, repo_limit=500,
-                 budget=120, now=None, on_transition=None):
+                 budget=120, now=None, on_transition=None, actions_enabled=False):
         self._factory = provider_factory or _provider
+        #: control_plane.ci_actions in the fleet file; retry/cancel are off unless set.
+        self.actions_enabled = bool(actions_enabled)
         self._interval = max(5, interval)
         self._repo_limit = repo_limit
         self._budget = budget
@@ -210,7 +211,7 @@ class CIMonitor:
             if row is None:
                 return {'available': False, 'error': 'Pipeline was not found.'}
             row = redact_payload(_dict(row))
-            if os.environ.get('HERDR_ENGINEERING_CI_ACTIONS') != '1':
+            if not self.actions_enabled:
                 row.update(can_retry=False, can_cancel=False)
             return {'available': True, 'pipeline': row, 'checked_at': _stamp()}
         except Exception as exc:
@@ -235,7 +236,7 @@ class CIMonitor:
 
     def action(self, repository, number, action):
         repository, number = self._validate(repository, number)
-        if os.environ.get('HERDR_ENGINEERING_CI_ACTIONS') != '1':
+        if not self.actions_enabled:
             raise PermissionError('CI actions are disabled by this deployment')
         if action not in {'retry', 'cancel'}:
             raise ValueError('unsupported CI action')

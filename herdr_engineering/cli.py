@@ -18,6 +18,10 @@ from typing import Any
 
 from .version import __version__
 
+# The central fleet file, alone in its own directory (deploy.sh mounts the directory).
+# Same value as fleet_config_cli.DEFAULT_CONFIG_PATH (not imported: keeps startup light).
+FLEET_CONFIG_DEFAULT = "~/.config/herdr-engineering/fleet/fleet-config.yaml"
+
 
 def _print_json(obj: Any) -> None:
     print(json.dumps(obj, indent=2, sort_keys=True))
@@ -93,7 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="session (default): mint per session, revoke at end; "
                          "project: reuse the cached project key")
     p2.add_argument("--no-llm-env", action="store_true",
-                    help="opt out (also llm.inject: false / HERDR_ENGINEERING_LLM_INJECT=0)")
+                    help="opt out (also llm.inject: false in the local config)")
     p2.add_argument("--require-llm-env", action="store_true",
                     help="fail instead of starting without a key when the control plane is down")
     p2.add_argument("command", nargs=argparse.REMAINDER, help="-- command and args")
@@ -156,8 +160,53 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="skip the herdr machine add step")
     pj.add_argument("--no-provision", action="store_true",
                     help="skip the fleet-sync provisioning playbook")
+    pj.add_argument("--roles", default=None,
+                    help="comma separated fleet-config roles (default: keep existing, else host)")
+    pj.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config file to add the host to")
+    pj.add_argument("--control-plane-url", default=None,
+                    help="control plane URL written to host.json (default: control_plane.public_url)")
+    pj.add_argument("--no-credentials", action="store_true",
+                    help="skip minting/installing the host's fleet-config token")
     pj.add_argument("--json", action="store_true")
     pj.set_defaults(func=_cmd_fleet_join)
+    pc = fsub.add_parser("config", help="central fleet configuration file tools")
+    csub = pc.add_subparsers(dest="fleet_config_command", required=True)
+    for name, hlp in (("init", "create a new fleet-config.yaml interactively"),
+                      ("validate", "validate the file (prints revision and host count only)"),
+                      ("token", "mint a fresh token for an existing host and install it"),
+                      ("revoke", "remove a host (its token stops working); backup first"),
+                      ("render-compose", "write the compose env file (0600)"),
+                      ("render-collab", "write the collab container's config slice (0600)"),
+                      ("render-llm", "write the llm-proxy container's config slice (0600)")):
+        sp = csub.add_parser(name, help=hlp)
+        sp.add_argument("--path", default=FLEET_CONFIG_DEFAULT)
+        if name == "init":
+            sp.add_argument("--from-env", default=None, metavar="PATH",
+                            help="import an existing docker-compose env file (e.g. the old "
+                                 "control-plane.env): keeps the Postgres/MinIO credentials the "
+                                 "live volumes were created with; prints names only")
+            sp.add_argument("--answers", default=None, metavar="PATH",
+                            help="YAML/JSON answers file (mode 0600); overrides --from-env")
+            sp.add_argument("--with-api-keys", action="store_true",
+                            help="generate control-plane API keys (keyed mode); the dashboard, "
+                                 "llm-proxy and emit hook do not send keys yet")
+        if name == "revoke":
+            sp.add_argument("host", help="host id in the fleet config")
+        if name == "token":
+            sp.add_argument("host", help="host id in the fleet config")
+            sp.add_argument("--target", default=None,
+                            help="ssh target (default: the host id); 'local' for this machine")
+            sp.add_argument("--control-plane-url", default=None)
+        if name == "render-compose":
+            sp.add_argument("--out", required=True, help="env file to write (0600)")
+        if name == "render-collab":
+            sp.add_argument("--out", required=True,
+                            help="file to write (0600): only control_plane.collab")
+        if name == "render-llm":
+            sp.add_argument("--out", required=True,
+                            help="file to write (0600): only llm + control_plane.llm_proxy")
+        sp.set_defaults(func=_cmd_fleet_config)
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
     pu.add_argument("--host", default=None, help="update only this host (default: all)")
@@ -173,7 +222,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ps.set_defaults(func=_cmd_fleet_status)
     pd = fsub.add_parser("drift", help="show tool/plugin versions that differ across hosts, with suggested fixes")
     pd.add_argument("--control-plane", default=None,
-                    help="control plane URL (default: HERDR_CP_URL or http://dev.lan)")
+                    help="control plane URL (default: host.json control_plane_url)")
     pd.add_argument("--host", help="only this host")
     pd.add_argument("--json", action="store_true")
     pd.set_defaults(func=_cmd_fleet_drift)
@@ -400,6 +449,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("migrate", help="apply versioned SQL migrations")
     p2.add_argument("--migrations", default=None,
                     help="migrations dir (default: bundled deploy/control-plane)")
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_migrate)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
@@ -411,6 +462,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--api-keys", default=None,
                     help="comma list of key=role (viewer|operator) pairs "
                          "(Spec §104); e.g. k1=viewer,k2=operator")
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config file: the only source of configuration. "
+                         "It is served to hosts, and its control_plane section supplies the "
+                         "Postgres DSN, host aliases, API keys, RustFS/MinIO, CI-actions "
+                         "and inspector settings")
     p2.add_argument("--pg-dsn", default=None,
                     help="optional Postgres DSN to hydrate the repo from "
                          "durable state on startup (Spec §106)")
@@ -443,7 +499,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--collab-public-url", default=None,
                     help="the https URL users open (must equal a registered callback URL), e.g. "
                          "https://bender.tail0c50da.ts.net:9447/")
-    p2.add_argument("--collab-cognito-group", default="local.dev",
+    p2.add_argument("--collab-cognito-group", default=None,
                     help="required cognito:groups membership (default: local.dev)")
     p2.add_argument("--collab-public-port", type=int, default=None,
                     help="also serve ONLY collaboration (API, MCP, page) on this port; point the "
@@ -470,7 +526,9 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(IP literals and localhost always work; repeatable; DNS-rebinding guard)")
     p2.add_argument("--collab-only", action="store_true",
                     help="serve ONLY the public collaboration surface on --collab-public-port: no "
-                         "dashboard, no operator API, no database (events go to --collab-log-file)")
+                         "dashboard, no operator API, no database (events go to --collab-log-file); "
+                         "unset --collab-cognito-* / --collab-public-url "
+                         "come from control_plane.collab in --fleet-config (the render-collab slice)")
     p2.add_argument("--collab-log-file", default=None,
                     help="append-only JSON-lines collaboration event log (required with --collab-only)")
     p2.add_argument("--collab-require-https", action="store_true",
@@ -488,10 +546,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="run a single pass and exit")
     p2.add_argument("--migrations", default=None,
                     help="migrations dir (default: bundled deploy/control-plane)")
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_worker)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
-    p2.add_argument("--control-plane", default=os.environ.get("HERDR_CP_URL", "http://dev.lan"))
-    p2.add_argument("--host-id", default=socket.gethostname())
+    p2.add_argument("--control-plane", default=None,
+                    help="control plane URL (default: host.json control_plane_url)")
+    p2.add_argument("--host-id", default=None, help="host id (default: host.json host_id)")
     p2.add_argument("--control-dir", default=None,
                     help="native Pi control directory (default: Pi runtime directory)")
     p2.add_argument("--interval", type=float, default=5.0)
@@ -503,7 +564,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--port", type=int, default=8088)
     p2.add_argument("--control-plane", default="http://control-plane-web:8080",
                     help="control-plane base URL")
-    p2.add_argument("--upstream", default="https://llm.metabolomics.us")
+    p2.add_argument("--upstream", default=None,
+                    help="upstream base URL (default: llm.upstream_url from the fleet config)")
+    p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/llm-proxy/llm-config.json",
+                    help="the llm slice of the central fleet file (`fleet config render-llm`): llm.upstream_key/upstream_url and "
+                         "control_plane.llm_proxy tuning (the only source of configuration)")
     p2.set_defaults(func=_cmd_cp_llm_proxy)
 
     return parser
@@ -515,26 +580,66 @@ def _build_parser() -> argparse.ArgumentParser:
 def _cmd_cp_mission_feed(args) -> int:
     from pathlib import Path
 
+    from .host_config import (
+        ConfigRefresher,
+        HostConfigUnavailable,
+        exit_unavailable,
+        host_config,
+        resolve_control_plane,
+    )
     from .mission_activity_feed import run_feed
-    return run_feed(args.control_plane, host_id=args.host_id,
+    from .host_config import host_config_or_none
+    try:
+        url = resolve_control_plane(args.control_plane)
+        if args.control_plane and args.host_id:
+            # Fully explicit: runs without host.json; only the ingest key (if
+            # any) follows the config.
+            live = host_config_or_none()
+        else:
+            live = host_config()
+        host_id = args.host_id or live.host_id
+        refresher = None if args.once or live is None else ConfigRefresher(live)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    return run_feed(url, host_id=host_id,
                     control_dir=Path(args.control_dir) if args.control_dir else None,
-                    interval=args.interval, once=args.once)
+                    interval=args.interval, once=args.once, refresher=refresher,
+                    follow_url=not args.control_plane)
 
 
 def _cmd_cp_llm_proxy(args) -> int:
-    """Serve the fabric LLM gateway. The upstream key is read from a file named by
-    FABRIC_LLM_UPSTREAM_KEY_FILE or, failing that, the FABRIC_LLM_UPSTREAM_KEY env
-    var — never from argv."""
-    from .llm_proxy import serve
-    key = os.environ.get("FABRIC_LLM_UPSTREAM_KEY", "")
-    key_file = os.environ.get("FABRIC_LLM_UPSTREAM_KEY_FILE")
-    if key_file:
-        with open(key_file) as fh:
-            key = fh.read().strip()
-    if not key:
-        print("FABRIC_LLM_UPSTREAM_KEY (or _FILE) is required", file=sys.stderr)
+    """Serve the fabric LLM gateway. Everything it needs comes from the llm slice
+    of the central fleet file (`fleet config render-llm`: llm.upstream_key /
+    upstream_url, control_plane.llm_proxy tuning); it refuses a file carrying
+    anything else. The key is never taken from argv or the environment."""
+    from pathlib import Path
+
+    from .fleet_config import FleetConfigError, load_fleet_config
+    from .fleet_config_cli import check_llm_slice
+    from .llm_proxy import DEFAULT_MAX_INFLIGHT, DEFAULT_QUEUE_WAIT_SECONDS, serve
+    path = Path(args.fleet_config).expanduser()
+    try:
+        cfg = load_fleet_config(path)
+        check_llm_slice(cfg)
+        llm = cfg.section("llm")
+        try:
+            tuning = cfg.section("control_plane").get("llm_proxy") or {}
+        except FleetConfigError:
+            tuning = {}
+        if not isinstance(tuning, dict):
+            raise FleetConfigError("control_plane.llm_proxy must be a mapping")
+        max_inflight = int(tuning.get("max_inflight", DEFAULT_MAX_INFLIGHT))
+        wait_seconds = float(tuning.get("queue_wait_seconds", DEFAULT_QUEUE_WAIT_SECONDS))
+    except (FleetConfigError, OSError, ValueError, TypeError) as exc:
+        print(f"--fleet-config {path}: {exc}", file=sys.stderr)
         return 2
-    httpd = serve(args.host, args.port, args.control_plane, args.upstream, key)
+    key = str(llm.get("upstream_key") or "")
+    upstream = args.upstream or str(llm.get("upstream_url") or "")
+    if not key or not upstream:
+        print("fleet config llm.upstream_key and llm.upstream_url are required", file=sys.stderr)
+        return 2
+    httpd = serve(args.host, args.port, args.control_plane, upstream, key,
+                  max_inflight=max_inflight, wait_seconds=wait_seconds)
     print(f"llm-proxy listening on {args.host}:{httpd.server_address[1]}", flush=True)
     try:
         httpd.serve_forever()
@@ -655,6 +760,7 @@ def _cmd_machines(args) -> int:
 
 
 def _cmd_fleet_join(args) -> int:
+    from pathlib import Path
     from .fleet import fleet_join
     report = fleet_join(
         ssh_target=args.ssh_target,
@@ -665,6 +771,9 @@ def _cmd_fleet_join(args) -> int:
         gateway=args.gateway,
         attach=not args.no_attach,
         provision=not args.no_provision,
+        fleet_config=None if args.no_credentials else Path(args.fleet_config).expanduser(),
+        roles=([r.strip() for r in args.roles.split(",") if r.strip()] if args.roles else None),
+        control_plane_url=args.control_plane_url,
     )
     if args.json:
         _print_json(report)
@@ -679,6 +788,62 @@ def _cmd_fleet_join(args) -> int:
             for e in report["errors"]:
                 print(f"  !! {e}")
     return 0 if report.get("ok") else 1
+
+
+def _cmd_fleet_config(args) -> int:
+    from pathlib import Path
+    from . import fleet_config_cli as fcc
+    from .fleet_config import FleetConfigError, load_fleet_config
+    cmd = args.fleet_config_command
+    path = Path(args.path).expanduser()
+    try:
+        if cmd == "init":
+            if args.with_api_keys:
+                print(fcc.API_KEYS_WARNING, file=sys.stderr)
+            answers: dict = {}
+            if args.from_env:
+                imported, report = fcc.import_env_file(Path(args.from_env))
+                answers.update(imported)
+                # names only, never values
+                for label, key in (("imported", "imported"), ("not used (unknown names)", "unknown"),
+                                   ("empty, ignored", "empty"),
+                                   ("token files not readable", "unreadable_files")):
+                    if report[key]:
+                        print(f"{args.from_env}: {label}: {', '.join(report[key])}", file=sys.stderr)
+                if report["bad_lines"]:
+                    print(f"{args.from_env}: skipped lines (not NAME=value): "
+                          f"{', '.join(map(str, report['bad_lines']))}", file=sys.stderr)
+                for dotted, state in report["tokens"].items():
+                    print(f"{dotted}: {state}", file=sys.stderr)
+            if args.answers:
+                answers.update(fcc.load_answers_file(Path(args.answers)))
+            fcc.init_config(path, answers, with_api_keys=args.with_api_keys,
+                            optional_secrets=("github_token",) if args.from_env else ())
+            print(f"wrote {path} (0600)")
+        elif cmd == "validate":
+            info = fcc.validate_config(path)
+            print(f"ok revision={info['revision']} hosts={info['hosts']}")
+        elif cmd == "token":
+            rep = fcc.issue_host_credentials(path, args.host, args.target or args.host,
+                                             control_plane_url=args.control_plane_url,
+                                             must_exist=True)
+            print(f"token for {rep['host']} installed on {rep['target']} (token: {rep['token']})")
+        elif cmd == "revoke":
+            backup = fcc.revoke_host(path, args.host)
+            print(f"revoked {args.host} (backup: {backup})")
+        elif cmd == "render-compose":
+            fcc.render_compose(load_fleet_config(path), Path(args.out).expanduser())
+            print(f"wrote {args.out} (0600)")
+        elif cmd == "render-collab":
+            fcc.render_collab(load_fleet_config(path), Path(args.out).expanduser())
+            print(f"wrote {args.out} (0600)")
+        elif cmd == "render-llm":
+            fcc.render_llm(load_fleet_config(path), Path(args.out).expanduser())
+            print(f"wrote {args.out} (0600)")
+    except FleetConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cmd_fleet_update(args) -> int:
@@ -745,7 +910,11 @@ def _cmd_fleet_drift(args) -> int:
     import urllib.request
 
     from .fleet import plan_version_sync
-    base = (args.control_plane or os.environ.get("HERDR_CP_URL") or "http://dev.lan").rstrip("/")
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+    try:
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
     try:
         with urllib.request.urlopen(f"{base}/api/v1/fleet/inventory", timeout=10) as response:
             matrix = json.loads(response.read(4 * 1024 * 1024))
@@ -1632,9 +1801,14 @@ def _cmd_dev_agent(args) -> int:
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
     from .fabric_agent import AgentConfig, FabricAgent
+    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        live = host_config()
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
     try:
         cfg = load_config()
     except InvalidError as exc:
@@ -1665,6 +1839,9 @@ def _cmd_dev_agent(args) -> int:
     # extra excluded ports + the dev-port window the agent will register.
     extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
         "agent_exclude_ports", []))
+    def control_plane_for(host_cfg):
+        return fabric_cfg.get("control_plane_url") or host_cfg.control_plane_url
+
     agent = FabricAgent(
         client=FabricClient(base),
         config=AgentConfig(
@@ -1675,16 +1852,31 @@ def _cmd_dev_agent(args) -> int:
             interval=args.interval,
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
-            control_plane_url=fabric_cfg.get("control_plane_url")
-                or os.environ.get("HERDR_ENGINEERING_CONTROL_PLANE_URL", ""),
+            control_plane_url=control_plane_for(live),
         ))
     if args.once:
         summary = agent.scan_once()
         agent.stop()
         _print_json({"ok": True, **summary})
         return 0
+    refresher = ConfigRefresher(live)
+    seen = {"fabric": (live.get("fabric.url"), live.get("fabric.token")), "cp": control_plane_for(live)}
+
+    def follow_config() -> None:
+        """Rebuild the gateway client / control-plane URL when a fresh fetch changed them."""
+        fresh = refresher.current()  # raises HostConfigUnavailable(revoked=True)
+        fab = (fresh.get("fabric.url"), fresh.get("fabric.token"))
+        cp = control_plane_for(fresh)
+        if fab == seen["fabric"] and cp == seen["cp"]:
+            return
+        new_base = gateway_url_from_config(cfg, fabric_url=fab[0] or "") or base
+        agent.retarget(FabricClient(new_base, fab[1] or None), cp)
+        seen["fabric"], seen["cp"] = fab, cp
+
     try:
-        agent.run()
+        agent.run(after_cycle=follow_config)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1814,8 +2006,8 @@ def _ci_provider():
 
 def _ci_offline() -> int:
     _print_json({"available": False, "repos": [], "pipelines": [],
-                 "note": "CI provider offline — set HERDR_ENGINEERING_CI_TOKEN "
-                         "(or ~/.config/herdr-engineering/ci-token). Stale view, "
+                 "note": "CI provider offline — ci.token is not in the central "
+                         "host config (see `herdr-eng fleet join`). Stale view, "
                          "never guessed success."})
     return 0
 
@@ -1968,14 +2160,29 @@ def _cp_migrations_dir() -> str:
     return str(pkg.parent / "deploy" / "control-plane" / "migrations")
 
 
-def _cp_config() -> dict:
+def _cp_config(fleet_config_path=None) -> dict:
+    """Control-plane settings: config.yaml defaults, with the Postgres DSN taken
+    from the central fleet file's control_plane section when that file exists."""
+    from pathlib import Path
+
     from .config import load_config
     from .control_plane.db import control_plane_config
+    from .fleet_config import FleetConfigError, load_fleet_config
     try:
         cfg = load_config()
     except Exception:
         cfg = {}
-    return control_plane_config(cfg)
+    out = control_plane_config(cfg)
+    if fleet_config_path:
+        path = Path(fleet_config_path).expanduser()
+        if path.exists():
+            try:
+                dsn = load_fleet_config(path).section("control_plane").get("pg_dsn")
+            except FleetConfigError as exc:
+                raise SystemExit(f"--fleet-config: {exc}") from None
+            if dsn:
+                out["postgres_dsn"] = str(dsn)
+    return out
 
 
 async def _cp_connect(dsn: str):
@@ -1990,7 +2197,7 @@ def _cmd_cp_migrate(args) -> int:
     migrations = args.migrations or _cp_migrations_dir()
 
     async def _run():
-        conn = await _cp_connect(_cp_config()["postgres_dsn"])
+        conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
         try:
             return await Migrator(conn).apply(migrations)
         finally:
@@ -2029,6 +2236,14 @@ def _self_report_services(repo, *, host_id, web_port, dsn=None,
     repo.upsert_service(host_id, "worker", 0, status="healthy")
 
 
+def _host_aliases_from(cp: dict) -> dict[str, str]:
+    """control_plane.host_aliases: a mapping, or the ``alias=canonical,...`` string."""
+    raw = cp.get("host_aliases") or {}
+    if isinstance(raw, dict):
+        return {str(a): str(c) for a, c in raw.items() if a and c}
+    return _parse_host_aliases(str(raw))
+
+
 def _parse_host_aliases(raw: str) -> dict[str, str]:
     """``alias=canonical,alias2=canonical2`` -> mapping; malformed pairs are ignored."""
     pairs = (item.split("=", 1) for item in raw.split(",") if "=" in item)
@@ -2046,16 +2261,36 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.repo import ControlPlaneRepo
     from .control_plane.sink import DurableEventSink
 
+    fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
     if args.collab_only:
+        # The public collab container is given only the collab slice of the central
+        # file (`fleet config render-collab`): no fleet endpoint, no API keys, no DSN.
+        if args.pg_dsn or set(cp) - {"collab"}:
+            raise SystemExit("--collab-only must not be given database credentials or other "
+                             "control-plane settings (mount the render-collab slice, not the "
+                             "central file)")
+        _apply_collab_config(args, cp)
         if not (args.collab_log_file and args.collab_public_port and args.collab_cognito_pool):
-            raise SystemExit("--collab-only needs --collab-log-file, --collab-public-port and "
-                             "--collab-cognito-pool")
-        if args.pg_dsn or os.environ.get("HERDR_CP_PG_DSN"):
-            raise SystemExit("--collab-only must not be given database credentials")
-    # In the compose stack the DSN is supplied via the HERDR_CP_PG_DSN env var
-    # (from env_file: .env) so the password never appears in process args.
-    dsn = None if args.collab_only else (args.pg_dsn or os.environ.get("HERDR_CP_PG_DSN"))
+            raise SystemExit("--collab-only needs --collab-log-file, --collab-public-port and a "
+                             "Cognito pool (control_plane.collab.cognito_pool or --collab-cognito-pool)")
+        fleet_store = None
+    elif fleet_store is not None:
+        _install_fleet_host_config(fleet_store)
+        file_keys = cp.get("api_keys") or {}
+        if not isinstance(file_keys, dict):
+            raise SystemExit("fleet config control_plane.api_keys must be a mapping of key -> role")
+        merged = {str(k): str(v) for k, v in file_keys.items()}
+        merged.update(api_keys or {})
+        api_keys = merged or None
+    if args.collab_cognito_group is None:
+        args.collab_cognito_group = "local.dev"
+    # The Postgres DSN comes from the fleet file's control_plane section (the
+    # mounted central file), so the password never appears in process args or env.
+    dsn = None if args.collab_only else (args.pg_dsn or cp.get("pg_dsn"))
+    inspector_limits = cp.get("inspector_limits") or {}
+    if not isinstance(inspector_limits, dict):
+        raise SystemExit("fleet config control_plane.inspector_limits must be a mapping")
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
@@ -2064,10 +2299,11 @@ def _cmd_cp_web(args) -> int:
     if args.collab_only:
         from .control_plane.collab import FileEventLog
         sink = FileEventLog(args.collab_log_file)
-    repo = ControlPlaneRepo(sink=sink, host_aliases=_parse_host_aliases(os.environ.get("HERDR_CP_HOST_ALIASES", "")))
+    repo = ControlPlaneRepo(sink=sink, host_aliases=_host_aliases_from(cp),
+                            inspector_limits=inspector_limits)
     if args.seed_demo:
         _seed_demo(repo)
-    rustfs = _maybe_rustfs_client()
+    rustfs = _maybe_rustfs_client(cp)
     collab = None
     if args.collab_cognito_pool:
         if args.collab_users_file:
@@ -2126,6 +2362,7 @@ def _cmd_cp_web(args) -> int:
                              rustfs=rustfs, collab=collab,
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
+                             fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
@@ -2140,10 +2377,10 @@ def _cmd_cp_web(args) -> int:
         if not args.collab_only:   # collab-only has no stack to report
             _self_report_services(
                 repo,
-                host_id=os.environ.get("HERDR_CP_SELF_HOST") or socket.gethostname(),
-                web_port=args.port or os.environ.get("HERDR_CP_WEB_PORT", "8080"),
+                host_id=cp.get("self_host") or socket.gethostname(),
+                web_port=args.port or cp.get("web_port") or 8080,
                 dsn=dsn,
-                rustfs_endpoint=os.environ.get("HERDR_CP_RUSTFS_ENDPOINT"),
+                rustfs_endpoint=cp.get("rustfs_endpoint"),
             )
     except Exception:
         logging.exception("self-report of stack services failed")
@@ -2159,23 +2396,104 @@ def _cmd_cp_web(args) -> int:
     return 0
 
 
-def _maybe_rustfs_client():
+def _install_fleet_host_config(store) -> None:
+    """The web process owns the fleet file, so its own ci/github/fabric/llm reads
+    (providers built via host_config) come straight from it, live on reload."""
+    from .fleet_config import FleetConfigError
+    from .host_config import HostConfig, install_source
+
+    def source():
+        cfg = store.current()
+        values = {}
+        for name in ("ingest", "agent", "github", "ci", "llm", "fabric", "inspector"):
+            try:
+                values[name] = cfg.section(name)
+            except FleetConfigError:
+                continue
+        return HostConfig("", socket.gethostname(), cfg.revision, values)
+    install_source(source)
+
+
+# control_plane.collab keys -> (argparse dest, kind). Read only by `web --collab-only`;
+# the dashboard never enables collaboration from the file.
+COLLAB_CONFIG_KEYS = {
+    "cognito_pool": ("collab_cognito_pool", str),
+    "cognito_clients": ("collab_cognito_client", list),
+    "cognito_group": ("collab_cognito_group", str),
+    "cognito_web_client": ("collab_cognito_web_client", str),
+    "cognito_domain": ("collab_cognito_domain", str),
+    "public_url": ("collab_public_url", str),
+    "operator_user": ("collab_operator_user", str),
+    "operator_email": ("collab_operator_email", str),
+}
+
+
+def _apply_collab_config(args, cp) -> None:
+    """Fill unset --collab-* flags from control_plane.collab (flags win; booleans OR)."""
+    collab = cp.get("collab") or {}
+    if not isinstance(collab, dict):
+        raise SystemExit("fleet config control_plane.collab must be a mapping")
+    unknown = sorted(set(collab) - set(COLLAB_CONFIG_KEYS))
+    if unknown:
+        raise SystemExit("fleet config control_plane.collab: unknown keys: " + ", ".join(unknown))
+    for key, (dest, kind) in COLLAB_CONFIG_KEYS.items():
+        if key not in collab:
+            continue
+        value = collab[key]
+        if kind is list:
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+                raise SystemExit(f"fleet config control_plane.collab.{key} must be a list of strings")
+            if not getattr(args, dest):
+                setattr(args, dest, list(value))
+        elif kind is bool:
+            if not isinstance(value, bool):
+                raise SystemExit(f"fleet config control_plane.collab.{key} must be true or false")
+            setattr(args, dest, bool(getattr(args, dest)) or value)
+        else:
+            if not isinstance(value, str) or not value:
+                raise SystemExit(f"fleet config control_plane.collab.{key} must be a non-empty string")
+            if getattr(args, dest) is None:
+                setattr(args, dest, value)
+
+
+def _load_cp_fleet_config(path_arg):
+    """Return (FleetConfigStore, control_plane section) or (None, {}) when no file exists."""
+    from pathlib import Path
+
+    from .fleet_config import FleetConfigError, FleetConfigStore
+    if not path_arg:
+        return None, {}
+    path = Path(path_arg).expanduser()
+    if not path.exists():
+        return None, {}
+    try:
+        store = FleetConfigStore(path)
+        cp = store.current().section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    return store, cp
+
+
+def _maybe_rustfs_client(cp=None):
     """Build an S3/RustFS client for artifact payloads, or None if not wired.
 
-    Configured via HERDR_CP_RUSTFS_ENDPOINT (default http://rustfs:9000) and
-    HERDR_CP_RUSTFS_BUCKET (default herdr-artifacts); the MinIO credentials come
-    from HERDR_CP_MINIO_USER / HERDR_CP_MINIO_PASSWORD when set, else the fixed
-    dev creds. Returns None when no endpoint is reachable/configured so the web
-    server still starts with the in-memory stand-in.
+    Configured by the fleet file's control_plane section: rustfs_endpoint,
+    rustfs_bucket (default herdr-artifacts), rustfs_region (default us-east-1),
+    minio_user and minio_password (default the fixed dev creds). Returns None
+    when there is no endpoint so the web server still starts with the
+    in-memory stand-in.
     """
     from .control_plane.rustfs import RustFSClient
-    endpoint = os.environ.get("HERDR_CP_RUSTFS_ENDPOINT")
+    cp = cp or {}
+    endpoint = cp.get("rustfs_endpoint")
+    bucket = cp.get("rustfs_bucket", "herdr-artifacts")
+    region = cp.get("rustfs_region", "us-east-1")
+    access_key = cp.get("minio_user", "herdr")
+    secret_key = cp.get("minio_password", "herdr")
     if not endpoint:
         return None
-    bucket = os.environ.get("HERDR_CP_RUSTFS_BUCKET", "herdr-artifacts")
-    region = os.environ.get("HERDR_CP_RUSTFS_REGION", "us-east-1")
-    access_key = os.environ.get("HERDR_CP_MINIO_USER", "herdr")
-    secret_key = os.environ.get("HERDR_CP_MINIO_PASSWORD", "herdr")
     client = RustFSClient(endpoint=endpoint, bucket=bucket, region=region,
                           access_key=access_key, secret_key=secret_key)
     try:
@@ -2253,7 +2571,7 @@ def _cmd_cp_worker(args) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     async def _run():
-        conn = await _cp_connect(_cp_config()["postgres_dsn"])
+        conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
         try:
             migrations = args.migrations or _cp_migrations_dir()
             await Migrator(conn).apply(migrations)

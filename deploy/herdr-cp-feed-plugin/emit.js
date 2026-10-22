@@ -23,17 +23,15 @@
 //   HERDR_PLUGIN_CONFIG_DIR  plugin config dir
 //   HERDR_PLUGIN_STATE_DIR   plugin state dir
 //
-// Control-plane URL resolution order:
-//   1. file <HERDR_PLUGIN_CONFIG_DIR>/cp-url
-//   2. env HERDR_CP_URL
-//   3. default http://dev.lan
+// Control-plane URL: control_plane_url from ~/.config/herdr-engineering/host.json
+// (written by `herdr-eng fleet join`). No env var or built-in default; a host
+// that has not joined emits nothing.
 import os from "node:os";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { readHostJson } from "./host-config.js";
 import { pathToFileURL } from "node:url";
 import { enrichSession, resolveSessionEnv } from "./enrich.js";
-
-export const CONTROL_PLANE_DEFAULT = "http://dev.lan";
 
 const EVENT_JSON = "HERDR_PLUGIN_EVENT_JSON";
 
@@ -255,18 +253,10 @@ export function mapEvent(env, ctx = {}) {
   return out;
 }
 
-// Control-plane base URL. Config file beats env beats default.
-export function resolveUrl(env) {
-  const dir = env.HERDR_PLUGIN_CONFIG_DIR;
-  if (dir) {
-    try {
-      const fromFile = readFileSync(join(dir, "cp-url"), "utf8").trim();
-      if (fromFile) return fromFile;
-    } catch {
-      // fall through
-    }
-  }
-  return env.HERDR_CP_URL || CONTROL_PLANE_DEFAULT;
+// Control-plane base URL from host.json, or null when this host has not joined.
+export function resolveUrl(env = process.env) {
+  try { return readHostJson(env.HOME || os.homedir()).url; }
+  catch { return null; }
 }
 
 async function send(url, envelope) {
@@ -317,6 +307,10 @@ async function main() {
   const enriched = await Promise.all(
     envelopes.map((e) => enrichSession(env, e).catch(() => e)));
   const url = resolveUrl(env);
+  if (!url) {
+    process.stderr.write("[herdr-cp-feed] host config unavailable: no host.json; run `herdr-eng fleet join`\n");
+    return;
+  }
   await Promise.allSettled(enriched.map((e) => send(url, e)));
 }
 

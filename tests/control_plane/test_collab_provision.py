@@ -155,8 +155,42 @@ def test_ledger_is_private(env):
 
 
 def test_no_operator_configured_does_nothing(monkeypatch):
-    monkeypatch.delenv("HERDR_COLLAB_OPERATOR_USER", raising=False)
+    # An operator in the environment is ignored: configuration is flags only (central config
+    # -> collab slice -> collab-sync.sh flags).
+    monkeypatch.setenv("HERDR_COLLAB_OPERATOR_USER", OP)
+    monkeypatch.setattr(prov, "run", lambda **kw: pytest.fail("run without --operator"))
     assert prov.main([]) == 0
+
+
+def test_flags_carry_the_slice_values_and_env_is_ignored(tmp_path, monkeypatch):
+    for k, v in {"HERDR_COLLAB_POOL": "us-east-1_ENV", "HERDR_COLLAB_GROUP": "env.group",
+                 "HERDR_COLLAB_DATA_DIR": "/env/data", "HERDR_COLLAB_MAX_PER_DAY": "99",
+                 "HERDR_COLLAB_AUTO_CREATE": "0", "HERDR_COLLAB_AUTO_DOMAINS": "env.org"}.items():
+        monkeypatch.setenv(k, v)
+    seen = {}
+    monkeypatch.setattr(prov, "run", lambda **kw: seen.update(kw))
+    assert prov.main(["--operator", OP, "--pool", "us-west-2_SLICE", "--group", "team.test",
+                      "--data-dir", str(tmp_path / "data"), "--ledger-dir", str(tmp_path / "led")]) == 0
+    assert seen["operator"] == OP and seen["log_path"] == str(tmp_path / "data" / "collab.jsonl")
+    assert seen["ledger_path"] == str(tmp_path / "led" / "ledger.jsonl")
+    assert (seen["cognito"].pool, seen["cognito"].group, seen["cognito"].region) == \
+        ("us-west-2_SLICE", "team.test", "us-west-2")
+    assert seen["auto_create"] is True and seen["domains"] == () and seen["max_per_day"] == prov.MAX_PER_DAY
+    assert seen["dry_run"] is False
+
+
+def test_policy_flags(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(prov, "run", lambda **kw: seen.update(kw))
+    prov.main(["--operator", OP, "--pool", "us-west-2_X", "--no-auto-create", "--domain", "UCDavis.edu",
+               "--domain", "x.org", "--max-per-day", "2", "--dry-run"])
+    assert seen["auto_create"] is False and seen["domains"] == ("ucdavis.edu", "x.org")
+    assert seen["max_per_day"] == 2 and seen["dry_run"] is True
+
+
+def test_operator_without_pool_is_refused():
+    with pytest.raises(SystemExit):
+        prov.main(["--operator", OP])
 
 
 # ---- review findings

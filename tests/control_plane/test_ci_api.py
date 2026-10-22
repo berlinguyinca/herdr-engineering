@@ -46,8 +46,7 @@ def test_pipeline_and_log_require_valid_query(server):
     assert request(server, 'ci/pipeline?repository=org%2Fapp&number=2')[1]['pipeline']['repository'] == 'org/app'
 
 
-def test_viewer_cannot_execute_and_operator_needs_deployment_opt_in(server, monkeypatch):
-    monkeypatch.delenv('HERDR_ENGINEERING_CI_ACTIONS', raising=False)
+def test_viewer_cannot_execute_and_operator_needs_deployment_opt_in(server):
     body = {'repository': 'org/app', 'number': 2, 'action': 'cancel'}
     assert request(server, 'ci/actions', body)[0] == 403
     assert request(server, 'ci/actions', body, key='write')[0] == 403

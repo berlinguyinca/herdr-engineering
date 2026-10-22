@@ -59,28 +59,6 @@ def test_control_plane_config_defaults(monkeypatch):
     assert c["rustfs_region"] == "us-east-1"
 
 
-def test_control_plane_config_uses_env_credentials(monkeypatch):
-    """When HERDR_CP_PG_USER/PASSWORD are set (compose env_file: .env), the
-    DSN credentials are substituted in while host/port/db come from config."""
-    monkeypatch.setenv("HERDR_CP_PG_USER", "herdr_abcd1234")
-    monkeypatch.setenv("HERDR_CP_PG_PASSWORD", "s3cr3t-password")
-    c = db.control_plane_config({"control_plane": {
-        "postgres_dsn": "postgresql://herdr:herdr@postgres:5432/herdr",
-    }})
-    assert c["postgres_dsn"] == (
-        "postgresql://herdr_abcd1234:s3cr3t-password@postgres:5432/herdr")
-
-
-def test_control_plane_config_env_substitutes_without_existing_creds(monkeypatch):
-    """Env creds are inserted even when the configured DSN has no user:pass."""
-    monkeypatch.setenv("HERDR_CP_PG_USER", "u")
-    monkeypatch.setenv("HERDR_CP_PG_PASSWORD", "p")
-    c = db.control_plane_config({"control_plane": {
-        "postgres_dsn": "postgresql://postgres:5432/herdr",
-    }})
-    assert c["postgres_dsn"] == "postgresql://u:p@postgres:5432/herdr"
-
-
 def test_control_plane_config_overrides(monkeypatch):
     monkeypatch.delenv("HERDR_CP_PG_USER", raising=False)
     monkeypatch.delenv("HERDR_CP_PG_PASSWORD", raising=False)

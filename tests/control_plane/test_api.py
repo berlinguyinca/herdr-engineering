@@ -223,10 +223,10 @@ def test_auth_required_when_key_set():
     svr.wait_until_ready()
     c = Client(svr.port)
     try:
-        status, _, _ = c.get("/api/v1/health")
+        status, _, _ = c.get("/api/v1/missions")   # health stays open (liveness only)
         assert status == 401
         req = urllib.request.Request(
-            f"http://127.0.0.1:{svr.port}/api/v1/health",
+            f"http://127.0.0.1:{svr.port}/api/v1/missions",
             headers={"X-API-Key": "sekret"})
         with urllib.request.urlopen(req) as r:
             assert r.status == 200
@@ -393,3 +393,221 @@ def test_retire_endpoint_is_a_dry_run_unless_told_otherwise(server):
     assert json.loads(c.get(f'/api/v1/services/{sid}')[2])['lifecycle']['archived'] is True
     status, _ = c.post('/api/v1/services/retire', {'older_than_days': 0})
     assert status == 400
+
+
+# ------------------------------------------------------------ fleet config
+import hashlib  # noqa: E402
+import os  # noqa: E402
+
+import yaml  # noqa: E402
+
+from herdr_engineering.fleet_config import FleetConfigStore  # noqa: E402
+
+_DB_URL = f"postgres://{'dbuser'}:{'dbvalue'}@h/db"  # assembled, not a literal credential URL
+_FC_SECRET = "placeholder-fleet-value"
+
+
+def _fc_sha(t):
+    return hashlib.sha256(t.encode()).hexdigest()
+
+
+def _fc_doc(extra=""):
+    return {
+        "version": 1,
+        "sections": {
+            "llm": {"roles": ["builder"], "values": {"key": _FC_SECRET + extra}},
+            "ci": {"roles": ["ci"], "values": {"token": "placeholder-ci-only"}},
+            "control_plane": {"roles": ["control-plane"], "values": {"pg_dsn": _DB_URL}},
+        },
+        "hosts": {
+            "bender": {"roles": ["builder"], "token_sha256": _fc_sha("placeholder-host-bender")},
+            "beast": {"roles": ["ci"], "token_sha256": _fc_sha("placeholder-host-beast")},
+        },
+    }
+
+
+def _fc_write(path, doc):
+    path.write_text(yaml.safe_dump(doc))
+    os.chmod(path, 0o600)
+
+
+def _fc_req(port, method, path, headers=None, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    h = dict(headers or {})
+    if data is not None:
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+@pytest.fixture()
+def fc_server(tmp_path, acknowledged_sink):
+    path = tmp_path / "fleet.yaml"
+    _fc_write(path, _fc_doc())
+    store = FleetConfigStore(path)
+    svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink),
+                             api_keys={"opkey": "operator", "viewkey": "viewer"},
+                             fleet_config=store)
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    yield svr.port, path, store
+    svr.shutdown()
+
+
+def test_fleet_config_requires_valid_host_token(fc_server):
+    port, _, _ = fc_server
+    for hdrs in ({}, {"X-Host-Token": "nope"}, {"X-API-Key": "opkey"}):
+        status, _, body = _fc_req(port, "GET", "/api/v1/fleet/config", hdrs)
+        assert status == 401
+        assert json.loads(body) == {"error": "unauthorized"}
+
+
+def test_fleet_config_returns_scoped_slice_no_store_header(fc_server):
+    port, _, _ = fc_server
+    status, headers, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "placeholder-host-bender"})
+    assert status == 200
+    assert headers["Cache-Control"] == "no-store"
+    data = json.loads(body)
+    assert data["values"] == {"llm": {"key": _FC_SECRET}}
+    assert len(data["revision"]) == 12
+    assert "control_plane" not in data["values"] and "ci" not in data["values"]
+
+
+def test_applied_revision_shows_in_status(fc_server):
+    port, _, store = fc_server
+    rev = store.current().revision
+    status, _, _ = _fc_req(port, "POST", "/api/v1/fleet/config/applied",
+                           {"X-Host-Token": "placeholder-host-bender"}, {"host_id": "bender", "revision": rev})
+    assert status == 200
+    # token of another host cannot report for bender
+    status, _, _ = _fc_req(port, "POST", "/api/v1/fleet/config/applied",
+                           {"X-Host-Token": "placeholder-host-beast"}, {"host_id": "bender", "revision": "x"})
+    assert status == 401
+    status, _, body = _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "viewkey"})
+    assert status == 200
+    data = json.loads(body)
+    assert data["revision"] == rev and data["last_error"] is None
+    hosts = {h["id"]: h for h in data["hosts"]}
+    assert hosts["bender"]["applied_revision"] == rev
+    assert hosts["bender"]["roles"] == ["builder"]
+    assert hosts["beast"]["applied_revision"] is None
+    # status needs the normal API key
+    assert _fc_req(port, "GET", "/api/v1/fleet/config/status")[0] == 401
+    assert _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-Host-Token": "placeholder-host-bender"})[0] == 401
+
+
+def test_broken_edit_keeps_last_good_revision(fc_server):
+    port, path, store = fc_server
+    good = store.current().revision
+    path.write_text("version: 1\nsections: [broken")
+    os.chmod(path, 0o600)
+    os.utime(path, (os.stat(path).st_atime + 5, os.stat(path).st_mtime + 5))
+    status, _, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "placeholder-host-bender"})
+    assert status == 200
+    assert json.loads(body)["revision"] == good
+    _, _, sbody = _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "viewkey"})
+    s = json.loads(sbody)
+    assert s["revision"] == good and s["last_error"]
+    # a valid edit afterwards is picked up and clears the error
+    _fc_write(path, _fc_doc("-v2"))
+    os.utime(path, (os.stat(path).st_atime + 10, os.stat(path).st_mtime + 10))
+    _, _, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "placeholder-host-bender"})
+    assert json.loads(body)["revision"] != good
+    assert json.loads(_fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "viewkey"})[2])["last_error"] is None
+
+
+def test_status_never_contains_secret_values(fc_server):
+    port, path, _ = fc_server
+    path.write_text(f"version: 1\nsections: [{_FC_SECRET}")
+    os.chmod(path, 0o600)
+    os.utime(path, (os.stat(path).st_atime + 5, os.stat(path).st_mtime + 5))
+    _, _, body = _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "opkey"})
+    text = body.decode()
+    for needle in (_FC_SECRET, "placeholder-ci-only", "postgres://", _fc_sha("placeholder-host-bender"), "placeholder-host-bender"):
+        assert needle not in text
+
+
+def test_fleet_config_routes_404_without_store(server):
+    c, _ = server
+    assert c.get("/api/v1/fleet/config")[0] == 404
+    assert c.get("/api/v1/fleet/config/status")[0] == 404
+
+
+@pytest.fixture()
+def keyed_server(acknowledged_sink):
+    svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink),
+                             api_keys={"opkey": "operator", "ingkey": "ingest", "agentkey": "agent"})
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    yield svr.port
+    svr.shutdown()
+
+
+def _post_as(port, path, body, key):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json", "X-API-Key": key})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def test_agent_role_may_post_ingest_and_host_tool_routes(keyed_server):
+    port = keyed_server
+    ev = {"entity_type": "host", "entity_id": "bender", "event_type": "host.registered",
+          "payload": {"host_name": "bender", "tailnet_ip": "100.104.39.6"}}
+    assert _post_as(port, "/api/v1/ingest", ev, "agentkey") == 200
+    # reaches the handler (not 401/403): the body is invalid or the entity absent
+    for path in ("/api/v1/llm/keys", "/api/v1/llm/keys/k1/revoke", "/api/v1/reviews",
+                 "/api/v1/reviews/r1/result", "/api/v1/reviews/r1/heartbeat",
+                 "/api/v1/reviews/r1/failure"):
+        assert _post_as(port, path, {}, "agentkey") not in (401, 403), path
+
+
+def test_agent_role_is_refused_everywhere_else(keyed_server):
+    port = keyed_server
+    for path in ("/api/v1/services/retire", "/api/v1/llm/models", "/api/v1/llm/models/m/delete",
+                 "/api/v1/sessions/s1/messages", "/api/v1/sessions/s1/actions",
+                 "/api/v1/hosts/h1/telemetry", "/api/v1/reviews/r1/other"):
+        assert _post_as(port, path, {}, "agentkey") == 403, path
+    # ingest stays ingest-only
+    assert _post_as(port, "/api/v1/llm/keys", {}, "ingkey") == 403
+    assert _post_as(port, "/api/v1/services/retire", {}, "opkey") != 403
+
+
+def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink):
+    """A reload between the token check and the slice (here: the host is revoked in
+    the second snapshot) must not raise: the request answers from ONE snapshot."""
+    from herdr_engineering.fleet_config import _parse
+    first = _parse(_fc_doc())
+    revoked = _fc_doc()
+    del revoked["hosts"]["bender"]
+    second = _parse(revoked)
+
+    class FlippingStore:
+        def __init__(self):
+            self.calls = 0
+
+        def current(self):
+            self.calls += 1
+            return first if self.calls == 1 else second
+
+        def record_applied(self, *_a):
+            pass
+
+    store = FlippingStore()
+    svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), fleet_config=store)
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    try:
+        status, _, body = _fc_req(svr.port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "placeholder-host-bender"})
+        assert status == 200 and json.loads(body)["revision"] == first.revision
+        assert store.calls == 1
+    finally:
+        svr.shutdown()

@@ -13,7 +13,7 @@ internet -> router (dst-nat 80/443) -> cubert 192.168.137.250 (nginx stream, rou
 
 The SNI router lives in the `cubert-ansible` repo (`roles/nginx/templates/edge-stream.conf.j2`,
 `bender_lan_ip`). Moving the service to another host means changing that upstream, the
-`--collab-public-url`, and the Cognito app client's callback/logout URLs together.
+`control_plane.collab.public_url`, and the Cognito app client's callback/logout URLs together.
 
 ## Agent protocols
 
@@ -25,9 +25,11 @@ The SNI router lives in the `cubert-ansible` repo (`roles/nginx/templates/edge-s
 
 ## Operator (local owner) path, no sign-in
 
-`herdr-collab-edge` also publishes port `HERDR_COLLAB_OPERATOR_PORT` (default 9482) on
-`HERDR_CP_WEB_BIND` (the tailnet IP) only. The dashboard (`herdr-cp-web`) proxies
-`/api/v1/collab/*` there, acting as `HERDR_COLLAB_OPERATOR_USER`. Both hops refuse DNS-rebound
+`herdr-collab-edge` also publishes port `control_plane.compose.HERDR_COLLAB_OPERATOR_PORT`
+(optional, default 9482) on `HERDR_CP_WEB_BIND` (the tailnet IP) only. The dashboard
+(`herdr-cp-web`) proxies `/api/v1/collab/*` there, acting as `control_plane.collab.operator_user`
+(required when collaboration is on; `operator_email` is optional). Both live in the central fleet
+config; collab-public sees them only through its rendered slice. Both hops refuse DNS-rebound
 `Host` values and cross-site writes. Reach the dashboard by IP, or add a name with
 `--collab-dashboard-host`. Anyone who can reach the dashboard is the owner: keep it tailnet-only.
 
@@ -45,7 +47,18 @@ These were applied by hand on bender; reapply them on a new host.
    .246 and .10 entries). Without it the TLS handshake from cubert never completes.
 3. Certificates: `collab-sync.sh install` sets up a systemd user timer that refreshes the Cognito
    keys and group membership every minute and copies only this lineage's cert and key to
-   `HERDR_COLLAB_CERT_DIR`. The certbot deploy hook also reloads `herdr-collab-edge`.
+   `control_plane.compose.HERDR_COLLAB_CERT_DIR` (deploy.sh passes it as `--cert-dir`), reloading
+   `herdr-collab-edge` when they changed. It also installs `herdr-collab-cert-renew.timer`, which
+   renews only that lineage. The certbot paths are script defaults, overridable with
+   `--cert-src`, `--acme-dir`, `--certbot` and `--cert-name` (no environment variables);
+   `collab-sync.sh renew-check` runs a certbot dry run.
+4. Invited people: each minute run first calls `collab-provision.py` (host-side, with the host's
+   AWS credentials), which adds the people `control_plane.collab.operator_user` invited to
+   `cognito_group`, creating their Cognito account if needed. The operator, pool and group come
+   from the slice, and the log is read from collab-public's data dir (`--data-dir`, passed by
+   deploy.sh). Policy is flags with defaults, not configuration: `--no-auto-create`, `--domain`
+   (repeatable allow-list), `--max-per-day` (default 5), `--ledger-dir`. The ledger
+   (`~/.local/share/herdr-engineering/collab-provision/ledger.jsonl`) is the audit trail.
 
 ## Verify
 

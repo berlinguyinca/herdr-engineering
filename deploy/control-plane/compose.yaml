@@ -24,8 +24,8 @@
 #                         (the web UI is a client of this API). Private-by-default;
 #                         expose 8080 only if you intend the control plane to be
 #                         reachable from the fabric (e.g. on the dev.lan gateway).
-#                         Set HERDR_CP_API_KEYS to a comma list of key=role pairs
-#                         to require X-API-Key auth (roles: viewer/operator).
+#                         API keys (key: role) live in control_plane.api_keys of
+#                         the central fleet file (roles: viewer/operator/ingest/agent).
 #
 # ONE project for everything on the master host: the control plane services
 # above use ordinary bridge networking (they resolve each other by service
@@ -34,10 +34,22 @@
 # which the gateway and CoreDNS require. See deploy/fabric-stack/README.md for
 # what those three do.
 #
-# Usage (see README.md in this directory):
-#   docker compose up -d --build
-#   docker compose exec postgres psql -U herdr -d herdr -c '\dt'
+# CONFIGURATION: the central fleet file (~/.config/herdr-engineering/fleet/fleet-config.yaml,
+# created by `herdr-eng fleet config init`) is the only source. The web and worker
+# containers get its DIRECTORY as a read-only mount at /etc/herdr/fleet/ (a directory
+# mount sees a rename-replace; a single-file mount would keep the old inode) and a
+# --fleet-config flag; llm-proxy gets only the llm slice (render-llm) the same way; they read no configuration from the environment. The ${VAR}
+# substitutions below are for docker compose itself and third-party images only; they
+# come from an env file that deploy.sh renders from the central file, never authors.
+#
+# Usage (see README.md in this directory): run deploy.sh; do not call
+# `docker compose up` by hand (the substitution variables would be missing).
 name: herdr-control-plane
+
+# Deploy layout marker: deploy.sh rolls back automatically only to a commit whose
+# compose.yaml carries this value (services it recreates have no relative bind
+# mounts and read the fleet config from mounted directories).
+x-herdr-deploy-layout: 2
 
 services:
   # ---- control plane (bridge network) -------------------------------------
@@ -45,12 +57,11 @@ services:
     image: postgres:16-alpine
     container_name: herdr-cp-postgres
     restart: unless-stopped
-    # SECURITY: credentials come from ./.env (see ./generate-env.sh).
-    # Compose refuses to start until HERDR_CP_PG_USER/PASSWORD are present.
-    env_file: ${HERDR_CP_ENV_FILE:-.env}
+    # SECURITY: credentials are substituted from the env file deploy.sh renders
+    # from the central file. Compose refuses to start until they are present.
     environment:
-      POSTGRES_USER: "${HERDR_CP_PG_USER}"
-      POSTGRES_PASSWORD: "${HERDR_CP_PG_PASSWORD}"
+      POSTGRES_USER: "${HERDR_CP_PG_USER:?run deploy.sh}"
+      POSTGRES_PASSWORD: "${HERDR_CP_PG_PASSWORD:?run deploy.sh}"
       POSTGRES_DB: herdr
     volumes:
       - herdr-cp-pg:/var/lib/postgresql/data
@@ -75,11 +86,10 @@ services:
     container_name: herdr-cp-rustfs
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
-    # SECURITY: credentials come from ./.env (see ./generate-env.sh).
-    env_file: ${HERDR_CP_ENV_FILE:-.env}
+    # SECURITY: credentials are substituted from the rendered env file (see postgres).
     environment:
-      MINIO_ROOT_USER: "${HERDR_CP_MINIO_USER}"
-      MINIO_ROOT_PASSWORD: "${HERDR_CP_MINIO_PASSWORD}"
+      MINIO_ROOT_USER: "${HERDR_CP_MINIO_USER:?run deploy.sh}"
+      MINIO_ROOT_PASSWORD: "${HERDR_CP_MINIO_PASSWORD:?run deploy.sh}"
     volumes:
       - herdr-cp-rustfs:/data
     healthcheck:
@@ -100,7 +110,9 @@ services:
       # `docker compose build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`.
       args:
         GIT_COMMIT: ${HERDR_CP_GIT_COMMIT:-dev}
-    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-0.1.0}
+    # deploy.sh builds herdr-engineering:<sha12> once and recreates web, worker and
+    # llm-proxy on that same tag (and rolls all three back together).
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-cp-web
     restart: unless-stopped
     depends_on:
@@ -111,25 +123,18 @@ services:
     # to the Tailnet interface (HERDR_CP_WEB_BIND), so only Tailnet clients can
     # reach it — never a plain LAN/`0.0.0.0` exposure. `--allow-open` is the
     # explicit acknowledgment that the Tailnet boundary replaces API keys.
-    env_file: ${HERDR_CP_ENV_FILE:-.env}
-    environment:
-      HERDR_CP_WEB_HOST: "0.0.0.0"
-      # alias=canonical,... folds one machine reporting under two names into one host
-      HERDR_CP_HOST_ALIASES: "${HERDR_CP_HOST_ALIASES:-}"
-      HERDR_CP_WEB_PORT: "8080"
-      HERDR_CP_WEB_BIND: "${HERDR_CP_WEB_BIND:-127.0.0.1}"
-      # Durable artifact object store (the `rustfs` MinIO service on the bridge
-      # network). When unset the web serves with the in-memory stand-in.
-      HERDR_CP_RUSTFS_ENDPOINT: "http://rustfs:9000"
-      HERDR_CP_RUSTFS_BUCKET: "${HERDR_CP_RUSTFS_BUCKET:-herdr-artifacts}"
+    # No environment: the process reads only the mounted central file
+    # (--fleet-config): Postgres DSN, host aliases, RustFS/MinIO, API keys, ...
+    volumes:
+      - ${HERDR_CP_FLEET_DIR:?run deploy.sh}:/etc/herdr/fleet:ro
     # The HerdR UI is served at dev.lan:<public-port> (default 80 = plain
     # http://dev.lan). Host bind is the Tailnet interface so only Tailnet
     # clients reach it; container keeps its internal 8080 listener.
     ports:
       - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_CP_WEB_PUBLIC_PORT:-80}:8080"
     # Exec-form command (no shell): host/port are fixed literals; the Postgres
-    # DSN is read from the HERDR_CP_PG_DSN env var (env_file: .env) by the CLI,
-    # so the password never appears in process args.
+    # DSN is read from the mounted fleet file, so the password never appears in
+    # process args or the environment.
     command:
       - "control-plane"
       - "web"
@@ -140,6 +145,8 @@ services:
       - "--web-root"
       - "/app/packages"
       - "--allow-open"
+      - "--fleet-config"
+      - "/etc/herdr/fleet/fleet-config.yaml"
 
   control-plane-worker:
     build:
@@ -147,7 +154,7 @@ services:
       dockerfile: deploy/fabric-stack/Dockerfile
       args:
         GIT_COMMIT: ${HERDR_CP_GIT_COMMIT:-dev}
-    image: herdr-engineering:0.1.0
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-cp-worker
     restart: unless-stopped
     depends_on:
@@ -155,34 +162,37 @@ services:
         condition: service_healthy
       rustfs:
         condition: service_healthy
-    env_file: ${HERDR_CP_ENV_FILE:-.env}
+    # config.yaml defaults and the SQL migrations are baked into the image
+    # (/app/control-plane/): no relative bind mounts, which would resolve into
+    # deploy.sh's temporary worktree and dangle after it is removed.
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
-      # Bundle the SQL migrations into the worker image so it can apply them
-      # on startup regardless of the working directory.
-      - ../../deploy/control-plane/migrations:/app/migrations:ro
+      - ${HERDR_CP_FLEET_DIR:?run deploy.sh}:/etc/herdr/fleet:ro
     environment:
-      HERDR_ENGINEERING_CONFIG: /app/config.yaml
+      HERDR_ENGINEERING_CONFIG: /app/control-plane/config.yaml
     command:
       - "control-plane"
       - "worker"
       - "--migrations"
-      - "/app/migrations"
+      - "/app/control-plane/migrations"
+      - "--fleet-config"
+      - "/etc/herdr/fleet/fleet-config.yaml"
 
   # ---- fabric LLM gateway (project keys + token accounting) --------------------
   # OpenAI-compatible forwarder: agents use a per-project key minted via
-  # POST /api/v1/llm/keys; the single lab API key (FABRIC_LLM_UPSTREAM_KEY in .env)
-  # never leaves this container. Bound to the tailnet interface only; it is NOT
+  # POST /api/v1/llm/keys; the single lab API key (llm.upstream_key in the central
+  # file) never leaves this container. Bound to the tailnet interface only; it is NOT
   # exposed beyond the fabric. Stopgap until the Rust gateway has the `upstream`
   # link role (inferweave-specs spec 63).
   llm-proxy:
-    image: herdr-engineering:0.1.0
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-llm-proxy
     restart: unless-stopped
     depends_on:
       - control-plane-web
-    environment:
-      FABRIC_LLM_UPSTREAM_KEY: "${FABRIC_LLM_UPSTREAM_KEY:?set FABRIC_LLM_UPSTREAM_KEY in .env}"
+    volumes:
+      # ONLY the llm slice (llm + control_plane.llm_proxy, `fleet config render-llm`),
+      # in a directory of its own; the process refuses any file carrying more.
+      - ${HERDR_LLM_SLICE_DIR:?run deploy.sh}:/etc/herdr/llm:ro
     ports:
       - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_LLM_PROXY_PORT:-8088}:8088"
     command:
@@ -194,6 +204,8 @@ services:
       - "8088"
       - "--control-plane"
       - "http://control-plane-web:8080"
+      - "--fleet-config"
+      - "/etc/herdr/llm/llm-config.json"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8088/healthz"]
       interval: 15s
@@ -202,7 +214,7 @@ services:
 
   # ---- dev.lan front door (host network; was deploy/fabric-stack) -------------
   # The worker mounts ./config.yaml (control plane); the fabric services mount
-  # the fabric config from ../fabric-stack. Same project, same .env.
+  # the fabric config from ../fabric-stack. Same project, same rendered substitution file.
   coredns:
     image: coredns/coredns:1.11.4
     container_name: herdr-coredns
@@ -219,6 +231,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/fabric-stack/Dockerfile
+    # Not rolled by deploy.sh: reads no fleet config, and recreating it drops leases.
     image: herdr-engineering:0.1.0
     container_name: herdr-fabric-gateway
     restart: unless-stopped
@@ -238,7 +251,7 @@ services:
       - "--control-port"
       - "29999"
       - "--bind"
-      - "127.0.0.1,${GATEWAY_TAILNET_IP:?set GATEWAY_TAILNET_IP in .env}"
+      - "${GATEWAY_BIND:?run deploy.sh (derived from GATEWAY_TAILNET_IP)}"
       - "--url-base"
       - "dev.lan"
       # The container entrypoint is always PID 1, so a stale gateway.lock from
@@ -247,8 +260,8 @@ services:
       - "--reset-lock"
     healthcheck:
       # The gateway's control API binds the tailnet IP (not loopback), so
-      # probe that address (interpolated from .env).
-      test: ["CMD", "curl", "-fsS", "http://${GATEWAY_TAILNET_IP}:29999/healthz"]
+      # probe that address (substituted from the rendered env file).
+      test: ["CMD", "curl", "-fsS", "http://${GATEWAY_HEALTH_HOST:?run deploy.sh (derived from GATEWAY_TAILNET_IP)}:29999/healthz"]
       interval: 15s
       timeout: 3s
       retries: 3

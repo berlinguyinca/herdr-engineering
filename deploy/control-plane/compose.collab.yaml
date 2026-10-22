@@ -1,21 +1,35 @@
 # Collaboration network (HCN) overlay; layered on by deploy.sh only when
-# ~/.config/herdr-engineering/collab-enabled exists. No secret is configured here:
-# every identifier below (pool, app clients, hosted-UI domain, URL) is public.
+# ~/.config/herdr-engineering/collab-enabled exists. No secret is configured here.
+#
+# Configuration comes from the central fleet file like everything else:
+#   * control_plane.collab (Cognito pool, app clients, group, hosted-UI domain, public URL;
+#     all public identifiers) - deploy.sh renders ONLY that mapping into a
+#     stable 0600 slice (`herdr-eng fleet config render-collab`) which collab-public mounts
+#     read-only and reads with --fleet-config. It never sees the central file itself.
+#   * control_plane.compose (optional keys HERDR_COLLAB_CERT_DIR, HERDR_COLLAB_CERT_UID,
+#     HERDR_COLLAB_EDGE_BIND, HERDR_COLLAB_OPERATOR_PORT (default 9482)) - what docker itself
+#     substitutes below, rendered by deploy.sh.
+#   * HERDR_COLLAB_{CONFIG_DIR,DATA_DIR,SYNC_DIR,EDGE_CONF} are paths deploy.sh exports
+#     (CONFIG_DIR holds only collab-config.json and is mounted as a directory so a
+#     re-render by rename is seen).
 #
 # Isolation model
-#   * The dashboard / operator API (control-plane-web) is NOT touched by this overlay: it stays
-#     bound to the tailnet interface and has no collaboration surface.
+#   * The dashboard / operator API (control-plane-web) stays bound to the tailnet interface; this
+#     overlay only adds --collab-operator-url so it proxies /api/v1/collab/* to collab-public's
+#     operator listener (published by collab-edge on the tailnet IP only).
 #   * collab-public is the only thing the internet reaches. It is its own container from the same
 #     image, started with --collab-only: no Postgres or object-store credentials, no docker
 #     socket, no host mounts except its own data volume, no operator API, a read-only root
 #     filesystem, no capabilities, non-root, resource limits, and a network of its own.
 #   * collab-edge (nginx) terminates TLS, rate-limits and allowlists routes in front of it.
-# Moving hosts: change --collab-public-url and the app client's callback/logout URLs together.
+# Moving hosts: change control_plane.collab.public_url and the app client's callback/logout
+# URLs together.
 name: herdr-control-plane
 
 services:
   # The dashboard talks to the collab service's operator listener so the local owner needs no
-  # sign-in there. Command repeated from compose.yaml with one extra flag.
+  # sign-in there. Command repeated EXACTLY from compose.yaml (compose replaces the whole list)
+  # plus one flag; a test keeps the two in step.
   control-plane-web:
     command:
       - "control-plane"
@@ -27,11 +41,13 @@ services:
       - "--web-root"
       - "/app/packages"
       - "--allow-open"
+      - "--fleet-config"
+      - "/etc/herdr/fleet/fleet-config.yaml"
       - "--collab-operator-url"
       - "http://${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_COLLAB_OPERATOR_PORT:-9482}"
 
   collab-public:
-    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-0.1.0}
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-collab-public
     restart: unless-stopped
     # Deliberately no env_file / environment: nothing from the control-plane stack's secrets.
@@ -40,6 +56,7 @@ services:
       - "control-plane"
       - "web"
       - "--collab-only"
+      - "--collab-require-https"     # fixed property of the public container, not configuration
       - "--host"
       - "127.0.0.1"
       - "--collab-public-port"
@@ -52,26 +69,14 @@ services:
       - "/data/collab.jsonl"
       - "--collab-sync-dir"
       - "/sync"
-      - "--collab-cognito-pool"
-      - "us-west-2_GjtcM0PCp"
-      - "--collab-cognito-client"
-      - "6mcn0idau4b5uhtkd1b2g6c9qg"
-      - "--collab-cognito-group"
-      - "local.dev"
-      - "--collab-cognito-web-client"
-      - "6pccn6slplfe3u30g49fuqbqtv"
-      - "--collab-cognito-domain"
-      - "https://us-west-2gjtcm0pcp.auth.us-west-2.amazoncognito.com"
-      - "--collab-public-url"
-      - "https://localdev.mcp.metabolomics.us/"
-      - "--collab-require-https"
-      # The local owner's no-sign-in listener (reached only through the edge's tailnet-bound port).
+      # pool, clients, group, web client, domain, public URL, operator user/email:
+      # control_plane.collab in the slice below
+      - "--fleet-config"
+      - "/etc/herdr/collab/collab-config.json"
+      # The local owner's no-sign-in listener (reached only through the edge's tailnet-bound
+      # port). The in-container port is fixed; the user comes from the slice.
       - "--collab-operator-port"
       - "8082"
-      - "--collab-operator-user"
-      - "${HERDR_COLLAB_OPERATOR_USER:?set HERDR_COLLAB_OPERATOR_USER (Cognito username) in the env file}"
-      - "--collab-operator-email"
-      - "${HERDR_COLLAB_OPERATOR_EMAIL:-}"
       - "--collab-operator-host"
       - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_COLLAB_OPERATOR_PORT:-9482}"
     read_only: true
@@ -80,6 +85,7 @@ services:
     volumes:
       - ${HERDR_COLLAB_DATA_DIR:?run deploy.sh}:/data
       - ${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/sync:ro   # Cognito keys + members, written by collab-sync.sh
+      - ${HERDR_COLLAB_CONFIG_DIR:?run deploy.sh}:/etc/herdr/collab:ro   # holds only the control_plane.collab slice
     # Internal network: no route out at all (keys and group membership arrive as files), and not on
     # the control-plane network, so it cannot reach postgres/rustfs.
     networks: [collab]
@@ -115,7 +121,7 @@ services:
     volumes:
       # deploy.sh installs this to a stable path (the build worktree is temporary)
       - ${HERDR_COLLAB_EDGE_CONF:?run deploy.sh}:/etc/nginx/nginx.conf:ro
-      - ${HERDR_COLLAB_CERT_DIR:?set HERDR_COLLAB_CERT_DIR in the env file}:/etc/acme:ro
+      - ${HERDR_COLLAB_CERT_DIR:?set control_plane.compose.HERDR_COLLAB_CERT_DIR in the central fleet config}:/etc/acme:ro
     ports:
       - "${HERDR_COLLAB_EDGE_BIND:-127.0.0.1:18444}:8443"
       # Operator listener, tailnet interface only (like the dashboard): no sign-in, local owner.

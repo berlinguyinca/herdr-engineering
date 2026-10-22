@@ -121,7 +121,9 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
                user: str | None = None, ansible_host: str | None = None,
                gateway: str = "http://dev.lan:29999", herdr_bin: str = "herdr",
                attach: bool = True, provision: bool = True,
-               inventory: Path | None = None, host_vars_dir: Path | None = None) -> dict:
+               inventory: Path | None = None, host_vars_dir: Path | None = None,
+               fleet_config: Path | None = None, roles: list[str] | None = None,
+               control_plane_url: str | None = None) -> dict:
     """One command: attach via herdr + add to inventory + converge + verify.
 
     Returns a JSON-serializable report.
@@ -159,6 +161,23 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
     except Exception as exc:
         report["steps"]["inventory"] = {"ok": False, "error": str(exc)}
         report["errors"] = [f"inventory update failed: {exc}"]
+
+    # 2b) fleet-config credentials (opt-in via ``fleet_config``): install the
+    # token on the target FIRST, only then persist its hash, so a failed ssh
+    # leaves the central file unchanged. The token is never reported.
+    if fleet_config is not None:
+        from . import fleet_config_cli as fcc
+        if not Path(fleet_config).exists():
+            report["steps"]["config"] = {"ok": True, "skipped": f"{fleet_config} does not exist"}
+        else:
+            try:
+                rep = fcc.issue_host_credentials(Path(fleet_config), host, ssh_target,
+                                                 roles=roles,
+                                                 control_plane_url=control_plane_url)
+                report["steps"]["config"] = {"ok": True, "host": host, "token": fcc.TOKEN_PLACEHOLDER}
+            except Exception as exc:
+                report["steps"]["config"] = {"ok": False, "error": str(exc)}
+                report.setdefault("errors", []).append(f"fleet config credentials failed: {exc}")
 
     # 3) converge herdr-eng + fabric agent + build-gate on the host
     if provision:

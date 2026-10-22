@@ -29,6 +29,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from ..version import __version__
 from .redact import redact_payload
 
+# Routes a host-side tool (session run, plannotator bridge) may POST with the
+# narrow `agent` role, besides /api/v1/ingest. Nothing else.
+_AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
+                        r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
 # back to "dev" in a local checkout / un-stamped image.
 _COMMIT = os.environ.get("HERDR_ENGINEERING_COMMIT", "dev")
@@ -110,6 +114,9 @@ class _RateLimiter:
             return True
 
 
+_FLEET_CONFIG_PATH = "/api/v1/fleet/config"
+
+
 class ControlPlaneServer:
     """Structured control-plane API + SSE + static web server."""
 
@@ -117,10 +124,10 @@ class ControlPlaneServer:
                  port=0, web_root=None, source=None, allow_open=False,
                  rustfs=None, dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
-                 collab_require_https=False, public_port=None, public_host=None,
-                 collab_only=False, operator_port=None, operator_user=None,
-                 operator_email=None, operator_hosts=(), collab_operator_url=None,
-                 collab_dashboard_hosts=()):
+                 collab_require_https=False, fleet_config=None, ci_actions=False,
+                 public_port=None, public_host=None, collab_only=False,
+                 operator_port=None, operator_user=None, operator_email=None,
+                 operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=()):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -136,7 +143,8 @@ class ControlPlaneServer:
         self.repo = repo
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
-                                    repo.record_event("ci_pipeline", key, event, row))
+                                    repo.record_event("ci_pipeline", key, event, row),
+                                    actions_enabled=ci_actions)
         if github_monitor is None:
             from ..github import GitHubMonitor
             github_monitor = GitHubMonitor()
@@ -172,9 +180,9 @@ class ControlPlaneServer:
         if not self._keys and not _is_loopback(host) and not allow_open:
             raise ValueError(
                 "refusing to bind an unauthenticated control plane to a "
-                f"non-loopback address {host!r}; configure --api-keys / "
-                "HERDR_CP_API_KEYS, or pass --allow-open to trust the "
-                "Tailnet boundary (Spec §104)")
+                f"non-loopback address {host!r}; configure keys in the central "
+                "fleet config (control_plane.api_keys) or --api-keys, or pass "
+                "--allow-open to trust the Tailnet boundary (Spec §104)")
         # HCN (feature-flagged, off by default). Bearer credentials must never
         # cross a network in clear text, so a non-loopback bind needs an explicit
         # assertion that TLS is terminated in front of this server.
@@ -184,6 +192,7 @@ class ControlPlaneServer:
                 "refusing to enable collaboration on non-loopback address "
                 f"{host!r} without collab_tls_terminated (bearer credentials "
                 "require TLS)")
+        self.fleet_config = fleet_config
         self.collab = collab
         self.collab_require_https = collab_require_https
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
@@ -384,7 +393,8 @@ def _make_handler(server, public=False, operator=False):
 
             Role model (Spec §104): viewer = read-only; operator = read +
             mutate; ingest = read + POST /api/v1/ingest only (read-only
-            everywhere else). Unknown roles are treated as viewer (fail-closed
+            everywhere else); agent = ingest plus exactly the host-side tool routes
+            (LLM key mint/revoke, review create/result). Unknown roles are treated as viewer (fail-closed
             for mutations).
 
             The return value MUST be truthy on refusal: callers do
@@ -402,9 +412,12 @@ def _make_handler(server, public=False, operator=False):
                 if (role == "ingest" and self.command == "POST"
                         and path == "/api/v1/ingest"):
                     return None
+                if (role == "agent" and self.command == "POST"
+                        and (path == "/api/v1/ingest" or _AGENT_POST.match(path))):
+                    return None
                 return self._deny(403, "read-only")
             if min_role == "ingest":
-                if role in ("operator", "ingest"):
+                if role in ("operator", "ingest", "agent"):
                     return None
                 return self._deny(403, "read-only")
             return None
@@ -514,6 +527,13 @@ def _make_handler(server, public=False, operator=False):
                 return self._public()
             if self._is_collab_path():
                 return self._collab()
+            if self._path_only() == _FLEET_CONFIG_PATH:
+                return self._fleet_config_get()
+            if self._path_only() == "/api/v1/health" and self._role() is None:
+                # Keyed mode without a valid key: liveness only (deploy.sh's health
+                # check needs status + commit), no counters, sources or capabilities.
+                h = server._health()
+                return self._json({k: h.get(k) for k in ("status", "version", "commit")})
             err = self._require("viewer")
             if err:
                 return err
@@ -528,6 +548,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._public()
             if self._is_collab_path():
                 return self._collab()
+            if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
+                return self._fleet_config_applied()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -546,6 +568,47 @@ def _make_handler(server, public=False, operator=False):
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._send_json(404, {"error": "not found"})
+
+        # ------------------------------------------------ fleet config (hosts)
+        def _path_only(self):
+            return self.path.split("?")[0].rstrip("/")
+
+        def _fleet_host(self, cfg):
+            """Host id owning the X-Host-Token in ``cfg``, or None. Never reveals why.
+            Callers pass ONE snapshot per request, so a reload between the token
+            check and the slice cannot hand out (or fail on) a different file."""
+            token = self.headers.get("X-Host-Token", "")
+            return cfg.host_for_token(token) if token else None
+
+        def _fleet_config_get(self):
+            """Host endpoints bypass the X-API-Key gate on purpose: the per-host
+            token is their credential, and an operator key grants no host slice."""
+            store = server.fleet_config
+            if store is None:
+                return self._deny(404, "not found")
+            cfg = store.current()
+            host = self._fleet_host(cfg)
+            if host is None:
+                return self._deny(401, "unauthorized")
+            return self._json({"revision": cfg.revision, "values": cfg.slice_for(host)})
+
+        def _fleet_config_applied(self):
+            store = server.fleet_config
+            if store is None:
+                return self._deny(404, "not found")
+            host = self._fleet_host(store.current())
+            if host is None:
+                return self._deny(401, "unauthorized")
+            try:
+                body = self._read_json()
+            except ValueError as exc:
+                return self._deny(400, str(exc))
+            if (not isinstance(body, dict) or body.get("host_id") != host
+                    or not isinstance(body.get("revision"), str)
+                    or not body["revision"] or len(body["revision"]) > 64):
+                return self._deny(401, "unauthorized")
+            store.record_applied(host, body["revision"])
+            return self._json({"ok": True})
 
         # --------------------------------------------------- collaboration (HCN)
         def _is_collab_path(self):
@@ -807,6 +870,10 @@ def _make_handler(server, public=False, operator=False):
                     # catalog projection is most of the bytes of a large inventory.
                     services = [{k: s.get(k) for k in _FEED_SERVICE_FIELDS} for s in services]
                 return self._json({"services": services, "summary": summary})
+            if resource == "fleet" and parts[4:] == ["config", "status"]:
+                if server.fleet_config is None:
+                    return self._json({"error": "not found"}, 404)
+                return self._json(server.fleet_config.status())
             if resource == "fleet" and len(parts) == 5 and parts[4] == "inventory":
                 return self._json(r.fleet_inventory())
             if resource == "hosts":

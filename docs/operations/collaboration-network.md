@@ -110,7 +110,31 @@ Coworkers need only a browser and Claude Code; nobody joins the tailnet. All of 
 |---|---|---|
 | Dashboard / operator API | `herdr-cp-web` (unchanged, no collab code path) | tailnet interface only |
 | Collaboration site + MCP | `herdr-collab-public` (`web --collab-only`) | only the edge, on its own `collab` network |
-| TLS edge | `herdr-collab-edge` (nginx) | published port (`HERDR_COLLAB_EDGE_BIND`) |
+| TLS edge | `herdr-collab-edge` (nginx) | published port (`control_plane.compose.HERDR_COLLAB_EDGE_BIND`) |
+
+**Configuration** comes from the central fleet file (`~/.config/herdr-engineering/fleet/fleet-config.yaml`,
+see `deploy/control-plane/fleet-config.example.yaml`); no env file is authored:
+
+- `control_plane.collab` - `cognito_pool`, `cognito_clients`, `cognito_group`, `cognito_web_client`,
+  `cognito_domain`, `public_url`, `operator_user` (required: the Cognito username the
+  dashboard's no-sign-in collaboration acts as) and optional `operator_email` (public identifiers only; `--collab-require-https` is fixed in
+  the compose file, not configurable). `deploy.sh` renders
+  just this mapping to `~/.config/herdr-engineering/collab/collab-config.json` (0600,
+  `herdr-eng fleet config render-collab`); `herdr-collab-public` mounts that directory (which holds
+  only the slice) read-only at `/etc/herdr/collab/` and reads the file with `--fleet-config`. It refuses to start if that file carries anything else (a DSN, API keys),
+  so the central file itself can never be mounted there. Unknown `collab` keys are rejected.
+- `control_plane.compose` - optional `HERDR_COLLAB_CERT_DIR` (required once collab is on),
+  `HERDR_COLLAB_CERT_UID` (owner of the certs, the data dir and the slice; default 1000) and
+  `HERDR_COLLAB_EDGE_BIND` (default `127.0.0.1:18444`) and `HERDR_COLLAB_OPERATOR_PORT` (default
+  9482; the operator listener, published on `HERDR_CP_WEB_BIND` only).
+- `collab-sync.sh` reads the pool and group from the same slice (`--config`) and copies the edge
+  certificate into `HERDR_COLLAB_CERT_DIR` (`--cert-dir`, passed by `deploy.sh`); `deploy.sh`
+  installs it, its 1-minute timer and the certificate renew timer. Each run first provisions the
+  people `operator_user` invited into the group (`collab-provision.py`, operator/pool/group from
+  the slice, collab-public's log from `--data-dir`). See
+  `deploy/control-plane/COLLAB.md`.
+
+Collab is optional: without the marker none of these keys are needed.
 
 `herdr-collab-public` has no database or object-store credentials, no docker socket, no operator API,
 a read-only root filesystem, no capabilities, resource limits, and one writable mount: its append-only
@@ -119,7 +143,7 @@ only `/api/v1/collab/*`, `/mcp` and an allowlist of static files; the edge enfor
 TLS, rate and connection limits and a 64 KB body cap.
 
 - **Certificate:** certbot lineage `localdev.mcp.metabolomics.us` (DNS-01, Route53) in the host's acme dir
-  (`HERDR_COLLAB_CERT_DIR` in the env file); the renewal hook also reloads the edge.
+  (`control_plane.compose.HERDR_COLLAB_CERT_DIR` in the central file); the renewal hook also reloads the edge.
 - **Router:** a hostname rule on the router sends `localdev.mcp.metabolomics.us` to the edge's published port.
 - **Sign-in:** Cognito Hosted UI (app client `herdr-collab-web`); access requires the `local.dev` group.
   Removing someone takes effect at token expiry (at most 1 hour).
@@ -129,4 +153,4 @@ TLS, rate and connection limits and a 64 KB body cap.
 - **MCP tools** (`rooms_list`, `room_read`, `room_post`, `agents_list`) only touch rooms the owner granted.
   Room content is returned wrapped as UNTRUSTED. No tool executes anything.
 - Collaboration events written before this split live in the dashboard's Postgres and are not migrated.
-- Moving hosts: change `--collab-public-url`, the app client callback/logout URLs and the router rule.
+- Moving hosts: change `control_plane.collab.public_url`, the app client callback/logout URLs and the router rule.
