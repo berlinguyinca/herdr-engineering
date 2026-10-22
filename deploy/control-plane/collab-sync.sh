@@ -9,13 +9,17 @@
 # one certbot lineage. Paths are flags (no environment): deploy.sh passes --cert-dir from
 # control_plane.compose.HERDR_COLLAB_CERT_DIR (the directory collab-edge mounts), and install
 # writes every flag into the units' ExecStart.
-# Usage: collab-sync.sh once|install|renew-check [--config SLICE] [--dir SYNC_DIR]
+# The operator invite provisioner (collab-provision.py) gets the operator, pool and group from
+# the same slice, and reads collab-public's log under --data-dir (the directory collab-public
+# mounts at /data; deploy.sh passes it).
+# Usage: collab-sync.sh once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR]
 #          [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]
 set -euo pipefail
-USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]"
+USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]"
 ACTION="${1:-once}"; [ $# -gt 0 ] && shift
 CONFIG="$HOME/.config/herdr-engineering/collab/collab-config.json"
 DIR="$HOME/.local/share/herdr-engineering/collab-sync"
+DATA_DIR="$HOME/.local/share/herdr-engineering/collab"
 CERT_DIR="$HOME/.local/share/herdr-engineering/collab-edge-certs"
 CERT_NAME="localdev.mcp.metabolomics.us"
 ACME="$HOME/.local/share/inferweave/bender-failover/acme"
@@ -24,6 +28,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config needs a value}"; shift 2 ;;
     --dir) DIR="${2:?--dir needs a value}"; shift 2 ;;
+    --data-dir) DATA_DIR="${2:?--data-dir needs a value}"; shift 2 ;;
     --cert-dir) CERT_DIR="${2:?--cert-dir needs a value}"; shift 2 ;;
     --cert-src) CERT_SRC="${2:?--cert-src needs a value}"; shift 2 ;;
     --acme-dir) ACME="${2:?--acme-dir needs a value}"; shift 2 ;;
@@ -34,15 +39,27 @@ while [ $# -gt 0 ]; do
 done
 CERT_SRC="${CERT_SRC:-$ACME/config/live/$CERT_NAME}"
 CERTBOT="${CERTBOT:-$ACME/../acme-venv/bin/certbot}"
-read -r POOL GROUP < <(python3 - "$CONFIG" <<'PY'
+read -r POOL GROUP OPERATOR < <(python3 - "$CONFIG" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["collab"]
-print(c["cognito_pool"], c.get("cognito_group") or "local.dev")
+print(c["cognito_pool"], c.get("cognito_group") or "local.dev", c.get("operator_user") or "")
 PY
 ) || { echo "cannot read control_plane.collab from $CONFIG (run deploy.sh)" >&2; exit 1; }
 REGION="${POOL%%_*}"
 
+# People the operator invites are added to the group here, on the host, because the public
+# container has no AWS credentials. Runs first so a new member shows up in this very refresh.
+provision() {
+  local p; p="$(dirname "$0")/collab-provision.py"
+  [ -f "$p" ] || p="$HOME/.local/share/herdr-engineering/collab-provision.py"
+  [ -f "$p" ] || return 0
+  [ -n "$OPERATOR" ] || return 0
+  timeout 120 python3 "$p" --operator "$OPERATOR" --pool "$POOL" --group "$GROUP" --data-dir "$DATA_DIR" || echo "WARNING: collab-provision failed; membership refresh continues" >&2
+}
+
 once() {
+  exec 9>"${DIR}.lock"; flock -n 9 || { echo "another collab-sync is running" >&2; return 0; }   # no overlapping runs
+  provision
   mkdir -p "$DIR"; chmod 755 "$DIR"
   local tmp; tmp="$(mktemp -d "$DIR/.tmp.XXXXXX")"; trap 'rm -rf "$tmp"' RETURN
   curl -fsS -m 10 "https://cognito-idp.${REGION}.amazonaws.com/${POOL}/.well-known/jwks.json" -o "$tmp/jwks.json"
@@ -114,12 +131,13 @@ certbot_dry_run() {   # proves the renewal path end to end against Let's Encrypt
 install_timer() {
   local u="$HOME/.config/systemd/user" bin="$HOME/.local/share/herdr-engineering/collab-sync.sh"
   mkdir -p "$u"; install -m 0755 "$0" "$bin"   # stable copy: deploy.sh runs from a temporary worktree
+  install -m 0755 "$(dirname "$0")/collab-provision.py" "$HOME/.local/share/herdr-engineering/collab-provision.py"
   cat > "$u/herdr-collab-sync.service" <<UNIT
 [Unit]
 Description=Refresh collab Cognito membership and keys
 [Service]
 Type=oneshot
-ExecStart="$bin" once --config "$CONFIG" --dir "$DIR" --cert-dir "$CERT_DIR" --cert-src "$CERT_SRC"
+ExecStart="$bin" once --config "$CONFIG" --dir "$DIR" --data-dir "$DATA_DIR" --cert-dir "$CERT_DIR" --cert-src "$CERT_SRC"
 UNIT
   cat > "$u/herdr-collab-sync.timer" <<UNIT
 [Unit]

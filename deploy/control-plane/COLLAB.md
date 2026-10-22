@@ -52,6 +52,13 @@ These were applied by hand on bender; reapply them on a new host.
    renews only that lineage. The certbot paths are script defaults, overridable with
    `--cert-src`, `--acme-dir`, `--certbot` and `--cert-name` (no environment variables);
    `collab-sync.sh renew-check` runs a certbot dry run.
+4. Invited people: each minute run first calls `collab-provision.py` (host-side, with the host's
+   AWS credentials), which adds the people `control_plane.collab.operator_user` invited to
+   `cognito_group`, creating their Cognito account if needed. The operator, pool and group come
+   from the slice, and the log is read from collab-public's data dir (`--data-dir`, passed by
+   deploy.sh). Policy is flags with defaults, not configuration: `--no-auto-create`, `--domain`
+   (repeatable allow-list), `--max-per-day` (default 5), `--ledger-dir`. The ledger
+   (`~/.local/share/herdr-engineering/collab-provision/ledger.jsonl`) is the audit trail.
 
 ## Verify
 

@@ -125,7 +125,9 @@ see `deploy/control-plane/fleet-config.example.yaml`); no env file is authored:
   9482; the operator listener, published on `HERDR_CP_WEB_BIND` only).
 - `collab-sync.sh` reads the pool and group from the same slice (`--config`) and copies the edge
   certificate into `HERDR_COLLAB_CERT_DIR` (`--cert-dir`, passed by `deploy.sh`); `deploy.sh`
-  installs it, its 1-minute timer and the certificate renew timer. See
+  installs it, its 1-minute timer and the certificate renew timer. Each run first provisions the
+  people `operator_user` invited into the group (`collab-provision.py`, operator/pool/group from
+  the slice, collab-public's log from `--data-dir`). See
   `deploy/control-plane/COLLAB.md`.
 
 Collab is optional: without the marker none of these keys are needed.
