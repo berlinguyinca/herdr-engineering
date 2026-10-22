@@ -3,7 +3,8 @@
 Agent summaries are disabled by default. Enabling them requires an explicit model
 endpoint and alias. The service below runs the official Qwen2.5 1.5B Instruct Q4_K_M model on
 CPU, inside the control-plane Docker bridge, with no published host port. It has
-one inference slot, a four-CPU limit, 3 GiB memory limit and an 8192-token context.
+one inference slot, a four-CPU limit, 3 GiB memory limit, 256 MiB prompt cache
+and an 8192-token context.
 Summary work is asynchronous and cached; opening an agent does not wait for an
 inference request. Measure response time on the deployment host before choosing
 request timeout and output limits. Initial short synthetic conversations measured
@@ -94,3 +95,7 @@ supports summaries while an older release simply ignores that configuration.
 
 Official artifacts: [Qwen model repository](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF)
 and [llama.cpp server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md).
+
+The prompt cache is explicitly bounded with `--cache-ram 256`. The pinned runtime
+defaults to an 8192 MiB cache, which exceeds this container's entire memory limit.
+Verify the cap remains present when upgrading the runtime.

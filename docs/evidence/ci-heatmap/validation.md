@@ -35,3 +35,5 @@ Provider history is a bounded, memory-only cache rebuilt after restart. Coverage
 - Ruff, JavaScript syntax and diff checks passed. Independent code review: APPROVE; architecture: CLEAR.
 - Live release proof follows after deployment.
 
+
+Main advanced with PR151 (summary-server Compose bounds only) after the full suites. It was merged without conflicts before release; **59 focused Python tests** (including the updated summary deployment contract, CI history/API and correlation) and **22 model/controller tests** passed on the combined tree.
