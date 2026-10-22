@@ -56,7 +56,7 @@ def _config(central, envfile, *files, fmt=None, extra_env=None):
     for f in files:
         cmd += ["-f", str(CP / f)]
     cmd += ["config"] + (["--format", fmt] if fmt else ["-q"])
-    env = dict(os.environ, HERDR_CP_FLEET_CONFIG_FILE=str(central), HERDR_CP_IMAGE_TAG="t",
+    env = dict(os.environ, HERDR_CP_FLEET_DIR=str(central.parent), HERDR_CP_IMAGE_TAG="t",
                HERDR_CP_GIT_COMMIT="t", **(extra_env or {}))
     return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
 
@@ -77,9 +77,9 @@ def test_rendered_env_validates_with_the_collab_overlay(tmp_path):
     central.unlink()
     fcc.write_private_file(central, yaml.safe_dump(data, sort_keys=False))
     fcc.render_compose(load_fleet_config(central), envfile)
-    slice_ = tmp_path / "collab-config.json"
+    slice_ = tmp_path / "collab" / "collab-config.json"
     fcc.render_collab(load_fleet_config(central), slice_)
-    extra = {"HERDR_COLLAB_CONFIG_FILE": str(slice_), "HERDR_COLLAB_DATA_DIR": str(tmp_path / "data"),
+    extra = {"HERDR_COLLAB_CONFIG_DIR": str(slice_.parent), "HERDR_COLLAB_DATA_DIR": str(tmp_path / "data"),
              "HERDR_COLLAB_SYNC_DIR": str(tmp_path / "sync"),
              "HERDR_COLLAB_EDGE_CONF": str(CP / "collab-edge" / "nginx.conf")}
     r = _config(central, envfile, "compose.yaml", "compose.collab.yaml", extra_env=extra)
@@ -87,12 +87,12 @@ def test_rendered_env_validates_with_the_collab_overlay(tmp_path):
     model = json.loads(_config(central, envfile, "compose.yaml", "compose.collab.yaml", fmt="json",
                                extra_env=extra).stdout)
     cmd = model["services"]["control-plane-web"]["command"]
-    assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/fleet-config.yaml"
+    assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/fleet/fleet-config.yaml"
     assert not [a for a in cmd if a.startswith("--collab")]
     pub = model["services"]["collab-public"]
-    assert pub["command"][pub["command"].index("--fleet-config") + 1] == "/etc/herdr/collab-config.yaml"
+    assert pub["command"][pub["command"].index("--fleet-config") + 1] == "/etc/herdr/collab/collab-config.json"
     sources = {v["source"] for v in pub["volumes"]}
-    assert str(slice_) in sources and str(central) not in sources
+    assert str(slice_.parent) in sources and str(central.parent) not in sources
     assert not pub.get("environment")
     edge = model["services"]["collab-edge"]
     assert any(v["source"] == str(tmp_path / "acme") for v in edge["volumes"])

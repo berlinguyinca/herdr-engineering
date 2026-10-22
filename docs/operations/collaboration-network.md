@@ -108,15 +108,15 @@ Coworkers need only a browser and Claude Code; nobody joins the tailnet. All of 
 | Collaboration site + MCP | `herdr-collab-public` (`web --collab-only`) | only the edge, on its own `collab` network |
 | TLS edge | `herdr-collab-edge` (nginx) | published port (`control_plane.compose.HERDR_COLLAB_EDGE_BIND`) |
 
-**Configuration** comes from the central fleet file (`~/.config/herdr-engineering/fleet-config.yaml`,
+**Configuration** comes from the central fleet file (`~/.config/herdr-engineering/fleet/fleet-config.yaml`,
 see `deploy/control-plane/fleet-config.example.yaml`); no env file is authored:
 
 - `control_plane.collab` - `cognito_pool`, `cognito_clients`, `cognito_group`, `cognito_web_client`,
   `cognito_domain`, `public_url` (public identifiers only; `--collab-require-https` is fixed in
   the compose file, not configurable). `deploy.sh` renders
   just this mapping to `~/.config/herdr-engineering/collab/collab-config.json` (0600,
-  `herdr-eng fleet config render-collab`); `herdr-collab-public` mounts it read-only and reads it
-  with `--fleet-config`. It refuses to start if that file carries anything else (a DSN, API keys),
+  `herdr-eng fleet config render-collab`); `herdr-collab-public` mounts that directory (which holds
+  only the slice) read-only at `/etc/herdr/collab/` and reads the file with `--fleet-config`. It refuses to start if that file carries anything else (a DSN, API keys),
   so the central file itself can never be mounted there. Unknown `collab` keys are rejected.
 - `control_plane.compose` - optional `HERDR_COLLAB_CERT_DIR` (required once collab is on),
   `HERDR_COLLAB_CERT_UID` (owner of the certs, the data dir and the slice; default 1000) and

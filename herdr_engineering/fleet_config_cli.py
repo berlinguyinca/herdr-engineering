@@ -1,8 +1,15 @@
-"""Operator tooling for the central fleet config: init, validate, token,
+"""Operator tooling for the central fleet config: init, validate, token, revoke,
 render-compose, render-collab, and the host-credential helpers `fleet join` shares.
 
 Secrets are never printed, never placed in argv, and every file that holds one
 is created 0600 atomically (os.open with the mode, then rename).
+
+Layout: the central file lives alone in a dedicated 0700 directory
+(``~/.config/herdr-engineering/fleet/fleet-config.yaml``). deploy.sh bind-mounts
+that DIRECTORY read-only, so a rename-replace (our atomic writes, ``sed -i``, vim)
+is visible inside the containers; a single-file mount would keep the old inode.
+Dated backups go to the sibling ``fleet-backups/`` directory (never into the
+mounted one), newest ``BACKUP_KEEP`` kept. Rewriting the YAML drops comments.
 """
 from __future__ import annotations
 
@@ -23,7 +30,10 @@ import yaml
 from .fleet_config import (CONTROL_PLANE_SECTION, SCHEMA_VERSION, FleetConfig,
                            FleetConfigError, _parse, load_fleet_config)
 
-DEFAULT_CONFIG_PATH = Path("~/.config/herdr-engineering/fleet-config.yaml")
+DEFAULT_CONFIG_PATH = Path("~/.config/herdr-engineering/fleet/fleet-config.yaml")
+# Where the file lived before it got its own directory: init leaves a symlink here.
+LEGACY_CONFIG_PATH = Path("~/.config/herdr-engineering/fleet-config.yaml")
+BACKUP_KEEP = 10
 HOST_JSON_REL = ".config/herdr-engineering/host.json"
 LOCAL_TARGET = "local"
 TOKEN_PLACEHOLDER = "<written to host>"
@@ -66,25 +76,6 @@ def write_private_file(path: Path, data: str | bytes, *, exclusive: bool = False
         except OSError:
             pass
         raise
-
-
-def write_in_place(path: Path, data: str | bytes) -> None:
-    """Replace the content of an existing file WITHOUT changing its inode, so a
-    single-file bind mount of it (the control-plane container) sees the update.
-    Mode is forced to 0600. A reader may briefly see a torn file; the fleet-config
-    store keeps its last good copy in that case."""
-    raw = data.encode() if isinstance(data, str) else data
-    fd = os.open(path, os.O_WRONLY)
-    try:
-        os.fchmod(fd, 0o600)
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        view = memoryview(raw)
-        while view:
-            view = view[os.write(fd, view):]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 # --------------------------------------------------------------------------
@@ -344,9 +335,28 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     }
     _parse(data)
     compose_env(_parse(data))  # reject unrepresentable values before writing
+    created = not path.parent.exists()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if created:
+        os.chmod(path.parent, 0o700)
     write_private_file(path, yaml.safe_dump(data, sort_keys=False), exclusive=True)
     load_fleet_config(path)  # final check of what is on disk
+    _link_legacy_path(path)
     return path
+
+
+def _link_legacy_path(path: Path) -> None:
+    """When the file is created at the default location, leave a relative symlink at
+    the old path (if nothing is there) so tools pointed at it keep working."""
+    if path != _expand(DEFAULT_CONFIG_PATH):
+        return
+    legacy = _expand(LEGACY_CONFIG_PATH)
+    if os.path.lexists(legacy):
+        return
+    try:
+        os.symlink(os.path.relpath(path, legacy.parent), legacy)
+    except OSError:
+        pass  # a convenience only
 
 
 # --------------------------------------------------------------------------
@@ -384,33 +394,73 @@ def install_host_json(target: str, payload: dict, *, runner: Callable | None = N
                                f"{(proc.stderr or '').strip()[-200:]}")
 
 
-def _backup(path: Path) -> Path | None:
+def backup_dir(path: Path) -> Path:
+    """``<dir>-backups`` beside the file's directory (``fleet`` -> ``fleet-backups``):
+    never inside the directory deploy.sh mounts into the containers."""
+    real = Path(os.path.realpath(_expand(path)))
+    return real.parent.with_name(real.parent.name + "-backups")
+
+
+def _private_dir(d: Path) -> Path:
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+def _backup(path: Path, keep: int = BACKUP_KEEP) -> Path | None:
+    """Dated 0600 copy in backup_dir(path); prunes all but the newest ``keep``."""
     if not path.exists():
         return None
+    d = _private_dir(backup_dir(path))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    dest = path.with_name(f"{path.name}.bak-{stamp}")
+    dest = d / f"{path.name}.bak-{stamp}"
     write_private_file(dest, path.read_bytes())
+    olds = sorted(d.glob(f"{path.name}.bak-*"))  # the stamp sorts chronologically
+    for stale in olds[:-keep] if keep > 0 else olds:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
     return dest
 
 
-def set_host(path: Path, host_id: str, token_sha256: str, roles: list[str] | None = None) -> None:
-    """Add or replace ``host_id``'s hash in the file (backup first, validated, written in place so the inode survives)."""
-    path = _expand(path)
-    lock = path.with_name(path.name + ".lock")
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _edit_central(path: Path, mutate: Callable[[dict], None]) -> Path | None:
+    """Locked read-modify-write of the central file: validate before and after,
+    dated backup, then an atomic write-new + fsync + rename onto the REAL file
+    (symlinks resolved, so the compatibility link stays a link). Returns the backup."""
+    real = Path(os.path.realpath(_expand(path)))
+    lock = _private_dir(backup_dir(real)) / ".fleet-config.lock"
     with open(os.open(lock, os.O_RDWR | os.O_CREAT, 0o600), "r+") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
-        load_fleet_config(path)  # refuses unsafe/invalid input
-        data = yaml.safe_load(path.read_text())
+        load_fleet_config(real)  # refuses unsafe/invalid input
+        data = yaml.safe_load(real.read_text())
+        mutate(data)
+        _parse(data)
+        dest = _backup(real)
+        write_private_file(real, yaml.safe_dump(data, sort_keys=False))
+        return dest
+
+
+def set_host(path: Path, host_id: str, token_sha256: str, roles: list[str] | None = None) -> None:
+    """Add or replace ``host_id``'s hash in the file (backup first, validated, atomic rename)."""
+    def mutate(data: dict) -> None:
         hosts = data.setdefault("hosts", {})
         old = hosts.get(host_id) or {}
-        entry = {"roles": list(roles) if roles is not None else list(old.get("roles", ["host"])),
-                 "token_sha256": token_sha256,
-                 "overrides": old.get("overrides", {})}
-        hosts[host_id] = entry
-        _parse(data)
-        _backup(path)
-        write_in_place(path, yaml.safe_dump(data, sort_keys=False))
+        hosts[host_id] = {"roles": list(roles) if roles is not None else list(old.get("roles", ["host"])),
+                          "token_sha256": token_sha256,
+                          "overrides": old.get("overrides", {})}
+    _edit_central(path, mutate)
+
+
+def revoke_host(path: Path, host_id: str) -> Path | None:
+    """Remove ``host_id`` (its token stops working on the server's next read).
+    Backup first, validated, atomic rename. Returns the backup path."""
+    def mutate(data: dict) -> None:
+        hosts = data.get("hosts")
+        if not isinstance(hosts, dict) or host_id not in hosts:
+            raise FleetConfigError(f"unknown host: {host_id}")
+        del hosts[host_id]
+    return _edit_central(path, mutate)
 
 
 def issue_host_credentials(config_path: Path, host_id: str, target: str, *,

@@ -28,8 +28,12 @@ def no_prompt(*_a):
 
 
 def make(tmp_path):
-    return fcc.init_config(tmp_path / "fleet-config.yaml", dict(ANSWERS), prompt=no_prompt,
+    return fcc.init_config(tmp_path / "fleet" / "fleet-config.yaml", dict(ANSWERS), prompt=no_prompt,
                            secret_prompt=no_prompt)
+
+
+def backups(tmp_path):
+    return sorted((tmp_path / "fleet-backups").glob("fleet-config.yaml.bak-*"))
 
 
 def parse_env_file(text):
@@ -161,8 +165,9 @@ def test_join_adds_host_and_never_prints_token_in_report(tmp_path, monkeypatch):
     assert cfg.host_for_token(token) == "newbox"
     assert cfg.status()["hosts"]["newbox"] == ["host"]
     assert mode(p) == 0o600
-    baks = list(tmp_path.glob("fleet-config.yaml.bak-*"))
+    baks = backups(tmp_path)
     assert len(baks) == 1 and mode(baks[0]) == 0o600
+    assert sorted(os.listdir(p.parent)) == ["fleet-config.yaml"]   # the mounted dir holds only the file
 
 
 def test_failed_ssh_leaves_file_unchanged(tmp_path, monkeypatch):
@@ -171,7 +176,7 @@ def test_failed_ssh_leaves_file_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(fcc.subprocess, "run", FakeSSH(rc=255))
     with pytest.raises(FleetConfigError):
         fcc.issue_host_credentials(p, "bender", "bender")
-    assert p.read_bytes() == before and not list(tmp_path.glob("*.bak-*"))
+    assert p.read_bytes() == before and not backups(tmp_path)
 
 
 def test_token_rotates_existing_host_and_local_target(tmp_path, monkeypatch):
@@ -328,17 +333,67 @@ def test_example_file_matches_what_the_code_requires():
     assert "rustfs_access_key" not in vals and "rustfs_secret_key" not in vals
 
 
-def test_set_host_writes_in_place_keeping_inode_and_mode(tmp_path):
+def test_set_host_writes_atomically_with_backup_outside_the_mounted_dir(tmp_path):
     p = make(tmp_path)
     before = os.stat(p)
     fcc.set_host(p, "bender", "a" * 64)
     after = os.stat(p)
-    assert (after.st_ino, after.st_dev) == (before.st_ino, before.st_dev)
-    assert mode(p) == 0o600
+    assert after.st_ino != before.st_ino          # write-new + rename (a dir mount sees it)
+    assert mode(p) == 0o600 and mode(p.parent) == 0o700
     assert load_fleet_config(p).status()["hosts"]["bender"] == ["builder"]
     assert yaml.safe_load(p.read_text())["hosts"]["bender"]["token_sha256"] == "a" * 64
-    backups = list(tmp_path.glob("fleet-config.yaml.bak-*"))
-    assert len(backups) == 1 and mode(backups[0]) == 0o600
-    # a second write still keeps the inode
-    fcc.set_host(p, "mac", "b" * 64)
-    assert os.stat(p).st_ino == before.st_ino
+    baks = backups(tmp_path)
+    assert len(baks) == 1 and mode(baks[0]) == 0o600
+    assert mode(tmp_path / "fleet-backups") == 0o700
+    assert sorted(os.listdir(p.parent)) == ["fleet-config.yaml"]   # no lock, no backup, no tmp
+
+
+def test_write_through_the_compat_symlink_keeps_it_a_symlink(tmp_path):
+    p = make(tmp_path)
+    link = tmp_path / "fleet-config.yaml"
+    link.symlink_to(os.path.relpath(p, tmp_path))
+    fcc.set_host(link, "bender", "c" * 64)
+    assert link.is_symlink() and os.path.realpath(link) == str(p)
+    assert yaml.safe_load(p.read_text())["hosts"]["bender"]["token_sha256"] == "c" * 64
+    assert len(backups(tmp_path)) == 1
+
+
+def test_backups_keep_only_the_newest_ten(tmp_path):
+    p = make(tmp_path)
+    for i in range(13):
+        fcc.set_host(p, "bender", f"{i:064x}")
+    baks = backups(tmp_path)
+    assert len(baks) == fcc.BACKUP_KEEP == 10
+    # the newest backup holds the state just before the last write
+    assert yaml.safe_load(baks[-1].read_text())["hosts"]["bender"]["token_sha256"] == f"{11:064x}"
+
+
+def test_revoke_removes_the_host_after_a_backup(tmp_path, capsys):
+    from herdr_engineering.cli import main
+    p = make(tmp_path)
+    secret_hash = yaml.safe_load(p.read_text())["hosts"]["bender"]["token_sha256"]
+    assert main(["fleet", "config", "revoke", "bender", "--path", str(p)]) == 0
+    out = capsys.readouterr()
+    assert "revoked bender" in out.out
+    assert secret_hash not in out.out + out.err and "placeholder-llm-value" not in out.out + out.err
+    cfg = load_fleet_config(p)
+    assert "bender" not in cfg.status()["hosts"] and "mac" in cfg.status()["hosts"]
+    assert len(backups(tmp_path)) == 1
+    assert main(["fleet", "config", "revoke", "ghost", "--path", str(p)]) == 1
+    assert "unknown host: ghost" in capsys.readouterr().err
+
+
+def test_init_at_the_default_path_makes_a_private_dir_and_a_compat_link(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    p = fcc.init_config(fcc.DEFAULT_CONFIG_PATH, dict(ANSWERS), prompt=no_prompt, secret_prompt=no_prompt)
+    assert p == tmp_path / ".config/herdr-engineering/fleet/fleet-config.yaml"
+    assert mode(p.parent) == 0o700 and sorted(os.listdir(p.parent)) == ["fleet-config.yaml"]
+    legacy = tmp_path / ".config/herdr-engineering/fleet-config.yaml"
+    assert legacy.is_symlink() and os.path.realpath(legacy) == str(p)
+    assert fcc.backup_dir(legacy) == tmp_path / ".config/herdr-engineering/fleet-backups"
+
+
+def test_cli_default_path_matches_the_module_default():
+    from herdr_engineering import cli
+    assert cli.FLEET_CONFIG_DEFAULT == str(fcc.DEFAULT_CONFIG_PATH)
+    assert not hasattr(fcc, "write_in_place")

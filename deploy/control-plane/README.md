@@ -33,8 +33,10 @@ Compose project (spec 0190). It is the structured-state backbone the unified
 ## Configuration and deploy
 
 All configuration, secrets included, lives in the **central fleet config**,
-`~/.config/herdr-engineering/fleet-config.yaml` (mode 0600, never in git). There is
-no `.env` to write or maintain.
+`~/.config/herdr-engineering/fleet/fleet-config.yaml` (mode 0600, never in git), alone
+in its 0700 directory (`fleet config init` creates it and leaves a symlink at the old
+path `~/.config/herdr-engineering/fleet-config.yaml`). There is no `.env` to write or
+maintain.
 
 ```bash
 # 1) once: create the central file (prompts for the public URL, LLM and CI
@@ -54,8 +56,8 @@ herdr-eng control-plane migrate
 herdr-eng control-plane worker --once
 ```
 
-The web, worker and llm-proxy containers mount the central file read-only at
-`/etc/herdr/fleet-config.yaml` and are started with `--fleet-config`; they read no
+The web and worker containers mount the central file's DIRECTORY read-only at
+`/etc/herdr/fleet/` and are started with `--fleet-config /etc/herdr/fleet/fleet-config.yaml`; they read no
 configuration from the environment. Do not run `docker compose up` by hand: the
 substitution variables only exist while `deploy.sh` runs. Compose refuses to start
 without them, and DB/object-store ports stay loopback-only.
@@ -71,9 +73,14 @@ for compose itself (e.g. `HERDR_CP_WEB_BIND`, `HERDR_CP_WEB_PUBLIC_PORT`,
 validate` names any that are missing). `fleet config init` asks for the gateway tailnet
 IP, defaulting to `tailscale ip -4`.
 
-The file is bind-mounted as a single file, so the tools that edit it (`fleet join`,
-`fleet config token`) write it in place (same inode, after a dated backup); the
-containers see the update at once.
+The directory (not the file) is bind-mounted because a single-file mount keeps the
+old inode: an edit that replaces the file by rename (`sed -i`, vim, our own tools)
+would never reach the server. `deploy.sh` refuses to run if the directory holds
+anything besides the file, since all of it is exposed to the containers. The tools
+that edit it (`fleet join`, `fleet config token`, `fleet config revoke <host>`) take
+a dated backup into `~/.config/herdr-engineering/fleet-backups/` (0700, newest 10
+kept) and replace the file atomically; the server picks up the new revision on its
+next read. Hand edits work the same way. Rewriting the YAML drops comments.
 
 ## Web UI + API (`control-plane-web` service)
 

@@ -18,6 +18,10 @@ from typing import Any
 
 from .version import __version__
 
+# The central fleet file, alone in its own directory (deploy.sh mounts the directory).
+# Same value as fleet_config_cli.DEFAULT_CONFIG_PATH (not imported: keeps startup light).
+FLEET_CONFIG_DEFAULT = "~/.config/herdr-engineering/fleet/fleet-config.yaml"
+
 
 def _print_json(obj: Any) -> None:
     print(json.dumps(obj, indent=2, sort_keys=True))
@@ -158,7 +162,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="skip the fleet-sync provisioning playbook")
     pj.add_argument("--roles", default=None,
                     help="comma separated fleet-config roles (default: keep existing, else host)")
-    pj.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
+    pj.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file to add the host to")
     pj.add_argument("--control-plane-url", default=None,
                     help="control plane URL written to host.json (default: control_plane.public_url)")
@@ -171,14 +175,17 @@ def _build_parser() -> argparse.ArgumentParser:
     for name, hlp in (("init", "create a new fleet-config.yaml interactively"),
                       ("validate", "validate the file (prints revision and host count only)"),
                       ("token", "mint a fresh token for an existing host and install it"),
+                      ("revoke", "remove a host (its token stops working); backup first"),
                       ("render-compose", "write the compose env file (0600)"),
                       ("render-collab", "write the collab container's config slice (0600)")):
         sp = csub.add_parser(name, help=hlp)
-        sp.add_argument("--path", default="~/.config/herdr-engineering/fleet-config.yaml")
+        sp.add_argument("--path", default=FLEET_CONFIG_DEFAULT)
         if name == "init":
             sp.add_argument("--with-api-keys", action="store_true",
                             help="generate control-plane API keys (keyed mode); the dashboard, "
                                  "llm-proxy and emit hook do not send keys yet")
+        if name == "revoke":
+            sp.add_argument("host", help="host id in the fleet config")
         if name == "token":
             sp.add_argument("host", help="host id in the fleet config")
             sp.add_argument("--target", default=None,
@@ -432,7 +439,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("migrate", help="apply versioned SQL migrations")
     p2.add_argument("--migrations", default=None,
                     help="migrations dir (default: bundled deploy/control-plane)")
-    p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_migrate)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
@@ -445,7 +452,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--api-keys", default=None,
                     help="comma list of key=role (viewer|operator) pairs "
                          "(Spec §104); e.g. k1=viewer,k2=operator")
-    p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file: the only source of configuration. "
                          "It is served to hosts, and its control_plane section supplies the "
                          "Postgres DSN, host aliases, API keys, RustFS/MinIO, CI-actions "
@@ -515,7 +522,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="run a single pass and exit")
     p2.add_argument("--migrations", default=None,
                     help="migrations dir (default: bundled deploy/control-plane)")
-    p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_worker)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
@@ -535,7 +542,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="control-plane base URL")
     p2.add_argument("--upstream", default=None,
                     help="upstream base URL (default: llm.upstream_url from the fleet config)")
-    p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/fleet-config.yaml",
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file: llm.upstream_key/upstream_url and "
                          "control_plane.llm_proxy tuning (the only source of configuration)")
     p2.set_defaults(func=_cmd_cp_llm_proxy)
@@ -776,6 +783,9 @@ def _cmd_fleet_config(args) -> int:
                                              control_plane_url=args.control_plane_url,
                                              must_exist=True)
             print(f"token for {rep['host']} installed on {rep['target']} (token: {rep['token']})")
+        elif cmd == "revoke":
+            backup = fcc.revoke_host(path, args.host)
+            print(f"revoked {args.host} (backup: {backup})")
         elif cmd == "render-compose":
             fcc.render_compose(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")

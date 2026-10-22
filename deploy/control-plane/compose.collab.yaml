@@ -8,7 +8,9 @@
 #     read-only and reads with --fleet-config. It never sees the central file itself.
 #   * control_plane.compose (optional keys HERDR_COLLAB_CERT_DIR, HERDR_COLLAB_CERT_UID,
 #     HERDR_COLLAB_EDGE_BIND) - what docker itself substitutes below, rendered by deploy.sh.
-#   * HERDR_COLLAB_{CONFIG_FILE,DATA_DIR,SYNC_DIR,EDGE_CONF} are paths deploy.sh exports.
+#   * HERDR_COLLAB_{CONFIG_DIR,DATA_DIR,SYNC_DIR,EDGE_CONF} are paths deploy.sh exports
+#     (CONFIG_DIR holds only collab-config.json and is mounted as a directory so a
+#     re-render by rename is seen).
 #
 # Isolation model
 #   * The dashboard / operator API (control-plane-web) is NOT touched by this overlay: it stays
@@ -49,14 +51,14 @@ services:
       # pool, clients, group, web client, domain, public URL:
       # control_plane.collab in the slice below
       - "--fleet-config"
-      - "/etc/herdr/collab-config.yaml"
+      - "/etc/herdr/collab/collab-config.json"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
     volumes:
       - ${HERDR_COLLAB_DATA_DIR:?run deploy.sh}:/data
       - ${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/sync:ro   # Cognito keys + members, written by collab-sync.sh
-      - ${HERDR_COLLAB_CONFIG_FILE:?run deploy.sh}:/etc/herdr/collab-config.yaml:ro   # control_plane.collab only
+      - ${HERDR_COLLAB_CONFIG_DIR:?run deploy.sh}:/etc/herdr/collab:ro   # holds only the control_plane.collab slice
     # Internal network: no route out at all (keys and group membership arrive as files), and not on
     # the control-plane network, so it cannot reach postgres/rustfs.
     networks: [collab]

@@ -324,7 +324,7 @@ Deployed on **bender**, the control-plane stack serves the HerdR UI at
 #### Repeatable deploys
 
 Deploys go through scripts, not hand-built compose overrides. The **central
-fleet config** (`~/.config/herdr-engineering/fleet-config.yaml`, mode 0600, outside
+fleet config** (`~/.config/herdr-engineering/fleet/fleet-config.yaml`, mode 0600, outside
 git) is the only place configuration and secrets live; nobody authors an env file.
 
 ```bash
@@ -336,7 +336,7 @@ herdr-eng fleet config init
 # control-plane web: renders a transient 0600 env file from the central file for
 # docker compose (deleted on exit, even on failure), builds from a ref, recreates only
 # control-plane-web with the central file mounted read-only at
-# /etc/herdr/fleet-config.yaml, waits for /api/v1/health to report the commit, rolls
+# /etc/herdr/fleet/ (its directory, so edits by rename are seen), waits for /api/v1/health to report the commit, rolls
 # back on failure. Refuses to run when the file is missing or invalid.
 # Writes a receipt (ref, commit, image, time - no config values) to
 # ~/.local/state/herdr-engineering/deploys/<sha>.json

@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- File: `~/.config/herdr-engineering/fleet-config.yaml`, mode 0600, outside git; the repo holds only `deploy/control-plane/fleet-config.example.yaml` with `REDACTED` placeholders.
+- File: `~/.config/herdr-engineering/fleet/fleet-config.yaml` (alone in its 0700 directory, which deploy.sh mounts read-only; symlink left at the old `~/.config/herdr-engineering/fleet-config.yaml`; backups in `fleet-backups/`, newest 10), mode 0600, outside git; the repo holds only `deploy/control-plane/fleet-config.example.yaml` with `REDACTED` placeholders.
 - Host bootstrap file: `~/.config/herdr-engineering/host.json`, mode 0600, keys `control_plane_url`, `host_id`, `token`.
 - Endpoint: `GET /api/v1/fleet/config` (header `X-Host-Token`), `Cache-Control: no-store`; `POST /api/v1/fleet/config/applied` `{host_id, revision}`; `GET /api/v1/fleet/config/status` (no values).
 - Host tokens are random; the file stores only `sha256` hex of a token. Unknown/revoked token: 401, body without detail.
@@ -62,7 +62,7 @@ File shape: `version: 1`, `sections: {name: {roles: [..]|["all"], values: {..}}}
 **Files:**
 - Modify: `herdr_engineering/control_plane/api.py` (new routes near the other `/api/v1/fleet/*` routes; constructor arg `fleet_config: FleetConfigStore | None`)
 - Modify: `herdr_engineering/fleet_config.py` (add `FleetConfigStore`)
-- Modify: `herdr_engineering/cli.py` (`control-plane web --fleet-config PATH`, default `~/.config/herdr-engineering/fleet-config.yaml`)
+- Modify: `herdr_engineering/cli.py` (`control-plane web --fleet-config PATH`, default `~/.config/herdr-engineering/fleet/fleet-config.yaml`)
 - Test: `tests/control_plane/test_api.py`
 
 **Interfaces:**

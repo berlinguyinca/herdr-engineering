@@ -6,16 +6,18 @@
 #
 # What it does, in order:
 #   1. checks the central fleet config (default
-#      ~/.config/herdr-engineering/fleet-config.yaml, created by
-#      `herdr-eng fleet config init`) exists and validates
+#      ~/.config/herdr-engineering/fleet/fleet-config.yaml, created by
+#      `herdr-eng fleet config init`) exists, validates, and sits ALONE in its
+#      directory (symlinks are resolved): that directory is what gets mounted
 #   2. resolves REF (default origin/main) to a commit and builds
 #      herdr-engineering:<sha12> from a clean detached worktree of exactly that commit
 #   3. renders the variables docker compose itself needs (images' passwords, ports,
 #      bind address) from the central file into a transient 0600 env file inside a
 #      0700 directory (`herdr-eng fleet config render-compose`), removed on exit
 #   4. recreates ONLY control-plane-web (postgres, rustfs, worker, gateway untouched)
-#      using the compose files from that same commit; the central file is mounted
-#      read-only into the containers at /etc/herdr/fleet-config.yaml.
+#      using the compose files from that same commit; the central file's DIRECTORY is
+#      mounted read-only at /etc/herdr/fleet/ (a single-file mount would keep the old
+#      inode after a rename-replace, so edits would never reach the server).
 #      With the collaboration marker it also renders control_plane.collab (and only
 #      that) to a stable 0600 slice, installs the edge nginx.conf at a stable path,
 #      refreshes the Cognito key/membership files and their timer (collab-sync.sh),
@@ -28,7 +30,7 @@
 set -euo pipefail
 
 REF="origin/main"; DRY=0; FETCH=1
-CENTRAL="$HOME/.config/herdr-engineering/fleet-config.yaml"
+CENTRAL="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="${2:?--ref needs a value}"; shift 2 ;;
@@ -45,7 +47,7 @@ REPO="$(git -C "$HERE" rev-parse --show-toplevel)"
 PROJECT="${HERDR_CP_PROJECT:-herdr-control-plane}"
 HEALTH_URL="${HERDR_CP_HEALTH_URL:-}"
 STATE_DIR="$HOME/.local/state/herdr-engineering/deploys"
-MOUNT_TARGET="/etc/herdr/fleet-config.yaml"
+MOUNT_TARGET="/etc/herdr/fleet/fleet-config.yaml"
 # Collaboration network (HCN) is opt-in per host: it is layered on only when this
 # marker file exists, so an ordinary deploy never switches it on elsewhere.
 COLLAB_MARKER="$HOME/.config/herdr-engineering/collab-enabled"
@@ -54,6 +56,20 @@ COLLAB_MARKER="$HOME/.config/herdr-engineering/collab-enabled"
 case "$CENTRAL" in /*) ;; *) CENTRAL="$PWD/$CENTRAL" ;; esac
 INIT_HINT="create it with: herdr-eng fleet config init --path $CENTRAL"
 [ -r "$CENTRAL" ] || { echo "central fleet config not readable: $CENTRAL ($INIT_HINT)" >&2; exit 1; }
+# The containers get the file's DIRECTORY read-only, so everything in it is exposed:
+# it must hold only fleet-config.yaml (writers' transient .fleet-config.yaml.*.tmp aside).
+CENTRAL_REAL="$(readlink -f "$CENTRAL")"
+FLEET_DIR="$(dirname "$CENTRAL_REAL")"
+if [ "$(basename "$CENTRAL_REAL")" != "fleet-config.yaml" ]; then
+  echo "central fleet config must be named fleet-config.yaml (it is mounted as $MOUNT_TARGET): $CENTRAL_REAL" >&2
+  exit 1
+fi
+OTHERS="$(find "$FLEET_DIR" -mindepth 1 -maxdepth 1 ! -name fleet-config.yaml ! -name '.fleet-config.yaml.*.tmp' -printf '%f ' 2>/dev/null || true)"
+if [ -n "$OTHERS" ]; then
+  echo "$FLEET_DIR must hold only fleet-config.yaml (the directory is mounted into the containers); also found: $OTHERS" >&2
+  echo "move the file into its own directory (default ~/.config/herdr-engineering/fleet/) and leave a symlink at the old path" >&2
+  exit 1
+fi
 
 WORK=""; ENV_DIR=""
 cleanup() {
@@ -84,7 +100,7 @@ if ! herdr_eng fleet config validate --path "$CENTRAL" >/dev/null 2>&1; then
 fi
 
 echo "deploying $REF = $SHA"
-echo "central config: $CENTRAL -> mounted read-only at $MOUNT_TARGET"
+echo "central config: $CENTRAL -> its directory $FLEET_DIR mounted read-only, file at $MOUNT_TARGET"
 COLLAB_FILES=()
 EDGE_SERVICE=()
 COLLAB=0
@@ -104,17 +120,25 @@ chmod 600 "$ENV_FILE"
 if [ "$COLLAB" = 1 ]; then
   # collab-public gets ONLY control_plane.collab (public identifiers), never the central
   # file. Dry-run renders into the temp dir and touches nothing else on the host.
-  if [ "$DRY" = 1 ]; then COLLAB_CONFIG="$ENV_DIR/collab-config.json"
-  else COLLAB_CONFIG="$HOME/.config/herdr-engineering/collab/collab-config.json"; fi
+  # The slice's own directory is mounted (not the file), so a re-render by rename is seen.
+  if [ "$DRY" = 1 ]; then COLLAB_DIR="$ENV_DIR/collab"
+  else COLLAB_DIR="$HOME/.config/herdr-engineering/collab"; fi
+  COLLAB_CONFIG="$COLLAB_DIR/collab-config.json"
   if ! herdr_eng fleet config render-collab --path "$CENTRAL" --out "$COLLAB_CONFIG" >/dev/null; then
     echo "collaboration is enabled ($COLLAB_MARKER) but control_plane.collab is missing or invalid in $CENTRAL" >&2
+    exit 1
+  fi
+  chmod 700 "$COLLAB_DIR"
+  COLLAB_OTHERS="$(find "$COLLAB_DIR" -mindepth 1 -maxdepth 1 ! -name collab-config.json ! -name '.collab-config.json.*.tmp' -printf '%f ' 2>/dev/null || true)"
+  if [ -n "$COLLAB_OTHERS" ]; then
+    echo "$COLLAB_DIR must hold only collab-config.json (it is mounted into collab-public); also found: $COLLAB_OTHERS" >&2
     exit 1
   fi
   if ! grep -qE '^HERDR_COLLAB_CERT_DIR=.+' "$ENV_FILE"; then
     echo "collaboration is enabled ($COLLAB_MARKER) but control_plane.compose.HERDR_COLLAB_CERT_DIR is not set in $CENTRAL" >&2
     exit 1
   fi
-  export HERDR_COLLAB_CONFIG_FILE="$COLLAB_CONFIG"
+  export HERDR_COLLAB_CONFIG_DIR="$COLLAB_DIR"
   if [ "$DRY" = 1 ]; then
     # Placeholders so the offline compose validation can resolve the paths.
     export HERDR_COLLAB_EDGE_CONF="$WORK/deploy/control-plane/collab-edge/nginx.conf"
@@ -140,7 +164,7 @@ if [ "$DRY" = 1 ]; then
   echo "[dry-run] rendered the compose variables to a 0600 file in a 0700 temp dir (removed on exit)"
   if docker compose version >/dev/null 2>&1; then
     # -q prints nothing on success; errors are withheld so no value can leak.
-    if HERDR_CP_FLEET_CONFIG_FILE="$CENTRAL" HERDR_CP_IMAGE_TAG="$TAG" HERDR_CP_GIT_COMMIT="$SHA" \
+    if HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_CP_IMAGE_TAG="$TAG" HERDR_CP_GIT_COMMIT="$SHA" \
         docker compose --env-file "$ENV_FILE" -p "$PROJECT" "${COMPOSE_FILES[@]}" config -q >/dev/null 2>&1; then
       echo "[dry-run] docker compose config: valid"
     else
@@ -151,7 +175,7 @@ if [ "$DRY" = 1 ]; then
     echo "[dry-run] docker compose not available: skipped offline compose validation"
   fi
   echo "[dry-run] would run: herdr-eng fleet config render-compose --path <central> --out <file>"
-  echo "[dry-run] control-plane-web, worker and llm-proxy mount the central file read-only at $MOUNT_TARGET"
+  echo "[dry-run] control-plane-web, worker and llm-proxy mount $FLEET_DIR read-only; the file is $MOUNT_TARGET"
   if [ "$COLLAB" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
   fi
@@ -173,7 +197,7 @@ docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMI
   -t "herdr-engineering:$TAG" "$WORK" >/dev/null
 
 compose() {
-  HERDR_CP_FLEET_CONFIG_FILE="$CENTRAL" HERDR_CP_IMAGE_TAG="$1" HERDR_CP_GIT_COMMIT="$SHA" \
+  HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_CP_IMAGE_TAG="$1" HERDR_CP_GIT_COMMIT="$SHA" \
     docker compose --env-file "$ENV_FILE" -p "$PROJECT" \
     "${COMPOSE_FILES[@]}" \
     up -d --no-deps --no-build control-plane-web "${EDGE_SERVICE[@]}"

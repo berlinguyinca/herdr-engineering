@@ -46,8 +46,13 @@ not use environment variables for configuration.
   per-host credential). This replaces env vars as the way a host finds the
   control plane.
 - The central file lives **on the control-plane host, outside git**, mode 0600,
-  at `~/.config/herdr-engineering/fleet-config.yaml`. The repo holds only a
-  schema and a commented example with `REDACTED` placeholders.
+  at `~/.config/herdr-engineering/fleet/fleet-config.yaml`, alone in its 0700
+  directory (final review: the containers mount the directory, because a
+  single-file bind mount keeps the old inode after a rename-replace; a symlink is
+  left at the old `~/.config/herdr-engineering/fleet-config.yaml`). Writers replace
+  the file atomically; dated backups go to `fleet-backups/` (newest 10 kept);
+  `fleet config revoke <host>` removes a host. Rewriting the YAML drops comments.
+  The repo holds only a schema and a commented example with `REDACTED` placeholders.
 - Secrets are included in the file, but each section is tagged with the roles
   allowed to read it; the endpoint serves a host only the sections its roles
   allow.

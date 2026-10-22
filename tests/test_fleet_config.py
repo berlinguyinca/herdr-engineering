@@ -193,3 +193,21 @@ def test_cp_web_sources_control_plane_section(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_CP_RUSTFS_ENDPOINT", "http://env:1")  # ignored: file only
     cli._maybe_rustfs_client(cp)
     assert seen["endpoint"] == "http://rfs:9000" and seen["access_key"] == "u"
+
+
+def test_store_picks_up_a_rename_replace(tmp_path):
+    """sed -i / vim / our own writers replace the file by rename (new inode): the store
+    must serve the new content (deploy.sh mounts the directory, so the container sees it)."""
+    import os
+    from herdr_engineering.fleet_config import FleetConfigStore
+    p = write(tmp_path, base())
+    store = FleetConfigStore(p)
+    old = store.current().revision
+    d = base()
+    del d["hosts"]["beast"]
+    tmp = p.with_name(".edit.tmp")
+    tmp.write_text(yaml.safe_dump(d))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+    assert store.current().revision != old
+    assert "beast" not in store.current().status()["hosts"]
