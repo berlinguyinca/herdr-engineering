@@ -78,6 +78,9 @@ sections:
       api_key: ""
 
   # Used by host-side tools (session run, review bridge): role agent.
+  # Trade-off: readable by every host (roles [all]). The agent role can only ingest
+  # events, mint/revoke LLM project keys and post reviews - nothing else. Recommended
+  # later: scope this section to a role (e.g. [builder]). Empty while keys are off.
   agent:
     roles: [all]
     values:
