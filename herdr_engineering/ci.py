@@ -111,6 +111,9 @@ class WoodpeckerProvider:
     `available` indicates configuration only; successful reads establish health.
     """
 
+    # /api/user/repos returns a complete snapshot, including exactly 50 rows.
+    repos_are_snapshot = True
+
     def __init__(self, base_url: str | None = None, token: str | None = None,
                  client=None) -> None:
         from .host_config import host_value

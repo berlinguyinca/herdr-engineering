@@ -1,6 +1,6 @@
 # CI heatmap and run tree — draft design
 
-Status: draft for user review, 2026-10-22. This extends the deployed CI insights design. No production changes are part of this wireframe.
+Status: approved by the user, 2026-10-22. This extends the deployed CI insights design. The reference wireframe uses illustrative data; implementation is tracked in the accompanying plan.
 
 ## Intent and selected approach
 

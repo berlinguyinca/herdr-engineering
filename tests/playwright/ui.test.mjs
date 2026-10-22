@@ -291,7 +291,7 @@ test('inspector: open server treats the viewer as operator; sessions without tel
     await page.locator('#advanced-inspector > summary').click();
     await page.waitForSelector('.hd-ins__tab');
     await page.click('[data-view=reasoning]');
-    await page.waitForFunction(() => /not report|Reasoning/.test(document.querySelector('#ins-root')?.innerText || ''));
+    await page.locator('#ins-list .hd-empty__message').filter({ hasText: /not reported|does not expose/ }).waitFor();
     const text = await page.locator('#ins-root').innerText();
     assert.ok(/No inspector telemetry|not reported|does not expose/.test(text), text);
   }, { BURST: '0', INSPECTOR_SEED: '0' });

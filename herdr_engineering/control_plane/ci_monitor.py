@@ -51,6 +51,9 @@ class CIMonitor:
                  budget=120, now=None, on_transition=None, actions_enabled=False,
                  on_observation=None):
         self._factory = provider_factory or _provider
+        from .ci_history import CIHistory
+        self._history = CIHistory(provider_factory=self._factory, interval=interval,
+                                  budget=budget, now=now, repo_limit=repo_limit)
         #: control_plane.ci_actions in the fleet file; retry/cancel are off unless set.
         self.actions_enabled = bool(actions_enabled)
         self._interval = max(5, interval)
@@ -84,6 +87,9 @@ class CIMonitor:
             view['stale'] = True
         return view
 
+    def history(self, *, start=True):
+        return self._history.snapshot(start=start)
+
     def start(self):
         with self._lock:
             if self._thread is None and not self._stop.is_set():
@@ -93,6 +99,7 @@ class CIMonitor:
 
     def close(self):
         self._stop.set()
+        self._history.close()
         if self._thread:
             self._thread.join(timeout=1)
 

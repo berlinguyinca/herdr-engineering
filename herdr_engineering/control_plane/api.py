@@ -1111,6 +1111,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server.github_monitor.repositories(**query))
             if resource == "ci":
                 what = parts[4] if len(parts) > 4 else ""
+                if what == "history":
+                    from .project_links import annotate_ci_history
+                    return self._json(annotate_ci_history(server.ci_monitor.history(), r))
                 if what == "reports":
                     return self._json(r.ci_reports())
                 if what == "pipeline":
