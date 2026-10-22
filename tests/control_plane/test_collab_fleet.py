@@ -107,9 +107,12 @@ def test_state_survives_a_restart_because_it_is_replayed_from_the_log(w):
 def test_http_routes_are_operator_only(w):
     body = {"harness_type": "pi", "name_prefix": "p", "count": 2}
     for method, parts in (("POST", ["fleet", "spawns"]), ("GET", ["fleet", "spawns"]), ("GET", ["fleet", "hosts"]),
-                          ("POST", ["fleet", "hosts", "beast"]), ("POST", ["fleet", "hosts"])):
+                          ("POST", ["fleet", "hosts", "beast"]), ("POST", ["fleet", "hosts"]),
+                          ("POST", ["fleet", "task-activity"])):
         s, _ = w.s.dispatch(method, parts, {}, {"auto_agents": False, "hosts": [], **body}, "Bearer tok-alice-0123456789", None)
         assert s == 404, (method, parts)                                    # a signed-in user on the public site
+    s, out = w.s.dispatch("POST", ["fleet", "task-activity"], {}, {"instance_ids": ["x"]}, "", None, operator="alice")
+    assert (s, out) == (200, {"activity": []})
     s, out = w.s.dispatch("POST", ["fleet", "spawns"], {}, body, "", None, operator="alice")
     assert s == 201 and out["status"] == "requested"
     s, out = w.s.dispatch("GET", ["fleet", "spawns"], {"status": "requested"}, {}, "", None, operator="alice")

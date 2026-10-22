@@ -8,6 +8,7 @@ const NODE_H = 34;
 const ROW_H = 46;
 const PAD = 16;
 const MAX_LEVEL = 4;
+const IDLE_ROWS = 8;                  // idle agents wrap into columns this tall instead of one long stack
 const STATUS_COLOR = { pending: 'var(--status-attention, #d89b1d)', accepted: 'var(--accent, #1f7ae0)', done: 'var(--status-ok, #1a9b6c)', failed: 'var(--status-danger, #c0392b)', cancelled: 'var(--text-muted, #888)', expired: 'var(--text-muted, #888)' };
 const FAMILY_COLOR = { 'claude-code': '#c96442', codex: '#10a37f', pi: '#6f5bd6' };
 const clip = (s, n) => (String(s).length > n ? `${String(s).slice(0, n - 1)}…` : String(s));
@@ -20,7 +21,8 @@ export const edgeState = (counts) => {
 };
 
 // People on the left; an agent sits one column right of the nearest source that feeds it, so a
-// delegation chain reads left to right. Agents nobody has tasked yet wait in column 1.
+// delegation chain reads left to right. Agents with no work yet wait in a compact "idle" grid
+// to the right, so dozens of them don't stretch the diagram into one tall column.
 export function layoutFlow(flow) {
   const level = new Map();
   for (const n of flow.nodes) if (n.kind === 'person') level.set(n.id, 0);
@@ -34,8 +36,12 @@ export function layoutFlow(flow) {
       if (!level.has(n.id) || want < level.get(n.id)) level.set(n.id, want);
     }
   }
+  const touched = new Set(flow.edges.flatMap((e) => [e.from, e.to]));
+  const idle = flow.nodes.filter((n) => n.kind === 'agent' && !touched.has(n.id));
+  const idleIds = new Set(idle.map((n) => n.id));
   const cols = new Map();
   for (const n of flow.nodes) {
+    if (idleIds.has(n.id)) continue;
     const l = level.get(n.id) ?? 1;
     if (!cols.has(l)) cols.set(l, []);
     cols.get(l).push(n);
@@ -50,7 +56,21 @@ export function layoutFlow(flow) {
       height = Math.max(height, PAD + (i + 1) * ROW_H);
     });
   });
-  const width = PAD * 2 + Math.max(1, used.length - 1) * COL_W + NODE_W;
+  let idleLabel = null;
+  let totalCols = used.length;
+  if (idle.length) {
+    idle.sort((a, b) => String(a.family || '').localeCompare(String(b.family || '')) || String(a.name).localeCompare(String(b.name)));
+    const rows = Math.min(IDLE_ROWS, idle.length);
+    const x0 = PAD + used.length * COL_W;
+    idleLabel = { x: x0, y: PAD + 8, text: `Idle · ${idle.length}` };
+    idle.forEach((n, i) => {
+      const col = Math.floor(i / rows); const row = i % rows;
+      placed.set(n.id, { ...n, level: -1, x: x0 + col * COL_W, y: PAD + 20 + row * ROW_H, w: NODE_W, h: NODE_H });
+      height = Math.max(height, PAD + 20 + (row + 1) * ROW_H);
+    });
+    totalCols += Math.ceil(idle.length / rows);
+  }
+  const width = PAD * 2 + Math.max(1, totalCols - 1) * COL_W + NODE_W;
   const edges = flow.edges.filter((e) => placed.has(e.from) && placed.has(e.to)).map((e) => {
     const a = placed.get(e.from); const b = placed.get(e.to);
     const self = a.id === b.id;
@@ -62,7 +82,7 @@ export function layoutFlow(flow) {
     const st = edgeState(e.counts);
     return { ...e, d, ...st, width: 1.5 + Math.min(6, Math.log2(st.total + 1) * 1.5), key: `${e.from}>${e.to}` };
   });
-  return { nodes: [...placed.values()], edges, width: Math.max(width, 360), height: Math.max(height + PAD, 120) };
+  return { nodes: [...placed.values()], edges, width: Math.max(width, 360), height: Math.max(height + PAD, 120), idleLabel };
 }
 
 const sig = (e) => `${e.state}:${e.total}:${e.last}`;
@@ -85,7 +105,7 @@ export function renderFlow(box, flow, { onNode, onEdge, prev = new Map() } = {})
       <text x="24" y="27" class="cx-flow-sub">${esc(clip(sub, 26))}</text>
       <title>${esc(n.name)}</title></g>`;
   }).join('');
-  box.innerHTML = `<div class="cx-flow-scroll"><svg class="cx-flow" viewBox="0 0 ${lay.width} ${lay.height}" width="${lay.width}" height="${lay.height}" role="img" aria-label="Flow of tasks between people and agents">${edgeSvg}${nodeSvg}</svg></div>`;
+  box.innerHTML = `<div class="cx-flow-scroll"><svg class="cx-flow" viewBox="0 0 ${lay.width} ${lay.height}" width="${lay.width}" height="${lay.height}" role="img" aria-label="Flow of tasks between people and agents">${lay.idleLabel ? `<text x="${lay.idleLabel.x}" y="${lay.idleLabel.y}" class="cx-flow-sub">${esc(lay.idleLabel.text)}</text>` : ''}${edgeSvg}${nodeSvg}</svg></div>`;
   box.querySelectorAll('[data-node]').forEach((el) => {
     const act = () => onNode && onNode(lay.nodes.find((n) => n.id === el.dataset.node));
     el.onclick = act;

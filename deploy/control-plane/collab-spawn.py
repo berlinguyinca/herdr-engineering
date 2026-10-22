@@ -43,12 +43,29 @@ REQUEST_DEADLINE = 480.0              # seconds one request may take; the system
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 HOST = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 SSH_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,126}$")
-FAMILY_CMD = {                       # task text arrives on stdin; the family's own non-interactive mode answers it
-    "claude-code": "claude -p",
-    "codex": "codex exec -",
-    "pi": "pi -p",
+# The task text arrives on stdin; the family's own non-interactive mode answers it. A task is written by a room
+# member (or an agent they started), so by default every harness runs WITHOUT tools: it can answer, but it
+# cannot run commands, read the credential files of the other agents on this host, or reach connectors/MCP
+# servers configured for your account. `--allow-tools` lifts that for people who want agents that do real work.
+#   claude: --tools "" drops the built-ins; --strict-mcp-config with an empty config drops claude.ai connectors
+#           (Gmail, Drive...) that `claude -p` would otherwise load; slash commands and skills are off too.
+#   pi:     takes its prompt as an argument, never stdin; "--" ends its options and the fixed prefix means a task
+#           that starts with "@" or "-" can't be read as a file attachment or a flag.
+#   codex:  has no way to be run without file access (even read-only it can read any file), so it is only
+#           started with --allow-tools, and then with `--skip-git-repo-check` (a worker's cwd is not a repo).
+FAMILY_CMD_TEXT_ONLY = {
+    "claude-code": "claude -p --tools '' --strict-mcp-config --mcp-config '{\"mcpServers\":{}}' --disable-slash-commands",
+    "pi": 'pi -p --no-session --no-tools -- "Task from a room member: $(cat)"',
     "agent": "",                     # no command: the worker acknowledges and reports
 }
+FAMILY_CMD_TOOLS = {
+    "claude-code": "claude -p",
+    "codex": "codex exec --skip-git-repo-check -",
+    "pi": 'pi -p --no-session -- "Task from a room member: $(cat)"',
+    "agent": "",
+}
+FAMILY_CMD = FAMILY_CMD_TOOLS       # every family the runner knows; which are started depends on --allow-tools
+FAMILY_BIN = {"claude-code": "claude", "codex": "codex", "pi": "pi"}
 AGENT_DIR = "herdr-agents"
 
 
@@ -61,12 +78,15 @@ def trim(text: str, n: int = 200) -> str:
 
 
 class Runner:
-    def __init__(self, url: str, state_dir: Path, herdr: str, ssh: str, worker: Path, host_id: str, say=print):
+    def __init__(self, url: str, state_dir: Path, herdr: str, ssh: str, worker: Path, host_id: str, say=print,
+                 allow_tools: bool = False):
         self.url, self.state, self.herdr, self.ssh, self.say = url.rstrip("/"), state_dir, herdr, ssh, say
         self.worker_text = worker.read_text(encoding="utf-8")
         self.host_id = host_id
         self.targets: dict[str, str | None] = {}          # host label -> ssh target (None = this machine)
         self.public_url = ""
+        self.cmds = FAMILY_CMD_TOOLS if allow_tools else FAMILY_CMD_TEXT_ONLY
+        self.families: dict[str, list[str]] = {}          # host label -> harness families it can start
 
     # ------------------------------------------------------------ the collab service (operator listener)
     def api(self, method: str, path: str, body: dict | None = None):
@@ -126,24 +146,39 @@ class Runner:
         except (OSError, ValueError):
             cache = {}
         now, up = time.time(), []
+        self.families = {}
         for host, target in self.targets.items():
             seen = cache.get(host)
-            if target is None:
-                alive = True
-            elif seen and now - seen["at"] < PROBE_EVERY:
+            if seen and now - seen["at"] < PROBE_EVERY:
                 alive = seen["ok"]
             else:
-                try:
-                    self.run(self.herdr_cmd(host, ["workspace", "list"]), timeout=15)
-                    alive = True
-                except Failure:
-                    alive = False
-                cache[host] = {"ok": alive, "at": now}
+                alive = True
+                if target is not None:
+                    try:
+                        self.run(self.herdr_cmd(host, ["workspace", "list"]), timeout=15)
+                    except Failure:
+                        alive = False
+                cache[host] = seen = {"ok": alive, "at": now,
+                                      "families": self.installed_families(target) if alive else []}
             if alive:
                 up.append(host)
+                self.families[host] = [f for f in seen.get("families", []) if f in FAMILY_BIN]
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         cache_file.write_text(json.dumps(cache))
         return up
+
+    def installed_families(self, target: str | None) -> list[str]:
+        """Which harness CLIs the host's own (interactive) shell can start: that shell is what a herdr pane
+        runs. A host without `claude` must not be handed claude agents that would fail every task."""
+        probe = "for c in claude codex pi; do command -v $c >/dev/null 2>&1 && echo $c; done"
+        argv = (["bash", "-lic", probe] if target is None
+                else [self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target, f"bash -lic '{probe}' 2>/dev/null"])
+        try:
+            out = self.run(argv, timeout=30)
+        except Failure:
+            return []
+        have = {line.strip() for line in out.splitlines()}
+        return [f for f, binary in FAMILY_BIN.items() if binary in have]
 
     # ------------------------------------------------------------ placing one agent
     def put(self, host: str, name: str, text: str, mode: int) -> None:
@@ -172,7 +207,7 @@ class Runner:
 
     def place(self, host: str, agent: dict, family: str, installed: set) -> None:
         name = agent["name"]
-        if not NAME.fullmatch(name) or family not in FAMILY_CMD:
+        if not NAME.fullmatch(name) or family not in self.cmds:
             raise Failure("refused: unexpected agent name or family")
         if host not in installed:
             base = "'" + self.public_url.replace("'", "'\\''") + "'"      # always single-quoted, like the dashboard's copy
@@ -186,10 +221,14 @@ class Runner:
             raise Failure("herdr returned an unexpected reply to workspace create") from None
         if not isinstance(pane, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}", pane):
             raise Failure("herdr returned an unexpected pane id")
-        cmd = FAMILY_CMD[family]
+        cmd = self.cmds[family]
         line = (f'{"HERDR_AGENT_CMD=" + shlex.quote(cmd) + " " if cmd else ""}"$HOME/{AGENT_DIR}/worker.sh" '
                 f'"$HOME/{AGENT_DIR}/{name}.json"')
         self.run(self.herdr_cmd(host, ["pane", "run", pane, line]), timeout=30)
+        try:        # tie the agent to its pane so the dashboard can show it with the fabric session
+            self.ok("POST", f"agents/{agent['agent_id']}/link", {"instance_id": f"pane:{host}:{pane}"})
+        except Exception:
+            pass    # cosmetic: the agent works without the link
 
     # ------------------------------------------------------------ one request
     def pick_host(self, eligible: list[str]) -> str | None:
@@ -235,6 +274,13 @@ class Runner:
             count = int(spec["count"])
             if not 1 <= count <= MAX_AGENTS or spec["harness_type"] not in FAMILY_CMD:
                 raise Failure("refused: request outside the runner's limits")
+            if spec["harness_type"] not in self.cmds:
+                raise Failure(f"{spec['harness_type']} agents are only started when the runner runs with --allow-tools: "
+                              "that CLI cannot be limited to text-only answers")
+            eligible = [h for h in eligible if spec["harness_type"] not in FAMILY_BIN
+                        or spec["harness_type"] in self.families.get(h, [])]
+            if not eligible:
+                raise Failure(f"no host that accepts automatic agents has {FAMILY_BIN[spec['harness_type']]} installed")
             body = {"harness_type": spec["harness_type"], "name_prefix": spec["name_prefix"], "count": count}
             if spec.get("room_id"):
                 body.update(room_id=spec["room_id"], actions=spec["actions"],
@@ -274,7 +320,8 @@ class Runner:
             raise Failure("the service has no public https url to give agents")
         self.discover()
         up = self.reachable()
-        self.ok("POST", "fleet/hosts", {"hosts": [{"host": h, "kind": "local" if self.targets[h] is None else "machine"} for h in up]})
+        self.ok("POST", "fleet/hosts", {"hosts": [{"host": h, "kind": "local" if self.targets[h] is None else "machine",
+                                                    "families": self.families.get(h, [])} for h in up]})
         flags = {h["host"]: h["auto_agents"] for h in self.ok("GET", "fleet/hosts")["hosts"]}
         eligible = sorted(h for h in up if flags.get(h, True))
         for sp in self.ok("GET", "fleet/spawns?status=requested")["spawns"]:
@@ -305,11 +352,13 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--herdr", default="herdr")
     ap.add_argument("--ssh", default="ssh")
     ap.add_argument("--worker", default=str(Path(__file__).with_name("collab-worker.sh")))
+    ap.add_argument("--allow-tools", action="store_true",
+                    help="let agents use their harness's tools (shell, files, MCP) on task text from room members")
     args = ap.parse_args(argv)
     if not args.url or not HOST.fullmatch(args.host_id):
         ap.error("no dashboard URL (pass --url) or an invalid --host-id")
     r = Runner(args.url, Path(args.state_dir), args.herdr, args.ssh, Path(args.worker), args.host_id,
-               say=lambda m: print(f"collab-spawn: {m}", file=sys.stderr))
+               say=lambda m: print(f"collab-spawn: {m}", file=sys.stderr), allow_tools=args.allow_tools)
     try:
         r.once()
     except Failure as exc:

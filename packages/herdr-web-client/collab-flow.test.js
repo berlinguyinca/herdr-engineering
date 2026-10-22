@@ -15,11 +15,12 @@ const flow = {
   ],
 };
 
-test('a delegation chain reads left to right and idle agents wait in column one', () => {
+test('a delegation chain reads left to right and idle agents wait in a grid to the right', () => {
   const lay = layoutFlow(flow);
   const x = Object.fromEntries(lay.nodes.map((n) => [n.id, n.x]));
   assert.ok(x['u:alice'] < x['a:1'] && x['a:1'] < x['a:2']);
-  assert.equal(x['a:3'], x['a:1']);
+  assert.ok(x['a:3'] > x['a:2']);
+  assert.equal(lay.idleLabel.text, 'Idle · 1');
   assert.equal(lay.edges.length, 2);
   assert.ok(lay.edges.every((e) => e.d.startsWith('M')));
 });
@@ -31,11 +32,14 @@ test('edge state follows open work, then failures', () => {
   assert.equal(edgeState({ done: 2 }).live, false);
 });
 
-test('dozens of agents stay in bounded columns and edges to unknown nodes are dropped', () => {
+test('dozens of idle agents wrap into short columns instead of one tall stack', () => {
   const many = { nodes: [{ id: 'u:a', kind: 'person', name: 'a' }], edges: [{ from: 'u:a', to: 'a:ghost', counts: { done: 1 }, last: '' }] };
   for (let i = 0; i < 60; i += 1) many.nodes.push({ id: `a:${i}`, kind: 'agent', name: `w${i}`, family: 'codex' });
   const lay = layoutFlow(many);
   assert.equal(lay.nodes.length, 61);
-  assert.equal(lay.edges.length, 0);
-  assert.ok(lay.height >= 60 * 46 && lay.width < 1200);
+  assert.equal(lay.edges.length, 0);                    // edges to unknown nodes are dropped
+  assert.ok(lay.height <= 8 * 46 + 80, `height ${lay.height}`);
+  assert.ok(lay.width < 2000);
+  assert.equal(lay.idleLabel.text, 'Idle · 60');
+  assert.equal(new Set(lay.nodes.map((n) => `${n.x},${n.y}`)).size, 61);   // nobody overlaps
 });

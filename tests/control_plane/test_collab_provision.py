@@ -17,9 +17,19 @@ OP = "operator-uuid"
 
 
 class FakeCognito:
-    def __init__(self, existing=None, fail=False):
+    def __init__(self, existing=None, fail=False, members=()):
         self.users = dict(existing or {})
         self.groups, self.created, self.fail = [], [], fail
+        self.members, self.removed = set(members), []
+
+    def in_group(self, username):
+        return username in self.members
+
+    def remove_from_group(self, username):
+        if self.fail:
+            raise RuntimeError("aws down")
+        self.removed.append(username)
+        self.members.discard(username)
 
     def find_user(self, email):
         if self.fail:
@@ -33,6 +43,7 @@ class FakeCognito:
 
     def add_to_group(self, username):
         self.groups.append(username)
+        self.members.add(username)
 
 
 def invite(iid, email, actor=OP, exp=NOW + 3600):
@@ -262,3 +273,84 @@ def test_one_run_makes_a_bounded_number_of_aws_attempts(env):
     events = [invite(f"i{n:02d}", f"u{n}@example.org", exp=NOW + 10 ** 6) for n in range(30)]
     cog, rows = env(events, FakeCognito(fail=True), max_per_day=100)
     assert len(rows) == prov.MAX_ATTEMPTS_PER_RUN
+
+
+def cancelled(iid, reason="cancelled"):
+    return {"event_type": "invite_closed", "payload": {"invite_id": iid, "reason": reason}}
+
+
+def test_cancelling_an_invite_takes_the_person_back_out_of_the_group(env):
+    cog, _ = env([invite("i1", "new@x.org")])
+    assert cog.members == {"sub-new@x.org"}
+    cog, rows = env([invite("i1", "new@x.org"), cancelled("i1")], cog=cog)
+    assert cog.removed == ["sub-new@x.org"] and cog.members == set()
+    assert [r["result"] for r in rows] == ["removed"]
+    cog, rows = env([invite("i1", "new@x.org"), cancelled("i1")], cog=cog)   # once only
+    assert rows == [] and cog.removed == ["sub-new@x.org"]
+
+
+def test_someone_already_in_the_group_is_never_removed(env):
+    cog = FakeCognito(existing={"old@x.org": "sub-old"}, members={"sub-old"})
+    env([invite("i1", "old@x.org")], cog=cog)
+    cog, rows = env([invite("i1", "old@x.org"), cancelled("i1")], cog=cog)
+    assert cog.removed == [] and cog.members == {"sub-old"} and rows == []
+
+
+def test_someone_who_accepted_is_kept(env):
+    cog, _ = env([invite("i1", "a@x.org"), invite("i2", "a@x.org", exp=NOW + 7200)])
+    cog, rows = env([invite("i1", "a@x.org"), cancelled("i1"), invite("i2", "a@x.org", exp=NOW + 7200),
+                     cancelled("i2", "accepted")], cog=cog)
+    assert cog.removed == [] and rows == []
+
+
+def test_a_second_open_invite_keeps_the_person(env):
+    cog, _ = env([invite("i1", "a@x.org")])
+    cog, rows = env([invite("i1", "a@x.org"), cancelled("i1"), invite("i2", "a@x.org")], cog=cog)
+    assert cog.removed == []
+
+
+def test_only_the_operators_cancellations_count(env):
+    cog, _ = env([invite("i1", "a@x.org")])
+    cog, rows = env([invite("i1", "a@x.org", actor="someone-else"), cancelled("i1")], cog=cog)
+    assert cog.removed == []
+
+
+def test_a_cancelled_person_can_be_invited_again(env):
+    cog, _ = env([invite("i1", "a@x.org")])
+    cog, _ = env([invite("i1", "a@x.org"), cancelled("i1")], cog=cog)
+    assert cog.members == set()
+    cog, rows = env([invite("i1", "a@x.org"), cancelled("i1"), invite("i3", "a@x.org")], cog=cog)
+    assert cog.members == {"sub-a@x.org"} and [r["result"] for r in rows] == ["added"]
+
+
+def test_older_ledger_rows_without_the_flag_are_never_taken_back(env):
+    cog = FakeCognito(existing={"a@x.org": "sub-a"}, members={"sub-a"})
+    env.ledger.parent.mkdir(parents=True)
+    env.ledger.write_text(json.dumps({"at": NOW - 5, "invite_id": "i1", "email": "a@x.org",
+                                      "result": "added", "created": False}) + "\n")
+    cog, rows = env([invite("i1", "a@x.org"), cancelled("i1")], cog=cog)
+    assert cog.removed == [] and rows == []
+
+
+def test_a_failed_removal_backs_off_and_dry_run_changes_nothing(env):
+    cog, _ = env([invite("i1", "a@x.org")])
+    ev = [invite("i1", "a@x.org"), cancelled("i1")]
+    env(ev, cog=cog, dry_run=True)
+    assert cog.removed == [] and cog.members
+    cog.fail = True
+    cog, rows = env(ev, cog=cog)
+    assert [r["result"] for r in rows] == ["remove_failed"]
+    cog, rows = env(ev, cog=cog, now=NOW + 60)       # too soon: no second attempt
+    assert rows == []
+    cog.fail = False
+    cog, rows = env(ev, cog=cog, now=NOW + prov.RETRY_AFTER + 1)
+    assert [r["result"] for r in rows] == ["removed"]
+
+
+def test_if_membership_cannot_be_checked_the_person_is_added_but_never_taken_back(env):
+    cog = FakeCognito(existing={"a@x.org": "sub-a"})
+    cog.in_group = lambda username: (_ for _ in ()).throw(RuntimeError("AccessDenied"))
+    cog, rows = env([invite("i1", "a@x.org")], cog=cog)
+    assert rows[0]["result"] == "added" and rows[0]["already_member"] is None
+    cog, rows = env([invite("i1", "a@x.org"), cancelled("i1")], cog=cog)
+    assert cog.removed == [] and rows == []

@@ -1093,7 +1093,10 @@ class CollabService:
         now, seen = self._now(), {}
         for h in hosts:
             name = self._require_host(h.get("host") if isinstance(h, dict) else None)
-            seen[name] = {"kind": "local" if h.get("kind") == "local" else "machine", "seen": now}
+            fams = h.get("families")
+            seen[name] = {"kind": "local" if h.get("kind") == "local" else "machine", "seen": now,
+                          "families": sorted({f for f in fams if f in SPAWN_FAMILIES and f != "agent"})
+                          if isinstance(fams, list) else []}
         with self._lock:
             self._fleet_seen = seen
         return {"ok": True}
@@ -1105,6 +1108,7 @@ class CollabService:
             names = sorted(set(self._fleet_seen) | set(self._fleet_flags))
             return {"hosts": [{"host": n, "kind": self._fleet_seen.get(n, {}).get("kind", "machine"),
                                "auto_agents": self._fleet_flags.get(n, True),
+                               "families": self._fleet_seen.get(n, {}).get("families", []),
                                "online": now - self._fleet_seen.get(n, {}).get("seen", -1e18) < FLEET_ONLINE}
                               for n in names]}
 
@@ -1172,6 +1176,37 @@ class CollabService:
                     if r["owner"] == pr.id and (status is None or r["status"] == status)]
         rows.sort(key=lambda r: r["created_at"], reverse=True)
         return {"spawns": rows[:50]}
+
+    TASK_ACTIVITY_MAX = 40
+
+    def task_activity(self, pr: Principal, body: dict) -> dict:
+        """For the dashboard's fabric timelines: recent task activity of the caller's own agents that
+        are linked to the given fabric sessions. Ids, names and statuses only: the task text and
+        result never leave the collaboration service this way."""
+        self._require_user(pr)
+        ids = body.get("instance_ids")
+        if (not isinstance(ids, list) or len(ids) > 100
+                or not all(isinstance(i, str) and 0 < len(i) <= 200 for i in ids)):
+            raise CollabError(400, "instance_ids must be a list of at most 100 session ids")
+        wanted = set(ids)
+        with self._lock:
+            mine = {aid: a for aid, a in self._agents.items()
+                    if a["owner"] == pr.id and a["status"] == "active" and a.get("instance_id") in wanted}
+            rows = []
+            if mine:
+                for tid, t in self._tasks.items():
+                    got = t["target"] in mine
+                    sent = t["by_kind"] == "agent" and t["by_id"] in mine
+                    if not (got or sent):
+                        continue
+                    aid = t["target"] if got else t["by_id"]
+                    room = self._rooms.get(t["room_id"]) or {}
+                    rows.append({"instance_id": mine[aid]["instance_id"], "agent": mine[aid]["name"],
+                                 "direction": "received" if got else "delegated", "task_id": tid,
+                                 "status": self._task_status(t), "updated_at": t["updated_at"],
+                                 "room": room.get("name"), "_seq": t["seq"]})
+            rows.sort(key=lambda r: r.pop("_seq"), reverse=True)
+        return {"activity": rows[:self.TASK_ACTIVITY_MAX]}
 
     def claim_spawn(self, pr: Principal, spawn_id: str) -> dict:
         """The runner takes a request exactly once (a second claim is refused, so a restart cannot start it twice)."""
@@ -1334,10 +1369,10 @@ class CollabService:
         return {"room_id": room_id, "agent_id": aid, "actions": actions, "status": "pending", "request_id": rid}
 
     def _name_free(self, room: dict, agent_id: str, name: str) -> None:
-        """Handles are how people address agents (@name): two agents in one room never share one."""
-        for other in set(room["grants"]) | {self._requests[i]["agent_id"]
-                                            for i in self._requests_by_room.get(room["id"], ())
-                                            if self._requests[i]["open"]}:
+        """Handles are how people address agents (@name): two agents in one room never share one.
+        Only agents that hold a grant own a handle. A pending request does not, so someone else's
+        request can't keep the owner from using that name; the clash shows up when it is approved."""
+        for other in room["grants"]:
             if other != agent_id and self._agents.get(other, {}).get("name") == name:
                 raise CollabError(409, "an agent with that name is already in this room; rename yours")
 
@@ -2013,6 +2048,8 @@ class CollabService:
                         return 200, self.set_fleet_host(pr, parts[2], body)
                     if parts == ["fleet", "spawns"]:
                         return 201, self.request_spawn(pr, body)
+                    if parts == ["fleet", "task-activity"]:
+                        return 200, self.task_activity(pr, body)
                     if n == 4 and parts[1] == "spawns" and parts[3] == "claim":
                         return 200, self.claim_spawn(pr, parts[2])
                     if n == 4 and parts[1] == "spawns" and parts[3] == "done":

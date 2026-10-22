@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 import shutil
 import stat
 import subprocess
@@ -95,7 +96,9 @@ def rig(svc, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_REMOTE_HOME", str(remote))
     r = runner.Runner(f"http://127.0.0.1:{srv.server_address[1]}", tmp_path / "state", str(bin_ / "herdr"),
                       str(bin_ / "ssh"), WORKER, "bender", say=lambda m: None)
-    yield type("Rig", (), dict(w=w, r=r, home=home, remote=remote, log=log))
+    have = {None: ["claude-code", "codex", "pi"], "beast": ["claude-code", "codex", "pi"]}     # per ssh target
+    monkeypatch.setattr(r, "installed_families", lambda target: list(have[target]))
+    yield type("Rig", (), dict(w=w, r=r, home=home, remote=remote, log=log, have=have))
     srv.shutdown()
 
 
@@ -128,10 +131,18 @@ def test_a_request_is_spread_round_robin_and_workers_start_in_herdr(rig):
         assert all(cred["credential"] not in line for line in calls(rig) + calls(rig, "ssh"))
     assert "BASE='https://localdev.example.org'" in (rig.home / "herdr-agents/worker.sh").read_text()
     runs = [line for line in calls(rig) if " pane run " in f" {line} "]
-    assert len(runs) == 4 and all("HERDR_AGENT_CMD='claude -p'" in line and "worker.sh" in line for line in runs)
+    # text-only by default: no built-in tools and no connectors; the quoting survives the shell untouched
+    want = runner.FAMILY_CMD_TEXT_ONLY["claude-code"]
+    assert len(runs) == 4 and all("worker.sh" in line for line in runs)
+    for line in runs:
+        env = shlex.split(line.split("pane run ", 1)[1].split(" ", 1)[1])[0]
+        assert env == "HERDR_AGENT_CMD=" + want and "--tools ''" in want and "--strict-mcp-config" in want
     assert sum(line.startswith("--machine beast pane run") for line in runs) == 2
     # the owner granted these in a room they own: they work at once
     assert {a["name"] for a in rig.w.s.list_room_agents(rig.w.alice, rig.w.room)["agents"]} >= {"fleet-1", "fleet-4"}
+    # each agent is tied to the pane it runs in, so the dashboard can show it next to its fabric session
+    linked = {a["name"]: a["instance_id"] for a in rig.w.s.list_my_agents(rig.w.alice)["agents"] if a["name"].startswith("fleet-")}
+    assert set(linked) == set(hosts) and all(v and v.startswith(f"pane:{hosts[k]}:w") for k, v in linked.items())
 
 
 def test_the_rotation_continues_across_requests(rig):
@@ -266,3 +277,57 @@ def test_a_request_nobody_took_in_time_is_expired_not_started_late(rig):
 def runner_stale():
     from herdr_engineering.control_plane.collab import SPAWN_STALE
     return SPAWN_STALE
+
+
+def test_a_host_without_the_cli_is_never_handed_that_family(rig):
+    rig.have["beast"] = ["codex"]                              # beast has no claude
+    ask(rig)
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert done["status"] == "done" and {p["host"] for p in done["placements"]} == {"bender"}
+    hosts = {h["host"]: h["families"] for h in rig.w.s.list_fleet_hosts(rig.w.alice)["hosts"]}
+    assert hosts == {"bender": ["claude-code", "codex", "pi"], "beast": ["codex"]}
+
+
+def test_no_host_with_the_cli_finishes_with_a_reason_and_creates_nothing(rig):
+    rig.have[None], rig.have["beast"] = ["claude-code"], ["claude-code"]
+    before = len(rig.w.s.list_my_agents(rig.w.alice)["agents"])
+    ask(rig, harness_type="pi")
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert done["status"] == "done" and "pi installed" in done["error"] and done["placements"] == []
+    assert len(rig.w.s.list_my_agents(rig.w.alice)["agents"]) == before
+
+
+def test_the_agent_family_needs_no_cli(rig):
+    rig.have[None], rig.have["beast"] = [], []
+    ask(rig, harness_type="agent", count=2)
+    rig.r.once()
+    assert {p["status"] for p in rig.w.s.list_spawns(rig.w.alice)["spawns"][0]["placements"]} == {"started"}
+
+
+def test_by_default_agents_get_no_tools_and_codex_is_not_started(rig):
+    assert "--tools ''" in runner.FAMILY_CMD_TEXT_ONLY["claude-code"] and "--no-tools" in runner.FAMILY_CMD_TEXT_ONLY["pi"]
+    assert "codex" not in runner.FAMILY_CMD_TEXT_ONLY
+    before = len(rig.w.s.list_my_agents(rig.w.alice)["agents"])
+    ask(rig, harness_type="codex")
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert done["placements"] == [] and "--allow-tools" in done["error"]
+    assert len(rig.w.s.list_my_agents(rig.w.alice)["agents"]) == before          # nothing was created
+
+
+def test_allow_tools_switches_to_the_full_commands(rig):
+    rig.r.cmds = runner.FAMILY_CMD_TOOLS
+    ask(rig, harness_type="codex", count=2)
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert {p["status"] for p in done["placements"]} == {"started"}
+    assert any("codex exec --skip-git-repo-check -" in line for line in calls(rig))
+    assert runner.Runner("http://x", Path("/tmp/x"), "h", "s", WORKER, "b", allow_tools=True).cmds is runner.FAMILY_CMD_TOOLS
+    assert runner.Runner("http://x", Path("/tmp/x"), "h", "s", WORKER, "b").cmds is runner.FAMILY_CMD_TEXT_ONLY
+
+
+def test_pi_prompt_cannot_be_read_as_a_file_or_flag():
+    for cmd in (runner.FAMILY_CMD_TEXT_ONLY["pi"], runner.FAMILY_CMD_TOOLS["pi"]):
+        assert ' -- "Task from a room member: $(cat)"' in cmd
