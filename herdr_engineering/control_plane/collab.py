@@ -64,7 +64,9 @@ TASK_TTL = 24 * 3600.0           # a task nobody finished in a day is expired
 MAX_TASK_DEPTH = 3               # human -> agent -> agent -> agent
 TASK_RATE = 20                   # new tasks per creator per 10 minutes
 MAX_OPEN_TASKS_PER_AGENT = 10
-MAX_PENDING_REQUESTS = 50        # open access requests per room
+MAX_PENDING_REQUESTS = 120       # open access requests per room (one family of agents fits)
+MAX_JOIN_AGENTS = 50             # agents one join token / bulk call may create
+JOIN_TOKEN_MAX_TTL = 24 * 3600.0
 REQUEST_TTL = 7 * 24 * 3600.0
 _HANDLE_BAD = re.compile(r"[^a-z0-9\-]")
 
@@ -242,6 +244,8 @@ class CollabService:
         self._requests_by_agent: dict[str, set] = defaultdict(set)
         self._rooms_by_agent: dict[str, set] = defaultdict(set)
         self._housekept = 0.0
+        self._joins: dict[str, dict] = {}                    # token digest -> record
+        self._joins_by_id: dict[str, str] = {}               # join id -> digest
         self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
         self._msg_room: dict[str, str] = {}                  # message event id -> room id
         self.stats = defaultdict(int)
@@ -367,6 +371,18 @@ class CollabService:
                 "cred_digest": p["secret_digest"], "expires_at": p["expires_at_epoch"]}
             self._by_cred[p["secret_digest"]] = p["agent_id"]
             self._agents_by_owner[p["owner_user_id"]].add(p["agent_id"])
+            if p.get("join_digest") in self._joins:
+                self._joins[p["join_digest"]]["uses"] += 1
+        elif t == "join_token_created":
+            self._joins[p["join_digest"]] = {
+                "id": p["join_id"], "owner": p["actor_user_id"], "family": p["harness_type"],
+                "prefix": p["name_prefix"], "max_uses": p["max_uses"], "uses": 0,
+                "expires_at": p["expires_at_epoch"], "room_id": p.get("room_id"),
+                "actions": list(p.get("actions") or []), "revoked": False, "created_at": p["created_at"]}
+            self._joins_by_id[p["join_id"]] = p["join_digest"]
+        elif t == "join_token_revoked":
+            if p["join_id"] in self._joins_by_id:
+                self._joins[self._joins_by_id[p["join_id"]]]["revoked"] = True
         elif t == "credential_rotated":
             a = self._agents[p["agent_id"]]
             self._by_cred.pop(a["cred_digest"], None)
@@ -856,6 +872,182 @@ class CollabService:
         return {"agent_id": aid, "credential": cred, "device_id": device, "expires_at": expires,
                 "name": handle or _default_handle(label, aid)}
 
+    # ------------------------------------------------------------ fleets of agents
+    def _agent_names(self, owner: str, prefix: str, count: int) -> list[str]:
+        """`prefix-1`, `prefix-2`, ... skipping handles this person's agents already use."""
+        taken = {self._agents[a]["name"] for a in self._agents_by_owner.get(owner, ())}
+        out, n = [], 1
+        while len(out) < count:
+            name = f"{prefix}-{n}"
+            if name not in taken:
+                out.append(name)
+            n += 1
+        return out
+
+    def _join_args(self, body: dict) -> tuple[str, str, int]:
+        family = _name(body.get("harness_type", "claude-code"), "harness_type")
+        prefix = _handle(body.get("name_prefix"))
+        if len(prefix) > 24:
+            raise CollabError(400, "name_prefix must be at most 24 characters")
+        count = body.get("count", 1)
+        if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= MAX_JOIN_AGENTS:
+            raise CollabError(400, f"count must be 1-{MAX_JOIN_AGENTS}")
+        return family, prefix, count
+
+    def create_join_token(self, pr: Principal, body: dict) -> dict:
+        """A short-lived, limited-use token that lets scripts on other machines register agents for
+        this person. It creates NOTHING by itself: each use makes one agent that has no access,
+        plus (if a room is named) a pending request that the room owner must approve."""
+        self._require_user(pr)
+        family, prefix, count = self._join_args(body)
+        ttl = body.get("ttl_seconds", 3600)
+        if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or not 60 <= ttl <= JOIN_TOKEN_MAX_TTL:
+            raise CollabError(400, "ttl_seconds must be 60-86400")
+        room_id, actions = body.get("room_id"), []
+        with self._lock:
+            if room_id is not None:
+                if not isinstance(room_id, str):
+                    raise CollabError(400, "invalid room_id")
+                self._authorize(pr, room_id, "grant_agent", "join.token")
+                actions = _actions(body.get("actions"))
+            self._throttle("jointoken:" + pr.id, 10, 3600.0, "join token")
+            self._agent_slots(pr.id, count)
+            token, jid = "hcj_" + secrets.token_urlsafe(24), ids.new_id("collab")
+            expires = self._now() + float(ttl)
+            self._commit("join_token_created", self._actor(
+                pr, join_id=jid, join_digest=_digest(token), harness_type=family, name_prefix=prefix,
+                max_uses=count, expires_at_epoch=expires, room_id=room_id, actions=actions,
+                action="join.token.create", outcome="allowed", project_ids=[], resource_id=jid))
+        return {"join_id": jid, "token": token, "expires_at": expires, "max_uses": count,
+                "name_prefix": prefix, "harness_type": family, "room_id": room_id, "actions": actions}
+
+    def list_join_tokens(self, pr: Principal) -> dict:
+        self._require_user(pr)
+        now = self._now()
+        with self._lock:
+            return {"tokens": [
+                {"join_id": r["id"], "harness_type": r["family"], "name_prefix": r["prefix"],
+                 "uses": r["uses"], "max_uses": r["max_uses"], "expires_at": r["expires_at"],
+                 "room_id": r["room_id"], "actions": r["actions"],
+                 "status": "revoked" if r["revoked"] else ("expired" if now >= r["expires_at"] else (
+                     "used up" if r["uses"] >= r["max_uses"] else "active"))}
+                for r in self._joins.values() if r["owner"] == pr.id and now - r["expires_at"] < 7 * 86400]}
+
+    def revoke_join_token(self, pr: Principal, join_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            digest = self._joins_by_id.get(join_id)
+            if not digest or self._joins[digest]["owner"] != pr.id:
+                raise CollabError(404, "not found")
+            if not self._joins[digest]["revoked"]:
+                self._commit("join_token_revoked", self._actor(
+                    pr, join_id=join_id, action="join.token.revoke", outcome="allowed",
+                    project_ids=[], resource_id=join_id))
+        return {"ok": True}
+
+    def redeem_join_token(self, body: dict) -> dict:
+        """Public, token-authenticated: one use = one new agent for the token's owner."""
+        token = body.get("token")
+        if not isinstance(token, str) or not token.startswith("hcj_") or len(token) > 80:
+            raise CollabError(401, "unauthorized")
+        digest = _digest(token)
+        instance = body.get("instance_id")
+        with self._lock:
+            rec = self._joins.get(digest)
+            if (rec is None or rec["revoked"] or self._now() >= rec["expires_at"]
+                    or rec["uses"] >= rec["max_uses"] or not self.auth.exists(rec["owner"])):
+                self.stats["auth_failures"] += 1
+                raise CollabError(401, "unauthorized")
+            self._throttle("join:" + digest, 120, 60.0, "join")
+            owner = rec["owner"]
+            self._agent_slots(owner)
+            name = self._agent_names(owner, rec["prefix"], 1)[0]
+            aid, cred = ids.new_id("agent"), "hca_" + secrets.token_urlsafe(32)
+            device = "remote-" + secrets.token_hex(8)
+            expires = self._now() + self.remote_credential_ttl
+            self._commit("agent_enrolled", {
+                "actor_user_id": owner, "actor_agent_id": None, "agent_id": aid, "owner_user_id": owner,
+                "code_digest": None, "join_digest": digest, "device_id": device,
+                "harness_type": rec["family"], "name": name,
+                "instance_id": instance if isinstance(instance, str) and len(instance) <= 120
+                and instance and not _NAME_BAD.search(instance) else None,
+                "secret_digest": _digest(cred), "expires_at_epoch": expires,
+                "action": "agent.join", "outcome": "allowed", "project_ids": [], "resource_id": aid})
+            request_id = self._file_request(owner, rec["room_id"], aid, rec["actions"]) if rec["room_id"] else None
+        return {"agent_id": aid, "name": name, "credential": cred, "device_id": device, "expires_at": expires,
+                "room_id": rec["room_id"], "request_id": request_id,
+                "status": "pending" if request_id else "no access yet"}
+
+    def _file_request(self, owner: str, room_id: str, agent_id: str, actions: list[str]) -> str | None:
+        """Ask on a person's behalf (their token was used); None when the room no longer takes it."""
+        room = self._rooms.get(room_id)
+        m = self._member(room, owner) if room else None
+        if not m or "grant_agent" not in ROLE_ACTIONS[m["role"]]:
+            return None
+        now = self._now()
+        open_here = [r for r in map(self._requests.get, self._requests_by_room.get(room_id, ()))
+                     if r and r["open"] and now - r["created_epoch"] < REQUEST_TTL
+                     and self._agents.get(r["agent_id"], {}).get("status") == "active"]
+        if len(open_here) >= MAX_PENDING_REQUESTS:
+            return None
+        rid = ids.new_id("grant")
+        self._commit("agent_access_requested", {
+            "actor_user_id": owner, "actor_agent_id": None, "project_id": room["project_id"],
+            "room_id": room_id, "agent_id": agent_id, "request_id": rid, "actions": actions,
+            "created_epoch": now, "action": "agent.request", "outcome": "allowed",
+            "project_ids": [room["project_id"]], "resource_id": agent_id})
+        return rid
+
+    def bulk_connect(self, pr: Principal, body: dict) -> dict:
+        """Dashboard owner only (the operator listener): create a family of agents in one call. In a
+        room the caller owns they are granted directly; otherwise they are requested."""
+        self._require_user(pr)
+        family, prefix, count = self._join_args(body)
+        room_id, actions = body.get("room_id"), []
+        with self._lock:
+            if room_id is not None:
+                if not isinstance(room_id, str):
+                    raise CollabError(400, "invalid room_id")
+                self._authorize(pr, room_id, "grant_agent", "agent.bulk")
+                actions = _actions(body.get("actions"))
+            self._throttle("bulk:" + pr.id, 12, 3600.0, "bulk registration")
+            self._agent_slots(pr.id, count)
+            out = []
+            for name in self._agent_names(pr.id, prefix, count):
+                info = self.connect_agent(pr, {"harness_type": family, "name": name})
+                status = None
+                if room_id is not None:
+                    status = self.grant_agent(pr, room_id, {
+                        "agent_id": info["agent_id"], "actions": actions,
+                        **({"expires_at": body["expires_at"]} if "expires_at" in body else {})}, _bulk=True)["status"]
+                out.append({**info, "status": status})
+        return {"agents": out}
+
+    def approve_all_requests(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """The owner approves several waiting requests at once; each is still capped at what its
+        agent asked for."""
+        self._require_user(pr)
+        ids_ = body.get("request_ids")
+        if ids_ is not None and (not isinstance(ids_, list) or len(ids_) > 200
+                                 or not all(isinstance(i, str) for i in ids_)):
+            raise CollabError(400, "invalid request_ids")
+        with self._lock:
+            self._authorize(pr, room_id, "invite", "agent.request.decide")
+            self._throttle("approveall:" + pr.id, 30, 600.0, "bulk approval")
+            wanted = list(ids_) if ids_ is not None else [
+                r["request_id"] for r in self.list_agent_requests(pr, room_id)["requests"]]
+            approved, skipped = 0, 0
+            for rid in wanted[:200]:
+                try:
+                    self.decide_agent_request(pr, room_id, rid, {
+                        "decision": "approve",
+                        **({"expires_at": body["expires_at"]} if "expires_at" in body else {}),
+                        **({"actions": [a for a in body["actions"]]} if "actions" in body else {})})
+                    approved += 1
+                except CollabError:
+                    skipped += 1
+        return {"approved": approved, "skipped": skipped}
+
     def list_my_agents(self, pr: Principal) -> dict:
         self._require_user(pr)
         with self._lock:
@@ -909,7 +1101,7 @@ class CollabService:
                 project_ids=[], resource_id=agent_id))
         return {"ok": True}
 
-    def grant_agent(self, pr: Principal, room_id: str, body: dict) -> dict:
+    def grant_agent(self, pr: Principal, room_id: str, body: dict, _bulk: bool = False) -> dict:
         """The room owner grants an agent its permissions directly. Anyone else who may bring an
         agent (a contributor) can only REQUEST access; the owner approves a subset of what was
         asked, so no one gets a permission they did not ask for or the owner did not approve.
@@ -928,7 +1120,8 @@ class CollabService:
             narrowing = bool(existing) and set(actions) <= set(existing["actions"])
             if existing and set(actions) == set(existing["actions"]) and m["role"] != "owner":
                 return {"room_id": room_id, "agent_id": aid, "actions": actions, "status": "granted"}   # nothing to do
-            self._throttle("grant:" + pr.id, 120 if m["role"] == "owner" else 30, 600.0, "agent permission")   # each call writes to the shared log
+            if not _bulk:                       # a bulk call charges once, for the whole family
+                self._throttle("grant:" + pr.id, 120 if m["role"] == "owner" else 30, 600.0, "agent permission")   # each call writes to the shared log
             if m["role"] == "owner" or narrowing:
                 exp = self._grant_expiry(body) if m["role"] == "owner" else existing["expires_at"]
                 self._commit("agent_granted", self._actor(
@@ -1437,6 +1630,8 @@ class CollabService:
         try:
             if parts == ["agents", "enrollment", "complete"] and method == "POST":
                 return 201, self.complete_enrollment(body)
+            if parts == ["agents", "join"] and method == "POST":
+                return 201, self.redeem_join_token(body)         # the token IS the authentication
             if parts == ["config"] and method == "GET":
                 return 200, self.public_config  # public identifiers only; no auth needed
             if operator is not None:
@@ -1454,6 +1649,8 @@ class CollabService:
                     return 200, self.me(pr)
                 if parts == ["agents"]:
                     return 200, self.list_my_agents(pr)
+                if parts == ["agents", "join-tokens"]:
+                    return 200, self.list_join_tokens(pr)
                 if parts == ["tasks", "inbox"]:
                     return 200, self.task_inbox(pr)
                 if parts == ["rooms"]:
@@ -1483,6 +1680,14 @@ class CollabService:
                     return 200, self.link_identity(pr, body)
                 if parts == ["agents", "connect"]:
                     return 201, self.connect_agent(pr, body)
+                if parts == ["agents", "join-tokens"]:
+                    return 201, self.create_join_token(pr, body)
+                if n == 4 and parts[:2] == ["agents", "join-tokens"] and parts[3] == "revoke":
+                    return 200, self.revoke_join_token(pr, parts[2])
+                if parts == ["agents", "bulk"]:
+                    if operator is None:                  # dashboard owner only: not offered to the public site
+                        raise CollabError(404, "not found")
+                    return 201, self.bulk_connect(pr, body)
                 if parts == ["projects"]:
                     return 201, self.create_project(pr, body)
                 if n == 3 and parts[0] == "projects" and parts[2] == "rooms":
@@ -1511,6 +1716,8 @@ class CollabService:
                         return 201, self.grant_agent(pr, rid, body)
                     if n == 5 and parts[2] == "agents" and parts[4] == "remove":
                         return 200, self.remove_agent_from_room(pr, rid, parts[3])
+                    if parts[2:] == ["agent-requests", "approve-all"]:
+                        return 200, self.approve_all_requests(pr, rid, body)
                     if n == 5 and parts[2] == "agent-requests" and parts[4] == "decide":
                         return 200, self.decide_agent_request(pr, rid, parts[3], body)
                     if parts[2:] == ["tasks"]:
