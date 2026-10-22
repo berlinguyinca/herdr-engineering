@@ -9,6 +9,8 @@ const store = new TokenStore(window.sessionStorage);
 let operator = false;   // the local owner on the dashboard: no sign-in, the server knows who they are
 const api = new CollabApi(() => (operator ? { access: 'operator', id: 'operator' } : store.get()));
 const ROLES = [['contributor', 'Can chat'], ['viewer', 'Read only'], ['guest', 'Guest (read only, expires)']];
+const PERMS = [['read', 'Read messages'], ['post', 'Write messages'], ['execute', 'Receive tasks'], ['instruct', 'Send tasks to agents']];
+const PERM_SHORT = { read: 'Read', post: 'Write', execute: 'Receive tasks', instruct: 'Send tasks' };
 const ROLE_LABEL = { owner: 'Owner', contributor: 'Can chat', viewer: 'Read only', guest: 'Guest' };
 
 async function loadConfig() {
@@ -71,12 +73,13 @@ const GUIDE = `<div class="hd-card">
 
 export function mountCollab(root) {
   let timer = null;
+  let timer2 = null;
   let cursor = 0;
   let lastCfg = null;
   let me = null;
   const standalone = root.dataset.standalone === '1';
   let current = '/rooms';   // in-dashboard navigation (the dashboard owns the URL hash)
-  const dispose = () => { clearInterval(timer); timer = null; };
+  const dispose = () => { clearInterval(timer); timer = null; clearInterval(timer2); timer2 = null; };
   const go = (path) => { if (standalone) { window.location.hash = path; } else { current = path; route(); } };
   const onHash = () => { if (store.get() && me) route(); };
   const $ = (id) => document.getElementById(id);
@@ -189,7 +192,7 @@ export function mountCollab(root) {
 
   async function showAgents() {
     frame('/agents', `<div class="cx-head"><div><h1>AI agents</h1><p class="cx-sub">Connect Claude Code, Codex, Pi or any MCP client so it can work in your rooms.</p></div>
-        <button id="hcn-connect" class="hd-btn" type="button">Connect an AI agent</button></div>
+        <div class="cx-row"><input id="hcn-agent-name" class="cx-input" maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="name, e.g. alices-helper (optional)" aria-label="Agent name" autocomplete="off"><button id="hcn-connect" class="hd-btn" type="button">Connect an AI agent</button></div></div>
       <div id="hcn-connect-out"></div>
       <section class="cx-section"><h2>Your agents</h2><div id="hcn-agents"></div></section>
       <section class="cx-section">${GUIDE}</section>`);
@@ -197,7 +200,7 @@ export function mountCollab(root) {
     $('hcn-connect').onclick = async () => {
       const btn = $('hcn-connect');
       btn.disabled = true;
-      try { showCredential(await api.connectAgent()); await renderAgents(); } catch (e) {
+      try { showCredential(await api.connectAgent($('hcn-agent-name').value.trim().toLowerCase())); await renderAgents(); } catch (e) {
         $('hcn-connect-out').innerHTML = `<div class="hd-error" role="alert">${esc(e.message)}</div>`;
       } finally { btn.disabled = false; }
     };
@@ -228,7 +231,7 @@ export function mountCollab(root) {
     const { agents } = await api.agents();
     const live = agents.filter((a) => a.status === 'active');
     box.innerHTML = live.length ? `<div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack">
-        <div class="cx-row cx-row--between"><span class="hd-card__title">${esc(a.harness_type)}</span>${pill('Active', 'var(--status-ok)')}</div>
+        <div class="cx-row cx-row--between"><span class="hd-card__title">@${esc(a.name || a.harness_type)}</span>${pill('Active', 'var(--status-ok)')}</div>
         <span class="hd-ident">${esc(a.agent_id)}</span>
         <span class="hd-card__sub">Expires ${esc(new Date(a.expires_at * 1000).toLocaleDateString())} · ${a.rooms.length ? `in ${esc(a.rooms.map((r) => r.name).join(', '))}` : 'not in any room yet'}</span>
         <div><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Revoke</button></div></div>`).join('')}</div>`
@@ -243,16 +246,23 @@ export function mountCollab(root) {
     const canInvite = info.role === 'owner';
     const canPost = ['owner', 'contributor'].includes(info.role);
     const names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
+    const agentName = new Map();           // agent id -> handle, for rendering task events
+    let roomAgentList = [];
     frame('/rooms', `<button id="hcn-back" class="cx-back" type="button">← All rooms</button>
       <div class="cx-head"><div><h1>${esc(info.name)}</h1><p class="cx-sub">You are ${esc(roleLabel(info.role).toLowerCase())} in this room.</p></div>${pill(roleLabel(info.role), 'var(--accent)')}</div>
       <div class="cx-room-layout">
         <section class="hd-card cx-chat" aria-label="Conversation">
           <div id="hcn-log" class="cx-log" role="log" aria-live="polite"><div class="hd-empty" id="hcn-empty">No messages yet.</div></div>
-          ${canPost ? '<form id="hcn-say" class="cx-compose"><input class="cx-input" name="text" required maxlength="8000" aria-label="Message" placeholder="Write a message…" autocomplete="off"><button class="hd-btn" type="submit">Send</button></form><div id="hcn-say-msg" class="cx-msg" role="status" style="padding:0 12px 10px"></div>'
+          ${canPost ? '<form id="hcn-say" class="cx-compose"><input class="cx-input" name="text" required maxlength="8000" aria-label="Message" placeholder="Write a message… (start with @agent-name to give that agent a task)" autocomplete="off"><button class="hd-btn" type="submit">Send</button></form><div id="hcn-say-msg" class="cx-msg" role="status" style="padding:0 12px 10px"></div>'
             : '<div class="cx-msg" style="padding:12px">Read-only access.</div>'}
         </section>
         <aside class="cx-side">
-          ${canPost ? '<section class="hd-card"><div class="hd-card__title">Your agents in this room</div><div id="hcn-grant"></div></section>' : ''}
+          <section class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></section>
+          ${canInvite ? '<section class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></section>' : ''}
+          ${canPost ? '<section class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></section>' : ''}
+          <section class="hd-card cx-stack"><div class="hd-card__title">Tasks</div>
+            ${canPost ? '<form id="hcn-task" class="cx-stack"><label class="cx-field">Give a task to<select name="target" id="hcn-task-target"></select></label><label class="cx-field">What should it do?<textarea class="cx-input" name="text" required maxlength="4000" rows="3"></textarea></label><button class="hd-btn" type="submit">Send task</button><span id="hcn-task-msg" class="cx-msg" role="alert"></span></form>' : ''}
+            <div id="hcn-tasks"></div></section>
           ${canInvite ? `<section class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div>
             <form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
               <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
@@ -278,7 +288,13 @@ export function mountCollab(root) {
             row.innerHTML = `<span class="cx-meta">${agent ? '🤖 ' : ''}${esc(who)} · ${esc(new Date(e.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}</span><div class="cx-bubble">${esc(e.text)}</div>`;
           } else {
             row.className = 'cx-event';
-            row.textContent = e.event_type.replaceAll('_', ' ');
+            if (e.event_type === 'task_created') {
+              row.textContent = `📋 Task for @${agentName.get(e.task.target_agent_id) || shortId(e.task.target_agent_id)}: ${e.task.text}`;
+            } else if (e.event_type === 'task_updated') {
+              row.textContent = `📋 @${agentName.get(e.task.target_agent_id) || shortId(e.task.target_agent_id)} ${e.task.status}${e.task.result ? `: ${e.task.result}` : ''}`;
+            } else {
+              row.textContent = e.event_type.replaceAll('_', ' ');
+            }
           }
           log.appendChild(row);
         }
@@ -291,28 +307,117 @@ export function mountCollab(root) {
     log.scrollTop = log.scrollHeight;
     timer = setInterval(poll, 3000);
 
-    const grantBox = $('hcn-grant');
-    if (grantBox) {
-      const draw = async () => {
-        const { agents } = await api.agents();
-        const live = agents.filter((a) => a.status === 'active');
-        grantBox.innerHTML = live.length ? `<ul class="cx-list">${live.map((a) => {
-          const g = a.rooms.find((r) => r.room_id === roomId);
-          return `<li><span class="grow">${esc(a.harness_type)}<br><span class="hd-ident">${esc(shortId(a.agent_id))}</span></span>${g
-            ? `${pill(g.actions.includes('post') ? 'Read + post' : 'Read only', 'var(--status-ok)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-g="${esc(a.agent_id)}" data-a="read">Read only</button>`
-            : `<span class="cx-row"><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-g="${esc(a.agent_id)}" data-a="read">Add (read)</button><button type="button" class="hd-btn hd-btn--sm" data-g="${esc(a.agent_id)}" data-a="read,post">Add (read + post)</button></span>`}</li>`;
-        }).join('')}</ul>` : '<div class="hd-empty">No agents yet. <a href="#/agents" data-go="/agents">Connect one</a>.</div>';
-        grantBox.querySelectorAll('[data-go]').forEach((a) => { a.onclick = (e) => { if (!standalone) { e.preventDefault(); go(a.dataset.go); } }; });
-        grantBox.querySelectorAll('[data-g]').forEach((b) => { b.onclick = async () => { await api.grantAgent(roomId, b.dataset.g, b.dataset.a.split(',')); draw(); }; });
+    // ---- agents, access requests and tasks
+    const permBoxes = (cur, name) => PERMS.map(([v, l]) => `<label class="cx-check"><input type="checkbox" name="${name}" value="${v}"${cur.includes(v) ? ' checked' : ''}> ${esc(l)}</label>`).join('');
+    const permPills = (actions) => actions.map((a) => pill(PERM_SHORT[a] || a, 'var(--status-ok)')).join(' ');
+    const picked = (form, name) => [...form.querySelectorAll(`input[name="${name}"]:checked`)].map((i) => i.value);
+
+    const drawRoomAgents = async () => {
+      const box = $('hcn-roomagents');
+      if (!box) return;
+      try { roomAgentList = (await api.roomAgents(roomId)).agents; } catch { roomAgentList = []; }
+      roomAgentList.forEach((a) => agentName.set(a.agent_id, a.name));
+      const mine = new Set(((await api.agents().catch(() => ({ agents: [] }))).agents || []).map((a) => a.agent_id));
+      box.innerHTML = roomAgentList.length ? `<ul class="cx-list">${roomAgentList.map((a) => `<li><span class="grow"><b>@${esc(a.name)}</b><br><span class="hd-ident">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></span>${permPills(a.actions)}${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
+      box.querySelectorAll('[data-rmagent]').forEach((b) => { b.onclick = async () => { await api.removeAgent(roomId, b.dataset.rmagent); await refreshAgentPanels(); }; });
+      drawTaskTargets();
+    };
+
+    const drawMyAgents = async () => {
+      const box = $('hcn-grant');
+      if (!box) return;
+      const { agents } = await api.agents();
+      const live = agents.filter((a) => a.status === 'active');
+      const owner = info.role === 'owner';
+      box.innerHTML = live.length ? `<ul class="cx-list">${live.map((a) => {
+        const g = a.rooms.find((r) => r.room_id === roomId);
+        const pend = (a.pending || []).find((r) => r.room_id === roomId);
+        const cur = g ? g.actions : (pend ? pend.actions : ['read']);
+        return `<li><form class="cx-stack" data-agent="${esc(a.agent_id)}" style="flex:1 1 100%">
+          <span><b>@${esc(a.name)}</b> <span class="hd-ident">${esc(shortId(a.agent_id))}</span> ${g ? permPills(g.actions) : ''}${pend ? pill('Waiting for the room owner', 'var(--status-attention)') : ''}</span>
+          <span class="cx-checks">${permBoxes(cur, 'p')}</span>
+          <button type="submit" class="hd-btn hd-btn--sm">${owner ? (g ? 'Update permissions' : 'Add to room') : (g ? 'Request change' : 'Request access')}</button></form></li>`;
+      }).join('')}</ul>${owner ? '' : '<p class="cx-msg">The room owner approves what each agent may do here.</p>'}` : '<div class="hd-empty">No agents yet. <a href="#/agents" data-go="/agents">Connect one</a>.</div>';
+      box.querySelectorAll('[data-go]').forEach((el) => { el.onclick = (e) => { if (!standalone) { e.preventDefault(); go(el.dataset.go); } }; });
+      box.querySelectorAll('form[data-agent]').forEach((f) => {
+        f.onsubmit = async (ev) => {
+          ev.preventDefault();
+          const actions = picked(f, 'p');
+          if (!actions.length) return;
+          try { await api.grantAgent(roomId, f.dataset.agent, actions); } catch (e) { alert(e.message); }
+          await refreshAgentPanels();
+        };
+      });
+    };
+
+    const drawRequests = async () => {
+      const box = $('hcn-requests');
+      if (!box) return;
+      const { requests } = await api.agentRequests(roomId);
+      box.innerHTML = requests.length ? `<ul class="cx-list">${requests.map((r) => `<li><form class="cx-stack" data-req="${esc(r.request_id)}" style="flex:1 1 100%">
+          <span><b>@${esc(r.name)}</b> from ${esc(r.owner_email || shortId(r.owner_user_id))}</span>
+          <span class="cx-checks">${permBoxes(r.actions, 'p')}</span>
+          <span class="cx-row"><button type="submit" class="hd-btn hd-btn--sm" data-decision="approve">Approve</button><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-deny="1">Deny</button></span></form></li>`).join('')}</ul>` : '<div class="hd-empty">No requests.</div>';
+      box.querySelectorAll('form[data-req]').forEach((f, i) => {
+        const asked = requests[i].actions;
+        f.querySelectorAll('input[name="p"]').forEach((c) => { if (!asked.includes(c.value)) { c.disabled = true; c.checked = false; } });   // cannot approve more than was asked
+        f.onsubmit = async (ev) => {
+          ev.preventDefault();
+          const actions = picked(f, 'p');
+          if (!actions.length) return;
+          await api.decideRequest(roomId, f.dataset.req, 'approve', actions);
+          await refreshAgentPanels();
+        };
+        f.querySelector('[data-deny]').onclick = async () => { await api.decideRequest(roomId, f.dataset.req, 'deny'); await refreshAgentPanels(); };
+      });
+    };
+
+    const taskChip = (st) => pill(st, ({ done: 'var(--status-ok)', failed: 'var(--status-danger, #c0392b)', pending: 'var(--status-attention)', accepted: 'var(--accent)' })[st] || 'var(--text-muted)');
+    const drawTasks = async () => {
+      const box = $('hcn-tasks');
+      if (!box) return;
+      const { tasks } = await api.tasks(roomId);
+      box.innerHTML = tasks.length ? `<ul class="cx-list">${tasks.slice(0, 20).map((t) => `<li><span class="grow"><b>@${esc(t.target_name || shortId(t.target_agent_id))}</b> ${esc(t.text)}${t.result ? `<br><span class="hd-ident">→ ${esc(t.result)}</span>` : ''}</span>${taskChip(t.status)}${(['pending', 'accepted'].includes(t.status) && canPost) ? `<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel-task="${esc(t.task_id)}">Cancel</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No tasks yet.</div>';
+      box.querySelectorAll('[data-cancel-task]').forEach((b) => { b.onclick = async () => { try { await api.cancelTask(roomId, b.dataset.cancelTask); } catch (e) { alert(e.message); } drawTasks(); }; });
+    };
+    const drawTaskTargets = () => {
+      const sel = $('hcn-task-target');
+      if (!sel) return;
+      const can = roomAgentList.filter((a) => a.actions.includes('execute'));
+      sel.innerHTML = can.length ? can.map((a) => `<option value="${esc(a.agent_id)}">@${esc(a.name)}</option>`).join('') : '<option value="">No agent accepts tasks yet</option>';
+    };
+    const refreshAgentPanels = async () => {
+      await Promise.all([drawRoomAgents(), drawMyAgents().catch(() => {}), canInvite ? drawRequests().catch(() => {}) : null, drawTasks().catch(() => {})]);
+    };
+    await refreshAgentPanels();
+    clearInterval(timer2); timer2 = setInterval(refreshAgentPanels, 8000);
+    const taskForm = $('hcn-task');
+    if (taskForm) {
+      taskForm.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const f = new FormData(taskForm);
+        try {
+          await api.createTask(roomId, f.get('target'), f.get('text'));
+          taskForm.reset(); $('hcn-task-msg').textContent = ''; drawTaskTargets(); await drawTasks(); await poll();
+        } catch (e) { $('hcn-task-msg').textContent = e.message; }
       };
-      await draw();
     }
     const sayForm = $('hcn-say');
     if (sayForm) {
       sayForm.onsubmit = async (ev) => {
         ev.preventDefault();
         const text = new FormData(sayForm).get('text');
-        try { await api.say(roomId, text); sayForm.reset(); $('hcn-say-msg').textContent = ''; await poll(); log.scrollTop = log.scrollHeight; } catch (e) { $('hcn-say-msg').textContent = e.message; }
+        const mention = /^@([a-z0-9-]{1,32})\s+([\s\S]+)$/.exec(text.trim());
+        try {
+          if (mention) {   // "@helper do this" gives that agent a task instead of posting chat
+            const hits = roomAgentList.filter((a) => a.name === mention[1] && a.actions.includes('execute'));
+            if (hits.length !== 1) throw new Error(hits.length ? `More than one agent is called @${mention[1]}; use the Tasks panel` : `No agent named @${mention[1]} in this room accepts tasks`);
+            const target = hits[0];
+            await api.createTask(roomId, target.agent_id, mention[2]);
+            sayForm.reset(); $('hcn-say-msg').textContent = ''; await drawTasks(); await poll(); log.scrollTop = log.scrollHeight;
+            return;
+          }
+          await api.say(roomId, text); sayForm.reset(); $('hcn-say-msg').textContent = ''; await poll(); log.scrollTop = log.scrollHeight; } catch (e) { $('hcn-say-msg').textContent = e.message; }
       };
     }
     if (canInvite) {

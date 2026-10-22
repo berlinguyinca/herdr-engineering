@@ -59,6 +59,25 @@ test('agent endpoints use the documented routes', async () => {
   assert.deepEqual(JSON.parse(calls[2][2]), { agent_id: 'agent_1', actions: ['read'] });
 });
 
+test('agent permission, request and task calls use the documented routes', async () => {
+  const calls = [];
+  const f = async (url, init) => { calls.push([init.method, url, init.body]); return { status: 200, ok: true, json: async () => ({}) }; };
+  const api = new CollabApi(() => ({ access: 'T' }), f);
+  await api.connectAgent('alices-helper'); await api.roomAgents('r1'); await api.agentRequests('r1');
+  await api.decideRequest('r1', 'g1', 'approve', ['read', 'execute']); await api.decideRequest('r1', 'g2', 'deny');
+  await api.removeAgent('r1', 'a1'); await api.tasks('r1'); await api.createTask('r1', 'a1', 'do it'); await api.cancelTask('r1', 't1');
+  assert.deepEqual(calls.map((c) => c.slice(0, 2)), [
+    ['POST', '/api/v1/collab/agents/connect'], ['GET', '/api/v1/collab/rooms/r1/agents'],
+    ['GET', '/api/v1/collab/rooms/r1/agent-requests'],
+    ['POST', '/api/v1/collab/rooms/r1/agent-requests/g1/decide'], ['POST', '/api/v1/collab/rooms/r1/agent-requests/g2/decide'],
+    ['POST', '/api/v1/collab/rooms/r1/agents/a1/remove'], ['GET', '/api/v1/collab/rooms/r1/tasks'],
+    ['POST', '/api/v1/collab/rooms/r1/tasks'], ['POST', '/api/v1/collab/rooms/r1/tasks/t1/cancel']]);
+  assert.deepEqual(JSON.parse(calls[0][2]), { harness_type: 'claude-code', name: 'alices-helper' });
+  assert.deepEqual(JSON.parse(calls[3][2]), { decision: 'approve', actions: ['read', 'execute'] });
+  assert.deepEqual(JSON.parse(calls[4][2]), { decision: 'deny' });
+  assert.deepEqual(JSON.parse(calls[7][2]), { target_agent_id: 'a1', text: 'do it' });
+});
+
 test('API wrapper sends the bearer token and turns 401 into AuthError', async () => {
   const calls = [];
   const f = async (url, init) => { calls.push([url, init]); return url.endsWith('/rooms') ? { status: 401, ok: false, json: async () => ({}) } : { status: 200, ok: true, json: async () => ({ ok: 1 }) }; };

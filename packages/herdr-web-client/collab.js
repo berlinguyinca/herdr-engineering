@@ -95,10 +95,28 @@ export class CollabApi {
       { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}` });
   }
   agents() { return this.call('GET', '/agents'); }
-  connectAgent() { return this.call('POST', '/agents/connect', { harness_type: 'claude-code' }); }
+  connectAgent(name) {
+    return this.call('POST', '/agents/connect', { harness_type: 'claude-code', ...(name ? { name } : {}) });
+  }
   revokeAgent(id) { return this.call('POST', `/agents/${encodeURIComponent(id)}/revoke`, {}); }
   grantAgent(room, agentId, actions) {
     return this.call('POST', `/rooms/${encodeURIComponent(room)}/agents`, { agent_id: agentId, actions });
+  }
+  roomAgents(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/agents`); }
+  agentRequests(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/agent-requests`); }
+  decideRequest(id, requestId, decision, actions) {
+    return this.call('POST', `/rooms/${encodeURIComponent(id)}/agent-requests/${encodeURIComponent(requestId)}/decide`,
+      { decision, ...(actions ? { actions } : {}) });
+  }
+  removeAgent(id, agentId) {
+    return this.call('POST', `/rooms/${encodeURIComponent(id)}/agents/${encodeURIComponent(agentId)}/remove`, {});
+  }
+  tasks(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/tasks`); }
+  createTask(id, agentId, text) {
+    return this.call('POST', `/rooms/${encodeURIComponent(id)}/tasks`, { target_agent_id: agentId, text });
+  }
+  cancelTask(id, taskId) {
+    return this.call('POST', `/rooms/${encodeURIComponent(id)}/tasks/${encodeURIComponent(taskId)}/cancel`, {});
   }
   invite(id, email, role) { return this.call('POST', `/rooms/${encodeURIComponent(id)}/invites`, { email, role }); }
   invites(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/invites`); }

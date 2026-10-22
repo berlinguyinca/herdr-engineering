@@ -139,9 +139,18 @@ def enroll(api, owner, device="dev-1", harness="claude-code"):
     return a
 
 
-def grant(api, room, agent, actions=("read", "post"), owner="alice"):
-    return api.call("POST", f"{BASE}/rooms/{room}/agents",
-                    {"agent_id": agent["agent_id"], "actions": list(actions)}, user=owner)
+def grant(api, room, agent, actions=("read", "post"), owner="alice", approver="alice", expires_at=None):
+    """The agent's owner asks; a contributor's request waits for the room owner (``approver``)."""
+    body = {"agent_id": agent["agent_id"], "actions": list(actions)}
+    if expires_at is not None and owner == approver:
+        body["expires_at"] = expires_at
+    s, out = api.call("POST", f"{BASE}/rooms/{room}/agents", body, user=owner)
+    if s == 201 and out.get("status") == "pending":
+        extra = {"expires_at": expires_at} if expires_at is not None else {}
+        s2, d = api.call("POST", f"{BASE}/rooms/{room}/agent-requests/{out['request_id']}/decide",
+                         {"decision": "approve", **extra}, user=approver)
+        assert s2 == 200, d
+    return s, out
 
 
 def say(api, room, text, key, **auth):
