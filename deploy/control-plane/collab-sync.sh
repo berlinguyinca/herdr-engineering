@@ -38,9 +38,50 @@ certs() {
       install -m 0600 "$src/$f" "$dst/$f.new"; mv -f "$dst/$f.new" "$dst/$f"; changed=1
     fi
   done
+  # renewal starts 30 days out; still unrenewed at 14 days means it is failing: say so in the journal
+  openssl x509 -in "$dst/fullchain.pem" -noout -checkend $((14 * 86400)) >/dev/null \
+    || echo "WARNING: collab edge certificate expires within 14 days; check herdr-collab-cert-renew" >&2
   if [ "$changed" = 1 ] && docker inspect herdr-collab-edge >/dev/null 2>&1; then
     docker exec herdr-collab-edge nginx -s reload || true
   fi
+}
+
+# Renews ONLY this lineage. The old bender-failover renew timer was stopped when that TLS front was
+# retired, and its deploy hook execs into that stopped container, so nothing renewed this cert.
+# No deploy hook is needed: the minute timer above copies a renewed cert to the edge and reloads it.
+ACME="${HERDR_COLLAB_ACME_DIR:-$HOME/.local/share/inferweave/bender-failover/acme}"
+CERTBOT="${HERDR_COLLAB_CERTBOT:-$ACME/../acme-venv/bin/certbot}"
+CERT_NAME="${HERDR_COLLAB_CERT_NAME:-localdev.mcp.metabolomics.us}"
+
+install_renew_timer() {
+  local u="$HOME/.config/systemd/user"
+  [ -x "$CERTBOT" ] || { echo "certbot not found at $CERTBOT (set HERDR_COLLAB_CERTBOT)" >&2; return 1; }
+  cat > "$u/herdr-collab-cert-renew.service" <<UNIT
+[Unit]
+Description=Renew the collab edge TLS certificate
+After=network-online.target
+[Service]
+Type=oneshot
+UMask=0077
+TimeoutStartSec=15min
+ExecStart=$CERTBOT renew --non-interactive --cert-name $CERT_NAME --config-dir $ACME/config --work-dir $ACME/work --logs-dir $ACME/logs
+UNIT
+  cat > "$u/herdr-collab-cert-renew.timer" <<UNIT
+[Unit]
+Description=Check collab edge certificate renewal twice daily
+[Timer]
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now herdr-collab-cert-renew.timer
+}
+
+certbot_dry_run() {   # proves the renewal path end to end against Let's Encrypt staging
+  "$CERTBOT" renew --dry-run --non-interactive --cert-name "$CERT_NAME" --config-dir "$ACME/config" --work-dir "$ACME/work" --logs-dir "$ACME/logs"
 }
 
 install_timer() {
@@ -65,6 +106,7 @@ WantedBy=timers.target
 UNIT
   systemctl --user daemon-reload
   systemctl --user enable --now herdr-collab-sync.timer
+  install_renew_timer
 }
 
-case "${1:-once}" in once) once ;; install) once; install_timer ;; *) echo "usage: $0 once|install" >&2; exit 2 ;; esac
+case "${1:-once}" in once) once ;; install) once; install_timer ;; renew-check) certbot_dry_run ;; *) echo "usage: $0 once|install|renew-check" >&2; exit 2 ;; esac
