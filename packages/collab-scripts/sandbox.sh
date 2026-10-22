@@ -33,13 +33,17 @@ case "$WORK" in "$(cd "$AREA" && pwd -P)"/*) ;; *) echo "collab-sandbox: workdir
 
 args=(--die-with-parent --new-session --unshare-pid --unshare-ipc --unshare-uts --cap-drop ALL
       --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
-      --ro-bind-try /etc/resolv.conf /etc/resolv.conf --ro-bind-try /run/systemd/resolve /run/systemd/resolve
       --ro-bind-try /etc/hosts /etc/hosts --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf
       --ro-bind-try /etc/ssl /etc/ssl --ro-bind-try /etc/ca-certificates /etc/ca-certificates
       --ro-bind-try /etc/passwd /etc/passwd --ro-bind-try /etc/group /etc/group --ro-bind-try /etc/localtime /etc/localtime
       --ro-bind-try /etc/alternatives /etc/alternatives
       --proc /proc --dev /dev --size 268435456 --tmpfs /tmp --size 67108864 --tmpfs /var/tmp
       --tmpfs "$HOME")
+# Local name resolution only for a box with the host network: a no-network box must not reach systemd-resolved's
+# socket (a DNS side channel); the egress proxy resolves names on the host side.
+if [ -z "${HERDR_EGRESS_SOCK+x}" ]; then
+  args+=(--ro-bind-try /etc/resolv.conf /etc/resolv.conf --ro-bind-try /run/systemd/resolve /run/systemd/resolve)
+fi
 
 # The harness and its login, read-only. Resolve where the executables really live (symlinks into ~/.local/share,
 # node under a version manager...) and expose just those directories.
@@ -62,11 +66,11 @@ args+=(--bind "$WORK" "$WORK" --chdir "$WORK"
 # of this user, so the process and memory caps are a systemd scope instead (a fork bomb stops at the cap).
 ulimit -n 1024 -f "${HERDR_SANDBOX_FILE_KB:-1048576}" -c 0 2>/dev/null || true
 inner=(/usr/bin/env bash -c "$CMD")
-if [ -n "${HERDR_EGRESS_SOCK:-}" ]; then
+if [ -n "${HERDR_EGRESS_SOCK+x}" ]; then   # set but empty is a runner bug: fail closed, never open
   no() { echo "collab-sandbox: $1; refusing to run" >&2; exit 126; }
   RELAY="$(dirname "$0")/collab-egress.py"
   PORT="${HERDR_EGRESS_PORT:-3128}"
-  [ -S "$HERDR_EGRESS_SOCK" ] || no "egress socket $HERDR_EGRESS_SOCK is not a socket"
+  [ -S "${HERDR_EGRESS_SOCK:-}" ] || no "egress socket ${HERDR_EGRESS_SOCK:-(empty)} is not a socket"
   [ -f "$RELAY" ] || no "the egress relay $RELAY is not installed"
   case "$PORT" in ''|*[!0-9]*) no "HERDR_EGRESS_PORT must be a number" ;; esac
   [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || no "HERDR_EGRESS_PORT must be 1024-65535"

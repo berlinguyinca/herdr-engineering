@@ -232,7 +232,8 @@ def tls_upstream(short_dir):
             body = self.rfile.read(n) if n else b""
             seen.append({"method": self.command, "path": self.path, "headers": dict(self.headers.items()), "body": body})
             out = json.dumps({"path": self.path, "headers": dict(self.headers.items())}).encode()   # a reflecting upstream
-            self.send_response(200)
+            self.send_response(200, self.headers.get("Authorization", "OK"))          # reason phrase reflects it too
+            self.send_header(self.headers.get("Authorization", "x x").split(" ")[-1], "named-after-the-key")
             self.send_header("Content-Type", "application/json")
             self.send_header("X-Echo-Auth", self.headers.get("Authorization", ""))
             self.send_header("Content-Length", str(len(out)))
@@ -278,7 +279,7 @@ def test_svc_forwards_with_the_bound_header_and_never_reflects_it(svc_proxy):
     assert got["headers"]["Authorization"] == f"Bearer {SECRET}"            # the proxy's value, not the client's
     assert "Cookie" not in got["headers"] and "Proxy-Authorization" not in got["headers"]
     assert got["headers"]["X-Keep"] == "yes"
-    assert SECRET.encode() not in out and b"stolen" not in body
+    assert SECRET.encode() not in out and b"stolen" not in body and b"named-after-the-key" not in head
     assert b"[redacted]" in body
     assert SECRET not in (p.log.read_text() if p.log.exists() else "")
 
@@ -328,6 +329,19 @@ print("svc=" + os.environ.get("SVC_MY_API_URL", ""), "noproxy=" + os.environ.get
 '''
 
 
+SOCKET_SCAN = r'''
+import os, stat
+for top in ("/run", "/tmp", "/var", "/etc", os.environ["HOME"]):
+    for d, dirs, files in os.walk(top):
+        for f in dirs + files:
+            try:
+                if stat.S_ISSOCK(os.stat(os.path.join(d, f)).st_mode):   # stat, not d_type: a bind mount hides it
+                    print(os.path.join(d, f))
+            except OSError:
+                pass
+'''
+
+
 def run_box(home, cmd, env, work="eg", stdin=""):
     return subprocess.run(["bash", str(SANDBOX), str(home / "herdr-agents" / "work" / work), cmd], input=stdin,
                           capture_output=True, text=True, timeout=60, env={**os.environ, **env})
@@ -353,6 +367,9 @@ def test_the_box_has_no_network_but_reaches_an_allowed_host_through_the_relay(ho
         assert "direct=blocked" in r.stdout
         assert "status=200 echo=via-relay" in r.stdout
         assert "svc=http://127.0.0.1:3128/svc/my-api" in r.stdout and "noproxy=127.0.0.1,localhost" in r.stdout
+        (probe.parent / "socks.py").write_text(SOCKET_SCAN)
+        r = run_box(home, "python3 socks.py", {"HERDR_EGRESS_SOCK": str(p.sock)})
+        assert set(r.stdout.split()) == {"/run/herdr-egress/sock"}, r.stdout     # no resolver socket: no DNS side channel
         r = run_box(home, "cat", {"HERDR_EGRESS_SOCK": str(p.sock)}, stdin="the task text\n")
         assert r.returncode == 0 and r.stdout == "the task text\n", r.stderr          # stdin reaches the command, not the relay
     finally:
@@ -364,6 +381,8 @@ def test_the_box_has_no_network_but_reaches_an_allowed_host_through_the_relay(ho
 def test_the_box_fails_closed_when_the_relay_cannot_come_up(home, short_dir):
     r = run_box(home, "echo ran", {"HERDR_EGRESS_SOCK": str(short_dir / "missing.sock")})
     assert r.returncode != 0 and "ran" not in r.stdout
+    r = run_box(home, "echo ran", {"HERDR_EGRESS_SOCK": ""})                    # set but empty never means open network
+    assert r.returncode == 126 and "ran" not in r.stdout
     # a sandbox script installed without its relay, or with a relay that never listens, refuses to run the command
     copy = short_dir / "sb"
     copy.mkdir()

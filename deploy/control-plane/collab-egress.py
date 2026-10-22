@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gzip
+import http
 import http.client
 import io
 import ipaddress
@@ -278,8 +279,13 @@ class Server:
             return reply(writer, 502, "Bad Gateway", b"upstream request failed\n")
         redact = redactor(secret)
         rheaders = [(k, redact(v.encode("latin-1", "replace")).decode("latin-1")) for k, v in rheaders
-                    if k.lower() not in STRIP_OUT and not k.lower().startswith("proxy-")]
-        reply(writer, status, reason or "OK", redact(rbody), rheaders)
+                    if k.lower() not in STRIP_OUT and not k.lower().startswith("proxy-")
+                    and redact(k.encode("latin-1", "replace")) == k.encode("latin-1", "replace")]
+        try:
+            phrase = http.HTTPStatus(status).phrase       # never the upstream's own reason text: it could carry the key
+        except ValueError:
+            phrase = "Upstream Status"
+        reply(writer, status, phrase, redact(rbody), rheaders)
         await writer.drain()
 
     def _secret(self, svc):
