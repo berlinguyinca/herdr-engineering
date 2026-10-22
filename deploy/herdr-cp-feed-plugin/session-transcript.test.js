@@ -205,7 +205,7 @@ test('Codex descendant environment resolves only exact pane-bound primary identi
   const f=fixture(t);writeFileSync(f.path,lines([{type:'session_meta',payload:{id,source:'cli'}},message('known')]));
   const procRoot=join(f.home,'proc');
   const process=(pid,children,environment='')=>{mkdirSync(join(procRoot,String(pid),'task',String(pid)),{recursive:true});writeFileSync(join(procRoot,String(pid),'task',String(pid),'children'),children);writeFileSync(join(procRoot,String(pid),'environ'),environment);};
-  process(42,'43',`CODEX_THREAD_ID=${id}\0HERDR_PANE_ID=w1:p0\0`);
+  process(42,'43',`CODEX_THREAD_ID=${id}\0`);
   process(43,'',`CODEX_THREAD_ID=${id}\0HERDR_PANE_ID=w1:p0\0`);
   const options={home:f.home,procRoot,pids:[42],paneId:'w1:p0'};
   assert.equal(await resolveTranscript('codex',null,options),f.path);
@@ -294,4 +294,25 @@ test('Codex descendant identity after a large environment prefix is still bounde
   assert.equal(await resolveTranscript('codex',null,options),f.path);
   writeFileSync(join(procRoot,'43','environ'),environment(70000));
   assert.equal(await resolveTranscript('codex',null,options),null);
+});
+
+
+test('moved Codex panes recover through matching ancestor and descendant inherited pane markers',async t=>{
+  const f=fixture(t);writeFileSync(f.path,lines([{type:'session_meta',payload:{id,source:'cli'}},message('moved')]));
+  const procRoot=join(f.home,'proc');
+  const process=(pid,children,environment)=>{
+    mkdirSync(join(procRoot,String(pid),'task',String(pid)),{recursive:true});
+    writeFileSync(join(procRoot,String(pid),'task',String(pid),'children'),children);
+    writeFileSync(join(procRoot,String(pid),'environ'),environment);
+  };
+  process(42,'43','HERDR_PANE_ID=original:pane\0');
+  process(43,'',`HERDR_PANE_ID=original:pane\0CODEX_THREAD_ID=${id}\0`);
+  process(99,'',`HERDR_PANE_ID=moved:pane\0CODEX_THREAD_ID=${id}\0`);
+  const options={home:f.home,procRoot,pids:[42],paneId:'moved:pane'};
+  assert.equal(await resolveTranscript('codex',null,options),f.path);
+  writeFileSync(join(procRoot,'43','environ'),`HERDR_PANE_ID=unrelated:pane\0CODEX_THREAD_ID=${id}\0`);
+  assert.equal(await resolveTranscript('codex',null,options),null,'unrelated marker and non-descendant process cannot bind');
+  writeFileSync(join(procRoot,'42','environ'),`HERDR_PANE_ID=original:pane\0CODEX_THREAD_ID=${id}\0`);
+  writeFileSync(join(procRoot,'43','environ'),'HERDR_PANE_ID=original:pane\0');
+  assert.equal(await resolveTranscript('codex',null,options),null,'ancestor thread identity is still ignored');
 });

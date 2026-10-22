@@ -210,21 +210,24 @@ function descendantIdentities(processIds,procRoot,paneId) {
   if(typeof paneId!=='string' || !paneId || typeof process.getuid!=='function')return [];
   const queue=[...processIds].map(pid=>({pid,depth:0})),visited=new Set(),identities=new Set();
   while(queue.length && visited.size<64) {
-    const {pid,depth}=queue.shift();
+    let {pid,depth,ancestorPane}=queue.shift();
     if(visited.has(pid))continue;visited.add(pid);
     const path=join(procRoot,String(pid));
     try {if(statSync(path).uid!==process.getuid())continue;} catch {continue;}
     // Parent processes can inherit another session's identity. Only tool
     // descendants with an explicit matching pane marker establish a binding.
+    const values=Object.fromEntries(procText(join(path,'environ'),64*1024).split('\0').slice(0,-1).filter(v=>v.includes('=')).map(v=>{const i=v.indexOf('=');return [v.slice(0,i),v.slice(i+1)];}));
+    // Pane moves preserve the original marker in the native process tree.
+    // Only the queried foreground ancestor may establish that alternate token.
+    if(depth===0)ancestorPane=values.HERDR_PANE_ID;
     if(depth>0) {
-      const values=Object.fromEntries(procText(join(path,'environ'),64*1024).split('\0').slice(0,-1).filter(v=>v.includes('=')).map(v=>{const i=v.indexOf('=');return [v.slice(0,i),v.slice(i+1)];}));
-      if(values.HERDR_PANE_ID===paneId) {
+      if(values.HERDR_PANE_ID===paneId || (ancestorPane && values.HERDR_PANE_ID===ancestorPane)) {
         const ids=[values.CODEX_THREAD_ID,values.CODEX_SESSION_ID].filter(v=>ID.test(v || ''));
         if(new Set(ids).size===1)identities.add(ids[0]);
       }
     }
     if(depth<6)for(const raw of procText(join(path,'task',String(pid),'children')).trim().split(/\s+/).slice(0,64)) {
-      const child=Number(raw);if(Number.isSafeInteger(child)&&child>0&&queue.length<64)queue.push({pid:child,depth:depth+1});
+      const child=Number(raw);if(Number.isSafeInteger(child)&&child>0&&queue.length<64)queue.push({pid:child,depth:depth+1,ancestorPane});
     }
   }
   return [...identities];
