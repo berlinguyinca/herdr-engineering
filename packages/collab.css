@@ -112,7 +112,7 @@
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0; font-size: .875rem; color: var(--text-secondary); }
 
 /* ---- room tabs: one tab per room, then sub-tabs inside a room ---- */
-.cx-rtabs { display: flex; align-items: flex-end; gap: 4px; overflow-x: auto; margin: 0 0 18px; padding: 0 2px;
+.cx-rtabs { display: flex; align-items: flex-end; gap: 4px; overflow-x: auto; overflow-y: hidden; margin: 0 0 18px; padding: 4px 2px 0;
   border-bottom: 1px solid var(--border-subtle); scrollbar-width: thin; }
 .cx-rtabs .grow { flex: 1 1 auto; }
 .cx-rtab { flex: 0 0 auto; border: 1px solid transparent; border-bottom: 0; background: transparent; color: var(--text-secondary);
@@ -233,3 +233,35 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: .875rem; }
 .cx-table th, .cx-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border-subtle); vertical-align: top; }
 .cx-table th { color: var(--text-secondary); font-weight: 600; }
+
+/* ---- polish: agent names, rows, cards ---- */
+.cx-page, .cx-embed { --cx-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent); }
+.cx-embed h1, .cx-page h1 { letter-spacing: -.01em; }
+.cx-head h1 { font-size: 1.6rem; }
+.cx-section > h2 { font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 12px; }
+.hd-card { border-radius: 12px; transition: border-color var(--motion-fast, .15s), box-shadow var(--motion-fast, .15s), transform var(--motion-fast, .15s); }
+.hd-grid > .hd-card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border-subtle)); box-shadow: 0 6px 18px rgba(0, 0, 0, .08); transform: translateY(-1px); }
+.hd-card__title { font-size: .95rem; }
+.cx-cols > .hd-card > .hd-card__title { font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; }
+.hd-btn { transition: background var(--motion-fast, .15s), box-shadow var(--motion-fast, .15s); }
+.hd-btn:focus-visible, .cx-input:focus-visible, .cx-page input:focus-visible, .cx-embed input:focus-visible, .cx-page select:focus-visible, .cx-embed select:focus-visible,
+.cx-rtab:focus-visible, .cx-stab:focus-visible, .cx-edit:focus-visible { outline: none; box-shadow: var(--cx-ring); }
+.hd-status { background: color-mix(in srgb, var(--sc, var(--text-muted)) 10%, var(--surface)); border-color: color-mix(in srgb, var(--sc, var(--text-muted)) 28%, var(--border-subtle)); }
+.cx-av--sm { width: 26px; height: 26px; flex-basis: 26px; font-size: .6875rem; }
+.cx-ntitle { display: inline-flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; flex-wrap: wrap; }
+.cx-nname { font-weight: 650; overflow-wrap: anywhere; }
+.cx-edit { border: 0; background: transparent; color: var(--text-muted); cursor: pointer; padding: 2px 6px; border-radius: 6px; font-size: .9rem; line-height: 1; opacity: .55; }
+.cx-edit:hover, .cx-ntitle:hover .cx-edit { opacity: 1; background: var(--surface-hover); color: var(--accent); }
+.cx-rename { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.cx-rename .cx-input { width: 11rem; padding: 4px 8px; }
+.cx-at { color: var(--text-muted); font-weight: 600; margin-right: -2px; }
+.cx-agentrow { align-items: center !important; gap: 8px 12px !important; }
+.cx-agentrow .grow { display: flex; flex-direction: column; gap: 3px; }
+.cx-sub1 { color: var(--text-muted); font-size: .75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.cx-pills { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.cx-list li { overflow-wrap: break-word; transition: background var(--motion-fast, .15s); }
+.cx-list li:hover { background: var(--surface-hover); }
+.cx-agentcard .cx-row--between { align-items: flex-start; }
+.cx-agentcard .hd-card__sub { line-height: 1.35; }
+.cx-event { background: var(--surface-2); border: 1px solid var(--border-subtle); }
+@media (prefers-reduced-motion: reduce) { .hd-card, .hd-btn, .cx-list li { transition: none; } .hd-grid > .hd-card:hover { transform: none; } }

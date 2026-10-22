@@ -20,6 +20,11 @@ Safety rails:
   * the harness command per family is fixed in this file; request text never becomes a command
   * at most MAX_AGENTS per request; the service caps open requests and agents per user
   * no environment: flags and host.json only
+
+Names. An agent's @name and the herdr labels of its pane (and, for an agent that has a workspace and tab to
+itself, the workspace and tab) are kept equal in both directions. The last name both sides agreed on is kept
+in names.json: a side that moved away from it is the side that changed; when both did, the web name wins.
+A rename made in herdr is only taken if it is a valid @name that is free (otherwise herdr is set back).
 Usage: collab-spawn.py [once] [--url URL] [--state-dir DIR] [--herdr BIN] [--ssh BIN] [--worker FILE]
 """
 from __future__ import annotations
@@ -34,6 +39,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -68,10 +74,34 @@ FAMILY_CMD = FAMILY_CMD_TOOLS       # every family the runner knows; which are s
 FAMILY_ROLE = {"claude-code": "claude", "codex": "codex", "pi": "pi", "agent": "agent"}
 FAMILY_BIN = {"claude-code": "claude", "codex": "codex", "pi": "pi"}
 AGENT_DIR = "herdr-agents"
+PANE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}$")
 
 
 class Failure(Exception):
     pass
+
+
+def label_name(raw) -> str | None:
+    """A herdr label as an @name: lowercase letters, digits, hyphens; None when nothing usable is left."""
+    if not isinstance(raw, str):
+        return None
+    name = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9-]", "-", raw.strip().lower())).strip("-")[:32].strip("-")
+    return name or None
+
+
+def link_target(instance_id) -> tuple[str, str] | None:
+    """(host label, pane id) for the two link forms: `pane:HOST:PANE` (set by this runner) and a fabric
+    session id `herdr:HOST:SERVER:PANE` (url-encoded pane), which the owner picks on the AI agents page."""
+    if not isinstance(instance_id, str):
+        return None
+    if instance_id.startswith("pane:"):
+        host, _, pane = instance_id[5:].partition(":")
+    elif instance_id.startswith("herdr:") and instance_id.count(":") >= 3:
+        _, host, _, pane = instance_id.split(":", 3)
+        pane = urllib.parse.unquote(pane)
+    else:
+        return None
+    return (host, pane) if HOST.fullmatch(host) and PANE_ID.fullmatch(pane) else None
 
 
 def trim(text: str, n: int = 200) -> str:
@@ -232,10 +262,12 @@ class Runner:
             installed.add(host)
         self.put(host, f"{name}.json", json.dumps({k: agent[k] for k in ("agent_id", "name", "credential", "device_id", "expires_at")}) + "\n", 0o600)
         try:
-            pane = json.loads(self.run(self.herdr_cmd(host, ["workspace", "create", "--label", f"collab {name}", "--no-focus"]),
-                                       timeout=30))["result"]["root_pane"]["pane_id"]
+            root = json.loads(self.run(self.herdr_cmd(host, ["workspace", "create", "--label", name, "--no-focus"]),
+                                       timeout=30))["result"]["root_pane"]
+            pane = root["pane_id"]
         except (ValueError, KeyError, TypeError):
             raise Failure("herdr returned an unexpected reply to workspace create") from None
+        tab = root.get("tab_id") if isinstance(root, dict) else None
         if not isinstance(pane, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}", pane):
             raise Failure("herdr returned an unexpected pane id")
         cmd = self.cmds[family]
@@ -249,6 +281,13 @@ class Runner:
         except Exception:
             pass    # cosmetic: the agent works without the link
         self.report_session(host, pane, family, name)
+        try:        # the pane and tab carry the name too; the first sync cycle would do it, this just is not late
+            if isinstance(tab, str) and PANE_ID.fullmatch(tab):
+                self.run(self.herdr_cmd(host, ["tab", "rename", tab, name]), timeout=20)
+            self.run(self.herdr_cmd(host, ["pane", "rename", pane, name]), timeout=20)
+            self.remember_name(agent["agent_id"], name)
+        except Failure:
+            pass
 
     def report_session(self, host: str, pane: str, family: str, name: str) -> None:
         """Tell the fabric about the pane, so the agent shows up with a host and status even before (or
@@ -264,6 +303,89 @@ class Runner:
             urllib.request.urlopen(req, timeout=10).close()          # noqa: S310 (operator-configured URL)
         except (OSError, ValueError):
             pass
+
+    # ------------------------------------------------------------ names, both ways
+    def _names_file(self) -> Path:
+        return self.state / "names.json"
+
+    def load_names(self) -> dict:
+        try:
+            d = json.loads(self._names_file().read_text())
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def save_names(self, names: dict) -> None:
+        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = self._names_file().with_suffix(".tmp")
+        tmp.write_text(json.dumps(names))
+        os.replace(tmp, self._names_file())
+
+    def remember_name(self, agent_id: str, name: str) -> None:
+        names = self.load_names()
+        names[agent_id] = name
+        self.save_names(names)
+
+    def herdr_state(self, host: str) -> tuple[dict, dict, dict]:
+        """panes, tabs and workspaces of one host, each by id."""
+        def listing(args, key, id_key):
+            rows = json.loads(self.run(self.herdr_cmd(host, args), timeout=30))["result"][key]
+            return {r[id_key]: r for r in rows if isinstance(r, dict) and isinstance(r.get(id_key), str)}
+        try:
+            return (listing(["pane", "list"], "panes", "pane_id"), listing(["tab", "list"], "tabs", "tab_id"),
+                    listing(["workspace", "list"], "workspaces", "workspace_id"))
+        except (ValueError, KeyError, TypeError):
+            raise Failure("herdr returned an unexpected reply to list") from None
+
+    def sync_names(self, up: list[str]) -> None:
+        """One pass over every agent tied to a herdr pane: keep @name and the herdr labels equal."""
+        links = [a for a in self.ok("GET", "fleet/agent-links")["agents"] if isinstance(a, dict)]
+        names, by_host = self.load_names(), {}
+        for a in links:
+            t = link_target(a.get("instance_id"))
+            if t and t[0] in up and isinstance(a.get("agent_id"), str) and NAME.fullmatch(str(a.get("name"))):
+                by_host.setdefault(t[0], []).append((a, t[1]))
+        for host, agents in by_host.items():
+            try:
+                panes, tabs, spaces = self.herdr_state(host)
+            except Failure as exc:
+                self.say(f"names: {host}: {trim(exc)}")
+                continue
+            for a, pane_id in agents:
+                try:
+                    self.sync_one(host, a, panes.get(pane_id), tabs, spaces, names)
+                except Failure as exc:
+                    self.say(f"names: {a['name']}: {trim(exc)}")
+        live = {a["agent_id"] for a in links}
+        self.save_names({k: v for k, v in names.items() if k in live})
+
+    def sync_one(self, host: str, agent: dict, pane: dict | None, tabs: dict, spaces: dict, names: dict) -> None:
+        if not pane:
+            return
+        aid, name, base = agent["agent_id"], agent["name"], names.get(agent["agent_id"])
+        ws, tab = spaces.get(pane.get("workspace_id"), {}), tabs.get(pane.get("tab_id"), {})
+        # A workspace and tab that hold only this pane are the agent's own; a shared one is never relabelled.
+        own = ws.get("pane_count") == 1 and ws.get("tab_count") == 1 and ws.get("workspace_id") and tab.get("tab_id")
+        seen = {"pane": (label_name(pane.get("label")), pane.get("label"))}
+        if own:
+            default_tab = str(tab.get("number")) == str(tab.get("label"))
+            seen["tab"] = (None if default_tab else label_name(tab.get("label")), tab.get("label"))
+            seen["workspace"] = (label_name(ws.get("label")), ws.get("label"))
+        target = name
+        if base is not None and name == base:                        # the web side did not move: follow herdr
+            moved = next((v for v, _ in seen.values() if v and v != base), None)
+            if moved:
+                try:
+                    self.ok("POST", f"agents/{aid}/rename", {"name": moved, "source": "herdr"})
+                    target = moved
+                    self.say(f"names: {base} -> {moved} (renamed in herdr)")
+                except Failure as exc:
+                    self.say(f"names: herdr label {moved!r} refused for {base}: {trim(exc)}; setting herdr back")
+        todo = [("pane", pane["pane_id"]), ("tab", tab.get("tab_id")), ("workspace", ws.get("workspace_id"))]
+        for kind, ident in todo:
+            if kind in seen and isinstance(ident, str) and PANE_ID.fullmatch(ident) and seen[kind][1] != target:
+                self.run(self.herdr_cmd(host, [kind, "rename", ident, target]), timeout=20)
+        names[aid] = target
 
     # ------------------------------------------------------------ one request
     def pick_host(self, eligible: list[str]) -> str | None:
@@ -359,6 +481,10 @@ class Runner:
                                                     "families": self.families.get(h, [])} for h in up]})
         flags = {h["host"]: h["auto_agents"] for h in self.ok("GET", "fleet/hosts")["hosts"]}
         eligible = sorted(h for h in up if flags.get(h, True))
+        try:
+            self.sync_names(up)
+        except Failure as exc:
+            self.say(f"names: {trim(exc)}")
         for sp in self.ok("GET", "fleet/spawns?status=requested")["spawns"]:
             status, spec = self.api("POST", f"fleet/spawns/{sp['spawn_id']}/claim", {})
             if status == 200:

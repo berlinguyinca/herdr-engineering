@@ -71,7 +71,7 @@ _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
 INVITE_TTL = 7 * 24 * 3600.0
 MAX_OPEN_INVITES = 50
 _FEED_TYPES = frozenset({"message", "member_added", "member_removed",
-                         "agent_granted", "agent_revoked", "agent_grant_revoked",
+                         "agent_granted", "agent_revoked", "agent_grant_revoked", "agent_renamed",
                          "task_created", "task_updated"})
 MAX_TASK_TEXT = 4000
 TASK_TTL = 24 * 3600.0           # a task nobody finished in a day is expired
@@ -441,6 +441,8 @@ class CollabService:
                 self._joins[self._joins_by_id[p["join_id"]]]["revoked"] = True
         elif t == "agent_linked":
             self._agents[p["agent_id"]]["instance_id"] = p.get("instance_id")
+        elif t == "agent_renamed":
+            self._agents[p["agent_id"]]["name"] = p["name"]
         elif t == "credential_rotated":
             a = self._agents[p["agent_id"]]
             self._by_cred.pop(a["cred_digest"], None)
@@ -1723,6 +1725,42 @@ class CollabService:
                 "edges": [{**e, "counts": dict(e["counts"])} for e in edges.values()],
                 "tasks": recent, "untrusted_text": True}
 
+    def rename_agent(self, pr: Principal, agent_id: str, body: dict) -> dict:
+        """Give an agent a new @name. The owner (or the dashboard operator) may; the name must stay unique
+        among the agent's own rooms and the owner's other live agents, since people address agents by it.
+        `source` records who asked ("herdr" when the runner follows a rename made in a herdr pane or tab);
+        old @mentions in past messages are plain text and stay as they were."""
+        self._require_user(pr)
+        name = _handle(body.get("name"))
+        source = "herdr" if body.get("source") == "herdr" and pr.admin else "web"
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent or agent["status"] != "active" or not (agent["owner"] == pr.id or pr.admin):
+                raise CollabError(404, "not found")
+            if agent["name"] == name:
+                return {"agent_id": agent_id, "name": name, "changed": False}
+            self._throttle("rename:" + pr.id, 120, 600.0, "agent rename")
+            for aid in self._agents_by_owner.get(agent["owner"], ()):
+                other = self._agents[aid]
+                if aid != agent_id and other["status"] == "active" and other["name"] == name:
+                    raise CollabError(409, "you already have an agent with that name")
+            for rid in self._rooms_by_agent.get(agent_id, ()):
+                if agent_id in self._rooms[rid]["grants"]:
+                    self._name_free(self._rooms[rid], agent_id, name)
+            rooms = [r for r in self._rooms_by_agent.get(agent_id, ()) if agent_id in self._rooms[r]["grants"]]
+            self._commit("agent_renamed", self._actor(
+                pr, agent_id=agent_id, name=name, old_name=agent["name"], source=source, room_ids=rooms,
+                action="agent.rename", outcome="allowed", project_ids=[], resource_id=agent_id))
+        return {"agent_id": agent_id, "name": name, "changed": True}
+
+    def agent_links(self, pr: Principal) -> dict:
+        """Operator only: every live agent that is tied to a fabric session or herdr pane, so the host runner
+        can keep their names in step with the herdr pane, tab and workspace labels."""
+        with self._lock:
+            out = [{"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"], "instance_id": a["instance_id"]}
+                   for aid, a in self._agents.items() if a["status"] == "active" and a.get("instance_id")]
+        return {"agents": out[:1000]}
+
     def link_agent(self, pr: Principal, agent_id: str, body: dict) -> dict:
         """The owner ties one of their agents to a fabric session (or clears it). The id is only a
         label here; the dashboard resolves it against sessions it knows about."""
@@ -2065,6 +2103,8 @@ class CollabService:
             out.update(actor_user_id=p.get("actor_user_id"), actor_agent_id=p.get("actor_agent_id"),
                        subject_user_id=p.get("subject_user_id"), role=p.get("role"),
                        agent_id=p.get("agent_id"))
+            if t == "agent_renamed":
+                out.update(name=p.get("name"), old_name=p.get("old_name"), source=p.get("source"))
         out.update(extra)
         return out
 
@@ -2198,6 +2238,8 @@ class CollabService:
                         raise CollabError(404, "not found")
                     if parts == ["fleet", "hosts"]:
                         return 200, self.list_fleet_hosts(pr)
+                    if parts == ["fleet", "agent-links"]:
+                        return 200, self.agent_links(pr)
                     if parts == ["fleet", "spawns"]:
                         st = str(query["status"]) if "status" in query else None
                         return 200, self.list_spawns(pr, st)
@@ -2275,6 +2317,8 @@ class CollabService:
                     return 200, self.rotate_credential(pr)
                 if n == 3 and parts[0] == "agents" and parts[2] == "link":
                     return 200, self.link_agent(pr, parts[1], body)
+                if n == 3 and parts[0] == "agents" and parts[2] == "rename":
+                    return 200, self.rename_agent(pr, parts[1], body)
                 if n == 3 and parts[0] == "agents" and parts[2] == "revoke":
                     return 200, self.revoke_agent(pr, parts[1])
                 if n >= 3 and parts[0] == "rooms":

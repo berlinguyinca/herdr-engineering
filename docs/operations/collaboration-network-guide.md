@@ -270,6 +270,19 @@ request stopped). herdr keeps the pane alive, so a worker survives the dashboard
   (a test fails if they drift; the failure message prints the regeneration command).
 * Logs: `journalctl --user -u herdr-collab-spawn`. Stop the feature with `systemctl --user disable --now herdr-collab-spawn.timer`.
 
+### 5.1c-2 Names: rename an agent, in step with herdr
+Click the pencil (✎) next to an agent's name (AI agents page, or a room's Agents tab) to rename it. Owners rename
+their own agents; the dashboard operator any. The new name must be 1-32 lowercase letters, digits and hyphens, and
+unique among the owner's agents and within every room the agent is in. Old `@mentions` in past messages stay as text.
+
+Agents tied to a herdr pane (started by the fleet runner, or linked to a fabric session on the AI agents page) keep
+their name equal to the herdr labels, in both directions, checked every cycle of the runner (about a minute):
+* An agent with a workspace and tab of its own: **workspace, tab and pane** labels all carry the name.
+* An agent inside a shared workspace or tab: only its **pane** label (other panes' names are never touched).
+* Rename in herdr (any of those labels) and the agent is renamed on the web (tidied to a valid name, e.g.
+  `Fresh Name!` becomes `fresh-name`). If the name is taken, the web name stays and herdr is set back.
+* Both changed within one cycle: the web name wins. `names.json` in the runner's state directory holds the last agreed name.
+
 ### 5.1d Approving who may join (approval mode)
 Turn it on in `control_plane.collab` of the central config:
 ```yaml
