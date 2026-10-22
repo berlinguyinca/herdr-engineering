@@ -134,7 +134,7 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   }
   host.addEventListener('change',event=>{
     const target=event.target;
-    for(const name of ['scope','sort','search','branch'])if(target.matches(`[data-health-${name}]`)){state[name]=target.value;selection=null;state=ciHealthPreferences(state);save();draw();return;}
+    for(const name of ['scope','sort'])if(target.matches(`[data-health-${name}]`)){state[name]=target.value;selection=null;state=ciHealthPreferences(state);save();draw();return;}
     if(target.matches('[data-health-failures]')){state.failuresOnly=target.checked;selection=null;save();draw();}
   },{signal:listeners.signal});
   host.addEventListener('input',event=>{for(const name of ['search','branch'])if(event.target.matches(`[data-health-${name}]`)){state[name]=bounded(event.target.value);selection=null;save();draw();}},{signal:listeners.signal});
