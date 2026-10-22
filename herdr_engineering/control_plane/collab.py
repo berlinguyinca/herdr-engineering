@@ -2084,8 +2084,15 @@ class CollabService:
             self._expire_helpers()
             rows = sorted((r for r in self._helpers.values() if self._helper_live(r)),
                           key=lambda r: (r["created_epoch"], r["helper_id"]))
-            return {"paused": self._helpers_paused, "helpers": [{**self._helper_view(r), "task": r["task"]}
-                                                                for r in rows]}
+            return {"paused": self._helpers_paused, "now": self._now(),
+                    "helpers": [{**self._helper_view(r), "task": r["task"], "profile": self._runner_profile(r)}
+                                for r in rows]}
+
+    def _runner_profile(self, r: dict) -> dict:
+        """What the runner needs of the room profile to start a helper (names only, never values). The
+        operator is not a member of most rooms, so it cannot read the profile itself."""
+        p = self._profile(r["room_id"])
+        return {"tools_allowed": p["tools_allowed"], "services": p["services"], "ssh_secret_names": p["ssh_secret_names"]}
 
     def claim_helper(self, pr: Principal, helper_id: str) -> dict:
         """Operator only, exactly once: re-checks the parent's grant and the room profile, then mints the
@@ -2147,6 +2154,7 @@ class CollabService:
                 action="helper.claim", outcome="allowed", project_ids=[r["project_id"]], resource_id=helper_id))
             par = self._agents.get(r["parent_agent_id"]) if r["parent_agent_id"] else None
             return {**self._helper_view(r), "task": r["task"], "credential": cred, "device_id": device,
+                    "now": now, "profile": self._runner_profile(r),
                     "agent_name": name, "actions": actions, "expires_at": expires,
                     "requester": {"agent_id": r["requester_agent_id"], "name": req["name"],
                                   "instance_id": req.get("instance_id")},
