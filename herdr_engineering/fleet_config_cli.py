@@ -20,7 +20,9 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -259,7 +261,11 @@ def _ask(answers: dict, key: str, label: str, prompt: Callable, secret_prompt: C
         return str(answers[key])
     suffix = f" [{default}]" if default else ""
     asker = secret_prompt if secret else prompt
-    reply = str(asker(f"{label}{suffix}: ")).strip()
+    try:
+        reply = str(asker(f"{label}{suffix}: ")).strip()
+    except EOFError:
+        raise FleetConfigError(f"{key} is required: not in --from-env/--answers and there is "
+                               "no terminal to ask") from None
     if not reply and default is not None:
         return default
     if not reply:
@@ -287,10 +293,16 @@ def _collect_hosts(answers: dict, prompt: Callable) -> dict[str, list[str]]:
             hosts[str(hid)] = list(roles)
         return hosts
     while True:
-        hid = str(prompt("host id (blank to finish): ")).strip()
+        try:
+            hid = str(prompt("host id (blank to finish): ")).strip()
+        except EOFError:  # non-interactive: no hosts now, add them later with fleet join
+            return hosts
         if not hid:
             return hosts
-        roles = str(prompt(f"roles for {hid} (comma separated, default host): ")).strip()
+        try:
+            roles = str(prompt(f"roles for {hid} (comma separated, default host): ")).strip()
+        except EOFError:
+            roles = ""
         hosts[hid] = [r.strip() for r in roles.split(",") if r.strip()] or ["host"]
 
 
@@ -332,16 +344,24 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
                      default=_tailscale_ip())
     hosts = _collect_hosts(a, prompt)
 
-    pg_user, pg_pass = f"herdr_{secrets.token_hex(4)}", secrets.token_hex(16)
-    minio_user, minio_pass = f"herdr_{secrets.token_hex(4)}", secrets.token_hex(16)
+    # Existing credentials (imported with --from-env/--answers) are kept: Postgres and
+    # MinIO apply their users only to an EMPTY volume, so new ones would not work.
+    pg_user = str(a.get("pg_user") or "") or f"herdr_{secrets.token_hex(4)}"
+    pg_pass = str(a.get("pg_password") or "") or secrets.token_hex(16)
+    minio_user = str(a.get("minio_user") or "") or f"herdr_{secrets.token_hex(4)}"
+    minio_pass = str(a.get("minio_password") or "") or secrets.token_hex(16)
     api_keys: dict[str, str] = {}
     ingest_key = agent_key = ""  # empty: hosts send no X-API-Key (open control plane)
     if with_api_keys:
         ingest_key = secrets.token_urlsafe(32)  # role ingest: every host posts events with it
         agent_key = secrets.token_urlsafe(32)   # role agent: ingest + LLM-key mint/revoke + reviews
         api_keys = {secrets.token_urlsafe(32): "operator", ingest_key: "ingest", agent_key: "agent"}
-    dsn = f"postgresql://{pg_user}:{pg_pass}@postgres:5432/herdr"
-    bucket = "herdr-artifacts"
+    dsn = build_pg_dsn(pg_user, pg_pass)
+    bucket = str(a.get("rustfs_bucket") or "") or "herdr-artifacts"
+    ci_actions = str(a.get("ci_actions", "")).strip().lower() in ("1", "true", "yes", "on")
+    extra_compose = a.get("compose_extra") or {}
+    if not isinstance(extra_compose, dict):
+        raise FleetConfigError("compose_extra must be a mapping of ENV_NAME: value")
     data = {
         "version": SCHEMA_VERSION,
         "sections": {
@@ -354,7 +374,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
                 "api_keys": api_keys,
                 "rustfs_endpoint": "http://rustfs:9000",
                 "rustfs_bucket": bucket,
-                "ci_actions": False,  # true lets operators retry/cancel CI pipelines from the UI
+                "ci_actions": ci_actions,  # true lets operators retry/cancel CI pipelines from the UI
                 "minio_user": minio_user,
                 "minio_password": minio_pass,
                 "compose": {
@@ -366,6 +386,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
                     "HERDR_CP_WEB_PUBLIC_PORT": web_port,
                     "HERDR_CP_PG_PORT": pg_port,
                     "GATEWAY_TAILNET_IP": gateway_ip,
+                    **{str(k): str(v) for k, v in extra_compose.items()},
                 },
             }},
             "ingest": {"roles": ["all"], "values": {"api_key": ingest_key}},
@@ -382,6 +403,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     }
     _parse(data)
     compose_env(_parse(data))  # reject unrepresentable values before writing
+    check_credentials_consistent(_parse(data))
     created = not path.parent.exists()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if created:
@@ -390,6 +412,221 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     load_fleet_config(path)  # final check of what is on disk
     _link_legacy_path(path)
     return path
+
+
+def build_pg_dsn(user: str, password: str, host: str = "postgres", port: int = 5432,
+                 db: str = "herdr") -> str:
+    """The web/worker DSN. User and password are percent-encoded, so imported
+    credentials containing @ : / ? # or spaces stay unambiguous."""
+    q = lambda v: urllib.parse.quote(v, safe="")  # noqa: E731
+    return f"postgresql://{q(user)}:{q(password)}@{host}:{port}/{db}"
+
+
+def _dsn_credentials(dsn: str) -> tuple[str, str, str] | None:
+    """(user, password, host) of a postgres DSN, decoded; None when unparseable."""
+    try:
+        parts = urllib.parse.urlsplit(dsn)
+        if parts.scheme not in ("postgresql", "postgres") or parts.username is None:
+            return None
+        return (urllib.parse.unquote(parts.username), urllib.parse.unquote(parts.password or ""),
+                parts.hostname or "")
+    except ValueError:
+        return None
+
+
+def check_credentials_consistent(cfg: FleetConfig) -> None:
+    """pg_dsn, minio_* and compose.HERDR_CP_{PG,MINIO}_* must name the same users and
+    passwords (when the DSN points at the compose `postgres` service). Names only."""
+    try:
+        cp = cfg.section(CONTROL_PLANE_SECTION)
+    except FleetConfigError:
+        return
+    compose = cp.get("compose") if isinstance(cp.get("compose"), dict) else {}
+    bad: list[str] = []
+    creds = _dsn_credentials(str(cp.get("pg_dsn") or ""))
+    if creds and creds[2] == "postgres":
+        if "HERDR_CP_PG_USER" in compose and str(compose["HERDR_CP_PG_USER"]) != creds[0]:
+            bad.append("pg_dsn user vs compose.HERDR_CP_PG_USER")
+        if "HERDR_CP_PG_PASSWORD" in compose and str(compose["HERDR_CP_PG_PASSWORD"]) != creds[1]:
+            bad.append("pg_dsn password vs compose.HERDR_CP_PG_PASSWORD")
+    for key, ckey in (("minio_user", "HERDR_CP_MINIO_USER"), ("minio_password", "HERDR_CP_MINIO_PASSWORD")):
+        if key in cp and ckey in compose and str(cp[key]) != str(compose[ckey]):
+            bad.append(f"{key} vs compose.{ckey}")
+    if bad:
+        raise FleetConfigError("control_plane credentials disagree: " + "; ".join(bad))
+
+
+# --------------------------------------------------------------------------
+# importing an existing setup (init --from-env / --answers)
+# --------------------------------------------------------------------------
+
+# env name -> init answer key. Values are never printed; reports carry names only.
+ENV_IMPORT_MAP = {
+    "HERDR_CP_PG_USER": "pg_user", "HERDR_CP_PG_PASSWORD": "pg_password",
+    "HERDR_CP_MINIO_USER": "minio_user", "HERDR_CP_MINIO_PASSWORD": "minio_password",
+    "HERDR_CP_WEB_BIND": "web_bind", "HERDR_CP_WEB_PUBLIC_PORT": "web_port",
+    "HERDR_CP_PG_PORT": "pg_port", "GATEWAY_TAILNET_IP": "gateway_tailnet_ip",
+    "FABRIC_LLM_UPSTREAM_KEY": "llm_upstream_key", "FABRIC_LLM_UPSTREAM_URL": "llm_upstream_url",
+    "HERDR_CP_HOST_ALIASES": "host_aliases", "HERDR_CP_RUSTFS_BUCKET": "rustfs_bucket",
+    "HERDR_ENGINEERING_CI_URL": "ci_url", "HERDR_ENGINEERING_CI_TOKEN": "ci_token",
+    "HERDR_ENGINEERING_CI_ACTIONS": "ci_actions", "HERDR_ENGINEERING_GITHUB_TOKEN": "github_token",
+    "HERDR_ENGINEERING_FABRIC_URL": "fabric_url", "HERDR_CP_URL": "public_url",
+}
+# env name -> answer key whose value is the CONTENT of the named file
+ENV_IMPORT_FILE_MAP = {
+    "FABRIC_LLM_UPSTREAM_KEY_FILE": "llm_upstream_key",
+    "HERDR_ENGINEERING_CI_TOKEN_FILE": "ci_token", "HERDR_ENGINEERING_CI_TOKEN_HOST_FILE": "ci_token",
+    "HERDR_ENGINEERING_GITHUB_TOKEN_FILE": "github_token",
+    "HERDR_ENGINEERING_GITHUB_TOKEN_HOST_FILE": "github_token",
+}
+# carried into control_plane.compose as-is (docker-level settings)
+ENV_COMPOSE_PASSTHROUGH = ("HERDR_LLM_PROXY_PORT", "HERDR_COLLAB_CERT_DIR", "HERDR_COLLAB_CERT_UID",
+                           "HERDR_COLLAB_EDGE_BIND")
+
+
+def parse_env_file(text: str) -> tuple[dict[str, str], list[int]]:
+    r"""Parse a docker-compose style env file without any shell evaluation.
+
+    Handles blank lines, ``#`` comments, an ``export`` prefix, CRLF, ``=`` inside
+    values, single quotes (literal, may span lines), double quotes (``\\ \" \n \$``
+    escapes, may span lines) and unquoted values with an inline `` #`` comment.
+    Returns (values, line numbers that were not NAME=value). Never raises on content.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    out: dict[str, str] = {}
+    bad: list[int] = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        lineno, line = i + 1, lines[i].strip()
+        i += 1
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export ") or line.startswith("export\t"):
+            line = line[7:].lstrip()
+        name, sep, rest = line.partition("=")
+        name = name.strip()
+        if not sep or not _ENV_NAME.match(name):
+            bad.append(lineno)
+            continue
+        rest = rest.lstrip()
+        if rest[:1] in ("'", '"'):
+            q, buf, body = rest[0], [], rest[1:]
+            while True:
+                closed, k = False, 0
+                while k < len(body):
+                    c = body[k]
+                    if q == '"' and c == "\\" and k + 1 < len(body):
+                        n = body[k + 1]
+                        buf.append({"n": "\n", "t": "\t"}.get(n, n))
+                        k += 2
+                        continue
+                    if c == q:
+                        closed = True
+                        break
+                    buf.append(c)
+                    k += 1
+                if closed:
+                    break
+                if i >= len(lines):     # unterminated quote: drop the entry
+                    buf = None
+                    break
+                buf.append("\n")
+                body = lines[i]
+                i += 1
+            if buf is None:
+                bad.append(lineno)
+                continue
+            out[name] = "".join(buf)
+        else:
+            value = rest
+            hash_at = value.find(" #")
+            if hash_at >= 0:
+                value = value[:hash_at]
+            out[name] = value.rstrip()
+    return out, bad
+
+
+def import_env_file(path: Path) -> tuple[dict, dict]:
+    """(answers, report) from an old env file such as control-plane.env. The report
+    lists variable NAMES only: imported, unknown, empty, unreadable files, bad lines."""
+    path = Path(path).expanduser()
+    try:
+        values, bad_lines = parse_env_file(path.read_text())
+    except (OSError, UnicodeDecodeError):
+        raise FleetConfigError(f"cannot read {path}") from None
+    answers: dict[str, Any] = {}
+    report: dict[str, list] = {"imported": [], "unknown": [], "empty": [], "unreadable_files": [],
+                               "bad_lines": bad_lines}
+    compose_extra: dict[str, str] = {}
+    dsn = values.get("HERDR_CP_PG_DSN")
+    for name, value in values.items():
+        if name == "HERDR_CP_PG_DSN":
+            continue
+        if value == "":
+            report["empty"].append(name)
+            continue
+        if name in ENV_IMPORT_MAP:
+            answers[ENV_IMPORT_MAP[name]] = value
+            report["imported"].append(name)
+        elif name in ENV_IMPORT_FILE_MAP:
+            try:
+                content = Path(value).expanduser().read_text().strip()
+            except (OSError, UnicodeDecodeError):
+                report["unreadable_files"].append(name)
+                continue
+            if content:
+                answers.setdefault(ENV_IMPORT_FILE_MAP[name], content)
+                report["imported"].append(name)
+            else:
+                report["empty"].append(name)
+        elif name in ENV_COMPOSE_PASSTHROUGH:
+            compose_extra[name] = value
+            report["imported"].append(name)
+        else:
+            report["unknown"].append(name)
+    if dsn:
+        creds = _dsn_credentials(dsn)
+        if creds is None:
+            report["unknown"].append("HERDR_CP_PG_DSN")
+        else:
+            for key, got in (("pg_user", creds[0]), ("pg_password", creds[1])):
+                if key in answers and answers[key] != got:
+                    raise FleetConfigError(
+                        f"{path}: HERDR_CP_PG_DSN and HERDR_CP_{'PG_USER' if key == 'pg_user' else 'PG_PASSWORD'} "
+                        "disagree; fix the file (values not shown)")
+                answers.setdefault(key, got)
+            report["imported"].append("HERDR_CP_PG_DSN")
+    if compose_extra:
+        answers["compose_extra"] = compose_extra
+    return answers, report
+
+
+ANSWER_KEYS = frozenset(set(ENV_IMPORT_MAP.values()) | set(ENV_IMPORT_FILE_MAP.values()) | {
+    "public_url", "llm_upstream_url", "llm_upstream_key", "ci_url", "ci_token", "web_bind",
+    "web_port", "pg_port", "gateway_tailnet_ip", "host_aliases", "github_token", "fabric_url",
+    "fabric_token", "hosts", "compose_extra"})
+
+
+def load_answers_file(path: Path) -> dict:
+    """YAML/JSON mapping of init answers. Must not be group/other accessible (0600)."""
+    path = Path(path).expanduser()
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        raise FleetConfigError(f"cannot read {path}") from None
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise FleetConfigError(f"{path} must not be accessible by group or other (chmod 600)")
+    try:
+        data = yaml.safe_load(path.read_text())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        raise FleetConfigError(f"{path} is not a readable YAML/JSON mapping") from None
+    if not isinstance(data, dict):
+        raise FleetConfigError(f"{path} must hold a mapping of answer keys")
+    unknown = sorted(str(k) for k in set(data) - ANSWER_KEYS)
+    if unknown:
+        raise FleetConfigError(f"{path}: unknown answer keys: " + ", ".join(unknown))
+    return data
 
 
 def _link_legacy_path(path: Path) -> None:
@@ -414,6 +651,7 @@ def validate_config(path: Path) -> dict:
     """Load and require a renderable control_plane.compose map. Names only, no values."""
     cfg = load_fleet_config(_expand(path))
     compose_env(cfg)
+    check_credentials_consistent(cfg)
     return {"revision": cfg.revision, "hosts": len(cfg.status()["hosts"])}
 
 

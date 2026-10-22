@@ -43,6 +43,13 @@ maintain.
 #    address/keys and the host list; generates Postgres/MinIO credentials. API keys
 #    stay off: control_plane.api_keys is {} and the control plane is open on the tailnet)
 herdr-eng fleet config init
+#    an EXISTING control plane must keep its Postgres/MinIO credentials (the live
+#    volumes were created with them): import the old env file instead - names, never
+#    values, are reported; anything still missing is prompted for.
+#    See docs/operations/central-config-cutover.md for the full order.
+herdr-eng fleet config init --from-env ~/.config/herdr-engineering/control-plane.env
+#    non-interactive: --answers answers.yaml (mode 0600; keys public_url,
+#    llm_upstream_url, llm_upstream_key, ci_url, ci_token, web_bind, web_port, hosts, ...)
 
 # 2) deploy: validates the file, renders the variables docker compose itself needs
 #    (image passwords, ports, bind address) into a transient 0600 file that is removed
