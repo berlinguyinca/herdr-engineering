@@ -14,7 +14,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from .redact import redact_payload, redact_text
@@ -82,6 +82,16 @@ def _endpoint(value):
     return value.rstrip('/')
 
 
+def _validate_transport(routing, api_key):
+    if routing not in ('direct', 'fabric'):
+        raise ValueError('summary routing must be direct or fabric')
+    if (not isinstance(api_key, str) or len(api_key) > 4096
+            or any(not 33 <= ord(c) <= 126 for c in api_key)):
+        raise ValueError('summary API key must be a bounded printable token without whitespace')
+    if routing == 'fabric' and not api_key:
+        raise ValueError('fabric summaries require a dedicated API key')
+
+
 @dataclass(frozen=True)
 class AgentSummaryConfig:
     enabled: bool = False
@@ -95,8 +105,11 @@ class AgentSummaryConfig:
     max_output_tokens: int = 400
     retry_initial_seconds: float = 30
     retry_max_seconds: float = 300
+    routing: str = 'direct'
+    api_key: str = field(default='', repr=False)
 
     def __post_init__(self):
+        _validate_transport(self.routing, self.api_key)
         if not isinstance(self.enabled, bool):
             raise ValueError('summary enabled must be a boolean')
         if not isinstance(self.endpoint, str) or not isinstance(self.model, str):
@@ -227,20 +240,49 @@ def summary_source(repo, session_id, config=None):
                          'note': 'Summary covers available recorded messages only.'}}
 
 
-class OpenAICompatibleSummaryClient:
-    """No provider discovery, aliases, or implicit fallback upstream."""
+class _RejectSummaryRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
-    def __init__(self, endpoint):
+
+class OpenAICompatibleSummaryClient:
+    """Explicit direct endpoint or authenticated, registered fabric model route."""
+
+    def __init__(self, endpoint, *, routing='direct', api_key=''):
+        _validate_transport(routing, api_key)
         endpoint = _endpoint(endpoint)
         self.endpoint = (endpoint if endpoint.endswith('/chat/completions')
                          else endpoint + '/chat/completions')
+        self._routing = routing
+        self._api_key = api_key
+        self._opener = (urllib.request.build_opener(_RejectSummaryRedirects())
+                        if routing == 'fabric' else None)
 
     def __call__(self, payload, *, timeout):
+        headers = {'Content-Type': 'application/json'}
+        if self._routing == 'fabric':
+            payload = dict(payload)
+            metadata = payload.pop('metadata', {})
+            identity = metadata.get('herdr_summary_session_id') if isinstance(metadata, dict) else None
+            if (not isinstance(identity, str) or len(identity) != 64
+                    or any(c not in '0123456789abcdef' for c in identity)):
+                raise ValueError('fabric summaries require a valid conversation identity')
+            headers.update({'Authorization': f'Bearer {self._api_key}',
+                            'X-Herdr-Require-Registered-Model': 'true',
+                            'X-InferWeave-Session-ID': identity,
+                            'X-InferWeave-Agent-ID': 'herdr-agent-summaries'})
         request = urllib.request.Request(self.endpoint,
                                          data=json.dumps(payload).encode(),
-                                         headers={'Content-Type': 'application/json'}, method='POST')
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read(131073)
+                                         headers=headers, method='POST')
+        try:
+            open_url = self._opener.open if self._opener else urllib.request.urlopen
+            with open_url(request, timeout=timeout) as response:
+                raw = response.read(131073)
+        except Exception:
+            if self._routing == 'fabric':
+                # Do not expose server responses, authenticated requests or redirect URLs.
+                raise RuntimeError('fabric summary request failed') from None
+            raise
         if len(raw) > 131072:
             raise ValueError('summary response exceeds limit')
         envelope = json.loads(raw)
@@ -276,7 +318,8 @@ class AgentSummaryService:
         self._persist = persist
         self._client = model_client
         if self._client is None and self.config.enabled:
-            self._client = OpenAICompatibleSummaryClient(self.config.endpoint)
+            self._client = OpenAICompatibleSummaryClient(
+                self.config.endpoint, routing=self.config.routing, api_key=self.config.api_key)
         self._clock = clock or time.monotonic
         self._lock = threading.RLock()
         self._run_lock = threading.Lock()
@@ -295,7 +338,7 @@ class AgentSummaryService:
 
     def _cache_key(self, source):
         return _digest([source['fingerprint'], self.config.endpoint.rstrip('/'), self.config.model,
-                        PROMPT_VERSION, SCHEMA_VERSION])
+                        PROMPT_VERSION, SCHEMA_VERSION, self.config.routing])
 
     def get(self, session_id):
         source = self.summary_source(session_id)
@@ -399,6 +442,8 @@ class AgentSummaryService:
                                             'latest_assistant_label': latest_assistant_label,
                                             'unanswered_user_labels': unanswered_user_labels},
                                             ensure_ascii=False)}]}
+                if self.config.routing == 'fabric':
+                    payload['metadata'] = {'herdr_summary_session_id': source['conversation_identity']}
                 raw = self._client(payload, timeout=self.config.timeout_seconds)
                 content = _validate_response(raw, set(labels) | set(source['source_ids']))
                 content['citations'] = [labels.get(label, label) for label in content['citations']]
@@ -415,7 +460,8 @@ class AgentSummaryService:
                     self.request(session_id)
                     return True
                 summary = {**content, 'session_id': session_id, 'state': 'ready',
-                           'model': self.config.model, 'generated_at': datetime.now(UTC).isoformat(),
+                           'model': self.config.model, 'routing': self.config.routing,
+                           'generated_at': datetime.now(UTC).isoformat(),
                            'source_ids': source['source_ids'],
                            'source_message_count': source['source_message_count'],
                            'source_revision': source['fingerprint'],

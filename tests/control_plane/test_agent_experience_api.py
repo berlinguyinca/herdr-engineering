@@ -49,6 +49,27 @@ def test_agent_names_rename_conflicts_and_viewer_capabilities():
         server.shutdown()
 
 
+def test_summary_fabric_policy_is_operator_owned_and_keeps_validated_fields():
+    repo = ControlPlaneRepo()
+    server = start(repo, api_keys={'read': 'viewer', 'write': 'operator', 'capture': 'ingest'})
+    registration = {'name': 'summaries', 'base_url': 'http://cpu:8080',
+                    'upstream_model': 'qwen-small', 'project': 'summaries',
+                    'fabric_model': 'qwen-small', 'context_window': 8192}
+    try:
+        assert call(server, '/api/v1/llm/models', registration, 'read')[0] == 403
+        assert call(server, '/api/v1/llm/models', registration, 'write')[0] == 200
+        assert repo.llm_config()['custom_models'][0]['fabric_model'] == 'qwen-small'
+        assert repo.llm_config()['custom_models'][0]['context_window'] == 8192
+        assert call(server, '/api/v1/llm/models', {**registration, 'context_window': True}, 'write')[0] == 400
+        assert repo.list_custom_models()['summaries']['context_window'] == 8192
+        for kind in ('custom_model', 'llm_key', 'token_usage'):
+            assert call(server, '/api/v1/ingest', {'entity_type': kind, 'entity_id': 'forged',
+                'event_type': f'{kind}.upserted', 'payload': registration}, 'capture')[0] == 400
+            assert repo.stream(kind, 'forged') == []
+    finally:
+        server.shutdown()
+
+
 def test_summary_runs_in_background_and_reads_cache_without_new_inference(acknowledged_sink):
     repo = ControlPlaneRepo(sink=acknowledged_sink)
     sid = 'herdr:bender:default:w1%3Ap1'

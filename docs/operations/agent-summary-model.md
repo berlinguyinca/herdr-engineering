@@ -1,4 +1,7 @@
-# Private model for agent summaries
+# Private CPU fallback model for agent summaries
+
+Production summaries route through the [fabric LLM](agent-summary-fabric.md),
+with this service as the explicitly allowed CPU fallback.
 
 Agent summaries are disabled by default. Enabling them requires an explicit model
 endpoint and alias. The service below runs the official Qwen2.5 1.5B Instruct Q4_K_M model on
