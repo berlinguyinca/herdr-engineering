@@ -105,7 +105,11 @@ the central file is the only source. The `.env`/`control-plane.env` files and
 **Setup on demand.** `herdr-eng fleet config init` prompts for required fields
 (public URL, LLM upstream address and key, CI address and token, host list and
 roles), writes the file 0600, and runs validation. Non-interactive when all
-values are supplied via a file argument. *(my call)*
+values are supplied via a file argument (`--answers`, mode 0600). An existing
+control plane is migrated with `--from-env <old control-plane.env>`, which keeps
+the Postgres/MinIO credentials the live volumes were created with (pg_dsn,
+minio_* and compose.HERDR_CP_{PG,MINIO}_* stay consistent; `validate` checks it)
+and reports variable names only. *(my call)*
 
 **Observability.** `/api/v1/fleet/config/status` (no values) lists current
 revision and each host's applied revision; the Hosts page shows a drift badge.

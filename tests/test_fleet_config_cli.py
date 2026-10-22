@@ -397,3 +397,158 @@ def test_cli_default_path_matches_the_module_default():
     from herdr_engineering import cli
     assert cli.FLEET_CONFIG_DEFAULT == str(fcc.DEFAULT_CONFIG_PATH)
     assert not hasattr(fcc, "write_in_place")
+
+
+# ------------------------------------------------ I1: import an existing setup
+
+HOSTILE_PW = "p@ss:w/rd?#%20 'q' \"dq\" $HOME \\ end=x"
+
+
+def _env_file(tmp_path, body, mode=0o600):
+    p = tmp_path / "control-plane.env"
+    p.write_text(body)
+    p.chmod(mode)
+    return p
+
+
+def test_parse_env_file_handles_compose_syntax_without_evaluation():
+    text = ("# comment\r\n"
+            "export A=plain value # inline comment\r\n"
+            "B='single $HOME \\ \"x\" # not a comment'\n"
+            'C="dq \\"esc\\" \\$HOME \\\\ back\\nnl"\n'
+            "D=with=equals\n"
+            "E='multi\nline'\n"
+            "F=\n"
+            "not a pair\n"
+            "1BAD=x\n"
+            "G=ünïcödé\n")
+    values, bad = fcc.parse_env_file(text)
+    assert values["A"] == "plain value"
+    assert values["B"] == 'single $HOME \\ "x" # not a comment'
+    assert values["C"] == 'dq "esc" $HOME \\ back\nnl'
+    assert values["D"] == "with=equals"
+    assert values["E"] == "multi\nline"
+    assert values["F"] == "" and values["G"] == "ünïcödé"
+    assert bad == [9, 10]
+
+
+def test_import_maps_names_and_reports_names_only(tmp_path):
+    token_file = tmp_path / "ci-token"
+    token_file.write_text("ci-file-secret-0001\n")
+    env = _env_file(tmp_path, (
+        "HERDR_CP_PG_USER=herdr_live\n"
+        f"HERDR_CP_PG_PASSWORD='{HOSTILE_PW.replace(chr(39), '')}'\n"
+        "HERDR_CP_MINIO_USER=minio_live\nHERDR_CP_MINIO_PASSWORD=minio-secret-0002\n"
+        "HERDR_CP_WEB_BIND=100.64.0.9\nHERDR_CP_WEB_PUBLIC_PORT=80\nHERDR_CP_PG_PORT=15433\n"
+        "GATEWAY_TAILNET_IP=100.64.0.9\nFABRIC_LLM_UPSTREAM_KEY=llm-secret-0003\n"
+        "HERDR_CP_HOST_ALIASES=a=b\nHERDR_ENGINEERING_CI_ACTIONS=1\n"
+        f"HERDR_ENGINEERING_CI_TOKEN_HOST_FILE={token_file}\n"
+        "HERDR_ENGINEERING_GITHUB_TOKEN_HOST_FILE=/nonexistent/gh\n"
+        "SOMETHING_ELSE=unknown-secret-0004\nHERDR_LLM_PROXY_PORT=8099\n"))
+    answers, report = fcc.import_env_file(env)
+    assert answers["pg_user"] == "herdr_live" and answers["ci_token"] == "ci-file-secret-0001"
+    assert answers["compose_extra"] == {"HERDR_LLM_PROXY_PORT": "8099"}
+    assert "SOMETHING_ELSE" in report["unknown"]
+    assert "HERDR_ENGINEERING_GITHUB_TOKEN_HOST_FILE" in report["unreadable_files"]
+    flat = json.dumps(report)
+    for secret in ("minio-secret-0002", "llm-secret-0003", "unknown-secret-0004", "ci-file-secret-0001"):
+        assert secret not in flat
+
+
+def test_dsn_and_user_disagreement_is_refused_without_values(tmp_path):
+    env = _env_file(tmp_path, "HERDR_CP_PG_USER=alice\nHERDR_CP_PG_PASSWORD=pw-secret-1\n"
+                              "HERDR_CP_PG_DSN=postgresql://bob:pw-secret-1@postgres:5432/herdr\n")
+    with pytest.raises(FleetConfigError) as e:
+        fcc.import_env_file(env)
+    assert "disagree" in str(e.value) and "pw-secret-1" not in str(e.value) and "bob" not in str(e.value)
+
+
+def test_dsn_only_supplies_the_pg_credentials(tmp_path):
+    env = _env_file(tmp_path, "HERDR_CP_PG_DSN=postgresql://bob:p%40ss@postgres:5432/herdr\n")
+    answers, _ = fcc.import_env_file(env)
+    assert answers["pg_user"] == "bob" and answers["pg_password"] == "p@ss"
+
+
+def test_init_keeps_imported_credentials_consistent_with_a_hostile_password(tmp_path):
+    a = dict(ANSWERS, pg_user="herdr_live", pg_password=HOSTILE_PW, minio_user="minio_live",
+             minio_password=HOSTILE_PW + "m")
+    p = fcc.init_config(tmp_path / "fleet" / "fleet-config.yaml", a, prompt=no_prompt,
+                        secret_prompt=no_prompt)
+    cfg = load_fleet_config(p)
+    cp = cfg.section("control_plane")
+    from urllib.parse import unquote, urlsplit
+    parts = urlsplit(cp["pg_dsn"])
+    assert (unquote(parts.username), unquote(parts.password)) == ("herdr_live", HOSTILE_PW)
+    assert parts.hostname == "postgres" and parts.port == 5432 and parts.path == "/herdr"
+    assert cp["compose"]["HERDR_CP_PG_PASSWORD"] == HOSTILE_PW
+    assert cp["minio_password"] == cp["compose"]["HERDR_CP_MINIO_PASSWORD"] == HOSTILE_PW + "m"
+    fcc.validate_config(p)          # includes the consistency check
+    out = tmp_path / "env" / "compose.env"
+    fcc.render_compose(cfg, out)
+    assert parse_env_file(out.read_text())["HERDR_CP_PG_PASSWORD"] == HOSTILE_PW
+
+
+def test_validate_catches_credentials_that_disagree(tmp_path):
+    p = make(tmp_path)
+    data = yaml.safe_load(p.read_text())
+    data["sections"]["control_plane"]["values"]["compose"]["HERDR_CP_PG_PASSWORD"] = "changed-secret-9"
+    p.unlink()
+    fcc.write_private_file(p, yaml.safe_dump(data, sort_keys=False))
+    with pytest.raises(FleetConfigError) as e:
+        fcc.validate_config(p)
+    assert "HERDR_CP_PG_PASSWORD" in str(e.value) and "changed-secret-9" not in str(e.value)
+
+
+def test_cli_init_from_env_and_answers_is_non_interactive_and_prints_no_values(tmp_path, monkeypatch, capsys):
+    import io
+    from herdr_engineering.cli import main
+    env = _env_file(tmp_path, "HERDR_CP_PG_USER=herdr_live\nHERDR_CP_PG_PASSWORD=pg-secret-0005\n"
+                              "HERDR_CP_MINIO_USER=minio_live\nHERDR_CP_MINIO_PASSWORD=minio-secret-0006\n"
+                              "HERDR_CP_WEB_BIND=100.64.0.9\nGATEWAY_TAILNET_IP=100.64.0.9\n"
+                              "FABRIC_LLM_UPSTREAM_KEY=llm-secret-0007\nMYSTERY=mystery-secret-0008\n")
+    answers = tmp_path / "answers.yaml"
+    answers.write_text(yaml.safe_dump({"public_url": "https://cp.example.test",
+                                       "llm_upstream_url": "https://llm.example.test",
+                                       "ci_url": "https://ci.example.test", "ci_token": "ci-secret-0009",
+                                       "web_port": "80", "hosts": {"bender": ["builder"]}}))
+    answers.chmod(0o600)
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))   # any prompt would hit EOF
+    target = tmp_path / "fleet" / "fleet-config.yaml"
+    assert main(["fleet", "config", "init", "--path", str(target), "--from-env", str(env),
+                 "--answers", str(answers)]) == 0
+    out = capsys.readouterr()
+    text = out.out + out.err
+    assert "HERDR_CP_PG_PASSWORD" in text and "MYSTERY" in text
+    for secret in ("pg-secret-0005", "minio-secret-0006", "llm-secret-0007", "mystery-secret-0008",
+                   "ci-secret-0009", "herdr_live", "100.64.0.9"):
+        assert secret not in text
+    cp = load_fleet_config(target).section("control_plane")
+    assert cp["compose"]["HERDR_CP_PG_PASSWORD"] == "pg-secret-0005"
+    assert cp["minio_user"] == "minio_live"
+
+
+def test_cli_init_missing_value_without_terminal_names_the_key(tmp_path, monkeypatch, capsys):
+    import io
+    from herdr_engineering.cli import main
+    answers = tmp_path / "answers.yaml"
+    answers.write_text(yaml.safe_dump({"llm_upstream_url": "https://llm.example.test",
+                                       "llm_upstream_key": "k-secret", "ci_url": "https://ci.test",
+                                       "ci_token": "t-secret"}))
+    answers.chmod(0o600)
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    rc = main(["fleet", "config", "init", "--path", str(tmp_path / "f" / "fleet-config.yaml"),
+               "--answers", str(answers)])
+    assert rc == 1
+    assert "public_url is required" in capsys.readouterr().err
+
+
+def test_answers_file_must_be_private_and_known(tmp_path):
+    answers = tmp_path / "answers.yaml"
+    answers.write_text("public_url: https://x\n")
+    answers.chmod(0o644)
+    with pytest.raises(FleetConfigError, match="chmod 600"):
+        fcc.load_answers_file(answers)
+    answers.chmod(0o600)
+    answers.write_text("public_url: https://x\nsecret_typo: v\n")
+    with pytest.raises(FleetConfigError, match="secret_typo"):
+        fcc.load_answers_file(answers)

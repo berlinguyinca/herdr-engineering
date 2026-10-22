@@ -182,6 +182,12 @@ def _build_parser() -> argparse.ArgumentParser:
         sp = csub.add_parser(name, help=hlp)
         sp.add_argument("--path", default=FLEET_CONFIG_DEFAULT)
         if name == "init":
+            sp.add_argument("--from-env", default=None, metavar="PATH",
+                            help="import an existing docker-compose env file (e.g. the old "
+                                 "control-plane.env): keeps the Postgres/MinIO credentials the "
+                                 "live volumes were created with; prints names only")
+            sp.add_argument("--answers", default=None, metavar="PATH",
+                            help="YAML/JSON answers file (mode 0600); overrides --from-env")
             sp.add_argument("--with-api-keys", action="store_true",
                             help="generate control-plane API keys (keyed mode); the dashboard, "
                                  "llm-proxy and emit hook do not send keys yet")
@@ -780,7 +786,22 @@ def _cmd_fleet_config(args) -> int:
         if cmd == "init":
             if args.with_api_keys:
                 print(fcc.API_KEYS_WARNING, file=sys.stderr)
-            fcc.init_config(path, None, with_api_keys=args.with_api_keys)
+            answers: dict = {}
+            if args.from_env:
+                imported, report = fcc.import_env_file(Path(args.from_env))
+                answers.update(imported)
+                # names only, never values
+                for label, key in (("imported", "imported"), ("not used (unknown names)", "unknown"),
+                                   ("empty, ignored", "empty"),
+                                   ("token files not readable", "unreadable_files")):
+                    if report[key]:
+                        print(f"{args.from_env}: {label}: {', '.join(report[key])}", file=sys.stderr)
+                if report["bad_lines"]:
+                    print(f"{args.from_env}: skipped lines (not NAME=value): "
+                          f"{', '.join(map(str, report['bad_lines']))}", file=sys.stderr)
+            if args.answers:
+                answers.update(fcc.load_answers_file(Path(args.answers)))
+            fcc.init_config(path, answers, with_api_keys=args.with_api_keys)
             print(f"wrote {path} (0600)")
         elif cmd == "validate":
             info = fcc.validate_config(path)
