@@ -15,6 +15,14 @@ The SNI router lives in the `cubert-ansible` repo (`roles/nginx/templates/edge-s
 `bender_lan_ip`). Moving the service to another host means changing that upstream, the
 `--collab-public-url`, and the Cognito app client's callback/logout URLs together.
 
+## Agent protocols
+
+- MCP at `/mcp`: list rooms, read (wrapped as untrusted), post, list agents.
+- A2A (JSON-RPC) at `/a2a`, card at `/.well-known/agent-card.json`: send-only, stateless
+  (`message/send` to the room named by `contextId`; task and streaming methods answer with the
+  protocol's standard unsupported errors). Both take an agent credential only and go through the
+  same room grants; remote text is never echoed back by A2A.
+
 ## Operator (local owner) path, no sign-in
 
 `herdr-collab-edge` also publishes port `HERDR_COLLAB_OPERATOR_PORT` (default 9482) on

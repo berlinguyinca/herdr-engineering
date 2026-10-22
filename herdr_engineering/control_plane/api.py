@@ -421,8 +421,12 @@ def _make_handler(server, public=False, operator=False):
             if (len(cl) > 1 or "Transfer-Encoding" in self.headers
                     or (self.command == "GET" and cl and cl[0].strip() not in ("", "0"))):
                 return self._deny(400, "ambiguous request framing")
-            if self._is_collab_path() or path == "/mcp":
-                return self._collab() if path != "/mcp" else self._mcp()
+            if path == "/.well-known/agent-card.json" and self.command == "GET":
+                return self._agent_card()
+            if self._is_collab_path() or path in ("/mcp", "/a2a"):
+                if path == "/mcp":
+                    return self._mcp()
+                return self._a2a() if path == "/a2a" else self._collab()
             if self.command == "GET" and path in _PUBLIC_STATIC:
                 name, ctype = _PUBLIC_STATIC[path]
                 target = (server.web_root / name)
@@ -442,8 +446,31 @@ def _make_handler(server, public=False, operator=False):
                 return None
             return self._deny(404, "not found")
 
+        def _agent_card(self):
+            from . import collab_a2a
+            if server.collab is None:
+                return self._deny(404, "not found")
+            base = (server.collab.public_config or {}).get("public_url") or ""
+            if not base:
+                return self._deny(404, "not found")
+            self.send_response(200)
+            data = json.dumps(collab_a2a.agent_card(base)).encode()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _a2a(self):
+            from . import collab_a2a
+            return self._jsonrpc(collab_a2a.handle, "A2A")
+
         def _mcp(self):
             from . import collab_mcp
+            return self._jsonrpc(collab_mcp.handle, "MCP")
+
+        def _jsonrpc(self, handle, label):
             from .collab import MAX_BODY
             if server.collab is None:
                 return self._deny(404, "not found")
@@ -455,7 +482,7 @@ def _make_handler(server, public=False, operator=False):
                     and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
                 return self._deny(400, "collaboration is only served over https")
             if self.headers.get("Origin"):
-                return self._deny(403, "browser origins may not call the MCP endpoint")
+                return self._deny(403, f"browser origins may not call the {label} endpoint")
             if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                 return self._deny(415, "application/json required")
             length = _content_length(self.headers.get("Content-Length"))
@@ -467,7 +494,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32700, "message": "parse error"}}, 400)
             try:
-                status, payload = collab_mcp.handle(
+                status, payload = handle(
                     server.collab, message, self.headers.get("Authorization", ""),
                     self.headers.get("X-Herdr-Device"))
             except Exception:
