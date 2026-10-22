@@ -337,12 +337,15 @@ git) is the only place configuration and secrets live; nobody authors an env fil
 herdr-eng fleet config init
 
 # control-plane web: renders a transient 0600 env file from the central file for
-# docker compose (deleted on exit, even on failure), builds from a ref, recreates only
-# control-plane-web with the central file mounted read-only at
-# /etc/herdr/fleet/ (its directory, so edits by rename are seen), waits for /api/v1/health to report the commit, rolls
-# back on failure. Refuses to run when the file is missing or invalid.
-# Writes a receipt (ref, commit, image, time - no config values) to
-# ~/.local/state/herdr-engineering/deploys/<sha>.json
+# docker compose (deleted on exit, even on failure), builds from a ref, recreates
+# control-plane-web, control-plane-worker and llm-proxy on that tag with the central
+# file's directory mounted read-only at /etc/herdr/fleet/ (so edits by rename are
+# seen; llm-proxy gets only an llm slice), waits for /api/v1/health to report the
+# commit, and on failure rolls back to the previous receipt's commit with that
+# commit's compose files, reporting honestly whether it came back healthy. Refuses
+# to run when the file is missing or invalid or its directory holds anything else.
+# Writes a receipt (ref, commit, image, previous commit/image, collab slice hash,
+# time - no config values) to ~/.local/state/herdr-engineering/deploys/<sha>.json
 deploy/control-plane/deploy.sh --dry-run            # validate and show the plan
 deploy/control-plane/deploy.sh --ref origin/main    # --fleet-config PATH to override
 

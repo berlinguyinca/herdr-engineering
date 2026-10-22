@@ -53,7 +53,12 @@ herdr-eng fleet config init --from-env ~/.config/herdr-engineering/control-plane
 
 # 2) deploy: validates the file, renders the variables docker compose itself needs
 #    (image passwords, ports, bind address) into a transient 0600 file that is removed
-#    on exit, builds the image from a git ref, and recreates control-plane-web
+#    on exit, builds the image from a git ref, and recreates control-plane-web,
+#    control-plane-worker and llm-proxy on that one tag. On failure it rolls back to
+#    the commit in the running image's receipt with THAT commit's compose files and
+#    says honestly whether the rollback came back healthy (exit 1) or not (exit 3);
+#    the very first deploy of the central config has no automatic rollback (see
+#    docs/operations/central-config-cutover.md)
 deploy/control-plane/deploy.sh --dry-run        # validate, render to a temp dir, `docker compose config -q`
 deploy/control-plane/deploy.sh                  # --ref, --no-fetch, --fleet-config PATH
 
