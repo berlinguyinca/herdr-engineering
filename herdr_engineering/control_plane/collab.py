@@ -846,6 +846,9 @@ class CollabService:
         """Capability summaries only: no device ids, hostnames, paths or instance ids."""
         with self._lock:
             room, _ = self._authorize(pr, room_id, "read", "agent.list")
+            # A roster (who owns which agent): never for guests, like the member list.
+            if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
+                raise CollabError(403, "forbidden")
             out = []
             for aid, g in room["grants"].items():
                 a = self._agents.get(aid)
