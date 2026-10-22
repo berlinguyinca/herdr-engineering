@@ -512,9 +512,16 @@ class AgentForwarder:
     """
 
     def __init__(self, bind_host: str, target_port: int,
-                 bind_port: int = 0, private_only: bool = True) -> None:
+                 bind_port: int = 0, private_only: bool = True,
+                 fabric_names: frozenset[str] = frozenset()) -> None:
         self.bind_host = bind_host
         self.target_port = target_port
+        # Host names the fabric itself owns (the control-plane host, the
+        # tailnet IP). A request addressed to one of them reaches a loopback
+        # app as ``Host: 127.0.0.1:<port>``, the name that app's own
+        # DNS-rebinding guard accepts, so nobody configures the app with the
+        # fabric's names. Any other Host is forwarded untouched.
+        self.fabric_names = frozenset(n.lower() for n in fabric_names)
         # bind_port=0 => OS-allocated ephemeral port; a specific bind_port
         # makes the forwarder reuse the SAME port so port-matching works
         # (localhost:4040 -> dev.lan:4040). Callers fall back to 0 on EADDRINUSE.
@@ -563,6 +570,9 @@ class AgentForwarder:
             target = socket.create_connection(
                 ("127.0.0.1", self.target_port), timeout=5)
             from .devfabric import proxy_pair
+            head = self._read_head(client)
+            if head is not None:
+                target.sendall(self._rewrite_head(head))
             proxy_pair(client, target)
         except OSError:
             pass  # app gone: drop the connection
@@ -573,6 +583,66 @@ class AgentForwarder:
                         s.close()
                     except OSError:
                         pass
+
+    _HEAD_LIMIT = 16384
+
+    def _read_head(self, client: socket.socket) -> bytes | None:
+        """The first request head (through the blank line), or what arrived.
+
+        ``None`` when nothing arrived within a second: the proxy then pumps as
+        before (a client that speaks second, or a non-HTTP protocol).
+        """
+        if not self.fabric_names:
+            return None
+        buf = b""
+        client.settimeout(1.0)
+        try:
+            while b"\r\n\r\n" not in buf and len(buf) < self._HEAD_LIMIT:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+        except (OSError, TimeoutError):
+            pass
+        return buf or None
+
+    def _rewrite_head(self, data: bytes) -> bytes:
+        """Point a fabric-addressed ``Host`` at the loopback target.
+
+        Only the first request head of a connection is touched, and only when
+        it is plain HTTP/1.x, names a fabric-owned host and is not an upgrade
+        (websockets stream on). ``Connection: close`` is forced on a rewritten
+        request so no later request on the same socket can go unrewritten.
+        """
+        end = data.find(b"\r\n\r\n")
+        if end < 0:
+            return data
+        lines = data[:end].split(b"\r\n")
+        first = lines[0].split(b" ")
+        if len(first) != 3 or not first[2].startswith(b"HTTP/1."):
+            return data
+        host_at = None
+        for i, line in enumerate(lines[1:], 1):
+            name, _, value = line.partition(b":")
+            lname = name.strip().lower()
+            if lname == b"upgrade":
+                return data
+            if lname == b"host":
+                if host_at is not None:
+                    return data  # two Host headers: not ours to interpret
+                host_at = i
+                value = value.strip().decode("latin-1").lower()
+                host = (value[1:].split("]")[0] if value.startswith("[")
+                        else value.split(":")[0])
+                if host not in self.fabric_names:
+                    return data
+        if host_at is None:
+            return data
+        lines[host_at] = f"Host: 127.0.0.1:{self.target_port}".encode()
+        lines = [l for l in lines
+                 if l.partition(b":")[0].strip().lower() != b"connection"]
+        lines.append(b"Connection: close")
+        return b"\r\n".join(lines) + data[end:]
 
     def stop(self) -> None:
         self._stopping.set()
@@ -613,6 +683,18 @@ class AgentConfig:
     # page with a clickable route. Empty = reporting disabled.
     control_plane_url: str = ""
 
+    def fabric_names(self) -> frozenset[str]:
+        """The host names the fabric owns: its control-plane host and this
+        machine's tailnet IP. A request for one of them is addressed to the
+        fabric, never to an attacker's domain."""
+        names = {self.tailnet_ip}
+        if self.control_plane_url:
+            from urllib.parse import urlparse
+            host = urlparse(self.control_plane_url).hostname
+            if host:
+                names.add(host)
+        return frozenset(n.lower() for n in names if n)
+
 
 class FabricAgent:
     """Detects web services on this host and keeps the gateway's lease set in
@@ -634,7 +716,8 @@ class FabricAgent:
         # Restore forwarders for loopback-only services survived a restart.
         for port_s, entry in self._store.items():
             if entry.get("fwd_port"):
-                fwd = AgentForwarder(config.tailnet_ip, int(port_s))
+                fwd = AgentForwarder(config.tailnet_ip, int(port_s),
+                                     fabric_names=config.fabric_names())
                 try:
                     fwd.start()
                     # Rebind to the remembered port when still free so the
@@ -912,7 +995,9 @@ class FabricAgent:
             for bind_port in (port, 0):
                 try:
                     fwd = AgentForwarder(self.cfg.tailnet_ip, port,
-                                         bind_port=bind_port).start()
+                                         bind_port=bind_port,
+                                         fabric_names=self.cfg.fabric_names()
+                                         ).start()
                     break
                 except OSError:
                     fwd = None
