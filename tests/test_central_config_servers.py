@@ -490,3 +490,11 @@ def test_approval_settings_come_from_the_collab_slice():
     assert args.collab_approver_group == ["Flag"]                    # flags win
     with pytest.raises(SystemExit):
         cli._apply_collab_config(argparse.Namespace(collab_open_signup=False), {"collab": {"open_signup": "yes"}})
+
+
+def test_dashboard_host_names_are_a_collab_config_key():
+    import argparse
+    args = argparse.Namespace(collab_dashboard_host=[])
+    cli._apply_collab_config(args, {"collab": {"dashboard_hosts": ["dev.lan"]}})
+    assert args.collab_dashboard_host == ["dev.lan"]
+    assert "dashboard_hosts" in fcc.COLLAB_KEYS

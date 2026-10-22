@@ -30,8 +30,8 @@ The SNI router lives in the `cubert-ansible` repo (`roles/nginx/templates/edge-s
 (`herdr-cp-web`) proxies `/api/v1/collab/*` there, acting as `control_plane.collab.operator_user`
 (required when collaboration is on; `operator_email` is optional). Both live in the central fleet
 config; collab-public sees them only through its rendered slice. Both hops refuse DNS-rebound
-`Host` values and cross-site writes. Reach the dashboard by IP, or add a name with
-`--collab-dashboard-host`. Anyone who can reach the dashboard is the owner: keep it tailnet-only.
+`Host` values and cross-site writes. Reach the dashboard by IP, or list a name under
+`control_plane.collab.dashboard_hosts` in the central config (flag: `--collab-dashboard-host`). Anyone who can reach the dashboard is the owner: keep it tailnet-only.
 
 ## Host settings that live outside this repo's compose files
 

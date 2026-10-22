@@ -182,7 +182,7 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
 # so an unknown key (which could be a secret) is refused rather than passed along.
 COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
                          "cognito_domain", "public_url", "operator_user", "operator_email",
-                         "open_signup", "approver_groups"})
+                         "open_signup", "approver_groups", "dashboard_hosts"})
 
 
 def collab_values(cfg: FleetConfig) -> dict:
