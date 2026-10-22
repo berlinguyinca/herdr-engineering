@@ -2305,6 +2305,11 @@ def _cmd_cp_web(args) -> int:
         fleet_store = None
     elif fleet_store is not None:
         _install_fleet_host_config(fleet_store)
+        names = (cp.get("collab") or {}).get("dashboard_hosts") if isinstance(cp.get("collab"), dict) else None
+        if names is not None:
+            if not isinstance(names, list) or not all(isinstance(v, str) and v for v in names):
+                raise SystemExit("fleet config control_plane.collab.dashboard_hosts must be a list of strings")
+            args.collab_dashboard_host = list(args.collab_dashboard_host) + [n for n in names if n not in args.collab_dashboard_host]
         file_keys = cp.get("api_keys") or {}
         if not isinstance(file_keys, dict):
             raise SystemExit("fleet config control_plane.api_keys must be a mapping of key -> role")
@@ -2462,6 +2467,7 @@ COLLAB_CONFIG_KEYS = {
     "operator_email": ("collab_operator_email", str),
     "open_signup": ("collab_open_signup", bool),
     "approver_groups": ("collab_approver_group", list),
+    "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
 }
 
 

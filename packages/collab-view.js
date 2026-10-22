@@ -129,7 +129,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const cfg = await loadConfig();
     lastCfg = cfg;
     if (!cfg) {
-      centered('<h1>Collaboration</h1><p role="status">The collaboration network is not enabled on this server.</p>');
+      centered('<h1>Collaboration</h1><p role="status">The collaboration network is not enabled on this server, or this address is not allowed for the dashboard. Try the dashboard by its IP address.</p>');
       return;
     }
     if (cfg.operator) {   // dashboard: tailnet-only, the owner is already trusted
