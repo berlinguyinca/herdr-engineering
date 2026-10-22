@@ -293,3 +293,30 @@ def test_conflicting_explicit_run_identities_are_not_treated_as_missing():
     result = annotate_ci(view, records(), repository_languages={'github.com/org/frontend': 'Rust'})
     assert result['pipelines']['org/frontend'][0]['language'] is None
     assert result['pipelines']['org/frontend'][0]['language_source'] == 'unknown'
+
+
+def test_github_pipeline_context_urls_keep_repository_language_for_pull_and_push_runs():
+    for event, path in [('pull_request', 'pull/1206'), ('push', f'commit/{SHA}')]:
+        for advertised_identity in ({}, {'repository_id': 'github.com/org/frontend'}):
+            view = snapshot()
+            row = view['pipelines']['org/frontend'][0]
+            row.update(event=event, forge_url=f'https://github.com/Org/Frontend/{path}',
+                       **advertised_identity)
+            result = annotate_ci(view, records(), repository_languages={'github.com/org/frontend': 'Rust'})
+            run = result['pipelines']['org/frontend'][0]
+            assert run['language'] == 'Rust'
+            assert run['language_source'] == 'github_primary_language'
+            assert run['forge_url'] == row['forge_url']
+
+
+def test_pipeline_context_normalization_does_not_hide_conflicting_repositories_or_forges():
+    for url in ('https://github.com/org/other/pull/1206',
+                f'https://gitlab.com/org/frontend/commit/{SHA}',
+                'https://github.com/org/frontend/tree/main',
+                'https://github.com/org/frontend/commit/not-a-commit'):
+        view = snapshot()
+        row = view['pipelines']['org/frontend'][0]
+        row.update(repository_id='github.com/org/frontend', forge_url=url)
+        result = annotate_ci(view, records(), repository_languages={'github.com/org/frontend': 'Rust'})
+        assert result['pipelines']['org/frontend'][0]['language'] is None
+        assert result['pipelines']['org/frontend'][0]['language_source'] == 'unknown'

@@ -241,7 +241,11 @@ def annotate_ci(view, repo, *, repository_languages=None):
                 candidates = by_name.get(row.get("repository") or group, [])
             record = candidates[0] if len(candidates) == 1 else {}
             identity = record.get("repository_id")
-            row_identities = _identities(row)
+            # Woodpecker pipeline forge_url links to the PR or commit, while
+            # repository inventory forge_url identifies the repository itself.
+            forge_identity = canonical_repository(row.get("forge_url"), forge_host=row.get("forge_host"))
+            context = re.fullmatch(r"(github\.com/[^/]+/[^/]+)/(?:pull/[1-9][0-9]*|commit/(?:[a-f0-9]{40}|[a-f0-9]{64}))", forge_identity or "")
+            row_identities = _identities({**row, "forge_url": context.group(1)} if context else row)
             language_record = record if not row_identities or row_identities == {identity} else {}
             row.update(language=language_record.get("language"),
                        language_source=language_record.get("language_source", "unknown"))
