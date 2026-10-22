@@ -86,7 +86,20 @@ def test_an_agent_cannot_set_the_profile(w):
     {"allowed_models": "x"}, {"tools_allowed": "yes"},
     {"ssh_secret_names": ["pass word"]}, {"ssh_secret_names": [5]},
     {"spend_tokens_per_day": -1}, {"spend_tokens_per_day": True},
-    {"password": "hunter2"},                                                 # unknown top-level key
+    {"password": "hunter2"},
+    {"services": [{**GOOD["services"][0], "header": "X-Api-Key\n"}]},
+    {"services": [{**GOOD["services"][0], "name": "search\n"}]},
+    {"services": [{**GOOD["services"][0], "secret_name": "SEARCH_KEY\n"}]},
+    {"permanent_hosts": ["bender:22\n"]}, {"ssh_secret_names": ["bender_ssh\n"]},
+    {"services": [{**GOOD["services"][0], "upstream_url": "https://api.example.org/v1?key=abc"}]},
+    {"services": [{**GOOD["services"][0], "upstream_url": "https://api.example.org/v1;key=abc"}]},
+    {"services": [{**GOOD["services"][0], "upstream_url": "https://api.example.org/?"}]},
+    {"services": [{**GOOD["services"][0], "upstream_url": "https://api.example.org:99999/v1"}]},
+    {"services": [{**GOOD["services"][0], "upstream_url": "https://api.example.org/v1\n"}]},
+    *[{"services": [{**GOOD["services"][0], "header": h}]}
+      for h in ("Host", "content-length", "Transfer-Encoding", "CONNECTION", "Upgrade",
+                "Proxy-Authorization", "TE", "Trailer")],
+    {"permanent_hosts": ["bender.example.org:\u0662\u0662"]},                                                 # unknown top-level key
 ])
 def test_invalid_profiles_rejected(w, patch):
     assert code(w.s.set_room_profile, w.alice, w.room, {**GOOD, **patch}) == 400
@@ -112,14 +125,26 @@ def test_later_set_replaces_earlier(w):
 
 
 def test_events_and_responses_hold_names_only(w):
-    w.s.set_room_profile(w.alice, w.room, GOOD)
+    # every place a value could ride in is refused, and the string never reaches log or responses
+    base = GOOD["services"][0]
+    attempts = [
+        {"services": [{**base, "value": "hunter2"}]},
+        {"services": [{**base, "secret_name": "hunter2 value"}]},
+        {"services": [{**base, "upstream_url": "https://api.example.org/v1?key=hunter2"}]},
+        {"services": [{**base, "upstream_url": "https://u:hunter2@api.example.org/"}]},
+        {"secrets": {"SEARCH_KEY": "hunter2"}}, {"ssh_secrets": ["hunter2 x"]},
+        {"ssh_secret_names": ["hunter2\n"]},
+    ]
+    for patch in attempts:
+        assert code(w.s.set_room_profile, w.alice, w.room, {**GOOD, **patch}) == 400, patch
+    out = w.s.set_room_profile(w.alice, w.room, GOOD)
     evs = [e for e in w.s._log if e["event_type"] == "room_profile_set"]
     assert len(evs) == 1
     prof = evs[0]["payload"]["profile"]
     assert prof["services"][0]["secret_name"] == "SEARCH_KEY" and prof["ssh_secret_names"] == ["bender_ssh"]
     for svc_ in prof["services"]:
         assert set(svc_) == {"name", "upstream_url", "header", "secret_name"}
-    blob = json.dumps(evs[0]["payload"])
+    blob = json.dumps(w.s._log) + json.dumps(out) + json.dumps(w.s.get_room_profile(w.alice, w.room))
     assert "hunter2" not in blob
     feed = w.s.read_events(w.alice, w.room, 0, 200)["events"]
     assert all(e["event_type"] != "room_profile_set" for e in feed)
@@ -135,3 +160,10 @@ def test_http_routes(w):
     st, _ = w.s.dispatch("PUT", ["rooms", w.room, "profile"], {}, {"limits": {"depth": 9}},
                          f"Bearer {USERS['alice']}", None)
     assert st == 400
+
+
+def test_post_alias_works_through_dispatch(w):
+    st, out = w.s.dispatch("POST", ["rooms", w.room, "profile"], {}, GOOD, f"Bearer {USERS['alice']}", None)
+    assert st == 200 and out == w.s._profile(w.room) and out["limits"]["live_per_agent"] == 2
+    st, _ = w.s.dispatch("POST", ["rooms", w.room, "profile"], {}, GOOD, f"Bearer {USERS['bob']}", None)
+    assert st == 404

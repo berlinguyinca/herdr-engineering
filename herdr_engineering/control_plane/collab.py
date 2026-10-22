@@ -27,7 +27,7 @@ import time
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import urlparse
 
 from . import ids
 from .redact import redact_text
@@ -87,10 +87,12 @@ PROFILE_LIMIT_DEFAULTS = {"live_per_agent": 3, "depth": 2, "per_hour": 20}   # a
 MAX_PROFILE_HOSTS = 50
 MAX_PROFILE_SERVICES = 20
 MAX_PROFILE_NAMES = 50
-_PROFILE_HOST = re.compile(r"^[a-z0-9.-]+:\d{1,5}$")
-_PROFILE_SECRET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")   # a NAME that refers to a host file, never a value
-_PROFILE_SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
-_PROFILE_HEADER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+_PROFILE_HOST = re.compile(r"[a-z0-9.-]+:\d{1,5}", re.ASCII)
+_PROFILE_SECRET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", re.ASCII)   # a NAME that refers to a host file, never a value
+_PROFILE_SERVICE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}", re.ASCII)
+_PROFILE_HEADER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}", re.ASCII)
+_PROFILE_BAD_HEADERS = frozenset({"host", "content-length", "transfer-encoding", "connection", "upgrade",
+                                  "proxy-authorization", "te", "trailer"})
 _PROFILE_KEYS = frozenset({"allowed_families", "allowed_models", "tools_allowed", "permanent_hosts", "services",
                            "ssh_secret_names", "spend_tokens_per_day", "limits"})
 MAX_SPAWN_AGENTS = 20            # agents one fleet start may place on the owner's hosts
@@ -2457,7 +2459,7 @@ def _profile_strings(v: Any, field: str, rx: re.Pattern | None, limit: int, maxl
         raise CollabError(400, f"{field} must be a list of at most {limit}")
     out = []
     for x in v:
-        if not isinstance(x, str) or len(x) > maxlen or (rx is not None and not rx.match(x)):
+        if not isinstance(x, str) or len(x) > maxlen or (rx is not None and not rx.fullmatch(x)):
             raise CollabError(400, f"{field} has an invalid entry")
         if x not in out:
             out.append(x)
@@ -2492,14 +2494,16 @@ def _normalize_profile(body: Any) -> dict:
         if not isinstance(sv, dict) or set(sv) != {"name", "upstream_url", "header", "secret_name"}:
             raise CollabError(400, "a service needs exactly name, upstream_url, header and secret_name")
         name, url, header, sec = sv["name"], sv["upstream_url"], sv["header"], sv["secret_name"]
-        if not (isinstance(name, str) and _PROFILE_SERVICE_NAME.match(name)
-                and isinstance(header, str) and _PROFILE_HEADER.match(header)
-                and isinstance(sec, str) and _PROFILE_SECRET_NAME.match(sec)):
+        if not (isinstance(name, str) and _PROFILE_SERVICE_NAME.fullmatch(name)
+                and isinstance(header, str) and _PROFILE_HEADER.fullmatch(header)
+                and header.lower() not in _PROFILE_BAD_HEADERS
+                and isinstance(sec, str) and _PROFILE_SECRET_NAME.fullmatch(sec)):
             raise CollabError(400, "a service has an invalid name, header or secret_name")
         try:
-            u = urlsplit(url) if isinstance(url, str) and len(url) <= 2000 and url.isprintable() else None
+            u = urlparse(url) if isinstance(url, str) and len(url) <= 2000 and url.isprintable() else None
             ok = bool(u) and u.scheme == "https" and bool(u.hostname) and u.username is None and u.password is None \
-                and not u.fragment
+                and not u.fragment and not u.query and not u.params and not any(c in url for c in "?#;") \
+                and u.port != 0
         except ValueError:
             ok = False
         if not ok:
