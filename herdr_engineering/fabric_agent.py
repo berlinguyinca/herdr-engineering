@@ -43,6 +43,7 @@ import socket
 import subprocess
 import threading
 import time
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -529,6 +530,7 @@ class AgentForwarder:
         self.private_only = private_only
         self._listener: socket.socket | None = None
         self._stopping = threading.Event()
+        self._slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
 
     @property
     def port(self) -> int:
@@ -564,19 +566,34 @@ class AgentForwarder:
         threading.Thread(target=_accept_loop, daemon=True).start()
         return self
 
+    _HEAD_LIMIT = 16384
+    _HEAD_DEADLINE = 2.0
+    MAX_CONNECTIONS = 256
+
     def _proxy(self, client: socket.socket) -> None:
         target: socket.socket | None = None
+        # Bounded: a flood of idle or trickling connections cannot hold every
+        # thread, descriptor and loopback slot.
+        if not self._slots.acquire(blocking=False):
+            try:
+                client.close()
+            except OSError:
+                pass
+            return
         try:
+            # The head is read BEFORE the app is dialled, so a client that
+            # never speaks holds nothing on the app.
+            head = self._read_head(client)
             target = socket.create_connection(
                 ("127.0.0.1", self.target_port), timeout=5)
             from .devfabric import proxy_pair
-            head = self._read_head(client)
-            if head is not None:
+            if head:
                 target.sendall(self._rewrite_head(head))
             proxy_pair(client, target)
         except OSError:
             pass  # app gone: drop the connection
         finally:
+            self._slots.release()
             for s in (client, target):
                 if s is not None:
                     try:
@@ -584,65 +601,81 @@ class AgentForwarder:
                     except OSError:
                         pass
 
-    _HEAD_LIMIT = 16384
+    def _read_head(self, client: socket.socket) -> bytes:
+        """What the client sent first, through the blank line if it arrives.
 
-    def _read_head(self, client: socket.socket) -> bytes | None:
-        """The first request head (through the blank line), or what arrived.
-
-        ``None`` when nothing arrived within a second: the proxy then pumps as
-        before (a client that speaks second, or a non-HTTP protocol).
+        One overall deadline, not one per read, so a trickle cannot hold the
+        connection. Whatever arrived is returned and forwarded either way.
         """
         if not self.fabric_names:
-            return None
+            return b""
         buf = b""
-        client.settimeout(1.0)
+        deadline = time.monotonic() + self._HEAD_DEADLINE
         try:
             while b"\r\n\r\n" not in buf and len(buf) < self._HEAD_LIMIT:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                client.settimeout(left)
                 chunk = client.recv(4096)
                 if not chunk:
                     break
                 buf += chunk
         except (OSError, TimeoutError):
             pass
-        return buf or None
+        return buf
 
     def _rewrite_head(self, data: bytes) -> bytes:
         """Point a fabric-addressed ``Host`` at the loopback target.
 
-        Only the first request head of a connection is touched, and only when
-        it is plain HTTP/1.x, names a fabric-owned host and is not an upgrade
-        (websockets stream on). ``Connection: close`` is forced on a rewritten
-        request so no later request on the same socket can go unrewritten.
+        Deliberately narrow, because the app's own Host guard is what keeps a
+        website from using the browser against it: only a plain ``GET`` or
+        ``HEAD`` (no state change, and a cross-site page cannot read the
+        answer), a head that parses unambiguously, no bytes after the head
+        (nothing pipelined behind it), no upgrade, and exactly one ``Host``
+        naming a fabric-owned host. Anything else is forwarded as received and
+        the app decides. ``Connection: close`` is forced on a rewritten request.
         """
         end = data.find(b"\r\n\r\n")
-        if end < 0:
+        if end < 0 or len(data) != end + 4:
             return data
-        lines = data[:end].split(b"\r\n")
+        head = data[:end]
+        # Ambiguity a lenient backend could read differently: a bare LF or CR.
+        if b"\n" in head.replace(b"\r\n", b"") or b"\r" in head.replace(b"\r\n", b""):
+            return data
+        lines = head.split(b"\r\n")
         first = lines[0].split(b" ")
-        if len(first) != 3 or not first[2].startswith(b"HTTP/1."):
+        if (len(first) != 3 or first[0] not in (b"GET", b"HEAD")
+                or not first[2].startswith(b"HTTP/1.")):
             return data
         host_at = None
+        host = ""
         for i, line in enumerate(lines[1:], 1):
-            name, _, value = line.partition(b":")
-            lname = name.strip().lower()
-            if lname == b"upgrade":
+            if line[:1] in (b" ", b"\t"):  # obs-fold continuation
+                return data
+            name, sep, value = line.partition(b":")
+            if not sep or name != name.strip() or not name:
+                return data  # no colon, or whitespace before it
+            lname = name.lower()
+            if lname in (b"upgrade", b"content-length", b"transfer-encoding"):
                 return data
             if lname == b"host":
                 if host_at is not None:
                     return data  # two Host headers: not ours to interpret
                 host_at = i
-                value = value.strip().decode("latin-1").lower()
-                host = (value[1:].split("]")[0] if value.startswith("[")
-                        else value.split(":")[0])
-                if host not in self.fabric_names:
+                v = value.strip().decode("latin-1").lower()
+                if not v or any(c in v for c in " \t@/\\"):
                     return data
-        if host_at is None:
+                host = (v[1:].split("]")[0] if v.startswith("[")
+                        else v.split(":")[0])
+                host = host.rstrip(".")
+        if host_at is None or host not in self.fabric_names:
             return data
         lines[host_at] = f"Host: 127.0.0.1:{self.target_port}".encode()
-        lines = [l for l in lines
-                 if l.partition(b":")[0].strip().lower() != b"connection"]
+        lines = [ln for ln in lines
+                 if ln.partition(b":")[0].strip().lower() != b"connection"]
         lines.append(b"Connection: close")
-        return b"\r\n".join(lines) + data[end:]
+        return b"\r\n".join(lines) + b"\r\n\r\n"
 
     def stop(self) -> None:
         self._stopping.set()
