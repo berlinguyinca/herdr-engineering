@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { CollabApi } from './collab.js';
 import {
   helperAction, parseProfileForm, renderEgressRequests, renderHelperTree, renderHostsTable,
-  renderPanic, renderProfileEditor,
+  renderPanic, renderProfileEditor, wireHelperHandlers,
 } from '../collab-helpers.js';
 
 const XSS = '<img src=x onerror=alert(1)>';
@@ -31,7 +31,7 @@ test('CollabApi wrappers use the server routes (profile is written with POST)', 
   await api.roomProfile('r/1'); await api.setRoomProfile('r1', { tools_allowed: true });
   await api.egressRequests(); await api.decideEgress('g1', 'approve', 86400); await api.decideEgress('g1', 'deny');
   await api.promoteEgress('r1', 'a.org:443'); await api.removeEgress('r1', 'a.org:443');
-  await api.helpers(); await api.pauseHelpers(true);
+  await api.egressAllowlist('r1'); await api.helpers(); await api.pauseHelpers(true);
   assert.deepEqual(seen, [
     ['GET', '/api/v1/collab/rooms/r%2F1/profile', null],
     ['POST', '/api/v1/collab/rooms/r1/profile', { tools_allowed: true }],
@@ -40,6 +40,7 @@ test('CollabApi wrappers use the server routes (profile is written with POST)', 
     ['POST', '/api/v1/collab/fleet/egress/g1/decide', { decision: 'deny' }],
     ['POST', '/api/v1/collab/fleet/egress/promote', { room_id: 'r1', host_port: 'a.org:443' }],
     ['POST', '/api/v1/collab/fleet/egress/remove', { room_id: 'r1', host_port: 'a.org:443' }],
+    ['GET', '/api/v1/collab/fleet/egress/r1', null],
     ['GET', '/api/v1/collab/fleet/helpers', null],
     ['POST', '/api/v1/collab/fleet/helpers/pause', { paused: true }],
   ]);
@@ -140,4 +141,50 @@ test('host, task, name and secret-name strings are escaped everywhere', () => {
     + renderProfileEditor(prof, { owner: true });
   assert.doesNotMatch(all, /<img/);
   assert.match(all, /&lt;img src=x/);
+});
+
+function fakeContainer() {
+  const l = { click: new Set(), submit: new Set() };
+  return { l, addEventListener: (t, f) => l[t].add(f), removeEventListener: (t, f) => l[t].delete(f),
+    fire(t, ev) { for (const f of [...l[t]]) f(ev); } };
+}
+const btn = (ds) => ({ target: { closest: () => ({ dataset: ds, closest: () => ({ dataset: { id: 'g1', hp: 'h.org:443' } }) }) } });
+
+test('after visiting room A then B, a click in B only touches B (A is unbound on teardown)', async () => {
+  const root = fakeContainer();
+  const api = fakeApi();
+  const mk = (roomId) => wireHelperHandlers(root, { api, roomId, operator: true, owner: true, act: (fn) => fn(), refresh: async () => {},
+    getProfile: () => ({}), setProfile: () => {}, onError: () => {}, readForm: () => ({}) });
+  const offA = mk('A'); offA();                      // room A's teardown runs when B opens
+  mk('B');
+  root.fire('click', btn({ egressAct: 'always' }));
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(api.calls.filter((c) => c[0] === 'promoteEgress'), [['promoteEgress', 'B', 'h.org:443']]);
+  root.fire('submit', { target: { id: 'hcn-profile' }, preventDefault() {} });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(api.calls.filter((c) => c[0] === 'setRoomProfile').map((c) => c[1]), ['B']);
+  assert.equal(root.l.click.size, 1);
+});
+
+test('the operator hosts table shows the allowlist: Always after promote, Until for approvals, model endpoints fixed', () => {
+  const reqs = [{ id: 'g1', room_id: 'r1', agent_id: 'a', host_port: 'new.org:443', state: 'approved', expires_at: 2000000000 }];
+  const html = renderHostsTable(['api.anthropic.com:443', 'new.org:443', 'tmp.org:443'], [...reqs, { ...reqs[0], host_port: 'tmp.org:443' }], { operator: true, room: 'r1', now: 1000, permanent: ['new.org:443'] });
+  assert.match(html, /new\.org:443<\/td><td>Always/); assert.match(html, /tmp\.org:443<\/td><td>Until/);
+  assert.match(html, /Model endpoint/);
+  assert.equal((html.match(/data-egress-act="remove"/g) || []).length, 2);
+});
+
+test('the profile editor has a family checkbox group that is saved', () => {
+  const html = renderProfileEditor({ ...PROFILE, allowed_families: ['codex'] }, { owner: true });
+  for (const f of ['claude-code', 'codex', 'pi', 'agent']) assert.match(html, new RegExp(`name="allowed_families" value="${f}"`));
+  assert.match(html, /value="codex" checked/); assert.doesNotMatch(html, /value="pi" checked/);
+  assert.deepEqual(parseProfileForm({ allowed_families: ['pi', 'codex'] }, PROFILE).allowed_families, ['pi', 'codex']);
+  assert.deepEqual(parseProfileForm({ allowed_families: [] }, PROFILE).allowed_families, []);
+});
+
+test('Always still reports success when the follow-up decide is refused (409)', async () => {
+  const api = fakeApi();
+  api.decideEgress = () => Promise.reject(new Error('already decided'));
+  await helperAction(api, { egressAct: 'always', id: 'g1', room: 'r1', hp: 'h.org:443' });
+  assert.deepEqual(api.calls, [['promoteEgress', 'r1', 'h.org:443']]);
 });

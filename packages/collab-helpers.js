@@ -5,6 +5,8 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
 const DAY = 86400;
+export const FAMILIES = ['claude-code', 'codex', 'pi', 'agent'];   // collab.py SPAWN_FAMILIES
+const MODEL_ENDPOINTS = new Set(['api.anthropic.com:443', 'api.openai.com:443', 'llm.metabolomics.us:443']);   // FAMILY_ENDPOINTS: always allowed
 const lines = (v) => String(v ?? '').split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
 
 export function renderPanic(paused, { operator }) {
@@ -26,14 +28,17 @@ export function renderEgressRequests(requests, { operator }) {
 }
 
 // Permanent hosts from the profile plus approvals that have not expired.
-export function renderHostsTable(permanent, requests, { operator, room, now = Date.now() / 1000 }) {
-  const rows = [...new Set(permanent || [])].map((h) => ({ hp: h, kind: 'always', until: null }));
-  for (const r of requests || []) {
-    if (r.state === 'approved' && r.expires_at > now && !rows.some((x) => x.hp === r.host_port)) rows.push({ hp: r.host_port, kind: 'until', until: r.expires_at });
+export function renderHostsTable(permanent, requests, opts) {
+  const { operator, room, now = Date.now() / 1000 } = opts;
+  // `permanent` is the room's allowlist (permanent + live + model endpoints) or just its permanent hosts
+  const live = new Map((requests || []).filter((r) => r.state === 'approved' && r.expires_at > now).map((r) => [r.host_port, r.expires_at]));
+  const rows = [...new Set(permanent || [])].map((h) => (MODEL_ENDPOINTS.has(h) ? { hp: h, kind: 'model' } : live.has(h) && !(opts.permanent || []).includes(h) ? { hp: h, kind: 'until', until: live.get(h) } : { hp: h, kind: 'always' }));
+  for (const [hp, until] of live) {
+    if (!rows.some((x) => x.hp === hp)) rows.push({ hp, kind: 'until', until });
   }
   if (!rows.length) return '<div class="hd-empty">No external hosts.</div>';
-  return `<table class="cx-table"><thead><tr><th>Host</th><th>Access</th>${operator ? '<th></th>' : ''}</tr></thead><tbody>${rows.map((r) => `<tr data-room="${esc(room || '')}" data-hp="${esc(r.hp)}"><td>${esc(r.hp)}</td><td>${r.kind === 'always' ? 'Always' : `Until ${esc(when(r.until))}`}</td>`
-    + `${operator ? '<td><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-egress-act="remove">Remove</button></td>' : ''}</tr>`).join('')}</tbody></table>`;
+  return `<table class="cx-table"><thead><tr><th>Host</th><th>Access</th>${operator ? '<th></th>' : ''}</tr></thead><tbody>${rows.map((r) => `<tr data-room="${esc(room || '')}" data-hp="${esc(r.hp)}"><td>${esc(r.hp)}</td><td>${r.kind === 'always' ? 'Always' : r.kind === 'model' ? 'Model endpoint' : `Until ${esc(when(r.until))}`}</td>`
+    + `${operator && r.kind !== 'model' ? '<td><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-egress-act="remove">Remove</button></td>' : ''}</tr>`).join('')}</tbody></table>`;
 }
 
 export function renderHelperTree(parentAgentId, flow, helpers, { operator } = {}) {
@@ -63,6 +68,7 @@ export function renderProfileEditor(profile, { owner }) {
   const svc = (p.services || []).map((s) => `${s.name} | ${s.upstream_url} | ${s.header} | ${s.secret_name}`).join('\n');
   return `<form id="hcn-profile" class="cx-stack">
     <p class="cx-msg">Secrets are named here, never typed here. Their values live in files on the host and are set with the host CLI; this page cannot read or change them.</p>
+    <fieldset class="cx-checks"><legend>Agent families helpers may use</legend>${FAMILIES.map((f) => `<label class="cx-check"><input type="checkbox" name="allowed_families" value="${esc(f)}"${(p.allowed_families || []).includes(f) ? ' checked' : ''}> ${esc(f)}</label>`).join('')}</fieldset>
     ${field('API keys: one per line as name | https upstream URL | header | secret name', `<textarea class="cx-input" name="services" rows="3" maxlength="4000">${esc(svc)}</textarea>`)}
     ${field('SSH secret names (one per line)', `<textarea class="cx-input" name="ssh_secret_names" rows="2">${esc((p.ssh_secret_names || []).join('\n'))}</textarea>`)}
     ${field('Allowed models (comma separated; empty = any)', `<input class="cx-input" name="allowed_models" value="${esc(p.allowed_models ? csv(p.allowed_models) : '')}">`)}
@@ -80,7 +86,7 @@ export function parseProfileForm(v, base = {}) {
   });
   const models = lines(v.allowed_models);
   return {
-    allowed_families: base.allowed_families || [], allowed_models: models.length ? models : null,
+    allowed_families: Array.isArray(v.allowed_families) ? v.allowed_families : (base.allowed_families || []), allowed_models: models.length ? models : null,
     tools_allowed: Boolean(v.tools_allowed), permanent_hosts: lines(v.permanent_hosts), services,
     ssh_secret_names: lines(v.ssh_secret_names), spend_tokens_per_day: base.spend_tokens_per_day ?? null,
     limits: base.limits || {},
@@ -97,9 +103,30 @@ export async function helperAction(api, ds, extra = {}) {
     case 'deny': return api.decideEgress(ds.id, 'deny');
     case 'always': {                                  // permanent for the room, and close the open request
       await api.promoteEgress(ds.room, ds.hp);
-      return api.decideEgress(ds.id, 'approve', DAY);
+      try { return await api.decideEgress(ds.id, 'approve', DAY); } catch { return undefined; }   // promoted already: a 409 here is fine
     }
     case 'remove': return api.removeEgress(ds.room, ds.hp);
     default: return undefined;
   }
+}
+
+// Click and submit handling for one open room. Returns an unbind function the room's teardown must
+// call, so a room visited earlier can never act on a click made in a later one.
+export function wireHelperHandlers(container, o) {
+  const onClick = (ev) => {
+    const b = ev.target.closest?.('[data-panic],[data-egress-act]');
+    if (!b || !o.operator) return;
+    const row = b.closest('[data-id],[data-hp]');
+    o.act(async () => { await helperAction(o.api, { ...(row ? row.dataset : {}), ...b.dataset, room: o.roomId }); await o.refresh(); });
+  };
+  const onSubmit = (ev) => {
+    if (ev.target.id !== 'hcn-profile' || !o.owner) return;
+    ev.preventDefault();
+    let body;
+    try { body = parseProfileForm(o.readForm(ev.target), o.getProfile() || {}); } catch (e) { o.onError(e.message); return; }
+    o.act(async () => { o.setProfile(await helperAction(o.api, { profile: 'save', room: o.roomId }, { profileBody: body })); });
+  };
+  container.addEventListener('click', onClick);
+  container.addEventListener('submit', onSubmit);
+  return () => { container.removeEventListener('click', onClick); container.removeEventListener('submit', onSubmit); };
 }

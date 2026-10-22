@@ -4,7 +4,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
 import {
-  helperAction, parseProfileForm, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor,
+  renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
 import { applyMention, mentionAt, quiet, suggest } from './collab-mention.js';
 import {
@@ -537,7 +537,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], profile: null, egress: [], helpers: [], paused: false };
+    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], profile: null, allow: [], egress: [], helpers: [], paused: false };
     const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents']]), ...(canInvite ? [['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
@@ -578,7 +578,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const stale = new Set();               // panels whose redraw was held back because you were typing in them
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
-    teardown = () => { alive = false; ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
+    teardown = () => { alive = false; unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
     const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
 
     // Replace a container's markup only when it changed and you are not typing in it.
@@ -719,32 +719,22 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         try { S.egress = ((await api.egressRequests()).requests || []).filter((r) => r.room_id === roomId); } catch { /* keep the old list */ }
         try { const h = await api.helpers(); S.helpers = h.helpers || []; S.paused = Boolean(h.paused); } catch { /* keep */ }
       }
-      if (operator || canInvite) { try { S.profile = await api.roomProfile(roomId); } catch { /* not readable: keep */ } }
+      if (operator) { try { S.allow = (await api.egressAllowlist(roomId)).allowlist || []; } catch { /* keep */ } }
+      if (canInvite) { try { S.profile = await api.roomProfile(roomId); } catch { /* not readable: keep */ } }
     };
     const drawHelpers = () => {
       if (operator) {
         put('hcn-panic', renderPanic(S.paused, { operator }));
         put('hcn-egress', renderEgressRequests(S.egress, { operator }));
-        put('hcn-hosts-table', renderHostsTable(S.profile ? S.profile.permanent_hosts : [], S.egress, { operator, room: roomId }));
+        put('hcn-hosts-table', renderHostsTable(S.allow || [], S.egress, { operator, room: roomId, permanent: S.profile ? S.profile.permanent_hosts : [] }));
       }
       if (canInvite && S.profile) put('hcn-profile-box', renderProfileEditor(S.profile, { owner: canInvite }));
     };
-    root.addEventListener('click', (ev) => {
-      const b = ev.target.closest?.('[data-panic],[data-egress-act]');
-      if (!b || !operator) return;
-      const row = b.closest('[data-id],[data-hp]');
-      act(async () => { await helperAction(api, { ...(row ? row.dataset : {}), ...b.dataset, room: roomId }); await loadHelpers(); drawHelpers(); });
-    });
-    root.addEventListener('submit', (ev) => {
-      if (ev.target.id !== 'hcn-profile' || !canInvite) return;
-      ev.preventDefault();
-      const f = ev.target; const fd = new FormData(f);
-      let body;
-      try {
-        body = parseProfileForm({ services: fd.get('services'), ssh_secret_names: fd.get('ssh_secret_names'), allowed_models: fd.get('allowed_models'),
-          tools_allowed: fd.get('tools_allowed') !== null, permanent_hosts: fd.get('permanent_hosts') }, S.profile || {});
-      } catch (e) { $('hcn-profile-msg').textContent = e.message; return; }
-      act(async () => { S.profile = await helperAction(api, { profile: 'save', room: roomId }, { profileBody: body }); $('hcn-profile-msg').textContent = 'Saved.'; });
+    const unbindHelpers = wireHelperHandlers(root, {
+      api, roomId, operator, owner: canInvite, act, getProfile: () => S.profile, setProfile: (p) => { S.profile = p; $('hcn-profile-msg').textContent = 'Saved.'; },
+      onError: (m) => { $('hcn-profile-msg').textContent = m; },
+      refresh: async () => { await loadHelpers(); drawHelpers(); },
+      readForm: (f) => { const fd = new FormData(f); return { services: fd.get('services'), ssh_secret_names: fd.get('ssh_secret_names'), allowed_models: fd.get('allowed_models'), allowed_families: fd.getAll('allowed_families'), tools_allowed: fd.get('tools_allowed') !== null, permanent_hosts: fd.get('permanent_hosts') }; },
     });
 
     // ---- live flow: nodes are people/agents, edges are tasks; the dashboard adds fabric session state
