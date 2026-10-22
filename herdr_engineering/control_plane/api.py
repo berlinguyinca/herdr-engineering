@@ -149,9 +149,9 @@ class ControlPlaneServer:
         if not self._keys and not _is_loopback(host) and not allow_open:
             raise ValueError(
                 "refusing to bind an unauthenticated control plane to a "
-                f"non-loopback address {host!r}; configure --api-keys / "
-                "HERDR_CP_API_KEYS, or pass --allow-open to trust the "
-                "Tailnet boundary (Spec §104)")
+                f"non-loopback address {host!r}; configure keys in the central "
+                "fleet config (control_plane.api_keys) or --api-keys, or pass "
+                "--allow-open to trust the Tailnet boundary (Spec §104)")
         # HCN (feature-flagged, off by default). Bearer credentials must never
         # cross a network in clear text, so a non-loopback bind needs an explicit
         # assertion that TLS is terminated in front of this server.

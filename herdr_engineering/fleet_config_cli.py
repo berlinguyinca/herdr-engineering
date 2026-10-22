@@ -16,6 +16,7 @@ from __future__ import annotations
 import fcntl
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -137,7 +138,16 @@ def compose_env(cfg: FleetConfig) -> dict[str, str]:
     if missing:
         raise FleetConfigError("control_plane.compose is missing required keys: " + ", ".join(missing))
     ip = out["GATEWAY_TAILNET_IP"]
+    try:
+        if "%" in ip:  # no zone ids: the value is substituted into a URL and a --bind list
+            raise ValueError
+        addr = ipaddress.ip_address(ip)  # one literal: no commas, spaces or host names
+    except ValueError:
+        raise FleetConfigError("control_plane.compose.GATEWAY_TAILNET_IP must be one IPv4 or "
+                               "IPv6 address literal (e.g. the output of `tailscale ip -4`)") from None
     out["GATEWAY_BIND"] = LOOPBACK if ip == LOOPBACK else f"{LOOPBACK},{ip}"
+    # host part of the gateway healthcheck URL (an IPv6 literal needs brackets)
+    out["GATEWAY_HEALTH_HOST"] = f"[{ip}]" if addr.version == 6 else ip
     return out
 
 

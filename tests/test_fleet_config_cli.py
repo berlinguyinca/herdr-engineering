@@ -552,3 +552,23 @@ def test_answers_file_must_be_private_and_known(tmp_path):
     answers.write_text("public_url: https://x\nsecret_typo: v\n")
     with pytest.raises(FleetConfigError, match="secret_typo"):
         fcc.load_answers_file(answers)
+
+
+@pytest.mark.parametrize("bad", ["100.64.0.7,10.0.0.1", "100.64.0.7 ", " ", "dev.lan", "100.64.0.300",
+                                 "fe80::1%eth0", "100.64.0.7\n10.0.0.1"])
+def test_gateway_ip_must_be_one_address_literal(tmp_path, bad):
+    with pytest.raises(FleetConfigError) as e:
+        fcc.init_config(tmp_path / "f" / "fleet-config.yaml", dict(ANSWERS, gateway_tailnet_ip=bad),
+                        prompt=no_prompt, secret_prompt=no_prompt)
+    assert "GATEWAY_TAILNET_IP" in str(e.value)
+    assert not (tmp_path / "f" / "fleet-config.yaml").exists()
+
+
+def test_gateway_ip_accepts_ipv4_and_brackets_ipv6_for_the_healthcheck(tmp_path):
+    p4 = fcc.init_config(tmp_path / "a" / "fleet-config.yaml", dict(ANSWERS, gateway_tailnet_ip="100.64.0.7"),
+                         prompt=no_prompt, secret_prompt=no_prompt)
+    env4 = fcc.compose_env(load_fleet_config(p4))
+    assert env4["GATEWAY_HEALTH_HOST"] == "100.64.0.7" and env4["GATEWAY_BIND"] == "127.0.0.1,100.64.0.7"
+    p6 = fcc.init_config(tmp_path / "b" / "fleet-config.yaml", dict(ANSWERS, gateway_tailnet_ip="fd7a:115c::1"),
+                         prompt=no_prompt, secret_prompt=no_prompt)
+    assert fcc.compose_env(load_fleet_config(p6))["GATEWAY_HEALTH_HOST"] == "[fd7a:115c::1]"

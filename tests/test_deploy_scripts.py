@@ -537,3 +537,12 @@ def test_collab_slice_dir_owner_mismatch_warns(env):
     fcc.write_private_file(env["central"], yaml.safe_dump(data, sort_keys=False))
     r = deploy(env)
     assert "WARNING" in r.stderr and "424242" in r.stderr
+
+
+def test_link_remote_refuses_a_url_as_first_argument(env):
+    script = ROOT / "deploy" / "herdr-cp-feed-plugin" / "link-remote.sh"
+    for arg in ("http://cp.example.test", "https://cp.example.test", "http"):
+        r = run(script, env, arg)
+        assert r.returncode == 2, r.stderr
+        assert "not a URL" in r.stderr
+    assert not (ROOT / "http:").exists() and not list(env["home"].rglob("*cp.example.test*"))

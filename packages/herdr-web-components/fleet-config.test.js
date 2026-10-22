@@ -68,3 +68,15 @@ test('client.getFleetConfigStatus returns body, null on 404, throws otherwise', 
   assert.equal(await mk(404, { error: 'no fleet config' }).getFleetConfigStatus(), null);
   await assert.rejects(mk(500, { error: 'x' }).getFleetConfigStatus(), ApiError);
 });
+
+test('client.getFleetConfigStatus gives up after its timeout', async () => {
+  let seen = null;
+  const hang = new HerdrClient('', { fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
+    seen = init.signal;
+    init.signal.addEventListener('abort', () => reject(init.signal.reason));
+  }) });
+  const started = Date.now();
+  await assert.rejects(hang.getFleetConfigStatus({ timeoutMs: 50 }));
+  assert.ok(seen && seen.aborted);
+  assert.ok(Date.now() - started < 2000);
+});

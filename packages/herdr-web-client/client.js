@@ -47,9 +47,12 @@ export class HerdrClient {
   }
 
   // Fleet config revision/drift status; null when the server has no fleet config (404).
-  async getFleetConfigStatus({ signal } = {}) {
+  // Bounded (default 5 s) so a slow status endpoint cannot hold up the Hosts page.
+  async getFleetConfigStatus({ signal, timeoutMs = 5000 } = {}) {
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const bounded = signal && AbortSignal.any ? AbortSignal.any([signal, timeout]) : timeout;
     try {
-      return await this.request('/api/v1/fleet/config/status', { signal });
+      return await this.request('/api/v1/fleet/config/status', { signal: bounded });
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) return null;
       throw err;

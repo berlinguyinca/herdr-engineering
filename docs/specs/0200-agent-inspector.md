@@ -84,29 +84,29 @@ The inspector adds **no new credential**. Pick the control-plane mode you alread
 
 | Mode | How | Pi hosts need | Who can read reasoning / sensitive bodies |
 |---|---|---|---|
-| **Tailnet-trust (no token)** — the shipped `deploy/control-plane` default | server runs `--allow-open`, reachable only on the tailnet / loopback | only `HERDR_CP_URL` + `PI_INSPECTOR_FEED=1` | **everyone who can reach the port** (open mode = operator for all) |
-| Keyed | `--api-keys 'ik=ingest,vk=viewer,ok=operator'` | the above + `HERDR_CP_API_KEY=ik` (ingest role: write-only for `/ingest`) | operators only (default) |
+| **Tailnet-trust (no token)** — the shipped `deploy/control-plane` default (`control_plane.api_keys: {}`) | server runs `--allow-open`, reachable only on the tailnet / loopback | `host.json` (from `herdr-eng fleet join`) and `inspector.enabled: true` in the central fleet config | **everyone who can reach the port** (open mode = operator for all) |
+| Keyed (not supported for the compose stack yet: the dashboard, llm-proxy and emit hook send no keys) | `control_plane.api_keys` in the central fleet config | the above; hosts send `ingest.api_key` from the central config (ingest role: write-only for `/ingest`) | operators only (default) |
 
 Tokenless is a *network* trust decision, not an application one: anyone on the tailnet can
 post events for any session id and read everything, including reasoning if an agent opted in.
 If that is not acceptable, either use keyed mode or keep reasoning off the control plane
-(`PI_INSPECTOR_REASONING=off`, the default, and/or `HERDR_INSPECTOR_STORE_REASONING=0` on the
-server). Verified end to end: the real Pi feed with no key reaches an open control plane, and a
+(`inspector.reasoning: off` in the central fleet config, the default, and/or
+`control_plane.inspector_limits.store_reasoning: false` for the server). Verified end to end: the real Pi feed with no key reaches an open control plane, and a
 keyed server answers 401 to the same request (`tests/control_plane/test_inspector.py`).
 
 ## Install
 
 1. Deploy this branch's control plane (no schema migration; no new dependency).
-2. Enable the Pi feed per host (see pi-engineering docs): set `HERDR_CP_URL`
-   and `PI_INSPECTOR_FEED=1` (optionally the reasoning opt-in).
+2. Enable the Pi feed: set `inspector.enabled: true` (optionally `inspector.reasoning`)
+   in the central fleet config; hosts read it through `host.json` on their next start.
 3. Open any session in the dashboard; the inspector appears under the summary.
 
 ## Rollback
 
 - UI only: revert `packages/inspector-view.js`, the 3 lines in `app.js` and the
   `.hd-ins*` CSS — the session page returns to its previous form.
-- Telemetry: unset `PI_INSPECTOR_FEED` on hosts (feed stops; nothing else
-  changes). The control plane simply holds no inspector data.
+- Telemetry: set `inspector.enabled: false` in the central fleet config (feeds
+  stop at their next start; nothing else changes). The control plane simply holds no inspector data.
 - Server: the `inspector` entity type is additive; older control planes ignore
   it via the generic "unknown entity" path. Durable `inspector.*` rows are inert
   to older versions (ignored on hydrate) and can be pruned with
