@@ -34,16 +34,23 @@
       become: false
       ansible.builtin.shell: |
         export PATH="{{ fleet_home }}/.local/bin:{{ fleet_home }}/.venvs/herdr-engineering/bin:$PATH"
-        HERDR=$(command -v herdr-eng || true)
-        if [ -z "$HERDR" ] && [ -x "{{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng" ]; then
-          HERDR="{{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng"
+        AGENTS="{{ am_agents }}"; DAYS={{ am_days }}
+        # 1) Preferred: herdr-eng agent-mine (the canonical, distributed entry point).
+        if command -v herdr-eng >/dev/null 2>&1; then
+          if herdr-eng agent-mine --agents "$AGENTS" --days $DAYS --json-summary 2>/dev/null; then
+            exit 0
+          fi
         fi
-        if [ -n "$HERDR" ] && [ -x "$HERDR" ]; then
-          "$HERDR" agent-mine --agents "{{ am_agents }}" --days {{ am_days }} --json-summary
-        else
-          echo "herdr-eng agent-mine not available on {{ inventory_hostname }}" >&2
-          exit 1
+        # 2) Fallback: the standalone miner (version-independent; ships with the
+        #    agent-mine cache on this host). Emits the same redacted JSON schema.
+        STANDALONE="{{ fleet_home }}/.cache/agent-mine/agent_mine.py"
+        if [ -f "$STANDALONE" ]; then
+          if python3 "$STANDALONE" --agents "$AGENTS" --days $DAYS --json-summary 2>/dev/null; then
+            exit 0
+          fi
         fi
+        echo "agent-mine not available on {{ inventory_hostname }} (no herdr-eng agent-mine subcommand, no standalone miner)" >&2
+        exit 1
       args:
         executable: /bin/bash
       register: am_summary
