@@ -31,19 +31,19 @@ WORK="$(cd "$WORK" && pwd -P)"
 # a symlink inside the work area must not lead out of it
 case "$WORK" in "$(cd "$AREA" && pwd -P)"/*) ;; *) echo "collab-sandbox: workdir resolves outside ~/herdr-agents/work/" >&2; exit 126 ;; esac
 
+# Local name resolution only for a box with the host network: a no-network box must not reach systemd-resolved's
+# socket (a DNS side channel); the egress proxy resolves names on the host side.
+resolver=(--ro-bind-try /etc/resolv.conf /etc/resolv.conf --ro-bind-try /run/systemd/resolve /run/systemd/resolve)
+if [ -n "${HERDR_EGRESS_SOCK+x}" ]; then resolver=(); fi
 args=(--die-with-parent --new-session --unshare-pid --unshare-ipc --unshare-uts --cap-drop ALL
       --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
+      "${resolver[@]}"
       --ro-bind-try /etc/hosts /etc/hosts --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf
       --ro-bind-try /etc/ssl /etc/ssl --ro-bind-try /etc/ca-certificates /etc/ca-certificates
       --ro-bind-try /etc/passwd /etc/passwd --ro-bind-try /etc/group /etc/group --ro-bind-try /etc/localtime /etc/localtime
       --ro-bind-try /etc/alternatives /etc/alternatives
       --proc /proc --dev /dev --size 268435456 --tmpfs /tmp --size 67108864 --tmpfs /var/tmp
       --tmpfs "$HOME")
-# Local name resolution only for a box with the host network: a no-network box must not reach systemd-resolved's
-# socket (a DNS side channel); the egress proxy resolves names on the host side.
-if [ -z "${HERDR_EGRESS_SOCK+x}" ]; then
-  args+=(--ro-bind-try /etc/resolv.conf /etc/resolv.conf --ro-bind-try /run/systemd/resolve /run/systemd/resolve)
-fi
 
 # The harness and its login, read-only. Resolve where the executables really live (symlinks into ~/.local/share,
 # node under a version manager...) and expose just those directories.

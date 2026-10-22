@@ -38,7 +38,7 @@ class Echo:
     """A TCP echo server that counts the connections it accepted."""
 
     def __init__(self, host="127.0.0.1"):
-        self.sock = socket.socket()
+        self.sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, 0))
         self.sock.listen(16)
@@ -75,7 +75,7 @@ def short_dir():
 
 
 class Proxy:
-    def __init__(self, d: Path, env=None):
+    def __init__(self, d: Path, env=None, args=()):
         self.dir = d
         self.sock = d / "egress.sock"
         self.allow = d / "allow.txt"
@@ -88,7 +88,7 @@ class Proxy:
         self.err = open(d / "proxy.err", "w+")
         self.proc = subprocess.Popen(
             [sys.executable, str(EGRESS), "serve", "--sock", str(self.sock), "--allow-file", str(self.allow),
-             "--secrets-file", str(self.secrets), "--services-file", str(self.services), "--log", str(self.log)],
+             "--secrets-file", str(self.secrets), "--services-file", str(self.services), "--log", str(self.log), *args],
             stdout=self.err, stderr=self.err, env={**os.environ, **(env or {})})
         for _ in range(100):
             if self.sock.exists():
@@ -175,7 +175,8 @@ def test_a_port_mismatch_is_refused(proxy, echo):
         s, status = proxy.connect(f"127.0.0.1:{other.port}")
         s.close()
         assert status == 403 and other.accepted == 0
-        assert proxy.logged()[-1] == {**proxy.logged()[-1], "host": "127.0.0.1", "port": other.port}
+        last = proxy.logged()[-1]
+        assert (last["host"], last["port"]) == ("127.0.0.1", other.port)
     finally:
         other.close()
 
@@ -196,7 +197,7 @@ def test_a_hostname_resolving_to_loopback_is_refused_unless_the_ip_is_listed(pro
 def test_malformed_targets_are_rejected_and_not_logged(proxy, echo):
     proxy.allow.write_text(f"127.0.0.1:{echo.port}\n")
     for bad in (f"user@127.0.0.1:{echo.port}", "127.0.0.1:0", "127.0.0.1:70000", f"127.0.0.1:+{echo.port}",
-                "127.0.0.1", "a\x01b:443", "[::1:80"):
+                "127.0.0.1", "a\x01b:443", "[::1:80", "2130706433:443", "0x7f.1:443", "0177.0.0.1:443", "10.1:443"):
         s, status = proxy.connect(bad)
         s.close()
         assert status == 400, bad
@@ -208,10 +209,135 @@ def test_malformed_targets_are_rejected_and_not_logged(proxy, echo):
 def test_the_address_classifier_blocks_internal_ranges():
     eg = load_egress()
     for ip in ("127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
-               "224.0.0.1", "::1", "fe80::1", "fc00::1", "fd12::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::", "ff02::1"):
+               "224.0.0.1", "::1", "fe80::1", "fc00::1", "fd12::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::", "ff02::1",
+               "64:ff9b::7f00:1", "64:ff9b::a00:1", "2002:7f00:1::1", "2002:a9fe:a9fe::1"):
         assert eg.forbidden(ip), ip
     for ip in ("8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"):
         assert not eg.forbidden(ip), ip
+
+
+def test_numeric_hostnames_never_enter_the_allow_list(short_dir):
+    eg = load_egress()
+    f = short_dir / "allow.txt"
+    f.write_text("2130706433:443\n0x7f.1:443\nExample.COM.:443\n[0:0::1]:8080\n")
+    assert eg.read_allow(str(f)) == {("example.com", 443), ("::1", 8080)}
+
+
+def test_trailing_dots_and_bracketed_ipv6_match_the_allow_list(proxy, echo):
+    proxy.allow.write_text(f"localhost.:{echo.port}\n127.0.0.1:{echo.port}\n")
+    s, status = proxy.connect(f"localhost:{echo.port}")
+    s.close()
+    assert status == 200
+    proxy.allow.write_text(f"localhost:{echo.port}\n127.0.0.1:{echo.port}\n")
+    s, status = proxy.connect(f"localhost.:{echo.port}")
+    s.close()
+    assert status == 200
+    try:
+        e6 = Echo("::1")
+    except OSError:
+        pytest.skip("no IPv6 loopback")
+    try:
+        proxy.allow.write_text(f"[0:0:0::1]:{e6.port}\n")
+        s, status = proxy.connect(f"[::1]:{e6.port}")
+        assert status == 200
+        s.sendall(b"six")
+        assert s.recv(10) == b"six"
+        s.close()
+    finally:
+        e6.close()
+
+
+def test_a_listed_name_with_only_internal_addresses_is_logged_as_such(proxy, echo):
+    proxy.allow.write_text(f"localhost:{echo.port}\n")
+    s, status = proxy.connect(f"localhost:{echo.port}")
+    s.close()
+    assert status == 403 and echo.accepted == 0
+    assert proxy.logged() == [{**proxy.logged()[0], "host": "localhost", "port": echo.port, "reason": "forbidden-address"}]
+
+
+def test_with_mixed_resolution_only_the_permitted_address_is_dialed(short_dir, echo):
+    import asyncio
+    import types
+    eg = load_egress()
+    dialed = []
+
+    async def fake_resolve(host, port):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.9.8.7", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    async def fake_dial(ip, port, family=0):
+        dialed.append(ip)
+        return await asyncio.open_connection("127.0.0.1", echo.port)
+
+    eg.resolve, eg.dial = fake_resolve, fake_dial
+    allow = short_dir / "allow.txt"
+    allow.write_text("mixed.example:443\n")
+    args = types.SimpleNamespace(allow_file=str(allow), log=str(short_dir / "log"), max_conns=8, head_timeout=5,
+                                 idle_timeout=0, services_file="", secrets_file="", svc_concurrency=1, svc_budget_mb=64)
+
+    async def main():
+        srv = await asyncio.start_unix_server(eg.Server(args).handle, path=str(short_dir / "s"))
+        r, w = await asyncio.open_unix_connection(str(short_dir / "s"))
+        w.write(b"CONNECT mixed.example:443 HTTP/1.1\r\n\r\n")
+        head = await r.readuntil(b"\r\n\r\n")
+        w.write(b"hi")
+        got = await r.read(2)
+        w.close()
+        srv.close()
+        return head, got
+    head, got = asyncio.run(main())
+    assert head.startswith(b"HTTP/1.1 200") and got == b"hi"
+    assert dialed == ["93.184.216.34"]                                        # the private address was never dialed
+
+
+def test_a_flood_of_blocked_connects_writes_few_log_lines(proxy):
+    for i in range(1000):
+        s, status = proxy.connect(f"h{i}.example.org:443")
+        s.close()
+        assert status == 403
+    for _ in range(50):
+        s, _ = proxy.connect("same.example.org:443")
+        s.close()
+    lines = proxy.logged()
+    assert len(lines) <= 2 * 121                                            # 120 a minute (+1 count line), maybe two minutes
+    assert any("suppressed" in x for x in lines) or len(lines) < 1000
+
+
+def test_a_slow_request_head_is_cut_off_and_connections_over_the_cap_are_refused(short_dir):
+    p = Proxy(short_dir, args=["--head-timeout", "1", "--max-conns", "2"])
+    try:
+        held = [socket.socket(socket.AF_UNIX) for _ in range(2)]
+        for h in held:
+            h.connect(str(p.sock))
+            h.sendall(b"CONNECT exa")                                       # never finishes its head
+        time.sleep(0.2)
+        t = time.monotonic()
+        out = p.request(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+        assert out.startswith(b"HTTP/1.1 503") and time.monotonic() - t < 1  # refused at once, not queued
+        for h in held:
+            h.settimeout(5)
+            assert h.recv(10) == b""                                          # closed by the head timeout
+            h.close()
+        out = p.request(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+        assert out.startswith(b"HTTP/1.1 403")                               # slots are free again
+    finally:
+        p.stop()
+
+
+def test_an_idle_tunnel_is_closed_when_asked(short_dir, echo):
+    p = Proxy(short_dir, args=["--idle-timeout", "1"])
+    try:
+        p.allow.write_text(f"127.0.0.1:{echo.port}\n")
+        s, status = p.connect(f"127.0.0.1:{echo.port}")
+        assert status == 200
+        s.sendall(b"a")
+        assert s.recv(1) == b"a"
+        s.settimeout(5)
+        t = time.monotonic()
+        assert s.recv(1) == b"" and time.monotonic() - t < 4
+        s.close()
+    finally:
+        p.stop()
 
 
 # --- /svc/<name>/...: the proxy adds the bound header; the helper never sees the value ---
@@ -228,6 +354,8 @@ def tls_upstream(short_dir):
 
     class H(http.server.BaseHTTPRequestHandler):
         def _reply(self):
+            if self.path.endswith("/slow"):
+                time.sleep(3)
             n = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(n) if n else b""
             seen.append({"method": self.command, "path": self.path, "headers": dict(self.headers.items()), "body": body})
@@ -257,7 +385,7 @@ def tls_upstream(short_dir):
 @pytest.fixture
 def svc_proxy(short_dir, tls_upstream):
     port, cert, seen = tls_upstream
-    p = Proxy(short_dir, env={"SSL_CERT_FILE": str(cert)})
+    p = Proxy(short_dir, env={"SSL_CERT_FILE": str(cert)}, args=["--svc-concurrency", "1"])
     p.services.write_text(json.dumps([
         {"name": "x", "upstream_url": f"https://127.0.0.1:{port}/base", "header": "Authorization", "secret_name": "x_key"},
         {"name": "nokey", "upstream_url": f"https://127.0.0.1:{port}/", "header": "X-Api-Key", "secret_name": "absent"},
@@ -408,3 +536,21 @@ def test_the_box_fails_closed_when_the_relay_cannot_come_up(home, short_dir):
 def test_without_the_variable_the_box_keeps_the_host_network(home):
     r = run_box(home, "test -z \"$HTTPS_PROXY\" && python3 -c 'import socket; print(*[n for _, n in socket.if_nameindex() if n != \"lo\"])'", {})
     assert r.returncode == 0 and r.stdout.strip(), r.stderr                    # existing workers are unchanged
+
+
+def test_svc_refuses_over_its_cap_at_once_and_bounds_bodies(svc_proxy):
+    p, seen = svc_proxy
+    slow = threading.Thread(target=p.request, args=(b"GET /svc/x/slow HTTP/1.1\r\nHost: a\r\n\r\n",))
+    slow.start()
+    for _ in range(100):
+        if seen:
+            break
+        time.sleep(0.02)
+    t = time.monotonic()
+    out = p.request(b"GET /svc/x/fast HTTP/1.1\r\nHost: a\r\n\r\n")
+    assert out.startswith(b"HTTP/1.1 503") and time.monotonic() - t < 1    # refused, not queued behind the slow one
+    slow.join(10)
+    assert p.request(b"GET /svc/x/fast HTTP/1.1\r\nHost: a\r\n\r\n").startswith(b"HTTP/1.1 200")
+    assert p.request(b"POST /svc/x/a HTTP/1.1\r\nHost: a\r\nContent-Length: 999999999\r\n\r\n").startswith(b"HTTP/1.1 413")
+    assert p.request(b"POST /svc/x/a HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+                     ).startswith(b"HTTP/1.1 411")

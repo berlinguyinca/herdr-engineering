@@ -37,11 +37,13 @@ import urllib.parse
 import zlib
 
 HEAD_MAX = 16384
-HEAD_TIMEOUT = 30
 CONNECT_TIMEOUT = 10
 SVC_TIMEOUT = 120
 BODY_MAX = 20 * 1024 * 1024
-MAX_CLIENTS = 256
+LOG_REPEAT_S = 60            # one log line per blocked (host, port, reason) per minute
+LOG_PER_MIN = 120            # and at most this many lines a minute in all; the rest are counted
+NAT64 = ipaddress.ip_network("64:ff9b::/96")
+NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
 HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62})(?:\.[a-z0-9](?:[a-z0-9-]{0,62}))*")
 PORT_RE = re.compile(r"[0-9]{1,5}")
 NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -55,8 +57,14 @@ STRIP_OUT = HOP | {"set-cookie", "content-encoding"}
 def forbidden(ip) -> bool:
     """True for any address a tunnel must not reach unless it is listed literally: everything that is not global."""
     ip = ipaddress.ip_address(ip)
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = ip.ipv4_mapped or ip.sixtofour or (ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF) if ip in NAT64 else None)
+        if ip.teredo:
+            embedded = ip.teredo[1]
+        if embedded is not None and forbidden(embedded):
+            return True
+        if ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
     return not ip.is_global or ip.is_multicast or ip.is_unspecified or ip.is_loopback or ip.is_link_local
 
 
@@ -84,7 +92,8 @@ def parse_target(text: str):
         try:
             host = str(ipaddress.IPv4Address(host))
         except ValueError:
-            if not HOST_RE.fullmatch(host) or len(host) > 253:
+            # a name whose last label is a number is an IPv4 address in some other spelling (2130706433, 0x7f.1, 0177.1)
+            if not HOST_RE.fullmatch(host) or len(host) > 253 or NUMERIC_LABEL.fullmatch(host.rsplit(".", 1)[-1]):
                 return None
     if not PORT_RE.fullmatch(port) or not 1 <= int(port) <= 65535:
         return None
@@ -106,16 +115,60 @@ def read_allow(path: str) -> set:
     return out
 
 
-def log_blocked(path: str, host: str, port: int) -> None:
-    line = json.dumps({"host": host, "port": port, "ts": time.time()}) + "\n"
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+class BlockedLog:
+    """The JSONL file the runner turns into host-access requests. Bounded: a blocked (host, port, reason) is written at
+    most once per LOG_REPEAT_S, and at most LOG_PER_MIN lines a minute in all; what is dropped by the second rule is
+    reported as one {"suppressed": n, "ts"} line when writing resumes."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.seen: dict = {}
+        self.window = 0
+        self.count = 0
+        self.suppressed = 0
+
+    def blocked(self, host: str, port: int, reason: str = "") -> None:
+        now = time.time()
+        key = (host, port, reason)
+        if now - self.seen.get(key, -1e9) < LOG_REPEAT_S:
+            return
+        if len(self.seen) > 10000:
+            self.seen = {k: t for k, t in self.seen.items() if now - t < LOG_REPEAT_S}
+        minute = int(now // 60)
+        if minute != self.window:
+            self.window, self.count = minute, 0
+        if self.count >= LOG_PER_MIN:
+            self.suppressed += 1
+            return
+        self.seen[key] = now
+        lines = []
+        if self.suppressed:
+            lines.append({"suppressed": self.suppressed, "ts": now})
+            self.suppressed = 0
+        line = {"host": host, "port": port, "ts": now}
+        if reason:
+            line["reason"] = reason
+        lines.append(line)
+        self.count += len(lines)
+        self._write("".join(json.dumps(x) + "\n" for x in lines))
+
+    def _write(self, text: str) -> None:
         try:
-            os.write(fd, line.encode())
-        finally:
-            os.close(fd)
-    except OSError as e:
-        print(f"collab-egress: cannot write {path}: {e.strerror}", file=sys.stderr)
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, text.encode())
+            finally:
+                os.close(fd)
+        except OSError as e:
+            print(f"collab-egress: cannot write {self.path}: {e.strerror}", file=sys.stderr)
+
+
+async def resolve(host: str, port: int):
+    loop = asyncio.get_running_loop()
+    return await asyncio.wait_for(loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), CONNECT_TIMEOUT)
+
+
+dial = asyncio.open_connection
 
 
 # --- the server ---
@@ -128,9 +181,23 @@ def reply(writer, status: int, reason: str, body: bytes = b"", headers=()) -> No
     writer.write(("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + body)
 
 
-async def pipe(reader, writer) -> None:
+async def pipe(reader, writer, idle: float = 0, activity=None) -> None:
+    """Copies until EOF. With idle > 0, gives up once neither direction (the shared `activity` list) moved for that long."""
     try:
-        while data := await reader.read(65536):
+        while True:
+            if idle > 0:
+                try:
+                    data = await asyncio.wait_for(reader.read(65536), idle)
+                except TimeoutError:
+                    if time.monotonic() - activity[0] < idle:
+                        continue
+                    break
+            else:
+                data = await reader.read(65536)
+            if not data:
+                break
+            if activity is not None:
+                activity[0] = time.monotonic()
             writer.write(data)
             await writer.drain()
     except (OSError, asyncio.IncompleteReadError):
@@ -152,22 +219,37 @@ async def close(writer) -> None:
 
 
 class Server:
+    """Every limit refuses rather than queues: over a cap the client gets 503 at once, so a box cannot make the
+    host hold more than max_conns sockets or more than svc_budget bytes of /svc bodies at a time."""
+
     def __init__(self, args):
         self.a = args
-        self.slots = asyncio.Semaphore(MAX_CLIENTS)
+        self.log = BlockedLog(args.log)
+        self.open = 0
+        self.svc_active = 0
+        self.svc_bytes = 0
 
     async def handle(self, reader, writer):
-        async with self.slots:
-            try:
-                await self._handle(reader, writer)
-            except Exception as e:                      # never let one client take the proxy down; never echo details
-                print(f"collab-egress: request failed: {type(e).__name__}", file=sys.stderr)
-            finally:
-                await close(writer)
+        if self.open >= self.a.max_conns:
+            reply(writer, 503, "Service Unavailable", b"too many connections\n")
+            try:                                         # swallow what the client already sent, so closing does not
+                writer.write_eof()                       # reset the socket before it reads the 503 (bounded: 0.2 s)
+                await asyncio.wait_for(reader.read(HEAD_MAX), 0.2)
+            except (TimeoutError, OSError):
+                pass
+            return await close(writer)
+        self.open += 1
+        try:
+            await self._handle(reader, writer)
+        except Exception as e:                          # never let one client take the proxy down; never echo details
+            print(f"collab-egress: request failed: {type(e).__name__}", file=sys.stderr)
+        finally:
+            self.open -= 1
+            await close(writer)
 
     async def _handle(self, reader, writer):
         try:
-            raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), HEAD_TIMEOUT)
+            raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), self.a.head_timeout)
         except (TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError):
             return
         try:
@@ -202,31 +284,34 @@ class Server:
         host, port = t
         allow = read_allow(self.a.allow_file)
         if t not in allow:
-            log_blocked(self.a.log, host, port)
+            self.log.blocked(host, port)
             return reply(writer, 403, "Forbidden", b"access pending: this host:port is not approved for this room yet\n")
-        loop = asyncio.get_running_loop()
         try:
-            infos = await asyncio.wait_for(loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), CONNECT_TIMEOUT)
+            infos = await resolve(host, port)
         except (TimeoutError, OSError):
             return reply(writer, 502, "Bad Gateway", b"cannot resolve host\n")
-        upstream = None
+        upstream, permitted = None, 0
         for family, _, _, _, sockaddr in infos:
             ip = sockaddr[0]
             if forbidden(ip) and (str(ipaddress.ip_address(ip)), port) not in allow:
                 continue
+            permitted += 1
             try:
-                ur, uw = await asyncio.wait_for(asyncio.open_connection(sockaddr[0], sockaddr[1], family=family), CONNECT_TIMEOUT)
-                upstream = (ur, uw)
+                upstream = await asyncio.wait_for(dial(ip, sockaddr[1], family=family), CONNECT_TIMEOUT)
                 break
             except (TimeoutError, OSError):
                 continue
         if upstream is None:
-            return reply(writer, 403, "Forbidden", b"no permitted address for this host\n")
+            if not permitted:                            # listed, but it resolves only to internal addresses
+                self.log.blocked(host, port, "forbidden-address")
+                return reply(writer, 403, "Forbidden", b"no permitted address for this host\n")
+            return reply(writer, 502, "Bad Gateway", b"cannot connect to host\n")
         ur, uw = upstream
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
+        activity = [time.monotonic()]
         try:
-            await asyncio.gather(pipe(reader, uw), pipe(ur, writer))
+            await asyncio.gather(pipe(reader, uw, self.a.idle_timeout, activity), pipe(ur, writer, self.a.idle_timeout, activity))
         finally:
             await close(uw)
 
@@ -254,10 +339,22 @@ class Server:
         length = hlower.get("content-length", "0")
         if not re.fullmatch(r"[0-9]{1,9}", length) or int(length) > BODY_MAX:
             return reply(writer, 413, "Payload Too Large", b"body too large\n")
+        cost = int(length) + BODY_MAX                    # the request body plus the largest response it may bring back
+        if self.svc_active >= self.a.svc_concurrency or self.svc_bytes + cost > self.a.svc_budget_mb * 1024 * 1024:
+            return reply(writer, 503, "Service Unavailable", b"too many service requests at once; retry shortly\n")
+        self.svc_active += 1
+        self.svc_bytes += cost
+        try:
+            await self._svc(reader, writer, method, svc, path, query, headers, int(length))
+        finally:
+            self.svc_active -= 1
+            self.svc_bytes -= cost
+
+    async def _svc(self, reader, writer, method, svc, path, query, headers, length):
         body = b""
-        if int(length):
+        if length:
             try:
-                body = await asyncio.wait_for(reader.readexactly(int(length)), SVC_TIMEOUT)
+                body = await asyncio.wait_for(reader.readexactly(length), SVC_TIMEOUT)
             except (TimeoutError, asyncio.IncompleteReadError):
                 return
         secret = self._secret(svc)
@@ -388,6 +485,13 @@ def main(argv=None):
     s = sub.add_parser("serve")
     for a in ("--sock", "--allow-file", "--secrets-file", "--services-file", "--log"):
         s.add_argument(a, required=True)
+    s.add_argument("--max-conns", type=int, default=128, help="open connections at once; more get 503 (default 128)")
+    s.add_argument("--svc-concurrency", type=int, default=4, help="/svc requests at once; more get 503 (default 4)")
+    s.add_argument("--svc-budget-mb", type=int, default=128,
+                   help="MiB of /svc request body + response cap reserved at once (default 128)")
+    s.add_argument("--head-timeout", type=float, default=10, help="seconds to send the request head (default 10)")
+    s.add_argument("--idle-timeout", type=float, default=0,
+                   help="close a tunnel after this many seconds with no traffic either way; 0 = never (default)")
     r = sub.add_parser("relay")
     r.add_argument("--sock", required=True)
     r.add_argument("--listen", required=True)
