@@ -369,7 +369,8 @@ def _fabric_enriched_flow(repo, payload: bytes) -> bytes:
             node["fabric"] = {"session_id": sess.get("session_id", inst), "status": sess.get("status"), "host": sess.get("host_id"),
                               "agent_role": sess.get("agent_role"), "mission_id": sess.get("mission_id"),
                               "mission_title": (mission or {}).get("title"), "cwd": sess.get("cwd"),
-                              "branch": sess.get("branch")}
+                              "branch": sess.get("branch"), "name": sess.get("name"),
+                              "parent_session_id": sess.get("parent_session_id")}
         return json.dumps(flow).encode()
     except Exception:           # the flow view must never break because fabric data is odd
         return payload
