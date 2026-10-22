@@ -144,7 +144,8 @@ class ControlPlaneServer:
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row),
-                                    actions_enabled=ci_actions)
+                                    actions_enabled=ci_actions,
+                                    on_observation=repo.observe_ci_pipeline)
         if github_monitor is None:
             from ..github import GitHubMonitor
             github_monitor = GitHubMonitor()
@@ -1070,6 +1071,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server.github_monitor.repositories(**query))
             if resource == "ci":
                 what = parts[4] if len(parts) > 4 else ""
+                if what == "reports":
+                    return self._json(r.ci_reports())
                 if what == "pipeline":
                     return self._json(server.ci_monitor.detail(
                         _q(self.path, "repository"), _q(self.path, "number")))
@@ -1112,6 +1115,8 @@ def _make_handler(server, public=False, operator=False):
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
             body = self._read_json() or {}
+            if resource == "ci" and len(parts) == 5 and parts[4] == "reports":
+                return self._json(r.ingest_ci_report(body))
             if resource == "ci" and len(parts) == 5 and parts[4] == "debug":
                 from ..errors import HerdrEngineeringError
                 from .ci_debug import debug_ci

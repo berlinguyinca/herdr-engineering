@@ -98,3 +98,17 @@ def test_provider_bounded_preview_keeps_truncation_flag():
             return 'bounded output\n[log truncated; open CI for the full log]'
 
     assert CIMonitor(provider_factory=Provider).log('org/app', 1, '2')['truncated'] is True
+
+
+def test_report_upload_requires_operator_and_is_readable_by_viewer(server):
+    body = {'repository': 'org/app', 'provider_repo_id': 17, 'run_number': 3,
+            'branch': 'main', 'revision': 'abc',
+            'xml': '<testsuite><testcase name="test_add"/></testsuite>'}
+    assert request(server, 'ci/reports', body)[0] == 403
+    assert request(server, 'ci/reports', body, key='write')[0] == 200
+    status, data = request(server, 'ci/reports')
+    assert status == 200
+    assert data['reports'][0]['summary']['passed'] == 1
+    assert data['scope']['complete'] is False
+    assert request(server, 'ci/reports', {**body, 'xml': '<broken'}, key='write')[0] == 400
+    assert request(server, 'ci/reports', ['bad'], key='write')[0] == 400

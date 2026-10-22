@@ -143,6 +143,7 @@ class ControlPlaneRepo:
         self._telemetry = {}  # host_id -> [sample, ...]
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
+        self._ci_sequence = 0  # one bounded counter survives stream eviction
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
         # Agent inspector (spec 0200): bounded per-session detail projection.
@@ -1379,6 +1380,91 @@ class ControlPlaneRepo:
             return True
         return False
 
+    # ---------------------------------------------------------- CI history
+    def ingest_ci_report(self, body):
+        from .ci_reports import normalize_report, reconcile_report_identities
+        with self._event_lock:
+            report = normalize_report(body, self._stamp())
+            existing = self._events.get(("ci_report", report["report_id"]))
+            if existing:
+                return copy.deepcopy(existing[-1]["payload"])
+            history = self.ci_reports()
+            projected = copy.deepcopy(report)
+            reconcile_report_identities([projected], history["pipelines"])
+            attempts = [row.get("attempt", 1) for row in history["reports"]
+                        if (row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
+                           (projected["repository"], str(projected["provider_repo_id"]), projected["run_number"])]
+            report["attempt"] = max(attempts, default=0) + 1
+            report["ingested_at"] = self._stamp()
+            self.record_event("ci_report", report["report_id"], "CITestReportReceived", report,
+                              require_durable=True)
+            self._trim_ci_history("ci_report")
+            return copy.deepcopy(report)
+
+    def observe_ci_pipeline(self, row):
+        row = redact_payload(copy.deepcopy(row))
+        key = f"{row.get('provider_repo_id') or row.get('repository')}:{row.get('run_number')}"
+        with self._event_lock:
+            previous = self._events.get(("ci_observation", key), [])
+            if previous and previous[-1]["payload"] == row:
+                return
+            self.record_event("ci_observation", key, "CIPipelineObserved", row,
+                              require_durable=True)
+            self._trim_ci_history("ci_observation")
+
+    def _trim_ci_history(self, kind=None):
+        from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
+        keep = set()
+        kinds = {kind} if kind is not None else {"ci_report", "ci_observation"}
+        arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
+        for kind, limit in (("ci_report", REPORT_LIMIT), ("ci_observation", PIPELINE_LIMIT)):
+            if kind not in kinds:
+                continue
+            keys = [key for key in self._events if key[0] == kind]
+            for key in keys:
+                for event in self._events[key]:
+                    if isinstance(event.get("payload"), str):
+                        event["payload"] = json.loads(event["payload"])
+            keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
+                                      arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
+                      reverse=True)
+            size = 0
+            for key in keys[:limit]:
+                latest = self._events[key][-1]
+                size += len(json.dumps(latest).encode())
+                if size > HISTORY_BYTES:
+                    break
+                self._events[key] = [latest]
+                keep.add(key)
+            for key in keys:
+                if key not in keep:
+                    del self._events[key]
+        self._event_order = [entry for entry in self._event_order
+                             if entry[0] not in kinds
+                             or ((entry[0], entry[1]) in keep and
+                                 entry[2] == self._events[(entry[0], entry[1])][-1]["sequence"])]
+
+    def ci_reports(self):
+        from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
+        with self._event_lock:
+            arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
+            def rows(kind):
+                events = [stream[-1] for (etype, _), stream in self._events.items()
+                          if etype == kind and stream]
+                events.sort(key=lambda event: (event.get("ingest_timestamp", ""), arrivals.get(
+                    (event["entity_type"], event["entity_id"], event["sequence"]), -1)), reverse=True)
+                return [copy.deepcopy(event["payload"]) for event in events]
+            reports, pipelines = rows("ci_report"), rows("ci_observation")
+            from .ci_reports import reconcile_report_identities
+            reconcile_report_identities(reports, pipelines)
+            return {"reports": reports, "pipelines": pipelines,
+                    "scope": {"kind": "retained_observations", "complete": False,
+                              "persistence": "durable_sink" if self._sink is not None else "memory_only",
+                              "report_limit": REPORT_LIMIT, "pipeline_limit": PIPELINE_LIMIT,
+                              "byte_limit_per_kind": HISTORY_BYTES,
+                              "report_count": len(reports), "pipeline_count": len(pipelines),
+                              "description": "Uploaded test reports and observed provider runs only; missing reports do not mean zero tests."}}
+
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
                      mission_id=None, session_id=None, require_durable=False, publish=True):
@@ -1386,6 +1472,8 @@ class ControlPlaneRepo:
             key = (entity_type, entity_id)
             stream = self._events.setdefault(key, [])
             seq = max((e.get("sequence", -1) for e in stream), default=-1) + 1
+            if entity_type in {"ci_report", "ci_observation"}:
+                seq = max(seq, self._ci_sequence)
             ev = {
                 "event_id": new_id("event"),
                 "schema_version": 1,
@@ -1399,7 +1487,14 @@ class ControlPlaneRepo:
             if require_durable and self._sink is not None:
                 # Command side effects require persistence before submission. A
                 # legacy best-effort sink cannot establish this prerequisite.
-                self._sink.record_required(ev)
+                try:
+                    self._sink.record_required(ev)
+                except Exception:
+                    if entity_type in {"ci_report", "ci_observation"} and not stream:
+                        self._events.pop(key, None)
+                    raise
+            if entity_type in {"ci_report", "ci_observation"}:
+                self._ci_sequence = seq + 1
             stream.append(ev)
             self._event_order.append((entity_type, entity_id, seq))
             if self._sink is not None and not require_durable:
@@ -1643,6 +1738,7 @@ class ControlPlaneRepo:
             "events": {f"{t}|{i}": [dict(e) for e in s]
                        for (t, i), s in self._events.items()},
             "event_order": list(self._event_order),
+            "ci_sequence": self._ci_sequence,
         }
 
     def import_state(self, state):
@@ -1662,6 +1758,12 @@ class ControlPlaneRepo:
             t, i = key.split("|")
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
+        self._ci_sequence = max(int(state.get("ci_sequence", 0)),
+                                max((event.get("sequence", -1) + 1
+                                     for key, stream in self._events.items()
+                                     if key[0] in {"ci_report", "ci_observation"}
+                                     for event in stream), default=0))
+        self._trim_ci_history()
         # Inspector summaries ride the durable log as ``inspector`` streams;
         # move them into the bounded store instead of the unbounded raw streams.
         durable = []

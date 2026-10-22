@@ -270,12 +270,22 @@ class WoodpeckerProvider:
         if not isinstance(data, dict):
             raise CIProviderError("invalid_response")
         tasks = []
+        workflows = []
         for wf in data.get("workflows", []) or []:
+            # Only retain execution metadata actually supplied by the provider.
+            # Absent depends_on remains absent, rather than implying a root node.
+            workflows.append({
+                **{key: wf[key] for key in ("id", "name", "state", "status", "depends_on",
+                                            "duration", "started", "finished") if key in wf},
+                "started_at": _timestamp(wf.get("started")),
+                "finished_at": _timestamp(wf.get("finished")),
+            })
             for child in wf.get("children", []) or []:
                 tasks.append({
                     "id": child.get("id"), "name": child.get("name"), "state": child.get("state"),
                     "exit_code": child.get("exit_code"), "type": child.get("type"),
                     "workflow": wf.get("name"), "workflow_id": wf.get("id"),
+                    **{key: child[key] for key in ("depends_on", "duration") if key in child},
                     "started": child.get("started"), "finished": child.get("finished"),
                     "started_at": _timestamp(child.get("started")),
                     "finished_at": _timestamp(child.get("finished")),
@@ -284,7 +294,7 @@ class WoodpeckerProvider:
         keys = ("id", "number", "status", "branch", "event", "commit", "author", "message",
                 "title", "created", "started", "finished", "ref", "forge_url")
         return {
-            **{key: data.get(key) for key in keys}, "repository": repository, "tasks": tasks,
+            **{key: data.get(key) for key in keys}, "repository": repository, "tasks": tasks, "workflows": workflows,
             "created_at": _timestamp(data.get("created")),
             "started_at": _timestamp(data.get("started")),
             "finished_at": _timestamp(data.get("finished")),

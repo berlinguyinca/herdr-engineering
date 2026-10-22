@@ -84,3 +84,13 @@ test('debug target selector excludes closed, failed, unknown and other agent ses
   assert.match(renderPipeline({state:'failure'}),/Debug with Pi/);
   assert.doesNotMatch(renderPipeline({state:'running'}),/Debug with Pi/);
 });
+
+test('CI scope filters use provider identity and exact branch and bounded dates',()=>{
+ const entries=integrationEntries({pipelines:{'org/app':[
+ {provider_repo_id:7,run_number:1,branch:'main',created_at:new Date().toISOString()},
+ {provider_repo_id:7,run_number:2,branch:'main-extra',created_at:new Date().toISOString()},
+ {provider_repo_id:8,run_number:3,branch:'main',created_at:new Date().toISOString()},
+ {provider_repo_id:7,run_number:4,branch:'main',created_at:'2020-01-01T00:00:00Z'},
+ ]}});
+ assert.deepEqual(selectIntegrations(entries,{tab:'all',repository:'7',branch:'main',days:7}).map(e=>e.record.run_number),[1]);
+});
