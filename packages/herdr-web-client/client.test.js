@@ -59,6 +59,16 @@ test('ApiError carries status and body on non-2xx', async () => {
   });
 });
 
+test('sendMessage retains an explicit operation identity across retries', async () => {
+  const bodies=[];
+  const client=new HerdrClient('',{fetchImpl:async(url,options)=>{
+    bodies.push(JSON.parse(options.body));return {ok:true,status:200,text:async()=>'{"status":"delivered"}'};
+  }});
+  await client.sendMessage('herdr:h:default:w1%3Ap1','hello',[],'message-1');
+  await client.sendMessage('herdr:h:default:w1%3Ap1','hello',[],'message-1');
+  assert.deepEqual(bodies.map(b=>b.operation_id),['message-1','message-1']);
+});
+
 test('calls fetch detached so native Window.fetch does not throw', async () => {
   // Simulates a browser where fetch is `this`-sensitive: calling it as a
   // method (receiver != undefined) throws "Illegal invocation".

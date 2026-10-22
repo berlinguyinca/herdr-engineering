@@ -9,7 +9,7 @@ import { mkdirSync, existsSync } from "node:fs";
 import { collectSnapshot, createSnapshotPublisher, publishSnapshot, main } from "./snapshot.js";
 import { loadHostConfig } from "./host-config.js";
 
-const collect = (env, options) => collectSnapshot(env, { resolveModel: async () => null, ...options });
+const collect = (env, options) => collectSnapshot(env, { resolveModel: async () => null, collectTranscript:async()=>({envelopes:[]}), ...options });
 
 const server = name => ({ name, running: true, socket_path: `/sessions/${name}/herdr.sock` });
 const pane = (index = 0) => ({ pane_id: `w1:p${index}`, terminal_id: `term_${index}`, agent: "pi", cwd: "/work/real", agent_status: "idle", revision: 5 });
@@ -286,4 +286,23 @@ test("an empty api key (open control plane) sends no X-API-Key header at all", a
   });
   assert.equal(calls.length, 1);
   assert.equal("X-API-Key" in calls[0].headers, false);
+});
+
+test('transcript envelopes do not affect session counts or snapshot limits', async () => {
+  const result=await collect({}, {queryNative:reader([server('eng')],Array.from({length:130},(_,i)=>pane(i))),metadata:async()=>({}),
+    collectTranscript:async (_server,_pane,id)=>({status:'recording',truncated:false,envelopes:[{entity_type:'inspector',entity_id:id,event_type:'inspector.transcript',payload:{events:[{kind:'message',role:'user',text:'hi',event_id:id}]}}]})});
+  assert.equal(result.summary.sessions,128);
+  assert.equal(result.envelopes.filter(e=>e.entity_type==='session').length,128);
+  assert.equal(result.envelopes.filter(e=>e.entity_type==='inspector').length,128);
+});
+
+test('publisher acknowledges transcript only after all events accepted and separates snapshot cache',async()=>{
+  let accepted=false,acks=0;
+  const transcript={entity_type:'inspector',entity_id:'same',payload:{events:[{event_id:'e'}]},onPublished:()=>acks++};
+  const snapshot={entity_type:'session',entity_id:'same',payload:{status:'working'}};
+  const publish=createSnapshotPublisher({fetcher:async()=>({ok:true,json:async()=>({ok:true,entity:{accepted:accepted?1:0,duplicates:0,rejected:accepted?[]:[{error:'bad'}]}})})});
+  assert.equal((await publish({},[snapshot,transcript])).errors,1); assert.equal(acks,0);
+  accepted=true;
+  assert.equal((await publish({},[snapshot,transcript])).posted,1); assert.equal(acks,1);
+  assert.equal((await publish({},[snapshot,transcript])).posted,0); assert.equal(acks,2);
 });

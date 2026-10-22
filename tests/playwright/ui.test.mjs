@@ -228,6 +228,7 @@ test('inspector: tabs, redaction/ACL, reasoning gating, search, layout, live too
     const sid = hash.split('/').pop();
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto(`${base}/${hash}`);
+    await page.locator('#advanced-inspector > summary').click();
     await page.waitForSelector('.hd-ins__tab', { timeout: 15000 });
     const inspector = () => page.locator('#ins-root');
 
@@ -287,6 +288,7 @@ test('inspector: open server treats the viewer as operator; sessions without tel
     const r = await fetch(`${base}/api/v1/sessions`);
     const { sessions } = await r.json();
     await page.goto(`${base}/#/herd/session/${sessions[0].session_id}`);
+    await page.locator('#advanced-inspector > summary').click();
     await page.waitForSelector('.hd-ins__tab');
     await page.click('[data-view=reasoning]');
     await page.waitForFunction(() => /not report|Reasoning/.test(document.querySelector('#ins-root')?.innerText || ''));
@@ -301,6 +303,7 @@ test('inspector: live events do not clobber typing, open prefs form, scroll posi
     const sid = hash.split('/').pop();
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto(`${base}/${hash}`);
+    await page.locator('#advanced-inspector > summary').click();
     await page.waitForSelector('.hd-ins__tab');
     const msgs = (n, tag) => Array.from({ length: n }, (_, i) => ({ kind: 'message', role: 'assistant', text: `${tag}-${i} `.padEnd(300, 'x') }));
     await postInspector(base, sid, msgs(60, 'bulk'));
@@ -333,6 +336,7 @@ test('inspector: a slow response for the previous tab never overwrites the curre
     const hash = await sessionHash(base);
     await page.route('**/inspector?*view=tools*', async (route) => { await sleep(1500); await route.continue(); });
     await page.goto(`${base}/${hash}`);
+    await page.locator('#advanced-inspector > summary').click();
     await page.waitForSelector('.hd-ins__tab');
     await page.waitForFunction(() => document.querySelector('#ins-root')?.innerText.includes('make the parser faster'));
     await page.click('[data-view=tools]');
@@ -875,6 +879,17 @@ test('session inspection renders before optional mission context and cancels tha
  },{BURST:'0'});
 });
 
+// These timing tests isolate the advanced inspector from the independently
+// streamed session workspace, while using the real client and backend.
+async function inspectorHarness(page,base,sid) {
+  await page.route('**/inspector-harness**',r=>r.fulfill({contentType:'text/html',body:`<!doctype html><div id="inspector-host"></div><script type="module">
+    import {mountInspector} from '/inspector-view.js';
+    import {HerdrClient} from '/herdr-web-client/client.js';
+    mountInspector(document.getElementById('inspector-host'),new HerdrClient(''),new URLSearchParams(location.search).get('session'));
+  </script>`}));
+  await page.goto(`${base}/inspector-harness?session=${encodeURIComponent(decodeURIComponent(sid))}`);
+}
+
 test('inspector resynchronizes events written between the initial snapshot and stream subscription',async()=>{
  await withApp(async({page,base})=>{
   const hash=await sessionHash(base),sid=hash.split('/').pop();
@@ -900,7 +915,7 @@ test('inspector resynchronizes events written between the initial snapshot and s
   });
   await page.route('**/inspector/stream',async r=>{await streamAllowed;return r.continue().catch(()=>{});});
   try{
-   await page.goto(`${base}/${hash}`);const initial=await captured;assert.equal(initial.events.length,0);
+   await inspectorHarness(page,base,sid);const initial=await captured;assert.equal(initial.events.length,0);
    await postInspector(base,sid,Array.from({length:60},(_,i)=>({kind:'message',role:'assistant',text:`gap-${i}`})));
    releaseStream();await page.waitForFunction(()=>window.inspectorConnected===true);
    await page.waitForFunction(()=>document.querySelectorAll('.hd-ins__row').length===60,null,{timeout:5000});
@@ -936,7 +951,7 @@ test('inspector HTTP cursor catches events received before its baseline even whe
    await gate;return r.fulfill({json}).catch(()=>{});
   });
   try{
-   await page.clock.install();await page.goto(`${base}/${hash}`);await baselines;
+   await page.clock.install();await inspectorHarness(page,base,sid);await baselines;
    await postInspector(base,sid,Array.from({length:60},(_,i)=>({kind:'message',role:'assistant',text:`cursor-${i}`})));
    await page.waitForFunction(()=>window.inspectorBuffered.length===60);
    await page.evaluate(()=>window.inspectorBuffered.slice(0,50).forEach(deliver=>deliver()));

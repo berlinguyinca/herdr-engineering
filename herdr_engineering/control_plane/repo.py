@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import threading
 import time
 from uuid import uuid4
@@ -150,8 +151,7 @@ class ControlPlaneRepo:
         self.mission_activity = MissionActivityStore(now=self._now)
 
     def _persist_inspector(self, ev):
-        """Mirror low-volume inspector summaries to the existing durable sink only
-        (never into the in-memory event streams or the global SSE feed)."""
+        """Persist inspector detail outside global streams; require message ACKs."""
         if self._sink is None:
             return
         ev = dict(ev)
@@ -159,7 +159,13 @@ class ControlPlaneRepo:
         ev.setdefault("schema_version", 1)
         ev["ingest_timestamp"] = self._stamp()
         ev["sequence"] = int(time.time() * 1000)
-        self._sink.record(ev)
+        if ev.get("event_type") == "inspector.message":
+            required = getattr(self._sink, "record_required", None)
+            if not callable(required):
+                raise RuntimeError("conversation persistence requires an acknowledged sink")
+            required(ev)
+        else:
+            self._sink.record(ev)
 
     # ------------------------------------------------------------------ ids
     def subscribe(self, listener):
@@ -808,7 +814,13 @@ class ControlPlaneRepo:
                        agent_session=None, revision=None, interactive_ready=None,
                        launch_pending=None, state_change_seq=None,
                        repository_id=None, commit_sha=None,
-                       parent_session_id=None, name=None):
+                       transcript=None, parent_session_id=None, name=None):
+        if transcript is not None:
+            if (not isinstance(transcript, dict) or transcript.get("status") not in (
+                    "recording", "unsupported", "identity_unavailable", "unreadable", "unavailable") or
+                    not isinstance(transcript.get("truncated", False), bool)):
+                raise ValueError("transcript requires a supported status and boolean truncated flag")
+            transcript = {"status": transcript["status"], "truncated": transcript.get("truncated", False)}
         stamp = self._stamp()
         existing = self._sessions.get(session_id)
         if (existing is not None and host_id is not None
@@ -825,7 +837,7 @@ class ControlPlaneRepo:
                   "interactive_ready": interactive_ready, "launch_pending": launch_pending,
                   "state_change_seq": state_change_seq,
                   "repository_id": repository_id, "commit_sha": commit_sha,
-                  "parent_session_id": _label(parent_session_id, session_id), "name": _label(name)}
+                  "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name)}
         if existing is None:
             rec = {"session_id": session_id, "mission_id": mission_id,
                    "host_id": host_id, "agent_role": agent_role,
@@ -875,7 +887,7 @@ class ControlPlaneRepo:
                               "summary", "attach", "pane_id", "terminal_id", "herdr_session",
                               "machine", "agent_session", "revision", "interactive_ready",
                               "launch_pending", "state_change_seq", "repository_id", "commit_sha",
-                              "parent_session_id", "name") if existing.get(k) is not None}},
+                              "transcript", "parent_session_id", "name") if existing.get(k) is not None}},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)

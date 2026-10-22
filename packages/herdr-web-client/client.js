@@ -118,16 +118,20 @@ export class HerdrClient {
   }
 
   // -- interaction ----------------------------------------------------------
-  sendMessage(sessionId, message, artifactIds = []) {
+  sendMessage(sessionId, message, artifactIds = [], operationId) {
     return this.request(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
-      { method: 'POST', body: { message, artifact_ids: artifactIds } });
+      { method: 'POST', body: { message, artifact_ids: artifactIds, ...(operationId ? {operation_id: operationId} : {}) } });
   }
 
   sessionAction(sessionId, action) {
     return this.request(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/actions`,
       { method: 'POST', body: { action } });
+  }
+
+  listCollabAgentLinks() {
+    return this.request('/api/v1/collab/fleet/agent-links');
   }
 
   // -- agent inspector (spec 0200) -----------------------------------------

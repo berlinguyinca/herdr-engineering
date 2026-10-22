@@ -1,9 +1,10 @@
 // Collaboration rooms: sign in with the BinView user pool, create rooms, chat, and invite
-// people by email. All remote text is untrusted: it is escaped, never interpreted.
+// people by email. Remote messages use the shared safe Markdown renderer.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
-import { applyMention, mentionAt, quiet, suggest } from './collab-mention.js';
+import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
+import { renderMarkdown } from './conversation-markdown.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
 } from './herdr-web-client/collab.js';
@@ -81,12 +82,18 @@ const GUIDE = `<div class="hd-card">
   </ol></div>`;
 
 export function mountCollab(root, { fabricSessions = null } = {}) {
+  ensureConversationStyles(root.ownerDocument);
   let teardown = null;      // stops the open room's live loop
   let cursor = 0;
   let lastCfg = null;
   let me = null;
   const standalone = root.dataset.standalone === '1';
-  let current = '/rooms';   // in-dashboard navigation (the dashboard owns the URL hash)
+  const linkedAgent = !standalone && /^#\/collab\?/.test(window.location.hash)
+    ? new URLSearchParams(window.location.hash.split('?')[1]).get('agent') : null;
+  let focusLinkedAgent = Boolean(linkedAgent);
+  let current = linkedAgent ? '/agents' : '/rooms'; // the dashboard owns the URL hash
+  const nativeSessionLink = (id) => operator && !standalone && typeof id === 'string' && id
+    ? `<a href="/#/herd/session/${esc(encodeURIComponent(id))}">Open session conversation</a>` : '';
   const dispose = () => { if (teardown) teardown(); teardown = null; };
   const go = (path) => { if (standalone) { window.location.hash = path; } else { current = path; route(); } };
   const onHash = () => { if (store.get() && me) route(); };
@@ -497,14 +504,20 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (cur && !list.some((x) => x.session_id === cur)) list.unshift({ session_id: cur, agent_role: 'linked', host_id: '' });
       return list.map((x) => `<option value="${esc(x.session_id)}"${x.session_id === cur ? ' selected' : ''}>${esc(`${x.agent_role || 'session'} · ${x.host_id || ''} · ${String(x.cwd || x.session_id).split('/').filter(Boolean).pop()}`)}</option>`).join('');
     };
-    box.innerHTML = live.length ? `<div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack cx-agentcard">
+    const knownSessions = new Set((sessions || []).map((session) => session.session_id));
+    box.innerHTML = live.length ? `<div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack cx-agentcard" data-agent-card="${esc(a.agent_id)}" tabindex="-1"${a.agent_id === linkedAgent ? ' style="outline:2px solid var(--accent);outline-offset:2px"' : ''}>
         <div class="cx-row cx-row--between"><span class="hd-card__title">${agentTitle({ ...a, name: a.name || a.harness_type }, true)}</span>${pill('Active', 'var(--status-ok)')}</div>
         <span class="hd-ident">${esc(a.harness_type)} · ${esc(a.agent_id)}</span>
         ${a.instance_id ? '<span class="hd-card__sub">Linked to a herdr pane: its name, pane and tab labels stay equal both ways (within a minute).</span>' : ''}
+        ${knownSessions.has(a.instance_id) ? nativeSessionLink(a.instance_id) : ''}
         <span class="hd-card__sub">Expires ${esc(new Date(a.expires_at * 1000).toLocaleDateString())} · ${a.rooms.length ? `in ${esc(a.rooms.map((r) => r.name).join(', '))}` : 'not in any room yet'}</span>
         ${sessions ? `<label class="cx-msg">Fabric session <select data-link="${esc(a.agent_id)}"><option value="">not linked</option>${sessionOptions(a.instance_id)}</select></label>` : ''}
         <div><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Revoke</button></div></div>`).join('')}</div>`
       : '<div class="hd-empty">No connected agents yet.</div>';
+    if (focusLinkedAgent) {
+      const selected = [...box.querySelectorAll('[data-agent-card]')].find((card) => card.dataset.agentCard === linkedAgent);
+      if (selected) { selected.focus({ preventScroll: true }); selected.scrollIntoView({ block: 'center' }); focusLinkedAgent = false; }
+    }
     wireRename(box, renderAgents);
     box.querySelectorAll('[data-link]').forEach((sel) => { sel.onchange = async () => { try { await api.linkAgent(sel.dataset.link, sel.value); } catch (e) { alert(e.message); } }; });
     box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { await api.revokeAgent(b.dataset.revoke); renderAgents(); }; });
@@ -544,11 +557,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       <section class="hd-card cx-chat cx-panel" id="hcn-p-chat" aria-label="Conversation">
         <div id="hcn-log" class="cx-log" role="log" aria-live="polite"><div class="hd-empty" id="hcn-empty">No messages yet.</div></div>
         <button type="button" id="hcn-jump" class="hd-btn hd-btn--sm cx-jump" hidden>↓ New messages</button>
-        ${canPost ? `<form id="hcn-say" class="cx-compose"><div class="cx-ac-wrap">
-            <ul id="hcn-ac" class="cx-ac" role="listbox" aria-label="Agents" hidden></ul>
-            <textarea id="hcn-text" class="cx-input" name="text" rows="1" required maxlength="8000" aria-label="Message" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="hcn-ac" placeholder="Message the room… type @ to hand an agent a task" autocomplete="off"></textarea></div>
-            <button class="hd-btn" type="submit">Send</button></form>
-          <div id="hcn-say-msg" class="cx-msg cx-compose-msg" role="status">Enter sends · Shift+Enter adds a line · <b>@agent …</b> gives that agent a task</div>`
+        ${canPost ? '<div id="hcn-composer"></div>'
         : '<div class="cx-msg" style="padding:12px">Read-only access.</div>'}
       </section>
       ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
@@ -566,6 +575,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
 
     const log = $('hcn-log');
     let alive = true;
+    let composer = null;
     let since = -1;
     let ctl = null;
     let wake = null;
@@ -573,7 +583,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const stale = new Set();               // panels whose redraw was held back because you were typing in them
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
-    teardown = () => { alive = false; ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
+    teardown = () => { alive = false; composer?.dispose(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
     const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
 
     // Replace a container's markup only when it changed and you are not typing in it.
@@ -607,7 +617,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         const cont = key === lastKey && at - lastAt < 5 * 60000;
         lastKey = key; lastAt = at.getTime();
         row.className = `cx-m${mine ? ' cx-m--mine' : ''}${agent ? ' cx-m--agent' : ''}${cont ? ' cx-m--cont' : ''}`;
-        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble">${esc(e.text)}</div></div>`;
+        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${renderMarkdown(e.text)}</div></div>`;
         return row;
       }
       lastKey = null;
@@ -724,7 +734,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         prev: flowSig,
         onNode: (n) => {
           const mine = flow.edges.filter((e) => e.from === n.id || e.to === n.id).map((e) => `${esc(flow.nodes.find((x) => x.id === e.from)?.name)} → ${esc(flow.nodes.find((x) => x.id === e.to)?.name)}: ${esc(Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}`);
-          const f = n.fabric ? `<br>Fabric session ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}${n.fabric.parent_session_id ? ` · started by session ${esc(n.fabric.parent_session_id)}` : ''}` : '';
+          const f = n.fabric ? `<br>Fabric session ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}${n.fabric.parent_session_id ? ` · started by session ${esc(n.fabric.parent_session_id)}` : ''}${nativeSessionLink(n.fabric.session_id) ? `<br>${nativeSessionLink(n.fabric.session_id)}` : ''}` : '';
           showDetail(`<b>${esc(n.kind === 'agent' ? `@${n.name}` : n.name)}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}`);
         },
         onEdge: (e) => {
@@ -768,7 +778,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       sub = k; subTab.set(roomId, k);
       root.querySelectorAll('[data-sub]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.sub === k)));
       root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${k}`; });
-      if (k === 'chat') { log.scrollTop = log.scrollHeight; $('hcn-text')?.focus(); }
+      if (k === 'chat') { log.scrollTop = log.scrollHeight; composer?.focus(); }
       paintPanel();
     };
     root.querySelectorAll('[data-sub]').forEach((b) => { b.onclick = () => showSub(b.dataset.sub); });
@@ -814,62 +824,26 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         } catch (e) { $('hcn-task-msg').textContent = e.message; }
       };
     }
-    const sayForm = $('hcn-say');
-    if (sayForm) {
-      const ta = $('hcn-text');
-      const pop = $('hcn-ac');
-      const hint = $('hcn-say-msg').textContent;
-      let items = [];
-      let idx = 0;
-      const closeAc = () => { pop.hidden = true; items = []; ta.setAttribute('aria-expanded', 'false'); ta.removeAttribute('aria-activedescendant'); };
-      const paintAc = () => {
-        pop.innerHTML = items.map((a, i) => `<li role="option" id="hcn-ac-${i}" data-i="${i}" aria-selected="${i === idx}"><b>@${esc(a.name)}</b><span>${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></li>`).join('');
-        ta.setAttribute('aria-activedescendant', `hcn-ac-${idx}`);
-        pop.children[idx]?.scrollIntoView({ block: 'nearest' });
-      };
-      const openAc = () => {
-        const m = mentionAt(ta.value, ta.selectionStart);
-        const found = m ? suggest(S.agents, m.query) : [];
-        if (!found.length) { closeAc(); return; }
-        if (found.length !== items.length || found.some((a, i) => a.agent_id !== items[i]?.agent_id)) idx = 0;
-        items = found; pop.hidden = false; ta.setAttribute('aria-expanded', 'true'); paintAc();
-      };
-      const choose = (i) => {
-        const m = mentionAt(ta.value, ta.selectionStart);
-        if (!m || !items[i]) { closeAc(); return; }
-        const out = applyMention(ta.value, ta.selectionStart, m.start, items[i].name);
-        ta.value = out.text; ta.setSelectionRange(out.caret, out.caret); closeAc(); ta.focus();
-      };
-      const grow = () => { ta.style.height = 'auto'; ta.style.height = `${Math.min(ta.scrollHeight, 180)}px`; };
-      const showSoon = quiet(openAc, 120);
-      ta.addEventListener('input', () => { grow(); showSoon(); });
-      ta.addEventListener('click', showSoon);
-      ta.addEventListener('blur', () => { showSoon.cancel(); closeAc(); });
-      ta.addEventListener('keydown', (ev) => {
-        if (!pop.hidden && items.length) {
-          if (ev.key === 'ArrowDown') { ev.preventDefault(); idx = (idx + 1) % items.length; paintAc(); return; }
-          if (ev.key === 'ArrowUp') { ev.preventDefault(); idx = (idx - 1 + items.length) % items.length; paintAc(); return; }
-          if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); choose(idx); return; }
-          if (ev.key === 'Escape') { ev.preventDefault(); closeAc(); return; }
-        }
-        if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); sayForm.requestSubmit(); }
-      });
-      pop.addEventListener('mousedown', (ev) => { const li = ev.target.closest('li'); if (li) { ev.preventDefault(); choose(Number(li.dataset.i)); } });
-      const say = $('hcn-say-msg');
-      sayForm.onsubmit = async (ev) => {
-        ev.preventDefault();
-        const text = ta.value;
-        const mention = /^@([a-z0-9-]{1,32})\s+([\s\S]+)$/.exec(text.trim());
-        try {
-          if (mention) {   // "@helper do this" gives that agent a task instead of posting chat
+    if ($('hcn-composer')) {
+      composer = mountComposer($('hcn-composer'), {
+        draftKey: `collab:${me.user_id}:${roomId}`,
+        placeholder: 'Message the room… type @ to hand an agent a task',
+        hint: 'Enter sends · Shift+Enter adds a line · @agent … gives that agent a task',
+        suggestions: () => S.agents.filter((a) => a.actions.includes('execute')).map((a) => ({
+          id: a.agent_id, label: `@${a.name}`, insertText: `@${a.name}`,
+          detail: `${a.harness_type} · ${names.get(a.owner_user_id) || shortId(a.owner_user_id)}`,
+        })),
+        onSend: async (text) => {
+          const mention = /^@([a-z0-9-]{1,32})\s+([\s\S]+)$/.exec(text.trim());
+          if (mention) { // Preserve the room's authenticated leading-agent task contract.
             const hits = S.agents.filter((a) => a.name === mention[1] && a.actions.includes('execute'));
             if (hits.length !== 1) throw new Error(hits.length ? `More than one agent is called @${mention[1]}; use the Tasks tab` : `No agent named @${mention[1]} in this room accepts tasks`);
             await api.createTask(roomId, hits[0].agent_id, mention[2]);
           } else await api.say(roomId, text);
-          ta.value = ''; grow(); closeAc(); say.textContent = hint; say.removeAttribute('role'); say.setAttribute('role', 'status');
-          kick(); log.scrollTop = log.scrollHeight;
-        } catch (e) { say.textContent = e.message; say.setAttribute('role', 'alert'); }
-      };
+          if (alive) { kick(); log.scrollTop = log.scrollHeight; }
+          return { status: 'delivered', message: mention ? 'Task created' : 'Message posted' };
+        },
+      });
     }
     const inviteForm = $('hcn-invite');
     if (inviteForm) {

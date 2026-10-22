@@ -10,6 +10,7 @@ import { loadHostConfig, HostConfigUnavailable } from "./host-config.js";
 import { gitMetadata } from "./git-metadata.js";
 import { createInventoryReporter, createLoadReporter } from "./inventory.js";
 import { createModelResolver } from "./session-model.js";
+import { createTranscriptCollector } from "./session-transcript.js";
 
 const TERMINAL_STATES = new Set([
   "failed", "error", "crashed", "finished", "complete", "completed", "closed",
@@ -26,8 +27,12 @@ function query(binary, args) {
 }
 
 let defaultModelResolver = null;
+let defaultTranscriptCollector = null;
 
-export async function collectSnapshot(env, { queryNative = query, metadata = gitMetadata, now = Date.now, resolveModel } = {}) {
+export async function collectSnapshot(env, { queryNative = query, metadata = gitMetadata, now = Date.now, resolveModel, collectTranscript } = {}) {
+  collectTranscript ??= (defaultTranscriptCollector ??= createTranscriptCollector({env,
+    queryProcess: (server, paneId) => queryNative(herdrBin(env), ["--session", server, "pane", "process-info", "--pane", paneId]),
+  }));
   resolveModel ??= (defaultModelResolver ??= createModelResolver({
     queryProcess: (server, paneId) => queryNative(herdrBin(env), ["--session", server, "pane", "process-info", "--pane", paneId]),
   }));
@@ -65,7 +70,7 @@ export async function collectSnapshot(env, { queryNative = query, metadata = git
       paneCounts.set(pane?.pane_id, (paneCounts.get(pane?.pane_id) || 0) + 1);
     }
     for (const pane of snapshot.agents) {
-      if (envelopes.length >= 128 || now() >= deadline) { summary.truncated = true; break; }
+      if (summary.sessions >= 128 || now() >= deadline) { summary.truncated = true; break; }
       if (!pane || typeof pane.pane_id !== "string" || !pane.pane_id || pane.pane_id.length > 200
         || typeof pane.terminal_id !== "string" || !/^term_[A-Za-z0-9_-]{1,128}$/.test(pane.terminal_id)
         || terminalCounts.get(pane.terminal_id) !== 1 || paneCounts.get(pane.pane_id) !== 1
@@ -84,13 +89,17 @@ export async function collectSnapshot(env, { queryNative = query, metadata = git
       for (const key of ["revision", "state_change_seq", "interactive_ready", "launch_pending", "agent_session"]) {
         if (pane[key] !== undefined && pane[key] !== null) payload[key] = pane[key];
       }
+      const sessionId = ["herdr", host, server.name, pane.pane_id].map(encodeURIComponent).join(":");
       envelopes.push({ source: "herdr", entity_type: "session",
-        entity_id: ["herdr", host, server.name, pane.pane_id].map(encodeURIComponent).join(":"),
+        entity_id: sessionId,
         event_type: "session.snapshot", payload });
+      summary.sessions++;
+      const transcript = await collectTranscript(server.name, pane, sessionId).catch(() => ({status:"unavailable", envelopes:[]}));
+      if (transcript.status) payload.transcript = {status:transcript.status, truncated:!!transcript.truncated};
+      envelopes.push(...transcript.envelopes);
       if (identity.repository_id && identity.commit_sha) summary.linked++;
     }
   }
-  summary.sessions = envelopes.length;
   return { envelopes, summary };
 }
 
@@ -103,22 +112,30 @@ export function createSnapshotPublisher({ fetcher = fetch, now = Date.now, maxEn
     // Stop at the first failure rather than multiplying timeouts during outages.
     for (const envelope of envelopes) {
       const body = JSON.stringify(envelope);
-      const previous = sent.get(envelope.entity_id);
+      const key = `${envelope.entity_type || ""}:${envelope.entity_id}`;
+      const previous = sent.get(key);
       const terminal = TERMINAL_STATES.has(String(envelope.payload?.status || "").trim().toLowerCase());
-      if (previous?.body === body && (terminal || now() - previous.at < 300000)) { unchanged++; continue; }
+      if (previous?.body === body && (terminal || now() - previous.at < 300000)) { envelope.onPublished?.(); unchanged++; continue; }
       try {
         const response = await fetcher(`${url}/api/v1/ingest`, {
           method: "POST", headers, body,
           redirect: "error", signal: AbortSignal.timeout(2000),
         });
-        await response.body?.cancel();
-        if (!response.ok) {
+        let inspectorAccepted = true;
+        if (response.ok && envelope.entity_type === "inspector") {
+          const result = await response.json();
+          const entity = result?.entity;
+          inspectorAccepted = result?.ok === true && Array.isArray(entity?.rejected) && entity.rejected.length === 0
+            && entity.accepted + entity.duplicates === envelope.payload.events.length;
+        } else await response.body?.cancel();
+        if (!response.ok || !inspectorAccepted) {
           const failure = { posted, unchanged, errors: 1 };
           if (response.status === 401 || response.status === 403) failure.authRejected = true;
           return failure;
         }
-        sent.delete(envelope.entity_id);
-        sent.set(envelope.entity_id, { body, at: now() });
+        sent.delete(key);
+        sent.set(key, { body, at: now() });
+        envelope.onPublished?.();
         while (sent.size > Math.max(1, maxEntries)) sent.delete(sent.keys().next().value);
         posted++;
       } catch { return { posted, unchanged, errors: 1 }; }
