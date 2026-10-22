@@ -95,6 +95,17 @@ _PROFILE_BAD_HEADERS = frozenset({"host", "content-length", "transfer-encoding",
                                   "proxy-authorization", "te", "trailer"})
 _PROFILE_KEYS = frozenset({"allowed_families", "allowed_models", "tools_allowed", "permanent_hosts", "services",
                            "ssh_secret_names", "spend_tokens_per_day", "limits"})
+# The model endpoint each harness family must reach; merged into every room's host allowlist.
+FAMILY_ENDPOINTS: dict[str, list[str]] = {
+    "claude-code": ["api.anthropic.com:443"],
+    "codex": ["api.openai.com:443"],
+    "pi": ["llm.metabolomics.us:443"],
+}
+MAX_OPEN_EGRESS = 60             # open host-access requests per room
+EGRESS_OPEN_TTL = 86400.0        # an unanswered request stops counting (and deduping) after this
+EGRESS_DENY_WINDOW = 3600.0      # a denied host cannot be re-requested for this long
+EGRESS_DEFAULT_TTL = 86400.0
+EGRESS_MAX_TTL = 30 * 86400.0
 MAX_SPAWN_AGENTS = 20            # agents one fleet start may place on the owner's hosts
 MAX_OPEN_SPAWNS = 3              # requests waiting for, or held by, the runner
 SPAWN_STALE = 900.0              # a claimed start with no result after this long is shown as stalled
@@ -286,6 +297,7 @@ class CollabService:
         self._rooms_by_agent: dict[str, set] = defaultdict(set)
         self._housekept = 0.0
         self._room_seq: dict[str, int] = {}                  # room id -> sequence of its latest change
+        self._egress: dict[str, dict] = {}                   # request id -> host-access request
         self._fleet_flags: dict[str, bool] = {}              # host -> may it receive automatic agents (default yes)
         self._fleet_seen: dict[str, dict] = {}               # host -> what the host runner last reported (memory only)
         self._spawns: dict[str, dict] = {}                   # spawn id -> request
@@ -506,6 +518,31 @@ class CollabService:
                 "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
             self._agent_projects[p["agent_id"]].add(p["project_id"])
             self._rooms_by_agent[p["agent_id"]].add(p["room_id"])
+        elif t == "egress_requested":
+            self._egress[p["request_id"]] = {
+                "id": p["request_id"], "room_id": p["room_id"], "agent_id": p["agent_id"],
+                "host_port": p["host_port"], "state": "open", "created_epoch": p["created_epoch"],
+                "decided_epoch": None, "expires_at": None, "decided_by": None}
+        elif t == "egress_decided":
+            r = self._egress.get(p["request_id"])
+            if r is not None:
+                r.update(state=p["state"], decided_epoch=p["decided_epoch"], expires_at=p.get("expires_at"),
+                         decided_by=p["actor_user_id"])
+        elif t == "egress_promoted":
+            room = self._rooms.get(p["room_id"])
+            if room is not None:
+                prof = room.get("profile") or _normalize_profile({})
+                if p["host_port"] not in prof["permanent_hosts"]:
+                    prof["permanent_hosts"] = [*prof["permanent_hosts"], p["host_port"]]
+                room["profile"] = prof
+        elif t == "egress_removed":
+            room = self._rooms.get(p["room_id"])
+            if room is not None and room.get("profile"):
+                room["profile"]["permanent_hosts"] = [h for h in room["profile"]["permanent_hosts"]
+                                                      if h != p["host_port"]]
+            for r in self._egress.values():
+                if r["room_id"] == p["room_id"] and r["host_port"] == p["host_port"] and r["state"] == "approved":
+                    r.update(state="removed", expires_at=p["removed_epoch"])
         elif t == "fleet_host_set":
             self._fleet_flags[p["host"]] = bool(p["auto_agents"])
         elif t == "fleet_spawn_requested":
@@ -1608,6 +1645,132 @@ class CollabService:
                 project_ids=[room["project_id"]], resource_id=room_id))
             return self._profile(room_id)
 
+    # ------------------------------------------------------- host-access requests
+    # The runner (as the operator) asks on an agent's behalf; only the operator decides. Approvals
+    # expire; "promote" copies a host into the room profile's permanent hosts.
+    def _require_operator(self, pr: Principal) -> None:
+        if pr.is_agent or not pr.admin:        # the same 404 for the room owner and for strangers
+            self.stats["policy_denied"] += 1
+            raise CollabError(404, "not found")
+
+    @staticmethod
+    def _egress_host_port(host: Any, port: Any) -> str:
+        if (not isinstance(host, str) or isinstance(port, bool) or not isinstance(port, int)
+                or not 1 <= port <= 65535 or len(host) > 253):
+            raise CollabError(400, "invalid host or port")
+        hp = f"{host}:{port}"
+        if not _PROFILE_HOST.fullmatch(hp):
+            raise CollabError(400, "invalid host or port")
+        return hp
+
+    def _egress_live(self, room_id: str, now: float) -> set[str]:
+        return {r["host_port"] for r in self._egress.values()
+                if r["room_id"] == room_id and r["state"] == "approved" and r["expires_at"] > now}
+
+    def egress_allowlist(self, room_id: str) -> list[str]:
+        """Permanent hosts, unexpired approvals and every family's model endpoint."""
+        with self._lock:
+            hosts = set(self._profile(room_id)["permanent_hosts"]) | self._egress_live(room_id, self._now())
+            for eps in FAMILY_ENDPOINTS.values():
+                hosts.update(eps)
+            return sorted(hosts)
+
+    def request_egress(self, pr: Principal, room_id: str, agent_id: str, host: Any, port: Any) -> dict:
+        self._require_operator(pr)
+        hp = self._egress_host_port(host, port)
+        if not isinstance(agent_id, str) or not agent_id or len(agent_id) > 128:
+            raise CollabError(400, "invalid agent id")
+        with self._lock:
+            if room_id not in self._rooms:
+                raise CollabError(404, "not found")
+            now = self._now()
+            if hp in self.egress_allowlist(room_id):
+                return {"state": "allowed", "host_port": hp}
+            mine = [r for r in self._egress.values() if r["room_id"] == room_id]
+            if any(r["host_port"] == hp and r["state"] == "denied"
+                   and now - r["decided_epoch"] < EGRESS_DENY_WINDOW for r in mine):
+                return {"state": "denied"}
+            open_ = [r for r in mine if r["state"] == "open" and now - r["created_epoch"] < EGRESS_OPEN_TTL]
+            for r in open_:
+                if r["host_port"] == hp:
+                    return dict(r)
+            if len(open_) >= MAX_OPEN_EGRESS:
+                raise CollabError(429, "too many open host-access requests in this room")
+            rid = ids.new_id("grant")
+            self._commit("egress_requested", self._actor(
+                pr, room_id=room_id, request_id=rid, agent_id=agent_id, host_port=hp, created_epoch=now,
+                action="egress.request", outcome="allowed", project_ids=[self._rooms[room_id]["project_id"]],
+                resource_id=rid))
+            return dict(self._egress[rid])
+
+    def list_egress(self, pr: Principal, room_id: str | None = None) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            if not pr.admin:
+                owned = {rid for rid, room in self._rooms.items()
+                         if (self._member(room, pr.id) or {}).get("role") == "owner"}
+                if room_id is not None and room_id not in owned:
+                    raise CollabError(404, "not found")
+            else:
+                owned = set(self._rooms)
+            rows = [dict(r) for r in self._egress.values()
+                    if r["room_id"] in owned and (room_id is None or r["room_id"] == room_id)]
+            rows.sort(key=lambda r: (r["created_epoch"], r["id"]))
+            return {"requests": rows}
+
+    def decide_egress(self, pr: Principal, request_id: str, decision: Any,
+                      ttl_seconds: Any = EGRESS_DEFAULT_TTL) -> dict:
+        self._require_operator(pr)
+        if decision not in ("approve", "deny"):
+            raise CollabError(400, "decision must be approve or deny")
+        if (isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float))
+                or not 1 <= ttl_seconds <= EGRESS_MAX_TTL):
+            raise CollabError(400, "ttl_seconds must be between 1 second and 30 days")
+        with self._lock:
+            r = self._egress.get(request_id)
+            if r is None:
+                raise CollabError(404, "not found")
+            if r["state"] != "open":
+                raise CollabError(409, "already decided")
+            now = self._now()
+            approve = decision == "approve"
+            self._commit("egress_decided", self._actor(
+                pr, room_id=r["room_id"], request_id=request_id, state="approved" if approve else "denied",
+                decided_epoch=now, expires_at=now + float(ttl_seconds) if approve else None,
+                action="egress.decide", outcome="allowed", project_ids=[self._rooms[r["room_id"]]["project_id"]],
+                resource_id=request_id))
+            return dict(self._egress[request_id])
+
+    def promote_egress(self, pr: Principal, room_id: str, host_port: Any) -> dict:
+        self._require_operator(pr)
+        hp = self._promote_target(room_id, host_port)
+        with self._lock:
+            profile = self._profile(room_id)
+            if hp not in profile["permanent_hosts"] and len(profile["permanent_hosts"]) >= MAX_PROFILE_HOSTS:
+                raise CollabError(400, "too many permanent hosts")
+            self._commit("egress_promoted", self._actor(
+                pr, room_id=room_id, host_port=hp, action="egress.promote", outcome="allowed",
+                project_ids=[self._rooms[room_id]["project_id"]], resource_id=room_id))
+            return {"permanent_hosts": self._profile(room_id)["permanent_hosts"]}
+
+    def remove_egress(self, pr: Principal, room_id: str, host_port: Any) -> dict:
+        self._require_operator(pr)
+        hp = self._promote_target(room_id, host_port)
+        with self._lock:
+            self._commit("egress_removed", self._actor(
+                pr, room_id=room_id, host_port=hp, removed_epoch=self._now(), action="egress.remove",
+                outcome="allowed", project_ids=[self._rooms[room_id]["project_id"]], resource_id=room_id))
+            return {"allowlist": self.egress_allowlist(room_id)}
+
+    def _promote_target(self, room_id: str, host_port: Any) -> str:
+        if not isinstance(host_port, str) or not _PROFILE_HOST.fullmatch(host_port) or len(host_port) > 260:
+            raise CollabError(400, "invalid host:port")
+        if not 1 <= int(host_port.rsplit(":", 1)[1]) <= 65535:
+            raise CollabError(400, "invalid host:port")
+        if room_id not in self._rooms:
+            raise CollabError(404, "not found")
+        return host_port
+
     def grant_agent(self, pr: Principal, room_id: str, body: dict, _bulk: bool = False) -> dict:
         """The room owner grants an agent its permissions directly. Anyone else who may bring an
         agent (a contributor) can only REQUEST access; the owner approves a subset of what was
@@ -2340,6 +2503,11 @@ class CollabService:
                         return 200, self.list_fleet_hosts(pr)
                     if parts == ["fleet", "agent-links"]:
                         return 200, self.agent_links(pr)
+                    if parts == ["fleet", "egress"]:
+                        return 200, self.list_egress(pr)
+                    if n == 3 and parts[1] == "egress":
+                        self._require_operator(pr)
+                        return 200, {"allowlist": self.egress_allowlist(parts[2])}
                     if parts == ["fleet", "spawns"]:
                         st = str(query["status"]) if "status" in query else None
                         return 200, self.list_spawns(pr, st)
@@ -2394,6 +2562,16 @@ class CollabService:
                         return 200, self.report_fleet_hosts(pr, body)
                     if n == 3 and parts[1] == "hosts":
                         return 200, self.set_fleet_host(pr, parts[2], body)
+                    if parts == ["fleet", "egress", "request"]:
+                        return 200, self.request_egress(pr, body.get("room_id"), body.get("agent_id"),
+                                                        body.get("host"), body.get("port"))
+                    if parts == ["fleet", "egress", "promote"]:
+                        return 200, self.promote_egress(pr, body.get("room_id"), body.get("host_port"))
+                    if parts == ["fleet", "egress", "remove"]:
+                        return 200, self.remove_egress(pr, body.get("room_id"), body.get("host_port"))
+                    if n == 4 and parts[1] == "egress" and parts[3] == "decide":
+                        kw = {"ttl_seconds": body["ttl_seconds"]} if "ttl_seconds" in body else {}
+                        return 200, self.decide_egress(pr, parts[2], body.get("decision"), **kw)
                     if parts == ["fleet", "spawns"]:
                         return 201, self.request_spawn(pr, body)
                     if parts == ["fleet", "task-activity"]:
