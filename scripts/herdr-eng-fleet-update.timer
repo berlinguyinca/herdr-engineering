@@ -1,9 +1,9 @@
 [Unit]
-Description=Daily HerdR Engineering fleet update
+Description=Daily HerdR Engineering fleet update at 11:59 local time
 
 [Timer]
-OnCalendar=daily
-RandomizedDelaySec=30m
+OnCalendar=*-*-* 11:59:00
+RandomizedDelaySec=0
 Persistent=true
 Unit=herdr-eng-fleet-update.service
 
