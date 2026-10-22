@@ -113,7 +113,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     root.innerHTML = `<div class="hd-shell">
       <aside class="hd-shell__sidebar">
         <div class="hd-shell__brand"><span class="cx-logo" aria-hidden="true">◆</span>HerdR Collaboration</div>
-        <nav class="hd-shell__nav" aria-label="Collaboration">${link('/rooms', 'Rooms')}${link('/agents', 'AI agents')}</nav>
+        <nav class="hd-shell__nav" aria-label="Collaboration">${link('/rooms', 'Rooms')}${link('/agents', 'AI agents')}<a class="hd-shell__link" href="/guide" target="_blank" rel="noopener">Guide</a></nav>
         <div class="cx-user"><span>${esc(me ? (me.email || me.user_id) : '')}</span>${operator ? '' : '<button id="hcn-out" class="hd-btn hd-btn--ghost hd-btn--sm" type="button">Sign out</button>'}</div>
       </aside>
       <main class="hd-shell__main"><div class="hd-shell__content">${content}</div></main></div>`;

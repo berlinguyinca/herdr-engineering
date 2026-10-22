@@ -157,3 +157,15 @@ textarea.cx-input { resize: vertical; font: inherit; }
 @keyframes cx-flow-move { to { stroke-dashoffset: -26; } }
 @keyframes cx-flow-pulse { 0% { opacity: 1; filter: drop-shadow(0 0 6px currentColor); } 100% { opacity: 0.85; } }
 @media (prefers-reduced-motion: reduce) { .cx-flow-edge--live, .cx-flow-pulse { animation: none; } }
+
+/* ---- public guide page */
+.cx-guide { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; line-height: 1.55; }
+.cx-guide h1 { font-size: 1.7rem; margin: 8px 0 12px; }
+.cx-guide h2 { font-size: 1.3rem; margin: 32px 0 8px; padding-top: 8px; border-top: 1px solid var(--border, #d0d4da); }
+.cx-guide h3 { font-size: 1.05rem; margin: 22px 0 6px; }
+.cx-guide pre { overflow-x: auto; padding: 12px; border-radius: 8px; background: var(--surface-sunken, rgba(127,127,127,.12)); }
+.cx-guide code { font-family: var(--font-mono, ui-monospace, monospace); font-size: .85em; }
+.cx-guide :not(pre) > code { padding: 1px 5px; border-radius: 4px; background: var(--surface-sunken, rgba(127,127,127,.12)); }
+.cx-guide-table { overflow-x: auto; margin: 10px 0; }
+.cx-guide table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+.cx-guide th, .cx-guide td { text-align: left; vertical-align: top; padding: 6px 10px; border-bottom: 1px solid var(--border, #d0d4da); }
