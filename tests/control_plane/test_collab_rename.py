@@ -90,7 +90,7 @@ def test_a_rename_survives_a_restart_and_links_list_current_names(w):
     w.s.link_agent(w.alice, i1["agent_id"], {"instance_id": "pane:bender:w1:p1"})
     w.s.rename_agent(w.alice, i1["agent_id"], {"name": "architect"})
     assert w.s.agent_links(w.alice)["agents"] == [{"agent_id": i1["agent_id"], "name": "architect",
-                                                    "harness_type": "claude-code", "instance_id": "pane:bender:w1:p1"}]
+                                                    "harness_type": "claude-code", "instance_id": "pane:bender:w1:p1", "parent_agent_id": None}]
     again = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), now=w.s.clock)
     again.hydrate(w.s._log)
     assert again.agent_links(user(again, "alice"))["agents"][0]["name"] == "architect"

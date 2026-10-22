@@ -421,6 +421,7 @@ _PUBLIC_STATIC = {
     "/herdr-design-system/theme.css": ("herdr-design-system/theme.css", "text/css"),
     "/herdr-design-system/base.css": ("herdr-design-system/base.css", "text/css"),
 }
+_SCRIPT_FILES = {"join.sh": "join.sh", "worker.sh": "worker.sh", "sandbox.sh": "sandbox.sh"}
 _PUBLIC_CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
                "connect-src 'self' https://*.amazoncognito.com; img-src 'self' data:; "
                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
@@ -516,6 +517,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(400, "ambiguous request framing")
             if path == "/.well-known/agent-card.json" and self.command == "GET":
                 return self._agent_card()
+            if self.command == "GET" and path.startswith("/api/v1/collab/scripts/"):
+                return self._script(path.rsplit("/", 1)[1])
             if self._is_collab_path() or path in ("/mcp", "/a2a"):
                 if path == "/mcp":
                     return self._mcp()
@@ -538,6 +541,32 @@ def _make_handler(server, public=False, operator=False):
                 self.wfile.write(data)
                 return None
             return self._deny(404, "not found")
+
+        def _script(self, name):
+            """The bash a `curl ... | bash` runs: templates with this site's address filled in. They contain no
+            secret (the join token travels in the caller's environment, never in the URL or these files)."""
+            import re as _re
+            if server.collab is None or name not in _SCRIPT_FILES:
+                return self._deny(404, "not found")
+            if self._rate_limit(self._proxied_client()):
+                return None
+            if (server.collab_require_https
+                    and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
+                return self._deny(400, "collaboration is only served over https")
+            base = ((server.collab.public_config or {}).get("public_url") or "").rstrip("/")
+            target = server.web_root / "collab-scripts" / _SCRIPT_FILES[name]
+            if not _re.fullmatch(r"(https://[A-Za-z0-9.-]+|http://(127\.0\.0\.1|localhost))(:[0-9]{1,5})?", base) or not target.is_file():
+                return self._deny(404, "not found")
+            text = target.read_text(encoding="utf-8").replace("'__HERDR_BASE__'", f"'{base}'").replace("__HERDR_BASE__", base)
+            data = text.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/x-shellscript; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return None
 
         def _agent_card(self):
             from . import collab_a2a

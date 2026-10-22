@@ -27,21 +27,52 @@ spec = importlib.util.spec_from_file_location("collab_spawn", RUNNER)
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
-FAKE_HERDR = r"""#!/usr/bin/env bash
-# records every call; `machine list` shows one machine, `workspace create` hands out pane ids
-echo "$*" >> "$FAKE_LOG/herdr.log"
-args=("$@"); machine=""
-if [ "${args[0]:-}" = "--machine" ]; then machine="${args[1]}"; args=("${args[@]:2}"); fi
-[ -n "$machine" ] && [ -f "$FAKE_LOG/down-$machine" ] && { echo "ssh: no route" >&2; exit 1; }
-case "${args[0]} ${args[1]:-}" in
-  "machine list") echo '[{"id":"12f6","label":"beast","target":"beast","session":"default","enabled":true},{"id":"99aa","label":"old","target":"old","session":"default","enabled":false}]' ;;
-  "workspace list") echo '{"result":{"type":"workspace_list","workspaces":[]}}' ;;
-  "workspace create") n=$(( $(cat "$FAKE_LOG/n" 2>/dev/null || echo 0) + 1 )); echo $n > "$FAKE_LOG/n"
-     echo "{\"result\":{\"root_pane\":{\"pane_id\":\"w$n:p1\"}}}" ;;
-  "pane run") : ;;
-  *) echo "unexpected: $*" >&2; exit 2 ;;
-esac
-"""
+FAKE_HERDR = r'''#!/usr/bin/env python3
+"""A herdr with state: workspaces, tabs and panes with labels, one state file per machine."""
+import json, os, sys
+a = sys.argv[1:]
+open(os.path.join(os.environ["FAKE_LOG"], "herdr.log"), "a").write(" ".join(a) + "\n")
+machine = "local"
+if a[:1] == ["--machine"]:
+    machine, a = a[1], a[2:]
+if machine != "local" and os.path.exists(os.path.join(os.environ["FAKE_LOG"], f"down-{machine}")):
+    print("ssh: no route", file=sys.stderr); sys.exit(1)
+path = os.path.join(os.environ["FAKE_LOG"], f"state-{machine}.json")
+st = json.load(open(path)) if os.path.exists(path) else {"n": 0, "ws": {}, "tabs": {}, "panes": {}}
+def save():
+    json.dump(st, open(path, "w"))
+def out(r):
+    print(json.dumps({"result": r}))
+if a[:2] == ["machine", "list"]:
+    print(json.dumps([{"id": "12f6", "label": "beast", "target": "beast", "session": "default", "enabled": True},
+                      {"id": "99aa", "label": "old", "target": "old", "session": "default", "enabled": False}]))
+elif a[:2] == ["workspace", "create"]:
+    st["n"] += 1; n = st["n"]; w, t, p = f"w{n}", f"w{n}:t1", f"w{n}:p1"
+    st["ws"][w] = {"workspace_id": w, "label": a[a.index("--label") + 1], "pane_count": 1, "tab_count": 1}
+    st["tabs"][t] = {"tab_id": t, "workspace_id": w, "label": "1", "number": 1, "pane_count": 1}
+    st["panes"][p] = {"pane_id": p, "tab_id": t, "workspace_id": w}
+    save(); out({"root_pane": {"pane_id": p, "tab_id": t, "workspace_id": w}})
+elif a[:2] == ["tab", "create"]:
+    st["n"] += 1; w = a[a.index("--workspace") + 1]; n = st["n"]; t, p = f"{w}:t{n}", f"{w}:p{n}"
+    num = sum(1 for x in st["tabs"].values() if x["workspace_id"] == w) + 1
+    st["tabs"][t] = {"tab_id": t, "workspace_id": w, "label": a[a.index("--label") + 1], "number": num, "pane_count": 1}
+    st["panes"][p] = {"pane_id": p, "tab_id": t, "workspace_id": w}
+    st["ws"][w]["tab_count"] += 1; save(); out({"root_pane": {"pane_id": p, "tab_id": t, "workspace_id": w}, "tab": st["tabs"][t]})
+elif a[:2] == ["pane", "split"]:
+    st["n"] += 1; src = st["panes"][a[2]]; p = f"{src['workspace_id']}:p{st['n']}"
+    st["panes"][p] = {"pane_id": p, "tab_id": src["tab_id"], "workspace_id": src["workspace_id"]}
+    st["tabs"][src["tab_id"]]["pane_count"] = st["tabs"][src["tab_id"]].get("pane_count", 1) + 1
+    st["ws"][src["workspace_id"]]["pane_count"] += 1; save(); out({"pane": st["panes"][p]})
+elif a[:2] == ["pane", "list"]: out({"panes": list(st["panes"].values())})
+elif a[:2] == ["tab", "list"]: out({"tabs": list(st["tabs"].values())})
+elif a[:2] == ["workspace", "list"]: out({"workspaces": list(st["ws"].values())})
+elif a[:2] == ["pane", "run"]: pass
+elif a[1:2] == ["rename"] and a[0] in ("pane", "tab", "workspace"):
+    key = {"pane": "panes", "tab": "tabs", "workspace": "ws"}[a[0]]
+    st[key][a[2]]["label"] = " ".join(a[3:]); save(); out({"type": "ok"})
+else:
+    print("unexpected: " + " ".join(a), file=sys.stderr); sys.exit(2)
+'''
 # an "ssh" that runs the remote command locally, with HOME pointing at the pretend remote host
 FAKE_SSH = r"""#!/usr/bin/env bash
 echo "$*" >> "$FAKE_LOG/ssh.log"
@@ -198,7 +229,7 @@ def test_one_failed_agent_does_not_stop_the_rest(rig, monkeypatch):
     real = rig.r.place
     seen = []
 
-    def flaky(host, agent, family, installed):
+    def flaky(host, agent, family, installed, *rest):
         seen.append(agent["name"])
         if agent["name"] == "fleet-2":
             raise runner.Failure("herdr exited 1: boom")
@@ -239,7 +270,7 @@ def test_machine_names_that_could_smuggle_options_are_ignored(rig, monkeypatch, 
 
 
 def test_an_unexpected_crash_still_reports_and_leaves_no_live_agent(rig, monkeypatch):
-    def boom(host, agent, family, installed):
+    def boom(host, agent, family, installed, *rest):
         if agent["name"] != "fleet-1":
             raise OSError("No space left on device")
         return None
@@ -263,7 +294,7 @@ def test_unticking_a_host_mid_request_stops_placements_there(rig, monkeypatch):
     rig.r.once()                                                # hosts reported
     real, n = rig.r.place, []
 
-    def untick_after_first(host, agent, family, installed):
+    def untick_after_first(host, agent, family, installed, *rest):
         real(host, agent, family, installed)
         n.append(host)
         if len(n) == 1:
@@ -399,45 +430,10 @@ def test_a_host_without_working_bubblewrap_is_offered_no_family_when_sandboxed(m
 
 
 # ---------------------------------------------------------------- names, kept equal both ways
-STATEFUL_HERDR = r'''#!/usr/bin/env python3
-"""A herdr with state: workspaces, tabs and panes with labels, one state file per machine."""
-import json, os, sys
-a = sys.argv[1:]
-machine = "local"
-if a[:1] == ["--machine"]:
-    machine, a = a[1], a[2:]
-path = os.path.join(os.environ["FAKE_LOG"], f"state-{machine}.json")
-st = json.load(open(path)) if os.path.exists(path) else {"n": 0, "ws": {}, "tabs": {}, "panes": {}}
-def save():
-    json.dump(st, open(path, "w"))
-def out(r):
-    print(json.dumps({"result": r}))
-if a[:2] == ["machine", "list"]:
-    print(json.dumps([{"id": "12f6", "label": "beast", "target": "beast", "session": "default", "enabled": True}]))
-elif a[:2] == ["workspace", "create"]:
-    st["n"] += 1; n = st["n"]; w, t, p = f"w{n}", f"w{n}:t1", f"w{n}:p1"
-    st["ws"][w] = {"workspace_id": w, "label": a[a.index("--label") + 1], "pane_count": 1, "tab_count": 1}
-    st["tabs"][t] = {"tab_id": t, "workspace_id": w, "label": "1", "number": 1}
-    st["panes"][p] = {"pane_id": p, "tab_id": t, "workspace_id": w}
-    save(); out({"root_pane": {"pane_id": p, "tab_id": t, "workspace_id": w}})
-elif a[:2] == ["pane", "list"]: out({"panes": list(st["panes"].values())})
-elif a[:2] == ["tab", "list"]: out({"tabs": list(st["tabs"].values())})
-elif a[:2] == ["workspace", "list"]: out({"workspaces": list(st["ws"].values())})
-elif a[:2] == ["pane", "run"]: pass
-elif a[1:2] == ["rename"] and a[0] in ("pane", "tab", "workspace"):
-    key = {"pane": "panes", "tab": "tabs", "workspace": "ws"}[a[0]]
-    st[key][a[2]]["label"] = " ".join(a[3:]); save(); out({"type": "ok"})
-else:
-    print("unexpected: " + " ".join(a), file=sys.stderr); sys.exit(2)
-'''
 
 
 @pytest.fixture
 def named(rig, tmp_path):
-    stateful = tmp_path / "bin" / "herdr-stateful"
-    stateful.write_text(STATEFUL_HERDR)
-    stateful.chmod(0o755)
-    rig.r.herdr = str(stateful)
     rig.state = lambda machine="local": json.loads((rig.log / f"state-{machine}.json").read_text())
     rig.labels = lambda machine="local": {k: {i: v["label"] for i, v in rig.state(machine)[k].items() if "label" in v}
                                            for k in ("ws", "tabs", "panes")}
@@ -450,12 +446,14 @@ def spawned(rig, count=2):
     return {a["name"]: a for a in rig.w.s.list_my_agents(rig.w.alice)["agents"]}
 
 
-def test_a_new_agent_carries_its_name_on_workspace_tab_and_pane(named):
-    agents = spawned(named)
+def test_each_fleet_gets_a_workspace_with_a_tab_per_agent_named_after_it(named):
+    agents = spawned(named, count=4)
     for machine in ("local", "beast"):
-        labels = named.labels(machine)
-        assert set(labels["ws"].values()) == set(labels["tabs"].values()) == set(labels["panes"].values())
-        assert len(labels["ws"]) == 1 and next(iter(labels["ws"].values())) in agents
+        st = named.state(machine)
+        assert [w["label"] for w in st["ws"].values()] == ["herd-fleet"]                   # one workspace per host
+        assert sorted(t["label"] for t in st["tabs"].values()) == sorted(n for n in agents if named.labels(machine)["panes"] and n in named.labels(machine)["panes"].values())
+        assert set(named.labels(machine)["tabs"].values()) == set(named.labels(machine)["panes"].values())
+    assert len({n for m in ("local", "beast") for n in named.labels(m)["panes"].values()}) == 4
 
 
 def rename_in_web(named, old, new):
@@ -464,57 +462,88 @@ def rename_in_web(named, old, new):
 
 
 def host_of(named, name):
-    return "local" if any(name in named.labels("local")["ws"].values() for _ in [0]) else "beast"
+    has = (named.log / "state-local.json").exists() and name in named.labels("local")["panes"].values()
+    return "local" if has else "beast"
 
 
-def test_a_rename_on_the_web_reaches_the_herdr_labels(named):
+def set_label(named, where, kind, name, label):
+    st = named.state(where)
+    key = "panes" if kind == "pane" else "tabs"
+    ident = next(i for i, v in st[key].items() if v.get("label") == name or (kind == "pane" and st["tabs"][v["tab_id"]]["label"] == name))
+    st[key][ident]["label"] = label
+    (named.log / f"state-{where}.json").write_text(json.dumps(st))
+
+
+def test_a_rename_on_the_web_reaches_the_pane_and_the_tab_but_not_the_workspace(named):
     agents = spawned(named)
     old = sorted(agents)[0]
     where = host_of(named, old)
     rename_in_web(named, old, "architect")
     named.r.once()
     labels = named.labels(where)
-    assert "architect" in labels["ws"].values() and "architect" in labels["tabs"].values() \
-        and "architect" in labels["panes"].values() and old not in labels["ws"].values()
+    assert "architect" in labels["tabs"].values() and "architect" in labels["panes"].values() and old not in labels["tabs"].values()
+    assert set(labels["ws"].values()) == {"herd-fleet"}
 
 
 def test_a_rename_in_herdr_reaches_the_web_and_is_tidied_to_a_valid_name(named):
     agents = spawned(named)
     old = sorted(agents)[0]
     where = host_of(named, old)
-    st = named.state(where)
-    pane = next(iter(st["panes"]))
-    st["panes"][pane]["label"] = "Fresh Name!"
-    (named.log / f"state-{where}.json").write_text(json.dumps(st))
+    set_label(named, where, "pane", old, "Fresh Name!")
     named.r.once()
     assert "fresh-name" in {a["name"] for a in named.w.s.list_my_agents(named.w.alice)["agents"]}
     labels = named.labels(where)
-    assert set(labels["ws"].values()) == set(labels["tabs"].values()) == set(labels["panes"].values()) == {"fresh-name"}
+    assert "fresh-name" in labels["tabs"].values() and "fresh-name" in labels["panes"].values() and "Fresh Name!" not in labels["panes"].values()
 
 
-def test_a_herdr_rename_to_a_taken_name_is_refused_and_herdr_is_set_back(named):
+def test_a_herdr_tab_rename_is_taken_too_and_a_taken_name_is_refused(named):
     agents = spawned(named)
     one, two = sorted(agents)
     where = host_of(named, one)
-    st = named.state(where)
-    st["ws"][next(iter(st["ws"]))]["label"] = two
-    (named.log / f"state-{where}.json").write_text(json.dumps(st))
+    set_label(named, where, "tab", one, two)                                  # herdr says: call me what the other agent is called
     named.r.once()
     assert {a["name"] for a in named.w.s.list_my_agents(named.w.alice)["agents"]} == {one, two}
-    assert set(named.labels(where)["ws"].values()) == {one}
+    assert one in named.labels(where)["tabs"].values()                       # set back
 
 
 def test_when_both_sides_changed_the_web_name_wins(named):
     agents = spawned(named)
     old = sorted(agents)[0]
     where = host_of(named, old)
-    st = named.state(where)
-    st["panes"][next(iter(st["panes"]))]["label"] = "from-herdr"
-    (named.log / f"state-{where}.json").write_text(json.dumps(st))
+    set_label(named, where, "pane", old, "from-herdr")
     rename_in_web(named, old, "from-web")
     named.r.once()
-    assert {"from-web"} <= {a["name"] for a in named.w.s.list_my_agents(named.w.alice)["agents"]}
-    assert set(named.labels(where)["panes"].values()) == {"from-web"}
+    assert "from-web" in {a["name"] for a in named.w.s.list_my_agents(named.w.alice)["agents"]}
+    assert "from-web" in named.labels(where)["panes"].values() and "from-herdr" not in named.labels(where)["panes"].values()
+
+
+def test_helpers_started_under_an_agent_split_its_tab_and_are_linked_as_its_children(named):
+    parent = spawned(named, count=1)
+    (pname, pagent), = parent.items()
+    where = host_of(named, pname)
+    named.w.s.request_spawn(named.w.alice, {"harness_type": "claude-code", "name_prefix": "helper", "count": 2,
+                                            "parent_agent_id": pagent["agent_id"]})
+    named.r.once()
+    st = named.state(where)
+    tab = next(t for t in st["tabs"].values() if t["label"] == pname)
+    assert tab["pane_count"] == 3 and len(st["tabs"]) == 1                    # two helpers, no new tab
+    helpers = [a for a in named.w.s.list_my_agents(named.w.alice)["agents"] if a["name"].startswith("helper-")]
+    assert len(helpers) == 2 and {st["panes"][p]["tab_id"] for p in st["panes"]} == {tab["tab_id"]}
+    assert {n for n in named.labels(where)["panes"].values()} == {pname, "helper-1", "helper-2"}
+    links = {a["name"]: a for a in named.w.s.agent_links(named.w.alice)["agents"]}
+    assert links["helper-1"]["parent_agent_id"] == pagent["agent_id"] and links["helper-1"]["instance_id"].startswith(f"pane:{'bender' if where == 'local' else where}:")
+    named.r.once()                                                            # a sync pass keeps the tab named after the parent
+    assert named.state(where)["tabs"][tab["tab_id"]]["label"] == pname
+
+
+def test_helpers_need_a_parent_the_runner_can_see(named):
+    info = named.w.s.connect_agent(named.w.alice, {"name": "nowhere"})
+    named.w.s.request_spawn(named.w.alice, {"harness_type": "claude-code", "name_prefix": "helper", "count": 1,
+                                            "parent_agent_id": info["agent_id"]})
+    named.r.once()
+    done = named.w.s.list_spawns(named.w.alice)["spawns"][0]
+    assert "parent" in done["error"] and done["placements"] == []
+    assert not any(a["name"].startswith("helper-") for a in named.w.s.list_my_agents(named.w.alice)["agents"])
 
 
 def test_an_agent_in_a_shared_workspace_only_gets_its_pane_labelled(named):
