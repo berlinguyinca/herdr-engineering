@@ -212,8 +212,8 @@ PREVIOUS_IMAGE="$(docker inspect -f '{{.Config.Image}}' herdr-cp-web 2>/dev/null
 echo "currently running: ${PREVIOUS_IMAGE:-nothing}"
 
 # What to roll back to: the commit recorded in the running image's receipt, deployed
-# again with THAT commit's compose files. Only a commit whose compose.yaml mounts the
-# fleet-config directory can run on this script's variables; anything older (or no
+# again with THAT commit's compose files. Only a commit whose compose.yaml carries
+# `x-herdr-deploy-layout: 2` can run on this script's variables; anything older (or no
 # receipt at all) gets no automatic rollback and a manual recipe instead.
 PREV_COMMIT=""; PREV_SHA=""; PREV_TAG=""; PREV_COLLAB_HASH=""; ROLLBACK_NOTE=""
 PREV_RECEIPT_TAG="${PREVIOUS_IMAGE#herdr-engineering:}"
@@ -236,8 +236,8 @@ else
   if ! [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]] \
       || ! git -C "$REPO" cat-file -e "$CANDIDATE^{commit}" 2>/dev/null; then
     ROLLBACK_NOTE="the receipt of $PREVIOUS_IMAGE names no commit present in this repository"
-  elif [[ "$PREV_COMPOSE" != *HERDR_CP_FLEET_DIR* ]]; then
-    ROLLBACK_NOTE="the running commit ${CANDIDATE:0:12} predates the directory-mounted central fleet config"
+  elif [[ "$PREV_COMPOSE" != *"x-herdr-deploy-layout: 2"* ]]; then
+    ROLLBACK_NOTE="the running commit ${CANDIDATE:0:12} predates the current deploy layout (directory-mounted central fleet config, no relative bind mounts)"
     PREV_COMMIT_OLD="$CANDIDATE"
   else
     PREV_COMMIT="$CANDIDATE"; PREV_SHA="${CANDIDATE:0:12}"; PREV_TAG="$PREV_RECEIPT_TAG"
