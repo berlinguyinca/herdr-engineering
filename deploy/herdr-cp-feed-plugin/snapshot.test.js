@@ -277,3 +277,13 @@ test("loop: a cache fallback never replaces a newer in-memory key", async () => 
   assert.deepEqual(h.keysUsed, ["k1", "k1", "k1", "k1", "k2", "k2", "k2", "k2"]);
   assert.equal(h.fleetCalls(), 3);
 });
+
+test("an empty api key (open control plane) sends no X-API-Key header at all", async () => {
+  const calls = [];
+  await publishSnapshot({ url: "http://control.test", apiKey: "" }, [{ n: 1 }], async (url, options) => {
+    calls.push(options);
+    return { ok: true, body: { cancel: async () => {} } };
+  });
+  assert.equal(calls.length, 1);
+  assert.equal("X-API-Key" in calls[0].headers, false);
+});

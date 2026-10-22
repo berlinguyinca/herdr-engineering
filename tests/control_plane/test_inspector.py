@@ -792,7 +792,8 @@ def test_every_mutating_route_is_refused_without_side_effects(server):
             assert st in (401, 403), (key, path, st)
     assert snapshot() == before
     assert call(server, "GET", f"/api/v1/sessions/{SID}/inspector", "nope")[0] == 401
-    assert call(server, "GET", "/api/v1/health", "")[0] == 401
+    st, body = call(server, "GET", "/api/v1/health", "")   # liveness only without a key
+    assert st == 200 and set(body) == {"status", "version", "commit"}
 
 
 def test_refused_post_closes_connection_so_the_body_cannot_be_smuggled(server):

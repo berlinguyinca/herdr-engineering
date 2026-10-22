@@ -10,10 +10,14 @@ sections:
     values:
       pg_dsn: "postgresql://REDACTED:REDACTED@postgres:5432/REDACTED"
       host_aliases: {}              # e.g. {bender: "bender.example.test"}
-      api_keys:                     # key: role (viewer | operator | ingest)
-        "REDACTED": operator
-        "REDACTED_INGEST": ingest   # the same value as ingest.api_key below
-        "REDACTED_AGENT": agent     # the same value as agent.api_key below (ingest + LLM keys + reviews)
+      # {} = open on the tailnet (the default `fleet config init` writes; the web port is
+      # bound to the tailnet interface and runs --allow-open).
+      # !!! KEYED MODE IS NOT SUPPORTED YET !!! Adding entries here (key: role, roles
+      # viewer | operator | ingest | agent) gates every route but /api/v1/health and the
+      # host endpoints. The browser dashboard, the llm-proxy and the emit hook do not
+      # send keys yet, so they all get 401 until they do. If you still enable it, put the
+      # ingest key in ingest.api_key and the agent key in agent.api_key below.
+      api_keys: {}
       rustfs_endpoint: "http://rustfs:9000"
       minio_user: "REDACTED"        # the object store's access key (what the web reads)
       minio_password: "REDACTED"
@@ -64,16 +68,17 @@ sections:
       token: "REDACTED"
 
   # Posted by every host's feeds as the control-plane API key (role ingest).
+  # Empty = send no X-API-Key (open control plane, the default).
   ingest:
     roles: [all]
     values:
-      api_key: "REDACTED_INGEST"
+      api_key: ""
 
   # Used by host-side tools (session run, review bridge): role agent.
   agent:
     roles: [all]
     values:
-      api_key: "REDACTED_AGENT"
+      api_key: ""
 
   fabric:
     roles: [all]

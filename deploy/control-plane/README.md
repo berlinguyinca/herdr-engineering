@@ -38,7 +38,8 @@ no `.env` to write or maintain.
 
 ```bash
 # 1) once: create the central file (prompts for the public URL, LLM and CI
-#    address/keys and the host list; generates Postgres/MinIO credentials and API keys)
+#    address/keys and the host list; generates Postgres/MinIO credentials. API keys
+#    stay off: control_plane.api_keys is {} and the control plane is open on the tailnet)
 herdr-eng fleet config init
 
 # 2) deploy: validates the file, renders the variables docker compose itself needs
@@ -107,10 +108,16 @@ Tailnet replaces API keys). **Do not** change the web bind address to `0.0.0.0`
 or drop the Tailnet-IP mapping — that would expose an unauthenticated admin API
 beyond the tailnet.
 
-**Optional RBAC (Spec §104).** If you still want key auth, run the standalone
-server (not this compose service): `herdr-eng control-plane web --api-keys
-'viewerkey=viewer,operatorkey=operator'` — viewer = read-only, operator = read +
-mutate.
+`fleet config init` keeps this posture: it writes `control_plane.api_keys: {}` and
+leaves `ingest.api_key` / `agent.api_key` empty, so hosts send no `X-API-Key` at all.
+
+**Optional RBAC (Spec §104) - not supported for the compose stack yet.** Keyed mode
+(entries in `control_plane.api_keys`, by hand or with `fleet config init
+--with-api-keys`) gates every route except `/api/v1/health` (which then answers only
+status, version and commit without a key) and the host endpoints. The browser
+dashboard, the llm-proxy and the emit hook do not send keys yet, so turning keys on
+breaks them until they do. viewer = read-only, operator = read + mutate, ingest =
+POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting.
 
 Run the same server standalone from the host:
 

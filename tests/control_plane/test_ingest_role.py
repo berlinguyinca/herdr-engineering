@@ -101,7 +101,7 @@ def test_operator_and_unknown_keys(server):
     # unknown key is unauthorized, not read-only
     assert _post(base, "/api/v1/ingest", _ingest_body(),
                 key="nope") == 401
-    assert _get(base, "/api/v1/health", key="nope") == 401
+    assert _get(base, "/api/v1/missions", key="nope") == 401
 
 
 @pytest.fixture()

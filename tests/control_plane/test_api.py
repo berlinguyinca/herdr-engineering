@@ -223,10 +223,10 @@ def test_auth_required_when_key_set():
     svr.wait_until_ready()
     c = Client(svr.port)
     try:
-        status, _, _ = c.get("/api/v1/health")
+        status, _, _ = c.get("/api/v1/missions")   # health stays open (liveness only)
         assert status == 401
         req = urllib.request.Request(
-            f"http://127.0.0.1:{svr.port}/api/v1/health",
+            f"http://127.0.0.1:{svr.port}/api/v1/missions",
             headers={"X-API-Key": "sekret"})
         with urllib.request.urlopen(req) as r:
             assert r.status == 200
