@@ -128,23 +128,29 @@ def _inbox(service: CollabService, pr, wait: float) -> dict:
 
 
 HELPER_WAIT_MAX = 20.0
+_HELPER_LIVE_STATUS = ("requested", "claimed", "running")
 
 
-def _helper_wait(service: CollabService, pr, helper_id: str, wait: float) -> dict:
-    """Block (at most `wait` s, never more than 20) until the helper is no longer live; return its result view."""
+def _helper_wait(service: CollabService, pr, helper_id: str, wait: float, *, strict: bool = True) -> dict:
+    """Block (at most `wait` s, never more than 20) until the helper is no longer live; return its result view.
+    A helper already finished returns at once. At the waiter cap: 429 if `strict`, else the current view."""
     wait = min(max(wait, 0.0), HELPER_WAIT_MAX)
     deadline = time.monotonic() + wait
+    out = service.helper_result(pr, helper_id)       # the service decides who may read it
+    if out["status"] not in _HELPER_LIVE_STATUS:
+        return out
     with _waiters_lock:
         if _waiters.get(pr.id, 0) >= MAX_WAITERS:
-            raise CollabError(429, "too many waiting calls")
+            if strict:
+                raise CollabError(429, "too many waiting calls")
+            return out
         _waiters[pr.id] = _waiters.get(pr.id, 0) + 1
     try:
         while True:
             seen = service.seq
-            out = service.helper_result(pr, helper_id)       # the service decides who may read it
+            out = service.helper_result(pr, helper_id)
             left = deadline - time.monotonic()
-            if out["status"] not in ("requested", "claimed", "running") or left <= 0 \
-                    or not service.still_valid(pr):
+            if out["status"] not in _HELPER_LIVE_STATUS or left <= 0 or not service.still_valid(pr):
                 return out
             service.wait_for_change(seen, min(2.0, left))
     finally:
@@ -163,7 +169,7 @@ def _helper_call(service: CollabService, pr, name: str, args: dict) -> dict:
         rec = service.request_helper(pr, body)
         if not wait:
             return _text({"helper_id": rec["helper_id"], "status": rec["status"]})
-        return _text(_helper_wait(service, pr, rec["helper_id"], HELPER_WAIT_MAX), untrusted=True)
+        return _text(_helper_wait(service, pr, rec["helper_id"], HELPER_WAIT_MAX, strict=False), untrusted=True)
     if set(args) - {"helper_id", "seconds"} or (name != "helper_wait" and "seconds" in args):
         raise CollabError(400, "unknown argument")
     hid = args.get("helper_id")

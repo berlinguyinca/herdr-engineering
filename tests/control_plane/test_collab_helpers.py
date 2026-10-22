@@ -765,3 +765,34 @@ def test_mcp_spawn_wait_is_capped_at_twenty_seconds(w, monkeypatch):
     monkeypatch.setattr(w.s, "wait_for_change", lambda seq, t: clock.__setitem__(0, clock[0] + t))
     out, _ = _mcp(w, w.root, "helper_spawn", room_id=w.room, role="reviewer", task=SECRET_TASK, wait=True)
     assert out["helper_id"] and out["status"] == "requested" and 19.0 <= clock[0] <= 20.0 + 1e-9
+
+
+def test_mcp_spawn_wait_at_the_waiter_cap_still_returns_the_helper_id(w, monkeypatch):
+    from herdr_engineering.control_plane import collab_mcp
+    monkeypatch.setitem(collab_mcp._waiters, w.root.id, collab_mcp.MAX_WAITERS)
+    out, _ = _mcp(w, w.root, "helper_spawn", room_id=w.room, role="reviewer", task=SECRET_TASK, wait=True)
+    assert out["helper_id"] and out["status"] == "requested"
+    assert w.s.helper_status(w.root, out["helper_id"])["status"] == "requested"
+
+
+def test_mcp_wait_at_the_cap_is_429_for_a_live_helper_but_not_a_finished_one(w, monkeypatch):
+    from herdr_engineering.control_plane import collab_mcp
+    rec = ask(w)
+    run(w, rec["helper_id"])
+    monkeypatch.setitem(collab_mcp._waiters, w.root.id, collab_mcp.MAX_WAITERS)
+    with pytest.raises(collab.CollabError) as e:
+        collab_mcp._call(w.s, w.root, "helper_wait", {"helper_id": rec["helper_id"]})
+    assert e.value.status == 429
+    w.s.finish_helper(w.op, rec["helper_id"], {"status": "done", "result": "ok"})
+    out, _ = _mcp(w, w.root, "helper_wait", helper_id=rec["helper_id"])
+    assert out["status"] == "done" and out["result"] == "ok"
+
+
+def test_mcp_cross_owner_read_wait_cancel_is_404(w):
+    from herdr_engineering.control_plane import collab_mcp
+    rec = ask(w)
+    bob_agent, _ = w.agent("bob", actions=("read",))
+    for tool in ("helper_result", "helper_wait", "helper_cancel"):
+        with pytest.raises(collab.CollabError) as e:
+            collab_mcp._call(w.s, bob_agent, tool, {"helper_id": rec["helper_id"]})
+        assert e.value.status == 404
