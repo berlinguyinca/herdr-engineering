@@ -51,7 +51,7 @@ agent_summaries:
   enabled: true
   endpoint: http://agent-summary-model:8080/v1
   model: qwen2.5-1.5b-instruct-q4_k_m
-  timeout_seconds: 45
+  timeout_seconds: 90
   max_output_tokens: 350
 ```
 
@@ -61,6 +61,11 @@ or `GET /api/v1/sessions/{id}/summary`. A valid cached summary remains visible w
 new conversation content is pending, or when inference is temporarily unavailable.
 The UI reports the model and source coverage; summaries cover the bounded retained
 conversation, not missing historical messages.
+
+The deployed CPU profile uses a 90-second timeout: one retained conversation took
+40.3 seconds, and a larger one completed in 84.5 seconds after exceeding the
+earlier 45-second budget. This is background work; cached summaries remain available while
+generation runs. Short synthetic benchmarks do not predict full-window latency.
 
 The endpoint is directly attached to this dedicated model. Do not substitute the
 shared gateway's unknown-model fallback: a misspelled alias could otherwise use an
