@@ -352,6 +352,7 @@ def test_a_reviewer_sees_its_parents_work_read_only_and_a_worker_does_not(hr):
     parent = hr.home / "herdr-agents/work/lead"
     parent.mkdir(parents=True)
     (parent / "main.py").write_text("x = 1\n")
+    hr.w.s.link_agent(hr.w.alice, hr.w.root_info["agent_id"], {"instance_id": "pane:beast:w9:p1"})   # an own agent
     h = ask(hr, role="reviewer")
     until(hr, finished(hr, h["helper_id"]))
     assert report(hr, h["helper_id"])[0]["view"] == ["main.py"]
@@ -537,3 +538,36 @@ def test_the_catalogue_is_posted_normalized_and_skips_odd_ids(hr, gateway):
 def test_without_a_gateway_nothing_is_posted(hr):
     hr.mk().catalogue_cycle()
     assert hr.w.s._catalogue == [] and any("no gateway" in m for m in hr.said)
+
+
+@needs_box
+def test_someone_elses_reviewer_named_like_an_operator_agent_gets_no_view(hr):
+    w = hr.w
+    pid = w.s.create_project(w.bob, {"name": "bp"})["project_id"]
+    broom = w.s.create_room(w.bob, pid, {"name": "br"})["room_id"]
+    w.s.set_room_profile(w.bob, broom, {"allowed_families": ["claude-code"]})
+    bagent, _ = w.agent("bob", actions=("read", "post", "spawn_helpers"), room=broom, name="bobby")
+    (hr.home / "herdr-agents/work/bobby").mkdir(parents=True)          # e.g. an operator agent of that name
+    (hr.home / "herdr-agents/work/bobby/private.txt").write_text("operator work")
+    h = ask(hr, agent=bagent, room=broom, role="reviewer")
+    until(hr, finished(hr, h["helper_id"], bagent))
+    info, res = report(hr, h["helper_id"], bagent)
+    assert info["view"] is None and "operator work" not in res
+
+
+@needs_box
+def test_a_paused_helper_stops_even_when_the_fleet_path_fails(hr, monkeypatch):
+    h = ask(hr, task="SLEEP until stopped")
+    until(hr, running(hr, h["helper_id"]))
+    r = hr.mk()
+    r.ok("POST", "fleet/helpers/pause", {"paused": True})
+    real = r.ok
+
+    def broken(method, path, body=None):
+        if path.startswith("fleet/spawns") or path == "config":
+            raise runner.Failure("GET config: 500")
+        return real(method, path, body)
+    monkeypatch.setattr(r, "ok", broken)
+    with pytest.raises(runner.Failure):
+        r.once()
+    assert not list(hr.state.iterdir()) and procs_with(str(hr.state)) == []

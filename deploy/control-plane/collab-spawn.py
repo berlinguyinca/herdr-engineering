@@ -731,7 +731,7 @@ class Runner:
     def helpers_dir(self) -> Path:
         return self.state / "helpers"
 
-    def helpers_cycle(self, local_ok: bool = True) -> None:
+    def helpers_cycle(self, local_ok: bool = True, claim: bool = True) -> None:
         """Watch the helpers this host runs (finish, stop, refresh their host list), then claim new ones. Every
         cycle is a new process: all that is known about a running helper is in its private state directory."""
         if self.sandbox_path is None:
@@ -747,7 +747,7 @@ class Runner:
                 self.watch_helper(d, live.get(d.name), paused)
             except Exception as exc:                          # noqa: BLE001  (one helper must not stall the rest)
                 self.say(f"helper {d.name}: {trim(exc)}")
-        if paused or not local_ok:
+        if paused or not local_ok or not claim:
             return
         have = set(self.families.get(self.host_id, []))
         busy = sum(1 for p in self.helpers_dir.iterdir() if p.is_dir()) if self.helpers_dir.is_dir() else 0
@@ -904,7 +904,11 @@ class Runner:
         binds = []
         req = c.get("requester") if isinstance(c.get("requester"), dict) else {}
         rname = req.get("name")
-        if role in ("reviewer", "debugger") and isinstance(rname, str) and NAME.fullmatch(rname):
+        # Only the operator's own agents (fleet/agent-links) have work directories here, and names are not unique
+        # across owners: anyone else's agent named like one of them must not get a view of that agent's work.
+        link = next((a for a in self.ok("GET", "fleet/agent-links").get("agents") or []
+                     if isinstance(a, dict) and a.get("agent_id") == req.get("agent_id")), None)
+        if role in ("reviewer", "debugger") and link and isinstance(rname, str) and NAME.fullmatch(rname):
             p = area / rname
             if p.is_dir() and not p.is_symlink():
                 binds.append(str(p))
@@ -936,7 +940,7 @@ class Runner:
             "work": str(work), "cmd": cmd, "deadline": st["deadline"], "sock": str(sock_dir / "egress.sock"),
             "services": [sv["name"] for sv in services], "ro_binds": binds,
             "ssh_dir": str(ssh_dir) if ssh_dir else None}))
-        pane, tab, own_tab = self.helper_pane(c, name)
+        pane, tab, own_tab = self.helper_pane(c, name, link)
         st.update(pane=pane, phase="launching", since=time.time())
         self.save_state(d, st)
         self.launch_helper(d, st, helper_prompt(role, binds) + c["task"])
@@ -957,7 +961,7 @@ class Runner:
             pass    # cosmetic
         self.say(f"helper {hid}: started {name} ({role}, {c.get('family')})")
 
-    def helper_pane(self, c: dict, name: str) -> tuple[str, str | None, bool]:
+    def helper_pane(self, c: dict, name: str, link: dict | None) -> tuple[str, str | None, bool]:
         """A split of the requesting agent's pane when that agent is the operator's own and sits in a pane on THIS
         host (fleet/agent-links lists only the operator's agents: anyone else could point a link at the operator's
         panes); otherwise a tab of its own in the workspace herd-<requester>. Returns (pane, tab, own tab)."""
@@ -965,8 +969,6 @@ class Runner:
         rname = req.get("name")
         prefix = rname if isinstance(rname, str) and NAME.fullmatch(rname) else "helpers"
         parent = None
-        link = next((a for a in self.ok("GET", "fleet/agent-links").get("agents") or []
-                     if isinstance(a, dict) and a.get("agent_id") == req.get("agent_id")), None)
         t = link_target(link.get("instance_id")) if link else None
         if t and t[0] == self.host_id:
             panes, _, _ = self.herdr_state(self.host_id)
@@ -1173,6 +1175,10 @@ class Runner:
 
     # ------------------------------------------------------------ one cycle
     def once(self) -> None:
+        try:        # the panic switch, revokes and expiry apply first, whatever happens to the fleet path below
+            self.helpers_cycle(claim=False)
+        except Failure as exc:
+            self.say(f"helpers: {trim(exc)}")
         self.public_url = (self.ok("GET", "config") or {}).get("public_url", "")
         if not self.public_url.startswith("https://"):
             raise Failure("the service has no public https url to give agents")
@@ -1193,7 +1199,7 @@ class Runner:
             elif status != 409:
                 self.say(f"claim {sp['spawn_id']}: {status}")
         try:
-            self.helpers_cycle(local_ok=self.host_id in eligible)
+            self.helpers_cycle(local_ok=self.host_id in eligible)       # watches again, then claims
         except Failure as exc:
             self.say(f"helpers: {trim(exc)}")
         try:
