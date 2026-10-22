@@ -88,6 +88,7 @@ MAX_PROFILE_HOSTS = 50
 MAX_PROFILE_SERVICES = 20
 MAX_PROFILE_NAMES = 50
 _PROFILE_HOST = re.compile(r"[a-z0-9.-]+:\d{1,5}", re.ASCII)
+_EGRESS_HOST = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", re.ASCII)
 _PROFILE_SECRET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", re.ASCII)   # a NAME that refers to a host file, never a value
 _PROFILE_SERVICE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}", re.ASCII)
 _PROFILE_HEADER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}", re.ASCII)
@@ -105,6 +106,7 @@ MAX_OPEN_EGRESS = 60             # open host-access requests per room
 EGRESS_OPEN_TTL = 86400.0        # an unanswered request stops counting (and deduping) after this
 EGRESS_DENY_WINDOW = 3600.0      # a denied host cannot be re-requested for this long
 EGRESS_DEFAULT_TTL = 86400.0
+EGRESS_KEEP = 7 * 86400.0        # decided rows stay listed this long past their decision / expiry, then are pruned
 EGRESS_MAX_TTL = 30 * 86400.0
 MAX_SPAWN_AGENTS = 20            # agents one fleet start may place on the owner's hosts
 MAX_OPEN_SPAWNS = 3              # requests waiting for, or held by, the runner
@@ -1656,12 +1658,9 @@ class CollabService:
     @staticmethod
     def _egress_host_port(host: Any, port: Any) -> str:
         if (not isinstance(host, str) or isinstance(port, bool) or not isinstance(port, int)
-                or not 1 <= port <= 65535 or len(host) > 253):
+                or not 1 <= port <= 65535 or len(host) > 253 or not _EGRESS_HOST.fullmatch(host)):
             raise CollabError(400, "invalid host or port")
-        hp = f"{host}:{port}"
-        if not _PROFILE_HOST.fullmatch(hp):
-            raise CollabError(400, "invalid host or port")
-        return hp
+        return f"{host}:{port}"
 
     def _egress_live(self, room_id: str, now: float) -> set[str]:
         return {r["host_port"] for r in self._egress.values()
@@ -1678,11 +1677,14 @@ class CollabService:
     def request_egress(self, pr: Principal, room_id: str, agent_id: str, host: Any, port: Any) -> dict:
         self._require_operator(pr)
         hp = self._egress_host_port(host, port)
+        if not isinstance(room_id, str):
+            raise CollabError(400, "invalid room id")
         if not isinstance(agent_id, str) or not agent_id or len(agent_id) > 128:
             raise CollabError(400, "invalid agent id")
         with self._lock:
             if room_id not in self._rooms:
                 raise CollabError(404, "not found")
+            self._housekeeping()
             now = self._now()
             if hp in self.egress_allowlist(room_id):
                 return {"state": "allowed", "host_port": hp}
@@ -1705,7 +1707,11 @@ class CollabService:
 
     def list_egress(self, pr: Principal, room_id: str | None = None) -> dict:
         self._require_user(pr)
+        if room_id is not None and not isinstance(room_id, str):
+            raise CollabError(400, "invalid room id")
         with self._lock:
+            self._housekeeping()
+            now = self._now()
             if not pr.admin:
                 owned = {rid for rid, room in self._rooms.items()
                          if (self._member(room, pr.id) or {}).get("role") == "owner"}
@@ -1714,13 +1720,16 @@ class CollabService:
             else:
                 owned = set(self._rooms)
             rows = [dict(r) for r in self._egress.values()
-                    if r["room_id"] in owned and (room_id is None or r["room_id"] == room_id)]
+                    if r["room_id"] in owned and (room_id is None or r["room_id"] == room_id)
+                    and not (r["state"] == "open" and now - r["created_epoch"] >= EGRESS_OPEN_TTL)]
             rows.sort(key=lambda r: (r["created_epoch"], r["id"]))
             return {"requests": rows}
 
     def decide_egress(self, pr: Principal, request_id: str, decision: Any,
                       ttl_seconds: Any = EGRESS_DEFAULT_TTL) -> dict:
         self._require_operator(pr)
+        if not isinstance(request_id, str):
+            raise CollabError(400, "invalid request id")
         if decision not in ("approve", "deny"):
             raise CollabError(400, "decision must be approve or deny")
         if (isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float))
@@ -1733,6 +1742,8 @@ class CollabService:
             if r["state"] != "open":
                 raise CollabError(409, "already decided")
             now = self._now()
+            if now - r["created_epoch"] >= EGRESS_OPEN_TTL:
+                raise CollabError(409, "expired: ask again")
             approve = decision == "approve"
             self._commit("egress_decided", self._actor(
                 pr, room_id=r["room_id"], request_id=request_id, state="approved" if approve else "denied",
@@ -1763,13 +1774,17 @@ class CollabService:
             return {"allowlist": self.egress_allowlist(room_id)}
 
     def _promote_target(self, room_id: str, host_port: Any) -> str:
-        if not isinstance(host_port, str) or not _PROFILE_HOST.fullmatch(host_port) or len(host_port) > 260:
+        if not isinstance(room_id, str):
+            raise CollabError(400, "invalid room id")
+        if not isinstance(host_port, str) or len(host_port) > 260 or not _PROFILE_HOST.fullmatch(host_port):
             raise CollabError(400, "invalid host:port")
-        if not 1 <= int(host_port.rsplit(":", 1)[1]) <= 65535:
+        host, port = host_port.rsplit(":", 1)
+        if not 1 <= int(port) <= 65535:
             raise CollabError(400, "invalid host:port")
+        hp = self._egress_host_port(host, int(port))        # canonical: a.org:0443 is a.org:443
         if room_id not in self._rooms:
             raise CollabError(404, "not found")
-        return host_port
+        return hp
 
     def grant_agent(self, pr: Principal, room_id: str, body: dict, _bulk: bool = False) -> dict:
         """The room owner grants an agent its permissions directly. Anyone else who may bring an
@@ -2172,6 +2187,7 @@ class CollabService:
         """Bound memory: finished tasks and closed requests older than their window drop out of the
         in-memory index (the append-only log keeps the history)."""
         now = self._now()
+        self._prune_egress()
         for tid in [i for i, t in self._tasks.items()
                     if self._task_status(t) not in ("pending", "accepted") and now - t["created_epoch"] > 7 * 86400]:
             t = self._tasks.pop(tid)
@@ -2182,6 +2198,14 @@ class CollabService:
             r = self._requests.pop(rid)
             self._requests_by_room[r["room_id"]].discard(rid)
             self._requests_by_agent[r["agent_id"]].discard(rid)
+
+    def _prune_egress(self) -> None:
+        now = self._now()
+        for rid in [i for i, r in self._egress.items()
+                    if (r["state"] == "open" and now - r["created_epoch"] >= EGRESS_OPEN_TTL + EGRESS_KEEP)
+                    or (r["state"] != "open" and now - (r["expires_at"] or r["decided_epoch"] or 0) >= EGRESS_KEEP
+                        and now - r["decided_epoch"] >= EGRESS_KEEP)]:
+            del self._egress[rid]
 
     def _creator_valid(self, t: dict, room: dict) -> bool:
         """A task is only as good as its requester's CURRENT authority."""
@@ -2507,6 +2531,9 @@ class CollabService:
                         return 200, self.list_egress(pr)
                     if n == 3 and parts[1] == "egress":
                         self._require_operator(pr)
+                        with self._lock:
+                            if parts[2] not in self._rooms:
+                                raise CollabError(404, "not found")
                         return 200, {"allowlist": self.egress_allowlist(parts[2])}
                     if parts == ["fleet", "spawns"]:
                         st = str(query["status"]) if "status" in query else None

@@ -164,3 +164,66 @@ def test_routes_are_operator_listener_only(w):
                           ("POST", ["fleet", "egress", "request"]), ("POST", ["fleet", "egress", r["id"], "decide"]),
                           ("POST", ["fleet", "egress", "promote"]), ("POST", ["fleet", "egress", "remove"])):
         assert call(method, parts, operator=None, auth=tok)[0] == 404      # the public listener never sees them
+
+
+def test_stale_open_request_cannot_be_decided_is_hidden_and_swept(w):
+    from herdr_engineering.control_plane.collab import EGRESS_KEEP, EGRESS_OPEN_TTL
+    r = ask(w)
+    w.s.clock.t += EGRESS_OPEN_TTL + 1
+    assert code(w.s.decide_egress, w.op, r["id"], "approve") == 409
+    assert w.s.list_egress(w.op)["requests"] == []
+    assert w.s.list_egress(w.alice, w.room)["requests"] == []
+    again = ask(w)                                          # a fresh request, not the stale one
+    assert again["state"] == "open" and again["id"] != r["id"]
+    assert r["id"] in w.s._egress
+    w.s.clock.t += EGRESS_KEEP + EGRESS_OPEN_TTL
+    w.s._housekeeping()
+    assert r["id"] not in w.s._egress
+
+
+def test_old_decided_rows_are_swept_but_live_approvals_stay(w):
+    from herdr_engineering.control_plane.collab import EGRESS_KEEP
+    d = ask(w, host="d.example.org")
+    w.s.decide_egress(w.op, d["id"], "deny")
+    a = ask(w)
+    w.s.decide_egress(w.op, a["id"], "approve", ttl_seconds=30 * 86400)
+    w.s.clock.t += EGRESS_KEEP + 10
+    w.s._housekeeping()
+    assert d["id"] not in w.s._egress and a["id"] in w.s._egress
+    assert "api.example.org:443" in w.s.egress_allowlist(w.room)
+
+
+def test_promote_and_remove_canonicalise_the_port(w):
+    w.s.promote_egress(w.op, w.room, "a.org:0443")
+    assert "a.org:443" in w.s.egress_allowlist(w.room)
+    w.s.promote_egress(w.op, w.room, "a.org:443")           # duplicate promote adds nothing
+    assert w.s._profile(w.room)["permanent_hosts"] == ["a.org:443"]
+    w.s.remove_egress(w.op, w.room, "a.org:00443")
+    assert "a.org:443" not in w.s.egress_allowlist(w.room)
+
+
+def test_promote_beyond_the_cap_is_refused(w):
+    from herdr_engineering.control_plane.collab import MAX_PROFILE_HOSTS
+    for i in range(MAX_PROFILE_HOSTS):
+        w.s.promote_egress(w.op, w.room, f"h{i}.example.org:80")
+    assert code(w.s.promote_egress, w.op, w.room, "extra.example.org:80") == 400
+    w.s.promote_egress(w.op, w.room, "h0.example.org:80")   # already present: still fine
+
+
+@pytest.mark.parametrize("host", ["..", "-", ".:1", ".a.org", "a.org.", "-a.org", "a.org\n", "a.org ", "é.org"])
+def test_malformed_hosts_are_refused(w, host):
+    assert code(ask, w, host=host) == 400
+    assert code(w.s.promote_egress, w.op, w.room, f"{host}:443") == 400
+
+
+def test_non_string_ids_are_400_not_a_crash(w):
+    for bad in ([], {}, 5, None):
+        assert code(w.s.request_egress, w.op, bad, "a1", "a.org", 443) == 400
+        assert code(w.s.promote_egress, w.op, bad, "a.org:443") == 400
+        assert code(w.s.remove_egress, w.op, bad, "a.org:443") == 400
+        assert code(w.s.decide_egress, w.op, bad, "approve") == 400
+        assert code(w.s.list_egress, w.op, bad) == 400 if bad is not None else True
+
+
+def test_allowlist_route_for_an_unknown_room_is_404(w):
+    assert w.s.dispatch("GET", ["fleet", "egress", "no-such-room"], {}, {}, "", None, operator="mallory")[0] == 404
