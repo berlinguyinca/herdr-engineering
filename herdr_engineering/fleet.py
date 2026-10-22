@@ -83,6 +83,52 @@ def _expected_hosts(inventory: Path, host: str | None) -> list[str]:
     return [host] if host else sorted(hosts)
 
 
+def _optional_hosts(inventory: Path, hosts: list[str]) -> list[str]:
+    """Hosts marked `herdr_fleet_optional: true`, inline in the inventory or in host_vars.
+
+    An optional host (a laptop that comes and goes) may be unreachable without failing
+    the fleet update; every other host is still required.
+    """
+    import yaml
+
+    def flagged(vars_: object) -> bool:
+        return isinstance(vars_, dict) and vars_.get("herdr_fleet_optional") is True
+
+    try:
+        data = yaml.safe_load(inventory.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+    inline: dict[str, object] = {}
+
+    def walk(node: dict) -> None:
+        inline.update(node.get("hosts") or {})
+        for child in (node.get("children") or {}).values():
+            walk(child or {})
+
+    walk(data.get("all", {}).get("children", {}).get("herdr_fleet", {}) or {})
+    result = []
+    for name in hosts:
+        marked = flagged(inline.get(name))
+        try:
+            marked = marked or flagged(yaml.safe_load(
+                (inventory.parent / "host_vars" / f"{name}.yml").read_text()))
+        except (OSError, yaml.YAMLError):
+            pass
+        if marked:
+            result.append(name)
+    return result
+
+
+def _absent_optional(inventory: Path, optional: list[str]) -> list[str]:
+    """Optional hosts that do not answer an Ansible ping right now."""
+    absent = []
+    for name in optional:
+        rc, _, _ = _run(["ansible", "-i", str(inventory), name, "-m", "ping", "-T", "20"], timeout=90)
+        if rc != 0:
+            absent.append(name)
+    return absent
+
+
 def _is_revision(value: str) -> bool:
     return re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is not None
 
@@ -236,6 +282,15 @@ def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:2999
             pi_revision is not None and not _is_revision(pi_revision)):
         report["error"] = "Release revisions must be full immutable commit IDs"
         return report
+    # A whole-fleet run tolerates an absent optional host (a laptop); a run that names
+    # the host explicitly does not, and every non-optional host stays required.
+    absent_optional: list[str] = []
+    if host is None:
+        absent_optional = _absent_optional(inv, _optional_hosts(inv, expected_hosts))
+    report["absent_optional"] = absent_optional
+    if absent_optional:
+        expected_hosts = [name for name in expected_hosts if name not in absent_optional]
+    limit = host or (",".join(expected_hosts) if absent_optional else None)
 
     # Even --no-pull must not label modified source with its clean commit ID.
     ok, dirty = step("controller_clean", ["git", "-C", str(root), "status",
@@ -326,12 +381,12 @@ def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:2999
     if pi_revision:
         variables["pi_engineering_revision"] = pi_revision
     cmd = ["ansible-playbook", "-i", str(inv), str(playbook), "-e", json.dumps(variables)]
-    if host:
-        cmd += ["-l", host]
+    if limit:
+        cmd += ["-l", limit]
     ok, out = step("fleet_sync", cmd, 1800)
     # Ansible usually puts host/task failures in stdout, not stderr.
     report["steps"]["fleet_sync"]["stdout"] = out[-4000:]
-    report["status"] = fleet_status(inventory=inv, host=host)
+    report["status"] = fleet_status(inventory=inv, host=limit)
     report["steps"]["revision_parity"] = _parity(
         report["status"], expected_hosts, revision, pi_revision, expected_build_gate=gate_checksum)
     report["ok"] = (ok and report["status"].get("rc") == 0
