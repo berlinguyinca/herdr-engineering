@@ -65,6 +65,7 @@ FAMILY_CMD_TOOLS = {
     "agent": "",
 }
 FAMILY_CMD = FAMILY_CMD_TOOLS       # every family the runner knows; which are started depends on --allow-tools
+FAMILY_ROLE = {"claude-code": "claude", "codex": "codex", "pi": "pi", "agent": "agent"}
 FAMILY_BIN = {"claude-code": "claude", "codex": "codex", "pi": "pi"}
 AGENT_DIR = "herdr-agents"
 
@@ -137,6 +138,14 @@ class Runner:
             if (m.get("enabled") is True and isinstance(label, str) and isinstance(target, str)
                     and HOST.fullmatch(label) and SSH_TARGET.fullmatch(target)):
                 self.targets.setdefault(label, target)      # the ssh target herdr itself uses for this machine
+        # One machine, one host: a second label for the same ssh target would be a way round "no automatic
+        # agents", so only the first label (alphabetically) for a target counts.
+        seen: set[str] = set()
+        for label in sorted(k for k, v in self.targets.items() if v is not None):
+            t = self.targets[label]
+            if t in seen:
+                del self.targets[label]
+            seen.add(t)
 
     def reachable(self) -> list[str]:
         """Probe each machine at most once a minute (a probe is an ssh round trip)."""
@@ -229,6 +238,22 @@ class Runner:
             self.ok("POST", f"agents/{agent['agent_id']}/link", {"instance_id": f"pane:{host}:{pane}"})
         except Exception:
             pass    # cosmetic: the agent works without the link
+        self.report_session(host, pane, family, name)
+
+    def report_session(self, host: str, pane: str, family: str, name: str) -> None:
+        """Tell the fabric about the pane, so the agent shows up with a host and status even before (or
+        without) herdr's own plugin reporting an agent in it. Best effort and cosmetic. The host id is the
+        fabric's name for this machine, which is what the plugin reports: the herdr label."""
+        env = {"entity_type": "session", "entity_id": f"collab:{host}:{pane}", "event_type": "session.start",
+               "source": "collab-spawn",
+               "payload": {"host_id": host, "pane_id": pane, "agent_role": FAMILY_ROLE.get(family, ""),
+                           "mission_id": pane.split(":", 1)[0], "summary": f"collab agent {name}", "status": "active"}}
+        try:
+            req = urllib.request.Request(f"{self.url}/api/v1/ingest", data=json.dumps(env).encode(), method="POST",
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10).close()          # noqa: S310 (operator-configured URL)
+        except (OSError, ValueError):
+            pass
 
     # ------------------------------------------------------------ one request
     def pick_host(self, eligible: list[str]) -> str | None:
