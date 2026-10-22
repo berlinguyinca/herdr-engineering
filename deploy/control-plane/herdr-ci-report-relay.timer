@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for native InferWeave CI test reports every two minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+RandomizedDelaySec=10s
+Unit=herdr-ci-report-relay.service
+
+[Install]
+WantedBy=timers.target
