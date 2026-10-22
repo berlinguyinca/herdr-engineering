@@ -1,5 +1,6 @@
 """deploy.sh / deploy-fleet-agents.sh, exercised by subprocess with a stub `docker`
 on PATH (nothing real is ever built, started or contacted)."""
+import json
 import os
 import stat
 import subprocess
@@ -44,31 +45,69 @@ def env(tmp_path):
     bindir.mkdir()
     log = tmp_path / "docker.log"
     stub = bindir / "docker"
-    # Records each call; on `compose ... up` it snapshots the --env-file it was given
-    # (existence, mode, directory mode) and fails when FAIL_COMPOSE is set.
+    running = tmp_path / "running-tag"
+    # Records each call. `inspect` answers $STUB_RUNNING_IMAGE. On `compose ... up` it
+    # snapshots the --env-file (mode, dir mode), the -f files and the image tag, fails
+    # when FAIL_COMPOSE is set or the tag is in FAIL_COMPOSE_TAGS, and otherwise records
+    # the tag as "running" (what the stub curl's health answer reports).
     stub.write_text(f"""#!/usr/bin/env bash
 echo "docker $*" >> {log}
+if [ "$1" = inspect ]; then
+  [ -n "${{STUB_RUNNING_IMAGE:-}}" ] || exit 1
+  echo "$STUB_RUNNING_IMAGE"; exit 0
+fi
 if [ "$1" = compose ]; then
   echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}} llmdir=${{HERDR_LLM_SLICE_DIR:-}}" >> {log}
   if [ -n "${{HERDR_LLM_SLICE_DIR:-}}" ]; then echo "llmslice $(cat "$HERDR_LLM_SLICE_DIR/llm-config.json" | tr -d '\n')" >> {log}; fi
-  prev=""
+  prev=""; files=""; up=0
   for a in "$@"; do
     if [ "$prev" = --env-file ]; then
       echo "envfile $a mode=$(stat -c %a "$a") dirmode=$(stat -c %a "$(dirname "$a")")" >> {log}
     fi
+    if [ "$prev" = -f ]; then files="$files $a"; fi
+    [ "$a" = up ] && up=1
     prev="$a"
   done
-  [ -n "${{FAIL_COMPOSE:-}}" ] && exit 1
+  echo "composefiles tag=${{HERDR_CP_IMAGE_TAG:-}}$files" >> {log}
+  if [ "$up" = 1 ]; then
+    [ -n "${{FAIL_COMPOSE:-}}" ] && exit 1
+    case " ${{FAIL_COMPOSE_TAGS:-}} " in *" ${{HERDR_CP_IMAGE_TAG:-}} "*) exit 1 ;; esac
+    echo "${{HERDR_CP_IMAGE_TAG:-}}" > {running}
+  fi
 fi
 exit 0
 """)
     stub.chmod(0o755)
+    # curl: the health URL reports the running tag (unless listed in STUB_UNHEALTHY_TAGS);
+    # anything else (collab-sync's JWKS fetch) gets a key set. Nothing leaves the machine.
+    curl = bindir / "curl"
+    curl.write_text(f"""#!/usr/bin/env bash
+out=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o|-m) [ "$1" = -o ] && out="$2"; shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac
+done
+echo "curl $url" >> {log}
+case "$url" in
+  *api/v1/health*)
+    tag="$(cat {running} 2>/dev/null)"
+    [ -n "$tag" ] || exit 7
+    case " ${{STUB_UNHEALTHY_TAGS:-}} " in *" $tag "*) exit 22 ;; esac
+    echo '{{"status":"ok","commit":"'"$tag"'"}}' ;;
+  *) echo '{{"keys":[{{"kid":"k"}}]}}' > "${{out:-/dev/stdout}}" ;;
+esac
+""")
+    curl.chmod(0o755)
+    for name, body in (("aws", 'echo \'["user-a"]\''), ("systemctl", "exit 0")):
+        (bindir / name).write_text(f"#!/usr/bin/env bash\necho {name} \"$*\" >> {log}\n{body}\n")
+        (bindir / name).chmod(0o755)
     secrets = {s for s in _strings(yaml.safe_load(central.read_text()))
                if len(s) >= 12 and "://" not in s and s not in ("control-plane",)}
     e = dict(os.environ, HOME=str(home), PATH=f"{bindir}:{os.environ['PATH']}")
     for k in list(e):
         if k.startswith(("HERDR_CP_", "FABRIC_")):
             del e[k]
+    e.update(HERDR_CP_HEALTH_URL="http://stub.invalid/api/v1/health", HERDR_CP_HEALTH_TRIES="2",
+             HERDR_CP_HEALTH_INTERVAL="0")
     return {"home": home, "central": central, "log": log, "env": e, "secrets": secrets,
             "tmp": tmp_path}
 
@@ -361,3 +400,140 @@ def test_dry_run_fails_when_compose_map_is_missing(env):
     assert r.returncode != 0 and "invalid" in r.stderr
     for secret in env["secrets"]:
         assert secret not in r.stdout + r.stderr
+
+
+# ------------------------------------------------------------- C2: honest rollback
+
+def _git(*args):
+    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def _head():
+    return _git("rev-parse", "--short=12", "HEAD")
+
+
+def _seed_previous(e, commit, extra=None):
+    """Pretend `commit` is what runs now: its image is up and it has a receipt."""
+    full = _git("rev-parse", commit)
+    tag = full[:12]
+    state = e["home"] / ".local/state/herdr-engineering/deploys"
+    state.mkdir(parents=True, exist_ok=True)
+    receipt = {"ref": "x", "commit": full, "image": f"herdr-engineering:{tag}", **(extra or {})}
+    (state / f"{tag}.json").write_text(json.dumps(receipt))
+    e["env"]["STUB_RUNNING_IMAGE"] = f"herdr-engineering:{tag}"
+    return full, tag
+
+
+def _worktrees():
+    return _git("worktree", "list", "--porcelain")
+
+
+def test_forward_compose_failure_rolls_back_with_the_previous_commits_files(env):
+    prev_full, prev_tag = _seed_previous(env, "HEAD~1")
+    env["env"]["FAIL_COMPOSE_TAGS"] = _head()
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    log = env["log"].read_text().splitlines()
+    files = [ln for ln in log if ln.startswith("composefiles ")]
+    assert files[0].startswith(f"composefiles tag={_head()} ")
+    rb = [ln for ln in files if ln.startswith(f"composefiles tag={prev_tag} ")]
+    assert rb and "rollback-worktree/deploy/control-plane/compose.yaml" in rb[0]
+    assert f"rolled back to herdr-engineering:{prev_tag} (commit {prev_tag}) and healthy" in r.stderr
+    assert "FAILED" in r.stderr                    # the deploy itself is reported failed
+    assert not (env["home"] / f".local/state/herdr-engineering/deploys/{_head()}.json").exists()
+    assert "rollback-worktree" not in _worktrees()  # removed by the trap
+
+
+def test_unhealthy_new_commit_rolls_back_and_reports_healthy(env):
+    _, prev_tag = _seed_previous(env, "HEAD~1")
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    r = deploy(env)
+    assert r.returncode == 1
+    assert "and healthy" in r.stderr and "FAILED TO ROLL BACK" not in r.stderr
+
+
+def test_failed_rollback_is_non_zero_and_honest(env):
+    prev_full, prev_tag = _seed_previous(env, "HEAD~1")
+    env["env"]["FAIL_COMPOSE"] = "1"                # forward AND rollback compose fail
+    r = deploy(env)
+    assert r.returncode == 3
+    assert "FAILED TO ROLL BACK" in r.stderr and "and healthy" not in r.stderr
+    assert f"--ref {prev_full}" in r.stderr         # the manual command
+    assert "rollback-worktree" not in _worktrees()
+    for secret in env["secrets"]:
+        assert secret not in r.stdout + r.stderr
+
+
+def test_unhealthy_rollback_is_non_zero_and_honest(env):
+    _, prev_tag = _seed_previous(env, "HEAD~1")
+    env["env"]["STUB_UNHEALTHY_TAGS"] = f"{_head()} {prev_tag}"
+    r = deploy(env)
+    assert r.returncode == 3 and "FAILED TO ROLL BACK" in r.stderr
+
+
+def test_first_deploy_failure_has_no_rollback_and_says_so(env):
+    env["env"]["FAIL_COMPOSE"] = "1"
+    r = deploy(env)
+    assert r.returncode == 1
+    assert "no automatic rollback for this deploy: nothing was running (first deploy)" in r.stdout
+    assert "NOT rolled back" in r.stderr and "rolled back to" not in r.stderr
+    assert len([ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]) == 1
+
+
+def test_pre_feature_running_commit_gets_the_manual_recipe(env):
+    old_full, _ = _seed_previous(env, "b4e6df6")
+    env["env"]["FAIL_COMPOSE"] = "1"
+    r = deploy(env)
+    assert r.returncode == 1
+    assert "predates the directory-mounted central fleet config" in r.stdout + r.stderr
+    assert "control-plane.env" in r.stderr and f"--ref {old_full}" in r.stderr
+    assert len([ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]) == 1
+
+
+def test_success_writes_a_receipt_with_the_previous_commit_and_no_values(env):
+    prev_full, prev_tag = _seed_previous(env, "HEAD~1")
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    receipt_path = env["home"] / f".local/state/herdr-engineering/deploys/{_head()}.json"
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["commit"].startswith(_head())
+    assert receipt["previous_commit"] == prev_full
+    assert receipt["previous_image"] == f"herdr-engineering:{prev_tag}"
+    assert receipt["collab_slice_sha256"] == ""
+    for secret in env["secrets"]:
+        assert secret not in receipt_path.read_text()
+
+
+def _collab_ups(e):
+    return [ln for ln in e["log"].read_text().splitlines()
+            if ln.startswith("docker compose") and "--force-recreate collab-public" in ln]
+
+
+def test_changed_collab_slice_force_recreates_collab_public(env):
+    _with_collab(env)
+    _seed_previous(env, "HEAD~1", {"collab_slice_sha256": "0" * 64})
+    collab = env["home"] / ".config/herdr-engineering/collab"
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    assert len(_collab_ups(env)) == 1
+    receipt = json.loads((env["home"] / f".local/state/herdr-engineering/deploys/{_head()}.json").read_text())
+    import hashlib
+    assert receipt["collab_slice_sha256"] == hashlib.sha256(
+        (collab / "collab-config.json").read_bytes()).hexdigest()
+    # same slice as the receipt of what runs now: no forced recreate
+    env["log"].write_text("")
+    env["env"]["STUB_RUNNING_IMAGE"] = f"herdr-engineering:{_head()}"
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    assert _collab_ups(env) == []
+
+
+def test_collab_slice_dir_owner_mismatch_warns(env):
+    _with_collab(env)
+    data = yaml.safe_load(env["central"].read_text())
+    data["sections"]["control_plane"]["values"]["compose"]["HERDR_COLLAB_CERT_UID"] = "424242"
+    env["central"].unlink()
+    fcc.write_private_file(env["central"], yaml.safe_dump(data, sort_keys=False))
+    r = deploy(env)
+    assert "WARNING" in r.stderr and "424242" in r.stderr

@@ -23,8 +23,16 @@
 #      that) to a stable 0600 slice, installs the edge nginx.conf at a stable path,
 #      refreshes the Cognito key/membership files and their timer (collab-sync.sh),
 #      and recreates collab-public + collab-edge
-#   5. waits for /api/v1/health to report the new commit; if it does not, puts the
-#      previous image back and exits non-zero
+#   5. waits for /api/v1/health to report the new commit. If compose up fails or
+#      the health check does not report it, rolls back: the commit recorded in the
+#      running image's receipt is checked out in a temporary worktree and ITS compose
+#      files are run with the previous image tag (same transient env file). Prints
+#      "rolled back ... and healthy" (exit 1) only when the old commit answers health
+#      again, otherwise FAILED TO ROLL BACK with the manual command (exit 3). A first
+#      deploy, or one whose running commit predates the directory-mounted fleet
+#      config, has no automatic rollback and says so.
+#
+#   HERDR_CP_HEALTH_URL / _TRIES (30) / _INTERVAL (2s) tune the health check.
 #
 # The central file is the only configuration source: no env file is authored or
 # kept. Nothing from it is printed by this script or written to a receipt.
@@ -38,7 +46,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1; shift ;;
     --no-fetch) FETCH=0; shift ;;
     --fleet-config) CENTRAL="${2:?--fleet-config needs a value}"; shift 2 ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -72,8 +80,9 @@ if [ -n "$OTHERS" ]; then
   exit 1
 fi
 
-WORK=""; ENV_DIR=""
+WORK=""; ENV_DIR=""; PREV_WORK=""
 cleanup() {
+  if [ -n "$PREV_WORK" ]; then git -C "$REPO" worktree remove --force "$PREV_WORK" >/dev/null 2>&1 || true; fi
   [ -z "$ENV_DIR" ] || rm -rf "$ENV_DIR"
   if [ -n "$WORK" ]; then git -C "$REPO" worktree remove --force "$WORK" >/dev/null 2>&1 || rm -rf "$WORK"; fi
 }
@@ -202,49 +211,139 @@ fi
 PREVIOUS_IMAGE="$(docker inspect -f '{{.Config.Image}}' herdr-cp-web 2>/dev/null || true)"
 echo "currently running: ${PREVIOUS_IMAGE:-nothing}"
 
+# What to roll back to: the commit recorded in the running image's receipt, deployed
+# again with THAT commit's compose files. Only a commit whose compose.yaml mounts the
+# fleet-config directory can run on this script's variables; anything older (or no
+# receipt at all) gets no automatic rollback and a manual recipe instead.
+PREV_COMMIT=""; PREV_SHA=""; PREV_TAG=""; PREV_COLLAB_HASH=""; ROLLBACK_NOTE=""
+PREV_RECEIPT_TAG="${PREVIOUS_IMAGE#herdr-engineering:}"
+if [ -z "$PREVIOUS_IMAGE" ]; then
+  ROLLBACK_NOTE="nothing was running (first deploy)"
+elif ! [[ "$PREV_RECEIPT_TAG" =~ ^[0-9a-f]{12}$ ]] || [ ! -r "$STATE_DIR/$PREV_RECEIPT_TAG.json" ]; then
+  ROLLBACK_NOTE="no deploy receipt for the running image $PREVIOUS_IMAGE"
+else
+  receipt_field() {
+    python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print(v if isinstance(v,str) else "")' \
+      "$STATE_DIR/$PREV_RECEIPT_TAG.json" "$1" 2>/dev/null || true
+  }
+  CANDIDATE="$(receipt_field commit)"
+  PREV_COLLAB_HASH="$(receipt_field collab_slice_sha256)"
+  # (no `git show | grep -q` under pipefail: grep's early exit would SIGPIPE git)
+  PREV_COMPOSE=""
+  if [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]; then
+    PREV_COMPOSE="$(git -C "$REPO" show "$CANDIDATE:deploy/control-plane/compose.yaml" 2>/dev/null || true)"
+  fi
+  if ! [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]] \
+      || ! git -C "$REPO" cat-file -e "$CANDIDATE^{commit}" 2>/dev/null; then
+    ROLLBACK_NOTE="the receipt of $PREVIOUS_IMAGE names no commit present in this repository"
+  elif [[ "$PREV_COMPOSE" != *HERDR_CP_FLEET_DIR* ]]; then
+    ROLLBACK_NOTE="the running commit ${CANDIDATE:0:12} predates the directory-mounted central fleet config"
+    PREV_COMMIT_OLD="$CANDIDATE"
+  else
+    PREV_COMMIT="$CANDIDATE"; PREV_SHA="${CANDIDATE:0:12}"; PREV_TAG="$PREV_RECEIPT_TAG"
+  fi
+fi
+if [ -n "$PREV_COMMIT" ]; then
+  echo "automatic rollback target: $PREVIOUS_IMAGE (commit $PREV_SHA)"
+else
+  echo "no automatic rollback for this deploy: $ROLLBACK_NOTE"
+fi
+
 if [ -z "$HEALTH_URL" ]; then
   # The UI is published on HERDR_CP_WEB_BIND:HERDR_CP_WEB_PUBLIC_PORT.
   BIND="$(grep -E '^HERDR_CP_WEB_BIND=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"")"
   PORT="$(grep -E '^HERDR_CP_WEB_PUBLIC_PORT=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"")"
+  case "$BIND" in *:*) BIND="[$BIND]" ;; esac   # IPv6 literal
   HEALTH_URL="http://${BIND:-127.0.0.1}:${PORT:-80}/api/v1/health"
+fi
+HEALTH_TRIES="${HERDR_CP_HEALTH_TRIES:-30}"
+HEALTH_INTERVAL="${HERDR_CP_HEALTH_INTERVAL:-2}"
+
+COLLAB_HASH=""
+if [ "$COLLAB" = 1 ]; then
+  COLLAB_HASH="$(sha256sum "$COLLAB_CONFIG" | cut -d' ' -f1)"
+  # collab-public runs as HERDR_COLLAB_CERT_UID and must be able to read its 0700 slice dir.
+  WANT_UID="$(grep -E '^HERDR_COLLAB_CERT_UID=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"" || true)"
+  WANT_UID="${WANT_UID:-1000}"
+  HAVE_UID="$(stat -c %u "$COLLAB_DIR")"
+  if [ "$HAVE_UID" != "$WANT_UID" ]; then
+    echo "WARNING: $COLLAB_DIR is owned by uid $HAVE_UID but collab-public runs as uid $WANT_UID" \
+         "(control_plane.compose.HERDR_COLLAB_CERT_UID); it will not be able to read its config." \
+         "Fix: run deploy.sh as that user, or set HERDR_COLLAB_CERT_UID to $HAVE_UID." >&2
+  fi
 fi
 
 docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
   -t "herdr-engineering:$TAG" "$WORK" >/dev/null
 
-compose() {
-  HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_CP_IMAGE_TAG="$1" HERDR_CP_GIT_COMMIT="$SHA" \
-    docker compose --env-file "$ENV_FILE" -p "$PROJECT" \
-    "${COMPOSE_FILES[@]}" \
-    up -d --no-deps --no-build "${APP_SERVICES[@]}" "${EDGE_SERVICE[@]}"
+# compose_run <worktree> <image tag> <commit> <compose args...>: that worktree's compose
+# files with this deploy's transient env file and paths. Rollback passes the previous
+# commit's worktree, so its compose files run with its own image.
+compose_run() {
+  local tree="$1" tag="$2" commit="$3"; shift 3
+  local files=(-f "$tree/deploy/control-plane/compose.yaml")
+  if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
+  HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_LLM_SLICE_DIR="$LLM_DIR" \
+    HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
+    docker compose --env-file "$ENV_FILE" -p "$PROJECT" "${files[@]}" "$@"
+}
+
+compose_up() {   # <worktree> <tag> <commit>
+  compose_run "$1" "$2" "$3" up -d --no-deps --no-build "${APP_SERVICES[@]}" "${EDGE_SERVICE[@]}"
 }
 
 healthy_commit() {
   local want="$1" i body
-  for i in $(seq 1 30); do
+  for i in $(seq 1 "$HEALTH_TRIES"); do
     body="$(curl -fsS -m 5 "$HEALTH_URL" 2>/dev/null || true)"
-    if printf '%s' "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('status')=='ok' and d.get('commit','').startswith('$want') else 1)" 2>/dev/null; then
+    if printf '%s' "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('status')=='ok' and str(d.get('commit','')).startswith(sys.argv[1]) else 1)" "$want" 2>/dev/null; then
       return 0
     fi
-    sleep 2
+    [ "$i" = "$HEALTH_TRIES" ] || sleep "$HEALTH_INTERVAL"
   done
   return 1
 }
 
-compose "$TAG" >/dev/null
-if healthy_commit "$SHA"; then
-  # The receipt names the ref, commit and images only - never configuration.
+forward() {
+  compose_up "$WORK" "$TAG" "$SHA" >/dev/null || return 1
+  if [ "$COLLAB" = 1 ] && [ "$COLLAB_HASH" != "$PREV_COLLAB_HASH" ]; then
+    # same image but a changed slice: collab-public reads it only at startup
+    compose_run "$WORK" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate collab-public >/dev/null || return 1
+  fi
+  healthy_commit "$SHA"
+}
+
+if forward; then
+  # The receipt names the ref, commits and images (and only a hash of the collab
+  # slice) - never configuration.
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
-  printf '{"ref":"%s","commit":"%s","image":"herdr-engineering:%s","previous":"%s","at":"%s"}\n' \
-    "$REF" "$FULL" "$TAG" "$PREVIOUS_IMAGE" "$(date -u +%FT%TZ)" > "$STATE_DIR/$SHA.json"
-  echo "ok: control-plane-web is running $SHA (receipt $STATE_DIR/$SHA.json)"
+  printf '{"ref":"%s","commit":"%s","image":"herdr-engineering:%s","previous_commit":"%s","previous_image":"%s","collab_slice_sha256":"%s","at":"%s"}\n' \
+    "$REF" "$FULL" "$TAG" "$PREV_COMMIT" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)" > "$STATE_DIR/$SHA.json"
+  echo "ok: ${APP_SERVICES[*]} running $SHA (receipt $STATE_DIR/$SHA.json)"
   exit 0
 fi
 
-echo "health check did not report $SHA; rolling back" >&2
-if [ -n "$PREVIOUS_IMAGE" ]; then
-  PREV_TAG="${PREVIOUS_IMAGE#herdr-engineering:}"
-  compose "$PREV_TAG" >/dev/null || true
-  echo "rolled back to $PREVIOUS_IMAGE" >&2
+echo "deploy of $SHA failed (compose up failed or the health check did not report $SHA)" >&2
+if [ -z "$PREV_COMMIT" ]; then
+  echo "NOT rolled back: $ROLLBACK_NOTE." >&2
+  if [ -n "${PREV_COMMIT_OLD:-}" ]; then
+    echo "manual rollback (that commit's own deploy.sh reads ~/.config/herdr-engineering/control-plane.env):" >&2
+    echo "  git -C $REPO worktree add /tmp/herdr-rollback $PREV_COMMIT_OLD && /tmp/herdr-rollback/deploy/control-plane/deploy.sh --ref $PREV_COMMIT_OLD --no-fetch" >&2
+  elif [ -n "$PREVIOUS_IMAGE" ]; then
+    echo "manual rollback: redeploy the commit $PREVIOUS_IMAGE was built from with that commit's deploy/control-plane/deploy.sh" >&2
+  fi
+  exit 1
 fi
-exit 1
+
+echo "rolling back to $PREVIOUS_IMAGE with the compose files of commit $PREV_SHA" >&2
+MANUAL="$REPO/deploy/control-plane/deploy.sh --ref $PREV_COMMIT --no-fetch --fleet-config $CENTRAL"
+PREV_WORK="$ENV_DIR/rollback-worktree"
+if git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
+    && compose_up "$PREV_WORK" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+    && healthy_commit "$PREV_SHA"; then
+  echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy; the deploy of $SHA FAILED" >&2
+  exit 1
+fi
+echo "FAILED TO ROLL BACK to $PREVIOUS_IMAGE (commit $PREV_SHA): the control plane may be down or mixed." >&2
+echo "manual rollback: $MANUAL" >&2
+exit 3
