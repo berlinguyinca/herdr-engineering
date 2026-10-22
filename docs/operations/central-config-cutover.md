@@ -25,6 +25,14 @@ otherwise. No step prints a secret.
    - CI address and token
    - the host list
 
+   **GitHub and CI tokens.** The old stack kept them in fixed files that the env file
+   never named: `~/.config/herdr-engineering/github-token` and `.../ci-token`.
+   `--from-env` reads those files when the env file names no token file, and prints
+   only `github.token: imported` / `ci.token: imported`, or `missing`. When the
+   GitHub token is missing, it asks for it; leave it blank (or run without a
+   terminal) to keep it empty. Without it the GitHub monitor and CI checks have no
+   token, so check that line before you go on.
+
    When asked for the **web bind address**, answer with this machine's tailnet IP
    (`tailscale ip -4`) unless the old file already set `HERDR_CP_WEB_BIND` to it.
    Use the Hosts-page names as host ids: `bender`, `beast`, `mac.lan`.

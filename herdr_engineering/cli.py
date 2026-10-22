@@ -813,9 +813,12 @@ def _cmd_fleet_config(args) -> int:
                 if report["bad_lines"]:
                     print(f"{args.from_env}: skipped lines (not NAME=value): "
                           f"{', '.join(map(str, report['bad_lines']))}", file=sys.stderr)
+                for dotted, state in report["tokens"].items():
+                    print(f"{dotted}: {state}", file=sys.stderr)
             if args.answers:
                 answers.update(fcc.load_answers_file(Path(args.answers)))
-            fcc.init_config(path, answers, with_api_keys=args.with_api_keys)
+            fcc.init_config(path, answers, with_api_keys=args.with_api_keys,
+                            optional_secrets=("github_token",) if args.from_env else ())
             print(f"wrote {path} (0600)")
         elif cmd == "validate":
             info = fcc.validate_config(path)

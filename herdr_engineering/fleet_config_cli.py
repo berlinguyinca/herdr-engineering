@@ -329,8 +329,12 @@ API_KEYS_WARNING = (
     "posture.")
 
 
+OPTIONAL_SECRET_LABELS = {"github_token": "GitHub token"}
+
+
 def init_config(path: Path, answers: dict | None = None, prompt: Callable = input,
-                secret_prompt: Callable = getpass.getpass, *, with_api_keys: bool = False) -> Path:
+                secret_prompt: Callable | None = None, *, with_api_keys: bool = False,
+                optional_secrets: tuple[str, ...] = ()) -> Path:
     """Create a new fleet config. Generates DB/MinIO credentials.
 
     The control plane stays open on the tailnet (``control_plane.api_keys: {}``) and
@@ -345,7 +349,14 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     if path.exists():
         raise FleetConfigError(f"{path} already exists; refusing to overwrite")
     a = dict(answers or {})
+    secret_prompt = secret_prompt or getpass.getpass  # resolved per call (tests patch it)
     ask = lambda k, label, **kw: _ask(a, k, label, prompt, secret_prompt, **kw)  # noqa: E731
+    for key in optional_secrets:  # asked only when missing; blank or no terminal = none
+        if not a.get(key):
+            try:
+                a[key] = str(secret_prompt(f"{OPTIONAL_SECRET_LABELS.get(key, key)} (blank = none): ")).strip()
+            except EOFError:
+                a[key] = ""
     public_url = ask("public_url", "public URL of the control plane")
     llm_url = ask("llm_upstream_url", "LLM upstream address")
     llm_key = ask("llm_upstream_key", "LLM upstream key", secret=True)
@@ -615,7 +626,23 @@ def import_env_file(path: Path) -> tuple[dict, dict]:
             report["imported"].append("HERDR_CP_PG_DSN")
     if compose_extra:
         answers["compose_extra"] = compose_extra
+    # The pre-feature stack kept these tokens in fixed files the env file never named
+    # (compose.github.yaml / compose.integrations.yaml defaults): fall back to them.
+    report["tokens"] = {}
+    for key, (dotted, rel) in LEGACY_TOKEN_FILES.items():
+        if not answers.get(key):
+            try:
+                content = (Path.home() / rel).read_text().strip()
+            except (OSError, UnicodeDecodeError):
+                content = ""
+            if content:
+                answers[key] = content
+        report["tokens"][dotted] = "imported" if answers.get(key) else "missing"
     return answers, report
+
+
+LEGACY_TOKEN_FILES = {"github_token": ("github.token", ".config/herdr-engineering/github-token"),
+                      "ci_token": ("ci.token", ".config/herdr-engineering/ci-token")}
 
 
 ANSWER_KEYS = frozenset(set(ENV_IMPORT_MAP.values()) | set(ENV_IMPORT_FILE_MAP.values()) | {
