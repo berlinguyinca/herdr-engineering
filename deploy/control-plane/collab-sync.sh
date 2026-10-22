@@ -24,6 +24,23 @@ json.dump({"updated": time.time(), "groups": {sys.argv[3]: users}}, open(sys.arg
 PY
   chmod 644 "$tmp"/*.json
   mv -f "$tmp/jwks.json" "$DIR/jwks.json"; mv -f "$tmp/members.json" "$DIR/members.json"   # atomic per file
+  certs
+}
+
+# Hand the edge ONLY its own certificate. Mounting certbot's whole config dir would give the
+# internet-facing container every lineage's private key and the ACME account key.
+certs() {
+  local src="${HERDR_COLLAB_CERT_SRC:-$HOME/.local/share/inferweave/bender-failover/acme/config/live/localdev.mcp.metabolomics.us}"
+  local dst="${HERDR_COLLAB_CERT_DIR:-$HOME/.local/share/herdr-engineering/collab-edge-certs}" changed=0 f
+  mkdir -p "$dst"; chmod 700 "$dst"
+  for f in fullchain.pem privkey.pem; do
+    if ! cmp -s "$src/$f" "$dst/$f"; then
+      install -m 0600 "$src/$f" "$dst/$f.new"; mv -f "$dst/$f.new" "$dst/$f"; changed=1
+    fi
+  done
+  if [ "$changed" = 1 ] && docker inspect herdr-collab-edge >/dev/null 2>&1; then
+    docker exec herdr-collab-edge nginx -s reload || true
+  fi
 }
 
 install_timer() {

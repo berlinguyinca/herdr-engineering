@@ -14,8 +14,10 @@ to a terminal.
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -45,9 +47,10 @@ PROJECT_ROLES = frozenset({"manager", "contributor"})
 
 MAX_TEXT = 8000
 MAX_BODY = 64 * 1024
-_KEY_RE = re.compile(r"^[A-Za-z0-9._:\-]{1,128}$")
+_KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
 _MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to"})
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")   # C0, DEL and C1 (8-bit CSI)
+_NAME_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
 INVITE_TTL = 7 * 24 * 3600.0
 MAX_OPEN_INVITES = 50
@@ -127,28 +130,49 @@ class FileEventLog:
     """Append-only JSON-lines event log for a collab-only deployment (no database).
 
     Same sink contract as the durable Postgres sink: ``record_required`` must have
-    reached stable storage before it returns, or raise.
+    reached stable storage before it returns, or raise. A failed write is rolled back
+    (truncated to the previous end) so a torn line can never sit in front of the next
+    event; if even the rollback fails the log refuses all further writes (fail closed).
     """
 
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
+        self._broken = False
         self._fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 
     def load(self) -> list[dict]:
         rows = []
-        with open(self.path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
+        with open(self.path, "rb") as fh:
+            raw = fh.read()
+        lines = raw.split(b"\n")
+        tail = lines.pop()          # text after the last newline: only ever a torn write
+        for line in lines:
+            if line.strip():
+                rows.append(json.loads(line))
+        if tail.strip():
+            # An unacknowledged partial append from a crash: it was never applied, so drop it.
+            os.truncate(self.path, len(raw) - len(tail))
         return rows
 
     def record_required(self, event: dict) -> None:
         data = (json.dumps(event, separators=(",", ":")) + "\n").encode("utf-8")
         with self._lock:
-            os.write(self._fd, data)
-            os.fsync(self._fd)
+            if self._broken:
+                raise OSError("collaboration log is in a failed state; restart required")
+            start = os.fstat(self._fd).st_size
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(self._fd, view):]
+                os.fsync(self._fd)
+            except BaseException:
+                try:
+                    os.ftruncate(self._fd, start)
+                    os.fsync(self._fd)
+                except OSError:
+                    self._broken = True
+                raise
 
     record = record_required
 
@@ -158,7 +182,10 @@ class CollabService:
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
                  max_streams_per_principal: int = 5, public_config: dict | None = None,
-                 remote_credential_ttl: float = 30 * 24 * 3600.0):
+                 remote_credential_ttl: float = 30 * 24 * 3600.0,
+                 max_agents_per_user: int = 10, max_projects_per_user: int = 20,
+                 max_rooms_per_project: int = 50, max_members_per_room: int = 100,
+                 max_log_events: int = 40_000, guest_ttl: float = 7 * 24 * 3600.0):
         self.auth = authenticator
         self._sink = sink
         self._now = now or time.time
@@ -167,6 +194,12 @@ class CollabService:
         self.remote_credential_ttl = remote_credential_ttl  # agents that connect over HTTP MCP
         self.stream_poll_seconds = stream_poll_seconds
         self.message_limit = message_limit
+        self.max_agents_per_user = max_agents_per_user
+        self.max_projects_per_user = max_projects_per_user
+        self.max_rooms_per_project = max_rooms_per_project
+        self.max_members_per_room = max_members_per_room
+        self.max_log_events = max_log_events
+        self.guest_ttl = guest_ttl
         self.max_streams = max_streams_per_principal
         self._lock = threading.RLock()
         self._log: list[dict] = []
@@ -185,6 +218,8 @@ class CollabService:
         self._email_user: dict[str, str] = {}   # email -> user id (linked at sign-in)
         self._user_email: dict[str, str] = {}
         self._invites: dict[str, dict] = {}
+        self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
+        self._msg_room: dict[str, str] = {}                  # message event id -> room id
         self.stats = defaultdict(int)
 
     # ------------------------------------------------------------ plumbing
@@ -198,6 +233,9 @@ class CollabService:
     def _commit(self, event_type: str, payload: dict) -> dict:
         """Persist first, then apply: a failed write never changes state."""
         with self._lock:
+            if len(self._log) >= self.max_log_events:
+                self.stats["log_full"] += 1
+                raise CollabError(503, "collaboration log is full; ask the operator")
             now = self._iso()
             payload = {"org_id": ORG_ID, "correlation_id": payload.pop("correlation_id", None)
                        or ids.new_id("collab"), "created_at": now, **payload}
@@ -268,7 +306,12 @@ class CollabService:
             self._rooms[p["room_id"]]["members"][p["subject_user_id"]] = {
                 "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq}
         elif t == "member_removed":
-            self._rooms[p["room_id"]]["members"].pop(p["subject_user_id"], None)
+            room = self._rooms[p["room_id"]]
+            room["members"].pop(p["subject_user_id"], None)
+            # Agents of a removed member lose their grants for good: re-adding the person
+            # must not silently revive access they never re-approved.
+            for aid in [a for a in room["grants"] if self._agents.get(a, {}).get("owner") == p["subject_user_id"]]:
+                room["grants"].pop(aid, None)
         elif t == "enrollment_started":
             self._pending[p["code_digest"]] = {
                 "owner": p["actor_user_id"], "device_id": p["device_id"],
@@ -307,6 +350,10 @@ class CollabService:
                 self._invites[p["invite_id"]]["open"] = False
         elif t == "message":
             self._idem[(p["sender_key"], p["room_id"], p["idempotency_key"])] = (p["fingerprint"], seq)
+            self._msg_room[ev["event_id"]] = (p["room_id"], seq)
+        if t in _FEED_TYPES:
+            for rid in {p.get("room_id"), *p.get("room_ids", ())} - {None}:
+                self._by_room[rid].append(ev)
 
     # ------------------------------------------------------ authentication
     def authenticate(self, authorization: str, device: str | None) -> Principal:
@@ -442,11 +489,27 @@ class CollabService:
             self.stats["policy_denied"] += 1
             raise CollabError(403, "forbidden: agents cannot perform this operation")
 
+    # ------------------------------------------------------------ quotas
+    def _room_has_space(self, room: dict) -> None:
+        if len(room["members"]) >= self.max_members_per_room:
+            raise CollabError(429, "room member limit reached")
+
+    def _agent_slots(self, owner: str) -> None:
+        now = self._now()
+        live = sum(1 for a in self._agents.values()
+                   if a["owner"] == owner and a["status"] == "active" and a["expires_at"] > now)
+        waiting = sum(1 for r in self._pending.values()
+                      if r["owner"] == owner and not r["used"] and r["expires_at"] > now)
+        if live + waiting >= self.max_agents_per_user:
+            raise CollabError(429, "agent limit reached; revoke one you no longer use")
+
     # ------------------------------------------------------------ operations
     def create_project(self, pr: Principal, body: dict) -> dict:
         self._require_user(pr)
         name = _name(body.get("name"))
         with self._lock:
+            if sum(1 for pj in self._projects.values() if pj["members"].get(pr.id) == "manager") >= self.max_projects_per_user:
+                raise CollabError(429, "project limit reached")
             pid = ids.new_id("project")
             self._commit("project_created", self._actor(
                 pr, project_id=pid, name=name, action="project.create", outcome="allowed",
@@ -466,7 +529,7 @@ class CollabService:
             if proj["members"].get(pr.id) != "manager":
                 raise CollabError(403, "forbidden")
             uid, role = body.get("user_id"), body.get("role")
-            if role not in PROJECT_ROLES:
+            if not isinstance(role, str) or role not in PROJECT_ROLES:
                 raise CollabError(400, "invalid role")
             if not isinstance(uid, str) or not self.auth.exists(uid):
                 raise CollabError(404, "unknown user")
@@ -482,6 +545,8 @@ class CollabService:
             proj = self._project_visible(pr, project_id)
             if pr.id not in proj["members"]:
                 raise CollabError(403, "forbidden")
+            if sum(1 for r in self._rooms.values() if r["project_id"] == project_id) >= self.max_rooms_per_project:
+                raise CollabError(429, "room limit reached for this project")
             rid = ids.new_id("room")
             self._commit("room_created", self._actor(
                 pr, project_id=project_id, room_id=rid, name=name, action="room.create",
@@ -516,15 +581,16 @@ class CollabService:
         with self._lock:
             room, _ = self._authorize(pr, room_id, "invite", "member.add")
             uid, role = body.get("user_id"), body.get("role")
-            if role not in INVITABLE_ROLES:
+            if not isinstance(role, str) or role not in INVITABLE_ROLES:
                 raise CollabError(400, "invalid role")
-            exp = body.get("expires_at")
-            if exp is not None and (not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp <= self._now()):
-                raise CollabError(400, "invalid expires_at")
+            exp = _finite_expiry(body.get("expires_at"), self._now())
             if not isinstance(uid, str) or not self.auth.exists(uid):
                 raise CollabError(404, "unknown user")
             if self._member(room, uid):
                 raise CollabError(409, "already a member")
+            self._room_has_space(room)
+            if role == "guest" and exp is None:
+                exp = self._now() + self.guest_ttl
             self._commit("member_added", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, subject_user_id=uid, role=role,
                 expires_at=exp, action="member.add", outcome="allowed",
@@ -575,11 +641,18 @@ class CollabService:
                 self._commit("invite_closed", {"actor_user_id": user, "actor_agent_id": None,
                                                "invite_id": iid, "reason": "expired"})
                 continue
-            if not self._member(room, user):
+            inviter = self._member(room, inv["inviter"])
+            if inviter is None or "invite" not in ROLE_ACTIONS[inviter["role"]] or not self.auth.exists(inv["inviter"]):
+                # The person who sent it no longer has the authority to add anyone.
+                self._commit("invite_closed", {"actor_user_id": user, "actor_agent_id": None,
+                                               "invite_id": iid, "reason": "inviter_unavailable"})
+                continue
+            if not self._member(room, user) and len(room["members"]) < self.max_members_per_room:
                 self._commit("member_added", {
                     "actor_user_id": inv["inviter"], "actor_agent_id": None,
                     "project_id": room["project_id"], "room_id": inv["room_id"],
-                    "subject_user_id": user, "role": inv["role"], "expires_at": None,
+                    "subject_user_id": user, "role": inv["role"],
+                    "expires_at": self._now() + self.guest_ttl if inv["role"] == "guest" else None,
                     "action": "member.add", "outcome": "allowed",
                     "project_ids": [room["project_id"]], "resource_id": inv["room_id"]})
             self._commit("invite_closed", {"actor_user_id": user, "actor_agent_id": None,
@@ -596,16 +669,16 @@ class CollabService:
                     or not _EMAIL_RE.match(email.strip())):
                 raise CollabError(400, "a valid email is required")
             email = email.strip().lower()
-            if role not in INVITABLE_ROLES:
+            if not isinstance(role, str) or role not in INVITABLE_ROLES:
                 raise CollabError(400, "invalid role")
             reply = {"status": "invited", "email": email, "role": role}
             user = self._email_user.get(email)
             if user and self.auth.exists(user):
                 if self._member(room, user):
-                    raise CollabError(409, "already a member")
+                    return reply   # same answer as a pending invite: no signed-in-or-not oracle
                 self._commit("member_added", self._actor(
                     pr, project_id=room["project_id"], room_id=room_id, subject_user_id=user,
-                    role=role, expires_at=None, action="member.add", outcome="allowed",
+                    role=role, expires_at=self._now() + self.guest_ttl if role == "guest" else None, action="member.add", outcome="allowed",
                     project_ids=[room["project_id"]], resource_id=room_id))
                 return reply
             open_here = [i for i in self._invites.values()
@@ -650,6 +723,7 @@ class CollabService:
         code = "hcn_" + secrets.token_urlsafe(24)
         expires = self._now() + self.enrollment_ttl
         with self._lock:
+            self._agent_slots(pr.id)
             self._commit("enrollment_started", self._actor(
                 pr, code_digest=_digest(code), device_id=device, harness_type=harness,
                 expires_at_epoch=expires, action="agent.enroll.start", outcome="allowed",
@@ -674,7 +748,8 @@ class CollabService:
                 "actor_user_id": rec["owner"], "actor_agent_id": None, "agent_id": aid,
                 "owner_user_id": rec["owner"], "code_digest": digest, "device_id": device,
                 "harness_type": rec["harness_type"],
-                "instance_id": instance if isinstance(instance, str) else None,
+                "instance_id": instance if isinstance(instance, str) and len(instance) <= 120
+                and not _NAME_BAD.search(instance) else None,
                 "secret_digest": _digest(cred), "expires_at_epoch": expires,
                 "action": "agent.enroll", "outcome": "allowed",
                 "project_ids": [], "resource_id": aid})
@@ -693,6 +768,7 @@ class CollabService:
         expires = self._now() + self.remote_credential_ttl
         aid = ids.new_id("agent")
         with self._lock:
+            self._agent_slots(pr.id)
             self._commit("agent_enrolled", {
                 "actor_user_id": pr.id, "actor_agent_id": None, "agent_id": aid,
                 "owner_user_id": pr.id, "code_digest": None, "device_id": device,
@@ -759,9 +835,7 @@ class CollabService:
             if (not isinstance(actions, list) or not actions
                     or not all(isinstance(a, str) and a in AGENT_ACTIONS for a in actions)):
                 raise CollabError(400, "actions must be a non-empty subset of read, post")
-            exp = body.get("expires_at")
-            if exp is not None and (not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp <= self._now()):
-                raise CollabError(400, "invalid expires_at")
+            exp = _finite_expiry(body.get("expires_at"), self._now())
             self._commit("agent_granted", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, agent_id=body["agent_id"],
                 actions=sorted(set(actions)), expires_at=exp, action="agent.grant", outcome="allowed",
@@ -783,7 +857,7 @@ class CollabService:
     # -- messages
     def post_message(self, pr: Principal, room_id: str, body: dict) -> tuple[int, dict]:
         with self._lock:
-            room, _ = self._authorize(pr, room_id, "post", "message.post")
+            room, first = self._authorize(pr, room_id, "post", "message.post")
             bad = [k for k in body if k not in _MESSAGE_FIELDS]
             if bad:
                 forged = any(k.startswith(("actor_", "sender_", "owner_")) or k in
@@ -803,9 +877,12 @@ class CollabService:
             if not clean.strip() or len(clean) > MAX_TEXT:
                 raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
             reply = body.get("in_reply_to")
-            if reply is not None and not any(
-                    e["payload"].get("room_id") == room_id and e["event_id"] == reply and
-                    e["event_type"] == "message" for e in self._log):
+            if reply is not None:
+                where = self._msg_room.get(reply) if isinstance(reply, str) else None
+                # only messages this poster could already see (not from before they joined)
+                if where is None or where[0] != room_id or where[1] < first:
+                    reply = False
+            if reply is False:
                 raise CollabError(400, "in_reply_to must reference a message in this room")
             fp = _digest(json.dumps([room_id, clean, reply]))
             prior = self._idem.get((pr.key, room_id, key))
@@ -819,8 +896,18 @@ class CollabService:
                 self._hits[pr.key] = hits
                 self.stats["rate_limited"] += 1
                 raise CollabError(429, "message rate limit exceeded")
+            # One budget per human across their own posts and all of their agents, so making
+            # more agents never buys more throughput.
+            okey = "owner:" + pr.owner
+            ohits = [t for t in self._hits[okey] if now - t < 60]
+            if len(ohits) >= self.message_limit * 2:
+                self._hits[okey] = ohits
+                self.stats["rate_limited"] += 1
+                raise CollabError(429, "message rate limit exceeded")
             hits.append(now)
+            ohits.append(now)
             self._hits[pr.key] = hits
+            self._hits[okey] = ohits
             ev = self._commit("message", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
                 sender_kind=pr.kind, sender_id=pr.id, idempotency_key=key, fingerprint=fp,
@@ -853,18 +940,13 @@ class CollabService:
         with self._lock:
             _, first = self._authorize(pr, room_id, "read", "events.read")
             out, more = [], False
-            for ev in self._log[max(cursor, first - 1):]:
-                if ev["sequence"] <= cursor or ev["sequence"] < first:
-                    continue
-                p = ev["payload"]
-                if ev["event_type"] not in _FEED_TYPES:
-                    continue
-                if p.get("room_id") != room_id and room_id not in p.get("room_ids", ()):
-                    continue
+            feed = self._by_room.get(room_id, [])
+            lo = bisect.bisect_right(feed, max(cursor, first - 1), key=lambda e: e["sequence"])
+            for ev in feed[lo:]:
                 if len(out) >= limit:
                     more = True
                     break
-                out.append(self._view(ev))
+                out.append({k: v for k, v in self._view(ev).items() if k != "project_id"})
             nxt = out[-1]["sequence"] if out else cursor
         return {"events": out, "next_cursor": nxt, "has_more": more}
 
@@ -900,7 +982,8 @@ class CollabService:
     def open_stream(self, pr: Principal, room_id: str, cursor: int) -> Stream:
         with self._lock:
             self._authorize(pr, room_id, "read", "events.stream")
-            if self._streams[pr.key] >= self.max_streams:
+            if (self._streams[pr.key] >= self.max_streams
+                    or self._streams["owner:" + pr.owner] >= self.max_streams * 2):
                 raise CollabError(429, "too many streams")
         return Stream(self, pr, room_id, cursor)
 
@@ -909,10 +992,13 @@ class CollabService:
         started = time.monotonic()
         cursor = stream.cursor
         with self._lock:
-            if self._streams[stream.principal.key] >= self.max_streams:
+            okey = "owner:" + stream.principal.owner
+            if (self._streams[stream.principal.key] >= self.max_streams
+                    or self._streams[okey] >= self.max_streams * 2):
                 yield {"type": "closed", "reason": "too_many_streams"}
                 return
             self._streams[stream.principal.key] += 1
+            self._streams[okey] += 1
         try:
             yield {"type": "connected", "cursor": cursor}
             while time.monotonic() - started < max_seconds:
@@ -931,6 +1017,7 @@ class CollabService:
         finally:
             with self._lock:
                 self._streams[stream.principal.key] -= 1
+                self._streams["owner:" + stream.principal.owner] -= 1
 
     # --------------------------------------------------------------- routing
     def dispatch(self, method: str, parts: list[str], query: dict, body: dict,
@@ -1002,8 +1089,17 @@ class CollabService:
             return exc.status, {"error": exc.message}
 
 
+def _finite_expiry(exp: Any, now: float) -> float | None:
+    if exp is None:
+        return None
+    if (not isinstance(exp, (int, float)) or isinstance(exp, bool) or not math.isfinite(exp)
+            or exp <= now):
+        raise CollabError(400, "invalid expires_at")
+    return float(exp)
+
+
 def _name(value: Any, field: str = "name") -> str:
-    if not isinstance(value, str) or not value.strip() or len(value) > 120 or _CONTROL.search(value):
+    if not isinstance(value, str) or not value.strip() or len(value) > 120 or _NAME_BAD.search(value):
         raise CollabError(400, f"{field} must be 1-120 printable characters")
     return value.strip()
 

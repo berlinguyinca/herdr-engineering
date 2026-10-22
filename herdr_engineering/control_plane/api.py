@@ -56,6 +56,13 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
     request_queue_size = 256
 
 
+def _content_length(raw):
+    """Non-negative int, or None when the header is malformed (never raises)."""
+    if raw is None or raw == "":
+        return 0
+    return int(raw) if raw.isascii() and raw.isdigit() and len(raw) <= 9 else None
+
+
 class _RateLimiter:
     """Tiny in-memory per-client sliding-window limiter (best-effort).
 
@@ -78,6 +85,8 @@ class _RateLimiter:
                 self._hits[key] = hits
                 return False
             hits.append(now)
+            if len(self._hits) > 20000:   # bounded: forget keys with no recent hits
+                self._hits = {k: v for k, v in self._hits.items() if v and now - v[-1] < self.window}
             self._hits[key] = hits
             return True
 
@@ -126,6 +135,7 @@ class ControlPlaneServer:
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.
         self._ingest_limiter = _RateLimiter(max_requests=6000)
+        self._stream_limiter = _RateLimiter(max_requests=120)
         # Fail-closed (Spec §104): never default a blank/missing role to
         # "operator". Keep roles verbatim after strip; empty/None/unknown
         # roles are treated as "viewer" (read-only) by `_require`.
@@ -291,6 +301,9 @@ def _make_handler(server, public=False):
     class _Handler(BaseHTTPRequestHandler):
         server_version = "HerdrControlPlane/0.1"
         protocol_version = "HTTP/1.1"
+        # Public listener only: a client that stalls mid-request cannot hold a thread for ever.
+        # (The operator listener is tailnet-only and keeps its blocking behaviour.)
+        timeout = 30 if public else None
 
         def log_message(self, fmt, *args):  # keep test output clean
             pass
@@ -362,6 +375,12 @@ def _make_handler(server, public=False):
             """Everything not on the allow-list is a plain 404: the legacy API, the
             dashboard and its static files do not exist on this listener."""
             path = self.path.split("?")[0]
+            # Request framing must be unambiguous: the edge and this server must agree where a
+            # request ends, or a pipelined second request could be smuggled behind the first.
+            cl = self.headers.get_all("Content-Length") or []
+            if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                    or (self.command == "GET" and cl and cl[0].strip() not in ("", "0"))):
+                return self._deny(400, "ambiguous request framing")
             if self._is_collab_path() or path == "/mcp":
                 return self._collab() if path != "/mcp" else self._mcp()
             if self.command == "GET" and path in _PUBLIC_STATIC:
@@ -399,12 +418,12 @@ def _make_handler(server, public=False):
                 return self._deny(403, "browser origins may not call the MCP endpoint")
             if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                 return self._deny(415, "application/json required")
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or length > MAX_BODY:
+            length = _content_length(self.headers.get("Content-Length"))
+            if length is None or length <= 0 or length > MAX_BODY:
                 return self._deny(413, "request body size not allowed")
             try:
                 message = json.loads(self.rfile.read(length))
-            except ValueError:
+            except (ValueError, RecursionError):
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32700, "message": "parse error"}}, 400)
             try:
@@ -486,13 +505,13 @@ def _make_handler(server, public=False):
             body = {}
             if self.command == "POST":
                 from .collab import MAX_BODY
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > MAX_BODY:
+                length = _content_length(self.headers.get("Content-Length"))
+                if length is None or length > MAX_BODY:
                     return self._deny(413, "request body too large")
                 if length:
                     try:
                         body = json.loads(self.rfile.read(length))
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         return self._json({"error": "invalid JSON body"}, 400)
                     if not isinstance(body, dict):
                         return self._json({"error": "JSON object required"}, 400)
@@ -553,14 +572,17 @@ def _make_handler(server, public=False):
             return fwd[:64] if fwd and trusted else peer
 
         def _rate_limit(self, key=None):
-            # Skip SSE streams: they are long-lived connections, not bursts.
             path = self.path.split("?")[0]
+            who = key or self.client_address[0]
             if self.command == "GET" and path.rstrip("/").endswith("/events/stream"):
-                return None
-            limiter = (server._ingest_limiter
-                       if self.command == "POST" and path == "/api/v1/ingest"
-                       else server._limiter)
-            if limiter.allow(key or self.client_address[0]):
+                # SSE is long-lived, so it is not counted like request bursts, but how often a
+                # client may open one is still bounded (it costs a token check each time).
+                limiter = server._stream_limiter
+            elif self.command == "POST" and path == "/api/v1/ingest":
+                limiter = server._ingest_limiter
+            else:
+                limiter = server._limiter
+            if limiter.allow(who):
                 return None
             self.send_response(429)
             self.send_header("Content-Type", "application/json")

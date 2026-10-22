@@ -19,6 +19,8 @@ import urllib.request
 from collections.abc import Callable
 
 _POOL_RE = re.compile(r"^([a-z]{2}-[a-z]+-\d)_[A-Za-z0-9]+$")
+_USER_RE = re.compile(r"^[A-Za-z0-9_.:@+-]{1,128}$")   # Cognito usernames; nothing else is ever looked up
+_MAX_CHECKED = 5000
 
 
 class CognitoAuthenticator:
@@ -40,6 +42,7 @@ class CognitoAuthenticator:
         self._now = now
         self._keys: dict[str, dict] = {}
         self._keys_at = -1e18
+        self._fail_at = -1e18
         self._lock = threading.Lock()
         self._checked: dict[str, tuple[float, bool]] = {}
         self._seen: set[str] = set()
@@ -54,11 +57,13 @@ class CognitoAuthenticator:
         with self._lock:
             # Refresh hourly, or once per 30 s when a token names an unknown kid.
             stale = self._now() - self._keys_at > 3600
-            if kid not in self._keys and (stale or self._now() - self._keys_at > 30):
+            if (kid not in self._keys and (stale or self._now() - self._keys_at > 30)
+                    and self._now() - self._fail_at > 30):
                 try:
                     self._keys = {k["kid"]: k for k in self._fetch().get("keys", [])}
                     self._keys_at = self._now()
                 except Exception:
+                    self._fail_at = self._now()   # an outage costs one fetch per 30 s, not one per request
                     if not self._keys:
                         return None
             jwk = self._keys.get(kid)
@@ -79,10 +84,11 @@ class CognitoAuthenticator:
                                 options={"verify_aud": False, "require": ["exp", "iss", "sub"]})
         except Exception:
             return None
-        if claims.get("token_use") != "access" or claims.get("client_id") not in self.client_ids:
+        client, groups = claims.get("client_id"), claims.get("cognito:groups") or []
+        if claims.get("token_use") != "access" or not isinstance(client, str) or client not in self.client_ids:
             return None
         user = claims.get("username") or claims.get("sub")
-        if not isinstance(user, str) or self.required_group not in (claims.get("cognito:groups") or []):
+        if not isinstance(user, str) or not user or not isinstance(groups, list) or self.required_group not in groups:
             return None
         if not self._still_in_group(user):
             return None
@@ -126,6 +132,8 @@ class CognitoAuthenticator:
 
     def exists(self, user_id: str) -> bool:
         """Known and still in the group (stream/agent re-checks come through here)."""
+        if not isinstance(user_id, str) or not _USER_RE.match(user_id):
+            return False
         if self._lookup is None:
             return user_id in self._seen
         return self._still_in_group(user_id)
@@ -144,6 +152,9 @@ class CognitoAuthenticator:
             if hit:
                 return hit[1] and now - hit[0] < 5 * self._recheck
         ok = bool(groups) and self.required_group in groups
+        if len(self._checked) >= _MAX_CHECKED:   # bounded: drop the oldest tenth
+            for k, _ in sorted(self._checked.items(), key=lambda kv: kv[1][0])[:_MAX_CHECKED // 10]:
+                self._checked.pop(k, None)
         self._checked[user] = (now, ok)
         return ok
 
@@ -169,7 +180,8 @@ class SyncedDirectory:
 
     def groups(self, user: str) -> list[str] | None:
         data = self._load("members.json")
-        if self._now() - float(data["updated"]) > self.max_age:
+        age = self._now() - float(data["updated"])
+        if age > self.max_age or age < -60:   # stale, or stamped in the future: both untrusted
             raise RuntimeError("group membership sync is stale")
         return [self.group] if user in data["groups"].get(self.group, []) else []
 
