@@ -199,10 +199,10 @@ function findIdentity(root, id, agent) {
   return walk.matches.length===1 ? confined(walk.matches[0],root) : null;
 }
 
-function procText(path) {
+function procText(path,limit=8192) {
   let fd;
   try {
-    fd=openSync(path,'r');const buffer=Buffer.alloc(8192);
+    fd=openSync(path,'r');const buffer=Buffer.alloc(Math.min(limit,64*1024));
     return buffer.subarray(0,readSync(fd,buffer,0,buffer.length,0)).toString();
   } catch { return ''; } finally {if(fd!==undefined)closeSync(fd);}
 }
@@ -217,7 +217,7 @@ function descendantIdentities(processIds,procRoot,paneId) {
     // Parent processes can inherit another session's identity. Only tool
     // descendants with an explicit matching pane marker establish a binding.
     if(depth>0) {
-      const values=Object.fromEntries(procText(join(path,'environ')).split('\0').filter(v=>v.includes('=')).map(v=>{const i=v.indexOf('=');return [v.slice(0,i),v.slice(i+1)];}));
+      const values=Object.fromEntries(procText(join(path,'environ'),64*1024).split('\0').slice(0,-1).filter(v=>v.includes('=')).map(v=>{const i=v.indexOf('=');return [v.slice(0,i),v.slice(i+1)];}));
       if(values.HERDR_PANE_ID===paneId) {
         const ids=[values.CODEX_THREAD_ID,values.CODEX_SESSION_ID].filter(v=>ID.test(v || ''));
         if(new Set(ids).size===1)identities.add(ids[0]);
@@ -230,7 +230,7 @@ function descendantIdentities(processIds,procRoot,paneId) {
   return [...identities];
 }
 
-function currentClaudeProcess(descriptor,pid,procRoot,platform) {
+function currentClaudeProcess(descriptor,pid,procRoot,platform,machineIdPath) {
   // A PID alone is reusable; Claude records the native process lifetime and
   // domain so stale descriptors cannot attach an unrelated conversation.
   if(platform!=='linux' || descriptor?.pid!==pid || !/^\d+$/.test(descriptor?.procStart || ''))return false;
@@ -243,16 +243,17 @@ function currentClaudeProcess(descriptor,pid,procRoot,platform) {
   const fields=stat.slice(stat.lastIndexOf(')')+1).trim().split(/\s+/);
   if(fields[19]!==String(descriptor.procStart))return false;
   if(descriptor.pidDomain!==undefined) {
-    const boot=procText(join(procRoot,'sys','kernel','random','boot_id')).trim();
+    // Claude's linux domain identifies the machine, not the kernel boot.
+    const machine=procText(machineIdPath).trim();
     let namespace;try {namespace=readlinkSync(join(path,'ns','pid'));} catch {return false;}
     const domain=typeof descriptor.pidDomain==='string' ? descriptor.pidDomain.match(/^linux:([a-fA-F0-9-]+):(pid:\[\d+\])$/) : null;
-    const canonicalBoot=value=>value.replaceAll('-','').toLowerCase();
-    if(!domain || !/^[a-f0-9]{32}$/.test(canonicalBoot(boot)) || canonicalBoot(domain[1])!==canonicalBoot(boot) || domain[2]!==namespace)return false;
+    const canonicalMachine=value=>value.replaceAll('-','').toLowerCase();
+    if(!domain || !/^[a-f0-9]{32}$/.test(canonicalMachine(machine)) || canonicalMachine(domain[1])!==canonicalMachine(machine) || domain[2]!==namespace)return false;
   }
   return true;
 }
 
-export async function resolveTranscript(agent, evidence, {home=homedir(),env=process.env,pids=[],procRoot='/proc',paneId,platform=process.platform}={}) {
+export async function resolveTranscript(agent, evidence, {home=homedir(),env=process.env,pids=[],procRoot='/proc',paneId,platform=process.platform,machineIdPath='/etc/machine-id'}={}) {
   const root=rootFor(agent,home);
   if(!root) return null;
   if(evidence?.agent && evidence.agent!==agent) return null;
@@ -267,7 +268,7 @@ export async function resolveTranscript(agent, evidence, {home=homedir(),env=pro
       if(processIds.has(d?.pid) && ID.test(d?.sessionId || '')) { const file=findIdentity(root,d.sessionId,agent); if(file) candidates.add(file); }
     }
   } else if(agent==='claude') {
-    for(const pid of processIds) { const d=jsonFile(join(home,'.claude','sessions',`${pid}.json`)); if(ID.test(d?.sessionId || '') && currentClaudeProcess(d,pid,procRoot,platform)) {const file=findIdentity(root,d.sessionId,agent); if(file)candidates.add(file);} }
+    for(const pid of processIds) { const d=jsonFile(join(home,'.claude','sessions',`${pid}.json`)); if(ID.test(d?.sessionId || '') && currentClaudeProcess(d,pid,procRoot,platform,machineIdPath)) {const file=findIdentity(root,d.sessionId,agent); if(file)candidates.add(file);} }
   } else if(agent==='codex') {
     for(const pid of processIds) for(const entry of entries(join(procRoot,String(pid),'fd'),256)) {
       let target; try { target=readlinkSync(join(procRoot,String(pid),'fd',entry.name)); } catch {continue;}
@@ -285,7 +286,7 @@ export async function resolveTranscript(agent, evidence, {home=homedir(),env=pro
   return candidates.size===1 ? [...candidates][0] : null;
 }
 
-export function createTranscriptCollector({home=homedir(),env=process.env,queryProcess,procRoot='/proc',maxBytes=MAX_BYTES,maxEvents=100,maxEntries=256}={}) {
+export function createTranscriptCollector({home=homedir(),env=process.env,queryProcess,procRoot='/proc',machineIdPath='/etc/machine-id',maxBytes=MAX_BYTES,maxEvents=100,maxEntries=256}={}) {
   const states=new Map();
   const checkpoint=join(home,'.cache','herdr-engineering','transcript-offsets.json');
   const saved=new Map();
@@ -316,7 +317,7 @@ export function createTranscriptCollector({home=homedir(),env=process.env,queryP
       const info=await queryProcess(server,pane.pane_id).catch(()=>null);
       pids=(info?.result?.process_info?.foreground_processes ?? []).map(p=>p?.pid);
     }
-    const path=await resolveTranscript(pane.agent,pane.agent_session,{home,env,pids,procRoot,paneId:pane.pane_id});
+    const path=await resolveTranscript(pane.agent,pane.agent_session,{home,env,pids,procRoot,machineIdPath,paneId:pane.pane_id});
     if(!path) return empty('identity_unavailable');
     const key=hash(`${sessionId}:${path}${agentId==='main'?'':`:${agentId}`}`);
     let state=states.get(key) || saved.get(key);

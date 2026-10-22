@@ -234,20 +234,21 @@ test('repeated Claude assistant records do not inflate usage',()=>{
   assert.equal([...first,...second].filter(e=>e.kind==='usage').reduce((n,e)=>n+e.input_tokens,0),10);
 });
 
-test('Claude PID descriptors require current process lifetime and boot namespace proof',async t=>{
+test('Claude PID descriptors require current process lifetime and machine namespace proof',async t=>{
   const f=fixture(t,'claude');
   writeFileSync(f.path,lines([{type:'user',sessionId:id,message:{role:'user',content:'recovered'}}]));
   const procRoot=join(f.home,'proc');
   mkdirSync(join(procRoot,'42','ns'),{recursive:true});
   mkdirSync(join(procRoot,'sys','kernel','random'),{recursive:true});
-  writeFileSync(join(procRoot,'sys','kernel','random','boot_id'),'ebf8189c-f339-41b4-b420-32bf1a8ee69f\n');
+  writeFileSync(join(procRoot,'sys','kernel','random','boot_id'),'9bb0969c-1111-2222-3333-444444444444\n');
+  const machineIdPath=join(f.home,'machine-id');writeFileSync(machineIdPath,'ebf8189cf33941b4b42032bf1a8ee69f\n');
   symlinkSync('pid:[1234]',join(procRoot,'42','ns','pid'));
   const fields=['S',...Array(18).fill('0'),'440839879','0'];
   writeFileSync(join(procRoot,'42','stat'),`42 (claude name with ) parens) ${fields.join(' ')}\n`);
   const descriptors=join(f.home,'.claude','sessions');mkdirSync(descriptors,{recursive:true});
   const descriptor=join(descriptors,'42.json');
   const evidence={pid:42,sessionId:id,procStart:'440839879',pidDomain:'linux:ebf8189cf33941b4b42032bf1a8ee69f:pid:[1234]'};
-  const options={home:f.home,procRoot,pids:[42],platform:'linux'};
+  const options={home:f.home,procRoot,machineIdPath,pids:[42],platform:'linux'};
   writeFileSync(descriptor,JSON.stringify(evidence));
   assert.equal(await resolveTranscript('claude',null,options),f.path);
   for(const override of [{pid:43},{procStart:'440839878'},{procStart:null},{pidDomain:'linux:old-boot:pid:[1234]'},{pidDomain:'linux:ebf8189cf33941b4b42032bf1a8ee69f:pid:[9999]'}]) {
@@ -257,7 +258,7 @@ test('Claude PID descriptors require current process lifetime and boot namespace
   writeFileSync(descriptor,JSON.stringify(evidence));
   assert.equal(await resolveTranscript('claude',null,{...options,platform:'darwin'}),null);
   assert.equal(await resolveTranscript('claude',null,{...options,pids:[43]}),null);
-  const collect=createTranscriptCollector({home:f.home,procRoot,queryProcess:async()=>({result:{process_info:{foreground_processes:[{pid:42}]}}})});
+  const collect=createTranscriptCollector({home:f.home,procRoot,machineIdPath,queryProcess:async()=>({result:{process_info:{foreground_processes:[{pid:42}]}}})});
   const captured=await collect('d',{...f.pane,agent_session:null},'s');
   assert.equal(captured.envelopes[0].payload.events[0].text,'recovered');
 });
@@ -277,4 +278,20 @@ test('large native metadata headers resolve fd, descendant, and private identity
   }
   writeFileSync(join(procRoot,'44','environ'),`CODEX_THREAD_ID=${id}\0HERDR_PANE_ID=w1:p0\0`);
   assert.equal(await resolveTranscript('codex',null,{home:f.home,procRoot,pids:[43],paneId:'w1:p0'}),f.path);
+});
+
+
+test('Codex descendant identity after a large environment prefix is still bounded and discoverable',async t=>{
+  const f=fixture(t);writeFileSync(f.path,lines([{type:'session_meta',payload:{id,source:'cli'}},message('known')]));
+  const procRoot=join(f.home,'proc');
+  for(const [pid,children] of [[42,'43'],[43,'']]) {
+    mkdirSync(join(procRoot,String(pid),'task',String(pid)),{recursive:true});
+    writeFileSync(join(procRoot,String(pid),'task',String(pid),'children'),children);
+  }
+  const environment=padding=>`LARGE_ENV=${'x'.repeat(padding)}\0CODEX_THREAD_ID=${id}\0HERDR_PANE_ID=w1:p0\0`;
+  writeFileSync(join(procRoot,'43','environ'),environment(12000));
+  const options={home:f.home,procRoot,pids:[42],paneId:'w1:p0'};
+  assert.equal(await resolveTranscript('codex',null,options),f.path);
+  writeFileSync(join(procRoot,'43','environ'),environment(70000));
+  assert.equal(await resolveTranscript('codex',null,options),null);
 });

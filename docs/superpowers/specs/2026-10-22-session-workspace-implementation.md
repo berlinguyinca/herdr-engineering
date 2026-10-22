@@ -36,7 +36,7 @@ Validation uses the existing `npm test`, the feed's `npm test --prefix deploy/he
 
 ## Release hardening
 
-Exact-ID lookup uses Codex UUIDv7 date buckets and resumable bounded traversal instead of abandoning established hosts with more than 2,048 log files. Native headers are bounded separately from message bodies. Linux Claude descriptors require matching queried PID, process start time, boot and PID namespace; Codex descendants require exact runtime/pane identity. Neither path joins by cwd or newest file.
+Exact-ID lookup uses Codex UUIDv7 date buckets and resumable bounded traversal instead of abandoning established hosts with more than 2,048 log files. Native headers are bounded separately from message bodies. Linux Claude descriptors require matching queried PID, process start time, machine identity and PID namespace; Codex descendants require exact runtime/pane identity. Neither path joins by cwd or newest file.
 
 Explicit Codex parent headers populate helper conversations, nested attribution and activity. Known transcript bindings survive pane exit, pane reuse and collector restart, allowing the reader to drain final output. Native event hooks hand off exact bindings even for short sessions that disappear before a snapshot poll. A legacy session that was never observed with exact identity cannot be backfilled safely. Claude/Pi helper associations are shown only when explicitly reported.
 
