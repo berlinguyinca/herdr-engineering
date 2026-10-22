@@ -4,7 +4,8 @@
 // Reads ~/.config/herdr-engineering/host.json {control_plane_url, host_id, token}
 // (written by `herdr-eng fleet join`), fetches GET {url}/api/v1/fleet/config and
 // caches it in ~/.cache/herdr-engineering/fleet-config.json (0600, dir 0700).
-// A revoked token (401) deletes the cache. Redirects are never followed and the
+// A revoked token (401) deletes the cache; any other refusal (403/404 from a
+// control plane without the fleet endpoint) uses the cache like a 5xx. Redirects are never followed and the
 // token and values never appear in an error message.
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -112,10 +113,15 @@ export async function loadHostConfig({ home = homedir(), fetch = globalThis.fetc
     } catch { /* best effort */ }
     return build(url, hostId, revision, values, "fetch");
   }
-  if (status !== null && status >= 400 && status < 500) {
-    throw new HostConfigUnavailable(`the control plane refused the configuration request (HTTP ${status})`);
+  // Only 401 revokes. 403/404/other refusals (a control plane without the fleet
+  // endpoint, or a rollback to one), 3xx, 5xx, unreachable and malformed replies
+  // all fall back to the cache.
+  const cached = readCache(cachePath, hostId);
+  if (!cached) {
+    if (status !== null) {
+      throw new HostConfigUnavailable(`the control plane at ${url} did not serve a configuration (HTTP ${status}) and no cached configuration exists`);
+    }
+    throw new HostConfigUnavailable(`control plane at ${url} unreachable and no cached configuration exists`);
   }
-  const cached = readCache(cachePath, hostId);   // unreachable, 3xx, 5xx or malformed
-  if (!cached) throw new HostConfigUnavailable(`control plane at ${url} unreachable and no cached configuration exists`);
   return build(url, hostId, cached.revision, cached.values, "cache");
 }

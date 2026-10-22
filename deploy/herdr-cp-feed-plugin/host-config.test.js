@@ -73,6 +73,23 @@ test("5xx uses cache", async () => {
   assert.equal(cfg.apiKey, VALUE);
 });
 
+for (const code of [403, 404, 400]) {
+  test(`${code} uses and keeps the cache (pre-feature control plane or rollback)`, async () => {
+    const home = makeHome();
+    await loadHostConfig({ home, fetch: recorder(() => ok(GOOD)).fetch });
+    const cfg = await loadHostConfig({ home, fetch: async () => reply(code) });
+    assert.equal(cfg.source, "cache");
+    assert.equal(cfg.apiKey, VALUE);
+    assert.ok(existsSync(cachePath(home)));
+  });
+}
+
+test("404 without a cache is unavailable, not revoked", async () => {
+  const home = makeHome();
+  await assert.rejects(loadHostConfig({ home, fetch: async () => reply(404) }),
+    err => err instanceof HostConfigUnavailable && err.revoked === false && /HTTP 404/.test(err.message));
+});
+
 test("malformed reply uses cache", async () => {
   const home = makeHome();
   await loadHostConfig({ home, fetch: recorder(() => ok(GOOD)).fetch });
