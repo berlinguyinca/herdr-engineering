@@ -243,6 +243,7 @@ def test_a_helper_runs_boxed_with_the_task_on_stdin_only_and_its_output_comes_ba
     assert all(TASK not in line for line in calls(hr) + hr.said)
     assert not list(hr.state.iterdir()) and not Path(info["cwd"]).exists()
     assert any(" pane close " in f" {line} " for line in calls(hr))
+    assert any(" pane run " in f" {x} " and x.endswith("| cat -v") for x in calls(hr))   # no raw escapes
 
 
 @needs_box
@@ -441,12 +442,15 @@ def test_model_ids_go_through_the_familys_flag_and_odd_ones_are_refused(hr):
     cmd, notes = r.helper_command({"family": "pi", "model": "qwen3:30b", "profile": prof})
     assert cmd.startswith("pi --model qwen3:30b -p ") and cmd.endswith('-- "Task from a room member: $(cat)"')
     cmd, _ = r.helper_command({"family": "codex", "model": "gpt-5", "profile": prof})
-    assert cmd == "codex exec --model gpt-5 --skip-git-repo-check -"
+    assert cmd == runner.FAMILY_CMD_TOOLS["codex"]                     # only pi takes --model (gateway ids)
+    cmd, notes = r.helper_command({"family": "claude-code", "model": "glm-5v", "profile": prof})
+    assert cmd == runner.FAMILY_CMD_TOOLS["claude-code"] and "--model" not in cmd
+    assert any("was not passed" in n for n in notes)
     cmd, _ = r.helper_command({"family": "claude-code", "model": None, "profile": {"tools_allowed": False}})
     assert cmd == runner.FAMILY_CMD_TEXT_ONLY["claude-code"]            # the room does not allow tools
-    for bad in ("a b", "x;rm -rf /", "$(id)", "m" * 129, "", "q\n"):
+    for bad in ("a b", "x;rm -rf /", "$(id)", "m" * 129, "", "q\n", "--x", "-m", ".hidden", ":x"):
         with pytest.raises(runner.Failure):
-            r.helper_command({"family": "claude-code", "model": bad, "profile": prof})
+            r.helper_command({"family": "pi", "model": bad, "profile": prof})
     with pytest.raises(runner.Failure):                                # codex has no text-only mode
         hr.mk().helper_command({"family": "codex", "model": None, "profile": prof})
 
@@ -571,3 +575,15 @@ def test_a_paused_helper_stops_even_when_the_fleet_path_fails(hr, monkeypatch):
     with pytest.raises(runner.Failure):
         r.once()
     assert not list(hr.state.iterdir()) and procs_with(str(hr.state)) == []
+
+
+def test_the_whole_posted_result_fits_in_20_kb(hr, tmp_path):
+    d = tmp_path / "hd"
+    d.mkdir()
+    (d / "out").write_bytes("é".encode() * 15000)                     # 30 KB of two-byte characters
+    (d / "result.json").write_text(json.dumps({"exit": 3, "bytes": 30000, "stderr": "E" * 4000}))
+    st = {"notes": ["model x was not passed: no model flag is known for codex"],
+          "asked": [f"h{i}.example.com:443" for i in range(20)], "forbidden": ["inner.example.com:443"]}
+    text = hr.mk().helper_result_text(d, st)
+    assert len(text.encode()) <= runner.HELPER_RESULT_CAP
+    assert "[output truncated at 20 KB]" in text and "[stderr]" in text and text.startswith("[model x")

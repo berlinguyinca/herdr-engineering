@@ -94,12 +94,13 @@ PANE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}$")
 # proxy, the task on stdin, and posts its stdout back as the result. Helpers run plain: no MCP wiring yet.
 HELPER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 ROOM_ID = HELPER_ID
-MODEL_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")       # leading alnum: never read as a flag
 SECRET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")          # the room profile's secret-name rule
 SERVICE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 ALLOW_LINE = re.compile(r"[A-Za-z0-9.:\[\]_-]{1,260}")
 HELPER_ROLES = ("reviewer", "debugger", "worker", "vision", "successor")
-MODEL_AFTER = {"claude-code": "claude", "codex": "codex exec", "pi": "pi"}   # `--model ID` goes right after these
+# `--model ID` goes right after these. pi only: catalogue ids are gateway models, which claude and codex can't serve.
+MODEL_AFTER = {"pi": "pi"}
 HELPER_RESULT_CAP = 20_000              # bytes of stdout returned; the rest is cut with a marker
 HELPER_CLAIM_STALE = 900.0              # a claim a previous process never started is failed after this long
 HELPERS_PER_HOST = 6                    # live helpers this host runs at once
@@ -948,7 +949,8 @@ class Runner:
         if status != 200:
             raise Failure(f"could not mark the helper running: {status} {trim(out.get('error', ''))}")
         try:                                       # presentation: the pane shows the helper's output as it comes
-            self.run(self.herdr_cmd(self.host_id, ["pane", "run", pane, f"tail -n +1 -F {shlex.quote(str(d / 'out'))}"]),
+            self.run(self.herdr_cmd(self.host_id, ["pane", "run", pane,
+                                                          f"tail -n +1 -F {shlex.quote(str(d / 'out'))} | cat -v"]),
                      timeout=30)
             if own_tab and isinstance(tab, str) and PANE_ID.fullmatch(tab):
                 self.run(self.herdr_cmd(self.host_id, ["tab", "rename", tab, name]), timeout=20)
@@ -1106,8 +1108,15 @@ class Runner:
             foot.append("[host access was requested for: " + ", ".join(st["asked"]) + "]")
         if res.get("exit") not in (0, None) and res.get("stderr"):
             foot.append("[stderr]\n" + str(res["stderr"])[-1500:])
-        text = raw[:HELPER_RESULT_CAP].decode("utf-8", "ignore")
-        return head + text + ("\n" + "\n".join(foot) if foot else "")
+        # the WHOLE posted text fits in HELPER_RESULT_CAP bytes: notes and footers first, the output gets the rest
+        head = head.encode()[:HELPER_RESULT_CAP // 4].decode("utf-8", "ignore")
+        tail = ("\n" + "\n".join(foot) if foot else "").encode()[:HELPER_RESULT_CAP // 4]
+        room = HELPER_RESULT_CAP - len(head.encode()) - len(tail)
+        marker = b"\n[output truncated at 20 KB]"
+        if len(raw) > room and b"[output truncated" not in tail:
+            tail, room = marker + tail, room - len(marker)
+        text = raw[:max(0, room)].decode("utf-8", "ignore")
+        return head + text + tail.decode("utf-8", "ignore")
 
     def end_helper(self, d: Path, st: dict, status: str, error: str | None) -> None:
         """Stop it, post how it ended (with its output), then remove its pane, work dir, socket dir and state."""
@@ -1177,7 +1186,7 @@ class Runner:
     def once(self) -> None:
         try:        # the panic switch, revokes and expiry apply first, whatever happens to the fleet path below
             self.helpers_cycle(claim=False)
-        except Failure as exc:
+        except (Failure, OSError) as exc:
             self.say(f"helpers: {trim(exc)}")
         self.public_url = (self.ok("GET", "config") or {}).get("public_url", "")
         if not self.public_url.startswith("https://"):
@@ -1200,7 +1209,7 @@ class Runner:
                 self.say(f"claim {sp['spawn_id']}: {status}")
         try:
             self.helpers_cycle(local_ok=self.host_id in eligible)       # watches again, then claims
-        except Failure as exc:
+        except (Failure, OSError) as exc:
             self.say(f"helpers: {trim(exc)}")
         try:
             self.catalogue_cycle()
