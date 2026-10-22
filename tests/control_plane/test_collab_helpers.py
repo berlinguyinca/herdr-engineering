@@ -608,7 +608,9 @@ def test_catalogue_validation_and_wholesale_replace(w):
     for bad in ("x", [3], [{**good, "id": ""}], [{**good, "id": "a" * 129}], [{**good, "id": "a\nb"}],
                 [{**good, "family": "f" * 65}], [{**good, "vision": 1}], [{**good, "price_out_per_mtok": -1}],
                 [{**good, "price_out_per_mtok": float("nan")}], [{**good, "context": -1}],
-                [{**good, "context": True}], [{**good, "local": "y"}], [{**good, "extra": 1}],
+                [{**good, "context": True}], [{**good, "local": "y"}], [{**good, "extra": 1}], [{**good, "id": "a;b"}], [{**good, "id": "a b"}], [{**good, "id": "a$b"}],
+                [{**good, "price_out_per_mtok": 10**400}], [{**good, "context": 10**400}],
+                [{**good, "price_out_per_mtok": 2e6}],
                 [good, good], [{**good, "id": f"m{i}"} for i in range(501)]):
         with pytest.raises(collab.CollabError) as e:
             w.s.set_catalogue(w.op, bad)
@@ -628,7 +630,7 @@ def test_unchanged_catalogue_is_not_logged_again_and_survives_hydrate(w):
     fresh = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}),
                           sink=None, now=w.s.clock, max_agents_per_user=20)
     fresh.hydrate(list(w.s._log))
-    assert [e["id"] for e in fresh._catalogue] == ["fx-cheap", "fx-top", "fx-eye"]
+    assert [e["id"] for e in fresh._catalogue] == ["fx-cheap", "fx-eye", "fx-top"]
 
 
 def test_catalogue_route_is_operator_listener_only(w):
@@ -638,3 +640,16 @@ def test_catalogue_route_is_operator_listener_only(w):
     assert call(["fleet", "catalogue"], {"models": CATALOGUE}, auth=bearer)[0] == 404
     assert call(["fleet", "catalogue"], {"models": "x"}, operator="mallory")[0] == 400
     assert call(["fleet", "catalogue"], {"models": CATALOGUE}, operator="mallory") == (200, {"count": 3})
+
+
+def test_catalogue_order_does_not_write_a_new_event(w):
+    w.s.set_catalogue(w.op, CATALOGUE)
+    n = len(w.s._log)
+    w.s.set_catalogue(w.op, list(reversed(CATALOGUE)))
+    assert len(w.s._log) == n
+
+
+def test_allowed_models_must_look_like_ids(w):
+    with pytest.raises(collab.CollabError) as e:
+        w.s.set_room_profile(w.alice, w.room, {"allowed_families": ["codex"], "allowed_models": ["a;b"]})
+    assert e.value.status == 400

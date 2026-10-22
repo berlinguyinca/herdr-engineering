@@ -12,8 +12,10 @@ import re
 from typing import Any, NamedTuple
 
 TIERS = ("trivial", "standard", "hard", "vision")
-_VISION_WORDS = re.compile(r"image|screenshot|picture|diagram|photo", re.I)
-_HARD_WORDS = ("race", "deadlock", "security", "concurrency", "memory leak", "corruption", "crypto")
+_VISION_WORDS = re.compile(r"\b(?:screenshots?|screen\s+shots?|pictures?|diagrams?|photos?|png|jpe?g)\b", re.I)
+_IMAGE_WORD = re.compile(r"\bimages?\b", re.I)
+_NOT_PICTURES = re.compile(r"\b(?:docker|disk|container|base|iso|vm)\s+images?\b|\bimages?\s+build", re.I)
+_HARD_WORDS = re.compile(r"\b(?:races?|deadlocks?|security|concurrency|memory\s+leaks?|corruption|crypto\w*)\b", re.I)
 _HARD_LONG = 3000
 _TRIVIAL_SHORT = 400
 _REVIEW_ROLES = ("reviewer", "debugger")
@@ -26,9 +28,9 @@ class Pick(NamedTuple):
 
 
 def _tier(role: str, task: str) -> tuple[str, str]:
-    low = task.lower()
-    hard = any(w in low for w in _HARD_WORDS)
-    if role == "vision" or _VISION_WORDS.search(task):
+    hard = _HARD_WORDS.search(task) is not None
+    pictures = _VISION_WORDS.search(task) or _IMAGE_WORD.search(_NOT_PICTURES.sub(" ", task))
+    if role == "vision" or pictures:
         return "vision", "vision role" if role == "vision" else "vision words"
     if role in _REVIEW_ROLES:
         if hard or len(task) > _HARD_LONG:
@@ -47,6 +49,10 @@ def _clean(catalogue: Any) -> list[dict]:
         seen.add(e["id"])
         price = e.get("price_out_per_mtok")
         ctx = e.get("context")
+        if (price is not None and not (isinstance(price, (int, float)) and not isinstance(price, bool)
+                                       and 0 <= price <= 1e6)) or \
+                (ctx is not None and not (isinstance(ctx, int) and not isinstance(ctx, bool) and 0 <= ctx <= 10**9)):
+            continue                      # NaN, negative, infinite or absurd numbers: skip the entry
         out.append({"id": e["id"], "family": e.get("family") if isinstance(e.get("family"), str) else None,
                     "vision": e.get("vision") is True,
                     "price": float(price) if isinstance(price, (int, float)) and not isinstance(price, bool) else None,
@@ -97,6 +103,7 @@ def pick(role: str, task: str, family_hint: str | None, model_hint: str | None,
         else:
             notes.append("family hint ignored: no such family")
     if model_hint:
+        # "capable" means vision-capable only: an allowed non-author hint is honoured even if weaker than the tier
         hit = [e for e in entries if e["id"] == model_hint]
         if hit:
             return Pick(hit[0]["id"], tier, "; ".join([f"tier {tier} ({why})", "model hint honoured", *notes]))

@@ -1955,7 +1955,7 @@ class CollabService:
                    if r["owner"] == pr.owner and now - r["created_epoch"] < 3600) >= limits["per_hour"]:
                 self._helper_refuse(pr, room, 429, "hourly helper limit reached for this person", "limit_hour")
             author = (mine or {}).get("model")
-            choice = collab_models.pick(role, task, body.get("family"), hint, self._catalogue,
+            choice = collab_models.pick(role, task, None, hint, self._catalogue,
                                         profile["allowed_models"], author if isinstance(author, str) else None)
             model = choice.model if isinstance(choice.model, str) else None
             hid = ids.new_id("collab")
@@ -2194,7 +2194,7 @@ class CollabService:
     def set_catalogue(self, pr: Principal, entries: Any) -> dict:
         """The runner posts the normalized model catalogue (operator only); it replaces the old one wholesale."""
         self._require_operator(pr)
-        clean = _catalogue_entries(entries)
+        clean = sorted(_catalogue_entries(entries), key=lambda e: e["id"])   # gateway order is not stable
         with self._lock:
             if clean != self._catalogue:          # the runner posts every 10 minutes: log only changes
                 # no "action": the list is configuration data, not an audit row
@@ -3056,7 +3056,7 @@ class CollabService:
                         kw = {"ttl_seconds": body["ttl_seconds"]} if "ttl_seconds" in body else {}
                         return 200, self.decide_egress(pr, parts[2], body.get("decision"), **kw)
                     if parts == ["fleet", "catalogue"]:
-                        return 200, self.set_catalogue(pr, body.get("models", body.get("entries")))
+                        return 200, self.set_catalogue(pr, body.get("models"))
                     if parts == ["fleet", "helpers", "pause"]:
                         return 200, self.set_helpers_paused(pr, body.get("paused"))
                     if n == 4 and parts[1] == "helpers" and parts[3] == "claim":
@@ -3132,9 +3132,8 @@ def _catalogue_entries(entries: Any) -> list[dict]:
         raise CollabError(400, f"models must be a list of at most {CATALOGUE_MAX} entries")
     keys = {"id", "family", "vision", "price_out_per_mtok", "context", "local"}
 
-    def num(v: Any, kind: type) -> bool:
-        return v is None or (isinstance(v, kind) and not isinstance(v, bool) and v >= 0
-                             and (kind is int or v == v and v != float("inf")))
+    def num(v: Any, kind: type, cap: float) -> bool:
+        return v is None or (isinstance(v, kind) and not isinstance(v, bool) and 0 <= v <= cap)   # NaN fails too
 
     out, seen = [], set()
     for e in entries:
@@ -3142,10 +3141,11 @@ def _catalogue_entries(entries: Any) -> list[dict]:
             raise CollabError(400, "invalid catalogue entry")
         mid, fam = e.get("id"), e.get("family")
         if (not isinstance(mid, str) or not 0 < len(mid) <= 128 or not mid.isprintable() or mid in seen
+                or not _KEY_RE.fullmatch(mid)
                 or not (fam is None or (isinstance(fam, str) and len(fam) <= 64 and fam.isprintable()))
                 or not isinstance(e.get("vision", False), bool) or not isinstance(e.get("local", False), bool)
-                or not num(e.get("context"), int)
-                or not (num(e.get("price_out_per_mtok"), float) or num(e.get("price_out_per_mtok"), int))):
+                or not num(e.get("context"), int, 1e9)
+                or not (num(e.get("price_out_per_mtok"), float, 1e6) or num(e.get("price_out_per_mtok"), int, 1e6))):
             raise CollabError(400, "invalid catalogue entry")
         seen.add(mid)
         price = e.get("price_out_per_mtok")
@@ -3180,7 +3180,7 @@ def _normalize_profile(body: Any) -> dict:
         raise CollabError(400, f"allowed_families must be among {', '.join(SPAWN_FAMILIES)}")
     models = body.get("allowed_models")
     if models is not None:
-        models = _profile_strings(models, "allowed_models", None, 100)
+        models = _profile_strings(models, "allowed_models", _KEY_RE, 100)
     tools = body.get("tools_allowed", False)
     if not isinstance(tools, bool):
         raise CollabError(400, "tools_allowed must be true or false")

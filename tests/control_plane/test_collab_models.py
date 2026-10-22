@@ -112,3 +112,32 @@ def test_reason_is_short_names_tier_and_has_no_task_text():
     secret = "zebra_quokka_secret deadlock"
     p = pick("debugger", secret, None, None, CAT, None, None)
     assert "hard" in p.reason and "zebra" not in p.reason and len(p.reason) < 200
+
+
+@pytest.mark.parametrize("task", ["read this traceback", "be gracefully tolerant", "embrace the trace", "a grace period"])
+def test_hard_words_are_whole_words(task):
+    assert pick("debugger", task, None, None, CAT, None, None).tier == "standard"
+
+
+@pytest.mark.parametrize("task", ["fix the Race", "a deadlock", "cryptography review", "memory  leak"])
+def test_whole_hard_words_still_count(task):
+    assert pick("debugger", task, None, None, CAT, None, None).tier == "hard"
+
+
+@pytest.mark.parametrize("task", ["build the docker image", "write a disk image", "pull the base image", "image build"])
+def test_container_images_are_not_vision(task):
+    assert pick("worker", task, None, None, CAT, None, None).tier != "vision"
+
+
+@pytest.mark.parametrize("task", ["describe this screenshot", "see logo.PNG", "this image is blurry", "a jpeg"])
+def test_picture_words_are_vision(task):
+    assert pick("worker", task, None, None, CAT, None, None).tier == "vision"
+
+
+def test_invalid_numbers_in_a_catalogue_skip_the_entry():
+    cat = [m("m-nan", float("nan")), m("m-neg", -1.0), m("m-inf", float("inf")), m("m-ok", 2.0)]
+    assert pick("debugger", "deadlock", None, None, cat, None, None).model == "m-ok"
+
+
+def test_allowed_weaker_model_hint_is_honoured_for_a_hard_tier():
+    assert pick("debugger", "deadlock", None, "m-cheap", CAT, None, None).model == "m-cheap"
