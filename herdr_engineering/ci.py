@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from .control_plane.project_links import repository_language
 from .errors import InvalidError, PermissionError_Engineering, UnreachableError
 
 
@@ -214,12 +215,16 @@ class WoodpeckerProvider:
         out = []
         for item in rows:
             full = item.get("full_name") or f"{item.get('owner', '')}/{item.get('name', '')}"
+            language = repository_language(item.get("language"))
+            if language and self.token and self.token in language:
+                language = None
             out.append({
                 "id": item.get("id"), "repository": full,
                 "owner": item.get("owner"), "name": item.get("name"),
                 "private": item.get("private", False), "active": item.get("active", True),
                 "default_branch": item.get("default_branch"), "clone_url": item.get("clone_url"),
                 "forge_url": item.get("forge_url"),
+                "language": language,
             })
         counts = Counter(row["repository"] for row in out)
         self._repo_id_cache = {

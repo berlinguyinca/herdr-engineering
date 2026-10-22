@@ -1112,10 +1112,14 @@ def _make_handler(server, public=False, operator=False):
             if resource == "ci":
                 what = parts[4] if len(parts) > 4 else ""
                 if what == "history":
-                    from .project_links import annotate_ci_history
-                    return self._json(annotate_ci_history(server.ci_monitor.history(), r))
+                    from .project_links import annotate_ci_history, cached_github_languages
+                    return self._json(annotate_ci_history(server.ci_monitor.history(), r,
+                        repository_languages=cached_github_languages(server.github_monitor)))
                 if what == "reports":
-                    return self._json(r.ci_reports())
+                    from .project_links import annotate_ci_history, cached_github_languages
+                    view = {**r.ci_reports(), "repos": server.ci_monitor.snapshot().get("repos", [])}
+                    return self._json(annotate_ci_history(view, r,
+                        repository_languages=cached_github_languages(server.github_monitor)))
                 if what == "pipeline":
                     return self._json(server.ci_monitor.detail(
                         _q(self.path, "repository"), _q(self.path, "number")))
@@ -1124,8 +1128,9 @@ def _make_handler(server, public=False, operator=False):
                         _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step")))
                 if what:
                     return self._json({"error": "not found"}, 404)
-                from .project_links import annotate_ci
-                return self._json(annotate_ci(server.ci_monitor.snapshot(), r))
+                from .project_links import annotate_ci, cached_github_languages
+                return self._json(annotate_ci(server.ci_monitor.snapshot(), r,
+                    repository_languages=cached_github_languages(server.github_monitor)))
             if resource == "reviews":
                 from .reviews import ReviewService
                 reviews = ReviewService(r)

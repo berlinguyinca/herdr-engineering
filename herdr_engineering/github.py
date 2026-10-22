@@ -14,7 +14,11 @@ import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 
-from .control_plane.project_links import canonical_repository, project_for_repository
+from .control_plane.project_links import (
+    canonical_repository,
+    project_for_repository,
+    repository_language,
+)
 from .control_plane.redact import redact_text
 
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -24,6 +28,7 @@ affiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],
 ownerAffiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],orderBy:{field:NAME,direction:ASC}) {
 totalCount pageInfo {hasNextPage endCursor} nodes {
 id nameWithOwner url isPrivate isArchived hasIssuesEnabled viewerPermission
+primaryLanguage {name}
 issues(states:OPEN) {totalCount} } } } rateLimit {remaining resetAt cost} }"""
 ISSUE_FIELDS = """id number title url state updatedAt
 labels(first:100) {nodes {name} pageInfo {hasNextPage}}
@@ -217,7 +222,10 @@ def _repository(row):
     count = (row.get("issues") or {}).get("totalCount")
     if not identity or not isinstance(name, str) or not isinstance(count, int):
         raise GitHubError("invalid_response")
+    primary_language = row.get("primaryLanguage")
+    language = repository_language(primary_language.get("name")) if isinstance(primary_language, dict) else None
     return {"github_id": row["id"], "repository_id": identity, "name_with_owner": name,
+            "language": language,
             "url": row["url"], "project_id": project_for_repository(identity),
             "private": bool(row.get("isPrivate")), "archived": bool(row.get("isArchived")),
             "issues_enabled": bool(row.get("hasIssuesEnabled")), "viewer_permission": row.get("viewerPermission"),
@@ -323,6 +331,18 @@ class GitHubMonitor:
                 age = self._now() - datetime.fromisoformat(view["last_success_at"]).timestamp()
                 view["stale"] = view["stale"] or age > self._interval * 2
             return view
+
+    def repository_languages(self, *, start=True):
+        """Return current-generation primary languages without a network read.
+
+        Discovery stays on the existing background worker. Partial/stale cache
+        entries remain useful, but token rotation clears them before exposure.
+        """
+        self._sync_credentials()
+        if start:
+            self.start()
+        with self._lock:
+            return {identity: record.get("language") for identity, record in self._repos.items()}
 
     def _sync_credentials(self):
         with self._lock:

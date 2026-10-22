@@ -32,6 +32,14 @@ Selecting a run from the original run list gives its pipeline the page width and
 
 Publish structured JUnit reports using the [CI report upload guide](ci-test-reports.md). Missing reports remain distinct from zero tests. History is a bounded observation window, not a complete provider backfill: up to 200 reports and 2,000 run observations, with a 16 MiB budget per kind. Report publication and observed run changes use the existing durable event sink when configured; without it, the UI explicitly identifies memory-only storage. Durable-sink failures leave observations retryable and surface a partial-history warning. Restart recovery replays retained evidence from the event log.
 
+## Run-time histograms and project/language averages
+
+Open **Run durations · histograms, project & language averages** on the CI page. It shows successful-run duration distributions and mean execution time by project and current primary repository language. Each group includes its sample count; **Chart data** provides all groups, exact histogram counts, mean, median and nearest-rank p95. Plots show the ten groups with the highest means. Small samples do not provide reliable tail estimates.
+
+Measurements run from provider start to finish, include setup/build/test/cache work, and exclude queued time. These are pipeline execution times, not compile-only benchmarks. Failed, canceled, skipped, active and invalid-duration runs are excluded from these successful-run statistics. Provider/repository/run identity removes duplicate observations. Repository, branch, period, search, mission and session filters apply across outcome tabs.
+
+Language comes from explicit provider repository metadata or the existing cached GitHub primary-language discovery. It describes the repository today, not every build step or the language at a historical revision; missing metadata remains **Unknown**. Discovery stays in the background and CI handlers do not make per-repository GitHub requests. Statistics cover the displayed bounded observation window, with retention, stale, partial and memory-only warnings preserved; they do not claim complete historical coverage.
+
 ## Project health heatmap and PR tree
 
 The CI page starts with a project-by-time heatmap. Choose **Last 24 hours**, **Last 24 runs**, **7 days**, **14 days**, or **30 days**. Hourly history covers the exact trailing 24 hours split at UTC hour boundaries; edge hours can be partial. Daily windows include today. Last 24 runs means the latest 24 matching provider runs for each project, with no date cutoff; its columns are ordinal positions rather than shared dates.

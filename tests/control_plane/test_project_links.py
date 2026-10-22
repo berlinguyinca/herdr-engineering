@@ -236,3 +236,60 @@ def test_flat_ci_history_keeps_exact_context_links_without_mutating_coverage():
     assert result['pipelines'][1]['related_missions'] == []
     assert result['coverage'] == original['coverage']
     assert view == original
+
+
+def test_repository_language_propagates_to_recent_and_flat_history_without_mutation():
+    from herdr_engineering.control_plane.project_links import annotate_ci_history
+
+    view = snapshot()
+    original = copy.deepcopy(view)
+    languages = {'github.com/org/frontend': 'Rust', 'github.com/org/backend': 'Go'}
+    recent = annotate_ci(view, records(), repository_languages=languages)
+    view['pipelines'] = [row for rows in view['pipelines'].values() for row in rows]
+    history = annotate_ci_history(view, records(), repository_languages=languages)
+    for result in (recent, history):
+        assert [(row['language'], row['language_source']) for row in result['repos']] == [
+            ('Rust', 'github_primary_language'), ('Go', 'github_primary_language')]
+    assert [row['language'] for row in history['pipelines']] == ['Rust', 'Go']
+    assert recent['pipelines']['org/frontend'][0]['language'] == 'Rust'
+    assert original['repos'] == view['repos']
+    assert 'language' not in view['pipelines'][0]
+
+
+def test_language_prefers_explicit_provider_metadata_and_never_matches_bare_names():
+    view = snapshot()
+    view['repos'][0]['language'] = ' Go '
+    view['repos'].append({'id': 19, 'repository': 'org/frontend',
+                          'forge_url': 'https://gitlab.com/org/frontend'})
+    view['pipelines']['19'] = [{'provider_repo_id': 19}]
+    result = annotate_ci(view, records(), repository_languages={'github.com/org/frontend': 'Rust'})
+    assert result['repos'][0]['language'] == 'Go'
+    assert result['repos'][0]['language_source'] == 'provider_repository'
+    assert result['pipelines']['19'][0]['language'] is None
+    assert result['pipelines']['19'][0]['language_source'] == 'unknown'
+    assert result['repos'][1]['language'] is None
+
+
+def test_invalid_repository_languages_are_explicit_unknown():
+    for language in (None, '', ' ', 12, {}, ['Go'], 'x' * 101, 'Rust\nGo', '[REDACTED]', 'token=private-value'):
+        view = snapshot()
+        view['repos'][0]['language'] = language
+        result = annotate_ci(view, records(), repository_languages={'github.com/org/backend': language})
+        assert all(row['language'] is None and row['language_source'] == 'unknown'
+                   for row in result['repos'])
+
+
+def test_conflicting_run_forge_does_not_inherit_another_forges_language():
+    view = snapshot()
+    view['pipelines']['org/frontend'][0]['forge_url'] = 'https://gitlab.com/org/frontend'
+    result = annotate_ci(view, records(), repository_languages={'github.com/org/frontend': 'Rust'})
+    assert result['pipelines']['org/frontend'][0]['language'] is None
+
+
+def test_conflicting_explicit_run_identities_are_not_treated_as_missing():
+    view = snapshot()
+    row = view['pipelines']['org/frontend'][0]
+    row.update(repository_id='github.com/org/frontend', forge_url='https://gitlab.com/org/frontend')
+    result = annotate_ci(view, records(), repository_languages={'github.com/org/frontend': 'Rust'})
+    assert result['pipelines']['org/frontend'][0]['language'] is None
+    assert result['pipelines']['org/frontend'][0]['language_source'] == 'unknown'

@@ -127,3 +127,86 @@ def test_history_is_viewer_readable_flat_and_memory_only(server):
     assert data['repos'][0]['provider_url'] == 'https://ci.example'
     assert data['coverage']['17']['exhausted'] is True
     assert request(server, 'ci/history', key='invalid')[0] == 401
+
+
+@pytest.mark.parametrize('path', ['ci', 'ci/history'])
+def test_ci_routes_use_cached_language_metadata_and_preserve_history_scope(server, path):
+    from tests.control_plane.test_project_links import snapshot
+
+    view = snapshot()
+    view['scope'] = {'memory_only': True}
+    if path.endswith('history'):
+        view['pipelines'] = [row for rows in view['pipelines'].values() for row in rows]
+    server.ci_monitor.snapshot = lambda: view
+    server.ci_monitor.history = lambda: view
+    server.github_monitor.repository_languages = lambda: {'github.com/org/frontend': 'Rust'}
+    status, data = request(server, path)
+    assert status == 200
+    row = data['pipelines'][0] if path.endswith('history') else data['pipelines']['org/frontend'][0]
+    assert row['language'] == 'Rust'
+    assert row['language_source'] == 'github_primary_language'
+    assert data['scope'] == view['scope']
+
+
+@pytest.mark.parametrize('path', ['ci', 'ci/history'])
+def test_ci_remains_available_when_language_monitor_is_unavailable(server, path):
+    from types import SimpleNamespace
+
+    from tests.control_plane.test_project_links import snapshot
+
+    server.github_monitor.close()
+    view = snapshot()
+    if path.endswith('history'):
+        view['pipelines'] = [row for rows in view['pipelines'].values() for row in rows]
+    server.ci_monitor.snapshot = lambda: view
+    server.ci_monitor.history = lambda: view
+    server.github_monitor = SimpleNamespace(close=lambda: None)
+    assert request(server, path)[1]['repos'][0]['language'] is None
+
+    def unavailable():
+        raise OSError('private-token-do-not-expose')
+
+    server.github_monitor.repository_languages = unavailable
+    status, data = request(server, path)
+    assert status == 200
+    assert data['repos'][0]['language'] is None
+    assert 'private-token-do-not-expose' not in json.dumps(data)
+
+
+def test_retained_report_runs_receive_current_repository_language_without_recent_runs(server):
+    from tests.control_plane.test_project_links import snapshot
+
+    view = snapshot()
+    view['pipelines'] = {}
+    server.ci_monitor.snapshot = lambda: view
+    server.github_monitor.repository_languages = lambda: {'github.com/org/frontend': 'Rust'}
+    server.repo.observe_ci_pipeline({'repository': 'org/frontend', 'provider_repo_id': 17,
+                                    'run_number': 100, 'state': 'success'})
+    before = server.repo.ci_reports()
+    status, data = request(server, 'ci/reports')
+    assert status == 200
+    assert data['pipelines'][0]['language'] == 'Rust'
+    assert data['pipelines'][0]['language_source'] == 'github_primary_language'
+    assert data['pipelines'][0]['project_id'] == 'github.com/org/frontend'
+    assert data['reports'] == before['reports']
+    assert data['scope'] == before['scope']
+    assert server.repo.ci_reports() == before
+
+
+@pytest.mark.parametrize('inventory', [[], [{'id': 99, 'repository': 'org/other',
+                                            'forge_url': 'https://github.com/org/other'}]])
+@pytest.mark.parametrize('metadata', [{}, {'repository_id': 'github.com/org/app',
+                                          'forge_host': 'github.com', 'project_id': 'shared-project'}])
+def test_retained_report_identity_survives_missing_current_repository(server, inventory, metadata):
+    stored = {'provider_repo_id': '17', 'repository': 'org/app', 'run_number': 1,
+              'provider_url': 'https://ci.example', **metadata}
+    server.repo.observe_ci_pipeline(stored)
+    server.ci_monitor.snapshot = lambda: {'repos': inventory, 'pipelines': {}}
+    server.github_monitor.repository_languages = lambda: {}
+    status, data = request(server, 'ci/reports')
+    assert status == 200
+    row = data['pipelines'][0]
+    assert {key: row[key] for key in stored} == stored
+    assert row['language'] is None
+    assert row['language_source'] == 'unknown'
+    assert server.repo.ci_reports()['pipelines'][0] == stored

@@ -12,8 +12,32 @@ import re
 from collections import defaultdict
 from urllib.parse import unquote, urlsplit
 
+from .redact import redact_text
+
 _FULL_COMMIT = re.compile(r"(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\Z")
 _PROJECT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}\Z")
+
+
+def repository_language(value):
+    """Accept one bounded provider-reported label, never infer from names."""
+    if not isinstance(value, str) or len(value) > 100 or not value.isprintable():
+        return None
+    value = value.strip()
+    if not value or "[REDACTED]" in value or redact_text(value) != value:
+        return None
+    return value
+
+
+def cached_github_languages(monitor):
+    """Optional cache enrichment must not make CI depend on GitHub availability."""
+    lookup = getattr(monitor, "repository_languages", None)
+    if not callable(lookup):
+        return {}
+    try:
+        languages = lookup()
+        return languages if isinstance(languages, dict) else {}
+    except Exception:
+        return {}
 
 
 def canonical_repository(value, *, forge_host=None):
@@ -61,11 +85,15 @@ def canonical_repository(value, *, forge_host=None):
     return f"{host}/{path}"
 
 
-def _identity(record):
-    identities = {
+def _identities(record):
+    return {
         identity for field in ("repository_id", "forge_url", "repository_url", "repo_url", "clone_url", "repository")
         if (identity := canonical_repository(record.get(field), forge_host=record.get("forge_host")))
     }
+
+
+def _identity(record):
+    identities = _identities(record)
     # Conflicting advertised origins must not silently pick one association.
     return next(iter(identities)) if len(identities) == 1 else None
 
@@ -159,14 +187,15 @@ def _related_records(repo):
     return indexes
 
 
-def annotate_ci_history(view, repo):
+def annotate_ci_history(view, repo, *, repository_languages=None):
     """Apply the same exact repository/commit associations to flat history."""
-    result = annotate_ci({**view, "pipelines": {"history": view.get("pipelines", [])}}, repo)
+    result = annotate_ci({**view, "pipelines": {"history": view.get("pipelines", [])}}, repo,
+                         repository_languages=repository_languages)
     result["pipelines"] = result["pipelines"].get("history", [])
     return result
 
 
-def annotate_ci(view, repo):
+def annotate_ci(view, repo, *, repository_languages=None):
     """Return a copied CI snapshot with project metadata and exact commit links.
 
     Related records need an explicit forge repository and full SHA-1/SHA-256
@@ -179,10 +208,18 @@ def annotate_ci(view, repo):
     mapping, status, error = _project_mapping()
     result.update(project_mapping_status=status, project_mapping_error=error)
     related = _related_records(repo)
+    repository_languages = repository_languages or {}
     by_id, by_name = defaultdict(list), defaultdict(list)
     projects = defaultdict(set)
     for record in result.get("repos", []):
         identity = _identity(record)
+        language = repository_language(record.get("language"))
+        language_source = "provider_repository" if language else "unknown"
+        if language is None and identity and identity.startswith("github.com/"):
+            language = repository_language(repository_languages.get(identity))
+            if language:
+                language_source = "github_primary_language"
+        record.update(language=language, language_source=language_source)
         provider_id = str(record["id"]) if record.get("id") is not None else None
         record.update(repository_id=identity, provider_repo_id=provider_id,
                       forge_host=identity.split("/", 1)[0] if identity else None,
@@ -204,8 +241,18 @@ def annotate_ci(view, repo):
                 candidates = by_name.get(row.get("repository") or group, [])
             record = candidates[0] if len(candidates) == 1 else {}
             identity = record.get("repository_id")
-            row.update(repository_id=identity, provider_repo_id=record.get("provider_repo_id"),
-                       forge_host=record.get("forge_host"), project_id=record.get("project_id"))
+            row_identities = _identities(row)
+            language_record = record if not row_identities or row_identities == {identity} else {}
+            row.update(language=language_record.get("language"),
+                       language_source=language_record.get("language_source", "unknown"))
+            if record:
+                row.update(repository_id=identity, provider_repo_id=record.get("provider_repo_id"),
+                           forge_host=record.get("forge_host"), project_id=record.get("project_id"))
+            else:
+                # Current inventory may not include a retained historical run's
+                # repository. Enrichment must not erase its stored identifiers.
+                for field in ("repository_id", "provider_repo_id", "forge_host", "project_id"):
+                    row.setdefault(field, None)
             key = (identity, _commit(row))
             row["related_sessions"] = related["sessions"].get(key, [])
             row["related_missions"] = related["missions"].get(key, [])

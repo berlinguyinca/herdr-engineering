@@ -3,6 +3,7 @@ import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration} from './herdr-web-components/format.js';
 import {safeServiceUrl} from './services-view.js';
 import {recordOutcome} from './record-state.js';
+import {ciRunKey} from './ci-performance.js';
 import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
 import {renderCiPipeline,ciPipelineStyles} from './ci-pipeline.js';
@@ -27,7 +28,7 @@ export function integrationOutcome(record, kind='ci') {
 export function integrationEntries(data={},kind='ci') {
   const list=kind==='reviews' ? records(data.reviews) : Object.entries(data.pipelines || {}).flatMap(([repository,runs])=>records(runs).map(r=>({...r,repository:r.repository || repository})));
   return list.map(record=>({record,
-    id:kind==='reviews' ? String(record.review_id || record.id || '') : record.provider_url ? JSON.stringify([String(record.provider_url).replace(/\/$/,''),String(record.provider_repo_id || record.repository_id || record.repository),record.run_number]) : `${record.provider_repo_id || record.repository_id || record.repository}#${record.run_number}`,
+    id:kind==='reviews' ? String(record.review_id || record.id || '') : ciRunKey(record),
     tab:integrationOutcome(record,kind),
     project:short(record.project_id || record.project || record.repository) || 'Project not reported',
     search:[record.title,record.repository,record.repository_id,record.project_id,record.project,record.branch,record.revision,record.run_number,record.review_id,record.status,record.state,record.mission_id,record.session_id].filter(v=>v!=null).join(' ').toLowerCase(),
@@ -139,7 +140,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
     ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="0">All retained history</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div data-ci-insights></div>' : ''}
     ${repository || mission || session ? `<p class="ig-note">Filtered to ${esc(repository || mission || session)} · <a href="#/${kind}">Clear context</a></p>` : ''}
-    ${isCi ? '<details class="ci-charts" data-ci-charts><summary>Run outcome & duration trends · observed history</summary><div class="ci-charts-body" data-ci-charts-body></div></details>' : ''}
+    ${isCi ? '<details class="ci-charts" data-ci-charts><summary>Run durations · histograms, project & language averages</summary><div class="ci-charts-body" data-ci-charts-body></div></details>' : ''}
     <p class="ig-note" data-ig-count></p><div class="ig-layout"><section id="ig-results" role="tabpanel" aria-labelledby="ig-tab-${state.tab}"></section><aside class="ig-inspector" aria-label="Pipeline inspector" hidden></aside></div>
     <div class="ig-pages"><button type="button" class="hd-btn" data-page="previous">Previous</button><span data-ig-page></span><button type="button" class="hd-btn" data-page="next">Next</button></div><div data-ig-runners></div>${!isCi ? '<details class="ig-runners"><summary>Start a review</summary><p>Start Plannotator from the project workspace with <code>herdr-plannotator --help</code>. Its review link and upstream decision appear here when the launcher is connected to this control plane.</p></details>' : ''}`;
   const el=selector=>container.querySelector(selector);
@@ -156,7 +157,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const reviewVersion=record=>JSON.stringify([record.updated_at,record.status,record.decision]);
   const ciObservations=()=>{
     const recent=Object.entries(data?.pipelines||{}).flatMap(([repository,runs])=>records(runs).map(r=>({...r,repository:r.repository||repository})));
-    const map=new Map();for(const r of [...records(reportData?.pipelines),...recent])map.set(`${r.provider_repo_id??r.repository_id??r.repository}#${r.run_number}`,r);
+    const map=new Map();for(const r of [...records(reportData?.pipelines),...recent])map.set(ciRunKey(r),r);
     return {...reportData,pipelines:[...map.values()],stale:!!data?.stale,partial:data?.status==='partial'};
   };
   const entries=()=>integrationEntries(isCi ? {pipelines:{retained:ciObservations().pipelines}} : kind==='reviews' && data ? {...data,reviews:records(data.reviews).map(summary=>{
@@ -227,16 +228,18 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       if(isCi) {
         const chart=el('[data-ci-charts-body]');
         const html=data ? renderCiCharts(ciChartModel(selectIntegrations(all,{...state,tab:'all'})),{
-          retained:!!reportData,stale:!!data.stale,partial:data.status==='partial'||Object.keys(data.repo_errors || {}).length>0,
+          retained:!!reportData,days:state.days,scope:reportData?.scope,stale:!!data.stale,partial:data.status==='partial'||Object.keys(data.repo_errors || {}).length>0,
         }) : '<p class="ci-chart-note">Waiting for CI reports…</p>';
         if(chartSignature!==html) {
           chartSignature=html;
           const disclosure=chart.querySelector('[data-ci-chart-data]');
           const open=disclosure?.open, focused=disclosure?.querySelector('summary')===document.activeElement;
+          const focusedTable=chart.contains(document.activeElement)&&document.activeElement.classList.contains('ci-chart-table')?document.activeElement.getAttribute('aria-label'):null;
           chart.innerHTML=html;
           const next=chart.querySelector('[data-ci-chart-data]');
           if(next && open)next.open=true;
           if(focused)next?.querySelector('summary')?.focus({preventScroll:true});
+          if(focusedTable)[...chart.querySelectorAll('.ci-chart-table')].find(t=>t.getAttribute('aria-label')===focusedTable)?.focus({preventScroll:true});
         }
       }
       const groups=new Map();
