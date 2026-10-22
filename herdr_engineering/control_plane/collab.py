@@ -15,6 +15,7 @@ to a terminal.
 from __future__ import annotations
 
 import bisect
+import copy
 import hashlib
 import json
 import math
@@ -26,6 +27,7 @@ import time
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from . import ids
 from .redact import redact_text
@@ -81,6 +83,16 @@ TASK_RATE = 20                   # new tasks per creator per 10 minutes
 MAX_OPEN_TASKS_PER_AGENT = 10
 MAX_PENDING_REQUESTS = 120       # open access requests per room (one family of agents fits)
 SPAWN_FAMILIES = ("claude-code", "codex", "pi", "agent")   # what the host runner knows how to start
+PROFILE_LIMIT_DEFAULTS = {"live_per_agent": 3, "depth": 2, "per_hour": 20}   # a room profile may only lower these
+MAX_PROFILE_HOSTS = 50
+MAX_PROFILE_SERVICES = 20
+MAX_PROFILE_NAMES = 50
+_PROFILE_HOST = re.compile(r"^[a-z0-9.-]+:\d{1,5}$")
+_PROFILE_SECRET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")   # a NAME that refers to a host file, never a value
+_PROFILE_SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+_PROFILE_HEADER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+_PROFILE_KEYS = frozenset({"allowed_families", "allowed_models", "tools_allowed", "permanent_hosts", "services",
+                           "ssh_secret_names", "spend_tokens_per_day", "limits"})
 MAX_SPAWN_AGENTS = 20            # agents one fleet start may place on the owner's hosts
 MAX_OPEN_SPAWNS = 3              # requests waiting for, or held by, the runner
 SPAWN_STALE = 900.0              # a claimed start with no result after this long is shown as stalled
@@ -392,6 +404,8 @@ class CollabService:
                 "id": p["room_id"], "project_id": p["project_id"], "name": p["name"], "created_by": p["actor_user_id"],
                 "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq}},
                 "grants": {}}
+        elif t == "room_profile_set":
+            self._rooms[p["room_id"]]["profile"] = p["profile"]
         elif t == "user_registered":
             self._users[p["user_id"]] = {"status": p["status"], "since": p["at"], "decided_by": p.get("decided_by"),
                                          "decided_at": p["at"] if p["status"] != "pending" else None, "reason": None}
@@ -1560,6 +1574,38 @@ class CollabService:
                 project_ids=[], resource_id=agent_id))
         return {"ok": True}
 
+    # ------------------------------------------------------- room profile
+    def _profile(self, room_id: str) -> dict:
+        """The room's helper policy (defaults when never set). Names of secrets only, never values."""
+        room = self._rooms.get(room_id)
+        stored = (room or {}).get("profile")
+        return copy.deepcopy(stored) if stored else _normalize_profile({})
+
+    def get_room_profile(self, pr: Principal, room_id: str) -> dict:
+        with self._lock:
+            self._authorize(pr, room_id, "read", "profile.get")
+            return self._profile(room_id)
+
+    def set_room_profile(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """Owner only. Replaces the whole profile; unmentioned fields return to their defaults."""
+        self._require_user(pr)
+        with self._lock:
+            room = self._rooms.get(room_id)
+            m = self._member(room, pr.id) if room else None
+            if not m or m["role"] != "owner":       # the same 404 for strangers and for non-owners
+                if room:
+                    self._audit_denied(pr, "profile.set", "not_owner", room_id=room_id,
+                                       project_ids=[room["project_id"]])
+                self.stats["policy_denied"] += 1
+                raise CollabError(404, "not found")
+            profile = _normalize_profile(body)
+            self._throttle("profile:" + pr.id, 60, 600.0, "room profile")
+            self._commit("room_profile_set", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, profile=profile,
+                action="profile.set", outcome="allowed",
+                project_ids=[room["project_id"]], resource_id=room_id))
+            return self._profile(room_id)
+
     def grant_agent(self, pr: Principal, room_id: str, body: dict, _bulk: bool = False) -> dict:
         """The room owner grants an agent its permissions directly. Anyone else who may bring an
         agent (a contributor) can only REQUEST access; the owner approves a subset of what was
@@ -2307,6 +2353,8 @@ class CollabService:
                     rid = parts[1]
                     if n == 2:
                         return 200, self.get_room(pr, rid)
+                    if parts[2:] == ["profile"]:
+                        return 200, self.get_room_profile(pr, rid)
                     if parts[2:] == ["agents"]:
                         return 200, self.list_room_agents(pr, rid)
                     if parts[2:] == ["invites"]:
@@ -2326,6 +2374,8 @@ class CollabService:
                                                      _int(query, "limit", 100, 1, 200))
                     if parts[2:] == ["events", "stream"]:
                         return self.open_stream(pr, rid, _int(query, "cursor", 0))
+            elif method in ("PUT", "POST") and n == 3 and parts[0] == "rooms" and parts[2] == "profile":
+                return 200, self.set_room_profile(pr, parts[1], body)
             elif method == "POST":
                 if parts == ["me"]:
                     return 200, self.link_identity(pr, body)
@@ -2400,6 +2450,79 @@ class CollabService:
             raise CollabError(404, "not found")
         except CollabError as exc:
             return exc.status, {"error": exc.message}
+
+
+def _profile_strings(v: Any, field: str, rx: re.Pattern | None, limit: int, maxlen: int = 120) -> list[str]:
+    if not isinstance(v, list) or len(v) > limit:
+        raise CollabError(400, f"{field} must be a list of at most {limit}")
+    out = []
+    for x in v:
+        if not isinstance(x, str) or len(x) > maxlen or (rx is not None and not rx.match(x)):
+            raise CollabError(400, f"{field} has an invalid entry")
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def _normalize_profile(body: Any) -> dict:
+    """Validate a room profile and return it in canonical form. Unknown keys are refused, so a
+    secret value has no field to ride in on: services and ssh refer to secrets by NAME only."""
+    if not isinstance(body, dict):
+        raise CollabError(400, "profile must be a JSON object")
+    extra = set(body) - _PROFILE_KEYS
+    if extra:
+        raise CollabError(400, f"unknown profile field: {sorted(extra)[0][:40]}")
+    fams = _profile_strings(body.get("allowed_families", []), "allowed_families", None, len(SPAWN_FAMILIES))
+    if any(f not in SPAWN_FAMILIES for f in fams):
+        raise CollabError(400, f"allowed_families must be among {', '.join(SPAWN_FAMILIES)}")
+    models = body.get("allowed_models")
+    if models is not None:
+        models = _profile_strings(models, "allowed_models", None, 100)
+    tools = body.get("tools_allowed", False)
+    if not isinstance(tools, bool):
+        raise CollabError(400, "tools_allowed must be true or false")
+    hosts = _profile_strings(body.get("permanent_hosts", []), "permanent_hosts", _PROFILE_HOST, MAX_PROFILE_HOSTS, 260)
+    if any(not 0 < int(h.rsplit(":", 1)[1]) < 65536 for h in hosts):
+        raise CollabError(400, "permanent_hosts has an invalid port")
+    raw = body.get("services", [])
+    if not isinstance(raw, list) or len(raw) > MAX_PROFILE_SERVICES:
+        raise CollabError(400, f"services must be a list of at most {MAX_PROFILE_SERVICES}")
+    services = []
+    for sv in raw:
+        if not isinstance(sv, dict) or set(sv) != {"name", "upstream_url", "header", "secret_name"}:
+            raise CollabError(400, "a service needs exactly name, upstream_url, header and secret_name")
+        name, url, header, sec = sv["name"], sv["upstream_url"], sv["header"], sv["secret_name"]
+        if not (isinstance(name, str) and _PROFILE_SERVICE_NAME.match(name)
+                and isinstance(header, str) and _PROFILE_HEADER.match(header)
+                and isinstance(sec, str) and _PROFILE_SECRET_NAME.match(sec)):
+            raise CollabError(400, "a service has an invalid name, header or secret_name")
+        try:
+            u = urlsplit(url) if isinstance(url, str) and len(url) <= 2000 and url.isprintable() else None
+            ok = bool(u) and u.scheme == "https" and bool(u.hostname) and u.username is None and u.password is None \
+                and not u.fragment
+        except ValueError:
+            ok = False
+        if not ok:
+            raise CollabError(400, "upstream_url must be an https URL without credentials")
+        if any(x["name"] == name for x in services):
+            raise CollabError(400, "service names must be unique")
+        services.append({"name": name, "upstream_url": url, "header": header, "secret_name": sec})
+    ssh = _profile_strings(body.get("ssh_secret_names", []), "ssh_secret_names", _PROFILE_SECRET_NAME, MAX_PROFILE_NAMES)
+    spend = body.get("spend_tokens_per_day")
+    if spend is not None and (not isinstance(spend, int) or isinstance(spend, bool) or not 0 <= spend < 2**53):
+        raise CollabError(400, "spend_tokens_per_day must be a non-negative integer or null")
+    lim_in = body.get("limits", {})
+    if not isinstance(lim_in, dict) or set(lim_in) - set(PROFILE_LIMIT_DEFAULTS):
+        raise CollabError(400, "limits may only set live_per_agent, depth and per_hour")
+    limits = {}
+    for k, default in PROFILE_LIMIT_DEFAULTS.items():
+        v = lim_in.get(k, default)
+        if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= default:
+            raise CollabError(400, f"limits.{k} must be an integer from 1 to {default} (a profile may only lower it)")
+        limits[k] = v
+    return {"allowed_families": fams, "allowed_models": models, "tools_allowed": tools,
+            "permanent_hosts": hosts, "services": services, "ssh_secret_names": ssh,
+            "spend_tokens_per_day": spend, "limits": limits}
 
 
 def _finite_expiry(exp: Any, now: float) -> float | None:
