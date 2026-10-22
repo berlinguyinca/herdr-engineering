@@ -34,7 +34,8 @@ PY
     tid=$(basename "$f" .txt)
     call task_update "$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":"accepted"}))' "$tid")" >/dev/null || true
     status=done
-    bash -c "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || status=failed
+    # a harness whose model never answers must not stall this agent for ever
+    timeout "${HERDR_TASK_TIMEOUT:-900}" bash -c "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || status=failed
     args=$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":sys.argv[2],"result":open(sys.argv[3]).read()[:3500]}))' "$tid" "$status" "$TMP/out.txt")
     call task_update "$args" >/dev/null || true
     echo "$tid $status"

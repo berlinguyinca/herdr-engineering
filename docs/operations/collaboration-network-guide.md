@@ -239,8 +239,7 @@ request stopped). herdr keeps the pane alive, so a worker survives the dashboard
   Credentials never appear in an argument list or a log.
 * Hosts are this machine plus the enabled machines in `herdr machine list`. Each is probed at most once a minute;
   an unreachable one is left out. **Hosts** (same page) has an **Automatic agents** tick per host: untick it and that
-  host never receives automatic agents (the choice survives restarts, and is re-read before every placement so un-ticking takes effect at once; it is per
-  herdr label, so a second label for the same machine is a different host).
+  host never receives automatic agents (the choice survives restarts, and is re-read before every placement so un-ticking takes effect at once; a second herdr label for the same ssh target is ignored, so it can't be used to get round the tick).
 * **Agents started this way are text-only by default.** Task text is written by a room member, so the runner starts
   each harness with no tools: `claude -p --tools '' --strict-mcp-config --mcp-config '{"mcpServers":{}}'
   --disable-slash-commands` (no built-ins, and none of the claude.ai connectors such as Gmail or Drive that a plain
@@ -251,8 +250,9 @@ request stopped). herdr keeps the pane alive, so a worker survives the dashboard
   agents do real work, run the runner with `--allow-tools` (`systemctl --user edit herdr-collab-spawn` and add
   `--allow-tools` to `ExecStart`): then `claude -p`, `codex exec --skip-git-repo-check -` and
   `pi -p --no-session -- "Task from a room member: $(cat)"` run, with your account's full access, on text from anyone
-  you approved with *Receive tasks*. `claude` and `codex` were checked on bender; pi's prompt form follows its help but
-  its model call hung when tried, so **check pi on your fleet first**. The `agent` family only acknowledges. The runner also looks (once a minute, through the host's interactive shell,
+  you approved with *Receive tasks*. `claude`, `codex` and `pi` were each checked on bender. pi uses whatever default model its own config names; if that
+  model's gateway doesn't answer, a task waits until the worker's per-task timeout (15 minutes, `HERDR_TASK_TIMEOUT` seconds in the
+  worker's environment) and is then reported failed. The `agent` family only acknowledges. The runner also looks (once a minute, through the host's interactive shell,
   which is what a herdr pane runs) at which of `claude`, `codex` and `pi` each host has, shows that on the Hosts list,
   and never places a family on a host that lacks its CLI. A request no host can serve ends with that reason and
   creates nothing. The command is in `collab-spawn.py`, never in the request. With `--allow-tools`, an agent
@@ -262,7 +262,9 @@ request stopped). herdr keeps the pane alive, so a worker survives the dashboard
   takes within 15 minutes is *expired* (never started late) and one nobody finishes shows as *stalled*; an agent that
   could not be started is revoked and its credential file removed. Each agent is linked to the herdr pane it runs in
   (`pane:<host>:<pane id>`); the dashboard resolves that to the pane's fabric session as soon as the session reports,
-  so spawned agents appear on the flow graph with their fabric host and status. `collab-worker.sh` is generated from `packages/collab-scripts.js`
+  so spawned agents appear on the flow graph with their fabric host and status. The runner also reports each pane to
+  the fabric as a session (`collab:<host>:<pane>`, role claude/codex/pi) so that works even when herdr's own plugin
+  doesn't see a worker script as an agent. `collab-worker.sh` is generated from `packages/collab-scripts.js`
   (a test fails if they drift; the failure message prints the regeneration command).
 * Logs: `journalctl --user -u herdr-collab-spawn`. Stop the feature with `systemctl --user disable --now herdr-collab-spawn.timer`.
 

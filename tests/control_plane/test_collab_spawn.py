@@ -53,15 +53,23 @@ HOME="$FAKE_REMOTE_HOME" exec bash -c "$1"
 
 class Front(BaseHTTPRequestHandler):
     svc = None
+    ingested: list = []
 
     def log_message(self, *a):
         pass
 
     def handle_any(self):
         u = urlsplit(self.path)
-        parts = [p for p in u.path.split("/") if p][3:]                      # after api/v1/collab
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+        if u.path == "/api/v1/ingest":                                       # the fabric, not the collab service
+            Front.ingested.append(body)
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+            return
+        parts = [p for p in u.path.split("/") if p][3:]                      # after api/v1/collab
         try:
             status, out = self.svc.dispatch(self.command, parts, dict(parse_qsl(u.query)), body, "", None, operator="alice")
         except CollabError as e:
@@ -81,6 +89,7 @@ def rig(svc, tmp_path, monkeypatch):
     svc.public_config = {"public_url": "https://localdev.example.org"}
     w = W(svc)
     Front.svc = svc
+    Front.ingested = []
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Front)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     home, remote, log = tmp_path / "home", tmp_path / "remote", tmp_path / "fakelog"
@@ -331,3 +340,28 @@ def test_allow_tools_switches_to_the_full_commands(rig):
 def test_pi_prompt_cannot_be_read_as_a_file_or_flag():
     for cmd in (runner.FAMILY_CMD_TEXT_ONLY["pi"], runner.FAMILY_CMD_TOOLS["pi"]):
         assert ' -- "Task from a room member: $(cat)"' in cmd
+
+
+def test_each_started_agent_is_reported_to_the_fabric_as_a_session_on_its_pane(rig):
+    ask(rig, count=2)
+    rig.r.once()
+    ev = [e for e in runner_front().ingested if e["entity_type"] == "session"]
+    assert len(ev) == 2 and {e["payload"]["host_id"] for e in ev} == {"bender", "beast"}
+    e = ev[0]
+    assert e["event_type"] == "session.start" and e["source"] == "collab-spawn"
+    assert e["payload"]["agent_role"] == "claude" and e["payload"]["mission_id"] == e["payload"]["pane_id"].split(":")[0]
+    assert e["entity_id"] == f"collab:{e['payload']['host_id']}:{e['payload']['pane_id']}"
+    assert all("credential" not in json.dumps(x) for x in ev)
+
+
+def runner_front():
+    return Front
+
+
+def test_a_second_label_for_the_same_machine_is_not_a_second_host(rig, monkeypatch):
+    machines = [{"label": "beast", "target": "beast.lan", "enabled": True},
+                {"label": "beast-again", "target": "beast.lan", "enabled": True},
+                {"label": "zed", "target": "zed.lan", "enabled": True}]
+    monkeypatch.setattr(rig.r, "run", lambda argv, stdin=None, timeout=60.0: json.dumps(machines))
+    rig.r.discover()
+    assert sorted(rig.r.targets) == ["beast", "bender", "zed"]
