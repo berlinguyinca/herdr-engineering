@@ -14,6 +14,22 @@
 name: herdr-control-plane
 
 services:
+  # The dashboard talks to the collab service's operator listener so the local owner needs no
+  # sign-in there. Command repeated from compose.yaml with one extra flag.
+  control-plane-web:
+    command:
+      - "control-plane"
+      - "web"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--web-root"
+      - "/app/packages"
+      - "--allow-open"
+      - "--collab-operator-url"
+      - "http://${HERDR_CP_WEB_BIND:-127.0.0.1}:8082"
+
   collab-public:
     image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-0.1.0}
     container_name: herdr-collab-public
@@ -49,6 +65,15 @@ services:
       - "--collab-public-url"
       - "https://localdev.mcp.metabolomics.us/"
       - "--collab-require-https"
+      # The local owner's no-sign-in listener (reached only through the edge's tailnet-bound port).
+      - "--collab-operator-port"
+      - "8082"
+      - "--collab-operator-user"
+      - "${HERDR_COLLAB_OPERATOR_USER:?set HERDR_COLLAB_OPERATOR_USER (Cognito username) in the env file}"
+      - "--collab-operator-email"
+      - "${HERDR_COLLAB_OPERATOR_EMAIL:-}"
+      - "--collab-operator-host"
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:8082"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -93,6 +118,8 @@ services:
       - ${HERDR_COLLAB_CERT_DIR:?set HERDR_COLLAB_CERT_DIR in the env file}:/etc/acme:ro
     ports:
       - "${HERDR_COLLAB_EDGE_BIND:-127.0.0.1:18444}:8443"
+      # Operator listener, tailnet interface only (like the dashboard): no sign-in, local owner.
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:8082:8082"
     networks: [collab, edge]      # edge: the bridge the published port lives on
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

@@ -1021,14 +1021,22 @@ class CollabService:
 
     # --------------------------------------------------------------- routing
     def dispatch(self, method: str, parts: list[str], query: dict, body: dict,
-                 authorization: str, device: str | None):
+                 authorization: str, device: str | None, operator: str | None = None):
         """parts: path segments after /api/v1/collab. Returns (status, json) or a Stream."""
         try:
             if parts == ["agents", "enrollment", "complete"] and method == "POST":
                 return 201, self.complete_enrollment(body)
             if parts == ["config"] and method == "GET":
                 return 200, self.public_config  # public identifiers only; no auth needed
-            pr = self.authenticate(authorization, device)
+            if operator is not None:
+                # Only the operator listener (tailnet-only, Host-checked) ever passes this: the
+                # local owner uses the dashboard without a sign-in, as the same user id they
+                # sign in as on the public site. They must still be a current group member.
+                if not self.auth.exists(operator):
+                    raise CollabError(403, "operator is not enabled for collaboration")
+                pr = Principal("user", operator, operator)
+            else:
+                pr = self.authenticate(authorization, device)
             n = len(parts)
             if method == "GET":
                 if parts == ["me"]:

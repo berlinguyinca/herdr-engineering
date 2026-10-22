@@ -6,7 +6,8 @@ import {
 } from './herdr-web-client/collab.js';
 
 const store = new TokenStore(window.sessionStorage);
-const api = new CollabApi(() => store.get());
+let operator = false;   // the local owner on the dashboard: no sign-in, the server knows who they are
+const api = new CollabApi(() => (operator ? { access: 'operator', id: 'operator' } : store.get()));
 const ROLES = [['contributor', 'Can chat'], ['viewer', 'Read only'], ['guest', 'Guest (read only, expires)']];
 const ROLE_LABEL = { owner: 'Owner', contributor: 'Can chat', viewer: 'Read only', guest: 'Guest' };
 
@@ -74,7 +75,10 @@ export function mountCollab(root) {
   let lastCfg = null;
   let me = null;
   const standalone = root.dataset.standalone === '1';
+  let current = '/rooms';   // in-dashboard navigation (the dashboard owns the URL hash)
   const dispose = () => { clearInterval(timer); timer = null; };
+  const go = (path) => { if (standalone) { window.location.hash = path; } else { current = path; route(); } };
+  const onHash = () => { if (store.get() && me) route(); };
   const $ = (id) => document.getElementById(id);
 
   async function signIn(cfg) {
@@ -91,16 +95,21 @@ export function mountCollab(root) {
 
   function frame(active, content) {
     dispose();
-    if (!standalone) { root.innerHTML = content; return; }
+    if (!standalone) {
+      const tab = (path, label) => `<button type="button" class="cx-tab" role="tab" data-go="${path}" aria-selected="${active === path}">${label}</button>`;
+      root.innerHTML = `<div class="cx-embed"><div class="cx-tabs" role="tablist">${tab('/rooms', 'Rooms')}${tab('/agents', 'AI agents')}</div>${content}</div>`;
+      root.querySelectorAll('[data-go]').forEach((b) => { b.onclick = () => go(b.dataset.go); });
+      return;
+    }
     const link = (path, label) => `<a class="hd-shell__link${active === path ? ' active' : ''}" href="#${path}">${label}</a>`;
     root.innerHTML = `<div class="hd-shell">
       <aside class="hd-shell__sidebar">
         <div class="hd-shell__brand"><span class="cx-logo" aria-hidden="true">◆</span>HerdR Collaboration</div>
         <nav class="hd-shell__nav" aria-label="Collaboration">${link('/rooms', 'Rooms')}${link('/agents', 'AI agents')}</nav>
-        <div class="cx-user"><span>${esc(me ? (me.email || me.user_id) : '')}</span><button id="hcn-out" class="hd-btn hd-btn--ghost hd-btn--sm" type="button">Sign out</button></div>
+        <div class="cx-user"><span>${esc(me ? (me.email || me.user_id) : '')}</span>${operator ? '' : '<button id="hcn-out" class="hd-btn hd-btn--ghost hd-btn--sm" type="button">Sign out</button>'}</div>
       </aside>
       <main class="hd-shell__main"><div class="hd-shell__content">${content}</div></main></div>`;
-    $('hcn-out').onclick = () => { store.clear(); window.location.hash = ''; start(); };
+    if ($('hcn-out')) $('hcn-out').onclick = () => { store.clear(); window.location.hash = ''; start(); };
   }
 
   function centered(inner) {
@@ -114,6 +123,11 @@ export function mountCollab(root) {
     if (!cfg) {
       centered('<h1>Collaboration</h1><p role="status">The collaboration network is not enabled on this server.</p>');
       return;
+    }
+    if (cfg.operator) {   // dashboard: tailnet-only, the owner is already trusted
+      operator = true;
+      me = cfg.operator;
+      return route();
     }
     if (window.location.origin !== new URL(cfg.public_url).origin) {
       centered(`<h1>Collaboration</h1><p role="status">Collaboration is only available over HTTPS.</p>
@@ -144,7 +158,7 @@ export function mountCollab(root) {
 
   async function route() {
     if (!me) return start();
-    const hash = window.location.hash.replace(/^#/, '');
+    const hash = standalone ? window.location.hash.replace(/^#/, '') : current;
     const room = /^\/room\/(.+)$/.exec(hash);
     if (room) return showRoom(decodeURIComponent(room[1]));
     if (hash === '/agents') return showAgents();
@@ -161,14 +175,14 @@ export function mountCollab(root) {
       <section class="cx-section"><h2>New room</h2>
         <form id="hcn-new" class="hd-card cx-form"><label class="cx-field">Room name<input name="name" required maxlength="120" placeholder="e.g. Metabolomics review"></label>
           <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></section>`);
-    document.querySelectorAll('[data-room]').forEach((b) => { b.onclick = () => { window.location.hash = `/room/${encodeURIComponent(b.dataset.room)}`; }; });
+    document.querySelectorAll('[data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
     $('hcn-new').onsubmit = async (ev) => {
       ev.preventDefault();
       const name = new FormData(ev.target).get('name');
       try {
         const p = await api.createProject(name);
         const r = await api.createRoom(p.project_id, name);
-        window.location.hash = `/room/${encodeURIComponent(r.room_id)}`;
+        go(`/room/${encodeURIComponent(r.room_id)}`);
       } catch (e) { $('hcn-new-msg').textContent = e.message; $('hcn-new-msg').setAttribute('role', 'alert'); }
     };
   }
@@ -225,7 +239,7 @@ export function mountCollab(root) {
   async function showRoom(roomId) {
     cursor = 0;
     let info;
-    try { info = await api.room(roomId); } catch (e) { window.location.hash = '/rooms'; return; }
+    try { info = await api.room(roomId); } catch (e) { go('/rooms'); return; }
     const canInvite = info.role === 'owner';
     const canPost = ['owner', 'contributor'].includes(info.role);
     const names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
@@ -245,7 +259,7 @@ export function mountCollab(root) {
               <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></section>` : ''}
         </aside>
       </div>`);
-    $('hcn-back').onclick = () => { window.location.hash = '/rooms'; };
+    $('hcn-back').onclick = () => go('/rooms');
     const log = $('hcn-log');
 
     const poll = async () => {
@@ -270,7 +284,7 @@ export function mountCollab(root) {
         }
         if (page.events.length) { cursor = page.next_cursor; if (stick) log.scrollTop = log.scrollHeight; }
       } catch (e) {
-        if (e instanceof AuthError) { dispose(); store.clear(); start(); } else if (/not found/.test(e.message)) { dispose(); window.location.hash = '/rooms'; }
+        if (e instanceof AuthError) { dispose(); store.clear(); start(); } else if (/not found/.test(e.message)) { dispose(); go('/rooms'); }
       }
     };
     await poll();
@@ -287,7 +301,8 @@ export function mountCollab(root) {
           return `<li><span class="grow">${esc(a.harness_type)}<br><span class="hd-ident">${esc(shortId(a.agent_id))}</span></span>${g
             ? `${pill(g.actions.includes('post') ? 'Read + post' : 'Read only', 'var(--status-ok)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-g="${esc(a.agent_id)}" data-a="read">Read only</button>`
             : `<span class="cx-row"><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-g="${esc(a.agent_id)}" data-a="read">Add (read)</button><button type="button" class="hd-btn hd-btn--sm" data-g="${esc(a.agent_id)}" data-a="read,post">Add (read + post)</button></span>`}</li>`;
-        }).join('')}</ul>` : '<div class="hd-empty">No agents yet. <a href="#/agents">Connect one</a>.</div>';
+        }).join('')}</ul>` : '<div class="hd-empty">No agents yet. <a href="#/agents" data-go="/agents">Connect one</a>.</div>';
+        grantBox.querySelectorAll('[data-go]').forEach((a) => { a.onclick = (e) => { if (!standalone) { e.preventDefault(); go(a.dataset.go); } }; });
         grantBox.querySelectorAll('[data-g]').forEach((b) => { b.onclick = async () => { await api.grantAgent(roomId, b.dataset.g, b.dataset.a.split(',')); draw(); }; });
       };
       await draw();
@@ -322,7 +337,7 @@ export function mountCollab(root) {
     }
   }
 
-  window.addEventListener('hashchange', () => { if (store.get() && me) route(); });
+  if (standalone) window.addEventListener('hashchange', onHash);
   start();
-  return { dispose };
+  return { dispose: () => { dispose(); window.removeEventListener('hashchange', onHash); } };
 }
