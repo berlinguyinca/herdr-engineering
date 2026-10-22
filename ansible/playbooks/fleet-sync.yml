@@ -51,6 +51,9 @@
       ansible.builtin.include_tasks: ../tasks/pi-runtime.yml
       when: pi_engineering_revision is defined
 
+    - name: "Keep the Pi session auto-resume hook installed"
+      ansible.builtin.include_tasks: ../tasks/pi-session-hook.yml
+
     - name: "Gather host version/registration fingerprint"
       ansible.builtin.include_tasks: ../tasks/fleet-fingerprint.yml
 
