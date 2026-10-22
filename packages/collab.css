@@ -1,8 +1,8 @@
 /* HerdR Collaboration: page styles on top of the shared design tokens (theme.css/base.css).
  * Same look as the dashboard: white cards on a light grey ground, green accent, Inter. */
-:root { color-scheme: light dark; }
+.cx-page { color-scheme: light dark; }
 @media (prefers-color-scheme: dark) {
-  :root {
+  .cx-page {
     --background: #14161a; --surface: #1c1f26; --surface-2: #272b34; --surface-hover: #232730;
     --border: #363b47; --border-subtle: #2b303a;
     --text: #e6e8ee; --text-secondary: #aab0bf; --text-muted: #8a91a3;
@@ -10,7 +10,7 @@
     --violet-weak: #2a2447; --status-ok: #34d399; --status-failed: #f87171; --status-attention: #fbbf24;
     --shadow: 0 1px 2px rgba(0, 0, 0, .4);
   }
-  .hd-error { background: #3a1d1d; }
+  .cx-page .hd-error { background: #3a1d1d; }
 }
 
 /* ---- shell (mirrors <herdr-app-shell>) ---- */
@@ -67,7 +67,8 @@
   padding: 1px 6px; border-radius: var(--radius-sm); overflow-wrap: anywhere; }
 
 /* ---- buttons and inputs ---- */
-button { font-family: var(--font-sans); font-size: .875rem; }
+/* the page itself and the dashboard-embedded view; never the rest of the dashboard */
+.cx-page button, .cx-embed button { font-family: var(--font-sans); font-size: .875rem; }
 .hd-btn { background: var(--accent); color: var(--text-on-accent); border: 1px solid transparent; padding: 8px 14px;
   border-radius: var(--radius-sm); font-weight: 500; cursor: pointer; }
 .hd-btn:hover { background: var(--accent-hover); }
@@ -77,7 +78,7 @@ button { font-family: var(--font-sans); font-size: .875rem; }
 .hd-btn--danger:hover { background: var(--surface-hover); }
 .hd-btn--sm { padding: 4px 10px; font-size: .8125rem; }
 .hd-btn[disabled] { opacity: .55; cursor: default; }
-.cx-input, input[type=text], input[type=email], input:not([type]), select { font: inherit; padding: 8px 10px; background: var(--surface);
+.cx-input, .cx-page input, .cx-embed input, .cx-page select, .cx-embed select { font: inherit; padding: 8px 10px; background: var(--surface);
   color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm); min-width: 0; }
 .cx-field { display: flex; flex-direction: column; gap: 4px; font-size: .8125rem; color: var(--text-secondary); flex: 1 1 200px; }
 .cx-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
@@ -132,3 +133,6 @@ button { font-family: var(--font-sans); font-size: .875rem; }
 .cx-list .grow { flex: 1 1 140px; min-width: 0; }
 .cx-back { background: transparent; border: 0; color: var(--text-secondary); cursor: pointer; padding: 0; margin-bottom: 6px; }
 .cx-back:hover { color: var(--accent); }
+
+.cx-embed .cx-tabs { margin-bottom: 16px; }
+.cx-embed .cx-room-layout { grid-template-columns: minmax(0, 1fr) 280px; }

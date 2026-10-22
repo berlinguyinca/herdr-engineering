@@ -19,6 +19,8 @@ import secrets
 import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -99,7 +101,8 @@ class ControlPlaneServer:
                  rustfs=None, dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
                  collab_require_https=False, public_port=None, public_host=None,
-                 collab_only=False):
+                 collab_only=False, operator_port=None, operator_user=None,
+                 operator_email=None, operator_hosts=(), collab_operator_url=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -170,6 +173,15 @@ class ControlPlaneServer:
         if public_port is not None and collab is None:
             raise ValueError("a public collaboration listener needs collab enabled")
         self.collab_only = collab_only
+        if operator_port is not None and not (collab_only and operator_user and operator_hosts):
+            raise ValueError("the operator listener needs collab-only mode, a user and allowed hosts")
+        self.operator_port, self.operator_user = operator_port, operator_user
+        self.operator_email = operator_email
+        self.operator_hosts = frozenset(h.lower() for h in operator_hosts)
+        self._operator_httpd = None
+        # Dashboard side: forward /api/v1/collab/* to the operator listener of the isolated
+        # collab service, so the local owner needs no sign-in.
+        self.collab_operator_url = collab_operator_url.rstrip("/") if collab_operator_url else None
         if collab_only and public_port is None:
             raise ValueError("collab-only mode needs the public collaboration port")
         self.public_port = public_port
@@ -245,6 +257,11 @@ class ControlPlaneServer:
             self._httpd = _DaemonThreadingServer(
                 (self.public_host, self.public_port), _make_handler(self, public=True))
             self.public_port = self.port = self._httpd.server_address[1]
+            if self.operator_port is not None:
+                self._operator_httpd = _DaemonThreadingServer(
+                    (self.public_host, self.operator_port), _make_handler(self, operator=True))
+                self.operator_port = self._operator_httpd.server_address[1]
+                threading.Thread(target=self._operator_httpd.serve_forever, daemon=True).start()
             self._ready.set()
             self._httpd.serve_forever()
             return
@@ -275,6 +292,9 @@ class ControlPlaneServer:
     def shutdown(self):
         self.ci_monitor.close()
         self.github_monitor.close()
+        if self._operator_httpd:
+            self._operator_httpd.shutdown()
+            self._operator_httpd.server_close()
         if self._public_httpd:
             self._public_httpd.shutdown()
             self._public_httpd.server_close()
@@ -298,7 +318,7 @@ _PUBLIC_CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-
                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
-def _make_handler(server, public=False):
+def _make_handler(server, public=False, operator=False):
     class _Handler(BaseHTTPRequestHandler):
         server_version = "HerdrControlPlane/0.1"
         protocol_version = "HTTP/1.1"
@@ -442,6 +462,8 @@ def _make_handler(server, public=False):
             return self._json(payload, status)
 
         def do_GET(self):
+            if operator:
+                return self._operator()
             if public:
                 return self._public()
             if self._is_collab_path():
@@ -454,6 +476,8 @@ def _make_handler(server, public=False):
             return self._serve_static()
 
         def do_POST(self):
+            if operator:
+                return self._operator()
             if public:
                 return self._public()
             if self._is_collab_path():
@@ -482,18 +506,62 @@ def _make_handler(server, public=False):
             path = self.path.split("?")[0]
             return path == "/api/v1/collab" or path.startswith("/api/v1/collab/")
 
-        def _collab(self):
+        def _operator(self):
+            """Tailnet-only listener for the local owner: collaboration API only, no sign-in.
+
+            Open by design (the tailnet is the trust boundary, as for the dashboard), so it
+            refuses DNS-rebinding (Host allowlist), cross-site writes (Origin check and
+            application/json in _collab) and every path outside /api/v1/collab."""
+            cl = self.headers.get_all("Content-Length") or []
+            if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                    or (self.command == "GET" and cl and cl[0].strip() not in ("", "0"))):
+                return self._deny(400, "ambiguous request framing")
+            if (self.headers.get("Host", "").lower() not in server.operator_hosts
+                    or not self._is_collab_path()):
+                return self._deny(404, "not found")
+            return self._collab(operator=True)
+
+        def _collab_proxy(self):
+            """Dashboard -> collab service operator listener (same user, no sign-in)."""
+            err = self._require("operator")
+            if err:
+                return err
+            from .collab import MAX_BODY
+            length = _content_length(self.headers.get("Content-Length"))
+            if self.command == "POST" and (length is None or length > MAX_BODY):
+                return self._deny(413, "request body too large")
+            data = self.rfile.read(length) if self.command == "POST" and length else None
+            req = urllib.request.Request(
+                server.collab_operator_url + self.path, data=data, method=self.command,
+                headers={"Content-Type": "application/json"} if data is not None or self.command == "POST" else {})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:   # noqa: S310 (operator-configured URL)
+                    status, payload = resp.status, resp.read(2_000_000)
+            except urllib.error.HTTPError as exc:
+                status, payload = exc.code, exc.read(2_000_000)
+            except Exception:
+                return self._json({"error": "collaboration service unavailable"}, 502)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _collab(self, operator=False):
             """HCN routes bypass the legacy X-API-Key gate on purpose: legacy keys are
             shared secrets with no identity, so they grant nothing here. Authentication
             is per-user / per-agent (collab.authenticate)."""
             service = server.collab
             if service is None:
+                if server.collab_operator_url and not operator and not public:
+                    return self._collab_proxy()
                 return self._deny(404, "not found")
             if self._rate_limit(self._proxied_client()):
                 return None
             # On a shared plain-HTTP listener, refuse collaboration unless the request
             # came through the TLS-terminating proxy (`tailscale serve` sets this header).
-            if (server.collab_require_https
+            if (server.collab_require_https and not operator
                     and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
                 return self._deny(400, "collaboration is only served over https")
             if self.command == "POST":
@@ -519,10 +587,14 @@ def _make_handler(server, public=False):
             split = urlsplit(self.path)
             parts = [unquote(seg) for seg in split.path.split("/")[4:] if seg]
             query = {k: v[0] for k, v in parse_qs(split.query).items()}
+            if operator and self.command == "GET" and parts == ["config"]:
+                return self._json({**service.public_config, "operator": {
+                    "user_id": server.operator_user, "email": server.operator_email}}, 200)
             try:
                 result = service.dispatch(self.command, parts, query, body,
                                           self.headers.get("Authorization", ""),
-                                          self.headers.get("X-Herdr-Device"))
+                                          self.headers.get("X-Herdr-Device"),
+                                          operator=server.operator_user if operator else None)
             except Exception:
                 return self._json({"error": "internal error"}, 500)  # never echo internals
             if isinstance(result, tuple):
