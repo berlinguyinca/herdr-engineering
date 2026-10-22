@@ -526,7 +526,7 @@ def test_task_creation_is_idempotent(w):
 def test_permission_churn_is_throttled(w):
     _, a = w.agent("alice", ("read", "post"))
     seen = 0
-    for i in range(80):
+    for i in range(140):
         try:
             w.s.grant_agent(w.alice, w.room, {"agent_id": a["agent_id"], "actions": ["read"] if i % 2 else ["read", "post"]})
         except CollabError as e:
@@ -552,3 +552,68 @@ def test_a_contributor_can_cancel_their_own_agents_tasks(w):
     tid = w.s.create_task(boss, w.room, {"target_agent_id": ti["agent_id"], "text": "go", "parent_task_id": root})["task_id"]
     w.s.cancel_task(w.bob, w.room, tid)
     assert w.s.task_inbox(t)["tasks"] == []
+
+
+# ----------------------------------------------------------- scale and expiry
+def test_grants_lapse_by_default_and_the_lapse_is_recorded(w):
+    agent, a = w.agent("alice", ("read", "post"))
+    assert w.s.agent_rooms(agent)["rooms"][0]["actions"] == ["post", "read"]
+    w.s.clock.t += w.s.default_grant_ttl + 120
+    assert w.s.agent_rooms(agent) == {"rooms": []}                   # refused at once ...
+    events = [e["event_type"] for e in w.s._log]
+    assert events.count("agent_grant_expired") == 1                  # ... and written down exactly once
+    w.s.clock.t += 120
+    w.s.agent_rooms(agent)
+    assert [e["event_type"] for e in w.s._log].count("agent_grant_expired") == 1
+
+
+def test_owner_may_choose_an_expiry_but_not_beyond_a_year(w):
+    agent, a = w.agent("alice", ("read",))
+    soon = w.s.clock.t + 3600
+    w.s.grant_agent(w.alice, w.room, {"agent_id": a["agent_id"], "actions": ["read", "post"], "expires_at": soon})
+    assert w.s._rooms[w.room]["grants"][a["agent_id"]]["expires_at"] == soon
+    assert code(w.s.grant_agent, w.alice, w.room,
+                {"agent_id": a["agent_id"], "actions": ["read"], "expires_at": w.s.clock.t + 400 * 86400}) == 400
+
+
+def test_sixty_agents_fit_and_the_sixty_first_does_not(w):
+    w.s.max_agents_per_user = 60            # the service default; the fixture lowers it
+    for _ in range(60):
+        w.s.connect_agent(w.alice, {})
+    assert code(w.s.connect_agent, w.alice, {}) == 429
+    assert len(w.s.list_my_agents(w.alice)["agents"]) == 60
+
+
+def test_a_waiting_agent_wakes_on_commit_without_polling(stack):
+    import threading
+    import time
+    api, room, agents = mcp_world(stack)
+    b = agents["bob"]
+    got = {}
+
+    def wait():
+        t0 = time.monotonic()
+        got["res"] = json.loads(tool_text(tool(stack, b, "tasks_wait", seconds=15)))
+        got["dt"] = time.monotonic() - t0
+
+    th = threading.Thread(target=wait)
+    th.start()
+    time.sleep(0.5)
+    s, _ = api.call("POST", f"/api/v1/collab/rooms/{room}/tasks",
+                    {"target_agent_id": b["agent_id"], "text": "wake up"}, user="alice")
+    assert s == 201
+    th.join(10)
+    assert len(got["res"]["tasks"]) == 1 and got["dt"] < 3
+
+
+def test_many_agents_and_tasks_stay_fast(w):
+    import time
+    w.s.max_agents_per_user = 60
+    agents = [w.agent("alice", ("read", "execute"))[1] for _ in range(40)]
+    t0 = time.monotonic()
+    for i in range(400):
+        w.s.clock.t += 31                       # keep inside the per-creator task rate limit
+        w.s.create_task(w.alice, w.room, {"target_agent_id": agents[i % 40]["agent_id"], "text": f"t{i}"})
+    for _ in range(5):
+        w.s.list_my_agents(w.alice)
+    assert time.monotonic() - t0 < 20

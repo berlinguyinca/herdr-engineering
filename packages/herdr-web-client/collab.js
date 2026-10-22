@@ -99,14 +99,15 @@ export class CollabApi {
     return this.call('POST', '/agents/connect', { harness_type: 'claude-code', ...(name ? { name } : {}) });
   }
   revokeAgent(id) { return this.call('POST', `/agents/${encodeURIComponent(id)}/revoke`, {}); }
-  grantAgent(room, agentId, actions) {
-    return this.call('POST', `/rooms/${encodeURIComponent(room)}/agents`, { agent_id: agentId, actions });
+  grantAgent(room, agentId, actions, expiresAt) {
+    return this.call('POST', `/rooms/${encodeURIComponent(room)}/agents`,
+      { agent_id: agentId, actions, ...(expiresAt ? { expires_at: expiresAt } : {}) });
   }
   roomAgents(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/agents`); }
   agentRequests(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/agent-requests`); }
-  decideRequest(id, requestId, decision, actions) {
+  decideRequest(id, requestId, decision, actions, expiresAt) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/agent-requests/${encodeURIComponent(requestId)}/decide`,
-      { decision, ...(actions ? { actions } : {}) });
+      { decision, ...(actions ? { actions } : {}), ...(expiresAt ? { expires_at: expiresAt } : {}) });
   }
   removeAgent(id, agentId) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/agents/${encodeURIComponent(agentId)}/remove`, {});
