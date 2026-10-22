@@ -419,10 +419,11 @@ forward() {
     install_private "$NEW_COLLAB" "$COLLAB_CONFIG" || return 1
     mkdir -p "$HERDR_COLLAB_DATA_DIR" && chmod 700 "$HERDR_COLLAB_DATA_DIR" || return 1
     # keys + membership files, the edge certificate, the 1-minute timer and the cert renew
-    # timer (pool and group come from the slice). Runs BEFORE the new nginx.conf lands, so
+    # timer (pool, group and the invite provisioner's operator come from the slice; the
+    # provisioner reads collab-public's log in the data dir it mounts). Runs BEFORE the new nginx.conf lands, so
     # a reload it triggers (changed certificate) still uses the running conf.
     "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" \
-      --dir "$HERDR_COLLAB_SYNC_DIR" --cert-dir "$CERT_DIR_VALUE" || return 1
+      --dir "$HERDR_COLLAB_SYNC_DIR" --data-dir "$HERDR_COLLAB_DATA_DIR" --cert-dir "$CERT_DIR_VALUE" || return 1
     mkdir -p "$(dirname "$HERDR_COLLAB_EDGE_CONF")" || return 1
     write_edge_conf "$WORK/deploy/control-plane/collab-edge/nginx.conf" || return 1
   fi

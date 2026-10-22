@@ -398,6 +398,43 @@ def test_collab_sync_reads_pool_and_group_from_the_slice_not_env(env):
     assert r.returncode != 0 and "control_plane.collab" in r.stderr
 
 
+def test_collab_sync_provisions_the_operators_invitees_from_the_slice_not_env(env):
+    # #119 (third origin/main merge): the operator, pool and group reach collab-provision.py as
+    # flags from the slice; main's HERDR_COLLAB_OPERATOR_USER / _POOL / _GROUP env is ignored.
+    _with_collab(env)
+    out = env["tmp"] / "slice.json"
+    fcc.render_collab(fcc.load_fleet_config(env["central"]), out)
+    data = env["tmp"] / "collab-data"
+    data.mkdir()
+    (data / "collab.jsonl").write_text(json.dumps({"event_type": "invite_created", "payload": {
+        "invite_id": "i1", "email": "new@example.org", "actor_user_id": "owner-test",
+        "expires_at_epoch": 4_000_000_000}}) + "\n" + json.dumps({"event_type": "invite_created", "payload": {
+        "invite_id": "i2", "email": "other@example.org", "actor_user_id": "env-operator",
+        "expires_at_epoch": 4_000_000_000}}) + "\n")
+    bindir = env["tmp"] / "bin"
+    (bindir / "curl").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (bindir / "curl").chmod(0o755)
+    (bindir / "aws").write_text(f"""#!/usr/bin/env bash
+echo "aws $*" >> {env['tmp']}/aws.log
+case "$*" in
+  *list-users*) echo '{{"Users": []}}' ;;
+  *admin-create-user*) echo '{{"User": {{"Username": "sub-new"}}}}' ;;
+esac
+""")
+    (bindir / "aws").chmod(0o755)
+    env["env"].update({"HERDR_COLLAB_OPERATOR_USER": "env-operator", "HERDR_COLLAB_POOL": "us-east-1_FROMENV",
+                       "HERDR_COLLAB_GROUP": "env.group", "HERDR_COLLAB_DATA_DIR": str(env["tmp"] / "nowhere")})
+    sync = ROOT / "deploy" / "control-plane" / "collab-sync.sh"
+    r = run(sync, env, "once", "--config", str(out), "--dir", str(env["tmp"] / "sync"), "--data-dir", str(data))
+    assert r.returncode != 0                     # the stub curl fails after provisioning
+    log = (env["tmp"] / "aws.log").read_text()
+    assert "admin-add-user-to-group --user-pool-id=us-west-2_TESTPOOL --username=sub-new --group-name=team.test" in log
+    assert "--region us-west-2" in log
+    assert "other@example.org" not in log and "FROMENV" not in log and "env.group" not in log
+    ledger = env["home"] / ".local/share/herdr-engineering/collab-provision/ledger.jsonl"
+    assert json.loads(ledger.read_text())["result"] == "added"
+
+
 def test_generate_env_script_is_gone():
     assert not (ROOT / "deploy/control-plane/generate-env.sh").exists()
 
@@ -590,6 +627,12 @@ def test_collab_deploy_hands_the_cert_dir_from_the_central_config_to_collab_sync
     units = env["home"] / ".config/systemd/user"
     assert f'--cert-dir "{certs}"' in (units / "herdr-collab-sync.service").read_text()   # quoted paths
     assert 'certbot" renew' in (units / "herdr-collab-cert-renew.service").read_text()
+    # #119: the invite provisioner reads collab-public's log in the data dir deploy.sh mounts
+    data_dir = env["home"] / ".local/share/herdr-engineering/collab"
+    unit = (units / "herdr-collab-sync.service").read_text()
+    assert f'--data-dir "{data_dir}"' in unit
+    assert "Environment=" not in unit and "HERDR_COLLAB_OPERATOR_USER" not in unit
+    assert (env["home"] / ".local/share/herdr-engineering/collab-provision.py").is_file()
     # edge nginx.conf written in place at a stable path (#110)
     edge = env["home"] / ".config/herdr-engineering/collab-edge/nginx.conf"
     assert edge.read_text() == (ROOT / "deploy/control-plane/collab-edge/nginx.conf").read_text()
