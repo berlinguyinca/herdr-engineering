@@ -1,0 +1,92 @@
+---
+# Agent-transcript fleet mining (spec: HPC-ssh adoption dashboard).
+#
+# Runs `herdr-eng agent-mine` on every site and collects the REDACTED JSON
+# summary (aggregate counts and redacted program names only — NO command lines or
+# arguments, NO raw transcripts) for
+# each onto the controller at ~/.cache/agent-mine/fleet/<host>.json. That is the
+# data source for the /api/agent-mine dashboard panel. Only summary counts cross
+# the wire; transcripts never leave a site.
+#
+#   cd ansible && ansible-playbook -i inventory/hosts.yml playbooks/agent-mine.yml
+#
+# Overridable vars: herdr_agent_mine_agents (default "claude,pi,codex,opencode"),
+# herdr_agent_mine_days (default 45).
+- name: "HerdR Engineering agent-mine fleet fan-out (redacted summaries only)"
+  hosts: herdr_fleet
+  gather_facts: false
+  become: "{{ herdr_engineering_become | default((ansible_user | default(lookup('env', 'USER'), true)) != 'root') }}"
+  vars:
+    am_agents: "{{ herdr_agent_mine_agents | default('claude,pi,codex,opencode') }}"
+    am_days: "{{ herdr_agent_mine_days | default(45) | int }}"
+    controller_home: "{{ lookup('env', 'HOME') }}"
+    controller_fleet_dir: "{{ controller_home }}/.cache/agent-mine/fleet"
+  tasks:
+    - name: "Gather facts as the connection user (no become)"
+      ansible.builtin.setup:
+      become: false
+
+    - name: "Record the fleet user's home"
+      ansible.builtin.set_fact:
+        fleet_home: "{{ ansible_env.HOME }}"
+
+    - name: "Mine this host's transcripts into a redacted JSON summary"
+      # become: false — must read the FLEET user's transcript stores, not root's.
+      become: false
+      ansible.builtin.shell: |
+        export PATH="{{ fleet_home }}/.local/bin:{{ fleet_home }}/.venvs/herdr-engineering/bin:$PATH"
+        AGENTS={{ am_agents | quote }}; DAYS={{ am_days }}
+        # 1) Preferred: herdr-eng agent-mine (the canonical, distributed entry point).
+        if command -v herdr-eng >/dev/null 2>&1; then
+          if herdr-eng agent-mine --agents "$AGENTS" --days $DAYS --json-summary 2>/dev/null; then
+            exit 0
+          fi
+        fi
+        # 2) Fallback: the standalone miner (version-independent; ships with the
+        #    agent-mine cache on this host). Emits the same redacted JSON schema.
+        STANDALONE="{{ fleet_home }}/.cache/agent-mine/agent_mine.py"
+        if [ -f "$STANDALONE" ]; then
+          if python3 "$STANDALONE" --agents "$AGENTS" --days $DAYS --json-summary 2>/dev/null; then
+            exit 0
+          fi
+        fi
+        echo "agent-mine not available on {{ inventory_hostname }} (no herdr-eng agent-mine subcommand, no standalone miner)" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: am_summary
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: "Make the controller's fleet summary directory"
+      delegate_to: localhost
+      run_once: true
+      become: false
+      ansible.builtin.file:
+        path: "{{ controller_fleet_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: "Store this site's redacted summary on the controller"
+      delegate_to: localhost
+      become: false
+      ansible.builtin.copy:
+        dest: "{{ controller_fleet_dir }}/{{ inventory_hostname | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
+        content: "{{ am_summary.stdout }}"
+        mode: "0600"
+      no_log: true
+      when: am_summary.rc == 0 and (am_summary.stdout | length) > 0
+
+    - name: "Drop a host's old summary when it could not be mined this run"
+      # Stale numbers must not look current on the dashboard.
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: "{{ controller_fleet_dir }}/{{ inventory_hostname | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
+        state: absent
+      when: am_summary.rc != 0 or (am_summary.stdout | length) == 0
+
+    - name: "Report agent-mine result for this host"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} | rc={{ am_summary.rc }} | summary_bytes={{ am_summary.stdout | default('') | length }}"

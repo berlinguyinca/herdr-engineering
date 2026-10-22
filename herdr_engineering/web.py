@@ -57,11 +57,12 @@ _INDEX_HTML = """<!doctype html>
  <a href="#tests" data-s="tests">Tests</a>
  <a href="#ci" data-s="ci">CI</a>
  <a href="#attention" data-s="attention">Attention</a>
+ <a href="#agentmine" data-s="agentmine">Agent Mine</a>
 </nav>
 <main id="main"></main>
 <script>
 const API={tree:'/api/tree',fleet:'/api/fleet',sessions:'/api/sessions',activity:'/api/activity',
- dev:'/api/dev',tests:'/api/tests',ci:'/api/ci',attention:'/api/attention'};
+ dev:'/api/dev',tests:'/api/tests',ci:'/api/ci',attention:'/api/attention',agentmine:'/api/agent-mine'};
 let active='tree';
 function treeHtml(node,depth){
  if(!node)return ''; depth=depth||0;
@@ -129,6 +130,15 @@ function render(d){
  else if(active==='tests'){ main.innerHTML='<div class="card muted">adapters: '+esc((d.adapters||[]).join(', '))+'</div>'; }
  else if(active==='ci'){ main.innerHTML='<div class="card muted">CI provider: '+(d.available===false?'offline (stale view)':'configured')+'</div>'; }
  else if(active==='attention'){ main.innerHTML=(d.items||[]).map(i=>card(i.title, esc(i.summary)+' · '+esc(i.severity),'')).join('')||'<div class="card muted">no attention items</div>'; }
+ else if(active==='agentmine'){
+   const f=d.fleet||{}; const num=v=>{const n=Number(v);return isFinite(n)?n:0;};
+   const siteCards=(d.sites||[]).map(s=>{
+     const h=s.hpc_ssh||{};
+     const sub='adoption since install <b>'+num(h.adoption_since_pct)+'%</b> · '+num(h.hpc_ssh_since)+' hpc / '+num(h.hand_ssh_hpc_since)+' hand<br>45d window: '+num(h.adoption_pct)+'% · '+num(h.hpc_ssh)+' hpc / '+num(h.hand_ssh_hpc)+' hand · '+num(s.totals&&s.totals.events)+' events';
+     const a=num(h.adoption_since_pct); return card(s.site||'?', sub, a>=50?'ok':(a>=25?'warn':'bad'));
+   }).join('');
+   main.innerHTML='<div class="card">'+num(f.sites)+' sites · '+num(f.events)+' events · fleet adoption since install <b>'+num(f.adoption_since_pct)+'%</b> ('+num(f.hpc_ssh_since)+' hpc / '+num(f.hand_ssh_hpc_since)+' hand) · generated '+esc(d.generated_at||'')+'</div>'+(siteCards||'<div class="card muted">no per-site summaries yet — run ansible playbooks/agent-mine.yml</div>');
+ }
 }
 document.querySelectorAll('nav a').forEach(a=>a.addEventListener('click',e=>{active=e.target.dataset.s;load();}));
 async function refresh(){ await load(); }
@@ -212,6 +222,36 @@ def _ci() -> dict[str, Any]:
     return {"available": provider.available}
 
 
+def _agent_mine() -> dict[str, Any]:
+    """Fleet agent-transcript mining roll-up (HPC-ssh adoption dashboard).
+
+    Reads the per-site REDACTED JSON summaries that the ansible fan-out playbook
+    (playbooks/agent-mine.yml) writes to ~/.cache/agent-mine/fleet/<host>.json
+    and rolls them into a fleet-wide view. Only aggregate counts are present;
+    transcripts never leave a site.
+    """
+    import glob
+    import os
+    import time
+    from .agent_mine import fleet_rollup
+    fleet_dir = os.path.join(os.path.expanduser("~"), ".cache", "agent-mine", "fleet")
+    sites = []
+    for path in sorted(glob.glob(os.path.join(fleet_dir, "*.json"))):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            data.setdefault("site", os.path.basename(path)[:-len(".json")])
+            sites.append(data)
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "fleet": fleet_rollup(sites),
+        "sites": sites,
+    }
+
+
 def _attention() -> dict[str, Any]:
     from .attention import AttentionCenter
     return {"items": [i.to_dict() for i in AttentionCenter().open_items()]}
@@ -226,6 +266,7 @@ _HANDLERS = {
     "/api/tests": _tests,
     "/api/ci": _ci,
     "/api/attention": _attention,
+    "/api/agent-mine": _agent_mine,
 }
 
 
