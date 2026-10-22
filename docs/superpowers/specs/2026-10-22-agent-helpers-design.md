@@ -1,6 +1,6 @@
 # Agent helpers: agents start their own helpers (design)
 
-Status: draft for approval. Repo: herdr-engineering (collab service, host runner, dashboard). Brainstormed 2026-10-22.
+Status: approved by the operator 2026-10-22 ("please implement this"); items marked *my call* were settled by the designer, not stated by the operator. Repo: herdr-engineering (collab service, host runner, dashboard). Brainstormed 2026-10-22.
 
 ## Intent
 An agent in a collaboration room can start helpers on its own, with no approval click, for four reasons:
@@ -63,6 +63,18 @@ On the same host as the parent, placed by the existing runner, as a pane split f
 - Public site stays an isolated container with no DB/AWS credentials; the spawn tool is reachable through the existing authenticated MCP path only.
 - Flag-gated, existing endpoints unchanged, spec's security requirements remain release blockers; an external security review is still pending.
 - Dashboard private (tailnet), as today.
+
+## Decisions recorded after the builder check
+- **Spawn permission** (*my call*): `spawn_helpers` is one more action in the existing per-room agent grants. The room owner ticks it per agent; without it `helper_spawn` is refused. Room profile secrets belong to the owner and are injected only into helpers of agents holding it. The hourly rate limit is per person.
+- **Secrets** (*my call*): API keys are injected by the proxy for the host they belong to; the helper never holds them. SSH keys are injected into the sandbox as files (they cannot be proxied), so a room with an SSH key should keep its host list tight.
+- **Spend ceiling is optional** (operator): off unless the owner sets it. When set (*my call*): tokens per room per day, measured at the gateway.
+- **Permission slice** (*my call*): room profile limited to what the parent's grants allow; approved hosts are room-wide (operator).
+- **Network** (*my call*): fixed permanent list of each family's model endpoint; proxy resolves DNS and tunnels any allowed host:port.
+- **Identity** (*my call*): the runner mints each helper's own credential at spawn; the server records the parent link; helpers may spawn within the depth limit.
+- **Limits** (*my call*): over a limit, spawn fails with a clear message (no queue); the panic switch blocks new spawns and stops running helpers.
+- **Files** (*my call*): fresh working directory per helper; reviewers/debuggers get the parent's directory read-only; workers return output or a patch.
+- **Successor** (*my call*): replaces its parent at the same depth; parent ends; chain capped at 5.
+- **Host approval wait** (*my call*): counts toward the helper's time limit; a denial is remembered for one hour.
 
 ## Order of work
 1. Room profile + egress proxy + host approval (everything else relies on it).
