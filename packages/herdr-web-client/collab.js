@@ -108,6 +108,10 @@ export class CollabApi {
   createJoinToken(body) { return this.call('POST', '/agents/join-tokens', body); }
   joinTokens() { return this.call('GET', '/agents/join-tokens'); }
   revokeJoinToken(id) { return this.call('POST', `/agents/join-tokens/${encodeURIComponent(id)}/revoke`, {}); }
+  fleetHosts() { return this.call('GET', '/fleet/hosts'); }
+  setFleetHost(host, autoAgents) { return this.call('POST', `/fleet/hosts/${encodeURIComponent(host)}`, { auto_agents: autoAgents }); }
+  requestSpawn(body) { return this.call('POST', '/fleet/spawns', body); }
+  spawns() { return this.call('GET', '/fleet/spawns'); }
   bulkConnect(body) { return this.call('POST', '/agents/bulk', body); }
   approveAll(room, body = {}) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/agent-requests/approve-all`, body); }
   revokeAgent(id) { return this.call('POST', `/agents/${encodeURIComponent(id)}/revoke`, {}); }

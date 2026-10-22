@@ -201,11 +201,25 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     frame('/agents', `<div class="cx-head"><div><h1>AI agents</h1><p class="cx-sub">Connect Claude Code, Codex, Pi or any MCP client so it can work in your rooms.</p></div>
         <div class="cx-row"><input id="hcn-agent-name" class="cx-input" maxlength="32" pattern="[a-z0-9]+(-[a-z0-9]+)*" placeholder="name, e.g. alices-helper (optional)" aria-label="Agent name" autocomplete="off"><button id="hcn-connect" class="hd-btn" type="button">Connect an AI agent</button></div></div>
       <div id="hcn-connect-out"></div>
-      <section class="cx-section"><h2>Add a fleet of agents</h2><div id="hcn-fleet"></div><div id="hcn-fleet-out"></div></section>
+      <section class="cx-section"><h2>Add a fleet of agents</h2><div id="hcn-fleet"></div><div id="hcn-fleet-out"></div><div id="hcn-spawns"></div></section>
+      ${operator ? '<section class="cx-section"><h2>Hosts</h2><p class="cx-sub">Fleets started from here are spread over these hosts in turn. Untick a host to keep automatic agents off it.</p><div id="hcn-hosts"></div></section>' : ''}
       <section class="cx-section"><h2>Your agents</h2><div id="hcn-agents"></div></section>
       <section class="cx-section">${GUIDE}</section>`, strip);
     await renderAgents();
     await renderFleet();
+    if (operator) {            // keep the host list and fleet progress fresh while this page is open
+      let alive = true;
+      let tick = null;
+      const cycle = async () => {
+        await renderHosts();
+        const busy = await renderSpawns();
+        if (busy) await renderAgents();
+        if (alive && !document.hidden) tick = setTimeout(cycle, busy ? 2000 : 6000);
+        else if (alive) tick = setTimeout(cycle, 6000);
+      };
+      teardown = () => { alive = false; clearTimeout(tick); };
+      cycle();
+    }
     $('hcn-connect').onclick = async () => {
       const btn = $('hcn-connect');
       btn.disabled = true;
@@ -230,7 +244,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           <label class="cx-msg">Room <select name="room"><option value="">none yet</option>${usable.map((r) => `<option value="${esc(r.room_id)}">${esc(r.name)}</option>`).join('')}</select></label>
         </div>
         <span class="cx-checks">${permBoxes(['read', 'post', 'execute', 'instruct'], 'fp')}</span>
-        ${operator ? `<label class="cx-check"><input type="radio" name="how" value="direct" checked> From this dashboard (tailnet): create now, no token</label>
+        ${operator ? `<label class="cx-check"><input type="radio" name="how" value="spawn" checked> Start them on my hosts (herdr, round robin): they keep running</label>
+        <label class="cx-check"><input type="radio" name="how" value="direct"> From this dashboard (tailnet): create now, no token</label>
         <label class="cx-check"><input type="radio" name="how" value="token"> Copy-paste script for any machine (join token)</label>` : '<input type="hidden" name="how" value="token">'}
         <div><button class="hd-btn" type="submit">Create</button> <span id="hcn-fleet-msg" class="cx-msg" role="status"></span></div>
         <p class="cx-msg">Agents start with no access. The room owner approves them (one click for the whole family under <em>Agent requests</em>), and every permission can lapse.</p>
@@ -245,6 +260,13 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       const msg = $('hcn-fleet-msg');
       msg.textContent = '';
       try {
+        if (fd.get('how') === 'spawn') {
+          await api.requestSpawn({ harness_type: body.harness_type, name_prefix: body.name_prefix, count: body.count, ...(room ? { room_id: room, actions: body.actions } : {}) });
+          $('hcn-fleet-out').innerHTML = '';
+          msg.textContent = 'Requested. They start within a few seconds; progress is listed below.';
+          await renderSpawns();
+          return;
+        }
         if (fd.get('how') === 'direct') showFleetFiles(await api.bulkConnect(body), body);
         else showFleetScript(await api.createJoinToken(body), body);
         await renderAgents();
@@ -252,6 +274,29 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       } catch (e) { msg.textContent = e.message; msg.setAttribute('role', 'alert'); }
     };
     await renderJoinTokens();
+  }
+
+  // ---- hosts that may receive automatic agents, and the progress of fleets started on them
+  async function renderHosts() {
+    const box = $('hcn-hosts');
+    if (!box || !operator) return;
+    let hosts;
+    try { hosts = (await api.fleetHosts()).hosts; } catch { return; }
+    const html = hosts.length ? `<ul class="cx-list">${hosts.map((h) => `<li><span class="grow"><b>${esc(h.host)}</b> ${pill(h.online ? 'online' : 'offline', h.online ? 'var(--status-ok)' : 'var(--text-muted)')}${h.kind === 'local' ? ' <span class="hd-ident">this machine</span>' : ''}</span><label class="cx-check"><input type="checkbox" data-auto="${esc(h.host)}"${h.auto_agents ? ' checked' : ''}> Automatic agents</label></li>`).join('')}</ul>` : '<div class="hd-empty">No hosts reported yet. The host runner reports every few seconds.</div>';
+    if (box.dataset.h === html) return;
+    box.dataset.h = html; box.innerHTML = html;
+    box.querySelectorAll('[data-auto]').forEach((c) => { c.onchange = async () => { try { await api.setFleetHost(c.dataset.auto, c.checked); } catch (e) { alert(e.message); } renderHosts(); }; });
+  }
+  async function renderSpawns() {
+    const box = $('hcn-spawns');
+    if (!box || !operator) return false;
+    let list;
+    try { list = (await api.spawns()).spawns.slice(0, 8); } catch { return false; }
+    const busy = list.some((s) => ['requested', 'claimed'].includes(s.status));
+    const colour = { requested: 'var(--status-attention)', claimed: 'var(--accent)', done: 'var(--status-ok)', stalled: 'var(--status-failed)' };
+    const html = list.length ? `<h3>Recent fleet starts</h3><ul class="cx-list">${list.map((s) => `<li><span class="grow"><b>${esc(s.name_prefix)}-N</b> ${esc(s.harness_type)} × ${s.count}${s.error ? `<br><span class="cx-msg" role="alert">${esc(s.error)}</span>` : ''}${s.placements.length ? `<br>${s.placements.map((p) => `<span class="hd-ident" title="${esc(p.error || '')}">${esc(p.name)} → ${esc(p.host)}${p.status === 'failed' ? ' ✗' : ''}</span>`).join(' ')}` : ''}</span>${pill(s.status === 'done' && s.placements.some((p) => p.status === 'failed') ? 'partly started' : s.status, colour[s.status] || 'var(--text-muted)')}</li>`).join('')}</ul>` : '';
+    if (box.dataset.h !== html) { box.dataset.h = html; box.innerHTML = html; }
+    return busy;
   }
 
   const scriptCard = (title, text, note) => `<div class="hd-card cx-stack"><div class="hd-card__title">${esc(title)}</div>
