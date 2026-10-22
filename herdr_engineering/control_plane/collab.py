@@ -38,8 +38,8 @@ ORG_ID = "default"  # single-organization deployment (spec: no federation in v1)
 # "task" is the human right to give an agent work; the agent-side rights are "instruct"
 # (give work to other agents) and "execute" (receive work). The room owner approves them per agent.
 ROLE_ACTIONS = {
-    "owner": frozenset({"read", "post", "invite", "grant_agent", "task", "instruct", "execute"}),
-    "contributor": frozenset({"read", "post", "grant_agent", "task", "instruct", "execute"}),
+    "owner": frozenset({"read", "post", "invite", "grant_agent", "task", "instruct", "execute", "spawn_helpers"}),
+    "contributor": frozenset({"read", "post", "grant_agent", "task", "instruct", "execute", "spawn_helpers"}),
     "viewer": frozenset({"read"}),
     "guest": frozenset({"read"}),
 }
@@ -58,7 +58,7 @@ class ApprovalPolicy:
     def __init__(self, auto_groups=(), approver_groups=()):
         self.auto_groups = frozenset(auto_groups)
         self.approver_groups = frozenset(approver_groups)
-AGENT_ACTIONS = frozenset({"read", "post", "instruct", "execute"})  # an agent can never invite/grant/administer
+AGENT_ACTIONS = frozenset({"read", "post", "instruct", "execute", "spawn_helpers"})  # an agent can never invite/grant/administer
 PROJECT_ROLES = frozenset({"manager", "contributor"})
 
 MAX_TEXT = 8000
@@ -2449,5 +2449,5 @@ def _handle(value: Any) -> str:
 def _actions(value: Any) -> list[str]:
     if (not isinstance(value, list) or not value
             or not all(isinstance(a, str) and a in AGENT_ACTIONS for a in value)):
-        raise CollabError(400, "actions must be a non-empty subset of read, post, instruct, execute")
+        raise CollabError(400, "actions must be a non-empty subset of read, post, instruct, execute, spawn_helpers")
     return sorted(set(value))
