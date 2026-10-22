@@ -49,7 +49,7 @@ def test_request_is_recorded_with_server_side_parent(w):
     assert h["status"] == "requested" and h["role"] == "reviewer" and h["family"] == "claude-code"
     assert h["requester_agent_id"] == w.root.id and h["parent_agent_id"] == w.root.id
     assert h["owner"] == "alice" and h["room_id"] == w.room and h["depth"] == 1
-    assert h["model"] is None and h["model_reason"] == "unpicked"
+    assert h["model"] is None and "no catalogue" in h["model_reason"]
     assert h["expires_epoch"] - h["created_epoch"] == 7200
 
 
@@ -551,3 +551,90 @@ def test_waiters_wake_on_helper_change(w):
     ask(w)
     t.join(5)
     assert woke and woke[0] > seq
+
+
+# ------------------------------------------------------------------ model catalogue and the picker
+def _cat(*rows):
+    return [{"id": i, "family": f, "vision": v, "price_out_per_mtok": p, "context": None, "local": False}
+            for i, f, v, p in rows]
+
+
+CATALOGUE = _cat(("fx-cheap", "fx", False, 1.0), ("fx-top", "fx", False, 20.0), ("fx-eye", "fx", True, 8.0))
+
+
+def test_no_catalogue_keeps_model_unset(w):
+    rec = ask(w)
+    assert rec["model"] is None and "no catalogue" in rec["model_reason"]
+
+
+def test_catalogue_is_operator_only(w):
+    for pr in (w.alice, w.root):
+        with pytest.raises(collab.CollabError) as e:
+            w.s.set_catalogue(pr, CATALOGUE)
+        assert e.value.status == 404
+
+
+def test_request_gets_a_picked_model_and_reason(w):
+    assert w.s.set_catalogue(w.op, CATALOGUE) == {"count": 3}
+    rec = ask(w, role="debugger", task="there is a deadlock in the pool")
+    assert rec["model"] == "fx-top" and rec["tier"] == "hard" and "hard" in rec["model_reason"]
+    assert "deadlock" not in rec["model_reason"]
+    rec = ask(w, role="worker", task="rename x")
+    assert rec["model"] == "fx-cheap" and rec["tier"] == "trivial"
+
+
+def test_room_allowed_models_and_model_hint_apply(w):
+    w.s.set_catalogue(w.op, CATALOGUE)
+    w.s.set_room_profile(w.alice, w.room, {"allowed_families": ["claude-code", "codex"],
+                                           "allowed_models": ["fx-cheap", "fx-eye"]})
+    assert ask(w, role="debugger", task="deadlock")["model"] == "fx-eye"
+    rec = ask(w, role="worker", task="rename x", model="fx-top")
+    assert rec["model"] == "fx-cheap" and "model hint ignored" in rec["model_reason"]
+
+
+def test_a_helper_reviewer_never_gets_its_requesters_model(w):
+    w.s.set_catalogue(w.op, CATALOGUE)
+    h1, _ = run(w, ask(w, role="worker", task="a" * 500)["helper_id"])      # standard worker
+    w.s.set_room_profile(w.alice, w.room, {"allowed_families": ["claude-code", "codex"]})
+    own = w.s._helper_by_agent[h1.id]["model"]
+    assert own is not None
+    w.s.set_catalogue(w.op, _cat((own, "fx", False, 5.0), ("fx-other", "fx", False, 5.0)))
+    rec = ask(w, h1, role="reviewer", task="look at it")
+    assert rec["model"] == "fx-other"
+
+
+def test_catalogue_validation_and_wholesale_replace(w):
+    good = {"id": "fx-a", "family": None, "vision": False, "price_out_per_mtok": 0, "context": 10, "local": True}
+    for bad in ("x", [3], [{**good, "id": ""}], [{**good, "id": "a" * 129}], [{**good, "id": "a\nb"}],
+                [{**good, "family": "f" * 65}], [{**good, "vision": 1}], [{**good, "price_out_per_mtok": -1}],
+                [{**good, "price_out_per_mtok": float("nan")}], [{**good, "context": -1}],
+                [{**good, "context": True}], [{**good, "local": "y"}], [{**good, "extra": 1}],
+                [good, good], [{**good, "id": f"m{i}"} for i in range(501)]):
+        with pytest.raises(collab.CollabError) as e:
+            w.s.set_catalogue(w.op, bad)
+        assert e.value.status == 400, bad
+    assert w.s.set_catalogue(w.op, [{**good, "id": f"m{i}"} for i in range(500)]) == {"count": 500}
+    w.s.set_catalogue(w.op, [good])
+    assert [e["id"] for e in w.s._catalogue] == ["fx-a"]
+    w.s.set_catalogue(w.op, [])
+    assert w.s._catalogue == []
+
+
+def test_unchanged_catalogue_is_not_logged_again_and_survives_hydrate(w):
+    w.s.set_catalogue(w.op, CATALOGUE)
+    n = len(w.s._log)
+    w.s.set_catalogue(w.op, CATALOGUE)
+    assert len(w.s._log) == n
+    fresh = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}),
+                          sink=None, now=w.s.clock, max_agents_per_user=20)
+    fresh.hydrate(list(w.s._log))
+    assert [e["id"] for e in fresh._catalogue] == ["fx-cheap", "fx-top", "fx-eye"]
+
+
+def test_catalogue_route_is_operator_listener_only(w):
+    def call(parts, body, operator=None, auth=""):
+        return w.s.dispatch("POST", parts, {}, body, auth, None, operator=operator)
+    bearer = f"Bearer {USERS['mallory']}"
+    assert call(["fleet", "catalogue"], {"models": CATALOGUE}, auth=bearer)[0] == 404
+    assert call(["fleet", "catalogue"], {"models": "x"}, operator="mallory")[0] == 400
+    assert call(["fleet", "catalogue"], {"models": CATALOGUE}, operator="mallory") == (200, {"count": 3})

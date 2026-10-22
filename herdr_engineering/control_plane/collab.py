@@ -321,6 +321,7 @@ class CollabService:
         self._helper_by_agent: dict[str, dict] = {}          # helper's own agent id -> its request
         self._helper_text: dict[str, dict] = {}              # helper id -> task text waiting for its request event
         self._helpers_paused = False                         # the panic switch
+        self._catalogue: list[dict] = []                     # normalized model catalogue the runner posted
         self._helper_minted: set[str] = set()                # agents a claim minted (a helper agent, linked or not)
         self._state_waiters: dict[str, int] = defaultdict(int)
         self._joins: dict[str, dict] = {}                    # token digest -> record
@@ -620,6 +621,8 @@ class CollabService:
                     finished_epoch=p["finished_epoch"])
         elif t == "helpers_paused":
             self._helpers_paused = bool(p["paused"])
+        elif t == "catalogue_set":
+            self._catalogue = list(p["entries"])
         elif t == "identity_linked":
             old = self._user_email.get(p["user_id"])
             if old:
@@ -1951,7 +1954,9 @@ class CollabService:
             if sum(1 for r in self._helpers.values()
                    if r["owner"] == pr.owner and now - r["created_epoch"] < 3600) >= limits["per_hour"]:
                 self._helper_refuse(pr, room, 429, "hourly helper limit reached for this person", "limit_hour")
-            choice = collab_models.pick(role, task, family, hint, None, profile["allowed_models"], None)
+            author = (mine or {}).get("model")
+            choice = collab_models.pick(role, task, body.get("family"), hint, self._catalogue,
+                                        profile["allowed_models"], author if isinstance(author, str) else None)
             model = choice.model if isinstance(choice.model, str) else None
             hid = ids.new_id("collab")
             # The text rides in its own event with no "action": the audit log and the room feed never show it.
@@ -2185,6 +2190,16 @@ class CollabService:
                                              "error": code, "action": "helper.finish"})
             self._end_agent(actor, r["helper_agent_id"], "finished", set())
             return self._helper_view(r)
+
+    def set_catalogue(self, pr: Principal, entries: Any) -> dict:
+        """The runner posts the normalized model catalogue (operator only); it replaces the old one wholesale."""
+        self._require_operator(pr)
+        clean = _catalogue_entries(entries)
+        with self._lock:
+            if clean != self._catalogue:          # the runner posts every 10 minutes: log only changes
+                # no "action": the list is configuration data, not an audit row
+                self._commit("catalogue_set", {"actor_user_id": pr.owner, "entries": clean})
+            return {"count": len(clean)}
 
     def set_helpers_paused(self, pr: Principal, paused: Any) -> dict:
         """The panic switch (operator only): refuse new helpers, end every live one and its credential."""
@@ -3040,6 +3055,8 @@ class CollabService:
                     if n == 4 and parts[1] == "egress" and parts[3] == "decide":
                         kw = {"ttl_seconds": body["ttl_seconds"]} if "ttl_seconds" in body else {}
                         return 200, self.decide_egress(pr, parts[2], body.get("decision"), **kw)
+                    if parts == ["fleet", "catalogue"]:
+                        return 200, self.set_catalogue(pr, body.get("models", body.get("entries")))
                     if parts == ["fleet", "helpers", "pause"]:
                         return 200, self.set_helpers_paused(pr, body.get("paused"))
                     if n == 4 and parts[1] == "helpers" and parts[3] == "claim":
@@ -3104,6 +3121,38 @@ class CollabService:
             raise CollabError(404, "not found")
         except CollabError as exc:
             return exc.status, {"error": exc.message}
+
+
+CATALOGUE_MAX = 500
+
+
+def _catalogue_entries(entries: Any) -> list[dict]:
+    """Validate a posted model catalogue; any bad entry rejects the whole post."""
+    if not isinstance(entries, list) or len(entries) > CATALOGUE_MAX:
+        raise CollabError(400, f"models must be a list of at most {CATALOGUE_MAX} entries")
+    keys = {"id", "family", "vision", "price_out_per_mtok", "context", "local"}
+
+    def num(v: Any, kind: type) -> bool:
+        return v is None or (isinstance(v, kind) and not isinstance(v, bool) and v >= 0
+                             and (kind is int or v == v and v != float("inf")))
+
+    out, seen = [], set()
+    for e in entries:
+        if not isinstance(e, dict) or set(e) - keys:
+            raise CollabError(400, "invalid catalogue entry")
+        mid, fam = e.get("id"), e.get("family")
+        if (not isinstance(mid, str) or not 0 < len(mid) <= 128 or not mid.isprintable() or mid in seen
+                or not (fam is None or (isinstance(fam, str) and len(fam) <= 64 and fam.isprintable()))
+                or not isinstance(e.get("vision", False), bool) or not isinstance(e.get("local", False), bool)
+                or not num(e.get("context"), int)
+                or not (num(e.get("price_out_per_mtok"), float) or num(e.get("price_out_per_mtok"), int))):
+            raise CollabError(400, "invalid catalogue entry")
+        seen.add(mid)
+        price = e.get("price_out_per_mtok")
+        out.append({"id": mid, "family": fam, "vision": e.get("vision", False),
+                    "price_out_per_mtok": None if price is None else float(price),
+                    "context": e.get("context"), "local": e.get("local", False)})
+    return out
 
 
 def _profile_strings(v: Any, field: str, rx: re.Pattern | None, limit: int, maxlen: int = 120) -> list[str]:
