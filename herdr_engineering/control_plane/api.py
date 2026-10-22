@@ -96,7 +96,8 @@ class ControlPlaneServer:
                  port=0, web_root=None, source=None, allow_open=False,
                  rustfs=None, dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
-                 collab_require_https=False, fleet_config=None, ci_actions=False):
+                 collab_require_https=False, fleet_config=None, ci_actions=False,
+                 public_port=None, public_host=None, collab_only=False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -163,6 +164,16 @@ class ControlPlaneServer:
         self.fleet_config = fleet_config
         self.collab = collab
         self.collab_require_https = collab_require_https
+        # Optional second listener that serves ONLY collaboration (API, MCP and its page);
+        # it is the only one an internet-facing proxy should be pointed at.
+        if public_port is not None and collab is None:
+            raise ValueError("a public collaboration listener needs collab enabled")
+        self.collab_only = collab_only
+        if collab_only and public_port is None:
+            raise ValueError("collab-only mode needs the public collaboration port")
+        self.public_port = public_port
+        self.public_host = public_host or host
+        self._public_httpd = None
         if collab is not None:
             collab.hydrate(repo.take_collab_replay())
         self.host = host
@@ -228,9 +239,22 @@ class ControlPlaneServer:
 
     # ------------------------------------------------------------- server
     def serve(self):
+        if self.collab_only:
+            # No operator listener at all: this process serves the public collab surface only.
+            self._httpd = _DaemonThreadingServer(
+                (self.public_host, self.public_port), _make_handler(self, public=True))
+            self.public_port = self.port = self._httpd.server_address[1]
+            self._ready.set()
+            self._httpd.serve_forever()
+            return
         self._httpd = _DaemonThreadingServer(
             (self.host, self.port), _make_handler(self))
         self.port = self._httpd.server_address[1]
+        if self.public_port is not None:
+            self._public_httpd = _DaemonThreadingServer(
+                (self.public_host, self.public_port), _make_handler(self, public=True))
+            self.public_port = self._public_httpd.server_address[1]
+            threading.Thread(target=self._public_httpd.serve_forever, daemon=True).start()
         self._ready.set()
         threading.Thread(target=self._sweep_loop, daemon=True).start()
         self._httpd.serve_forever()
@@ -250,12 +274,29 @@ class ControlPlaneServer:
     def shutdown(self):
         self.ci_monitor.close()
         self.github_monitor.close()
+        if self._public_httpd:
+            self._public_httpd.shutdown()
+            self._public_httpd.server_close()
         if self._httpd:
             self._httpd.shutdown()
             self._httpd.server_close()
 
 
-def _make_handler(server):
+_PUBLIC_STATIC = {
+    "/": ("collab.html", "text/html; charset=utf-8"),
+    "/collab-app.js": ("collab-app.js", "text/javascript"),
+    "/collab-view.js": ("collab-view.js", "text/javascript"),
+    "/herdr-web-client/collab.js": ("herdr-web-client/collab.js", "text/javascript"),
+    "/herdr-web-components/util.js": ("herdr-web-components/util.js", "text/javascript"),
+    "/herdr-design-system/theme.css": ("herdr-design-system/theme.css", "text/css"),
+    "/herdr-design-system/base.css": ("herdr-design-system/base.css", "text/css"),
+}
+_PUBLIC_CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+               "connect-src 'self' https://*.amazoncognito.com; img-src 'self' data:; "
+               "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+
+def _make_handler(server, public=False):
     class _Handler(BaseHTTPRequestHandler):
         server_version = "HerdrControlPlane/0.1"
         protocol_version = "HTTP/1.1"
@@ -329,7 +370,73 @@ def _make_handler(server):
             return None
 
         # ------------------------------------------------------------ routes
+        # -------------------------------------------- public (collab-only) listener
+        def _public(self):
+            """Everything not on the allow-list is a plain 404: the legacy API, the
+            dashboard and its static files do not exist on this listener."""
+            path = self.path.split("?")[0]
+            if self._is_collab_path() or path == "/mcp":
+                return self._collab() if path != "/mcp" else self._mcp()
+            if self.command == "GET" and path in _PUBLIC_STATIC:
+                name, ctype = _PUBLIC_STATIC[path]
+                target = (server.web_root / name)
+                if not target.is_file():
+                    return self._deny(404, "not found")
+                data = target.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Security-Policy", _PUBLIC_CSP)
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Frame-Options", "DENY")
+                self.end_headers()
+                self.wfile.write(data)
+                return None
+            return self._deny(404, "not found")
+
+        def _mcp(self):
+            from . import collab_mcp
+            from .collab import MAX_BODY
+            if server.collab is None:
+                return self._deny(404, "not found")
+            if self._rate_limit(self._proxied_client()):
+                return None
+            if self.command != "POST":
+                return self._deny(405, "POST only")
+            if (server.collab_require_https
+                    and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
+                return self._deny(400, "collaboration is only served over https")
+            if self.headers.get("Origin"):
+                return self._deny(403, "browser origins may not call the MCP endpoint")
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                return self._deny(415, "application/json required")
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > MAX_BODY:
+                return self._deny(413, "request body size not allowed")
+            try:
+                message = json.loads(self.rfile.read(length))
+            except ValueError:
+                return self._json({"jsonrpc": "2.0", "id": None,
+                                   "error": {"code": -32700, "message": "parse error"}}, 400)
+            try:
+                status, payload = collab_mcp.handle(
+                    server.collab, message, self.headers.get("Authorization", ""),
+                    self.headers.get("X-Herdr-Device"))
+            except Exception:
+                return self._json({"jsonrpc": "2.0", "id": None,
+                                   "error": {"code": -32603, "message": "internal error"}}, 500)
+            if payload is None:
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
+            return self._json(payload, status)
+
         def do_GET(self):
+            if public:
+                return self._public()
             if self._is_collab_path():
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH:
@@ -342,6 +449,8 @@ def _make_handler(server):
             return self._serve_static()
 
         def do_POST(self):
+            if public:
+                return self._public()
             if self._is_collab_path():
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
@@ -492,7 +601,13 @@ def _make_handler(server):
             forwarded address, but only trust it from a loopback peer (the proxy)."""
             peer = self.client_address[0]
             fwd = self.headers.get("X-Forwarded-For", "").split(",")[-1].strip()
-            return fwd[:64] if fwd and _is_loopback(peer) else peer
+            # The public listener is reachable only from the host's own proxy (possibly
+            # across the Docker bridge), so a private peer is trusted there too.
+            try:
+                trusted = _is_loopback(peer) or (public and ipaddress.ip_address(peer).is_private)
+            except ValueError:
+                trusted = False
+            return fwd[:64] if fwd and trusted else peer
 
         def _rate_limit(self, key=None):
             # Skip SSE streams: they are long-lived connections, not bursts.

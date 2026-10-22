@@ -120,7 +120,7 @@ def test_host_aliases_accept_mapping_and_string():
     assert cli._host_aliases_from({}) == {}
 
 
-def _run_web(monkeypatch, path):
+def _run_web(monkeypatch, path, **overrides):
     seen = {}
 
     class FakeServer:
@@ -148,7 +148,13 @@ def _run_web(monkeypatch, path):
                               web_root=None, allow_open=True, collab_cognito_pool=None,
                               collab_users_file=None, collab_tls_terminated=False,
                               collab_require_https=False, collab_cognito_client=[],
-                              collab_cognito_group=None)
+                              collab_cognito_group=None, collab_only=False,
+                              collab_public_port=None, collab_public_host=None,
+                              collab_log_file=None, collab_sync_dir=None,
+                              collab_cognito_web_client=None, collab_cognito_domain=None,
+                              collab_public_url=None)
+    for k, v in overrides.items():
+        setattr(args, k, v)
     assert cli._cmd_cp_web(args) == 0
     return seen
 
@@ -174,6 +180,106 @@ def test_web_without_file_has_no_durable_config_even_with_env(tmp_path, monkeypa
     assert seen["self_report"]["rustfs_endpoint"] is None
     assert seen["self_report"]["host_id"] != "env-self"
     assert seen["server_kw"]["ci_actions"] is False
+
+
+# ------------------------------------------------------------- collab-only (public)
+
+COLLAB = {"cognito_pool": "us-west-2_TESTPOOL", "cognito_clients": ["client-a"],
+          "cognito_group": "team.test", "cognito_web_client": "web-client",
+          "cognito_domain": "https://pool.auth.example.test", "public_url": "https://collab.example.test/"}
+
+
+def _collab_slice(tmp_path, collab=None):
+    central = make_file(tmp_path, collab=dict(collab or COLLAB))
+    out = tmp_path / "slice" / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(central), out)
+    return central, out
+
+
+def _collab_only_args(tmp_path, log=None):
+    return dict(collab_only=True, collab_public_port=18081, collab_public_host="127.0.0.1",
+                collab_log_file=str(log or tmp_path / "collab.jsonl"),
+                collab_sync_dir=None, allow_open=False)
+
+
+def test_render_collab_slice_holds_only_the_collab_mapping(tmp_path):
+    central, out = _collab_slice(tmp_path)
+    assert oct(out.stat().st_mode & 0o777) == "0o600"
+    text = out.read_text()
+    data = yaml.safe_load(text)
+    assert data["sections"]["control_plane"]["values"] == {"collab": COLLAB}
+    assert data["hosts"] == {}
+    cp = yaml.safe_load(central.read_text())["sections"]["control_plane"]["values"]
+    for secret in (cp["pg_dsn"], cp["minio_password"], *cp["api_keys"]):
+        assert secret not in text
+
+
+def test_render_collab_refuses_missing_or_unknown_keys(tmp_path):
+    central = make_file(tmp_path)
+    with pytest.raises(fcc.FleetConfigError, match="control_plane.collab is not set"):
+        fcc.render_collab(fcc.load_fleet_config(central), tmp_path / "x.json")
+    central.unlink()
+    central = make_file(tmp_path, collab=dict(COLLAB, client_secret="s3cret"))
+    with pytest.raises(fcc.FleetConfigError, match="unknown keys: client_secret"):
+        fcc.render_collab(fcc.load_fleet_config(central), tmp_path / "x.json")
+
+
+def test_collab_keys_match_the_cli_mapping():
+    assert set(cli.COLLAB_CONFIG_KEYS) == set(fcc.COLLAB_KEYS)
+
+
+def test_collab_only_reads_cognito_settings_from_the_slice(tmp_path, monkeypatch, old_env, capsys):
+    import herdr_engineering.control_plane.collab_cognito as cc
+    seen_auth = {}
+    real = cc.CognitoAuthenticator
+
+    def spy(**kw):
+        seen_auth.update(kw)
+        return real(**kw)
+    monkeypatch.setattr(cc, "CognitoAuthenticator", spy)
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    _, out = _collab_slice(tmp_path)
+    seen = _run_web(monkeypatch, out, **_collab_only_args(tmp_path))
+    assert seen_auth["pool_id"] == "us-west-2_TESTPOOL"
+    assert seen_auth["client_ids"] == ["client-a", "web-client"]
+    assert seen_auth["required_group"] == "team.test"
+    kw = seen["server_kw"]
+    assert kw["collab_only"] is True
+    assert kw["fleet_config"] is None              # no fleet endpoint on the public container
+    assert kw["collab"].public_config == {"client_id": "web-client",
+                                          "hosted_ui_domain": "https://pool.auth.example.test",
+                                          "public_url": "https://collab.example.test/"}
+    assert "self_report" not in seen and "sink_dsn" not in seen
+
+
+def test_collab_only_flags_override_the_slice(tmp_path, monkeypatch, old_env, capsys):
+    import herdr_engineering.control_plane.collab_cognito as cc
+    seen_auth = {}
+    real = cc.CognitoAuthenticator
+    monkeypatch.setattr(cc, "CognitoAuthenticator", lambda **kw: seen_auth.update(kw) or real(**kw))
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    _, out = _collab_slice(tmp_path)
+    _run_web(monkeypatch, out, collab_cognito_pool="us-west-2_FLAG", collab_cognito_group="flag.group",
+             **_collab_only_args(tmp_path))
+    assert seen_auth["pool_id"] == "us-west-2_FLAG" and seen_auth["required_group"] == "flag.group"
+
+
+def test_collab_only_refuses_the_central_file(tmp_path, monkeypatch, old_env, capsys):
+    central = make_file(tmp_path, collab=dict(COLLAB))
+    with pytest.raises(SystemExit, match="must not be given database credentials"):
+        _run_web(monkeypatch, central, **_collab_only_args(tmp_path))
+
+
+def test_collab_only_without_a_pool_fails_and_ignores_env(tmp_path, monkeypatch, old_env, capsys):
+    monkeypatch.setenv("HERDR_COLLAB_POOL", "us-west-2_ENV")
+    with pytest.raises(SystemExit, match="Cognito pool"):
+        _run_web(monkeypatch, tmp_path / "missing.json", **_collab_only_args(tmp_path))
+
+
+def test_dashboard_ignores_control_plane_collab(tmp_path, monkeypatch, old_env, capsys):
+    central = make_file(tmp_path, collab=dict(COLLAB))
+    seen = _run_web(monkeypatch, central)
+    assert seen["server_kw"]["collab"] is None
 
 
 # ------------------------------------------------------------------- llm proxy

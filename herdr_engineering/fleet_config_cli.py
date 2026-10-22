@@ -1,5 +1,5 @@
 """Operator tooling for the central fleet config: init, validate, token,
-render-compose, and the host-credential helpers `fleet join` shares.
+render-compose, render-collab, and the host-credential helpers `fleet join` shares.
 
 Secrets are never printed, never placed in argv, and every file that holds one
 is created 0600 atomically (os.open with the mode, then rename).
@@ -169,6 +169,46 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
     env = compose_env(cfg)
     lines = [f"{k}={_quote_env_value(v)}" for k, v in env.items()]
     write_private_file(Path(out), "\n".join(lines) + "\n")
+
+
+# --------------------------------------------------------------------------
+# collab slice (the public collab container's only configuration)
+# --------------------------------------------------------------------------
+
+# Public identifiers only: the slice is handed to the internet-facing collab container,
+# so an unknown key (which could be a secret) is refused rather than passed along.
+COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
+                         "cognito_domain", "public_url"})
+
+
+def collab_values(cfg: FleetConfig) -> dict:
+    """Validated ``control_plane.collab`` mapping (optional section; required only
+    when the collaboration network is enabled on this host)."""
+    try:
+        values = cfg.section(CONTROL_PLANE_SECTION)
+    except FleetConfigError:
+        raise FleetConfigError("no control_plane section in the fleet config") from None
+    collab = values.get("collab")
+    if not isinstance(collab, dict) or not collab:
+        raise FleetConfigError("control_plane.collab is not set (needed when the collaboration "
+                               "network is enabled: cognito_pool, cognito_clients, ...)")
+    unknown = sorted(str(k) for k in set(collab) - COLLAB_KEYS)
+    if unknown:
+        raise FleetConfigError("control_plane.collab: unknown keys: " + ", ".join(unknown))
+    pool = collab.get("cognito_pool")
+    if not isinstance(pool, str) or not pool:
+        raise FleetConfigError("control_plane.collab.cognito_pool is required")
+    return dict(collab)
+
+
+def render_collab(cfg: FleetConfig, out: Path) -> None:
+    """Write a minimal fleet file (JSON, valid YAML, 0600) holding only control_plane.collab."""
+    data = {"version": SCHEMA_VERSION,
+            "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"],
+                                                 "values": {"collab": collab_values(cfg)}}},
+            "hosts": {}}
+    _parse(data)
+    write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 # --------------------------------------------------------------------------

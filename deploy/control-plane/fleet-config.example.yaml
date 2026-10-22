@@ -19,8 +19,19 @@ sections:
       minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
       ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: the public collaboration container (only when the host has the marker
+      # ~/.config/herdr-engineering/collab-enabled). Public identifiers only - deploy.sh
+      # hands exactly this mapping (nothing else from this file) to collab-public, and
+      # an unknown key is refused. Omit the whole block when collab is not used.
+      collab:
+        cognito_pool: "us-west-2_REDACTED"           # also read by collab-sync.sh
+        cognito_clients: ["REDACTED"]                # allowed app client ids (tokens)
+        cognito_group: "local.dev"                   # required cognito:groups membership
+        cognito_web_client: "REDACTED"               # browser page app client (Hosted UI, PKCE)
+        cognito_domain: "https://REDACTED.auth.us-west-2.amazoncognito.com"
+        public_url: "https://collab.example.test/"   # must equal the web client's callback URL
       # Variables docker compose itself substitutes; deploy.sh renders exactly this
-      # mapping into a transient 0600 env file. All keys below are required.
+      # mapping into a transient 0600 env file. The first eight keys are required.
       compose:
         HERDR_CP_PG_USER: "REDACTED"          # same user as in pg_dsn
         HERDR_CP_PG_PASSWORD: "REDACTED"      # same password as in pg_dsn
@@ -30,6 +41,10 @@ sections:
         HERDR_CP_WEB_PUBLIC_PORT: "80"
         HERDR_CP_PG_PORT: "5432"              # loopback host port of postgres
         GATEWAY_TAILNET_IP: "127.0.0.1"       # `tailscale ip -4`; 127.0.0.1 = loopback only
+        # Optional, collab only (needed when the collab marker exists):
+        # HERDR_COLLAB_CERT_DIR: "/path/to/acme"     # certbot dir with live/<host>/ (required for collab)
+        # HERDR_COLLAB_CERT_UID: "1000"              # owner of the certs, data dir and collab slice
+        # HERDR_COLLAB_EDGE_BIND: "127.0.0.1:18444"  # published address of the TLS edge
 
   llm:
     roles: [builder]

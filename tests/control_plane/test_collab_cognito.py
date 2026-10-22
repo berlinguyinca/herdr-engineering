@@ -204,3 +204,145 @@ def test_require_https_refuses_plain_requests_but_serves_proxied_ones(acknowledg
     finally:
         srv.shutdown()
         t.join(timeout=5)
+
+
+# ------------------------------------------------ email linking + invites
+def id_token(user="alice", email="alice@example.org", **over):
+    claims = {"iss": ISS, "sub": f"sub-{user}", "cognito:username": user, "token_use": "id",
+              "aud": CLIENT, "email": email, "email_verified": True,
+              "exp": time.time() + 3600}
+    claims.update(over)
+    claims = {k: v for k, v in claims.items() if v is not None}
+    return jwt.encode(claims, KEY, algorithm="RS256", headers={"kid": "k1"})
+
+
+@pytest.mark.parametrize("bad", [
+    lambda: id_token(token_use="access"),
+    lambda: id_token(email_verified=False),
+    lambda: id_token(email_verified=None),
+    lambda: id_token(aud="other-client"),
+    lambda: id_token(user="mallory"),                  # someone else's id token
+    lambda: id_token(exp=time.time() - 1),
+    lambda: id_token(email=None),
+    lambda: "junk",
+])
+def test_id_token_linking_rejects_bad_tokens(bad):
+    assert auth().verify_id_token(bad(), user="alice") is None
+
+
+def test_id_token_gives_normalised_email():
+    assert auth().verify_id_token(id_token(email="Alice@Example.ORG"), user="alice") == "alice@example.org"
+
+
+def link(api, user, email=None):
+    return api.call("POST", f"{BASE}/me", {"id_token": id_token(user, email or f"{user}@example.org")},
+                    headers=bearer(token(user)))
+
+
+def make_room_for(api, owner="alice"):
+    h = bearer(token(owner))
+    s, p = api.call("POST", f"{BASE}/projects", {"name": "p"}, headers=h)
+    s, r = api.call("POST", f"{BASE}/projects/{p['project_id']}/rooms", {"name": "r"}, headers=h)
+    return r["room_id"]
+
+
+def test_invite_by_email_pending_then_activates_on_first_sign_in(server):
+    api, _ = server
+    link(api, "alice")
+    room = make_room_for(api)
+    s, body = api.call("POST", f"{BASE}/rooms/{room}/invites",
+                       {"email": "Bob@Example.org", "role": "contributor"}, headers=bearer(token("alice")))
+    assert (s, body["status"]) == (201, "invited")
+    # bob has never signed in: pending, and he cannot see the room yet
+    assert api.call("GET", f"{BASE}/rooms/{room}", headers=bearer(token("bob")))[0] == 404
+    s, pend = api.call("GET", f"{BASE}/rooms/{room}/invites", headers=bearer(token("alice")))
+    assert [i["email"] for i in pend["invites"]] == ["bob@example.org"]
+    # first sign-in links his email and the invitation activates
+    assert link(api, "bob")[0] == 200
+    assert api.call("GET", f"{BASE}/rooms/{room}", headers=bearer(token("bob")))[0] == 200
+    assert api.call("GET", f"{BASE}/rooms/{room}/invites", headers=bearer(token("alice")))[1]["invites"] == []
+    s, room_info = api.call("GET", f"{BASE}/rooms/{room}", headers=bearer(token("alice")))
+    assert {m["email"] for m in room_info["members"]} == {"alice@example.org", "bob@example.org"}
+
+
+def test_invite_known_user_adds_directly_with_identical_reply(server):
+    api, _ = server
+    link(api, "alice"); link(api, "bob")
+    room = make_room_for(api)
+    known = api.call("POST", f"{BASE}/rooms/{room}/invites", {"email": "bob@example.org", "role": "viewer"},
+                     headers=bearer(token("alice")))
+    unknown = api.call("POST", f"{BASE}/rooms/{room}/invites", {"email": "zed@example.org", "role": "viewer"},
+                       headers=bearer(token("alice")))
+    assert known[0] == unknown[0] == 201
+    assert set(known[1]) == set(unknown[1])          # same shape: no oracle on who has signed in
+    assert api.call("GET", f"{BASE}/rooms/{room}", headers=bearer(token("bob")))[0] == 200
+
+
+def test_invite_permissions_and_validation(server):
+    api, _ = server
+    link(api, "alice"); link(api, "bob")
+    room = make_room_for(api)
+    h = bearer(token("alice"))
+    api.call("POST", f"{BASE}/rooms/{room}/invites", {"email": "bob@example.org", "role": "viewer"}, headers=h)
+    # a viewer cannot invite; a stranger gets 404
+    body = {"email": "x@example.org", "role": "viewer"}
+    assert api.call("POST", f"{BASE}/rooms/{room}/invites", body, headers=bearer(token("bob")))[0] == 403
+    assert api.call("POST", f"{BASE}/rooms/{room}/invites", body, headers=bearer(token("carol")))[0] == 404
+    assert api.call("GET", f"{BASE}/rooms/{room}/invites", headers=bearer(token("bob")))[0] == 403
+    for bad in ({"email": "nope", "role": "viewer"}, {"email": "a@b.org", "role": "owner"},
+                {"email": "a@b.org", "role": "root"}, {"role": "viewer"}):
+        assert api.call("POST", f"{BASE}/rooms/{room}/invites", bad, headers=h)[0] == 400
+    assert api.call("POST", f"{BASE}/rooms/{room}/invites",
+                    {"email": "bob@example.org", "role": "viewer"}, headers=h)[0] == 409
+
+
+def test_cancelled_and_expired_invites_do_not_activate(server):
+    api, svc = server
+    link(api, "alice")
+    room = make_room_for(api)
+    h = bearer(token("alice"))
+    api.call("POST", f"{BASE}/rooms/{room}/invites", {"email": "bob@example.org", "role": "viewer"}, headers=h)
+    api.call("POST", f"{BASE}/rooms/{room}/invites", {"email": "carol@example.org", "role": "viewer"}, headers=h)
+    iid = [i["invite_id"] for i in api.call("GET", f"{BASE}/rooms/{room}/invites", headers=h)[1]["invites"]
+           if i["email"] == "bob@example.org"][0]
+    assert api.call("POST", f"{BASE}/rooms/{room}/invites/{iid}/cancel", {}, headers=h)[0] == 200
+    link(api, "bob")
+    assert api.call("GET", f"{BASE}/rooms/{room}", headers=bearer(token("bob")))[0] == 404
+    svc._now = lambda: time.time() + 8 * 24 * 3600     # past the 7-day invitation lifetime
+    assert link(api, "carol")[0] == 200
+    svc._now = time.time
+    assert api.call("GET", f"{BASE}/rooms/{room}", headers=bearer(token("carol")))[0] == 404
+
+
+def test_link_requires_matching_id_token(server):
+    api, _ = server
+    s, _ = api.call("POST", f"{BASE}/me", {"id_token": id_token("mallory", "boss@example.org")},
+                    headers=bearer(token("alice")))
+    assert s == 400
+    assert api.call("POST", f"{BASE}/me", {}, headers=bearer(token("alice")))[0] == 400
+
+
+def test_config_is_public_and_me_requires_auth(acknowledged_sink):
+    svc = CollabService(auth(), sink=acknowledged_sink, public_config={"client_id": "web", "domain": "d"})
+    srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=svc)
+    t = threading.Thread(target=srv.serve, daemon=True)
+    t.start(); srv.wait_until_ready()
+    try:
+        api = Api(srv.port)
+        assert api.call("GET", f"{BASE}/config") == (200, {"client_id": "web", "domain": "d"})
+        assert api.call("GET", f"{BASE}/me")[0] == 401
+    finally:
+        srv.shutdown(); t.join(timeout=5)
+
+
+def test_links_and_invites_survive_restart(server, acknowledged_sink):
+    api, svc = server
+    link(api, "alice")
+    room = make_room_for(api)
+    api.call("POST", f"{BASE}/rooms/{room}/invites", {"email": "bob@example.org", "role": "viewer"},
+             headers=bearer(token("alice")))
+    fresh = CollabService(auth(), sink=acknowledged_sink)
+    fresh.hydrate(list(acknowledged_sink.events))
+    assert fresh._user_email == {"alice": "alice@example.org"}
+    assert [i["email"] for i in fresh._invites.values() if i["open"]] == ["bob@example.org"]
+    assert fresh.auth.exists("alice")        # known from the log, so its agents survive a restart

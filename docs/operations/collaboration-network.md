@@ -26,6 +26,16 @@ herdr-eng control-plane web --host 127.0.0.1 --port 18766 --pg-dsn "$DSN" \
 * A person can be invited to a room once they have signed in to this server once
   (or when the lookup above is available).
 
+## Web page (invite people from the browser)
+Open `https://<host>:9447/#/collab`, sign in with your BinView account (Cognito Hosted
+UI, authorization code + PKCE; the password never reaches this server or page), then
+create rooms, chat, and **invite by email**. The page links your verified email to your
+account at sign-in, so invitations work by email: if the person has signed in before they
+are added at once, otherwise the invitation is pending (7 days) and activates on their
+first sign-in. Either way the owner sees the same reply. The invitee must still be in
+the `local.dev` group. Browser sign-in uses its own app client, `herdr-collab-web`
+(public client, code flow only, one callback URL). Tokens live in sessionStorage only.
+
 ## TLS on the tailnet
 Keep the server on loopback and let Tailscale terminate TLS (real Let's Encrypt
 certificate, tailnet-only, no Funnel):
@@ -86,3 +96,51 @@ principal are persisted at most once per minute; the rest are counted.
 SSO/MFA not wired (static hashed tokens); no TLS handling in-process; no
 Prometheus export yet (`CollabService.stats` counters only); artifacts, tasks,
 A2A, MCP and UI are P2–P4. See `audit.md` for the blocker list.
+
+## Public hostname, edge and MCP (`localdev.mcp.metabolomics.us`)
+
+Coworkers need only a browser and Claude Code; nobody joins the tailnet. All of it is docker-compose
+(`deploy/control-plane/compose.collab.yaml`, layered on by `deploy.sh` when the marker exists).
+
+| Piece | Container | Reachable from |
+|---|---|---|
+| Dashboard / operator API | `herdr-cp-web` (unchanged, no collab code path) | tailnet interface only |
+| Collaboration site + MCP | `herdr-collab-public` (`web --collab-only`) | only the edge, on its own `collab` network |
+| TLS edge | `herdr-collab-edge` (nginx) | published port (`control_plane.compose.HERDR_COLLAB_EDGE_BIND`) |
+
+**Configuration** comes from the central fleet file (`~/.config/herdr-engineering/fleet-config.yaml`,
+see `deploy/control-plane/fleet-config.example.yaml`); no env file is authored:
+
+- `control_plane.collab` - `cognito_pool`, `cognito_clients`, `cognito_group`, `cognito_web_client`,
+  `cognito_domain`, `public_url` (public identifiers only; `--collab-require-https` is fixed in
+  the compose file, not configurable). `deploy.sh` renders
+  just this mapping to `~/.config/herdr-engineering/collab/collab-config.json` (0600,
+  `herdr-eng fleet config render-collab`); `herdr-collab-public` mounts it read-only and reads it
+  with `--fleet-config`. It refuses to start if that file carries anything else (a DSN, API keys),
+  so the central file itself can never be mounted there. Unknown `collab` keys are rejected.
+- `control_plane.compose` - optional `HERDR_COLLAB_CERT_DIR` (required once collab is on),
+  `HERDR_COLLAB_CERT_UID` (owner of the certs, the data dir and the slice; default 1000) and
+  `HERDR_COLLAB_EDGE_BIND` (default `127.0.0.1:18444`).
+- `collab-sync.sh` reads the pool and group from the same slice (`--config`); `deploy.sh` installs it
+  and its 1-minute timer.
+
+Collab is optional: without the marker none of these keys are needed.
+
+`herdr-collab-public` has no database or object-store credentials, no docker socket, no operator API,
+a read-only root filesystem, no capabilities, resource limits, and one writable mount: its append-only
+event log (`~/.local/share/herdr-engineering/collab/collab.jsonl`, mode 0600; back it up). It serves
+only `/api/v1/collab/*`, `/mcp` and an allowlist of static files; the edge enforces the same allowlist,
+TLS, rate and connection limits and a 64 KB body cap.
+
+- **Certificate:** certbot lineage `localdev.mcp.metabolomics.us` (DNS-01, Route53) in the host's acme dir
+  (`control_plane.compose.HERDR_COLLAB_CERT_DIR` in the central file); the renewal hook also reloads the edge.
+- **Router:** a hostname rule on the router sends `localdev.mcp.metabolomics.us` to the edge's published port.
+- **Sign-in:** Cognito Hosted UI (app client `herdr-collab-web`); access requires the `local.dev` group.
+  Removing someone takes effect at token expiry (at most 1 hour).
+- **Connect Claude Code:** sign in, press *Connect Claude Code* under "Your AI agents", run the shown
+  `claude mcp add --transport http herdr-collab https://localdev.mcp.metabolomics.us/mcp --header ...`.
+  The credential is shown once, lasts 30 days, and can be revoked on the same page.
+- **MCP tools** (`rooms_list`, `room_read`, `room_post`, `agents_list`) only touch rooms the owner granted.
+  Room content is returned wrapped as UNTRUSTED. No tool executes anything.
+- Collaboration events written before this split live in the dashboard's Postgres and are not migrated.
+- Moving hosts: change `control_plane.collab.public_url`, the app client callback/logout URLs and the router rule.

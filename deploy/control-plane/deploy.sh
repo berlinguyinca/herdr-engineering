@@ -15,7 +15,11 @@
 #      0700 directory (`herdr-eng fleet config render-compose`), removed on exit
 #   4. recreates ONLY control-plane-web (postgres, rustfs, worker, gateway untouched)
 #      using the compose files from that same commit; the central file is mounted
-#      read-only into the containers at /etc/herdr/fleet-config.yaml
+#      read-only into the containers at /etc/herdr/fleet-config.yaml.
+#      With the collaboration marker it also renders control_plane.collab (and only
+#      that) to a stable 0600 slice, installs the edge nginx.conf at a stable path,
+#      refreshes the Cognito key/membership files and their timer (collab-sync.sh),
+#      and recreates collab-public + collab-edge
 #   5. waits for /api/v1/health to report the new commit; if it does not, puts the
 #      previous image back and exits non-zero
 #
@@ -31,7 +35,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1; shift ;;
     --no-fetch) FETCH=0; shift ;;
     --fleet-config) CENTRAL="${2:?--fleet-config needs a value}"; shift 2 ;;
-    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -69,7 +73,9 @@ WORK="$(mktemp -d)"
 git -C "$REPO" worktree add -q --detach "$WORK" "$FULL"
 # herdr-eng from exactly the commit being deployed, so the rendered variables match
 # the compose files that ship with it.
-herdr_eng() { PYTHONPATH="$WORK" python3 -m herdr_engineering.cli "$@"; }
+# Run from inside $WORK: `python3 -m` puts the cwd first on sys.path, so a caller
+# standing in another checkout would otherwise get that checkout's code.
+herdr_eng() { (cd "$WORK" && PYTHONPATH="$WORK" python3 -m herdr_engineering.cli "$@"); }
 
 # Validation prints revision and host count only, never a value.
 if ! herdr_eng fleet config validate --path "$CENTRAL" >/dev/null 2>&1; then
@@ -80,8 +86,12 @@ fi
 echo "deploying $REF = $SHA"
 echo "central config: $CENTRAL -> mounted read-only at $MOUNT_TARGET"
 COLLAB_FILES=()
+EDGE_SERVICE=()
+COLLAB=0
 if [ -e "$COLLAB_MARKER" ]; then
+  COLLAB=1
   COLLAB_FILES=(-f "$WORK/deploy/control-plane/compose.collab.yaml")
+  EDGE_SERVICE=(collab-public collab-edge)
   echo "collaboration network: enabled (marker $COLLAB_MARKER)"
 fi
 
@@ -90,6 +100,39 @@ ENV_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/herdr-cp-env.XXXXXX")"
 ENV_FILE="$ENV_DIR/compose.env"
 herdr_eng fleet config render-compose --path "$CENTRAL" --out "$ENV_FILE" >/dev/null
 chmod 600 "$ENV_FILE"
+
+if [ "$COLLAB" = 1 ]; then
+  # collab-public gets ONLY control_plane.collab (public identifiers), never the central
+  # file. Dry-run renders into the temp dir and touches nothing else on the host.
+  if [ "$DRY" = 1 ]; then COLLAB_CONFIG="$ENV_DIR/collab-config.json"
+  else COLLAB_CONFIG="$HOME/.config/herdr-engineering/collab/collab-config.json"; fi
+  if ! herdr_eng fleet config render-collab --path "$CENTRAL" --out "$COLLAB_CONFIG" >/dev/null; then
+    echo "collaboration is enabled ($COLLAB_MARKER) but control_plane.collab is missing or invalid in $CENTRAL" >&2
+    exit 1
+  fi
+  if ! grep -qE '^HERDR_COLLAB_CERT_DIR=.+' "$ENV_FILE"; then
+    echo "collaboration is enabled ($COLLAB_MARKER) but control_plane.compose.HERDR_COLLAB_CERT_DIR is not set in $CENTRAL" >&2
+    exit 1
+  fi
+  export HERDR_COLLAB_CONFIG_FILE="$COLLAB_CONFIG"
+  if [ "$DRY" = 1 ]; then
+    # Placeholders so the offline compose validation can resolve the paths.
+    export HERDR_COLLAB_EDGE_CONF="$WORK/deploy/control-plane/collab-edge/nginx.conf"
+    export HERDR_COLLAB_DATA_DIR="$ENV_DIR/collab-data"
+    export HERDR_COLLAB_SYNC_DIR="$ENV_DIR/collab-sync"
+  else
+    EDGE_DIR="$HOME/.config/herdr-engineering/collab-edge"
+    mkdir -p "$EDGE_DIR"
+    install -m 0644 "$WORK/deploy/control-plane/collab-edge/nginx.conf" "$EDGE_DIR/nginx.conf"
+    export HERDR_COLLAB_EDGE_CONF="$EDGE_DIR/nginx.conf"
+    export HERDR_COLLAB_DATA_DIR="$HOME/.local/share/herdr-engineering/collab"
+    mkdir -p "$HERDR_COLLAB_DATA_DIR"
+    chmod 700 "$HERDR_COLLAB_DATA_DIR"
+    export HERDR_COLLAB_SYNC_DIR="$HOME/.local/share/herdr-engineering/collab-sync"
+    # keys + membership files and the 1-minute timer; pool and group come from the slice
+    "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" --dir "$HERDR_COLLAB_SYNC_DIR"
+  fi
+fi
 
 COMPOSE_FILES=(-f "$WORK/deploy/control-plane/compose.yaml" "${COLLAB_FILES[@]}")
 
@@ -109,7 +152,10 @@ if [ "$DRY" = 1 ]; then
   fi
   echo "[dry-run] would run: herdr-eng fleet config render-compose --path <central> --out <file>"
   echo "[dry-run] control-plane-web, worker and llm-proxy mount the central file read-only at $MOUNT_TARGET"
-  echo "[dry-run] would build herdr-engineering:$TAG and recreate control-plane-web"
+  if [ "$COLLAB" = 1 ]; then
+    echo "[dry-run] rendered control_plane.collab to a temp slice; would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
+  fi
+  echo "[dry-run] would build herdr-engineering:$TAG and recreate control-plane-web ${EDGE_SERVICE[*]}"
   exit 0
 fi
 
@@ -130,7 +176,7 @@ compose() {
   HERDR_CP_FLEET_CONFIG_FILE="$CENTRAL" HERDR_CP_IMAGE_TAG="$1" HERDR_CP_GIT_COMMIT="$SHA" \
     docker compose --env-file "$ENV_FILE" -p "$PROJECT" \
     "${COMPOSE_FILES[@]}" \
-    up -d --no-deps --no-build control-plane-web
+    up -d --no-deps --no-build control-plane-web "${EDGE_SERVICE[@]}"
 }
 
 healthy_commit() {
