@@ -226,7 +226,10 @@ def test_agents_need_instruct_and_cannot_task_themselves(w):
     boss, b = w.agent("bob", ("read", "instruct", "execute"))
     assert code(w.s.create_task, quiet, w.room, {"target_agent_id": t["agent_id"], "text": "x"}) == 403
     assert code(w.s.create_task, boss, w.room, {"target_agent_id": b["agent_id"], "text": "x"}) == 400
-    out = w.s.create_task(boss, w.room, {"target_agent_id": t["agent_id"], "text": "do it"})
+    root = w.s.create_task(w.bob, w.room, {"target_agent_id": b["agent_id"], "text": "lead"})["task_id"]
+    w.s.update_task(boss, root, {"status": "accepted"})
+    assert code(w.s.create_task, boss, w.room, {"target_agent_id": t["agent_id"], "text": "do it"}) == 400  # needs a parent
+    out = w.s.create_task(boss, w.room, {"target_agent_id": t["agent_id"], "text": "do it", "parent_task_id": root})
     assert w.s.task_inbox(target)["tasks"][0]["requested_by"] == {
         "type": "agent", "id": b["agent_id"], "owner_user_id": "bob"}
     assert out["status"] == "pending"
@@ -397,10 +400,21 @@ def mcp_world(stack):
     return api, room, agents
 
 
+def accepted_parent(stack, api, room, agent):
+    """A person gives `agent` a task and it accepts: the root of any chain an agent may extend."""
+    s, t = api.call("POST", f"/api/v1/collab/rooms/{room}/tasks",
+                    {"target_agent_id": agent["agent_id"], "text": "coordinate"}, user="alice")
+    assert s == 201, t
+    assert tool(stack, agent, "task_update", task_id=t["task_id"], status="accepted")["isError"] is False
+    return t["task_id"]
+
+
 def test_mcp_round_trip_between_two_agents(stack):
     api, room, agents = mcp_world(stack)
     a, b = agents["alice"], agents["bob"]
-    out = json.loads(tool_text(tool(stack, a, "task_create", room_id=room, target_agent_id=b["agent_id"], text="summarise QC")))
+    parent = accepted_parent(stack, api, room, a)
+    out = json.loads(tool_text(tool(stack, a, "task_create", room_id=room, target_agent_id=b["agent_id"],
+                                    text="summarise QC", parent_task_id=parent)))
     assert out["created"] is True
     inbox = json.loads(tool_text(tool(stack, b, "tasks_inbox")))
     assert inbox["notice"].startswith("TASKS assigned to you") and inbox["tasks"][0]["text"] == "summarise QC"
@@ -417,7 +431,9 @@ def test_mcp_wait_returns_at_once_when_work_exists_and_is_bounded(stack):
     import time
     api, room, agents = mcp_world(stack)
     b = agents["bob"]
-    tool(stack, agents["alice"], "task_create", room_id=room, target_agent_id=b["agent_id"], text="go")
+    parent = accepted_parent(stack, api, room, agents["alice"])
+    tool(stack, agents["alice"], "task_create", room_id=room, target_agent_id=b["agent_id"], text="go",
+         parent_task_id=parent)
     t0 = time.monotonic()
     assert len(json.loads(tool_text(tool(stack, b, "tasks_wait", seconds=20)))["tasks"]) == 1
     assert time.monotonic() - t0 < 3
@@ -460,3 +476,79 @@ def test_http_routes_enforce_the_same_rules(stack):
     s, rem = api.call("POST", f"{base}/agents/{agents['bob']['agent_id']}/remove", {}, user="bob")
     assert s == 200
     assert api.call("POST", f"{base}/agents/{agents['bob']['agent_id']}/remove", {}, user="bob")[0] == 404
+
+
+# ----------------------------------------------------------- hardening from the security review
+def test_agents_cannot_hand_work_straight_back_or_start_chains_alone(w):
+    a1, i1 = w.agent("alice", ("read", "execute", "instruct"))
+    a2, i2 = w.agent("alice", ("read", "execute", "instruct"))
+    t1 = w.s.create_task(w.bob, w.room, {"target_agent_id": i1["agent_id"], "text": "x"})["task_id"]
+    w.s.update_task(a1, t1, {"status": "accepted"})
+    t2 = w.s.create_task(a1, w.room, {"target_agent_id": i2["agent_id"], "text": "y", "parent_task_id": t1})["task_id"]
+    w.s.update_task(a2, t2, {"status": "accepted"})
+    assert code(w.s.create_task, a2, w.room, {"target_agent_id": i1["agent_id"], "text": "ping", "parent_task_id": t2}) == 400
+    assert w.s.task_inbox(a2)["tasks"][0]["started_by_user_id"] == "bob"      # provenance reaches the end of the chain
+
+
+def test_a_task_dies_with_its_requesters_authority(w):
+    target, t = w.agent("alice", ("read", "execute"))
+    tid = w.s.create_task(w.bob, w.room, {"target_agent_id": t["agent_id"], "text": "x"})["task_id"]
+    assert len(w.s.task_inbox(target)["tasks"]) == 1
+    w.s.remove_member(w.alice, w.room, "bob")
+    assert w.s.task_inbox(target)["tasks"] == []
+    assert code(w.s.update_task, target, tid, {"status": "accepted"}) == 404
+
+
+def test_regranting_execute_does_not_revive_old_tasks(w):
+    target, t = w.agent("alice", ("read", "execute"))
+    w.s.create_task(w.bob, w.room, {"target_agent_id": t["agent_id"], "text": "stale"})
+    w.s.grant_agent(w.alice, w.room, {"agent_id": t["agent_id"], "actions": ["read"]})
+    w.s.grant_agent(w.alice, w.room, {"agent_id": t["agent_id"], "actions": ["read", "execute"]})
+    assert w.s.task_inbox(target)["tasks"] == []
+
+
+def test_agent_names_are_unique_in_a_room(w):
+    w.agent("alice", name="builder")
+    info = w.s.connect_agent(w.bob, {"name": "builder"})
+    assert code(w.s.grant_agent, w.bob, w.room, {"agent_id": info["agent_id"], "actions": ["read"]}) == 409
+    assert w.s.agent_rooms(w.s.authenticate(f"Agent {info['credential']}", info["device_id"])) == {"rooms": []}
+
+
+def test_task_creation_is_idempotent(w):
+    _, a = w.agent("alice")
+    body = {"target_agent_id": a["agent_id"], "text": "once", "idempotency_key": "k1"}
+    first = w.s.create_task(w.bob, w.room, body)
+    again = w.s.create_task(w.bob, w.room, body)
+    assert again["task_id"] == first["task_id"] and again["replayed"] is True
+    assert code(w.s.create_task, w.bob, w.room, {**body, "text": "different"}) == 409
+
+
+def test_permission_churn_is_throttled(w):
+    _, a = w.agent("alice", ("read", "post"))
+    seen = 0
+    for i in range(80):
+        try:
+            w.s.grant_agent(w.alice, w.room, {"agent_id": a["agent_id"], "actions": ["read"] if i % 2 else ["read", "post"]})
+        except CollabError as e:
+            assert e.status == 429
+            seen += 1
+            break
+    assert seen == 1
+
+
+def test_a_revoked_agents_request_leaves_the_queue(w):
+    info = w.s.connect_agent(w.bob, {})
+    w.s.grant_agent(w.bob, w.room, {"agent_id": info["agent_id"], "actions": ["read"]})
+    assert len(w.s.list_agent_requests(w.alice, w.room)["requests"]) == 1
+    w.s.revoke_agent(w.bob, info["agent_id"])
+    assert w.s.list_agent_requests(w.alice, w.room)["requests"] == []
+
+
+def test_a_contributor_can_cancel_their_own_agents_tasks(w):
+    boss, b = w.agent("bob", ("read", "execute", "instruct"))
+    t, ti = w.agent("alice", ("read", "execute"))
+    root = w.s.create_task(w.alice, w.room, {"target_agent_id": b["agent_id"], "text": "lead"})["task_id"]
+    w.s.update_task(boss, root, {"status": "accepted"})
+    tid = w.s.create_task(boss, w.room, {"target_agent_id": ti["agent_id"], "text": "go", "parent_task_id": root})["task_id"]
+    w.s.cancel_task(w.bob, w.room, tid)
+    assert w.s.task_inbox(t)["tasks"] == []

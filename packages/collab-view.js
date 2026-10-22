@@ -253,7 +253,7 @@ export function mountCollab(root) {
       <div class="cx-room-layout">
         <section class="hd-card cx-chat" aria-label="Conversation">
           <div id="hcn-log" class="cx-log" role="log" aria-live="polite"><div class="hd-empty" id="hcn-empty">No messages yet.</div></div>
-          ${canPost ? '<form id="hcn-say" class="cx-compose"><input class="cx-input" name="text" required maxlength="8000" aria-label="Message" placeholder="Write a message…" autocomplete="off"><button class="hd-btn" type="submit">Send</button></form><div id="hcn-say-msg" class="cx-msg" role="status" style="padding:0 12px 10px"></div>'
+          ${canPost ? '<form id="hcn-say" class="cx-compose"><input class="cx-input" name="text" required maxlength="8000" aria-label="Message" placeholder="Write a message… (start with @agent-name to give that agent a task)" autocomplete="off"><button class="hd-btn" type="submit">Send</button></form><div id="hcn-say-msg" class="cx-msg" role="status" style="padding:0 12px 10px"></div>'
             : '<div class="cx-msg" style="padding:12px">Read-only access.</div>'}
         </section>
         <aside class="cx-side">
@@ -410,8 +410,9 @@ export function mountCollab(root) {
         const mention = /^@([a-z0-9-]{1,32})\s+([\s\S]+)$/.exec(text.trim());
         try {
           if (mention) {   // "@helper do this" gives that agent a task instead of posting chat
-            const target = roomAgentList.find((a) => a.name === mention[1] && a.actions.includes('execute'));
-            if (!target) throw new Error(`No agent named @${mention[1]} in this room accepts tasks`);
+            const hits = roomAgentList.filter((a) => a.name === mention[1] && a.actions.includes('execute'));
+            if (hits.length !== 1) throw new Error(hits.length ? `More than one agent is called @${mention[1]}; use the Tasks panel` : `No agent named @${mention[1]} in this room accepts tasks`);
+            const target = hits[0];
             await api.createTask(roomId, target.agent_id, mention[2]);
             sayForm.reset(); $('hcn-say-msg').textContent = ''; await drawTasks(); await poll(); log.scrollTop = log.scrollHeight;
             return;
