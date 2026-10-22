@@ -144,7 +144,7 @@ async function viewOverview() {
 }
 
 async function viewCollab() {
-  dashboardView = mountCollab(root);
+  dashboardView = mountCollab(root, { fabricSessions: () => client.listSessions('active') });
 }
 
 async function viewGithub() {

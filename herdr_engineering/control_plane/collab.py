@@ -383,6 +383,8 @@ class CollabService:
         elif t == "join_token_revoked":
             if p["join_id"] in self._joins_by_id:
                 self._joins[self._joins_by_id[p["join_id"]]]["revoked"] = True
+        elif t == "agent_linked":
+            self._agents[p["agent_id"]]["instance_id"] = p.get("instance_id")
         elif t == "credential_rotated":
             a = self._agents[p["agent_id"]]
             self._by_cred.pop(a["cred_digest"], None)
@@ -1079,6 +1081,7 @@ class CollabService:
                            if r and r["open"] and r["room_id"] in self._rooms
                            and self._now() - r["created_epoch"] < REQUEST_TTL]
                 out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
+                            "instance_id": a.get("instance_id"),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
                             "pending": pending})
         return {"agents": out}
@@ -1230,6 +1233,78 @@ class CollabService:
                 action="agent.remove", outcome="allowed", project_ids=[room["project_id"]],
                 resource_id=agent_id))
         return {"ok": True}
+
+    FLOW_TASKS = 60
+
+    def room_flow(self, pr: Principal, room_id: str) -> dict:
+        """Who hands work to whom in this room, for the live flow view: people and agents as nodes,
+        tasks aggregated into edges. A fabric session id (instance_id) is only ever shown to the
+        agent's own owner; everyone else just sees names, families and permissions."""
+        with self._lock:
+            room, first = self._authorize(pr, room_id, "read", "task.flow")
+            if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
+                raise CollabError(403, "forbidden")
+            self._housekeeping()
+            nodes: dict[str, dict] = {}
+
+            def agent_node(aid: str) -> dict:
+                key = "a:" + aid
+                if key not in nodes:
+                    a = self._agents.get(aid, {})
+                    g = room["grants"].get(aid)
+                    nodes[key] = {
+                        "id": key, "kind": "agent", "agent_id": aid, "name": a.get("name", "removed"),
+                        "family": a.get("harness_type"), "owner_user_id": a.get("owner"),
+                        "owner_email": self._user_email.get(a.get("owner")),
+                        "actions": list(g["actions"]) if g else [],
+                        "status": "active" if g and a.get("status") == "active" else "removed",
+                        "instance_id": a.get("instance_id") if a.get("owner") == pr.id else None}
+                return nodes[key]
+
+            def user_node(uid: str) -> dict:
+                key = "u:" + uid
+                if key not in nodes:
+                    m = self._member(room, uid)
+                    nodes[key] = {"id": key, "kind": "person", "user_id": uid, "name": self._user_email.get(uid) or "…" + uid[-6:],
+                                  "role": m["role"] if m else None, "status": "active" if m else "removed"}
+                return nodes[key]
+
+            for aid in room["grants"]:
+                agent_node(aid)
+            edges: dict[tuple, dict] = {}
+            rows = sorted(((t["seq"], tid, t) for tid, t in self._tasks.items()
+                           if t["room_id"] == room_id and t["seq"] >= first), key=lambda r: r[0], reverse=True)
+            for _, tid, t in rows:
+                src = (user_node(t["by_id"]) if t["by_kind"] == "user" else agent_node(t["by_id"]))["id"]
+                dst = agent_node(t["target"])["id"]
+                e = edges.setdefault((src, dst), {"from": src, "to": dst, "counts": defaultdict(int), "last": ""})
+                e["counts"][self._task_status(t)] += 1
+                e["last"] = max(e["last"], t["updated_at"])
+            recent = [{"task_id": tid, "from": ("u:" if t["by_kind"] == "user" else "a:") + t["by_id"],
+                       "to": "a:" + t["target"], "status": self._task_status(t), "depth": t["depth"],
+                       "parent_task_id": t["parent"], "updated_at": t["updated_at"], "text": t["text"][:140]}
+                      for _, tid, t in rows[:self.FLOW_TASKS]]
+        return {"room_id": room_id, "seq": self._seq, "nodes": list(nodes.values()),
+                "edges": [{**e, "counts": dict(e["counts"])} for e in edges.values()],
+                "tasks": recent, "untrusted_text": True}
+
+    def link_agent(self, pr: Principal, agent_id: str, body: dict) -> dict:
+        """The owner ties one of their agents to a fabric session (or clears it). The id is only a
+        label here; the dashboard resolves it against sessions it knows about."""
+        self._require_user(pr)
+        inst = body.get("instance_id")
+        if inst is not None and (not isinstance(inst, str) or not inst or len(inst) > 200
+                                 or _NAME_BAD.search(inst)):
+            raise CollabError(400, "invalid instance_id")
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent or agent["owner"] != pr.id or agent["status"] != "active":
+                raise CollabError(404, "not found")
+            self._throttle("link:" + pr.id, 120, 600.0, "agent link")
+            self._commit("agent_linked", self._actor(
+                pr, agent_id=agent_id, instance_id=inst, action="agent.link", outcome="allowed",
+                project_ids=[], resource_id=agent_id))
+        return {"agent_id": agent_id, "instance_id": inst}
 
     def list_room_agents(self, pr: Principal, room_id: str) -> dict:
         """Capability summaries only: no device ids, hostnames, paths or instance ids."""
@@ -1688,6 +1763,8 @@ class CollabService:
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
+                    if parts[2:] == ["flow"]:
+                        return 200, self.room_flow(pr, rid)
                     if parts[2:] == ["events"]:
                         return 200, self.read_events(pr, rid, _int(query, "cursor", 0),
                                                      _int(query, "limit", 100, 1, 200))
@@ -1718,6 +1795,8 @@ class CollabService:
                     return 200, self.update_task(pr, parts[1], body)
                 if parts == ["agent", "rotate"]:
                     return 200, self.rotate_credential(pr)
+                if n == 3 and parts[0] == "agents" and parts[2] == "link":
+                    return 200, self.link_agent(pr, parts[1], body)
                 if n == 3 and parts[0] == "agents" and parts[2] == "revoke":
                     return 200, self.revoke_agent(pr, parts[1])
                 if n >= 3 and parts[0] == "rooms":

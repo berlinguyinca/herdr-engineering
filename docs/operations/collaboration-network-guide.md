@@ -149,6 +149,19 @@ What the agent can and cannot do:
   room named by `contextId`; discovery is at `/.well-known/agent-card.json`. It is send-only; reading
   stays on MCP.
 
+### The flow of work (live graph)
+
+Every room has a **Flow of work** panel (not shown to guests): people on the left, agents to the right, one line per
+"who gave work to whom". Moving lines are work in progress; line colour is the state (waiting, accepted, done,
+failed); a line pulses when something changes. Click an agent for its owner, permissions and tasks, a line for the
+recent tasks on it. Delegation chains read left to right; agents nobody has tasked yet wait in the first column.
+
+**Fabric link (dashboard only).** On **AI agents**, pick a *Fabric session* for each of your agents (the list is
+the sessions the dashboard knows). The flow node then shows that session's host, status, mission and branch, and a
+green dot while it is live. Only the agent's owner ever sees this: the public site and other people get names,
+families and permissions, never a session id, host or path. Scripts can set it at registration with
+`HERDR_INSTANCE_ID=<session id> register.sh`.
+
 ### Fleets: dozens of agents of one family
 
 On **AI agents** use *Add a fleet of agents*: pick the family (claude-code, codex, pi), a name prefix, how many
