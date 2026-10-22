@@ -117,6 +117,17 @@ ENV_FILE="$ENV_DIR/compose.env"
 herdr_eng fleet config render-compose --path "$CENTRAL" --out "$ENV_FILE" >/dev/null
 chmod 600 "$ENV_FILE"
 
+# llm-proxy gets ONLY the llm slice (llm + control_plane.llm_proxy), in a directory of
+# its own that is mounted read-only; never the central file. Dry-run: temp dir.
+if [ "$DRY" = 1 ]; then LLM_DIR="$ENV_DIR/llm-proxy"
+else LLM_DIR="$HOME/.config/herdr-engineering/llm-proxy"; fi
+if ! herdr_eng fleet config render-llm --path "$CENTRAL" --out "$LLM_DIR/llm-config.json" >/dev/null; then
+  echo "the llm section is missing or invalid in $CENTRAL (needed by llm-proxy)" >&2
+  exit 1
+fi
+chmod 700 "$LLM_DIR"
+export HERDR_LLM_SLICE_DIR="$LLM_DIR"
+
 if [ "$COLLAB" = 1 ]; then
   # collab-public gets ONLY control_plane.collab (public identifiers), never the central
   # file. Dry-run renders into the temp dir and touches nothing else on the host.
@@ -175,7 +186,8 @@ if [ "$DRY" = 1 ]; then
     echo "[dry-run] docker compose not available: skipped offline compose validation"
   fi
   echo "[dry-run] would run: herdr-eng fleet config render-compose --path <central> --out <file>"
-  echo "[dry-run] control-plane-web, worker and llm-proxy mount $FLEET_DIR read-only; the file is $MOUNT_TARGET"
+  echo "[dry-run] control-plane-web and worker mount $FLEET_DIR read-only; the file is $MOUNT_TARGET"
+  echo "[dry-run] llm-proxy mounts only the llm slice (rendered to a temp dir; would install it at ~/.config/herdr-engineering/llm-proxy/)"
   if [ "$COLLAB" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
   fi
