@@ -9,7 +9,8 @@ tool call -> (tool, command-signature, success) triple, and produces:
     signatures that RECUR ACROSS AGENTS (the "build a better tool" candidates).
 
 Why: to design better tool calls / tools from observed agent behavior.
-Default output is REDACTED (no command bodies). --full adds truncated commands.
+Default output is REDACTED: signatures carry only the program (and subcommand for known CLIs),
+never flags or arguments. --full adds truncated command bodies (sensitive; files are mode 0600).
 """
 import json, os, glob, time, argparse, collections, sys, re, socket
 
@@ -24,7 +25,7 @@ STORES = {
 # Coarse tool "family" so we can compare across agents despite different names.
 FAMILY = {
     "bash": "shell", "shell": "shell", "local_shell": "shell", "exec": "shell",
-    "terminal": "shell", "run": "shell", "run_command": "shell",
+    "terminal": "shell", "run": "shell", "run_command": "shell", "exec_command": "shell",
     "read": "file_read", "read_file": "file_read", "view": "file_read", "cat": "file_read",
     "grep": "search", "glob": "search", "search": "search", "rg": "search",
     "toolsearch": "search", "listdir": "search", "ls": "search",
@@ -52,12 +53,40 @@ def shell_cmd(tool, args):
             return " ".join(v)
     return None
 
+# Programs whose first plain-word arguments are subcommands, not data. For every
+# other program only the program name is kept: flags and arguments are where
+# tokens, passwords, hostnames and paths live.
+_SUBCOMMAND_PROGRAMS = frozenset((
+    "git", "gh", "npm", "npx", "pnpm", "yarn", "cargo", "go", "docker", "podman", "kubectl",
+    "systemctl", "journalctl", "pip", "pip3", "uv", "make", "apptainer", "brew", "apt", "apt-get",
+    "sbatch", "squeue", "scontrol", "sacct", "sacctmgr", "ansible-playbook", "herdr-eng",
+))
+_WRAPPERS = frozenset(("sudo", "time", "env", "nohup", "nice", "exec", "command"))
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_PROGRAM = re.compile(r"^[A-Za-z0-9_.+-]{1,40}$")
+_SUBCOMMAND = re.compile(r"^[a-z][a-z0-9_-]{0,23}$")
+
+
 def sig_of(cmd):
-    """A short, comparable signature for a command (first line, first 4 tokens)."""
+    """A comparable, redacted signature: the program, plus its subcommand for known CLIs.
+
+    Never contains flags, assignments, paths, hosts or other arguments, so it cannot
+    carry a secret that was typed into the command line.
+    """
     if not cmd: return None
-    first = cmd.strip().splitlines()[0].strip()
-    toks = first.split()
-    return " ".join(toks[:4]) if toks else None
+    lines = cmd.strip().splitlines()
+    toks = lines[0].split() if lines else []
+    while toks and (_ASSIGNMENT.match(toks[0]) or toks[0] in _WRAPPERS):
+        toks.pop(0)
+    if not toks: return None
+    prog = os.path.basename(toks[0].strip("'\"")) or "?"
+    if not _PROGRAM.match(prog): return "?"
+    sig = [prog]
+    if prog in _SUBCOMMAND_PROGRAMS:
+        for t in toks[1:3]:
+            if not _SUBCOMMAND.match(t): break
+            sig.append(t)
+    return " ".join(sig)
 
 ERR_HINTS = ("command not found", "no such file", "permission denied", "traceback (most recent",
              "exit status 1", "exit code 1", "error:", "fatal:", "panic:", "segmentation fault",
@@ -97,16 +126,28 @@ def codex_out_text(out):
 # event = dict(tool, sig, fam, ok(bool|None), dur_ms(int|None), cmd(str|None), ts(str))
 
 def ev(agent, tool, cmd, ok, dur=None, ts=None):
-    return {"agent": agent, "tool": tool, "sig": sig_of(cmd), "fam": family(tool),
-            "ok": ok, "dur": dur, "cmd": cmd, "ts": ts}
+    return {"agent": agent, "tool": tool if isinstance(tool, str) else None, "sig": sig_of(cmd),
+            "fam": family(tool if isinstance(tool, str) else None), "ok": ok,
+            "dur": dur if isinstance(dur, (int, float)) else None, "cmd": cmd,
+            "ts": ts if isinstance(ts, str) else None}
+
+def _lines(path):
+    """Yield a transcript's lines; an unreadable file yields nothing instead of aborting the run."""
+    try:
+        with open(path, errors="replace") as fh:
+            yield from fh
+    except OSError:
+        return
+
 
 def mine_claude(path):
     pending = {}
-    for line in open(path, errors="replace"):
+    for line in _lines(path):
         if '"tool_use"' not in line and '"tool_result"' not in line:
             continue
         try: d = json.loads(line)
         except Exception: continue
+        if not isinstance(d, dict): continue
         m = d.get("message")
         c = m.get("content") if isinstance(m, dict) else None
         if not isinstance(c, list): continue
@@ -122,11 +163,12 @@ def mine_claude(path):
 
 def mine_pi(path):
     calls = {}
-    for line in open(path, errors="replace"):
+    for line in _lines(path):
         if '"toolCall"' not in line and '"toolResult"' not in line:
             continue
         try: d = json.loads(line)
         except Exception: continue
+        if not isinstance(d, dict): continue
         m = d.get("message")
         if not isinstance(m, dict): continue
         ts = d.get("timestamp") or m.get("timestamp")
@@ -141,18 +183,18 @@ def mine_pi(path):
             name = m.get("toolName"); cmd = None
             if tid in calls:
                 name, cmd = calls.pop(tid)
-            else:
-                calls.clear()
             yield ev("pi", name, cmd, (not m.get("isError")), dur=m.get("durationMs"), ts=ts)
 
 def mine_codex(path):
     fifo = collections.deque(); byid = {}
-    for line in open(path, errors="replace"):
+    for line in _lines(path):
         if "_call" not in line:          # matches function_call(_output) + custom_tool_call(_output)
             continue
         try: d = json.loads(line)
         except Exception: continue
+        if not isinstance(d, dict): continue
         p = d.get("payload", d)
+        if not isinstance(p, dict): continue
         t = p.get("type"); ts = d.get("timestamp")
         if t == "function_call":
             args = p.get("arguments")
@@ -331,9 +373,12 @@ def run(agents, days, full, outdir, limit_files=None, json_summary=False, since_
         n = 0
         for f in use:
             sess = os.path.basename(f)
-            for e in fn(f):
-                e["session"] = sess
-                events.append(e)
+            try:
+                for e in fn(f):
+                    e["session"] = sess
+                    events.append(e)
+            except Exception as exc:  # one odd transcript must not discard the host's other data
+                print(f"  [{agent}] skipped {sess}: {type(exc).__name__}", file=sys.stderr)
             n += 1
         stats[agent] = {"found": True, "files": len(files), "scanned": n, "events": sum(1 for e in events if e["agent"] == agent)}
         print(f"  [{agent}] {len(files)} files in window, scanned {n} -> {stats[agent]['events']} tool events", file=sys.stderr)
@@ -344,7 +389,7 @@ def run(agents, days, full, outdir, limit_files=None, json_summary=False, since_
         if summary_out:
             d = os.path.dirname(os.path.abspath(summary_out))
             os.makedirs(d, exist_ok=True)
-            with open(summary_out, "w") as fh:
+            with os.fdopen(os.open(summary_out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
                 fh.write(js + "\n")
             print(f"wrote JSON summary -> {summary_out}", file=sys.stderr)
         else:
@@ -354,7 +399,7 @@ def run(agents, days, full, outdir, limit_files=None, json_summary=False, since_
     # write redacted TSV
     tsv = os.path.join(outdir, "events.tsv")
     cols = ["agent", "session", "ts", "tool", "fam", "ok", "sig"] + (["cmd"] if full else [])
-    with open(tsv, "w") as fh:
+    with os.fdopen(os.open(tsv, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
         fh.write("\t".join(cols) + "\n")
         for e in events:
             row = [e["agent"], e.get("session", ""), e.get("ts") or "", e["tool"] or "", e["fam"],

@@ -2,7 +2,8 @@
 # Agent-transcript fleet mining (spec: HPC-ssh adoption dashboard).
 #
 # Runs `herdr-eng agent-mine` on every site and collects the REDACTED JSON
-# summary (aggregate counts only — NO command bodies, NO raw transcripts) for
+# summary (aggregate counts and redacted program names only — NO command lines or
+# arguments, NO raw transcripts) for
 # each onto the controller at ~/.cache/agent-mine/fleet/<host>.json. That is the
 # data source for the /api/agent-mine dashboard panel. Only summary counts cross
 # the wire; transcripts never leave a site.
@@ -34,7 +35,7 @@
       become: false
       ansible.builtin.shell: |
         export PATH="{{ fleet_home }}/.local/bin:{{ fleet_home }}/.venvs/herdr-engineering/bin:$PATH"
-        AGENTS="{{ am_agents }}"; DAYS={{ am_days }}
+        AGENTS={{ am_agents | quote }}; DAYS={{ am_days }}
         # 1) Preferred: herdr-eng agent-mine (the canonical, distributed entry point).
         if command -v herdr-eng >/dev/null 2>&1; then
           if herdr-eng agent-mine --agents "$AGENTS" --days $DAYS --json-summary 2>/dev/null; then
@@ -56,15 +57,35 @@
       register: am_summary
       changed_when: false
       failed_when: false
+      no_log: true
+
+    - name: "Make the controller's fleet summary directory"
+      delegate_to: localhost
+      run_once: true
+      become: false
+      ansible.builtin.file:
+        path: "{{ controller_fleet_dir }}"
+        state: directory
+        mode: "0700"
 
     - name: "Store this site's redacted summary on the controller"
       delegate_to: localhost
       become: false
       ansible.builtin.copy:
-        dest: "{{ controller_fleet_dir }}/{{ inventory_hostname }}.json"
+        dest: "{{ controller_fleet_dir }}/{{ inventory_hostname | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
         content: "{{ am_summary.stdout }}"
-        mode: "0644"
+        mode: "0600"
+      no_log: true
       when: am_summary.rc == 0 and (am_summary.stdout | length) > 0
+
+    - name: "Drop a host's old summary when it could not be mined this run"
+      # Stale numbers must not look current on the dashboard.
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: "{{ controller_fleet_dir }}/{{ inventory_hostname | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
+        state: absent
+      when: am_summary.rc != 0 or (am_summary.stdout | length) == 0
 
     - name: "Report agent-mine result for this host"
       ansible.builtin.debug:

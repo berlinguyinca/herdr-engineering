@@ -131,13 +131,13 @@ function render(d){
  else if(active==='ci'){ main.innerHTML='<div class="card muted">CI provider: '+(d.available===false?'offline (stale view)':'configured')+'</div>'; }
  else if(active==='attention'){ main.innerHTML=(d.items||[]).map(i=>card(i.title, esc(i.summary)+' · '+esc(i.severity),'')).join('')||'<div class="card muted">no attention items</div>'; }
  else if(active==='agentmine'){
-   const f=d.fleet||{};
+   const f=d.fleet||{}; const num=v=>{const n=Number(v);return isFinite(n)?n:0;};
    const siteCards=(d.sites||[]).map(s=>{
      const h=s.hpc_ssh||{};
-     const sub='adoption since install <b>'+(h.adoption_since_pct??0)+'%</b> · '+(h.hpc_ssh_since||0)+' hpc / '+(h.hand_ssh_hpc_since||0)+' hand<br>45d window: '+(h.adoption_pct??0)+'% · '+(h.hpc_ssh||0)+' hpc / '+(h.hand_ssh_hpc||0)+' hand · '+(((s.totals&&s.totals.events)||0))+' events';
-     const a=h.adoption_since_pct??0; return card(s.site||'?', sub, a>=50?'ok':(a>=25?'warn':'bad'));
+     const sub='adoption since install <b>'+num(h.adoption_since_pct)+'%</b> · '+num(h.hpc_ssh_since)+' hpc / '+num(h.hand_ssh_hpc_since)+' hand<br>45d window: '+num(h.adoption_pct)+'% · '+num(h.hpc_ssh)+' hpc / '+num(h.hand_ssh_hpc)+' hand · '+num(s.totals&&s.totals.events)+' events';
+     const a=num(h.adoption_since_pct); return card(s.site||'?', sub, a>=50?'ok':(a>=25?'warn':'bad'));
    }).join('');
-   main.innerHTML='<div class="card">'+(f.sites||0)+' sites · '+(f.events||0)+' events · fleet adoption since install <b>'+(f.adoption_since_pct??0)+'%</b> ('+(f.hpc_ssh_since||0)+' hpc / '+(f.hand_ssh_hpc_since||0)+' hand) · generated '+esc(d.generated_at||'')+'</div>'+(siteCards||'<div class="card muted">no per-site summaries yet — run ansible playbooks/agent-mine.yml</div>');
+   main.innerHTML='<div class="card">'+num(f.sites)+' sites · '+num(f.events)+' events · fleet adoption since install <b>'+num(f.adoption_since_pct)+'%</b> ('+num(f.hpc_ssh_since)+' hpc / '+num(f.hand_ssh_hpc_since)+' hand) · generated '+esc(d.generated_at||'')+'</div>'+(siteCards||'<div class="card muted">no per-site summaries yet — run ansible playbooks/agent-mine.yml</div>');
  }
 }
 document.querySelectorAll('nav a').forEach(a=>a.addEventListener('click',e=>{active=e.target.dataset.s;load();}));
