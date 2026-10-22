@@ -3,6 +3,7 @@ import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {mergeEntry, renderEvent, telemetryHealth} from './herdr-web-components/inspector.js';
 import {mountComposer} from './conversation-composer.js';
 import {renderMarkdown} from './conversation-markdown.js';
+import {parseJson,renderJson} from './conversation-json.js';
 import {selectEvents, linkedAgents, githubLinks, referenceSuggestions, pendingOperation} from './session-workspace-model.js';
 import {randomString} from './herdr-web-client/collab.js';
 import {recordOutcome} from './record-state.js';
@@ -10,26 +11,29 @@ import {recordOutcome} from './record-state.js';
 const MAX_EVENTS=2000;
 const PAGE=200;
 
-export function mountSessionWorkspace(host,client,session,{connect=connectEvents}={}) {
+export function mountSessionWorkspace(host,client,session,{connect=connectEvents,onRename=()=>{}}={}) {
   if(!document.querySelector('link[data-session-workspace-style]')) {
     const link=document.createElement('link');link.rel='stylesheet';link.href=new URL('./session-workspace.css',import.meta.url).href;
     link.dataset.sessionWorkspaceStyle='';document.head.append(link);
   }
   let disposed=false, data=null, events=[], sessions=[], collaborators=[], epoch=null, request=0, loading=false, hasMore=false, error='', streamError=false;
   let renderTimer, refreshTimer, selection=null, split=60;
-  let historyReset=false;
+  let historyReset=false,fullscreen=false,fullscreenFocus=null,agentSummary=null,summaryBusy=false,summaryError='',summarySignature='';
   const expanded=new Map();
   const state={agent:'',q:'',type:'',errors:false};
   host.innerHTML=`<section class="sw" data-session-workspace>
+    <header class="sw-workspace-heading"><strong data-agent-name>${esc(session.display_name || session.agent_role || 'Agent')}</strong><button type="button" data-rename-agent${session.capabilities?.rename_agent?'':' hidden'}>Rename agent</button><button type="button" data-fullscreen aria-expanded="false">Fullscreen workspace</button></header>
+    <form data-rename-form hidden><label>Agent name <input aria-label="Agent name" name="agent_name" maxlength="64" required></label><button type="submit">Save name</button><button type="button" data-cancel-rename>Cancel</button><p data-rename-status role="status"></p></form>
+    <section class="sw-summary-card" aria-label="Agent summary"><div class="sw-summary-heading"><h3>AI-generated summary</h3><button type="button" data-regenerate-summary${session.capabilities?.regenerate_summary?'':' hidden'}>Regenerate summary</button></div><div data-agent-summary role="status">Loading summary…</div></section>
     <div class="sw-status" data-recording-status role="status">Loading recorded conversation…</div>
     <div class="sw-relations" data-session-relations></div>
     <div class="sw-filters"><label>Agent <select data-agent-filter><option value="">All agents</option></select></label>
       <label>Search <input type="search" data-search placeholder="Search conversation and activity"></label>
       <button type="button" data-load-older>Load older history</button><button type="button" data-refresh>Refresh</button></div>
-    <div class="sw-mobile-tabs" role="tablist" aria-label="Session panes"><button type="button" role="tab" data-pane-tab="conversation" aria-selected="true">Conversation</button><button type="button" role="tab" data-pane-tab="activity" aria-selected="false">Activity</button></div>
+    <div class="sw-mobile-tabs" role="tablist" aria-label="Agent panes"><button type="button" role="tab" data-pane-tab="conversation" aria-selected="true">Conversation</button><button type="button" role="tab" data-pane-tab="activity" aria-selected="false">Activity</button></div>
     <div class="sw-panes" data-panes data-mobile-pane="conversation">
       <section class="sw-conversation" data-conversation-pane aria-label="Conversation"><h3>Conversation</h3>
-        <div class="sw-log" data-conversation role="log" aria-label="Session messages" aria-live="polite"></div>
+        <div class="sw-log" data-conversation role="log" aria-label="Agent messages" aria-live="polite"></div>
         <button type="button" data-new-messages hidden>↓ New messages</button>
         <div data-composer></div></section>
       <div class="sw-splitter" data-splitter role="separator" aria-label="Resize conversation pane" aria-orientation="vertical" tabindex="0" aria-valuemin="30" aria-valuemax="75" aria-valuenow="60"></div>
@@ -46,17 +50,17 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   const operationKey=`herdr.conversation.pending:${session.session_id}`;
   const composer=mountComposer($('[data-composer]'),{
     draftKey:`session:${session.session_id}`,disabled:terminal,
-    placeholder:terminal?'This session has ended':'Message this session… type @ for references',
+    placeholder:terminal?'This agent has ended':'Message this agent… type @ for references',
     hint:terminal?'Recorded history remains available.':'Enter sends · Shift+Enter adds a line · @ inserts a file, agent or GitHub reference.',
     suggestions:()=>referenceSuggestions(session,data,sessions,collaborators),
     onSend:async(text,attachments)=>{
-      if(attachments.length)throw new Error('This session transport cannot deliver files. Remove attachments before sending.');
+      if(attachments.length)throw new Error('This agent transport cannot deliver files. Remove attachments before sending.');
       if(!operationId || operationText!==text){operationId=pendingOperation(storage,operationKey,text,()=>randomString(18));operationText=text;}
       const receipt=await client.sendMessage(session.session_id,text,[],operationId);
       if(receipt.status!=='delivered')throw new Error(receipt.status==='queued'?'Message queued; delivery is not confirmed. Refresh before retrying.':receipt.error || 'Delivery was not acknowledged.');
       operationId=null;operationText=null;
       try{storage?.removeItem(operationKey);}catch{/* optional storage */}
-      scheduleRefresh();return {...receipt,message:'Delivered to session. Waiting for the recorded response.'};
+      scheduleRefresh();return {...receipt,message:'Delivered to agent. Waiting for the recorded response.'};
     },
   });
 
@@ -64,12 +68,14 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     if(disposed)return;
     const health=telemetryHealth(data?.summary,data?.telemetry);
     const capture=session.transcript?.status;
-    const captureNote=capture==='identity_unavailable'?' · Waiting for this session to identify its transcript.':capture==='unreadable'?' · The session transcript could not be read.':capture==='unsupported'?' · Recording is unavailable for this agent.':'';
+    const captureNote=capture==='identity_unavailable'?' · Waiting for this agent to identify its transcript.':capture==='unreadable'?' · The agent transcript could not be read.':capture==='unsupported'?' · Recording is unavailable for this agent.':'';
     $('[data-recording-status]').textContent=error || (streamError?'Live connection interrupted; reconnecting. ': '')+health.text+(events.length?'':captureNote)+(historyReset?' · History refreshed after a recording gap. Load older history to inspect earlier turns.':'')+(data?.dropped?` · ${data.dropped} earlier events expired.`:'')+(events.length>=MAX_EVENTS?' · Display limited to the most recent 2,000 events.':'');
     const bottom=conversation.scrollHeight-conversation.scrollTop-conversation.clientHeight<60;
     const oldScroll=conversation.scrollTop,oldHeight=conversation.scrollHeight;
+    const agentNames=new Map((data?.summary?.agents || []).map(a=>[a.agent_id,a.display_name || a.agent_id]));
+    agentNames.set('main',session.display_name || agentNames.get('main') || 'Assistant');
     const rows=selectEvents(events,{...state,pane:'conversation'});
-    const html=rows.map(e=>`<article class="sw-message sw-message--${esc(e.data.role)}" data-message-seq="${e.seq}"><header><strong>${esc(e.data.role==='user'?'You':e.agent_id==='main' || !e.agent_id?'Assistant':e.agent_id)}</strong><time>${esc(e.ts || '')}</time><button type="button" data-related-turn="${e.seq}" aria-label="Show activity for this turn">Activity ↗</button></header>${e.data.withheld?'<p>Message withheld.</p>':renderMarkdown(e.data.text || '')}${e.data.text_more?`<button type="button" data-expand-message="${e.seq}">Show full message</button>`:''}${e.truncated?'<p class="sw-note">Message truncated by recording limits.</p>':''}</article>`).join('') || '<p class="sw-empty">No conversation messages recorded for these filters.</p>';
+    const html=rows.map(e=>`<article class="sw-message conversation-markdown sw-message--${esc(e.data.role)}" data-message-seq="${e.seq}"><header><strong>${esc(e.data.role==='user'?'You':agentNames.get(e.agent_id || 'main') || e.agent_id)}</strong><time>${esc(e.ts || '')}</time><button type="button" data-related-turn="${e.seq}" aria-label="Show activity for this turn">Activity ↗</button></header>${e.data.withheld?'<p>Message withheld.</p>':renderMarkdown(e.data.text || '')}${e.data.text_more?`<button type="button" data-expand-message="${e.seq}">Show full message</button>`:''}${e.truncated?'<p class="sw-note">Message truncated by recording limits.</p>':''}</article>`).join('') || '<p class="sw-empty">No conversation messages recorded for these filters.</p>';
     if(conversation.innerHTML!==html){
       const previousNewest=Number(conversation.lastElementChild?.dataset.messageSeq || 0);
       conversation.innerHTML=html;
@@ -81,29 +87,102 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
       }
     }
     const open=new Set([...activity.querySelectorAll('details[open]')].map(d=>d.dataset.activitySeq));
+    const treeState=new Map([...activity.querySelectorAll('[data-activity-seq]')].map(row=>[row.dataset.activitySeq,[...row.querySelectorAll('details')].map(node=>node.open)]));
     const scroll=activity.scrollTop;
     let activityRows=selectEvents(events,{...state,pane:'activity'});
     if(selection!=null){
       const next=events.filter(e=>e.kind==='message' && e.seq>selection).sort((a,b)=>a.seq-b.seq)[0]?.seq ?? Infinity;
       activityRows=activityRows.filter(e=>e.seq>selection && e.seq<next);
     }
-    const activityHtml=activityRows.map(e=>`<details class="sw-event" data-activity-seq="${e.seq}"${open.has(String(e.seq))?' open':''}><summary>${esc(e.data?.tool || e.data?.path || e.kind)} <span>${esc(e.agent_id || 'main')} · ${esc(e.data?.status || '')}</span></summary>${renderEvent(e,{show_tool_output:true,tool_output_lines:expanded.has(e.seq)?Number.MAX_SAFE_INTEGER:100,diff_max_lines:expanded.has(e.seq)?Number.MAX_SAFE_INTEGER:200})}</details>`).join('') || '<p class="sw-empty">No coding activity recorded for these filters.</p>';
-    if(activity.innerHTML!==activityHtml){activity.innerHTML=activityHtml;activity.scrollTop=scroll;}
+    const activityHtml=activityRows.map(e=>`<details class="sw-event" data-activity-seq="${e.seq}"${open.has(String(e.seq))?' open':''}><summary>${esc(e.data?.tool || e.data?.path || e.kind)} <span>${esc(agentNames.get(e.agent_id || 'main') || e.agent_id || 'main')} · ${esc(e.data?.status || '')}</span></summary>${activityEvent(e)}</details>`).join('') || '<p class="sw-empty">No coding activity recorded for these filters.</p>';
+    if(activity.innerHTML!==activityHtml){activity.innerHTML=activityHtml;activity.scrollTop=scroll;for(const row of activity.querySelectorAll('[data-activity-seq]')){const previous=treeState.get(row.dataset.activitySeq);if(previous)[...row.querySelectorAll('details')].forEach((node,index)=>{if(index<previous.length)node.open=previous[index];});}}
     const agents=linkedAgents({...session,parent_session_id:session.parent_session_id || data?.summary?.association?.parent_session_id},data?.summary?.agents || [],sessions,collaborators);
     const agentIds=[...new Set([...agents.map(a=>a.agent_id).filter(Boolean),...events.map(e=>e.agent_id || 'main')])];
-    const options='<option value="">All agents</option>'+agentIds.map(id=>`<option value="${esc(id)}">${esc(id)}</option>`).join('');
+    const options='<option value="">All agents</option>'+agentIds.map(id=>`<option value="${esc(id)}">${esc(agentNames.get(id) || id)}</option>`).join('');
     const filter=$('[data-agent-filter]');if(filter.innerHTML!==options){filter.innerHTML=options;filter.value=state.agent;}
-    $('[data-session-relations]').innerHTML=`<div class="sw-links">${agents.map(a=>a.collab_agent_id?`${a.session_id && a.session_id!==session.session_id?`<a href="#/herd/session/${esc(encodeURIComponent(a.session_id))}">${esc(a.relation)}: @${esc(a.agent_role)}</a>`:''}<a href="#/collab?agent=${esc(encodeURIComponent(a.collab_agent_id))}">@${esc(a.agent_role)} in Collaboration</a>`:a.session_id?`<a href="#/herd/session/${esc(encodeURIComponent(a.session_id))}">${esc(a.relation)}: ${esc(a.agent_role || a.session_id)}</a>`:`<button type="button" data-select-agent="${esc(a.agent_id)}">${esc(a.agent_id)}${a.parent_agent_id?` ← ${esc(a.parent_agent_id)}`:''}${a.events!=null?` · ${esc(a.events)} events`:''}</button>`).join('')}${githubLinks(session,data?.summary?.association).map(l=>`<a href="${esc(l.href)}" target="_blank" rel="noopener noreferrer">${esc(l.label)}</a>`).join('')}</div>`;
+    $('[data-session-relations]').innerHTML=`<div class="sw-links">${agents.map(a=>a.collab_agent_id?`${a.session_id && a.session_id!==session.session_id?`<a href="#/herd/session/${esc(encodeURIComponent(a.session_id))}">${esc(a.relation)}: @${esc(a.display_name || a.agent_role)}</a>`:''}<a href="#/collab?agent=${esc(encodeURIComponent(a.collab_agent_id))}">@${esc(a.display_name || a.agent_role)} in Collaboration</a>`:a.session_id?`<a href="#/herd/session/${esc(encodeURIComponent(a.session_id))}">${esc(a.relation)}: ${esc(a.display_name || a.agent_role || a.session_id)}</a>`:`<button type="button" data-select-agent="${esc(a.agent_id)}">${esc(a.display_name || a.agent_id)}${a.parent_agent_id?` ← ${esc(agentNames.get(a.parent_agent_id) || a.parent_agent_id)}`:''}${a.events!=null?` · ${esc(a.events)} events`:''}</button>`).join('')}${githubLinks(session,data?.summary?.association).map(l=>`<a href="${esc(l.href)}" target="_blank" rel="noopener noreferrer">${esc(l.label)}</a>`).join('')}</div>`;
     $('[data-load-older]').hidden=!hasMore || events.length>=MAX_EVENTS;
     $('[data-load-older]').disabled=loading;
     $('[data-clear-selection]').hidden=selection==null;
   }
+  function activityEvent(entry) {
+    entry={...entry,display_name:data?.summary?.agents?.find(agent=>agent.agent_id===entry.agent_id)?.display_name};
+    const prefs={show_tool_output:true,tool_output_lines:expanded.has(entry.seq)?Number.MAX_SAFE_INTEGER:100,diff_max_lines:expanded.has(entry.seq)?Number.MAX_SAFE_INTEGER:200};
+    const output=entry.data?.output;
+    if(entry.kind==='tool' && !entry.data?.withheld && typeof output==='string' && output.trim() && parseJson(output).ok){
+      const html=renderEvent({...entry,data:{...entry.data,output:''}},prefs);
+      return html+renderJson(output)+(entry.data.output_more || entry.truncated?`<button type="button" class="hd-ins__expand" data-seq="${entry.seq}">Show full output</button>`:'');
+    }
+    return renderEvent(entry,prefs);
+  }
+  function paintSummary(){
+    if(disposed)return;
+    const value=agentSummary || {state:summaryError?'failed':'pending'};
+    const signature=JSON.stringify([value,summaryError]);if(signature===summarySignature)return;summarySignature=signature;
+    const states={disabled:'Automatic summaries are not enabled.',pending:'Summary update pending.',ready:'Up to date with recorded conversation.',stale:'Newer conversation or unavailable history: showing the last saved summary.',failed:'Summary update failed. The last saved summary is retained.',no_data:'No recorded conversation is available to summarize.'};
+    const fields=[['discussed','Discussed'],['decisions','Decisions'],['completed','Completed'],['next_steps','Next steps'],['blockers','Blockers']];
+    const coverage=value.coverage;
+    const provenance=coverage ? `${coverage.status==='partial'?'Partial recording':'Recorded window only'} · ${Number(coverage.message_count ?? value.source_message_count ?? 0)} messages${coverage.reasons?.length?` · ${coverage.reasons.join(', ')}`:''}` : 'Recording coverage is unavailable.';
+    $('[data-agent-summary]').innerHTML=`<p class="sw-summary-state">${esc(summaryError || states[value.state] || 'Summary status unknown.')}</p>${value.overview?`<div class="conversation-markdown">${renderMarkdown(value.overview)}</div>`:''}${value.where_left_off?`<h4>Where we left off</h4><div class="conversation-markdown">${renderMarkdown(value.where_left_off)}</div>`:''}${fields.some(([key])=>value[key]?.length)?`<details><summary>Discussion, decisions and next steps</summary>${fields.filter(([key])=>Array.isArray(value[key]) && value[key].length).map(([key,label])=>`<h4>${label}</h4><ul>${value[key].map(item=>`<li>${esc(item)}</li>`).join('')}</ul>`).join('')}</details>`:''}<p class="sw-summary-provenance">${esc(provenance)}${value.generated_at?` · Generated ${esc(value.generated_at)}`:''}${value.model?` · ${esc(value.model)}`:''}</p>`;
+  }
+  async function loadSummary(){
+    if(disposed || document.hidden || summaryBusy)return;
+    if(typeof client.getAgentSummary!=='function'){agentSummary={state:'disabled'};paintSummary();return;}
+    summaryBusy=true;
+    try{
+      const value=await client.getAgentSummary(session.session_id);if(disposed)return;
+      // Older valid text keeps its original provenance when an update has no result yet.
+      agentSummary=agentSummary?.generated_at && !value.generated_at ? {...agentSummary,state:value.state,error:value.error} : value;
+      summaryError='';
+    }catch(err){if(!disposed)summaryError=`Summary unavailable: ${err.message}${agentSummary?.generated_at?' Showing the last saved summary.':''}`;}
+    finally{summaryBusy=false;paintSummary();}
+  }
+  const fullscreenButton=$('[data-fullscreen]'), workspace=$('[data-session-workspace]');
+  function setFullscreen(value){
+    if(value===fullscreen)return;
+    if(value)fullscreenFocus=document.activeElement;
+    fullscreen=value;workspace.classList.toggle('sw--fullscreen',value);fullscreenButton.setAttribute('aria-expanded',String(value));fullscreenButton.textContent=value?'Exit fullscreen workspace':'Fullscreen workspace';
+    if(value){workspace.setAttribute('role','dialog');workspace.setAttribute('aria-label','Agent workspace');workspace.setAttribute('aria-modal','true');fullscreenButton.focus();}
+    else{workspace.removeAttribute('role');workspace.removeAttribute('aria-label');workspace.removeAttribute('aria-modal');if(fullscreenFocus?.isConnected)fullscreenFocus.focus();}
+  }
+  fullscreenButton.addEventListener('click',()=>setFullscreen(!fullscreen));
+  workspace.addEventListener('keydown',event=>{
+    if(event.defaultPrevented || event.isComposing || event.keyCode===229)return;
+    if(event.key==='Escape' && fullscreen && !workspace.querySelector('.conversation-composer--expanded')){event.preventDefault();event.stopPropagation();setFullscreen(false);}
+    if(event.key==='Tab' && fullscreen && !workspace.querySelector('.conversation-composer--expanded')){
+      const controls=[...workspace.querySelectorAll('a,button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),[tabindex="0"]')].filter(el=>el.getClientRects().length);
+      if(event.shiftKey && document.activeElement===controls[0]){event.preventDefault();controls.at(-1)?.focus();}
+      else if(!event.shiftKey && document.activeElement===controls.at(-1)){event.preventDefault();controls[0]?.focus();}
+    }
+  });
+  const renameForm=$('[data-rename-form]'),renameInput=renameForm.querySelector('input'),renameStatus=$('[data-rename-status]');
+  $('[data-rename-agent]').addEventListener('click',()=>{renameInput.value=session.display_name || session.agent_role || '';renameStatus.textContent='';renameForm.hidden=false;renameInput.focus();});
+  $('[data-cancel-rename]').addEventListener('click',()=>{renameForm.hidden=true;$('[data-rename-agent]').focus();});
+  renameForm.addEventListener('submit',async event=>{
+    event.preventDefault();const submit=renameForm.querySelector('[type=submit]');if(submit.disabled)return;submit.disabled=true;
+    try{
+      const profile=await client.renameAgent(session.session_id,renameInput.value,session.name_version);
+      if(disposed)return;session.display_name=profile.display_name;session.agent_handle=profile.handle;session.name_version=profile.version;
+      $('[data-agent-name]').textContent=profile.display_name;renameForm.hidden=true;$('[data-rename-agent]').focus();onRename(profile);paint();
+    }catch(err){if(!disposed){renameStatus.setAttribute('role','alert');renameStatus.textContent=err.status===409?`Name could not be saved: ${err.message}. Choose another name or refresh to load the latest name.`:`Name could not be saved: ${err.message}`;}}
+    finally{submit.disabled=false;}
+  });
+  $('[data-regenerate-summary]').addEventListener('click',async event=>{
+    const button=event.currentTarget;if(button.disabled)return;button.disabled=true;
+    try{const value=await client.regenerateAgentSummary(session.session_id);if(!disposed){agentSummary=agentSummary?.generated_at && !value.generated_at ? {...agentSummary,state:value.state,error:value.error} : value;summaryError='';paintSummary();}}
+    catch(err){if(!disposed){summaryError=`Summary refresh could not start: ${err.message}`;paintSummary();}}
+    finally{if(!disposed)button.disabled=false;}
+  });
+  const onVisibility=()=>{if(!document.hidden)loadSummary();};
+  document.addEventListener('visibilitychange',onVisibility);
+  const summaryTimer=setInterval(loadSummary,10000);
+  loadSummary();
   function schedulePaint(){if(!renderTimer)renderTimer=setTimeout(()=>{renderTimer=null;paint();},100);}
   function scheduleRefresh(){if(!refreshTimer)refreshTimer=setTimeout(()=>{refreshTimer=null;load();},2000);}
   function merge(entry) {
     const full=expanded.get(entry.seq);
     if(full && full.rev!==entry.rev)expanded.delete(entry.seq);
-    mergeEntry(events,full?.rev===entry.rev?full:entry,MAX_EVENTS);
+    mergeEntry(events,full && full.rev===entry.rev?full:entry,MAX_EVENTS);
     if(expanded.size>MAX_EVENTS)for(const seq of expanded.keys())if(!events.some(e=>e.seq===seq))expanded.delete(seq);
   }
   async function load(older=false) {
@@ -165,5 +244,5 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   client.listSessions().then(result=>{if(!disposed){sessions=result.sessions || [];schedulePaint();}}).catch(()=>{});
   client.listCollabAgentLinks?.().then(result=>{if(!disposed){collaborators=result.agents || [];schedulePaint();}}).catch(()=>{});
   load();
-  return ()=>{disposed=true;request++;clearTimeout(renderTimer);clearTimeout(refreshTimer);stop();composer.dispose();};
+  return ()=>{disposed=true;request++;clearInterval(summaryTimer);document.removeEventListener('visibilitychange',onVisibility);clearTimeout(renderTimer);clearTimeout(refreshTimer);stop();composer.dispose();};
 }

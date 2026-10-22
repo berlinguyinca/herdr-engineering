@@ -5,6 +5,20 @@ import {createServer} from 'node:http';
 import { HerdrClient, ApiError } from './client.js';
 import { connectEvents } from './events.js';
 
+test('agent summary and rename requests preserve encoded identity and version', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    calls.push({ url, method: opts.method, body: opts.body && JSON.parse(opts.body) });
+    return { ok: true, status: 200, text: async () => '{}' };
+  } });
+  await client.getAgentSummary('a:b');
+  await client.regenerateAgentSummary('a:b');
+  await client.renameAgent('a:b', 'Ada', 2);
+  assert.deepEqual(calls.map(c => c.url), ['/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/name']);
+  assert.equal(calls[1].method, 'POST');
+  assert.deepEqual(calls[2].body, { name: 'Ada', expected_version: 2 });
+});
+
 function fakeFetch(routes) {
   return async (url, opts) => {
     const hit = routes.find((r) => url.endsWith(r.path));

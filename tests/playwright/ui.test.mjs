@@ -34,7 +34,7 @@ const ROUTES = [
   ['/activity', 'Activity'],
   ['/analytics', 'Analytics'],
   ['/missions', 'Finished'],
-  ['/herd', 'Sessions'],
+  ['/herd', 'Agents'],
   ['/hosts', 'beast'],
   ['/services', 'web service on beast'],
 ];
@@ -806,7 +806,7 @@ test('sessions tabs keep closed records separate, retain filters and encode exac
   assert.equal(await page.evaluate(()=>document.activeElement.closest('[data-session-id]')?.dataset.sessionId),focused);
   await page.locator('#ss-search').fill('');await page.locator('#ss-tab-finished').click();await page.locator('#ss-search').fill('Closed stage');
   await page.locator('[data-session-link]').click();await page.locator('#session-details').waitFor();await eventRead;
-  assert.equal(eventId,id);assert.match(await page.locator('#view').innerText(),/Finished session/);assert.doesNotMatch(await page.locator('.sd-head').innerText(),/reported active/);
+  assert.equal(eventId,id);assert.match(await page.locator('#view').innerText(),/Finished agent/);assert.doesNotMatch(await page.locator('.sd-head').innerText(),/reported active/);
   assert.equal(await page.locator('#msg-form').count(),0);assert.equal(await page.locator('#session-details').evaluate(el=>el.open),false);
   await page.locator('#session-details > summary').click();assert.ok((await page.locator('#session-details').innerText()).includes(id));
   await page.setViewportSize({width:390,height:844});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
@@ -824,7 +824,7 @@ test('overview keeps healthy panels through partial errors and links to the exac
   await page.route('**/api/v1/mission-activity',r=>++liveReads===1?r.fulfill({status:503,json:{error:'temporarily unavailable'}}):r.fulfill({json:{activities:[liveProjection({activity:{health:'active'}})]}}));
   await page.route('**/api/v1/health',r=>r.fulfill({status:503,json:{error:'health unavailable'}}));
   await page.clock.install();await page.goto(`${base}/#/overview`);
-  await page.waitForFunction(()=>document.querySelector('[data-overview=sessions]')?.textContent.includes('1Recently reported sessions'));
+  await page.waitForFunction(()=>document.querySelector('[data-overview=sessions]')?.textContent.includes('1Recently reported agents'));
   await page.waitForFunction(()=>document.querySelector('[data-overview=missions]')?.textContent.includes('Could not refresh'));
   assert.equal(await page.locator('#view h1').innerText(),'Overview');
   assert.equal(await page.locator('[data-overview=missions] a[href*="status=attention"] strong').innerText(),'—');assert.match(await page.locator('[data-overview=sessions]').innerText(),/Parser/);
@@ -1044,7 +1044,7 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
     const failed={provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure'};
     await page.route('**/api/v1/ci',r=>r.fulfill({json:{available:true,status:'connected',pipelines:{'lab/spectra':[failed]}}}));
     await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{repository:'7',number:42,status:'failure',commit:'a'.repeat(40),tasks:[{id:1,name:'Tests',state:'failure'}]}}}));
-    await page.route('**/api/v1/sessions',r=>r.fulfill({json:{sessions:[{session_id:'chosen',agent_role:'pi',status:'active',title:'Parser agent',host_id:'beast',terminal_id:'term_1',herdr_session:'default',agent_session:{agent:'pi'}},{session_id:'closed',agent_role:'pi',status:'closed'},{session_id:'other',agent_role:'codex',status:'active'}]}}));
+    await page.route('**/api/v1/sessions',r=>r.fulfill({json:{sessions:[{session_id:'chosen',display_name:'Amber Finch',agent_role:'pi',status:'active',title:'Parser agent',host_id:'beast',terminal_id:'term_1',herdr_session:'default',agent_session:{agent:'pi'}},{session_id:'closed',agent_role:'pi',status:'closed'},{session_id:'other',agent_role:'codex',status:'active'}]}}));
     await page.route('**/api/v1/ci/debug',r=>{posts.push(r.request().postDataJSON());if(posts.length===1)return r.abort('failed');return r.fulfill({json:{ok:true,status:'delivered'}});});
     await page.addInitScript(()=>{
       Object.defineProperty(crypto,'randomUUID',{value:undefined,configurable:true});
@@ -1063,8 +1063,8 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
     await page.evaluate(()=>{window.location.hash='/ci?tab=failed';});
     await page.getByRole('button',{name:'Run #42',exact:true}).click();
     await page.getByText('Debug with Pi',{exact:true}).click();
-    const select=page.getByRole('combobox',{name:'Target Pi session'});
-    await select.waitFor();assert.equal(await select.locator('option').count(),2);
+    const select=page.getByRole('combobox',{name:'Target Pi agent'});
+    await select.waitFor();assert.equal(await select.locator('option').count(),2);assert.match(await select.innerText(),/Amber Finch/);
     assert.equal(await page.getByRole('button',{name:'Send to Pi',exact:true}).isDisabled(),true);
     assert.equal(posts.length,0);
     await select.selectOption('chosen');
@@ -1072,7 +1072,7 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
     await page.getByText('Delivery unconfirmed; retry checks the same operation.',{exact:true}).waitFor();
     assert.equal(posts.length,1);
     await page.getByRole('button',{name:'Send to Pi',exact:true}).click();
-    await page.getByText('Debugging context delivered to the selected Pi session.',{exact:true}).waitFor();
+    await page.getByText('Debugging context delivered to the selected Pi agent.',{exact:true}).waitFor();
     assert.equal(posts.length,2);assert.equal(posts[1].operation_id,posts[0].operation_id);assert.equal(posts[0].session_id,'chosen');assert.equal(posts[0].repository,'7');
     assert.equal(posts[0].number,42);assert.match(posts[0].operation_id,/^[0-9a-f-]{36}$/);
     assert.match(await page.locator('.ig-inspector').innerText(),/Run #42/);

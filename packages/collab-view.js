@@ -55,7 +55,7 @@ const shortId = (id) => `…${String(id || '').slice(-6)}`;
 const hue = (s) => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
 // An agent's name as a coloured badge, with a pencil for those allowed to rename it.
 const agentBadge = (name) => `<span class="cx-av cx-av--sm" style="--h:${hue(name)}" aria-hidden="true">${esc((String(name).match(/[a-z0-9]/gi) || ['?'])[0].toUpperCase())}</span>`;
-const agentTitle = (a, canRename) => `<span class="cx-ntitle">${agentBadge(a.name)}<b class="cx-nname">@${esc(a.name)}</b>${canRename ? `<button type="button" class="cx-edit" data-rename="${esc(a.agent_id)}" data-name="${esc(a.name)}" title="Rename" aria-label="Rename @${esc(a.name)}">✎</button>` : ''}</span>`;
+const agentTitle = (a, canRename) => `<span class="cx-ntitle">${agentBadge(a.name)}<b class="cx-nname">${esc(a.display_name || `@${a.name}`)}</b>${a.display_name?`<small class="hd-ident">@${esc(a.name)}</small>`:''}${canRename ? `<button type="button" class="cx-edit" data-rename="${esc(a.agent_id)}" data-name="${esc(a.name)}" title="Rename @ handle" aria-label="Rename @${esc(a.name)} handle">✎</button>` : ''}</span>`;
 
 // One credential, shown once, in the format each client wants. Secrets only ever go through textContent.
 const connectSnippets = (cfg, a) => {
@@ -93,7 +93,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   let focusLinkedAgent = Boolean(linkedAgent);
   let current = linkedAgent ? '/agents' : '/rooms'; // the dashboard owns the URL hash
   const nativeSessionLink = (id) => operator && !standalone && typeof id === 'string' && id
-    ? `<a href="/#/herd/session/${esc(encodeURIComponent(id))}">Open session conversation</a>` : '';
+    ? `<a href="/#/herd/session/${esc(encodeURIComponent(id))}">Open agent conversation</a>` : '';
   const dispose = () => { if (teardown) teardown(); teardown = null; };
   const go = (path) => { if (standalone) { window.location.hash = path; } else { current = path; route(); } };
   const onHash = () => { if (store.get() && me) route(); };
@@ -286,14 +286,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     }
   }
 
-  // Click the pencil: the name turns into a small form. The herdr pane, tab and workspace follow within a minute.
+  // Collaboration handles route mentions; canonical dashboard names are edited in Agents.
   function wireRename(box, after) {
     box.querySelectorAll('[data-rename]').forEach((btn) => {
       btn.onclick = () => {
         const holder = btn.closest('.cx-ntitle');
         const id = btn.dataset.rename;
         const old = btn.dataset.name;
-        holder.innerHTML = `<form class="cx-rename"><span class="cx-at">@</span><input class="cx-input" name="n" value="${esc(old)}" maxlength="32" pattern="[a-z0-9]+(-[a-z0-9]+)*" required aria-label="New name" autocomplete="off"><button class="hd-btn hd-btn--sm" type="submit">Save</button><button class="hd-btn hd-btn--ghost hd-btn--sm" type="button" data-x="1">Cancel</button><span class="cx-msg" role="alert"></span></form>`;
+        holder.innerHTML = `<form class="cx-rename"><span class="cx-at">@</span><input class="cx-input" name="n" value="${esc(old)}" maxlength="32" pattern="[a-z0-9]+(-[a-z0-9]+)*" required aria-label="New @ handle" autocomplete="off"><button class="hd-btn hd-btn--sm" type="submit">Save handle</button><button class="hd-btn hd-btn--ghost hd-btn--sm" type="button" data-x="1">Cancel</button><span class="cx-msg" role="alert"></span></form>`;
         const f = holder.querySelector('form');
         const input = f.elements.n;
         input.focus();
@@ -502,16 +502,16 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const sessionOptions = (cur) => {
       const list = [...(sessions || [])];
       if (cur && !list.some((x) => x.session_id === cur)) list.unshift({ session_id: cur, agent_role: 'linked', host_id: '' });
-      return list.map((x) => `<option value="${esc(x.session_id)}"${x.session_id === cur ? ' selected' : ''}>${esc(`${x.agent_role || 'session'} · ${x.host_id || ''} · ${String(x.cwd || x.session_id).split('/').filter(Boolean).pop()}`)}</option>`).join('');
+      return list.map((x) => `<option value="${esc(x.session_id)}"${x.session_id === cur ? ' selected' : ''}>${esc(`${x.display_name || x.agent_role || 'agent'} · ${x.host_id || ''} · ${String(x.cwd || x.session_id).split('/').filter(Boolean).pop()}`)}</option>`).join('');
     };
     const knownSessions = new Set((sessions || []).map((session) => session.session_id));
     box.innerHTML = live.length ? `<div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack cx-agentcard" data-agent-card="${esc(a.agent_id)}" tabindex="-1"${a.agent_id === linkedAgent ? ' style="outline:2px solid var(--accent);outline-offset:2px"' : ''}>
-        <div class="cx-row cx-row--between"><span class="hd-card__title">${agentTitle({ ...a, name: a.name || a.harness_type }, true)}</span>${pill('Active', 'var(--status-ok)')}</div>
+        <div class="cx-row cx-row--between"><span class="hd-card__title">${agentTitle({ ...a, name: a.name || a.harness_type, display_name: sessions?.find(s=>s.session_id===a.instance_id)?.display_name }, true)}</span>${pill('Active', 'var(--status-ok)')}</div>
         <span class="hd-ident">${esc(a.harness_type)} · ${esc(a.agent_id)}</span>
-        ${a.instance_id ? '<span class="hd-card__sub">Linked to a herdr pane: its name, pane and tab labels stay equal both ways (within a minute).</span>' : ''}
+        ${a.instance_id ? '<span class="hd-card__sub">Linked to a HerdR agent. The readable name is shared; the @ handle routes Collaboration tasks.</span>' : ''}
         ${knownSessions.has(a.instance_id) ? nativeSessionLink(a.instance_id) : ''}
         <span class="hd-card__sub">Expires ${esc(new Date(a.expires_at * 1000).toLocaleDateString())} · ${a.rooms.length ? `in ${esc(a.rooms.map((r) => r.name).join(', '))}` : 'not in any room yet'}</span>
-        ${sessions ? `<label class="cx-msg">Fabric session <select data-link="${esc(a.agent_id)}"><option value="">not linked</option>${sessionOptions(a.instance_id)}</select></label>` : ''}
+        ${sessions ? `<label class="cx-msg">Fabric agent <select data-link="${esc(a.agent_id)}"><option value="">not linked</option>${sessionOptions(a.instance_id)}</select></label>` : ''}
         <div><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Revoke</button></div></div>`).join('')}</div>`
       : '<div class="hd-empty">No connected agents yet.</div>';
     if (focusLinkedAgent) {
@@ -653,14 +653,15 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const warn = (e) => { alert(e.message); };
     const act = async (fn) => { try { await fn(); } catch (e) { warn(e); } kick(); };
 
+    const namedAgent = a => ({...a,display_name:S.flow?.nodes?.find(n=>n.agent_id===a.agent_id)?.fabric?.display_name});
     const drawRoomAgents = () => {
       const mine = new Set(S.mine.map((a) => a.agent_id));
-      const html = S.agents.length ? `<ul class="cx-list">${S.agents.map((a) => `<li class="cx-agentrow"><span class="grow">${agentTitle(a, mine.has(a.agent_id) || operator)}<span class="cx-sub1">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></span><span class="cx-pills">${permPills(a.actions)}</span>${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
+      const html = S.agents.length ? `<ul class="cx-list">${S.agents.map((a) => `<li class="cx-agentrow"><span class="grow">${agentTitle(namedAgent(a), mine.has(a.agent_id) || operator)}<span class="cx-sub1">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></span><span class="cx-pills">${permPills(a.actions)}</span>${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
       if (put('hcn-roomagents', html)) { $('hcn-roomagents').querySelectorAll('[data-rmagent]').forEach((b) => { b.onclick = () => act(() => api.removeAgent(roomId, b.dataset.rmagent)); }); wireRename($('hcn-roomagents'), redraw('hcn-roomagents')); }
     };
     const drawTaskTargets = () => {
       const can = S.agents.filter((a) => a.actions.includes('execute'));
-      put('hcn-task-target', can.length ? can.map((a) => `<option value="${esc(a.agent_id)}">@${esc(a.name)}</option>`).join('') : '<option value="">No agent accepts tasks yet</option>');
+      put('hcn-task-target', can.length ? can.map((a) => `<option value="${esc(a.agent_id)}">${esc(namedAgent(a).display_name || `@${a.name}`)}</option>`).join('') : '<option value="">No agent accepts tasks yet</option>');
     };
     const drawTasks = () => {
       const html = S.tasks.length ? `<ul class="cx-list">${S.tasks.slice(0, 30).map((t) => `<li><span class="grow"><b>@${esc(t.target_name || shortId(t.target_agent_id))}</b> ${esc(t.text)}${t.result ? `<br><span class="hd-ident">→ ${esc(t.result)}</span>` : ''}</span>${taskChip(t.status)}${(['pending', 'accepted'].includes(t.status) && canPost) ? `<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel-task="${esc(t.task_id)}">Cancel</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No tasks yet.</div>';
@@ -675,7 +676,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         const pend = (a.pending || []).find((r) => r.room_id === roomId);
         const cur = g ? g.actions : (pend ? pend.actions : ['read']);
         return `<li><form class="cx-stack" data-agent="${esc(a.agent_id)}" style="flex:1 1 100%">
-          <span class="cx-row">${agentTitle(a, true)} <span class="hd-ident">${esc(shortId(a.agent_id))}</span> ${g ? permPills(g.actions) : ''}${pend ? pill('Waiting for the room owner', 'var(--status-attention)') : ''}</span>
+          <span class="cx-row">${agentTitle(namedAgent(a), true)} <span class="hd-ident">${esc(shortId(a.agent_id))}</span> ${g ? permPills(g.actions) : ''}${pend ? pill('Waiting for the room owner', 'var(--status-attention)') : ''}</span>
           <span class="cx-checks">${permBoxes(cur, 'p')}</span>${canInvite ? ttlSelect() : ''}
           <button type="submit" class="hd-btn hd-btn--sm">${canInvite ? (g ? 'Update permissions' : 'Add to room') : (g ? 'Request change' : 'Request access')}</button></form></li>`;
       }).join('')}</ul>${canInvite ? '' : '<p class="cx-msg">The room owner approves what each agent may do here.</p>'}` : '<div class="hd-empty">No agents yet. <a href="#/agents" data-go="/agents">Connect one</a>.</div>';
@@ -724,7 +725,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     let flowKey = '';
     const drawFlow = () => {
       const box = $('hcn-flow');
-      const flow = S.flow;
+      const flow = S.flow && {...S.flow,nodes:S.flow.nodes.map(n=>({...n,name:n.fabric?.display_name || n.name}))};
       if (!box || !flow) return;
       const key = JSON.stringify(flow);
       if (key === flowKey) return;                  // nothing moved: leave the animation alone
@@ -734,8 +735,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         prev: flowSig,
         onNode: (n) => {
           const mine = flow.edges.filter((e) => e.from === n.id || e.to === n.id).map((e) => `${esc(flow.nodes.find((x) => x.id === e.from)?.name)} → ${esc(flow.nodes.find((x) => x.id === e.to)?.name)}: ${esc(Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}`);
-          const f = n.fabric ? `<br>Fabric session ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}${n.fabric.parent_session_id ? ` · started by session ${esc(n.fabric.parent_session_id)}` : ''}${nativeSessionLink(n.fabric.session_id) ? `<br>${nativeSessionLink(n.fabric.session_id)}` : ''}` : '';
-          showDetail(`<b>${esc(n.kind === 'agent' ? `@${n.name}` : n.name)}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}`);
+          const f = n.fabric ? `<br>Fabric agent ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}${n.fabric.parent_session_id ? ` · started by agent ${esc(n.fabric.parent_session_id)}` : ''}${nativeSessionLink(n.fabric.session_id) ? `<br>${nativeSessionLink(n.fabric.session_id)}` : ''}` : '';
+          showDetail(`<b>${esc(n.fabric?.display_name || (n.kind === 'agent' ? `@${n.name}` : n.name))}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}`);
         },
         onEdge: (e) => {
           const ts = flow.tasks.filter((t) => t.from === e.from && t.to === e.to).slice(0, 5);
@@ -788,6 +789,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const apply = (s) => {
       if (s.agents) { S.agents = s.agents; S.agents.forEach((a) => agentName.set(a.agent_id, a.name)); }
       S.tasks = s.tasks || []; S.flow = s.flow || null; S.requests = s.requests || null;
+      S.agents.forEach(a=>agentName.set(a.agent_id,namedAgent(a).display_name || a.name));
       addEvents(s.events || []);
       cursor = s.next_cursor ?? cursor;
       paintPanel();
@@ -830,7 +832,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         placeholder: 'Message the room… type @ to hand an agent a task',
         hint: 'Enter sends · Shift+Enter adds a line · @agent … gives that agent a task',
         suggestions: () => S.agents.filter((a) => a.actions.includes('execute')).map((a) => ({
-          id: a.agent_id, label: `@${a.name}`, insertText: `@${a.name}`,
+          id: a.agent_id, label: namedAgent(a).display_name || `@${a.name}`, insertText: `@${a.name}`,
           detail: `${a.harness_type} · ${names.get(a.owner_user_id) || shortId(a.owner_user_id)}`,
         })),
         onSend: async (text) => {

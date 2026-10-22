@@ -125,7 +125,7 @@ test('Collaboration uses shared Markdown and composer while preserving authentic
     else if (path === '/rooms/room-one/state') {
       stateCount++;
       body = { changed: stateCount === 1, seq: 1, next_cursor: 1, agents: [{ agent_id: 'coder-id', name: 'coder', actions: ['execute'], harness_type: 'codex', owner_user_id: 'owner' }], tasks: [], events: stateCount === 1 ? [{ event_type: 'message', sender: { type: 'user', id: 'owner' }, text: '**Formatted** <script>bad()</script>', created_at: new Date().toISOString() }] : [] };
-      body.flow = { nodes: [{ id: 'coder-id', agent_id: 'coder-id', name: 'coder', kind: 'agent', actions: ['execute'], fabric: { session_id: 'session:one', status: 'active' } }], edges: [], tasks: [] };
+      body.flow = { nodes: [{ id: 'coder-id', agent_id: 'coder-id', name: 'coder', kind: 'agent', actions: ['execute'], fabric: { session_id: 'session:one', status: 'active', display_name: 'Amber Finch' } }], edges: [], tasks: [] };
       if (stateCount > 1) await new Promise((r) => setTimeout(r, 100));
     }
     await route.fulfill({ json: body });
@@ -140,7 +140,9 @@ test('Collaboration uses shared Markdown and composer while preserving authentic
   assert.equal(await page.locator('.conversation-markdown strong').innerText(), 'Formatted');
   assert.equal(await page.locator('.conversation-markdown script').count(), 0);
   const input = page.getByRole('combobox', { name: 'Message' });
-  await input.fill('@co'); await input.press('Tab'); await input.press('i'); await input.press('Enter');
+  await input.fill('@Amber'); await page.getByRole('option', { name: /Amber Finch/ }).waitFor(); await input.press('Tab');
+  assert.equal(await input.inputValue(), '@coder ');
+  await input.press('i'); await input.press('Enter');
   await page.getByRole('status').filter({ hasText: 'Task created' }).waitFor();
   assert.deepEqual(requests[0], { path: '/rooms/room-one/tasks', auth: 'Bearer operator', body: { target_agent_id: 'coder-id', text: 'i' } });
   await input.fill('hello'); await input.press('Enter');
@@ -154,7 +156,7 @@ test('Collaboration uses shared Markdown and composer while preserving authentic
   assert.equal(await input.inputValue(), '@missing do work');
   await page.getByRole('tab', { name: 'Flow', exact: true }).click();
   await page.locator('[data-node="coder-id"]').click();
-  assert.equal(await page.getByRole('link', { name: 'Open session conversation' }).getAttribute('href'), '/#/herd/session/session%3Aone');
+  assert.equal(await page.getByRole('link', { name: 'Open agent conversation' }).getAttribute('href'), '/#/herd/session/session%3Aone');
   await page.evaluate(() => window.collab.dispose());
 }));
 
@@ -186,16 +188,17 @@ test('embedded Collaboration deep links focus the selected agent and link only k
     window.composer.dispose();
     window.location.hash = '/collab?agent=coder-id';
     const { mountCollab } = await import('/collab-view.js');
-    window.collab = mountCollab(document.querySelector('#host'), { fabricSessions: async () => [{ session_id: sessionId, agent_role: 'coder', host_id: 'bender' }] });
+    window.collab = mountCollab(document.querySelector('#host'), { fabricSessions: async () => [{ session_id: sessionId, display_name: 'Slate Owl', agent_role: 'coder', host_id: 'bender' }] });
   }, nativeId);
   const target = page.locator('[data-agent-card="coder-id"]');
   await target.waitFor({ timeout: 3000 });
+  assert.match(await target.innerText(), /Slate Owl/);
   assert.equal(await target.evaluate((el) => el === document.activeElement), true);
-  assert.equal(await target.getByRole('link', { name: 'Open session conversation' }).getAttribute('href'), `/#/herd/session/${encodeURIComponent(nativeId)}`);
+  assert.equal(await target.getByRole('link', { name: 'Open agent conversation' }).getAttribute('href'), `/#/herd/session/${encodeURIComponent(nativeId)}`);
   assert.equal(await page.locator('[data-agent-card="unknown-id"] a').count(), 0);
   // Refreshing agent cards must not steal focus back from an active control.
   await target.getByRole('button', { name: 'Rename @coder' }).click();
-  await page.getByRole('textbox', { name: 'New name' }).press('Escape');
+  await page.getByRole('textbox', { name: 'New @ handle' }).press('Escape');
   await target.waitFor();
   assert.equal(await target.evaluate((el) => el === document.activeElement), false);
   await page.evaluate(async (sessionId) => {
@@ -206,6 +209,89 @@ test('embedded Collaboration deep links focus the selected agent and link only k
     window.collab = mountCollab(host, { fabricSessions: async () => [{ session_id: sessionId }] });
   }, nativeId);
   await page.locator('.hd-shell .cx-agentcard').first().waitFor();
-  assert.equal(await page.getByRole('link', { name: 'Open session conversation' }).count(), 0);
+  assert.equal(await page.getByRole('link', { name: 'Open agent conversation' }).count(), 0);
   await page.evaluate(() => window.collab.dispose());
+}));
+
+test('expanded editor preserves textarea, attachment, selection and Escape completion priority', async () => withComposer(async (page) => {
+  await page.evaluate(() => window.mount({ upload: async (file) => ({ name: file.name }) }));
+  const input = page.getByRole('combobox', { name: 'Message' });
+  await input.fill('hello @co');
+  await input.evaluate((el) => { window.originalInput = el; el.setSelectionRange(6, 9); });
+  await page.locator('input[type=file]').setInputFiles({ name: 'keep.txt', mimeType: 'text/plain', buffer: Buffer.from('x') });
+  await page.getByRole('button', { name: 'Expand editor' }).click();
+  assert.equal(await input.evaluate((el) => el === window.originalInput), true);
+  assert.deepEqual(await input.evaluate((el) => [el.selectionStart, el.selectionEnd]), [6, 9]);
+  await page.getByRole('button', { name: 'Remove keep.txt' }).waitFor();
+  await input.fill('@co');
+  await input.press('Escape');
+  assert.equal(await page.locator('.conversation-composer--expanded').count(), 1);
+  await input.press('Escape');
+  assert.equal(await page.locator('.conversation-composer--expanded').count(), 0);
+  assert.equal(await page.getByRole('button', { name: 'Expand editor' }).evaluate((el) => el === document.activeElement), true);
+  assert.deepEqual(await page.evaluate(() => window.sent), []);
+}));
+
+test('editor JSON format and find replace are undoable and preview is safely rendered', async () => withComposer(async (page) => {
+  const input = page.getByRole('combobox', { name: 'Message' });
+  await input.fill('{"a":1}');
+  await page.getByRole('button', { name: 'Expand editor' }).click();
+  await page.getByRole('button', { name: 'Format JSON' }).click();
+  assert.equal(await input.inputValue(), '{\n  "a": 1\n}');
+  await page.getByRole('button', { name: 'Undo', exact: true }).click();
+  assert.equal(await input.inputValue(), '{"a":1}');
+  await page.getByRole('button', { name: 'Redo', exact: true }).click();
+  assert.equal(await input.inputValue(), '{\n  "a": 1\n}');
+  await page.getByRole('button', { name: 'Find and replace' }).click();
+  await page.getByRole('textbox', { name: 'Find text', exact: true }).fill('a');
+  await page.getByRole('textbox', { name: 'Replace with', exact: true }).fill('b');
+  await page.getByRole('button', { name: 'Replace all', exact: true }).click();
+  assert.ok((await input.inputValue()).includes('"b"'));
+  await page.getByRole('button', { name: 'Undo', exact: true }).click();
+  assert.ok((await input.inputValue()).includes('"a"'));
+  await input.fill('{bad');
+  await page.getByRole('button', { name: 'Format JSON' }).click();
+  await page.getByRole('alert').filter({ hasText: 'Invalid JSON' }).waitFor();
+  assert.equal(await input.inputValue(), '{bad');
+  await input.fill('# Heading\n\n<script>bad()</script>');
+  await page.getByRole('button', { name: 'Split preview', exact: true }).click();
+  assert.equal(await page.locator('.conversation-editor-preview h1').innerText(), 'Heading');
+  assert.equal(await page.locator('.conversation-editor-preview script').count(), 0);
+  assert.deepEqual(await page.evaluate(() => window.sent), []);
+}));
+
+test('JSON viewer toggles raw content and handles clipboard denial', async () => withComposer(async (page) => {
+  await page.evaluate(async () => {
+    const { mountJsonViewer } = await import('/conversation-json.js');
+    const host = document.createElement('div'); document.body.append(host);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('denied'); } } });
+    mountJsonViewer(host, '{"<script>":{"a":true}}');
+  });
+  await page.getByRole('button', { name: 'Raw JSON', exact: true }).click();
+  assert.equal(await page.locator('[data-json-raw]').innerText(), '{"<script>":{"a":true}}');
+  await page.getByRole('button', { name: 'Copy JSON', exact: true }).click();
+  await page.getByText('Copy unavailable. Select and copy the raw JSON.').waitFor();
+  assert.equal(await page.locator('[data-json-tree] script').count(), 0);
+}));
+
+test('expanded keyboard editing, indentation and previews never submit implicitly', async () => withComposer(async (page) => {
+  const input = page.getByRole('combobox', { name: 'Message' });
+  await input.fill('one\ntwo');
+  await page.getByRole('button', { name: 'Expand editor' }).click();
+  await input.press('Control+End'); await input.press('Enter'); await input.press('x');
+  assert.equal(await input.inputValue(), 'one\ntwo\nx');
+  await input.press('Control+z'); assert.equal(await input.inputValue(), 'one\ntwo\n');
+  await input.press('Control+Shift+z'); assert.equal(await input.inputValue(), 'one\ntwo\nx');
+  await input.press('Control+a'); await input.press('Tab');
+  assert.equal(await input.inputValue(), '  one\n  two\n  x');
+  await input.press('Shift+Tab'); assert.equal(await input.inputValue(), 'one\ntwo\nx');
+  await page.getByRole('button', { name: 'Preview', exact: true }).click();
+  assert.equal(await input.isVisible(), false);
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  assert.equal(await input.inputValue(), 'one\ntwo\nx');
+  await page.getByRole('button', { name: 'Find and replace' }).click();
+  await page.getByRole('textbox', { name: 'Find text', exact: true }).fill('two');
+  await page.getByRole('textbox', { name: 'Find text', exact: true }).press('Enter');
+  assert.deepEqual(await input.evaluate((el) => [el.selectionStart, el.selectionEnd]), [4,7]);
+  assert.deepEqual(await page.evaluate(() => window.sent), []);
 }));

@@ -26,3 +26,9 @@ test('unclosed fences remain escaped code and large messages stay bounded', () =
   assert.equal(renderMarkdown('```\n<script>'), '<pre><code>&lt;script&gt;</code></pre>');
   assert.ok(renderMarkdown('a'.repeat(210000)).length < 201000);
 });
+
+test('GFM tables, checked tasks, strikethrough and rules stay escaped', () => {
+  const html = renderMarkdown('| Name | Value |\n| :--- | ---: |\n| **one** | <script>x</script> |\n\n- [x] done\n- [ ] next\n\n~~old~~\n\n---');
+  for (const part of ['<table>', '<th', '<td', '<strong>one</strong>', '&lt;script&gt;', 'type="checkbox" disabled checked', '<del>old</del>', '<hr>']) assert.ok(html.includes(part), part);
+  assert.ok(!html.includes('<script>'));
+});

@@ -99,6 +99,20 @@ export class HerdrClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
   }
 
+  getAgentSummary(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { signal });
+  }
+
+  regenerateAgentSummary(id) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { method: 'POST', body: {} });
+  }
+
+  renameAgent(id, name, expectedVersion) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/name`, {
+      method: 'POST', body: { name, expected_version: expectedVersion },
+    });
+  }
+
   // -- services / hosts ---------------------------------------------------
   listServices({ signal } = {}) {
     return this.request('/api/v1/services', { signal });
