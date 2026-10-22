@@ -91,7 +91,7 @@ After=network-online.target
 Type=oneshot
 UMask=0077
 TimeoutStartSec=15min
-ExecStart=$CERTBOT renew --non-interactive --cert-name $CERT_NAME --config-dir $ACME/config --work-dir $ACME/work --logs-dir $ACME/logs
+ExecStart="$CERTBOT" renew --non-interactive --cert-name "$CERT_NAME" --config-dir "$ACME/config" --work-dir "$ACME/work" --logs-dir "$ACME/logs"
 UNIT
   cat > "$u/herdr-collab-cert-renew.timer" <<UNIT
 [Unit]
@@ -119,7 +119,7 @@ install_timer() {
 Description=Refresh collab Cognito membership and keys
 [Service]
 Type=oneshot
-ExecStart=$bin once --config $CONFIG --dir $DIR --cert-dir $CERT_DIR --cert-src $CERT_SRC
+ExecStart="$bin" once --config "$CONFIG" --dir "$DIR" --cert-dir "$CERT_DIR" --cert-src "$CERT_SRC"
 UNIT
   cat > "$u/herdr-collab-sync.timer" <<UNIT
 [Unit]

@@ -155,6 +155,11 @@ otherwise. No step prints a secret.
    *and* the operator confirms. Until then it is the manual-rollback path from
    step 4.
 
+**Migrations and rollback.** The worker applies SQL migrations when it starts. A
+rollback puts the old worker image back on a schema the new image may already have
+migrated. Keep migrations backward compatible (additive: new tables and nullable
+columns, no drops or renames in the same release), or plan a manual restore.
+
 ## Wrong orders that break
 
 - **New host code before the new control plane.** The old control plane has no
