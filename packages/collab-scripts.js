@@ -7,10 +7,12 @@ export const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
 
 const JGET = `jget() { python3 -c 'import sys,json;print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$F" "$1"; }`;
 
-const CALL = `call() {  # call TOOL JSON_ARGS  -> the MCP JSON-RPC reply on stdout
+const CALL = `HDR=$(mktemp); trap 'rm -f "$HDR"' EXIT; chmod 600 "$HDR"   # the credential goes in a file, never in argv
+printf 'Authorization: Agent %s\\nX-Herdr-Device: %s\\n' "$CRED" "$DEV" > "$HDR"
+call() {  # call TOOL JSON_ARGS  -> the MCP JSON-RPC reply on stdout
   python3 -c 'import sys,json;print(json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":sys.argv[1],"arguments":json.loads(sys.argv[2])}}))' "$1" "$2" |
   curl -fsS -X POST "$BASE/mcp" -H 'content-type: application/json' -H 'accept: application/json' \\
-    -H "Authorization: Agent $CRED" -H "X-Herdr-Device: $DEV" --data-binary @-
+    -H @"$HDR" --data-binary @-
 }`;
 
 const PREAMBLE = (base) => `set -euo pipefail
@@ -32,7 +34,7 @@ COUNT="\${1:-${Number(count)}}"
 OUT="\${HERDR_AGENT_DIR:-$HOME/herdr-agents}"
 umask 077; mkdir -p "$OUT"
 for i in $(seq 1 "$COUNT"); do
-  body=$(python3 -c 'import sys,json;print(json.dumps({"token":sys.argv[1],"instance_id":sys.argv[2]}))' "$TOKEN" "$(hostname)-$$-$i")
+  body=$(T="$TOKEN" python3 -c 'import os,sys,json;print(json.dumps({"token":os.environ["T"],"instance_id":sys.argv[1]}))' "$(hostname)-$$-$i")
   resp=$(curl -fsS -X POST "$BASE/api/v1/collab/agents/join" -H 'content-type: application/json' -d "$body")
   name=$(printf '%s' "$resp" | python3 -c 'import sys,json;print(json.load(sys.stdin)["name"])')
   printf '%s\\n' "$resp" > "$OUT/$name.json"
@@ -50,7 +52,7 @@ export function workerScript({ base }) {
 # they started): it is never spliced into a shell command by this script.
 ${PREAMBLE(base)}
 CMD="\${HERDR_AGENT_CMD:-cat >/dev/null; echo acknowledged}"
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d); mkdir "$TMP/tasks"; trap 'rm -rf "$TMP" "$HDR"' EXIT
 echo "waiting for tasks as $(jget name)..."
 while :; do
   call tasks_wait '{"seconds":20}' > "$TMP/r.json" || { sleep 5; continue; }
@@ -59,10 +61,10 @@ import sys, json
 reply = json.load(open(sys.argv[1]))
 tasks = json.loads(reply["result"]["content"][0]["text"]).get("tasks", [])
 for t in tasks:
-    open(f"{sys.argv[2]}/{t['task_id']}.txt", "w").write(t["text"])
+    open(f"{sys.argv[2]}/tasks/{t['task_id']}.txt", "w").write(t["text"])
     print(t["task_id"])
 PY
-  for f in "$TMP"/*.txt; do
+  for f in "$TMP"/tasks/*.txt; do
     [ -e "$f" ] || continue
     tid=$(basename "$f" .txt)
     call task_update "$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":"accepted"}))' "$tid")" >/dev/null || true

@@ -455,7 +455,7 @@ export function mountCollab(root) {
         box.insertAdjacentHTML('afterbegin', `<div class="cx-row"><button type="button" class="hd-btn hd-btn--sm" id="hcn-approve-all">Approve all ${requests.length}</button>${ttlSelect().replace('<select', '<select id="hcn-all-ttl"')}</div>`);
         $('hcn-approve-all').onclick = async () => {
           const v = Number($('hcn-all-ttl').value || 0);
-          try { await api.approveAll(roomId, v ? { expires_at: Date.now() / 1000 + v } : {}); } catch (e) { alert(e.message); }
+          try { await api.approveAll(roomId, { request_ids: requests.map((r) => r.request_id), ...(v ? { expires_at: Date.now() / 1000 + v } : {}) }); } catch (e) { alert(e.message); }
           await refreshAgentPanels();
         };
       }

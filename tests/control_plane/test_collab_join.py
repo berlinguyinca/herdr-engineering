@@ -32,8 +32,9 @@ def test_a_token_makes_agents_that_have_no_access_until_the_owner_approves(w):
     agent = w.s.authenticate(f"Agent {made[0]['credential']}", made[0]["device_id"])
     assert w.s.agent_rooms(agent) == {"rooms": []}                     # nothing yet
     assert len(w.s.list_agent_requests(w.alice, w.room)["requests"]) == 3
-    out = w.s.approve_all_requests(w.alice, w.room, {})
-    assert out == {"approved": 3, "skipped": 0}
+    shown = [r["request_id"] for r in w.s.list_agent_requests(w.alice, w.room)["requests"]]
+    out = w.s.approve_all_requests(w.alice, w.room, {"request_ids": shown})
+    assert (out["approved"], out["skipped"]) == (3, 0)
     assert w.s.agent_rooms(agent)["rooms"][0]["actions"] == ["execute", "post", "read"]
 
 
@@ -118,11 +119,37 @@ def test_approve_all_never_exceeds_what_was_asked_and_is_owner_only(w):
     tok = mint(w, count=2, actions=["read"])
     for _ in range(2):
         w.s.redeem_join_token({"token": tok["token"]})
-    assert code(w.s.approve_all_requests, w.bob, w.room, {}) in (403, 404)
-    out = w.s.approve_all_requests(w.alice, w.room, {"actions": ["read", "execute"]})   # asked for read only
-    assert out == {"approved": 0, "skipped": 2}
-    assert w.s.approve_all_requests(w.alice, w.room, {"actions": ["read"]}) == {"approved": 2, "skipped": 0}
-    assert code(w.s.approve_all_requests, w.alice, w.room, {"request_ids": "all"}) == 400
+    shown = [r["request_id"] for r in w.s.list_agent_requests(w.alice, w.room)["requests"]]
+    assert code(w.s.approve_all_requests, w.bob, w.room, {"request_ids": shown}) in (403, 404)
+    out = w.s.approve_all_requests(w.alice, w.room, {"request_ids": shown, "actions": ["read", "execute"]})   # asked for read only
+    assert (out["approved"], out["skipped"]) == (0, 2) and out["reasons"]
+    out = w.s.approve_all_requests(w.alice, w.room, {"request_ids": shown, "actions": ["read"]})
+    assert (out["approved"], out["skipped"]) == (2, 0)
+    for bad in ("all", [], None, [5], {"request_ids": shown}):
+        assert code(w.s.approve_all_requests, w.alice, w.room, {"request_ids": bad}) == 400
+    assert code(w.s.approve_all_requests, w.alice, w.room, {"request_ids": shown, "actions": 5}) == 400
+
+
+def test_approve_all_never_takes_requests_the_owner_has_not_seen(w):
+    tok = mint(w, count=3)
+    w.s.redeem_join_token({"token": tok["token"]})
+    shown = [r["request_id"] for r in w.s.list_agent_requests(w.alice, w.room)["requests"]]
+    w.s.redeem_join_token({"token": tok["token"]})                  # arrives after the owner looked
+    out = w.s.approve_all_requests(w.alice, w.room, {"request_ids": shown})
+    assert out["approved"] == 1
+    assert len(w.s.list_agent_requests(w.alice, w.room)["requests"]) == 1
+
+
+def test_bulk_connect_checks_the_queue_first_and_keeps_partial_credentials(w):
+    from herdr_engineering.control_plane import collab
+    old = collab.MAX_PENDING_REQUESTS
+    collab.MAX_PENDING_REQUESTS = 3
+    try:
+        body = {"harness_type": "x", "name_prefix": "bx", "count": 5, "room_id": w.room, "actions": ["read"]}
+        assert code(w.s.bulk_connect, w.bob, body) == 429          # refused before any agent exists
+        assert w.s.list_my_agents(w.bob) == {"agents": []}
+    finally:
+        collab.MAX_PENDING_REQUESTS = old
 
 
 def test_http_routes_public_join_is_open_but_bulk_is_operator_only(w):

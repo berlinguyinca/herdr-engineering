@@ -78,7 +78,9 @@ def test_fleet_end_to_end_register_approve_work_and_delegate(stack, shim, tmp_pa
     first = subprocess.run(["bash", str(tmp_path / "agents" / "agents.sh"), str(files[0])], env=env,
                            capture_output=True, text=True, timeout=30)
     assert json.loads(json.loads(first.stdout)["result"]["content"][0]["text"].split("\n\n", 1)[1])["rooms"] == []
-    s, ap = api.call("POST", f"{BASE}/rooms/{room}/agent-requests/approve-all", {}, user="alice")
+    s, reqs = api.call("GET", f"{BASE}/rooms/{room}/agent-requests", user="alice")
+    s, ap = api.call("POST", f"{BASE}/rooms/{room}/agent-requests/approve-all",
+                     {"request_ids": [r["request_id"] for r in reqs["requests"]]}, user="alice")
     assert s == 200 and ap["approved"] == 2, ap
 
     # a person gives fleet-1 a task; the worker script does it and reports
@@ -107,6 +109,8 @@ def test_fleet_end_to_end_register_approve_work_and_delegate(stack, shim, tmp_pa
     d = subprocess.run(["bash", str(tmp_path / "agents" / "delegate.sh"), str(files[0]), room, ids["fleet-2"],
                         t2["task_id"], "sub-task; $(touch /tmp/pwned2)"], env=env, capture_output=True, text=True, timeout=30)
     assert d.returncode == 0, d.stderr
+    # worker.sh must never feed its own output back in as a task (it once did, as task "out")
+    assert not [x for x in api.call("GET", f"{BASE}/rooms/{room}/tasks", user="alice")[1]["tasks"] if x["text"].startswith("got:")]
     s, tasks = api.call("GET", f"{BASE}/rooms/{room}/tasks", user="alice")
     sub = [x for x in tasks["tasks"] if x["target_agent_id"] == ids["fleet-2"]]
     assert sub and sub[0]["text"] == "sub-task; $(touch /tmp/pwned2)" and sub[0]["requested_by"]["type"] == "agent"

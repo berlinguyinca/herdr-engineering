@@ -1012,15 +1012,28 @@ class CollabService:
                 actions = _actions(body.get("actions"))
             self._throttle("bulk:" + pr.id, 12, 3600.0, "bulk registration")
             self._agent_slots(pr.id, count)
+            if room_id is not None:                      # fail before creating anything we could not place
+                now = self._now()
+                waiting = sum(1 for r in map(self._requests.get, self._requests_by_room.get(room_id, ()))
+                              if r and r["open"] and now - r["created_epoch"] < REQUEST_TTL)
+                if waiting + count > MAX_PENDING_REQUESTS and self._member(self._rooms[room_id], pr.id)["role"] != "owner":
+                    raise CollabError(429, "too many pending agent requests for this room")
+            if "expires_at" in body:
+                self._grant_expiry(body)
             out = []
-            for name in self._agent_names(pr.id, prefix, count):
-                info = self.connect_agent(pr, {"harness_type": family, "name": name})
-                status = None
-                if room_id is not None:
-                    status = self.grant_agent(pr, room_id, {
-                        "agent_id": info["agent_id"], "actions": actions,
-                        **({"expires_at": body["expires_at"]} if "expires_at" in body else {})}, _bulk=True)["status"]
-                out.append({**info, "status": status})
+            try:
+                for name in self._agent_names(pr.id, prefix, count):
+                    info = self.connect_agent(pr, {"harness_type": family, "name": name})
+                    out.append({**info, "status": None})        # recorded first: credentials are never lost
+                    if room_id is not None:
+                        out[-1]["status"] = self.grant_agent(pr, room_id, {
+                            "agent_id": info["agent_id"], "actions": actions,
+                            **({"expires_at": body["expires_at"]} if "expires_at" in body else {})},
+                            _bulk=True)["status"]
+            except CollabError as exc:
+                if not out:
+                    raise
+                return {"agents": out, "error": exc.message}
         return {"agents": out}
 
     def approve_all_requests(self, pr: Principal, room_id: str, body: dict) -> dict:
@@ -1028,25 +1041,30 @@ class CollabService:
         agent asked for."""
         self._require_user(pr)
         ids_ = body.get("request_ids")
-        if ids_ is not None and (not isinstance(ids_, list) or len(ids_) > 200
-                                 or not all(isinstance(i, str) for i in ids_)):
-            raise CollabError(400, "invalid request_ids")
+        # Exactly the requests the owner was shown: "everything waiting" would also approve ones that
+        # arrived after they looked.
+        if (not isinstance(ids_, list) or not ids_ or len(ids_) > 200
+                or not all(isinstance(i, str) for i in ids_)):
+            raise CollabError(400, "request_ids is required: the requests you reviewed")
+        wanted_actions = _actions(body["actions"]) if "actions" in body else None
+        if "expires_at" in body:
+            self._grant_expiry(body)                       # reject a bad date before touching anything
         with self._lock:
             self._authorize(pr, room_id, "invite", "agent.request.decide")
             self._throttle("approveall:" + pr.id, 30, 600.0, "bulk approval")
-            wanted = list(ids_) if ids_ is not None else [
-                r["request_id"] for r in self.list_agent_requests(pr, room_id)["requests"]]
-            approved, skipped = 0, 0
-            for rid in wanted[:200]:
+            approved, skipped, reasons = 0, 0, []
+            for rid in ids_:
                 try:
                     self.decide_agent_request(pr, room_id, rid, {
                         "decision": "approve",
                         **({"expires_at": body["expires_at"]} if "expires_at" in body else {}),
-                        **({"actions": [a for a in body["actions"]]} if "actions" in body else {})})
+                        **({"actions": wanted_actions} if wanted_actions is not None else {})})
                     approved += 1
-                except CollabError:
+                except CollabError as exc:
                     skipped += 1
-        return {"approved": approved, "skipped": skipped}
+                    if exc.message not in reasons and len(reasons) < 5:
+                        reasons.append(exc.message)
+        return {"approved": approved, "skipped": skipped, "reasons": reasons}
 
     def list_my_agents(self, pr: Principal) -> dict:
         self._require_user(pr)
