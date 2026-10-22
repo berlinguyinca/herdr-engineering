@@ -411,3 +411,84 @@ def test_update_selected_pi_revision_is_required_on_each_host(tmp_path, monkeypa
     assert not result['ok']
     cmd = next(c for c in calls if 'ansible-playbook' in c)
     assert json.loads(cmd[cmd.index('-e') + 1])['pi_engineering_revision'] == REVISION
+
+
+def _optional_mac(repo, *, inline=False):
+    inv = repo / "ansible" / "inventory"
+    if inline:
+        (inv / "hosts.yml").write_text(
+            "all:\n  children:\n    herdr_fleet:\n      children:\n"
+            "        linux:\n          hosts:\n            fry: {}\n"
+            "        macos:\n          hosts:\n            mac:\n              herdr_fleet_optional: true\n")
+    else:
+        (inv / "host_vars").mkdir()
+        (inv / "host_vars" / "mac.yml").write_text("herdr_fleet_optional: true\n")
+
+
+def _fleet_with_mac(monkeypatch, repo, *, mac_up, status_hosts):
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    calls, limits = [], []
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == 'ansible':
+            return (0, 'SUCCESS', '') if mac_up else (4, '', 'unreachable')
+        return _success(cmd, **kwargs)
+    monkeypatch.setattr(fleet, '_run', run)
+    def status(**kwargs):
+        limits.append(kwargs.get('host'))
+        return {'rc': 0, 'hosts': [h for h in STATUS['hosts'] if h['host'] in status_hosts]}
+    monkeypatch.setattr(fleet, 'fleet_status', status)
+    return calls, limits
+
+
+def test_absent_optional_host_does_not_fail_the_update(tmp_path, monkeypatch):
+    for inline in (False, True):
+        repo = _fake_repo(tmp_path / str(inline))
+        _optional_mac(repo, inline=inline)
+        calls, limits = _fleet_with_mac(monkeypatch, repo, mac_up=False, status_hosts={'fry'})
+        result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+        assert result['ok'], result
+        assert result['absent_optional'] == ['mac']
+        assert result['steps']['revision_parity']['expected_hosts'] == ['fry']
+        sync = next(c for c in calls if c[0] == 'ansible-playbook' and any('fleet-sync.yml' in part for part in c))
+        assert sync[sync.index('-l') + 1] == 'fry'
+        assert limits == ['fry']
+
+
+def test_present_optional_host_is_updated_and_required(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    _optional_mac(repo)
+    calls, limits = _fleet_with_mac(monkeypatch, repo, mac_up=True, status_hosts={'fry', 'mac'})
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert result['ok'] and result['absent_optional'] == []
+    assert not any('-l' in c for c in calls if c[0] == 'ansible-playbook')
+    assert limits == [None]
+    # ...and if it answered the ping but is then missing from the status, that is a failure.
+    calls, limits = _fleet_with_mac(monkeypatch, repo, mac_up=True, status_hosts={'fry'})
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert not result['ok'] and result['steps']['revision_parity']['missing_hosts'] == ['mac']
+
+
+def test_absent_host_that_is_not_optional_still_fails(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    calls, _ = _fleet_with_mac(monkeypatch, repo, mac_up=False, status_hosts={'fry'})
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert not result['ok'] and result['steps']['revision_parity']['missing_hosts'] == ['mac']
+    assert not any(c[0] == 'ansible' for c in calls)
+
+
+def test_optional_absence_does_not_hide_another_hosts_failure(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    _optional_mac(repo)
+    _fleet_with_mac(monkeypatch, repo, mac_up=False, status_hosts=set())
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert not result['ok'] and result['steps']['revision_parity']['missing_hosts'] == ['fry']
+
+
+def test_naming_an_optional_host_explicitly_is_not_tolerated(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    _optional_mac(repo)
+    calls, _ = _fleet_with_mac(monkeypatch, repo, mac_up=False, status_hosts=set())
+    result = fleet.fleet_update(host='mac', pull_controller=False, reinstall_local=False)
+    assert not result['ok'] and result['absent_optional'] == []
+    assert not any(c[0] == 'ansible' for c in calls)

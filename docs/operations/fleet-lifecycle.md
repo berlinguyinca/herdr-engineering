@@ -207,6 +207,16 @@ scripts/fleet-auto-update.sh
 systemctl --user list-timers herdr-eng-fleet-update.timer
 ```
 
+### Optional hosts (laptops)
+
+A host that comes and goes can be marked optional in the private inventory, either
+inline (`mac: {herdr_fleet_optional: true}`) or in `host_vars/<host>.yml`
+(`herdr_fleet_optional: true`). A whole-fleet `fleet_update` pings each optional host
+first; one that does not answer is left out of that run's sync, status and revision
+parity, and is listed under `absent_optional` in the report. It is updated by the next
+run that finds it awake. Every other host stays required, an optional host that does
+answer must reach parity, and `--host <name>` for an optional host is never tolerated.
+
 The timer runs daily at 11:59 local time with no jitter and catches missed runs
 when the user service manager starts. It uses this checkout's virtualenv and
 private inventory; install it on the controller only, not every fleet host.
