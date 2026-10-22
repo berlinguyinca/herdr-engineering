@@ -27,4 +27,15 @@ Screenshots were directly inspected. Measured failure border: `rgb(220, 53, 69)`
 
 ## Operating boundaries
 
-This validation uses local servers and synthetic reports; production was not deployed or mutated. CI jobs must publish JUnit reports using `python3 -m herdr_engineering.ci_report_upload`; see `docs/ci-test-reports.md`. Reports require an operator key. Durable history requires the existing event sink; deployments without it explicitly display memory-only storage. Retained observations are bounded and do not claim complete provider history. Pipeline arrows require provider-reported dependencies.
+This validation uses local servers and synthetic reports; production was not deployed or mutated. CI jobs must publish JUnit reports using `python3 -m herdr_engineering.ci_report_upload`; see `docs/ci-test-reports.md`. Keyed deployments require an operator key; an intentionally open trusted-network deployment can use the explicit uploader `--allow-open` option. Durable history requires the existing event sink; deployments without it explicitly display memory-only storage. Retained observations are bounded and do not claim complete provider history. Pipeline arrows require provider-reported dependencies.
+
+## Deployment-candidate integration
+
+Rebased onto deployed main `88c4d5e`, preserving fleet-controlled CI actions and the newer session/collaboration interfaces. Independent code and architecture lanes approved the integrated candidate plus the following compatibility fixes:
+
+- Explicit trusted-open upload option matching the existing Tailnet deployment, without changing server authentication.
+- Bounded acknowledged-observation fingerprints independent of the smaller retained-history window; unchanged inventories above 2,000 runs do not repeatedly persist evicted observations.
+
+Fresh integrated verification: `python3 -m pytest -q --durations=8 -o faulthandler_timeout=90`: **2103 passed, 6 skipped, 1 xfailed** (607.68 s). `npm test`: **287 passed**. Uploader/monitor focused tests and Ruff pass. An earlier integrated run had one timing-sensitive pre-existing collaboration SSE quota test failure; five isolated reruns and the complete clean integrated run passed without changing that test or its assertions.
+
+Read-only live checks: Woodpecker authentication succeeds, 117 repositories and 452 recent runs are connected; the dashboard uses PostgreSQL. Standard `deploy.sh --dry-run` on bender validates central configuration, Compose and the enabled collaboration overlay. No schema changes are required.

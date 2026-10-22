@@ -1,4 +1,4 @@
-"""Publish one bounded JUnit report to HerdR using a private environment key."""
+"""Publish bounded JUnit reports using an operator key or explicit trusted-network access."""
 from __future__ import annotations
 
 import argparse
@@ -39,6 +39,8 @@ def _endpoint(value):
 def _parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('report', help='UTF-8 JUnit XML file (at most 1 MiB)')
+    parser.add_argument('--allow-open', action='store_true',
+                        help='Allow upload without a key to an intentionally open trusted-network server')
     parser.add_argument('--control-plane', default=os.environ.get('HERDR_ENGINEERING_CONTROL_PLANE_URL', ''))
     for option, environment in [('repository', 'CI_REPO'), ('run-number', 'CI_PIPELINE_NUMBER'),
                                 ('branch', 'CI_COMMIT_BRANCH'), ('revision', 'CI_COMMIT_SHA'),
@@ -52,7 +54,8 @@ def main(argv=None):
     try:
         endpoint = _endpoint(args.control_plane)
         key = os.environ.get('HERDR_ENGINEERING_API_KEY', '')
-        if not key or not key.isascii() or any(ord(character) < 33 or ord(character) > 126 for character in key):
+        if ((not key and not args.allow_open)
+                or (key and (not key.isascii() or any(ord(character) < 33 or ord(character) > 126 for character in key)))):
             raise ValueError('Set HERDR_ENGINEERING_API_KEY to an operator key')
         body = {}
         for name in ('repository', 'branch', 'revision'):
@@ -84,7 +87,8 @@ def main(argv=None):
         parse_junit(body['xml'])
         request = urllib.request.Request(endpoint, method='POST',
                                          data=json.dumps(body, ensure_ascii=False).encode('utf-8'),
-                                         headers={'X-API-Key': key, 'Content-Type': 'application/json'})
+                                         headers={'Content-Type': 'application/json',
+                                                  **({'X-API-Key': key} if key else {})})
         try:
             with urllib.request.build_opener(_NoRedirect).open(request, timeout=REQUEST_TIMEOUT) as response:
                 payload = response.read(MAX_RESPONSE_BYTES + 1)

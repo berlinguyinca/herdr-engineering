@@ -6,6 +6,8 @@ run off the request path. Progress measures repositories checked, not job work.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import threading
 import time
 from collections import Counter
@@ -62,6 +64,7 @@ class CIMonitor:
         self._last_success = None
         self._on_transition = on_transition
         self._on_observation = on_observation
+        self._observation_fingerprints = {}
         self._observed = {}
         self._baselined = set()
         self._view = {
@@ -168,13 +171,9 @@ class CIMonitor:
             limited = len(repos) >= self._repo_limit
             if limited:
                 errors['_inventory'] = f'Inventory limited to {self._repo_limit} repositories.'
-            if self._on_observation:
-                for rows in pipelines.values():
-                    for row in rows:
-                        try:
-                            self._on_observation(copy.deepcopy(row))
-                        except Exception:
-                            errors['_history'] = 'CI history could not be persisted. Retrying automatically.'
+            history_error = self._persist_observations(pipelines)
+            if history_error:
+                errors['_history'] = history_error
             self._transitions(pipelines, successful_repos)
             if not errors:
                 self._last_success = self._now()
@@ -186,6 +185,32 @@ class CIMonitor:
         except Exception as exc:
             status, message = _error(exc)
             self._update(available=False, status=status, stale=bool(self._last_success), error=message)
+
+    def _persist_observations(self, pipelines):
+        """Deduplicate the poll inventory independently of retained history.
+
+        Keep only acknowledged fingerprints in this snapshot, bounded by the
+        repository inventory and provider's per-repository recent-run limit.
+        Failed writes remain retryable even when a run itself is unchanged.
+        """
+        if self._on_observation is None:
+            return None
+        fingerprints, error = {}, None
+        for rows in pipelines.values():
+            for row in rows:
+                key = (str(row.get('provider_repo_id')), str(row.get('run_number')))
+                digest = hashlib.sha256(json.dumps(
+                    row, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                previous = fingerprints.get(key, self._observation_fingerprints.get(key))
+                if previous != digest:
+                    try:
+                        self._on_observation(copy.deepcopy(row))
+                    except Exception:
+                        error = 'CI history could not be persisted. Retrying automatically.'
+                        continue
+                fingerprints[key] = digest
+        self._observation_fingerprints = fingerprints
+        return error
 
     def _transitions(self, pipelines, successful_repos):
         failed = {'failure', 'error', 'failed', 'killed'}

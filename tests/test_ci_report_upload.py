@@ -131,3 +131,66 @@ def test_explicit_metadata_overrides_environment(upload_server, report_env):
     result = upload_server.repo.ci_reports()['reports'][0]
     assert (result['repository'], result['branch'], result['revision'], result['run_number'],
             result['provider_repo_id']) == ('org/other', 'dev', 'fedcba', 9, '42')
+
+
+@pytest.fixture
+def open_upload_server():
+    server = ControlPlaneServer(ControlPlaneRepo(), api_keys={}, allow_open=True)
+    threading.Thread(target=server.serve, daemon=True).start()
+    server.wait_until_ready()
+    yield server
+    server.shutdown()
+
+
+def test_trusted_open_upload_requires_explicit_flag(open_upload_server, report_env, monkeypatch, capsys):
+    monkeypatch.delenv('HERDR_ENGINEERING_API_KEY')
+    args = [str(report_env), '--control-plane', f'http://127.0.0.1:{open_upload_server.port}']
+    assert main(args) == 1
+    assert 'operator key' in capsys.readouterr().err
+    assert open_upload_server.repo.ci_reports()['reports'] == []
+    assert main([*args, '--allow-open']) == 0
+    assert open_upload_server.repo.ci_reports()['reports'][0]['summary']['total'] == 2
+
+
+def test_allow_open_does_not_bypass_keyed_server(upload_server, report_env, monkeypatch, capsys):
+    monkeypatch.delenv('HERDR_ENGINEERING_API_KEY')
+    args = [str(report_env), '--allow-open', '--control-plane', f'http://127.0.0.1:{upload_server.port}']
+    assert main(args) == 1
+    assert 'HTTP 401' in capsys.readouterr().err
+    monkeypatch.setenv('HERDR_ENGINEERING_API_KEY', 'private-operator')
+    assert main(args) == 0
+
+
+@pytest.mark.parametrize('key', [' ', 'private-key-☃', 'bad\nkey'])
+def test_allow_open_still_rejects_present_invalid_key(open_upload_server, report_env, monkeypatch, capsys, key):
+    monkeypatch.setenv('HERDR_ENGINEERING_API_KEY', key)
+    assert main([str(report_env), '--allow-open', '--control-plane',
+                 f'http://127.0.0.1:{open_upload_server.port}']) == 1
+    assert 'operator key' in capsys.readouterr().err
+    assert open_upload_server.repo.ci_reports()['reports'] == []
+
+
+def test_allow_open_omits_authentication_header(report_env, monkeypatch):
+    monkeypatch.delenv('HERDR_ENGINEERING_API_KEY')
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(dict(self.headers))
+            self.rfile.read(int(self.headers['Content-Length']))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"summary":{"total":2}}')
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        assert main([str(report_env), '--allow-open', '--control-plane',
+                     f'http://127.0.0.1:{server.server_port}']) == 0
+        assert not any(name.lower() in {'x-api-key', 'authorization'} for name in received[0])
+    finally:
+        server.shutdown()
+        server.server_close()

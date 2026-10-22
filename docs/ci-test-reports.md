@@ -16,6 +16,16 @@ python3 -m herdr_engineering.ci_report_upload junit.xml \
 
 `HERDR_ENGINEERING_API_KEY` must be a control-plane **operator** key. Viewer and ingest-only keys cannot upload reports. Use HTTPS for traffic outside a trusted local network. The command refuses redirects, embedded URL credentials, non-HTTP URLs, query strings and fragments. A failed upload exits nonzero and prints a bounded diagnostic without echoing credentials, XML, response bodies or destination URLs.
 
+For the intentionally open deployment on the trusted Tailnet (configured with empty API keys as described in [the deployment guide](../deploy/control-plane/README.md)), supply the explicit `--allow-open` flag and leave `HERDR_ENGINEERING_API_KEY` unset:
+
+```sh
+# Woodpecker supplies CI_REPO, CI_PIPELINE_NUMBER, CI_COMMIT_BRANCH and CI_COMMIT_SHA.
+unset HERDR_ENGINEERING_API_KEY
+python3 -m herdr_engineering.ci_report_upload junit.xml --allow-open --control-plane http://dev.lan
+```
+
+This sends no authentication header. Without `--allow-open`, a missing key remains an error. The flag does not bypass server authentication: a keyed server rejects uploads without a key. If a key is present, it is validated and sent normally even with the flag. Use this mode only for an intentionally open server reachable through the trusted Tailnet; it does not change the server’s global authentication configuration.
+
 The following Woodpecker variables supply defaults; explicit options override them:
 
 | Option | Environment default |
