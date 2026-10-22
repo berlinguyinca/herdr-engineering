@@ -112,7 +112,8 @@ Coworkers need only a browser and Claude Code; nobody joins the tailnet. All of 
 see `deploy/control-plane/fleet-config.example.yaml`); no env file is authored:
 
 - `control_plane.collab` - `cognito_pool`, `cognito_clients`, `cognito_group`, `cognito_web_client`,
-  `cognito_domain`, `public_url` (public identifiers only; `--collab-require-https` is fixed in
+  `cognito_domain`, `public_url`, `operator_user` (required: the Cognito username the
+  dashboard's no-sign-in collaboration acts as) and optional `operator_email` (public identifiers only; `--collab-require-https` is fixed in
   the compose file, not configurable). `deploy.sh` renders
   just this mapping to `~/.config/herdr-engineering/collab/collab-config.json` (0600,
   `herdr-eng fleet config render-collab`); `herdr-collab-public` mounts that directory (which holds
@@ -120,9 +121,12 @@ see `deploy/control-plane/fleet-config.example.yaml`); no env file is authored:
   so the central file itself can never be mounted there. Unknown `collab` keys are rejected.
 - `control_plane.compose` - optional `HERDR_COLLAB_CERT_DIR` (required once collab is on),
   `HERDR_COLLAB_CERT_UID` (owner of the certs, the data dir and the slice; default 1000) and
-  `HERDR_COLLAB_EDGE_BIND` (default `127.0.0.1:18444`).
-- `collab-sync.sh` reads the pool and group from the same slice (`--config`); `deploy.sh` installs it
-  and its 1-minute timer.
+  `HERDR_COLLAB_EDGE_BIND` (default `127.0.0.1:18444`) and `HERDR_COLLAB_OPERATOR_PORT` (default
+  9482; the operator listener, published on `HERDR_CP_WEB_BIND` only).
+- `collab-sync.sh` reads the pool and group from the same slice (`--config`) and copies the edge
+  certificate into `HERDR_COLLAB_CERT_DIR` (`--cert-dir`, passed by `deploy.sh`); `deploy.sh`
+  installs it, its 1-minute timer and the certificate renew timer. See
+  `deploy/control-plane/COLLAB.md`.
 
 Collab is optional: without the marker none of these keys are needed.
 

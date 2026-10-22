@@ -20,9 +20,10 @@
 #      mounted read-only at /etc/herdr/fleet/ (a single-file mount would keep the old
 #      inode after a rename-replace, so edits would never reach the server).
 #      With the collaboration marker it also renders control_plane.collab (and only
-#      that) to a stable 0600 slice, installs the edge nginx.conf at a stable path,
-#      refreshes the Cognito key/membership files and their timer (collab-sync.sh),
-#      and recreates collab-public + collab-edge
+#      that) to a stable 0600 slice, writes the edge nginx.conf in place at a stable
+#      path (reloading the edge when it changed), refreshes the Cognito key/membership
+#      files, the edge certificate and their timers (collab-sync.sh), and recreates
+#      collab-public + collab-edge
 #   5. waits for /api/v1/health to report the new commit. If compose up fails or
 #      the health check does not report it, rolls back: the commit recorded in the
 #      running image's receipt is checked out in a temporary worktree and ITS compose
@@ -138,6 +139,23 @@ fi
 chmod 700 "$LLM_DIR"
 export HERDR_LLM_SLICE_DIR="$LLM_DIR"
 
+# The edge bind-mounts this single nginx.conf, so it is written IN PLACE (same inode): a
+# rename-replace would leave the running container reading the old file. Sets EDGE_CONF_CHANGED.
+EDGE_CONF_CHANGED=0
+install_edge_conf() {   # <worktree>
+  local src="$1/deploy/control-plane/collab-edge/nginx.conf"
+  [ -e "$HERDR_COLLAB_EDGE_CONF" ] || install -m 0644 /dev/null "$HERDR_COLLAB_EDGE_CONF"
+  if ! cmp -s "$src" "$HERDR_COLLAB_EDGE_CONF"; then
+    cat "$src" > "$HERDR_COLLAB_EDGE_CONF"
+    EDGE_CONF_CHANGED=1
+  fi
+}
+reload_edge_if_changed() {
+  if [ "$EDGE_CONF_CHANGED" = 1 ] && docker inspect herdr-collab-edge >/dev/null 2>&1; then
+    docker exec herdr-collab-edge nginx -s reload >/dev/null
+  fi
+}
+
 if [ "$COLLAB" = 1 ]; then
   # collab-public gets ONLY control_plane.collab (public identifiers), never the central
   # file. Dry-run renders into the temp dir and touches nothing else on the host.
@@ -168,14 +186,19 @@ if [ "$COLLAB" = 1 ]; then
   else
     EDGE_DIR="$HOME/.config/herdr-engineering/collab-edge"
     mkdir -p "$EDGE_DIR"
-    install -m 0644 "$WORK/deploy/control-plane/collab-edge/nginx.conf" "$EDGE_DIR/nginx.conf"
     export HERDR_COLLAB_EDGE_CONF="$EDGE_DIR/nginx.conf"
+    install_edge_conf "$WORK"
     export HERDR_COLLAB_DATA_DIR="$HOME/.local/share/herdr-engineering/collab"
     mkdir -p "$HERDR_COLLAB_DATA_DIR"
     chmod 700 "$HERDR_COLLAB_DATA_DIR"
     export HERDR_COLLAB_SYNC_DIR="$HOME/.local/share/herdr-engineering/collab-sync"
-    # keys + membership files and the 1-minute timer; pool and group come from the slice
-    "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" --dir "$HERDR_COLLAB_SYNC_DIR"
+    # The edge mounts control_plane.compose.HERDR_COLLAB_CERT_DIR; collab-sync copies the
+    # certificate there (the timer has no environment, so it gets the path as a flag).
+    CERT_DIR_VALUE="$(grep -E '^HERDR_COLLAB_CERT_DIR=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"")"
+    # keys + membership files, the edge certificate, the 1-minute timer and the cert renew
+    # timer; pool and group come from the slice
+    "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" \
+      --dir "$HERDR_COLLAB_SYNC_DIR" --cert-dir "$CERT_DIR_VALUE"
   fi
 fi
 
@@ -306,6 +329,7 @@ healthy_commit() {
 
 forward() {
   compose_up "$WORK" "$TAG" "$SHA" >/dev/null || return 1
+  if [ "$COLLAB" = 1 ]; then reload_edge_if_changed || return 1; fi
   if [ "$COLLAB" = 1 ] && [ "$COLLAB_HASH" != "$PREV_COLLAB_HASH" ]; then
     # same image but a changed slice: collab-public reads it only at startup
     compose_run "$WORK" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate collab-public >/dev/null || return 1
@@ -338,8 +362,15 @@ fi
 echo "rolling back to $PREVIOUS_IMAGE with the compose files of commit $PREV_SHA" >&2
 MANUAL="$REPO/deploy/control-plane/deploy.sh --ref $PREV_COMMIT --no-fetch --fleet-config $CENTRAL"
 PREV_WORK="$ENV_DIR/rollback-worktree"
+# the previous commit's edge nginx.conf too (it routes to that commit's collab-public)
+rollback_edge() {
+  [ "$COLLAB" = 1 ] || return 0
+  EDGE_CONF_CHANGED=0
+  install_edge_conf "$PREV_WORK" && reload_edge_if_changed
+}
 if git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
     && compose_up "$PREV_WORK" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+    && rollback_edge \
     && healthy_commit "$PREV_SHA"; then
   echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy; the deploy of $SHA FAILED" >&2
   exit 1

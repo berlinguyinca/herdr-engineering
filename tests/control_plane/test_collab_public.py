@@ -19,7 +19,7 @@ H = {"X-Forwarded-Proto": "https"}
 def stack(acknowledged_sink, tmp_path):
     web = tmp_path / "web"
     web.mkdir()
-    for n in ("collab.html", "collab-app.js", "collab-view.js", "app.js", "index.html"):
+    for n in ("collab.html", "collab-app.js", "collab.css", "collab-view.js", "app.js", "index.html"):
         (web / n).write_text(f"// {n}")
     svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in TOKENS.items()}),
                         sink=acknowledged_sink, public_config={"client_id": "c"})
@@ -96,10 +96,11 @@ def test_connect_agent_flow_and_scoping(stack):
     assert agent["credential"].startswith("hca_") and agent["expires_at"] > stack.svc._now() + 20 * 86400
     # nothing until the owner grants it into a room
     s, out = rpc(stack.pub, "tools/call", {"name": "rooms_list", "arguments": {}}, agent=agent)
-    assert json.loads(out["result"]["content"][0]["text"])["rooms"] == []
+    assert out["result"]["content"][0]["text"].startswith(UNTRUSTED)   # room names are user text too
+    assert json.loads(out["result"]["content"][0]["text"].split("\n\n", 1)[1])["rooms"] == []
     assert grant(api, room, agent)[0] == 201
     s, out = rpc(stack.pub, "tools/call", {"name": "rooms_list", "arguments": {}}, agent=agent)
-    assert [r["room_id"] for r in json.loads(out["result"]["content"][0]["text"])["rooms"]] == [room]
+    assert [r["room_id"] for r in json.loads(out["result"]["content"][0]["text"].split("\n\n", 1)[1])["rooms"]] == [room]
     s, mine = api.call("GET", f"{BASE}/agents", user="alice")
     assert mine["agents"][0]["rooms"][0]["room_id"] == room
     assert api.call("GET", f"{BASE}/agents", user="bob")[1]["agents"] == []

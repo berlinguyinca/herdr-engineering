@@ -37,6 +37,9 @@ sections:
         cognito_web_client: "REDACTED"               # browser page app client (Hosted UI, PKCE)
         cognito_domain: "https://REDACTED.auth.us-west-2.amazoncognito.com"
         public_url: "https://collab.example.test/"   # must equal the web client's callback URL
+        operator_user: "REDACTED"                    # Cognito username the dashboard's no-sign-in
+                                                     # collaboration acts as (required)
+        # operator_email: "owner@example.test"       # optional, shown for the operator
       # Variables docker compose itself substitutes; deploy.sh renders exactly this
       # mapping into a transient 0600 env file. The first eight keys are required.
       compose:
@@ -49,9 +52,11 @@ sections:
         HERDR_CP_PG_PORT: "5432"              # loopback host port of postgres
         GATEWAY_TAILNET_IP: "127.0.0.1"       # `tailscale ip -4`; 127.0.0.1 = loopback only
         # Optional, collab only (needed when the collab marker exists):
-        # HERDR_COLLAB_CERT_DIR: "/path/to/acme"     # certbot dir with live/<host>/ (required for collab)
+        # HERDR_COLLAB_CERT_DIR: "/path/to/collab-edge-certs"  # collab-sync.sh copies ONLY the edge's
+        #                                    # fullchain.pem + privkey.pem here (required for collab)
         # HERDR_COLLAB_CERT_UID: "1000"              # owner of the certs, data dir and collab slice
         # HERDR_COLLAB_EDGE_BIND: "127.0.0.1:18444"  # published address of the TLS edge
+        # HERDR_COLLAB_OPERATOR_PORT: "9482"         # operator listener on HERDR_CP_WEB_BIND (tailnet)
 
   llm:
     roles: [builder]

@@ -51,6 +51,15 @@ otherwise. No step prints a secret.
    directory is now mounted whole into collab-public, and `deploy.sh` refuses to run
    if it holds anything else.
 
+   With collab enabled the central file also needs, by hand (`init --from-env` does not
+   create a `collab` block): `control_plane.collab` with the Cognito ids and
+   `operator_user` (the Cognito username the dashboard's no-sign-in collaboration acts as;
+   the old env file's `HERDR_COLLAB_OPERATOR_USER`, optional `operator_email`), and
+   `control_plane.compose.HERDR_COLLAB_CERT_DIR` set to the directory collab-sync copies the
+   edge certificate into (main's default was
+   `~/.local/share/herdr-engineering/collab-edge-certs`). `HERDR_COLLAB_OPERATOR_PORT`
+   (default 9482) is optional.
+
    ```bash
    deploy/control-plane/deploy.sh --dry-run
    ```

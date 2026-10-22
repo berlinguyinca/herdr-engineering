@@ -123,7 +123,7 @@ class DevServiceRegistry:
         self._ttl = lease_ttl_seconds
         self._leases: dict[str, DevServiceLease] = {}
         self._lock = threading.RLock()
-        self._loaded_mtime: float | None = None
+        self._loaded_mtime: tuple[int, int, int] | None = None   # store signature, see _sig()
         self._dirty = False
         self._load()
 
@@ -158,12 +158,20 @@ class DevServiceRegistry:
         """
         return self._lo, self._hi
 
+    def _sig(self) -> tuple[int, int, int]:
+        """Identity of the store file's current contents. Every write replaces the file
+        (new inode), and mtime alone is too coarse: two writers within a kernel tick get
+        the same st_mtime, which made a persist skip the cross-process merge and drop
+        the other process's lease."""
+        st = self._path.stat()
+        return st.st_ino, st.st_mtime_ns, st.st_size
+
     def _load(self) -> None:
         if not self._path.exists():
             self._loaded_mtime = None
             return
         try:
-            self._loaded_mtime = self._path.stat().st_mtime
+            self._loaded_mtime = self._sig()
             data = json.loads(self._path.read_text())
         except Exception:
             return
@@ -179,7 +187,7 @@ class DevServiceRegistry:
         (e.g. a register served by an old process that was mid-shutdown).
         """
         try:
-            mtime = self._path.stat().st_mtime
+            mtime = self._sig()
         except OSError:
             return False
         if mtime == self._loaded_mtime:
@@ -227,7 +235,7 @@ class DevServiceRegistry:
             # one process's persist can no longer clobber a lease another
             # process just wrote (the whole-record rewrite race).
             try:
-                mtime = self._path.stat().st_mtime
+                mtime = self._sig()
             except OSError:
                 mtime = None
             if (mtime is not None and self._loaded_mtime is not None
@@ -251,7 +259,7 @@ class DevServiceRegistry:
             tmp.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True))
             os.replace(tmp, self._path)
             try:
-                self._loaded_mtime = self._path.stat().st_mtime
+                self._loaded_mtime = self._sig()
             except OSError:
                 pass
         except OSError:

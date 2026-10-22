@@ -5,18 +5,35 @@
 # Runs on the host with the operator's AWS credentials; the container only sees the output.
 # The pool and group come from the central fleet config (control_plane.collab), via the
 # slice deploy.sh renders with `herdr-eng fleet config render-collab`.
-# Usage: collab-sync.sh once|install [--config SLICE] [--dir SYNC_DIR]
+# It also hands the edge its TLS certificate (certs) and, on install, a renew timer for that
+# one certbot lineage. Paths are flags (no environment): deploy.sh passes --cert-dir from
+# control_plane.compose.HERDR_COLLAB_CERT_DIR (the directory collab-edge mounts), and install
+# writes every flag into the units' ExecStart.
+# Usage: collab-sync.sh once|install|renew-check [--config SLICE] [--dir SYNC_DIR]
+#          [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]
 set -euo pipefail
+USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]"
 ACTION="${1:-once}"; [ $# -gt 0 ] && shift
 CONFIG="$HOME/.config/herdr-engineering/collab/collab-config.json"
 DIR="$HOME/.local/share/herdr-engineering/collab-sync"
+CERT_DIR="$HOME/.local/share/herdr-engineering/collab-edge-certs"
+CERT_NAME="localdev.mcp.metabolomics.us"
+ACME="$HOME/.local/share/inferweave/bender-failover/acme"
+CERT_SRC=""; CERTBOT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config needs a value}"; shift 2 ;;
     --dir) DIR="${2:?--dir needs a value}"; shift 2 ;;
-    *) echo "usage: $0 once|install [--config SLICE] [--dir SYNC_DIR]" >&2; exit 2 ;;
+    --cert-dir) CERT_DIR="${2:?--cert-dir needs a value}"; shift 2 ;;
+    --cert-src) CERT_SRC="${2:?--cert-src needs a value}"; shift 2 ;;
+    --acme-dir) ACME="${2:?--acme-dir needs a value}"; shift 2 ;;
+    --certbot) CERTBOT="${2:?--certbot needs a value}"; shift 2 ;;
+    --cert-name) CERT_NAME="${2:?--cert-name needs a value}"; shift 2 ;;
+    *) echo "$USAGE" >&2; exit 2 ;;
   esac
 done
+CERT_SRC="${CERT_SRC:-$ACME/config/live/$CERT_NAME}"
+CERTBOT="${CERTBOT:-$ACME/../acme-venv/bin/certbot}"
 read -r POOL GROUP < <(python3 - "$CONFIG" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["collab"]
@@ -39,6 +56,59 @@ json.dump({"updated": time.time(), "groups": {sys.argv[3]: users}}, open(sys.arg
 PY
   chmod 644 "$tmp"/*.json
   mv -f "$tmp/jwks.json" "$DIR/jwks.json"; mv -f "$tmp/members.json" "$DIR/members.json"   # atomic per file
+  certs
+}
+
+# Hand the edge ONLY its own certificate. Mounting certbot's whole config dir would give the
+# internet-facing container every lineage's private key and the ACME account key.
+certs() {
+  local src="$CERT_SRC" dst="$CERT_DIR" changed=0 f
+  mkdir -p "$dst"; chmod 700 "$dst"
+  for f in fullchain.pem privkey.pem; do
+    if ! cmp -s "$src/$f" "$dst/$f"; then
+      install -m 0600 "$src/$f" "$dst/$f.new"; mv -f "$dst/$f.new" "$dst/$f"; changed=1
+    fi
+  done
+  # renewal starts 30 days out; still unrenewed at 14 days means it is failing: say so in the journal
+  openssl x509 -in "$dst/fullchain.pem" -noout -checkend $((14 * 86400)) >/dev/null \
+    || echo "WARNING: collab edge certificate expires within 14 days; check herdr-collab-cert-renew" >&2
+  if [ "$changed" = 1 ] && docker inspect herdr-collab-edge >/dev/null 2>&1; then
+    docker exec herdr-collab-edge nginx -s reload || true
+  fi
+}
+
+# Renews ONLY this lineage. The old bender-failover renew timer was stopped when that TLS front was
+# retired, and its deploy hook execs into that stopped container, so nothing renewed this cert.
+# No deploy hook is needed: the minute timer above copies a renewed cert to the edge and reloads it.
+install_renew_timer() {
+  local u="$HOME/.config/systemd/user"
+  [ -x "$CERTBOT" ] || { echo "certbot not found at $CERTBOT (pass --certbot or --acme-dir)" >&2; return 1; }
+  cat > "$u/herdr-collab-cert-renew.service" <<UNIT
+[Unit]
+Description=Renew the collab edge TLS certificate
+After=network-online.target
+[Service]
+Type=oneshot
+UMask=0077
+TimeoutStartSec=15min
+ExecStart=$CERTBOT renew --non-interactive --cert-name $CERT_NAME --config-dir $ACME/config --work-dir $ACME/work --logs-dir $ACME/logs
+UNIT
+  cat > "$u/herdr-collab-cert-renew.timer" <<UNIT
+[Unit]
+Description=Check collab edge certificate renewal twice daily
+[Timer]
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now herdr-collab-cert-renew.timer
+}
+
+certbot_dry_run() {   # proves the renewal path end to end against Let's Encrypt staging
+  "$CERTBOT" renew --dry-run --non-interactive --cert-name "$CERT_NAME" --config-dir "$ACME/config" --work-dir "$ACME/work" --logs-dir "$ACME/logs"
 }
 
 install_timer() {
@@ -49,7 +119,7 @@ install_timer() {
 Description=Refresh collab Cognito membership and keys
 [Service]
 Type=oneshot
-ExecStart=$bin once --config $CONFIG --dir $DIR
+ExecStart=$bin once --config $CONFIG --dir $DIR --cert-dir $CERT_DIR --cert-src $CERT_SRC
 UNIT
   cat > "$u/herdr-collab-sync.timer" <<UNIT
 [Unit]
@@ -63,6 +133,7 @@ WantedBy=timers.target
 UNIT
   systemctl --user daemon-reload
   systemctl --user enable --now herdr-collab-sync.timer
+  install_renew_timer
 }
 
-case "$ACTION" in once) once ;; install) once; install_timer ;; *) echo "usage: $0 once|install" >&2; exit 2 ;; esac
+case "$ACTION" in once) once ;; install) once; install_timer ;; renew-check) certbot_dry_run ;; *) echo "$USAGE" >&2; exit 2 ;; esac

@@ -1,6 +1,7 @@
 """Stable entity IDs (identity is stable, location is dynamic)."""
 from __future__ import annotations
 
+import secrets
 import time
 from typing import Final
 
@@ -14,8 +15,8 @@ _KINDS: Final[frozenset[str]] = frozenset({
 _CROCKFORD: Final[str] = "0123456789abcdefghjkmnpqrstvwxyz"
 _SUFFIX_LEN = 26
 
-# 48-bit millisecond timestamp occupies the high bits; a per-process counter
-# occupies the low 80 bits. The counter guarantees strict monotonicity even
+# 48-bit millisecond timestamp occupies the high bits, then a per-process counter, then
+# random bits. The counter guarantees strict monotonicity even
 # for two ids created within the same millisecond, so string comparison (which
 # is lexicographic) matches creation order. Identity is stable; the counter
 # only affects sortability, not the entity's identity.
@@ -26,8 +27,10 @@ def new_id(kind: str) -> str:
     global _counter
     if kind not in _KINDS:
         raise ValueError(f"unknown entity kind: {kind!r}")
-    _counter += 1
-    value = (int(time.time() * 1000) << 80) | _counter
+    _counter = (_counter + 1) & 0xFFFFFFFF
+    # ms timestamp | 32-bit counter (strict order within a millisecond) | 48 random bits, so
+    # an observed id does not reveal the neighbouring ones.
+    value = (int(time.time() * 1000) << 80) | (_counter << 48) | secrets.randbits(48)
     suffix = _encode(value, _SUFFIX_LEN)
     return f"{kind}_{suffix}"
 

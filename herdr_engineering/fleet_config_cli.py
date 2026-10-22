@@ -181,7 +181,7 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
 # Public identifiers only: the slice is handed to the internet-facing collab container,
 # so an unknown key (which could be a secret) is refused rather than passed along.
 COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
-                         "cognito_domain", "public_url"})
+                         "cognito_domain", "public_url", "operator_user", "operator_email"})
 
 
 def collab_values(cfg: FleetConfig) -> dict:
@@ -201,6 +201,12 @@ def collab_values(cfg: FleetConfig) -> dict:
     pool = collab.get("cognito_pool")
     if not isinstance(pool, str) or not pool:
         raise FleetConfigError("control_plane.collab.cognito_pool is required")
+    # collab-public always runs the local owner's no-sign-in listener, which acts as this
+    # Cognito username; refusing here beats a container that crashes at startup.
+    user = collab.get("operator_user")
+    if not isinstance(user, str) or not user:
+        raise FleetConfigError("control_plane.collab.operator_user is required (the Cognito username "
+                               "the dashboard's no-sign-in collaboration acts as)")
     return dict(collab)
 
 
@@ -491,7 +497,7 @@ ENV_IMPORT_FILE_MAP = {
 }
 # carried into control_plane.compose as-is (docker-level settings)
 ENV_COMPOSE_PASSTHROUGH = ("HERDR_LLM_PROXY_PORT", "HERDR_COLLAB_CERT_DIR", "HERDR_COLLAB_CERT_UID",
-                           "HERDR_COLLAB_EDGE_BIND")
+                           "HERDR_COLLAB_EDGE_BIND", "HERDR_COLLAB_OPERATOR_PORT")
 
 
 def parse_env_file(text: str) -> tuple[dict[str, str], list[int]]:

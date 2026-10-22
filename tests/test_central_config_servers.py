@@ -152,7 +152,10 @@ def _run_web(monkeypatch, path, **overrides):
                               collab_public_port=None, collab_public_host=None,
                               collab_log_file=None, collab_sync_dir=None,
                               collab_cognito_web_client=None, collab_cognito_domain=None,
-                              collab_public_url=None)
+                              collab_public_url=None, collab_operator_port=None,
+                              collab_operator_user=None, collab_operator_email=None,
+                              collab_operator_host=[], collab_operator_url=None,
+                              collab_dashboard_host=[])
     for k, v in overrides.items():
         setattr(args, k, v)
     assert cli._cmd_cp_web(args) == 0
@@ -186,7 +189,8 @@ def test_web_without_file_has_no_durable_config_even_with_env(tmp_path, monkeypa
 
 COLLAB = {"cognito_pool": "us-west-2_TESTPOOL", "cognito_clients": ["client-a"],
           "cognito_group": "team.test", "cognito_web_client": "web-client",
-          "cognito_domain": "https://pool.auth.example.test", "public_url": "https://collab.example.test/"}
+          "cognito_domain": "https://pool.auth.example.test", "public_url": "https://collab.example.test/",
+          "operator_user": "owner-test", "operator_email": "owner@example.test"}
 
 
 def _collab_slice(tmp_path, collab=None):
@@ -262,6 +266,26 @@ def test_collab_only_flags_override_the_slice(tmp_path, monkeypatch, old_env, ca
     _run_web(monkeypatch, out, collab_cognito_pool="us-west-2_FLAG", collab_cognito_group="flag.group",
              **_collab_only_args(tmp_path))
     assert seen_auth["pool_id"] == "us-west-2_FLAG" and seen_auth["required_group"] == "flag.group"
+
+
+def test_collab_only_reads_the_operator_user_from_the_slice(tmp_path, monkeypatch, old_env, capsys):
+    # #111 (second origin/main merge): the operator identity is configuration, so it comes from
+    # control_plane.collab via the slice, not from HERDR_COLLAB_OPERATOR_USER in an env file.
+    import herdr_engineering.control_plane.collab_cognito as cc
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    monkeypatch.setenv("HERDR_COLLAB_OPERATOR_USER", "env-user")
+    _, out = _collab_slice(tmp_path)
+    seen = _run_web(monkeypatch, out, collab_operator_port=0,
+                    collab_operator_host=["100.64.0.1:9482"], **_collab_only_args(tmp_path))
+    kw = seen["server_kw"]
+    assert kw["operator_user"] == "owner-test" and kw["operator_email"] == "owner@example.test"
+    assert kw["operator_hosts"] == ["100.64.0.1:9482"]
+
+
+def test_render_collab_requires_the_operator_user(tmp_path):
+    central = make_file(tmp_path, collab={k: v for k, v in COLLAB.items() if k != "operator_user"})
+    with pytest.raises(fcc.FleetConfigError, match="operator_user is required"):
+        fcc.render_collab(fcc.load_fleet_config(central), tmp_path / "x.json")
 
 
 def test_collab_only_refuses_the_central_file(tmp_path, monkeypatch, old_env, capsys):

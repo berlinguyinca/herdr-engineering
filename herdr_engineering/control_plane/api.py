@@ -19,6 +19,8 @@ import secrets
 import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -60,6 +62,30 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
     request_queue_size = 256
 
 
+
+def _dashboard_host_ok(host_header, extra_hosts):
+    """A Host an attacker cannot make point here: an IP literal, localhost, or a configured name.
+    DNS rebinding needs a DNS name, so a bare name is refused unless the operator listed it."""
+    import ipaddress
+    host = host_header.strip().lower()
+    if host in extra_hosts:
+        return True
+    name = host[1:host.index("]")] if host.startswith("[") and "]" in host else host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if name == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return True
+
+def _content_length(raw):
+    """Non-negative int, or None when the header is malformed (never raises)."""
+    if raw is None or raw == "":
+        return 0
+    return int(raw) if raw.isascii() and raw.isdigit() and len(raw) <= 9 else None
+
+
 class _RateLimiter:
     """Tiny in-memory per-client sliding-window limiter (best-effort).
 
@@ -82,6 +108,8 @@ class _RateLimiter:
                 self._hits[key] = hits
                 return False
             hits.append(now)
+            if len(self._hits) > 20000:   # bounded: forget keys with no recent hits
+                self._hits = {k: v for k, v in self._hits.items() if v and now - v[-1] < self.window}
             self._hits[key] = hits
             return True
 
@@ -97,7 +125,9 @@ class ControlPlaneServer:
                  rustfs=None, dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
                  collab_require_https=False, fleet_config=None, ci_actions=False,
-                 public_port=None, public_host=None, collab_only=False):
+                 public_port=None, public_host=None, collab_only=False,
+                 operator_port=None, operator_user=None, operator_email=None,
+                 operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=()):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -134,6 +164,7 @@ class ControlPlaneServer:
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.
         self._ingest_limiter = _RateLimiter(max_requests=6000)
+        self._stream_limiter = _RateLimiter(max_requests=120)
         # Fail-closed (Spec §104): never default a blank/missing role to
         # "operator". Keep roles verbatim after strip; empty/None/unknown
         # roles are treated as "viewer" (read-only) by `_require`.
@@ -169,6 +200,16 @@ class ControlPlaneServer:
         if public_port is not None and collab is None:
             raise ValueError("a public collaboration listener needs collab enabled")
         self.collab_only = collab_only
+        if operator_port is not None and not (collab_only and operator_user and operator_hosts):
+            raise ValueError("the operator listener needs collab-only mode, a user and allowed hosts")
+        self.operator_port, self.operator_user = operator_port, operator_user
+        self.operator_email = operator_email
+        self.operator_hosts = frozenset(h.lower() for h in operator_hosts)
+        self._operator_httpd = None
+        # Dashboard side: forward /api/v1/collab/* to the operator listener of the isolated
+        # collab service, so the local owner needs no sign-in.
+        self.collab_operator_url = collab_operator_url.rstrip("/") if collab_operator_url else None
+        self.collab_dashboard_hosts = frozenset(h.lower() for h in collab_dashboard_hosts)
         if collab_only and public_port is None:
             raise ValueError("collab-only mode needs the public collaboration port")
         self.public_port = public_port
@@ -244,6 +285,11 @@ class ControlPlaneServer:
             self._httpd = _DaemonThreadingServer(
                 (self.public_host, self.public_port), _make_handler(self, public=True))
             self.public_port = self.port = self._httpd.server_address[1]
+            if self.operator_port is not None:
+                self._operator_httpd = _DaemonThreadingServer(
+                    (self.public_host, self.operator_port), _make_handler(self, operator=True))
+                self.operator_port = self._operator_httpd.server_address[1]
+                threading.Thread(target=self._operator_httpd.serve_forever, daemon=True).start()
             self._ready.set()
             self._httpd.serve_forever()
             return
@@ -274,6 +320,9 @@ class ControlPlaneServer:
     def shutdown(self):
         self.ci_monitor.close()
         self.github_monitor.close()
+        if self._operator_httpd:
+            self._operator_httpd.shutdown()
+            self._operator_httpd.server_close()
         if self._public_httpd:
             self._public_httpd.shutdown()
             self._public_httpd.server_close()
@@ -285,6 +334,7 @@ class ControlPlaneServer:
 _PUBLIC_STATIC = {
     "/": ("collab.html", "text/html; charset=utf-8"),
     "/collab-app.js": ("collab-app.js", "text/javascript"),
+    "/collab.css": ("collab.css", "text/css"),
     "/collab-view.js": ("collab-view.js", "text/javascript"),
     "/herdr-web-client/collab.js": ("herdr-web-client/collab.js", "text/javascript"),
     "/herdr-web-components/util.js": ("herdr-web-components/util.js", "text/javascript"),
@@ -296,10 +346,13 @@ _PUBLIC_CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-
                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
-def _make_handler(server, public=False):
+def _make_handler(server, public=False, operator=False):
     class _Handler(BaseHTTPRequestHandler):
         server_version = "HerdrControlPlane/0.1"
         protocol_version = "HTTP/1.1"
+        # Public listener only: a client that stalls mid-request cannot hold a thread for ever.
+        # (The operator listener is tailnet-only and keeps its blocking behaviour.)
+        timeout = 30 if public else None
 
         def log_message(self, fmt, *args):  # keep test output clean
             pass
@@ -375,8 +428,18 @@ def _make_handler(server, public=False):
             """Everything not on the allow-list is a plain 404: the legacy API, the
             dashboard and its static files do not exist on this listener."""
             path = self.path.split("?")[0]
-            if self._is_collab_path() or path == "/mcp":
-                return self._collab() if path != "/mcp" else self._mcp()
+            # Request framing must be unambiguous: the edge and this server must agree where a
+            # request ends, or a pipelined second request could be smuggled behind the first.
+            cl = self.headers.get_all("Content-Length") or []
+            if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                    or (self.command == "GET" and cl and cl[0].strip() not in ("", "0"))):
+                return self._deny(400, "ambiguous request framing")
+            if path == "/.well-known/agent-card.json" and self.command == "GET":
+                return self._agent_card()
+            if self._is_collab_path() or path in ("/mcp", "/a2a"):
+                if path == "/mcp":
+                    return self._mcp()
+                return self._a2a() if path == "/a2a" else self._collab()
             if self.command == "GET" and path in _PUBLIC_STATIC:
                 name, ctype = _PUBLIC_STATIC[path]
                 target = (server.web_root / name)
@@ -396,8 +459,31 @@ def _make_handler(server, public=False):
                 return None
             return self._deny(404, "not found")
 
+        def _agent_card(self):
+            from . import collab_a2a
+            if server.collab is None:
+                return self._deny(404, "not found")
+            base = (server.collab.public_config or {}).get("public_url") or ""
+            if not base:
+                return self._deny(404, "not found")
+            self.send_response(200)
+            data = json.dumps(collab_a2a.agent_card(base)).encode()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _a2a(self):
+            from . import collab_a2a
+            return self._jsonrpc(collab_a2a.handle, "A2A")
+
         def _mcp(self):
             from . import collab_mcp
+            return self._jsonrpc(collab_mcp.handle, "MCP")
+
+        def _jsonrpc(self, handle, label):
             from .collab import MAX_BODY
             if server.collab is None:
                 return self._deny(404, "not found")
@@ -409,19 +495,19 @@ def _make_handler(server, public=False):
                     and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
                 return self._deny(400, "collaboration is only served over https")
             if self.headers.get("Origin"):
-                return self._deny(403, "browser origins may not call the MCP endpoint")
+                return self._deny(403, f"browser origins may not call the {label} endpoint")
             if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                 return self._deny(415, "application/json required")
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or length > MAX_BODY:
+            length = _content_length(self.headers.get("Content-Length"))
+            if length is None or length <= 0 or length > MAX_BODY:
                 return self._deny(413, "request body size not allowed")
             try:
                 message = json.loads(self.rfile.read(length))
-            except ValueError:
+            except (ValueError, RecursionError):
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32700, "message": "parse error"}}, 400)
             try:
-                status, payload = collab_mcp.handle(
+                status, payload = handle(
                     server.collab, message, self.headers.get("Authorization", ""),
                     self.headers.get("X-Herdr-Device"))
             except Exception:
@@ -435,6 +521,8 @@ def _make_handler(server, public=False):
             return self._json(payload, status)
 
         def do_GET(self):
+            if operator:
+                return self._operator()
             if public:
                 return self._public()
             if self._is_collab_path():
@@ -454,6 +542,8 @@ def _make_handler(server, public=False):
             return self._serve_static()
 
         def do_POST(self):
+            if operator:
+                return self._operator()
             if public:
                 return self._public()
             if self._is_collab_path():
@@ -525,18 +615,73 @@ def _make_handler(server, public=False):
             path = self.path.split("?")[0]
             return path == "/api/v1/collab" or path.startswith("/api/v1/collab/")
 
-        def _collab(self):
+        def _operator(self):
+            """Tailnet-only listener for the local owner: collaboration API only, no sign-in.
+
+            Open by design (the tailnet is the trust boundary, as for the dashboard), so it
+            refuses DNS-rebinding (Host allowlist), cross-site writes (Origin check and
+            application/json in _collab) and every path outside /api/v1/collab."""
+            cl = self.headers.get_all("Content-Length") or []
+            if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                    or (self.command == "GET" and cl and cl[0].strip() not in ("", "0"))):
+                return self._deny(400, "ambiguous request framing")
+            if (self.headers.get("Host", "").lower() not in server.operator_hosts
+                    or not self._is_collab_path()):
+                return self._deny(404, "not found")
+            return self._collab(operator=True)
+
+        def _collab_proxy(self):
+            """Dashboard -> collab service operator listener (same user, no sign-in)."""
+            err = self._require("operator")
+            if err:
+                return err
+            # This path acts as the owner without any credential, so it needs the same browser
+            # defences as the operator listener: no DNS-rebound names, no cross-site writes.
+            if not _dashboard_host_ok(self.headers.get("Host", ""), server.collab_dashboard_hosts):
+                return self._deny(404, "not found")
+            if self.command == "POST":
+                origin = self.headers.get("Origin")
+                if origin and (urlsplit(origin).netloc != self.headers.get("Host")
+                               or urlsplit(origin).scheme not in {"http", "https"}):
+                    return self._deny(403, "cross-origin mutation refused")
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                    return self._deny(415, "mutations require application/json")
+            from .collab import MAX_BODY
+            length = _content_length(self.headers.get("Content-Length"))
+            if self.command == "POST" and (length is None or length > MAX_BODY):
+                return self._deny(413, "request body too large")
+            data = self.rfile.read(length) if self.command == "POST" and length else None
+            req = urllib.request.Request(
+                server.collab_operator_url + self.path, data=data, method=self.command,
+                headers={"Content-Type": "application/json"} if data is not None or self.command == "POST" else {})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:   # noqa: S310 (operator-configured URL)
+                    status, payload = resp.status, resp.read(2_000_000)
+            except urllib.error.HTTPError as exc:
+                status, payload = exc.code, exc.read(2_000_000)
+            except Exception:
+                return self._json({"error": "collaboration service unavailable"}, 502)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _collab(self, operator=False):
             """HCN routes bypass the legacy X-API-Key gate on purpose: legacy keys are
             shared secrets with no identity, so they grant nothing here. Authentication
             is per-user / per-agent (collab.authenticate)."""
             service = server.collab
             if service is None:
+                if server.collab_operator_url and not operator and not public:
+                    return self._collab_proxy()
                 return self._deny(404, "not found")
             if self._rate_limit(self._proxied_client()):
                 return None
             # On a shared plain-HTTP listener, refuse collaboration unless the request
             # came through the TLS-terminating proxy (`tailscale serve` sets this header).
-            if (server.collab_require_https
+            if (server.collab_require_https and not operator
                     and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
                 return self._deny(400, "collaboration is only served over https")
             if self.command == "POST":
@@ -549,23 +694,27 @@ def _make_handler(server, public=False):
             body = {}
             if self.command == "POST":
                 from .collab import MAX_BODY
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > MAX_BODY:
+                length = _content_length(self.headers.get("Content-Length"))
+                if length is None or length > MAX_BODY:
                     return self._deny(413, "request body too large")
                 if length:
                     try:
                         body = json.loads(self.rfile.read(length))
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         return self._json({"error": "invalid JSON body"}, 400)
                     if not isinstance(body, dict):
                         return self._json({"error": "JSON object required"}, 400)
             split = urlsplit(self.path)
             parts = [unquote(seg) for seg in split.path.split("/")[4:] if seg]
             query = {k: v[0] for k, v in parse_qs(split.query).items()}
+            if operator and self.command == "GET" and parts == ["config"]:
+                return self._json({**service.public_config, "operator": {
+                    "user_id": server.operator_user, "email": server.operator_email}}, 200)
             try:
                 result = service.dispatch(self.command, parts, query, body,
                                           self.headers.get("Authorization", ""),
-                                          self.headers.get("X-Herdr-Device"))
+                                          self.headers.get("X-Herdr-Device"),
+                                          operator=server.operator_user if operator else None)
             except Exception:
                 return self._json({"error": "internal error"}, 500)  # never echo internals
             if isinstance(result, tuple):
@@ -616,14 +765,17 @@ def _make_handler(server, public=False):
             return fwd[:64] if fwd and trusted else peer
 
         def _rate_limit(self, key=None):
-            # Skip SSE streams: they are long-lived connections, not bursts.
             path = self.path.split("?")[0]
+            who = key or self.client_address[0]
             if self.command == "GET" and path.rstrip("/").endswith("/events/stream"):
-                return None
-            limiter = (server._ingest_limiter
-                       if self.command == "POST" and path == "/api/v1/ingest"
-                       else server._limiter)
-            if limiter.allow(key or self.client_address[0]):
+                # SSE is long-lived, so it is not counted like request bursts, but how often a
+                # client may open one is still bounded (it costs a token check each time).
+                limiter = server._stream_limiter
+            elif self.command == "POST" and path == "/api/v1/ingest":
+                limiter = server._ingest_limiter
+            else:
+                limiter = server._limiter
+            if limiter.allow(who):
                 return None
             self.send_response(429)
             self.send_header("Content-Type", "application/json")

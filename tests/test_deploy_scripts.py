@@ -274,19 +274,28 @@ def test_compose_web_has_no_env_file_and_mounts_central_file_read_only():
 
 
 def test_collab_overlay_reads_only_the_collab_slice():
-    # Updated in the origin/main merge: main moved collaboration out of control-plane-web
-    # into its own public container, so the overlay no longer overrides the dashboard's
-    # command. collab-public gets its settings from the render-collab slice via
-    # --fleet-config, never from the central file, the environment or inline ids.
+    # collab-public gets its settings from the render-collab slice via --fleet-config, never
+    # from the central file, the environment or inline ids. Second origin/main merge (#111):
+    # the overlay overrides the dashboard's command again, to add --collab-operator-url;
+    # compose replaces the whole list, so it must be the base command plus only that pair.
     doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.collab.yaml").read_text())
-    assert "control-plane-web" not in doc["services"]
+    base = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    web = doc["services"]["control-plane-web"]
+    assert set(web) == {"command"}
+    wcmd = web["command"]
+    i = wcmd.index("--collab-operator-url")
+    assert wcmd[:i] + wcmd[i + 2:] == base["services"]["control-plane-web"]["command"]
+    assert not any(a.startswith("--collab-") for a in wcmd[:i] + wcmd[i + 2:])
     pub = doc["services"]["collab-public"]
     cmd = pub["command"]
     assert "--collab-only" in cmd
     assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/collab/collab-config.json"
     for flag in ("--collab-cognito-pool", "--collab-cognito-client", "--collab-cognito-group",
-                 "--collab-cognito-web-client", "--collab-cognito-domain", "--collab-public-url"):
+                 "--collab-cognito-web-client", "--collab-cognito-domain", "--collab-public-url",
+                 "--collab-operator-user", "--collab-operator-email"):
         assert flag not in cmd, flag
+    assert not any("HERDR_COLLAB_OPERATOR_USER" in a or "HERDR_COLLAB_OPERATOR_EMAIL" in a
+                   for a in cmd)
     assert "--collab-require-https" in cmd       # fixed: the public container never serves plain http
     assert "environment" not in pub and "env_file" not in pub
     vols = pub["volumes"]
@@ -297,16 +306,32 @@ def test_collab_overlay_reads_only_the_collab_slice():
 
 
 COLLAB = {"cognito_pool": "us-west-2_TESTPOOL", "cognito_clients": ["client-a"],
-          "cognito_group": "team.test"}
+          "cognito_group": "team.test", "operator_user": "owner-test"}
 
 
-def _with_collab(e, collab=COLLAB, cert_dir="/srv/acme"):
+_DEFAULT = object()
+
+
+def _with_collab(e, collab=COLLAB, cert_dir=_DEFAULT):
+    if cert_dir is _DEFAULT:
+        cert_dir = str(e["tmp"] / "edge-certs")
     data = yaml.safe_load(e["central"].read_text())
     cpv = data["sections"]["control_plane"]["values"]
     if collab is not None:
         cpv["collab"] = dict(collab)
     if cert_dir is not None:
         cpv["compose"]["HERDR_COLLAB_CERT_DIR"] = cert_dir
+    # collab-sync.sh's default certbot layout under the fake HOME (#115): a lineage to copy
+    # and a certbot to put in the renew unit. Nothing runs certbot.
+    acme = e["home"] / ".local/share/inferweave/bender-failover/acme"
+    live = acme / "config/live/localdev.mcp.metabolomics.us"
+    live.mkdir(parents=True)
+    (live / "fullchain.pem").write_text("not a real cert\n")
+    (live / "privkey.pem").write_text("not a real key\n")
+    certbot = acme.parent / "acme-venv/bin/certbot"
+    certbot.parent.mkdir(parents=True)
+    certbot.write_text("#!/bin/sh\nexit 0\n")
+    certbot.chmod(0o755)
     e["central"].unlink()
     fcc.write_private_file(e["central"], yaml.safe_dump(data, sort_keys=False))
     marker = e["home"] / ".config" / "herdr-engineering" / "collab-enabled"
@@ -537,6 +562,40 @@ def test_changed_collab_slice_force_recreates_collab_public(env):
     r = deploy(env)
     assert r.returncode == 0, r.stderr
     assert _collab_ups(env) == []
+
+
+def test_collab_deploy_hands_the_cert_dir_from_the_central_config_to_collab_sync(env):
+    # #115 (second origin/main merge): collab-sync copies the edge cert into the directory the
+    # edge mounts. That is control_plane.compose.HERDR_COLLAB_CERT_DIR, passed as a flag and
+    # written into the timer unit (the timer has no environment), never HERDR_COLLAB_CERT_DIR env.
+    _with_collab(env)
+    env["env"]["HERDR_COLLAB_CERT_DIR"] = str(env["tmp"] / "from-env")
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    certs = env["tmp"] / "edge-certs"
+    assert (certs / "fullchain.pem").read_text() == "not a real cert\n"
+    assert oct((certs / "privkey.pem").stat().st_mode & 0o777) == "0o600"
+    assert not (env["tmp"] / "from-env").exists()
+    units = env["home"] / ".config/systemd/user"
+    assert f"--cert-dir {certs}" in (units / "herdr-collab-sync.service").read_text()
+    assert "certbot renew" in (units / "herdr-collab-cert-renew.service").read_text()
+    # edge nginx.conf written in place at a stable path (#110)
+    edge = env["home"] / ".config/herdr-engineering/collab-edge/nginx.conf"
+    assert edge.read_text() == (ROOT / "deploy/control-plane/collab-edge/nginx.conf").read_text()
+
+
+def test_edge_conf_is_rewritten_in_place_and_the_edge_reloaded(env):
+    _with_collab(env)
+    edge = env["home"] / ".config/herdr-engineering/collab-edge/nginx.conf"
+    edge.parent.mkdir(parents=True)
+    edge.write_text("old\n")
+    inode = edge.stat().st_ino
+    env["env"]["STUB_RUNNING_IMAGE"] = "herdr-engineering:000000000000"   # edge "exists"
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    assert edge.stat().st_ino == inode
+    assert edge.read_text() != "old\n"
+    assert "docker exec herdr-collab-edge nginx -s reload" in env["log"].read_text()
 
 
 def test_collab_slice_dir_owner_mismatch_warns(env):

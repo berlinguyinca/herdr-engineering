@@ -510,6 +510,20 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="read Cognito JWKS (jwks.json) and group members (members.json) from this "
                          "directory, refreshed by a host job, instead of calling AWS: the "
                          "container then needs no credentials and no outbound network")
+    p2.add_argument("--collab-operator-port", type=int, default=None,
+                    help="with --collab-only: also serve the collaboration API WITHOUT sign-in on this "
+                         "port, as --collab-operator-user, for the local owner's dashboard (publish it "
+                         "on the tailnet interface only)")
+    p2.add_argument("--collab-operator-user", default=None, help="Cognito username the operator acts as")
+    p2.add_argument("--collab-operator-email", default=None, help="email shown for the operator")
+    p2.add_argument("--collab-operator-host", action="append", default=[],
+                    help="Host header value the operator listener accepts (repeatable; DNS-rebinding guard)")
+    p2.add_argument("--collab-operator-url", default=None,
+                    help="dashboard: forward /api/v1/collab/* to the operator listener of the "
+                         "isolated collab service (e.g. http://100.64.0.1:8082)")
+    p2.add_argument("--collab-dashboard-host", action="append", default=[],
+                    help="extra DNS name the dashboard may be reached by for collaboration "
+                         "(IP literals and localhost always work; repeatable; DNS-rebinding guard)")
     p2.add_argument("--collab-only", action="store_true",
                     help="serve ONLY the public collaboration surface on --collab-public-port: no "
                          "dashboard, no operator API, no database (events go to --collab-log-file); "
@@ -891,6 +905,7 @@ def _cmd_fleet_rollout(args) -> int:
 
 def _cmd_fleet_drift(args) -> int:
     import urllib.request
+
     from .fleet import plan_version_sync
     from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
     try:
@@ -1381,7 +1396,7 @@ def _cmd_dev_enroll_sync(args) -> int:
     import signal
     import time
 
-    from .devfabric import DevServiceRegistry, forwarder_for
+    from .devfabric import DevServiceRegistry
     reg = DevServiceRegistry()
     client = _local_fabric_client()
     if client is None:
@@ -2347,7 +2362,13 @@ def _cmd_cp_web(args) -> int:
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
-                             collab_only=args.collab_only)
+                             collab_only=args.collab_only,
+                             operator_port=args.collab_operator_port,
+                             operator_user=args.collab_operator_user,
+                             operator_email=args.collab_operator_email,
+                             operator_hosts=args.collab_operator_host,
+                             collab_operator_url=args.collab_operator_url,
+                             collab_dashboard_hosts=args.collab_dashboard_host)
     # Self-report the control-plane stack so the Services page has real data.
     try:
         if not args.collab_only:   # collab-only has no stack to report
@@ -2399,6 +2420,8 @@ COLLAB_CONFIG_KEYS = {
     "cognito_web_client": ("collab_cognito_web_client", str),
     "cognito_domain": ("collab_cognito_domain", str),
     "public_url": ("collab_public_url", str),
+    "operator_user": ("collab_operator_user", str),
+    "operator_email": ("collab_operator_email", str),
 }
 
 
