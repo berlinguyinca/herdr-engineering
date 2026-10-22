@@ -244,6 +244,8 @@ class CollabService:
         self._requests_by_agent: dict[str, set] = defaultdict(set)
         self._rooms_by_agent: dict[str, set] = defaultdict(set)
         self._housekept = 0.0
+        self._room_seq: dict[str, int] = {}                  # room id -> sequence of its latest change
+        self._state_waiters: dict[str, int] = defaultdict(int)
         self._joins: dict[str, dict] = {}                    # token digest -> record
         self._joins_by_id: dict[str, str] = {}               # join id -> digest
         self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
@@ -281,8 +283,20 @@ class CollabService:
             self._seq += 1
             self._log.append(ev)
             self._apply(ev)
+            self._touch_rooms(payload, ev["sequence"])
             self._cv.notify_all()
             return ev
+
+    def _touch_rooms(self, p: dict, seq: int) -> None:
+        """Remember which rooms an event changed, so a room's long-poll wakes only for its own news."""
+        rooms = set()
+        if isinstance(p.get("room_id"), str):
+            rooms.add(p["room_id"])
+        rooms.update(r for r in (p.get("room_ids") or ()) if isinstance(r, str))
+        if isinstance(p.get("agent_id"), str):
+            rooms |= self._rooms_by_agent.get(p["agent_id"], set())
+        for r in rooms:
+            self._room_seq[r] = seq
 
     @property
     def seq(self) -> int:
@@ -1234,6 +1248,48 @@ class CollabService:
                 resource_id=agent_id))
         return {"ok": True}
 
+    STATE_WAIT_MAX = 10.0       # below the dashboard proxy's 15 s timeout
+
+    MAX_STATE_WAITERS = 6                  # a tab switch leaves its old poll running for a few seconds
+
+    def room_state(self, pr: Principal, room_id: str, since: int, cursor: int, wait: float) -> dict:
+        """One request that replaces five pollers: returns at once when this room changed after
+        `since`, otherwise holds (up to `wait` seconds) until it does. Unchanged = a tiny reply."""
+        wait = max(0.0, min(float(wait), self.STATE_WAIT_MAX))
+        deadline = time.monotonic() + wait
+        with self._cv:
+            self._authorize(pr, room_id, "read", "room.state")
+            if self._state_waiters[pr.key] >= self.MAX_STATE_WAITERS:
+                raise CollabError(429, "too many open room views")
+            self._state_waiters[pr.key] += 1
+        try:
+            with self._cv:
+                while True:
+                    self._authorize(pr, room_id, "read", "room.state")        # access lost while waiting -> 404
+                    if not self.still_valid(pr):
+                        raise CollabError(401, "unauthorized")
+                    cur = self._room_seq.get(room_id, 0)
+                    left = deadline - time.monotonic()
+                    if since < 0 or cur != since or left <= 0:
+                        break
+                    self._cv.wait(min(left, 2.0))
+                if since >= 0 and cur == since:
+                    return {"seq": cur, "changed": False}
+            m = self._member(self._rooms[room_id], pr.id) if not pr.is_agent else None
+            guest = bool(m and m["role"] == "guest")
+            out: dict[str, Any] = {"seq": cur, "changed": True, **self.read_events(pr, room_id, cursor, 200)}
+            out["agents"] = [] if guest else self.list_room_agents(pr, room_id)["agents"]
+            out["tasks"] = self.list_tasks(pr, room_id)["tasks"]
+            out["flow"] = None if guest else self.room_flow(pr, room_id)
+            with self._lock:                      # ask quietly: a denied call would log an event and wake every waiter
+                eff = self._effective(pr, self._rooms[room_id])
+                may_review = not pr.is_agent and bool(eff and "invite" in eff[0])
+            out["requests"] = self.list_agent_requests(pr, room_id)["requests"] if may_review else None
+            return out
+        finally:
+            with self._cv:
+                self._state_waiters[pr.key] -= 1
+
     FLOW_TASKS = 60
 
     def room_flow(self, pr: Principal, room_id: str) -> dict:
@@ -1765,6 +1821,10 @@ class CollabService:
                         return 200, self.list_tasks(pr, rid)
                     if parts[2:] == ["flow"]:
                         return 200, self.room_flow(pr, rid)
+                    if parts[2:] == ["state"]:
+                        wait = _int(query, "wait", 0, 0, 10)
+                        return 200, self.room_state(pr, rid, _int(query, "since", -1, -1),
+                                                    _int(query, "cursor", 0), float(wait))
                     if parts[2:] == ["events"]:
                         return 200, self.read_events(pr, rid, _int(query, "cursor", 0),
                                                      _int(query, "limit", 100, 1, 200))
