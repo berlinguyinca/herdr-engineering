@@ -86,3 +86,18 @@ test('client.getFleetConfigStatus gives up after its timeout', async () => {
     clearTimeout(keepAlive);
   }
 });
+
+test('client.getFleetConfigStatus honours the caller signal without AbortSignal.any', async () => {
+  const saved = AbortSignal.any;
+  AbortSignal.any = undefined;
+  try {
+    const ctl = new AbortController();
+    const hang = new HerdrClient('', { fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason));
+      ctl.abort(new Error('caller gave up'));
+    }) });
+    await assert.rejects(hang.getFleetConfigStatus({ signal: ctl.signal, timeoutMs: 60000 }), /caller gave up/);
+  } finally {
+    AbortSignal.any = saved;
+  }
+});
