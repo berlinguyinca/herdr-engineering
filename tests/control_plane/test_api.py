@@ -578,3 +578,35 @@ def test_agent_role_is_refused_everywhere_else(keyed_server):
     # ingest stays ingest-only
     assert _post_as(port, "/api/v1/llm/keys", {}, "ingkey") == 403
     assert _post_as(port, "/api/v1/services/retire", {}, "opkey") != 403
+
+
+def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink):
+    """A reload between the token check and the slice (here: the host is revoked in
+    the second snapshot) must not raise: the request answers from ONE snapshot."""
+    from herdr_engineering.fleet_config import _parse
+    first = _parse(_fc_doc())
+    revoked = _fc_doc()
+    del revoked["hosts"]["bender"]
+    second = _parse(revoked)
+
+    class FlippingStore:
+        def __init__(self):
+            self.calls = 0
+
+        def current(self):
+            self.calls += 1
+            return first if self.calls == 1 else second
+
+        def record_applied(self, *_a):
+            pass
+
+    store = FlippingStore()
+    svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), fleet_config=store)
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    try:
+        status, _, body = _fc_req(svr.port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "tok-bender"})
+        assert status == 200 and json.loads(body)["revision"] == first.revision
+        assert store.calls == 1
+    finally:
+        svr.shutdown()

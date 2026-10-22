@@ -483,11 +483,12 @@ def _make_handler(server, public=False):
         def _path_only(self):
             return self.path.split("?")[0].rstrip("/")
 
-        def _fleet_host(self):
-            """Host id owning the X-Host-Token, or None. Never reveals why."""
-            store = server.fleet_config
+        def _fleet_host(self, cfg):
+            """Host id owning the X-Host-Token in ``cfg``, or None. Never reveals why.
+            Callers pass ONE snapshot per request, so a reload between the token
+            check and the slice cannot hand out (or fail on) a different file."""
             token = self.headers.get("X-Host-Token", "")
-            return store.current().host_for_token(token) if token else None
+            return cfg.host_for_token(token) if token else None
 
         def _fleet_config_get(self):
             """Host endpoints bypass the X-API-Key gate on purpose: the per-host
@@ -495,17 +496,17 @@ def _make_handler(server, public=False):
             store = server.fleet_config
             if store is None:
                 return self._deny(404, "not found")
-            host = self._fleet_host()
+            cfg = store.current()
+            host = self._fleet_host(cfg)
             if host is None:
                 return self._deny(401, "unauthorized")
-            cfg = store.current()
             return self._json({"revision": cfg.revision, "values": cfg.slice_for(host)})
 
         def _fleet_config_applied(self):
             store = server.fleet_config
             if store is None:
                 return self._deny(404, "not found")
-            host = self._fleet_host()
+            host = self._fleet_host(store.current())
             if host is None:
                 return self._deny(401, "unauthorized")
             try:
