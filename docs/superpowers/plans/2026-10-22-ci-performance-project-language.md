@@ -40,14 +40,23 @@
 
 ## Task 4: Integration and delivery (leader)
 
-- [ ] Run targeted Python/JS suites, lint/syntax and relevant browser checks; use fresh evidence, not installed stale package sources (`PYTHONPATH=.` in worktree).
-- [ ] Independent reviews of Rust cache safety, backend identity/provenance and UI statistics; fix material findings.
-- [ ] Inspect real configured HerdR endpoint/data and verify visible charts with screenshots and true provider metadata.
-- [ ] Stage additive Rust helpers/pilot and HerdR app using existing deployment tooling only after verification; preserve concurrent edits and collect rollback/evidence.
-- [ ] Publish reviewable changes and report scope, measured Rust results, UI validation and any rollout limits.
+- [x] Run targeted Python/JS suites, lint/syntax and relevant browser checks; use fresh evidence, not installed stale package sources (`PYTHONPATH=.` in worktree).
+- [x] Independent reviews of Rust cache safety, backend identity/provenance and UI statistics; fix material findings.
+- [x] Inspect real configured HerdR endpoint/data and verify visible charts with screenshots and true provider metadata.
+- [x] Stage additive Rust helpers/pilot and HerdR app using existing deployment tooling only after verification; preserve concurrent edits and collect rollback/evidence.
+- [x] Publish reviewable changes and report scope, measured Rust results, UI validation and any rollout limits.
 
 ## Evidence and rollout notes
 
 Compiled Cargo target reuse was measured in independent Hive allocations and rejected for rollout: registry-only was faster after snapshot overhead. The experiment and timings remain in the runner proof directory; InferWeave receives registry reuse and per-stage timing wrappers without changing test commands or target-directory guards.
 
 Frontend tests cover successful-only statistics, provider prefixes, row identity, histogram boundaries and refresh/mobile behavior. Backend tests cover cache-only language enrichment, credential rotation, retained reports and conflicting identities. The latest main deployment is integrated before rollout to preserve concurrent agent-summary work. Fresh command outputs and live deployment evidence are collected by the leader.
+
+## Delivered
+
+- HerdR PR #156; runtime commit `a3447bfad12a`, healthy through the official control-plane rollout. Latest main agent-summary routing retained.
+- Live CI page: 261 measured successful runs, 101 projects, 17 current-primary-language groups at verification. Rust: 10 runs, mean 42m21s (whole pipeline). Desktop/mobile browser proof: no exceptions or horizontal overflow. API discovery: 118 repositories, 93 with known current language.
+- Live validation exposed provider PR/commit URLs being mistaken for repository identities; added realistic context-URL regressions and verified the correction after redeployment.
+- Fresh checks: 124 targeted Python tests before the context fix, 42 project-link/API tests after it; 264 JS/client/component/browser tests after rebase; Ruff, compilation/syntax, independent review.
+- Rust pilot PR #1205 remains unmerged; full-workspace Woodpecker check is pending. Four independent small executable allocations completed; compiled-target reuse rejected after registry controls. Runner PR #13 includes bounded evidence.
+- Evidence and screenshots: `/home/wohlgemuth/IdeaProjects/artifacts/herdr-ci-performance-20261022/`. No default-branch merge performed.
