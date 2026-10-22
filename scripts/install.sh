@@ -98,8 +98,8 @@ dev_fabric:
 ci:
   provider: woodpecker
   base_url: https://ci.metabolomics.us
-  # token is a secret: set HERDR_ENGINEERING_CI_TOKEN or write it to
-  # ~/.config/herdr-engineering/ci-token (never in this file)
+  # token is a secret: it lives in the central fleet config (ci.token, set by
+  # `herdr-eng fleet config init`), never in this file
 
 security:
   allow_public_listeners: false

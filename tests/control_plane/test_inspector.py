@@ -501,11 +501,10 @@ def test_rejected_event_id_can_be_retried_after_capability_arrives(store):
     assert feed(store, ev)["accepted"] == 1
 
 
-def test_from_env_configuration_and_fail_closed_roles():
-    s = InspectorStore.from_env({
-        "HERDR_INSPECTOR_REASONING_ROLE": "viewer", "HERDR_INSPECTOR_SENSITIVE_ROLE": "bogus",
-        "HERDR_INSPECTOR_MAX_EVENTS": "123", "HERDR_INSPECTOR_MAX_BYTES": "999999999999",
-        "HERDR_INSPECTOR_STORE_REASONING": "1"})
+def test_from_config_configuration_and_fail_closed_roles():
+    s = InspectorStore.from_config({
+        "reasoning_role": "viewer", "sensitive_role": "bogus",
+        "max_events": 123, "max_bytes": 999999999999, "store_reasoning": True})
     assert s.limits["max_events_per_session"] == 123
     assert s.limits["max_bytes_per_session"] == 64_000_000     # clamped to the hard ceiling
     feed(s, {"kind": "capabilities", "reasoning": "full"}, {"kind": "reasoning", "text": "r"},
@@ -514,7 +513,7 @@ def test_from_env_configuration_and_fail_closed_roles():
     by_kind = {e["kind"]: e for e in v}
     assert by_kind["reasoning"]["data"]["text"] == "r"              # viewer allowed by config
     assert by_kind["message"]["data"]["withheld"] is True           # unknown role => operator-only
-    assert not InspectorStore.from_env({"HERDR_INSPECTOR_STORE_REASONING": "0"}).store_reasoning
+    assert not InspectorStore.from_config({"store_reasoning": False}).store_reasoning
 
 
 def test_http_64_agents_concurrent_ingest_and_read(server):
@@ -735,7 +734,7 @@ def test_open_tailnet_mode_needs_no_token_and_is_operator_for_everyone():
         assert st == 200 and b["entity"]["accepted"] == 2
         st, q = raw("GET", f"/api/v1/sessions/{SID}/inspector?view=reasoning")
         # Open mode treats every caller as operator, so reasoning is readable by anyone who can
-        # reach the port. Operators who do not want that set HERDR_INSPECTOR_STORE_REASONING=0.
+        # reach the port. Operators who do not want that set control_plane.inspector_limits.store_reasoning: false.
         assert q["events"][0]["data"]["text"] == "visible to the whole tailnet"
     finally:
         srv.shutdown()
@@ -793,7 +792,8 @@ def test_every_mutating_route_is_refused_without_side_effects(server):
             assert st in (401, 403), (key, path, st)
     assert snapshot() == before
     assert call(server, "GET", f"/api/v1/sessions/{SID}/inspector", "nope")[0] == 401
-    assert call(server, "GET", "/api/v1/health", "")[0] == 401
+    st, body = call(server, "GET", "/api/v1/health", "")   # liveness only without a key
+    assert st == 200 and set(body) == {"status", "version", "commit"}
 
 
 def test_refused_post_closes_connection_so_the_body_cannot_be_smuggled(server):

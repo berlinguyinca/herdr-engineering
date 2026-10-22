@@ -70,3 +70,38 @@ test('integration lifecycle changes appear without heartbeat or synchronization 
   assert.match(html,/CI run finished/);assert.match(html,/CI run failed/);
   assert.doesNotMatch(html,/heartbeat|sync|Started/);
 });
+
+test('fleet strip counts reporting hosts and surfaces version drift', async () => {
+  const { renderOverviewSection } = await import('../overview-view.js');
+  const now = Date.now();
+  const data = {
+    hosts: [{ host_id: 'a', host_name: 'bender', last_seen: new Date(now - 60e3).toISOString() },
+            { host_id: 'b', host_name: 'mac.lan', last_seen: new Date(now - 5 * 864e5).toISOString() }],
+    fleet: { hosts: [{ host: 'bender' }], components: [], summary: { drifted: 3, missing: 1 } },
+  };
+  const html = renderOverviewSection('fleet', data, { hosts: { loaded: true }, fleet: { loaded: true } }, now, now);
+  assert.match(html, /<strong>1 \/ 2<\/strong>/);
+  assert.match(html, /<strong>3<\/strong><span>Versions that differ/);
+  assert.match(html, /No recent report from mac\.lan/);
+});
+
+test('cleanTitle strips pasted-prompt markers', async () => {
+  const { cleanTitle } = await import('../herdr-web-components/util.js');
+  assert.equal(cleanTitle('- "Phase 0 forensic audit is mandatory"'), 'Phase 0 forensic audit is mandatory');
+  assert.equal(cleanTitle('# Pi Engineering — Fault-Tolerant'), 'Pi Engineering — Fault-Tolerant');
+  assert.equal(cleanTitle('Plain title'), 'Plain title');
+});
+
+test('snoozed attention missions leave the count and rows, and can be brought back', () => {
+  const projections = [live('pi:stuck', 'EXECUTING', 'stalled')];
+  const states = { projections: { loaded: true }, missions: { loaded: true } };
+  const base = renderOverviewSection('missions', { projections, missions: [] }, states, now, now);
+  assert.match(base, /<strong>1<\/strong><span>Need attention/);
+  assert.match(base, /data-snooze="pi:stuck"/);
+  const snoozed = renderOverviewSection('missions', { projections, missions: [], snoozed: new Map([['pi:stuck', now + 1000]]) }, states, now, now);
+  assert.match(snoozed, /<strong>0<\/strong><span>Need attention/);
+  assert.match(snoozed, /1 snoozed for 24 hours/);
+  assert.doesNotMatch(snoozed, /data-snooze="pi:stuck"/);
+  const expired = renderOverviewSection('missions', { projections, missions: [], snoozed: new Map([['pi:stuck', now - 1]]) }, states, now, now);
+  assert.match(expired, /data-snooze="pi:stuck"/);
+});

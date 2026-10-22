@@ -17,7 +17,6 @@ a reasoning capability, and it is never synthesised.
 from __future__ import annotations
 
 import math
-import os
 import re
 import secrets
 import threading
@@ -282,27 +281,28 @@ class InspectorStore:
                       "evicted_events": 0, "evicted_sessions": 0}
 
     @classmethod
-    def from_env(cls, env=None, **kw) -> InspectorStore:
-        """Operator configuration (all optional)::
+    def from_config(cls, config=None, **kw) -> InspectorStore:
+        """Operator configuration, the fleet file's ``control_plane.inspector_limits``
+        mapping (every key optional)::
 
-            HERDR_INSPECTOR_REASONING_ROLE   minimum role to read reasoning (viewer|operator, default operator)
-            HERDR_INSPECTOR_SENSITIVE_ROLE   minimum role to read sensitive output/diffs (default operator)
-            HERDR_INSPECTOR_STORE_REASONING  0 = never accept/store reasoning (default 1)
-            HERDR_INSPECTOR_MAX_EVENTS / _MAX_BYTES / _MAX_SESSIONS / _MAX_TOTAL_BYTES / _RETENTION_HOURS
+            reasoning_role    minimum role to read reasoning (viewer|operator, default operator)
+            sensitive_role    minimum role to read sensitive output/diffs (default operator)
+            store_reasoning   false = never accept/store reasoning (default true)
+            max_events / max_bytes / max_sessions / max_total_bytes / retention_hours
         """
-        env = os.environ if env is None else env
+        config = config if isinstance(config, dict) else {}
         limits = {}
-        for key, name in (("max_events_per_session", "MAX_EVENTS"), ("max_bytes_per_session", "MAX_BYTES"),
-                          ("max_sessions", "MAX_SESSIONS"), ("max_total_bytes", "MAX_TOTAL_BYTES"),
-                          ("retention_hours", "RETENTION_HOURS")):
-            raw = env.get(f"HERDR_INSPECTOR_{name}")
-            if raw and raw.isdigit():
-                limits[key] = int(raw)
+        for key, name in (("max_events_per_session", "max_events"), ("max_bytes_per_session", "max_bytes"),
+                          ("max_sessions", "max_sessions"), ("max_total_bytes", "max_total_bytes"),
+                          ("retention_hours", "retention_hours")):
+            raw = config.get(name)
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+                limits[key] = raw
         return cls(
             limits=limits,
-            reasoning_roles=env.get("HERDR_INSPECTOR_REASONING_ROLE", "operator"),
-            sensitive_roles=env.get("HERDR_INSPECTOR_SENSITIVE_ROLE", "operator"),
-            store_reasoning=env.get("HERDR_INSPECTOR_STORE_REASONING", "1") != "0", **kw)
+            reasoning_roles=str(config.get("reasoning_role", "operator")),
+            sensitive_roles=str(config.get("sensitive_role", "operator")),
+            store_reasoning=config.get("store_reasoning", True) is not False, **kw)
 
     # ----------------------------------------------------------- preferences
     def get_prefs(self, session_id: str | None = None) -> dict:

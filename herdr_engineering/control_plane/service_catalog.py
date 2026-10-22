@@ -47,7 +47,14 @@ def service_lifecycle(record, now, *, archive_after_days=ARCHIVE_AFTER_DAYS):
     since_stamp = _timestamp(since)
     archived = (status in INACTIVE and since_stamp is not None
                 and now - since_stamp >= archive_after_days * 86400)
-    if archived:
+    # An operator may retire silent records (POST /api/v1/services/retire). A later
+    # report from the service itself lifts the retirement, like any archive.
+    retired_at = _timestamp(record.get("retired_at"))
+    retired = retired_at is not None and (last_stamp is None or last_stamp <= retired_at)
+    if retired and not archived:
+        archived = True
+        state, reason = "archived", "Retired by an operator; a new report restores it. History retained"
+    elif archived:
         state, reason = "archived", f"Unavailable for at least {archive_after_days:g} days; history retained"
     elif status in INACTIVE:
         state, reason = "unavailable", "Reporter marked this service unavailable"

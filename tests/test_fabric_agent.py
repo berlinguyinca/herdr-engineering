@@ -919,3 +919,182 @@ def test_leased_listener_is_not_reported_unleased(tmp_path, monkeypatch):
         server.shutdown()
         agent.stop()
         gw.stop()
+
+
+# ---------------------------------------------------------------------------
+# Host rewriting for loopback apps (the app's own rebinding guard must accept
+# the request without anyone configuring the fabric's names into the app)
+# ---------------------------------------------------------------------------
+
+def _echo_host_server():
+    import socket as _s
+    import threading as _t
+    srv = _s.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    seen: list[bytes] = []
+
+    def _serve():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = c.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            seen.append(data)
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                      b"Connection: close\r\n\r\nok")
+            c.close()
+
+    _t.Thread(target=_serve, daemon=True).start()
+    return srv, seen
+
+
+def _through_forwarder(names, request: bytes):
+    import socket as _s
+    srv, seen = _echo_host_server()
+    fwd = AgentForwarder("127.0.0.1", srv.getsockname()[1],
+                         fabric_names=frozenset(names)).start()
+    try:
+        c = _s.create_connection(("127.0.0.1", fwd.port), timeout=5)
+        c.sendall(request)
+        reply = b""
+        while True:
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
+        c.close()
+        return seen[0], reply, srv.getsockname()[1]
+    finally:
+        fwd.stop()
+        srv.close()
+
+
+def test_a_fabric_host_reaches_a_loopback_app_as_its_own_address():
+    got, reply, port = _through_forwarder(
+        {"dev.lan"}, b"GET / HTTP/1.1\r\nHost: DEV.lan:9990\r\n"
+                     b"Connection: keep-alive\r\nAccept: */*\r\n\r\n")
+    assert f"Host: 127.0.0.1:{port}".encode() in got
+    assert b"dev.lan" not in got.lower()
+    assert got.lower().count(b"connection:") == 1
+    assert b"Connection: close" in got
+    assert reply.endswith(b"ok")
+
+
+def test_a_foreign_host_is_forwarded_untouched_so_the_app_can_refuse_it():
+    got, _reply, _port = _through_forwarder(
+        {"dev.lan"}, b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+    assert b"Host: evil.example" in got
+
+
+def test_a_websocket_upgrade_is_not_rewritten():
+    got, _r, _p = _through_forwarder(
+        {"dev.lan"}, b"GET /ws HTTP/1.1\r\nHost: dev.lan\r\n"
+                     b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+    assert b"Host: dev.lan" in got
+
+
+def test_without_fabric_names_nothing_is_rewritten():
+    got, _r, _p = _through_forwarder(
+        set(), b"GET / HTTP/1.1\r\nHost: dev.lan\r\n\r\n")
+    assert b"Host: dev.lan" in got
+
+
+def test_the_agent_config_names_its_control_plane_and_tailnet_ip():
+    from pathlib import Path
+    cfg = AgentConfig(tailnet_ip="100.1.2.3", store_path=Path("/tmp/x"),
+                      control_plane_url="http://Dev.LAN")
+    assert cfg.fabric_names() == frozenset({"100.1.2.3", "dev.lan"})
+
+
+def test_retarget_moves_the_fabric_names_of_live_forwarders(tmp_path):
+    # Central fleet config: follow_config() retargets the agent when a refresh changes the
+    # control-plane URL. Forwarders already running must rewrite for the NEW host, not the old.
+    gw = _FakeGateway()
+    agent = _agent(tmp_path, gw, control_plane_url="http://old.lan")
+    fwd = fa.AgentForwarder("127.0.0.1", 1, fabric_names=agent.cfg.fabric_names())
+    agent._forwards[1] = fwd
+    try:
+        assert "old.lan" in fwd.fabric_names
+        agent.retarget(FabricClient(gw.url), "http://New.LAN:8080/")
+        assert fwd.fabric_names == frozenset({"127.0.0.1", "new.lan"})
+        assert agent.cfg.fabric_names() == fwd.fabric_names
+    finally:
+        gw.stop()
+
+
+def _untouched(request: bytes) -> bool:
+    got, _r, _p = _through_forwarder({"dev.lan"}, request)
+    return b"dev.lan" in got.lower() and b"127.0.0.1:" not in got.split(b"\r\n")[1]
+
+
+def test_only_a_plain_get_is_rewritten():
+    # A state-changing method keeps the fabric Host, so the app's own guard
+    # still refuses a cross-site POST.
+    assert _untouched(b"POST /x HTTP/1.1\r\nHost: dev.lan\r\n\r\n")
+
+
+def test_pipelined_bytes_after_the_head_stop_the_rewrite():
+    assert _untouched(b"GET /a HTTP/1.1\r\nHost: dev.lan\r\n\r\n"
+                      b"GET /b HTTP/1.1\r\nHost: dev.lan\r\n\r\n")
+
+
+def test_ambiguous_heads_are_forwarded_as_received():
+    for req in (
+        b"GET / HTTP/1.1\r\nHost: dev.lan\r\nHost: dev.lan\r\n\r\n",
+        b"GET / HTTP/1.1\r\nX-A: 1\r\n Host: dev.lan\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost : dev.lan\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: dev.lan\r\nX: a\nHost: evil\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: dev.lan@evil.example\r\n\r\n",
+    ):
+        got, _r, _p = _through_forwarder({"dev.lan"}, req)
+        assert got.split(b"\r\n\r\n")[0] == req.split(b"\r\n\r\n")[0], req
+
+
+def test_a_trailing_dot_fabric_name_is_still_a_fabric_name():
+    got, _r, port = _through_forwarder(
+        {"dev.lan"}, b"GET / HTTP/1.1\r\nHost: dev.lan.:9990\r\n\r\n")
+    assert f"Host: 127.0.0.1:{port}".encode() in got
+
+
+def test_a_client_that_never_speaks_does_not_dial_the_app():
+    import socket as _s
+    srv, seen = _echo_host_server()
+    fwd = AgentForwarder("127.0.0.1", srv.getsockname()[1],
+                         fabric_names=frozenset({"dev.lan"}))
+    fwd._HEAD_DEADLINE = 0.3  # noqa: SLF001
+    fwd.start()
+    try:
+        c = _s.create_connection(("127.0.0.1", fwd.port), timeout=5)
+        time.sleep(0.1)
+        assert seen == []          # nothing dialled yet
+        c.close()
+    finally:
+        fwd.stop()
+        srv.close()
+
+
+def test_connections_beyond_the_cap_are_dropped():
+    import socket as _s
+    srv, _seen = _echo_host_server()
+    fwd = AgentForwarder("127.0.0.1", srv.getsockname()[1],
+                         fabric_names=frozenset({"dev.lan"}))
+    fwd.MAX_CONNECTIONS = 1
+    fwd._slots = threading.BoundedSemaphore(1)  # noqa: SLF001
+    fwd.start()
+    try:
+        held = _s.create_connection(("127.0.0.1", fwd.port), timeout=5)
+        time.sleep(0.2)            # the first holds the only slot
+        second = _s.create_connection(("127.0.0.1", fwd.port), timeout=5)
+        second.settimeout(3)
+        assert second.recv(10) == b""   # closed unanswered
+        held.close()
+    finally:
+        fwd.stop()
+        srv.close()

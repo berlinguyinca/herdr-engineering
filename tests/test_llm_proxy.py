@@ -31,7 +31,8 @@ def _upstream(seen):
 
         def do_POST(self):  # noqa: N802
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            seen.append({"auth": self.headers.get("Authorization"), "body": body})
+            seen.append({"auth": self.headers.get("Authorization"), "body": body,
+                         "headers": {k.lower(): v for k, v in self.headers.items()}})
             usage = {"prompt_tokens": 7, "completion_tokens": 3,
                      "completion_tokens_details": {"reasoning_tokens": 1}}
             if body.get("stream"):
@@ -161,3 +162,77 @@ def test_hydrated_string_payloads_are_understood():
     fresh.import_state(state)
     assert fresh.llm_config()["keys"][0]["key_id"] == minted["key_id"]
     assert fresh.token_analytics()["total"]["output_tokens"] == 2
+
+
+def _post_headers(proxy, key, body, extra=None):
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", **(extra or {})}
+    req = urllib.request.Request(f"http://127.0.0.1:{proxy.server_address[1]}/v1/chat/completions",
+                                 data=json.dumps(body).encode(), headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status, r.read()
+
+
+def _teardown(proxy, srvs):
+    proxy.shutdown()
+    [s.shutdown() for s in srvs]
+
+
+def test_gateway_identity_defaults_to_project_and_key():
+    repo, key, proxy, seen, _, srvs = _setup()
+    try:
+        _post_headers(proxy, key, {"model": "qwen", "messages": []})
+        h = seen[0]["headers"]
+        assert h["x-inferweave-client-id"] == "herdr:proj-a"
+        assert h["x-inferweave-session-id"].startswith("proj-a:")  # not the shared "default" bucket
+        assert "x-inferweave-agent-id" not in h
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_valid_session_and_agent_pass_through_and_client_is_not_spoofable():
+    repo, key, proxy, seen, _, srvs = _setup()
+    try:
+        _post_headers(proxy, key, {"model": "qwen", "messages": []},
+                      {"X-InferWeave-Session-ID": "mission-9", "X-InferWeave-Agent-ID": "implementer",
+                       "X-InferWeave-Client-ID": "someone-else"})
+        h = seen[0]["headers"]
+        assert h["x-inferweave-session-id"] == "mission-9"
+        assert h["x-inferweave-agent-id"] == "implementer"
+        assert h["x-inferweave-client-id"] == "herdr:proj-a"
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_x_session_id_alias_is_honoured_and_unsafe_values_are_dropped_not_forwarded():
+    repo, key, proxy, seen, _, srvs = _setup()
+    try:
+        _post_headers(proxy, key, {"model": "qwen", "messages": []}, {"X-Session-Id": "alias-1"})
+        assert seen[0]["headers"]["x-inferweave-session-id"] == "alias-1"
+        _post_headers(proxy, key, {"model": "qwen", "messages": []},
+                      {"X-InferWeave-Session-ID": "has space", "X-InferWeave-Agent-ID": "x" * 129})
+        h = seen[1]["headers"]
+        assert h["x-inferweave-session-id"].startswith("proj-a:")  # a bad value must not 400 the request
+        assert "x-inferweave-agent-id" not in h
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_per_project_inflight_cap_returns_429_with_retry_after_and_does_not_forward():
+    repo, key, proxy, seen, _, srvs = _setup()
+    try:
+        state = proxy.RequestHandlerClass.state
+        state.configure_limits(max_inflight=1, wait_seconds=0.05)
+        assert state.acquire("proj-a")
+        try:
+            _post_headers(proxy, key, {"model": "qwen", "messages": []})
+            raise AssertionError("expected 429")
+        except urllib.error.HTTPError as e:
+            assert e.code == 429
+            assert int(e.headers["Retry-After"]) >= 1
+            assert json.loads(e.read())["error"]["type"] == "proxy_backpressure"
+        assert seen == []
+        state.release("proj-a")
+        assert _post_headers(proxy, key, {"model": "qwen", "messages": []})[0] == 200
+        assert state.inflight("proj-a") == 0  # the slot is released after the request
+    finally:
+        _teardown(proxy, srvs)

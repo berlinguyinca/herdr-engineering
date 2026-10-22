@@ -61,14 +61,10 @@ The systemd template is `deploy/mission-feed/herdr-service-metadata.service`.
 Install a dedicated wheel/venv under an immutable release in
 `~/.local/share/herdr-service-metadata/`, with `current` pointing to it. Do not
 upgrade the shared global Herdr Engineering venv. The template preserves the
-existing `fabric.env` and accepts additional private settings in
-`~/.config/herdr-engineering/service-metadata.env` (mode `0600`):
-
-- `HERDR_ENGINEERING_CONTROL_PLANE_URL` or `HERDR_CP_URL`: control-plane URL.
-- `HERDR_SERVICE_METADATA_HOST`: an explicitly verified existing host ID.
-- `HERDR_ENGINEERING_STATE`: existing fabric state directory, when overridden.
-- `HERDR_CP_API_KEY`: optional control-plane credential; alternatively set
-  `HERDR_SERVICE_METADATA_API_KEY_FILE` to a private credential file.
+existing `fabric.env`. The control-plane URL, the host id and (only when keys
+are enabled) `ingest.api_key` come from the central fleet config via
+`~/.config/herdr-engineering/host.json` (`herdr-eng fleet join`); no
+configuration env file is read.
 
 Explicit CLI overrides are `--control-plane`, `--host-id`, `--state-file` and
 `--api-key-file`; credentials themselves never appear in arguments or logs.

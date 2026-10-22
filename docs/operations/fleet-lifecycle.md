@@ -207,7 +207,7 @@ scripts/fleet-auto-update.sh
 systemctl --user list-timers herdr-eng-fleet-update.timer
 ```
 
-The timer runs daily with up to 30 minutes of jitter and catches missed runs
+The timer runs daily at 11:59 local time with no jitter and catches missed runs
 when the user service manager starts. It uses this checkout's virtualenv and
 private inventory; install it on the controller only, not every fleet host.
 `HERDR_ENG_PYTHON` selects another controller virtualenv when installing.

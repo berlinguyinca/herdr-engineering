@@ -30,13 +30,19 @@ WORKDIR /app
 # Install the package (no dev deps). [build-system] is setuptools.
 COPY pyproject.toml README.md LICENSE ./
 COPY herdr_engineering/ ./herdr_engineering/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[collab]"
 
 # Build-free frontend assets (ES modules + Web Components, no bundler). Copied
 # into the image so the control-plane web is self-contained; serve via
 # `--web-root /app/packages` (dev checkouts resolve packages/ relative to the
 # package instead).
 COPY packages/ ./packages/
+
+# The control-plane worker's defaults and SQL migrations ship IN the image, so they
+# roll forward and back with the image tag (deploy.sh builds from a temporary
+# worktree; a relative bind mount would point into a directory that is deleted).
+COPY deploy/control-plane/config.yaml ./control-plane/config.yaml
+COPY deploy/control-plane/migrations/ ./control-plane/migrations/
 
 # Runtime state + config live here; both are provided at runtime by the stack
 # (state -> named volume, config -> bind-mount). Overridable per service.

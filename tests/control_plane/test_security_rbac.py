@@ -99,7 +99,6 @@ def _post(base_url, path, body=None, key=None):
     "method,path",
     [
         ("GET", "/api/v1/missions"),
-        ("GET", "/api/v1/health"),
         ("GET", "/"),
         ("GET", "/api/v1/events?entity_type=x&entity_id=y"),
         ("POST", "/api/v1/ingest"),
@@ -120,6 +119,14 @@ def test_missing_key_is_401(server, method, path):
     status, parsed, _ = _request(base_url, method, path, body=body)
     assert status == 401
     assert parsed == {"error": "unauthorized"}
+
+
+def test_health_without_key_is_liveness_only(server):
+    # deploy.sh's health check carries no key: keyed mode answers status/version/commit
+    base_url, _ = server
+    status, parsed, _ = _request(base_url, "GET", "/api/v1/health")
+    assert status == 200
+    assert set(parsed) == {"status", "version", "commit"}
 
 
 def test_wrong_key_is_401(server):

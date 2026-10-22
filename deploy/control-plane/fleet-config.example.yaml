@@ -1,0 +1,116 @@
+# Central fleet configuration. Copy to ~/.config/herdr-engineering/fleet/fleet-config.yaml
+# on the control-plane host (the file must be ALONE in that 0700 directory: deploy.sh
+# mounts the directory into the containers) and chmod 600. NEVER commit the real file.
+# The tools that edit it (fleet join / config token / config revoke) rewrite the YAML,
+# which drops comments; keep notes elsewhere. Backups: ../fleet-backups/ (newest 10).
+# Every REDACTED value is a placeholder. The revision is computed, not authored.
+version: 1
+
+sections:
+  # Read only by the control-plane web process; never served to a host.
+  control_plane:
+    roles: [control-plane]          # must not be "all"
+    values:
+      pg_dsn: "postgresql://REDACTED:REDACTED@postgres:5432/REDACTED"
+      host_aliases: {}              # e.g. {bender: "bender.example.test"}
+      # {} = open on the tailnet (the default `fleet config init` writes; the web port is
+      # bound to the tailnet interface and runs --allow-open).
+      # !!! KEYED MODE IS NOT SUPPORTED YET !!! Adding entries here (key: role, roles
+      # viewer | operator | ingest | agent) gates every route but /api/v1/health and the
+      # host endpoints. The browser dashboard, the llm-proxy and the emit hook do not
+      # send keys yet, so they all get 401 until they do. If you still enable it, put the
+      # ingest key in ingest.api_key and the agent key in agent.api_key below.
+      api_keys: {}
+      rustfs_endpoint: "http://rustfs:9000"
+      minio_user: "REDACTED"        # the object store's access key (what the web reads)
+      minio_password: "REDACTED"
+      rustfs_bucket: "REDACTED"
+      ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: the public collaboration container (only when the host has the marker
+      # ~/.config/herdr-engineering/collab-enabled). Public identifiers only - deploy.sh
+      # hands exactly this mapping (nothing else from this file) to collab-public, and
+      # an unknown key is refused. Omit the whole block when collab is not used.
+      collab:
+        cognito_pool: "us-west-2_REDACTED"           # also read by collab-sync.sh
+        cognito_clients: ["REDACTED"]                # allowed app client ids (tokens)
+        cognito_group: "local.dev"                   # required cognito:groups membership
+        cognito_web_client: "REDACTED"               # browser page app client (Hosted UI, PKCE)
+        cognito_domain: "https://REDACTED.auth.us-west-2.amazoncognito.com"
+        public_url: "https://collab.example.test/"   # must equal the web client's callback URL
+        operator_user: "REDACTED"                    # Cognito username the dashboard's no-sign-in
+                                                     # collaboration acts as (required)
+        # operator_email: "owner@example.test"       # optional, shown for the operator
+      # Variables docker compose itself substitutes; deploy.sh renders exactly this
+      # mapping into a transient 0600 env file. The first eight keys are required.
+      compose:
+        HERDR_CP_PG_USER: "REDACTED"          # same user as in pg_dsn
+        HERDR_CP_PG_PASSWORD: "REDACTED"      # same password as in pg_dsn
+        HERDR_CP_MINIO_USER: "REDACTED"       # same as minio_user
+        HERDR_CP_MINIO_PASSWORD: "REDACTED"   # same as minio_password
+        HERDR_CP_WEB_BIND: "127.0.0.1"        # tailnet IP to expose on dev.lan
+        HERDR_CP_WEB_PUBLIC_PORT: "80"
+        HERDR_CP_PG_PORT: "5432"              # loopback host port of postgres
+        GATEWAY_TAILNET_IP: "127.0.0.1"       # `tailscale ip -4`; 127.0.0.1 = loopback only
+        # Optional, collab only (needed when the collab marker exists):
+        # HERDR_COLLAB_CERT_DIR: "/path/to/collab-edge-certs"  # collab-sync.sh copies ONLY the edge's
+        #                                    # fullchain.pem + privkey.pem here (required for collab)
+        # HERDR_COLLAB_CERT_UID: "1000"              # owner of the certs, data dir and collab slice
+        # HERDR_COLLAB_EDGE_BIND: "127.0.0.1:18444"  # published address of the TLS edge
+        # HERDR_COLLAB_OPERATOR_PORT: "9482"         # operator listener on HERDR_CP_WEB_BIND (tailnet)
+
+  llm:
+    roles: [builder]
+    values:
+      upstream_url: "https://llm.example.test"
+      upstream_key: "REDACTED"
+
+  ci:
+    roles: [builder, ci]
+    values:
+      url: "https://ci.example.test"
+      token: "REDACTED"
+
+  github:
+    roles: [ci]
+    values:
+      token: "REDACTED"
+
+  # Posted by every host's feeds as the control-plane API key (role ingest).
+  # Empty = send no X-API-Key (open control plane, the default).
+  ingest:
+    roles: [all]
+    values:
+      api_key: ""
+
+  # Used by host-side tools (session run, review bridge): role agent.
+  # Trade-off: readable by every host (roles [all]). The agent role can only ingest
+  # events, mint/revoke LLM project keys and post reviews - nothing else. Recommended
+  # later: scope this section to a role (e.g. [builder]). Empty while keys are off.
+  agent:
+    roles: [all]
+    values:
+      api_key: ""
+
+  fabric:
+    roles: [all]
+    values:
+      url: "https://fabric.example.test"
+      token: "REDACTED"
+
+  inspector:
+    roles: [all]
+    values:
+      enabled: false
+      reasoning: "off"
+
+hosts:
+  # token_sha256 is the sha256 hex of the host's random token (the token itself
+  # lives only in that host's host.json). Each hash must be unique.
+  bender:
+    roles: [builder]
+    token_sha256: "REDACTED_64_HEX_CHARS"
+    overrides:                      # optional, deep-merged over a section
+      inspector: {reasoning: "on"}
+  mac:
+    roles: []                       # empty roles: only "all" sections
+    token_sha256: "REDACTED_64_HEX_CHARS"

@@ -56,6 +56,22 @@ def test_persist_merges_concurrent_external_lease(tmp_path):
         "A's persist clobbered B's concurrently-written lease")
 
 
+def test_persist_merges_even_when_two_writes_share_an_mtime(tmp_path):
+    """Kernel timestamps are coarse: two writers inside one tick get the same st_mtime.
+    The cross-process merge must still run (the store is identified by inode, not mtime)."""
+    import os
+    store = tmp_path / "leases.json"
+    a = DevServiceRegistry(store_path=store, port_range=_RNG)
+    la = a.register(target_machine_id="m1", target_host="127.0.0.1", target_port=8101)
+    stamp = store.stat().st_mtime_ns
+    b = DevServiceRegistry(store_path=store, port_range=_RNG)
+    lb = b.register(target_machine_id="m2", target_host="127.0.0.1", target_port=8102)
+    os.utime(store, ns=(stamp, stamp))   # B's write now carries A's exact mtime
+    a.heartbeat(la.id)
+    c = DevServiceRegistry(store_path=store, port_range=_RNG)
+    assert c.get(lb.id) is not None, "A's persist clobbered B's lease when mtimes matched"
+
+
 def test_heartbeat_guard_rejects_stale_base(tmp_path, caplog):
     """A heartbeat whose caller observed an older `renewed_at` than the record
     now has (another process renewed it) must not renew from the stale base —

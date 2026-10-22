@@ -26,7 +26,12 @@ export function serviceState(s, now = Date.now()) {
 export function serviceScope(s) {
   return ['herdr','system','unassigned'].includes(s?.catalog?.scope) ? s.catalog.scope : 'unassigned';
 }
-const inScope = (service, scope) => scope === 'system' ? serviceScope(service) !== 'herdr' : serviceScope(service) === 'herdr';
+// Three catalogs: started in HerdR, verified system units, and everything else the
+// host listens on (local dev servers, tunnels) which has no proven owner.
+const SCOPE_OF = {herdr:'herdr', system:'system', local:'unassigned'};
+const inScope = (service, scope) => serviceScope(service) === (SCOPE_OF[scope] || 'herdr');
+const SCOPE_PAGE = {herdr:{path:'#/services',title:'Services',label:'HerdR services'}, system:{path:'#/system-services',title:'System services',label:'System services'}, local:{path:'#/local-services',title:'Local services',label:'Local services'}};
+const SCOPE_INTRO = {herdr:'Applications started in HerdR. Each service shows its reported project, purpose and discovered endpoint.', system:'Services confirmed to belong to a system unit. Their origin and last report remain inspectable.', local:'Dev servers, tunnels and other listeners on your machines that were not launched from a HerdR pane. HerdR cannot prove who started them, so they are listed here rather than as HerdR services.'};
 const stateLabel = s => ({current:'Reported healthy', unavailable:'Unavailable', archived:'Archived', unknown:'Unconfirmed'})[serviceState(s)];
 function serviceReason(s) {
   const observation=metadataObservation(s);
@@ -140,7 +145,7 @@ export function renderServiceDetails(s) {
     ['Last report',formatTimestamp(s.lifecycle?.last_seen_at || s.updated_at)],['Unavailable since',formatTimestamp(s.lifecycle?.unavailable_since)],
     ['Registered',formatTimestamp(s.created_at)],['Service ID',s.service_id],
   ];
-  return `${styles}<a data-service-back href="${serviceScope(s) === 'herdr' ? '#/services' : '#/system-services'}">← ${serviceScope(s) === 'herdr' ? 'Services' : 'System and unassigned'}</a><h1>${esc(s.service_name || s.service_id)}</h1>
+  return `${styles}<a data-service-back href="${SCOPE_PAGE[{herdr:'herdr',system:'system'}[serviceScope(s)] || 'local'].path}">← ${SCOPE_PAGE[{herdr:'herdr',system:'system'}[serviceScope(s)] || 'local'].title}</a><h1>${esc(s.service_name || s.service_id)}</h1>
     <p class="sc-intro">${esc(s.description || s.catalog?.purpose || 'Description not reported.')}</p>
     <p><strong>${stateLabel(s)}</strong> · ${esc(serviceReason(s))} Last report <span data-service-age>${esc(lastSeen(s))}</span>.</p>
     ${s.lifecycle?.archived ? '<p class="sc-intro">Archived services are hidden from the current catalog. A healthy report restores this service automatically; its history is retained.</p>' : ''}
@@ -195,11 +200,11 @@ export function mountServices(root, client, initial, {showAll = false, status, s
   let services = initial;
   let disposed = false;
   let pending = false;
-  const state = {scope:scope === 'system' ? 'system' : 'herdr',search:'',host:'',status:['current','unavailable','unknown','all','archived'].includes(status)?status:showAll?'all':'current',archived:status==='archived',group:scope==='system'?'type':'project'};
+  const state = {scope:SCOPE_PAGE[scope] ? scope : 'herdr',search:'',host:'',status:['current','unavailable','unknown','all','archived'].includes(status)?status:showAll?'all':'current',archived:status==='archived',group:SCOPE_PAGE[scope] && scope!=='herdr'?'type':'project'};
   const openGroups = new Map();
-  root.innerHTML = `${styles}<h1>${state.scope === 'herdr' ? 'Services' : 'System and unassigned services'}</h1>
-    <p class="sc-intro">${state.scope === 'herdr' ? 'Applications started in HerdR. Each service shows its reported project, purpose and discovered endpoint.' : 'System services and discovered listeners without a confirmed HerdR launch association. Their origin and last report remain inspectable.'}</p>
-    <p class="sc-meta"><a href="${state.scope === 'herdr' ? '#/system-services' : '#/services'}">${state.scope === 'herdr' ? 'System and unassigned services →' : '← HerdR services'}</a></p>
+  root.innerHTML = `${styles}<h1>${SCOPE_PAGE[state.scope].title}</h1>
+    <p class="sc-intro">${SCOPE_INTRO[state.scope]}</p>
+    <p class="sc-meta">${Object.entries(SCOPE_PAGE).filter(([key])=>key!==state.scope).map(([,page])=>`<a href="${page.path}">${page.label} →</a>`).join(' · ')}</p>
     <div class="sc-counts" id="sc-counts"></div><details class="sc-history" id="sc-history"><summary id="sc-history-summary">History and unconfirmed reports</summary><div class="sc-counts" id="sc-history-counts"></div></details>
     <p class="sc-meta" id="sc-policy"></p>
     <div class="sc-controls">
@@ -246,7 +251,7 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       const open=openGroups.has(key)?openGroups.get(key):groups.length<=3&&selected.length<=12;
       const summary=[...new Set(g.services.map(stateLabel))].map(label=>`${g.services.filter(s=>stateLabel(s)===label).length} ${label.toLowerCase()}`).join(' · ');
       return `<details class="sc-group" data-group="${esc(key)}" ${open?'open':''}><summary>${esc(g.label)}<span>${g.services.length} services · ${esc(summary)}</span></summary>${g.services.map(serviceRow).join('')}</details>`;
-    }).join(''):`<herdr-empty message="${!scoped.length ? state.scope==='herdr' ? 'No services have a confirmed HerdR launch association yet. Discovered listeners are available under System and unassigned services.' : 'No system or unassigned services have been reported.' : 'No services match these filters. Choose a status count above, select All statuses, or clear your search to explore the catalog.'}"></herdr-empty>`;
+    }).join(''):`<herdr-empty message="${!scoped.length ? state.scope==='herdr' ? 'No services have a confirmed HerdR launch association yet. Discovered listeners are under Local services.' : state.scope==='system' ? 'No services have been confirmed as system units.' : 'No local services have been reported.' : 'No services match these filters. Choose a status count above, select All statuses, or clear your search to explore the catalog.'}"></herdr-empty>`;
     root.querySelectorAll('.sc-group').forEach(d=>d.addEventListener('toggle',()=>{if(d.isConnected)openGroups.set(d.dataset.group,d.open);}));
     if(focusKey && !focused.isConnected) {
       let target;

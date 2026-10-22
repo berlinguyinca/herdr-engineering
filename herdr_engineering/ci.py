@@ -4,7 +4,6 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import os
 import re
 import socket
 import urllib.error
@@ -40,7 +39,6 @@ class PipelineView:
         return dict(self.__dict__)
 
 
-_TOKEN_FILE = os.path.join("~", ".config", "herdr-engineering", "ci-token")
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_LOG_CHARS = 64 * 1024
 _TERMINAL_STATES = {"success", "failure", "error", "killed", "declined", "skipped", "canceled"}
@@ -115,22 +113,12 @@ class WoodpeckerProvider:
 
     def __init__(self, base_url: str | None = None, token: str | None = None,
                  client=None) -> None:
-        self.base_url = (base_url or os.environ.get("HERDR_ENGINEERING_CI_URL")
+        from .host_config import host_value
+        self.base_url = (base_url or host_value("ci.url")
                          or "https://ci.metabolomics.us").rstrip("/")
-        self.token = token or os.environ.get("HERDR_ENGINEERING_CI_TOKEN") \
-            or self._read_token_file()
+        self.token = token or host_value("ci.token") or None
         self._client = client or urllib.request.build_opener(_NoRedirect())
         self._repo_id_cache: dict[str, str] = {}
-
-    @staticmethod
-    def _read_token_file() -> str | None:
-        path = os.path.expanduser(os.environ.get("HERDR_ENGINEERING_CI_TOKEN_FILE") or _TOKEN_FILE)
-        try:
-            with open(path) as f:
-                tok = f.read(16385).strip()
-            return tok if tok and len(tok) <= 16384 else None
-        except (OSError, UnicodeError):
-            return None
 
     @property
     def available(self) -> bool:

@@ -1,0 +1,268 @@
+# ruff: noqa: F811  (pytest fixtures are imported by name from the sibling test modules)
+"""The host runner, end to end: the real collab service behind a tiny HTTP front, fake herdr and ssh
+programs that record what they were asked, and two "hosts" (this machine and `beast`) that are just
+directories."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import shutil
+import stat
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
+
+import pytest
+
+from herdr_engineering.control_plane.collab import CollabError
+from tests.control_plane.test_collab_tasks import W, svc  # noqa: F401
+
+ROOT = Path(__file__).resolve().parents[2]
+RUNNER = ROOT / "deploy/control-plane/collab-spawn.py"
+WORKER = ROOT / "deploy/control-plane/collab-worker.sh"
+spec = importlib.util.spec_from_file_location("collab_spawn", RUNNER)
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+
+FAKE_HERDR = r"""#!/usr/bin/env bash
+# records every call; `machine list` shows one machine, `workspace create` hands out pane ids
+echo "$*" >> "$FAKE_LOG/herdr.log"
+args=("$@"); machine=""
+if [ "${args[0]:-}" = "--machine" ]; then machine="${args[1]}"; args=("${args[@]:2}"); fi
+[ -n "$machine" ] && [ -f "$FAKE_LOG/down-$machine" ] && { echo "ssh: no route" >&2; exit 1; }
+case "${args[0]} ${args[1]:-}" in
+  "machine list") echo '[{"id":"12f6","label":"beast","target":"beast","session":"default","enabled":true},{"id":"99aa","label":"old","target":"old","session":"default","enabled":false}]' ;;
+  "workspace list") echo '{"result":{"type":"workspace_list","workspaces":[]}}' ;;
+  "workspace create") n=$(( $(cat "$FAKE_LOG/n" 2>/dev/null || echo 0) + 1 )); echo $n > "$FAKE_LOG/n"
+     echo "{\"result\":{\"root_pane\":{\"pane_id\":\"w$n:p1\"}}}" ;;
+  "pane run") : ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"""
+# an "ssh" that runs the remote command locally, with HOME pointing at the pretend remote host
+FAKE_SSH = r"""#!/usr/bin/env bash
+echo "$*" >> "$FAKE_LOG/ssh.log"
+while [ "$1" != "--" ]; do shift; done; shift   # options, then "--"
+shift                                            # the target
+HOME="$FAKE_REMOTE_HOME" exec bash -c "$1"
+"""
+
+
+class Front(BaseHTTPRequestHandler):
+    svc = None
+
+    def log_message(self, *a):
+        pass
+
+    def handle_any(self):
+        u = urlsplit(self.path)
+        parts = [p for p in u.path.split("/") if p][3:]                      # after api/v1/collab
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+        try:
+            status, out = self.svc.dispatch(self.command, parts, dict(parse_qsl(u.query)), body, "", None, operator="alice")
+        except CollabError as e:
+            status, out = e.status, {"error": e.message}
+        data = json.dumps(out).encode()
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_GET = do_POST = handle_any
+
+
+@pytest.fixture
+def rig(svc, tmp_path, monkeypatch):
+    svc.max_agents_per_user = 60
+    svc.public_config = {"public_url": "https://localdev.example.org"}
+    w = W(svc)
+    Front.svc = svc
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Front)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    home, remote, log = tmp_path / "home", tmp_path / "remote", tmp_path / "fakelog"
+    for d in (home, remote, log):
+        d.mkdir()
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    for name, text in (("herdr", FAKE_HERDR), ("ssh", FAKE_SSH)):
+        (bin_ / name).write_text(text)
+        (bin_ / name).chmod(0o755)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("FAKE_LOG", str(log))
+    monkeypatch.setenv("FAKE_REMOTE_HOME", str(remote))
+    r = runner.Runner(f"http://127.0.0.1:{srv.server_address[1]}", tmp_path / "state", str(bin_ / "herdr"),
+                      str(bin_ / "ssh"), WORKER, "bender", say=lambda m: None)
+    yield type("Rig", (), dict(w=w, r=r, home=home, remote=remote, log=log))
+    srv.shutdown()
+
+
+def ask(rig, **kw):
+    return rig.w.s.request_spawn(rig.w.alice, {"harness_type": "claude-code", "name_prefix": "fleet", "count": 4,
+                                               "room_id": rig.w.room, "actions": ["read", "execute"], **kw})
+
+
+def calls(rig, which="herdr"):
+    p = rig.log / f"{which}.log"
+    return p.read_text().splitlines() if p.exists() else []
+
+
+def test_a_request_is_spread_round_robin_and_workers_start_in_herdr(rig):
+    sp = ask(rig)
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert done["status"] == "done" and {p["status"] for p in done["placements"]} == {"started"}
+    hosts = {p["name"]: p["host"] for p in done["placements"]}
+    assert sorted(hosts.values()) == ["beast", "beast", "bender", "bender"]
+    assert hosts["fleet-1"] != hosts["fleet-2"] and hosts["fleet-2"] != hosts["fleet-3"]       # alternating
+    assert sp["spawn_id"] == done["spawn_id"]
+    # the credential sits in a 0600 file on the host that runs the agent, nowhere on a command line
+    for name, host in hosts.items():
+        base = rig.home if host == "bender" else rig.remote
+        f = base / "herdr-agents" / f"{name}.json"
+        cred = json.loads(f.read_text())
+        assert cred["credential"].startswith("hca_") and stat.S_IMODE(f.stat().st_mode) == 0o600
+        assert (base / "herdr-agents/worker.sh").stat().st_mode & 0o700 == 0o700
+        assert all(cred["credential"] not in line for line in calls(rig) + calls(rig, "ssh"))
+    assert "BASE='https://localdev.example.org'" in (rig.home / "herdr-agents/worker.sh").read_text()
+    runs = [line for line in calls(rig) if " pane run " in f" {line} "]
+    assert len(runs) == 4 and all("HERDR_AGENT_CMD='claude -p'" in line and "worker.sh" in line for line in runs)
+    assert sum(line.startswith("--machine beast pane run") for line in runs) == 2
+    # the owner granted these in a room they own: they work at once
+    assert {a["name"] for a in rig.w.s.list_room_agents(rig.w.alice, rig.w.room)["agents"]} >= {"fleet-1", "fleet-4"}
+
+
+def test_the_rotation_continues_across_requests(rig):
+    ask(rig, count=1, name_prefix="a")
+    rig.r.once()
+    ask(rig, count=1, name_prefix="b")
+    rig.r.once()
+    done = {p["name"]: p["host"] for s in rig.w.s.list_spawns(rig.w.alice)["spawns"] for p in s["placements"]}
+    assert done["a-1"] != done["b-1"]
+
+
+def test_an_opted_out_host_never_receives_agents(rig):
+    rig.r.once()                                              # report the hosts first
+    rig.w.s.set_fleet_host(rig.w.alice, "beast", {"auto_agents": False})
+    ask(rig, count=3)
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert {p["host"] for p in done["placements"]} == {"bender"} and len(done["placements"]) == 3
+    assert not (rig.remote / "herdr-agents").exists()                    # nothing was written on the opted-out host
+
+
+def test_no_eligible_host_finishes_with_a_reason_and_creates_nothing(rig):
+    rig.r.once()
+    for h in ("beast", "bender"):
+        rig.w.s.set_fleet_host(rig.w.alice, h, {"auto_agents": False})
+    ask(rig)
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert done["status"] == "done" and done["placements"] == [] and "no host accepts" in done["error"]
+    assert rig.w.s.list_my_agents(rig.w.alice)["agents"] == []
+
+
+def test_an_unreachable_machine_is_left_out_and_a_failed_placement_is_reported(rig):
+    (rig.log / "down-beast").write_text("")
+    ask(rig, count=2)
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert {p["host"] for p in done["placements"]} == {"bender"}
+    hosts = {h["host"]: h["online"] for h in rig.w.s.list_fleet_hosts(rig.w.alice)["hosts"]}
+    assert hosts == {"bender": True}                          # beast failed its probe, so it is not reported
+
+
+def test_one_failed_agent_does_not_stop_the_rest(rig, monkeypatch):
+    real = rig.r.place
+    seen = []
+
+    def flaky(host, agent, family, installed):
+        seen.append(agent["name"])
+        if agent["name"] == "fleet-2":
+            raise runner.Failure("herdr exited 1: boom")
+        return real(host, agent, family, installed)
+    monkeypatch.setattr(rig.r, "place", flaky)
+    ask(rig, count=3)
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert [p["status"] for p in sorted(done["placements"], key=lambda p: p["name"])] == ["started", "failed", "started"]
+    assert "boom" in next(p["error"] for p in done["placements"] if p["status"] == "failed")
+
+
+def test_a_request_is_claimed_once_even_if_two_runners_race(rig):
+    ask(rig, count=1)
+    rig.r.once()
+    rig.r.once()                                              # nothing left to claim: no second start
+    assert len([line for line in calls(rig) if " pane run " in f" {line} "]) == 1
+
+
+def test_worker_template_matches_the_script_the_dashboard_hands_out():
+    js = ("import('./packages/collab-scripts.js').then(m=>process.stdout.write(m.workerScript({base:'__HERDR_BASE__'})))")
+    if not shutil.which("node"):
+        pytest.skip("needs node")
+    fresh = subprocess.run(["node", "-e", js], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    assert WORKER.read_text() == fresh, ("collab-worker.sh is out of date; regenerate it with: node -e \"" + js +
+                                         "\" > deploy/control-plane/collab-worker.sh")
+    subprocess.run(["bash", "-n", str(WORKER)], check=True)
+
+
+@pytest.mark.parametrize("label,target,enabled,ok", [
+    ("beast", "beast", True, True), ("Bad Name", "x", True, False), ("-oProxy", "x", True, False),
+    ("ok", "-oProxyCommand=x", True, False), ("ok", "user@host", False, False), ("ok", "user@host", True, True)])
+def test_machine_names_that_could_smuggle_options_are_ignored(rig, monkeypatch, label, target, enabled, ok):
+    listing = json.dumps([{"label": label, "target": target, "enabled": enabled}])
+    monkeypatch.setattr(rig.r, "run", lambda argv, **k: listing)
+    rig.r.discover()
+    assert (len(rig.r.targets) == 2) is ok
+
+
+def test_an_unexpected_crash_still_reports_and_leaves_no_live_agent(rig, monkeypatch):
+    def boom(host, agent, family, installed):
+        if agent["name"] != "fleet-1":
+            raise OSError("No space left on device")
+        return None
+    monkeypatch.setattr(rig.r, "place", boom)
+    ask(rig, count=3)
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert done["status"] == "done" and sorted(p["status"] for p in done["placements"]) == ["failed", "failed", "started"]
+    live = {a["name"] for a in rig.w.s.list_my_agents(rig.w.alice)["agents"] if a["status"] == "active"}
+    assert live == {"fleet-1"}                                  # the ones that never started were revoked
+    assert not (rig.home / "herdr-agents/fleet-2.json").exists()
+
+
+def test_the_service_being_unreachable_ends_the_cycle_cleanly(rig):
+    rig.r.url = "http://127.0.0.1:1"                            # nothing listens here
+    with pytest.raises(runner.Failure):
+        rig.r.once()
+
+
+def test_unticking_a_host_mid_request_stops_placements_there(rig, monkeypatch):
+    rig.r.once()                                                # hosts reported
+    real, n = rig.r.place, []
+
+    def untick_after_first(host, agent, family, installed):
+        real(host, agent, family, installed)
+        n.append(host)
+        if len(n) == 1:
+            rig.w.s.set_fleet_host(rig.w.alice, "beast", {"auto_agents": False})
+    monkeypatch.setattr(rig.r, "place", untick_after_first)
+    ask(rig, count=4)
+    rig.r.once()
+    assert "beast" not in n[1:]                                 # whatever came after the click avoided it
+    assert len(n) == 4
+
+
+def test_a_request_nobody_took_in_time_is_expired_not_started_late(rig):
+    sp = ask(rig, count=1)
+    rig.w.s.clock.t += runner_stale() + 1
+    rig.r.once()
+    assert rig.w.s.list_spawns(rig.w.alice)["spawns"][0]["status"] == "expired"
+    assert [line for line in calls(rig) if " pane run " in f" {line} "] == [] and sp["spawn_id"]
+
+
+def runner_stale():
+    from herdr_engineering.control_plane.collab import SPAWN_STALE
+    return SPAWN_STALE

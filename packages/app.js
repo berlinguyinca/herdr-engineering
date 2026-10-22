@@ -15,8 +15,11 @@ import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
-import { recordOutcome, statusOutcome } from './record-state.js';
+import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
+import { renderFleetMatrix } from './fleet-view.js';
+import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
+import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -47,6 +50,7 @@ const NAV = [
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Sessions' },
   { path: '/services', label: 'Services' },
+  { path: '/local-services', label: 'Local services' },
   { path: '/system-services', label: 'System services' },
   { path: '/github', label: 'Projects' },
   { path: '/ci', label: 'CI' },
@@ -54,6 +58,7 @@ const NAV = [
   { path: '/hosts', label: 'Hosts' },
   { path: '/activity', label: 'Activity' },
   { path: '/analytics', label: 'Analytics' },
+  { path: '/collab', label: 'Collaboration' },
 ];
 
 const SHELL = document.getElementById('shell');
@@ -70,6 +75,7 @@ function route() {
 const ROUTES = {
   '/overview': viewOverview,
   '/github': viewGithub,
+  '/collab': viewCollab,
   '/ci': viewIntegrations,
   '/reviews': viewIntegrations,
   '/topology': viewTopology,
@@ -79,6 +85,7 @@ const ROUTES = {
   '/herd/session/:id': viewSession,
   '/services': viewServices,
   '/system-services': viewServices,
+  '/local-services': viewServices,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/hosts/:id': viewHost,
@@ -134,6 +141,10 @@ async function viewTopology() {
 async function viewOverview() {
   root.innerHTML = '<h1>Overview</h1><div id="overview-dashboard"></div>';
   dashboardView = mountOverview(document.getElementById('overview-dashboard'), client);
+}
+
+async function viewCollab() {
+  dashboardView = mountCollab(root, { fabricSessions: () => client.listSessions('active') });
 }
 
 async function viewGithub() {
@@ -315,7 +326,7 @@ async function copyText(text, btn) {
 async function viewServices(_parts, revision) {
   const { services } = await client.listServices();
   if (revision !== renderRevision) return;
-  servicesView = mountServices(root, client, services, { scope: _parts[0] === 'system-services' ? 'system' : 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
+  servicesView = mountServices(root, client, services, { scope: ({'system-services':'system','local-services':'local'})[_parts[0]] || 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
 }
 
 async function viewService(parts, revision) {
@@ -326,14 +337,28 @@ async function viewService(parts, revision) {
 }
 
 async function viewHosts() {
-  const { hosts } = await client.listHosts();
+  const [{ hosts }, matrix, configStatus] = await Promise.all([
+    client.listHosts(),
+    client.request('/api/v1/fleet/inventory').catch(() => ({ hosts: [], components: [] })),
+    client.getFleetConfigStatus().catch(() => null),
+  ]);
+  const cfg = indexConfigStatus(configStatus);
   if (!hosts.length) { root.innerHTML = '<herdr-empty message="No hosts reporting"></herdr-empty>'; return; }
-  root.innerHTML = '<h1>Hosts</h1><div class="hd-grid">' + hosts.map((h) => `
-    <div class="hd-card">
+  const driftedOnly = route().query.get('drift') === '1';
+  const now = Date.now();
+  root.innerHTML = `<h1>Hosts</h1>
+    ${configNotice(cfg)}
+    <div class="hd-grid">` + hosts.map((h) => {
+      const fresh = reportFreshness(h.last_seen, now) === 'current';
+      return `<div class="hd-card">
       <div class="hd-card__title"><a href="#/hosts/${esc(h.host_id)}">${esc(h.host_name)}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${esc(h.status)}"></herdr-status></div>
-      <div class="hd-card__sub"><code>${esc(h.tailnet_ip)}</code> · seen ${formatTimestamp(h.last_seen)}</div>
-    </div>`).join('') + '</div>';
+      <div style="margin:6px 0"><herdr-status stage="${fresh ? esc(h.status) : 'stalled'}"></herdr-status> ${configBadge(cfg, h)}</div>
+      <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code> · ` : ''}${fresh ? 'seen' : '<strong>no report since</strong>'} ${h.last_seen ? formatTimestamp(h.last_seen) : 'never'}</div>
+      ${Number.isFinite(h.cpu) || Number.isFinite(h.mem) ? `<div class="hd-card__sub">${[Number.isFinite(h.cpu) ? `CPU ${h.cpu}%` : '', Number.isFinite(h.mem) ? `memory ${h.mem}%` : ''].filter(Boolean).join(' · ')}</div>` : ''}
+    </div>`; }).join('') + `</div>
+    <h2 style="margin-top:24px">Fleet versions</h2>
+    <p class="hd-card__sub"><a href="#/hosts${driftedOnly ? '' : '?drift=1'}">${driftedOnly ? 'Show all components' : 'Show only components that differ'}</a></p>
+    ${renderFleetMatrix(matrix, { driftedOnly })}`;
 }
 
 async function viewHost(parts) {
@@ -343,10 +368,11 @@ async function viewHost(parts) {
   try {
     const { samples } = await client.request(`/api/v1/hosts/${esc(parts[1])}/telemetry?limit=1`);
     if (samples && samples.length) {
-      const s = samples[0];
-      cpu = (s.cpu ?? s.cpu_pct) ?? '—';
-      mem = (s.mem ?? s.mem_pct) ?? '—';
-      disk = s.disk_pct ?? '—';
+      const s = samples[samples.length - 1];
+      const pct = (v) => (Number.isFinite(v) ? `${v}%` : '—');
+      cpu = pct(s.cpu ?? s.cpu_pct);
+      mem = pct(s.mem ?? s.mem_pct);
+      disk = pct(s.disk_pct);
       seen = formatTimestamp(s.at ?? h.last_seen);
     }
   } catch { /* telemetry optional */ }
@@ -518,7 +544,12 @@ connectEvents({
     // LIVE_REFRESH_MS since the previous live refresh.
     const wait = Math.max(150, LIVE_REFRESH_MS - (Date.now() - lastLiveRender));
     liveTimer = setTimeout(() => {
+      liveTimer = null;
       lastLiveRender = Date.now();
+      // The event may have arrived while the view was still loading; a view that
+      // mounted since then owns its refresh (a full re-render would reset filters).
+      if (servicesView) { servicesView.refresh(); return; }
+      if (dashboardView) return;
       render();
     }, wait);
   },
@@ -529,4 +560,4 @@ window.addEventListener('hashchange', () => {
   if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
   lastLiveRender = Date.now(); render();
 });
-render();
+completeSignInIfRedirected().finally(() => render());

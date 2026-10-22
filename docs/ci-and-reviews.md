@@ -6,11 +6,11 @@ CI and Reviews are native navigation pages with the same outcome tabs, project g
 
 The connector targets the installed Woodpecker v3.18 API. It discovers the authenticated user's repositories, checks recent pipelines in a single background poll, retains last-known runs on failure, and reports discovery progress, per-repository errors, freshness and authentication failure separately. A pending/running pipeline is not declared stalled just because time passes. Logs use the stored log API, are bounded and redacted, and retain a link to the full provider output.
 
-Keep a personal access token in `~/.config/herdr-engineering/ci-token` with mode0600. Alternatively configure `HERDR_ENGINEERING_CI_TOKEN_FILE` or server-only `HERDR_ENGINEERING_CI_TOKEN`. The token inherits its user's access; use an appropriately restricted account. The browser never receives it.
+The Woodpecker address and personal access token live in the `ci` section of the central fleet config (`herdr-eng fleet config init` asks for them; file mode 0600). The token inherits its user's access; use an appropriately restricted account. The browser never receives it.
 
-For Compose, add `-f deploy/control-plane/compose.integrations.yaml` after the normal compose file. Set `HERDR_ENGINEERING_CI_TOKEN_HOST_FILE` for a different protected host path. The override mounts only that file read-only. Recreate the web service after atomically replacing a bind-mounted credential file. Configure `HERDR_ENGINEERING_CI_URL` for another HTTPS server.
+`deploy/control-plane/deploy.sh` mounts the central file read-only into the web container; no separate credential file or compose override is needed.
 
-Retry/cancel are disabled unless `HERDR_ENGINEERING_CI_ACTIONS=1`. When enabled, they still require HerdR's operator role and Woodpecker push permission. The correct upstream operations are POST restart and POST cancel; cancel does not delete pipeline history. Runner inventory is optional and requires additional upstream privileges. Missing runner permissions do not disable repository monitoring.
+Retry/cancel are disabled unless `control_plane.ci_actions: true` is set in the central fleet config. When enabled, they still require HerdR's operator role and Woodpecker push permission. The correct upstream operations are POST restart and POST cancel; cancel does not delete pipeline history. Runner inventory is optional and requires additional upstream privileges. Missing runner permissions do not disable repository monitoring.
 
 Shared projects can span repositories: `HERDR_ENGINEERING_PROJECT_REPOS_FILE` points to a JSON object mapping canonical identities to a common project ID, for example `{"github.com/team/frontend":"product", "github.com/team/backend":"product"}`. Defaults preserve the full forge/repository identity. Provider numeric IDs distinguish equal repository names on different forges.
 

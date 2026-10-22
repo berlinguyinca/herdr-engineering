@@ -196,17 +196,16 @@ def test_router_restart_rebinds_active_leases(tmp_path):
         server.shutdown()
 
 
-def test_gateway_url_from_config_env_wins(monkeypatch):
+def test_gateway_url_from_config_host_config_wins(fake_host_config):
     from herdr_engineering.fabric import gateway_url_from_config
     config = {"fabric": {"gateway_url": "http://cfg-host:29999"}}
     assert gateway_url_from_config(config) == "http://cfg-host:29999"
-    monkeypatch.setenv("HERDR_ENGINEERING_FABRIC_URL", "http://env-host:29999")
-    assert gateway_url_from_config(config) == "http://env-host:29999"
+    fake_host_config({"fabric": {"url": "http://central-host:29999"}})
+    assert gateway_url_from_config(config) == "http://central-host:29999"
 
 
-def test_gateway_url_bare_base_gets_default_port(monkeypatch):
+def test_gateway_url_bare_base_gets_default_port():
     from herdr_engineering.fabric import gateway_url_from_config
-    monkeypatch.delenv("HERDR_ENGINEERING_FABRIC_URL", raising=False)
     assert gateway_url_from_config({"fabric": {"gateway_url": "bender.ts.net"}}) \
         == "http://bender.ts.net:29999"
     assert gateway_url_from_config({"fabric": {"gateway_url": ""}}) is None

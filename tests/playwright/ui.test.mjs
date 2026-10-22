@@ -1063,3 +1063,18 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
     assert.match(await page.locator('.ig-inspector').innerText(),/Run #42/);
   },{BURST:'0'});
 });
+
+test('hosts page lists the fleet version matrix and flags the host that differs', async () => {
+  await withApp(async ({ page, base }) => {
+    await page.goto(`${base}/#/hosts`);
+    await page.waitForSelector('.hd-fleet table');
+    const text = await bodyText(page);
+    assert.ok(/Fleet versions/.test(text), text);
+    const drifted = await page.$$eval('.hd-fleet__cell--drifted', (cells) => cells.map((c) => c.innerText.trim()));
+    assert.strictEqual(drifted.length, 1, drifted.join(','));
+    assert.ok(drifted[0].startsWith('1.2.0'), drifted[0]);
+    await page.goto(`${base}/#/hosts?drift=1`);
+    await page.waitForSelector('.hd-fleet table');
+    assert.ok(!/superpowers/.test(await bodyText(page)), 'in-sync rows hide under the drift filter');
+  });
+});

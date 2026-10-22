@@ -74,35 +74,31 @@ class Provider:
         return issue(number, ["auto-implement"], body="Details password=private-secret")
 
 
-@pytest.mark.parametrize("payload", [None, [], "bad", {"data": None}, {"errors": {}}, {"errors": [None]}, {"errors": "secret-token-value"}, {"data": {}, "errors": {"message": "secret-token-value"}}])
+@pytest.mark.parametrize("payload", [None, [], "bad", {"data": None}, {"errors": {}}, {"errors": [None]}, {"errors": "placeholder-token-value"}, {"data": {}, "errors": {"message": "placeholder-token-value"}}])
 def test_invalid_graphql_payloads_are_safe_errors(payload):
-    provider = GitHubProvider(token="secret-token-value", client=Client(payload))
+    provider = GitHubProvider(token="placeholder-token-value", client=Client(payload))
     with pytest.raises(GitHubError) as error:
         provider.repositories_page()
     assert error.value.reason == "invalid_response"
-    assert "secret-token-value" not in str(error.value)
+    assert "placeholder-token-value" not in str(error.value)
 
 
 def test_graphql_partial_errors_are_not_successful_empty_inventory():
     payload = {"data": {"viewer": {"login": "fixture", "repositories": connection([])}},
-               "errors": [{"type": "FORBIDDEN", "message": "secret-token-value"}]}
+               "errors": [{"type": "FORBIDDEN", "message": "placeholder-token-value"}]}
     with pytest.raises(GitHubError, match="denied"):
-        GitHubProvider(token="secret-token-value", client=Client(payload)).repositories_page()
+        GitHubProvider(token="placeholder-token-value", client=Client(payload)).repositories_page()
 
 
-def test_private_token_file_is_required_and_never_serialized(tmp_path, monkeypatch):
-    path = tmp_path / "token"
-    path.write_text("secret-token-value")
-    monkeypatch.setenv("HERDR_ENGINEERING_GITHUB_TOKEN_FILE", str(path))
-    path.chmod(0o644)
+def test_token_comes_from_host_config_and_is_never_serialized(fake_host_config):
     assert not GitHubProvider().available
-    path.chmod(0o600)
+    fake_host_config({"github": {"token": "placeholder-token-value"}})
     provider = GitHubProvider()
     assert provider.available
     monitor = GitHubMonitor(provider_factory=lambda: Provider())
     monitor.refresh()
     assert "fingerprint" not in json.dumps(monitor.repositories(start=False))
-    assert "secret-token-value" not in json.dumps(monitor.repositories(start=False))
+    assert "placeholder-token-value" not in json.dumps(monitor.repositories(start=False))
 
 
 def test_graphql_uses_exact_issue_totals_and_cursor_variables():
@@ -199,14 +195,14 @@ def test_autospec_labels_never_claim_execution_readiness(labels, state, managed)
 def test_http_rate_limit_and_redirect_errors_never_include_headers_or_tokens():
     headers = Message()
     headers["Retry-After"] = "60"
-    error = urllib.error.HTTPError("https://api.github.com/graphql", 429, "secret-token-value", headers, io.BytesIO(b"secret-token-value"))
+    error = urllib.error.HTTPError("https://api.github.com/graphql", 429, "placeholder-token-value", headers, io.BytesIO(b"placeholder-token-value"))
     with pytest.raises(GitHubError) as caught:
-        GitHubProvider(token="secret-token-value", client=Client(error)).repositories_page()
+        GitHubProvider(token="placeholder-token-value", client=Client(error)).repositories_page()
     assert caught.value.reason == "rate_limited" and caught.value.retry_at
-    assert "secret-token-value" not in str(caught.value)
+    assert "placeholder-token-value" not in str(caught.value)
     redirect = urllib.error.HTTPError("https://evil.example", 302, "redirect", Message(), io.BytesIO())
     with pytest.raises(GitHubError) as caught:
-        GitHubProvider(token="secret-token-value", client=Client(redirect)).repositories_page()
+        GitHubProvider(token="placeholder-token-value", client=Client(redirect)).repositories_page()
     assert caught.value.reason == "redirect"
 
 

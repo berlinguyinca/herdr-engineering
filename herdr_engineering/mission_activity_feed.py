@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -28,6 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .control_plane.redact import redact_text
+from .host_config import HostConfigUnavailable, exit_unavailable, host_value
 
 MAX_SESSIONS = 64
 MAX_MISSIONS = 20
@@ -261,6 +263,13 @@ class MissionActivityFeed:
         self.sent: dict[str, tuple[str, float]] = {}
         self._lock = threading.Lock()
         self._http = urllib.request.build_opener(_NoRedirect())
+        self.auth_rejected = False
+
+    def retarget(self, url: str | None, api_key: str | None) -> None:
+        if url:
+            self.url = url.rstrip('/')
+        if api_key is not None:
+            self.api_key = api_key
 
     def _http_json(self, route: str, body: dict | None = None) -> dict:
         headers = {'Content-Type': 'application/json'}
@@ -270,8 +279,13 @@ class MissionActivityFeed:
         if raw is not None and len(raw) > 256 * 1024:
             raise ValueError('activity payload too large')
         request = urllib.request.Request(self.url + route, data=raw, headers=headers)
-        with self._http.open(request, timeout=3) as response:
-            data = response.read(MAX_REPLY_BYTES + 1)
+        try:
+            with self._http.open(request, timeout=3) as response:
+                data = response.read(MAX_REPLY_BYTES + 1)
+        except urllib.error.HTTPError as error:
+            if route == '/api/v1/ingest' and error.code in (401, 403):
+                self.auth_rejected = True
+            raise
         if len(data) > MAX_REPLY_BYTES:
             raise ValueError('control-plane reply too large')
         result = json.loads(data)
@@ -390,12 +404,13 @@ class MissionActivityFeed:
 
 
 def run_feed(url: str, *, host_id: str, control_dir: Path | None = None,
-             interval: float = 5, once: bool = False) -> int:
+             interval: float = 5, once: bool = False, api_key: str | None = None,
+             refresher=None, follow_url: bool = True) -> int:
     """One host process, bounded polling and interruptible graceful shutdown."""
     if not 1 <= interval <= 300:
         raise ValueError('interval must be between 1 and 300 seconds')
     collector = MissionActivityFeed(url, host_id=host_id, control_dir=control_dir,
-                                    api_key=os.environ.get('HERDR_CP_API_KEY', ''))
+                                    api_key=api_key if api_key is not None else (host_value('ingest.api_key') or ''))
     # Separate from Pi's directory: may start before the first Pi session exists.
     state = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'herdr-engineering'
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -417,6 +432,12 @@ def run_feed(url: str, *, host_id: str, control_dir: Path | None = None,
                 if once:
                     print(json.dumps(result))
                     return 0 if result['capable'] and result['errors'] == 0 else 1
+                if refresher is not None:
+                    try:
+                        refresher.sync(collector, follow_url=follow_url,
+                                       follow_key=api_key is None)
+                    except HostConfigUnavailable as exc:
+                        return exit_unavailable(exc)
                 stopped.wait(interval)
         finally:
             for sig, handler in old_handlers.items():

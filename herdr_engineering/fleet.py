@@ -121,7 +121,9 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
                user: str | None = None, ansible_host: str | None = None,
                gateway: str = "http://dev.lan:29999", herdr_bin: str = "herdr",
                attach: bool = True, provision: bool = True,
-               inventory: Path | None = None, host_vars_dir: Path | None = None) -> dict:
+               inventory: Path | None = None, host_vars_dir: Path | None = None,
+               fleet_config: Path | None = None, roles: list[str] | None = None,
+               control_plane_url: str | None = None) -> dict:
     """One command: attach via herdr + add to inventory + converge + verify.
 
     Returns a JSON-serializable report.
@@ -159,6 +161,23 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
     except Exception as exc:
         report["steps"]["inventory"] = {"ok": False, "error": str(exc)}
         report["errors"] = [f"inventory update failed: {exc}"]
+
+    # 2b) fleet-config credentials (opt-in via ``fleet_config``): install the
+    # token on the target FIRST, only then persist its hash, so a failed ssh
+    # leaves the central file unchanged. The token is never reported.
+    if fleet_config is not None:
+        from . import fleet_config_cli as fcc
+        if not Path(fleet_config).exists():
+            report["steps"]["config"] = {"ok": True, "skipped": f"{fleet_config} does not exist"}
+        else:
+            try:
+                rep = fcc.issue_host_credentials(Path(fleet_config), host, ssh_target,
+                                                 roles=roles,
+                                                 control_plane_url=control_plane_url)
+                report["steps"]["config"] = {"ok": True, "host": host, "token": fcc.TOKEN_PLACEHOLDER}
+            except Exception as exc:
+                report["steps"]["config"] = {"ok": False, "error": str(exc)}
+                report.setdefault("errors", []).append(f"fleet config credentials failed: {exc}")
 
     # 3) converge herdr-eng + fabric agent + build-gate on the host
     if provision:
@@ -374,3 +393,45 @@ def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None)
             "sourceRoot": status["hosts"][0]["pi_path"] if ok else None,
             "stdout": out[-4000:], "stderr": err[-1000:], "status": status,
             "hosts": status.get("hosts", []), "parity": parity}
+
+
+# ---- version drift plan -----------------------------------------------------
+# Hosts report tool and plugin versions to the control plane; this turns the
+# resulting matrix into per-host actions. It only *describes* what to run: the
+# updaters differ per machine (nvm, Homebrew, pinned releases) and a wrong
+# global install is hard to undo, so nothing here executes remotely.
+_UPDATERS = {
+    "claude": "npm install -g @anthropic-ai/claude-code@{version}",
+    "codex": "npm install -g @openai/codex@{version}",
+    "pi": "pi-engineering-update   # moves pi-engineering; pi itself follows its own release channel",
+    "herdr-eng": "herdr-eng fleet update --host {host}",
+}
+
+
+def plan_version_sync(matrix: dict) -> list[dict]:
+    """One entry per (host, component) that differs from the fleet reference."""
+    plan = []
+    for component in matrix.get("components", []):
+        reference = component.get("reference")
+        if not reference or reference == "dev":  # dev checkouts have no version to sync to
+            continue
+        name = component["name"]
+        for host, cell in sorted(component.get("hosts", {}).items()):
+            state = cell.get("state")
+            if state == "ok":
+                continue
+            entry = {"host": host, "component": name, "group": component.get("group"),
+                     "state": state, "current": cell.get("version"), "target": reference}
+            if component.get("group") == "plugins" and name.startswith("claude:"):
+                plugin = name.split(":", 1)[1]
+                entry["command"] = (f"claude plugin update {plugin}" if state == "drifted"
+                                    else f"claude plugin install {plugin}")
+            elif name in _UPDATERS and state in {"drifted", "missing"}:
+                entry["command"] = _UPDATERS[name].format(version=reference, host=host)
+            elif name == "node":
+                entry["command"] = None
+                entry["note"] = "node differs per service manager; align it only if a tool needs it"
+            else:
+                entry["command"] = None
+            plan.append(entry)
+    return plan

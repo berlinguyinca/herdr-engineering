@@ -99,7 +99,8 @@ test('main service catalog requires confirmed HerdR origin and keeps host listen
     {...base,service_id:'legacy',session_id:'guessed',project:'herdr',repository:'github.com/example/herdr'},
     {...base,service_id:'invalid',catalog:{scope:'HERDR'}}];
   assert.deepEqual(selectServices(rows,{now}).map(s=>s.service_id),['owned']);
-  assert.deepEqual(selectServices(rows,{scope:'system',now}).map(s=>s.service_id),['invalid','legacy','system','unassigned']);
+  assert.deepEqual(selectServices(rows,{scope:'system',now}).map(s=>s.service_id),['system']);
+  assert.deepEqual(selectServices(rows,{scope:'local',now}).map(s=>s.service_id),['invalid','legacy','unassigned']);
   assert.equal(overviewModel({services:rows},now,now).services.current,1);
   assert.match(renderOverviewSection('services',{services:rows},{services:{loaded:true}},now,now),/#\/system-services/);
 });

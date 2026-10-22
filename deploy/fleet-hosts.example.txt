@@ -1,0 +1,5 @@
+# name | ssh target ("local" for this machine) | service manager (systemd|launchd)
+# Copy to ~/.config/herdr-engineering/fleet-hosts.txt and edit. Lines starting with # are ignored.
+bender | local | systemd
+beast  | beast | systemd
+mac.lan | user@100.x.y.z | launchd

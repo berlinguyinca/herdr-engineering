@@ -151,7 +151,7 @@ def test_unknown_key_unauthorized():
     svr.wait_until_ready()
     base = f"http://127.0.0.1:{svr.port}"
     try:
-        req = urllib.request.Request(f"{base}/api/v1/health",
+        req = urllib.request.Request(f"{base}/api/v1/missions",
                                      headers={"X-API-Key": "wrong"})
         with pytest.raises(urllib.error.HTTPError) as ei:
             urllib.request.urlopen(req)

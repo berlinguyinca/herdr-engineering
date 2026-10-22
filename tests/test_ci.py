@@ -47,7 +47,6 @@ def _provider(routes, default=None, base="https://ci.example"):
 
 def test_offline_safe_stale_view(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))  # no token file exists there
-    monkeypatch.delenv("HERDR_ENGINEERING_CI_TOKEN", raising=False)
     p = WoodpeckerProvider(base_url="https://ci.example")
     assert p.available is False
     assert p.pipelines("repo") == []  # never guessed success
@@ -151,17 +150,6 @@ def test_html_response_is_an_error_not_empty_logs():
     assert exc.value.reason == "invalid_response"
 
 
-def test_token_from_machine_local_file(tmp_path, monkeypatch):
-    tok_file = tmp_path / ".config" / "herdr-engineering" / "ci-token"
-    tok_file.parent.mkdir(parents=True)
-    tok_file.write_text("sekrit\n")
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("HERDR_ENGINEERING_CI_TOKEN", raising=False)
-    p = WoodpeckerProvider(base_url="https://ci.example")
-    assert p.token == "sekrit"
-    assert p.available is True
-
-
 def test_retry_requires_authorization_and_uses_id_path():
     repo = {"id": 1, "full_name": "acme/repo", "owner": "acme", "name": "repo"}
     p = _provider({
@@ -201,7 +189,6 @@ def test_debug_with_pi_builds_bounded_handoff_from_failing_tasks():
 
 def test_debug_with_pi_handoff_is_bounded(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))  # hermetic: no token file
-    monkeypatch.delenv("HERDR_ENGINEERING_CI_TOKEN", raising=False)
     p = WoodpeckerProvider()
     h = p.debug_with_pi_handoff(
         "repo", PipelineView(pipeline_id="p1", run_number=1,
@@ -220,12 +207,12 @@ def test_cancel_posts_cancel_route_and_never_deletes_pipeline():
     assert p._client.methods[-1] == "POST"
 
 
-def test_secret_file_override(tmp_path, monkeypatch):
-    path = tmp_path / "secret"
-    path.write_text("mounted-secret\n")
-    monkeypatch.delenv("HERDR_ENGINEERING_CI_TOKEN", raising=False)
-    monkeypatch.setenv("HERDR_ENGINEERING_CI_TOKEN_FILE", str(path))
-    assert WoodpeckerProvider().token == "mounted-secret"
+def test_credentials_come_from_host_config(fake_host_config):
+    fake_host_config({"ci": {"url": "https://ci.central.test/", "token": "placeholder-central-value"}})
+    p = WoodpeckerProvider()
+    assert p.token == "placeholder-central-value" and p.base_url == "https://ci.central.test"
+    assert p.available
+    assert WoodpeckerProvider(token="explicit").token == "explicit"
 
 
 @pytest.mark.parametrize("status,reason", [(401,"authentication"),(403,"permission"),

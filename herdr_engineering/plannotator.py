@@ -23,6 +23,7 @@ from uuid import uuid4
 
 from .control_plane.project_links import canonical_repository, project_for_repository
 from .control_plane.reviews import MAX_TEXT, safe_review_url
+from .host_config import resolve_control_plane
 from .session_env import _post
 
 
@@ -223,11 +224,13 @@ def main(argv=None):
     parser.add_argument("--plan-file")
     parser.add_argument("--receipt-file")
     parser.add_argument("--cwd", default=os.getcwd())
-    parser.add_argument("--control-plane", default=os.environ.get("HERDR_ENGINEERING_CONTROL_PLANE_URL", "http://dev.lan"))
+    parser.add_argument("--control-plane", default=None,
+                        help="control plane URL (default: host.json control_plane_url)")
     for option in ("repository", "project-id", "revision", "mission-id", "session-id", "title", "url-host"):
         parser.add_argument("--" + option)
     try:
         args = vars(parser.parse_args(argv))
+        args["control_plane"] = resolve_control_plane(args["control_plane"])
         receipt_file = args.pop("receipt_file")
         if args["kind"] == "replay":
             if not receipt_file:
@@ -239,7 +242,7 @@ def main(argv=None):
             result = run_review(**args)
         print(json.dumps(result))
         return 0
-    except (ValueError, OSError, RuntimeError) as exc:
+    except (ValueError, OSError, RuntimeError) as exc:  # HostConfigUnavailable is a RuntimeError
         print(f"Plannotator bridge: {exc}", file=sys.stderr)
         return 1
 
