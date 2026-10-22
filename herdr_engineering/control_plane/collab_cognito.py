@@ -27,10 +27,16 @@ class CognitoAuthenticator:
     def __init__(self, *, pool_id: str, client_ids: list[str], required_group: str,
                  jwks_fetch: Callable[[], dict] | None = None,
                  group_lookup: Callable[[str], list[str] | None] | None = None,
-                 recheck_seconds: float = 60.0, now: Callable[[], float] = time.time):
+                 recheck_seconds: float = 60.0, now: Callable[[], float] = time.time,
+                 open_signup: bool = False):
         m = _POOL_RE.match(pool_id or "")
-        if not m or not client_ids or not required_group:
+        if not m or not client_ids or not (required_group or open_signup):
             raise ValueError("pool_id, client_ids and required_group are required")
+        # open_signup: any valid pool token authenticates. Who may DO anything is then decided by the
+        # collaboration service (an approval queue), not by a Cognito group, and the token's group
+        # claims are handed to it (``verify_claims``) to auto-approve members of trusted groups and to
+        # recognise approvers.
+        self.open_signup = open_signup
         self.region = m.group(1)
         self.issuer = f"https://cognito-idp.{self.region}.amazonaws.com/{pool_id}"
         self.pool_id = pool_id
@@ -72,6 +78,11 @@ class CognitoAuthenticator:
     # -- UserAuthenticator
     def verify(self, token: str) -> tuple[str, float] | None:
         """(user id, token expiry epoch) for a valid access token in the required group."""
+        got = self.verify_claims(token)
+        return (got["user"], got["exp"]) if got else None
+
+    def verify_claims(self, token: str) -> dict | None:
+        """{user, exp, groups} for a valid access token (in the required group unless open_signup)."""
         import jwt
         try:
             header = jwt.get_unverified_header(token)
@@ -88,12 +99,14 @@ class CognitoAuthenticator:
         if claims.get("token_use") != "access" or not isinstance(client, str) or client not in self.client_ids:
             return None
         user = claims.get("username") or claims.get("sub")
-        if not isinstance(user, str) or not user or not isinstance(groups, list) or self.required_group not in groups:
+        if not isinstance(user, str) or not user or not isinstance(groups, list) or not _USER_RE.match(user):
             return None
-        if not self._still_in_group(user):
-            return None
+        groups = [g for g in groups if isinstance(g, str)][:64]
+        if not self.open_signup:
+            if self.required_group not in groups or not self._still_in_group(user):
+                return None
         self._seen.add(user)
-        return user, float(claims["exp"])
+        return {"user": user, "exp": float(claims["exp"]), "groups": groups}
 
     def verify_id_token(self, token: str, *, user: str) -> str | None:
         """Verified, lower-cased email from an ID token that belongs to ``user``.
@@ -134,6 +147,8 @@ class CognitoAuthenticator:
         """Known and still in the group (stream/agent re-checks come through here)."""
         if not isinstance(user_id, str) or not _USER_RE.match(user_id):
             return False
+        if self.open_signup:
+            return True            # the service's approval state decides, not group membership
         if self._lookup is None:
             return user_id in self._seen
         return self._still_in_group(user_id)

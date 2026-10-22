@@ -162,7 +162,8 @@ def _run_web(monkeypatch, path, **overrides):
                               collab_public_url=None, collab_operator_port=None,
                               collab_operator_user=None, collab_operator_email=None,
                               collab_operator_host=[], collab_operator_url=None,
-                              collab_dashboard_host=[])
+                              collab_dashboard_host=[], collab_open_signup=False,
+                              collab_approver_group=[])
     for k, v in overrides.items():
         setattr(args, k, v)
     assert cli._cmd_cp_web(args) == 0
@@ -477,3 +478,15 @@ def test_llm_proxy_refuses_a_slice_with_extra_control_plane_keys(tmp_path, capsy
     out.unlink()
     fcc.write_private_file(out, _json.dumps(data))
     assert cli._cmd_cp_llm_proxy(_proxy_args(out)) == 2
+
+
+def test_approval_settings_come_from_the_collab_slice():
+    import argparse
+    args = argparse.Namespace(collab_open_signup=False, collab_approver_group=[])
+    cli._apply_collab_config(args, {"collab": {"open_signup": True, "approver_groups": ["Administrators", "Managers"]}})
+    assert args.collab_open_signup is True and args.collab_approver_group == ["Administrators", "Managers"]
+    args = argparse.Namespace(collab_open_signup=False, collab_approver_group=["Flag"])
+    cli._apply_collab_config(args, {"collab": {"approver_groups": ["Administrators"]}})
+    assert args.collab_approver_group == ["Flag"]                    # flags win
+    with pytest.raises(SystemExit):
+        cli._apply_collab_config(argparse.Namespace(collab_open_signup=False), {"collab": {"open_signup": "yes"}})

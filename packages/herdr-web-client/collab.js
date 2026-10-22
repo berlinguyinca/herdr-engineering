@@ -87,6 +87,12 @@ export class CollabApi {
   me() { return this.call('GET', '/me'); }
   link(idToken) { return this.call('POST', '/me', { id_token: idToken }); }
   rooms() { return this.call('GET', '/rooms'); }
+  // approval: the people who asked to join (operator: everyone; approvers: those waiting)
+  users(status) { return this.call('GET', `/admin/users${status ? `?status=${encodeURIComponent(status)}` : ''}`); }
+  decideUser(user, action, reason) {
+    return this.call('POST', `/admin/users/${encodeURIComponent(user)}/${encodeURIComponent(action)}`, reason ? { reason } : {});
+  }
+  userLog() { return this.call('GET', '/admin/users/log'); }
   room(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}`); }
   createProject(name) { return this.call('POST', '/projects', { name }); }
   createRoom(project, name) { return this.call('POST', `/projects/${encodeURIComponent(project)}/rooms`, { name }); }

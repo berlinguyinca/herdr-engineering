@@ -44,6 +44,20 @@ ROLE_ACTIONS = {
     "guest": frozenset({"read"}),
 }
 INVITABLE_ROLES = frozenset({"contributor", "viewer", "guest"})
+MAX_USERS = 2000                 # people ever registered (approval mode)
+MAX_PENDING_USERS = 200          # waiting for approval: beyond this, new sign-ins are refused until some are decided
+USER_STATUSES = frozenset({"pending", "approved", "denied", "disabled", "kicked"})
+USER_ACTIONS = {"approve": "approved", "deny": "denied", "disable": "disabled", "enable": "approved", "kick": "kicked"}
+
+
+class ApprovalPolicy:
+    """Who may use the network once approval mode is on: anyone with a pool account may sign in and
+    ask; nothing works until an approver or the operator approves. ``auto_groups`` (e.g. local.dev) are
+    approved on sight; ``approver_groups`` (e.g. Administrators) are too, and may approve others."""
+
+    def __init__(self, auto_groups=(), approver_groups=()):
+        self.auto_groups = frozenset(auto_groups)
+        self.approver_groups = frozenset(approver_groups)
 AGENT_ACTIONS = frozenset({"read", "post", "instruct", "execute"})  # an agent can never invite/grant/administer
 PROJECT_ROLES = frozenset({"manager", "contributor"})
 
@@ -123,11 +137,14 @@ class StaticTokenAuthenticator:
 
 
 class Principal:
-    __slots__ = ("kind", "id", "owner", "digest", "exp")
+    __slots__ = ("kind", "id", "owner", "digest", "exp", "status", "approver", "admin")
 
     def __init__(self, kind: str, id: str, owner: str, digest: str | None = None,
                  exp: float | None = None):
         self.kind, self.id, self.owner, self.digest, self.exp = kind, id, owner, digest, exp
+        self.status = "approved"       # approval mode sets this for people; agents are judged by their owner
+        self.approver = False          # may approve or deny people waiting
+        self.admin = False             # the operator on the tailnet-only listener: may also disable and remove
 
     @property
     def key(self) -> str:
@@ -205,8 +222,11 @@ class CollabService:
                  max_agents_per_user: int = 60, max_projects_per_user: int = 20,
                  max_rooms_per_project: int = 50, max_members_per_room: int = 100,
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
-                 default_grant_ttl: float = 30 * 24 * 3600.0):
+                 default_grant_ttl: float = 30 * 24 * 3600.0,
+                 approval: ApprovalPolicy | None = None):
         self.auth = authenticator
+        self.approval = approval
+        self._users: dict[str, dict] = {}       # approval mode: user id -> {status, since, decided_by, decided_at, reason}
         self._sink = sink
         self._now = now or time.time
         self.enrollment_ttl = enrollment_ttl
@@ -350,6 +370,13 @@ class CollabService:
             mark = getattr(self.auth, "mark_known", None)
             if mark:
                 mark({u for u in known if isinstance(u, str)})
+            if self.approval is not None:
+                # Everyone who was already using the network when approval was switched on keeps working;
+                # only people who show up from now on wait. (Recomputed on every start, never logged.)
+                for u in known:
+                    if isinstance(u, str) and u not in self._users:
+                        self._users[u] = {"status": "approved", "since": None, "decided_by": "grandfathered",
+                                          "decided_at": None, "reason": None}
             return len(parsed)
 
     # --------------------------------------------------------- state fold
@@ -364,6 +391,12 @@ class CollabService:
                 "id": p["room_id"], "project_id": p["project_id"], "name": p["name"], "created_by": p["actor_user_id"],
                 "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq}},
                 "grants": {}}
+        elif t == "user_registered":
+            self._users[p["user_id"]] = {"status": p["status"], "since": p["at"], "decided_by": p.get("decided_by"),
+                                         "decided_at": p["at"] if p["status"] != "pending" else None, "reason": None}
+        elif t == "user_decided":
+            u = self._users.setdefault(p["user_id"], {"since": p["at"]})
+            u.update(status=p["status"], decided_by=p["decided_by"], decided_at=p["at"], reason=p.get("reason"))
         elif t == "member_added":
             self._rooms[p["room_id"]]["members"][p["subject_user_id"]] = {
                 "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq}
@@ -494,11 +527,19 @@ class CollabService:
             self.stats["auth_failures"] += 1
             raise CollabError(401, "unauthorized")
         if scheme == "Bearer":
-            got = self.auth.verify(token)
+            claims = getattr(self.auth, "verify_claims", None)
+            if claims is not None:
+                c = claims(token)
+                got, groups = ((c["user"], c["exp"]), c["groups"]) if c else (None, [])
+            else:
+                got, groups = self.auth.verify(token), []
             if got is None:
                 self.stats["auth_failures"] += 1
                 raise CollabError(401, "unauthorized")
-            return Principal("user", got[0], got[0], exp=got[1])
+            pr = Principal("user", got[0], got[0], exp=got[1])
+            if self.approval is not None:
+                self._admit(pr, set(groups))
+            return pr
         if scheme == "Agent":
             digest = _digest(token)
             with self._lock:
@@ -514,7 +555,7 @@ class CollabService:
                     reason = "expired"
                 elif device != agent["device_id"]:
                     reason = "device_mismatch"
-                elif not self.auth.exists(agent["owner"]):
+                elif not self._ok(agent["owner"]):
                     reason = "owner_disabled"
                 if reason:
                     self.stats["auth_failures"] += 1
@@ -525,19 +566,66 @@ class CollabService:
         self.stats["auth_failures"] += 1
         raise CollabError(401, "unauthorized")
 
+    _REFUSED = {"denied": "your request to join was declined", "disabled": "your account is disabled",
+                "kicked": "your access was removed"}
+
+    def _admit(self, pr: Principal, groups: set) -> None:
+        """Approval mode: record a first sign-in, apply the automatic rules, refuse the refused. Someone
+        waiting is let through with status "pending", which dispatch limits to asking for approval."""
+        pol, uid = self.approval, pr.id
+        auto = bool(groups & (pol.auto_groups | pol.approver_groups))
+        with self._lock:
+            u = self._users.get(uid)
+            if u is None:
+                if len(self._users) >= MAX_USERS or (
+                        not auto and sum(1 for x in self._users.values() if x["status"] == "pending") >= MAX_PENDING_USERS):
+                    self.stats["policy_denied"] += 1
+                    raise CollabError(429, "too many people are waiting for approval; ask the operator")
+                self._commit("user_registered", {
+                    "actor_user_id": uid, "actor_agent_id": None, "user_id": uid, "at": self._iso(),
+                    "status": "approved" if auto else "pending", "decided_by": "auto:group" if auto else None,
+                    "action": "user.register", "outcome": "allowed", "project_ids": [], "resource_id": uid})
+            elif u["status"] == "pending" and auto:
+                self._commit("user_decided", {
+                    "actor_user_id": uid, "actor_agent_id": None, "user_id": uid, "at": self._iso(),
+                    "status": "approved", "decided_by": "auto:group", "reason": None,
+                    "action": "user.approve", "outcome": "allowed", "project_ids": [], "resource_id": uid})
+            status = self._users[uid]["status"]
+        if status in self._REFUSED:
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, self._REFUSED[status])
+        pr.status = status
+        pr.approver = bool(groups & pol.approver_groups)
+
+    def _ensure_operator(self, uid: str) -> None:
+        """The tailnet-only dashboard owner is always approved: nobody else can lock them out."""
+        with self._lock:
+            if self._users.get(uid, {}).get("status") != "approved":
+                self._commit("user_decided", {
+                    "actor_user_id": uid, "actor_agent_id": None, "user_id": uid, "at": self._iso(),
+                    "status": "approved", "decided_by": "operator", "reason": None,
+                    "action": "user.approve", "outcome": "allowed", "project_ids": [], "resource_id": uid})
+
     def still_valid(self, pr: Principal) -> bool:
         """Re-check a long-lived stream's principal (revocation / expiry / owner loss)."""
         with self._lock:
             if pr.kind == "user":
                 # An open stream ends when its token expires (the client re-opens
                 # with a fresh one) or when the user loses access.
-                return (pr.exp is None or self._now() < pr.exp) and self.auth.exists(pr.id)
+                return (pr.exp is None or self._now() < pr.exp) and self._ok(pr.id)
             a = self._agents.get(pr.id)
             return bool(a and a["status"] == "active" and self._now() < a["expires_at"]
                         and self._by_cred.get(a["cred_digest"]) == pr.id
-                        and a["cred_digest"] == pr.digest and self.auth.exists(a["owner"]))
+                        and a["cred_digest"] == pr.digest and self._ok(a["owner"]))
 
     # ---------------------------------------------------------- authorization
+    def _approved(self, uid: str) -> bool:
+        return self.approval is None or self._users.get(uid, {}).get("status") == "approved"
+
+    def _ok(self, uid: str) -> bool:
+        """The person exists and may use the network (signed up, and approved when approval is on)."""
+        return self.auth.exists(uid) and self._approved(uid)
+
     def _member(self, room: dict, uid: str) -> dict | None:
         m = room["members"].get(uid)
         if m is None or (m["expires_at"] is not None and self._now() >= m["expires_at"]):
@@ -567,7 +655,7 @@ class CollabService:
         if grant["expires_at"] is not None and self._now() >= grant["expires_at"]:
             return None
         m = self._member(room, agent["owner"])
-        if not m or not self.auth.exists(agent["owner"]):
+        if not m or not self._ok(agent["owner"]):
             return None  # owner lost membership: the agent loses it too
         allowed = frozenset(grant["actions"]) & ROLE_ACTIONS[m["role"]] & AGENT_ACTIONS
         return allowed, max(grant["granted_seq"], m["joined_seq"])
@@ -662,7 +750,7 @@ class CollabService:
             uid, role = body.get("user_id"), body.get("role")
             if not isinstance(role, str) or role not in PROJECT_ROLES:
                 raise CollabError(400, "invalid role")
-            if not isinstance(uid, str) or not self.auth.exists(uid):
+            if not isinstance(uid, str) or not self._ok(uid):
                 raise CollabError(404, "unknown user")
             self._commit("project_member_added", self._actor(
                 pr, project_id=project_id, subject_user_id=uid, role=role, action="project.member.add",
@@ -715,7 +803,7 @@ class CollabService:
             if not isinstance(role, str) or role not in INVITABLE_ROLES:
                 raise CollabError(400, "invalid role")
             exp = _finite_expiry(body.get("expires_at"), self._now())
-            if not isinstance(uid, str) or not self.auth.exists(uid):
+            if not isinstance(uid, str) or not self._ok(uid):
                 raise CollabError(404, "unknown user")
             if self._member(room, uid):
                 raise CollabError(409, "already a member")
@@ -743,10 +831,106 @@ class CollabService:
                 resource_id=room_id))
         return {"ok": True}
 
+    # -- people: approval, disable, kick
+    def _user_row(self, uid: str, u: dict) -> dict:
+        rooms = sum(1 for room in self._rooms.values() if uid in room["members"])
+        agents = sum(1 for aid in self._agents_by_owner.get(uid, ()) if self._agents[aid]["status"] == "active")
+        return {"user_id": uid, "email": self._user_email.get(uid), "status": u["status"], "since": u.get("since"),
+                "decided_by": u.get("decided_by"), "decided_at": u.get("decided_at"), "reason": u.get("reason"),
+                "rooms": rooms, "agents": agents}
+
+    def list_users(self, pr: Principal, status: str | None = None) -> dict:
+        """The operator sees everyone; an approver sees only the people waiting."""
+        self._require_user(pr)
+        if self.approval is None or not (pr.admin or pr.approver):
+            raise CollabError(404, "not found")
+        if status is not None and status not in USER_STATUSES:
+            raise CollabError(400, "unknown status")
+        with self._lock:
+            rows = [self._user_row(uid, u) for uid, u in self._users.items()
+                    if (status is None or u["status"] == status) and (pr.admin or u["status"] == "pending")]
+            counts: dict[str, int] = defaultdict(int)
+            for u in self._users.values():
+                counts[u["status"]] += 1
+        order = {"pending": 0, "denied": 1, "kicked": 2, "disabled": 3, "approved": 4}
+        rows.sort(key=lambda r: (order[r["status"]], r["since"] or "", r["user_id"]))
+        return {"users": rows[:500], "counts": dict(counts), "can_manage": pr.admin}
+
+    def user_log(self, pr: Principal) -> dict:
+        """Who was registered, approved, declined, disabled, enabled or removed, by whom, newest first."""
+        self._require_user(pr)
+        if self.approval is None or not pr.admin:
+            raise CollabError(404, "not found")
+        with self._lock:
+            rows = [{"at": e["payload"].get("at"), "user_id": e["payload"]["user_id"],
+                     "email": self._user_email.get(e["payload"]["user_id"]), "action": e["payload"].get("action"),
+                     "status": e["payload"]["status"], "by": e["payload"].get("decided_by"),
+                     "reason": e["payload"].get("reason")}
+                    for e in reversed(self._log) if e["event_type"] in ("user_registered", "user_decided")]
+        return {"log": rows[:300]}
+
+    def decide_user(self, pr: Principal, uid: str, action: str, body: dict) -> dict:
+        """approve / deny (operator or approver, for people waiting); disable / enable / kick (operator).
+        Every decision is a logged event with who made it."""
+        self._require_user(pr)
+        if self.approval is None or not (pr.admin or pr.approver):
+            raise CollabError(404, "not found")
+        if action not in USER_ACTIONS:
+            raise CollabError(404, "not found")
+        reason = body.get("reason")
+        if reason is not None and (not isinstance(reason, str) or len(reason) > 200 or _NAME_BAD.search(reason)):
+            raise CollabError(400, "reason must be a short plain-text note")
+        if not isinstance(uid, str) or not self.auth.exists(uid):
+            raise CollabError(404, "not found")
+        with self._lock:
+            u = self._users.get(uid)
+            if u is None:
+                raise CollabError(404, "not found")
+            if uid == pr.id:
+                raise CollabError(400, "you cannot do this to yourself")
+            if action == "approve" and not self._user_email.get(uid):
+                # Nobody is approved blind: the pool lets anyone sign up, and the email is what says who it is.
+                raise CollabError(409, "they have not finished signing in yet (no verified email); ask again in a moment")
+            if action in ("approve", "deny"):
+                if not pr.admin and u["status"] != "pending":
+                    raise CollabError(403, "approvers only decide people who are waiting")
+            elif not pr.admin:
+                raise CollabError(403, "only the operator can do this")
+            if action == "enable" and u["status"] != "disabled":
+                raise CollabError(409, "that person is not disabled")
+            if action in ("disable",) and u["status"] != "approved":
+                raise CollabError(409, "only an approved person can be disabled")
+            self._throttle("userdecide:" + pr.id, 300, 600.0, "user decision")
+            new = USER_ACTIONS[action]
+            self._commit("user_decided", self._actor(
+                pr, user_id=uid, at=self._iso(), status=new, decided_by=pr.id, reason=reason,
+                action=f"user.{action}", outcome="allowed", project_ids=[], resource_id=uid))
+            if action == "kick":
+                # Out of every room, and every agent they own stops working for good.
+                for rid, room in list(self._rooms.items()):
+                    m = room["members"].get(uid)
+                    if m is not None and m["role"] != "owner":      # an owner's room stays; they simply can't get in
+                        self._commit("member_removed", self._actor(
+                            pr, project_id=room["project_id"], room_id=rid, subject_user_id=uid,
+                            action="member.remove", outcome="allowed", project_ids=[room["project_id"]],
+                            resource_id=rid))
+                for aid in list(self._agents_by_owner.get(uid, ())):
+                    if self._agents[aid]["status"] == "active":
+                        rooms = [r for r, room in self._rooms.items() if aid in room["grants"]]
+                        self._commit("agent_revoked", self._actor(
+                            pr, agent_id=aid, room_ids=rooms, action="agent.revoke", outcome="allowed",
+                            project_ids=[], resource_id=aid))
+            elif action in ("approve", "enable") and self._user_email.get(uid):
+                self._deliver_pending(uid, self._user_email[uid])
+            return self._user_row(uid, self._users[uid])
+
     # -- people: link email at sign-in, invite by email
     def me(self, pr: Principal) -> dict:
         self._require_user(pr)
-        return {"user_id": pr.id, "email": self._user_email.get(pr.id)}
+        out = {"user_id": pr.id, "email": self._user_email.get(pr.id)}
+        if self.approval is not None:
+            out.update(status=pr.status, approver=pr.approver, admin=pr.admin)
+        return out
 
     def link_identity(self, pr: Principal, body: dict) -> dict:
         """Record the verified email of the signed-in user and activate pending invites."""
@@ -760,8 +944,12 @@ class CollabService:
             if self._user_email.get(pr.id) != email:
                 self._commit("identity_linked", {"actor_user_id": pr.id, "actor_agent_id": None,
                                                  "user_id": pr.id, "email": email})
-            self._deliver_pending(pr.id, email)
-        return {"user_id": pr.id, "email": email}
+            if self._approved(pr.id):                  # invitations wait for approval, then arrive
+                self._deliver_pending(pr.id, email)
+        out = {"user_id": pr.id, "email": email}
+        if self.approval is not None:
+            out.update(status=pr.status, approver=pr.approver, admin=pr.admin)
+        return out
 
     def _deliver_pending(self, user: str, email: str) -> None:
         for iid, inv in list(self._invites.items()):
@@ -773,7 +961,7 @@ class CollabService:
                                                "invite_id": iid, "reason": "expired"})
                 continue
             inviter = self._member(room, inv["inviter"])
-            if inviter is None or "invite" not in ROLE_ACTIONS[inviter["role"]] or not self.auth.exists(inv["inviter"]):
+            if inviter is None or "invite" not in ROLE_ACTIONS[inviter["role"]] or not self._ok(inv["inviter"]):
                 # The person who sent it no longer has the authority to add anyone.
                 self._commit("invite_closed", {"actor_user_id": user, "actor_agent_id": None,
                                                "invite_id": iid, "reason": "inviter_unavailable"})
@@ -804,7 +992,7 @@ class CollabService:
                 raise CollabError(400, "invalid role")
             reply = {"status": "invited", "email": email, "role": role}
             user = self._email_user.get(email)
-            if user and self.auth.exists(user):
+            if user and self._ok(user):
                 if self._member(room, user):
                     return reply   # same answer as a pending invite: no signed-in-or-not oracle
                 self._commit("member_added", self._actor(
@@ -869,7 +1057,7 @@ class CollabService:
         with self._lock:
             rec = self._pending.get(digest)
             if (rec is None or rec["used"] or self._now() >= rec["expires_at"]
-                    or rec["device_id"] != device or not self.auth.exists(rec["owner"])):
+                    or rec["device_id"] != device or not self._ok(rec["owner"])):
                 self.stats["auth_failures"] += 1
                 raise CollabError(401, "unauthorized")
             aid, cred = ids.new_id("agent"), "hca_" + secrets.token_urlsafe(32)
@@ -994,7 +1182,7 @@ class CollabService:
         with self._lock:
             rec = self._joins.get(digest)
             if (rec is None or rec["revoked"] or self._now() >= rec["expires_at"]
-                    or rec["uses"] >= rec["max_uses"] or not self.auth.exists(rec["owner"])):
+                    or rec["uses"] >= rec["max_uses"] or not self._ok(rec["owner"])):
                 self.stats["auth_failures"] += 1
                 raise CollabError(401, "unauthorized")
             self._throttle("join:" + digest, 120, 60.0, "join")
@@ -1700,7 +1888,7 @@ class CollabService:
         """A task is only as good as its requester's CURRENT authority."""
         if t["by_kind"] == "user":
             m = self._member(room, t["by_id"])
-            return bool(m and "task" in ROLE_ACTIONS[m["role"]] and self.auth.exists(t["by_id"]))
+            return bool(m and "task" in ROLE_ACTIONS[m["role"]] and self._ok(t["by_id"]))
         creator = self._agents.get(t["by_id"])
         if not creator:
             return False
@@ -1980,10 +2168,24 @@ class CollabService:
                 # sign in as on the public site. They must still be a current group member.
                 if not self.auth.exists(operator):
                     raise CollabError(403, "operator is not enabled for collaboration")
+                if self.approval is not None:
+                    self._ensure_operator(operator)
                 pr = Principal("user", operator, operator)
+                pr.admin = pr.approver = True
             else:
                 pr = self.authenticate(authorization, device)
             n = len(parts)
+            if pr.status != "approved" and parts != ["me"]:
+                self.stats["policy_denied"] += 1
+                raise CollabError(403, "waiting for approval")
+            if parts[:2] == ["admin", "users"]:
+                if method == "GET" and parts == ["admin", "users", "log"]:
+                    return 200, self.user_log(pr)
+                if method == "GET" and n == 2:
+                    return 200, self.list_users(pr, str(query["status"]) if "status" in query else None)
+                if method == "POST" and n == 4:
+                    return 200, self.decide_user(pr, parts[2], parts[3], body)
+                raise CollabError(404, "not found")
             if method == "GET":
                 if parts == ["me"]:
                     return 200, self.me(pr)

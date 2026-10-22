@@ -112,7 +112,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     root.innerHTML = `<div class="hd-shell">
       <aside class="hd-shell__sidebar">
         <div class="hd-shell__brand"><span class="cx-logo" aria-hidden="true">◆</span>HerdR Collaboration</div>
-        <nav class="hd-shell__nav" aria-label="Collaboration">${link('/rooms', 'Rooms')}${link('/agents', 'AI agents')}<a class="hd-shell__link" href="/guide" target="_blank" rel="noopener">Guide</a></nav>
+        <nav class="hd-shell__nav" aria-label="Collaboration">${link('/rooms', 'Rooms')}${link('/agents', 'AI agents')}${canManagePeople() ? link('/people', 'People') : ''}<a class="hd-shell__link" href="/guide" target="_blank" rel="noopener">Guide</a></nav>
         <div class="cx-user"><span>${esc(me ? (me.email || me.user_id) : '')}</span>${operator ? '' : '<button id="hcn-out" class="hd-btn hd-btn--ghost hd-btn--sm" type="button">Sign out</button>'}</div>
       </aside>
       <main class="hd-shell__main"><div class="hd-shell__content">${strip}${content}</div></main></div>`;
@@ -146,7 +146,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     window.sessionStorage.removeItem('hcn.error');
     if (!store.get()) {
       centered(`<h1>HerdR Collaboration</h1>
-        <p>Shared rooms for people and their AI agents. Sign in with your BinView account; you need to be in the <strong>local.dev</strong> group.</p>
+        <p>Shared rooms for people and their AI agents. Sign in with your BinView account. New accounts wait for approval before anything is shared.</p>
         ${err ? `<p class="cx-msg" role="alert">${esc(err)}</p>` : ''}
         <button id="hcn-signin" class="hd-btn" type="button">Sign in</button>`);
       $('hcn-signin').onclick = () => signIn(cfg);
@@ -154,6 +154,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     }
     try {
       me = await api.link(store.get().id);   // records your verified email so others can invite you
+      if (me.status && me.status !== 'approved') return waiting();
       await route();
     } catch (e) {
       if (e instanceof AuthError) { store.clear(); return start(); }
@@ -164,12 +165,32 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     }
   }
 
+  // Signed in but not approved yet: nothing else works, so say so plainly and keep checking.
+  let waitTimer = null;
+  function waiting() {
+    clearTimeout(waitTimer);
+    centered(`<h1>Waiting for approval</h1>
+      <p>You're signed in as <strong>${esc(me.email || me.user_id)}</strong>. The person who runs this network, or a lab admin, has to approve your account before you can use rooms or connect agents. Nothing is shared with you until then.</p>
+      <p class="cx-sub">This page checks every few seconds and opens as soon as you're approved.</p>
+      <button id="hcn-out3" class="hd-btn hd-btn--ghost" type="button">Sign out</button>`);
+    $('hcn-out3').onclick = () => { clearTimeout(waitTimer); store.clear(); start(); };
+    waitTimer = setTimeout(async () => {
+      try {
+        const now = await api.me();
+        if (now.status === 'approved') { me = now; return route(); }
+      } catch (e) { if (e instanceof AuthError) { store.clear(); return start(); } }
+      return waiting();
+    }, 5000);
+  }
+
   async function route() {
+    clearTimeout(waitTimer);
     if (!me) return start();
     const hash = standalone ? window.location.hash.replace(/^#/, '') : current;
     const room = /^\/room\/(.+)$/.exec(hash);
     if (room) return showRoom(decodeURIComponent(room[1]));
     if (hash === '/agents') return showAgents();
+    if (hash === '/people' && canManagePeople()) return showPeople();
     return showRooms();
   }
 
@@ -194,6 +215,64 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         go(`/room/${encodeURIComponent(r.room_id)}`);
       } catch (e) { $('hcn-new-msg').textContent = e.message; $('hcn-new-msg').setAttribute('role', 'alert'); }
     };
+  }
+
+  const canManagePeople = () => operator || Boolean(me && (me.approver || me.admin));
+  const USER_PILL = { pending: ['Waiting', 'var(--status-attention, #d89b1d)'], approved: ['Approved', 'var(--status-ok, #1a9b6c)'],
+    denied: ['Declined', 'var(--text-muted)'], disabled: ['Disabled', 'var(--status-danger, #c0392b)'], kicked: ['Removed', 'var(--status-danger, #c0392b)'] };
+  const when = (iso) => (iso ? String(iso).replace('T', ' ').slice(0, 16) : '');
+
+  async function showPeople(filter = 'pending', showLog = false) {
+    let data;
+    try { data = await api.users(); } catch (e) { go('/rooms'); return; }
+    const manage = Boolean(data.can_manage);
+    const strip = await tabsStrip(null, '/people');
+    const counts = data.counts || {};
+    const chips = manage ? ['pending', 'approved', 'disabled', 'denied', 'kicked', 'all'] : ['pending'];
+    const rows = data.users.filter((u) => filter === 'all' || u.status === filter);
+    const buttons = (u) => {
+      const b = (act, label, cls = '') => `<button type="button" class="hd-btn hd-btn--sm${cls}" data-act="${act}" data-user="${esc(u.user_id)}">${label}</button>`;
+      if (u.status === 'pending') return b('approve', 'Approve') + b('deny', 'Decline', ' hd-btn--ghost');
+      if (!manage) return '';
+      if (u.status === 'approved') return b('disable', 'Disable', ' hd-btn--ghost') + b('kick', 'Remove', ' hd-btn--danger');
+      if (u.status === 'disabled') return b('enable', 'Enable') + b('kick', 'Remove', ' hd-btn--danger');
+      return b('approve', 'Approve again', ' hd-btn--ghost');
+    };
+    frame('/people', `<div class="cx-head"><div><h1>People</h1>
+      <p class="cx-sub">${manage ? 'Everyone who has signed in. Nobody can use rooms or agents until approved; you can disable or remove anyone at any time.' : 'People waiting to join. Approve the ones you know; they get access straight away.'}</p></div></div>
+      <div class="cx-chips" role="tablist" aria-label="Filter people">${chips.map((c) => `<button type="button" class="cx-chip" role="tab" data-filter="${c}" aria-selected="${c === filter}">${c === 'all' ? 'Everyone' : (USER_PILL[c] || [c])[0]}${c !== 'all' && counts[c] ? ` · ${counts[c]}` : ''}</button>`).join('')}</div>
+      <label class="cx-field">Note for the log (optional)<input id="hcn-user-note" maxlength="200" placeholder="e.g. joins the MS team"></label>
+      ${rows.length ? `<ul class="cx-list" id="hcn-users">${rows.map((u) => `<li>
+        <span class="grow"><b>${esc(u.email || shortId(u.user_id))}</b> ${pill(...USER_PILL[u.status])}
+          <span class="hd-card__sub">${u.status === 'pending' ? `asked ${esc(when(u.since))}` : `${esc(u.decided_by || '')} ${esc(when(u.decided_at))}`}${manage && u.status === 'approved' ? ` · ${u.rooms} room${u.rooms === 1 ? '' : 's'}, ${u.agents} agent${u.agents === 1 ? '' : 's'}` : ''}${u.reason ? ` · “${esc(u.reason)}”` : ''}</span></span>
+        <span class="cx-row">${buttons(u)}</span></li>`).join('')}</ul>`
+        : `<div class="hd-empty">${filter === 'pending' ? 'Nobody is waiting.' : 'Nobody here.'}</div>`}
+      ${manage ? `<section class="cx-section"><h2>Decision log</h2><button id="hcn-log-btn" class="hd-btn hd-btn--ghost hd-btn--sm" type="button">${showLog ? 'Hide' : 'Show'} the log</button><div id="hcn-log"></div></section>` : ''}
+      <span id="hcn-people-msg" class="cx-msg" role="status"></span>`, strip);
+    document.querySelectorAll('[data-filter]').forEach((b) => { b.onclick = () => showPeople(b.dataset.filter, showLog); });
+    document.querySelectorAll('[data-act]').forEach((b) => {
+      b.onclick = async () => {
+        const act = b.dataset.act;
+        const who = b.closest('li').querySelector('b').textContent;
+        const ask = { kick: `Remove ${who}? They lose every room and all their agents stop working.`, disable: `Disable ${who}? They and their agents are locked out until you enable them.`, deny: `Decline ${who}?` }[act];
+        if (ask && !window.confirm(ask)) return;
+        b.disabled = true;
+        try { await api.decideUser(b.dataset.user, act, ($('hcn-user-note').value || '').trim()); showPeople(filter, showLog); }
+        catch (e) { $('hcn-people-msg').textContent = e.message; $('hcn-people-msg').setAttribute('role', 'alert'); b.disabled = false; }
+      };
+    });
+    if (manage) {
+      const paint = async () => {
+        const box = $('hcn-log');
+        if (!showLog) { box.innerHTML = ''; return; }
+        try {
+          const { log } = await api.userLog();
+          box.innerHTML = log.length ? `<table class="cx-table"><thead><tr><th>When</th><th>Who</th><th>What</th><th>By</th><th>Note</th></tr></thead><tbody>${log.map((r) => `<tr><td>${esc(when(r.at))}</td><td>${esc(r.email || shortId(r.user_id))}</td><td>${esc(String(r.action || '').replace('user.', ''))}</td><td>${esc(r.by || 'sign-in')}</td><td>${esc(r.reason || '')}</td></tr>`).join('')}</tbody></table>` : '<div class="hd-empty">Nothing yet.</div>';
+        } catch (e) { box.textContent = e.message; }
+      };
+      $('hcn-log-btn').onclick = () => showPeople(filter, !showLog);
+      paint();
+    }
   }
 
   async function showAgents() {
@@ -393,8 +472,10 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   let roomsCache = [];
   async function tabsStrip(activeRoom, activePage) {
     try { roomsCache = (await api.rooms()).rooms; } catch { /* keep the last list */ }
+    let waitingCount = 0;
+    if (canManagePeople()) { try { waitingCount = (await api.users('pending')).users.length; } catch { /* not an approver */ } }
     const t = (to, label, on, extra = '') => `<button type="button" class="cx-rtab${extra}" role="tab" data-go="${to}" aria-selected="${on}">${label}</button>`;
-    return `<div class="cx-rtabs" role="tablist" aria-label="Rooms">${roomsCache.map((r) => t(`/room/${encodeURIComponent(r.room_id)}`, esc(r.name), r.room_id === activeRoom)).join('')}${t('/rooms', '＋ New room', activePage === '/rooms', ' cx-rtab--new')}<span class="grow"></span>${t('/agents', 'AI agents', activePage === '/agents')}</div>`;
+    return `<div class="cx-rtabs" role="tablist" aria-label="Rooms">${roomsCache.map((r) => t(`/room/${encodeURIComponent(r.room_id)}`, esc(r.name), r.room_id === activeRoom)).join('')}${t('/rooms', '＋ New room', activePage === '/rooms', ' cx-rtab--new')}<span class="grow"></span>${canManagePeople() ? t('/people', `People${waitingCount ? ` <span class="cx-badge" title="waiting for approval">${waitingCount}</span>` : ''}`, activePage === '/people') : ''}${t('/agents', 'AI agents', activePage === '/agents')}</div>`;
   }
 
   const hueOf = (s) => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
