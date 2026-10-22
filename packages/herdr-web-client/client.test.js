@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {createServer} from 'node:http';
 
 import { HerdrClient, ApiError } from './client.js';
 import { connectEvents } from './events.js';
@@ -230,4 +231,18 @@ test('GitHub failures retain the shared structured error contract', async () => 
     assert.equal(error.message, 'Integration service is unavailable.');
     return true;
   });
+});
+
+test('CI report history reads use viewer GET and forward cancellation',async()=>{
+ const calls=[];
+ const server=createServer((req,res)=>{calls.push({url:req.url,method:req.method});res.setHeader('Content-Type','application/json');res.end(JSON.stringify({reports:[],pipelines:[]}));});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try {
+  const client=new HerdrClient(`http://127.0.0.1:${server.address().port}`);
+  assert.deepEqual(await client.getCiReports(),{reports:[],pipelines:[]});
+  assert.deepEqual(calls[0],{url:'/api/v1/ci/reports',method:'GET'});
+  const controller=new AbortController();
+  const request=client.getCiReports({signal:controller.signal});controller.abort();
+  await assert.rejects(request,{name:'AbortError'});
+ } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 });

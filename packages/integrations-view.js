@@ -4,6 +4,8 @@ import {formatDuration} from './herdr-web-components/format.js';
 import {safeServiceUrl} from './services-view.js';
 import {recordOutcome} from './record-state.js';
 import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
+import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
+import {renderCiPipeline,ciPipelineStyles} from './ci-pipeline.js';
 
 const text = value => typeof value === 'string' ? value : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -30,9 +32,10 @@ export function integrationEntries(data={},kind='ci') {
     search:[record.title,record.repository,record.repository_id,record.project_id,record.project,record.branch,record.revision,record.run_number,record.review_id,record.status,record.state,record.mission_id,record.session_id].filter(v=>v!=null).join(' ').toLowerCase(),
   })).sort((a,b)=>integrationTimestamp(b.record.updated_at || b.record.created_at)-integrationTimestamp(a.record.updated_at || a.record.created_at));
 }
-export function selectIntegrations(entries,{tab='current',search='',repository='',mission='',session=''}={}) {
+export function selectIntegrations(entries,{tab='current',search='',repository='',mission='',session='',branch='',days=0}={}) {
   const terms=search.toLowerCase().trim().split(/\s+/).filter(Boolean);
-  return entries.filter(e=>(tab==='all' || e.tab===tab) && (!repository || e.record.repository===repository || e.record.repository_id===repository)
+  return entries.filter(e=>(tab==='all' || e.tab===tab) && (!repository || e.record.repository===repository || e.record.repository_id===repository || String(e.record.provider_repo_id)===repository)
+    && (!branch || e.record.branch===branch) && (!Number(days) || (integrationTimestamp(e.record.created_at || e.record.created)>=Date.now()-Number(days)*86400000 && integrationTimestamp(e.record.created_at || e.record.created)<=Date.now()))
     && (!mission || (e.record.mission_key || e.record.mission_id)===mission || records(e.record.related_missions).some(r=>(r.mission_key || r.mission_id)===mission))
     && (!session || e.record.session_id===session || records(e.record.related_sessions).some(r=>r.session_id===session)) && terms.every(t=>e.search.includes(t)));
 }
@@ -102,53 +105,61 @@ export function renderPipeline(pipeline,{loading=false,error='',log=null,logErro
   const tasks=records(pipeline.tasks);
   const completed=tasks.filter(t=>integrationOutcome(t)!=='current').length;
   return `<div class="ig-heading"><h2>Run #${esc(pipeline.run_number ?? '')}</h2><button type="button" class="hd-btn" data-close-inspector>Close</button></div>
-    <p class="ig-note">${esc(pipeline.repository || '')} · ${esc(human(stateOf(pipeline)) || 'Status unknown')} · ${elapsed(pipeline)}</p>
+    <p class="ig-note">${esc(pipeline.repository || '')}${pipeline.branch ? ` · ${esc(pipeline.branch)}` : ''}${pipeline.revision ? ` · <code>${esc(pipeline.revision)}</code>` : ''} · ${esc(human(stateOf(pipeline)) || 'Status unknown')} · ${elapsed(pipeline)}</p>
     <div class="ig-links">${external(pipeline.url,'Open in Woodpecker')}${pipeline.can_retry ? '<button class="hd-btn" type="button" data-ci-action="retry">Retry run</button>' : ''}${pipeline.can_cancel ? '<button class="hd-btn" type="button" data-ci-action="cancel">Cancel run</button>' : ''}</div>
     ${error ? `<p class="ig-warning" role="status">${esc(error)} Showing the last received details.</p>` : ''}${actionMessage ? `<p role="status" class="ig-note">${esc(actionMessage)}</p>` : ''}
     ${integrationOutcome(pipeline)==='failed' ? `<details class="ig-debug" data-debug-disclosure><summary>Debug with Pi</summary><p class="ig-note">Send the failed revision, step details and bounded log output to a Pi session you choose.</p>${debugSessions===null ? '<p class="ig-note">Open this section to load active Pi sessions.</p>' : `<label class="ig-note">Target Pi session<select data-debug-session aria-label="Target Pi session"><option value="">Choose a session…</option>${debugSessions.map(s=>`<option value="${esc(s.session_id)}" ${s.session_id===debugSessionId?'selected':''}>${esc(short(s.title || s.summary || s.cwd || s.session_id,100))}${s.host_id?` · ${esc(short(s.host_id,60))}`:''}</option>`).join('')}</select></label>${!debugSessions.length ? '<p class="ig-note">No active Pi sessions with verified messaging are available.</p>' : ''}<button type="button" class="hd-btn" data-debug-send ${!debugSessionId?'disabled':''}>Send to Pi</button>`}${debugMessage ? `<p class="ig-note" role="status">${esc(debugMessage)}</p>` : ''}</details>` : ''}
-    ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress><div class="ig-steps">${tasks.map(t=>`<button type="button" data-step="${esc(String(t.id))}" aria-pressed="${String(t.id)===step}"><span>${esc(short(t.name) || `Step ${t.id}`)}${t.workflow ? `<small>${esc(short(t.workflow))}</small>` : ''}</span><span>${esc(human(stateOf(t)) || 'unknown')}</span></button>`).join('')}</div>` : (!Array.isArray(pipeline.tasks) && loading && !error ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
+    ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress>${renderCiPipeline(pipeline,{step})}` : (!Array.isArray(pipeline.tasks) && loading && !error ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
     ${step ? `<h3>Step log</h3>${logError ? `<p class="ig-warning" role="status">${esc(logError)}</p>` : ''}${log===null ? '<p class="ig-note" role="status">Loading step output…</p>' : `<p class="ig-note">${age(log.checked_at,'Log checked')}${log.truncated?' · Output truncated':''}</p>${log.available===false ? `<p class="ig-note">${esc(log.error || 'Log output is not available yet.')}</p>` : `<pre class="ig-log" tabindex="0" aria-label="Step output">${esc(text(log.log)) || 'No output reported yet.'}</pre>`}`}` : ''}`;
 }
 
 const styles=`<style>
-.ig-intro,.ig-note{color:var(--text-secondary);font-size:12px;line-height:1.6}.ig-intro{font-size:13px;max-width:85ch}.ig-note{margin:7px 0}.ig-warning{color:var(--status-attention);font-size:13px;line-height:1.6;overflow-wrap:anywhere}.ig-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0}.ig-tabs button{font:inherit;padding:10px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);cursor:pointer}.ig-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.ig-tabs strong{margin-left:6px}.ig-controls{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}.ig-controls label{display:flex;flex-direction:column;gap:6px;font-size:13px}.ig-controls label:first-child{flex:1;min-width:160px}.ig-controls input,.ig-controls select{padding:9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}.ig-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:18px}.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr) minmax(280px,1fr)}.ig-group,.ig-inspector{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);min-width:0;overflow-wrap:anywhere}.ig-group{margin-bottom:12px}.ig-group h2{font-size:14px;margin:0;padding:12px 16px}.ig-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;padding:14px 16px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ig-main{min-width:0}.ig-title{font-size:14px;font-weight:600;line-height:1.5;text-align:left}.ig-title:is(button){border:0;padding:0;background:none;color:var(--accent);cursor:pointer;font-family:inherit}.ig-title:is(button):hover{text-decoration:underline}.ig-state{display:flex;flex-direction:column;gap:5px;font-size:12px;line-height:1.5;max-width:170px}.ig-state strong{font-weight:500}.ig-state span{color:var(--text-secondary)}.ig-links{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;align-items:center}.ig-debug{font-size:12px;margin:16px 0}.ig-debug summary{cursor:pointer;font-weight:600}.ig-debug select{display:block;padding:8px;max-width:100%;width:100%;margin:6px 0 10px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm)}.ig-debug button:disabled{opacity:.45;cursor:default}.ig-review-details{margin-top:12px;font-size:12px}.ig-review-details summary{cursor:pointer}.ig-review-feedback{white-space:pre-wrap;overflow-wrap:anywhere}.ig-summary{font-size:12px;line-height:1.6;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ig-pages,.ig-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.ig-pages[hidden]{display:none}.ig-pages button:disabled{opacity:.45;cursor:default}.ig-pages{justify-content:flex-start;font-size:12px;margin:18px 0}.ig-inspector{padding:16px;align-self:start}.ig-heading h2{font-size:17px;margin:0}.ig-inspector h3{font-size:14px}.ig-sync{display:flex;flex-direction:column;gap:5px;font-size:12px}.ig-sync progress,.ig-inspector progress{width:100%;height:6px;accent-color:var(--accent)}.ig-steps{display:flex;flex-direction:column;margin:12px 0}.ig-steps button{font:inherit;display:flex;justify-content:space-between;gap:12px;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;cursor:pointer;font-size:12px;overflow-wrap:anywhere}.ig-steps button[aria-pressed=true]{border-color:var(--accent)}.ig-steps small{display:block;color:var(--text-secondary);margin-top:4px}.ig-log{max-height:400px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:12px}.ig-runners{margin:16px 0;color:var(--text-secondary);font-size:12px}.ig-runners summary{cursor:pointer}.ig-empty{padding:22px;color:var(--text-secondary);font-size:13px}
+.ig-intro,.ig-note{color:var(--text-secondary);font-size:12px;line-height:1.6}.ig-intro{font-size:13px;max-width:85ch}.ig-note{margin:7px 0}.ig-warning{color:var(--status-attention);font-size:13px;line-height:1.6;overflow-wrap:anywhere}.ig-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0}.ig-tabs button{font:inherit;padding:10px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);cursor:pointer}.ig-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.ig-tabs strong{margin-left:6px}.ig-controls{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}.ig-controls label{display:flex;flex-direction:column;gap:6px;font-size:13px}.ig-controls label:first-child{flex:1;min-width:160px}.ig-controls input,.ig-controls select{padding:9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}.ig-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:18px}.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}.ig-group,.ig-inspector{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);min-width:0;overflow-wrap:anywhere}.ig-group{margin-bottom:12px}.ig-group h2{font-size:14px;margin:0;padding:12px 16px}.ig-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;padding:14px 16px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ig-main{min-width:0}.ig-title{font-size:14px;font-weight:600;line-height:1.5;text-align:left}.ig-title:is(button){border:0;padding:0;background:none;color:var(--accent);cursor:pointer;font-family:inherit}.ig-title:is(button):hover{text-decoration:underline}.ig-state{display:flex;flex-direction:column;gap:5px;font-size:12px;line-height:1.5;max-width:170px}.ig-state strong{font-weight:500}.ig-state span{color:var(--text-secondary)}.ig-links{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;align-items:center}.ig-debug{font-size:12px;margin:16px 0}.ig-debug summary{cursor:pointer;font-weight:600}.ig-debug select{display:block;padding:8px;max-width:100%;width:100%;margin:6px 0 10px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm)}.ig-debug button:disabled{opacity:.45;cursor:default}.ig-review-details{margin-top:12px;font-size:12px}.ig-review-details summary{cursor:pointer}.ig-review-feedback{white-space:pre-wrap;overflow-wrap:anywhere}.ig-summary{font-size:12px;line-height:1.6;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ig-pages,.ig-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.ig-pages[hidden]{display:none}.ig-pages button:disabled{opacity:.45;cursor:default}.ig-pages{justify-content:flex-start;font-size:12px;margin:18px 0}.ig-inspector{padding:16px;align-self:start}.ig-heading h2{font-size:17px;margin:0}.ig-inspector h3{font-size:14px}.ig-sync{display:flex;flex-direction:column;gap:5px;font-size:12px}.ig-sync progress,.ig-inspector progress{width:100%;height:6px;accent-color:var(--accent)}.ig-steps{display:flex;flex-direction:column;margin:12px 0}.ig-steps button{font:inherit;display:flex;justify-content:space-between;gap:12px;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;cursor:pointer;font-size:12px;overflow-wrap:anywhere}.ig-steps button[aria-pressed=true]{border-color:var(--accent)}.ig-steps small{display:block;color:var(--text-secondary);margin-top:4px}.ig-log{max-height:400px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:12px}.ig-runners{margin:16px 0;color:var(--text-secondary);font-size:12px}.ig-runners summary{cursor:pointer}.ig-empty{padding:22px;color:var(--text-secondary);font-size:13px}
 @media(max-width:900px){.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}}@media(max-width:550px){.ig-row{grid-template-columns:minmax(0,1fr);gap:8px}.ig-state{max-width:none}.ig-tabs button{padding:9px 12px}}
 </style>`;
 
 export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',mission='',session=''}={}) {
   const isCi=kind==='ci';
   const tabs=isCi ? [['current','Current'],['failed','Failed'],['finished','Finished']] : [['current','Current'],['changes','Changes requested'],['failed','Failed'],['finished','Finished']];
-  const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,mission,session,page:0,group:'project'};
+  const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,mission,session,page:0,group:'project',branch:'',days:0};
   let disposed=false,data=null,error='',selected=null,pipeline=null,detailError='',log=null,logError='',step='',actionMessage='';
   let timer=null,clock=null,signature='',detailSignature='',chartSignature='';
+  let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='';
   const pending=new Map();
   const listenerController=new AbortController();
   const reviewCache=new Map();
   const title=isCi?'CI':'Reviews';
-  container.innerHTML=`${styles}${isCi?ciChartStyles:''}<h1>${title}</h1><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
+  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles:''}<h1>${title}</h1><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
     <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
     <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
+    ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="0">All retained history</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div data-ci-insights></div>' : ''}
     ${repository || mission || session ? `<p class="ig-note">Filtered to ${esc(repository || mission || session)} · <a href="#/${kind}">Clear context</a></p>` : ''}
-    ${isCi ? '<details class="ci-charts" data-ci-charts><summary>CI trends · recent loaded window</summary><div class="ci-charts-body" data-ci-charts-body></div></details>' : ''}
+    ${isCi ? '<details class="ci-charts" data-ci-charts><summary>Run outcome & duration trends · observed history</summary><div class="ci-charts-body" data-ci-charts-body></div></details>' : ''}
     <p class="ig-note" data-ig-count></p><div class="ig-layout"><section id="ig-results" role="tabpanel" aria-labelledby="ig-tab-${state.tab}"></section><aside class="ig-inspector" aria-label="Pipeline inspector" hidden></aside></div>
     <div class="ig-pages"><button type="button" class="hd-btn" data-page="previous">Previous</button><span data-ig-page></span><button type="button" class="hd-btn" data-page="next">Next</button></div><div data-ig-runners></div>${!isCi ? '<details class="ig-runners"><summary>Start a review</summary><p>Start Plannotator from the project workspace with <code>herdr-plannotator --help</code>. Its review link and upstream decision appear here when the launcher is connected to this control plane.</p></details>' : ''}`;
   const el=selector=>container.querySelector(selector);
   const reviewVersion=record=>JSON.stringify([record.updated_at,record.status,record.decision]);
-  const entries=()=>integrationEntries(kind==='reviews' && data ? {...data,reviews:records(data.reviews).map(summary=>{
+  const ciObservations=()=>{
+    const recent=Object.entries(data?.pipelines||{}).flatMap(([repository,runs])=>records(runs).map(r=>({...r,repository:r.repository||repository})));
+    const map=new Map();for(const r of [...records(reportData?.pipelines),...recent])map.set(`${r.provider_repo_id??r.repository_id??r.repository}#${r.run_number}`,r);
+    return {...reportData,pipelines:[...map.values()],stale:!!data?.stale,partial:data?.status==='partial'};
+  };
+  const entries=()=>integrationEntries(isCi ? {pipelines:{retained:ciObservations().pipelines}} : kind==='reviews' && data ? {...data,reviews:records(data.reviews).map(summary=>{
     const cached=reviewCache.get(String(summary.review_id));
     return cached && cached.version===reviewVersion(summary) ? {...cached.record,...summary,_detailsError:cached.error,_detailsLoaded:!!cached.record} : summary;
   })} : data||{},kind);
   function replace(element,html) {
     const focused=document.activeElement;
-    const focusKey=element.contains(focused) ? ['data-run','data-step','data-close-inspector','data-ci-action'].find(k=>focused.hasAttribute(k)) : null;
+    const focusKey=element.contains(focused) ? ['data-run','data-step','data-close-inspector','data-ci-action','data-ci-test-search','data-ci-test-page'].find(k=>focused.hasAttribute(k)) : null;
     const focusValue=focusKey ? focused.getAttribute(focusKey) : null;
     const reviewFocus=element.contains(focused) && focused.tagName==='SUMMARY' ? focused.closest('[data-review-details]')?.dataset.reviewDetails : null;
     const linkFocus=element.contains(focused) && focused.tagName==='A' ? focused.getAttribute('href') : null;
     const debugOpen=element.querySelector('[data-debug-disclosure]')?.open;
     const debugFocus=element.contains(focused) && focused.closest('[data-debug-disclosure]') ? (focused.hasAttribute('data-debug-session')?'select':focused.tagName==='SUMMARY'?'summary':focused.hasAttribute('data-debug-send')?'button':null) : null;
     const openReviews=new Set([...element.querySelectorAll('[data-review-details][open]')].map(e=>e.dataset.reviewDetails));
+    const testInput=element.querySelector('[data-ci-test-search]'),selection=testInput&&document.activeElement===testInput?[testInput.selectionStart,testInput.selectionEnd]:null;
     const logElement=element.querySelector('.ig-log');
     const logScroll=logElement?.scrollTop;
     const atEnd=logElement && logElement.scrollHeight-logElement.clientHeight-logElement.scrollTop<8;
@@ -159,6 +170,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(debugFocus)debug?.querySelector(debugFocus)?.focus({preventScroll:true});
     if(reviewFocus)[...element.querySelectorAll('[data-review-details]')].find(e=>e.dataset.reviewDetails===reviewFocus)?.querySelector('summary')?.focus({preventScroll:true});
     if(linkFocus)[...element.querySelectorAll('a')].find(e=>e.getAttribute('href')===linkFocus)?.focus({preventScroll:true});
+    if(selection){const input=element.querySelector('[data-ci-test-search]');input?.setSelectionRange(...selection);}
     const nextLog=element.querySelector('.ig-log');
     if(nextLog && logScroll!=null)nextLog.scrollTop=atEnd?nextLog.scrollHeight:logScroll;
   }
@@ -174,7 +186,24 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(healthElement.dataset.signature!==healthKey){healthElement.dataset.signature=healthKey;const issuesOpen=healthElement.querySelector('details')?.open;healthElement.innerHTML=health;if(issuesOpen && healthElement.querySelector('details'))healthElement.querySelector('details').open=true;}
     const all=entries(),filtered=selectIntegrations(all,state),pageSize=20;
     state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
-    const nextSignature=JSON.stringify([state,data,[...reviewCache]]);
+    const nextSignature=JSON.stringify([state,data,reportData,[...reviewCache]]);
+    if(isCi) {
+      const observations=ciObservations();
+      const model=ciInsightsModel(observations,state);
+      const html=renderCiInsights(model,{loading:reportData===null&&!reportsError,error:reportsError,failurePage});
+      if(insightsSignature!==html){
+        const host=el('[data-ci-insights]'),disclosures=[...host.querySelectorAll('details')];
+        const open=disclosures.map(d=>d.open),focus=disclosures.findIndex(d=>d.querySelector('summary')===document.activeElement);
+        host.innerHTML=html;const next=[...host.querySelectorAll('details')];next.forEach((d,i)=>d.open=!!open[i]);if(focus>=0)next[focus]?.querySelector('summary')?.focus({preventScroll:true});insightsSignature=html;
+      }
+      for(const [selector,field,label] of [['[data-ci-repository]','repository','All repositories'],['[data-ci-branch]','branch','All branches']]){
+        const select=el(selector),values=new Map();
+        for(const r of [...observations.pipelines,...records(observations.reports)]) {const value=field==='repository'?String(r.provider_repo_id??r.repository_id??r.repository??''):text(r.branch);if(value)values.set(value,field==='repository'?`${r.repository||value} (${value})`:value);}
+        if(state[field])values.set(state[field],values.get(state[field])||state[field]);
+        const options=`<option value="">${label}</option>`+[...values].sort((a,b)=>a[1].localeCompare(b[1])).map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join('');
+        if(select.innerHTML!==options)select.innerHTML=options;select.value=state[field];
+      }
+    }
     if(signature!==nextSignature) {
       signature=nextSignature;
       for(const [key] of tabs) {
@@ -185,7 +214,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       if(isCi) {
         const chart=el('[data-ci-charts-body]');
         const html=data ? renderCiCharts(ciChartModel(selectIntegrations(all,{...state,tab:'all'})),{
-          stale:!!data.stale,partial:data.status==='partial'||Object.keys(data.repo_errors || {}).length>0,
+          retained:!!reportData,stale:!!data.stale,partial:data.status==='partial'||Object.keys(data.repo_errors || {}).length>0,
         }) : '<p class="ci-chart-note">Waiting for CI reports…</p>';
         if(chartSignature!==html) {
           chartSignature=html;
@@ -204,7 +233,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       }
       const result=el('#ig-results');result.setAttribute('aria-labelledby',`ig-tab-${state.tab}`);
       replace(result,[...groups].map(([name,rows])=>`<div class="ig-group"><h2>${esc(name)}</h2>${rows.map(e=>integrationRow(e,kind)).join('')}</div>`).join('') || `<div class="ig-group ig-empty">${!data ? 'Waiting for reports…' : isCi && data.available===false && !all.length ? 'No CI reports available. Connection details are shown above.' : `No ${state.tab==='current'?'current ':''}${isCi?'runs':'reviews'} match this view.`}</div>`);
-      el('[data-ig-count]').textContent=data ? `${filtered.length} matching ${isCi?'runs':'reviews'}${isCi?' in the recent pipeline window':data.has_more?` · Showing the latest ${records(data.reviews).length}${Number.isFinite(data.total)?` of ${data.total}`:''} reviews; older records are outside this window`:''}` : '';
+      el('[data-ig-count]').textContent=data ? `${filtered.length} matching ${isCi?'runs':'reviews'}${isCi?reportData?' in retained observations':' in the recent pipeline window':data.has_more?` · Showing the latest ${records(data.reviews).length}${Number.isFinite(data.total)?` of ${data.total}`:''} reviews; older records are outside this window`:''}` : '';
       el('.ig-pages').hidden=filtered.length<=pageSize;
       el('[data-ig-page]').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(filtered.length/pageSize))}`;
       el('[data-page="previous"]').disabled=state.page===0;el('[data-page="next"]').disabled=(state.page+1)*pageSize>=filtered.length;
@@ -216,9 +245,11 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       }
     }
     const inspector=el('.ig-inspector');inspector.hidden=!selected;
+    if(isCi){el('[data-ci-insights]').hidden=!!selected;el('[data-ci-charts]').hidden=!!selected;}
     if(selected) {
-      const next=JSON.stringify([pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage]);
-      if(detailSignature!==next){detailSignature=next;replace(inspector,renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage}));}
+      const runReports=records(reportData?.reports).filter(r=>String(r.provider_repo_id??r.repository)===String(pipeline?.provider_repo_id??selected.providerId) && r.run_number===Number(selected.number));
+      const next=JSON.stringify([testSearch,testPage,runReports,pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage]);
+      if(detailSignature!==next){detailSignature=next;replace(inspector,renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage})+renderCiRunReports(runReports,{search:testSearch,page:testPage}));}
     }
     tick();
   }
@@ -243,6 +274,10 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     },()=>{if(selected?.id===key && step===selectedStep)logError='Step output could not refresh.';});
   }
   function refresh() {
+    if(isCi && typeof client.getCiReports==='function')request('reports',signal=>client.getCiReports({signal}),response=>{
+      if(!Array.isArray(response?.reports)||!Array.isArray(response?.pipelines))throw new Error('Invalid CI history response');
+      reportData=response;reportsError='';
+    },()=>{reportsError=`CI history could not refresh.${reportData?' Showing last received reports.':''}`;});
     request('list',signal=>isCi ? client.getCi({signal}) : client.listReviews({signal}),response=>{
       if(!response || (isCi ? typeof response.available!=='boolean' : !Array.isArray(response.reviews)))throw new Error('Invalid integration response');
       data=response;error='';
@@ -253,9 +288,11 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   container.addEventListener('click',async event=>{
     if(disposed)return;
     const button=event.target.closest('button');if(!button)return;
+    if(button.dataset.ciTestPage){testPage=Math.max(0,testPage+(button.dataset.ciTestPage==='next'?1:-1));draw();}
+    if(button.dataset.ciFailurePage){failurePage=Math.max(0,failurePage+(button.dataset.ciFailurePage==='next'?1:-1));draw();el(`[data-ci-failure-page="${button.dataset.ciFailurePage}"]`)?.focus();}
     if(button.dataset.tab){state.tab=button.dataset.tab;state.page=0;draw();}
     if(button.dataset.page){state.page+=button.dataset.page==='next'?1:-1;draw();}
-    if(button.hasAttribute('data-run')) {
+    if(button.hasAttribute('data-run')) {testPage=0;testSearch='';
       const entry=entries().find(e=>e.id===button.dataset.run);if(!entry)return;
       if(selected?.id===entry.id){el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});return;}
       cancelDetail();selected={id:entry.id,repository:entry.record.repository,providerId:entry.record.provider_repo_id || entry.record.repository,number:entry.record.run_number};pipeline=entry.record;debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';draw();refreshDetail();
@@ -309,6 +346,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const index=tabs.findIndex(([key])=>key===state.tab);
     state.tab=tabs[event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:tabs.length-1))%tabs.length][0];state.page=0;event.preventDefault();draw();el(`[data-tab="${state.tab}"]`).focus();
   });
+  if(isCi)for(const [selector,key] of [['[data-ci-repository]','repository'],['[data-ci-branch]','branch'],['[data-ci-period]','days']])el(selector).addEventListener('change',event=>{state[key]=event.target.value;state.page=0;draw();});
+  container.addEventListener('input',event=>{if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
   el('[data-ig-search]').addEventListener('input',event=>{state.search=event.target.value;state.page=0;draw();});
   el('[data-ig-group]').addEventListener('change',event=>{state.group=event.target.value;draw();});
   function visibility() {

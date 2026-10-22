@@ -46,7 +46,8 @@ def _dict(row):
 
 class CIMonitor:
     def __init__(self, *, provider_factory=None, interval=30, repo_limit=500,
-                 budget=120, now=None, on_transition=None, actions_enabled=False):
+                 budget=120, now=None, on_transition=None, actions_enabled=False,
+                 on_observation=None):
         self._factory = provider_factory or _provider
         #: control_plane.ci_actions in the fleet file; retry/cancel are off unless set.
         self.actions_enabled = bool(actions_enabled)
@@ -60,6 +61,7 @@ class CIMonitor:
         self._thread = None
         self._last_success = None
         self._on_transition = on_transition
+        self._on_observation = on_observation
         self._observed = {}
         self._baselined = set()
         self._view = {
@@ -166,6 +168,13 @@ class CIMonitor:
             limited = len(repos) >= self._repo_limit
             if limited:
                 errors['_inventory'] = f'Inventory limited to {self._repo_limit} repositories.'
+            if self._on_observation:
+                for rows in pipelines.values():
+                    for row in rows:
+                        try:
+                            self._on_observation(copy.deepcopy(row))
+                        except Exception:
+                            errors['_history'] = 'CI history could not be persisted. Retrying automatically.'
             self._transitions(pipelines, successful_repos)
             if not errors:
                 self._last_success = self._now()

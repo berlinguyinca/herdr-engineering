@@ -23,3 +23,11 @@ The host launcher and exact usage are documented alongside the implementation. A
 ## Verification boundaries
 
 Automated contract tests verify denied permissions, correct action HTTP methods, log decoding/redaction, snapshot failure retention, single-flight progress, durable receipt replay and native UI outcomes. Live validation uses read-only CI calls. Retry/cancel are never fired simply to test connectivity, and test plan approval is not approval of product code.
+
+## Stability, tests and rendered pipelines
+
+The CI page includes retained run outcomes and measured durations, success rate (successful / passed-or-failed runs), latest test inventories by repository and branch, count changes and history, current failing tests with recurrence/first failure/last pass, and slow tests. Inconsistent outcomes require both passed and failed observations on the same revision; they are investigation evidence rather than a claim that environments were identical. Repository, branch, period and search filters scope the reports independently of outcome tabs.
+
+Selecting a run gives its pipeline the page width and temporarily hides the aggregate overview. Reported dependencies render as arrows with parallel branches; when the provider omits dependencies, workflow groups explicitly state that execution order is unknown. Failed steps are red, successful steps green, and running, queued, skipped and blocked steps retain text labels. Select a step for bounded logs. The test table shows the latest report attempt with search and pagination; report attempts remain inspectable.
+
+Publish structured JUnit reports using the [CI report upload guide](ci-test-reports.md). Missing reports remain distinct from zero tests. History is a bounded observation window, not a complete provider backfill: up to 200 reports and 2,000 run observations, with a 16 MiB budget per kind. Report publication and observed run changes use the existing durable event sink when configured; without it, the UI explicitly identifies memory-only storage. Durable-sink failures leave observations retryable and surface a partial-history warning. Restart recovery replays retained evidence from the event log.

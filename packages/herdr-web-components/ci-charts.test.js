@@ -68,3 +68,8 @@ test('out-of-range numeric timestamps cannot crash the charts or create duration
   assert.equal(model.durations.length,0);
   assert.doesNotMatch(renderCiCharts(model),/NaN|Infinity/);
 });
+
+test('retained chart scope is explicit when the backend supplies observed history',()=>{
+ const html=renderCiCharts(ciChartModel([]),{retained:true});
+ assert.match(html,/retained observed history/);assert.doesNotMatch(html,/recent loaded pipeline window/);
+});
