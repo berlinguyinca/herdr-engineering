@@ -53,9 +53,20 @@ def env(tmp_path):
     stub.write_text(f"""#!/usr/bin/env bash
 echo "docker $*" >> {log}
 if [ "$1" = inspect ]; then
+  case "$*" in
+    *.State*)   # container state: crash-looping when "<running tag>:<container>" is in STUB_CRASH
+      name="${{@: -1}}"; tag="$(cat {running} 2>/dev/null)"
+      [ -n "$tag" ] || {{ echo "missing false 0 none"; exit 0; }}
+      case " ${{STUB_CRASH:-}} " in
+        *" $tag:$name "*) echo "restarting true $(date +%s%N) none" ;;
+        *) echo "running false 0 none" ;;
+      esac
+      exit 0 ;;
+  esac
   [ -n "${{STUB_RUNNING_IMAGE:-}}" ] || exit 1
   echo "$STUB_RUNNING_IMAGE"; exit 0
 fi
+if [ "$1" = build ] && [ -n "${{FAIL_BUILD:-}}" ]; then exit 1; fi
 if [ "$1" = compose ]; then
   echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}} llmdir=${{HERDR_LLM_SLICE_DIR:-}}" >> {log}
   if [ -n "${{HERDR_LLM_SLICE_DIR:-}}" ]; then echo "llmslice $(cat "$HERDR_LLM_SLICE_DIR/llm-config.json" | tr -d '\n')" >> {log}; fi
@@ -192,8 +203,8 @@ def test_deploy_refuses_a_central_dir_holding_other_files(env):
 
 
 def test_deploy_hands_llm_proxy_only_the_llm_slice(env):
-    env["env"]["FAIL_COMPOSE"] = "1"
-    deploy(env)
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
     log = env["log"].read_text()
     llmdir = env["home"] / ".config/herdr-engineering/llm-proxy"
     assert f"llmdir={llmdir}" in log
@@ -577,8 +588,8 @@ def test_collab_deploy_hands_the_cert_dir_from_the_central_config_to_collab_sync
     assert oct((certs / "privkey.pem").stat().st_mode & 0o777) == "0o600"
     assert not (env["tmp"] / "from-env").exists()
     units = env["home"] / ".config/systemd/user"
-    assert f"--cert-dir {certs}" in (units / "herdr-collab-sync.service").read_text()
-    assert "certbot renew" in (units / "herdr-collab-cert-renew.service").read_text()
+    assert f'--cert-dir "{certs}"' in (units / "herdr-collab-sync.service").read_text()   # quoted paths
+    assert 'certbot" renew' in (units / "herdr-collab-cert-renew.service").read_text()
     # edge nginx.conf written in place at a stable path (#110)
     edge = env["home"] / ".config/herdr-engineering/collab-edge/nginx.conf"
     assert edge.read_text() == (ROOT / "deploy/control-plane/collab-edge/nginx.conf").read_text()
@@ -634,3 +645,122 @@ def test_recreated_services_have_no_relative_bind_mounts():
     dockerfile = (ROOT / "deploy/fabric-stack/Dockerfile").read_text()
     assert "COPY deploy/control-plane/migrations/ ./control-plane/migrations/" in dockerfile
     assert "COPY deploy/control-plane/config.yaml ./control-plane/config.yaml" in dockerfile
+
+
+
+# ------------------------- re-review I-B: every recreated service must be up
+
+def test_crash_looping_worker_fails_the_deploy_into_rollback(env):
+    _, prev_tag = _seed_previous(env, _layout_commit())
+    env["env"]["STUB_CRASH"] = f"{_head()}:herdr-cp-worker"
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    assert "not settled: control-plane-worker(restarting)" in r.stderr
+    assert "and healthy" in r.stderr          # the old commit's worker is fine
+    assert not (env["home"] / f".local/state/herdr-engineering/deploys/{_head()}.json").exists()
+
+
+def test_first_deploy_with_a_crash_looping_llm_proxy_is_not_ok(env):
+    env["env"]["STUB_CRASH"] = f"{_head()}:herdr-llm-proxy"
+    r = deploy(env)
+    assert r.returncode == 1 and "ok:" not in r.stdout
+    assert "llm-proxy(restarting)" in r.stderr and "NOT rolled back" in r.stderr
+
+
+def test_rollback_is_not_healthy_on_the_web_alone(env):
+    _with_collab(env)
+    _, prev_tag = _seed_previous(env, _layout_commit())
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    env["env"]["STUB_CRASH"] = f"{prev_tag}:herdr-collab-public"   # old collab-public refuses its slice
+    r = deploy(env)
+    assert r.returncode == 3
+    assert "FAILED TO ROLL BACK" in r.stderr and "and healthy" not in r.stderr
+    assert "collab-public(restarting)" in r.stderr
+
+
+def test_rollback_renders_the_compose_env_with_the_previous_commits_code(env):
+    _, prev_tag = _seed_previous(env, _layout_commit())
+    env["env"]["FAIL_COMPOSE_TAGS"] = _head()
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    envfiles = [ln.split()[1] for ln in env["log"].read_text().splitlines() if ln.startswith("envfile ")]
+    assert envfiles[0].endswith("/compose.env") and envfiles[-1].endswith("/rollback-compose.env")
+
+
+def test_receipt_is_valid_json_for_a_ref_with_a_quote(env):
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    receipt = json.loads((env["home"] / f".local/state/herdr-engineering/deploys/{_head()}.json").read_text())
+    assert receipt["ref"] == "HEAD"
+
+
+def test_llm_slice_dir_holding_other_files_is_refused(env):
+    d = env["home"] / ".config/herdr-engineering/llm-proxy"
+    d.mkdir(parents=True)
+    (d / "stray.txt").write_text("x")
+    r = deploy(env)
+    assert r.returncode != 0 and "must hold only llm-config.json" in r.stderr
+    assert "docker build" not in env["log"].read_text() if env["log"].exists() else True
+
+
+# ------------------------------ re-review I-C: no host change before the build
+
+def _seed_host_state(env):
+    edge = env["home"] / ".config/herdr-engineering/collab-edge/nginx.conf"
+    edge.parent.mkdir(parents=True)
+    edge.write_text("previous nginx conf\n")
+    llm = env["home"] / ".config/herdr-engineering/llm-proxy/llm-config.json"
+    llm.parent.mkdir(parents=True, mode=0o700)
+    llm.write_text('{"previous": "llm slice"}\n')
+    llm.chmod(0o600)
+    units = env["home"] / ".config/systemd/user"
+    units.mkdir(parents=True)
+    (units / "herdr-collab-sync.service").write_text("previous unit\n")
+    return edge, llm, units
+
+
+def test_failed_build_changes_nothing_on_the_host(env):
+    _with_collab(env)
+    edge, llm, units = _seed_host_state(env)
+    before = {p: p.read_text() for p in (edge, llm, units / "herdr-collab-sync.service")}
+    env["env"]["FAIL_BUILD"] = "1"
+    r = deploy(env)
+    assert r.returncode != 0
+    for p, text in before.items():
+        assert p.read_text() == text, p
+    log = env["log"].read_text()
+    assert "nginx -s reload" not in log and "systemctl" not in log
+    assert not (env["home"] / ".config/herdr-engineering/collab/collab-config.json").exists()
+
+
+def test_failed_deploy_restores_nginx_conf_slices_and_sync_units(env):
+    _with_collab(env)
+    edge, llm, units = _seed_host_state(env)
+    inode = edge.stat().st_ino
+    env["env"]["FAIL_COMPOSE"] = "1"
+    env["env"]["STUB_RUNNING_IMAGE"] = "herdr-engineering:000000000000"   # edge "exists"
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    assert edge.read_text() == "previous nginx conf\n" and edge.stat().st_ino == inode
+    assert llm.read_text() == '{"previous": "llm slice"}\n'
+    assert (units / "herdr-collab-sync.service").read_text() == "previous unit\n"
+    assert not (units / "herdr-collab-sync.timer").exists()          # did not exist before
+    assert not (env["home"] / ".config/herdr-engineering/collab/collab-config.json").exists()
+    log = env["log"].read_text().splitlines()
+    build = next(i for i, ln in enumerate(log) if ln.startswith("docker build"))
+    first_sync = next(i for i, ln in enumerate(log) if ln.startswith("systemctl"))
+    assert build < first_sync                  # collab-sync install only after the build
+    assert sum("nginx -s reload" in ln for ln in log) >= 2   # new conf, then the restored one
+
+
+def test_collab_sync_install_failure_triggers_rollback(env):
+    _with_collab(env)
+    edge, llm, units = _seed_host_state(env)
+    _, prev_tag = _seed_previous(env, _layout_commit())
+    (env["tmp"] / "bin" / "systemctl").write_text("#!/usr/bin/env bash\nexit 1\n")
+    r = deploy(env)
+    assert r.returncode in (1, 3), r.stderr
+    assert "deploy of" in r.stderr and "failed" in r.stderr
+    assert edge.read_text() == "previous nginx conf\n"
+    ups = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]
+    assert not any(f"tag={_head()} " in ln for ln in ups)     # forward compose never ran

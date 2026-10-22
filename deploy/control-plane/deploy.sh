@@ -24,8 +24,12 @@
 #      path (reloading the edge when it changed), refreshes the Cognito key/membership
 #      files, the edge certificate and their timers (collab-sync.sh), and recreates
 #      collab-public + collab-edge
-#   5. waits for /api/v1/health to report the new commit. If compose up fails or
-#      the health check does not report it, rolls back: the commit recorded in the
+#   5. waits for /api/v1/health to report the new commit AND for every recreated
+#      container (web, worker, llm-proxy, collab-public/edge) to be running, not
+#      restarting and not unhealthy. Nothing on the host changes before the image is
+#      built; slices, nginx.conf and the collab-sync units are installed after it and
+#      restored from a backup on any failure. If an install step, compose up or the
+#      checks fail, rolls back: the commit recorded in the
 #      running image's receipt is checked out in a temporary worktree and ITS compose
 #      files are run with the previous image tag (same transient env file). Prints
 #      "rolled back ... and healthy" (exit 1) only when the old commit answers health
@@ -123,30 +127,42 @@ if [ -e "$COLLAB_MARKER" ]; then
 fi
 
 # Transient compose variables: 0600 file in a 0700 directory, gone on any exit.
+# NOTHING on the host changes before the image is built: the compose env and both
+# slices are rendered into this temp dir first and installed by forward() below.
 ENV_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/herdr-cp-env.XXXXXX")"
 ENV_FILE="$ENV_DIR/compose.env"
 herdr_eng fleet config render-compose --path "$CENTRAL" --out "$ENV_FILE" >/dev/null
 chmod 600 "$ENV_FILE"
 
+# only_file <dir> <name>: the directory (mounted whole into a container) holds nothing else
+only_file() {
+  [ -d "$1" ] || return 0
+  local others
+  others="$(find "$1" -mindepth 1 -maxdepth 1 ! -name "$2" ! -name ".$2.*.tmp" -printf '%f ' 2>/dev/null || true)"
+  if [ -n "$others" ]; then
+    echo "$1 must hold only $2 (it is mounted into a container); also found: $others" >&2
+    return 1
+  fi
+}
+
 # llm-proxy gets ONLY the llm slice (llm + control_plane.llm_proxy), in a directory of
-# its own that is mounted read-only; never the central file. Dry-run: temp dir.
-if [ "$DRY" = 1 ]; then LLM_DIR="$ENV_DIR/llm-proxy"
-else LLM_DIR="$HOME/.config/herdr-engineering/llm-proxy"; fi
-if ! herdr_eng fleet config render-llm --path "$CENTRAL" --out "$LLM_DIR/llm-config.json" >/dev/null; then
+# its own that is mounted read-only; never the central file.
+NEW_LLM="$ENV_DIR/new/llm-proxy/llm-config.json"
+if ! herdr_eng fleet config render-llm --path "$CENTRAL" --out "$NEW_LLM" >/dev/null; then
   echo "the llm section is missing or invalid in $CENTRAL (needed by llm-proxy)" >&2
   exit 1
 fi
-chmod 700 "$LLM_DIR"
+if [ "$DRY" = 1 ]; then LLM_DIR="$(dirname "$NEW_LLM")"
+else LLM_DIR="$HOME/.config/herdr-engineering/llm-proxy"; only_file "$LLM_DIR" llm-config.json || exit 1; fi
 export HERDR_LLM_SLICE_DIR="$LLM_DIR"
 
 # The edge bind-mounts this single nginx.conf, so it is written IN PLACE (same inode): a
-# rename-replace would leave the running container reading the old file. Sets EDGE_CONF_CHANGED.
+# rename-replace would leave the running container reading the old file.
 EDGE_CONF_CHANGED=0
-install_edge_conf() {   # <worktree>
-  local src="$1/deploy/control-plane/collab-edge/nginx.conf"
+write_edge_conf() {   # <source file>: in place; sets EDGE_CONF_CHANGED when it changed
   [ -e "$HERDR_COLLAB_EDGE_CONF" ] || install -m 0644 /dev/null "$HERDR_COLLAB_EDGE_CONF"
-  if ! cmp -s "$src" "$HERDR_COLLAB_EDGE_CONF"; then
-    cat "$src" > "$HERDR_COLLAB_EDGE_CONF"
+  if ! cmp -s "$1" "$HERDR_COLLAB_EDGE_CONF"; then
+    cat "$1" > "$HERDR_COLLAB_EDGE_CONF"
     EDGE_CONF_CHANGED=1
   fi
 }
@@ -154,25 +170,21 @@ reload_edge_if_changed() {
   if [ "$EDGE_CONF_CHANGED" = 1 ] && docker inspect herdr-collab-edge >/dev/null 2>&1; then
     docker exec herdr-collab-edge nginx -s reload >/dev/null
   fi
+  EDGE_CONF_CHANGED=0
 }
 
+NEW_COLLAB=""
 if [ "$COLLAB" = 1 ]; then
   # collab-public gets ONLY control_plane.collab (public identifiers), never the central
-  # file. Dry-run renders into the temp dir and touches nothing else on the host.
-  # The slice's own directory is mounted (not the file), so a re-render by rename is seen.
-  if [ "$DRY" = 1 ]; then COLLAB_DIR="$ENV_DIR/collab"
-  else COLLAB_DIR="$HOME/.config/herdr-engineering/collab"; fi
-  COLLAB_CONFIG="$COLLAB_DIR/collab-config.json"
-  if ! herdr_eng fleet config render-collab --path "$CENTRAL" --out "$COLLAB_CONFIG" >/dev/null; then
+  # file. The slice's own directory is mounted (not the file), so a re-render is seen.
+  NEW_COLLAB="$ENV_DIR/new/collab/collab-config.json"
+  if ! herdr_eng fleet config render-collab --path "$CENTRAL" --out "$NEW_COLLAB" >/dev/null; then
     echo "collaboration is enabled ($COLLAB_MARKER) but control_plane.collab is missing or invalid in $CENTRAL" >&2
     exit 1
   fi
-  chmod 700 "$COLLAB_DIR"
-  COLLAB_OTHERS="$(find "$COLLAB_DIR" -mindepth 1 -maxdepth 1 ! -name collab-config.json ! -name '.collab-config.json.*.tmp' -printf '%f ' 2>/dev/null || true)"
-  if [ -n "$COLLAB_OTHERS" ]; then
-    echo "$COLLAB_DIR must hold only collab-config.json (it is mounted into collab-public); also found: $COLLAB_OTHERS" >&2
-    exit 1
-  fi
+  if [ "$DRY" = 1 ]; then COLLAB_DIR="$(dirname "$NEW_COLLAB")"
+  else COLLAB_DIR="$HOME/.config/herdr-engineering/collab"; only_file "$COLLAB_DIR" collab-config.json || exit 1; fi
+  COLLAB_CONFIG="$COLLAB_DIR/collab-config.json"
   if ! grep -qE '^HERDR_COLLAB_CERT_DIR=.+' "$ENV_FILE"; then
     echo "collaboration is enabled ($COLLAB_MARKER) but control_plane.compose.HERDR_COLLAB_CERT_DIR is not set in $CENTRAL" >&2
     exit 1
@@ -184,21 +196,12 @@ if [ "$COLLAB" = 1 ]; then
     export HERDR_COLLAB_DATA_DIR="$ENV_DIR/collab-data"
     export HERDR_COLLAB_SYNC_DIR="$ENV_DIR/collab-sync"
   else
-    EDGE_DIR="$HOME/.config/herdr-engineering/collab-edge"
-    mkdir -p "$EDGE_DIR"
-    export HERDR_COLLAB_EDGE_CONF="$EDGE_DIR/nginx.conf"
-    install_edge_conf "$WORK"
+    export HERDR_COLLAB_EDGE_CONF="$HOME/.config/herdr-engineering/collab-edge/nginx.conf"
     export HERDR_COLLAB_DATA_DIR="$HOME/.local/share/herdr-engineering/collab"
-    mkdir -p "$HERDR_COLLAB_DATA_DIR"
-    chmod 700 "$HERDR_COLLAB_DATA_DIR"
     export HERDR_COLLAB_SYNC_DIR="$HOME/.local/share/herdr-engineering/collab-sync"
     # The edge mounts control_plane.compose.HERDR_COLLAB_CERT_DIR; collab-sync copies the
     # certificate there (the timer has no environment, so it gets the path as a flag).
     CERT_DIR_VALUE="$(grep -E '^HERDR_COLLAB_CERT_DIR=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"")"
-    # keys + membership files, the edge certificate, the 1-minute timer and the cert renew
-    # timer; pool and group come from the slice
-    "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" \
-      --dir "$HERDR_COLLAB_SYNC_DIR" --cert-dir "$CERT_DIR_VALUE"
   fi
 fi
 
@@ -225,7 +228,7 @@ if [ "$DRY" = 1 ]; then
   echo "[dry-run] control-plane-web and worker mount $FLEET_DIR read-only; the file is $MOUNT_TARGET"
   echo "[dry-run] llm-proxy mounts only the llm slice (rendered to a temp dir; would install it at ~/.config/herdr-engineering/llm-proxy/)"
   if [ "$COLLAB" = 1 ]; then
-    echo "[dry-run] rendered control_plane.collab to a temp slice; would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
+    echo "[dry-run] rendered control_plane.collab to a temp slice; after the build would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
   fi
   echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}"
   exit 0
@@ -284,11 +287,11 @@ HEALTH_INTERVAL="${HERDR_CP_HEALTH_INTERVAL:-2}"
 
 COLLAB_HASH=""
 if [ "$COLLAB" = 1 ]; then
-  COLLAB_HASH="$(sha256sum "$COLLAB_CONFIG" | cut -d' ' -f1)"
+  COLLAB_HASH="$(sha256sum "$NEW_COLLAB" | cut -d' ' -f1)"
   # collab-public runs as HERDR_COLLAB_CERT_UID and must be able to read its 0700 slice dir.
   WANT_UID="$(grep -E '^HERDR_COLLAB_CERT_UID=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"" || true)"
   WANT_UID="${WANT_UID:-1000}"
-  HAVE_UID="$(stat -c %u "$COLLAB_DIR")"
+  HAVE_UID="$(stat -c %u "$COLLAB_DIR" 2>/dev/null || id -u)"
   if [ "$HAVE_UID" != "$WANT_UID" ]; then
     echo "WARNING: $COLLAB_DIR is owned by uid $HAVE_UID but collab-public runs as uid $WANT_UID" \
          "(control_plane.compose.HERDR_COLLAB_CERT_UID); it will not be able to read its config." \
@@ -296,23 +299,69 @@ if [ "$COLLAB" = 1 ]; then
   fi
 fi
 
+# A failed build exits here: nothing on the host has been touched yet.
 docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
   -t "herdr-engineering:$TAG" "$WORK" >/dev/null
 
-# compose_run <worktree> <image tag> <commit> <compose args...>: that worktree's compose
-# files with this deploy's transient env file and paths. Rollback passes the previous
-# commit's worktree, so its compose files run with its own image.
+# ---- host files this deploy may change, backed up so every failure path restores them
+BACKUP_DIR="$ENV_DIR/backup"; mkdir -p "$BACKUP_DIR"
+BACKED_UP=()
+backup_file() {   # <path>: remember its content (or that it did not exist)
+  local key; key="$(printf '%s' "$1" | sha256sum | cut -c1-16)"
+  if [ -e "$1" ]; then cp -p "$1" "$BACKUP_DIR/$key"; else : > "$BACKUP_DIR/$key.absent"; fi
+  BACKED_UP+=("$1")
+}
+SYNC_STABLE="$HOME/.local/share/herdr-engineering/collab-sync.sh"
+UNIT_DIR="$HOME/.config/systemd/user"
+SYNC_UNITS=(herdr-collab-sync.service herdr-collab-sync.timer herdr-collab-cert-renew.service herdr-collab-cert-renew.timer)
+backup_file "$LLM_DIR/llm-config.json"
+if [ "$COLLAB" = 1 ]; then
+  backup_file "$COLLAB_CONFIG"
+  backup_file "$HERDR_COLLAB_EDGE_CONF"
+  backup_file "$SYNC_STABLE"
+  for u in "${SYNC_UNITS[@]}"; do backup_file "$UNIT_DIR/$u"; done
+fi
+
+# restore_host_state: every backed-up file back to its pre-deploy content. nginx.conf in
+# place (same inode, then the edge reloads); the collab-sync units reload in systemd.
+restore_host_state() {
+  local f key rc=0
+  for f in "${BACKED_UP[@]}"; do
+    key="$(printf '%s' "$f" | sha256sum | cut -c1-16)"
+    if [ -e "$BACKUP_DIR/$key.absent" ]; then
+      rm -f "$f" || rc=1
+    elif [ "$f" = "${HERDR_COLLAB_EDGE_CONF:-}" ]; then
+      write_edge_conf "$BACKUP_DIR/$key" || rc=1
+    else
+      cp -p "$BACKUP_DIR/$key" "$f.restore.tmp" && mv -f "$f.restore.tmp" "$f" || rc=1
+    fi
+  done
+  if [ "$COLLAB" = 1 ]; then
+    reload_edge_if_changed || rc=1
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+  return "$rc"
+}
+
+install_private() {   # <src> <dest>: 0600 file in a 0700 dir, atomic
+  mkdir -p "$(dirname "$2")" && chmod 700 "$(dirname "$2")" \
+    && install -m 0600 "$1" "$2.install.tmp" && mv -f "$2.install.tmp" "$2"
+}
+
+# compose_run <worktree> <env file> <image tag> <commit> <compose args...>: that
+# worktree's compose files with the given env file and this deploy's paths. Rollback
+# passes the previous commit's worktree and an env file rendered by ITS code.
 compose_run() {
-  local tree="$1" tag="$2" commit="$3"; shift 3
+  local tree="$1" envf="$2" tag="$3" commit="$4"; shift 4
   local files=(-f "$tree/deploy/control-plane/compose.yaml")
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
   HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_LLM_SLICE_DIR="$LLM_DIR" \
     HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
-    docker compose --env-file "$ENV_FILE" -p "$PROJECT" "${files[@]}" "$@"
+    docker compose --env-file "$envf" -p "$PROJECT" "${files[@]}" "$@"
 }
 
-compose_up() {   # <worktree> <tag> <commit>
-  compose_run "$1" "$2" "$3" up -d --no-deps --no-build "${APP_SERVICES[@]}" "${EDGE_SERVICE[@]}"
+compose_up() {   # <worktree> <env file> <tag> <commit>
+  compose_run "$1" "$2" "$3" "$4" up -d --no-deps --no-build "${APP_SERVICES[@]}" "${EDGE_SERVICE[@]}"
 }
 
 healthy_commit() {
@@ -327,27 +376,90 @@ healthy_commit() {
   return 1
 }
 
+# services_settled: EVERY recreated container is running, not restarting, not unhealthy,
+# and its restart count did not move between two consecutive samples (a crash loop
+# fails the deploy even when the web answers health).
+container_of() {
+  case "$1" in
+    control-plane-web) echo herdr-cp-web ;; control-plane-worker) echo herdr-cp-worker ;;
+    llm-proxy) echo herdr-llm-proxy ;; collab-public) echo herdr-collab-public ;;
+    collab-edge) echo herdr-collab-edge ;; *) echo "$1" ;;
+  esac
+}
+services_settled() {
+  local i svc name st status restarting count health ok counts prev="" bad
+  for i in $(seq 1 "$HEALTH_TRIES"); do
+    ok=1; counts=""; bad=""
+    for svc in "${APP_SERVICES[@]}" "${EDGE_SERVICE[@]}"; do
+      name="$(container_of "$svc")"
+      st="$(docker inspect -f '{{.State.Status}} {{.State.Restarting}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$name" 2>/dev/null || echo "missing false 0 none")"
+      read -r status restarting count health <<< "$st"
+      counts="$counts $name=$count"
+      if [ "$status" != running ] || [ "$restarting" = true ] \
+          || [ "$health" = unhealthy ] || [ "$health" = starting ]; then
+        [ "$health" = none ] && health=""
+        ok=0; bad="$bad $svc($status${health:+/$health})"
+      fi
+    done
+    if [ "$ok" = 1 ] && [ "$counts" = "$prev" ]; then return 0; fi
+    if [ "$ok" = 1 ]; then prev="$counts"; else prev=""; fi
+    [ "$i" = "$HEALTH_TRIES" ] || sleep "$HEALTH_INTERVAL"
+  done
+  echo "not settled:${bad:- restart count still rising}" >&2
+  return 1
+}
+
+verify() {   # <commit>: the web reports it AND every recreated service is up
+  healthy_commit "$1" && services_settled
+}
+
 forward() {
-  compose_up "$WORK" "$TAG" "$SHA" >/dev/null || return 1
+  install_private "$NEW_LLM" "$LLM_DIR/llm-config.json" || return 1
+  if [ "$COLLAB" = 1 ]; then
+    install_private "$NEW_COLLAB" "$COLLAB_CONFIG" || return 1
+    mkdir -p "$HERDR_COLLAB_DATA_DIR" && chmod 700 "$HERDR_COLLAB_DATA_DIR" || return 1
+    # keys + membership files, the edge certificate, the 1-minute timer and the cert renew
+    # timer (pool and group come from the slice). Runs BEFORE the new nginx.conf lands, so
+    # a reload it triggers (changed certificate) still uses the running conf.
+    "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" \
+      --dir "$HERDR_COLLAB_SYNC_DIR" --cert-dir "$CERT_DIR_VALUE" || return 1
+    mkdir -p "$(dirname "$HERDR_COLLAB_EDGE_CONF")" || return 1
+    write_edge_conf "$WORK/deploy/control-plane/collab-edge/nginx.conf" || return 1
+  fi
+  compose_up "$WORK" "$ENV_FILE" "$TAG" "$SHA" >/dev/null || return 1
   if [ "$COLLAB" = 1 ]; then reload_edge_if_changed || return 1; fi
   if [ "$COLLAB" = 1 ] && [ "$COLLAB_HASH" != "$PREV_COLLAB_HASH" ]; then
     # same image but a changed slice: collab-public reads it only at startup
-    compose_run "$WORK" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate collab-public >/dev/null || return 1
+    compose_run "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate collab-public >/dev/null || return 1
   fi
-  healthy_commit "$SHA"
+  verify "$SHA"
 }
 
 if forward; then
   # The receipt names the ref, commits and images (and only a hash of the collab
-  # slice) - never configuration.
+  # slice) - never configuration. json.dumps: a ref may contain quotes.
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
-  printf '{"ref":"%s","commit":"%s","image":"herdr-engineering:%s","previous_commit":"%s","previous_image":"%s","collab_slice_sha256":"%s","at":"%s"}\n' \
-    "$REF" "$FULL" "$TAG" "$PREV_COMMIT" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)" > "$STATE_DIR/$SHA.json"
-  echo "ok: ${APP_SERVICES[*]} running $SHA (receipt $STATE_DIR/$SHA.json)"
+  python3 - "$STATE_DIR/$SHA.json" "$REF" "$FULL" "herdr-engineering:$TAG" "$PREV_COMMIT" \
+      "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)" <<'PY'
+import json, sys
+out, ref, commit, image, prev_commit, prev_image, collab, at = sys.argv[1:]
+with open(out, "w") as fh:
+    json.dump({"ref": ref, "commit": commit, "image": image, "previous_commit": prev_commit,
+               "previous_image": prev_image, "collab_slice_sha256": collab, "at": at}, fh)
+    fh.write("\n")
+PY
+  echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
   exit 0
 fi
 
-echo "deploy of $SHA failed (compose up failed or the health check did not report $SHA)" >&2
+echo "deploy of $SHA failed (an install step or compose up failed, the health check did not report $SHA, or a recreated service is not running)" >&2
+# Host files go back first (slices rendered by the previous deploy, its nginx.conf and
+# collab-sync units), so a rollback - or the old containers left running - read them.
+RESTORED=1
+if ! restore_host_state; then
+  RESTORED=0
+  echo "WARNING: could not restore every host file this deploy changed" >&2
+fi
 if [ -z "$PREV_COMMIT" ]; then
   echo "NOT rolled back: $ROLLBACK_NOTE." >&2
   if [ -n "${PREV_COMMIT_OLD:-}" ]; then
@@ -356,23 +468,25 @@ if [ -z "$PREV_COMMIT" ]; then
   elif [ -n "$PREVIOUS_IMAGE" ]; then
     echo "manual rollback: redeploy the commit $PREVIOUS_IMAGE was built from with that commit's deploy/control-plane/deploy.sh" >&2
   fi
+  [ "$RESTORED" = 1 ] || exit 3
   exit 1
 fi
 
-echo "rolling back to $PREVIOUS_IMAGE with the compose files of commit $PREV_SHA" >&2
+echo "rolling back to $PREVIOUS_IMAGE with the compose files and code of commit $PREV_SHA" >&2
 MANUAL="$REPO/deploy/control-plane/deploy.sh --ref $PREV_COMMIT --no-fetch --fleet-config $CENTRAL"
 PREV_WORK="$ENV_DIR/rollback-worktree"
-# the previous commit's edge nginx.conf too (it routes to that commit's collab-public)
-rollback_edge() {
-  [ "$COLLAB" = 1 ] || return 0
-  EDGE_CONF_CHANGED=0
-  install_edge_conf "$PREV_WORK" && reload_edge_if_changed
+PREV_ENV="$ENV_DIR/rollback-compose.env"
+# the compose env as the PREVIOUS commit's own code renders it
+prev_render() {
+  (cd "$PREV_WORK" && PYTHONPATH="$PREV_WORK" python3 -m herdr_engineering.cli \
+    fleet config render-compose --path "$CENTRAL" --out "$PREV_ENV") >/dev/null 2>&1
 }
-if git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
-    && compose_up "$PREV_WORK" "$PREV_TAG" "$PREV_SHA" >/dev/null \
-    && rollback_edge \
-    && healthy_commit "$PREV_SHA"; then
-  echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy; the deploy of $SHA FAILED" >&2
+if [ "$RESTORED" = 1 ] \
+    && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
+    && prev_render \
+    && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+    && verify "$PREV_SHA"; then
+  echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy (all of: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}); the deploy of $SHA FAILED" >&2
   exit 1
 fi
 echo "FAILED TO ROLL BACK to $PREVIOUS_IMAGE (commit $PREV_SHA): the control plane may be down or mixed." >&2
