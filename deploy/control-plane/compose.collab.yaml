@@ -26,7 +26,7 @@ name: herdr-control-plane
 
 services:
   collab-public:
-    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-0.1.0}
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-collab-public
     restart: unless-stopped
     # Deliberately no env_file / environment: nothing from the control-plane stack's secrets.

@@ -168,6 +168,26 @@ def test_deploy_hands_llm_proxy_only_the_llm_slice(env):
     assert data["sections"]["llm"]["values"]["upstream_key"] in sliced
 
 
+def test_compose_runs_every_app_service_on_the_deploy_tag():
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    for name in ("control-plane-web", "control-plane-worker", "llm-proxy"):
+        assert doc["services"][name]["image"] == "herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}", name
+    collab = yaml.safe_load((ROOT / "deploy/control-plane/compose.collab.yaml").read_text())
+    assert collab["services"]["collab-public"]["image"] == "herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}"
+
+
+def test_deploy_recreates_web_worker_and_proxy_on_one_tag(env):
+    env["env"]["FAIL_COMPOSE"] = "1"
+    deploy(env)
+    log = env["log"].read_text().splitlines()
+    up = [ln for ln in log if ln.startswith("docker compose") and " up " in ln]
+    assert up and up[0].endswith("up -d --no-deps --no-build control-plane-web control-plane-worker llm-proxy")
+    sha = subprocess.run(["git", "rev-parse", "--short=12", "HEAD"], cwd=ROOT, capture_output=True,
+                         text=True).stdout.strip()
+    assert any(ln.startswith("composeenv ") and f" tag={sha} " in ln for ln in log)
+    assert any(ln.startswith("docker build") and f"herdr-engineering:{sha}" in ln for ln in log)
+
+
 def test_trap_removes_env_file_on_failure(env):
     env["env"]["FAIL_COMPOSE"] = "1"
     r = deploy(env)

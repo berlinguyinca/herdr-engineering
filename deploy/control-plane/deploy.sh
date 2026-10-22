@@ -14,8 +14,9 @@
 #   3. renders the variables docker compose itself needs (images' passwords, ports,
 #      bind address) from the central file into a transient 0600 env file inside a
 #      0700 directory (`herdr-eng fleet config render-compose`), removed on exit
-#   4. recreates ONLY control-plane-web (postgres, rustfs, worker, gateway untouched)
-#      using the compose files from that same commit; the central file's DIRECTORY is
+#   4. recreates control-plane-web, control-plane-worker and llm-proxy on that one
+#      image tag (postgres, rustfs, coredns, gateway, herdr-web untouched) using the
+#      compose files from that same commit; the central file's DIRECTORY is
 #      mounted read-only at /etc/herdr/fleet/ (a single-file mount would keep the old
 #      inode after a rename-replace, so edits would never reach the server).
 #      With the collaboration marker it also renders control_plane.collab (and only
@@ -170,6 +171,9 @@ if [ "$COLLAB" = 1 ]; then
 fi
 
 COMPOSE_FILES=(-f "$WORK/deploy/control-plane/compose.yaml" "${COLLAB_FILES[@]}")
+# Every service of ours that runs the herdr-engineering image and reads the fleet
+# config: rolled forward (and back) together on one tag.
+APP_SERVICES=(control-plane-web control-plane-worker llm-proxy)
 
 if [ "$DRY" = 1 ]; then
   echo "[dry-run] rendered the compose variables to a 0600 file in a 0700 temp dir (removed on exit)"
@@ -191,7 +195,7 @@ if [ "$DRY" = 1 ]; then
   if [ "$COLLAB" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
   fi
-  echo "[dry-run] would build herdr-engineering:$TAG and recreate control-plane-web ${EDGE_SERVICE[*]}"
+  echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}"
   exit 0
 fi
 
@@ -212,7 +216,7 @@ compose() {
   HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_CP_IMAGE_TAG="$1" HERDR_CP_GIT_COMMIT="$SHA" \
     docker compose --env-file "$ENV_FILE" -p "$PROJECT" \
     "${COMPOSE_FILES[@]}" \
-    up -d --no-deps --no-build control-plane-web "${EDGE_SERVICE[@]}"
+    up -d --no-deps --no-build "${APP_SERVICES[@]}" "${EDGE_SERVICE[@]}"
 }
 
 healthy_commit() {
