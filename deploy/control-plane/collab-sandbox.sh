@@ -57,6 +57,30 @@ for n in claude codex pi node; do
 done
 for d in .claude .codex .pi; do bindro "$HOME/$d"; done
 if [ -e "$HOME/.claude.json" ]; then args+=(--ro-bind "$HOME/.claude.json" "$HOME/.claude.json"); fi
+# Helpers only (set by the runner, never by a task), each fails closed when it does not check out:
+#   HERDR_SANDBOX_RO_BINDS  newline-separated directories under ~/herdr-agents/work/ (a reviewer's view of its
+#                           parent's work), shown READ-ONLY at the same path
+#   HERDR_SANDBOX_SSH_DIR   a directory of your own with mode 0700 holding key files, shown READ-ONLY as ~/.ssh
+deny() { echo "collab-sandbox: $1; refusing to run" >&2; exit 126; }
+if [ -n "${HERDR_SANDBOX_RO_BINDS+x}" ]; then
+  while IFS= read -r ro; do
+    [ -n "$ro" ] || continue
+    case "$ro" in /*) ;; *) deny "a read-only bind must be an absolute path" ;; esac
+    case "/$ro/" in */../*|*/./*) deny "a read-only bind must not contain . or .." ;; esac
+    if [ -L "$ro" ] || [ ! -d "$ro" ]; then deny "a read-only bind must be a directory, not a link"; fi
+    real="$(cd "$ro" && pwd -P)"
+    case "$real" in "$(cd "$AREA" && pwd -P)"/*) ;; *) deny "a read-only bind must be under ~/herdr-agents/work/" ;; esac
+    [ "$real" != "$WORK" ] || deny "a read-only bind must not be the work directory"
+    args+=(--ro-bind "$real" "$real")
+  done <<< "$HERDR_SANDBOX_RO_BINDS"
+fi
+if [ -n "${HERDR_SANDBOX_SSH_DIR+x}" ]; then
+  SSHD="$HERDR_SANDBOX_SSH_DIR"
+  case "$SSHD" in /*) ;; *) deny "the ssh directory must be an absolute path" ;; esac
+  if [ -L "$SSHD" ] || [ ! -d "$SSHD" ]; then deny "the ssh directory must be a directory, not a link"; fi
+  [ "$(stat -c '%u %a' "$SSHD")" = "$(id -u) 700" ] || deny "the ssh directory must be yours with mode 0700"
+  args+=(--ro-bind "$SSHD" "$HOME/.ssh")
+fi
 args+=(--bind "$WORK" "$WORK" --chdir "$WORK"
        --clearenv --setenv PATH "$(dirname "$(command -v claude 2>/dev/null || echo /usr/bin/x)"):$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
        --setenv HOME "$HOME" --setenv USER "${USER:-agent}" --setenv LANG "${LANG:-C.UTF-8}" --setenv TERM dumb
