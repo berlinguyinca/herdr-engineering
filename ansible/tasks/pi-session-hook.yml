@@ -1,0 +1,26 @@
+---
+# Pi's own updater rewrites ~/.pi/agent/bin/pi and drops the session auto-resume
+# hook with it. Every fleet sync re-runs the installer from the newest staged
+# release that ships it, so the hook is back within a day. The installer is
+# idempotent; a host without a managed wrapper, or without a staged release that
+# has the installer, is left alone, and a broken hook never stops Pi starting.
+- name: "Restore the session auto-resume hook in a managed Pi wrapper"
+  become: false
+  ansible.builtin.shell: |
+    set -eu
+    wrapper="{{ fleet_home }}/.pi/agent/bin/pi"
+    grep -q 'exec "\$pi_release_bin"' "$wrapper" 2>/dev/null || grep -q 'pi-session-auto-resume' "$wrapper" 2>/dev/null \
+      || { echo "skipped: no managed wrapper"; exit 0; }
+    release=""
+    for d in $(ls -td "{{ fleet_home }}"/.local/share/herdr-engineering/pi/releases/*/ 2>/dev/null); do
+      if [ -f "$d/scripts/install-session-auto-resume.ts" ]; then release="$d"; break; fi
+    done
+    [ -n "$release" ] || { echo "skipped: no staged release has the installer"; exit 0; }
+    cd "$release"
+    node scripts/install-session-auto-resume.ts --managed
+  args:
+    executable: /bin/sh
+  register: pi_session_hook
+  changed_when: "'skipped' not in pi_session_hook.stdout"
+  failed_when: false
+  when: not ansible_check_mode
