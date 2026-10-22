@@ -229,11 +229,15 @@ request stopped). herdr keeps the pane alive, so a worker survives the dashboard
   Credentials never appear in an argument list or a log.
 * Hosts are this machine plus the enabled machines in `herdr machine list`. Each is probed at most once a minute;
   an unreachable one is left out. **Hosts** (same page) has an **Automatic agents** tick per host: untick it and that
-  host never receives automatic agents (the choice survives restarts).
+  host never receives automatic agents (the choice survives restarts, and is re-read before every placement so un-ticking takes effect at once; it is per
+  herdr label, so a second label for the same machine is a different host).
 * Per family the runner runs a fixed non-interactive command on each task: `claude -p`, `codex exec -`, `pi -p`;
-  the `agent` family only acknowledges. The command is in `collab-spawn.py`, never in the request.
+  the `agent` family only acknowledges. The command is in `collab-spawn.py`, never in the request. Note that an agent
+  holding *Receive tasks* runs room members' task text through that harness as your account, and the workers on a host
+  share one account and can read each other's credential files: only start fleets you would trust with that.
 * Limits: 20 agents per request, 3 requests in flight, 12 requests an hour, 60 agents per user. A request nobody
-  finishes shows as *stalled* after 15 minutes. `collab-worker.sh` is generated from `packages/collab-scripts.js`
+  takes within 15 minutes is *expired* (never started late) and one nobody finishes shows as *stalled*; an agent that
+  could not be started is revoked and its credential file removed. `collab-worker.sh` is generated from `packages/collab-scripts.js`
   (a test fails if they drift; the failure message prints the regeneration command).
 * Logs: `journalctl --user -u herdr-collab-spawn`. Stop the feature with `systemctl --user disable --now herdr-collab-spawn.timer`.
 

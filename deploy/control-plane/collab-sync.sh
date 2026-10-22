@@ -139,7 +139,7 @@ install_spawn_timer() {
 Description=Start collab agent fleets on the owner's hosts over herdr
 [Service]
 Type=oneshot
-TimeoutStartSec=5min
+TimeoutStartSec=10min
 ExecStart=/usr/bin/python3 "$d/collab-spawn.py" once --worker "$d/collab-worker.sh"
 UNIT
   cat > "$u/herdr-collab-spawn.timer" <<UNIT

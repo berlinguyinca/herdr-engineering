@@ -1117,6 +1117,7 @@ class CollabService:
         with self._lock:
             if len(self._fleet_flags) >= 200 and host not in self._fleet_flags:
                 raise CollabError(429, "too many hosts")
+            self._throttle("fleethost:" + pr.id, 60, 3600.0, "host setting")
             self._commit("fleet_host_set", self._actor(pr, host=host, auto_agents=body["auto_agents"]))
         return {"host": host, "auto_agents": body["auto_agents"]}
 
@@ -1147,8 +1148,8 @@ class CollabService:
             if sum(1 for r in self._spawns.values() if r["owner"] == pr.id and r["status"] in ("requested", "claimed")
                    and self._now() - r["created_epoch"] < SPAWN_STALE) >= MAX_OPEN_SPAWNS:
                 raise CollabError(429, "too many fleet starts in progress")
-            self._throttle("spawn:" + pr.id, 12, 3600.0, "fleet start")
             self._agent_slots(pr.id, count)
+            self._throttle("spawn:" + pr.id, 12, 3600.0, "fleet start")
             sid = ids.new_id("collab")
             self._commit("fleet_spawn_requested", self._actor(
                 pr, spawn_id=sid, harness_type=family, name_prefix=prefix, count=count, target_room_id=room_id,
@@ -1158,7 +1159,7 @@ class CollabService:
     def _spawn_view(self, r: dict) -> dict:
         status = r["status"]
         if status in ("requested", "claimed") and self._now() - (r["claimed_epoch"] or r["created_epoch"]) > SPAWN_STALE:
-            status = "stalled"                           # the runner never finished: say so instead of waiting for ever
+            status = "expired" if status == "requested" else "stalled"      # never taken / never finished: say so
         return {"spawn_id": r["spawn_id"], "status": status, "harness_type": r["harness_type"],
                 "name_prefix": r["name_prefix"], "count": r["count"], "room_id": r["target_room_id"],
                 "actions": r["actions"], "placements": r["placements"], "error": r["error"],
@@ -1167,8 +1168,8 @@ class CollabService:
     def list_spawns(self, pr: Principal, status: str | None = None) -> dict:
         self._require_user(pr)
         with self._lock:
-            rows = [self._spawn_view(r) for r in self._spawns.values() if r["owner"] == pr.id]
-        rows = [r for r in rows if status is None or r["status"] == status]
+            rows = [self._spawn_view(r) for r in self._spawns.values()
+                    if r["owner"] == pr.id and (status is None or r["status"] == status)]
         rows.sort(key=lambda r: r["created_at"], reverse=True)
         return {"spawns": rows[:50]}
 
@@ -1181,6 +1182,8 @@ class CollabService:
                 raise CollabError(404, "not found")
             if r["status"] != "requested":
                 raise CollabError(409, "already claimed")
+            if self._now() - r["created_epoch"] > SPAWN_STALE:
+                raise CollabError(409, "expired: ask again")      # do not start something nobody is waiting for
             self._commit("fleet_spawn_claimed", self._actor(pr, spawn_id=spawn_id, claimed_epoch=self._now()))
             return {**self._spawn_view(self._spawns[spawn_id]), "expires_at": r["expires_at"]}
 

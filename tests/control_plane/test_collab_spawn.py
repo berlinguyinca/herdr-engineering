@@ -33,7 +33,7 @@ args=("$@"); machine=""
 if [ "${args[0]:-}" = "--machine" ]; then machine="${args[1]}"; args=("${args[@]:2}"); fi
 [ -n "$machine" ] && [ -f "$FAKE_LOG/down-$machine" ] && { echo "ssh: no route" >&2; exit 1; }
 case "${args[0]} ${args[1]:-}" in
-  "machine list") printf '12f6\tbeast\tbeast\tdefault\tenabled\n99aa\told\told\tdefault\tdisabled\n' ;;
+  "machine list") echo '[{"id":"12f6","label":"beast","target":"beast","session":"default","enabled":true},{"id":"99aa","label":"old","target":"old","session":"default","enabled":false}]' ;;
   "workspace list") echo '{"result":{"type":"workspace_list","workspaces":[]}}' ;;
   "workspace create") n=$(( $(cat "$FAKE_LOG/n" 2>/dev/null || echo 0) + 1 )); echo $n > "$FAKE_LOG/n"
      echo "{\"result\":{\"root_pane\":{\"pane_id\":\"w$n:p1\"}}}" ;;
@@ -208,10 +208,61 @@ def test_worker_template_matches_the_script_the_dashboard_hands_out():
     subprocess.run(["bash", "-n", str(WORKER)], check=True)
 
 
-@pytest.mark.parametrize("line,ok", [("a1b2\tbeast\tbeast\tdefault\tenabled", True), ("a\tBad Name\tx\td\tenabled", False),
-                                     ("a\t-oProxy\tx\td\tenabled", False), ("a\tok\t-oProxyCommand=x\td\tenabled", False),
-                                     ("a\tok\tuser@host\td\tdisabled", False), ("a\tok\tuser@host\td\tenabled", True)])
-def test_machine_names_that_could_smuggle_options_are_ignored(rig, monkeypatch, line, ok):
-    monkeypatch.setattr(rig.r, "run", lambda argv, **k: line + "\n")
+@pytest.mark.parametrize("label,target,enabled,ok", [
+    ("beast", "beast", True, True), ("Bad Name", "x", True, False), ("-oProxy", "x", True, False),
+    ("ok", "-oProxyCommand=x", True, False), ("ok", "user@host", False, False), ("ok", "user@host", True, True)])
+def test_machine_names_that_could_smuggle_options_are_ignored(rig, monkeypatch, label, target, enabled, ok):
+    listing = json.dumps([{"label": label, "target": target, "enabled": enabled}])
+    monkeypatch.setattr(rig.r, "run", lambda argv, **k: listing)
     rig.r.discover()
     assert (len(rig.r.targets) == 2) is ok
+
+
+def test_an_unexpected_crash_still_reports_and_leaves_no_live_agent(rig, monkeypatch):
+    def boom(host, agent, family, installed):
+        if agent["name"] != "fleet-1":
+            raise OSError("No space left on device")
+        return None
+    monkeypatch.setattr(rig.r, "place", boom)
+    ask(rig, count=3)
+    rig.r.once()
+    done = rig.w.s.list_spawns(rig.w.alice)["spawns"][0]
+    assert done["status"] == "done" and sorted(p["status"] for p in done["placements"]) == ["failed", "failed", "started"]
+    live = {a["name"] for a in rig.w.s.list_my_agents(rig.w.alice)["agents"] if a["status"] == "active"}
+    assert live == {"fleet-1"}                                  # the ones that never started were revoked
+    assert not (rig.home / "herdr-agents/fleet-2.json").exists()
+
+
+def test_the_service_being_unreachable_ends_the_cycle_cleanly(rig):
+    rig.r.url = "http://127.0.0.1:1"                            # nothing listens here
+    with pytest.raises(runner.Failure):
+        rig.r.once()
+
+
+def test_unticking_a_host_mid_request_stops_placements_there(rig, monkeypatch):
+    rig.r.once()                                                # hosts reported
+    real, n = rig.r.place, []
+
+    def untick_after_first(host, agent, family, installed):
+        real(host, agent, family, installed)
+        n.append(host)
+        if len(n) == 1:
+            rig.w.s.set_fleet_host(rig.w.alice, "beast", {"auto_agents": False})
+    monkeypatch.setattr(rig.r, "place", untick_after_first)
+    ask(rig, count=4)
+    rig.r.once()
+    assert "beast" not in n[1:]                                 # whatever came after the click avoided it
+    assert len(n) == 4
+
+
+def test_a_request_nobody_took_in_time_is_expired_not_started_late(rig):
+    sp = ask(rig, count=1)
+    rig.w.s.clock.t += runner_stale() + 1
+    rig.r.once()
+    assert rig.w.s.list_spawns(rig.w.alice)["spawns"][0]["status"] == "expired"
+    assert [line for line in calls(rig) if " pane run " in f" {line} "] == [] and sp["spawn_id"]
+
+
+def runner_stale():
+    from herdr_engineering.control_plane.collab import SPAWN_STALE
+    return SPAWN_STALE

@@ -39,6 +39,7 @@ from pathlib import Path
 
 MAX_AGENTS = 20
 PROBE_EVERY = 60.0
+REQUEST_DEADLINE = 480.0              # seconds one request may take; the systemd unit allows 10 minutes
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 HOST = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 SSH_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,126}$")
@@ -80,6 +81,8 @@ class Runner:
                 return exc.code, json.loads(exc.read(100_000) or b"{}")
             except ValueError:
                 return exc.code, {}
+        except (OSError, ValueError) as exc:                                  # URLError, timeouts, bad JSON
+            raise Failure(f"{method} {path}: {trim(exc)}") from None
 
     def ok(self, method: str, path: str, body: dict | None = None) -> dict:
         status, out = self.api(method, path, body)
@@ -105,14 +108,15 @@ class Runner:
         """Local machine plus every enabled herdr machine; labels are re-validated, never trusted."""
         self.targets = {self.host_id: None}
         try:
-            listing = self.run([self.herdr, "machine", "list"], timeout=20)
-        except Failure as exc:
-            self.say(f"herdr machine list failed: {exc}")
+            machines = json.loads(self.run([self.herdr, "machine", "list", "--json"], timeout=20))
+        except (Failure, ValueError) as exc:
+            self.say(f"herdr machine list failed: {trim(exc)}")
             return
-        for line in listing.splitlines():
-            f = line.split()
-            if len(f) >= 3 and f[-1] == "enabled" and HOST.fullmatch(f[1]) and SSH_TARGET.fullmatch(f[2]):
-                self.targets.setdefault(f[1], f[2])
+        for m in machines if isinstance(machines, list) else []:
+            label, target = (m.get("label"), m.get("target")) if isinstance(m, dict) else (None, None)
+            if (m.get("enabled") is True and isinstance(label, str) and isinstance(target, str)
+                    and HOST.fullmatch(label) and SSH_TARGET.fullmatch(target)):
+                self.targets.setdefault(label, target)      # the ssh target herdr itself uses for this machine
 
     def reachable(self) -> list[str]:
         """Probe each machine at most once a minute (a probe is an ssh round trip)."""
@@ -150,13 +154,19 @@ class Runner:
         if target is None:
             d = Path.home() / AGENT_DIR
             d.mkdir(mode=0o700, exist_ok=True)
-            tmp = d / f".{name}.{os.getpid()}"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(text)
-            os.replace(tmp, d / name)
+            d.chmod(0o700)
+            tmp = d / f".{name}.{os.getpid()}.{os.urandom(4).hex()}"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+            try:
+                os.fchmod(fd, mode)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                os.replace(tmp, d / name)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
             return
-        script = (f'umask 077; mkdir -p "$HOME/{AGENT_DIR}" && cat > "$HOME/{AGENT_DIR}/.{name}.new" && '
+        script = (f'umask 077; mkdir -p "$HOME/{AGENT_DIR}" && chmod 700 "$HOME/{AGENT_DIR}" && cat > "$HOME/{AGENT_DIR}/.{name}.new" && '
                   f'chmod {mode:o} "$HOME/{AGENT_DIR}/.{name}.new" && mv -f "$HOME/{AGENT_DIR}/.{name}.new" "$HOME/{AGENT_DIR}/{name}"')
         self.run([self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target, script], stdin=text, timeout=45)
 
@@ -169,9 +179,12 @@ class Runner:
             self.put(host, "worker.sh", self.worker_text.replace("'__HERDR_BASE__'", base), 0o700)
             installed.add(host)
         self.put(host, f"{name}.json", json.dumps({k: agent[k] for k in ("agent_id", "name", "credential", "device_id", "expires_at")}) + "\n", 0o600)
-        out = json.loads(self.run(self.herdr_cmd(host, ["workspace", "create", "--label", f"collab {name}", "--no-focus"]), timeout=30))
-        pane = out["result"]["root_pane"]["pane_id"]
-        if not re.fullmatch(r"[A-Za-z0-9:_.-]{1,40}", pane):
+        try:
+            pane = json.loads(self.run(self.herdr_cmd(host, ["workspace", "create", "--label", f"collab {name}", "--no-focus"]),
+                                       timeout=30))["result"]["root_pane"]["pane_id"]
+        except (ValueError, KeyError, TypeError):
+            raise Failure("herdr returned an unexpected reply to workspace create") from None
+        if not isinstance(pane, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}", pane):
             raise Failure("herdr returned an unexpected pane id")
         cmd = FAMILY_CMD[family]
         line = (f'{"HERDR_AGENT_CMD=" + shlex.quote(cmd) + " " if cmd else ""}"$HOME/{AGENT_DIR}/worker.sh" '
@@ -179,21 +192,43 @@ class Runner:
         self.run(self.herdr_cmd(host, ["pane", "run", pane, line]), timeout=30)
 
     # ------------------------------------------------------------ one request
-    def next_hosts(self, eligible: list[str], count: int) -> list[str]:
-        """Round robin that carries on where the last request stopped."""
+    def pick_host(self, eligible: list[str]) -> str | None:
+        """Next host in the rotation that still accepts automatic agents. The flags are read again for every
+        agent, so un-ticking a host stops placements at once, not at the next cycle. The rotation carries on
+        where the last placement stopped."""
+        flags = {h["host"]: h["auto_agents"] for h in self.ok("GET", "fleet/hosts")["hosts"]}
+        live = [h for h in eligible if flags.get(h, True)]
+        if not live:
+            return None
         cursor_file = self.state / "rr"
         try:
             cursor = int(cursor_file.read_text())
         except (OSError, ValueError):
             cursor = 0
-        order = [eligible[(cursor + i) % len(eligible)] for i in range(count)]
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
-        cursor_file.write_text(str((cursor + count) % 1_000_000))
-        return order
+        cursor_file.write_text(str((cursor + 1) % 1_000_000))
+        return live[cursor % len(live)]
+
+    def forget(self, host: str, agent: dict) -> None:
+        """An agent that could not be started must not stay alive with a credential nobody holds."""
+        try:
+            self.ok("POST", f"agents/{agent['agent_id']}/revoke", {})
+        except (Failure, KeyError):
+            pass
+        try:
+            target = self.targets.get(host)
+            if target is None:
+                (Path.home() / AGENT_DIR / f"{agent['name']}.json").unlink(missing_ok=True)
+            elif NAME.fullmatch(agent["name"]):
+                self.run([self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target,
+                          f'rm -f "$HOME/{AGENT_DIR}/{agent["name"]}.json"'], timeout=20)
+        except (Failure, KeyError, OSError):
+            pass
 
     def handle(self, spec: dict, eligible: list[str]) -> None:
         sid = spec["spawn_id"]
         placements, error = [], None
+        deadline = time.monotonic() + REQUEST_DEADLINE
         try:
             if not eligible:
                 raise Failure("no host accepts automatic agents right now")
@@ -207,17 +242,28 @@ class Runner:
             made = self.ok("POST", "agents/bulk", body)
             if made.get("error"):
                 error = trim(made["error"])
-            hosts = self.next_hosts(eligible, len(made["agents"]))
             installed: set = set()
-            for host, agent in zip(hosts, made["agents"]):
+            for agent in made["agents"]:
+                host = "-"
                 try:
+                    if time.monotonic() > deadline:
+                        raise Failure("ran out of time")
+                    host = self.pick_host(eligible) or ""
+                    if not host:
+                        raise Failure("every host opted out meanwhile")
                     self.place(host, agent, spec["harness_type"], installed)
                     placements.append({"name": agent["name"], "host": host, "status": "started", "error": None})
-                except (Failure, KeyError, ValueError) as exc:
-                    placements.append({"name": agent["name"], "host": host, "status": "failed", "error": trim(exc)})
-        except Failure as exc:
+                except Exception as exc:                          # noqa: BLE001  (one agent must not strand the rest)
+                    self.forget(host, agent)
+                    placements.append({"name": str(agent.get("name", "?"))[:32], "host": host if HOST.fullmatch(host) else "none",
+                                       "status": "failed", "error": trim(exc)})
+        except Exception as exc:                                  # noqa: BLE001
             error = trim(exc)
-        self.ok("POST", f"fleet/spawns/{sid}/done", {"placements": placements, **({"error": error} if error else {})})
+        finally:
+            try:
+                self.ok("POST", f"fleet/spawns/{sid}/done", {"placements": placements, **({"error": error} if error else {})})
+            except Failure as exc:
+                self.say(f"spawn {sid}: could not report the result: {exc}")
         self.say(f"spawn {sid}: {sum(p['status'] == 'started' for p in placements)}/{len(placements)} started"
                  + (f" ({error})" if error else ""))
 
