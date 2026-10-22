@@ -259,6 +259,45 @@ def test_finish_result_is_size_limited_and_cleaned(w):
     assert "\0" not in out["result"] and len(out["result"]) <= collab.MAX_HELPER_RESULT
 
 
+# ------------------------------------------------------------------ a helper holds no more than its parent, live
+def test_narrowing_the_parent_narrows_its_helper(w):
+    h, c = run(w, ask(w)["helper_id"])
+    assert w.s.post_message(h, w.room, {"text": "hi", "idempotency_key": "k1"})[0] == 201
+    w.s.grant_agent(w.alice, w.room, {"agent_id": w.root.id, "actions": ["read"]})
+    assert code(w.s.post_message, h, w.room, {"text": "hi", "idempotency_key": "k1"}) == 403
+    assert code(ask, w, h) == 403
+
+
+def test_narrowing_a_middle_helper_narrows_its_child(w):
+    h1, c1 = run(w, ask(w)["helper_id"])
+    h2, _ = run(w, ask(w, h1)["helper_id"])
+    w.s.grant_agent(w.alice, w.room, {"agent_id": c1["helper_agent_id"], "actions": ["read", "spawn_helpers"]})
+    assert code(w.s.post_message, h2, w.room, {"text": "hi", "idempotency_key": "k1"}) == 403
+    assert w.s.read_events(h2, w.room, 0, 1)["events"] is not None      # still reads: read survived
+    assert code(ask, w, h2) == 429                                     # depth, but spawn_helpers is still in the chain
+
+
+def test_a_helper_cannot_be_granted_into_another_room(w):
+    _, c = run(w, ask(w)["helper_id"])
+    aid = c["helper_agent_id"]
+    assert code(w.s.grant_agent, w.alice, w.room2, {"agent_id": aid, "actions": ["read"]}) == 403
+
+
+def test_a_helper_request_into_another_room_cannot_be_approved(w):
+    # bob's helper; bob asks alice's room2 for access for it, which alice may not approve
+    w.s.add_member(w.alice, w.room2, {"user_id": "bob", "role": "contributor"})
+    b, _ = w.agent("bob", actions=("read", "spawn_helpers"))
+    _, c = run(w, ask(w, b)["helper_id"])
+    rid = "grant_fake"
+    w.s._commit("agent_access_requested", {
+        "actor_user_id": "bob", "actor_agent_id": None, "project_id": w.s._rooms[w.room2]["project_id"],
+        "room_id": w.room2, "agent_id": c["helper_agent_id"], "request_id": rid, "actions": ["read"],
+        "created_epoch": w.s.clock.t, "action": "agent.request", "outcome": "allowed", "project_ids": [],
+        "resource_id": c["helper_agent_id"]})
+    assert code(w.s.decide_agent_request, w.alice, w.room2, rid, {"decision": "approve"}) == 403
+    assert code(w.s.grant_agent, w.bob, w.room2, {"agent_id": c["helper_agent_id"], "actions": ["read"]}) == 403
+
+
 # ------------------------------------------------------------------ revoke and cancel end the whole subtree
 def test_revoking_the_parent_ends_every_descendant(w):
     h1, c1 = run(w, ask(w)["helper_id"])
@@ -279,6 +318,55 @@ def test_removing_the_parent_from_the_room_ends_its_helpers_there(w):
     w.s.remove_agent_from_room(w.alice, w.room, w.root.id)
     assert code(w.s.authenticate, f"Agent {c['credential']}", c["device_id"]) == 401
     assert w.s.helper_status(w.alice, queued["helper_id"])["status"] == "cancelled"
+
+
+def test_parent_credential_expiry_ends_the_subtree_from_housekeeping(w):
+    _, c1 = run(w, ask(w)["helper_id"])
+    w.s._agents[w.root.id]["expires_at"] = w.s.clock.t + 10      # the root's credential runs out first
+    w.s.clock.t += 11
+    w.s.agent_rooms(w.alice)                                     # any housekeeping call, no helper call
+    assert w.s._helpers[c1["helper_id"]]["status"] == "cancelled"
+    assert w.s._helpers[c1["helper_id"]]["reason"] == "parent expired"
+    assert w.s._agents[c1["helper_agent_id"]]["status"] == "revoked"
+
+
+def test_owner_losing_the_room_or_being_disabled_frees_the_slots(w):
+    b, _ = w.agent("bob", actions=("read", "spawn_helpers"))
+    rec = ask(w, b)
+    _, c = run(w, rec["helper_id"])
+    w.s.remove_member(w.alice, w.room, "bob")
+    assert w.s._helpers[rec["helper_id"]]["status"] == "cancelled"
+    assert w.s._agents[c["helper_agent_id"]]["status"] == "revoked"
+
+
+def test_an_agent_minted_by_an_interrupted_claim_is_revoked(w):
+    rec = ask(w)
+    real = w.s._commit
+    def cut(t, p):
+        if t == "helper_claimed":
+            raise collab.CollabError(503, "collaboration log unavailable")
+        return real(t, p)
+    w.s._commit = cut
+    assert code(w.s.claim_helper, w.op, rec["helper_id"]) == 503
+    w.s._commit = real
+    orphan = next(a for a in w.s._helper_minted)
+    assert w.s._agents[orphan]["status"] == "active"
+    w.s.list_helpers_for_runner(w.op)
+    assert w.s._agents[orphan]["status"] == "revoked"
+
+
+def test_runner_error_text_never_reaches_an_audited_event(w):
+    rec = ask(w)
+    run(w, rec["helper_id"])
+    w.s.finish_helper(w.op, rec["helper_id"], {"status": "failed", "error": "sk-NOTE kangaroo at /home/x"})
+    assert w.s.helper_status(w.root, rec["helper_id"])["error"] == "failed"
+    assert "kangaroo" in w.s.helper_result(w.root, rec["helper_id"])["error_text"]
+    audited = [e for e in w.s._log if "action" in e["payload"]]
+    assert all("kangaroo" not in json.dumps(e["payload"]) for e in audited)
+    rec2 = ask(w)
+    run(w, rec2["helper_id"])
+    w.s.finish_helper(w.op, rec2["helper_id"], {"status": "failed", "error": "timeout"})
+    assert w.s.helper_status(w.root, rec2["helper_id"])["error"] == "timeout"
 
 
 def test_cancel_ends_the_helper_and_its_children(w):
@@ -319,7 +407,19 @@ def test_successor_replaces_parent_at_the_same_depth(w):
     hs, _ = run(w, s["helper_id"])
     assert w.s.agent_rooms(h1)["rooms"]                  # the parent is not revoked here; it ends itself
     w.s.finish_helper(w.op, s["helper_id"], {"status": "running"})
-    w.s.revoke_agent(w.alice, h1.id)                       # the parent ending does not end a running successor
+    w.s.revoke_agent(w.alice, h1.id)                       # revoking a predecessor that is still active ends it
+    assert not w.s.still_valid(hs)
+    assert w.s.helper_status(w.alice, s["helper_id"])["status"] == "cancelled"
+
+
+def test_revoking_a_finished_predecessor_leaves_its_successor_alone(w):
+    rec = ask(w)
+    h1, _ = run(w, rec["helper_id"])
+    s = ask(w, h1, role="successor")
+    hs, _ = run(w, s["helper_id"])
+    w.s.finish_helper(w.op, s["helper_id"], {"status": "running"})
+    w.s.finish_helper(w.op, rec["helper_id"], {"status": "done"})      # the hand-over
+    w.s.revoke_agent(w.alice, h1.id)
     assert w.s.still_valid(hs)
     assert w.s.helper_status(w.alice, s["helper_id"])["status"] == "running"
 
@@ -345,13 +445,14 @@ def test_a_successor_starts_after_its_predecessor_finished(w):
     assert w.s.still_valid(hs)
 
 
-def test_root_successor_has_no_parent_and_survives_the_root_ending(w):
+def test_root_successor_has_no_parent_and_ends_when_the_root_is_revoked(w):
     s = ask(w, role="successor")
     assert s["depth"] == 0 and s["parent_agent_id"] is None
     hs, _ = run(w, s["helper_id"])
     w.s.finish_helper(w.op, s["helper_id"], {"status": "running"})
     w.s.revoke_agent(w.alice, w.root.id)
-    assert w.s.still_valid(hs)
+    assert not w.s.still_valid(hs)
+    assert w.s.helper_status(w.alice, s["helper_id"])["status"] == "cancelled"
 
 
 def test_successor_chain_of_six_is_refused(w):
@@ -375,7 +476,7 @@ def test_pause_refuses_new_requests_and_stops_running_ones(w):
     with pytest.raises(collab.CollabError) as e:
         ask(w)
     assert e.value.status == 503 and e.value.message == "helpers are paused"
-    assert code(w.s.claim_helper, w.op, queued["helper_id"]) in (409, 503)
+    assert code(w.s.claim_helper, w.op, queued["helper_id"]) == 503
     rows = w.s.list_helpers_for_runner(w.op)
     assert rows["paused"] is True and rows["helpers"] == []
     assert code(w.s.authenticate, f"Agent {c['credential']}", c["device_id"]) == 401

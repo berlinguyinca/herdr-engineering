@@ -129,6 +129,7 @@ MAX_HELPER_RESULT = 32000
 _HELPER_LIVE = frozenset({"requested", "claimed", "running"})
 _HELPER_FIELDS = frozenset({"room_id", "role", "task", "family", "model", "wait"})
 _HELPER_IGNORED = frozenset({"parent", "parent_agent_id"})   # the parent is the caller, never what the body says
+HELPER_ERRORS = frozenset({"failed", "timeout", "cancelled", "sandbox-error", "egress-denied"})   # audited codes
 _HELPER_BAD = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")   # all control chars but \t \n
 
 
@@ -320,6 +321,7 @@ class CollabService:
         self._helper_by_agent: dict[str, dict] = {}          # helper's own agent id -> its request
         self._helper_text: dict[str, dict] = {}              # helper id -> task text waiting for its request event
         self._helpers_paused = False                         # the panic switch
+        self._helper_minted: set[str] = set()                # agents a claim minted (a helper agent, linked or not)
         self._state_waiters: dict[str, int] = defaultdict(int)
         self._joins: dict[str, dict] = {}                    # token digest -> record
         self._joins_by_id: dict[str, str] = {}               # join id -> digest
@@ -411,6 +413,9 @@ class CollabService:
                 self._seq = ev["sequence"]
                 self._log.append(ev)
                 self._apply(ev)
+            # helper_task is always committed right before its helper_requested (two commits under one lock):
+            # a text still waiting here belongs to a request whose second commit failed. Drop it.
+            self._helper_text.clear()
             known = {ev["payload"].get(k) for ev in parsed
                      for k in ("actor_user_id", "subject_user_id", "user_id", "owner_user_id")}
             mark = getattr(self.auth, "mark_known", None)
@@ -476,6 +481,8 @@ class CollabService:
                 "cred_digest": p["secret_digest"], "expires_at": p["expires_at_epoch"]}
             self._by_cred[p["secret_digest"]] = p["agent_id"]
             self._agents_by_owner[p["owner_user_id"]].add(p["agent_id"])
+            if p.get("action") == "helper.agent.create":
+                self._helper_minted.add(p["agent_id"])
             if p.get("join_digest") in self._joins:
                 self._joins[p["join_digest"]]["uses"] += 1
         elif t == "join_token_created":
@@ -589,7 +596,7 @@ class CollabService:
                 "task": extra.get("task"), "depth": p["depth"], "chain": p["chain"], "status": "requested",
                 "created_epoch": p["created_epoch"], "expires_epoch": p["expires_epoch"], "claimed_epoch": None,
                 "finished_epoch": None, "helper_agent_id": None, "actions": [], "result": None, "error": None,
-                "reason": None, "parent_actions": list(p.get("parent_actions") or [])}
+                "reason": None, "parent_actions": list(p.get("parent_actions") or []), "error_text": None}
         elif t == "helper_claimed":
             r = self._helpers.get(p["helper_id"])
             if r is not None:
@@ -601,7 +608,7 @@ class CollabService:
                 self._helpers[p["helper_id"]]["status"] = "running"
         elif t == "helper_result":
             if p["helper_id"] in self._helpers:
-                self._helpers[p["helper_id"]]["result"] = p["result"]
+                self._helpers[p["helper_id"]].update(result=p.get("result"), error_text=p.get("error_text"))
         elif t == "helper_finished":
             if p["helper_id"] in self._helpers:
                 self._helpers[p["helper_id"]].update(status=p["status"], error=p.get("error"),
@@ -772,6 +779,14 @@ class CollabService:
         if not m or not self._ok(agent["owner"]):
             return None  # owner lost membership: the agent loses it too
         allowed = frozenset(grant["actions"]) & ROLE_ACTIONS[m["role"]] & AGENT_ACTIONS
+        h = self._helper_by_agent.get(pr.id)
+        if h is not None and h["parent_agent_id"]:
+            # a helper never holds more than the agent it works under holds right now (recursively)
+            parent = self._agents.get(h["parent_agent_id"])
+            peff = self._effective(Principal("agent", h["parent_agent_id"], parent["owner"]), room) if parent else None
+            if peff is None:
+                return None
+            allowed &= peff[0]
         return allowed, max(grant["granted_seq"], m["joined_seq"])
 
     def _authorize(self, pr: Principal, room_id: str, action: str, audit_action: str) -> tuple[dict, int]:
@@ -943,6 +958,7 @@ class CollabService:
                 pr, project_id=room["project_id"], room_id=room_id, subject_user_id=uid,
                 action="member.remove", outcome="allowed", project_ids=[room["project_id"]],
                 resource_id=room_id))
+            self._expire_helpers()                   # their helpers in this room end now and free their slots
         return {"ok": True}
 
     # -- people: approval, disable, kick
@@ -1037,6 +1053,8 @@ class CollabService:
                 seen: set = set()
                 for aid in list(self._agents_by_owner.get(uid, ())):
                     self._end_agent(self._actor(pr), aid, "owner removed", seen)
+            elif action == "disable":
+                self._expire_helpers()                # a disabled person's helpers end now
             elif action in ("approve", "enable") and self._user_email.get(uid):
                 self._deliver_pending(uid, self._user_email[uid])
             return self._user_row(uid, self._users[uid])
@@ -1940,11 +1958,16 @@ class CollabService:
             self._commit("helper_task", {"actor_user_id": pr.owner, "actor_agent_id": pr.id, "helper_id": hid,
                                          "task": task, "tier": str(choice.tier)[:40],
                                          "model_reason": str(choice.reason)[:200]})
-            self._commit("helper_requested", self._actor(
-                pr, project_id=room["project_id"], room_id=room_id, helper_id=hid, requester_agent_id=pr.id,
-                owner_user_id=pr.owner, parent_agent_id=parent, role=role, family=family, model=model,
-                depth=depth, chain=chain, parent_actions=sorted(self._effective(pr, room)[0]), created_epoch=now, expires_epoch=now + HELPER_TTL,
-                action="helper.request", outcome="allowed", project_ids=[room["project_id"]], resource_id=hid))
+            try:
+                self._commit("helper_requested", self._actor(
+                    pr, project_id=room["project_id"], room_id=room_id, helper_id=hid, requester_agent_id=pr.id,
+                    owner_user_id=pr.owner, parent_agent_id=parent, role=role, family=family, model=model,
+                    depth=depth, chain=chain, parent_actions=sorted(self._effective(pr, room)[0]),
+                    created_epoch=now, expires_epoch=now + HELPER_TTL, action="helper.request", outcome="allowed",
+                    project_ids=[room["project_id"]], resource_id=hid))
+            except CollabError:
+                self._helper_text.pop(hid, None)     # never left waiting for a request that was not written
+                raise
             return self._helper_view(self._helpers[hid])
 
     def _helper_for(self, pr: Principal, helper_id: Any) -> dict:
@@ -1963,7 +1986,7 @@ class CollabService:
         with self._lock:
             self._expire_helpers()
             r = self._helper_for(pr, helper_id)
-            return {**self._helper_view(r), "result": r["result"], "untrusted": True}
+            return {**self._helper_view(r), "result": r["result"], "error_text": r.get("error_text"), "untrusted": True}
 
     def cancel_helper(self, pr: Principal, helper_id: str) -> dict:
         with self._lock:
@@ -1998,14 +2021,15 @@ class CollabService:
         self._end_dependents(actor, aid, reason, seen)
 
     def _end_dependents(self, actor: dict, aid: str, reason: str, seen: set, room: str | None = None) -> None:
-        """Helpers under `aid`. Unless `aid` ended normally (finished or expired: the hand-over a successor
-        is for), also the successors it asked for that have not started yet."""
-        pending = reason not in ("finished", "expired")
+        """Helpers under `aid`, and the successors it asked for (any live status). Only a predecessor that
+        ended normally (its own helper finished or expired: the hand-over) leaves its successors alone."""
+        own = self._helper_by_agent.get(aid)
+        handed_over = reason in ("finished", "expired") or (own is not None and own["status"] in ("done", "failed", "expired"))
         for r in list(self._helpers.values()):
             if room is not None and r["room_id"] != room:
                 continue
-            if r["parent_agent_id"] == aid or (pending and r["requester_agent_id"] == aid
-                                               and r["status"] in ("requested", "claimed")):
+            if r["parent_agent_id"] == aid or (not handed_over and r["requester_agent_id"] == aid
+                                               and r["status"] in _HELPER_LIVE):
                 self._end_helper(actor, r, reason, seen)
 
     def _expire_helpers(self) -> None:
@@ -2022,8 +2046,31 @@ class CollabService:
                     "resource_id": r["helper_id"]})
                 if r["helper_agent_id"]:
                     self._end_agent(actor, r["helper_agent_id"], "expired", set())
+            for r in [r for r in self._helpers.values() if r["status"] in _HELPER_LIVE]:
+                if r["status"] not in _HELPER_LIVE:
+                    continue
+                reason = self._helper_lost_reason(r, now)
+                if reason:
+                    self._end_helper(actor, r, reason, set())
+            for aid in [a for a in self._helper_minted
+                        if a not in self._helper_by_agent and self._agents[a]["status"] == "active"]:
+                self._end_agent(actor, aid, "unlinked helper", set())    # a claim that was cut off half-way
         except CollabError:
             pass                                             # log full: expired helpers are refused anyway
+
+    def _helper_lost_reason(self, r: dict, now: float) -> str | None:
+        """Why a live helper can no longer run although nobody ended it explicitly, or None."""
+        room = self._rooms.get(r["room_id"])
+        if room is None or not self._member(room, r["owner"]) or not self._ok(r["owner"]):
+            return "owner lost access"
+        for aid in (r["requester_agent_id"], r["parent_agent_id"]):
+            a = self._agents.get(aid) if aid else None
+            if a is not None and aid not in self._helper_by_agent and now >= a["expires_at"]:
+                return "parent expired"
+        par = self._agents.get(r["parent_agent_id"]) if r["parent_agent_id"] else None
+        if par is not None and par["status"] != "active":
+            return "parent ended"
+        return None
 
     def list_helpers_for_runner(self, pr: Principal) -> dict:
         """Operator only: every live helper (any owner), with its task, and whether the panic switch is on."""
@@ -2127,12 +2174,15 @@ class CollabService:
                 return self._helper_view(r)
             if r["status"] not in ("claimed", "running"):
                 raise CollabError(409, f"helper is {self._helper_view(r)['status']}")
-            if result:
-                clean = redact_text(_HELPER_BAD.sub("", result)[:MAX_HELPER_RESULT])
-                self._commit("helper_result", {**actor, "helper_id": helper_id, "result": clean})   # no "action"
+            # Free text (output, the runner's error note) only in an event without "action"; audited
+            # events carry a fixed error code.
+            text = redact_text(_HELPER_BAD.sub("", err)[:200]) if err else None
+            if result or text:
+                clean = redact_text(_HELPER_BAD.sub("", result)[:MAX_HELPER_RESULT]) if result else None
+                self._commit("helper_result", {**actor, "helper_id": helper_id, "result": clean, "error_text": text})
+            code = (err if err in HELPER_ERRORS else "failed") if status == "failed" or err else None
             self._commit("helper_finished", {**actor, **base, "status": status, "finished_epoch": self._now(),
-                                             "error": _HELPER_BAD.sub("", err)[:200] if err else None,
-                                             "action": "helper.finish"})
+                                             "error": code, "action": "helper.finish"})
             self._end_agent(actor, r["helper_agent_id"], "finished", set())
             return self._helper_view(r)
 
@@ -2162,6 +2212,7 @@ class CollabService:
             agent = self._agents.get(body.get("agent_id")) if isinstance(body.get("agent_id"), str) else None
             if not agent or agent["owner"] != pr.id or agent["status"] != "active":
                 raise CollabError(404, "not found")
+            self._helper_room_only(body["agent_id"], room_id)
             aid = body["agent_id"]
             actions = _actions(body.get("actions"))
             m = self._member(room, pr.id)
@@ -2191,6 +2242,12 @@ class CollabService:
                 actions=actions, created_epoch=now, action="agent.request", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=aid))
         return {"room_id": room_id, "agent_id": aid, "actions": actions, "status": "pending", "request_id": rid}
+
+    def _helper_room_only(self, agent_id: str, room_id: str) -> None:
+        h = self._helper_by_agent.get(agent_id)
+        if (h is not None and h["room_id"] != room_id) or (agent_id in self._helper_minted and h is None):
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "a helper works only in its own room")
 
     def _name_free(self, room: dict, agent_id: str, name: str) -> None:
         """Handles are how people address agents (@name): two agents in one room never share one.
@@ -2232,6 +2289,7 @@ class CollabService:
             if decision == "approve":
                 if not agent or agent["status"] != "active" or not self._member(room, agent["owner"]):
                     raise CollabError(404, "not found")
+                self._helper_room_only(r["agent_id"], room_id)
                 actions = _actions(body["actions"]) if "actions" in body else list(r["actions"])
                 self._name_free(room, r["agent_id"], agent["name"])
                 if not set(actions) <= set(r["actions"]):
@@ -2542,6 +2600,7 @@ class CollabService:
             return
         self._housekept = now
         self._prune()
+        self._expire_helpers()
         for rid, room in list(self._rooms.items()):
             for aid, g in list(room["grants"].items()):
                 if g["expires_at"] is not None and now >= g["expires_at"]:
