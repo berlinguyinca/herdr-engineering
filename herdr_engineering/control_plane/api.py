@@ -336,6 +336,7 @@ _PUBLIC_STATIC = {
     "/collab-app.js": ("collab-app.js", "text/javascript"),
     "/collab.css": ("collab.css", "text/css"),
     "/collab-view.js": ("collab-view.js", "text/javascript"),
+    "/collab-scripts.js": ("collab-scripts.js", "text/javascript"),
     "/herdr-web-client/collab.js": ("herdr-web-client/collab.js", "text/javascript"),
     "/herdr-web-components/util.js": ("herdr-web-components/util.js", "text/javascript"),
     "/herdr-design-system/theme.css": ("herdr-design-system/theme.css", "text/css"),

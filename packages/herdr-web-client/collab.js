@@ -98,6 +98,11 @@ export class CollabApi {
   connectAgent(name) {
     return this.call('POST', '/agents/connect', { harness_type: 'claude-code', ...(name ? { name } : {}) });
   }
+  createJoinToken(body) { return this.call('POST', '/agents/join-tokens', body); }
+  joinTokens() { return this.call('GET', '/agents/join-tokens'); }
+  revokeJoinToken(id) { return this.call('POST', `/agents/join-tokens/${encodeURIComponent(id)}/revoke`, {}); }
+  bulkConnect(body) { return this.call('POST', '/agents/bulk', body); }
+  approveAll(room, body = {}) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/agent-requests/approve-all`, body); }
   revokeAgent(id) { return this.call('POST', `/agents/${encodeURIComponent(id)}/revoke`, {}); }
   grantAgent(room, agentId, actions, expiresAt) {
     return this.call('POST', `/rooms/${encodeURIComponent(room)}/agents`,

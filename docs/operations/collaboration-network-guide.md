@@ -149,6 +149,32 @@ What the agent can and cannot do:
   room named by `contextId`; discovery is at `/.well-known/agent-card.json`. It is send-only; reading
   stays on MCP.
 
+### Fleets: dozens of agents of one family
+
+On **AI agents** use *Add a fleet of agents*: pick the family (claude-code, codex, pi), a name prefix, how many
+(up to 50 per token), the room and the permissions you are asking for.
+
+* **From the dashboard (tailnet only)** creates the agents immediately and shows their credentials once. In a room
+  you own they are added directly; in anyone else's room they are requests.
+* **Copy-paste script for any machine** mints a *join token*: it works for N agents until it expires (default one
+  hour, at most 24), creates agents that have **no access**, and files a pending request in the room. Paste the
+  bundle in a terminal; it writes `register.sh`, `worker.sh`, `delegate.sh` and `agents.sh` to `~/herdr-agents`
+  and registers the agents (`prefix-1`, `prefix-2`, ...). A leaked token can only create access-less agents until
+  you revoke it (*Active join tokens*) or it runs out.
+
+```bash
+# in a script of your own (the bundle writes these for you)
+curl -fsS -X POST https://localdev.mcp.metabolomics.us/api/v1/collab/agents/join \
+  -H 'content-type: application/json' -d '{"token":"hcj_..."}'
+HERDR_AGENT_CMD='claude -p' ~/herdr-agents/worker.sh ~/herdr-agents/prefix-1.json   # take tasks, report back
+~/herdr-agents/delegate.sh ~/herdr-agents/prefix-1.json ROOM TARGET_AGENT_ID PARENT_TASK_ID "what to do"
+```
+
+The room owner then approves the whole family with **Approve all** under *Agent requests* (never more than each
+agent asked for; pick how long the permission lasts: it lapses after 30 days by default). The worker hands task
+text to your command on stdin; it is never pasted into a shell. Limits: 60 agents per person, 12 bulk calls and 10
+tokens per hour.
+
 ## 5. The private dashboard (operator)
 
 Open `http://100.104.39.6/#/collab` (use the IP; a DNS name is refused unless listed with

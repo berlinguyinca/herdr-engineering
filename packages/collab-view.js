@@ -1,6 +1,7 @@
 // Collaboration rooms: sign in with the BinView user pool, create rooms, chat, and invite
 // people by email. All remote text is untrusted: it is escaped, never interpreted.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { bundleScript, filesFromBulk, workerScript } from './collab-scripts.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
 } from './herdr-web-client/collab.js';
@@ -42,6 +43,8 @@ export async function completeSignInIfRedirected() {
   return true;
 }
 
+const permBoxes = (cur, name) => PERMS.map(([v, l]) => `<label class="cx-check"><input type="checkbox" name="${name}" value="${v}"${cur.includes(v) ? ' checked' : ''}> ${esc(l)}</label>`).join('');
+const picked = (form, name) => [...form.querySelectorAll(`input[name="${name}"]:checked`)].map((i) => i.value);
 const pill = (text, color = 'var(--text-muted)') =>
   `<span class="hd-status" style="--sc:${color}"><span class="hd-status__dot" aria-hidden="true">●</span><span class="hd-status__label">${esc(text)}</span></span>`;
 const roleLabel = (r) => ROLE_LABEL[r] || r;
@@ -192,11 +195,13 @@ export function mountCollab(root) {
 
   async function showAgents() {
     frame('/agents', `<div class="cx-head"><div><h1>AI agents</h1><p class="cx-sub">Connect Claude Code, Codex, Pi or any MCP client so it can work in your rooms.</p></div>
-        <div class="cx-row"><input id="hcn-agent-name" class="cx-input" maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="name, e.g. alices-helper (optional)" aria-label="Agent name" autocomplete="off"><button id="hcn-connect" class="hd-btn" type="button">Connect an AI agent</button></div></div>
+        <div class="cx-row"><input id="hcn-agent-name" class="cx-input" maxlength="32" pattern="[a-z0-9]+(-[a-z0-9]+)*" placeholder="name, e.g. alices-helper (optional)" aria-label="Agent name" autocomplete="off"><button id="hcn-connect" class="hd-btn" type="button">Connect an AI agent</button></div></div>
       <div id="hcn-connect-out"></div>
+      <section class="cx-section"><h2>Add a fleet of agents</h2><div id="hcn-fleet"></div><div id="hcn-fleet-out"></div></section>
       <section class="cx-section"><h2>Your agents</h2><div id="hcn-agents"></div></section>
       <section class="cx-section">${GUIDE}</section>`);
     await renderAgents();
+    await renderFleet();
     $('hcn-connect').onclick = async () => {
       const btn = $('hcn-connect');
       btn.disabled = true;
@@ -204,6 +209,92 @@ export function mountCollab(root) {
         $('hcn-connect-out').innerHTML = `<div class="hd-error" role="alert">${esc(e.message)}</div>`;
       } finally { btn.disabled = false; }
     };
+  }
+
+  // ---- fleets: many agents of one family, registered by copy-paste scripts
+  const FAMILIES = ['claude-code', 'codex', 'pi', 'agent'];
+  async function renderFleet() {
+    const box = $('hcn-fleet');
+    if (!box) return;
+    const { rooms } = await api.rooms();
+    const usable = rooms.filter((r) => ['owner', 'contributor'].includes(r.role));
+    box.innerHTML = `<form id="hcn-fleet-form" class="cx-stack">
+        <div class="cx-row">
+          <label class="cx-msg">Family <select name="family">${FAMILIES.map((f) => `<option>${esc(f)}</option>`).join('')}</select></label>
+          <label class="cx-msg">Name prefix <input class="cx-input" name="prefix" maxlength="24" pattern="[a-z0-9]+(-[a-z0-9]+)*" value="worker" required></label>
+          <label class="cx-msg">How many <input class="cx-input" name="count" type="number" min="1" max="50" value="5" required></label>
+          <label class="cx-msg">Room <select name="room"><option value="">none yet</option>${usable.map((r) => `<option value="${esc(r.room_id)}">${esc(r.name)}</option>`).join('')}</select></label>
+        </div>
+        <span class="cx-checks">${permBoxes(['read', 'post', 'execute', 'instruct'], 'fp')}</span>
+        ${operator ? `<label class="cx-check"><input type="radio" name="how" value="direct" checked> From this dashboard (tailnet): create now, no token</label>
+        <label class="cx-check"><input type="radio" name="how" value="token"> Copy-paste script for any machine (join token)</label>` : '<input type="hidden" name="how" value="token">'}
+        <div><button class="hd-btn" type="submit">Create</button> <span id="hcn-fleet-msg" class="cx-msg" role="status"></span></div>
+        <p class="cx-msg">Agents start with no access. The room owner approves them (one click for the whole family under <em>Agent requests</em>), and every permission can lapse.</p>
+      </form>`;
+    $('hcn-fleet-form').onsubmit = async (ev) => {
+      ev.preventDefault();
+      const f = ev.target;
+      const fd = new FormData(f);
+      const room = fd.get('room');
+      const body = { harness_type: fd.get('family'), name_prefix: String(fd.get('prefix')).toLowerCase(), count: Number(fd.get('count')),
+        ...(room ? { room_id: room, actions: picked(f, 'fp') } : {}) };
+      const msg = $('hcn-fleet-msg');
+      msg.textContent = '';
+      try {
+        if (fd.get('how') === 'direct') showFleetFiles(await api.bulkConnect(body), body);
+        else showFleetScript(await api.createJoinToken(body), body);
+        await renderAgents();
+        await renderJoinTokens();
+      } catch (e) { msg.textContent = e.message; msg.setAttribute('role', 'alert'); }
+    };
+    await renderJoinTokens();
+  }
+
+  const scriptCard = (title, text, note) => `<div class="hd-card cx-stack"><div class="hd-card__title">${esc(title)}</div>
+      <div class="cx-code"><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-copy>Copy</button><pre data-text></pre></div>
+      <p class="cx-msg">${esc(note)}</p></div>`;
+  function fillScripts(out, items) {
+    out.innerHTML = items.map((i) => scriptCard(i.title, i.text, i.note)).join('');
+    out.querySelectorAll('.hd-card').forEach((card, n) => {
+      card.querySelector('[data-text]').textContent = items[n].text;     // textContent: never parsed as HTML
+      const btn = card.querySelector('[data-copy]');
+      btn.onclick = () => copy(items[n].text, btn);
+    });
+  }
+
+  function showFleetScript(tok, body) {
+    const base = lastCfg.public_url;
+    const opts = { base, token: tok.token, count: tok.max_uses, prefix: tok.name_prefix };
+    fillScripts($('hcn-fleet-out'), [
+      { title: `1. Paste this in a terminal on each machine (registers up to ${tok.max_uses} agents)`, text: bundleScript(opts),
+        note: `The token works for ${tok.max_uses} agents until ${new Date(tok.expires_at * 1000).toLocaleString()}, then stops. It only creates agents with no access${body.room_id ? ' and files a request in the room' : ''}. Treat it like a password.` },
+      { title: '2. Make an agent do work', text: `HERDR_AGENT_CMD='claude -p' ~/herdr-agents/worker.sh ~/herdr-agents/${tok.name_prefix}-1.json`,
+        note: 'Waits for tasks, hands each task text to your command on stdin and reports its output. Without HERDR_AGENT_CMD it just acknowledges.' },
+      { title: '3. Let an agent delegate', text: `~/herdr-agents/agents.sh ~/herdr-agents/${tok.name_prefix}-1.json ROOM_ID\n~/herdr-agents/delegate.sh ~/herdr-agents/${tok.name_prefix}-1.json ROOM_ID TARGET_AGENT_ID PARENT_TASK_ID "what to do"`,
+        note: 'An agent can only pass on part of a task it accepted, so work always traces back to a person.' },
+    ]);
+  }
+
+  function showFleetFiles(res, body) {
+    const files = filesFromBulk(lastCfg.public_url, res.agents);
+    const out = $('hcn-fleet-out');
+    fillScripts(out, [
+      { title: `Created ${res.agents.length} agents${body.room_id ? ' and added them to the room' : ''}`,
+        text: `mkdir -p ~/herdr-agents && cd ~/herdr-agents\n${files.map((f) => `cat > ${f.name} <<'EOF'\n${f.text}EOF`).join('\n')}\nchmod 600 *.json`,
+        note: 'These credentials are shown once. Paste on the machine that runs the agents, then use worker.sh below.' },
+      { title: 'worker.sh', text: workerScript({ base: lastCfg.public_url }), note: 'Save as ~/herdr-agents/worker.sh and chmod +x. Run: worker.sh AGENT.json' },
+    ]);
+  }
+
+  async function renderJoinTokens() {
+    const box = $('hcn-fleet-out');
+    if (!box) return;
+    let list;
+    try { list = (await api.joinTokens()).tokens.filter((t) => t.status === 'active'); } catch { return; }
+    let holder = $('hcn-tokens');
+    if (!holder) { holder = document.createElement('div'); holder.id = 'hcn-tokens'; box.after(holder); }
+    holder.innerHTML = list.length ? `<h3>Active join tokens</h3><ul class="cx-list">${list.map((t) => `<li><span class="grow"><b>${esc(t.name_prefix)}-N</b> ${esc(t.harness_type)} · ${t.uses}/${t.max_uses} used · until ${esc(new Date(t.expires_at * 1000).toLocaleString())}</span><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke-token="${esc(t.join_id)}">Revoke</button></li>`).join('')}</ul>` : '';
+    holder.querySelectorAll('[data-revoke-token]').forEach((b) => { b.onclick = async () => { await api.revokeJoinToken(b.dataset.revokeToken); renderJoinTokens(); }; });
   }
 
   function showCredential(a) {
@@ -308,9 +399,7 @@ export function mountCollab(root) {
     timer = setInterval(poll, 3000);
 
     // ---- agents, access requests and tasks
-    const permBoxes = (cur, name) => PERMS.map(([v, l]) => `<label class="cx-check"><input type="checkbox" name="${name}" value="${v}"${cur.includes(v) ? ' checked' : ''}> ${esc(l)}</label>`).join('');
     const permPills = (actions) => actions.map((a) => pill(PERM_SHORT[a] || a, 'var(--status-ok)')).join(' ');
-    const picked = (form, name) => [...form.querySelectorAll(`input[name="${name}"]:checked`)].map((i) => i.value);
 
     const drawRoomAgents = async () => {
       const box = $('hcn-roomagents');
@@ -362,6 +451,14 @@ export function mountCollab(root) {
           <span><b>@${esc(r.name)}</b> from ${esc(r.owner_email || shortId(r.owner_user_id))}</span>
           <span class="cx-checks">${permBoxes(r.actions, 'p')}</span>${ttlSelect()}
           <span class="cx-row"><button type="submit" class="hd-btn hd-btn--sm" data-decision="approve">Approve</button><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-deny="1">Deny</button></span></form></li>`).join('')}</ul>` : '<div class="hd-empty">No requests.</div>';
+      if (requests.length > 1) {
+        box.insertAdjacentHTML('afterbegin', `<div class="cx-row"><button type="button" class="hd-btn hd-btn--sm" id="hcn-approve-all">Approve all ${requests.length}</button>${ttlSelect().replace('<select', '<select id="hcn-all-ttl"')}</div>`);
+        $('hcn-approve-all').onclick = async () => {
+          const v = Number($('hcn-all-ttl').value || 0);
+          try { await api.approveAll(roomId, { request_ids: requests.map((r) => r.request_id), ...(v ? { expires_at: Date.now() / 1000 + v } : {}) }); } catch (e) { alert(e.message); }
+          await refreshAgentPanels();
+        };
+      }
       box.querySelectorAll('form[data-req]').forEach((f, i) => {
         const asked = requests[i].actions;
         f.querySelectorAll('input[name="p"]').forEach((c) => { if (!asked.includes(c.value)) { c.disabled = true; c.checked = false; } });   // cannot approve more than was asked
