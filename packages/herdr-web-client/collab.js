@@ -150,4 +150,16 @@ export class CollabApi {
   removeMember(id, user) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/members/${encodeURIComponent(user)}/remove`, {});
   }
+  // agent helpers: the room profile (names only, never secret values), host-access requests, the panic switch
+  roomProfile(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/profile`); }
+  setRoomProfile(id, profile) { return this.call('POST', `/rooms/${encodeURIComponent(id)}/profile`, profile); }
+  egressRequests() { return this.call('GET', '/fleet/egress'); }
+  decideEgress(requestId, decision, ttlSeconds) {
+    return this.call('POST', `/fleet/egress/${encodeURIComponent(requestId)}/decide`,
+      { decision, ...(ttlSeconds ? { ttl_seconds: ttlSeconds } : {}) });
+  }
+  promoteEgress(room, hostPort) { return this.call('POST', '/fleet/egress/promote', { room_id: room, host_port: hostPort }); }
+  removeEgress(room, hostPort) { return this.call('POST', '/fleet/egress/remove', { room_id: room, host_port: hostPort }); }
+  helpers() { return this.call('GET', '/fleet/helpers'); }
+  pauseHelpers(paused) { return this.call('POST', '/fleet/helpers/pause', { paused: Boolean(paused) }); }
 }

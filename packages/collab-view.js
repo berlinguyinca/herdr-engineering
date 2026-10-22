@@ -3,6 +3,9 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
+import {
+  helperAction, parseProfileForm, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor,
+} from './collab-helpers.js';
 import { applyMention, mentionAt, quiet, suggest } from './collab-mention.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
@@ -534,7 +537,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [] };
+    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], profile: null, egress: [], helpers: [], paused: false };
     const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents']]), ...(canInvite ? [['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
@@ -558,7 +561,9 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       ${guest ? '' : `<section class="cx-panel cx-cols" id="hcn-p-agents" hidden>
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
-        ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}</section>`}
+        ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}
+        ${operator ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helpers</div><div id="hcn-panic"></div><div class="hd-card__title">Host access requests</div><div id="hcn-egress"></div><div class="hd-card__title">External hosts</div><div id="hcn-hosts-table"></div></div>' : ''}
+        ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helper profile</div><div id="hcn-profile-box"></div></div>' : ''}</section>`}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
@@ -708,6 +713,40 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       });
     };
 
+    // ---- agent helpers: panic switch, host-access requests and hosts (operator), profile (owner)
+    const loadHelpers = async () => {
+      if (operator) {
+        try { S.egress = ((await api.egressRequests()).requests || []).filter((r) => r.room_id === roomId); } catch { /* keep the old list */ }
+        try { const h = await api.helpers(); S.helpers = h.helpers || []; S.paused = Boolean(h.paused); } catch { /* keep */ }
+      }
+      if (operator || canInvite) { try { S.profile = await api.roomProfile(roomId); } catch { /* not readable: keep */ } }
+    };
+    const drawHelpers = () => {
+      if (operator) {
+        put('hcn-panic', renderPanic(S.paused, { operator }));
+        put('hcn-egress', renderEgressRequests(S.egress, { operator }));
+        put('hcn-hosts-table', renderHostsTable(S.profile ? S.profile.permanent_hosts : [], S.egress, { operator, room: roomId }));
+      }
+      if (canInvite && S.profile) put('hcn-profile-box', renderProfileEditor(S.profile, { owner: canInvite }));
+    };
+    root.addEventListener('click', (ev) => {
+      const b = ev.target.closest?.('[data-panic],[data-egress-act]');
+      if (!b || !operator) return;
+      const row = b.closest('[data-id],[data-hp]');
+      act(async () => { await helperAction(api, { ...(row ? row.dataset : {}), ...b.dataset, room: roomId }); await loadHelpers(); drawHelpers(); });
+    });
+    root.addEventListener('submit', (ev) => {
+      if (ev.target.id !== 'hcn-profile' || !canInvite) return;
+      ev.preventDefault();
+      const f = ev.target; const fd = new FormData(f);
+      let body;
+      try {
+        body = parseProfileForm({ services: fd.get('services'), ssh_secret_names: fd.get('ssh_secret_names'), allowed_models: fd.get('allowed_models'),
+          tools_allowed: fd.get('tools_allowed') !== null, permanent_hosts: fd.get('permanent_hosts') }, S.profile || {});
+      } catch (e) { $('hcn-profile-msg').textContent = e.message; return; }
+      act(async () => { S.profile = await helperAction(api, { profile: 'save', room: roomId }, { profileBody: body }); $('hcn-profile-msg').textContent = 'Saved.'; });
+    });
+
     // ---- live flow: nodes are people/agents, edges are tasks; the dashboard adds fabric session state
     let flowSig = new Map();
     const showDetail = (html) => { const d = $('hcn-flow-detail'); if (d) d.innerHTML = html; };
@@ -725,7 +764,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         onNode: (n) => {
           const mine = flow.edges.filter((e) => e.from === n.id || e.to === n.id).map((e) => `${esc(flow.nodes.find((x) => x.id === e.from)?.name)} → ${esc(flow.nodes.find((x) => x.id === e.to)?.name)}: ${esc(Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}`);
           const f = n.fabric ? `<br>Fabric session ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}${n.fabric.parent_session_id ? ` · started by session ${esc(n.fabric.parent_session_id)}` : ''}` : '';
-          showDetail(`<b>${esc(n.kind === 'agent' ? `@${n.name}` : n.name)}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}`);
+          showDetail(`<b>${esc(n.kind === 'agent' ? `@${n.name}` : n.name)}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}${n.kind === 'agent' ? renderHelperTree(n.agent_id, flow, S.helpers, { operator }) : ''}`);
         },
         onEdge: (e) => {
           const ts = flow.tasks.filter((t) => t.from === e.from && t.to === e.to).slice(0, 5);
@@ -757,10 +796,11 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       setBadge('tasks', S.tasks.filter((t) => ['pending', 'accepted'].includes(t.status)).length);
       if (sub === 'tasks') drawTasks();
       else if (sub === 'flow') drawFlow();
-      else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); }
+      else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); }
     }
     const paintPanel = async () => {
       if (sub === 'agents' && canPost) await loadMine();
+      if (sub === 'agents') await loadHelpers();
       if (sub === 'people') await drawPeople();
       paint();
     };
