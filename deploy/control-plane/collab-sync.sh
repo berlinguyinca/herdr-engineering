@@ -10,7 +10,18 @@ GROUP="${HERDR_COLLAB_GROUP:-local.dev}"
 REGION="${POOL%%_*}"
 DIR="${HERDR_COLLAB_SYNC_DIR:-$HOME/.local/share/herdr-engineering/collab-sync}"
 
+# People the operator invites are added to the group here, on the host, because the public
+# container has no AWS credentials. Runs first so a new member shows up in this very refresh.
+provision() {
+  local p; p="$(dirname "$0")/collab-provision.py"
+  [ -f "$p" ] || p="$HOME/.local/share/herdr-engineering/collab-provision.py"
+  [ -f "$p" ] || return 0
+  timeout 120 python3 "$p" || echo "WARNING: collab-provision failed; membership refresh continues" >&2
+}
+
 once() {
+  exec 9>"${DIR}.lock"; flock -n 9 || { echo "another collab-sync is running" >&2; return 0; }   # no overlapping runs
+  provision
   mkdir -p "$DIR"; chmod 755 "$DIR"
   local tmp; tmp="$(mktemp -d "$DIR/.tmp.XXXXXX")"; trap 'rm -rf "$tmp"' RETURN
   curl -fsS -m 10 "https://cognito-idp.${REGION}.amazonaws.com/${POOL}/.well-known/jwks.json" -o "$tmp/jwks.json"
@@ -87,11 +98,15 @@ certbot_dry_run() {   # proves the renewal path end to end against Let's Encrypt
 install_timer() {
   local u="$HOME/.config/systemd/user" bin="$HOME/.local/share/herdr-engineering/collab-sync.sh"
   mkdir -p "$u"; install -m 0755 "$0" "$bin"   # stable copy: deploy.sh runs from a temporary worktree
+  install -m 0755 "$(dirname "$0")/collab-provision.py" "$HOME/.local/share/herdr-engineering/collab-provision.py"
+  # The unit gets only the operator id, not the whole env file (it holds unrelated secrets).
+  local op; op="$(sed -n 's/^HERDR_COLLAB_OPERATOR_USER=//p' "$HOME/.config/herdr-engineering/control-plane.env" 2>/dev/null | tail -1)"
   cat > "$u/herdr-collab-sync.service" <<UNIT
 [Unit]
 Description=Refresh collab Cognito membership and keys
 [Service]
 Type=oneshot
+${op:+Environment=HERDR_COLLAB_OPERATOR_USER=$op}
 ExecStart=$bin once
 UNIT
   cat > "$u/herdr-collab-sync.timer" <<UNIT
