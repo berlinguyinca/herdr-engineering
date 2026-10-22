@@ -76,14 +76,14 @@ test("missing native registry reports failure without inventing stopped sessions
 
 test("publication uses private key header and stops on first rejected write", async () => {
   const calls = [];
-  const result = await publishSnapshot({ url: "http://control.test", apiKey: "fixture-key" }, [{ n: 1 }, { n: 2 }], async (url, options) => {
+  const result = await publishSnapshot({ url: "http://control.test", apiKey: "placeholder-fixture-value" }, [{ n: 1 }, { n: 2 }], async (url, options) => {
     calls.push({ url, options });
     return { ok: false, body: { cancel: async () => {} } };
   });
   assert.deepEqual(result, { posted: 0, unchanged: 0, errors: 1 });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "http://control.test/api/v1/ingest");
-  assert.equal(calls[0].options.headers["X-API-Key"], "fixture-key");
+  assert.equal(calls[0].options.headers["X-API-Key"], "placeholder-fixture-value");
   assert.equal(calls[0].options.redirect, "error");
 });
 

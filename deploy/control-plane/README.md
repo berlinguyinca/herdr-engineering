@@ -163,7 +163,7 @@ herdr-eng control-plane worker             # run the bounded background worker
 herdr-eng control-plane worker --once      # run a single pass and exit
 ```
 
-On the host without a central file the DSN defaults to `postgresql://herdr:herdr@127.0.0.1:5432/herdr`
+On the host without a central file the DSN defaults to the local development database `postgresql://herdr@127.0.0.1:5432/herdr` (password from `PGPASSWORD` or `~/.pgpass`)
 (port 5432 is exposed by the compose project). Override via the
 `control_plane:` block in the config or `HERDR_ENGINEERING_CONFIG`; with a central
 file its `control_plane.pg_dsn` wins.

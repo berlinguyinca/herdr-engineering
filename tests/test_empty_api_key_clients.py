@@ -58,7 +58,7 @@ def test_metadata_client_sends_no_header_for_empty_key():
 def test_session_env_sends_no_header_for_empty_agent_key(monkeypatch, tmp_path):
     import herdr_engineering.host_config as hc
     monkeypatch.setattr(hc, "host_value", lambda key, default=None: "")
-    monkeypatch.setattr(session_env, "KEY_FILE", str(tmp_path / "missing-key"))
+    monkeypatch.setattr(session_env, "KEY_FILE", str(tmp_path / "placeholder-missing-value"))
     opener = _Opener()
     monkeypatch.setattr(session_env, "_OPENER", opener)
     session_env._post("http://cp.test", "/api/v1/llm/keys", {"project": "p"})

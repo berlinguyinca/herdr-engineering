@@ -30,8 +30,8 @@ pytestmark = pytest.mark.skipif(not _compose_ok(), reason="docker compose not av
 
 ANSWERS = {
     "public_url": "https://cp.example.test", "llm_upstream_url": "https://llm.example.test",
-    "llm_upstream_key": "llm-secret-key", "ci_url": "https://ci.example.test",
-    "ci_token": "ci-secret-token", "web_bind": "127.0.0.1", "web_port": "8080",
+    "llm_upstream_key": "placeholder-llm-value", "ci_url": "https://ci.example.test",
+    "ci_token": "placeholder-ci-value", "web_bind": "127.0.0.1", "web_port": "8080",
     "gateway_tailnet_ip": "100.64.0.7", "hosts": {"bender": ["builder"]},
 }
 

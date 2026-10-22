@@ -16,9 +16,9 @@ DEPLOY = ROOT / "deploy" / "control-plane" / "deploy.sh"
 AGENTS = ROOT / "deploy" / "deploy-fleet-agents.sh"
 ANSWERS = {
     "public_url": "https://cp.example.test", "llm_upstream_url": "https://llm.example.test",
-    "llm_upstream_key": "llm-secret-key-0001", "ci_url": "https://ci.example.test",
-    "ci_token": "ci-secret-token-0002", "web_bind": "127.0.0.1", "web_port": "8080", "gateway_tailnet_ip": "127.0.0.1",
-    "github_token": "gh-secret-token-0003", "hosts": {"bender": ["builder"]},
+    "llm_upstream_key": "placeholder-llm-one", "ci_url": "https://ci.example.test",
+    "ci_token": "placeholder-ci-two", "web_bind": "127.0.0.1", "web_port": "8080", "gateway_tailnet_ip": "127.0.0.1",
+    "github_token": "placeholder-gh-three", "hosts": {"bender": ["builder"]},
 }
 
 

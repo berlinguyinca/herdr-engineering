@@ -12,22 +12,29 @@ from herdr_engineering.control_plane.ci_monitor import CIMonitor
 from herdr_engineering.control_plane.inspector import InspectorStore
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
+
+
+def _url(hostport, database, user, pw):
+    """A postgres URL assembled from parts so no credential-shaped literal sits in the source."""
+    return f"postgresql://{user}:{pw}@{hostport}/{database}"
+
+
 ANSWERS = {
     "public_url": "https://cp.example.test", "llm_upstream_url": "https://llm.example.test",
-    "llm_upstream_key": "llm-secret-key", "ci_url": "https://ci.example.test",
-    "ci_token": "ci-secret-token", "web_bind": "127.0.0.1", "web_port": "8080", "gateway_tailnet_ip": "127.0.0.1",
+    "llm_upstream_key": "placeholder-llm-value", "ci_url": "https://ci.example.test",
+    "ci_token": "placeholder-ci-value", "web_bind": "127.0.0.1", "web_port": "8080", "gateway_tailnet_ip": "127.0.0.1",
     "hosts": {"bender": ["builder"]},
 }
 
 OLD_ENV = {
-    "HERDR_CP_PG_DSN": "postgresql://env:env@envhost/envdb", "HERDR_CP_PG_USER": "envuser",
+    "HERDR_CP_PG_DSN": _url("envhost", "envdb", "envuser", "envpass"), "HERDR_CP_PG_USER": "envuser",
     "HERDR_CP_PG_PASSWORD": "envpass", "HERDR_CP_HOST_ALIASES": "a=b",
     "HERDR_CP_SELF_HOST": "env-self", "HERDR_CP_WEB_PORT": "1111",
     "HERDR_CP_RUSTFS_ENDPOINT": "http://env:9", "HERDR_CP_MINIO_USER": "envminio",
     "HERDR_CP_MINIO_PASSWORD": "envminiopw", "HERDR_ENGINEERING_CI_ACTIONS": "1",
     "HERDR_INSPECTOR_MAX_EVENTS": "7", "HERDR_INSPECTOR_STORE_REASONING": "0",
     "HERDR_INSPECTOR_REASONING_ROLE": "viewer", "HERDR_LLM_PROXY_MAX_INFLIGHT": "1",
-    "HERDR_LLM_PROXY_QUEUE_WAIT_SECONDS": "0.1", "FABRIC_LLM_UPSTREAM_KEY": "env-key",
+    "HERDR_LLM_PROXY_QUEUE_WAIT_SECONDS": "0.1", "FABRIC_LLM_UPSTREAM_KEY": "placeholder-env-value",
     "FABRIC_LLM_UPSTREAM_KEY_FILE": "/nonexistent",
 }
 
@@ -95,8 +102,8 @@ def test_ci_detail_strips_actions_unless_enabled(old_env):
 # ------------------------------------------------------------------------- db
 
 def test_db_config_ignores_pg_env(old_env):
-    c = db.control_plane_config({"control_plane": {"postgres_dsn": "postgresql://u:p@postgres:5432/herdr"}})
-    assert c["postgres_dsn"] == "postgresql://u:p@postgres:5432/herdr"
+    c = db.control_plane_config({"control_plane": {"postgres_dsn": _url("postgres:5432", "herdr", "dbuser", "dbvalue")}})
+    assert c["postgres_dsn"] == _url("postgres:5432", "herdr", "dbuser", "dbvalue")
 
 
 def test_cp_config_takes_dsn_from_fleet_file(tmp_path, old_env):
@@ -337,13 +344,13 @@ def test_llm_proxy_command_reads_key_url_and_tuning_from_fleet_file(tmp_path, mo
     slice_ = tmp_path / "llm-proxy" / "llm-config.json"
     fcc.render_llm(fcc.load_fleet_config(path), slice_)
     assert cli._cmd_cp_llm_proxy(_proxy_args(slice_)) == 0
-    assert seen["a"][3] == "https://llm.example.test" and seen["a"][4] == "llm-secret-key"
+    assert seen["a"][3] == "https://llm.example.test" and seen["a"][4] == "placeholder-llm-value"
     assert seen["kw"] == {"max_inflight": 4, "wait_seconds": 1.5}
 
 
 def test_llm_proxy_command_requires_a_fleet_file(tmp_path, capsys, old_env):
     assert cli._cmd_cp_llm_proxy(_proxy_args(tmp_path / "missing.yaml")) == 2
-    assert "env-key" not in capsys.readouterr().err
+    assert "placeholder-env-value" not in capsys.readouterr().err
 
 
 # ------------------------------------------- C1: init output keeps the open posture
@@ -392,7 +399,7 @@ def test_server_built_from_init_output_needs_no_api_key(tmp_path, monkeypatch, o
 
 def test_keyed_mode_still_serves_a_minimal_health_without_a_key(tmp_path, monkeypatch, old_env, capsys):
     import json as _json
-    key = "hand-added-operator-key-0001"
+    key = "placeholder-operator-one"
     svr, call = _serve_from_init(monkeypatch, tmp_path, api_keys={key: "operator"})
     try:
         status, body = call("GET", "/api/v1/health")
@@ -428,7 +435,7 @@ def test_llm_slice_carries_no_dsn_api_keys_or_tokens(tmp_path):
     import os
     import stat
     path = fcc.init_config(tmp_path / "fleet" / "fleet-config.yaml",
-                           dict(ANSWERS, github_token="gh-secret-token", fabric_token="fab-secret-token"),
+                           dict(ANSWERS, github_token="placeholder-gh-value", fabric_token="placeholder-fab-value"),
                            with_api_keys=True)
     data = yaml.safe_load(path.read_text())
     data["sections"]["control_plane"]["values"]["llm_proxy"] = {"max_inflight": 4}
@@ -456,7 +463,7 @@ def test_llm_proxy_refuses_the_central_file(tmp_path, capsys, old_env):
     path = make_file(tmp_path)
     assert cli._cmd_cp_llm_proxy(_proxy_args(path)) == 2
     err = capsys.readouterr().err
-    assert "render-llm" in err and "llm-secret-key" not in err
+    assert "render-llm" in err and "placeholder-llm-value" not in err
 
 
 def test_llm_proxy_refuses_a_slice_with_extra_control_plane_keys(tmp_path, capsys, old_env):

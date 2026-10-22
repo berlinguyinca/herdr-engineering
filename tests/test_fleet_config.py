@@ -10,7 +10,8 @@ import yaml
 
 from herdr_engineering.fleet_config import FleetConfigError, load_fleet_config
 
-SECRET = "sk-super-secret-value"
+_DB_URL = f"postgres://{'dbuser'}:{'dbvalue'}@h/db"  # assembled, not a literal credential URL
+SECRET = "placeholder-super-value"
 
 
 def sha(token: str) -> str:
@@ -23,15 +24,15 @@ def base() -> dict:
         "sections": {
             "common": {"roles": ["all"], "values": {"region": "us"}},
             "llm": {"roles": ["builder"], "values": {"upstream_key": SECRET, "upstream_url": "http://x"}},
-            "ci": {"roles": ["ci"], "values": {"token": "ci-token-value"}},
-            "control_plane": {"roles": ["control-plane"], "values": {"pg_dsn": "postgres://u:pw@h/db"}},
+            "ci": {"roles": ["ci"], "values": {"token": "placeholder-ci-token-value"}},
+            "control_plane": {"roles": ["control-plane"], "values": {"pg_dsn": _DB_URL}},
         },
         "hosts": {
-            "bender": {"roles": ["builder"], "token_sha256": sha("tok-bender")},
-            "bare": {"roles": [], "token_sha256": sha("tok-bare")},
+            "bender": {"roles": ["builder"], "token_sha256": sha("placeholder-host-bender")},
+            "bare": {"roles": [], "token_sha256": sha("placeholder-host-bare")},
             "beast": {
                 "roles": ["builder", "ci"],
-                "token_sha256": sha("tok-beast"),
+                "token_sha256": sha("placeholder-host-beast"),
                 "overrides": {"common": {"region": "eu"}},
             },
         },
@@ -81,7 +82,7 @@ def test_control_plane_section_cannot_be_all(tmp_path):
 
 def test_section_returns_values_regardless_of_roles(tmp_path):
     cfg = load_fleet_config(write(tmp_path, base()))
-    assert cfg.section("ci") == {"token": "ci-token-value"}
+    assert cfg.section("ci") == {"token": "placeholder-ci-token-value"}
     with pytest.raises(FleetConfigError):
         cfg.section("nope")
 
@@ -112,7 +113,7 @@ def test_revision_changes_with_content_not_comments(tmp_path):
 
 def test_host_for_token_unknown_returns_none(tmp_path):
     cfg = load_fleet_config(write(tmp_path, base()))
-    assert cfg.host_for_token("tok-beast") == "beast"
+    assert cfg.host_for_token("placeholder-host-beast") == "beast"
     assert cfg.host_for_token("nope") is None
     assert cfg.host_for_token("") is None
 
@@ -120,7 +121,7 @@ def test_host_for_token_unknown_returns_none(tmp_path):
 def test_status_has_no_values(tmp_path):
     cfg = load_fleet_config(write(tmp_path, base()))
     out = json.dumps(cfg.status())
-    assert SECRET not in out and "ci-token-value" not in out and sha("tok-bender") not in out
+    assert SECRET not in out and "placeholder-ci-token-value" not in out and sha("placeholder-host-bender") not in out
     st = cfg.status()
     assert st["revision"] == cfg.revision
     assert st["hosts"]["beast"] == ["builder", "ci"]

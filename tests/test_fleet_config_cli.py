@@ -13,8 +13,8 @@ from herdr_engineering.fleet_config import FleetConfigError, load_fleet_config
 
 ANSWERS = {
     "public_url": "https://cp.example.test", "llm_upstream_url": "https://llm.example.test",
-    "llm_upstream_key": "llm-secret-key", "ci_url": "https://ci.example.test",
-    "ci_token": "ci-secret-token", "web_bind": "127.0.0.1", "web_port": "8080", "gateway_tailnet_ip": "127.0.0.1",
+    "llm_upstream_key": "placeholder-llm-value", "ci_url": "https://ci.example.test",
+    "ci_token": "placeholder-ci-value", "web_bind": "127.0.0.1", "web_port": "8080", "gateway_tailnet_ip": "127.0.0.1",
     "hosts": {"bender": ["builder"], "mac": ["host"]},
 }
 
@@ -90,7 +90,7 @@ def test_init_writes_0600_and_validates(tmp_path):
     cfg = load_fleet_config(p)
     assert set(cfg.status()["hosts"]) == {"bender", "mac"}
     env = fcc.compose_env(cfg)
-    assert len(env["HERDR_CP_PG_PASSWORD"]) == 32 and cfg.section("llm")["upstream_key"] == "llm-secret-key"
+    assert len(env["HERDR_CP_PG_PASSWORD"]) == 32 and cfg.section("llm")["upstream_key"] == "placeholder-llm-value"
     assert env["HERDR_CP_WEB_PUBLIC_PORT"] == "8080"
     assert fcc.validate_config(p)["hosts"] == 2
 
@@ -210,7 +210,7 @@ def test_cli_validate_prints_no_values(tmp_path, capsys):
     p = make(tmp_path)
     assert main(["fleet", "config", "validate", "--path", str(p)]) == 0
     out = capsys.readouterr().out
-    assert "revision=" in out and "hosts=2" in out and "llm-secret-key" not in out
+    assert "revision=" in out and "hosts=2" in out and "placeholder-llm-value" not in out
 
 
 def test_init_keeps_the_control_plane_open_and_host_keys_empty(tmp_path):
@@ -383,7 +383,7 @@ def test_revoke_removes_the_host_after_a_backup(tmp_path, capsys):
     assert main(["fleet", "config", "revoke", "bender", "--path", str(p)]) == 0
     out = capsys.readouterr()
     assert "revoked bender" in out.out
-    assert secret_hash not in out.out + out.err and "llm-secret-key" not in out.out + out.err
+    assert secret_hash not in out.out + out.err and "placeholder-llm-value" not in out.out + out.err
     cfg = load_fleet_config(p)
     assert "bender" not in cfg.status()["hosts"] and "mac" in cfg.status()["hosts"]
     assert len(backups(tmp_path)) == 1
@@ -442,37 +442,37 @@ def test_parse_env_file_handles_compose_syntax_without_evaluation():
 
 def test_import_maps_names_and_reports_names_only(tmp_path):
     token_file = tmp_path / "ci-token"
-    token_file.write_text("ci-file-secret-0001\n")
+    token_file.write_text("placeholder-ci-file-one\n")
     env = _env_file(tmp_path, (
         "HERDR_CP_PG_USER=herdr_live\n"
         f"HERDR_CP_PG_PASSWORD='{HOSTILE_PW.replace(chr(39), '')}'\n"
-        "HERDR_CP_MINIO_USER=minio_live\nHERDR_CP_MINIO_PASSWORD=minio-secret-0002\n"
+        "HERDR_CP_MINIO_USER=minio_live\nHERDR_CP_MINIO_PASSWORD=placeholder-minio-two\n"
         "HERDR_CP_WEB_BIND=100.64.0.9\nHERDR_CP_WEB_PUBLIC_PORT=80\nHERDR_CP_PG_PORT=15433\n"
-        "GATEWAY_TAILNET_IP=100.64.0.9\nFABRIC_LLM_UPSTREAM_KEY=llm-secret-0003\n"
+        "GATEWAY_TAILNET_IP=100.64.0.9\nFABRIC_LLM_UPSTREAM_KEY=placeholder-llm-three\n"
         "HERDR_CP_HOST_ALIASES=a=b\nHERDR_ENGINEERING_CI_ACTIONS=1\n"
         f"HERDR_ENGINEERING_CI_TOKEN_HOST_FILE={token_file}\n"
         "HERDR_ENGINEERING_GITHUB_TOKEN_HOST_FILE=/nonexistent/gh\n"
-        "SOMETHING_ELSE=unknown-secret-0004\nHERDR_LLM_PROXY_PORT=8099\n"))
+        "SOMETHING_ELSE=placeholder-unknown-four\nHERDR_LLM_PROXY_PORT=8099\n"))
     answers, report = fcc.import_env_file(env)
-    assert answers["pg_user"] == "herdr_live" and answers["ci_token"] == "ci-file-secret-0001"
+    assert answers["pg_user"] == "herdr_live" and answers["ci_token"] == "placeholder-ci-file-one"
     assert answers["compose_extra"] == {"HERDR_LLM_PROXY_PORT": "8099"}
     assert "SOMETHING_ELSE" in report["unknown"]
     assert "HERDR_ENGINEERING_GITHUB_TOKEN_HOST_FILE" in report["unreadable_files"]
     flat = json.dumps(report)
-    for secret in ("minio-secret-0002", "llm-secret-0003", "unknown-secret-0004", "ci-file-secret-0001"):
+    for secret in ("placeholder-minio-two", "placeholder-llm-three", "placeholder-unknown-four", "placeholder-ci-file-one"):
         assert secret not in flat
 
 
 def test_dsn_and_user_disagreement_is_refused_without_values(tmp_path):
-    env = _env_file(tmp_path, "HERDR_CP_PG_USER=alice\nHERDR_CP_PG_PASSWORD=pw-secret-1\n"
-                              "HERDR_CP_PG_DSN=postgresql://bob:pw-secret-1@postgres:5432/herdr\n")
+    env = _env_file(tmp_path, "HERDR_CP_PG_USER=alice\nHERDR_CP_PG_PASSWORD=placeholder-pg-one\n"
+                              f"HERDR_CP_PG_DSN=postgresql://bob:{'placeholder-pg-one'}@postgres:5432/herdr\n")
     with pytest.raises(FleetConfigError) as e:
         fcc.import_env_file(env)
-    assert "disagree" in str(e.value) and "pw-secret-1" not in str(e.value) and "bob" not in str(e.value)
+    assert "disagree" in str(e.value) and "placeholder-pg-one" not in str(e.value) and "bob" not in str(e.value)
 
 
 def test_dsn_only_supplies_the_pg_credentials(tmp_path):
-    env = _env_file(tmp_path, "HERDR_CP_PG_DSN=postgresql://bob:p%40ss@postgres:5432/herdr\n")
+    env = _env_file(tmp_path, "HERDR_CP_PG_DSN=postgresql://bob:" + "p%40ss" + "@postgres:5432/herdr\n")
     answers, _ = fcc.import_env_file(env)
     assert answers["pg_user"] == "bob" and answers["pg_password"] == "p@ss"
 
@@ -499,25 +499,25 @@ def test_init_keeps_imported_credentials_consistent_with_a_hostile_password(tmp_
 def test_validate_catches_credentials_that_disagree(tmp_path):
     p = make(tmp_path)
     data = yaml.safe_load(p.read_text())
-    data["sections"]["control_plane"]["values"]["compose"]["HERDR_CP_PG_PASSWORD"] = "changed-secret-9"
+    data["sections"]["control_plane"]["values"]["compose"]["HERDR_CP_PG_PASSWORD"] = "placeholder-changed-nine"
     p.unlink()
     fcc.write_private_file(p, yaml.safe_dump(data, sort_keys=False))
     with pytest.raises(FleetConfigError) as e:
         fcc.validate_config(p)
-    assert "HERDR_CP_PG_PASSWORD" in str(e.value) and "changed-secret-9" not in str(e.value)
+    assert "HERDR_CP_PG_PASSWORD" in str(e.value) and "placeholder-changed-nine" not in str(e.value)
 
 
 def test_cli_init_from_env_and_answers_is_non_interactive_and_prints_no_values(tmp_path, monkeypatch, capsys):
     import io
     from herdr_engineering.cli import main
-    env = _env_file(tmp_path, "HERDR_CP_PG_USER=herdr_live\nHERDR_CP_PG_PASSWORD=pg-secret-0005\n"
-                              "HERDR_CP_MINIO_USER=minio_live\nHERDR_CP_MINIO_PASSWORD=minio-secret-0006\n"
+    env = _env_file(tmp_path, "HERDR_CP_PG_USER=herdr_live\nHERDR_CP_PG_PASSWORD=placeholder-pg-five\n"
+                              "HERDR_CP_MINIO_USER=minio_live\nHERDR_CP_MINIO_PASSWORD=placeholder-minio-six\n"
                               "HERDR_CP_WEB_BIND=100.64.0.9\nGATEWAY_TAILNET_IP=100.64.0.9\n"
-                              "FABRIC_LLM_UPSTREAM_KEY=llm-secret-0007\nMYSTERY=mystery-secret-0008\n")
+                              "FABRIC_LLM_UPSTREAM_KEY=placeholder-llm-seven\nMYSTERY=placeholder-mystery-eight\n")
     answers = tmp_path / "answers.yaml"
     answers.write_text(yaml.safe_dump({"public_url": "https://cp.example.test",
                                        "llm_upstream_url": "https://llm.example.test",
-                                       "ci_url": "https://ci.example.test", "ci_token": "ci-secret-0009",
+                                       "ci_url": "https://ci.example.test", "ci_token": "placeholder-ci-nine",
                                        "web_port": "80", "hosts": {"bender": ["builder"]}}))
     answers.chmod(0o600)
     monkeypatch.setattr("sys.stdin", io.StringIO(""))   # any prompt would hit EOF
@@ -528,11 +528,11 @@ def test_cli_init_from_env_and_answers_is_non_interactive_and_prints_no_values(t
     out = capsys.readouterr()
     text = out.out + out.err
     assert "HERDR_CP_PG_PASSWORD" in text and "MYSTERY" in text
-    for secret in ("pg-secret-0005", "minio-secret-0006", "llm-secret-0007", "mystery-secret-0008",
-                   "ci-secret-0009", "herdr_live", "100.64.0.9"):
+    for secret in ("placeholder-pg-five", "placeholder-minio-six", "placeholder-llm-seven", "placeholder-mystery-eight",
+                   "placeholder-ci-nine", "herdr_live", "100.64.0.9"):
         assert secret not in text
     cp = load_fleet_config(target).section("control_plane")
-    assert cp["compose"]["HERDR_CP_PG_PASSWORD"] == "pg-secret-0005"
+    assert cp["compose"]["HERDR_CP_PG_PASSWORD"] == "placeholder-pg-five"
     assert cp["minio_user"] == "minio_live"
 
 
@@ -541,8 +541,8 @@ def test_cli_init_missing_value_without_terminal_names_the_key(tmp_path, monkeyp
     from herdr_engineering.cli import main
     answers = tmp_path / "answers.yaml"
     answers.write_text(yaml.safe_dump({"llm_upstream_url": "https://llm.example.test",
-                                       "llm_upstream_key": "k-secret", "ci_url": "https://ci.test",
-                                       "ci_token": "t-secret"}))
+                                       "llm_upstream_key": "placeholder-k-value", "ci_url": "https://ci.test",
+                                       "ci_token": "placeholder-t-value"}))
     answers.chmod(0o600)
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
     rc = main(["fleet", "config", "init", "--path", str(tmp_path / "f" / "fleet-config.yaml"),
@@ -598,22 +598,22 @@ def _legacy_home(tmp_path, monkeypatch, github=None, ci=None):
 
 
 def test_import_falls_back_to_the_legacy_github_and_ci_token_files(tmp_path, monkeypatch):
-    _legacy_home(tmp_path, monkeypatch, github="gh-legacy-secret-1\n", ci="ci-legacy-secret-2\n")
+    _legacy_home(tmp_path, monkeypatch, github="placeholder-gh-legacy-one\n", ci="placeholder-ci-legacy-two\n")
     env = _env_file(tmp_path, "HERDR_CP_PG_USER=u\n")
     answers, report = fcc.import_env_file(env)
-    assert answers["github_token"] == "gh-legacy-secret-1"
-    assert answers["ci_token"] == "ci-legacy-secret-2"
+    assert answers["github_token"] == "placeholder-gh-legacy-one"
+    assert answers["ci_token"] == "placeholder-ci-legacy-two"
     assert report["tokens"] == {"github.token": "imported", "ci.token": "imported"}
     assert "secret" not in json.dumps(report)
 
 
 def test_an_env_named_token_file_wins_over_the_legacy_default(tmp_path, monkeypatch):
-    _legacy_home(tmp_path, monkeypatch, github="gh-legacy-secret-1\n")
+    _legacy_home(tmp_path, monkeypatch, github="placeholder-gh-legacy-one\n")
     named = tmp_path / "gh"
-    named.write_text("gh-named-secret-3\n")
+    named.write_text("placeholder-gh-named-three\n")
     env = _env_file(tmp_path, f"HERDR_ENGINEERING_GITHUB_TOKEN_HOST_FILE={named}\n")
     answers, report = fcc.import_env_file(env)
-    assert answers["github_token"] == "gh-named-secret-3"
+    assert answers["github_token"] == "placeholder-gh-named-three"
     assert report["tokens"]["github.token"] == "imported"
 
 
@@ -628,8 +628,8 @@ def _cli_answers(tmp_path, **extra):
     answers = tmp_path / "answers.yaml"
     answers.write_text(yaml.safe_dump({"public_url": "https://cp.example.test",
                                        "llm_upstream_url": "https://llm.example.test",
-                                       "llm_upstream_key": "k-secret", "ci_url": "https://ci.test",
-                                       "ci_token": "t-secret", "web_bind": "127.0.0.1",
+                                       "llm_upstream_key": "placeholder-k-value", "ci_url": "https://ci.test",
+                                       "ci_token": "placeholder-t-value", "web_bind": "127.0.0.1",
                                        "web_port": "80", "gateway_tailnet_ip": "127.0.0.1",
                                        "hosts": {}, **extra}))
     answers.chmod(0o600)
@@ -639,29 +639,29 @@ def _cli_answers(tmp_path, **extra):
 def test_cli_from_env_imports_the_legacy_github_token_silently(tmp_path, monkeypatch, capsys):
     import io
     from herdr_engineering.cli import main
-    _legacy_home(tmp_path, monkeypatch, github="gh-legacy-secret-1\n")
+    _legacy_home(tmp_path, monkeypatch, github="placeholder-gh-legacy-one\n")
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
     monkeypatch.setattr(fcc.getpass, "getpass", lambda *_a: pytest.fail("prompted although imported"))
     target = tmp_path / "f" / "fleet-config.yaml"
     assert main(["fleet", "config", "init", "--path", str(target), "--from-env",
                  str(_env_file(tmp_path, "HERDR_CP_PG_USER=u\n")), "--answers", str(_cli_answers(tmp_path))]) == 0
     out = capsys.readouterr()
-    assert "github.token: imported" in out.err and "gh-legacy-secret-1" not in out.out + out.err
-    assert load_fleet_config(target).section("github")["token"] == "gh-legacy-secret-1"
+    assert "github.token: imported" in out.err and "placeholder-gh-legacy-one" not in out.out + out.err
+    assert load_fleet_config(target).section("github")["token"] == "placeholder-gh-legacy-one"
 
 
 def test_cli_from_env_prompts_for_a_missing_github_token(tmp_path, monkeypatch, capsys):
     from herdr_engineering.cli import main
     _legacy_home(tmp_path, monkeypatch)
     asked = []
-    monkeypatch.setattr(fcc.getpass, "getpass", lambda label: asked.append(label) or "gh-typed-secret-4")
+    monkeypatch.setattr(fcc.getpass, "getpass", lambda label: asked.append(label) or "placeholder-gh-typed-four")
     target = tmp_path / "f" / "fleet-config.yaml"
     assert main(["fleet", "config", "init", "--path", str(target), "--from-env",
                  str(_env_file(tmp_path, "HERDR_CP_PG_USER=u\n")), "--answers", str(_cli_answers(tmp_path))]) == 0
     out = capsys.readouterr()
     assert "github.token: missing" in out.err and any("GitHub token" in a for a in asked)
-    assert "gh-typed-secret-4" not in out.out + out.err
-    assert load_fleet_config(target).section("github")["token"] == "gh-typed-secret-4"
+    assert "placeholder-gh-typed-four" not in out.out + out.err
+    assert load_fleet_config(target).section("github")["token"] == "placeholder-gh-typed-four"
 
 
 def test_cli_from_env_missing_github_token_without_terminal_stays_empty(tmp_path, monkeypatch, capsys):

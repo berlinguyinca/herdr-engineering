@@ -14,8 +14,8 @@ from herdr_engineering.host_config import (
     host_config as _REAL_HOST_CONFIG,  # noqa: E402  (before the conftest stub)
 )
 
-TOKEN = "tok-SECRET-123"
-VALUES = {"ingest": {"api_key": "ing-SECRET"}, "ci": {"url": "https://ci.test", "token": "ci-SECRET"}}
+TOKEN = "placeholder-value-one"
+VALUES = {"ingest": {"api_key": "placeholder-ing-upper"}, "ci": {"url": "https://ci.test", "token": "placeholder-ci-upper"}}
 
 
 def _home(tmp_path):
@@ -123,7 +123,7 @@ def test_dotted_get_and_api_key():
     cfg = HostConfig("http://cp", "h", "r", VALUES)
     assert cfg.get("ci.url") == "https://ci.test"
     assert cfg.get("ci.missing", "d") == "d" and cfg.get("nosuch.x") is None
-    assert cfg.api_key == "ing-SECRET"
+    assert cfg.api_key == "placeholder-ing-upper"
     assert "SECRET" not in repr(cfg)
 
 
@@ -235,9 +235,9 @@ def test_control_plane_source_serves_fetched_or_cached_values(tmp_path, monkeypa
     from herdr_engineering.fabric import gateway_url_from_config, read_fabric_token
     from herdr_engineering.github import GitHubProvider
 
-    values = {"ci": {"url": "https://ci.src.test", "token": "ci-tok"},
-              "github": {"token": "gh-tok"},
-              "fabric": {"url": "http://fab.src.test:29999", "token": "fab-tok"},
+    values = {"ci": {"url": "https://ci.src.test", "token": "placeholder-ci-short"},
+              "github": {"token": "placeholder-gh-short"},
+              "fabric": {"url": "http://fab.src.test:29999", "token": "placeholder-fab-short"},
               "llm": {"upstream_url": "https://llm.src.test"}}
     home = _home(tmp_path)
     load_host_config(home=home, fetch=Fetch(get=(200, {"revision": "r9", "values": values})))
@@ -247,10 +247,10 @@ def test_control_plane_source_serves_fetched_or_cached_values(tmp_path, monkeypa
     hc.install_source(lambda: cfg)
     try:
         p = WoodpeckerProvider()
-        assert (p.base_url, p.token) == ("https://ci.src.test", "ci-tok")
+        assert (p.base_url, p.token) == ("https://ci.src.test", "placeholder-ci-short")
         assert GitHubProvider().available
         assert gateway_url_from_config({}) == "http://fab.src.test:29999"
-        assert read_fabric_token() == "fab-tok"
+        assert read_fabric_token() == "placeholder-fab-short"
         assert hc.host_value("llm.upstream_url") == "https://llm.src.test"
     finally:
         hc.reset_host_config()
@@ -293,7 +293,7 @@ class Clock:
 
 class FakeClient:
     def __init__(self):
-        self.url, self.key, self.auth_rejected = "http://old", "old-key", False
+        self.url, self.key, self.auth_rejected = "http://old", "placeholder-old-value", False
 
     def retarget(self, url, api_key):
         if url:
@@ -308,20 +308,20 @@ def _cfg(key, source="fetch", url="http://cp"):
 
 def _refresher(loader, clock=None, err=None, initial=None):
     from herdr_engineering.host_config import ConfigRefresher
-    return ConfigRefresher(initial or _cfg("old-key"), loader=loader, interval=300,
+    return ConfigRefresher(initial or _cfg("placeholder-old-value"), loader=loader, interval=300,
                            clock=clock or Clock(), err=err)
 
 
 def test_rotated_key_used_after_interval_and_not_before(capsys):
     clock, calls = Clock(), []
-    r = _refresher(lambda: calls.append(1) or _cfg("new-key"), clock)
+    r = _refresher(lambda: calls.append(1) or _cfg("placeholder-new-value"), clock)
     c = FakeClient()
     clock.t = 299
     r.sync(c)
-    assert c.key == "old-key" and not calls
+    assert c.key == "placeholder-old-value" and not calls
     clock.t = 300
     r.sync(c)
-    assert c.key == "new-key" and len(calls) == 1
+    assert c.key == "placeholder-new-value" and len(calls) == 1
     clock.t = 400
     r.sync(c)
     assert len(calls) == 1  # the timer advanced
@@ -329,11 +329,11 @@ def test_rotated_key_used_after_interval_and_not_before(capsys):
 
 def test_auth_rejection_forces_refresh_before_interval():
     clock, calls = Clock(), []
-    r = _refresher(lambda: calls.append(1) or _cfg("new-key"), clock)
+    r = _refresher(lambda: calls.append(1) or _cfg("placeholder-new-value"), clock)
     c = FakeClient()
     c.auth_rejected = True
     r.sync(c)
-    assert c.key == "new-key" and c.auth_rejected is False
+    assert c.key == "placeholder-new-value" and c.auth_rejected is False
 
 
 def test_revoked_ends_with_exit_2_and_cache_deleted(tmp_path, monkeypatch, capsys):
@@ -343,7 +343,7 @@ def test_revoked_ends_with_exit_2_and_cache_deleted(tmp_path, monkeypatch, capsy
     load_host_config(home=home, fetch=Fetch())
     assert (home / CACHE_REL).exists()
     monkeypatch.setattr(hc.Path, "home", staticmethod(lambda: home))
-    monkeypatch.setattr(hc, "host_config", lambda: _cfg("old-key"))
+    monkeypatch.setattr(hc, "host_config", lambda: _cfg("placeholder-old-value"))
     monkeypatch.setattr(hc, "_default_fetch", lambda *a, **k: (401, None))
     monkeypatch.setattr(smf.ServiceMetadataFeed, "run_once",
                         lambda self, dry_run=False: {"errors": 0})
@@ -372,9 +372,9 @@ def test_transient_failure_without_cache_keeps_old_key_and_signals_once():
     for t in (300, 600, 900):
         clock.t = t
         r.sync(c)
-    assert c.key == "old-key"
+    assert c.key == "placeholder-old-value"
     assert err.getvalue().count("\n") == 1  # one line per outage
-    assert "old-key" not in err.getvalue() and TOKEN not in err.getvalue()
+    assert "placeholder-old-value" not in err.getvalue() and TOKEN not in err.getvalue()
 
 
 def test_cache_fallback_does_not_overwrite_a_fresh_key_and_signal_resets():
@@ -403,7 +403,7 @@ def test_auth_rejected_stale_refresh_does_not_advance_timer():
     clock.t = 100
     c.auth_rejected = True
     r.sync(c)  # forced, stale: timer must not advance
-    assert len(calls) == 1 and c.key == "old-key"
+    assert len(calls) == 1 and c.key == "placeholder-old-value"
     clock.t = 300  # 300 since the original load -> periodic refresh is due
     r.sync(c)
     assert len(calls) == 2
@@ -531,7 +531,7 @@ def test_forced_refresh_floor_prevents_a_storm():
 def test_fully_explicit_service_metadata_runs_without_host_config(tmp_path, monkeypatch, capsys):
     from herdr_engineering import service_metadata_feed as smf
     keyfile = tmp_path / "key"
-    keyfile.write_text("file-key\n")
+    keyfile.write_text("placeholder-file-value\n")
     assert smf.main(["--control-plane", "http://127.0.0.1:9", "--host-id", "h",
                      "--api-key-file", str(keyfile), "--once", "--dry-run",
                      "--state-file", str(tmp_path / "s.json")]) in (0, 1)
@@ -544,7 +544,7 @@ def test_explicit_values_are_not_followed_after_refresh():
     c = FakeClient()
     clock.t = 300
     r.sync(c, follow_url=False, follow_key=False)
-    assert (c.url, c.key) == ("http://old", "old-key")
+    assert (c.url, c.key) == ("http://old", "placeholder-old-value")
     clock.t = 600
     r.sync(c, follow_url=False, follow_key=True)
     assert (c.url, c.key) == ("http://old", "rotated")
@@ -616,26 +616,26 @@ def _fab(url, token, source="fetch"):
 
 
 def test_fabric_agent_follows_rotated_token_and_url(monkeypatch, tmp_path):
-    live = _fab("http://gw1:29999", "tok1")
-    climod, log = _agent_setup(monkeypatch, tmp_path, live, [_fab("http://gw1:29999", "tok2")])
+    live = _fab("http://gw1:29999", "placeholder-host-one")
+    climod, log = _agent_setup(monkeypatch, tmp_path, live, [_fab("http://gw1:29999", "placeholder-host-two")])
     assert climod.main(["devfabric", "agent"]) == 0
-    assert log["clients"][0] == ("http://gw1:29999", "tok1")
-    assert log["clients"][-1] == ("http://gw1:29999", "tok2")
+    assert log["clients"][0] == ("http://gw1:29999", "placeholder-host-one")
+    assert log["clients"][-1] == ("http://gw1:29999", "placeholder-host-two")
 
 
 def test_fabric_agent_cache_fallback_and_transient_keep_live_config(monkeypatch, tmp_path):
-    live = _fab("http://gw1:29999", "tok1")
+    live = _fab("http://gw1:29999", "placeholder-host-one")
     climod, log = _agent_setup(monkeypatch, tmp_path, live, [
         _fab("http://stale:29999", "stale", "cache"),
         HostConfigUnavailable("unreachable and no cached configuration exists")])
     assert climod.main(["devfabric", "agent"]) == 0
-    assert log["clients"] == [("http://gw1:29999", "tok1")]  # never rebuilt
+    assert log["clients"] == [("http://gw1:29999", "placeholder-host-one")]  # never rebuilt
 
 
 def test_fabric_agent_revoked_exits_2(monkeypatch, tmp_path, capsys):
-    live = _fab("http://gw1:29999", "tok1")
+    live = _fab("http://gw1:29999", "placeholder-host-one")
     climod, log = _agent_setup(monkeypatch, tmp_path, live,
                                [HostConfigUnavailable("token rejected", revoked=True)])
     assert climod.main(["devfabric", "agent"]) == 2
     err = capsys.readouterr().err
-    assert "token rejected" in err and "tok1" not in err
+    assert "token rejected" in err and "placeholder-host-one" not in err

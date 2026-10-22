@@ -118,7 +118,7 @@ def test_host_launcher_uses_authenticated_http_routes(tmp_path, monkeypatch, ack
     from herdr_engineering.plannotator import run_review
     from herdr_engineering.session_env import _get
 
-    fake_host_config({"agent": {"api_key": "fixture-private-key"}})
+    fake_host_config({"agent": {"api_key": "placeholder-private-value"}})
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     executable = tmp_path / "plannotator"
     executable.write_text("#!/usr/bin/python3\n" + '''import json,os,time
@@ -129,7 +129,7 @@ print(json.dumps({'decision':'annotated','feedback':'Add the missing test'}))
 ''')
     executable.chmod(0o700)
     repo = ControlPlaneRepo(sink=acknowledged_sink)
-    server = ControlPlaneServer(repo, api_key="fixture-private-key")
+    server = ControlPlaneServer(repo, api_key="placeholder-private-value")
     thread = threading.Thread(target=server.serve, daemon=True)
     thread.start()
     server.wait_until_ready()

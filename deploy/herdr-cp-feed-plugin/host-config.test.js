@@ -7,8 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadHostConfig, HostConfigUnavailable } from "./host-config.js";
 
-const TOKEN = "tok-SECRET-123";
-const VALUE = "ingest-key-SECRET-456";
+const TOKEN = "placeholder-value-one";
+const VALUE = "placeholder-value-two";
 
 function makeHome(url = "http://cp.test") {
   const home = mkdtempSync(join(tmpdir(), "hostcfg-"));

@@ -208,9 +208,9 @@ def test_cancel_posts_cancel_route_and_never_deletes_pipeline():
 
 
 def test_credentials_come_from_host_config(fake_host_config):
-    fake_host_config({"ci": {"url": "https://ci.central.test/", "token": "central-token"}})
+    fake_host_config({"ci": {"url": "https://ci.central.test/", "token": "placeholder-central-value"}})
     p = WoodpeckerProvider()
-    assert p.token == "central-token" and p.base_url == "https://ci.central.test"
+    assert p.token == "placeholder-central-value" and p.base_url == "https://ci.central.test"
     assert p.available
     assert WoodpeckerProvider(token="explicit").token == "explicit"
 

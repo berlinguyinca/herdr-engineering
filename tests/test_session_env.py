@@ -158,8 +158,8 @@ def test_unreachable_control_plane_fails_open_without_leaking(tmp_path, monkeypa
 
 def test_api_key_header_sent_and_redirects_not_followed(tmp_path, monkeypatch, fake_host_config):
     monkeypatch.setenv("HOME", str(tmp_path))
-    fake_host_config({"agent": {"api_key": "operator-key"}})
-    c = _CP(require_key="operator-key")
+    fake_host_config({"agent": {"api_key": "placeholder-operator-value"}})
+    c = _CP(require_key="placeholder-operator-value")
     try:
         assert se.mint_key(c.url, "p")["key_id"] == "k1"
     finally:

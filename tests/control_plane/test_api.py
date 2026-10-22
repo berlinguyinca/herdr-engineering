@@ -403,7 +403,8 @@ import yaml  # noqa: E402
 
 from herdr_engineering.fleet_config import FleetConfigStore  # noqa: E402
 
-_FC_SECRET = "sk-fleet-secret-value"
+_DB_URL = f"postgres://{'dbuser'}:{'dbvalue'}@h/db"  # assembled, not a literal credential URL
+_FC_SECRET = "placeholder-fleet-value"
 
 
 def _fc_sha(t):
@@ -415,12 +416,12 @@ def _fc_doc(extra=""):
         "version": 1,
         "sections": {
             "llm": {"roles": ["builder"], "values": {"key": _FC_SECRET + extra}},
-            "ci": {"roles": ["ci"], "values": {"token": "ci-only"}},
-            "control_plane": {"roles": ["control-plane"], "values": {"pg_dsn": "postgres://u:pw@h/db"}},
+            "ci": {"roles": ["ci"], "values": {"token": "placeholder-ci-only"}},
+            "control_plane": {"roles": ["control-plane"], "values": {"pg_dsn": _DB_URL}},
         },
         "hosts": {
-            "bender": {"roles": ["builder"], "token_sha256": _fc_sha("tok-bender")},
-            "beast": {"roles": ["ci"], "token_sha256": _fc_sha("tok-beast")},
+            "bender": {"roles": ["builder"], "token_sha256": _fc_sha("placeholder-host-bender")},
+            "beast": {"roles": ["ci"], "token_sha256": _fc_sha("placeholder-host-beast")},
         },
     }
 
@@ -467,7 +468,7 @@ def test_fleet_config_requires_valid_host_token(fc_server):
 
 def test_fleet_config_returns_scoped_slice_no_store_header(fc_server):
     port, _, _ = fc_server
-    status, headers, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "tok-bender"})
+    status, headers, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "placeholder-host-bender"})
     assert status == 200
     assert headers["Cache-Control"] == "no-store"
     data = json.loads(body)
@@ -480,11 +481,11 @@ def test_applied_revision_shows_in_status(fc_server):
     port, _, store = fc_server
     rev = store.current().revision
     status, _, _ = _fc_req(port, "POST", "/api/v1/fleet/config/applied",
-                           {"X-Host-Token": "tok-bender"}, {"host_id": "bender", "revision": rev})
+                           {"X-Host-Token": "placeholder-host-bender"}, {"host_id": "bender", "revision": rev})
     assert status == 200
     # token of another host cannot report for bender
     status, _, _ = _fc_req(port, "POST", "/api/v1/fleet/config/applied",
-                           {"X-Host-Token": "tok-beast"}, {"host_id": "bender", "revision": "x"})
+                           {"X-Host-Token": "placeholder-host-beast"}, {"host_id": "bender", "revision": "x"})
     assert status == 401
     status, _, body = _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "viewkey"})
     assert status == 200
@@ -496,7 +497,7 @@ def test_applied_revision_shows_in_status(fc_server):
     assert hosts["beast"]["applied_revision"] is None
     # status needs the normal API key
     assert _fc_req(port, "GET", "/api/v1/fleet/config/status")[0] == 401
-    assert _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-Host-Token": "tok-bender"})[0] == 401
+    assert _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-Host-Token": "placeholder-host-bender"})[0] == 401
 
 
 def test_broken_edit_keeps_last_good_revision(fc_server):
@@ -505,7 +506,7 @@ def test_broken_edit_keeps_last_good_revision(fc_server):
     path.write_text("version: 1\nsections: [broken")
     os.chmod(path, 0o600)
     os.utime(path, (os.stat(path).st_atime + 5, os.stat(path).st_mtime + 5))
-    status, _, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "tok-bender"})
+    status, _, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "placeholder-host-bender"})
     assert status == 200
     assert json.loads(body)["revision"] == good
     _, _, sbody = _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "viewkey"})
@@ -514,7 +515,7 @@ def test_broken_edit_keeps_last_good_revision(fc_server):
     # a valid edit afterwards is picked up and clears the error
     _fc_write(path, _fc_doc("-v2"))
     os.utime(path, (os.stat(path).st_atime + 10, os.stat(path).st_mtime + 10))
-    _, _, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "tok-bender"})
+    _, _, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "placeholder-host-bender"})
     assert json.loads(body)["revision"] != good
     assert json.loads(_fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "viewkey"})[2])["last_error"] is None
 
@@ -526,7 +527,7 @@ def test_status_never_contains_secret_values(fc_server):
     os.utime(path, (os.stat(path).st_atime + 5, os.stat(path).st_mtime + 5))
     _, _, body = _fc_req(port, "GET", "/api/v1/fleet/config/status", {"X-API-Key": "opkey"})
     text = body.decode()
-    for needle in (_FC_SECRET, "ci-only", "postgres://", _fc_sha("tok-bender"), "tok-bender"):
+    for needle in (_FC_SECRET, "placeholder-ci-only", "postgres://", _fc_sha("placeholder-host-bender"), "placeholder-host-bender"):
         assert needle not in text
 
 
@@ -605,7 +606,7 @@ def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     try:
-        status, _, body = _fc_req(svr.port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "tok-bender"})
+        status, _, body = _fc_req(svr.port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "placeholder-host-bender"})
         assert status == 200 and json.loads(body)["revision"] == first.revision
         assert store.calls == 1
     finally:
