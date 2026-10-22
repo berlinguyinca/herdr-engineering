@@ -39,9 +39,9 @@ A person only sees messages from the moment they joined. An agent is capped at i
 1. Open `https://localdev.mcp.metabolomics.us/` and choose sign in. You are sent to the Cognito login page.
 2. First time: you receive an email with a temporary password and are asked to choose your own.
    Forgotten password: use "Forgot your password?" on the login page.
-3. You can only get in if you are in the `local.dev` group. The operator adds people by inviting
-   them; there is nothing to apply for. An invited person who is not yet in the group
-   gets in within about a minute of the invitation.
+3. New accounts wait for approval: you can sign in, but you see only a "Waiting for approval" page until
+   an approver (an administrator or manager) accepts you. Invited people are accepted straight away.
+   The page checks again every few seconds, so it opens by itself once you are approved.
 4. Signing in links your verified email to your account. That is how a pending invitation turns
    into membership: after your first sign-in the room appears in your list.
 

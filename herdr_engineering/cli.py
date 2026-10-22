@@ -517,6 +517,12 @@ def _build_parser() -> argparse.ArgumentParser:
                          "https://bender.tail0c50da.ts.net:9447/")
     p2.add_argument("--collab-cognito-group", default=None,
                     help="required cognito:groups membership (default: local.dev)")
+    p2.add_argument("--collab-open-signup", action="store_true",
+                    help="approval mode: any pool account may sign in and ask to join, and nothing works until "
+                         "an approver or the operator approves it; --collab-cognito-group members are approved "
+                         "on sight instead of being required")
+    p2.add_argument("--collab-approver-group", action="append", default=[],
+                    help="Cognito group whose members may approve new people (repeatable; approval mode)")
     p2.add_argument("--collab-public-port", type=int, default=None,
                     help="also serve ONLY collaboration (API, MCP, page) on this port; point the "
                          "internet-facing proxy here, never at the main port")
@@ -2346,21 +2352,28 @@ def _cmd_cp_web(args) -> int:
         try:
             auth = CognitoAuthenticator(pool_id=args.collab_cognito_pool,
                                         client_ids=clients,
-                                        required_group=args.collab_cognito_group)
+                                        required_group=args.collab_cognito_group,
+                                        open_signup=args.collab_open_signup)
             if args.collab_sync_dir:
                 from .control_plane.collab_cognito import SyncedDirectory
                 directory = SyncedDirectory(args.collab_sync_dir, args.collab_cognito_group)
                 auth._fetch = directory.jwks
-                auth._lookup = directory.groups
-                auth._recheck = 15.0
-            else:
+                if not args.collab_open_signup:        # approval mode keeps its own state, not a group list
+                    auth._lookup = directory.groups
+                    auth._recheck = 15.0
+            elif not args.collab_open_signup:
                 auth._lookup = boto_group_lookup(auth.pool_id, auth.region)
         except ValueError as exc:
             raise SystemExit(f"--collab-cognito-*: {exc}") from exc
         if sink is not None and source is None and not args.collab_only:   # the file log is hydrated below
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
-        collab = CollabService(auth, sink=sink, public_config=public)
+        approval = None
+        if args.collab_open_signup:
+            from .control_plane.collab import ApprovalPolicy
+            approval = ApprovalPolicy(auto_groups=[args.collab_cognito_group],
+                                      approver_groups=args.collab_approver_group)
+        collab = CollabService(auth, sink=sink, public_config=public, approval=approval)
         if args.collab_only:
             collab.hydrate(sink.load())
     elif args.collab_users_file:
@@ -2447,6 +2460,8 @@ COLLAB_CONFIG_KEYS = {
     "public_url": ("collab_public_url", str),
     "operator_user": ("collab_operator_user", str),
     "operator_email": ("collab_operator_email", str),
+    "open_signup": ("collab_open_signup", bool),
+    "approver_groups": ("collab_approver_group", list),
 }
 
 

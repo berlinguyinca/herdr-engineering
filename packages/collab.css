@@ -223,3 +223,13 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-embed .hd-btn--ghost { background: transparent; color: var(--text-secondary); border: 1px solid var(--border); }
 .cx-embed .hd-btn--ghost:hover { background: var(--surface-hover); color: var(--text); }
 #hcn-roomagents, #hcn-grant, #hcn-requests, #hcn-tasks { max-height: 560px; overflow-y: auto; }
+
+/* People: who asked to join, and what the operator did about it */
+.cx-chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 14px; }
+.cx-chip { border: 1px solid var(--border-subtle); background: var(--surface); color: var(--text-secondary);
+  padding: 5px 12px; border-radius: 999px; cursor: pointer; font: inherit; }
+.cx-chip:hover { background: var(--surface-hover); color: var(--text); }
+.cx-chip[aria-selected=true] { background: var(--accent-weak); color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.cx-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: .875rem; }
+.cx-table th, .cx-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border-subtle); vertical-align: top; }
+.cx-table th { color: var(--text-secondary); font-weight: 600; }
