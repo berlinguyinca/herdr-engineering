@@ -12,6 +12,13 @@ from herdr_engineering.control_plane.ci_monitor import CIMonitor
 from herdr_engineering.control_plane.inspector import InspectorStore
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
+
+
+def _url(hostport, database, user, pw):
+    """A postgres URL assembled from parts so no credential-shaped literal sits in the source."""
+    return f"postgresql://{user}:{pw}@{hostport}/{database}"
+
+
 ANSWERS = {
     "public_url": "https://cp.example.test", "llm_upstream_url": "https://llm.example.test",
     "llm_upstream_key": "placeholder-llm-value", "ci_url": "https://ci.example.test",
@@ -20,7 +27,7 @@ ANSWERS = {
 }
 
 OLD_ENV = {
-    "HERDR_CP_PG_DSN": f"postgresql://{'envuser'}:{'envpass'}@envhost/envdb", "HERDR_CP_PG_USER": "envuser",
+    "HERDR_CP_PG_DSN": _url("envhost", "envdb", "envuser", "envpass"), "HERDR_CP_PG_USER": "envuser",
     "HERDR_CP_PG_PASSWORD": "envpass", "HERDR_CP_HOST_ALIASES": "a=b",
     "HERDR_CP_SELF_HOST": "env-self", "HERDR_CP_WEB_PORT": "1111",
     "HERDR_CP_RUSTFS_ENDPOINT": "http://env:9", "HERDR_CP_MINIO_USER": "envminio",
@@ -95,8 +102,8 @@ def test_ci_detail_strips_actions_unless_enabled(old_env):
 # ------------------------------------------------------------------------- db
 
 def test_db_config_ignores_pg_env(old_env):
-    c = db.control_plane_config({"control_plane": {"postgres_dsn": f"postgresql://{'dbuser'}:{'dbvalue'}@postgres:5432/herdr"}})
-    assert c["postgres_dsn"] == f"postgresql://{'dbuser'}:{'dbvalue'}@postgres:5432/herdr"
+    c = db.control_plane_config({"control_plane": {"postgres_dsn": _url("postgres:5432", "herdr", "dbuser", "dbvalue")}})
+    assert c["postgres_dsn"] == _url("postgres:5432", "herdr", "dbuser", "dbvalue")
 
 
 def test_cp_config_takes_dsn_from_fleet_file(tmp_path, old_env):

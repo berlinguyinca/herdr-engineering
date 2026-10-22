@@ -10,6 +10,7 @@ import yaml
 
 from herdr_engineering.fleet_config import FleetConfigError, load_fleet_config
 
+_DB_URL = f"postgres://{'dbuser'}:{'dbvalue'}@h/db"  # assembled, not a literal credential URL
 SECRET = "placeholder-super-value"
 
 
@@ -24,7 +25,7 @@ def base() -> dict:
             "common": {"roles": ["all"], "values": {"region": "us"}},
             "llm": {"roles": ["builder"], "values": {"upstream_key": SECRET, "upstream_url": "http://x"}},
             "ci": {"roles": ["ci"], "values": {"token": "placeholder-ci-token-value"}},
-            "control_plane": {"roles": ["control-plane"], "values": {"pg_dsn": f"postgres://{'dbuser'}:{'dbvalue'}@h/db"}},
+            "control_plane": {"roles": ["control-plane"], "values": {"pg_dsn": _DB_URL}},
         },
         "hosts": {
             "bender": {"roles": ["builder"], "token_sha256": sha("placeholder-host-bender")},

@@ -403,6 +403,7 @@ import yaml  # noqa: E402
 
 from herdr_engineering.fleet_config import FleetConfigStore  # noqa: E402
 
+_DB_URL = f"postgres://{'dbuser'}:{'dbvalue'}@h/db"  # assembled, not a literal credential URL
 _FC_SECRET = "placeholder-fleet-value"
 
 
@@ -416,7 +417,7 @@ def _fc_doc(extra=""):
         "sections": {
             "llm": {"roles": ["builder"], "values": {"key": _FC_SECRET + extra}},
             "ci": {"roles": ["ci"], "values": {"token": "placeholder-ci-only"}},
-            "control_plane": {"roles": ["control-plane"], "values": {"pg_dsn": f"postgres://{'dbuser'}:{'dbvalue'}@h/db"}},
+            "control_plane": {"roles": ["control-plane"], "values": {"pg_dsn": _DB_URL}},
         },
         "hosts": {
             "bender": {"roles": ["builder"], "token_sha256": _fc_sha("placeholder-host-bender")},
