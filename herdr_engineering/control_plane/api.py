@@ -441,6 +441,11 @@ def _make_handler(server, public=False):
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH:
                 return self._fleet_config_get()
+            if self._path_only() == "/api/v1/health" and self._role() is None:
+                # Keyed mode without a valid key: liveness only (deploy.sh's health
+                # check needs status + commit), no counters, sources or capabilities.
+                h = server._health()
+                return self._json({k: h.get(k) for k in ("status", "version", "commit")})
             err = self._require("viewer")
             if err:
                 return err

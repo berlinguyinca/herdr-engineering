@@ -318,3 +318,65 @@ def test_llm_proxy_command_reads_key_url_and_tuning_from_fleet_file(tmp_path, mo
 def test_llm_proxy_command_requires_a_fleet_file(tmp_path, capsys, old_env):
     assert cli._cmd_cp_llm_proxy(_proxy_args(tmp_path / "missing.yaml")) == 2
     assert "env-key" not in capsys.readouterr().err
+
+
+# ------------------------------------------- C1: init output keeps the open posture
+
+from herdr_engineering.control_plane.api import ControlPlaneServer as _RealServer  # noqa: E402
+
+
+def _serve_from_init(monkeypatch, tmp_path, **cp_extra):
+    """Build the web server exactly as `control-plane web --fleet-config` would
+    from an `init` file (the CLI's api_keys merge included), then serve it for real."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    path = make_file(tmp_path, **cp_extra)
+    seen = _run_web(monkeypatch, path, host="127.0.0.1", port=0)
+    svr = _RealServer(seen["repo"], **seen["server_kw"])
+    t = threading.Thread(target=svr.serve, daemon=True)
+    t.start()
+    svr.wait_until_ready()
+    base = f"http://127.0.0.1:{svr.port}"
+
+    def call(method, route, body=None, headers=None):
+        data = _json.dumps(body).encode() if body is not None else None
+        h = {"Content-Type": "application/json", **(headers or {})}
+        req = urllib.request.Request(base + route, data=data, method=method, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+    return svr, call
+
+
+def test_server_built_from_init_output_needs_no_api_key(tmp_path, monkeypatch, old_env, capsys):
+    svr, call = _serve_from_init(monkeypatch, tmp_path)
+    try:
+        assert call("GET", "/api/v1/health")[0] == 200
+        assert call("GET", "/")[0] == 200
+        assert call("GET", "/api/v1/llm/config")[0] == 200
+        status, _ = call("POST", "/api/v1/token-usage",
+                         {"project": "p", "model": "m", "input_tokens": 1, "output_tokens": 1})
+        assert status == 200
+    finally:
+        svr.shutdown()
+
+
+def test_keyed_mode_still_serves_a_minimal_health_without_a_key(tmp_path, monkeypatch, old_env, capsys):
+    import json as _json
+    key = "hand-added-operator-key-0001"
+    svr, call = _serve_from_init(monkeypatch, tmp_path, api_keys={key: "operator"})
+    try:
+        status, body = call("GET", "/api/v1/health")
+        assert status == 200
+        assert set(_json.loads(body)) == {"status", "version", "commit"}
+        assert call("GET", "/api/v1/missions")[0] == 401
+        status, body = call("GET", "/api/v1/health", headers={"X-API-Key": key})
+        assert status == 200 and "capabilities" in _json.loads(body)
+        # a wrong key gets the minimal view, not an error and not the full payload
+        status, body = call("GET", "/api/v1/health", headers={"X-API-Key": "wrong"})
+        assert status == 200 and set(_json.loads(body)) == {"status", "version", "commit"}
+    finally:
+        svr.shutdown()

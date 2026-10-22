@@ -175,6 +175,10 @@ def _build_parser() -> argparse.ArgumentParser:
                       ("render-collab", "write the collab container's config slice (0600)")):
         sp = csub.add_parser(name, help=hlp)
         sp.add_argument("--path", default="~/.config/herdr-engineering/fleet-config.yaml")
+        if name == "init":
+            sp.add_argument("--with-api-keys", action="store_true",
+                            help="generate control-plane API keys (keyed mode); the dashboard, "
+                                 "llm-proxy and emit hook do not send keys yet")
         if name == "token":
             sp.add_argument("host", help="host id in the fleet config")
             sp.add_argument("--target", default=None,
@@ -760,7 +764,9 @@ def _cmd_fleet_config(args) -> int:
     path = Path(args.path).expanduser()
     try:
         if cmd == "init":
-            fcc.init_config(path, None)
+            if args.with_api_keys:
+                print(fcc.API_KEYS_WARNING, file=sys.stderr)
+            fcc.init_config(path, None, with_api_keys=args.with_api_keys)
             print(f"wrote {path} (0600)")
         elif cmd == "validate":
             info = fcc.validate_config(path)

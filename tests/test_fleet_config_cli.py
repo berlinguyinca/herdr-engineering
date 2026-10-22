@@ -200,15 +200,13 @@ def test_cli_validate_prints_no_values(tmp_path, capsys):
     assert "revision=" in out and "hosts=2" in out and "llm-secret-key" not in out
 
 
-def test_init_generates_ingest_key_in_both_places_and_host_sections(tmp_path):
+def test_init_keeps_the_control_plane_open_and_host_keys_empty(tmp_path):
     path = make(tmp_path)
     cfg = load_fleet_config(path)
     cp = cfg.section("control_plane")
-    ingest_key = cfg.section("ingest")["api_key"]
-    assert cp["api_keys"][ingest_key] == "ingest"
-    agent_key = cfg.section("agent")["api_key"]
-    assert cp["api_keys"][agent_key] == "agent" and agent_key != ingest_key
-    assert sorted(cp["api_keys"].values()) == ["agent", "ingest", "operator"]
+    assert cp["api_keys"] == {}                      # open on the tailnet, as today
+    assert cfg.section("ingest") == {"api_key": ""}  # clients send no X-API-Key when empty
+    assert cfg.section("agent") == {"api_key": ""}
     assert cfg.section("github") == {"token": ""}
     assert cfg.section("fabric") == {"url": "", "token": ""}
     assert cfg.section("inspector") == {"enabled": False, "reasoning": "off"}
@@ -216,6 +214,30 @@ def test_init_generates_ingest_key_in_both_places_and_host_sections(tmp_path):
     served = cfg.slice_for("mac")  # a roleless-ish host still gets the "all" sections
     assert {"ingest", "agent", "fabric", "inspector"} <= set(served)
     assert "github" not in served and "control_plane" not in served
+
+
+def test_init_with_api_keys_generates_them_in_both_places(tmp_path):
+    path = fcc.init_config(tmp_path / "fleet-config.yaml", dict(ANSWERS), prompt=no_prompt,
+                           secret_prompt=no_prompt, with_api_keys=True)
+    cfg = load_fleet_config(path)
+    cp = cfg.section("control_plane")
+    ingest_key = cfg.section("ingest")["api_key"]
+    agent_key = cfg.section("agent")["api_key"]
+    assert ingest_key and agent_key and agent_key != ingest_key
+    assert cp["api_keys"][ingest_key] == "ingest" and cp["api_keys"][agent_key] == "agent"
+    assert sorted(cp["api_keys"].values()) == ["agent", "ingest", "operator"]
+
+
+def test_cli_init_with_api_keys_warns_it_breaks_unkeyed_clients(tmp_path, monkeypatch, capsys):
+    from herdr_engineering.cli import main
+    seen = {}
+    monkeypatch.setattr(fcc, "init_config",
+                        lambda path, answers=None, **kw: seen.update(kw) or path)
+    assert main(["fleet", "config", "init", "--path", str(tmp_path / "f.yaml"),
+                 "--with-api-keys"]) == 0
+    err = capsys.readouterr().err
+    assert seen.get("with_api_keys") is True
+    assert "dashboard" in err and "llm-proxy" in err and "emit" in err
 
 
 # ----------------------------------------------------- gateway ip / compose map / in place

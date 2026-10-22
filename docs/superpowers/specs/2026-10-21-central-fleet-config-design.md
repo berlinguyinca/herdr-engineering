@@ -52,6 +52,12 @@ not use environment variables for configuration.
   allowed to read it; the endpoint serves a host only the sections its roles
   allow.
 - Missing file on (re)install: the setup command asks questions and writes it.
+- Control-plane API keys stay **off** (final review, 2026-10-21): `fleet config init`
+  writes `control_plane.api_keys: {}` and empty `ingest.api_key` / `agent.api_key`, so
+  the control plane stays open on the tailnet as before and clients send no
+  `X-API-Key`. Keyed mode is possible by hand-editing (or `init --with-api-keys`) but
+  is not supported until the dashboard, llm-proxy and emit hook carry keys.
+  `/api/v1/health` answers status, version and commit without a key in keyed mode.
 
 ## Design (my calls, marked)
 

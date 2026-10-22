@@ -256,9 +256,21 @@ def _collect_hosts(answers: dict, prompt: Callable) -> dict[str, list[str]]:
         hosts[hid] = [r.strip() for r in roles.split(",") if r.strip()] or ["host"]
 
 
+API_KEYS_WARNING = (
+    "warning: --with-api-keys turns on X-API-Key auth for the control plane. The browser "
+    "dashboard, the llm-proxy and the emit hook do not send keys yet, so they will get "
+    "401 until they do. Leave control_plane.api_keys empty ({}) to keep the tailnet-open "
+    "posture.")
+
+
 def init_config(path: Path, answers: dict | None = None, prompt: Callable = input,
-                secret_prompt: Callable = getpass.getpass) -> Path:
-    """Create a new fleet config. Generates DB/MinIO credentials and API keys.
+                secret_prompt: Callable = getpass.getpass, *, with_api_keys: bool = False) -> Path:
+    """Create a new fleet config. Generates DB/MinIO credentials.
+
+    The control plane stays open on the tailnet (``control_plane.api_keys: {}``) and
+    ``ingest.api_key`` / ``agent.api_key`` are empty, so clients send no X-API-Key.
+    ``with_api_keys`` generates operator/ingest/agent keys instead (keyed mode; the
+    dashboard, llm-proxy and emit hook do not support keys yet - see API_KEYS_WARNING).
 
     Hosts get a placeholder hash of a discarded token: they cannot authenticate
     until ``fleet join`` / ``fleet config token`` installs a real one.
@@ -284,9 +296,12 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
 
     pg_user, pg_pass = f"herdr_{secrets.token_hex(4)}", secrets.token_hex(16)
     minio_user, minio_pass = f"herdr_{secrets.token_hex(4)}", secrets.token_hex(16)
-    api_key = secrets.token_urlsafe(32)
-    ingest_key = secrets.token_urlsafe(32)  # control-plane key (role ingest) every host posts events with
-    agent_key = secrets.token_urlsafe(32)   # role agent: ingest + LLM-key mint/revoke + review routes
+    api_keys: dict[str, str] = {}
+    ingest_key = agent_key = ""  # empty: hosts send no X-API-Key (open control plane)
+    if with_api_keys:
+        ingest_key = secrets.token_urlsafe(32)  # role ingest: every host posts events with it
+        agent_key = secrets.token_urlsafe(32)   # role agent: ingest + LLM-key mint/revoke + reviews
+        api_keys = {secrets.token_urlsafe(32): "operator", ingest_key: "ingest", agent_key: "agent"}
     dsn = f"postgresql://{pg_user}:{pg_pass}@postgres:5432/herdr"
     bucket = "herdr-artifacts"
     data = {
@@ -296,7 +311,9 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
                 "public_url": public_url,
                 "pg_dsn": dsn,
                 "host_aliases": str(a.get("host_aliases") or ""),
-                "api_keys": {api_key: "operator", ingest_key: "ingest", agent_key: "agent"},
+                # {} = open on the tailnet (today's posture). Keyed mode also needs the
+                # dashboard, llm-proxy and emit hook to carry keys (not supported yet).
+                "api_keys": api_keys,
                 "rustfs_endpoint": "http://rustfs:9000",
                 "rustfs_bucket": bucket,
                 "ci_actions": False,  # true lets operators retry/cancel CI pipelines from the UI
