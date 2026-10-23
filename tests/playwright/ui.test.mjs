@@ -1359,14 +1359,20 @@ test('overview attention opens only the intended CI provider when repository and
 
 test('large Overview attention queues keep cards close and expand within a keyboard-accessible scroll region',async()=>{
  await withApp(async({page,base})=>{
-  let refreshed=false;
+  let refreshed=false,releaseOtherPanels;
+  const otherPanelsReady=new Promise(resolve=>{releaseOtherPanels=resolve;});
   const missions=Array.from({length:196},(_,index)=>({mission_id:`failure-${index}`,title:`Failure ${index}`,status:'failed',updated_at:new Date(Date.now()-index*1000).toISOString()}));
   await page.route('**/api/v1/missions',route=>route.fulfill({json:{missions:missions.map(record=>({...record,title:refreshed?`${record.title} refreshed`:record.title}))}}));
   await page.route('**/api/v1/mission-activity',route=>route.fulfill({json:{activities:[]}}));
+  const hosts=Array.from({length:5},(_,index)=>({host_id:`host-${index}`,host_name:`Host ${index}`,status:'healthy',last_seen:new Date().toISOString()}));
+  const events=Array.from({length:8},(_,index)=>({event_type:'MissionStarted',source_timestamp:new Date().toISOString(),payload:{title:`Activity ${index}: ${'observed lifecycle change '.repeat(6)}`}}));
+  // Independent sources finish after the mobile collapsed measurement.
+  await page.route('**/api/v1/hosts',async route=>{await otherPanelsReady;await route.fulfill({json:{hosts}});});
+  await page.route('**/api/v1/activity**',async route=>{await otherPanelsReady;await route.fulfill({json:{events}});});
   await page.route('**/api/v1/fleet/inventory',route=>route.fulfill({json:{components:[],hosts:[],summary:{drifted:0}}}));
   await page.addInitScript(()=>localStorage.setItem('herdr.overview.layout.v1',JSON.stringify({order:['ci'],hidden:['sessions']})));
   await page.clock.install();await page.goto(`${base}/#/overview`);
-  const attention=page.locator('[data-overview=attention]'),toggle=attention.locator('[data-attention-toggle]'),list=attention.locator('#ov-attention-items');
+  const attention=page.locator('[data-overview=attention]'),toggle=attention.locator('[data-attention-toggle]');
   await page.waitForFunction(()=>document.querySelectorAll('[data-attention-key]').length===6);
   await attention.getByText('Showing 6 of 196 observed items',{exact:true}).waitFor();
   assert.equal(await attention.locator('[data-attention-key] a').first().getAttribute('href'),'#/missions/failure-0');
@@ -1377,24 +1383,43 @@ test('large Overview attention queues keep cards close and expand within a keybo
    assert.ok(collapsed.attention<1000,`Attention height ${collapsed.attention} at ${width}`);
    assert.ok(collapsed.cards<1400,`cards start at ${collapsed.cards} at ${width}`);
    assert.ok(collapsed.page<4500,`document height ${collapsed.page} at ${width}`);
+   if(width===390) {
+    releaseOtherPanels();
+    await page.waitForFunction(()=>document.querySelectorAll('[data-overview=hosts] .ov-row').length===5 && document.querySelectorAll('[data-overview=activity] .ov-row').length===8);
+   }
    await toggle.focus();await page.keyboard.press('Enter');
    assert.equal(await toggle.getAttribute('aria-expanded'),'true');
-   assert.equal(await toggle.evaluate(element=>element===document.activeElement),true);
+   assert.equal(await page.evaluate(()=>document.querySelector('[data-attention-toggle]')===document.activeElement),true);
    assert.equal(await attention.locator('[data-attention-key]').count(),196);
-   const expanded=await list.evaluate(element=>({height:element.clientHeight,scroll:element.scrollHeight,limit:innerHeight*.6,overflow:document.documentElement.scrollWidth>innerWidth}));
+   const expanded=await page.evaluate(()=>{
+    const element=document.querySelector('#ov-attention-items');
+    return {height:element.clientHeight,scroll:element.scrollHeight,limit:innerHeight*.6,overflow:document.documentElement.scrollWidth>innerWidth,page:document.documentElement.scrollHeight,attention:document.querySelector('[data-overview=attention]').getBoundingClientRect().height,cards:document.querySelector('.ov-layout').getBoundingClientRect().top+scrollY};
+   });
    assert.ok(expanded.height<=expanded.limit+1);assert.ok(expanded.scroll>expanded.height);assert.equal(expanded.overflow,false);
-   assert.ok(await page.evaluate(()=>document.documentElement.scrollHeight)<collapsed.page+700);
+   // Late card responses may grow the document independently of Attention.
+   assert.ok(expanded.attention<collapsed.attention+700,JSON.stringify({width,collapsed,expanded}));
+   assert.ok(expanded.cards<collapsed.cards+700,JSON.stringify({width,collapsed,expanded}));
+   assert.ok(expanded.page<4500,`expanded document height ${expanded.page} at ${width}`);
    if(width===390) {
-    await list.evaluate(element=>{element.scrollTop=200;element.focus({preventScroll:true});});
-    const scroll=await list.evaluate(element=>element.scrollTop);
+    const initial=await page.evaluate(()=>{
+     const element=document.querySelector('#ov-attention-items');
+     element.scrollTop=200;element.focus({preventScroll:true});
+     return {scroll:element.scrollTop,focused:element===document.activeElement};
+    });
+    assert.equal(initial.focused,true,'expanded list accepts focus before refresh');
     refreshed=true;await page.clock.runFor(5500);
     await attention.getByRole('link',{name:'Failure 0 refreshed',exact:true}).waitFor();
-    assert.equal(await list.evaluate(element=>element===document.activeElement),true);
-    assert.equal(await list.evaluate(element=>element.scrollTop),scroll);
+    // Resolve the current DOM node and focus together, rather than an old
+    // element handle that a concurrent source redraw may have detached.
+    const retained=await page.evaluate(()=>{
+     const element=document.querySelector('#ov-attention-items');
+     return {focused:element===document.activeElement,scroll:element.scrollTop};
+    });
+    assert.deepEqual(retained,{focused:true,scroll:initial.scroll});
    }
    await toggle.focus();await page.keyboard.press('Enter');
    assert.equal(await toggle.getAttribute('aria-expanded'),'false');
-   assert.equal(await toggle.evaluate(element=>element===document.activeElement),true);
+   assert.equal(await page.evaluate(()=>document.querySelector('[data-attention-toggle]')===document.activeElement),true);
    assert.equal(await attention.locator('[data-attention-key]').count(),6);
   }
   assert.equal(await page.locator('[data-overview=sessions]').isVisible(),false);
