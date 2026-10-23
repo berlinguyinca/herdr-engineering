@@ -21,6 +21,9 @@ import time
 from uuid import uuid4
 
 from .agent_identity import AgentIdentityRegistry
+from .host_metrics_store import ENTITY_TYPE as HOST_METRICS_ENTITY
+from .host_metrics_store import STATE_KEYS as HOST_STATE_KEYS
+from .host_metrics_store import HostMetricsStore, clean_metrics, clean_state
 from .ids import new_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
@@ -155,6 +158,19 @@ class ControlPlaneRepo:
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+        self.host_metrics = self._new_host_metrics()
+
+    def _new_host_metrics(self):
+        return HostMetricsStore(now=lambda: self._now(), persist=self._persist_host_metrics)
+
+    def _persist_host_metrics(self, ev):
+        """Rollups and host-state changes go to the sink, not the shared streams/SSE."""
+        if self._sink is None:
+            return
+        stamp = self._stamp()
+        self._sink.record({"event_id": new_id("event"), "schema_version": 1,
+                           "source_timestamp": stamp, "ingest_timestamp": stamp,
+                           "mission_id": None, "session_id": None, **ev})
 
     def _persist_inspector(self, ev):
         """Persist inspector detail outside global streams; require capture ACKs."""
@@ -739,7 +755,7 @@ class ControlPlaneRepo:
                 base["host_id"] = base["host_name"] = canonical
                 continue
             if (rec.get("last_seen") or "") > (base.get("last_seen") or ""):
-                for key in ("last_seen", "status", "cpu", "mem"):
+                for key in ("last_seen", "status", "cpu", "mem", "latest", *HOST_STATE_KEYS):
                     if rec.get(key) is not None:
                         base[key] = rec[key]
             if rec.get("inventory") and not base.get("inventory"):
@@ -817,6 +833,46 @@ class ControlPlaneRepo:
     def list_telemetry(self, host_id, limit=100):
         samples = self._telemetry.get(host_id, [])
         return samples[-limit:]
+
+    def record_host_metrics(self, host_id, sample, *, updates=None, versions=None,
+                            pins=None, fleet_update=None, maintenance=None):
+        """Store one fabric-agent sample: history, ``host["latest"]`` and host state.
+
+        Everything is validated before anything is written, so a ``ValueError``
+        leaves the host record untouched. A state field that is ``None`` was not
+        reported this time and keeps its previous value. ``sample`` may be
+        ``None`` when only state was reported."""
+        cleaned = clean_metrics(sample) if sample is not None else None
+        state = {k: clean_state(k, v) for k, v in
+                 (("updates", updates), ("versions", versions), ("pins", pins),
+                  ("fleet_update", fleet_update), ("maintenance", maintenance))}
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            latest = None
+            if cleaned is not None:
+                latest = {**cleaned, "at": self._stamp()}
+                self.host_metrics.record(host_id, cleaned)
+                self.record_telemetry(host_id, {**cleaned, "cpu_pct": cleaned.get("cpu"),
+                                                "mem_pct": cleaned.get("mem"),
+                                                "disk_pct": cleaned.get("disk")})
+            if h is None:
+                return
+            if latest is not None:
+                h["latest"] = latest
+            for key, value in state.items():
+                if value is not None:
+                    h[key] = value
+            self.host_metrics.observe_state(host_id, {k: h.get(k) for k in HOST_STATE_KEYS},
+                                            h.get("latest"))
+
+    def host_history(self, host_id, range):
+        """At most 300 history points for ``range`` (1h raw, 24h/7d from rollups)."""
+        canonical = self._canonical_host(host_id)
+        ids = [host_id, canonical] + [a for a, c in self._host_aliases.items() if c == canonical]
+        for hid in dict.fromkeys(ids):
+            if self.host_metrics.has(hid):
+                return self.host_metrics.history(hid, range)
+        return self.host_metrics.history(host_id, range)
 
     # ---------------------------------------------------------- ingestion
     # Idempotent upserts that honor an external (runtime-supplied) entity id, so
@@ -1958,6 +2014,17 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != "collab"]
         if durable:
             self.inspector.hydrate(durable)
+        # Host telemetry rollups/state ride a private stream: rebuild history and
+        # put the latest record back on each host.
+        metrics = []
+        for key in [k for k in self._events if k[0] == HOST_METRICS_ENTITY]:
+            metrics.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != HOST_METRICS_ENTITY]
+        self.host_metrics = self._new_host_metrics()
+        for hid, rec in self.host_metrics.hydrate(metrics).items():
+            host = self._hosts.get(hid)
+            if host is not None:
+                host.update({k: v for k, v in rec.items() if v is not None})
 
     def take_collab_replay(self):
         """Hand the diverted durable HCN events to the collaboration service (once)."""

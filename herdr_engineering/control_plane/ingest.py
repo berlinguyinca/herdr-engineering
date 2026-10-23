@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
+from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
 from .project_links import canonical_repository
 
 
@@ -102,19 +103,28 @@ class IngestService:
     def _ingest_host(self, entity_id, event_type, payload) -> dict:
         status = ("unavailable" if "unavailable" in event_type.lower()
                   else "healthy")
+        # Validate everything before touching the host: a bad sample is a 400
+        # and must leave the stored record as it was.
+        telemetry = payload.get("telemetry")
+        sample = clean_metrics(telemetry) if telemetry is not None else None
+        state = {k: clean_state(k, payload.get(k)) for k in STATE_KEYS}
+        legacy = {k: clean_metrics({k: payload.get(k)}).get(k) for k in ("cpu", "mem", "disk")}
+        cpu = sample.get("cpu") if sample is not None else legacy["cpu"]
+        mem = sample.get("mem") if sample is not None else legacy["mem"]
         host = self.repo.upsert_host(
             entity_id,
             payload.get("host_name") or payload.get("name") or entity_id,
             payload.get("tailnet_ip") or payload.get("ip"),
-            cpu=payload.get("cpu"), mem=payload.get("mem"), status=status,
+            cpu=cpu, mem=mem, status=status,
             inventory=payload.get("inventory"))
-        sample = {k: payload[k] for k in ("cpu", "mem", "disk")
-                  if isinstance(payload.get(k), (int, float))
-                  and not isinstance(payload.get(k), bool)}
-        if sample:
+        if sample is not None or any(v is not None for v in state.values()):
+            self.repo.record_host_metrics(entity_id, sample, **state)
+            return host
+        legacy = {k: v for k, v in legacy.items() if v is not None}
+        if legacy:
             self.repo.record_telemetry(entity_id, {
-                "cpu_pct": sample.get("cpu"), "mem_pct": sample.get("mem"),
-                "disk_pct": sample.get("disk")})
+                "cpu_pct": legacy.get("cpu"), "mem_pct": legacy.get("mem"),
+                "disk_pct": legacy.get("disk")})
         return host
 
     def _ingest_session(self, entity_id, event_type, payload,

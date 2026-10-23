@@ -1168,7 +1168,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(r.fleet_inventory())
             if resource == "hosts":
                 if len(parts) > 5 and parts[5] == "telemetry":
-                    return self._json({"samples": r.list_telemetry(parts[4])})
+                    rng = _q(self.path, "range")
+                    if rng is not None:  # unknown range: ValueError -> 400
+                        return self._json({"samples": r.host_history(parts[4], rng), "range": rng})
+                    # ?limit= (the page asks for 1): full samples are up to 16 KiB each.
+                    limit = min(max(_qint(self.path, "limit", 100), 1), 500)
+                    return self._json({"samples": r.list_telemetry(parts[4], limit)})
                 if len(parts) == 5:
                     h = r.get_host(parts[4])
                     return self._json(h) if h else self._json(
