@@ -786,3 +786,51 @@ def test_a_sponsor_can_revoke_their_agent_and_only_an_owner_can_invite_or_revoke
     inv = w.invite("late")
     assert p.c("POST", f"/rooms/{w.room}/externals/invites/{inv['invite_id']}/revoke", {}, user="alice").status == 200
     assert p.c("POST", "/agents/join", {"token": inv["code"]}).status == 401
+
+
+# ======================================================================================== known gaps, written as strict xfails
+# Each asserts the DESIRED behaviour and fails today. They turn into failures (XPASS strict) the day the gap closes,
+# which forces the marker to be removed. (Review finding: these were prose in the evidence doc only.)
+@pytest.mark.xfail(strict=True, reason="GAP: tools/list advertises the same fixed menu to every external agent, including tools that are "
+                                       "ALWAYS refused for it (agents_list, task_create, tasks_inbox, task_update) and delegation tools the "
+                                       "agent was not invited to use. Desired: the menu lists only what the caller may call.")
+def test_gap_mcp_tool_menu_is_per_agent_and_lists_only_callable_tools(world):
+    w, p = world, world.p
+    dana = w.enroll("Dana's Claude")
+    erin = w.enroll("Erin's Pi", harness_type="pi", proposals=False, lineage=False)
+    menu = lambda ext: {t["name"] for t in p.rpc("/mcp", "tools/list", {}, ext.agent).body["result"]["tools"]}  # noqa: E731
+    assert p.tool(erin.agent, "delegations_inbox", {})[0] == 403                    # control: erin cannot call it ...
+    assert "delegations_inbox" in menu(dana) and p.tool(dana.agent, "delegations_inbox", {})[0] == 200
+    assert "delegations_inbox" not in menu(erin)                                    # ... so it must not be advertised to her
+    assert not menu(dana) & {"agents_list", "task_create", "tasks_inbox", "task_update"}
+
+
+@pytest.mark.xfail(strict=True, reason="GAP: a delegation's budget has no turn/hop bound (max_turns, max_hops); the nearest field is "
+                                       "max_steps and an external agent cannot delegate onward at all. Desired: max_turns/max_hops are "
+                                       "accepted, echoed and enforced.")
+def test_gap_delegation_budget_carries_max_turns_and_max_hops(world):
+    w = world
+    dana = w.enroll("Dana's Claude")
+    ok = delegate(w, dana)                                                          # control: the existing budget shape is accepted
+    assert ok.status in (200, 201), ok.body
+    r = delegate(w, dana, budget={"max_proposals": 2, "max_steps": 4, "max_artifact_bytes": 4096, "max_tokens": 1000,
+                                  "max_turns": 3, "max_hops": 1})
+    assert r.status in (200, 201), r.body
+    assert r.body.get("task", r.body).get("budget", {}).get("max_turns") == 3
+
+
+@pytest.mark.xfail(strict=True, reason="GAP: the consultation edge runs thread -> subject, with asker and target only as thread attrs; "
+                                       "there is no edge from the asking person to the answering agent. Desired: an edge asker -> target "
+                                       "so 'who asked whom' is a graph fact.")
+def test_gap_consultation_edge_connects_the_asker_to_the_target_agent(world):
+    w, p = world, world.p
+    w.seed_node("task:s4-edge", "edge direction", 0)
+    dana = w.enroll("Dana's Claude")
+    ask = {"target": {"kind": "agent", "id": dana.id}, "subject": {"kind": "node", "node_id": "task:s4-edge"},
+           "question": "who asked whom?", "idempotency_key": "gap-edge"}
+    cid = p.c("POST", f"/rooms/{w.room}/consultations", ask, user="bob")["consultation"]["consult_id"]     # control: it was asked
+    thread = "thread:hcn-consult." + cid
+    edges = [e for e in p.edges(thread, key="operator") if e[0] == "consultation"]
+    assert edges, "control: the consultation edge exists"
+    touched = {x for e in edges for x in e[1:3]}
+    assert dana.id in json.dumps(sorted(touched)) and "bob" in json.dumps(sorted(touched)), edges

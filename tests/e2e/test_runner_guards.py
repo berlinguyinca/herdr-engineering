@@ -41,3 +41,21 @@ def test_zero_tests_short_runs_skips_failures_and_unlisted_files_all_fail_the_ru
     assert any("todo" in f for f in judge(p=p))
     assert any("not in manifest" in f for f in judge(disk=("test/e2e/b.e2e.test.ts", "test/e2e/new.e2e.test.ts")))
     assert any("file missing" in f for f in judge(p={"test/e2e/b.e2e.test.ts": None}))
+
+
+def test_a_pi_file_may_not_name_more_tests_gap_than_the_manifest_allows():
+    import copy
+    p = copy.deepcopy(GOOD_P)
+    p["test/e2e/b.e2e.test.ts"]["gaps"] = ["GAP: x"]
+    assert any("named GAP" in f for f in judge(p=p))                       # max_gap defaults to 0
+    m = copy.deepcopy(MANIFEST); m["pi"]["test/e2e/b.e2e.test.ts"]["max_gap"] = 1
+    assert ra.judge(m, GOOD_H, p, None, ["test/e2e/b.e2e.test.ts"]) == []   # an allowed, listed gap is fine
+
+
+def test_xfail_must_be_the_strict_marker():
+    ok = "import pytest\n@pytest.mark.xfail(strict=True, reason='GAP: x')\ndef test_a():\n    assert 0\n"
+    assert ra.xfail_violations({"t.py": ok}) == []
+    for bad in ("@pytest.mark.xfail(reason='x')\ndef test_a(): pass\n",
+                "@pytest.mark.xfail(strict=False)\ndef test_a(): pass\n",
+                "def test_a():\n    pytest.xfail('later')\n"):
+        assert ra.xfail_violations({"t.py": "import pytest\n" + bad}), bad

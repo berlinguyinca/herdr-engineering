@@ -42,7 +42,7 @@ def postgres(tmp_path_factory):
         pytest.fail("asyncpg is a declared dependency (pyproject.toml) and is missing from this python")
     db = pg.ThrowawayPostgres(bins, tmp_path_factory.mktemp("pg7")).start()
     yield db
-    db.stop()
+    db.close()
 
 
 def _plane(tmp: Path, name: str, **kw) -> Plane:
