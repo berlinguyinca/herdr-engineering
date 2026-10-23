@@ -950,9 +950,20 @@ class Runner:
             os.close(fd)
         if not isinstance(data, dict):
             return {}
-        # a plain string is a key file (--base64); {value, host} is a header value bound to one host (--host)
-        return {k: v for k, v in data.items() if isinstance(k, str) and (isinstance(v, str) or (
-            isinstance(v, dict) and isinstance(v.get("value"), str) and isinstance(v.get("host"), str)))}
+        # {value, host}: a header value bound to one host (--host); {ssh_b64}: a key file (--ssh). Nothing else:
+        # an old plain string could be a service key that happens to be valid base64, so it is neither.
+        out = {}
+        for k, v in data.items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                if isinstance(k, str) and isinstance(v, str):
+                    self.say(f"room secrets for {room}: {trim(k, 64)} is in the old format and is not used; set it "
+                             f"again with collab-secrets.py set {room} {trim(k, 64)} --host HOST (service) or --ssh (key)")
+                continue
+            if set(v) == {"value", "host"} and isinstance(v["value"], str) and isinstance(v["host"], str):
+                out[k] = v
+            elif set(v) == {"ssh_b64"} and isinstance(v["ssh_b64"], str):
+                out[k] = v
+        return out
 
     @staticmethod
     def profile_services(prof: dict) -> list[dict]:
@@ -971,7 +982,7 @@ class Runner:
             v = secrets.get(n)
             if v is None:
                 continue
-            if not isinstance(v, dict):
+            if not isinstance(v, dict) or "host" not in v:
                 say(f"helper {hid}: room secret {n} has no bound host; service {sv['name']} gets no key "
                          f"(store it again with collab-secrets.py set ROOM {n} --host HOST)")
                 continue
@@ -984,6 +995,21 @@ class Runner:
                          f"{trim(host, 80) or '(no host)'}; service {sv['name']} gets no key")
                 continue
             out[n] = {"value": v["value"], "host": v["host"]}
+        return out
+
+    def ssh_key_names(self, prof: dict, secrets: dict, hid: str) -> list[str]:
+        """The ssh_secret_names that are copied into the box: stored as key files ({ssh_b64}, collab-secrets.py
+        --ssh) and not also a service's secret (one name never serves as both)."""
+        services = {sv.get("secret_name") for sv in prof.get("services") or [] if isinstance(sv, dict)}
+        out = []
+        for n in prof.get("ssh_secret_names") or []:
+            if not isinstance(n, str) or not SECRET_NAME.fullmatch(n):
+                continue
+            v = secrets.get(n)
+            if n in services:
+                self.say(f"helper {hid}: room secret {n} is a service's key; not copied as an ssh key")
+            elif isinstance(v, dict) and isinstance(v.get("ssh_b64"), str):
+                out.append(n)
         return out
 
     def harness_login(self, d: Path, family, hid: str) -> Path:
@@ -1104,9 +1130,7 @@ class Runner:
         write_private(d / "services.json", json.dumps(services))
         write_private(d / "secrets.json", json.dumps(self.proxy_secrets(services, secrets, hid)))
         ssh_dir = None
-        # key files are plain (base64) strings only: a header value listed as an ssh name is never written out
-        keys = [n for n in prof.get("ssh_secret_names") or [] if isinstance(n, str) and SECRET_NAME.fullmatch(n)
-                and isinstance(secrets.get(n), str)]
+        keys = self.ssh_key_names(prof, secrets, hid)
         # what the helper was started with, so a later watch can tell when the room profile took it away
         st.update(family=c.get("family"), tools=prof.get("tools_allowed") is True and self.allow_tools, ssh_keys=keys)
         if keys:
@@ -1115,7 +1139,7 @@ class Runner:
             ssh_dir.chmod(0o700)
             for n in keys:
                 try:
-                    write_private(ssh_dir / n, base64.b64decode(secrets[n], validate=True))
+                    write_private(ssh_dir / n, base64.b64decode(secrets[n]["ssh_b64"], validate=True))
                 except (ValueError, binascii.Error):
                     self.say(f"helper {hid}: room secret {n} is not base64; not copied")
         harness = self.harness_login(d, c.get("family"), hid)
