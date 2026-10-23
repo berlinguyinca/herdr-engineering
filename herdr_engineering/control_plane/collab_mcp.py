@@ -177,7 +177,7 @@ def _helper_call(service: CollabService, pr, name: str, args: dict) -> dict:
         raise CollabError(400, "helper_id is required")
     if name == "helper_wait":
         secs = args.get("seconds", 20)
-        if not isinstance(secs, int) or isinstance(secs, bool) or secs < 1:
+        if not isinstance(secs, int) or isinstance(secs, bool) or not 1 <= secs <= HELPER_WAIT_MAX:
             raise CollabError(400, "invalid arguments")
         return _text(_helper_wait(service, pr, hid, float(secs)), untrusted=True)
     if name == "helper_result":

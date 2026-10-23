@@ -251,11 +251,15 @@ def helper_run(d: Path) -> int:
     outlives the runner cycle that started it; later cycles read the result and clean up."""
     os.umask(0o077)
     spec = json.loads((d / "spec.json").read_text())
-    task = sys.stdin.buffer.read(HELPER_STDIN_MAX)
+    task = sys.stdin.buffer.read(HELPER_STDIN_MAX + 1)
     sys.stdin.close()
     res: dict = {"exit": None, "timed_out": False, "bytes": 0, "error": None, "stderr": ""}
     proxy = None
     try:
+        if len(task) > HELPER_STDIN_MAX:        # never run on a cut-off task: fail, and say why
+            res["error"] = "sandbox-error"
+            res["stderr"] = f"the task is larger than {HELPER_STDIN_MAX} bytes; not run"
+            return 1
         sock = spec["sock"]
         with open(d / "proxy.err", "ab") as perr:
             proxy = subprocess.Popen(proxy_argv(spec, d), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=perr)
@@ -1042,7 +1046,10 @@ class Runner:
                 except OSError:
                     continue                      # not signed in that way: the harness says so in the result
                 try:
-                    if stat.S_ISREG(os.fstat(fd).st_mode):
+                    fst = os.fstat(fd)
+                    if fst.st_uid != os.getuid():
+                        self.say(f"helper {hid}: {src / n} is not owned by this runner's user; not copied")
+                    elif stat.S_ISREG(fst.st_mode):
                         with os.fdopen(fd, "rb", closefd=False) as fh:
                             data = fh.read(4_000_000)
                         if (fam, n) == ("claude-code", ".credentials.json"):
@@ -1110,6 +1117,12 @@ class Runner:
                 or not isinstance(room, str) or not ROOM_ID.fullmatch(room) or not isinstance(st.get("agent_id"), str)
                 or not isinstance(c.get("task"), str)):
             raise Failure("refused: unexpected helper name, role, room or task")
+        note = (c.get("handoff") or {}).get("text") if role == "successor" and isinstance(c.get("handoff"), dict) else None
+        text = note if isinstance(note, str) else c["task"]
+        # the supervisor refuses a task over HELPER_STDIN_MAX (it never runs a cut-off one): refuse it here first,
+        # with room for the prompt and the read-only bind lines
+        if len(text.encode("utf-8")) + 4096 > HELPER_STDIN_MAX:
+            raise Failure(f"refused: the task is larger than {HELPER_STDIN_MAX - 4096} bytes")
         cmd, notes = self.helper_command(c)
         try:
             lifetime = float(c["expires_epoch"]) - float(c["now"])
@@ -1166,8 +1179,7 @@ class Runner:
         pane, tab, own_tab = self.helper_pane(c, name, link)
         st.update(pane=pane, phase="launching", since=time.time())
         self.save_state(d, st)
-        note = (c.get("handoff") or {}).get("text") if role == "successor" and isinstance(c.get("handoff"), dict) else None
-        self.launch_helper(d, st, helper_prompt(role, binds) + (note if isinstance(note, str) else c["task"]))
+        self.launch_helper(d, st, helper_prompt(role, binds) + text)
         status, out = self.api("POST", f"fleet/helpers/{hid}/finish", {"status": "running"})
         if status != 200:
             raise Failure(f"could not mark the helper running: {status} {trim(out.get('error', ''))}")

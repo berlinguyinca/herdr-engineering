@@ -745,14 +745,14 @@ def test_mcp_wait_wakes_within_a_second_of_finish(w):
     assert box["out"]["untrusted"] is True and box["text"].startswith("UNTRUSTED CONTENT")
 
 
-def test_mcp_wait_times_out_with_status_and_clamps_seconds(w, monkeypatch):
+def test_mcp_wait_times_out_with_status_at_its_twenty_second_max(w, monkeypatch):
     from herdr_engineering.control_plane import collab_mcp
     rec = ask(w)
     clock = [0.0]
     monkeypatch.setattr(collab_mcp.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(w.s, "wait_for_change", lambda seq, t: clock.__setitem__(0, clock[0] + t))
-    out = collab_mcp._call(w.s, w.root, "helper_wait", {"helper_id": rec["helper_id"], "seconds": 500})
-    assert clock[0] <= 20.0 + 1e-9 and clock[0] >= 19.0
+    out = collab_mcp._call(w.s, w.root, "helper_wait", {"helper_id": rec["helper_id"], "seconds": 20})
+    assert clock[0] <= 20.0 + 1e-9 and clock[0] >= 19.0             # more than 20 is refused (400)
     assert '"status": "requested"' in out["content"][0]["text"]
 
 
