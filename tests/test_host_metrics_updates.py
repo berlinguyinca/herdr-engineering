@@ -1,4 +1,5 @@
 """Host metrics: updates, failed units, versions."""
+import os
 import platform
 import shutil
 from pathlib import Path
@@ -19,7 +20,7 @@ def _env(monkeypatch, system, tools, outputs, flag=None):
     monkeypatch.setattr(shutil, "which", lambda t: f"/usr/bin/{t}" if t in tools else None)
     monkeypatch.setattr(host_metrics, "_REBOOT_REQUIRED", str(flag) if flag else "/nonexistent")
     monkeypatch.setattr(host_metrics, "_run",
-                        lambda cmd, timeout=5.0: outputs.get(cmd[0]))
+                        lambda cmd, timeout=5.0: outputs.get(os.path.basename(cmd[0])))
 
 
 def test_parse_apt_counts_security():
@@ -116,3 +117,43 @@ def test_versions_parsed(monkeypatch, tmp_path):
 def test_failed_unit_name_starting_with_x(monkeypatch):
     _env(monkeypatch, "Linux", {"systemctl"}, {"systemctl": "x11-foo.service loaded failed failed X\n"})
     assert read_updates()["failed_units"] == ["x11-foo.service"]
+
+
+def test_apt_empty_and_garbage_are_unknown():
+    for text in ("", "W: proxy said no\nLocale: cs_CZ\n"):
+        r = parse_apt_simulate(text)
+        assert r["manager"] == "apt" and r["outdated"] is None
+        assert r["security"] is None and r["packages"] == []
+
+
+def test_apt_zero_upgraded_is_zero():
+    r = parse_apt_simulate("Reading package lists...\n0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n")
+    assert r["outdated"] == 0 and r["security"] == 0
+
+
+def test_security_suite_token_is_tight():
+    r = parse_apt_simulate("Inst a [1] (2 x/jammy-security-extras [amd64])\n"
+                           "Inst b [1] (2 x/jammy-security [amd64])\n")
+    assert r["security"] == 1
+
+
+def test_reboot_none_when_not_apt(monkeypatch, tmp_path):
+    flag = tmp_path / "rr"
+    flag.write_text("x")
+    _env(monkeypatch, "Linux", {"dnf"}, {}, flag)
+    assert read_updates()["reboot_required"] is None
+
+
+def test_brew_found_via_fallback_path(monkeypatch):
+    _env(monkeypatch, "Darwin", set(), {"brew": _fx("brew_outdated.json")})
+    monkeypatch.setattr(host_metrics, "_BREW_PATHS", ("/opt/homebrew/bin/brew",))
+    monkeypatch.setattr(os, "access", lambda p, m: p == "/opt/homebrew/bin/brew")
+    r = read_updates()
+    assert r["manager"] == "brew" and r["outdated"] == 3
+
+
+def test_brew_non_json_and_timeout_are_unknown(monkeypatch):
+    for out in ({"brew": "Error: not json"}, {}):
+        _env(monkeypatch, "Darwin", {"brew"}, out)
+        r = read_updates()
+        assert r["manager"] == "brew" and r["outdated"] is None and r["packages"] == []

@@ -424,9 +424,12 @@ class HostSampler:
 # --- slow report: updates, failed units, versions ---------------------------------
 
 MAX_PACKAGES = 50
-_APT_TIMEOUT = 30.0  # `apt-get -s upgrade` reads the whole dpkg/apt cache; can be slow
+_PKG_TIMEOUT = 30.0  # `apt-get -s upgrade` / `brew outdated` read the whole dpkg/apt cache; can be slow
 _REBOOT_REQUIRED = "/var/run/reboot-required"
 _PI_EXT_DIR = os.path.expanduser("~/.pi/agent/extensions")
+_SUMMARY_RE = re.compile(r"^\d+ upgraded, \d+ newly installed", re.M)
+_SECURITY_RE = re.compile(r"-security(?:[,\s\]]|$)")
+_BREW_PATHS = ("/opt/homebrew/bin/brew", "/usr/local/bin/brew")  # launchd PATH is minimal
 _INST_RE = re.compile(r"^Inst (\S+)(?: \[([^\]]*)\])? \((\S+) ([^)]*)\)")
 
 
@@ -438,6 +441,8 @@ def _updates(manager, outdated=None, security=None, packages=None) -> dict:
 def parse_apt_simulate(text: str) -> dict:
     """``apt-get -s upgrade`` output: one ``Inst`` line per pending upgrade; a
     ``-security`` suite on the line counts it as a security update."""
+    if not _SUMMARY_RE.search(text) and not re.search(r"^Inst ", text, re.M):
+        return _updates("apt")  # unrecognisable output: unknown, not zero
     packages, security = [], 0
     for line in text.splitlines():
         m = _INST_RE.match(line)
@@ -445,7 +450,7 @@ def parse_apt_simulate(text: str) -> dict:
             continue
         name, old, new, suites = m.groups()
         packages.append({"name": name, "from": old, "to": new})
-        if "-security" in suites:
+        if _SECURITY_RE.search(suites):
             security += 1
     return _updates("apt", len(packages), security, packages)
 
@@ -473,6 +478,13 @@ def _failed_units() -> list[str]:
     return units
 
 
+def _find_brew() -> str | None:
+    found = shutil.which("brew")
+    if found:
+        return found
+    return next((p for p in _BREW_PATHS if os.access(p, os.X_OK)), None)
+
+
 def read_updates() -> dict:
     """Pending package updates, reboot flag and failed units. Unknown is ``None``."""
     linux = platform.system() == "Linux"
@@ -480,17 +492,19 @@ def read_updates() -> dict:
     try:
         if linux and shutil.which("apt-get"):
             res = _updates("apt")
-            out = _run(["apt-get", "-s", "upgrade"], timeout=_APT_TIMEOUT)
+            out = _run(["apt-get", "-s", "upgrade"], timeout=_PKG_TIMEOUT)
             if out is not None:
                 res = parse_apt_simulate(out)
-        elif platform.system() == "Darwin" and shutil.which("brew"):
+        elif platform.system() == "Darwin" and _find_brew():
             res = _updates("brew")
-            out = _run(["brew", "outdated", "--json=v2"], timeout=_APT_TIMEOUT)
+            out = _run([_find_brew(), "outdated", "--json=v2"], timeout=_PKG_TIMEOUT)
             if out is not None:
                 res = parse_brew_outdated(out)
     except Exception:  # noqa: BLE001 - unparsable output means unknown
         res = _updates(res["manager"])
-    res["reboot_required"] = os.path.exists(_REBOOT_REQUIRED) if linux else None
+    # Only Debian-family hosts (apt) have the flag file; elsewhere we did not look.
+    res["reboot_required"] = (os.path.exists(_REBOOT_REQUIRED)
+                              if res["manager"] == "apt" else None)
     res["failed_units"] = _failed_units() if linux else []
     return res
 
