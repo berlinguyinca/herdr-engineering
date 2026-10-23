@@ -192,7 +192,7 @@ def _text(value: object, limit: int, what: str) -> str:
     return text
 
 
-_HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_HUNK = re.compile(r"@@ -(\d{1,9})(?:,(\d{1,9}))? \+(\d{1,9})(?:,(\d{1,9}))? @@")
 _GIT = re.compile(r"diff --git a/(\S.*) b/(\S.*)\Z")
 _MODE = re.compile(r"(new|deleted) file mode (\d{6})\Z")
 
@@ -312,11 +312,15 @@ def check_link(url: object) -> str:
     """An https URL with a public-looking host, kept as a string. It is never fetched by the server."""
     if not isinstance(url, str) or not url or len(url) > 500 or any(c.isspace() or ord(c) < 33 or ord(c) > 126 for c in url):
         raise DelegationError(400, "url must be a plain ASCII https URL of at most 500 characters")
-    parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        port = parts.port                    # raises ValueError for a non-numeric or out-of-range port
+    except ValueError:
+        raise DelegationError(400, "url is not a valid https URL") from None
     if parts.scheme != "https" or parts.username is not None or parts.password is not None or not host:
         raise DelegationError(400, "only https URLs without credentials are accepted")
-    if (parts.port not in (None, 443) or "." not in host or host.endswith((".local", ".internal", ".localhost", ".lan"))
+    if (port not in (None, 443) or "." not in host or host.endswith((".local", ".internal", ".localhost", ".lan"))
             or re.fullmatch(r"[0-9.]+|\[.*\]|0x[0-9a-f]+", host) or host == "localhost"):
         raise DelegationError(400, "the host must be a public DNS name on port 443")
     if redact_text(url) != url:

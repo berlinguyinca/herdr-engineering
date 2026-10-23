@@ -270,6 +270,10 @@ CASES = {
     "secret_like": (lambda d, t, v: d.propose(t, kind="doc", title="t", content="Authorization: Bearer " + "A" * 40, expected_version=v), 400, "secret_like"),
     "http_link": (lambda d, t, v: d.propose(t, kind="link", title="t", url="http://example.org/x", expected_version=v), 400, None),
     "js_link": (lambda d, t, v: d.propose(t, kind="link", title="t", url="javascript:alert(1)", expected_version=v), 400, None),
+    "link_bad_port": (lambda d, t, v: d.propose(t, kind="link", title="t", url="https://example.org:99999/", expected_version=v), 400, None),
+    "link_text_port": (lambda d, t, v: d.propose(t, kind="link", title="t", url="https://example.org:abc/", expected_version=v), 400, None),
+    "link_bad_ipv6": (lambda d, t, v: d.propose(t, kind="link", title="t", url="https://[::1/", expected_version=v), 400, None),
+    "lone_surrogate": (lambda d, t, v: d.propose(t, kind="doc", title="t", content="a\ud800b", expected_version=v), 400, "hidden_characters"),
     "private_link": (lambda d, t, v: d.propose(t, kind="link", title="t", url="https://10.0.0.5/x", expected_version=v), 400, None),
     "userinfo_link": (lambda d, t, v: d.propose(t, kind="link", title="t", url="https://u:p@example.org/x", expected_version=v), 400, None),
     "link_with_content": (lambda d, t, v: d.propose(t, kind="link", title="t", url="https://example.org/x", content="x", expected_version=v), 400, None),
@@ -608,8 +612,9 @@ def test_the_kill_switch_stops_everything_but_the_safe_directions(world, surface
     pid = pid["proposal_id"] if surface != "a2a" else pid["metadata"]["herdr"]["result"]["proposal_id"]
     dig = w.s.get_proposal(w.alice, w.room, pid)["digest"]
     w.s.delegation_enabled = False
-    assert d.propose(tid, kind="doc", title="u", content="y", expected_version=v + 1)[:2] == (403, "delegation_disabled")
-    assert d.respond(tid, "progress", expected_version=v + 1)[:2] == (403, "delegation_disabled")
+    gone = (400, None) if surface == "a2a" else (403, "delegation_disabled")     # A2A: a data part is just an unsupported part again
+    assert d.propose(tid, kind="doc", title="u", content="y", expected_version=v + 1)[:2] == gone
+    assert d.respond(tid, "progress", expected_version=v + 1)[:2] == gone
     if surface == "a2a":                                    # the whole task surface vanishes: no such method
         assert d._a2a(None, "tasks/list", {})[2]["code"] == -32601
     else:
@@ -654,14 +659,34 @@ def test_a2a_tasks_get_list_cancel_map_onto_the_same_store(world):
     assert "bounded-task" in {s["id"] for s in card["skills"]}
 
 
-def test_a_text_message_with_a_task_id_is_not_a_task_answer(world):
+def test_a_text_message_with_a_task_id_is_still_a_plain_chat_post_with_the_switch_off_or_on(w):
+    # many A2A clients set taskId on follow-ups; before T11 it was ignored and the text was posted
+    pr, out, _ = enroll(w, proposals=True, actions=["read", "post"])
+    d = Delegate(w, pr, out, "a2a")
+    for enabled in (False, True):
+        w.s.delegation_enabled = enabled
+        st, c, res = d._a2a({"role": "agent", "messageId": f"m{enabled}", "taskId": "grant_whatever", "contextId": w.room,
+                             "parts": [{"kind": "text", "text": f"follow-up {enabled}"}]})
+        assert st == 200 and res["kind"] == "message", res
+    texts = [e["text"] for e in w.s.read_events(w.alice, w.room, 0, 100)["events"] if e["event_type"] == "message"]
+    assert "follow-up False" in texts and "follow-up True" in texts
+    # with the switch off a data part is not a task answer either: it is refused like any non-text part
+    w.s.delegation_enabled = False
+    st, c, err = d._a2a({"role": "agent", "messageId": "m9", "taskId": "grant_x", "contextId": w.room,
+                         "parts": [{"kind": "data", "data": {"action": "accept"}}]})
+    assert err["code"] == -32005
+
+
+def test_a_malformed_task_answer_is_refused_and_changes_nothing(world):
     w = world
     d, pr, tid = make(w, "a2a")
-    st, c, err = d._a2a({"role": "agent", "messageId": "m", "taskId": tid, "parts": [{"kind": "text", "text": "accept"}]})
-    assert err["code"] == -32005 and w.s._tasks[tid]["status"] == "pending"
     st, c, err = d._a2a({"role": "agent", "messageId": "m", "taskId": tid, "parts": [{"kind": "data", "data": {"action": "propose"}},
                                                                                        {"kind": "data", "data": {}}]})
-    assert err["code"] == -32005
+    assert err["code"] == -32005 and w.s._tasks[tid]["status"] == "pending"
+    st, c, err = d._a2a({"role": "agent", "messageId": "m", "taskId": tid, "parts": [{"kind": "data", "data": {"action": "nope"}}]})
+    assert st == 400 and w.s._tasks[tid]["status"] == "pending"
+    st, c, err = d._a2a({"role": "agent", "messageId": "m", "taskId": 5, "parts": [{"kind": "data", "data": {"action": "accept"}}]})
+    assert err["code"] == -32602
 
 
 def test_owner_rest_routes_and_the_review_view(world):
@@ -834,3 +859,12 @@ def test_real_server_delegation_end_to_end_and_the_ingest_key_cannot_forge_prove
         assert call("POST", f"/rooms/{rid}/proposals/{pid}/decide", {"decision": "accept", "expected_digest": one["digest"]}, a)[1]["replayed"] is True
     finally:
         srv.shutdown()
+
+
+def test_a_hunk_header_with_a_huge_number_is_a_clean_refusal_not_a_crash():
+    text = "--- a/src/x\n+++ b/src/x\n@@ -1 +1," + "9" * 5000 + " @@\n-a\n+b\n"
+    with pytest.raises(dlg.DelegationError):
+        dlg.parse_patch(text, ["src/"])
+    for url in ("https://example.org:99999/", "https://example.org:abc/", "https://[::1/", "https://" + "a" * 600 + ".org/"):
+        with pytest.raises(dlg.DelegationError):
+            dlg.check_link(url)

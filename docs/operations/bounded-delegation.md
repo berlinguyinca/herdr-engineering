@@ -73,8 +73,8 @@ delegate, via `supersedes`) | `expired` (undecided after 3 days). Every decision
   delegating owner, accepting owner and time, `trust: "accepted-untrusted-content"`, `applied: false`, `executable: false`; never the
   content) and a `produced` edge from the task to the artifact. Event ids and sequences derive from the proposal id, so a retry is a duplicate.
 * Those two id prefixes are reserved: only the HCN service (and an authenticated operator key) may write a node or edge touching them;
-  ordinary ingest keys and the delegate itself are refused (`403 lineage_forbidden`). A key whose configured role is spelled `external` or
-  `collab` is treated as an unprivileged key.
+  ordinary ingest keys and the delegate itself are refused (`403 lineage_forbidden`). As defence in depth (not covered by a test), an API key whose configured role is spelled `external` or
+  `collab` gets principal kind `unknown` rather than those service-only kinds.
 * Applying a patch is a separate human action outside HCN. An applier must treat the content as hostile: `git apply --check` in a throwaway
   worktree, never through symlinks, never with hooks, after re-reading the diff.
 

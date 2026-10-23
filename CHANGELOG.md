@@ -11,8 +11,8 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   accepts or rejects it with the digest of what was reviewed. Accepting records `task:hcn-delegation.*` and `artifact:hcn-proposal.*` nodes and a
   `produced` edge in the lineage graph; nothing is ever applied. Same checks over REST, MCP (4 tools) and A2A (`tasks/get|list|cancel`, `message/send` with a `taskId`).
 - New YAML kill switch `control_plane.collab.delegation_enabled` (default `false`; works for the combined and `--collab-only` servers). No environment variable.
-- Extends the existing task store, event log and external credentials; new log events are additive; no migration. A key whose role is spelled
-  `external` or `collab` is now an unprivileged ingest principal. See `docs/operations/bounded-delegation.md` and the T11 addendum of the HCN threat model.
+- Extends the existing task store, event log and external credentials; new log events are additive; no migration. Defence in depth (untested): an API key whose configured
+  role is spelled `external` or `collab` is given principal kind `unknown`, never those service-only kinds. See `docs/operations/bounded-delegation.md` and the T11 addendum of the HCN threat model.
 - Rollback: `delegation_enabled: false`, or revert the PR.
 
 ### Tabs/panes and membership-scoped lineage (T08, stacked on #165 and #164)

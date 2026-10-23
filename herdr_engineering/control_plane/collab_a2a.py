@@ -125,7 +125,11 @@ def _send(service: CollabService, pr, rid: Any, params: Any):
     msg = params.get("message") if isinstance(params, dict) else None
     if not isinstance(msg, dict):
         return 200, _error(rid, -32602, "message is required")
-    if msg.get("taskId") is not None:
+    # A message with a taskId and a data part is a task answer, but only while delegation is switched on. Otherwise
+    # (the default) this is the old text-only send and a taskId, which many A2A clients set on follow-ups, is ignored.
+    parts_ = msg.get("parts")
+    if (service.delegation_enabled and msg.get("taskId") is not None and isinstance(parts_, list)
+            and any(isinstance(p, dict) and p.get("kind") == "data" for p in parts_)):
         if not isinstance(msg["taskId"], str):
             return 200, _error(rid, -32602, "taskId must be a string")
         return _delegation_send(service, pr, rid, msg)

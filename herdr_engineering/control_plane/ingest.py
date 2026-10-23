@@ -83,7 +83,7 @@ class IngestService:
             ends = (payload.get("from_id"), payload.get("to_id")) if event_type.startswith("edge.") else (payload.get("node_id"),)
             if any(isinstance(e, str) and self.service_node(e) for e in ends):
                 raise PermissionError("not permitted to modify this lineage object")
-        if self.reserved_node is None or actor.get("kind") in ("external", "collab") or (
+        if self.reserved_node is None or actor.get("kind") == "external" or (
                 actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
             return
         written = payload.get("from_id") if event_type.startswith("edge.") else payload.get("node_id")
