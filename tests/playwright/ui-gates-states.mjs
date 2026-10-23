@@ -21,6 +21,30 @@ const nodeSelected = async (page, node = 'attempt:a1') => {
 export const STATES = [
   { id: 'lineage: node selected (comment, steering, consult and link forms)', scope: '#hcn-p-lineage',
     must: ['form[data-wb-form="comment"]', 'form[data-wb-form="propose"]', 'form[data-ctx-form="ask"]', 'form[data-ctx-form="link"]'], min: 45, open: nodeSelected },
+  { id: 'lineage: an edited comment with its revision history', scope: '#hcn-p-lineage', must: ['[data-wb-act="history"]', '.wb-comment'], min: 45,
+    open: async (page) => {
+      await nodeSelected(page);
+      await page.locator('textarea[data-wb-field="comment"]').fill('first wording');
+      await page.locator('form[data-wb-form="comment"] button[type="submit"]').click();
+      await page.locator('[data-wb-act="edit"]').first().waitFor();
+      await page.locator('[data-wb-act="edit"]').first().click();
+      await page.locator('textarea[data-wb-field="edit"]').fill('second wording');
+      await page.locator('form[data-wb-form="edit"] button[type="submit"]').click();
+      await page.locator('[data-wb-act="history"]').first().waitFor();
+      await page.locator('[data-wb-act="history"]').first().click();
+      await page.waitForTimeout(250);
+    } },
+  { id: 'lineage: a retracted comment with its history', scope: '#hcn-p-lineage', must: ['[data-wb-act="history"]'], min: 45,
+    open: async (page) => {
+      await nodeSelected(page);
+      page.on('dialog', (d) => d.accept());
+      await page.locator('textarea[data-wb-field="comment"]').fill('to be taken back');
+      await page.locator('form[data-wb-form="comment"] button[type="submit"]').click();
+      await page.locator('[data-wb-act="retract"]').first().waitFor();
+      await page.locator('[data-wb-act="retract"]').first().click();
+      await page.locator('[data-wb-act="history"]').first().waitFor();
+      await page.waitForTimeout(250);
+    } },
   { id: 'lineage: fork form (a base commit to fork from)', scope: '#hcn-p-lineage', must: ['select[data-wb-field="base_sha"]'], min: 45,
     open: async (page) => {
       await nodeSelected(page);
