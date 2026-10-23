@@ -5,7 +5,7 @@
 //! Arms are interleaved per repetition so host noise hits every arm alike. A credential file
 //! (models.json) is copied into a private 0600 agent dir that is removed on exit and never logged.
 
-use pi_runtime_bench::{clearly_lower, phases, summarize, Marks, PhaseTracker, Phases, Summary};
+use pi_runtime_bench::{bar_svg, clearly_lower, median_ci95, median, Bar, phases, summarize, Marks, PhaseTracker, Phases, Summary};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -326,7 +326,42 @@ fn roundtrip(args: &[String], arms: &BTreeMap<String, Arm>) -> bool {
     ok
 }
 
+/// `plot --jsonl FILE --field NAME --title T --unit U --out FILE.svg`: bars per arm from measured rows.
+fn plot(args: &[String]) {
+    let file = arg(args, "--jsonl").expect("--jsonl");
+    let field = arg(args, "--field").expect("--field");
+    let mut by_arm: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for l in fs::read_to_string(&file).expect("jsonl").lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else { continue };
+        if v.get("measured").and_then(|m| m.as_bool()) == Some(false) || v.get("exit").and_then(|e| e.as_i64()).is_some_and(|e| e != 0) {
+            continue;
+        }
+        if let (Some(arm), Some(x)) = (v.get("arm").and_then(|a| a.as_str()), v.get(&field).and_then(|x| x.as_f64())) {
+            if x > 0.0 {
+                by_arm.entry(arm.to_string()).or_default().push(x);
+            }
+        }
+    }
+    let mut names: Vec<&String> = by_arm.keys().collect();
+    names.sort_by_key(|n| (n.as_str() != "standard-pi", n.to_string()));
+    let bars: Vec<Bar> = names
+        .iter()
+        .map(|n| {
+            let xs = &by_arm[*n];
+            let (lo, hi) = median_ci95(xs, 2000, 0x5eed);
+            Bar { label: (*n).clone(), n: xs.len(), median: median(xs), lo, hi }
+        })
+        .collect();
+    let svg = bar_svg(&arg(args, "--title").unwrap_or(field.clone()), &arg(args, "--unit").unwrap_or_default(), &bars);
+    fs::write(arg(args, "--out").expect("--out"), svg).expect("write svg");
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("plot") {
+        plot(&args);
+        return;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(scenario) = args.first().cloned() else {
         eprintln!("usage: pi-runtime-bench <version|help|noop|tools> [--reps N] [--warmups N] [--concurrency N] [--runtimes FILE] [--models-json FILE --model P/ID] [--out FILE]");

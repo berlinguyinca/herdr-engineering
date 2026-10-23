@@ -149,6 +149,41 @@ pub fn clearly_lower(a: &Summary, b: &Summary) -> bool {
     a.ci95.1 < b.ci95.0
 }
 
+/// One bar: label, median and its 95% interval.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bar {
+    pub label: String,
+    pub n: usize,
+    pub median: f64,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Horizontal bar chart with CI whiskers, as a self-contained SVG (light and dark safe via a backing rect).
+pub fn bar_svg(title: &str, unit: &str, bars: &[Bar]) -> String {
+    let (w, row, left, right, top) = (760.0, 44.0, 150.0, 90.0, 54.0);
+    let h = top + row * bars.len() as f64 + 28.0;
+    let max = bars.iter().map(|b| b.hi.max(b.median)).fold(0.0_f64, f64::max).max(f64::MIN_POSITIVE);
+    let plot_w = w - left - right;
+    let x = |v: f64| left + plot_w * (v / max);
+    let mut o = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w} {h}\" font-family=\"sans-serif\" font-size=\"13\"><rect width=\"{w}\" height=\"{h}\" fill=\"#fff\"/><text x=\"12\" y=\"26\" font-size=\"16\" font-weight=\"600\" fill=\"#111\">{}</text><text x=\"12\" y=\"44\" fill=\"#555\">median, whiskers = bootstrap 95% CI, unit: {}</text>", esc(title), esc(unit));
+    let colors = ["#2563eb", "#d97706", "#059669", "#7c3aed"];
+    for (i, b) in bars.iter().enumerate() {
+        let y = top + row * i as f64;
+        let c = colors[i % colors.len()];
+        o.push_str(&format!("<text x=\"12\" y=\"{}\" fill=\"#111\">{} (n={})</text>", y + 24.0, esc(&b.label), b.n));
+        o.push_str(&format!("<rect x=\"{left}\" y=\"{}\" width=\"{:.1}\" height=\"20\" fill=\"{c}\"/>", y + 8.0, (x(b.median) - left).max(1.0)));
+        o.push_str(&format!("<line x1=\"{:.1}\" y1=\"{}\" x2=\"{:.1}\" y2=\"{}\" stroke=\"#111\" stroke-width=\"2\"/>", x(b.lo), y + 18.0, x(b.hi), y + 18.0));
+        o.push_str(&format!("<text x=\"{:.1}\" y=\"{}\" fill=\"#111\">{:.3}</text>", x(b.hi) + 6.0, y + 23.0, b.median));
+    }
+    o.push_str("</svg>");
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +271,23 @@ mod tests {
         assert!(clearly_lower(&fast, &slow));
         assert!(!clearly_lower(&slow, &fast));
         assert!(!clearly_lower(&fast, &fast));
+    }
+
+    #[test]
+    fn svg_has_one_bar_per_arm_and_escapes_text() {
+        let bars = vec![
+            Bar { label: "a<b".into(), n: 10, median: 100.0, lo: 80.0, hi: 120.0 },
+            Bar { label: "c".into(), n: 10, median: 10.0, lo: 8.0, hi: 12.0 },
+        ];
+        let svg = bar_svg("T & U", "ms", &bars);
+        assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
+        assert_eq!(svg.matches("<rect x=").count(), 2);
+        assert!(svg.contains("a&lt;b (n=10)") && svg.contains("T &amp; U"));
+    }
+
+    #[test]
+    fn svg_scales_to_the_largest_interval_and_survives_all_zero() {
+        let zero = vec![Bar { label: "z".into(), n: 1, median: 0.0, lo: 0.0, hi: 0.0 }];
+        assert!(bar_svg("t", "u", &zero).contains("width=\"1.0\""));
     }
 }
