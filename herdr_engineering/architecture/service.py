@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import re
 import threading
+import time
+import uuid
 from collections import defaultdict
 
 from ..control_plane.project_links import canonical_repository
-from . import identity
+from . import identity, overlays as ov
 from .extract import EDGE_KINDS, NODE_KINDS
 
 ENTITY = "architecture_snapshot"
@@ -107,14 +109,19 @@ class ArchitectureService:
     def __init__(self, repo, enabled=False):
         self.repo = repo
         self.enabled = bool(enabled)
+        self.gate_store_fn = lambda: None          # set by the server when the review gate is running
         self._meta: dict[str, dict] = {}
         self._graphs: dict[str, _Loaded] = {}
-        self._lock = threading.Lock()
+        self._jobs: dict[str, dict] = {}
+        self._lock = threading.RLock()
         for (etype, eid), stream in list(getattr(repo, "_events", {}).items()):
             if etype == ENTITY and stream:
                 ev = stream[0]
                 if ev.get("event_type") == "architecture.snapshot.published":
                     self._meta[eid] = ev["payload"]["snapshot"]
+            elif etype == JOB_ENTITY:
+                for ev in stream:
+                    self._apply(ev)
 
     # ------------------------------------------------------------ publish
     def publish(self, body: dict) -> dict:
@@ -281,6 +288,75 @@ class ArchitectureService:
                 "items": page, "next_cursor": nxt, "total": total, "incomplete": nxt is not None, "warnings": warnings}
 
     # ----------------------------------------------------------- analyses
+    def _apply(self, ev: dict) -> dict:
+        p, kind = ev["payload"], ev["event_type"].rsplit(".", 1)[-1]
+        job = self._jobs.setdefault(ev["entity_id"], {"analysis_id": ev["entity_id"], "created_at": ev["ingest_timestamp"]})
+        job.update(p)
+        job["state"], job["updated_at"] = kind, ev["ingest_timestamp"]
+        if kind == "requested":
+            job["created_at"] = ev["ingest_timestamp"]
+        return job
+
+    def _open(self, job) -> bool:
+        if job["state"] == "requested":
+            return True
+        return job["state"] in ("started", "progress") and job.get("lease_expires_at", 0) > time.time()
+
+    @staticmethod
+    def _request_key(repository_id, host_id, rev) -> str:
+        return identity.hash_obj([repository_id, host_id, rev])[:24]
+
+    def request_analysis(self, body: dict) -> dict:
+        """Ask a host to analyse a revision. Identical open requests collapse; known snapshots are returned."""
+        if not isinstance(body, dict):
+            raise ArchitectureError("body must be an object")
+        repo_id, host_id, rev = body.get("repository_id"), body.get("host_id"), body.get("rev", "HEAD")
+        if canonical_repository(repo_id) != repo_id:
+            raise ArchitectureError("repository_id must be a canonical repository identity")
+        if not (isinstance(host_id, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", host_id)):
+            raise ArchitectureError("host_id is required")
+        if not (isinstance(rev, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", rev)):
+            raise ArchitectureError("rev must be a branch, tag or commit name")
+        prio = body.get("priority", "interactive")
+        if prio not in ("interactive", "background"):
+            raise ArchitectureError("priority must be interactive or background")
+        key = self._request_key(repo_id, host_id, rev)
+        with self._lock:
+            if identity.is_full_sha(rev):
+                known = [m for m in self._meta.values() if m["repository_id"] == repo_id and m["host_id"] == host_id
+                         and m["commit_sha"] == rev]
+                if known:
+                    return {"analysis_id": None, "deduplicated": True, "snapshot_id": known[0]["snapshot_id"]}
+            for job in self._jobs.values():
+                if job.get("key") == key and self._open(job):
+                    return {"analysis_id": job["analysis_id"], "deduplicated": True, "state": job["state"]}
+            aid = "an-" + uuid.uuid4().hex[:16]
+            ev = self.repo.record_event(JOB_ENTITY, aid, "architecture.analysis.requested",
+                                        {"repository_id": repo_id, "host_id": host_id, "rev": rev, "priority": prio,
+                                         "key": key})
+            self._apply(ev)
+            return {"analysis_id": aid, "deduplicated": False, "state": "requested"}
+
+    def claim_analysis(self, body: dict) -> dict:
+        """A host takes the oldest requested job for itself (interactive first) under a lease."""
+        host_id = (body or {}).get("host_id")
+        if not (isinstance(host_id, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", host_id)):
+            raise ArchitectureError("host_id is required")
+        lease = max(30, min(int((body or {}).get("lease_seconds", 600)), 3600))
+        with self._lock:
+            now = time.time()
+            ready = [j for j in self._jobs.values() if j.get("host_id") == host_id and (
+                j["state"] == "requested" or (j["state"] in ("started", "progress") and j.get("lease_expires_at", 0) <= now))]
+            if not ready:
+                return {"job": None}
+            ready.sort(key=lambda j: (j.get("priority") != "interactive", j["created_at"], j["analysis_id"]))
+            job = ready[0]
+            ev = self.repo.record_event(JOB_ENTITY, job["analysis_id"], "architecture.analysis.started",
+                                        {"host_id": host_id, "lease_expires_at": now + lease})
+            self._apply(ev)
+            return {"job": {k: job[k] for k in ("analysis_id", "repository_id", "host_id", "rev", "priority") if k in job},
+                    "lease_expires_at": now + lease}
+
     def record_analysis(self, body: dict) -> dict:
         if not isinstance(body, dict):
             raise ArchitectureError("body must be an object")
@@ -298,19 +374,95 @@ class ArchitectureService:
             raise ArchitectureError("commit_sha must be a full hexadecimal commit")
         if "progress" in payload and not (isinstance(payload["progress"], (int, float)) and 0 <= payload["progress"] <= 1):
             raise ArchitectureError("progress must be between 0 and 1")
-        return self.repo.record_event(JOB_ENTITY, aid, f"architecture.analysis.{event}", payload,
-                                      require_durable=event in {"completed", "failed", "cancelled"})
+        with self._lock:
+            cur = self._jobs.get(aid)
+            if cur and cur["state"] in ("completed", "failed", "cancelled"):
+                raise ArchitectureError("analysis already finished", 409)
+            if event in ("started", "progress") and "lease_expires_at" not in payload:
+                payload["lease_expires_at"] = time.time() + 600     # a heartbeat extends the lease
+            ev = self.repo.record_event(JOB_ENTITY, aid, f"architecture.analysis.{event}", payload,
+                                        require_durable=event in {"completed", "failed", "cancelled"})
+            self._apply(ev)
+        return ev
 
-    def analyses(self, limit=50):
-        out = []
-        for (etype, eid), stream in list(getattr(self.repo, "_events", {}).items()):
-            if etype != JOB_ENTITY or not stream:
-                continue
-            state = {"analysis_id": eid}
-            for ev in stream:
-                state.update(ev["payload"])
-                state["state"] = ev["event_type"].rsplit(".", 1)[-1]
-                state["updated_at"] = ev["ingest_timestamp"]
-            out.append(state)
-        out.sort(key=lambda s: s["updated_at"], reverse=True)
-        return {"analyses": out[:max(1, min(int(limit), MAX_LIMIT))]}
+    def analyses(self, limit=50, analysis_id=None):
+        if analysis_id:
+            job = self._jobs.get(analysis_id)
+            if job is None:
+                raise KeyError(analysis_id)
+            return {"analysis": dict(job)}
+        rows = sorted(self._jobs.values(), key=lambda s: s["updated_at"], reverse=True)
+        return {"analyses": [dict(j) for j in rows[:max(1, min(int(limit), MAX_LIMIT))]]}
+
+    # ----------------------------------------------------------- overlays / correlation
+    def overlays(self, sid):
+        meta = self._meta.get(sid)
+        if meta is None:
+            raise KeyError(sid)
+        return ov.overlays(self.repo, self.gate_store_fn(), meta)
+
+    def _previous(self, meta):
+        """The newest earlier snapshot of the same repository on the same host (the comparison base for 'what changed')."""
+        older = [m for m in self._meta.values() if m["repository_id"] == meta["repository_id"] and m["host_id"] == meta["host_id"]
+                 and m["snapshot_id"] != meta["snapshot_id"] and m["commit_sha"] != meta["commit_sha"]
+                 and m["created_at"] <= meta["created_at"]]
+        return max(older, key=lambda m: (m["created_at"], m["snapshot_id"]), default=None)
+
+    def _changed_nodes(self, meta) -> tuple[dict, dict | None]:
+        prev = self._previous(meta)
+        if prev is None:
+            return {}, None
+        gb, gh = self._load(prev["snapshot_id"]), self._load(meta["snapshot_id"])
+        out = {i: "added" for i in set(gh.nodes) - set(gb.nodes)}
+        out.update({i: "modified" for i in set(gb.nodes) & set(gh.nodes)
+                    if gb.nodes[i]["metadata"].get("content_hash") != gh.nodes[i]["metadata"].get("content_hash")})
+        return out, prev
+
+    def correlations(self, sid, node=None, cursor=None, limit=100):
+        meta = self._meta.get(sid)
+        if meta is None:
+            raise KeyError(sid)
+        o = ov.overlays(self.repo, self.gate_store_fn(), meta)
+        prs = [p["pr_ref"] for p in o["pull_requests"]]
+        by_id = {s["session_id"]: s for s in self.repo.list_sessions()}
+        rows, notes = [], []
+        change = None
+        if node:
+            changed, prev = self._changed_nodes(meta)
+            if node not in self._load(sid).nodes:
+                raise KeyError(node)
+            change = changed.get(node, "unchanged" if prev else "unknown")
+            if prev is None:
+                notes.append("no earlier snapshot of this repository on this host: changes cannot be attributed")
+        for s in o["sessions"]:
+            rec = ov.correlation(meta, by_id.get(s["session_id"]), node=node, pr_refs=prs)
+            if node:
+                rec["change"] = change
+            rows.append(rec)
+        if node and change in ("unchanged", "unknown"):
+            rows = []            # an agent at this commit is not related to a symbol it did not change
+        if rows:
+            notes.append("attribution is commit-level: every agent recorded at this commit shares it; per-agent symbol "
+                         "authorship is not recorded")
+        page, nxt, total = _page(rows, cursor, limit)
+        return {"correlations": page, "next_cursor": nxt, "total": total, "notes": notes, "change": change}
+
+    def session_changes(self, session_id, limit=200):
+        s = next((x for x in self.repo.list_sessions() if x["session_id"] == session_id), None)
+        if s is None:
+            raise KeyError(session_id)
+        repo_id, commit = ov.pl._identity(s), ov.pl._commit({"commit_sha": s.get("commit_sha")})
+        snaps = [m for m in self._meta.values() if m["repository_id"] == repo_id and m["commit_sha"] == commit]
+        if not snaps:
+            return {"session_id": session_id, "snapshot": None, "changes": [],
+                    "notes": ["no snapshot exists for this session's repository and commit"]}
+        meta = sorted(snaps, key=lambda m: (m["created_at"], m["snapshot_id"]))[-1]
+        changed, prev = self._changed_nodes(meta)
+        g = self._load(meta["snapshot_id"])
+        items = [{"node_id": i, "change": c, "qualified_name": g.nodes[i]["qualified_name"], "kind": g.nodes[i]["kind"],
+                  "relative_path": g.nodes[i]["relative_path"], "line_start": g.nodes[i]["line_start"]}
+                 for i, c in sorted(changed.items()) if g.nodes[i]["kind"] in ("class", "function", "module")]
+        return {"session_id": session_id, "snapshot_id": meta["snapshot_id"], "base_snapshot_id": prev and prev["snapshot_id"],
+                "changes": items[:max(1, min(int(limit), MAX_LIMIT))], "total": len(items), "incomplete": len(items) > limit,
+                "notes": ([] if prev else ["no earlier snapshot to compare against"])
+                + ["attribution is commit-level, not per-agent authorship"]}

@@ -6,7 +6,10 @@ from a key file, not the environment.
 from __future__ import annotations
 
 import json
+import os
 import socket
+import threading
+import time
 import sys
 import urllib.error
 import urllib.request
@@ -15,6 +18,9 @@ from pathlib import Path
 
 from ..control_plane.project_links import canonical_repository
 from . import gitsource, runner
+
+
+DEFAULT_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "herdr-engineering", "architecture")
 
 
 def register(sub) -> None:
@@ -30,7 +36,26 @@ def register(sub) -> None:
     a.add_argument("--api-key-file", default=None, help="file holding an operator/agent API key")
     a.add_argument("--output", default=None, help="write the snapshot JSON here instead of publishing")
     a.add_argument("--timeout", type=float, default=300.0, help="wall-clock limit in seconds")
+    a.add_argument("--cache-dir", default=DEFAULT_CACHE, help="facts cache for incremental runs (outside the repo)")
+    a.add_argument("--no-cache", action="store_true", help="full baseline: ignore and do not write the facts cache")
     a.set_defaults(func=cmd_analyze)
+    sv = asub.add_parser("serve", help="claim analysis requests for this host from the control plane and run them")
+    sv.add_argument("--url", required=True)
+    sv.add_argument("--api-key-file", required=True)
+    sv.add_argument("--host-id", default=None)
+    sv.add_argument("--checkout", action="append", default=[], metavar="REPOSITORY_ID=PATH",
+                    help="local checkout for a canonical repository id (repeatable); only these are ever analysed")
+    sv.add_argument("--poll", type=float, default=5.0)
+    sv.add_argument("--once", action="store_true", help="process at most one request, then exit")
+    sv.add_argument("--timeout", type=float, default=300.0)
+    sv.add_argument("--cache-dir", default=DEFAULT_CACHE)
+    sv.set_defaults(func=cmd_serve)
+
+
+def _get(url: str, key: str | None) -> dict:
+    req = urllib.request.Request(url, headers={"X-API-Key": key} if key else {})
+    with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - operator-supplied control plane
+        return json.loads(resp.read())
 
 
 def _post(url: str, body: dict, key: str | None) -> dict:
@@ -66,7 +91,8 @@ def cmd_analyze(args) -> int:
     event("started", commit_sha=commit)
     try:
         result = runner.run_isolated(repo, commit, host_id, repository_id,
-                                     limits=runner.Limits(wall_seconds=args.timeout))
+                                     limits=runner.Limits(wall_seconds=args.timeout),
+                                     config=None if args.no_cache else {"cache_dir": args.cache_dir})
     except runner.AnalysisCancelled:
         event("cancelled", commit_sha=commit)
         raise
@@ -85,3 +111,64 @@ def cmd_analyze(args) -> int:
                       "graph_hash": snap["graph_hash"], "network_isolated": result["sandbox"]["network_isolated"]},
                      indent=2))
     return 0
+
+
+def _run_job(base, key, job, checkouts, host_id, timeout, cache_dir) -> None:
+    """Run one claimed job; always ends it with completed / failed / cancelled."""
+    aid, rid = job["analysis_id"], job["repository_id"]
+    ident = {"analysis_id": aid, "repository_id": rid, "host_id": host_id}
+    path = checkouts.get(rid)
+    if path is None:
+        _post(f"{base}/api/v1/architecture/analyses", {**ident, "event": "failed",
+              "message": "no checkout is registered on this host for that repository"}, key)
+        return
+    cancel, done = threading.Event(), threading.Event()
+
+    def watch():                                   # heartbeat extends the lease; a cancel request stops the child
+        while not done.wait(2.0):
+            try:
+                st = _get(f"{base}/api/v1/architecture/analyses/{aid}", key)["analysis"]["state"]
+                if st == "cancelled":
+                    cancel.set()
+                else:
+                    _post(f"{base}/api/v1/architecture/analyses", {**ident, "event": "progress"}, key)
+            except Exception:  # noqa: BLE001 - best effort; the lease simply lapses
+                pass
+    threading.Thread(target=watch, daemon=True).start()
+    try:
+        commit = gitsource.resolve_commit(path, job["rev"])
+        result = runner.run_isolated(path, commit, host_id, rid, cancel=cancel,
+                                     limits=runner.Limits(wall_seconds=timeout), config={"cache_dir": cache_dir})
+        snap = result["snapshot"]
+        _post(f"{base}/api/v1/architecture/snapshots", {"snapshot": snap, "graph": result["graph"]}, key)
+        done.set()
+        _post(f"{base}/api/v1/architecture/analyses", {**ident, "event": "completed", "commit_sha": commit,
+                                                       "snapshot_id": snap["snapshot_id"]}, key)
+    except runner.AnalysisCancelled:
+        done.set()
+    except (runner.AnalysisError, gitsource.GitSourceError, SystemExit) as exc:
+        done.set()
+        _post(f"{base}/api/v1/architecture/analyses", {**ident, "event": "failed", "message": str(exc)[:400]}, key)
+    finally:
+        done.set()
+
+
+def cmd_serve(args) -> int:
+    base, key = args.url.rstrip("/"), Path(args.api_key_file).read_text().strip()
+    host_id = args.host_id or socket.gethostname()
+    checkouts = {}
+    for item in args.checkout:
+        rid, _, path = item.partition("=")
+        if canonical_repository(rid) != rid or not Path(path).is_dir():
+            raise SystemExit(f"invalid --checkout {item!r}: need a canonical repository id and an existing directory")
+        checkouts[rid] = str(Path(path).resolve())
+    while True:
+        got = _post(f"{base}/api/v1/architecture/analyses/claim", {"host_id": host_id}, key)
+        if got.get("job"):
+            _run_job(base, key, got["job"], checkouts, host_id, args.timeout, args.cache_dir)
+            if args.once:
+                return 0
+            continue
+        if args.once:
+            return 0
+        time.sleep(args.poll)

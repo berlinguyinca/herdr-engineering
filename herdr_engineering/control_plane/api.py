@@ -34,7 +34,7 @@ from .redact import redact_payload
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure)"
-                        r"|architecture/(?:snapshots|analyses))$")
+                        r"|architecture/(?:snapshots|analyses|analyses/claim))$")
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
 # back to "dev" in a local checkout / un-stamped image.
 _COMMIT = os.environ.get("HERDR_ENGINEERING_COMMIT", "dev")
@@ -253,6 +253,7 @@ class ControlPlaneServer:
         from ..architecture.service import ArchitectureService
         self.architecture = ArchitectureService(
             repo, enabled=self._architecture_enabled(fleet_config, architecture_enabled))
+        self.architecture.gate_store_fn = lambda: self.gate_store
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
 
@@ -1121,6 +1122,10 @@ def _make_handler(server, public=False, operator=False):
                                                          q("cursor"), q("limit")))
                 if rest == ["analyses"]:
                     return self._json(svc.analyses(_qint(self.path, "limit", 50)))
+                if len(rest) == 2 and rest[0] == "analyses":
+                    return self._json(svc.analyses(analysis_id=rest[1]))
+                if len(rest) == 3 and rest[0] == "sessions" and rest[2] == "changes":
+                    return self._json(svc.session_changes(rest[1], _qint(self.path, "limit", 200)))
                 if rest == ["diff"]:
                     if not (q("base") and q("head")):
                         raise ValueError("base and head are required")
@@ -1131,6 +1136,10 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(svc.get_snapshot(sid))
                     if tail == ["children"]:
                         return self._json(svc.children(sid, q("parent"), q("cursor"), q("limit")))
+                    if tail == ["overlays"]:
+                        return self._json(svc.overlays(sid))
+                    if tail == ["correlations"]:
+                        return self._json(svc.correlations(sid, q("node"), q("cursor"), q("limit")))
                     if tail == ["nodes"]:
                         return self._json(svc.search(sid, q("q") or "", q("kind"), q("cursor"), q("limit")))
                     if len(tail) == 2 and tail[0] == "nodes":
@@ -1159,6 +1168,13 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(out, 200 if out["duplicate"] else 201)
                 if parts[4:] == ["analyses"]:
                     return self._json(svc.record_analysis(body), 201)
+                if parts[4:] == ["analyses", "claim"]:
+                    return self._json(svc.claim_analysis(body))
+                if parts[4:] == ["analyses", "request"]:
+                    if self._role() not in ("operator",):
+                        return self._json({"error": "operator role required"}, 403)
+                    out = svc.request_analysis(body)
+                    return self._json(out, 200 if out["deduplicated"] else 201)
             except ArchitectureError as exc:
                 return self._json({"error": str(exc)}, exc.status)
             return self._json({"error": "not found"}, 404)

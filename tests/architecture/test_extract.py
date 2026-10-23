@@ -54,7 +54,7 @@ def test_every_edge_endpoint_exists_and_no_calls_edges():
 
 
 def test_unsupported_language_and_syntax_error_make_snapshot_partial():
-    g = graph({**BASE, "web/a.ts": "x", "bad.py": "def (:\n"})
+    g = graph({**BASE, "web/a.go": "package x", "bad.py": "def (:\n"})
     assert g["completeness"] == "partial"
     codes = {d["code"] for d in g["diagnostics"]}
     assert {"unsupported_language", "parse_error"} <= codes
