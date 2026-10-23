@@ -157,6 +157,7 @@ class ControlPlaneRepo:
         # Envelope v2 idempotency / sequence / freshness state (envelope.py).
         self.ledger = SourceLedger(now=self._now, persist=self._persist_source_state)
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
+        self.collab_quarantine_reasons = []
         self.collab_quarantine = []  # foreign 'collab' rows found at startup (never replayed)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
         self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
@@ -1941,20 +1942,21 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != "inspector"]
         # HCN events are private to the collaboration service: they must never sit
         # in the shared streams that /activity and the global SSE feed expose.
+        from .collab_repair import classify
+        stored = []
         for key in [k for k in self._events if k[0] == "collab"]:
-            for row in self._events.pop(key):
-                # T16 H1: the collaboration service writes ONE stream (collab/log) and never an ingest
-                # envelope. Anything else under this entity type was not written by it (rows stored before
-                # ingest became an allow-list): quarantine it, keep it for the operator, never replay it.
-                if key[1] == "log" and row.get("source") is None and not row.get("actor"):
-                    self._collab_replay.append(row)
-                else:
-                    self.collab_quarantine.append(row)
+            stored.extend(self._events.pop(key))
+        # T16 H1: only rows the collaboration service itself could have written are replayed; the rest are kept
+        # in storage, reported at ERROR and left alone (`collab-repair` moves them aside on request).
+        keep, bad = classify(stored)
+        self._collab_replay.extend(keep)
+        self.collab_quarantine.extend(row for row, _ in bad)
+        self.collab_quarantine_reasons = [why for _, why in bad]
         if self.collab_quarantine:
             logging.getLogger(__name__).error(
-                "quarantined %d foreign 'collab' row(s) from the durable log (not written by the "
-                "collaboration service); they are kept in storage and were NOT replayed",
-                len(self.collab_quarantine))
+                "quarantined %d foreign 'collab' row(s) from the durable log (%s); they are kept in storage and "
+                "were NOT replayed; see `collab-repair`", len(self.collab_quarantine),
+                ", ".join(sorted(set(self.collab_quarantine_reasons))))
         self._event_order = [t for t in self._event_order if t[0] != "collab"]
         if durable:
             self.inspector.hydrate(durable)

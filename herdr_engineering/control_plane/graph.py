@@ -744,7 +744,7 @@ class GraphProjection:
         # the room/mission context its scope names. The projection keeps only winners; replay and the ledger
         # need the events. Derived, never persisted: rebuild refills it exactly as it refills the graph.
         self._keep_log = keep_log
-        self._first_ts: dict[str, float] = {}      # event_id -> earliest admission time (since_join stripping)
+        self._first_ts: dict[str, tuple] = {}      # event_id -> (earliest admission time, room) for since_join stripping
         self._log_ctx: dict[tuple, list] = {}        # context -> (event, op) in apply order: PER ROOM, so one busy
         self._log_evicted: dict[tuple, int] = {}     # room never costs another room anything
         # a replayed projection reads through the CURRENT projection: nothing is visible in the past
@@ -979,12 +979,16 @@ class GraphProjection:
                 return
             if self._keep_log:
                 eid = ev.get("event_id")
-                if isinstance(eid, str):          # T16 M2: the EARLIEST time any event of this id was admitted
+                if isinstance(eid, str):          # T16 M2: when an event id was first admitted, and in which room
                     t = _ts(ev)
-                    if t < self._first_ts.get(eid, float("inf")):
-                        self._first_ts[eid] = t
+                    room = ev.get("room_id") if isinstance(ev.get("room_id"), str) else None
+                    known = self._first_ts.get(eid)
+                    if known is None:
+                        self._first_ts[eid] = (t, room)
                         if len(self._first_ts) > FIRST_TS_MAX:        # bounded; an unknown id is stripped (fail closed)
                             self._first_ts.pop(next(iter(self._first_ts)))
+                    else:                                              # an id reused by another event: keep the strictest
+                        self._first_ts[eid] = (min(t, known[0]), room if room == known[1] else None)
                 label = scope_label(ev)
                 if isinstance(label, tuple):
                     lst = self._log_ctx.setdefault(label[:3], [])
@@ -2085,23 +2089,35 @@ class GraphProjection:
                 fix(v)
         return out
 
-    def strip_before(self, out: Any, since: float | None) -> Any:
-        """T16 M2: ``replay_history: since_join`` for EVERY read, not just ``/lineage``. Current values stay, but
-        the id, admission time and removal reason of any event admitted before ``since`` (or unknown, or sharing
-        its id with an earlier event) are dropped from the response, wherever they appear. Mutates and returns
-        ``out``."""
-        if since is None:
+    def strip_before(self, out: Any, joins: dict | None) -> Any:
+        """T16 M2: ``replay_history: since_join`` for EVERY read, not just ``/lineage``. ``joins`` maps each room the
+        reader reads through to the reader's join time. The horizon of an event is the join time of the room that
+        SCOPES the event (never a room the caller merely named); an event with no room uses the LATEST join; an
+        event of a room the reader has no join time for, an unknown event id, or an id shared with an earlier event
+        is treated as pre-join. Pre-join events lose their id, admission time and removal reason, and an edge that
+        was removed before the reader joined is dropped altogether (no endpoints, no writer). Mutates ``out``."""
+        if joins is None:
             return out
         first = self._first_ts
+        latest = max(joins.values()) if joins else None
 
         def pre(eid):
-            ts = first.get(eid) if isinstance(eid, str) else None
-            return ts is None or ts < since
+            got = first.get(eid) if isinstance(eid, str) else None
+            if got is None or latest is None:
+                return True
+            ts, room = got
+            horizon = latest if room is None else joins.get(room)
+            return horizon is None or ts < horizon
+
+        def dead(edge):          # removed before the reader joined: its existence is pre-join history
+            return (isinstance(edge, dict) and "edge_type" in edge and edge.get("removed") is True
+                    and isinstance(edge.get("removal"), dict) and pre(edge["removal"].get("event_id")))
 
         def walk(d, depth=0):
             if depth > 12:
                 return
             if isinstance(d, list):
+                d[:] = [x for x in d if not dead(x)]
                 for x in d:
                     walk(x, depth + 1)
                 return
@@ -2116,7 +2132,10 @@ class GraphProjection:
                                 d[extra] = None
             for v in d.values():
                 walk(v, depth + 1)
+        had_edges = isinstance(out, dict) and bool(out.get("edges"))
         walk(out)
+        if had_edges and isinstance(out, dict) and not out["edges"] and "node" not in out and "nodes" not in out:
+            raise KeyError("edge")           # the only edge asked for was removed before the reader joined
         return out
 
     def room_lineage(self, principal, contexts, *, step: int | None = None, at: str | None = None,
@@ -2134,7 +2153,8 @@ class GraphProjection:
                 return out
             # L2: the id set alone is fooled by a hostile writer reusing a victim's event id; the earliest-admission
             # check below is not
-            return self.strip_before(self._strip_pre_join(out, {ev["event_id"] for ev, _ in entries}), since)
+            joins = {r: since for r in {c[1] if c[0] == "room" else c[2] for c in contexts if c[0] in ("room", "mission")}}
+            return self.strip_before(self._strip_pre_join(out, {ev["event_id"] for ev, _ in entries}), joins)
         return self._coherent(compute, finish)
 
     def room_timeline(self, principal, contexts, *, step: int | None = None, at: str | None = None,

@@ -39,15 +39,28 @@ from .redact import redact_text
 SCHEMA_VERSION = 1
 ENTITY = "collab"
 STREAM_ID = "log"
-# T16 H2: events that REMOVE or NARROW access. They are admitted until the log is truly full; everything
-# else is refused earlier (see CollabService._log_limit), so a full log never blocks a revoke.
+# T16 H2. The log cap is a lifetime limit, so a full log must never stop a revocation. Design (pre-paid revocation):
+#  * every event that CREATES something revocable (REVOCABLE_CREATE) is admitted only if the log still has room for
+#    its revocation, i.e. len(log) + outstanding + 2 <= the ordinary limit (95 %). "outstanding" is the number of
+#    creations not yet revoked, kept per kind. A user can therefore create and revoke as much as they like without
+#    ever spending a slot that was not already paid for: the revocation is an event the creation reserved.
+#  * every other ordinary write needs len(log) + outstanding + 1 <= its tier (chat/comments/audit noise 90 %,
+#    the rest 95 %), so outstanding revocations are always covered.
+#  * SAFETY_EVENTS (revocations an admin performs) may use the log up to 100 %.
+# Events a member or agent can fire at will without pre-paying (credential rotation, cancelling a consultation,
+# request or invite, steering rejection, a grant lapsing, presence changes) are NOT safety events.
 SAFETY_EVENTS = frozenset({
-    "member_removed", "agent_revoked", "external_status_changed", "user_decided", "join_token_revoked",
+    "member_removed", "agent_revoked", "user_decided", "join_token_revoked",
     "xlink_revoked", "workspace_unlinked", "mission_unlinked", "agent_grant_revoked"})
-# Deliberately NOT in the set: events a member or agent can fire at will or that fire on their own (credential
-# rotation, cancelling a consultation/request/invite, a grant lapsing...). The same attacker class could drain the reserve.
 BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_denied", "task_progress",
-                         "steer_proposed", "consult_asked", "proposal_submitted"})
+                         "steer_proposed", "consult_asked", "proposal_submitted", "external_status_changed"})
+# creation event -> kind; revocation event -> the kind it settles
+REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_enrolled": "agent",
+                    "join_token_created": "join", "xlink_created": "xlink", "workspace_linked": "workspace",
+                    "mission_linked": "mission"}
+REVOCABLE_SETTLE = {"member_removed": "member", "agent_grant_revoked": "grant", "agent_grant_expired": "grant",
+                    "agent_revoked": "agent", "join_token_revoked": "join", "xlink_revoked": "xlink",
+                    "workspace_unlinked": "workspace", "mission_unlinked": "mission"}
 ORG_ID = "default"  # single-organization deployment (spec: no federation in v1)
 
 # "task" is the human right to give an agent work; the agent-side rights are "instruct"
@@ -252,6 +265,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, delegation_enabled: bool = False):
         self.auth = authenticator
+        self._revocable: dict[str, int] = defaultdict(int)     # outstanding revocable creations per kind (H2)
         self.degraded: str | None = None     # set when the durable log failed its startup integrity check
         # Kill switch for bounded task delegation and artifact proposals (T11), from the fleet YAML
         # (control_plane.collab.delegation_enabled). Off by default: while off, no delegation can be created,
@@ -355,6 +369,19 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
     def _iso(self, t: float | None = None) -> str:
         return datetime.fromtimestamp(self._now() if t is None else t, UTC).isoformat()
 
+    def hydrate_or_degrade(self, rows) -> bool:
+        """Replay the durable log at startup. ANY failure (a gap, a KeyError from a malformed row...) switches
+        collaboration off with an ERROR instead of stopping the whole process. True = replayed cleanly."""
+        import logging
+        try:
+            self.hydrate(rows() if callable(rows) else rows)      # a callable loads lazily, inside the guard
+            return True
+        except Exception as exc:   # noqa: BLE001
+            self.degraded = f"durable collab log failed its integrity check ({type(exc).__name__}: {exc})"
+            logging.getLogger(__name__).error("collaboration DISABLED at startup: %s; "
+                                              "inspect with `collab-repair`", self.degraded)
+            return False
+
     @property
     def delegation_enabled(self) -> bool:
         """T16 M15: hot like the other switches. A source that fails or returns anything but a real
@@ -385,22 +412,34 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
     def replay_history(self, value: str) -> None:
         self._replay_history = value
 
+    def _outstanding(self) -> int:
+        return sum(self._revocable.values())
+
+    def _track_revocable(self, event_type: str) -> None:
+        kind = REVOCABLE_CREATE.get(event_type)
+        if kind:
+            self._revocable[kind] += 1
+        kind = REVOCABLE_SETTLE.get(event_type)
+        if kind and self._revocable[kind] > 0:
+            self._revocable[kind] -= 1
+
     def _log_limit(self, event_type: str) -> int:
-        """T16 H2: the log cap is tiered so a full log can never block a revocation. Bulk writers (chat,
-        comments, audit noise) stop at 90 %, every other ordinary write at 95 %, and only the safety
-        events in ``SAFETY_EVENTS`` may use the last 5 %."""
+        """The log length below which ``event_type`` is still admitted (see SAFETY_EVENTS for the design)."""
         cap = self.max_log_events
         if event_type in SAFETY_EVENTS:
             return cap
         if event_type in BULK_EVENTS or event_type.startswith("attn_"):
-            return max(1, cap - max(2, cap // 10))
-        return max(1, cap - max(1, cap // 20))
+            base = cap - max(2, cap // 10)
+        else:
+            base = cap - max(1, cap // 20)
+        paid = self._outstanding() + (1 if event_type in REVOCABLE_CREATE else 0)
+        return max(0, base - paid)
 
     def _commit(self, event_type: str, payload: dict) -> dict:
         """Persist first, then apply: a failed write never changes state."""
         with self._lock:
             if self.degraded:
-                raise CollabError(503, "collaboration is disabled: " + self.degraded)
+                raise CollabError(503, "collaboration is disabled; ask the operator")
             if len(self._log) >= self._log_limit(event_type):
                 self.stats["log_full"] += 1
                 if event_type not in SAFETY_EVENTS:
@@ -422,6 +461,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                     raise CollabError(503, "collaboration log unavailable") from exc
             self._seq += 1
             self._log.append(ev)
+            self._track_revocable(event_type)
             self._apply(ev)
             self._touch_rooms(payload, ev["sequence"], event_type)
             self._cv.notify_all()
@@ -483,6 +523,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 expected += 1
                 self._seq = ev["sequence"]
                 self._log.append(ev)
+                self._track_revocable(ev["event_type"])
                 self._apply(ev)
             for k, v in self._usage_reserved.items():
                 self._usage[k] = max(self._usage[k], v)      # restart: the durable ceiling, never lower than used
@@ -784,7 +825,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
     # ------------------------------------------------------ authentication
     def authenticate(self, authorization: str, device: str | None) -> Principal:
         if self.degraded:
-            raise CollabError(503, "collaboration is disabled: " + self.degraded)
+            raise CollabError(503, "collaboration is disabled; ask the operator")
         scheme, _, token = (authorization or "").partition(" ")
         token = token.strip()
         if not token:
@@ -1792,7 +1833,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             self._throttle("hb:" + pr.id, ext.HEARTBEATS_PER_MINUTE, 60.0, "heartbeat")
             prev = self._presence.get(pr.id)
             self._presence[pr.id] = {"status": status, "activity": text, "at": self._now()}
-            if prev is None or prev["status"] != status:
+            if (prev is None or prev["status"] != status) and len(self._log) < self._log_limit("external_status_changed"):
+                # presence stays in memory; a flip is written down only while the log has comfortable room (T16 H2)
                 now = self._now()
                 hits = [t for t in self._hits["extstatus:" + pr.id] if now - t < 600.0]
                 if len(hits) < ext.STATUS_CHANGES_PER_10_MIN:
@@ -2946,28 +2988,26 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         try:
             out = self._graph_read(pr, graph, access, principal, parts, query, room_id)
             if parts[:1] != ["lineage"]:                # the lineage views strip by their own replay
-                out = graph.strip_before(out, self._join_horizon(pr, access, room_id))
+                out = graph.strip_before(out, self._join_times(pr, access))
             return self.xlink_filter(out)
         except KeyError:
             raise CollabError(404, "not found") from None
 
-    def _join_horizon(self, pr: Principal, access: dict, room_id: str | None) -> float | None:
-        """T16 M2: under ``since_join`` the time before which history is hidden from this reader on a read that
-        is not a replay. One room is named: that room's join time. Otherwise the LATEST join among the rooms the
-        reader can read through (the strictest; a node can be visible through several rooms)."""
+    def _join_times(self, pr: Principal, access: dict) -> dict | None:
+        """T16 M2: the reader's join time in EVERY room they read through (``None`` = history is not restricted).
+        The graph decides per event which room scopes it; the caller-named ``room_id`` plays no part. A missing
+        join time means history starts now (fail closed)."""
         if self.replay_history != "since_join":
             return None
-        rooms = [room_id] if room_id in access["rooms"] else sorted(access["rooms"])
-        horizon = None
+        out = {}
         with self._lock:
-            for rid in rooms:
+            for rid in access["rooms"]:
                 joined = ((self._rooms.get(rid) or {}).get("members", {}).get(pr.id) or {}).get("joined_at")
                 try:
-                    t = datetime.fromisoformat(joined).timestamp()
+                    out[rid] = datetime.fromisoformat(joined).timestamp()
                 except (TypeError, ValueError):
-                    t = self._now()            # no recorded join time: fail closed, history starts now
-                horizon = t if horizon is None else max(horizon, t)
-        return horizon
+                    out[rid] = self._now()
+        return out
 
     def _graph_read(self, pr, graph, access, principal, parts, query, room_id):
         from .graph import read_graph

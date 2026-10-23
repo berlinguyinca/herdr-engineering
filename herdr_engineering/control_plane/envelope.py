@@ -36,7 +36,7 @@ ENVELOPE_ONLY_TYPES = frozenset({"host", "session", "mission", "service",
 MAX_SEQUENCE = 2**63 - 1          # PostgreSQL bigint
 MAX_GAPS_PER_SOURCE = 64
 MAX_SOURCES = 1024
-MAX_SOURCES_PER_ACTOR = 64      # T16 M6: one principal can never push another's gap/freshness state out
+MAX_SOURCES_PER_ACTOR = 32      # T16 M6: one principal can never push another's gap/freshness state out
 
 
 class EnvelopeConflict(Exception):

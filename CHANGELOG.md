@@ -9,7 +9,8 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Ingest is an allow-list of entity types; `collab`, `ci_*` and other adapter-owned streams and the server's session receipts can no longer be forged
   by an ingest key (H1, M1, M5). Foreign `collab` rows already in a database are quarantined at startup, and a corrupt collab log disables collaboration
   alone with an ERROR instead of stopping the control plane.
-- A full collab log keeps the last 5 % for safety events (removals, revokes, link revokes); chat stops at 90 %, other writes at 95 % (H2).
+- A full collab log still revokes: creating a revocable thing pre-pays its revocation (cannot be drained by create/revoke cycles or presence flips); chat stops at 90 %, other writes at 95 %, revocations may use 100 % (H2).
+- `collab-repair` (dry run by default) sets aside foreign `collab` rows without deleting; a corrupt log disables collaboration only and shows in `/api/v1/health` (H1).
 - `replay_history: since_join` now also covers node/edge/listing reads and the insights/progress snapshots (M2, L2).
 - All collab feature switches (`steering`, `contextual`, `insights`, `delegation_enabled`, `replay_history`) are hot and fail closed the same way,
   including under `--collab-only` (M3, M15). One consistency test enumerates them.

@@ -243,14 +243,7 @@ class ControlPlaneServer:
         self.public_host = public_host or host
         self._public_httpd = None
         if collab is not None:
-            try:
-                collab.hydrate(repo.take_collab_replay())
-            except ValueError as exc:
-                # T16 H1: a log that fails its integrity check must not brick the whole control plane
-                # (lineage, CI, hosts...). Collaboration alone is switched off (every request 503s, no
-                # write) until the operator repairs the log; the error is logged at ERROR.
-                collab.degraded = f"durable collab log failed its integrity check ({exc})"
-                logging.getLogger(__name__).error("collaboration DISABLED at startup: %s", collab.degraded)
+            collab.hydrate_or_degrade(repo.take_collab_replay())     # T16 H1: a bad log disables collaboration only
             if not collab_only:
                 # membership-scoped lineage reads (lineage-events.md, "Scope semantics"): the
                 # isolated collab-only process never sees fabric data, so it serves none
@@ -317,6 +310,8 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
+        if self.collab is not None and self.collab.degraded:
+            h["collab_degraded"] = True       # no detail here: the reason is in the server log and the repair command
         h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1", "github_v1"]
         if self.collab is not None:
             h["capabilities"].append("collab_v1")
@@ -1197,7 +1192,15 @@ def _make_handler(server, public=False, operator=False):
             if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
                 # T16 M4: emitter names, actor digests and sequences of other principals are operator
                 # business; every other key sees only the sources it emitted itself.
-                own = None if self._role() == "operator" else self._principal().get("id") or ""
+                # ``?scope=all`` is the explicit full listing: operator-role keys only (403 otherwise). Without it an
+                # operator key still sees everything and any other key only its own domains.
+                is_operator = self._role() == "operator"
+                scope = (parse_qs(urlsplit(self.path).query).get("scope") or [""])[0]
+                if scope not in ("", "all", "own"):
+                    return self._json({"error": "scope must be all or own"}, 400)
+                if scope == "all" and not is_operator:
+                    return self._json({"error": "forbidden"}, 403)
+                own = None if (is_operator and scope != "own") else (self._principal().get("id") or "")
                 return self._json({"sources": r.ledger.source_states(own), "server_time": r._stamp()})
             if resource == "ingest":
                 return self._json({"endpoint": "POST /api/v1/ingest",

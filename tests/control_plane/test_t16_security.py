@@ -241,8 +241,8 @@ def test_non_safety_writes_stop_before_safety_writes_and_the_tiers_are_ordered()
     bulk, ordinary, safety = (svc._log_limit(t) for t in ("message", "room_created", "member_removed"))
     assert bulk < ordinary < safety == 1000
     assert "message" in BULK_EVENTS and not (BULK_EVENTS & SAFETY_EVENTS)
-    assert {"member_removed", "agent_revoked", "external_status_changed", "xlink_revoked", "workspace_unlinked",
-            "mission_unlinked", "user_decided", "join_token_revoked"} <= SAFETY_EVENTS
+    assert SAFETY_EVENTS == {"member_removed", "agent_revoked", "user_decided", "join_token_revoked", "xlink_revoked",
+                             "workspace_unlinked", "mission_unlinked", "agent_grant_revoked"}
     svc._log.extend([{}] * (ordinary - len(svc._log)))        # exactly at the ordinary limit
     with pytest.raises(CollabError):
         svc._commit("room_created", {})
@@ -315,7 +315,7 @@ def test_the_reserve_only_holds_events_an_attacker_class_cannot_fire_at_will():
     """Self-triggerable or auto-fired events (an agent rotating its credential, a member cancelling a consultation or
     request, a grant lapsing) would let the same attacker drain the reserve, so they are not safety events."""
     for name in ("credential_rotated", "host_unregistered", "consult_closed", "agent_request_closed", "steer_rejected",
-                 "invite_closed", "agent_grant_expired", "xlink_unpublished"):
+                 "invite_closed", "agent_grant_expired", "xlink_unpublished", "external_status_changed"):
         assert name not in SAFETY_EVENTS, name
 
 
@@ -342,16 +342,19 @@ def test_since_join_strips_pre_join_ids_times_and_removal_reasons_from_node_edge
     assert node["first_event_id"] is None and node["last_event_id"] is None
     assert node["fields"]["label"]["event_id"] is None and node["fields"]["label"]["admitted_at"] is None
     hood = fab.s.graph_read(fab.bob, ["nodes", "task:old", "neighborhood"], {**q, "include_removed": "true"})
-    one = fab.s.graph_read(fab.bob, ["edge"], {"edge_type": "spawn", "from_id": "task:old", "to_id": "task:peer",
-                                               "room_id": fab.room})
+    with pytest.raises(CollabError) as gone:        # removed before bob joined: the edge does not exist for him
+        fab.s.graph_read(fab.bob, ["edge"], {"edge_type": "spawn", "from_id": "task:old", "to_id": "task:peer",
+                                             "room_id": fab.room})
+    assert gone.value.status == 404
+    one = {}
     listing = fab.s.graph_read(fab.bob, ["nodes"], {**q, "node_type": "task"})
     dumped = json.dumps([hood, one, listing, node])
     assert "PRESECRET_REMOVAL_REASON" not in dumped
     assert all(n["first_event_id"] is None for n in listing["nodes"] if n["id"] != "task:new")
     g = fab.repo.graph
-    pre = [eid for eid, ts in g._first_ts.items() if ts < g._first_ts["pi-4"] - 1e-9]
+    pre = [eid for eid, t in g._first_ts.items() if t[0] < g._first_ts["pi-4"][0] - 1e-9]
     assert len(pre) >= 4 and not any(eid in dumped for eid in pre)                   # no pre-join event id anywhere
-    assert hood["edges"] and (hood["edges"][0].get("removal") or {}).get("event_id") is None
+    assert not [e for e in hood["edges"] if e["edge_type"] == "spawn"]     # no endpoints, no writer of a pre-join edge
     # the post-join node keeps its provenance, and the full-history setting changes nothing else
     fresh = next(n for n in listing["nodes"] if n["id"] == "task:new")
     assert fresh["first_event_id"] is not None
@@ -616,21 +619,462 @@ def test_trusted_evidence_survives_spam_through_the_real_progress_wiring(fx):
     assert task_row(prog(f), "task:t1")["stage"] == "complete"
 
 
-def test_legacy_v1_shaped_forged_collab_rows_degrade_collaboration_instead_of_bricking_startup():
-    """Pins the residual: a forged row from before the allow-list that is shaped exactly like a genuine one
-    (entity_id 'log', no envelope) cannot be told apart; it collides with the real sequence, the integrity check
-    trips, and collaboration alone is switched off. The control plane still starts."""
+def _restart_with(extra_rows):
     sink = Sink()
     collab = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), sink=sink)
     W(collab)
-    sink.rows.append({"entity_type": "collab", "entity_id": "log", "sequence": 1, "event_type": "member_added",
-                      "event_id": "forged", "payload": {"room_id": "r", "subject_user_id": "mallory", "role": "owner"}})
+    good = len(sink.rows)
+    rows = copy.deepcopy(sink.rows) + extra_rows
     repo = ControlPlaneRepo()
-    load_into(repo, Src(copy.deepcopy(sink.rows)))
-    broken = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}))
-    server = ControlPlaneServer(repo, collab=broken, allow_open=True)
+    load_into(repo, Src(rows))
+    again = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}))
+    server = ControlPlaneServer(repo, collab=again, allow_open=True)
     server.shutdown()
-    assert broken.degraded
+    return repo, again, good
+
+
+def test_pre_fix_v1_forged_rows_without_a_collab_payload_are_quarantined_and_collaboration_stays_up():
+    forged = {"entity_type": "collab", "entity_id": "log", "sequence": 1, "event_type": "member_added",
+              "event_id": "forged", "payload": {"room_id": "r", "subject_user_id": "mallory", "role": "owner"}}
+    repo, again, good = _restart_with([forged])
+    assert repo.collab_quarantine_reasons == ["not_collab_schema"] and not again.degraded
+    assert len(again._log) == good                                                       # the real log, nothing else
+
+
+def test_pre_fix_forged_rows_that_copy_the_payload_shape_are_quarantined_by_sequence():
+    """A forger who copies org_id/correlation_id/created_at still collides with a real sequence: the first row wins."""
+    mimic = {"entity_type": "collab", "entity_id": "log", "sequence": 1, "event_type": "member_added",
+             "event_id": "forged2", "payload": {"org_id": "default", "correlation_id": "c", "created_at": "t",
+                                                "room_id": "r", "subject_user_id": "mallory", "role": "owner"}}
+    repo, again, good = _restart_with([mimic])
+    assert repo.collab_quarantine_reasons == ["duplicate_sequence"] and not again.degraded
+    assert len(again._log) == good
+
+
+@pytest.mark.parametrize("payload", [{}, {"room_id": 5}, None, "text", [1]])
+def test_malformed_collab_payloads_never_crash_startup(payload):
+    """The audit's a8 probe: whatever shape a stored row has, the control plane starts."""
+    n = 99
+    row = {"entity_type": "collab", "entity_id": "log", "sequence": n, "event_type": "member_added",
+           "event_id": "zz", "payload": payload}
+    repo, again, good = _restart_with([row])
+    assert len(again._log) == good and repo.collab_quarantine
+
+
+def test_a_replay_error_of_any_type_degrades_collaboration_instead_of_crashing():
+    """KeyError from a well-formed-looking row; also the callable form collab-only uses for sink.load."""
+    sink = Sink()
+    CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), sink=sink)
+    bad = {"entity_type": "collab", "entity_id": "log", "sequence": 1, "event_type": "member_added", "event_id": "e",
+           "payload": {"org_id": "default", "correlation_id": "c", "created_at": "t"}}      # no room_id: KeyError
+    for rows in ([bad], lambda: [bad], lambda: (_ for _ in ()).throw(ValueError("torn json"))):
+        c = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}))
+        assert c.hydrate_or_degrade(rows) is False and c.degraded
+        with pytest.raises(CollabError) as exc:
+            c.authenticate("Bearer " + USERS["alice"], None)
+        assert exc.value.status == 503 and "KeyError" not in exc.value.message and "integrity" not in exc.value.message
+
+
+def test_degraded_collaboration_is_visible_on_health_without_internal_detail():
+    sink = Sink()
+    c = CollabService(StaticTokenAuthenticator({"a": "0" * 64}))
+    c.hydrate_or_degrade([{"entity_type": "collab", "entity_id": "log", "sequence": 5, "event_type": "x", "payload": {}}])
+    srv = ControlPlaneServer(ControlPlaneRepo(sink=sink), collab=c, allow_open=True)
+    try:
+        health = srv._health()
+    finally:
+        srv.shutdown()
+    assert health["collab_degraded"] is True and "contiguous" not in json.dumps(health)
+
+
+def test_the_cli_uses_the_guarded_replay_in_both_modes():
+    import inspect
+    src = inspect.getsource(cli._cmd_cp_web)
+    assert "hydrate_or_degrade(sink.load)" in src                      # collab-only
+    assert "collab.hydrate(" not in src
+    from herdr_engineering.control_plane import api
+    assert "hydrate_or_degrade(repo.take_collab_replay())" in inspect.getsource(api.ControlPlaneServer.__init__)
+
+
+# ---- the operator repair command
+def _file_log(tmp_path, extra=()):
+    from herdr_engineering.control_plane.collab import FileEventLog
+    path = tmp_path / "collab.jsonl"
+    log = FileEventLog(str(path))
+    svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), sink=log)
+    W(svc)
+    with open(path, "ab") as fh:
+        for row in extra:
+            fh.write((json.dumps(row) + "\n").encode())
+    return path
+
+
+FOREIGN = [{"entity_type": "collab", "entity_id": "log", "sequence": 1, "event_type": "member_added", "event_id": "f1",
+            "payload": {"room_id": "r"}},
+           {"entity_type": "collab", "entity_id": "elsewhere", "sequence": 2, "event_type": "x", "event_id": "f2",
+            "payload": {}}]
+
+
+def test_collab_repair_is_a_dry_run_by_default_and_changes_nothing(tmp_path):
+    from herdr_engineering.control_plane.collab_repair import repair_file
+    path = _file_log(tmp_path, FOREIGN)
+    before = path.read_bytes()
+    out = repair_file(str(path))
+    assert out["mode"] == "dry-run" and [q["reason"] for q in out["quarantine"]] == ["not_collab_schema", "foreign_stream"]
+    assert path.read_bytes() == before and not (tmp_path / "collab.jsonl.quarantine.jsonl").exists()
+
+
+def test_collab_repair_apply_needs_confirmation_then_moves_rows_and_never_deletes(tmp_path):
+    from herdr_engineering.control_plane.collab_repair import repair_file
+    path = _file_log(tmp_path, FOREIGN)
+    before = path.read_bytes()
+    with pytest.raises(PermissionError):
+        repair_file(str(path), apply=True)
+    assert path.read_bytes() == before
+    out = repair_file(str(path), apply=True, confirmed=True)
+    moved = [json.loads(line) for line in open(out["quarantine_file"])]
+    assert [m["row"]["event_id"] for m in moved] == ["f1", "f2"] and {m["quarantine_reason"] for m in moved}
+    assert open(out["backup"], "rb").read() == before                   # the original is kept whole
+    kept = [json.loads(line) for line in path.read_bytes().split(b"\n") if line.strip()]
+    assert all(r["event_id"] not in ("f1", "f2") for r in kept)
+    c = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}))
+    assert c.hydrate_or_degrade(kept) and not c.degraded                # and the repaired log replays
+    assert os.stat(out["quarantine_file"]).st_mode & 0o077 == 0
+
+
+def test_collab_repair_gap_tail_is_only_set_aside_on_explicit_request(tmp_path):
+    from herdr_engineering.control_plane.collab_repair import classify
+    rows = [{"entity_type": "collab", "entity_id": "log", "sequence": n, "event_type": "x", "event_id": f"e{n}",
+             "payload": {"org_id": "d", "correlation_id": "c", "created_at": "t"}} for n in (1, 2, 4, 5)]
+    keep, bad = classify(rows)
+    assert len(keep) == 4 and not bad                                    # a gap is the service's call (it degrades)
+    keep, bad = classify(rows, cut_tail=True)
+    assert [r["sequence"] for r in keep] == [1, 2] and [why for _, why in bad] == ["after_gap"] * 2
+
+
+def test_collab_repair_postgres_plan_and_apply_use_one_transaction_and_a_quarantine_table():
+    import asyncio
+
+    from herdr_engineering.control_plane.collab_repair import repair_postgres
+
+    class Conn:
+        def __init__(self):
+            self.sql, self.in_tx = [], False
+
+        async def fetch(self, q, *a):
+            self.sql.append(q)
+            ok = {"org_id": "d", "correlation_id": "c", "created_at": "t"}
+            return [{"tid": "(0,1)", "event_id": "g1", "entity_id": "log", "sequence": 1, "event_type": "x",
+                     "payload": json.dumps(ok), "source": None, "source_sequence": None, "actor": None},
+                    {"tid": "(0,2)", "event_id": "f1", "entity_id": "log", "sequence": 1, "event_type": "x",
+                     "payload": "{}", "source": "pi", "source_sequence": 0, "actor": "{}"}]
+
+        async def execute(self, q, *a):
+            assert self.in_tx
+            self.sql.append(q)
+
+        def transaction(self):
+            conn = self
+
+            class Tx:
+                async def __aenter__(self):
+                    conn.in_tx = True
+
+                async def __aexit__(self, *exc):
+                    conn.in_tx = False
+            return Tx()
+    dry = Conn()
+    out = asyncio.run(repair_postgres(dry))
+    assert out["mode"] == "dry-run" and out["quarantine"][0]["reason"] == "ingest_envelope" and len(dry.sql) == 1
+    with pytest.raises(PermissionError):
+        asyncio.run(repair_postgres(Conn(), apply=True))
+    live = Conn()
+    asyncio.run(repair_postgres(live, apply=True, confirmed=True))
+    text = " ".join(live.sql)
+    assert "fabric_events_quarantine" in text and "DELETE FROM fabric_events" in text and "RETURNING *" in text
+    assert "DROP" not in text and "TRUNCATE" not in text
+
+
+# ======================================================================== H2 round 2
+def test_one_enrolled_external_agent_cannot_drain_the_reserve_by_toggling_presence(w, svc):
+    from tests.control_plane.test_collab_external import enroll
+    ag, _, _ = enroll(w)
+    s = w.s
+    s.max_log_events = 600
+    s._log.extend([{}] * (s._log_limit("room_created") - len(s._log)))
+    start = len(s._log)
+    states = ["idle", "working"]
+    for i in range(300):
+        if i % 10 == 9:
+            s.clock.t += 601
+        if i % 10 == 0:
+            s.clock.t += 6
+        try:
+            s.external_heartbeat(ag, {"status": states[i % 2], "activity": "x"})
+        except CollabError as exc:
+            assert exc.status != 503, "a heartbeat must never fail because the log is full"
+            s.clock.t += 61
+    assert len(s._log) == start                         # presence changes above 90 % are kept in memory only
+    s.remove_member(w.alice, w.room, "bob")
+
+
+def test_presence_flips_are_logged_while_the_log_has_room(w, svc):
+    from tests.control_plane.test_collab_external import enroll
+    ag, _, _ = enroll(w)
+    before = len(w.s._log)
+    w.s.external_heartbeat(ag, {"status": "working", "activity": "x"})
+    assert len(w.s._log) == before + 1 and w.s._log[-1]["event_type"] == "external_status_changed"
+
+
+def test_create_then_revoke_cycles_cannot_drain_the_reserve(w, svc):
+    """The audit's a3 probe: a user links missions (ordinary) up to the limit, then unlinks them (safety)."""
+    s = w.s
+    s.max_log_events = 400
+    base = s._outstanding()
+    m = w.bob
+    pid = s.create_project(m, {"name": "bobs"})["project_id"]
+    rooms = [s.create_room(m, pid, {"name": f"r{i}"})["room_id"] for i in range(10)]
+    linked, i = [], 0
+    try:
+        while True:
+            r = rooms[i % 10]
+            s.link_mission(m, r, {"mission_id": f"m{i}", "host": "bender"})
+            linked.append((r, f"m{i}"))
+            i += 1
+            if i % 40 == 0:
+                s.clock.t += 3700
+    except CollabError as exc:
+        assert exc.status == 503
+    assert linked
+    for k, (r, mid) in enumerate(linked):
+        s.unlink_mission(m, r, mid)
+        if k % 40 == 0:
+            s.clock.t += 3700
+    assert len(s._log) <= s.max_log_events - s.max_log_events // 20          # the reserve was not touched
+    assert s._outstanding() == base
+    s.remove_member(w.alice, w.room, "bob")                                   # the owner's revoke still succeeds
+
+
+def test_a_full_set_of_outstanding_creations_still_leaves_room_to_revoke_each_of_them(w, svc):
+    s = w.s
+    s.max_log_events = 300
+    base = s._outstanding()
+    n = 0
+    try:
+        while True:
+            s.link_mission(w.alice, w.room, {"mission_id": f"mm{n}", "host": "bender"})
+            n += 1
+            if n % 40 == 0:
+                s.clock.t += 3700
+    except CollabError:
+        pass
+    assert n > 0 and len(s._log) + s._outstanding() <= s.max_log_events
+    for k in range(n):
+        s.unlink_mission(w.alice, w.room, f"mm{k}")
+        if k % 40 == 0:
+            s.clock.t += 3700
+    assert s._outstanding() == base
+
+
+def test_revocation_accounting_survives_a_restart():
+    sink = Sink()
+    c = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), sink=sink)
+    cast = W(c)
+    mid = c._revocable["member"]
+    c.add_member(cast.alice, cast.room, {"user_id": "mallory", "role": "viewer"})
+    again = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}))
+    again.hydrate(copy.deepcopy(sink.rows))
+    assert again._revocable["member"] == c._revocable["member"] == mid + 1
+
+
+# ======================================================================== M4 round 2
+def test_ingest_sources_scope_all_is_operator_only_and_scope_own_narrows_operators():
+    keys = {"op-key-0123456789abcdef": "operator", "ing-a-0123456789abcdef": "ingest",
+            "view-0123456789abcdefgh": "viewer"}
+    srv = _server(keys)
+    try:
+        _http(srv, "POST", "/api/v1/ingest", "ing-a-0123456789abcdef",
+              body=v2("host", "h1", "host.registered", {"host_name": "h1"}, 0, source="a-emitter"))
+        path = "/api/v1/ingest/sources"
+        status, body = _http(srv, "GET", path + "?scope=all", "op-key-0123456789abcdef")
+        assert status == 200 and [s["source"] for s in body["sources"]] == ["a-emitter"]
+        assert _http(srv, "GET", path + "?scope=all", "view-0123456789abcdefgh")[0] == 403
+        assert _http(srv, "GET", path + "?scope=all", "ing-a-0123456789abcdef")[0] == 403
+        assert _http(srv, "GET", path + "?scope=own", "op-key-0123456789abcdef")[1]["sources"] == []
+        assert _http(srv, "GET", path + "?scope=bogus", "op-key-0123456789abcdef")[0] == 400
+    finally:
+        srv.shutdown()
+
+
+def test_the_ledger_stays_inside_its_global_cap_with_one_domain_per_key():
+    led = envelope_mod.SourceLedger()
+    for i in range(envelope_mod.MAX_SOURCES + 200):
+        led.commit({"event_id": f"e{i}", "source": "s", "source_sequence": 1, "actor": {"id": f"key:{i}"},
+                    "content_hash": "h", "received_at": "2026-01-01T00:00:00+00:00"}, persist=False)
+    assert len(led.source_states()) <= envelope_mod.MAX_SOURCES
+
+
+# ======================================================================== M2 round 2
+def _join_at(fab, room, who, when):
+    fab.s._rooms[room]["members"][who]["joined_at"] = datetime.fromtimestamp(when, UTC).isoformat()
+
+
+def _two_room_world(fab):
+    """bob is in fab.room (joined EARLY) and fab.room2 (joined LATE); task:secret2 and its removed edge belong to room2."""
+    f = fab.feed
+    put(f, "task:secret2", "room", label="r2-old", room_id=fab.room2)
+    put(f, "task:peer2", "room", label="peer2", room_id=fab.room2)
+    f.edge("spawn", "task:secret2", "task:peer2", scope="room", nodes=False, room_id=fab.room2)
+    f.send("edge.remove", {"edge_type": "spawn", "from_id": "task:secret2", "to_id": "task:peer2",
+                           "reason": "R2PRESECRET"}, "room", room_id=fab.room2)
+    put(f, "task:post2", "room", label="r2-new", room_id=fab.room2)
+    fab.s.add_member(fab.alice, fab.room2, {"user_id": "bob", "role": "contributor"})
+    ts = sorted(t for t, _ in fab.repo.graph._first_ts.values())
+    fab.s.replay_history = "since_join"
+    _join_at(fab, fab.room, "bob", ts[0] - 1)
+    _join_at(fab, fab.room2, "bob", ts[-1] - 1e-6)
+    return ts
+
+
+@pytest.mark.parametrize("named", ["room2", "room", None])
+def test_the_caller_named_room_cannot_move_the_since_join_horizon(fab, named):
+    """The audit's room probe: bob joined room2 late but names the room he joined early."""
+    _two_room_world(fab)
+    q = {} if named is None else {"room_id": fab.room2 if named == "room2" else fab.room}
+    node = fab.s.graph_read(fab.bob, ["nodes", "task:secret2"], q)["node"]
+    hood = fab.s.graph_read(fab.bob, ["nodes", "task:secret2", "neighborhood"], {**q, "include_removed": "true"})
+    assert node["first_event_id"] is None and node["fields"]["label"]["admitted_at"] is None
+    assert "R2PRESECRET" not in json.dumps([node, hood])
+    assert not [e for e in hood["edges"] if e["edge_type"] == "spawn"]
+
+
+def test_an_event_without_a_room_uses_the_latest_join_of_the_readers_rooms(fab):
+    g = fab.repo.graph
+    g._first_ts["org-event"] = (100.0, None)
+    g._first_ts["room-event"] = (100.0, fab.room)
+    out = lambda joins: g.strip_before([{"event_id": "org-event"}, {"event_id": "room-event"}], joins)  # noqa: E731
+    assert out({fab.room: 50.0, fab.room2: 90.0}) == [{"event_id": "org-event"}, {"event_id": "room-event"}]
+    got = out({fab.room: 50.0, fab.room2: 150.0})                       # latest join (150) is after the org event
+    assert got[0]["event_id"] is None and got[1]["event_id"] == "room-event"
+    assert out({fab.room: 150.0, fab.room2: 40.0})[1]["event_id"] is None      # its own room's join decides
+
+
+def test_a_missing_join_time_hides_history_before_now_and_an_unknown_room_is_pre_join(fab):
+    f = fab.feed
+    put(f, "task:old", "room", label="old", room_id=fab.room)
+    fab.s.replay_history = "since_join"
+    fab.s._rooms[fab.room]["members"]["bob"].pop("joined_at")
+    node = fab.s.graph_read(fab.bob, ["nodes", "task:old"], {"room_id": fab.room})["node"]
+    assert node["first_event_id"] is None and node["fields"]["label"]["admitted_at"] is None
+    g = fab.repo.graph
+    g._first_ts["x"] = (500.0, "room-the-reader-never-joined")
+    assert g.strip_before({"event_id": "x"}, {fab.room: 1.0}) == {"event_id": None}
+
+
+def test_strip_before_treats_an_unknown_event_id_as_pre_join_and_none_as_unrestricted(fab):
+    g = fab.repo.graph
+    assert g.strip_before({"event_id": "never-seen", "admitted_at": "t"}, {fab.room: 0.0}) == {
+        "event_id": None, "admitted_at": None}
+    keep = {"event_id": "never-seen"}
+    assert g.strip_before(keep, None) == {"event_id": "never-seen"}
+    assert g.strip_before({"event_id": "never-seen"}, {}) == {"event_id": None}      # no rooms at all: fail closed
+
+
+def test_a_hostile_writer_reusing_a_victims_event_id_cannot_keep_it_visible(fab):
+    """L2: the id is shared by an old (victim) event and a new (hostile) one; the earlier admission decides."""
+    f = fab.feed
+    put(f, "task:old", "room", label="old", room_id=fab.room)               # event id pi-0
+    fab.s.replay_history = "full"
+    ts_old = fab.repo.graph._first_ts["pi-0"][0]
+    hostile = {"kind": "ingest", "id": "key:hostile", "authenticated_by": "api_key"}
+    f.send("node.upsert", {"node_type": "task", "node_id": "task:new", "label": "n"}, "room", room_id=fab.room,
+           principal=hostile, seq=0)                                          # event_id "pi-0" again, other actor
+    ts_new = fab.repo.graph._first_ts["pi-0"][0]
+    assert ts_new == ts_old                                                   # the earliest admission is kept
+    out = fab.repo.graph.strip_before({"event_id": "pi-0"}, {fab.room: ts_old + 1e-3})
+    assert out["event_id"] is None
+
+
+def test_get_edge_of_an_edge_removed_before_the_join_is_not_found(fab):
+    f = fab.feed
+    put(f, "task:a", "room", label="a", room_id=fab.room)
+    put(f, "task:b", "room", label="b", room_id=fab.room)
+    f.edge("spawn", "task:a", "task:b", scope="room", nodes=False, room_id=fab.room)
+    f.send("edge.remove", {"edge_type": "spawn", "from_id": "task:a", "to_id": "task:b", "reason": "gone"}, "room", room_id=fab.room)
+    put(f, "task:c", "room", label="c", room_id=fab.room)
+    fab.s.replay_history = "since_join"
+    _join_cut(fab, "bob", 4)
+    with pytest.raises(CollabError) as exc:
+        fab.s.graph_read(fab.bob, ["edge"], {"edge_type": "spawn", "from_id": "task:a", "to_id": "task:b",
+                                             "room_id": fab.room})
+    assert exc.value.status == 404
+    fab.s.replay_history = "full"
+    assert fab.s.graph_read(fab.bob, ["edge"], {"edge_type": "spawn", "from_id": "task:a", "to_id": "task:b",
+                                                "room_id": fab.room})["edges"]
+
+
+# ======================================================================== M15 round 2
+def test_an_explicit_replay_history_flag_wins_over_the_file(tmp_path):
+    path = make_file(tmp_path, collab=dict(COLLAB, replay_history="full"))
+    svc = CollabService(StaticTokenAuthenticator({"a": "0" * 64}))
+    svc.replay_history = "since_join"                                       # what the flag set at startup
+    cli._wire_collab_switches(svc, FleetConfigStore(path), pinned=frozenset({"replay_history"}))
+    assert svc.replay_history == "since_join" and svc.replay_history_source is None
+    other = CollabService(StaticTokenAuthenticator({"a": "0" * 64}))
+    cli._wire_collab_switches(other, FleetConfigStore(path))
+    assert other.replay_history == "full"
+
+
+def test_an_invalid_switch_block_at_startup_is_logged_loudly_and_the_switch_is_off(tmp_path, caplog):
+    path = make_file(tmp_path, collab=dict(COLLAB, steering={"kill_switch": "yes"}, delegation_enabled="yes"))
+    svc = CollabService(StaticTokenAuthenticator({"a": "0" * 64}))
+    with caplog.at_level(logging.ERROR):
+        cli._wire_collab_switches(svc, FleetConfigStore(path))
+    text = " ".join(r.message for r in caplog.records)
+    assert "control_plane.collab.steering" in text and "control_plane.collab.delegation_enabled" in text
+    assert _switch_values(svc)["steering"] is False and svc.delegation_enabled is False
+
+
+def test_collab_only_keeps_the_store_for_hot_switches_and_the_restart_list_is_documented():
+    import inspect
+    src = inspect.getsource(cli._cmd_cp_web)
+    assert "switch_store, fleet_store = fleet_store, None" in src and "_wire_collab_switches(collab, switch_store" in src
+    assert {"review_quorum", "lineage_key_scopes", "api_keys"} <= set(cli.RESTART_REQUIRED_KEYS)
+    assert set(cli.RESTART_REQUIRED_KEYS).isdisjoint({"collab"})
+
+
+# ======================================================================== M7 round 2: the real readers
+def test_the_insights_reader_names_the_evidence_writers_to_the_graph(fx):
+    f = fx
+    seen = []
+    graph = f.repo.graph
+    real = graph.room_graph
+
+    def spy(reader, *a, **k):
+        seen.append(reader.get("keep_writers"))
+        return real(reader, *a, **k)
+    graph.room_graph = spy
+    prog(f)
+    assert seen and "key:op" in seen[0] and f"collab:room:{f.room}" in seen[0]
+
+
+def test_the_fork_evidence_reader_names_the_evidence_writers_to_the_graph(monkeypatch):
+    from herdr_engineering.control_plane import forks
+    readers = []
+    monkeypatch.setattr(forks, "_get", lambda graph, reader, nid, kind: readers.append(reader) or None)
+    forks._evidence(object(), {"id": "user:bob"}, "approach:x", "a" * 40, None, {"evidence_writers": ["key:w1"]})
+    assert readers and all(r["keep_writers"] == frozenset({"key:w1"}) for r in readers)
+
+
+# ======================================================================== L1 round 2
+def test_an_open_listener_may_not_write_inside_a_service_namespace():
+    svc = IngestService(ControlPlaneRepo())
+    svc.service_node = lambda node_id: node_id.startswith("task:hcn-")
+    open_listener = {"kind": "operator", "id": "open-listener", "authenticated_by": "open_listener"}
+    body = v2("lineage", "task:hcn-1", "node.upsert", {"node_type": "task", "node_id": "task:hcn-1"}, 0)
+    body["visibility_scope"] = "org"
+    with pytest.raises(PermissionError):
+        svc.ingest(body, open_listener)
 
 
 # ======================================================================== L1

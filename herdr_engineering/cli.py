@@ -477,6 +477,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_migrate)
+    p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
+                         "never deletes: rows move to a quarantine file/table)")
+    p2.add_argument("--log-file", default=None, help="a collab-only JSON-lines log; without it the Postgres "
+                    "fabric_events table named by --fleet-config is used")
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT)
+    p2.add_argument("--apply", action="store_true", help="really move the rows (needs --confirm-quarantine)")
+    p2.add_argument("--confirm-quarantine", action="store_true", help="explicit confirmation for --apply")
+    p2.add_argument("--include-gap-tail", action="store_true",
+                    help="also set aside every row after the first missing sequence (may drop genuine events)")
+    p2.set_defaults(func=_cmd_cp_collab_repair)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -2283,6 +2293,29 @@ def _cmd_cp_migrate(args) -> int:
     return 0
 
 
+def _cmd_cp_collab_repair(args) -> int:
+    import asyncio
+
+    from .control_plane import collab_repair
+    try:
+        if args.log_file:
+            report = collab_repair.repair_file(args.log_file, apply=args.apply, confirmed=args.confirm_quarantine,
+                                               cut_tail=args.include_gap_tail)
+        else:
+            async def _run():
+                conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
+                try:
+                    return await collab_repair.repair_postgres(conn, apply=args.apply, confirmed=args.confirm_quarantine,
+                                                               cut_tail=args.include_gap_tail)
+                finally:
+                    await conn.close()
+            report = asyncio.run(_run())
+    except PermissionError as exc:
+        raise SystemExit(str(exc)) from None
+    _print_json({"ok": True, **report})
+    return 0
+
+
 def _parse_service_port(endpoint: str | None, default: int) -> int:
     """Best-effort port extraction from a URL/DSN (``http://rustfs:9000``)."""
     if not endpoint:
@@ -2338,6 +2371,7 @@ def _cmd_cp_web(args) -> int:
 
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     switch_store = fleet_store
+    replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
     lineage_key_scopes = {}
     if args.collab_only:
@@ -2443,11 +2477,7 @@ def _cmd_cp_web(args) -> int:
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
                                delegation_enabled=_delegation_switch(args, cp))
         if args.collab_only:
-            try:
-                collab.hydrate(sink.load())
-            except ValueError as exc:      # T16 H1: a corrupt log disables collaboration with an ERROR, as in the combined server
-                collab.degraded = f"durable collab log failed its integrity check ({exc})"
-                logging.getLogger(__name__).error("collaboration DISABLED at startup: %s", collab.degraded)
+            collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
     elif args.collab_users_file:
         from pathlib import Path
 
@@ -2473,7 +2503,7 @@ def _cmd_cp_web(args) -> int:
         collab.steering = normalize_steering(getattr(args, "collab_steering", None))
         collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
-        _wire_collab_switches(collab, switch_store)
+        _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
@@ -2613,8 +2643,13 @@ HOT_COLLAB_SWITCHES = {
 STARTUP_ONLY_COLLAB_KEYS = frozenset(COLLAB_CONFIG_KEYS) - frozenset(HOT_COLLAB_SWITCHES)
 
 
-def _wire_collab_switches(collab, store) -> None:
-    """Attach the hot, fail-closed sources of every collab switch (no-op without a fleet file)."""
+# control_plane keys read ONCE at startup: editing them needs a restart (unlike HOT_COLLAB_SWITCHES)
+RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn")
+
+
+def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
+    """Attach the hot, fail-closed sources of every collab switch (no-op without a fleet file). ``pinned`` names
+    switches given on the command line: the flag wins and the file is not consulted for them."""
     if store is None:
         return
 
@@ -2624,6 +2659,13 @@ def _wire_collab_switches(collab, store) -> None:
             collab_section = section.get("collab")
             return collab_section.get(key) if isinstance(collab_section, dict) else None
         return source
+    from .control_plane.collab_attention import normalize_insights
+    from .control_plane.collab_context import normalize_contextual
+    from .control_plane.collab_workbench import normalize_steering
+    normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights}
+
+    def check(key, value):
+        return normalizers[key](value) if key in normalizers else value
     for key, (attr, kind) in HOT_COLLAB_SWITCHES.items():
         base = make(key)
         if kind == "bool":
@@ -2644,7 +2686,14 @@ def _wire_collab_switches(collab, store) -> None:
                 return value
         else:
             source = base
+        if key in pinned:
+            continue
         setattr(collab, attr, source)
+        try:                       # an invalid block is not a startup error (the switch is simply OFF) but it is loud
+            check(key, source())
+        except Exception as exc:   # noqa: BLE001
+            logging.getLogger(__name__).error(
+                "control_plane.collab.%s is unusable (%s): the feature is OFF until the file is fixed", key, exc)
 
 
 def _delegation_switch(args, cp) -> bool:

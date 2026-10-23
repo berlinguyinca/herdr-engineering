@@ -871,22 +871,39 @@ Fixes for the T16 security audit. Each has a regression test in `tests/control_p
   (`collab`, `ci_observation`, `ci_report`, `ci_telemetry`, `plannotator_review`, `agent_identity`, `token_usage`, ...) belongs to a dedicated
   adapter and answers 400. The session receipts `SessionCommandQueued` / `SessionCommandSettled` are server-owned event names and also answer 400.
   Adding a type to `INGEST_ENTITY_TYPES` is a security decision.
-* **Collab log startup (H1).** Only rows of the single `collab/log` stream that carry no ingest envelope are replayed. Anything else under the
-  `collab` entity type (rows written before the allow-list) is *quarantined*: kept in storage, logged at ERROR, never applied. A log that still
-  fails the contiguity check does not stop the control plane: collaboration alone is switched off (`CollabService.degraded`; every request 503s
-  and nothing is written) and the error is logged at ERROR. The operator repairs the log and restarts.
-* **A full log still revokes (H2).** `max_log_events` is tiered: chat, comments and audit noise stop at 90 %, every other ordinary write at 95 %, and
-  only the safety events (member/agent/external/link/join-token/grant removal, user decision, steering rejection, credential rotation) may use the
-  last 5 %. Refused ordinary writes count in `stats.log_headroom_refused`. There is still no compaction: a lifetime cap is a deliberate
-  limit; the plan is snapshot-and-truncate of the collab stream (a follow-up, needs a migration), until then raise `max_log_events` before it fills.
+* **Collab log startup (H1).** Only rows the collaboration service itself could have written are replayed: stream `collab/log`, no ingest
+  envelope, a payload with `org_id`, `correlation_id` and `created_at`, and the first row at each sequence. Everything else (rows stored before the
+  allow-list, including v1-body forgeries that carry no envelope) is *quarantined*: kept in storage, logged at ERROR with its reason
+  (`foreign_stream`, `ingest_envelope`, `not_collab_schema`, `duplicate_sequence`), never replayed. A log that still fails the contiguity check, or
+  whose replay raises anything, does not stop the control plane (combined server and `--collab-only` alike): collaboration alone is switched off
+  (`CollabService.degraded`; authentication and every write answer a generic 503, `GET /api/v1/health` shows `collab_degraded: true`, the reason is
+  in the server log). A gap is NOT repaired automatically because dropping the tail could drop a revocation.
+  **Operator repair:** `herdr-engineering cp collab-repair [--log-file F | --fleet-config C]` prints what it would set aside (dry run by default).
+  `--apply --confirm-quarantine` moves the rows to `F.quarantine.jsonl` / table `fabric_events_quarantine` (every column kept, original log
+  backed up as `F.bak-<time>`), never deletes; `--include-gap-tail` also sets aside everything after the first missing sequence. A forger who copied
+  the payload shape AND used a sequence beyond the real end cannot be told apart; the allow-list closes new cases.
+* **A full log still revokes (H2).** `max_log_events` is protected by *pre-paid revocation*. Creating something revocable (member, agent, agent
+  grant, join token, cross link, workspace link, mission link) is admitted only while `len(log) + outstanding + 2 <= 95 %`, where `outstanding`
+  is the number of creations not yet revoked; every other ordinary write needs `len(log) + outstanding + 1 <= 90 %` (chat, comments, audit noise,
+  presence) or `95 %` (the rest). So every revocation is an event its creation already reserved, and create-then-revoke cycles cannot consume
+  the reserve. `SAFETY_EVENTS` (member/agent/grant/join-token/cross-link/workspace/mission revocation, user decision) may use the log up to 100 %.
+  Self-triggerable or self-firing events are *not* safety events: credential rotation, cancelling a consultation/request/invite, steering
+  rejection, grant lapse, presence. Presence (`external_status_changed`) is logged only while the log is below the 90 % tier and otherwise stays in
+  memory. Costs: outstanding items shorten the room left for chat. Refused ordinary writes count in `stats.log_headroom_refused`. There is still no
+  compaction (a lifetime cap); raise `max_log_events` before it fills.
 * **`since_join` applies to every read (M2, L2).** Node, edge, neighbourhood and listing reads and the insights snapshot hide the event id,
-  admission time and removal reason of any event admitted before the reader joined (or whose id is shared with an earlier event). A read that
-  names no room uses the latest join among the rooms the reader can read through.
+  admission time and removal reason of any event admitted before the reader joined. The horizon of an event is the reader's join time in the room
+  that SCOPES that event (never the room the caller names in `room_id`); an event with no room uses the latest join among the reader's rooms; no
+  join time, an unknown event id, an id shared with an earlier event, or a room the reader has no join time for is pre-join (fail closed). An
+  edge removed before the reader joined is dropped altogether (`include_removed` shows no endpoints or writer; the edge read answers 404).
 * **Switches are uniform (M3, M15).** `steering`, `contextual`, `insights`, `delegation_enabled` and `replay_history` are all read per request through
   `FleetConfigStore.secure_section`, also under `web --collab-only`. A missing, unparseable, group/other-accessible or invalid file means the feature
-  is OFF (`replay_history`: the stricter `since_join`). `config_failure_mode: last_good` is the one opt-in to the last good value.
-* **`/api/v1/ingest/sources` (M4)** lists every emitter only to operator keys; other keys see only their own `(actor, source)` domains.
-* **Gap/freshness state is per principal (M6).** At most 64 sequence domains per key (the key evicts its own stalest); when the global 1024 is
+  is OFF (`replay_history`: the stricter `since_join`). `config_failure_mode: last_good` is the one opt-in to the last good value. An explicit
+  `--collab-replay-history` flag wins over the file. An invalid block at startup is logged at ERROR (the switch is OFF) but is not a startup error.
+  Keys read ONCE at startup (restart required): `review_quorum`, `lineage_key_scopes`, `api_keys`, `ci_actions`, `pg_dsn`.
+* **`/api/v1/ingest/sources` (M4)** lists every emitter only to operator-role keys; other keys see only their own `(actor, source)` domains.
+  `?scope=all` is the explicit full listing (operator-role keys only, 403 otherwise); `?scope=own` narrows an operator to itself.
+* **Gap/freshness state is per principal (M6).** At most 32 sequence domains per key (the key evicts its own stalest); when the global 1024 is
   reached the principal holding the most domains pays.
 * **Trusted evidence survives the contribution cap (M7).** Insight and fork reads name the configured `evidence_writers` (and the room's own service
   principal); their latest visible values are selected before `MAX_CONTRIBUTIONS` is applied, so spam writers cannot push them out.
@@ -895,7 +912,7 @@ Fixes for the T16 security audit. Each has a regression test in `tests/control_p
 * **Rate limiter identity (M12).** Every route uses the same client identity (`X-Forwarded-For` honoured only from a loopback/proxy peer).
 * **L1:** an open listener is not an operator inside a reserved (external agent) namespace.
 
-Not fixed here: a per-API-key ingest limiter (M12's second half); compaction/snapshotting of the collab log and a per-room budget (H2 ships the
-reserved headroom only); an invalid switch block at startup is still a silent OFF in the combined server (no startup error); a `since_join` read that
-names no room uses the latest join (over-strict); L3 (accepted), L4, L6-L9, L13 (a longer principal id would break configured key ids), L14.
+Not fixed here: a per-API-key ingest limiter (M12's second half); compaction/snapshotting of the collab log and a per-room budget (H2 ships
+pre-paid revocation only); a `since_join` read that
+has an org-scope event with no room uses the latest join (over-strict); L3 (accepted), L4, L6-L9, L13 (a longer principal id would break configured key ids), L14.
 
