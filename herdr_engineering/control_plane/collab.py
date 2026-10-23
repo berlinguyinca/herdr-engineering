@@ -125,6 +125,8 @@ _HANDLE_BAD = re.compile(r"[^a-z0-9\-]")
 HELPER_ROLES = ("reviewer", "debugger", "worker", "vision", "successor")
 HELPER_TTL = 7200.0              # a helper (and its credential) lives at most this long
 HELPERS_GLOBAL_LIVE = 24         # live helpers across every room and person
+HELPERS_PER_OWNER_LIVE = 6       # live helpers of one person's agents, across rooms (so one person cannot hold them all)
+HELPER_CLAIM_WINDOW = 600.0      # a request no runner claimed in this long expires and frees its slot
 MAX_SUCCESSOR_CHAIN = 5          # successors of successors, in a row
 MAX_HELPER_TASK = 8000
 MAX_HELPER_RESULT = 32000
@@ -1955,6 +1957,8 @@ class CollabService:
             live = [r for r in self._helpers.values() if self._helper_live(r, now)]
             if sum(1 for r in live if r["requester_agent_id"] == pr.id) >= limits["live_per_agent"]:
                 self._helper_refuse(pr, room, 429, "live helper limit reached for this agent", "limit_live")
+            if sum(1 for r in live if r["owner"] == pr.owner) >= HELPERS_PER_OWNER_LIVE:
+                self._helper_refuse(pr, room, 429, "live helper limit reached for this person", "limit_owner")
             if len(live) >= HELPERS_GLOBAL_LIVE:
                 self._helper_refuse(pr, room, 429, "global helper limit reached; try again later", "limit_global")
             # every request counts, cancelled or not: asking and cancelling cannot get around it
@@ -2067,6 +2071,13 @@ class CollabService:
                     "resource_id": r["helper_id"]})
                 if r["helper_agent_id"]:
                     self._end_agent(actor, r["helper_agent_id"], "expired", set())
+            for r in [r for r in self._helpers.values()
+                      if r["status"] == "requested" and now - r["created_epoch"] >= HELPER_CLAIM_WINDOW]:
+                self._commit("helper_expired", {
+                    **actor, "room_id": r["room_id"], "project_id": r["project_id"], "helper_id": r["helper_id"],
+                    "role": r["role"], "model": r["model"], "status": "expired", "reason": "not claimed in time",
+                    "finished_epoch": now, "action": "helper.expire", "outcome": "allowed",
+                    "project_ids": [r["project_id"]], "resource_id": r["helper_id"]})
             for r in [r for r in self._helpers.values() if r["status"] in _HELPER_LIVE]:
                 if r["status"] not in _HELPER_LIVE:
                     continue

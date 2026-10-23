@@ -114,6 +114,7 @@ HELPER_LOGIN = {"claude-code": ("claude", "CLAUDE_CONFIG_DIR", ".claude", (".cre
                 "pi": ("pi", "PI_CODING_AGENT_DIR", ".pi/agent", ("auth.json", "models.json"))}
 HELPER_RESULT_CAP = 20_000              # bytes of stdout returned; the rest is cut with a marker
 HELPER_CLAIM_STALE = 900.0              # a claim a previous process never started is failed after this long
+CLAIM_BACKOFF = 60.0                    # a claim the service refused (429 and other errors) is not retried sooner
 HELPERS_PER_HOST = 6                    # live helpers this host runs at once
 HELPER_MARGIN = 30.0                    # stop before the server's expiry, so the result is still accepted
 MAX_EGRESS_ASKS = 20                    # host-access requests one helper may cause
@@ -780,10 +781,13 @@ class Runner:
             return
         have = set(self.families.get(self.host_id, []))
         busy = sum(1 for p in self.helpers_dir.iterdir() if p.is_dir()) if self.helpers_dir.is_dir() else 0
+        backoff = self.load_backoff(live)
         for h in rows:
             hid = h["helper_id"]
             if h.get("status") != "requested" or (self.helpers_dir / hid).exists():
                 continue
+            if float((backoff.get(hid) or {}).get("at") or 0) + CLAIM_BACKOFF > time.time():
+                continue                          # refused recently: the service said why, and it was logged once
             if h.get("family") not in have:
                 self.say(f"helper {hid}: {h.get('family')} is not installed on {self.host_id}")
                 continue
@@ -791,7 +795,21 @@ class Runner:
                 self.say(f"helpers: {HELPERS_PER_HOST} already run on {self.host_id}")
                 break
             busy += 1
-            self.claim_and_start(h)
+            self.claim_and_start(h, backoff)
+        self.save_backoff(backoff)
+
+    def load_backoff(self, live: dict) -> dict:
+        """Refused claims by helper id: {at, said}. Every cycle is a new process, so this is a state file; ids
+        the service no longer lists (claimed elsewhere, expired) are dropped."""
+        try:
+            d = json.loads((self.state / "claim-backoff.json").read_text())
+        except (OSError, ValueError):
+            d = {}
+        return {k: v for k, v in d.items() if k in live and isinstance(v, dict)} if isinstance(d, dict) else {}
+
+    def save_backoff(self, backoff: dict) -> None:
+        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        write_private(self.state / "claim-backoff.json", json.dumps(backoff))
 
     def load_state(self, d: Path) -> dict:
         try:
@@ -805,7 +823,7 @@ class Runner:
     def save_state(self, d: Path, st: dict) -> None:
         write_private(d / "state.json", json.dumps(st))
 
-    def claim_and_start(self, row: dict) -> None:
+    def claim_and_start(self, row: dict, backoff: dict | None = None) -> None:
         hid = row["helper_id"]
         self.helpers_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.helpers_dir.chmod(0o700)
@@ -816,7 +834,12 @@ class Runner:
         status, c = self.api("POST", f"fleet/helpers/{hid}/claim", {})
         if status != 200:
             remove_tree(d)
-            if status not in (409, 503):
+            if status not in (409, 503) and backoff is not None:
+                said = f"claim {status} {trim(c.get('error', '') if isinstance(c, dict) else '', 120)}".strip()
+                if (backoff.get(hid) or {}).get("said") != said:     # once per distinct answer, not every cycle
+                    self.say(f"helper {hid}: {said}; retrying in {int(CLAIM_BACKOFF)} s at the earliest")
+                backoff[hid] = {"at": time.time(), "said": said}
+            elif status not in (409, 503):
                 self.say(f"helper {hid}: claim {status}")
             return
         # Helpers run without MCP for now, so the helper agent's credential is not needed here: it is never written

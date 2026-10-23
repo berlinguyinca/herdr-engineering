@@ -45,3 +45,34 @@ def test_an_ipv6_host_the_proxy_blocked_is_requested_bracketed_and_its_approval_
     r.refresh_allow(d, hr.w.room)
     assert f"[{V6}]:443" in (d / "allow.txt").read_text().splitlines()
     assert (V6, 443) in load_egress().read_allow(str(d / "allow.txt"))     # what the proxy matches a CONNECT on
+
+
+def test_a_429_at_claim_backs_off_and_is_logged_once_per_distinct_answer(hr, monkeypatch):
+    rec = hr.w.s.request_helper(hr.w.root, {"room_id": hr.w.room, "role": "worker", "task": "t"})
+    hid = rec["helper_id"]
+    claims, answer = [], {"error": "agent limit reached; revoke one you no longer use"}
+
+    def mk():
+        r = hr.mk()
+        real = r.api
+
+        def api(method, path, body=None):
+            if path == f"fleet/helpers/{hid}/claim":
+                claims.append(path)
+                return 429, dict(answer)
+            return real(method, path, body)
+        r.api = api
+        return r
+
+    for _ in range(3):                                   # every cycle is a new process
+        mk().helpers_cycle()
+    assert len(claims) == 1
+    assert sum(hid in m and "429" in m for m in hr.said) == 1
+    monkeypatch.setattr(runner, "CLAIM_BACKOFF", 0.0)
+    mk().helpers_cycle()
+    mk().helpers_cycle()
+    assert len(claims) == 3 and sum(hid in m and "429" in m for m in hr.said) == 1   # same answer: not logged again
+    answer["error"] = "global helper limit reached"
+    mk().helpers_cycle()
+    assert sum(hid in m and "429" in m for m in hr.said) == 2
+    assert not (hr.state / hid).exists()
