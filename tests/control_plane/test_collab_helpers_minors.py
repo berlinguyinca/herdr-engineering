@@ -284,3 +284,15 @@ def test_guests_see_no_grant_or_revoke_of_helper_agents_through_claim_and_finish
     # an ordinary agent's grant is still shown to guests
     a, info = w.agent("alice", actions=("read",), name="plainone")
     assert any(e.get("agent_id") == info["agent_id"] for e in w.s.read_events(w.dave, w.room, first, 200)["events"])
+
+
+@pytest.mark.parametrize("host,internal", [("api.example.org", False), ("10.0.0.1", True), ("127.0.0.1", True),
+                                           ("[::ffff:a00:1]", True), ("[fd00::1]", True), (f"[{V6}]", False),
+                                           ("0x7f.1", True)])
+def test_host_requests_to_internal_addresses_are_marked(w, host, internal):
+    try:
+        w.s.request_egress(w.op, w.room, "a1", host, 443)
+    except collab.CollabError:
+        pytest.skip("not a requestable spelling")
+    row = w.s.list_egress(w.op)["requests"][0]
+    assert row["internal"] is internal
