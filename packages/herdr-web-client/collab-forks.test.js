@@ -22,7 +22,7 @@ const noRaw = (html) => {
 
 test('the comparison labels the fork-reported numbers as unverified and shows trusted evidence separately', () => {
   const html = renderForks(model());
-  for (const needle of ['try a queue', 'approach:f1', 'not verified', 'key:writer', '1 trusted validation', 'ready to promote', 'Propose promotion', 'Review quorum is not available']) assert.ok(html.includes(needle), needle);
+  for (const needle of ['try a queue', 'approach:f1', 'not verified', 'key:writer', '1 trusted validation', 'ready to promote', 'Propose promotion', 'The review quorum applies to pull requests']) assert.ok(html.includes(needle), needle);
   assert.ok(html.includes('<th scope="col">Diff (self-reported)</th>'));
 });
 

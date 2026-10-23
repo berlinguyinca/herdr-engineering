@@ -317,7 +317,16 @@ def _span_start(lane: dict | None, states: frozenset) -> float | None:
     return None
 
 
-def evidence_time(task: dict, snap: dict) -> float | None:
+def _trusted_state_time(node: dict | None, writers: frozenset, states: frozenset) -> float | None:
+    """When a TRUSTED writer's own state entry first said one of ``states`` (server admission time). Entries of other
+    writers on the same commons node never move it, so an agent's early self-reported "merged" cannot shift a time."""
+    times = [epoch(e["admitted_at"]) for e in _entries(node or {}, "state")
+             if e.get("writer") in writers and e.get("value") in states and e.get("admitted_at")]
+    times = [t for t in times if t is not None]
+    return min(times) if times else None
+
+
+def evidence_time(task: dict, snap: dict, writers: frozenset, room_id: str) -> float | None:
     """When the room's ledger first showed the evidence that completed the task (server receipt time, not the
     emitter's claim). None when it cannot be told; such a task is left out of any time statistic, never guessed."""
     times = []
@@ -325,9 +334,9 @@ def evidence_time(task: dict, snap: dict) -> float | None:
         if not ev["counted"]:
             continue
         if ev["kind"] == "merged_pr":
-            t = _span_start(snap["lanes"].get(ev["node_id"]), MERGED_STATES)
+            t = _trusted_state_time(snap["nodes"].get(ev["node_id"]), writers, MERGED_STATES)
         elif ev["kind"] == "accepted_proposal":
-            t = _span_start(snap["lanes"].get(ev["node_id"]), ACCEPTED_STATES)
+            t = _trusted_state_time(snap["nodes"].get(ev["node_id"]), frozenset({f"collab:room:{room_id}"}), ACCEPTED_STATES)
         elif ev["kind"] in ("validated_task", "validated_at_head"):
             subject = ev.get("subject") or task["task_id"]
             t = next((epoch(m["at"]) for m in snap["markers"]
@@ -349,15 +358,30 @@ def _group_label(mid: str, snap: dict) -> str | None:
     return None
 
 
-def progress(snap: dict, cfg: dict, room_id: str, now: float, quorum=None) -> dict:
+def progress(snap: dict, cfg: dict, room_id: str, now: float, quorum=None, *, keep_rows: bool = False) -> dict:
     """Room and per-milestone (linked mission) progress from evidence only, with an explicit, labelled estimate."""
     writers = frozenset(cfg["evidence_writers"])
     k = cfg["eta_min_samples"]
-    tasks_ids = sorted(n["id"] for n in snap["nodes"].values() if n["node_type"] == "task")
-    omitted = max(0, len(tasks_ids) - MAX_TASKS_SHOWN)
-    tasks = [task_evidence(t, snap, writers, room_id, quorum) for t in tasks_ids[:MAX_TASKS_SHOWN]]
+    # service-generated delegation tasks are bookkeeping of the room's own service, not work items: they are reported
+    # separately ("delegations") unless a trusted writer has marked one, which makes it an ordinary task
+    tasks_ids, deleg = [], {"total": 0, "accepted": 0}
+    for n in sorted(snap["nodes"].values(), key=lambda x: x["id"]):
+        if n["node_type"] != "task":
+            continue
+        if n["id"].startswith(SERVICE_DELEGATION_PREFIX) and trusted_value(n, "state", writers) is None:
+            deleg["total"] += 1
+            deleg["accepted"] += any(
+                e["to_id"].startswith(SERVICE_PROPOSAL_PREFIX) and trusted_value(
+                    snap["nodes"].get(e["to_id"]), "state", frozenset({f"collab:room:{room_id}"})) in ACCEPTED_STATES
+                for e in _index(snap)["out"].get(("produced", n["id"]), ()))
+            continue
+        tasks_ids.append(n["id"])
+    # EVERY visible task in the snapshot is evaluated (counts only); only the DISPLAY list is capped below
+    tasks = [task_evidence(t, snap, writers, room_id, quorum) for t in tasks_ids]
+    partial_why = snap["reason"]                 # the graph read was cut: counts may be low
+    timing_why = snap["timeline_reason"]         # the timeline was cut: counts are right, times are not
     for t in tasks:
-        t["evidence_at"] = evidence_time(t, snap) if t["stage"] == "complete" else None
+        t["evidence_at"] = evidence_time(t, snap, writers, room_id) if t["stage"] == "complete" else None
         lane = snap["lanes"].get(t["task_id"])
         t["started_at"] = epoch(lane["first_at"]) if lane else None
     where = {}
@@ -374,7 +398,9 @@ def progress(snap: dict, cfg: dict, room_id: str, now: float, quorum=None) -> di
         ver = sum(1 for t in counted if t["stage"] == "verified")
         reported = sum(1 for t in counted if t["stage"] == "none" and t["reported_done"])
         total = len(counted)
-        out = {"tasks": total, "excluded_by_trusted_writer": len(rows) - total, "complete": done,
+        out = {"partial": bool(partial_why), "partial_reason": partial_why,
+               "timing_partial": bool(timing_why), "timing_partial_reason": timing_why,
+               "tasks": total, "excluded_by_trusted_writer": len(rows) - total, "complete": done,
                "verified_not_merged": ver, "reported_done_without_evidence": reported,
                "in_flight_or_not_started": total - done - ver - reported}
         if not writers:
@@ -403,10 +429,11 @@ def progress(snap: dict, cfg: dict, room_id: str, now: float, quorum=None) -> di
                                               cfg, snap, summary=out_groups[-1])
     all_summary["estimate"] = estimate(pool, all_summary["tasks"] - all_summary["complete"], k, now, cfg, snap, summary=all_summary)
     by_stage = {"complete": 0, "verified": 1, "none": 2}
-    return {"room": all_summary, "milestones": out_groups,
-            "tasks": sorted(({kk: v for kk, v in t.items() if kk not in ("evidence_at", "started_at")}
-                             | {"evidence_at": iso(t["evidence_at"])} for t in tasks),
-                            key=lambda t: (by_stage[t["stage"]], t["task_id"])),
+    shown = sorted(tasks, key=lambda t: (by_stage[t["stage"]], t["task_id"]))[:MAX_TASKS_SHOWN]
+    omitted = max(0, len(tasks) - MAX_TASKS_SHOWN)
+    return {**({"_rows": tasks} if keep_rows else {}), "room": all_summary, "milestones": out_groups, "delegations": deleg,
+            "tasks": [{kk: v for kk, v in t.items() if kk not in ("evidence_at", "started_at")}
+                      | {"evidence_at": iso(t["evidence_at"])} for t in shown],
             "tasks_omitted": omitted, "truncated": snap["reason"], "timeline_truncated": snap["timeline_reason"],
             "as_of": snap["as_of"], "method": {
                 "completion": "a task is complete only with: a PR it is attested to be linked to that a trusted writer marks merged; "
@@ -424,6 +451,10 @@ def estimate(pool: list[float], remaining: int, min_samples: int, now: float, cf
     base = {"label": "estimate", "method": METHOD}
     if summary.get("status") != "ok":
         return {**base, "status": "insufficient_evidence", "reason": summary.get("note") or "no progress can be computed yet"}
+    if summary.get("partial") or summary.get("timing_partial"):
+        why = summary.get("partial_reason") or summary.get("timing_partial_reason")
+        return {**base, "status": "insufficient_evidence",
+                "reason": f"the room view is partial ({why}), so no pace is estimated"}
     if remaining <= 0:
         return {**base, "status": "not_needed", "reason": "every counted task has completion evidence"}
     n = len(pool)
@@ -507,10 +538,10 @@ def analytics_of(snap: dict, cfg: dict, room_id: str, now: float, quorum=None) -
     """Simple, explainable aggregates over what this reader may see. Never per person or per agent; every figure
     that rests on fewer than ``min_group_size`` items is replaced by ``suppressed``; cost is self-reported."""
     k = cfg["min_group_size"]
-    prog = progress(snap, cfg, room_id, now, quorum)
+    prog = progress(snap, cfg, room_id, now, quorum, keep_rows=True)
+    rows = prog.pop("_rows")
     nodes, lanes = snap["nodes"], snap["lanes"]
-    tasks = prog["tasks"]
-    full = {t["task_id"]: t for t in tasks}
+    full = {t["task_id"]: t for t in rows}
     # cycle time: first sight of the task -> first counted completion evidence (server receipt times)
     cycle = []
     for n in nodes.values():
@@ -518,7 +549,7 @@ def analytics_of(snap: dict, cfg: dict, room_id: str, now: float, quorum=None) -
         if n["node_type"] != "task" or not t or t["stage"] != "complete":
             continue
         a = epoch((lanes.get(n["id"]) or {}).get("first_at"))
-        b = evidence_time({**t}, snap)
+        b = t["evidence_at"]
         if a is not None and b is not None and b >= a:
             cycle.append(b - a)
     # time blocked / idle: share of the active time of task and attempt lanes
@@ -663,6 +694,8 @@ def graph_items(snap: dict, cfg: dict, now: float, quorum=None) -> tuple[list[di
             if q is None:
                 continue
             status = q.get("status")
+            if status == "satisfied" and len(q.get("counted") or ()) < (q.get("required") or 1):
+                status = "insufficient"        # T06 decides over ALL reviews; this reader is told only what the visible ones add up to
             extra = (q.get("head"), status, tuple(q.get("counted") or ()), tuple(q.get("stale_reviewers") or ()))
             detail = {"quorum_status": status, "head": q.get("head"), "required": q.get("required"),
                       "approvals": len(q.get("counted") or ())}

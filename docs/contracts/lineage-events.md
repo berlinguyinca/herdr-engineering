@@ -815,7 +815,7 @@ Graph reads run outside the CollabService lock (T09 chunked pattern) and results
 ### Operator YAML (`control_plane.collab.insights`; default off, no environment variables)
 `enabled`, `kill_switch`, `inbox`, `progress`, `analytics` (sub-switches), `evidence_writers` (list of principal keys), `verified_credit` (0..1, default 0.5),
 `stuck_after_seconds`, `blocked_escalate_seconds`, `ci_failed_window_seconds`, `max_items`, `max_items_per_category`, `max_prs`, `max_pages`,
-`min_group_size` (default 5), `eta_min_samples` (default 5), `reads_per_minute`, `acks_per_10min`, `max_acks_per_reader`, `ack_retention_days`,
+`min_group_size` (default 5), `eta_min_samples` (default 5), `reads_per_minute`, `acks_per_10min`, `max_acks_per_reader`, `max_ack_events_per_reader`, `log_headroom_percent`, `ack_retention_days`,
 `snooze_min_seconds`, `snooze_max_seconds`, `cache_entries`. Unknown keys and wrong types are refused at startup.
 
 ### Priority rules
@@ -828,9 +828,15 @@ Items are deduplicated by `key` (category plus subject); `fp` fingerprints the c
 ### Evidence rules
 A task is complete only when: a pull request it is attested to be linked to is marked merged by a writer in `evidence_writers`; or an accepted proposal
 written by this room's service exists; or, with no attested PR, a validated edge from a trusted writer is bound to a commit. Reviewed or validated
-at the head without a merge counts as verified (credit `verified_credit`), never complete. A task whose state says done without evidence is listed as
+at the head without a merge counts as verified (credit `verified_credit`), never complete. Service-generated delegation tasks (`task:hcn-delegation.*`) are not work items: they are reported separately as `delegations {total, accepted}` unless a trusted writer marks one, which makes it an ordinary task. A task whose state says done without evidence is listed as
 "reported done without evidence". State, labels, diff statistics and cost written by an agent about itself are never counted. With no evidence writer
-configured, progress says so instead of showing a number. Progress treats a pull request as verified only when the approvals the reader can see reach the quorum, so hidden approvals never move a progress number. The inbox follows T06's own quorum status, which is decided over all reviews and names only reviewers the reader can see; a hidden block is flagged `blocked_by_hidden`, never named.
+configured, progress says so instead of showing a number. Progress treats a pull request as verified only when the approvals the reader can see reach the quorum, so hidden approvals never move a progress number. The inbox counts the same way: a pull request whose quorum is met only with approvals the reader cannot see still shows as `review_requested`. A block is never hidden for safety; one the reader cannot see is flagged `blocked_by_hidden`, never named.
+
+### Completeness and times
+Every visible task in the snapshot is evaluated and counted; only the displayed list is capped (300, evidence-backed first, `tasks_omitted` says how many are not listed). If the graph read was cut by a budget the headline carries `partial: true` with the reason; a cut timeline sets `timing_partial`. Either suppresses the estimate. Evidence times come from the trusted writer's own state entry (for merged pull requests and accepted proposals), never from a mixed timeline.
+
+### Marks
+Only a currently visible item with its current fingerprint can be acknowledged or snoozed; every other key gets the same 404. Marks spend their own rate bucket, a per-reader cap on ack events (`max_ack_events_per_reader`) and a log headroom guard (`log_headroom_percent` of `max_log_events`: marks are refused with 429 `marks_exhausted` first). Ack events are droppable: dropping them only makes acknowledged items reappear.
 
 ### Estimates
 Method `completion_interval_quantiles_v1`: nearest-rank 25th/50th/75th percentile of the gaps between evidence-timed completions (server receipt time),
@@ -852,5 +858,5 @@ long-poll exposes.
 ### Limitations
 Estimates assume a steady pace and are weak for small rooms. Erasing evidence by re-adding an unbound edge only understates progress. Evidence writers
 must be keys an agent does not control. Room-scoped pull requests written by a key that cannot see the room, and organization-scope nodes, are outside the
-reader's view and so not counted. T13 `forks.py` still reports the review quorum as absent (left unchanged here; follow-up). No Pi change was needed:
+reader's view and so not counted. T13 fork comparison reports `quorum: unavailable` on purpose: the T06 quorum is decided per pull request head and an approach is not a pull request (its reason text now says so, and the page shows the same wording). No Pi change was needed:
 Pi's ledger and mission adapter already supply the nodes this reads. The client renderers are covered by node tests and a Playwright smoke test (`tests/playwright/attention.test.mjs`); the assembled collab page was not driven end to end.

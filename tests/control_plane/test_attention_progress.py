@@ -303,9 +303,58 @@ def test_accepted_proposal_completes_the_delegation_task_and_a_pending_one_does_
     dig = f.s.get_proposal(f.alice, f.room, pid)["digest"]
     f.s.decide_proposal(f.alice, f.room, pid, {"decision": "accept", "expected_digest": dig})
     out = prog(f)
-    row = task_row(out, "task:hcn-delegation." + tid)
-    assert row["stage"] == "complete" and row["evidence"][0]["kind"] == "accepted_proposal" and row["evidence"][0]["counted"]
-    assert out["room"]["completion"] == 1.0
+    # service-generated bookkeeping is not a work item: reported separately, never inflating task completion
+    assert out["room"]["tasks"] == 0 and out["delegations"] == {"total": 1, "accepted": 1} and out["tasks"] == []
+    assert "task:hcn-delegation." + tid not in json.dumps(out["tasks"])
+
+
+def test_a_delegation_task_a_trusted_writer_marks_is_an_ordinary_task(fx):
+    f = fx
+    d, pr, tid = make(f)
+    d.accept(tid)
+    node(f.feed, "task:hcn-delegation." + tid, state="done", room_id=f.room, principal=OPERATOR)
+    out = prog(f)
+    assert out["delegations"]["total"] == 0 and task_row(out, "task:hcn-delegation." + tid)["reported_done"] is True
+
+
+def test_every_visible_task_is_counted_even_when_only_300_are_listed(fx):
+    f = fx
+    for i in range(310):
+        node(f.feed, f"task:a{i:03d}", state="running", room_id=f.room)         # incomplete tasks sort first by id
+    for i in range(20):
+        merged_task(f, 1000 + i)
+    out = prog(f)
+    assert out["room"]["tasks"] == 330 and out["room"]["complete"] == 20 and out["room"]["partial"] is False
+    assert len(out["tasks"]) == 300 and out["tasks_omitted"] == 30
+    assert sum(1 for t in out["tasks"] if t["stage"] == "complete") == 20       # evidence-backed ones are listed first
+    assert stats(f)["completion"]["complete"] == 20 and stats(f)["completion"]["of"] == 330
+
+
+def test_a_cut_read_marks_the_headline_partial_and_suppresses_the_estimate(fx, monkeypatch):
+    f = fx
+    for i in range(8):
+        merged_task(f, i)
+        tick(f, 60)
+    node(f.feed, "task:left", state="running", room_id=f.room)
+    assert prog(f)["room"]["estimate"]["status"] == "estimate"
+    cfg(f, max_pages=1)
+    monkeypatch.setattr(ins, "MAX_NODES", 10)
+    out = prog(f)
+    assert out["truncated"] and out["room"]["partial"] is True and out["room"]["partial_reason"] == out["truncated"]
+    assert out["room"]["estimate"]["status"] == "insufficient_evidence"
+    assert out["room"]["tasks"] > 0 and "partial" in out["room"]["estimate"]["reason"]
+
+
+def test_an_agents_early_merged_claim_does_not_move_the_evidence_time(fx):
+    f = fx
+    node(f.feed, "task:t1", state="running", room_id=f.room)
+    node(f.feed, PR1, state="merged", room_id=f.room, principal=WRITER)       # an untrusted writer claims "merged" early
+    edge(f.feed, "produced", "task:t1", PR1, room_id=f.room, principal=OPERATOR)
+    tick(f, 5000)
+    node(f.feed, PR1, state="merged", room_id=f.room, principal=OPERATOR)     # the trusted writer says so much later
+    t0 = f.s.clock.t
+    row = task_row(prog(f), "task:t1")
+    assert row["stage"] == "complete" and ins.epoch(row["evidence_at"]) == pytest.approx(t0, abs=2)
 
 
 def test_review_quorum_counts_as_verified_only_when_configured_and_satisfied(fx):
@@ -631,8 +680,13 @@ def test_ack_input_is_validated(fx, body):
     assert code(fx.s.attention_ack, fx.alice, fx.room, body) == 400
 
 
+def fp_map(f, who=None):
+    return {i["key"]: i["fp"] for i in inbox(f, who)["items"]}
+
+
 def test_snooze_bounds(fx):
-    k_ = {"key": "blocked|task:t1", "fp": "a" * 24}
+    node(fx.feed, "task:t1", state="blocked", room_id=fx.room)
+    k_ = {"key": "blocked|task:t1", "fp": fp_map(fx)["blocked|task:t1"]}
     for secs in (1, 299, 14 * 86400 + 1, True, "3600", None):
         assert code(fx.s.attention_snooze, fx.alice, fx.room, {**k_, "seconds": secs}) == 400
     assert fx.s.attention_snooze(fx.alice, fx.room, {**k_, "seconds": 300})["state"] == "snoozed"
@@ -640,20 +694,75 @@ def test_snooze_bounds(fx):
 
 def test_marks_are_bounded_rate_limited_and_say_nothing_about_what_exists(fx):
     f = fx
-    cfg(fx, max_acks_per_reader=10, acks_per_10min=15)
+    cfg(fx, max_acks_per_reader=10, acks_per_10min=60)
+    for i in range(14):
+        node(f.feed, f"task:n{i}", state="blocked", room_id=f.room)
+    fps = fp_map(f)
     for i in range(12):
-        f.s.attention_ack(f.alice, f.room, {"key": f"blocked|task:n{i}", "fp": "a" * 24})
+        f.s.attention_ack(f.alice, f.room, {"key": f"blocked|task:n{i}", "fp": fps[f"blocked|task:n{i}"]})
     assert len(f.s._attn[("alice", f.room)]) == 10                                    # oldest dropped, never unbounded
     assert "blocked|task:n0" not in f.s._attn[("alice", f.room)] and "blocked|task:n11" in f.s._attn[("alice", f.room)]
-    for i in range(3):
-        f.s.attention_ack(f.alice, f.room, {"key": f"blocked|task:m{i}", "fp": "a" * 24})
-    assert code(f.s.attention_ack, f.alice, f.room, {"key": "blocked|task:z", "fp": "a" * 24}) == 429
-    f.s.attention_ack(f.bob, f.room, {"key": "blocked|task:z", "fp": "a" * 24})         # bob's budget is his own
-    # an existing and a non-existing key answer identically
+    cfg(fx, max_acks_per_reader=10, acks_per_10min=14)
+    for i in range(12, 14):
+        f.s.attention_ack(f.alice, f.room, {"key": f"blocked|task:n{i}", "fp": fps[f"blocked|task:n{i}"]})
+    assert code(f.s.attention_ack, f.alice, f.room, {"key": "blocked|task:n0", "fp": fps["blocked|task:n0"]}) == 429
+    f.s.attention_ack(f.bob, f.room, {"key": "blocked|task:n0", "fp": fps["blocked|task:n0"]})   # bob's budget is his own
+
+
+def test_only_currently_visible_items_with_their_current_fingerprint_can_be_marked(fx):
+    f = fx
+    f.s.link_mission(f.alice, f.room, {"mission_id": "m-secret", "members": ["bob"]})
     node(f.feed, "task:real", state="blocked", room_id=f.room)
-    a = f.s.attention_ack(f.bob, f.room, {"key": "blocked|task:real", "fp": "b" * 24})
-    b = f.s.attention_ack(f.bob, f.room, {"key": "blocked|task:fake", "fp": "b" * 24})
-    assert a == b
+    node(f.feed, "task:hidden", state="blocked", scope="mission", room_id=f.room, mission_id="m-secret")
+    node(f.feed, "task:private", state="blocked", scope="private")
+    fp = fp_map(f, f.alice)["blocked|task:real"]
+    before = len(f.s._log)
+    misses = [{"key": "blocked|task:fake", "fp": fp}, {"key": "blocked|task:hidden", "fp": fp_map(f, f.bob)["blocked|task:hidden"]},
+              {"key": "blocked|task:private", "fp": fp}, {"key": "blocked|task:real", "fp": "0" * 24}]      # made-up, hidden, hidden, stale fp
+    got = {err(f.s.attention_ack, f.alice, f.room, m) for m in misses}
+    assert len(got) == 1 and next(iter(got))[0] == 404                                    # one generic answer for every miss
+    assert {err(f.s.attention_snooze, f.alice, f.room, {**m, "seconds": 600}) for m in misses} == got
+    assert len(f.s._log) == before and f.s._attn.get(("alice", f.room)) is None            # a miss writes nothing
+    assert f.s.attention_ack(f.alice, f.room, {"key": "blocked|task:real", "fp": fp})["state"] == "acknowledged"
+    assert f.s.attention_ack(f.bob, f.room, {"key": "blocked|task:hidden", "fp": fp_map(f, f.bob)["blocked|task:hidden"]})["ok"]
+    f.s.unlink_mission(f.alice, f.room, "m-secret")                                       # bob loses sight of it: no new marks
+    assert code(f.s.attention_ack, f.bob, f.room, {"key": "blocked|task:hidden", "fp": "a" * 24}) == 404
+
+
+def test_marks_spend_their_own_budget_not_the_read_budget(fx):
+    f = fx
+    cfg(fx, reads_per_minute=4, acks_per_10min=60)
+    node(f.feed, "task:t1", state="blocked", room_id=f.room)
+    it = inbox(f)["items"][0]
+    for _ in range(2):
+        inbox(f)
+    for _ in range(5):
+        f.s.attention_ack(f.alice, f.room, {"key": it["key"], "fp": it["fp"]})
+        f.s.attention_restore(f.alice, f.room, {"key": it["key"]})
+    inbox(f)                                                                            # the third read is still allowed
+    assert err(inbox, f)[0] == 429
+
+
+def test_acks_cannot_use_up_the_log_that_other_writes_need(fx):
+    f = fx
+    cfg(fx, max_ack_events_per_reader=10, acks_per_10min=200, max_acks_per_reader=200, max_items_per_category=100, max_items=500)
+    for i in range(30):
+        node(f.feed, f"task:n{i}", state="blocked", room_id=f.room)
+    fps = fp_map(f)
+    codes = []
+    for i in range(30):
+        try:
+            f.s.attention_ack(f.alice, f.room, {"key": f"blocked|task:n{i}", "fp": fps[f"blocked|task:n{i}"]})
+            codes.append(200)
+        except CollabError as e:
+            codes.append(e.status)
+    assert codes.count(200) == 10 and set(codes) == {200, 429}                           # per-member cap on ack events
+    assert sum(1 for e in f.s._log if e["event_type"] in ATTN_EVENTS) == 10
+    f.s.attention_ack(f.bob, f.room, {"key": "blocked|task:n0", "fp": fps["blocked|task:n0"]})   # bob has his own allowance
+    # and a nearly full log refuses marks first, leaving the rest of the log for everything else
+    f.s.max_log_events = len(f.s._log) * 100 // 85
+    cfg(fx, max_ack_events_per_reader=1000, log_headroom_percent=80, max_items_per_category=100, max_items=500)
+    assert err(f.s.attention_ack, f.carol, f.room, {"key": "blocked|task:n1", "fp": fps["blocked|task:n1"]})[1] == "marks_exhausted"
 
 
 def test_marks_need_the_same_access_as_reads(fx):
@@ -986,8 +1095,8 @@ def test_an_ack_about_a_hidden_node_leaks_neither_its_key_nor_its_id_to_anyone_e
     for name, out in surfaces.items():
         blob = json.dumps(out, default=str)
         assert "h-secret-ci" not in blob and "attn_" not in blob and it["key"] not in blob, name
-    assert f.s.attention_ack(f.carol, f.room, {"key": it["key"], "fp": it["fp"]}) == f.s.attention_ack(
-        f.carol, f.room, {"key": "ci_failed|ci:nothing-like-it", "fp": it["fp"]})      # carol cannot even probe whether the id exists
+    assert err(f.s.attention_ack, f.carol, f.room, {"key": it["key"], "fp": it["fp"]}) == err(
+        f.s.attention_ack, f.carol, f.room, {"key": "ci_failed|ci:nothing-like-it", "fp": it["fp"]})   # carol cannot probe whether the id exists
 
 
 def test_a_hidden_approval_moves_no_number_and_a_hidden_block_is_flagged_but_never_named(fx):
@@ -1007,8 +1116,9 @@ def test_a_hidden_approval_moves_no_number_and_a_hidden_block_is_flagged_but_nev
     assert seen_by_carol["stage"] == "none" and not any(e["counted"] for e in seen_by_carol["evidence"])
     alone = json.dumps(prog(f, f.alice), sort_keys=True)
     assert "review:b" not in alone and "m-secret" not in alone
-    # the inbox follows T06's own status (decided over ALL reviews, so the merge gate is true): that adds nothing T06 does not already tell alice
-    assert inbox(f, f.alice)["items"] == [] and inbox(f, f.bob)["items"] == []
+    # the inbox, like progress, counts only the approvals the reader can see
+    assert [i["category"] for i in inbox(f, f.alice)["items"]] == ["review_requested"]
+    assert inbox(f, f.alice)["items"][0]["detail"]["approvals"] == 1 and inbox(f, f.bob)["items"] == []
     assert task_row(prog(f, f.bob), "task:t1")["stage"] == "verified"                    # whoever CAN see both approvals sees a verified task
     # a hidden block: the reader is told one exists, never whose
     node(f.feed, "review:c", scope="mission", room_id=f.room, mission_id="m-secret", principal=R2)

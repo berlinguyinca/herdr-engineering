@@ -29,7 +29,7 @@ INSIGHTS_KEYS = frozenset({
     "enabled", "kill_switch", "inbox", "progress", "analytics", "evidence_writers", "verified_credit",
     "stuck_after_seconds", "blocked_escalate_seconds", "ci_failed_window_seconds", "max_items", "max_items_per_category",
     "max_prs", "max_pages", "min_group_size", "eta_min_samples", "reads_per_minute", "acks_per_10min",
-    "max_acks_per_reader", "ack_retention_days", "snooze_min_seconds", "snooze_max_seconds", "cache_entries"})
+    "max_acks_per_reader", "max_ack_events_per_reader", "log_headroom_percent", "ack_retention_days", "snooze_min_seconds", "snooze_max_seconds", "cache_entries"})
 ATTN_EVENTS = frozenset({"attn_ack", "attn_snooze", "attn_clear"})
 CATEGORIES = ("review_blocked", "stale_head", "rereview_required", "review_requested", "review_unverifiable",
               "ci_failed", "blocked", "expired_or_stuck", "steering_confirm", "promotion_confirm",
@@ -68,12 +68,12 @@ def normalize_insights(raw: Any) -> dict:
            "evidence_writers": [], "verified_credit": 0.5, "stuck_after_seconds": 1800, "blocked_escalate_seconds": 3600,
            "ci_failed_window_seconds": 7 * 86400, "max_items": 100, "max_items_per_category": 25, "max_prs": 20,
            "max_pages": 3, "min_group_size": 5, "eta_min_samples": 5, "reads_per_minute": 60, "acks_per_10min": 60,
-           "max_acks_per_reader": 200, "ack_retention_days": 30, "snooze_min_seconds": 300,
+           "max_acks_per_reader": 200, "max_ack_events_per_reader": 500, "log_headroom_percent": 80, "ack_retention_days": 30, "snooze_min_seconds": 300,
            "snooze_max_seconds": 14 * 86400, "cache_entries": 8}
     ranges = {"stuck_after_seconds": (60, 7 * 86400), "blocked_escalate_seconds": (60, 30 * 86400),
               "ci_failed_window_seconds": (3600, 90 * 86400), "max_items": (10, 500), "max_items_per_category": (1, 100),
               "max_prs": (1, 50), "max_pages": (1, 8), "min_group_size": (2, 50), "eta_min_samples": (3, 100),
-              "reads_per_minute": (1, 240), "acks_per_10min": (1, 200), "max_acks_per_reader": (10, 500),
+              "reads_per_minute": (1, 240), "acks_per_10min": (1, 200), "max_acks_per_reader": (10, 500), "max_ack_events_per_reader": (10, 5000), "log_headroom_percent": (10, 100),
               "ack_retention_days": (1, 90), "snooze_min_seconds": (60, 86400), "snooze_max_seconds": (3600, 90 * 86400),
               "cache_entries": (1, 32)}
     for key, value in raw.items():
@@ -109,6 +109,7 @@ class AttentionMixin:
         self.insights_source = None          # optional callable -> raw YAML mapping, read per request (hot kill switch)
         self.quorum_config = None            # T06 QuorumConfig, handed over by the server; None = review items off
         self._attn: dict[tuple, OrderedDict] = {}
+        self._attn_events: dict[tuple, int] = {}   # ack events written per (reader, room): a hard cap on log growth
         self._snap_cache: OrderedDict = OrderedDict()
 
     # --------------------------------------------------------------- config
@@ -126,7 +127,12 @@ class AttentionMixin:
         t, p = ev["event_type"], ev["payload"]
         if t not in ATTN_EVENTS:
             return False
-        state = self._attn.setdefault((p["actor_user_id"], p["scope_room_id"]), OrderedDict())
+        who = (p["actor_user_id"], p["scope_room_id"])
+        state = self._attn.setdefault(who, OrderedDict())
+        self._attn_events[who] = self._attn_events.get(who, 0) + 1
+        horizon = p["epoch"] - p.get("retention", 30 * 86400)
+        for old in [k for k, v in state.items() if v["at"] < horizon][:8]:       # lapsed marks are dropped as new ones arrive
+            state.pop(old, None)
         if t == "attn_clear":
             state.pop(p["key"], None)
         else:
@@ -138,7 +144,7 @@ class AttentionMixin:
         return True
 
     # -------------------------------------------------------------- guards
-    def _insight_access(self, pr, room_id: str, feature: str, what: str):
+    def _insight_access(self, pr, room_id: str, feature: str, what: str, *, reads: bool = True):
         """(cfg, room, graph, reader, contexts, since) for a signed-in non-guest member whose graph access covers the
         room. Every miss (no such room, not a member, a guest, no graph) is the same 404; the feature switch is only
         revealed to members."""
@@ -155,8 +161,11 @@ class AttentionMixin:
             if not (cfg["enabled"] and not cfg["kill_switch"] and cfg[feature]):
                 self.stats["policy_denied"] += 1
                 raise WorkbenchError(403, "this feature is switched off on this service", code="insights_disabled")
-            self._throttle("insights:" + pr.key, cfg["reads_per_minute"], 60.0, "insights read")
-            self._throttle("insights-room:" + room_id, cfg["reads_per_minute"] * 10, 60.0, "insights read")
+            if reads:             # marks spend their own bucket (below), never the read budget
+                self._throttle("insights:" + pr.key, cfg["reads_per_minute"], 60.0, "insights read")
+                self._throttle("insights-room:" + room_id, cfg["reads_per_minute"] * 10, 60.0, "insights read")
+            else:
+                self._throttle("attn-mark:" + pr.key, cfg["acks_per_10min"], 600.0, "acknowledgement")
             reader = self._room_reader(access, room_id, pr.id)
             contexts = frozenset({("room", room_id, None), *(("mission", m, r) for r, m in access["room_missions"]
                                                              if r == room_id)})
@@ -238,6 +247,11 @@ class AttentionMixin:
         include = query.get("include")
         if include not in (None, "", "acked"):
             raise WorkbenchError(400, "include must be 'acked' or absent")
+        out = self._inbox_core(pr, room_id, cfg, room, graph, reader, contexts, since, include)
+        out.pop("_current", None)
+        return out
+
+    def _inbox_core(self, pr, room_id, cfg, room, graph, reader, contexts, since, include) -> dict:
         now = self._now()
         with self._lock:                       # phase 1: copy the small collab-side rows, then let go of the lock
             rows = self._personal_rows(pr, room_id, room, cfg)
@@ -292,7 +306,8 @@ class AttentionMixin:
         sev: dict[str, int] = {}
         for it in final:
             sev[it["severity"]] = sev.get(it["severity"], 0) + 1
-        return {"room_id": room_id, "generated_at": self._iso(now), "items": final, "quiet_items": out_quiet,
+        return {"_current": {it["key"]: it["fp"] for it in by_key.values()},
+                "room_id": room_id, "generated_at": self._iso(now), "items": final, "quiet_items": out_quiet,
                 "counts": {"open": len(final) + sum(capped.values()), "shown": len(final), "by_category": per, "by_severity": sev,
                            "acknowledged": acked, "snoozed": snoozed, "not_shown_because_of_caps": capped},
                 "truncated": snap["reason"], "timeline_truncated": snap["timeline_reason"],
@@ -389,7 +404,7 @@ class AttentionMixin:
         """Acknowledge or snooze ONE item for the calling reader only, or take that back. The mark is bound to the item's
         fingerprint, so when the condition changes the item comes back. State is per reader and room, bounded, and
         rate limited. The response never says whether the key exists (nothing to probe)."""
-        cfg, room, _graph, _reader, _ctx, _since = self._insight_access(pr, room_id, "inbox", f"attention.{kind}")
+        cfg, room, graph, reader, contexts, since = self._insight_access(pr, room_id, "inbox", f"attention.{kind}", reads=False)
         allowed = {"ack": ("key", "fp"), "snooze": ("key", "fp", "seconds"), "clear": ("key",)}[kind]
         if [k for k in body if k not in allowed]:
             raise WorkbenchError(400, "unknown field")
@@ -404,6 +419,12 @@ class AttentionMixin:
             secs = body.get("seconds")
             if isinstance(secs, bool) or not isinstance(secs, int) or not cfg["snooze_min_seconds"] <= secs <= cfg["snooze_max_seconds"]:
                 raise WorkbenchError(400, f"seconds must be an integer {cfg['snooze_min_seconds']}-{cfg['snooze_max_seconds']}")
+        if kind != "clear":
+            # only a CURRENTLY VISIBLE item of this reader can be marked, with its current fingerprint; anything else
+            # (a hidden node, a made-up key, a stale fingerprint) gets one generic answer, so marks are no probe
+            current = self._inbox_core(pr, room_id, cfg, room, graph, reader, contexts, since, None)["_current"]
+            if current.get(key) != fp:
+                raise WorkbenchError(404, "not found")
         with self._lock:
             now = self._now()
             have = self._attn.get((pr.id, room_id), {}).get(key)
@@ -411,11 +432,15 @@ class AttentionMixin:
                 return {"ok": True, "state": "acknowledged", "replayed": True}
             if kind == "clear" and have is None:
                 return {"ok": True, "state": "open", "replayed": True}
-            self._throttle("attn-mark:" + pr.key, cfg["acks_per_10min"], 600.0, "acknowledgement")
+            if (self._attn_events.get((pr.id, room_id), 0) >= cfg["max_ack_events_per_reader"]
+                    or len(self._log) * 100 >= self.max_log_events * cfg["log_headroom_percent"]):
+                # marks may never use up the log that every other collab write needs: refuse them first
+                raise WorkbenchError(429, "too many acknowledgements recorded; marks are paused", code="marks_exhausted")
             if kind == "snooze":
                 until = now + body["seconds"]
             self._commit("attn_" + ("snooze" if kind == "snooze" else kind), {
                 "actor_user_id": pr.id, "actor_agent_id": None, "actor_kind": "user", "scope_room_id": room_id, "key": key,
-                "fp": fp, "until_epoch": until, "epoch": now, "cap": cfg["max_acks_per_reader"]})
+                "fp": fp, "until_epoch": until, "epoch": now, "cap": cfg["max_acks_per_reader"],
+                "retention": cfg["ack_retention_days"] * 86400})
         return {"ok": True, "state": {"ack": "acknowledged", "snooze": "snoozed", "clear": "open"}[kind],
                 **({"snoozed_until": self._iso(until)} if until else {})}

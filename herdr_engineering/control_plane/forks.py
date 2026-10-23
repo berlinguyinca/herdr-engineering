@@ -12,7 +12,7 @@ and the fork's own agent controls the code under test. They are shown, always la
 NEVER decide anything. What may gate a promotion is only head-bound evidence (a ``validated`` / ``reviewed`` edge
 bound to the approach's exact ``head_sha``, not stale, not removed) written by a principal the OPERATOR listed in
 ``control_plane.collab.steering.forks.evidence_writers``. The list comes from YAML, never from an event.
-T06's review quorum is not on this stack; ``quorum`` says so rather than inventing a verdict.
+T06's review quorum applies to pull requests, not approaches; ``quorum`` says so rather than inventing a verdict.
 
 Nothing here writes, deletes, closes or merges anything.
 """
@@ -328,7 +328,7 @@ def comparison(graph, reader, node_id: str, cfg: dict) -> dict:
 
 def _policy(cfg: dict) -> dict:
     return {"quorum": {"status": "unavailable",
-                       "reason": "T06 review quorum is not part of this build; reviews are counted per approach head"},
+                       "reason": "the T06 review quorum is decided per pull request head; an approach is not a pull request, so reviews are counted per approach head"},
             "policy": {"require_validation": cfg["require_validation"], "min_reviews": cfg["min_reviews"],
                        "trusted_evidence_configured": bool(cfg["evidence_writers"]),
                        "note": "diff, paths and cost are reported by the fork's emitter and never decide a promotion"}}
