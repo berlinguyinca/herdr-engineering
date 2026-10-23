@@ -47,6 +47,7 @@ ad-hoc work.
 - No new runtime dependencies on hosts (stdlib Python only; `psutil` is not
   assumed present).
 - No Windows hosts.
+- No `ansible-pull` or per-host git credentials.
 - Not changing the existing 500-sample in-memory API contract for current
   callers; history is additive.
 
@@ -94,7 +95,7 @@ capped).
 - `problems` computed server-side so the list view and detail view agree:
   stale (no report > 3 intervals), disk > 85% warn / > 95% critical, memory
   > 90% sustained 5 min, swap thrash, GPU temp > 85 °C, failed units, security
-  updates pending, reboot required, version drift vs fleet majority.
+  updates pending, reboot required, version drift vs the pinned versions.
   Thresholds are config values with these defaults. Each problem has severity
   and a short human message.
 - `tailnet_ip` null is fixed at the source (collector sends it) and the UI
@@ -118,16 +119,27 @@ New roles under `ansible/roles/`, called from `playbooks/site.yml`:
   `tailscale up --auth-key=… --hostname={{ inventory_hostname }}` only when the
   node is not already logged in (idempotent via `tailscale status --json`).
   **Auth key is supplied at run time** from Ansible Vault or `--extra-vars`
-  from a prompt; it is never in Git or host_vars in clear. Recommended key
+  from a prompt; it is never in Git or host_vars in clear. The key belongs to
+  the Tailscale account of the owner running the herdr interface and lives in
+  Ansible Vault on the main host, so the cron run is unattended. Hosts already
+  on the tailnet are left alone (no re-tag). Recommended key
   type: reusable, pre-authorized, tagged (e.g. `tag:fleet`), 90-day expiry.
   (This was not specified by the operator; it is the builder's call and is
   flagged for review.)
-- `herdr_fleet_update`: a systemd timer (launchd on macOS) that updates OS
-  packages (security-only by default; full upgrade opt-in), then herdr, pi, pi
-  extensions and autospec to the pinned/latest versions defined in
-  `group_vars`, and restarts the fabric agent. It defers when agents are
-  running a mission unless `force` is set, and reports its result in the
-  `versions` telemetry.
+- `herdr_fleet_update` (decided by the operator): updates are **pushed from the
+  main host** (the designated gateway host, `bender` today, which already runs
+  the web UI) by a cron/systemd timer that runs `ansible-playbook` against the
+  fleet. Hosts hold no repo access or credentials for this. The playbook
+  updates OS packages (security-only by default; full upgrade opt-in), then
+  herdr, pi, pi extensions and autospec to the versions pinned in
+  `group_vars`, and restarts the fabric agent. Per host it defers while agents
+  are running, up to a 7-day maximum; after that the host shows a Problem
+  ("updates deferred 7 d") and nothing is forced without `force`. Each run
+  records its result and a "last updated" time, which feeds `versions`
+  telemetry; an old "last updated" is itself a Problem. Pins are published to
+  the control plane so version drift is judged against them, not the fleet
+  majority. Hosts flagged `maintenance: true` in inventory are exempt from
+  stale alarms.
 - Existing roles continue to own herdr/pi install; `fleet-status.yml` is
   extended to print the new telemetry for a host over SSH as a fallback.
 - Playbook order: baseline, tailscale, herdr/pi, fabric agent + collector,
@@ -163,3 +175,8 @@ agents, and package-manager coverage beyond apt/brew.
 - Retention 48 h raw / 7 d rollup; thresholds listed above.
 - Ansible work extends the existing `ansible/` tree rather than the separate
   `fry-ansible` / `cubert-ansible` repos.
+- Main host = the gateway host (`herdr_engineering_gateway_host`); the
+  Tailscale tag (`tag:fleet`) must exist in the account's access rules before
+  first run. This is an assumption to confirm.
+- Stale threshold reuses the existing `reportFreshness` limit; telemetry goes
+  over the existing host-event path with a capped payload.
