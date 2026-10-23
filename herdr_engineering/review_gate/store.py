@@ -45,14 +45,32 @@ def _payload(event: dict) -> dict:
     return payload
 
 
+_REVIEWABLE = (State.CI_GREEN, State.REVIEW_QUEUED, State.REVIEWING)
+
+
 def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
+    """Apply one event, but only if its writer's guard would have allowed it.
+
+    Defence in depth: each branch re-checks the transition the matching
+    ``on_*`` method enforces (current head sha, legal source state), so an
+    out-of-order or forged event in the log cannot move the PR (for example to
+    ``APPROVED``). Every log the store itself writes folds unchanged.
+    """
+    sha = p.get("sha")
+    on_head = isinstance(sha, str) and sha == snap.head_sha
     if event_type == "push":
+        if not isinstance(sha, str) or snap.state == State.MERGED or sha == snap.head_sha:
+            return snap
         if snap.state == State.ESCALATED:  # only an operator resume clears escalation
-            return replace(snap, head_sha=p["sha"])
-        return replace(snap, head_sha=p["sha"], state=State.CI_PENDING, reason=None)
+            return replace(snap, head_sha=sha)
+        return replace(snap, head_sha=sha, state=State.CI_PENDING, reason=None)
     if event_type == "ci_green":
+        if not on_head or snap.state != State.CI_PENDING:
+            return snap
         return replace(snap, state=State.CI_GREEN)
     if event_type == "ci_red":
+        if not on_head or snap.state not in (State.CI_PENDING, State.CI_GREEN):
+            return snap
         return replace(
             snap,
             ci_fix_rounds=snap.ci_fix_rounds + 1,
@@ -60,16 +78,22 @@ def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
             reason=p.get("reason"),
         )
     if event_type == "review_started":
+        if not on_head or snap.state not in _REVIEWABLE:
+            return snap
         return replace(snap, state=State.REVIEWING)
     if event_type == "verdict":
-        if p["verdict"] == "PASS":
+        if not on_head or snap.state != State.REVIEWING:
+            return snap
+        if p.get("verdict") == "PASS":
             return replace(
                 snap,
                 state=State.APPROVED,
-                approved_sha=p["sha"],
+                approved_sha=sha,
                 approved_patch_id=p.get("patch_id"),
                 reason=None,
             )
+        if p.get("verdict") != "FAIL":
+            return snap
         return replace(
             snap,
             review_rounds=snap.review_rounds + 1,
@@ -80,8 +104,12 @@ def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
             reason=p.get("reason"),
         )
     if event_type == "merged":
+        if not on_head or snap.state != State.APPROVED:
+            return snap
         return replace(snap, state=State.MERGED)
     if event_type == "resume":
+        if snap.state != State.ESCALATED:
+            return snap
         return replace(
             snap,
             state=State.CI_PENDING,
@@ -91,8 +119,26 @@ def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
             reason=None,
         )
     if event_type == "carry_over_approval":
-        return replace(snap, state=State.APPROVED, approved_sha=p["sha"], reason=None)
+        if (
+            not on_head
+            or snap.approved_patch_id is None
+            or p.get("patch_id") != snap.approved_patch_id
+            or snap.state not in (State.CI_PENDING, *_REVIEWABLE)
+        ):
+            return snap
+        return replace(snap, state=State.APPROVED, approved_sha=sha, reason=None)
     return snap
+
+
+def _safe_fold(snap: PrSnapshot, event: dict) -> PrSnapshot:
+    """A malformed event is skipped: one bad row must never break every read."""
+    try:
+        payload = _payload(event)
+        if not isinstance(payload, dict):
+            return snap
+        return _fold(snap, event["event_type"], payload)
+    except (KeyError, TypeError, ValueError):
+        return snap
 
 
 class PipelineStore:
@@ -119,7 +165,7 @@ class PipelineStore:
         with self._lock:
             snap = PrSnapshot(key, None, State.CI_PENDING, 0, 0, (), None, None, None)
             for event in self._repo.stream(ENTITY, str(key)):
-                snap = _fold(snap, event["event_type"], _payload(event))
+                snap = _safe_fold(snap, event)
             return snap
 
     def known_keys(self) -> list[PrKey]:

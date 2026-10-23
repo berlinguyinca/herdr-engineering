@@ -300,3 +300,59 @@ def test_per_repo_cap_overrides_default():
     store.on_push(elsewhere, "c" * 40)
     store.on_ci_red(elsewhere, "c" * 40, ["lint"])
     assert store.snapshot(elsewhere).state != State.ESCALATED
+
+
+def _forge(repo, event_type, payload):
+    repo.record_event("pr_gate", str(KEY), event_type, payload)
+
+
+def test_forged_verdict_outside_reviewing_is_ignored_by_fold():
+    repo, s = make()
+    s.on_push(KEY, "A")
+    s.on_ci_green(KEY, "A")  # CI_GREEN, not REVIEWING
+    _forge(repo, "verdict", {"verdict": "PASS", "sha": "A"})
+    snap = s.snapshot(KEY)
+    assert snap.state == State.CI_GREEN and snap.approved_sha is None
+
+
+def test_forged_verdict_for_wrong_sha_is_ignored_by_fold():
+    repo, s = make()
+    to_reviewing(s, "A")
+    _forge(repo, "verdict", {"verdict": "PASS", "sha": "B"})
+    _forge(repo, "verdict", {"verdict": "PASS"})  # no sha at all: must not raise
+    snap = s.snapshot(KEY)
+    assert snap.state == State.REVIEWING and snap.approved_sha is None
+
+
+def test_forged_review_started_from_ci_pending_is_ignored_by_fold():
+    repo, s = make()
+    s.on_push(KEY, "A")
+    _forge(repo, "review_started", {"sha": "A"})
+    _forge(repo, "verdict", {"verdict": "PASS", "sha": "A"})
+    assert s.snapshot(KEY).state == State.CI_PENDING
+
+
+def test_forged_resume_outside_escalated_is_ignored_by_fold():
+    repo, s = make()
+    to_reviewing(s, "A")
+    assert s.on_verdict(KEY, fail("A"))
+    _forge(repo, "resume", {})
+    snap = s.snapshot(KEY)
+    assert snap.state == State.CHANGES_REQUESTED and snap.review_rounds == 1
+
+
+def test_forged_merged_and_ci_green_out_of_order_are_ignored_by_fold():
+    repo, s = make()
+    s.on_push(KEY, "A")
+    _forge(repo, "merged", {"sha": "A"})
+    _forge(repo, "ci_green", {"sha": "B"})
+    assert s.snapshot(KEY).state == State.CI_PENDING
+
+
+def test_malformed_forged_events_never_break_the_fold():
+    repo, s = make()
+    to_reviewing(s, "A")
+    _forge(repo, "verdict", {"verdict": "FAIL", "sha": "A", "findings": [{"bogus": 1}]})
+    _forge(repo, "push", {})
+    assert s.snapshot(KEY).head_sha == "A"
+    assert s.snapshots()  # GET /prs must keep working
