@@ -58,7 +58,9 @@ function grantsByWorkspace(links) {
 export function buildTabsPanes(graphs, links = null) {
   const { nodes, edges } = merge(graphs);
   const grants = grantsByWorkspace(links);
-  const agents = [...nodes.values()].filter((n) => n.node_type === 'agent').sort((a, b) => (a.id < b.id ? -1 : 1)).slice(0, MAX_AGENTS);
+  const allAgents = [...nodes.values()].filter((n) => n.node_type === 'agent').sort((a, b) => (a.id < b.id ? -1 : 1));
+  const agents = allAgents.slice(0, MAX_AGENTS);
+  const omitted = allAgents.length - agents.length;
   const byId = new Map(agents.map((a) => [a.id, a]));
 
   // spawn lineage between visible agents only; the smallest parent id wins so the result is stable
@@ -87,13 +89,14 @@ export function buildTabsPanes(graphs, links = null) {
   }
 
   const isOwnTab = (a) => !parent.has(a.id) || attrsOf(a).presentation === 'tab' || attrsOf(a).external === true;
+  // null when no tab ancestor is reachable within MAX_DEPTH (a very deep chain, or a cycle with no entry)
   const tabOf = (id) => {
     let cur = id;
-    for (let i = 0; i < MAX_DEPTH; i += 1) {
+    for (let i = 0; i < MAX_DEPTH && cur; i += 1) {
       if (isOwnTab(byId.get(cur))) return cur;
       cur = parent.get(cur);
     }
-    return id;
+    return null;
   };
   const depthOf = (id, tab) => {
     let d = 0;
@@ -127,15 +130,18 @@ export function buildTabsPanes(graphs, links = null) {
 
   const tabs = new Map();
   for (const a of agents) if (isOwnTab(a) && allowed(a, 'tabs')) tabs.set(a.id, { ...entry(a), panes: [] });
+  const unplaced = [];            // nested too deep (or cyclic) to place under a tab: listed flat, never dropped
   for (const a of agents) {
     if (isOwnTab(a)) continue;
-    const t = tabs.get(tabOf(a.id));
+    const root = tabOf(a.id);
+    const t = root && tabs.get(root);
+    if (!root) { if (allowed(a, 'panes')) unplaced.push(entry(a)); continue; }
     if (!t || !allowed(a, 'panes')) continue;
     t.panes.push({ ...entry(a), depth: depthOf(a.id, t.agent_id) });
   }
   const list = [...tabs.values()];
   for (const t of list) t.panes.sort((x, y) => x.depth - y.depth || (x.agent_id < y.agent_id ? -1 : 1));
-  return { tabs: list, hidden_by_grant: hiddenByGrant };
+  return { tabs: list, hidden_by_grant: hiddenByGrant, unplaced, omitted };
 }
 
 // Arrow / Home / End navigation for the tablist (roving tabindex).
@@ -163,11 +169,22 @@ function paneRow(p) {
     + `${p.external ? pill('Remote', 'var(--accent, #6f5bd6)') : ''}${pill(p.state, stateTone(p.state))}</li>`;
 }
 
+function flatNote(model) {
+  const flat = model.unplaced || [];
+  const more = model.omitted || 0;
+  if (!flat.length && !more) return '';
+  const rows = flat.map((p) => `<li class="cx-pane" data-agent="${esc(p.agent_id)}"><span class="grow"><b>${esc(p.label)}</b></span>${pill(p.state, stateTone(p.state))}</li>`).join('');
+  return `<div class="cx-msg" role="status">${flat.length ? `${esc(String(flat.length))} more agents are nested too deeply or cyclic to place under a tab; listed flat.` : ''}`
+    + `${more ? ` ${esc(String(more))} further agents are not shown (limit).` : ''}</div>${rows ? `<ul class="cx-list" aria-label="Agents not placed under a tab">${rows}</ul>` : ''}`;
+}
+
 export function renderTabsPanes(model, selected = null) {
-  if (!model || !model.tabs.length) {
+  if (!model || (!model.tabs.length && !(model.unplaced || []).length)) {
     const note = model && model.hidden_by_grant ? ' Some are not shared with your role by their workspace link.' : '';
     return `<div class="hd-empty">No agents are shown for this room yet.${esc(note)} Tabs and panes appear only from recorded spawn lineage.</div>`;
   }
+  const extra = flatNote(model);
+  if (!model.tabs.length) return extra;
   const tab = model.tabs.find((t) => t.agent_id === selected) || model.tabs[0];
   const tabId = (t) => `hcn-tab-${esc(t.agent_id)}`;
   const strip = model.tabs.map((t) => `<button type="button" role="tab" class="hd-btn hd-btn--ghost hd-btn--sm" id="${tabId(t)}"`
@@ -182,5 +199,5 @@ export function renderTabsPanes(model, selected = null) {
   const hidden = model.hidden_by_grant ? `<div class="cx-msg">${esc(String(model.hidden_by_grant))} more are not shared with your role by their workspace link.</div>` : '';
   return `<div role="tablist" aria-label="Primary agents" class="cx-pills">${strip}</div>`
     + `<div role="tabpanel" id="hcn-tabpanel" aria-labelledby="${tabId(tab)}" tabindex="0" class="cx-stack">`
-    + `<h3 class="hd-card__title">${esc(tab.label)} ${pill(tab.state, stateTone(tab.state))}</h3>${lineage}${ext}${closed}${panes}${hidden}</div>`;
+    + `<h3 class="hd-card__title">${esc(tab.label)} ${pill(tab.state, stateTone(tab.state))}</h3>${lineage}${ext}${closed}${panes}${hidden}${extra}</div>`;
 }

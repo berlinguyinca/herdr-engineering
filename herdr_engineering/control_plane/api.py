@@ -133,7 +133,7 @@ class ControlPlaneServer:
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 summary_config=None, summary_client=None):
+                 summary_config=None, summary_client=None, lineage_key_scopes=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -175,7 +175,13 @@ class ControlPlaneServer:
         # in-memory blob stand-in, so they survive a web restart.
         self.rustfs = rustfs
         from .ingest import IngestService
-        self.ingest = IngestService(repo)
+        # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
+        scopes = {}
+        for key, allow in (lineage_key_scopes or {}).items():
+            digest = hashlib.sha256(str(key).encode()).hexdigest()[:12]
+            scopes[f"key:{digest}"] = {"rooms": frozenset(allow.get("rooms") or ()),
+                                       "missions": frozenset(allow.get("missions") or ())}
+        self.ingest = IngestService(repo, key_scopes=scopes)
         self._limiter = _RateLimiter()
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.

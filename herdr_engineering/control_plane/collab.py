@@ -2295,13 +2295,11 @@ class CollabService:
                         room_ws.add((rid, lk["workspace_id"]))
             if not rooms:
                 return None
-            missions, mission_ws = set(), set()
-            for (rid, mid), ms in self._missions.items():
-                if rid in rooms and pr.id in ms["members"]:
-                    missions.add(mid)
-                    mission_ws.update((mid, w) for r, w in room_ws if r == rid)
+            # a mission is readable only through the room that linked it, by the people that link lists
+            room_missions = {(rid, mid) for (rid, mid), ms in self._missions.items()
+                             if rid in rooms and pr.id in ms["members"]}
             return {"rooms": frozenset(rooms), "room_ws": frozenset(room_ws),
-                    "missions": frozenset(missions), "mission_ws": frozenset(mission_ws)}
+                    "room_missions": frozenset(room_missions)}
 
     def graph_read(self, pr: Principal, parts: list[str], query: dict) -> dict:
         """Lineage graph read for a signed-in person. Hidden, missing and 'no graph for you' all
@@ -2314,13 +2312,15 @@ class CollabService:
         principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
         contexts = None
         room_id = query.get("room_id")
-        if parts == ["nodes"] and room_id is not None:
-            # one room's view: its own scope plus the missions linked to it that this person belongs to
+        if parts == ["nodes"]:
+            # a listing is always ONE room's view (its own scope plus the missions it linked that this person
+            # belongs to), so its cost never depends on other rooms' data
+            if room_id is None:
+                raise CollabError(400, "room_id is required")
             if room_id not in access["rooms"]:
                 raise CollabError(404, "not found")
-            with self._lock:
-                contexts = frozenset({("room", room_id), *(("mission", m) for (r, m), ms in self._missions.items()
-                                                           if r == room_id and pr.id in ms["members"])})
+            contexts = frozenset({("room", room_id, None), *(("mission", m, r) for r, m in access["room_missions"]
+                                                             if r == room_id)})
         try:
             return read_graph(graph, principal, parts, lambda name: query.get(name), contexts=contexts)
         except KeyError:

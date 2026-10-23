@@ -2333,6 +2333,7 @@ def _cmd_cp_web(args) -> int:
 
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
+    lineage_key_scopes = {}
     if args.collab_only:
         # The public collab container is given only the collab slice of the central
         # file (`fleet config render-collab`): no fleet endpoint, no API keys, no DSN.
@@ -2358,6 +2359,16 @@ def _cmd_cp_web(args) -> int:
         merged = {str(k): str(v) for k, v in file_keys.items()}
         merged.update(api_keys or {})
         api_keys = merged or None
+        raw_scopes = cp.get("lineage_key_scopes") or {}
+        if not isinstance(raw_scopes, dict):
+            raise SystemExit("fleet config control_plane.lineage_key_scopes must map an api key to {rooms: [...], missions: [...]}")
+        for key, allow in raw_scopes.items():
+            if (str(key) not in (api_keys or {}) or not isinstance(allow, dict) or set(allow) - {"rooms", "missions"}
+                    or not all(isinstance(allow.get(n, []), list) and all(isinstance(v, str) and v for v in allow.get(n, []))
+                               for n in ("rooms", "missions"))):
+                raise SystemExit("fleet config control_plane.lineage_key_scopes: each entry must name a configured api key "
+                                 "and hold only rooms/missions lists of non-empty strings")
+        lineage_key_scopes = {str(k): v for k, v in raw_scopes.items()}
     if args.collab_cognito_group is None:
         args.collab_cognito_group = "local.dev"
     # The Postgres DSN comes from the fleet file's control_plane section (the
@@ -2436,7 +2447,7 @@ def _cmd_cp_web(args) -> int:
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
         collab = CollabService(StaticTokenAuthenticator(users), sink=sink)
-    svr = ControlPlaneServer(repo, api_keys=api_keys,
+    svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
                              # collab-only has no operator listener, so nothing is left open

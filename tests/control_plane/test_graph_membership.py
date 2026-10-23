@@ -21,13 +21,13 @@ from tests.control_plane.test_graph import (
     OTHER,
     VIEWER,
     WRITER,
+    Feed,
     ids,
     make,
 )
 
 HOSTILE = {"kind": "member", "id": "user:bob", "authenticated_by": "api_key",
-           "access": {"rooms": frozenset({"x"}), "room_ws": frozenset(), "missions": frozenset(),
-                      "mission_ws": frozenset()}}
+           "access": {"rooms": frozenset({"x"}), "room_ws": frozenset(), "room_missions": frozenset()}}
 
 
 @pytest.fixture
@@ -119,7 +119,7 @@ def test_a_room_that_does_not_exist_grants_nothing(fab):
 # ------------------------------------------------------------------------------ missions
 def test_mission_scope_needs_the_explicit_mission_member_list(fab):
     fab.s.link_mission(fab.alice, fab.room, {"mission_id": "m-1", "members": ["bob"]})
-    put(fab.feed, "task:m1", "mission", mission_id="m-1")
+    put(fab.feed, "task:m1", "mission", room_id=fab.room, mission_id="m-1")
     assert visible(fab, fab.bob, "task:m1")
     assert not visible(fab, fab.carol, "task:m1")    # room member, not a mission member
     assert not visible(fab, fab.alice, "task:m1")    # the owner is not on the list either
@@ -127,23 +127,43 @@ def test_mission_scope_needs_the_explicit_mission_member_list(fab):
     fab.s.unlink_mission(fab.alice, fab.room, "m-1")
     assert not visible(fab, fab.bob, "task:m1")
     # an unlinked mission id names nobody
-    put(fab.feed, "task:m2", "mission", mission_id="m-unlinked")
+    put(fab.feed, "task:m2", "mission", room_id=fab.room, mission_id="m-unlinked")
     assert not visible(fab, fab.bob, "task:m2")
 
 
 def test_losing_the_room_ends_mission_visibility(fab):
     fab.s.link_mission(fab.alice, fab.room, {"mission_id": "m-1", "members": ["bob"]})
-    put(fab.feed, "task:m1", "mission", mission_id="m-1")
+    put(fab.feed, "task:m1", "mission", room_id=fab.room, mission_id="m-1")
     fab.s.remove_member(fab.alice, fab.room, "bob")
     assert not visible(fab, fab.bob, "task:m1")
 
 
-def test_a_mission_linked_to_two_rooms_is_visible_through_either(fab):
+def test_a_mission_id_linked_in_two_rooms_stays_bound_to_each_room(fab):
     fab.s.link_mission(fab.alice, fab.room, {"mission_id": "m-1", "members": ["bob"]})
     fab.s.link_mission(fab.alice, fab.room2, {"mission_id": "m-1", "members": ["alice"]})
-    put(fab.feed, "task:m1", "mission", mission_id="m-1")
-    assert visible(fab, fab.bob, "task:m1") and visible(fab, fab.alice, "task:m1")
+    put(fab.feed, "task:m1", "mission", room_id=fab.room, mission_id="m-1")
+    put(fab.feed, "task:m2", "mission", room_id=fab.room2, mission_id="m-1")
+    assert visible(fab, fab.bob, "task:m1") and not visible(fab, fab.bob, "task:m2")
+    assert visible(fab, fab.alice, "task:m2") and not visible(fab, fab.alice, "task:m1")   # not on room 1's list
     assert not visible(fab, fab.carol, "task:m1")
+
+
+def test_a_mission_id_linked_by_someone_elses_room_grants_nothing(fab):
+    """Review M1: any room owner can link any mission id; the label is bound to the linking room."""
+    put(fab.feed, "task:secret", "mission", room_id=fab.room, mission_id="m-secret")
+    fab.s.link_mission(fab.alice, fab.room, {"mission_id": "m-secret", "members": ["bob"]})
+    assert visible(fab, fab.bob, "task:secret") and not visible(fab, fab.mallory, "task:secret")
+    pid = fab.s.create_project(fab.mallory, {"name": "evil"})["project_id"]
+    rid = fab.s.create_room(fab.mallory, pid, {"name": "evil"})["room_id"]
+    fab.s.link_mission(fab.mallory, rid, {"mission_id": "m-secret", "members": ["mallory"]})
+    assert not visible(fab, fab.mallory, "task:secret")
+    # her own room can only ever see events that name HER room
+    put(fab.feed, "task:hers", "mission", room_id=rid, mission_id="m-secret")
+    assert visible(fab, fab.mallory, "task:hers") and not visible(fab, fab.bob, "task:hers")
+    # a mission event without a room is the bare operator-only scope
+    put(fab.feed, "task:norom", "mission", mission_id="m-secret")
+    assert not visible(fab, fab.bob, "task:norom") and not visible(fab, fab.mallory, "task:norom")
+    assert fab.repo.graph.get_node(OPERATOR, "task:norom")["node"]["visibility_scope"] == "mission"
 
 
 # ---------------------------------------------------------------------- workspace links
@@ -171,7 +191,7 @@ def test_an_event_naming_a_workspace_needs_a_viewing_link_from_that_room(fab):
 
 def test_mission_events_with_a_workspace_need_the_mission_room_link(fab):
     fab.s.link_mission(fab.alice, fab.room, {"mission_id": "m-1", "members": ["bob"]})
-    put(fab.feed, "task:mw", "mission", mission_id="m-1", workspace_id="ws-1")
+    put(fab.feed, "task:mw", "mission", room_id=fab.room, mission_id="m-1", workspace_id="ws-1")
     assert not visible(fab, fab.bob, "task:mw")
     link(fab, ws="ws-1")
     assert visible(fab, fab.bob, "task:mw")
@@ -252,9 +272,10 @@ def test_a_hand_built_member_principal_is_not_trusted(fab):
 def test_scope_label_is_derived_from_validated_event_fields_only():
     assert scope_label({"visibility_scope": "org", "room_id": "r"}) == "org"
     assert scope_label({"visibility_scope": "private", "room_id": "r"}) == "private"
-    assert scope_label({"visibility_scope": "room", "room_id": "r"}) == ("room", "r", ())
+    assert scope_label({"visibility_scope": "room", "room_id": "r"}) == ("room", "r", None, ())
     assert scope_label({"visibility_scope": "room", "mission_id": "m"}) == "room"
-    assert scope_label({"visibility_scope": "mission", "mission_id": "m", "workspace_id": "w"}) == ("mission", "m", ("w",))
+    assert scope_label({"visibility_scope": "mission", "mission_id": "m", "room_id": "r", "workspace_id": "w"}) == ("mission", "m", "r", ("w",))
+    assert scope_label({"visibility_scope": "mission", "mission_id": "m"}) == "mission"      # needs its room
     assert scope_label({"visibility_scope": "bogus", "room_id": "r"}) == "private"
     assert scope_label({"visibility_scope": "room", "room_id": ""}) == "room"
     assert scope_label({"visibility_scope": "room", "room_id": 7}) == "room"
@@ -304,7 +325,7 @@ def test_rebuild_equals_live_for_every_reader_across_grant_and_revoke(fab):
     put(f, "task:org", "org")
     put(f, "task:r1", "room", room_id=fab.room)
     put(f, "task:r2", "room", room_id=fab.room2)
-    put(f, "task:m1", "mission", mission_id="m-1")
+    put(f, "task:m1", "mission", room_id=fab.room, mission_id="m-1")
     put(f, "task:w1", "room", room_id=fab.room, workspace_id="ws-1")
     put(f, "task:w2", "room", room_id=fab.room, workspace_id="ws-2")
     put(f, "task:x", "room", room_id=fab.room)
@@ -438,8 +459,10 @@ def test_the_label_meet_is_a_semilattice_and_never_widens_anyone():
 
     from herdr_engineering.control_plane.graph import _narrow
     labels = ["private", "mission", "room", "org",
-              ("room", "R1", ()), ("room", "R1", ("a",)), ("room", "R1", ("b",)), ("room", "R1", ("a", "b")),
-              ("room", "R2", ()), ("mission", "M1", ()), ("mission", "M1", ("a",)), ("mission", "M2", ())]
+              ("room", "R1", None, ()), ("room", "R1", None, ("a",)), ("room", "R1", None, ("b",)),
+              ("room", "R1", None, ("a", "b")), ("room", "R2", None, ()),
+              ("mission", "M1", "R1", ()), ("mission", "M1", "R1", ("a",)), ("mission", "M1", "R2", ()),
+              ("mission", "M2", "R1", ())]
     for a, b in itertools.product(labels, labels):
         assert _narrow(a, b) == _narrow(b, a)
         assert _narrow(a, a) == a
@@ -448,9 +471,8 @@ def test_the_label_meet_is_a_semilattice_and_never_widens_anyone():
     rng = random.Random(7)
     for _ in range(300):
         access = {"rooms": frozenset(x for x in ("R1", "R2") if rng.random() < .5),
-                  "missions": frozenset(x for x in ("M1", "M2") if rng.random() < .5),
-                  "room_ws": frozenset((r, w) for r in ("R1", "R2") for w in "ab" if rng.random() < .5),
-                  "mission_ws": frozenset((m, w) for m in ("M1", "M2") for w in "ab" if rng.random() < .5)}
+                  "room_missions": frozenset((r, m) for r in ("R1", "R2") for m in ("M1", "M2") if rng.random() < .5),
+                  "room_ws": frozenset((r, w) for r in ("R1", "R2") for w in "ab" if rng.random() < .5)}
         member = {"kind": "member", "id": "user:x", "authenticated_by": "collab", "access": access}
         for who in (member, OPERATOR, VIEWER):
             for a, b in itertools.product(labels, labels):
@@ -460,7 +482,7 @@ def test_the_label_meet_is_a_semilattice_and_never_widens_anyone():
                     assert can_see(who, a, frozenset()) and can_see(who, b, frozenset()), (who["kind"], a, b)
     # a member never reads fleet `org`, whatever else they belong to
     full = {"kind": "member", "id": "user:x", "authenticated_by": "collab",
-            "access": {"rooms": frozenset({"R1"}), "missions": frozenset(), "room_ws": frozenset(), "mission_ws": frozenset()}}
+            "access": {"rooms": frozenset({"R1"}), "room_missions": frozenset(), "room_ws": frozenset()}}
     assert can_see(full, "org", None) is False and can_see(VIEWER, "org", None) is True
 
 
@@ -469,11 +491,11 @@ def test_listing_agents_is_scoped_to_one_room_and_its_missions(fab):
     f = fab.feed
     fab.s.link_mission(fab.alice, fab.room, {"mission_id": "m-1", "members": ["bob"]})
     put(f, "agent:lead", "room", room_id=fab.room)
-    put(f, "agent:kid", "mission", mission_id="m-1")                   # Pi's shape: mission_id, no room_id
+    put(f, "agent:kid", "mission", room_id=fab.room, mission_id="m-1")                   # a mission-scoped event, bound to the room that linked it
     put(f, "agent:elsewhere", "room", room_id=fab.room2)
     put(f, "agent:fleet", "org")
     put(f, "agent:bare", "room")
-    f.edge("spawn", "agent:lead", "agent:kid", scope="mission", mission_id="m-1", nodes=False)
+    f.edge("spawn", "agent:lead", "agent:kid", scope="mission", room_id=fab.room, mission_id="m-1", nodes=False)
     f.edge("spawn", "agent:lead", "agent:elsewhere", scope="room", room_id=fab.room2, nodes=False)
 
     def listing(who, room=None):
@@ -487,7 +509,9 @@ def test_listing_agents_is_scoped_to_one_room_and_its_missions(fab):
     assert ids(listing(fab.carol, fab.room)) == {"agent:lead"}
     # alice belongs to both rooms; asking for room2 gives room2's agents only, and no org or bare ones
     assert ids(listing(fab.alice, fab.room2)) == {"agent:elsewhere"}
-    assert ids(listing(fab.alice)) == {"agent:lead", "agent:elsewhere"}
+    with pytest.raises(CollabError) as e:
+        listing(fab.alice)                                             # a listing is always ONE room's view
+    assert e.value.status == 400
     for who in (fab.mallory, fab.dave):
         with pytest.raises(CollabError) as e:
             listing(who, fab.room)
@@ -514,6 +538,103 @@ def test_listing_is_bounded_and_does_not_count_hidden_nodes(fab):
     out = fab.repo.graph.list_nodes(OPERATOR, "agent", limit=4)
     assert len(out["nodes"]) == 4 and out["truncated"] is True
     mem = {"kind": "member", "id": "user:x", "authenticated_by": "collab",
-           "access": {"rooms": frozenset({fab.room}), "missions": frozenset(), "room_ws": frozenset(), "mission_ws": frozenset()}}
+           "access": {"rooms": frozenset({fab.room}), "room_missions": frozenset(), "room_ws": frozenset()}}
     small = fab.repo.graph.list_nodes(mem, "agent", limit=6)
     assert len(small["nodes"]) == 6 and small["truncated"] is False      # the six hidden ones are not counted
+
+
+# ------------------------------------------------------- review M2: listing cost is per room
+def test_a_flood_in_other_contexts_cannot_blank_a_rooms_listing(fab, monkeypatch):
+    from herdr_engineering.control_plane import graph as G
+    monkeypatch.setattr(G, "SCAN_BUDGET", 40)
+    evil = Feed(fab.svc, source="evil")
+    for i in range(60):                                   # private, and addressed to another room
+        evil.send("node.upsert", {"node_type": "agent", "node_id": f"agent:p{i}", "label": "x"}, "private", principal=OTHER)
+        put(evil, f"agent:o{i}", "room", room_id=fab.room2, principal=OTHER)
+    put(fab.feed, "agent:real", "room", room_id=fab.room, label="real")
+    out = fab.s.graph_read(fab.bob, ["nodes"], {"node_type": "agent", "room_id": fab.room})
+    assert ids(out) == {"agent:real"} and out["truncated"] is False and out["truncated_reason"] is None
+
+
+def test_a_listing_that_hits_a_budget_says_which_and_counts_nothing_hidden(fab, monkeypatch):
+    from herdr_engineering.control_plane import graph as G
+    monkeypatch.setattr(G, "SCAN_BUDGET", 5)
+    for i in range(8):
+        put(fab.feed, f"agent:a{i}", "room", room_id=fab.room)
+    out = fab.s.graph_read(fab.bob, ["nodes"], {"node_type": "agent", "room_id": fab.room})
+    assert out["truncated"] is True and out["truncated_reason"] == "scan_budget" and len(out["nodes"]) == 5
+    assert [n["id"] for n in out["nodes"]] == sorted(n["id"] for n in out["nodes"])           # deterministic
+    monkeypatch.setattr(G, "SCAN_BUDGET", 3000)
+    monkeypatch.setattr(G, "EDGE_SCAN_TOTAL", 3)
+    for i in range(7):
+        fab.feed.edge("spawn", f"agent:a{i}", f"agent:a{i + 1}", scope="room", room_id=fab.room, nodes=False)
+    out = fab.s.graph_read(fab.bob, ["nodes"], {"node_type": "agent", "edge_type": "spawn", "room_id": fab.room})
+    assert out["truncated_reason"] == "edge_budget"
+
+
+# ------------------------------------------------- review M3: keys address only listed rooms
+def _restricted(rooms=(), missions=()):
+    from herdr_engineering.control_plane.ingest import IngestService
+    repo = ControlPlaneRepo()
+    svc = IngestService(repo, key_scopes={WRITER["id"]: {"rooms": frozenset(rooms), "missions": frozenset(missions)}})
+    return repo, svc, Feed(svc)
+
+
+def test_a_key_without_a_list_writes_only_org_and_private(fab):
+    _, _, f = _restricted()
+    put(f, "task:ok1", "org")
+    put(f, "task:ok2", "private")
+    for scope, ctx in (("room", {"room_id": fab.room}), ("room", {}), ("mission", {"room_id": fab.room, "mission_id": "m"}),
+                       ("mission", {"mission_id": "m"})):
+        with pytest.raises(PermissionError):
+            put(f, "task:no", scope, **ctx)
+    # operators are not restricted
+    put(f, "task:op", "room", principal=OPERATOR, room_id=fab.room)
+
+
+def test_a_key_may_address_only_its_listed_rooms_and_missions(fab):
+    repo, _, f = _restricted(rooms=["room-a"], missions=["m-1"])
+    put(f, "agent:a", "room", room_id="room-a")
+    with pytest.raises(PermissionError):
+        put(f, "agent:b", "room", room_id="room-b")
+    with pytest.raises(PermissionError):
+        put(f, "agent:c", "room")                                       # bare room scope is not on the list either
+    put(f, "agent:m", "mission", room_id="room-a", mission_id="m-1")
+    for ctx in ({"room_id": "room-a", "mission_id": "m-2"}, {"room_id": "room-b", "mission_id": "m-1"},
+                {"mission_id": "m-1"}):
+        with pytest.raises(PermissionError):
+            put(f, "agent:x", "mission", **ctx)
+    assert set(repo.graph._nodes) == {"agent:a", "agent:m"}              # refused events leave no trace
+    # a forged agent in a victim room by a key that is not allowed there
+    with pytest.raises(PermissionError):
+        f.edge("spawn", "agent:a", "agent:m", scope="room", room_id="room-b", nodes=False)
+
+
+def test_key_scopes_come_from_operator_yaml_config_and_the_http_refusal_is_typed():
+    import http.client
+    import threading
+
+    from herdr_engineering.control_plane.api import ControlPlaneServer
+    keys = {"in-" + "a": "ingest", "in-" + "b": "ingest"}
+    server = ControlPlaneServer(ControlPlaneRepo(), api_keys=keys,
+                                lineage_key_scopes={"in-" + "a": {"rooms": ["room-a"], "missions": []}})
+    threading.Thread(target=server.serve, daemon=True).start()
+    server.wait_until_ready()
+    try:
+        def post(key, n, scope, **ctx):
+            body = {"schema_version": 2, "event_id": f"x{n}", "source": "pi", "source_sequence": n, "entity_type": "lineage",
+                    "entity_id": f"task:t{n}", "event_type": "node.upsert",
+                    "payload": {"node_type": "task", "node_id": f"task:t{n}"}, "visibility_scope": scope, **ctx}
+            c = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+            c.request("POST", "/api/v1/ingest", json.dumps(body), {"X-API-Key": key, "Content-Type": "application/json"})
+            r = c.getresponse()
+            out = json.loads(r.read() or b"{}")
+            c.close()
+            return r.status, out
+        assert post("in-a", 0, "room", room_id="room-a")[0] == 200
+        status, out = post("in-a", 1, "room", room_id="room-z")
+        assert status == 403 and out.get("reason") == "lineage_forbidden"
+        assert post("in-b", 2, "room", room_id="room-a")[0] == 403          # no entry: fail closed
+        assert post("in-b", 3, "org")[0] == 200
+    finally:
+        server.shutdown()

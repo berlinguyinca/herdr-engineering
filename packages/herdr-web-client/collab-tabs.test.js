@@ -110,3 +110,17 @@ test('the graph list call is scoped to one room and uses the collab route', asyn
   assert.deepEqual(calls[0], ['GET', '/api/v1/collab/graph/nodes?node_type=agent&room_id=room+1&limit=500&edge_type=spawn']);
   assert.deepEqual(calls[1], ['GET', '/api/v1/collab/graph/nodes?node_type=pane&room_id=room+1&limit=500']);
 });
+
+test('a chain deeper than the limit and a cycle with no entry are listed flat, never dropped', () => {
+  const names = Array.from({ length: 40 }, (_, i) => `n${String(i).padStart(2, '0')}`);
+  const nodes = [agent('root'), ...names.map((n) => agent(n))];
+  const edges = [spawn('root', names[0]), ...names.slice(1).map((n, i) => spawn(names[i], n))];
+  const m = buildTabsPanes([{ nodes, edges }]);
+  const placed = m.tabs.flatMap((t) => [t.label, ...t.panes.map((p) => p.label)]);
+  const flat = m.unplaced.map((p) => p.label);
+  assert.equal(placed.length + flat.length, 41, 'every agent is shown somewhere');
+  assert.ok(flat.length > 0);
+  assert.match(renderTabsPanes(m), /more agents are nested too deeply or cyclic/);
+  const cyc = buildTabsPanes([{ nodes: [agent('x'), agent('y'), agent('z')], edges: [spawn('x', 'y'), spawn('y', 'z'), spawn('z', 'x')] }]);
+  assert.equal(cyc.tabs.flatMap((t) => [t.label, ...t.panes.map((p) => p.label)]).length + cyc.unplaced.length, 3);
+});

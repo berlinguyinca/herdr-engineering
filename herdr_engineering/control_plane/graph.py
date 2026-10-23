@@ -81,6 +81,7 @@ MAX_SOURCES_PER_ACTOR_OBJECT = 4
 MAX_BINDINGS = 20                    # bindings listed per edge view
 SCAN_BUDGET = 3000                   # incident edges examined per node per read
 NEIGHBOR_SCAN_BUDGET = 500
+EDGE_SCAN_TOTAL = 20000              # incident edges a whole listing may examine
 MAX_CONTRIBUTIONS = 5                # foreign values listed per commons field
 MAX_INSTANCES_PER_TRIPLE = 8         # live per-writer instances of a commons-from edge
 _GENERIC_LIMIT = "lineage object limit reached"
@@ -232,7 +233,11 @@ def validate_lineage(event_type: str, payload: Any, *, strict: bool = True) -> d
 
 # ------------------------------------------------------------- visibility
 # A scope LABEL is a plain scope string, or for a ``room``/``mission`` scope that names its
-# context the tuple ``(scope, context_id, workspaces)`` where ``workspaces`` is a sorted tuple
+# context the tuple ``(scope, context_id, room_id, workspaces)``: a room label has ``room_id`` None and
+# ``context_id`` the room; a MISSION label is bound to the room that linked it (``room_id`` required,
+# otherwise the label is the bare operator-only ``mission``), so another room's owner linking the same
+# mission id gains nothing. ``workspaces`` is
+# the tuple (the audience's room must also hold links to them) where ``workspaces`` is a sorted tuple
 # of the workspace ids the audience's room must also be linked to (empty = no workspace gate).
 # Labels form a meet-semilattice (narrower = fewer readers):
 #   private < bare mission < bare room < contextual room (same id: MORE workspaces = narrower) < org
@@ -253,10 +258,14 @@ def scope_label(ev: dict):
     if scope not in SCOPE_RANK:
         return "private"
     if scope in ("room", "mission"):
-        cid = ev.get("room_id" if scope == "room" else "mission_id")
-        if isinstance(cid, str) and cid and len(cid) <= MAX_ID:
-            ws = ev.get("workspace_id")
-            return (scope, cid, (ws,) if isinstance(ws, str) and ws and len(ws) <= MAX_ID else ())
+        def ident(name):
+            v = ev.get(name)
+            return v if isinstance(v, str) and v and len(v) <= MAX_ID else None
+        rid = ident("room_id")
+        cid = rid if scope == "room" else ident("mission_id")
+        if cid is not None and rid is not None:
+            ws = ident("workspace_id")
+            return (scope, cid, None if scope == "room" else rid, (ws,) if ws else ())
     return scope
 
 
@@ -278,10 +287,11 @@ def _ctx_visible(principal: dict, label: tuple) -> bool:
     if principal.get("kind") != "member" or principal.get("authenticated_by") != "collab" \
             or not isinstance(access, dict):
         return False
-    scope, cid, wss = label
+    scope, cid, rid, wss = label
     if scope == "room":
         return cid in access["rooms"] and all((cid, w) in access["room_ws"] for w in wss)
-    return cid in access["missions"] and all((cid, w) in access["mission_ws"] for w in wss)
+    # a mission is readable through THE room that linked it, and only by the people that link lists
+    return (rid, cid) in access["room_missions"] and all((rid, w) in access["room_ws"] for w in wss)
 
 
 def _widen_labels(cur: tuple, label) -> tuple:
@@ -389,9 +399,9 @@ def _narrow(a, b):
     if isinstance(a, str) and isinstance(b, str):
         return a if SCOPE_RANK.get(a, 0) <= SCOPE_RANK.get(b, 0) else b
     if isinstance(a, tuple) and isinstance(b, tuple):
-        if a[:2] == b[:2]:                              # same room/mission: every workspace gate applies
-            union = tuple(sorted(set(a[2]) | set(b[2])))
-            return (a[0], a[1], union) if len(union) <= MAX_LABEL_WORKSPACES else a[0]
+        if a[:3] == b[:3]:                              # same room/mission: every workspace gate applies
+            union = tuple(sorted(set(a[3]) | set(b[3])))
+            return (*a[:3], union) if len(union) <= MAX_LABEL_WORKSPACES else a[0]
         return a[0] if a[0] == b[0] else "mission"      # different contexts: bare, operator-only
     ctx, bare = (a, b) if isinstance(a, tuple) else (b, a)
     if ctx[0] == "room" or bare in ("private", "mission"):
@@ -676,6 +686,10 @@ class GraphProjection:
         self._out: dict[str, dict] = {}
         self._in: dict[str, dict] = {}
         self._by_type: dict[str, dict] = {}         # node_type -> ids in first-seen order
+        # (scope, id, room_id) context -> node_type -> ids: every node an event ever addressed to that
+        # context (a SUPERSET: later narrowing is applied at read time). Maintained in `_apply_node`, which
+        # live ingest and rebuild both run, so a listing costs the size of one context, not of the graph.
+        self._by_ctx: dict[tuple, dict] = {}
         self._by_triple: dict[tuple, dict] = {}     # (type, from, to) -> keys (all bindings)
         self._subject: dict[tuple, dict] = {}       # (to_id, type) -> keys, bound types only
         self._edges_by_owner: dict[str, set] = {}   # actor id -> edge keys it owns
@@ -924,6 +938,9 @@ class GraphProjection:
                              or op["state"] is not None or op["attrs"]):
             node.note_field_claim(ev, owns=mode == "normal")
         node.note_scope(ev)
+        label = scope_label(ev)
+        if isinstance(label, tuple):
+            self._by_ctx.setdefault(label[:3], {}).setdefault(op["node_type"], {})[op["node_id"]] = None
         if op["op"] == "node.upsert":
             if op["label"] is not None:
                 node.label.set(ev, op["label"])
@@ -1326,35 +1343,52 @@ class GraphProjection:
         if not isinstance(limit, int) or not 1 <= limit <= MAX_NODES:
             raise ValueError(f"limit must be between 1 and {MAX_NODES}")
         with self._lock:
-            views, truncated = {}, False
-            for scanned, nid in enumerate(self._by_type.get(node_type, ())):
+            views, reason = {}, None
+            if contexts is None:
+                candidates = self._by_type.get(node_type, ())      # keyed API: first-seen order
+            else:                                                  # one room: only what was addressed to it
+                seen = {}
+                for c in sorted(contexts, key=repr):
+                    seen.update(dict.fromkeys(sorted(self._by_ctx.get(c, {}).get(node_type, ()))))
+                candidates = seen
+            for scanned, nid in enumerate(candidates):
                 if scanned >= SCAN_BUDGET:
-                    truncated = True
+                    reason = "scan_budget"
                     break
                 node = self._nodes[nid]
                 if not self._node_visible(principal, node):
                     continue
                 if contexts is not None:
                     label = node.eff_scope(principal, internal=False) if node.commons else node.eff_scope()
-                    if not (isinstance(label, tuple) and label[:2] in contexts):
+                    if not (isinstance(label, tuple) and label[:3] in contexts):
                         continue
                 if len(views) >= limit:
-                    truncated = True
+                    reason = "limit"
                     break
                 views[nid] = self._node_view(node, principal)
             edges, ctx, done = [], {}, set()
             if edge_type is not None:
+                left = EDGE_SCAN_TOTAL                              # one budget for the whole read
                 for nid in views:
-                    own, others, exhausted = self._expand(principal, nid, "out", {edge_type}, False, None,
-                                                          NEIGHBOR_SCAN_BUDGET)
-                    truncated = truncated or exhausted
+                    if left <= 0:
+                        reason = reason or "edge_budget"
+                        break
+                    per = min(NEIGHBOR_SCAN_BUDGET, left)
+                    left -= min(len(self._out.get(nid, ())), per)
+                    own, others, exhausted = self._expand(principal, nid, "out", {edge_type}, False, None, per)
+                    if exhausted:
+                        reason = reason or "edge_budget"
                     for edge in own + others:
-                        if edge.to_id in views and edge.key not in done and len(edges) < MAX_EDGES:
+                        if edge.to_id in views and edge.key not in done:
+                            if len(edges) >= MAX_EDGES:
+                                reason = reason or "limit"
+                                continue
                             done.add(edge.key)
                             edges.append(self._edge_view(edge, principal, ctx))
-                        elif edge.to_id in views and edge.key not in done:
-                            truncated = True
-            return {"node_type": node_type, "nodes": list(views.values()), "edges": edges, "truncated": truncated}
+            # `truncated_reason` names the budget that ended the read; it counts only visible items or the size
+            # of the one context asked about, never hidden nodes elsewhere in the graph.
+            return {"node_type": node_type, "nodes": list(views.values()), "edges": edges,
+                    "truncated": reason is not None, "truncated_reason": reason}
 
     def neighborhood(self, principal, root: str, *, depth: int = DEFAULT_DEPTH,
                      max_nodes: int = DEFAULT_NODES, max_edges: int = DEFAULT_EDGES,

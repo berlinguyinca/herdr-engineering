@@ -171,13 +171,13 @@ no Herdr code derives an agent state change from a session stop or pane close.
 
 ### Scope semantics (T08: room and mission membership)
 A scope is a LABEL derived from the stored envelope fields of the event that carried it: `private`, `org`, a bare `room` /
-`mission` (no id on the envelope), or a contextual `(room, room_id, workspace_id?)` / `(mission, mission_id, workspace_id?)`
-when the envelope names `room_id` (resp. `mission_id`) - so live ingest and rebuild read the same stored columns.
+`mission` (no id on the envelope), or a contextual `(room, room_id, -, workspaces)` / `(mission, mission_id, room_id, workspaces)`
+when the envelope names `room_id` (resp. `room_id` AND `mission_id`) - so live ingest and rebuild read the same stored columns.
 | label | who can read |
 |---|---|
 | `org` | any authenticated fleet KEY (keyed API). **Never a signed-in person**: the HCN route does not read `org` lineage |
 | `room` + `room_id` | operator keys; a signed-in, approved NON-GUEST member of that room (expired membership does not count) |
-| `mission` + `mission_id` | operator keys; a person on that mission's explicit member list (T07 `link_mission`) in a room where they are still a non-guest member |
+| `mission` + `room_id` + `mission_id` | operator keys; a person on the member list of the T07 `link_mission` link **in that same room** (`room_id`), while still a non-guest member of it. Another room linking the same mission id gains nothing. A mission event without `room_id` is the bare, operator-only scope |
 | either, plus `workspace_id` | as above AND that room holds a link to the workspace granting `status`, `tabs` or `panes` (revoking the grant, or unlinking, hides it). Events of one object that name several workspaces need a link to EACH (at most 8, then the bare label) |
 | bare `room` / `mission` | operator keys only (fail closed; no member can satisfy a label that names nothing) |
 | `private` | only the object's writers (owner + operator-set `co_writers`) |
@@ -189,7 +189,7 @@ when the envelope names `room_id` (resp. `mission_id`) - so live ingest and rebu
 - **Who is a reader.** Only people (HCN user principals). Agents, guests, unapproved people and people with no non-guest room
   membership get one 404 for the whole route. Room access still never implies workspace terminal access.
 - **Front doors.** `GET /api/v1/collab/graph/nodes/{id}`, `.../nodes/{id}/neighborhood` (alias `subgraph`),
-  `.../graph/edge` and the listing `.../graph/nodes?node_type=&edge_type=&limit=[&room_id=]` take the same parameters as the keyed `/api/v1/graph/...` routes and use the same `read_graph` router.
+  `.../graph/edge` and the listing `.../graph/nodes?node_type=&edge_type=&limit=&room_id=` take the same parameters (the listing REQUIRES `room_id`: it is always one room's view and costs the size of that room's context, via an index kept at apply time in live and rebuild alike; the response carries `truncated_reason`: `limit`, `scan_budget` or `edge_budget`, never a count of hidden nodes) as the keyed `/api/v1/graph/...` routes and use the same `read_graph` router.
   They exist only when the collab service runs in the combined server (not `collab_only`, which by design never sees fabric
   data): in the isolated process the route is a plain 404. The keyed API still sees `room`/`mission` as operator-only.
 - **Meet rules** (a node/edge keeps the NARROWEST label of any event that defined it, never widening). Labels form a
@@ -201,7 +201,19 @@ when the envelope names `room_id` (resp. `mission_id`) - so live ingest and rebu
   into either. Commutativity, associativity and idempotence are tested over the whole label universe, together with
   "the meet is never visible to someone who could not see both inputs" (`org` aside: it is fleet data, not people data).
   Commons nodes keep per-writer labels (at most 4 per writer) and every field stays gated by its own writer's label.
-- **Trust.** The room/mission/workspace named on an event is whatever the (authenticated) ingest key put in its envelope:
+- **Key scopes (who may address a room or mission).** Operator YAML, no environment variables:
+  ```yaml
+  control_plane:
+    lineage_key_scopes:            # key string exactly as in api_keys -> what it may address
+      "<ingest key>": {rooms: ["<room id>"], missions: ["<mission id>"]}
+  ```
+  Enforced at ingest before anything is stored or sequenced. A non-operator key may write `room` scope only with a listed
+  `room_id`, and `mission` scope only with a listed `room_id` AND a listed `mission_id`; otherwise it is refused with the
+  usual 403 `lineage_forbidden`. **A key with no entry may write only `org`/`private` scopes (fail closed; this is the new
+  default).** `"*"` in a list is an explicit opt-in for every id and for bare id-less scopes (the old behaviour; for trusted
+  fleet keys only). Operator keys are not restricted. Entries must name a configured key; malformed entries stop startup.
+- **Trust.** The room/mission/workspace named on an event is whatever the (authenticated) ingest key put in its envelope, now
+  limited to what the operator listed for that key (above). Residue:
   ingest keys are fleet credentials, and they could already publish `org` lineage that every signed-in key reads. The new
   capability is only that such a key can address content to a specific room's members; it shows attributed (`writer`,
   `source`) and cannot change what any other writer sees, and a room or mission that does not exist (or is not linked)
@@ -232,8 +244,11 @@ panel lists by type instead of walking from a root.
 ### T08 rollout and rollback
 - Code-only, no migration. Deploy order: server first (new read routes and label handling), then the web files
   (`collab-tabs.js` is served from the static map in `api.py`). Emitters need no change to keep today's behaviour; to make
-  lineage visible to a room, a producer sets envelope `room_id` (and `visibility_scope: "room"`), or `mission_id` with
-  `visibility_scope: "mission"`, plus `workspace_id` when the workspace link should gate it.
+  lineage visible to a room, a producer sets envelope `room_id` (and `visibility_scope: "room"`), or `room_id` + `mission_id` with
+  `visibility_scope: "mission"`, plus `workspace_id` when the workspace link should gate it, **and the operator adds the key to
+  `control_plane.lineage_key_scopes`** (without an entry the key can no longer write room/mission scope: existing deployments
+  that did so get 403 `lineage_forbidden` until listed, or until `"*"` is set to keep the old behaviour). Pi needs
+  `visibility: mission`, a key allowed for its mission and room, and the room id on its envelope (Pi does not send `room_id` today).
 - Rollback: revert the PR. Stored events are untouched (labels are derived at read time), so the graph rebuilds exactly as
   before: contextual scopes become bare `room`/`mission` again (operator-only), i.e. members lose access, nothing leaks.
   A web-only rollback just removes the Tabs panel.
@@ -252,12 +267,13 @@ panel lists by type instead of walking from a root.
   edge instances are not compacted (bounded by 64 records per triple and the global edge cap).
 - **Membership resolution (T08)** exists only on the HCN-authenticated route and only in the combined server; the keyed
   `/api/v1/graph` API still treats `room`/`mission` as operator-only. Agents and guests read no graph.
-- **Addressing is not authorization of the writer**: any ingest key may address a room it can name (see "Trust" above).
-  A per-key allowed-room list in the fleet YAML is the next hardening step (not done).
+- **Node ids are one namespace.** Two keys allowed for different rooms can still collide on an owned id such as `agent:main`
+  (first creator owns it). Emitters should include a room/mission-specific part in agent ids; not enforced.
 - **Pi (pi-t02 `src/runtime/herdr/lineage.ts`, read for this PR)** puts `mission_id` (and task/agent/workspace ids when it has
-  them) on the envelope and uses ONE configured `visibility_scope` for the whole emitter; it never sets `room_id`. So Pi lineage
-  becomes member-readable with `visibility: mission` plus a T07 mission link that lists the people; `room` scope needs a
-  `room_id` Pi does not send. It emits `agent`/`attempt`/`session`/`handoff`/`artifact` nodes and agent->agent `spawn` edges
+  them) on the envelope and uses ONE configured `visibility_scope` for the whole emitter; it never sets `room_id`. Since a mission
+  is bound to the room that linked it, Pi lineage becomes member-readable only with `visibility: mission`, a T07 mission link that
+  lists the people, a key allowed for that room and mission, AND a `room_id` on the envelope, which Pi does not send today
+  (until then it stays operator-only and a key without `"*"` cannot even write it: **unfixed on the Pi side**). It emits `agent`/`attempt`/`session`/`handoff`/`artifact` nodes and agent->agent `spawn` edges
   (so tabs and panes work from `mission` scope), but no `tab:`/`pane:` surface nodes, so "pane closed" notes stay empty until
   an emitter adds them (with `attrs.agent_id`). Pi does not put `workspace_id` on agent attrs, so link-grant filtering of
   tabs/panes does not apply to Pi data (the server-side workspace gate still does when `workspace_id` is on the envelope).
