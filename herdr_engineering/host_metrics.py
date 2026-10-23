@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import os
 import platform
+import json
 import re
 import subprocess
 import time
 from pathlib import Path
+from typing import Callable
 
 _PSEUDO_FS = {
     "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2", "overlay",
@@ -21,6 +23,92 @@ _PSEUDO_FS = {
     "rpc_pipefs", "fuse.lxcfs",
 }
 MAX_MOUNTS = 8
+MAX_GPUS = 8
+TOP_N = 5
+_MIB = 1024 ** 2
+
+
+def _run(cmd: list[str], timeout: float = 5.0) -> str | None:
+    """Run ``cmd``; stdout on success, ``None`` on any failure or timeout."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              check=True).stdout
+    except Exception:  # noqa: BLE001 - missing tool, timeout, non-zero exit
+        return None
+
+
+def _num(s) -> float | None:
+    try:
+        return float(str(s).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _gpu(name, util=None, used=None, total=None, temp=None) -> dict:
+    return {"name": name, "util_pct": util, "vram_used_b": used,
+            "vram_total_b": total, "temp_c": temp}
+
+
+def parse_nvidia_smi(csv: str) -> list[dict]:
+    """``nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,
+    temperature.gpu --format=csv,noheader,nounits`` (memory in MiB)."""
+    out = []
+    for line in csv.splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) < 5 or not f[0]:
+            continue
+        util, used, total, temp = (_num(x) for x in f[1:5])
+        out.append(_gpu(f[0], util,
+                        None if used is None else int(used * _MIB),
+                        None if total is None else int(total * _MIB), temp))
+    return out[:MAX_GPUS]
+
+
+def parse_rocm_smi(json_text: str) -> list[dict]:
+    """``rocm-smi --showproductname --showuse --showmeminfo vram --showtemp --json``."""
+    data = json.loads(json_text)
+    out = []
+    for key in sorted(k for k in data if str(k).startswith("card")):
+        c = data[key]
+        used, total = _num(c.get("VRAM Total Used Memory (B)")), _num(c.get("VRAM Total Memory (B)"))
+        out.append(_gpu(c.get("Card Series") or c.get("Card series") or key,
+                        _num(c.get("GPU use (%)")),
+                        None if used is None else int(used),
+                        None if total is None else int(total),
+                        _num(c.get("Temperature (Sensor edge) (C)"))))
+    return out[:MAX_GPUS]
+
+
+def parse_apple_gpu(system_profiler_json: str) -> list[dict]:
+    """``system_profiler SPDisplaysDataType -json``: name and core count only."""
+    out = []
+    for d in json.loads(system_profiler_json).get("SPDisplaysDataType", []):
+        name = d.get("sppci_model") or d.get("_name")
+        if not name:
+            continue
+        g = _gpu(name)
+        cores = _num(d.get("sppci_cores"))
+        if cores is not None:
+            g["cores"] = int(cores)
+        out.append(g)
+    return out[:MAX_GPUS]
+
+
+def parse_ps(output: str, limit: int = TOP_N) -> dict:
+    """Parse ``ps -A -o pid=,user=,pcpu=,pmem=,comm=`` into top-N by cpu and mem."""
+    rows = []
+    for line in output.splitlines():
+        f = line.split(None, 4)
+        if len(f) < 5:
+            continue
+        pid, cpu, mem = _num(f[0]), _num(f[2]), _num(f[3])
+        if pid is None or cpu is None or mem is None:
+            continue
+        cmd = f[4].strip().rsplit("/", 1)[-1] or f[4].strip()
+        rows.append({"pid": int(pid), "command": cmd[:64], "user": f[1],
+                     "cpu_pct": cpu, "mem_pct": mem, "owner": None})
+    return {"cpu": sorted(rows, key=lambda r: -r["cpu_pct"])[:limit],
+            "mem": sorted(rows, key=lambda r: -r["mem_pct"])[:limit]}
 
 
 def _herdr_data_dir() -> str:
@@ -60,7 +148,10 @@ def _parse_size(s: str) -> int:
 
 
 class HostSampler:
-    def __init__(self) -> None:
+    def __init__(self, agent_lookup: Callable[[int], str | None] = lambda pid: None,
+                 agents_running: Callable[[], int] = lambda: 0) -> None:
+        self._agent_lookup = agent_lookup
+        self._agents_running = agents_running
         self._prev_cpu: tuple[int, int] | None = None
         self._prev_net: tuple[float, int, int] | None = None
 
@@ -70,8 +161,10 @@ class HostSampler:
             return fh.read()
 
     def _run(self, argv: list[str]) -> str:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=5,
-                              check=True).stdout
+        out = _run(argv)
+        if out is None:
+            raise RuntimeError(f"command failed: {argv[0]}")
+        return out
 
     def _statvfs(self, path: str):
         return os.statvfs(path)
@@ -81,15 +174,19 @@ class HostSampler:
         out: dict = {}
         darwin = platform.system() == "Darwin"
         steps = ([self._mac_cpu, self._mac_mem, self._mac_uptime, self._mac_net,
-                  self._load, self._disk_pct, self._mounts_df]
+                  self._load, self._disk_pct, self._mounts_df, self._gpus, self._top, self._agents]
                  if darwin else
                  [self._linux_cpu, self._linux_mem, self._linux_uptime,
-                  self._linux_net, self._load, self._disk_pct, self._mounts_proc])
+                  self._linux_net, self._load, self._disk_pct, self._mounts_proc, self._gpus, self._top,
+                  self._agents])
         for step in steps:
             try:
                 out.update(step())
             except Exception:  # noqa: BLE001 - a failed reader omits its fields
                 pass
+        if darwin and out.get("gpus") and "mem_total_b" in out:
+            for g in out["gpus"]:  # unified memory: report system RAM use
+                g["vram_used_b"], g["vram_total_b"] = out["mem_used_b"], out["mem_total_b"]
         return out
 
     # -- shared ----------------------------------------------------------
@@ -142,6 +239,55 @@ class HostSampler:
         mounts = [{k: v for k, v in m.items() if k != "_dev"}
                   for m in sorted(mounts, key=lambda m: m["path"])[:MAX_MOUNTS]]
         return {"mounts": mounts} if mounts else {}
+
+    # -- gpu / top / agents -----------------------------------------------
+    def _try(self, argv: list[str]) -> str | None:
+        try:
+            return self._run(argv)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _gpus(self) -> dict:
+        gpus: list[dict] = []
+        if platform.system() == "Darwin":
+            txt = self._try(["system_profiler", "SPDisplaysDataType", "-json"])
+            gpus = parse_apple_gpu(txt) if txt else []
+            if gpus and self._try(["sudo", "-n", "true"]) is not None:
+                pm = self._try(["sudo", "-n", "powermetrics", "--samplers", "gpu_power",
+                                "-n", "1", "-i", "200"])
+                m = re.search(r"GPU (?:HW )?active residency:\s+([\d.]+)%", pm or "")
+                if m:
+                    gpus[0]["util_pct"] = float(m.group(1))
+        else:
+            txt = self._try(["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,"
+                             "memory.total,temperature.gpu", "--format=csv,noheader,nounits"])
+            gpus = parse_nvidia_smi(txt) if txt else []
+            if not gpus:
+                txt = self._try(["rocm-smi", "--showproductname", "--showuse", "--showmeminfo",
+                                 "vram", "--showtemp", "--json"])
+                try:
+                    gpus = parse_rocm_smi(txt) if txt else []
+                except ValueError:
+                    gpus = []
+        return {"gpus": gpus[:MAX_GPUS]} if gpus else {}
+
+    def _top(self) -> dict:
+        txt = self._try(["ps", "-A", "-o", "pid=,user=,pcpu=,pmem=,comm="])
+        if not txt:
+            return {}
+        top = parse_ps(txt)
+        for e in top["cpu"] + top["mem"]:
+            try:
+                e["owner"] = self._agent_lookup(e["pid"])
+            except Exception:  # noqa: BLE001
+                e["owner"] = None
+        return {"top": top} if top["cpu"] else {}
+
+    def _agents(self) -> dict:
+        try:
+            return {"agents_running": int(self._agents_running())}
+        except Exception:  # noqa: BLE001
+            return {}
 
     # -- linux -----------------------------------------------------------
     def _linux_cpu(self) -> dict:
