@@ -1,0 +1,9 @@
+Cancel / crash drill, real binaries, bender (load >100), 2026-10-23. One attempt, manual, not a harness.
+1. pi-bolt (AOT), SIGTERM 12 s into a streaming reply: exit=143, process ended promptly.
+2. pi-bolt-jit, SIGKILL 12 s into a streaming reply: exit=137.
+3. Standard Pi 1.4.0 --continue afterwards: hit the 150 s timeout (exit=124) under load.
+INCONCLUSIVE for data safety: no session .jsonl existed after step 1 (print mode had not flushed one
+before the signal), so steps 2-3 had no session to corrupt or resume. What it shows: signals end the
+runtime with the conventional exit codes. What it does NOT show: no corrupted session after a kill,
+and no resume of a half-written session. Launcher-level behaviour (exit-code propagation, no replay
+after start) is covered by pi-engineering test/integration/pi-runtime-launcher.test.ts instead.

@@ -62,7 +62,8 @@ used for magnitudes. Magnitudes above come from the lower-load repetitions 1-2.
 
 ## Limits of this evidence (read before deciding)
 - Host was heavily loaded (load 78-120) for the whole run; absolute numbers are not representative of an idle host. Re-run on a quiet host before any approval.
-- Not run: 24-agent concurrency, full Herdr mission with child agents and issue links, collaboration room with reconnect, long soak, crash recovery, extension-failure injection, macOS/beast/Apptainer hosts, OpenViking (not installed on bender), steady-state CPU/RSS after load, true cold start (page cache not dropped).
+- Cancel/crash: one manual drill, inconclusive for data safety (results/cancel-drill.txt).
+- Not run: 24-agent concurrency, full Herdr mission with child agents and issue links, collaboration room with reconnect, long soak, gateway-side accounting parity, Autospec/Planotator/lineage gates under Pi-Bolt, crash recovery, extension-failure injection, macOS/beast/Apptainer hosts, OpenViking (not installed on bender), steady-state CPU/RSS after load, true cold start (page cache not dropped).
 - Concurrency (5, 12) used 3 repetitions; interval estimates are wide. Tools and extension-load reps (3) are below the spec's 10 because each extension-loaded run takes minutes on this host.
 - Bundled mode (`pi-bolt compile`) was attempted and is blocked; it is the one mode that could remove the extension-load penalty.
 - Single model; reasoning-heavy models and long contexts untested.
