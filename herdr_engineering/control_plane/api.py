@@ -32,6 +32,7 @@ from ..version import __version__
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .graph import read_graph
+from .ingest import INGEST_ENTITY_TYPES
 from .review_quorum import pr_review_quorum
 from .redact import redact_payload
 
@@ -242,7 +243,14 @@ class ControlPlaneServer:
         self.public_host = public_host or host
         self._public_httpd = None
         if collab is not None:
-            collab.hydrate(repo.take_collab_replay())
+            try:
+                collab.hydrate(repo.take_collab_replay())
+            except ValueError as exc:
+                # T16 H1: a log that fails its integrity check must not brick the whole control plane
+                # (lineage, CI, hosts...). Collaboration alone is switched off (every request 503s, no
+                # write) until the operator repairs the log; the error is logged at ERROR.
+                collab.degraded = f"durable collab log failed its integrity check ({exc})"
+                logging.getLogger(__name__).error("collaboration DISABLED at startup: %s", collab.degraded)
             if not collab_only:
                 # membership-scoped lineage reads (lineage-events.md, "Scope semantics"): the
                 # isolated collab-only process never sees fabric data, so it serves none
@@ -988,7 +996,7 @@ def _make_handler(server, public=False, operator=False):
 
         def _rate_limit(self, key=None):
             path = self.path.split("?")[0]
-            who = key or self.client_address[0]
+            who = key or self._proxied_client()       # T16 M12: the same client identity on every route
             if self.command == "GET" and path.rstrip("/").endswith("/events/stream"):
                 # SSE is long-lived, so it is not counted like request bursts, but how often a
                 # client may open one is still bounded (it costs a token check each time).
@@ -1187,10 +1195,13 @@ def _make_handler(server, public=False, operator=False):
             if resource == "steering":
                 return self._steering(parts)
             if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
-                return self._json({"sources": r.ledger.source_states(), "server_time": r._stamp()})
+                # T16 M4: emitter names, actor digests and sequences of other principals are operator
+                # business; every other key sees only the sources it emitted itself.
+                own = None if self._role() == "operator" else self._principal().get("id") or ""
+                return self._json({"sources": r.ledger.source_states(own), "server_time": r._stamp()})
             if resource == "ingest":
                 return self._json({"endpoint": "POST /api/v1/ingest",
-                                   "entities": ["host", "session", "mission"]})
+                                   "entities": sorted(INGEST_ENTITY_TYPES)})
             if resource == "github":
                 what = parts[4] if len(parts) == 5 else ""
                 if len(parts) > 5 or (len(parts) == 5 and what not in {"issues", "issue"}):

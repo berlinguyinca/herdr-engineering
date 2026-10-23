@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import threading
 import time
 from uuid import uuid4
@@ -156,6 +157,7 @@ class ControlPlaneRepo:
         # Envelope v2 idempotency / sequence / freshness state (envelope.py).
         self.ledger = SourceLedger(now=self._now, persist=self._persist_source_state)
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
+        self.collab_quarantine = []  # foreign 'collab' rows found at startup (never replayed)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
         self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
         # Agent inspector (spec 0200): bounded per-session detail projection.
@@ -1940,7 +1942,19 @@ class ControlPlaneRepo:
         # HCN events are private to the collaboration service: they must never sit
         # in the shared streams that /activity and the global SSE feed expose.
         for key in [k for k in self._events if k[0] == "collab"]:
-            self._collab_replay.extend(self._events.pop(key))
+            for row in self._events.pop(key):
+                # T16 H1: the collaboration service writes ONE stream (collab/log) and never an ingest
+                # envelope. Anything else under this entity type was not written by it (rows stored before
+                # ingest became an allow-list): quarantine it, keep it for the operator, never replay it.
+                if key[1] == "log" and row.get("source") is None and not row.get("actor"):
+                    self._collab_replay.append(row)
+                else:
+                    self.collab_quarantine.append(row)
+        if self.collab_quarantine:
+            logging.getLogger(__name__).error(
+                "quarantined %d foreign 'collab' row(s) from the durable log (not written by the "
+                "collaboration service); they are kept in storage and were NOT replayed",
+                len(self.collab_quarantine))
         self._event_order = [t for t in self._event_order if t[0] != "collab"]
         if durable:
             self.inspector.hydrate(durable)

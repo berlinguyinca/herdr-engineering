@@ -36,7 +36,7 @@ It extends the existing `Event` / `POST /api/v1/ingest` contract; v1 bodies keep
 ## Herdr implementation notes (resolved ambiguities)
 - A v2 body must carry `event_id`, `source` (no `herdr` default: the source is the sequence domain) and `source_sequence`.
 - The first event seen from a source sets its baseline; it never opens a gap. A later arrival inside a gap removes that sequence from the gap (the gap splits or closes).
-- Freshness window defaults to 300 s (`SourceLedger.freshness_seconds`); `GET /api/v1/ingest/sources` lists `status: healthy|stale`.
+- Freshness window defaults to 300 s (`SourceLedger.freshness_seconds`); `GET /api/v1/ingest/sources` lists `status: healthy|stale` (all domains to operator keys, only the caller's own to any other key; T16 M4). A key keeps at most 64 domains and cannot evict another key's (T16 M6). Ingest accepts an allow-list of entity types only (T16 H1).
 - `actor.id` is `key:<12-hex sha256 digest of the API key>`; `kind` is the key's role. An open (keyless loopback) listener reports `open-listener`.
 - No per-principal visibility grant exists yet, so the server only validates the enum (unknown => `private`); it does not narrow further.
 - Idempotency compares emitter-controlled content (not `actor`/`received_at`). The content digest is stored in the envelope row (`payload._envelope.content_sha256`) so a restart-rebuilt ledger still detects same-id/different-content.

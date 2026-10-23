@@ -35,6 +35,18 @@ def _git_identity(payload):
     return {"repository_id": next(iter(identities), None), "commit_sha": commit_sha}
 
 
+# Entity types an ingest principal may write. Dispatched types have handlers; the generic ones are
+# plain activity records nothing authoritative reads back. Adding a type here is a security decision.
+DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
+                                     "mission_activity"})
+# ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
+GENERIC_ENTITY_TYPES = frozenset({"task", "note", "workspace", "ledger", "platform", "lifecycle"})
+INGEST_ENTITY_TYPES = DISPATCHED_ENTITY_TYPES | GENERIC_ENTITY_TYPES
+# Event types the server itself writes for an allowed entity type: receipts other code trusts as idempotency
+# markers (repo.send_message, ci_debug, bridge). A client may not name them.
+SERVER_OWNED_EVENT_TYPES = {"session": frozenset({"SessionCommandQueued", "SessionCommandSettled"})}
+
+
 class IngestService:
     """Translates lifecycle event envelopes into idempotent repo mutations."""
 
@@ -89,7 +101,8 @@ class IngestService:
                 # the room's service principal) and adds nothing to the endpoint's own namespace
                 actor.get("kind") == "collab" and event_type.startswith("edge.")
                 and payload.get("edge_type") == "cross_link") or (
-                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
+                # T16 L1: an open listener is no operator here either (it already is not for service nodes)
+                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none", "open_listener")):
             return
         written = payload.get("from_id") if event_type.startswith("edge.") else payload.get("node_id")
         if isinstance(written, str) and self.reserved_node(written):
@@ -128,11 +141,12 @@ class IngestService:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", source):
             raise ValueError("invalid source")
 
-        # Provider-owned observations and review outcomes have dedicated,
-        # authenticated adapters; generic telemetry cannot forge those streams.
-        if entity_type in {"plannotator_review", "ci_pipeline", "agent_identity", "agent_summary",
-                           "custom_model", "llm_key", "token_usage"}:
-            raise ValueError("provider-owned entity type is not accepted by generic ingestion")
+        # T16 H1/M1/M5: an ALLOW-LIST. Everything else (collab, ci_*, plannotator_review, agent_identity,
+        # token_usage, ...) is owned by a dedicated, authenticated adapter and can never be written here.
+        if entity_type not in INGEST_ENTITY_TYPES:
+            raise ValueError("entity type is not accepted by generic ingestion")
+        if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()):
+            raise ValueError("event type is reserved for the server")
         env = normalize_envelope(body, principal, self.repo._stamp())
         if env is None and entity_type == "lineage":
             raise ValueError("lineage events require schema_version 2")

@@ -2337,6 +2337,7 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.sink import DurableEventSink
 
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
+    switch_store = fleet_store
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
     lineage_key_scopes = {}
     if args.collab_only:
@@ -2350,7 +2351,7 @@ def _cmd_cp_web(args) -> int:
         if not (args.collab_log_file and args.collab_public_port and args.collab_cognito_pool):
             raise SystemExit("--collab-only needs --collab-log-file, --collab-public-port and a "
                              "Cognito pool (control_plane.collab.cognito_pool or --collab-cognito-pool)")
-        fleet_store = None
+        switch_store, fleet_store = fleet_store, None     # no fleet endpoint here, but the switches still reload
     elif fleet_store is not None:
         _install_fleet_host_config(fleet_store)
         names = (cp.get("collab") or {}).get("dashboard_hosts") if isinstance(cp.get("collab"), dict) else None
@@ -2442,7 +2443,11 @@ def _cmd_cp_web(args) -> int:
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
                                delegation_enabled=_delegation_switch(args, cp))
         if args.collab_only:
-            collab.hydrate(sink.load())
+            try:
+                collab.hydrate(sink.load())
+            except ValueError as exc:      # T16 H1: a corrupt log disables collaboration with an ERROR, as in the combined server
+                collab.degraded = f"durable collab log failed its integrity check ({exc})"
+                logging.getLogger(__name__).error("collaboration DISABLED at startup: %s", collab.degraded)
     elif args.collab_users_file:
         from pathlib import Path
 
@@ -2462,32 +2467,13 @@ def _cmd_cp_web(args) -> int:
         if history not in ("full", "since_join"):
             raise SystemExit("control_plane.collab.replay_history must be 'full' or 'since_join'")
         collab.replay_history = history
-        # T12: comments and steering. Settings are YAML only (no flag or env), and when a fleet file is in use the
-        # service re-reads them per request, so editing `kill_switch: true` takes effect without a restart.
+        from .control_plane.collab_attention import normalize_insights
+        from .control_plane.collab_context import normalize_contextual
         from .control_plane.collab_workbench import normalize_steering
         collab.steering = normalize_steering(getattr(args, "collab_steering", None))
-        if fleet_store is not None:
-            def _steering_from_yaml(_store=fleet_store):
-                section = _store.secure_section("control_plane")
-                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("steering")
-            collab.steering_source = _steering_from_yaml
-        # T14: contextual chat, consultation and cross-workspace links. Same rule: YAML only, off by default, re-read
-        # per request when a fleet file is in use so `kill_switch: true` needs no restart.
-        from .control_plane.collab_context import normalize_contextual
         collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
-        if fleet_store is not None:
-            def _contextual_from_yaml(_store=fleet_store):
-                section = _store.secure_section("control_plane")
-                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("contextual")
-            collab.contextual_source = _contextual_from_yaml
-        # T15: attention inbox, evidence-based progress and analytics. Same rule: YAML only, off by default, hot kill switch.
-        from .control_plane.collab_attention import normalize_insights
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
-        if fleet_store is not None:
-            def _insights_from_yaml(_store=fleet_store):
-                section = _store.current().section("control_plane")
-                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("insights")
-            collab.insights_source = _insights_from_yaml
+        _wire_collab_switches(collab, switch_store)
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
@@ -2610,6 +2596,55 @@ def _apply_collab_config(args, cp) -> None:
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be a non-empty string")
             if getattr(args, dest) is None:
                 setattr(args, dest, value)
+
+
+# T16 M3/M15: EVERY collab feature switch is read per request through FleetConfigStore.secure_section, so a
+# missing, unreadable (unparseable, group/other-accessible) or invalid fleet file turns it OFF (or, for
+# replay_history, to the stricter value) identically. Adding a switch to COLLAB_CONFIG_KEYS without
+# registering it here fails tests/control_plane/test_t16_security.py.
+HOT_COLLAB_SWITCHES = {
+    "steering": ("steering_source", "dict"),
+    "contextual": ("contextual_source", "dict"),
+    "insights": ("insights_source", "dict"),
+    "delegation_enabled": ("delegation_source", "bool"),
+    "replay_history": ("replay_history_source", "str"),
+}
+# collab keys that are not feature switches (identity, listener and URL settings read once at startup)
+STARTUP_ONLY_COLLAB_KEYS = frozenset(COLLAB_CONFIG_KEYS) - frozenset(HOT_COLLAB_SWITCHES)
+
+
+def _wire_collab_switches(collab, store) -> None:
+    """Attach the hot, fail-closed sources of every collab switch (no-op without a fleet file)."""
+    if store is None:
+        return
+
+    def make(key):
+        def source(_store=store):
+            section = _store.secure_section("control_plane")          # raises while the file is unusable
+            collab_section = section.get("collab")
+            return collab_section.get(key) if isinstance(collab_section, dict) else None
+        return source
+    for key, (attr, kind) in HOT_COLLAB_SWITCHES.items():
+        base = make(key)
+        if kind == "bool":
+            def source(_base=base):
+                value = _base()
+                if value is None:
+                    return False
+                if not isinstance(value, bool):
+                    raise ValueError("delegation_enabled must be true or false")
+                return value
+        elif kind == "str":
+            def source(_base=base):
+                value = _base()
+                if value is None:
+                    return "since_join"
+                if value not in ("full", "since_join"):
+                    raise ValueError("replay_history must be 'full' or 'since_join'")
+                return value
+        else:
+            source = base
+        setattr(collab, attr, source)
 
 
 def _delegation_switch(args, cp) -> bool:

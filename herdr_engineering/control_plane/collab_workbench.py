@@ -293,10 +293,12 @@ class WorkbenchMixin:
         return graph, self._room_reader(access, room_id, pr.id)
 
     @staticmethod
-    def _room_reader(access: dict, room_id: str, uid: str) -> dict:
+    def _room_reader(access: dict, room_id: str, uid: str, keep=()) -> dict:
         """The graph principal NARROWED to one room. A comment or steering request in room A must never be
         anchored to, nor read through, something that only room B (or a different mission) can see."""
-        return {"kind": "member", "id": f"user:{uid}", "authenticated_by": "collab",
+        # ``keep_writers`` (T16 M7): trusted evidence writers whose values the commons-field contribution cap must
+        # never push out of this reader's view (the cap exists to bound spam, not to hide the operator's evidence)
+        return {"kind": "member", "id": f"user:{uid}", "authenticated_by": "collab", "keep_writers": frozenset(keep),
                 "access": {"rooms": frozenset({room_id}),
                            "room_ws": frozenset(x for x in access["room_ws"] if x[0] == room_id),
                            "room_missions": frozenset(x for x in access["room_missions"] if x[0] == room_id)}}

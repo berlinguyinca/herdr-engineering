@@ -209,7 +209,9 @@ vector file `tests/control_plane/fixtures/review-quorum-vectors.json` (byte-iden
    for a head not yet observed waits until a trusted writer reports that head.
 8. Matching is ASCII-only, identical in autospec: whitespace is the six ASCII blanks, case folding touches only A-Z, ids and
    targets must be printable ASCII (`invalid_target` otherwise); no Unicode folding (Kelvin sign, dotted I, NBSP).
-   `rereview_needed` is computed from the approvals the CALLER can see only, so a hidden approval never shifts it.
+   `rereview_needed` is computed from the approvals the CALLER can see only, so a hidden approval never shifts it. (T16 L5: this holds
+   for the count, not at the transition into `satisfied`: a hidden approval that completes the quorum turns `rereview_needed` from 1 to 0 and the
+   status to `satisfied`, which discloses its existence the same way `has_hidden_reviews` does.)
 9. A mistaken verdict is retracted by its owner at the same head: `autospec review-quorum publish --retract` sends an
    `edge.remove` (same key, same edge) which Herdr honours only from the edge's owner.
 10. The decision is computed over ALL matching edges. A caller sees names only of reviewers whose edges it can see; it also gets
@@ -492,8 +494,8 @@ Every id, label, attribute and reason is escaped for text and attribute contexts
 ### Not in this task / limitations
 - Click-to-inspect terminal is NOT offered (needs `authorize_workspace`; the inspector says so). No comments, fork, steer or retry.
 - T05 (canonical GitHub issue/PR linking and reconciliation) is not built: issue/PR nodes and `issue_link` edges are drawn when an
-  emitter sends them, but no canonicalisation or reconciliation exists yet. T06's `review_quorum.py` is on a sibling branch and
-  is not on this stack; stale/head-change come only from the T02 projection's own flags.
+  emitter sends them, but no canonicalisation or reconciliation exists yet. T06's `review_quorum.py` is on this stack
+  (see "Head-bound review quorum"); stale/head-change come from the T02 projection's own flags.
 - Replay cost is the reader's visible prefix (see budgets); beyond 25,000 visible events a past position answers 400. A busy room needs
   the snapshot table mentioned above. Not load-tested at that size. No visual-regression suite exists; layout is checked by
   unit tests and a browser smoke run against a mocked API plus one real-HTTP pytest of the routes, not by screenshots.
@@ -788,7 +790,7 @@ start an agent in it; "invalidates stale reviews" is done by binding evidence to
 evidence stale at read time and blocks promotion) and no gate node is rewritten; promotion is unreachable until the
 operator lists `evidence_writers` and something writes `validated` edges for the fork head.
 
-Limitations: T06 review quorum is not on this stack (comparison reports `quorum: unavailable`); independent
+Limitations: the T06 review quorum is per pull request head and not per approach (comparison reports `quorum: unavailable`); independent
 evidence writers must be keys that can see room-scoped nodes, i.e. operator keys; an older Pi ignores the new actions
 and Herdr re-offers up to 5 times.
 
@@ -860,3 +862,40 @@ Estimates assume a steady pace and are weak for small rooms. Erasing evidence by
 must be keys an agent does not control. Room-scoped pull requests written by a key that cannot see the room, and organization-scope nodes, are outside the
 reader's view and so not counted. T13 fork comparison reports `quorum: unavailable` on purpose: the T06 quorum is decided per pull request head and an approach is not a pull request (its reason text now says so, and the page shows the same wording). No Pi change was needed:
 Pi's ledger and mission adapter already supply the nodes this reads. The client renderers are covered by node tests and a Playwright smoke test (`tests/playwright/attention.test.mjs`); the assembled collab page was not driven end to end.
+
+## T16 security hardening (Herdr side)
+Fixes for the T16 security audit. Each has a regression test in `tests/control_plane/test_t16_security.py`.
+
+* **Ingest is an allow-list (H1, M1, M5).** `POST /api/v1/ingest` accepts only `lineage`, `host`, `session`, `mission`, `service`,
+  `inspector`, `mission_activity` (each has a handler) and the plain activity types `task`, `note`, `workspace` and Pi's `ledger`, `platform`, `lifecycle` streams. Everything else
+  (`collab`, `ci_observation`, `ci_report`, `ci_telemetry`, `plannotator_review`, `agent_identity`, `token_usage`, ...) belongs to a dedicated
+  adapter and answers 400. The session receipts `SessionCommandQueued` / `SessionCommandSettled` are server-owned event names and also answer 400.
+  Adding a type to `INGEST_ENTITY_TYPES` is a security decision.
+* **Collab log startup (H1).** Only rows of the single `collab/log` stream that carry no ingest envelope are replayed. Anything else under the
+  `collab` entity type (rows written before the allow-list) is *quarantined*: kept in storage, logged at ERROR, never applied. A log that still
+  fails the contiguity check does not stop the control plane: collaboration alone is switched off (`CollabService.degraded`; every request 503s
+  and nothing is written) and the error is logged at ERROR. The operator repairs the log and restarts.
+* **A full log still revokes (H2).** `max_log_events` is tiered: chat, comments and audit noise stop at 90 %, every other ordinary write at 95 %, and
+  only the safety events (member/agent/external/link/join-token/grant removal, user decision, steering rejection, credential rotation) may use the
+  last 5 %. Refused ordinary writes count in `stats.log_headroom_refused`. There is still no compaction: a lifetime cap is a deliberate
+  limit; the plan is snapshot-and-truncate of the collab stream (a follow-up, needs a migration), until then raise `max_log_events` before it fills.
+* **`since_join` applies to every read (M2, L2).** Node, edge, neighbourhood and listing reads and the insights snapshot hide the event id,
+  admission time and removal reason of any event admitted before the reader joined (or whose id is shared with an earlier event). A read that
+  names no room uses the latest join among the rooms the reader can read through.
+* **Switches are uniform (M3, M15).** `steering`, `contextual`, `insights`, `delegation_enabled` and `replay_history` are all read per request through
+  `FleetConfigStore.secure_section`, also under `web --collab-only`. A missing, unparseable, group/other-accessible or invalid file means the feature
+  is OFF (`replay_history`: the stricter `since_join`). `config_failure_mode: last_good` is the one opt-in to the last good value.
+* **`/api/v1/ingest/sources` (M4)** lists every emitter only to operator keys; other keys see only their own `(actor, source)` domains.
+* **Gap/freshness state is per principal (M6).** At most 64 sequence domains per key (the key evicts its own stalest); when the global 1024 is
+  reached the principal holding the most domains pays.
+* **Trusted evidence survives the contribution cap (M7).** Insight and fork reads name the configured `evidence_writers` (and the room's own service
+  principal); their latest visible values are selected before `MAX_CONTRIBUTIONS` is applied, so spam writers cannot push them out.
+* **The quorum route hides a head the reader cannot read (M9).** The decision still uses the real head; `head` is `null` and `head_hidden: true`
+  for a reader who may not see the field.
+* **Rate limiter identity (M12).** Every route uses the same client identity (`X-Forwarded-For` honoured only from a loopback/proxy peer).
+* **L1:** an open listener is not an operator inside a reserved (external agent) namespace.
+
+Not fixed here: a per-API-key ingest limiter (M12's second half); compaction/snapshotting of the collab log and a per-room budget (H2 ships the
+reserved headroom only); an invalid switch block at startup is still a silent OFF in the combined server (no startup error); a `since_join` read that
+names no room uses the latest join (over-strict); L3 (accepted), L4, L6-L9, L13 (a longer principal id would break configured key ids), L14.
+

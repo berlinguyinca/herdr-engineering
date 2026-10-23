@@ -39,6 +39,15 @@ from .redact import redact_text
 SCHEMA_VERSION = 1
 ENTITY = "collab"
 STREAM_ID = "log"
+# T16 H2: events that REMOVE or NARROW access. They are admitted until the log is truly full; everything
+# else is refused earlier (see CollabService._log_limit), so a full log never blocks a revoke.
+SAFETY_EVENTS = frozenset({
+    "member_removed", "agent_revoked", "external_status_changed", "user_decided", "join_token_revoked",
+    "xlink_revoked", "workspace_unlinked", "mission_unlinked", "agent_grant_revoked"})
+# Deliberately NOT in the set: events a member or agent can fire at will or that fire on their own (credential
+# rotation, cancelling a consultation/request/invite, a grant lapsing...). The same attacker class could drain the reserve.
+BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_denied", "task_progress",
+                         "steer_proposed", "consult_asked", "proposal_submitted"})
 ORG_ID = "default"  # single-organization deployment (spec: no federation in v1)
 
 # "task" is the human right to give an agent work; the agent-side rights are "instruct"
@@ -243,10 +252,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, delegation_enabled: bool = False):
         self.auth = authenticator
+        self.degraded: str | None = None     # set when the durable log failed its startup integrity check
         # Kill switch for bounded task delegation and artifact proposals (T11), from the fleet YAML
         # (control_plane.collab.delegation_enabled). Off by default: while off, no delegation can be created,
         # answered, proposed to or accepted, and the MCP/A2A adapters do not advertise it.
-        self.delegation_enabled = bool(delegation_enabled)
+        self._delegation_enabled = bool(delegation_enabled)
+        self.delegation_source = None     # optional callable -> raw YAML value, read per request (hot kill switch)
+        self.replay_history_source = None
         self.approval = approval
         # The fabric lineage graph, attached by the combined (non collab-only) server. The graph never
         # calls back into this service: membership is handed to it as a per-request snapshot.
@@ -269,7 +281,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         self.max_log_events = max_log_events
         # lineage replay for a member starts at their join time ("since_join", default) or covers the whole
         # room history ("full"). Operator YAML: control_plane.collab.replay_history.
-        self.replay_history = "since_join"
+        self._replay_history = "since_join"
         self.guest_ttl = guest_ttl
         self.default_grant_ttl = default_grant_ttl
         self.max_streams = max_streams_per_principal
@@ -343,11 +355,56 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
     def _iso(self, t: float | None = None) -> str:
         return datetime.fromtimestamp(self._now() if t is None else t, UTC).isoformat()
 
+    @property
+    def delegation_enabled(self) -> bool:
+        """T16 M15: hot like the other switches. A source that fails or returns anything but a real
+        boolean means OFF (fail closed)."""
+        if self.delegation_source is None:
+            return self._delegation_enabled
+        try:
+            return self.delegation_source() is True
+        except Exception:
+            return False
+
+    @delegation_enabled.setter
+    def delegation_enabled(self, value: bool) -> None:
+        self._delegation_enabled = bool(value)
+
+    @property
+    def replay_history(self) -> str:
+        """T16 M15: hot. A failing or invalid source means the STRICTER ``since_join``."""
+        if self.replay_history_source is None:
+            return self._replay_history
+        try:
+            value = self.replay_history_source()
+        except Exception:
+            return "since_join"
+        return value if value in ("full", "since_join") else "since_join"
+
+    @replay_history.setter
+    def replay_history(self, value: str) -> None:
+        self._replay_history = value
+
+    def _log_limit(self, event_type: str) -> int:
+        """T16 H2: the log cap is tiered so a full log can never block a revocation. Bulk writers (chat,
+        comments, audit noise) stop at 90 %, every other ordinary write at 95 %, and only the safety
+        events in ``SAFETY_EVENTS`` may use the last 5 %."""
+        cap = self.max_log_events
+        if event_type in SAFETY_EVENTS:
+            return cap
+        if event_type in BULK_EVENTS or event_type.startswith("attn_"):
+            return max(1, cap - max(2, cap // 10))
+        return max(1, cap - max(1, cap // 20))
+
     def _commit(self, event_type: str, payload: dict) -> dict:
         """Persist first, then apply: a failed write never changes state."""
         with self._lock:
-            if len(self._log) >= self.max_log_events:
+            if self.degraded:
+                raise CollabError(503, "collaboration is disabled: " + self.degraded)
+            if len(self._log) >= self._log_limit(event_type):
                 self.stats["log_full"] += 1
+                if event_type not in SAFETY_EVENTS:
+                    self.stats["log_headroom_refused"] += 1
                 raise CollabError(503, "collaboration log is full; ask the operator")
             now = self._iso()
             payload = {"org_id": ORG_ID, "correlation_id": payload.pop("correlation_id", None)
@@ -726,6 +783,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
 
     # ------------------------------------------------------ authentication
     def authenticate(self, authorization: str, device: str | None) -> Principal:
+        if self.degraded:
+            raise CollabError(503, "collaboration is disabled: " + self.degraded)
         scheme, _, token = (authorization or "").partition(" ")
         token = token.strip()
         if not token:
@@ -2885,9 +2944,30 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         if room_id in access["rooms"]:
             self._xlink_sweep(room_id)          # a lapsed link is tombstoned now, not at someone's next list
         try:
-            return self.xlink_filter(self._graph_read(pr, graph, access, principal, parts, query, room_id))
+            out = self._graph_read(pr, graph, access, principal, parts, query, room_id)
+            if parts[:1] != ["lineage"]:                # the lineage views strip by their own replay
+                out = graph.strip_before(out, self._join_horizon(pr, access, room_id))
+            return self.xlink_filter(out)
         except KeyError:
             raise CollabError(404, "not found") from None
+
+    def _join_horizon(self, pr: Principal, access: dict, room_id: str | None) -> float | None:
+        """T16 M2: under ``since_join`` the time before which history is hidden from this reader on a read that
+        is not a replay. One room is named: that room's join time. Otherwise the LATEST join among the rooms the
+        reader can read through (the strictest; a node can be visible through several rooms)."""
+        if self.replay_history != "since_join":
+            return None
+        rooms = [room_id] if room_id in access["rooms"] else sorted(access["rooms"])
+        horizon = None
+        with self._lock:
+            for rid in rooms:
+                joined = ((self._rooms.get(rid) or {}).get("members", {}).get(pr.id) or {}).get("joined_at")
+                try:
+                    t = datetime.fromisoformat(joined).timestamp()
+                except (TypeError, ValueError):
+                    t = self._now()            # no recorded join time: fail closed, history starts now
+                horizon = t if horizon is None else max(horizon, t)
+        return horizon
 
     def _graph_read(self, pr, graph, access, principal, parts, query, room_id):
         from .graph import read_graph

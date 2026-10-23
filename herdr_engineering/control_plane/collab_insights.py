@@ -95,7 +95,7 @@ def take_snapshot(graph, reader: dict, contexts: frozenset, since: float | None,
     edges: dict[tuple, dict] = {}
     reason, offset = None, 0
     for _ in range(max_pages):
-        out = graph.room_graph(reader, contexts, limit=MAX_NODES, offset=offset)
+        out = graph.strip_before(graph.room_graph(reader, contexts, limit=MAX_NODES, offset=offset), since)
         for n in out["nodes"]:
             nodes.setdefault(n["id"], n)
         for e in out["edges"]:

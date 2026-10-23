@@ -5,6 +5,20 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### T16 security fixes, Herdr side (stacked on the T16 release-gate branch)
+- Ingest is an allow-list of entity types; `collab`, `ci_*` and other adapter-owned streams and the server's session receipts can no longer be forged
+  by an ingest key (H1, M1, M5). Foreign `collab` rows already in a database are quarantined at startup, and a corrupt collab log disables collaboration
+  alone with an ERROR instead of stopping the control plane.
+- A full collab log keeps the last 5 % for safety events (removals, revokes, link revokes); chat stops at 90 %, other writes at 95 % (H2).
+- `replay_history: since_join` now also covers node/edge/listing reads and the insights/progress snapshots (M2, L2).
+- All collab feature switches (`steering`, `contextual`, `insights`, `delegation_enabled`, `replay_history`) are hot and fail closed the same way,
+  including under `--collab-only` (M3, M15). One consistency test enumerates them.
+- `/api/v1/ingest/sources` is operator-only for other principals' sources (M4); gap state is partitioned per key (M6); trusted evidence writers are
+  selected before the contribution cap (M7); the quorum route hides a head the reader cannot read (M9); the generic rate limiter keys clients behind a
+  proxy by their forwarded address (M12); an open listener is no operator in a reserved namespace (L1).
+- Test: the graph neighbourhood budget test counts rendered nodes instead of timing a wall clock.
+- No migration, no environment variable. Rollback: revert the PR.
+
 ### Attention inbox, evidence-based progress and optimization analytics (T15, stacked on #174, #173, #168, #169)
 - New read routes `GET /rooms/{id}/attention|progress|analytics` and `POST /rooms/{id}/attention/ack|snooze|restore`, plus Attention and Progress
   tabs. Everything is derived from what the reader can see in the room graph, review quorum (T06), steering/promotion (T12/T13), proposals (T11),

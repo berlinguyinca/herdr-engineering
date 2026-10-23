@@ -36,6 +36,7 @@ ENVELOPE_ONLY_TYPES = frozenset({"host", "session", "mission", "service",
 MAX_SEQUENCE = 2**63 - 1          # PostgreSQL bigint
 MAX_GAPS_PER_SOURCE = 64
 MAX_SOURCES = 1024
+MAX_SOURCES_PER_ACTOR = 64      # T16 M6: one principal can never push another's gap/freshness state out
 
 
 class EnvelopeConflict(Exception):
@@ -222,9 +223,19 @@ class SourceLedger:
             (_, old_id), (_, old_source, old_seq, old_actor) = self._events.popitem(last=False)
             if self._sequences.get((old_actor, old_source, old_seq)) == old_id:
                 del self._sequences[(old_actor, old_source, old_seq)]
-        if domain not in self._sources and len(self._sources) >= MAX_SOURCES:
-            stalest = min(self._sources.values(), key=lambda st: st["last_seen_at"] or "")
-            del self._sources[(stalest["actor"], stalest["source"])]
+        if domain not in self._sources:
+            mine = [st for st in self._sources.values() if st["actor"] == actor]
+            if len(mine) >= MAX_SOURCES_PER_ACTOR:
+                victim = min(mine, key=lambda st: st["last_seen_at"] or "")      # evict your own first
+                del self._sources[(victim["actor"], victim["source"])]
+            elif len(self._sources) >= MAX_SOURCES:
+                counts: dict[str, int] = {}
+                for st in self._sources.values():
+                    counts[st["actor"]] = counts.get(st["actor"], 0) + 1
+                heaviest = max(counts, key=lambda a: (counts[a], a == actor))      # the biggest holder pays
+                victim = min((st for st in self._sources.values() if st["actor"] == heaviest),
+                             key=lambda st: st["last_seen_at"] or "")
+                del self._sources[(victim["actor"], victim["source"])]
         state = self._sources.setdefault(
             domain, {"source": source, "actor": actor, "last_sequence": None,
                      "last_seen_at": None, "gaps": []})
@@ -314,9 +325,11 @@ class SourceLedger:
                 "last_seen_at": None, "gaps": []}
             return self._view(state)
 
-    def source_states(self) -> list[dict]:
+    def source_states(self, actor: str | None = None) -> list[dict]:
+        """Every domain, or (T16 M4) only those of one principal."""
         with self._lock_ctx():
-            return [self._view(s) for _, s in sorted(self._sources.items())]
+            return [self._view(s) for (a, _), s in sorted(self._sources.items())
+                    if actor is None or a == actor]
 
     def _lock_ctx(self):
         return self.lock
