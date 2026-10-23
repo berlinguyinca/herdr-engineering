@@ -42,6 +42,7 @@ export const SURFACES = [
     regions: [{ name: 'graph', selector: '.lin-scroll' }, { name: 'node', selector: 'g[data-node="attempt:a1"]' }, { name: 'inspector', selector: '.lin-inspector' }] },
   { slug: 'collab-lineage-gantt', sub: 'lineage', proof: 'svg.lin-svg', resetScroll: true, steps: async (page) => { await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role=img]').waitFor(); },
     regions: [{ name: 'gantt', selector: 'svg.lin-svg[role=img]' }] },
+  { slug: 'collab-flow', sub: 'flow', proof: '#hcn-flow svg.cx-flow', regions: [{ name: 'flowhead', selector: '#hcn-p-flow .cx-row--between' }] },
   { slug: 'collab-attention', sub: 'attention', proof: '.cx-attn-item', regions: [{ name: 'item', selector: '.cx-attn-item' }] },
   { slug: 'collab-progress', sub: 'progress', proof: '#hcn-p-progress' },
   { slug: 'collab-links', sub: 'links', proof: '#hcn-links li' },

@@ -36,7 +36,7 @@ test('the capture is deterministic: three fresh loads of the same surfaces agree
 
 test('the baselines respect the size policy (total and per file)', () => {
   const sz = baselineSizes();
-  assert.ok(sz.count >= 54, `${sz.count} baselines`);
+  assert.ok(sz.count >= 60, `${sz.count} baselines`);
   assert.ok(sz.totalKb <= CFG.screenshots.max_total_kb, `${sz.totalKb.toFixed(0)} KB of baselines exceed the ${CFG.screenshots.max_total_kb} KB cap`);
   assert.ok(sz.biggest.kb <= CFG.screenshots.max_file_kb, `${sz.biggest.f} is ${sz.biggest.kb.toFixed(0)} KB, above ${CFG.screenshots.max_file_kb} KB`);
 });
@@ -56,6 +56,7 @@ const TEETH = [
   ['buttons are one pixel wider', 'collab-attention', '.hd-btn { padding: 8px 15px !important }', ['item']],
   ['cards gained a pixel of padding', 'collab-attention', '.hd-card { padding: 17px !important }', []],
   ['the sub-tab bar gained 4px of padding', 'collab-attention', '.cx-stabs { padding-top: 4px !important }', []],
+  ['the Pause motion label is gone (the button is an empty box)', 'collab-flow', '#hcn-flow-still { font-size: 0 !important; width: 10px; padding: 0 !important; overflow: hidden }', ['flowhead']],
   ['the lineage node boxes lost their borders', 'collab-lineage', '.lin-box { stroke: transparent !important }', ['node', 'graph']],
   ['a failed node is painted the wrong colour', 'collab-lineage', '.lin-node--failed .lin-box { fill: #ccc !important }', ['graph']],
 ];
