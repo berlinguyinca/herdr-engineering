@@ -17,7 +17,8 @@ blocking finding remains. A failed review (gateway error, truncated or malformed
 pending status; a head that moves during the review posts nothing for either SHA.
 
 The gateway key is read from the pi provider config on this host and sent only as the Authorization header to that
-provider's https baseUrl host. It is never written anywhere, never in argv/env/logs/comments/statuses/prompts, and
+provider's baseUrl host: https, or plain http only to a tailnet IP (100.64.0.0/10) listed exactly in
+reviewer.allow_plain_http_hosts. It is never written anywhere, never in argv/env/logs/comments/statuses/prompts, and
 redacted from every message this script prints.
 
 Exit codes: 0 the review completed (a status was posted, or would have been with --dry-run); 1 the review failed;
@@ -32,6 +33,7 @@ import datetime as dt
 import fcntl
 import fnmatch
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -68,8 +70,9 @@ DEFAULTS: dict = {
         "models_file": "~/.pi/agent/models.json",
         "model": "deepseek_v4-flash-modality-text-quant-mxfp4",   # an id the gateway advertises (GET /models)
         "max_tokens": 32768,                     # reasoning models need headroom before they answer
-        # false sends chat_template_kwargs.enable_thinking=false (llama.cpp). Measured: with thinking, deepseek used
-        # all 32768 tokens reasoning on 24 KB chunks (finish_reason=length); without, 15-30 s per chunk
+        # false sends chat_template_kwargs.enable_thinking=false (llama.cpp; also what pi's qwen-chat-template
+        # thinkingFormat sends). Measured: with thinking, deepseek used all 32768 tokens reasoning on 24 KB chunks
+        # (finish_reason=length); without, 15-30 s per chunk. qwen3.8-27b on llama.cpp: 0 reasoning tokens with it
         "thinking": False,
         "temperature": 0.2,
         "response_format": "json_schema",        # json_schema | json_object | none
@@ -78,6 +81,9 @@ DEFAULTS: dict = {
         "retries": 4,                            # extra attempts on 429 / 5xx / connection errors
         "backoff_s": 5.0,                        # first backoff; doubles; Retry-After wins (capped at 60 s)
         "parallel": 1,                           # chunks in flight at once; the gateway is shared
+        # exact tailnet IPv4 literals (100.64.0.0/10) whose provider baseUrl may be plain http: the key then crosses
+        # the tailnet without TLS (WireGuard still encrypts the link). Empty: https only
+        "allow_plain_http_hosts": [],
     },
     # measured on llm.metabolomics.us: a 16 KB prompt took 1-3 min, a 64 KB one reasoned 13+ min and did not finish
     "chunk_bytes": 24000,
@@ -158,6 +164,21 @@ def merge(base: dict, over: dict, where: str = "") -> dict:
     return out
 
 
+TAILNET = ipaddress.ip_network("100.64.0.0/10")   # Tailscale's CGNAT range: the only plain-http targets allowed
+
+
+def plain_http_host_ok(h) -> bool:
+    """An exact, canonical IPv4 literal inside TAILNET. No hostnames (DNS could point anywhere), no IPv6, no other
+    private or public range."""
+    if not isinstance(h, str):
+        return False
+    try:
+        ip = ipaddress.IPv4Address(h)
+    except ValueError:
+        return False
+    return str(ip) == h and ip in TAILNET
+
+
 def load_config(path: str | None) -> dict:
     over = {}
     if path:
@@ -177,6 +198,10 @@ def load_config(path: str | None) -> dict:
         raise Refused("config: reviewer.parallel must be 1..8")
     if r["max_tokens"] < 1024 or r["timeout_s"] < 1 or r["retries"] < 0:
         raise Refused("config: reviewer.max_tokens/timeout_s/retries out of range")
+    for h in r["allow_plain_http_hosts"]:
+        if not plain_http_host_ok(h):
+            raise Refused(f"config: reviewer.allow_plain_http_hosts: {h!r} is not an exact IPv4 address in the "
+                          f"tailnet range {TAILNET}")
     if cfg["visual_review"]:
         raise Refused("config: visual_review is not implemented; it must stay false")
     if not 200 <= cfg["chunk_bytes"] <= 2_000_000:
@@ -326,7 +351,8 @@ class Answer:
 
 class Gateway:
     """The pi provider's OpenAI-compatible endpoint. http.client, not urllib: no redirects are ever followed and no
-    proxy from the environment is used, so the key goes to the baseUrl host and nowhere else."""
+    proxy from the environment is used, so the key goes to the baseUrl host and nowhere else. https, or plain http to
+    a host listed in reviewer.allow_plain_http_hosts (an exact tailnet IP)."""
 
     def __init__(self, cfg: dict):
         r = cfg["reviewer"]
@@ -346,14 +372,21 @@ class Gateway:
         self.key = resolve_key(prov.get("apiKey"))
         REDACT.add(self.key)
         u = urllib.parse.urlsplit(str(prov.get("baseUrl", "")))
-        if u.scheme != "https":
+        if u.scheme == "http":
+            # exact string match on the literal as written: no DNS, no normalisation that could widen the list
+            if u.hostname is None or u.hostname not in r["allow_plain_http_hosts"] or not plain_http_host_ok(
+                    u.hostname):
+                raise Refused("the provider's baseUrl must be https (plain http only to a host in "
+                              "reviewer.allow_plain_http_hosts)")
+        elif u.scheme != "https":
             raise Refused("the provider's baseUrl must be https")
         try:
-            port = u.port or 443
+            port = u.port or (443 if u.scheme == "https" else 80)
         except ValueError:
             raise Refused("the provider's baseUrl has a bad port") from None
         if not u.hostname or u.username or u.password or u.query or u.fragment:
             raise Refused("the provider's baseUrl must be https://host[:port]/path, no credentials or query")
+        self.tls = u.scheme == "https"
         self.host, self.port, self.base = u.hostname, port, u.path.rstrip("/")
         mtf = (prov.get("compat") or {}).get("maxTokensField") or "max_tokens"
         self.max_tokens_field = mtf if mtf in ("max_tokens", "max_completion_tokens") else "max_tokens"
@@ -362,7 +395,7 @@ class Gateway:
     def _sse(self, resp) -> dict:
         """A streamed chat completion, assembled into the non-streamed shape. Reasoning deltas only keep the
         connection alive; only `content` deltas are the answer. An error event fails the chunk."""
-        content, model, finish, usage, size, csize = [], None, "", {}, 0, 0
+        content, model, finish, usage, size, csize, done = [], None, "", {}, 0, 0, False
         deadline = time.monotonic() + float(self.r["deadline_s"])
         while True:
             line = resp.readline(1_000_000)
@@ -378,6 +411,7 @@ class Gateway:
                 continue
             data = text[5:].strip()
             if data == "[DONE]":
+                done = True
                 break
             try:
                 ev = json.loads(data)
@@ -403,12 +437,18 @@ class Gateway:
                         raise ReviewFailed("the answer is larger than any verdict can be")
                 if isinstance(ch, dict) and ch.get("finish_reason"):
                     finish = str(ch["finish_reason"])
+        if not done and not finish:
+            # the connection closed before the answer finished (seen: a node answering 200 with an empty stream)
+            raise Transient(f"the gateway's stream ended unfinished after {size} bytes")
         return {"model": model, "usage": usage,
                 "choices": [{"finish_reason": finish, "message": {"content": "".join(content)}}]}
 
     def _once(self, method: str, sub: str, body: dict | None) -> tuple[int, dict, bytes | dict]:
-        conn = http.client.HTTPSConnection(self.host, self.port, context=ssl.create_default_context(),
-                                           timeout=float(self.r["timeout_s"]))
+        if self.tls:
+            conn = http.client.HTTPSConnection(self.host, self.port, context=ssl.create_default_context(),
+                                               timeout=float(self.r["timeout_s"]))
+        else:                                    # only a listed tailnet IP (checked in __init__)
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=float(self.r["timeout_s"]))
         headers = {"Authorization": f"Bearer {self.key}", "Accept": "application/json"}
         data = None
         if body is not None:
@@ -957,7 +997,7 @@ def review(cfg: dict, repo: str, n: int, dry_run: bool, max_chunks: int | None =
         rfam = check_independent(model, afams)
         gw = Gateway(cfg)
         say(f"{repo}#{n} @ {sha[:12]}: author {'+'.join(sorted(afams))}, reviewer {model} ({rfam}) "
-            f"via {gw.host}")
+            f"via {gw.host}" + ("" if gw.tls else " (plain http, allowed by reviewer.allow_plain_http_hosts)"))
         diff = gh.diff(repo, n)
         if gh.head(repo, n) != sha:
             raise HeadMoved("the head moved while the diff was read")

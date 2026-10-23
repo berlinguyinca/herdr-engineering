@@ -12,7 +12,7 @@ state_dir: ~/.local/state/herdr-ai-review   # locks only
 author_default_family: claude
 
 reviewer:
-  pi_provider: metabolomics              # provider in models_file: its https baseUrl and apiKey are used
+  pi_provider: metabolomics              # provider in models_file: its baseUrl and apiKey are used
   models_file: ~/.pi/agent/models.json
   # An id the gateway advertises (GET {baseUrl}/models), exactly. Its family (deepseek, qwen, ...) must differ from
   # every author family; the status names the id the gateway reports having used.
@@ -28,6 +28,9 @@ reviewer:
   retries: 4                             # extra attempts on 429, 5xx and connection errors
   backoff_s: 5                           # doubles each retry; a Retry-After header wins (capped at 60 s)
   parallel: 1                            # chunks in flight at once; the gateway is shared
+  # Exact tailnet IPv4 literals (100.64.0.0/10) whose baseUrl may be plain http, e.g. ["100.104.39.6"]. The key
+  # then crosses the tailnet without TLS (WireGuard still encrypts the link). Empty = https only.
+  allow_plain_http_hosts: []
 
 # A request is about chunk_bytes + context_bytes_per_chunk + the PR description. Measured on the gateway: 16 KB
 # prompts answered in 1-3 min; a 64 KB one was still reasoning after 13 min. Keep requests small.

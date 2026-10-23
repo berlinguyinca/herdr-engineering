@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -175,7 +176,7 @@ class Gateway:
     """An OpenAI-compatible endpoint: GET /v1/models, POST /v1/chat/completions answering scripted responses (the
     last one repeats). Every request is logged; chat requests also go to the FAKE_REV_LOG file the fake gh reads."""
 
-    def __init__(self, key: Path, cert: Path, rev_log: Path, models: list[str]):
+    def __init__(self, key: Path, cert: Path, rev_log: Path, models: list[str], tls: bool = True):
         self.models = models
         self.responses: list[dict] = [{"content": EMPTY}]
         self.requests: list[dict] = []
@@ -232,6 +233,8 @@ class Gateway:
                                       headers=r.get("headers"))
                 if "sse_error" in r:
                     return self.sse([{"error": r["sse_error"]}], done=False)
+                if r.get("empty_stream"):
+                    return self.sse([], done=False)
                 content = r["content"] if isinstance(r["content"], str) else json.dumps(r["content"])
                 used = r.get("model", req["model"])
                 if req.get("stream") and not r.get("json"):
@@ -250,9 +253,10 @@ class Gateway:
                                  "usage": {"prompt_tokens": 100, "completion_tokens": 20}})
 
         self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(cert, key)
-        self.srv.socket = ctx.wrap_socket(self.srv.socket, server_side=True)
+        if tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            self.srv.socket = ctx.wrap_socket(self.srv.socket, server_side=True)
         self.port = self.srv.server_address[1]
         self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.thread.start()
@@ -321,7 +325,8 @@ class Env:
         self.write_state(st)
 
     def responses(self, rs):
-        self.gw.responses = [r if isinstance(r, dict) and ("content" in r or "status" in r or "sse_error" in r)
+        self.gw.responses = [r if isinstance(r, dict) and ("content" in r or "status" in r or "sse_error" in r
+                                                       or "empty_stream" in r)
                              else {"content": r}
                              for r in rs]
 
@@ -479,6 +484,104 @@ def test_bad_base_urls_are_refused(env, base):
     assert review(env) == 2
 
 
+# ---------- plain http, only to a listed tailnet IP ----------
+
+TAILNET_IP = "100.104.39.6"
+
+
+@pytest.fixture
+def plain(env, cert, monkeypatch):
+    """A plain-http fake gateway reached as http://100.104.39.6:<port>: every dial is recorded, the tailnet IP is
+    redirected to the loopback server, and any other address fails at once (never a real connection)."""
+    gw = Gateway(cert[0], cert[1], env.rev_log, [MODEL, LONG_MODEL], tls=False)
+    dials: list = []
+    real = socket.create_connection
+
+    def dial(address, *a, **kw):
+        dials.append(tuple(address[:2]))
+        if tuple(address[:2]) == (TAILNET_IP, gw.port):
+            return real(("127.0.0.1", gw.port), *a, **kw)
+        raise ConnectionRefusedError(f"test: no dialing {address}")
+
+    monkeypatch.setattr(socket, "create_connection", dial)
+    env.gw.stop()
+    env.gw = gw
+    env.models_json({"baseUrl": f"http://{TAILNET_IP}:{gw.port}/v1", "apiKey": KEY})
+    env.dials = dials
+    return gw
+
+
+def test_plain_http_to_a_listed_tailnet_ip_works_and_keeps_the_key_in_the_header(env, plain, capfd):
+    env.config({"reviewer": {"model": MODEL, "allow_plain_http_hosts": [TAILNET_IP]}})
+    env.responses([blocking()])
+    assert review(env) == 0
+    assert plain.requests and set(env.dials) == {(TAILNET_IP, plain.port)}
+    for r in plain.requests:
+        assert r["headers"]["Authorization"] == f"Bearer {KEY}"
+        assert r["headers"]["Host"] == f"{TAILNET_IP}:{plain.port}"
+        assert KEY not in r["body"] and KEY not in r["path"]
+    assert KEY not in all_text(env, capfd)
+    assert [s["state"] for s in env.terminal()] == ["failure"]
+
+
+def test_plain_http_is_refused_by_default(env, plain):
+    assert review(env) == 2
+    assert env.dials == [] and plain.requests == [] and env.writes() == []
+
+
+@pytest.mark.parametrize("host", ["8.8.8.8", "llm.metabolomics.us", "10.0.0.1", "192.168.1.5", "127.0.0.1",
+                                  "100.63.255.255", "100.128.0.1", "100.104.039.6", "fd7a:115c:a1e0::1",
+                                  "100.104.39.6/32", " 100.104.39.6", 1684285190])
+def test_allow_plain_http_hosts_takes_only_exact_tailnet_ips(env, plain, host):
+    env.config({"reviewer": {"model": MODEL, "allow_plain_http_hosts": [host]}})
+    assert review(env) == 2
+    assert env.dials == [] and plain.requests == [] and env.writes() == []
+
+
+def test_allow_plain_http_hosts_must_be_a_list(env, plain):
+    env.config({"reviewer": {"model": MODEL, "allow_plain_http_hosts": TAILNET_IP}})
+    assert review(env) == 2
+    assert env.dials == []
+
+
+@pytest.mark.parametrize("base", ["http://100.104.39.7:{port}/v1",        # a tailnet IP, but not the listed one
+                                  "http://8.8.8.8:{port}/v1",             # public
+                                  "http://10.0.0.1:{port}/v1",            # another private range
+                                  "http://gateway.tailnet.ts.net:{port}/v1",   # a hostname
+                                  "http://user:pw@100.104.39.6:{port}/v1"])    # credentials
+def test_a_plain_http_base_url_not_in_the_list_is_refused(env, plain, base):
+    env.config({"reviewer": {"model": MODEL, "allow_plain_http_hosts": [TAILNET_IP]}})
+    env.models_json({"baseUrl": base.format(port=plain.port), "apiKey": KEY})
+    assert review(env) == 2
+    assert env.dials == [] and plain.requests == [] and env.writes() == []
+
+
+def test_a_listed_host_over_https_still_uses_tls(env, plain):
+    env.config({"reviewer": {"model": MODEL, "allow_plain_http_hosts": [TAILNET_IP]}})
+    env.models_json({"baseUrl": f"https://{TAILNET_IP}:{plain.port}/v1", "apiKey": KEY})
+    assert review(env) == 1                     # the plain server cannot speak TLS: the run fails, nothing posted
+    assert env.terminal() == [] and all(r["method"] != "POST" for r in plain.requests)
+
+
+def test_a_plain_http_redirect_is_not_followed(env, plain):
+    env.config({"reviewer": {"model": MODEL, "allow_plain_http_hosts": [TAILNET_IP]}})
+    env.responses([{"status": 302, "headers": {"Location": "http://8.8.8.8/v1/chat/completions"}}])
+    assert review(env) == 1
+    assert set(env.dials) == {(TAILNET_IP, plain.port)} and env.terminal() == []
+
+
+def test_qwen_chat_template_provider_gets_enable_thinking_false(env, plain):
+    env.config({"reviewer": {"model": LONG_MODEL, "allow_plain_http_hosts": [TAILNET_IP]}})
+    env.models_json({"baseUrl": f"http://{TAILNET_IP}:{plain.port}/v1", "apiKey": KEY,
+                     "compat": {"maxTokensField": "max_tokens", "thinkingFormat": "qwen-chat-template"}})
+    env.responses([{"content": EMPTY, "model": "qwen3.8-27b-vision-c120k-2x"}])
+    assert review(env) == 0
+    (chat,) = env.rev_calls()
+    assert chat["model"] == LONG_MODEL and chat["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "enable_thinking" not in chat
+    assert "qwen3.8-27b-vision-c120k-2x" in env.terminal()[0]["description"]
+
+
 def test_a_redirect_is_not_followed(env, cert):
     other = Gateway(cert[0], cert[1], env.tmp / "other.log", [MODEL])
     try:
@@ -547,6 +650,16 @@ def test_a_stream_error_is_retried_like_a_5xx(env):
     assert review(env) == 0
     assert [s["state"] for s in env.terminal()] == ["success"]
     assert len(env.rev_calls()) == 2 and len(env.sleeps) == 1
+
+
+def test_an_empty_unfinished_stream_is_retried_then_fails(env):
+    env.responses([{"empty_stream": True}, {"content": EMPTY}])
+    assert review(env) == 0
+    assert len(env.rev_calls()) == 2 and len(env.sleeps) == 1
+    env.reset()
+    env.gw.responses = [{"empty_stream": True}]
+    assert review(env) == 1
+    assert env.terminal() == []
 
 
 def test_long_reasoning_does_not_count_against_the_answer_cap(env, monkeypatch):

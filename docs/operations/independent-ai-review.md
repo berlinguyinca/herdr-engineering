@@ -86,6 +86,20 @@ next poll.
 - **The key lives on the host that runs the script.** It is read from `~/.pi/agent/models.json` and sent only
   as the `Authorization` header, to that provider's https `baseUrl` host. Redirects are not followed. The key is
   redacted from every message.
+- **Plain http to a tailnet node is an explicit opt-in.** `reviewer.allow_plain_http_hosts` takes exact IPv4
+  literals in `100.64.0.0/10`, for example `["100.104.39.6"]` for pi's `development` provider
+  (`http://100.104.39.6:8390/v1`). Hostnames, IPv6, public addresses and other private ranges are refused, and so
+  is a tailnet IP that is not listed. The default is empty: https only. With a listed host:
+  - the key, the diff and the verdict cross the tailnet as plain HTTP. WireGuard still encrypts the link between
+    the two machines, but anything on either end can read them: a proxy or sniffer on the reviewing host, the
+    node's own process and logs, and any tailnet member that the ACLs let reach that port;
+  - a tailnet address is only as trustworthy as the tailnet's membership and ACLs. If another device takes over
+    that IP, it receives the key.
+
+  It is acceptable when the node is a lab machine on our own tailnet, the key is a per-node key for that gateway
+  only (not the `llm.metabolomics.us` key), and https is not available. One example is the 2026-10-23 review of
+  PR #160 while `llm.metabolomics.us` was down. It is not acceptable for a key that also opens a public gateway,
+  or for an IP the tailnet ACLs expose to devices we do not run. Remove the entry when https is back.
 - **The gateway is shared, and its capacity comes and goes.** Chunks run one at a time. Measured on 2026-10-22
   against PR #160 (40 files, 36 chunks at 24 KB):
   - with thinking off (the default), deepseek answered in 15 to 31 s per chunk;
@@ -94,5 +108,13 @@ next poll.
   - routes sometimes ended mid-answer (`upstream_transport_error`), and qwen's single slot answered 429;
   - for a while the gateway advertised no models at all.
 
-  Route failures, 429s and 5xx responses are retried with backoff. A model that is not advertised fails the run
-  before anything is posted.
+  Route failures, 429s and 5xx responses are retried with backoff. A stream that closes unfinished (no `[DONE]`,
+  no `finish_reason`) is retried the same way. A model that is not advertised fails the run before anything is
+  posted.
+- **qwen on the `development` provider.** That provider sets `compat.thinkingFormat: qwen-chat-template`. pi then
+  sends `chat_template_kwargs.enable_thinking`, which is the switch this script already sends, so no other switch
+  is needed. Measured on 2026-10-23 against qwen3.8-27b: 0 reasoning tokens with the switch, and about 670
+  characters of reasoning without it. A top-level `enable_thinking: false` was ignored. The node answers under
+  its own id, `qwen3.8-27b-vision-c120k-2x`, not the requested
+  `qwen3.8-27b-modality-text-ctx-c128k-quant-q4_k_m`. The family is still qwen, and the status names the id
+  that answered.

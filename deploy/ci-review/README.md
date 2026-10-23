@@ -31,9 +31,15 @@ is refused, and nothing from models.json is run.
   `authHeader` is set.
 - It goes only to the `baseUrl` host, over https with TLS verified. `http.client` is used, so no redirect is
   followed (a 3xx fails the chunk) and no proxy from the environment is used.
+- Plain http is an explicit opt-in: `reviewer.allow_plain_http_hosts` lists exact IPv4 literals in the tailnet
+  range `100.64.0.0/10`. Only a baseUrl `http://<listed ip>[:port]/path` is then accepted. A hostname, IPv6, a
+  public address, another private range (10/8, 172.16/12, 192.168/16, loopback) or a non-canonical literal is
+  refused at config load; a tailnet IP not in the list is refused too. The default is an empty list: https only.
+  See `docs/operations/independent-ai-review.md` for what that costs.
 - It is never written to a file, argv, the environment, a log, a prompt, a comment or a status. It is redacted
   from every message the script prints, including gateway error bodies that echo it.
-- The baseUrl must be `https://host[:port]/path`, without credentials or a query. A provider with custom
+- The baseUrl must be `https://host[:port]/path` (or the allowed `http://` form above), without credentials or a
+  query. A provider with custom
   `headers` is refused.
 
 **One request.**
@@ -43,6 +49,11 @@ is refused, and nothing from models.json is run.
 - `max_tokens` is 32768. Thinking is off by default (`reviewer.thinking: false` sends
   `chat_template_kwargs.enable_thinking=false`). With thinking on, deepseek spent all 32768 tokens reasoning on
   24 KB chunks and never answered (`finish_reason=length`); with it off, it answered in 15 to 30 s per chunk.
+  The same switch is what pi sends for `compat.thinkingFormat: qwen-chat-template`; on the `development`
+  provider's qwen3.8-27b (llama.cpp) it gave 0 reasoning tokens, while a top-level `enable_thinking: false` was
+  ignored (2026-10-23).
+- A stream that closes with neither `[DONE]` nor a `finish_reason` (seen: a node answering 200 with an empty
+  stream) is retried like a 5xx.
 - `stream: true`. The gateway ends a request that produces no tokens for a while (`inference_idle_timeout`), and
   reasoning tokens keep a slow answer alive. Only `content` deltas count as the answer; `reasoning_content` is
   ignored.
