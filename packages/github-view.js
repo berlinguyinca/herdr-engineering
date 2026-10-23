@@ -56,7 +56,7 @@ export function renderGithubDetail(response,{summary,loading=false,error=''}={})
  const issue=response?.issue||summary;
  if(!issue)return '<p class="gh-note">Choose an issue to inspect its description and AutoSpec labels.</p>';
  const autospec=issue.autospec||{},reasons=strings(autospec.reasons),body=text(issue.body),full=!!response?.issue;
- return `<div class="gh-heading"><h2>Issue #${esc(issue.number??'?')}</h2><button type="button" class="hd-btn" data-gh-close>Close</button></div><h3>${esc(short(issue.title,300))}</h3><p class="gh-note">${esc(issue.repository_id||'')} · ${esc(human(issue.state)||'State not reported')}</p>
+ return `<div class="gh-heading"><h2>Issue #${esc(issue.number??'?')}</h2><button type="button" class="hd-btn" data-gh-close><span class="gh-close-label">Close</span><span class="gh-back-label">Back to issues</span></button></div><h3>${esc(short(issue.title,300))}</h3><p class="gh-note">${esc(issue.repository_id||'')} · ${esc(human(issue.state)||'State not reported')}</p>
   <div class="gh-links">${link(issue.url,'Open on GitHub')}<button type="button" class="hd-btn" data-gh-refresh-issue aria-busy="${loading}">Refresh issue</button></div>
   ${error||response?.error?`<p class="gh-warning" role="status">${esc(error||short(response.error,300))}${full?' Showing the last received issue.':''}</p>`:''}${loading?'<p class="gh-note" role="status">Reading issue details…</p>':''}${response?.stale?'<p class="gh-warning">These issue details come from an earlier synchronization.</p>':''}
   <p class="gh-state">${esc(githubIssueLabel(issue))}</p>${autospec.evidence_source==='github_labels'?'<p class="gh-note">AutoSpec state comes from GitHub labels. Execution readiness has not been verified.</p>':''}${reasons.length?`<ul class="gh-reasons">${reasons.map(reason=>`<li>${esc(reason)}</li>`).join('')}</ul>`:''}
@@ -66,8 +66,23 @@ export function renderGithubDetail(response,{summary,loading=false,error=''}={})
 }
 const styles=`<style>
 .gh-intro,.gh-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.gh-intro{max-width:86ch}.gh-note{font-size:12px;margin:7px 0}.gh-warning{color:var(--status-attention);font-size:12px;line-height:1.6;overflow-wrap:anywhere}.gh-progress{display:flex;flex-direction:column;gap:7px;font-size:12px;margin:14px 0}.gh-progress progress{width:min(100%,600px);height:7px;accent-color:var(--accent)}.gh-layout{display:grid;grid-template-columns:minmax(180px,240px) minmax(0,1fr);gap:18px;align-items:start;margin-top:20px}.gh-repositories,.gh-inspector,.gh-issue-list{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);min-width:0;overflow:hidden}.gh-repositories>summary{padding:14px;font-weight:600;font-size:14px;cursor:pointer}.gh-repository-content{padding:0 12px 12px}.gh-controls label{display:flex;flex-direction:column;gap:6px;font-size:12px;margin:12px 0}.gh-controls input{padding:9px;font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);width:100%;min-width:0;box-sizing:border-box}.gh-repo-list{list-style:none;padding:0;margin:0}.gh-repo{display:flex;flex-direction:column;gap:5px;width:100%;text-align:left;background:none;border:0;border-top:1px solid var(--border-subtle);color:var(--text);padding:12px 8px;cursor:pointer;overflow-wrap:anywhere;font:inherit}.gh-repo strong{font-size:13px}.gh-repo span,.gh-repo small{font-size:12px;color:var(--text-secondary)}.gh-repo[aria-pressed=true]{background:var(--bg);box-shadow:inset 3px 0 var(--accent)}.gh-all-repos{width:100%;margin:7px 0}.gh-tabs{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.gh-tabs button{font:inherit;font-size:12px;padding:9px 10px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);cursor:pointer}.gh-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.gh-tabs small{margin-left:6px;color:var(--text-secondary)}.gh-main{min-width:0}.gh-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.gh-heading h2{font-size:17px;margin:0;overflow-wrap:anywhere}.gh-issue-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;align-items:start}.gh-issue{padding:14px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.gh-issue:first-child{border-top:0}.gh-issue-title{border:0;background:none;padding:0;text-align:left;font:inherit;font-weight:600;font-size:14px;line-height:1.6;color:var(--accent);cursor:pointer}.gh-issue-title[aria-pressed=true]{text-decoration:underline}.gh-state{font-size:12px;line-height:1.6;color:var(--text);margin:8px 0}.gh-labels{display:flex;flex-wrap:wrap;gap:5px;margin:8px 0}.gh-labels span{padding:3px 6px;border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:11px;color:var(--text-secondary);overflow-wrap:anywhere;max-width:100%}.gh-pages{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;margin:12px 0;font-size:12px;color:var(--text-secondary)}.gh-pages[hidden]{display:none}.gh-pages button:disabled{opacity:.45;cursor:default}.gh-inspector{padding:15px;overflow-wrap:anywhere;grid-row:1}.gh-inspector h3{font-size:14px;line-height:1.6;margin:14px 0 8px}.gh-links{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px}.gh-body{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);padding:12px;border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font:inherit;font-size:13px;line-height:1.7;max-height:450px;overflow:auto;margin:8px 0}.gh-reasons{padding-left:20px;font-size:12px;line-height:1.7}.gh-metadata{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 12px;font-size:12px}.gh-metadata dt{color:var(--text-secondary)}.gh-metadata dd{margin:0}.gh-all-labels{font-size:12px;margin:12px 0}.gh-all-labels summary{cursor:pointer}.gh-empty{padding:22px;color:var(--text-secondary);font-size:13px;line-height:1.6}.gh-section-label{font-size:12px;color:var(--text-secondary);line-height:1.6}.gh-inspector[hidden]{display:none}
-@media(min-width:1250px){.gh-issue-layout:has(.gh-inspector:not([hidden])){grid-template-columns:minmax(0,1fr) minmax(280px,1fr)}.gh-inspector{grid-row:auto;grid-column:2}}
+.gh-back-label{display:none}
+@media(min-width:1250px){
+.gh-layout{height:calc(100dvh - var(--gh-workspace-top,220px) - 24px);min-height:240px;align-items:stretch}
+.gh-repositories,.gh-main{position:sticky;top:16px;height:100%;min-height:0;box-sizing:border-box}
+.gh-repository-content{display:flex;flex-direction:column;height:calc(100dvh - var(--gh-workspace-top,220px) - var(--gh-repository-heading,48px) - 26px);box-sizing:border-box;min-height:0}
+.gh-repository-content>.gh-controls,.gh-repository-content>.gh-all-repos,.gh-repository-content>.gh-note,.gh-repository-content>.gh-pages{flex-shrink:0}
+.gh-repo-list{min-height:0;overflow:auto;flex:1;overscroll-behavior:contain;scrollbar-gutter:stable}
+.gh-main{display:flex;flex-direction:column}.gh-main>.gh-heading,.gh-main>.gh-tabs,.gh-main>.gh-controls,.gh-main>.gh-section-label,.gh-main>.gh-warning,.gh-main>.gh-pages{flex-shrink:0}
+.gh-issue-layout{flex:1;min-height:0;align-items:stretch}.gh-issue-list,.gh-inspector{overflow:auto;min-height:0;overscroll-behavior:contain;scrollbar-gutter:stable}
+.gh-inspector .gh-body{max-height:none;overflow:visible}
+.gh-issue-layout:has(.gh-inspector:not([hidden])){grid-template-columns:minmax(0,1fr) minmax(280px,1fr)}.gh-inspector{grid-row:auto;grid-column:2}}
 @media(min-width:2200px){.gh-layout{grid-template-columns:minmax(280px,360px) minmax(0,1fr)}.gh-issue-layout:has(.gh-inspector:not([hidden])){grid-template-columns:minmax(520px,.8fr) minmax(600px,1.2fr)}}
+@media(max-width:1249px){
+.gh-layout.gh-detail-open{grid-template-columns:minmax(0,1fr)}
+.gh-detail-open>.gh-repositories,.gh-detail-open .gh-main>.gh-heading,.gh-detail-open .gh-main>.gh-tabs,.gh-detail-open .gh-main>.gh-controls,.gh-detail-open .gh-main>.gh-section-label,.gh-detail-open .gh-main>.gh-warning,.gh-detail-open .gh-main>.gh-pages,.gh-detail-open .gh-issue-list{display:none}
+.gh-inspector{overflow:visible}.gh-inspector>.gh-heading{position:sticky;top:0;background:var(--surface);padding:12px 0;z-index:1}.gh-inspector .gh-body{max-height:none;overflow:visible}.gh-close-label{display:none}.gh-back-label{display:inline}
+}
 @media(max-width:850px){.gh-layout{grid-template-columns:minmax(0,1fr)}.gh-repo-list{max-height:280px;overflow:auto}.gh-tabs button{padding:8px}.gh-body{max-height:350px}}
 </style>`;
 
@@ -75,12 +90,15 @@ export function mountGithub(container,client) {
  const state={repository:'',repositoryLabel:'All repositories',repositorySearch:'',issueSearch:'',tab:'all',repositoryPage:1,issuePage:1};
  let disposed=false,repositories=null,issues=null,repoError='',issueError='',selected=null,detail=null,detailError='',detailLoading=false;
  let clock=null,pollTimer=null,repositoryDebounce=null,issueDebounce=null;
- let account=null,connectionGeneration=null;
+ let account=null,connectionGeneration=null,listScroll=null;
  const requests=new Map(),cache=new Map(),signatures=new Map(),listeners=new AbortController();
  container.innerHTML=`${styles}<h1>GitHub projects</h1><p class="gh-intro">Repositories ranked by open issues. Find work to inspect and review its AutoSpec labels, preparation needs and reported progress.</p><div data-gh-health role="status"></div><p data-gh-repo-error class="gh-warning" role="status"></p>
   <div class="gh-layout"><details class="gh-repositories" ${window.matchMedia('(min-width:851px)').matches?'open':''}><summary>Repositories · most open issues first</summary><div class="gh-repository-content"><div class="gh-controls"><label>Search repositories<input type="search" data-gh-repo-search placeholder="Owner or repository"></label></div><button type="button" class="hd-btn gh-all-repos" data-gh-all-repositories>All repositories</button><p class="gh-note" data-gh-repo-count></p><ul class="gh-repo-list" data-gh-repositories></ul><div class="gh-pages" data-gh-repo-pages><button type="button" class="hd-btn" data-gh-repo-page="previous">Previous</button><span data-gh-repo-page-label></span><button type="button" class="hd-btn" data-gh-repo-page="next">Next</button></div></div></details>
   <section class="gh-main"><div class="gh-heading"><h2 data-gh-scope>All repositories</h2></div><div class="gh-tabs" role="tablist" aria-label="Issue classification">${tabs.map(([key,label])=>`<button type="button" role="tab" id="gh-tab-${key}" data-gh-tab="${key}" aria-controls="gh-issue-panel" aria-selected="${key==='all'}" tabindex="${key==='all'?0:-1}">${label}<small data-gh-tab-count="${key}">…</small></button>`).join('')}</div><div class="gh-controls"><label>Search open issues<input type="search" data-gh-issue-search placeholder="Issue title or number"></label></div><p class="gh-section-label" data-gh-issue-count role="status"></p><p class="gh-warning" data-gh-issue-error role="status"></p><div class="gh-issue-layout"><div class="gh-issue-list" id="gh-issue-panel" role="tabpanel" aria-labelledby="gh-tab-all"></div><aside class="gh-inspector" data-gh-inspector aria-label="Issue inspector" hidden></aside></div><div class="gh-pages" data-gh-issue-pages><button type="button" class="hd-btn" data-gh-issue-page="previous">Previous</button><span data-gh-issue-page-label></span><button type="button" class="hd-btn" data-gh-issue-page="next">Next</button></div></section></div>`;
  const el=selector=>container.querySelector(selector);
+ const narrow=()=>window.matchMedia('(max-width:1249px)').matches;
+ function sizeWorkspace(){const layout=el('.gh-layout');layout.style.setProperty('--gh-workspace-top',`${Math.max(16,layout.getBoundingClientRect().top+window.scrollY)}px`);layout.style.setProperty('--gh-repository-heading',`${el('.gh-repositories>summary').getBoundingClientRect().height}px`);}
+ window.addEventListener('resize',sizeWorkspace,{signal:listeners.signal});
  const cancel=key=>{requests.get(key)?.abort();requests.delete(key);};
  function replace(element,html,key,signature) {
   if(signatures.get(key)===signature)return;signatures.set(key,signature);
@@ -124,9 +142,10 @@ export function mountGithub(container,client) {
   replace(el('#gh-issue-panel'),rows.map(issue=>renderGithubIssue(issue,selected?.key===issueKey(issue))).join('')||`<p class="gh-empty">${!issues?'Loading open issues…':issues.available===false?'Issue data is unavailable.':'No open issues match this view.'}${issues?.partial?' Synchronization is incomplete.':''}</p>`,'issues',JSON.stringify([issues,selected?.key]));
   el('[data-gh-issue-count]').textContent=issues?`${rows.length} issues on this page${integer(issues.pagination?.total)?` · ${issues.pagination.total} matching open issues`:''}`:'';
   pages('repo',repositories,state.repositoryPage);pages('issue',issues,state.issuePage);
+  el('.gh-layout').classList.toggle('gh-detail-open',!!selected);
   const inspector=el('[data-gh-inspector]');inspector.hidden=!selected;
   if(selected)replace(inspector,renderGithubDetail(detail,{summary:selected.summary,loading:detailLoading,error:detailError}),'detail',JSON.stringify([selected,detail,detailLoading,detailError]));
-  tick();
+  tick();sizeWorkspace();
  }
  async function request(key,read,accept,reject) {
   if(disposed||document.hidden||requests.has(key))return;
@@ -167,7 +186,7 @@ export function mountGithub(container,client) {
   if(latest&&latest.updated_at!==selected.summary.updated_at){selected={key:selected.key,summary:latest};loadDetail();}
  },()=>{issueError=`Open issues could not refresh.${issues?' Showing last received issues.':' Retrying automatically.'}`;});}
  function refresh(){readRepositories();readIssues();}
- function clearSelection(){cancel('detail');selected=null;detail=null;detailError='';detailLoading=false;el('[data-gh-inspector]').innerHTML='';el('[data-gh-inspector]').hidden=true;signatures.delete('detail');}
+ function clearSelection(){cancel('detail');selected=null;el('.gh-layout').classList.remove('gh-detail-open');detail=null;detailError='';detailLoading=false;el('[data-gh-inspector]').innerHTML='';el('[data-gh-inspector]').hidden=true;signatures.delete('detail');}
  function changeIssues(){cancel('issues');issues=null;issueError='';readIssues();draw();}
  container.addEventListener('click',event=>{
   if(disposed)return;const button=event.target.closest('button');if(!button)return;
@@ -179,9 +198,11 @@ export function mountGithub(container,client) {
   if(button.dataset.ghIssuePage){state.issuePage+=button.dataset.ghIssuePage==='next'?1:-1;changeIssues();}
   if(button.hasAttribute('data-gh-issue')){
    const summary=records(issues?.issues).find(issue=>issueKey(issue)===button.dataset.ghIssue);if(!summary)return;
-   cancel('detail');selected={key:issueKey(summary),summary};detail=cache.get(selected.key)?.response||null;loadDetail();el('[data-gh-inspector]').scrollIntoView({block:'nearest',behavior:'smooth'});
+   if(narrow())listScroll=window.scrollY;
+   cancel('detail');selected={key:issueKey(summary),summary};detail=cache.get(selected.key)?.response||null;loadDetail();
+   if(narrow()){el('[data-gh-inspector]').scrollIntoView({block:'start'});el('[data-gh-close]').focus({preventScroll:true});}
   }
-  if(button.hasAttribute('data-gh-close')){const key=selected?.key;clearSelection();draw();[...container.querySelectorAll('[data-gh-issue]')].find(node=>node.dataset.ghIssue===key)?.focus({preventScroll:true});}
+  if(button.hasAttribute('data-gh-close')){const key=selected?.key,restore=narrow()?listScroll:null;clearSelection();draw();[...container.querySelectorAll('[data-gh-issue]')].find(node=>node.dataset.ghIssue===key)?.focus({preventScroll:true});if(restore!==null)window.scrollTo(0,restore);listScroll=null;}
   if(button.hasAttribute('data-gh-refresh-issue')&&!detailLoading)loadDetail(true);
  },{signal:listeners.signal});
  el('[data-gh-repo-search]').addEventListener('input',event=>{state.repositorySearch=event.target.value;state.repositoryPage=1;cancel('repos');clearTimeout(repositoryDebounce);repositoryDebounce=setTimeout(()=>{repositories=null;readRepositories();draw();},250);},{signal:listeners.signal});
