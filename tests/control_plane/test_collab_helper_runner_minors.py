@@ -223,3 +223,59 @@ def test_the_local_deadline_still_ends_a_helper_when_the_service_is_unreachable(
     with pytest.raises(runner.Failure):
         r.helpers_cycle(claim=False)
     assert killed == ["h_fake"]
+
+
+# ------------------------------------------------------------------ profile changes reach running helpers (item 6)
+SVC = {"name": "gh", "upstream_url": "https://api.github.com/v3", "header": "Authorization", "secret_name": "gh_token"}
+ROW_PROFILE = {"allowed_families": ["claude-code"], "tools_allowed": True, "services": [], "ssh_secret_names": ["k1"]}
+
+
+def watched(hr, monkeypatch, st=None, profile=None):
+    d = fake_running(hr, **{"family": "claude-code", "tools": True, "ssh_keys": ["k1"], **(st or {})})
+    (d / "services.json").write_text("[]")
+    (d / "secrets.json").write_text("{}")
+    r = hr.mk(allow_tools=True)
+    monkeypatch.setattr(r, "alive", lambda st: True)
+    ended = []
+    monkeypatch.setattr(r, "end_helper", lambda d, st, status, error: ended.append((status, error, st.get("stopped"))))
+    r.watch_helper(d, {"helper_id": "h_fake", "status": "running", "profile": {**ROW_PROFILE, **(profile or {})}}, False)
+    return d, ended
+
+
+def test_new_services_and_rotated_keys_reach_a_running_helpers_proxy(hr, monkeypatch):
+    from tests.control_plane.test_collab_helper_runner import write_secrets
+    write_secrets(hr, hr.w.room, {"gh_token": {"value": "Bearer NEW", "host": "api.github.com"}})
+    d, ended = watched(hr, monkeypatch, profile={"services": [SVC]})
+    assert ended == []
+    assert json.loads((d / "services.json").read_text()) == [SVC]
+    assert json.loads((d / "secrets.json").read_text()) == {"gh_token": {"value": "Bearer NEW", "host": "api.github.com"}}
+    r = hr.mk(allow_tools=True)
+    monkeypatch.setattr(r, "alive", lambda st: True)
+    r.watch_helper(d, {"helper_id": "h_fake", "status": "running", "profile": ROW_PROFILE}, False)
+    assert json.loads((d / "services.json").read_text()) == [] and json.loads((d / "secrets.json").read_text()) == {}
+
+
+@pytest.mark.parametrize("change,why", [({"allowed_families": ["codex"]}, "family"),
+                                        ({"tools_allowed": False}, "tools"),
+                                        ({"ssh_secret_names": []}, "ssh key")])
+def test_tightening_the_profile_stops_a_running_helper_within_one_watch(hr, monkeypatch, change, why):
+    _, ended = watched(hr, monkeypatch, profile=change)
+    assert len(ended) == 1 and ended[0][:2] == ("failed", "profile-changed") and why in ended[0][2]
+
+
+def test_an_unchanged_profile_leaves_the_helper_running(hr, monkeypatch):
+    _, ended = watched(hr, monkeypatch)
+    assert ended == []
+
+
+def test_a_text_only_helper_is_not_stopped_when_tools_go_off(hr, monkeypatch):
+    _, ended = watched(hr, monkeypatch, st={"tools": False}, profile={"tools_allowed": False})
+    assert ended == []
+
+
+def test_the_stop_reason_is_in_the_result(hr, tmp_path):
+    r = hr.mk()
+    d = tmp_path / "x"
+    d.mkdir()
+    text = r.helper_result_text(d, {"stopped": "tools are no longer allowed in this room"})
+    assert "[stopped: the room profile changed: tools are no longer allowed in this room]" in text

@@ -629,7 +629,8 @@ def test_runner_rows_carry_the_profile_slice_and_the_service_clock(hr):
     h = ask(hr)
     r = hr.mk()
     row = next(x for x in r.ok("GET", "fleet/helpers")["helpers"] if x["helper_id"] == h["helper_id"])
-    assert row["profile"] == {"tools_allowed": True, "services": [], "ssh_secret_names": ["k1"]}
+    assert row["profile"] == {"allowed_families": ["claude-code"], "tools_allowed": True, "services": [],
+                              "ssh_secret_names": ["k1"]}
     c = r.ok("POST", f"fleet/helpers/{h['helper_id']}/claim", {})
     assert c["profile"] == row["profile"] and c["now"] == w.s.clock.t and c["expires_epoch"] - c["now"] > 0
 

@@ -133,7 +133,7 @@ MAX_HELPER_RESULT = 32000
 _HELPER_LIVE = frozenset({"requested", "claimed", "running"})
 _HELPER_FIELDS = frozenset({"room_id", "role", "task", "family", "model"})   # helper_spawn's wait is MCP-side
 _HELPER_IGNORED = frozenset({"parent", "parent_agent_id"})   # the parent is the caller, never what the body says
-HELPER_ERRORS = frozenset({"failed", "timeout", "cancelled", "sandbox-error"})   # audited codes
+HELPER_ERRORS = frozenset({"failed", "timeout", "cancelled", "sandbox-error", "profile-changed"})   # audited codes
 _HELPER_BAD = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")   # all control chars but \t \n
 
 
@@ -2138,7 +2138,8 @@ class CollabService:
         """What the runner needs of the room profile to start a helper (names only, never values). The
         operator is not a member of most rooms, so it cannot read the profile itself."""
         p = self._profile(r["room_id"])
-        return {"tools_allowed": p["tools_allowed"], "services": p["services"], "ssh_secret_names": p["ssh_secret_names"]}
+        return {"allowed_families": p["allowed_families"], "tools_allowed": p["tools_allowed"],
+                "services": p["services"], "ssh_secret_names": p["ssh_secret_names"]}
 
     def claim_helper(self, pr: Principal, helper_id: str) -> dict:
         """Operator only, exactly once: re-checks the parent's grant and the room profile, then mints the

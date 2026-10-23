@@ -221,3 +221,13 @@ def test_a_root_predecessor_is_not_ended_by_its_successor(w):
 def test_an_ordinary_helper_carries_no_handoff(w):
     _, c = run(w, ask(w)["helper_id"])
     assert c["handoff"] is None
+
+
+# ------------------------------------------------------------------ profile changes reach running helpers (item 6)
+def test_runner_rows_carry_the_allowed_families_and_a_profile_change_is_an_audited_code(w):
+    rec = ask(w)
+    row = next(h for h in w.s.list_helpers_for_runner(w.op)["helpers"] if h["helper_id"] == rec["helper_id"])
+    assert row["profile"]["allowed_families"] == ["claude-code", "codex"]
+    run(w, rec["helper_id"])
+    w.s.finish_helper(w.op, rec["helper_id"], {"status": "failed", "error": "profile-changed"})
+    assert w.s.helper_status(w.root, rec["helper_id"])["error"] == "profile-changed"
