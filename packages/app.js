@@ -156,7 +156,7 @@ async function viewIntegrations(parts) {
   const query = route().query;
   dashboardView = mountIntegrations(root, client, {
     kind: parts[0], tab: query.get('tab') || 'current', search: query.get('search') || '',
-    repository: query.get('repository') || '', mission: query.get('mission') || '', session: query.get('session') || '',
+    repository: query.get('repository') || '', provider: query.get('provider') || '', mission: query.get('mission') || '', session: query.get('session') || '',
   });
 }
 
@@ -393,28 +393,86 @@ async function viewHost(parts) {
 }
 
 async function viewActivity() {
+  const { events } = await client.activity(50);
+  if (!events.length) {
+    root.innerHTML = '<h1>Activity</h1><herdr-empty message="No activity yet"></herdr-empty>';
+    return;
+  }
+  const missionTitleLookup = titles(await missionTitles());
+  const entries = events.map((event) => {
+    const description = describeEvent(event, { missionTitles: missionTitleLookup });
+    const rawPayload = JSON.stringify(event.payload || {}, null, 2);
+    return {
+      event,
+      description,
+      payload: rawPayload.length > 8000 ? `${rawPayload.slice(0, 7999)}…` : rawPayload,
+    };
+  });
+  const counts = new Map();
+  for (const { event } of entries) counts.set(event.event_type, (counts.get(event.event_type) || 0) + 1);
+  const types = [...counts.keys()];
+  const selectedDetail = ({ event, description, payload }) => `<div class="ac-selected-head"><div><span class="ac-eyebrow">Selected event</span><h2>${esc(description.title)}</h2></div><time>${formatTimestamp(event.source_timestamp)}</time></div>
+    <dl class="ac-selected-meta"><div><dt>Type</dt><dd>${esc(event.event_type || 'Event')}</dd></div><div><dt>Event ID</dt><dd><code>${esc(event.event_id || 'unavailable')}</code></dd></div></dl>
+    <p class="ac-selected-detail">${esc(description.detail)}</p><pre class="ac-payload" aria-label="Selected event payload">${esc(payload)}</pre>`;
   root.innerHTML = `<style>
-    .ac-list{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+    .ac-workspace{display:grid;grid-template-columns:minmax(620px,1600px) minmax(320px,1fr);gap:var(--density-gap,16px);align-items:start;width:100%}
+    .ac-stream{min-width:0}.ac-stream-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:8px}.ac-stream-head h2{margin:0}.ac-stream-head span,.ac-eyebrow{font-size:12px;color:var(--text-secondary)}
+    .ac-list{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
     .ac-row{border-bottom:1px solid var(--border-subtle)}.ac-row:last-child{border-bottom:0}.ac-row[open]{background:var(--bg)}
     .ac-row summary{display:grid;grid-template-columns:minmax(140px,220px) minmax(0,1fr) auto;gap:14px;align-items:center;padding:10px 12px;cursor:pointer;list-style-position:inside;font-size:13px}
     .ac-row summary strong{overflow-wrap:anywhere}.ac-kind,.ac-time{font-size:12px;color:var(--text-secondary)}.ac-time{white-space:nowrap}
     .ac-detail{margin:0;padding:0 32px 8px;font-size:12px;line-height:1.5;color:var(--text-secondary);overflow-wrap:anywhere}.ac-payload{margin:0 32px 12px;max-height:240px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.45;background:var(--surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:10px}
     .ac-row[data-muted=true]{opacity:.65}
-    @media(min-width:2200px){.ac-list{max-width:1600px}}
-    @media(max-width:650px){.ac-row summary{grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;padding:12px}.ac-kind{grid-column:1}.ac-time{grid-column:2;grid-row:1/3}.ac-detail{padding:0 12px 8px}.ac-payload{margin:0 12px 12px}}
-  </style><h1>Activity</h1>` + await activityList(50);
-}
+    .ac-rail{position:sticky;top:16px;display:grid;gap:var(--density-gap,16px);min-width:0}.ac-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--density-panel-padding,16px)}.ac-panel h2{font-size:16px;margin:0 0 10px}.ac-panel p{color:var(--text-secondary);line-height:1.5}
+    .ac-filter-list{display:flex;flex-wrap:wrap;gap:8px;min-width:0}.ac-filter{min-height:36px;max-width:100%;border:1px solid var(--border);border-radius:999px;background:var(--bg);color:var(--text);padding:6px 10px;cursor:pointer;overflow-wrap:anywhere;white-space:normal}.ac-filter[aria-pressed=true]{border-color:var(--accent);background:var(--accent);color:var(--accent-contrast,#fff)}
+    .ac-repeat-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:14px 0 0;padding:0;list-style:none}.ac-repeat-list li{display:flex;justify-content:space-between;gap:8px;min-width:0;border-top:1px solid var(--border-subtle);padding-top:8px;font-size:12px}.ac-repeat-list li span{min-width:0;overflow-wrap:anywhere}.ac-repeat-list strong{flex:0 0 auto;font-size:14px}.ac-filter-status{margin:10px 0 0;font-size:12px;color:var(--text-secondary)}
+    .ac-selected{min-width:0}.ac-selected>*{min-width:0;max-width:100%;box-sizing:border-box}.ac-selected-head{display:flex;justify-content:space-between;gap:12px;align-items:start}.ac-selected-head>div{min-width:0;max-width:100%}.ac-selected-head h2{min-width:0;margin:3px 0 0;overflow-wrap:anywhere;word-break:break-word}.ac-selected-head time{flex:0 0 auto;font-size:12px;color:var(--text-secondary);white-space:nowrap}.ac-selected-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:14px 0}.ac-selected-meta div{min-width:0}.ac-selected-meta dt{font-size:11px;color:var(--text-secondary)}.ac-selected-meta dd{margin:3px 0 0;overflow-wrap:anywhere}.ac-selected-detail{overflow-wrap:anywhere;word-break:break-word}.ac-selected .ac-payload{margin:12px 0 0;max-width:100%;max-height:360px;box-sizing:border-box;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+    .ac-selection-status{position:fixed;inset:0 auto auto 0;width:1px;max-width:1px;height:1px;padding:0;margin:0;overflow:hidden;overflow-wrap:anywhere;word-break:break-all;clip-path:inset(50%);white-space:normal;border:0;contain:strict}
+    @media(min-width:2200px){.ac-workspace{grid-template-columns:minmax(900px,1600px) minmax(760px,1fr)}.ac-rail{grid-template-columns:minmax(260px,.7fr) minmax(360px,1.3fr)}}
+    @media(max-width:1300px){.ac-workspace{grid-template-columns:minmax(0,1fr)}.ac-rail{position:static;grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media(max-width:650px){.ac-rail{grid-template-columns:minmax(0,1fr)}.ac-row summary{grid-template-columns:minmax(0,1fr);gap:4px;padding:12px}.ac-row summary>*{min-width:0}.ac-kind,.ac-time{grid-column:1}.ac-time{white-space:normal;overflow-wrap:anywhere}.ac-detail{padding:0 12px 8px}.ac-payload{margin:0 12px 12px;overflow-wrap:anywhere}.ac-selected-meta{grid-template-columns:minmax(0,1fr)}.ac-selected-head{display:block}.ac-selected-head time{display:block;margin-top:6px}}
+  </style><h1>Activity</h1><div class="ac-workspace">
+    <section class="ac-stream" aria-labelledby="activity-stream-title"><div class="ac-stream-head"><h2 id="activity-stream-title">Chronological stream</h2><span>${entries.length} events</span></div>
+      <div class="ac-list">${entries.map(({ event, description, payload }, index) => `<details class="ac-row" data-event-id="${esc(event.event_id || '')}" data-event-type="${esc(event.event_type || '')}" data-entry-index="${index}" data-muted="${description.muted}"><summary><strong>${esc(description.title)}</strong><span class="ac-kind">${esc(description.kind)}</span><time class="ac-time">${formatTimestamp(event.source_timestamp)}</time></summary><p class="ac-detail">${esc(description.detail)}</p><pre class="ac-payload" aria-label="Original event payload">${esc(payload)}</pre></details>`).join('')}</div>
+    </section>
+    <aside class="ac-rail" aria-label="Activity summary and selected event">
+      <section class="ac-panel"><h2>Event types</h2><div class="ac-filter-list" role="group" aria-label="Filter activity by event type"><button class="ac-filter" type="button" data-event-filter="all" aria-pressed="true">All <strong>${entries.length}</strong></button>${types.map((type) => `<button class="ac-filter" type="button" data-event-filter="${esc(type)}" aria-pressed="false">${esc(type)} <strong>${counts.get(type)}</strong></button>`).join('')}</div>
+        <p class="ac-filter-status" role="status">Showing all ${entries.length} events</p>
+        <h2 style="margin-top:18px">Repeated types</h2><ul class="ac-repeat-list">${types.filter((type) => counts.get(type) > 1).map((type) => `<li data-repeat-type="${esc(type)}"><span>${esc(type)}</span><strong>${counts.get(type)}</strong></li>`).join('') || '<li><span>No repeated event types</span></li>'}</ul>
+      </section>
+      <p class="ac-selection-status" data-activity-selection-status role="status" aria-live="polite">Selected event: ${esc(entries[0].description.title)}</p>
+      <section class="ac-panel ac-selected" data-activity-selected data-entry-index="0">${selectedDetail(entries[0])}</section>
+    </aside>
+  </div>`;
 
-async function activityList(limit) {
-  const { events } = await client.activity(limit);
-  if (!events.length) return '<herdr-empty message="No activity yet"></herdr-empty>';
-  const t = titles(await missionTitles());
-  return `<div class="ac-list">${events.map((e) => {
-    const d = describeEvent(e, { missionTitles: t });
-    const rawPayload=JSON.stringify(e.payload || {},null,2);
-    const payload=rawPayload.length>8000?`${rawPayload.slice(0,7999)}…`:rawPayload;
-    return `<details class="ac-row" data-muted="${d.muted}"><summary><strong>${esc(d.title)}</strong><span class="ac-kind">${esc(d.kind)}</span><time class="ac-time">${formatTimestamp(e.source_timestamp)}</time></summary><p class="ac-detail">${esc(d.detail)}</p><pre class="ac-payload" aria-label="Original event payload">${esc(payload)}</pre></details>`;
-  }).join('')}</div>`;
+  const rows = [...root.querySelectorAll('.ac-row')];
+  const selected = root.querySelector('[data-activity-selected]');
+  const selectionStatus = root.querySelector('[data-activity-selection-status]');
+  const showSelected = (row) => {
+    const entry = entries[Number(row.dataset.entryIndex)];
+    if (!entry) return;
+    selected.dataset.entryIndex = row.dataset.entryIndex;
+    selected.innerHTML = selectedDetail(entry);
+    selectionStatus.textContent = `Selected event: ${entry.description.title}`;
+  };
+  for (const row of rows) {
+    row.querySelector('summary').addEventListener('focus', () => showSelected(row));
+    row.addEventListener('toggle', () => { if (row.open) showSelected(row); });
+  }
+  const filters = [...root.querySelectorAll('[data-event-filter]')];
+  const filterStatus = root.querySelector('.ac-filter-status');
+  for (const button of filters) button.addEventListener('click', () => {
+    const type = button.dataset.eventFilter;
+    let shown = 0;
+    for (const row of rows) {
+      row.hidden = type !== 'all' && row.dataset.eventType !== type;
+      if (!row.hidden) shown += 1;
+    }
+    for (const candidate of filters) candidate.setAttribute('aria-pressed', String(candidate === button));
+    filterStatus.textContent = type === 'all' ? `Showing all ${shown} events` : `Showing ${shown} ${type} events`;
+    const selectedRow = rows[Number(selected.dataset.entryIndex)];
+    if (!selectedRow || selectedRow.hidden) showSelected(rows.find((row) => !row.hidden));
+  });
 }
 
 async function viewAnalytics() {
@@ -423,18 +481,21 @@ async function viewAnalytics() {
   ]);
   root.innerHTML = `
     <style>
-      .an-links{display:grid;grid-template-columns:repeat(3,minmax(200px,1fr));gap:12px;margin:16px 0}.an-links a{display:flex;flex-direction:column;gap:4px;padding:14px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);text-decoration:none}.an-links strong{color:var(--text)}.an-links span{font-size:12px;color:var(--text-secondary)}
-      .an-stage{margin-top:18px}@media(min-width:2200px){.an-stage{max-width:1600px}}@media(max-width:720px){.an-links{grid-template-columns:minmax(0,1fr)}}
+      .an-dashboard{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:var(--density-gap,16px);align-items:start;width:100%}.an-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--density-panel-padding,16px)}.an-panel h2{font-size:16px;margin:0 0 12px}.an-panel p{font-size:12px;color:var(--text-secondary)}
+      .an-value{font-size:28px;font-weight:700;line-height:1.1}.an-value span{font-size:12px;font-weight:400;color:var(--text-secondary)}.an-pairs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.an-pairs div{min-width:0}.an-pairs strong{display:block;font-size:20px}.an-pairs span{font-size:12px;color:var(--text-secondary)}
+      .an-links{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(160px,100%),1fr));gap:8px}.an-links a{display:flex;flex-direction:column;gap:4px;min-width:0;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);text-decoration:none}.an-links a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.an-links strong{color:var(--text)}.an-links span{font-size:12px;color:var(--text-secondary)}
+      .an-stage{grid-column:span 2}.an-model-list{margin:0;padding:0;list-style:none}.an-model-list li{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid var(--border-subtle);font-size:12px}.an-model-list li:first-child{border-top:0}.an-model-list span{overflow-wrap:anywhere}.an-stage .hd-card{padding:10px;margin-top:8px}
+      @media(max-width:700px){.an-stage{grid-column:auto}.an-pairs{grid-template-columns:minmax(0,1fr)}}
     </style>
     <h1>Analytics</h1>
-    <div class="hd-grid">
-      <herdr-metric label="Missions" value="${missions.total}"></herdr-metric>
-      <herdr-metric label="Completion rate" value="${missions.completion_rate}%"></herdr-metric>
-      <herdr-metric label="Models" value="${Object.keys(models.models).length}"></herdr-metric>
-      <herdr-metric label="Hosts healthy" value="${hosts.healthy} / ${hosts.total}"></herdr-metric>
-    </div>
-    <nav class="an-links" data-analytics-links aria-label="Analytics views"><a href="#/analytics/models"><strong>Models</strong><span>Agent distribution by model</span></a><a href="#/analytics/hosts"><strong>Hosts</strong><span>Reported fleet health</span></a><a href="#/analytics/tokens"><strong>Token usage</strong><span>Requests and tokens by project</span></a></nav>
-    <section class="an-stage"><h3>Missions by stage</h3>${stageBars(missions.by_stage)}</section>`;
+    <div class="an-dashboard">
+      <section class="an-panel" data-analytics-panel="missions"><h2>Missions</h2><div class="an-value">${missions.total} <span>observed</span></div><p>${missions.completed} completed</p></section>
+      <section class="an-panel" data-analytics-panel="completion"><h2>Completion</h2><div class="an-value">${missions.completion_rate}%</div><p>Across recorded missions</p></section>
+      <section class="an-panel" data-analytics-panel="fleet"><h2>Fleet health</h2><div class="an-pairs"><div><strong>${hosts.healthy}</strong><span>healthy</span></div><div><strong>${hosts.unavailable}</strong><span>unavailable</span></div></div><p>${hosts.total} hosts reporting</p></section>
+      <section class="an-panel" data-analytics-panel="models"><h2>Model coverage</h2><div class="an-value">${Object.keys(models.models).length} <span>models</span></div><p>${models.total_sessions} agent sessions</p><ul class="an-model-list">${Object.entries(models.models).slice(0, 4).map(([model, usage]) => `<li><span>${esc(model)}</span><strong>${usage.sessions}</strong></li>`).join('') || '<li><span>No model usage recorded</span></li>'}</ul></section>
+      <section class="an-panel" data-analytics-panel="views"><h2>Explore analytics</h2><nav class="an-links" data-analytics-links aria-label="Analytics views"><a href="#/analytics/models"><strong>Models</strong><span>Agent distribution by model</span></a><a href="#/analytics/hosts"><strong>Hosts</strong><span>Reported fleet health</span></a><a href="#/analytics/tokens"><strong>Token usage</strong><span>Requests and tokens by project</span></a></nav></section>
+      <section class="an-panel an-stage" data-analytics-panel="stages"><h2>Missions by stage</h2>${stageBars(missions.by_stage)}</section>
+    </div>`;
 }
 
 async function viewAnalyticsMissions() { await viewAnalytics(); }

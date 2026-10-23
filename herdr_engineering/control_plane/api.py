@@ -1139,10 +1139,12 @@ def _make_handler(server, public=False, operator=False):
                         repository_languages=cached_github_languages(server.github_monitor)))
                 if what == "pipeline":
                     return self._json(server.ci_monitor.detail(
-                        _q(self.path, "repository"), _q(self.path, "number")))
+                        _q(self.path, "repository"), _q(self.path, "number"),
+                        **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
                 if what == "log":
                     return self._json(server.ci_monitor.log(
-                        _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step")))
+                        _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
+                        **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
                 if what:
                     return self._json({"error": "not found"}, 404)
                 from .project_links import annotate_ci, cached_github_languages
@@ -1194,7 +1196,8 @@ def _make_handler(server, public=False, operator=False):
                 try:
                     receipt = debug_ci(server.ci_monitor, r, server.dispatcher,
                                        body.get("repository"), body.get("number"),
-                                       body.get("session_id"), body.get("operation_id"))
+                                       body.get("session_id"), body.get("operation_id"),
+                                       **({"provider_url": body["provider_url"]} if "provider_url" in body else {}))
                 except HerdrEngineeringError as exc:
                     return self._json({"error": exc.message}, exc.http_status)
                 status = {"delivered": 200, "queued": 202}.get(receipt.get("status"), 502)
@@ -1204,7 +1207,8 @@ def _make_handler(server, public=False, operator=False):
             if resource == "ci" and len(parts) == 5 and parts[4] == "actions":
                 try:
                     return self._json(server.ci_monitor.action(
-                        body.get("repository"), body.get("number"), body.get("action")))
+                        body.get("repository"), body.get("number"), body.get("action"),
+                        **({"provider_url": body["provider_url"]} if "provider_url" in body else {})))
                 except PermissionError as exc:
                     return self._json({"error": str(exc)}, 403)
                 except Exception as exc:
