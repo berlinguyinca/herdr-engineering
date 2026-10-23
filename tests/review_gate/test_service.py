@@ -676,3 +676,76 @@ def test_tick_counts_a_durable_failure_and_retries_next_tick():
     sink.fail = False
     assert svc.tick()["errors"] == 0
     assert store.snapshot(KEY).head_sha == A
+
+
+class MaterialApp(FakeApp):
+    """FakeApp that also serves review material (``None`` while ``closed``)."""
+
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    def review_material(self, repo, number, expected_head_sha, *, max_bytes):
+        from herdr_engineering.review_gate.github_app import ReviewMaterial
+
+        if self.closed:
+            return None
+        return ReviewMaterial("t", "b", "main", expected_head_sha, (), False)
+
+
+def _coordinator(store, queue, app):
+    from herdr_engineering.review_gate.config import ReviewerConfig
+    from herdr_engineering.review_gate.coordinator import ReviewCoordinator
+
+    return ReviewCoordinator(
+        store=store, queue=queue, app=app, config=ReviewerConfig(), enrolled=(REPO,)
+    )
+
+
+def _live_jobs(queue):
+    return [j for j in queue.snapshot() if j["key"] == str(KEY) and j["sha"] == A]
+
+
+def test_pr_closed_during_review_and_reopened_is_requeued():
+    svc, app, store, queue, _, ci = make()
+    app.__class__ = MaterialApp
+    app.closed = False
+    coord = _coordinator(store, queue, app)
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    svc.tick()
+    app.closed = True  # PR closed while the reviewer fetches
+    assert coord.claim("w1", "reviewer-m") is None
+    assert store.snapshot(KEY).state == State.REVIEWING
+    app.prs[REPO] = []
+    svc.tick()  # PR left the open list: job cancelled
+    assert _live_jobs(queue) == []
+    app.prs[REPO] = [pr()]
+    app.closed = False
+    svc.tick()  # reopened at the same sha
+    svc.tick()
+    assert len(_live_jobs(queue)) == 1
+    claim = coord.claim("w2", "reviewer-m")
+    assert claim is not None and claim.sha == A
+    assert coord.submit(claim.job_id, "w2", '{"verdict": "PASS", "findings": []}') == "recorded"
+    assert store.snapshot(KEY).state == State.APPROVED
+
+
+def test_reviewing_pr_with_live_job_is_not_rearmed():
+    svc, app, store, queue, _, ci = make()
+    app.__class__ = MaterialApp
+    app.closed = False
+    coord = _coordinator(store, queue, app)
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    svc.tick()
+    claim = coord.claim("w1", "reviewer-m")
+    assert store.snapshot(KEY).state == State.REVIEWING
+    before = _live_jobs(queue)
+    summary = svc.tick()
+    assert summary["enqueued"] == 0
+    after = _live_jobs(queue)
+    assert [j["job_id"] for j in after] == [j["job_id"] for j in before] == [claim.job_id]
+    assert after[0]["state"] == "claimed"

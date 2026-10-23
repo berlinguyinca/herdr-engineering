@@ -16,7 +16,9 @@ touched) and every open, non-draft PR in it:
    normal). If that returns ``None`` and no live job exists for (key, sha) the
    status says "cannot queue review" instead of "review queued". The store has
    no event that produces ``REVIEW_QUEUED``, so after enqueueing the state
-   stays ``CI_GREEN``, which ``on_review_started`` accepts.
+   stays ``CI_GREEN``, which ``on_review_started`` accepts. ``REVIEWING``
+   with no live (queued/claimed) job for (key, sha), e.g. a PR closed during
+   its review and reopened at the same head, -> ``queue.rearm``.
 4. ``APPROVED`` -> ``decide_merge``: ``merge`` -> status ``success``, then
    ``app.merge_pr(repo, number, head_sha)``; only a True result records
    ``store.on_merged``. False (head moved / not mergeable) or a raise leaves
@@ -333,6 +335,11 @@ class GateService:
                 return
             self._status(repo, sha, "pending", "review gate: CI green, review queued")
         elif state == State.REVIEWING:
+            if not any(j["key"] == str(key) and j["sha"] == sha for j in self._queue.snapshot()):
+                # Reopened after its job was cancelled: re-queue the head. A job
+                # enqueued between the snapshot and here is cancelled and replaced.
+                self._queue.rearm(key, sha, self._author_model(key, sha, pr.head_ref))
+                counts["enqueued"] += 1
             self._status(repo, sha, "pending", "review gate: review in progress")
         elif state == State.CI_RED:
             if self._posted.get((repo, sha), ("",))[0] != "failure":  # keep the run list

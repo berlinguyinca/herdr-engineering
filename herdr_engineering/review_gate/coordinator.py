@@ -34,8 +34,9 @@ times and has still not produced a verdict":
 A job whose material cannot be fetched, or whose ``on_review_started`` is
 refused, is neither released nor completed: it stays claimed and its lease
 expiry is the backoff, so one bad PR never blocks a healthy one in the same
-call. GateService cancels jobs of closed PRs and moved heads on its next tick;
-a PR reopened at the same sha keeps its job. Cost: a GitHub outage longer than
+call. GateService cancels the job when a PR leaves the open list (or its
+head moves), and re-queues the head if the PR comes back while still
+REVIEWING or CI_GREEN. Cost: a GitHub outage longer than
 about ``max_attempts * lease_seconds`` (45 minutes with the defaults) escalates
 every PR it touched, and an operator must ``resume`` them.
 
