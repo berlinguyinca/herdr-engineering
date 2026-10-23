@@ -33,7 +33,8 @@ from .redact import redact_payload
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
-                        r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
+                        r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        r"|architecture/(?:snapshots|analyses))$")
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
 # back to "dev" in a local checkout / un-stamped image.
 _COMMIT = os.environ.get("HERDR_ENGINEERING_COMMIT", "dev")
@@ -51,6 +52,7 @@ def _is_loopback(host: str) -> bool:
 _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
+_MAX_ARCHITECTURE_BODY = 64 * 1024 * 1024  # a published graph snapshot; validated by the service
 _MAX_SSE_SECONDS = 3600
 
 
@@ -139,7 +141,7 @@ class ControlPlaneServer:
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 summary_config=None, summary_client=None):
+                 summary_config=None, summary_client=None, architecture_enabled=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -248,8 +250,31 @@ class ControlPlaneServer:
         self._httpd = None
         self.gate_service = self.gate_store = self.gate_queue = None
         self._start_review_gate(repo, fleet_config)
+        from ..architecture.service import ArchitectureService
+        self.architecture = ArchitectureService(
+            repo, enabled=self._architecture_enabled(fleet_config, architecture_enabled))
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    @staticmethod
+    def _architecture_enabled(fleet_config, override):
+        """`control_plane.architecture.enabled` in the central fleet config; off unless set."""
+        if override is not None:
+            return bool(override)
+        if fleet_config is None:
+            return False
+        from ..fleet_config import FleetConfigError
+        try:
+            section = fleet_config.current().section("control_plane")
+        except FleetConfigError:
+            return False
+        arch = (section or {}).get("architecture") or {}
+        unknown = set(arch) - {"enabled"}
+        if unknown:
+            raise ValueError(f"control_plane.architecture: unknown key(s) {sorted(unknown)}")
+        if not isinstance(arch.get("enabled", False), bool):
+            raise ValueError("control_plane.architecture.enabled must be a boolean")
+        return arch.get("enabled", False)
 
     def _start_review_gate(self, repo, fleet_config):
         """Build and start the PR review gate when the central config enables it.
@@ -332,6 +357,8 @@ class ControlPlaneServer:
         h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1", "github_v1"]
         if self.collab is not None:
             h["capabilities"].append("collab_v1")
+        if self.architecture.enabled:
+            h["capabilities"].append("architecture_v1")
         return h
 
     # ------------------------------------------------------- SSE plumbing
@@ -769,7 +796,8 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4):
+            if (res.startswith("reviews") or res == "architecture"
+                    or (res in {"ci", "review-gate"} and len(segs) > 4)):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -1080,10 +1108,67 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "pull request is not escalated"}, 409)
             return self._json(_gate_pr(store.snapshot(key)))
 
+        def _architecture_get(self, parts):
+            """/api/v1/architecture/... — read-only, bounded queries over immutable snapshots."""
+            svc = server.architecture
+            if not svc.enabled:
+                return self._json({"error": "not found"}, 404)
+            q = lambda k: _q(self.path, k) or None  # noqa: E731
+            try:
+                rest = parts[4:]
+                if rest == ["snapshots"]:
+                    return self._json(svc.list_snapshots(q("repository_id"), q("commit_sha"), q("host_id"),
+                                                         q("cursor"), q("limit")))
+                if rest == ["analyses"]:
+                    return self._json(svc.analyses(_qint(self.path, "limit", 50)))
+                if rest == ["diff"]:
+                    if not (q("base") and q("head")):
+                        raise ValueError("base and head are required")
+                    return self._json(svc.diff(q("base"), q("head"), q("cursor"), q("limit")))
+                if len(rest) >= 2 and rest[0] == "snapshots":
+                    sid, tail = rest[1], rest[2:]
+                    if not tail:
+                        return self._json(svc.get_snapshot(sid))
+                    if tail == ["children"]:
+                        return self._json(svc.children(sid, q("parent"), q("cursor"), q("limit")))
+                    if tail == ["nodes"]:
+                        return self._json(svc.search(sid, q("q") or "", q("kind"), q("cursor"), q("limit")))
+                    if len(tail) == 2 and tail[0] == "nodes":
+                        return self._json(svc.node(sid, tail[1]))
+                    if len(tail) == 3 and tail[0] == "nodes" and tail[2] == "edges":
+                        return self._json(svc.expand(sid, tail[1], q("direction") or "both", q("kind"),
+                                                     q("cursor"), q("limit")))
+            except KeyError:
+                return self._json({"error": "not found"}, 404)
+            except Exception as exc:
+                from ..architecture.service import ArchitectureError
+                if isinstance(exc, ArchitectureError):
+                    return self._json({"error": str(exc)}, exc.status)
+                raise
+            return self._json({"error": "not found"}, 404)
+
+        def _architecture_post(self, parts):
+            svc = server.architecture
+            if not svc.enabled:
+                return self._json({"error": "not found"}, 404)
+            from ..architecture.service import ArchitectureError
+            try:
+                body = self._read_json(_MAX_ARCHITECTURE_BODY) or {}
+                if parts[4:] == ["snapshots"]:
+                    out = svc.publish(body)
+                    return self._json(out, 200 if out["duplicate"] else 201)
+                if parts[4:] == ["analyses"]:
+                    return self._json(svc.record_analysis(body), 201)
+            except ArchitectureError as exc:
+                return self._json({"error": str(exc)}, exc.status)
+            return self._json({"error": "not found"}, 404)
+
         def _api_get(self, parts, resource):
             r = server.repo
             if resource == "health":
                 return self._json(server._health())
+            if resource == "architecture":
+                return self._architecture_get(parts)
             if resource == "mission-activity" and len(parts) == 4:
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
@@ -1288,6 +1373,8 @@ def _make_handler(server, public=False, operator=False):
                 if r.get_session(parts[4]) is None and not r.inspector.has_session(parts[4]):
                     return self._json({"error": "session not found"}, 404)
                 return self._inspector_set_prefs(parts[4])
+            if resource == "architecture":
+                return self._architecture_post(parts)
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
@@ -1631,12 +1718,12 @@ def _make_handler(server, public=False, operator=False):
             return None
 
         # ---------------------------------------------------------- helpers
-        def _read_json(self):
+        def _read_json(self, limit=_MAX_JSON_BODY):
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 if not length:
                     return None
-                if length > _MAX_JSON_BODY:
+                if length > limit:
                     raise ValueError("request body too large")
                 try:
                     return json.loads(self.rfile.read(length))

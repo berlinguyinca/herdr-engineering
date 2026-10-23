@@ -68,6 +68,9 @@ class IngestService:
         # would merge unreviewed code, so they are reserved for the gate itself.
         if entity_type.strip().lower().startswith(RESERVED_ENTITY_PREFIXES):
             raise ValueError("reserved review-gate entity type is not accepted by generic ingestion")
+        # Architecture snapshots are published through their validating route only.
+        if entity_type.strip().lower().startswith("architecture"):
+            raise ValueError("reserved architecture entity type is not accepted by generic ingestion")
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":
                 raise ValueError("invalid mission activity event_type")
