@@ -1,6 +1,7 @@
 """Supervisor: run the worker in a resource-limited, network-less, env-scrubbed child process."""
 from __future__ import annotations
 
+import functools
 import json
 import os
 import resource
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,16 +38,17 @@ class Limits:
     open_files: int = 256
 
 
-def _network_wrapper() -> list[str]:
+@functools.lru_cache(maxsize=1)
+def _network_wrapper() -> tuple[str, ...]:
     """``unshare -rn`` when unprivileged user namespaces work; else none (reported to the caller)."""
     unshare = shutil.which("unshare")
     if not unshare:
-        return []
+        return ()
     try:
         ok = subprocess.run([unshare, "-rn", "true"], capture_output=True, timeout=10).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         ok = False
-    return [unshare, "-rn", "--"] if ok else []
+    return (unshare, "-rn", "--") if ok else ()
 
 
 def _limiter(lim: Limits):
@@ -65,7 +68,7 @@ def run_isolated(repo_path: str, rev: str, host_id: str, repository_id: str, *, 
     """Analyse ``rev`` of ``repo_path``. Returns {"snapshot", "graph", "sandbox"}."""
     req = {"repo_path": os.path.realpath(repo_path), "rev": rev, "host_id": host_id,
            "repository_id": repository_id, "worktree_id": worktree_id, **(config or {})}
-    net = _network_wrapper()
+    net = list(_network_wrapper())
     with tempfile.TemporaryDirectory(prefix="herdr-arch-") as cwd:
         env = gitsource.clean_env(home=cwd)
         cmd = [*net, sys.executable, "-I", _WORKER]
@@ -81,19 +84,18 @@ def run_isolated(repo_path: str, rev: str, host_id: str, repository_id: str, *, 
             proc.stdin.close()
         except BrokenPipeError:
             pass
-        deadline = limits.wall_seconds
-        waited = 0.0
+        deadline = time.monotonic() + limits.wall_seconds
         while proc.poll() is None:
             if cancel is not None and cancel.is_set():
                 _kill(proc)
                 raise AnalysisCancelled("analysis cancelled")
-            if waited >= deadline:
+            if time.monotonic() >= deadline:
                 _kill(proc)
-                raise AnalysisError(f"analysis exceeded the {deadline:g}s wall-clock limit")
+                raise AnalysisError(f"analysis exceeded the {limits.wall_seconds:g}s wall-clock limit")
             try:
                 proc.wait(timeout=0.1)
             except subprocess.TimeoutExpired:
-                waited += 0.1
+                pass
         for t in threads:
             t.join(5)
     if proc.returncode != 0:

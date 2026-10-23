@@ -103,6 +103,7 @@ def overlays(repo, gate_store, meta: dict) -> dict:
     return {"snapshot_id": meta["snapshot_id"], "repository_id": meta["repository_id"], "commit_sha": meta["commit_sha"],
             "ci": ci_runs(repo, meta), "pull_requests": prs, "missions": missions,
             "sessions": [{"session_id": s["session_id"], "agent_role": s.get("agent_role"), "status": s.get("status"),
+                          "created_at": s.get("created_at"),
                           "host_id": s.get("host_id"), "parent_session_id": s.get("parent_session_id"),
                           "flow": s.get("mission_source") or "unknown"} for s in sessions],
             "issues": issue_mentions(repo, meta, missions),

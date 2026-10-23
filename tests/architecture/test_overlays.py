@@ -128,3 +128,17 @@ def test_autospec_and_non_autospec_flows_both_correlate(world):
     flows = {r["session_id"]: r["flow"] for r in rows}
     assert flows["pi:s1"] == "pi" and flows["as:w1"] == "autospec" and flows["pi:s2"] == "unknown"
     assert all(r["autospec_ref"] is None and "autospec_ref" in r["unknown"] for r in rows)   # no record carries a spec/issue id
+
+
+def test_timeline_has_independent_tracks_linked_only_by_exact_commit(world):
+    base, a, b, head = world
+    t = call(base, f"/api/v1/architecture/timeline?repository_id={REPO_ID}")[1]
+    assert [x["snapshot_id"] for x in t["architecture"]] == [a, b]                       # chronological
+    assert {x["session_id"] for x in t["agents"]} >= {"pi:s1", "pi:s2", "other", "branchy"}   # all repo sessions, linked or not
+    s1 = next(x for x in t["agents"] if x["session_id"] == "pi:s1")
+    assert s1["snapshot_ids"] == [b] and s1["parent_session_id"] == "pi:root"
+    assert next(x for x in t["agents"] if x["session_id"] == "other")["snapshot_ids"] == []
+    assert next(x for x in t["agents"] if x["session_id"] == "branchy")["commit_sha"] is None
+    assert sorted(next(x for x in t["architecture"] if x["snapshot_id"] == b)["session_ids"]) == ["pi:s1", "pi:s2"]
+    assert call(base, "/api/v1/architecture/timeline?repository_id=bogus")[0] == 400
+    assert call(base, "/api/v1/architecture/timeline")[0] == 400

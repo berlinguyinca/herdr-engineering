@@ -13,7 +13,7 @@ import uuid
 from collections import defaultdict
 
 from ..control_plane.project_links import canonical_repository
-from . import identity, overlays as ov
+from . import crossrepo, explain as ex, identity, overlays as ov
 from .extract import EDGE_KINDS, NODE_KINDS
 
 ENTITY = "architecture_snapshot"
@@ -113,6 +113,8 @@ class ArchitectureService:
         self.repo = repo
         self.enabled = bool(enabled)
         self.gate_store_fn = lambda: None          # set by the server when the review gate is running
+        self.explain_config = None                 # set from control_plane.architecture.explain (off by default)
+        self.explain_key = None
         self._meta: dict[str, dict] = {}
         self._graphs: dict[str, _Loaded] = {}
         self._jobs: dict[str, dict] = {}
@@ -527,3 +529,63 @@ class ArchitectureService:
         """Which rooms discuss this entity (ids only; the notes stay behind the room's own permissions)."""
         return {"rooms": sorted({rid for rid, rows in self._links.items() for r in rows
                                  if r["snapshot_id"] == sid and r["node_id"] == nid})}
+
+    # ----------------------------------------------------------- cross-repository
+    def cross_repo(self, snapshot_ids, mappings=None):
+        if not snapshot_ids:
+            raise ArchitectureError("pass at least two snapshot ids")
+        pairs = []
+        for sid in dict.fromkeys(snapshot_ids):
+            if sid not in self._meta:
+                raise KeyError(sid)
+            pairs.append((self._meta[sid], self._load(sid)))
+        if len(pairs) < 2:
+            raise ArchitectureError("pass at least two snapshot ids")
+        try:
+            out = crossrepo.resolve(pairs, mappings)
+        except ValueError as exc:
+            raise ArchitectureError(str(exc)) from exc
+        out["snapshots"] = [{"snapshot_id": m["snapshot_id"], "repository_id": m["repository_id"],
+                             "commit_sha": m["commit_sha"], "completeness": m["completeness"]} for m, _ in pairs]
+        out["warnings"] = ["name-match edges are inferred: a package name alone does not prove which project provides it"]
+        return out
+
+    # ----------------------------------------------------------- explanations
+    def explain(self, sid, nid):
+        if not self.explain_config:
+            raise ArchitectureError("explanations are not configured on this control plane", 404)
+        g = self._load(sid)
+        if nid not in g.nodes:
+            raise KeyError(nid)
+        try:
+            return ex.explain(self.explain_config, g, nid, self.explain_key)
+        except ex.ExplainError as exc:
+            raise ArchitectureError(str(exc), 502) from exc
+
+    # ----------------------------------------------------------- timeline
+    def timeline(self, repository_id, limit=200):
+        """Two independent tracks for one repository. A correlation link exists only where a session's recorded
+        commit equals a snapshot's commit; sessions without an exact commit stay on their own track, unlinked."""
+        if ov.pl.canonical_repository(repository_id) != repository_id:
+            raise ArchitectureError("repository_id must be a canonical repository identity")
+        snaps = sorted((m for m in self._meta.values() if m["repository_id"] == repository_id),
+                       key=lambda m: (m["created_at"], m["snapshot_id"]))
+        by_commit: dict[str, list[str]] = defaultdict(list)
+        for m in snaps:
+            by_commit[m["commit_sha"]].append(m["snapshot_id"])
+        sessions = []
+        for sess in self.repo.list_sessions():
+            if ov.pl._identity(sess) != repository_id:
+                continue
+            commit = ov.pl._commit({"commit_sha": sess.get("commit_sha")})
+            sessions.append({"track": "agents", "at": sess.get("created_at"), "session_id": sess["session_id"],
+                             "agent_role": sess.get("agent_role"), "parent_session_id": sess.get("parent_session_id"),
+                             "mission_id": sess.get("mission_key") or sess.get("mission_id"), "host_id": sess.get("host_id"),
+                             "commit_sha": commit, "snapshot_ids": by_commit.get(commit, []) if commit else []})
+        sessions.sort(key=lambda r: (str(r["at"]), r["session_id"]))
+        arch = [{"track": "architecture", "at": m["created_at"], "snapshot_id": m["snapshot_id"], "commit_sha": m["commit_sha"],
+                 "host_id": m["host_id"], "completeness": m["completeness"],
+                 "session_ids": [x["session_id"] for x in sessions if x["commit_sha"] == m["commit_sha"]][:20]} for m in snaps]
+        n = max(1, min(int(limit), MAX_LIMIT))
+        return {"repository_id": repository_id, "architecture": arch[-n:], "agents": sessions[-n:],
+                "note": "tracks are independent; links exist only for an exact repository + full commit match"}

@@ -141,7 +141,8 @@ class ControlPlaneServer:
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 summary_config=None, summary_client=None, architecture_enabled=None):
+                 summary_config=None, summary_client=None, architecture_enabled=None,
+                 architecture_explain=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -254,6 +255,7 @@ class ControlPlaneServer:
         self.architecture = ArchitectureService(
             repo, enabled=self._architecture_enabled(fleet_config, architecture_enabled))
         self.architecture.gate_store_fn = lambda: self.gate_store
+        self._configure_architecture_explain(fleet_config, architecture_explain)
         if collab is not None:
             collab.architecture = self.architecture
         # live stream (Spec §52)
@@ -272,12 +274,30 @@ class ControlPlaneServer:
         except FleetConfigError:
             return False
         arch = (section or {}).get("architecture") or {}
-        unknown = set(arch) - {"enabled"}
+        unknown = set(arch) - {"enabled", "explain"}
         if unknown:
             raise ValueError(f"control_plane.architecture: unknown key(s) {sorted(unknown)}")
         if not isinstance(arch.get("enabled", False), bool):
             raise ValueError("control_plane.architecture.enabled must be a boolean")
         return arch.get("enabled", False)
+
+    def _configure_architecture_explain(self, fleet_config, override):
+        """Optional LLM explanations: only from an explicit, validated `architecture.explain` section."""
+        from ..architecture import explain as ex
+        section = override
+        if section is None and fleet_config is not None:
+            from ..fleet_config import FleetConfigError
+            try:
+                section = ((fleet_config.current().section("control_plane") or {}).get("architecture") or {}).get("explain")
+            except FleetConfigError:
+                section = None
+        cfg = ex.parse_config(section)
+        self.architecture.explain_config = cfg
+        if cfg and cfg.get("api_key_file"):
+            try:
+                self.architecture.explain_key = Path(cfg["api_key_file"]).expanduser().read_text().strip()
+            except OSError as exc:
+                raise ValueError(f"control_plane.architecture.explain.api_key_file is unreadable: {exc.strerror}") from exc
 
     def _start_review_gate(self, repo, fleet_config):
         """Build and start the PR review gate when the central config enables it.
@@ -362,6 +382,8 @@ class ControlPlaneServer:
             h["capabilities"].append("collab_v1")
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
+            if self.architecture.explain_config:
+                h["capabilities"].append("architecture_explain_v1")
         return h
 
     # ------------------------------------------------------- SSE plumbing
@@ -1128,6 +1150,17 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(svc.analyses(analysis_id=rest[1]))
                 if len(rest) == 3 and rest[0] == "sessions" and rest[2] == "changes":
                     return self._json(svc.session_changes(rest[1], _qint(self.path, "limit", 200)))
+                if rest == ["timeline"]:
+                    return self._json(svc.timeline(q("repository_id") or "", _qint(self.path, "limit", 200)))
+                if rest == ["cross-repo"]:
+                    qs = parse_qs(urlsplit(self.path).query)
+                    maps = []
+                    for item in qs.get("map", [])[:50]:
+                        bits = item.split("|")
+                        if len(bits) != 3:
+                            raise ValueError("map must be importer|package|provider")
+                        maps.append(dict(zip(("importer", "package", "provider"), bits)))
+                    return self._json(svc.cross_repo(qs.get("snapshot", [])[:20], maps))
                 if rest == ["diff"]:
                     if not (q("base") and q("head")):
                         raise ValueError("base and head are required")
@@ -1173,6 +1206,8 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(out, 200 if out["duplicate"] else 201)
                 if parts[4:] == ["analyses"]:
                     return self._json(svc.record_analysis(body), 201)
+                if len(parts) == 9 and parts[4] == "snapshots" and parts[6] == "nodes" and parts[8] == "explain":
+                    return self._json(svc.explain(parts[5], parts[7]))
                 if parts[4:] == ["analyses", "claim"]:
                     return self._json(svc.claim_analysis(body))
                 if parts[4:] == ["analyses", "request"]:
@@ -1182,6 +1217,8 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(out, 200 if out["deduplicated"] else 201)
             except ArchitectureError as exc:
                 return self._json({"error": str(exc)}, exc.status)
+            except KeyError:
+                return self._json({"error": "not found"}, 404)
             return self._json({"error": "not found"}, 404)
 
         def _api_get(self, parts, resource):
