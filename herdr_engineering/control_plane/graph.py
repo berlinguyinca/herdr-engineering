@@ -79,6 +79,7 @@ SCAN_BUDGET = 3000                   # incident edges examined per node per read
 NEIGHBOR_SCAN_BUDGET = 500
 MAX_CONTRIBUTIONS = 5                # foreign values listed per commons field
 MAX_INSTANCES_PER_TRIPLE = 8         # live per-writer instances of a commons-from edge
+_GENERIC_LIMIT = "lineage object limit reached"
 MAX_TRIPLE_RECORDS = 64              # instances incl. tombstoned ones (bounds the admit scan)
 MAX_OBJECT_ATTR_KEYS = 1024          # hard cap per object across all writers
 MAX_OBJECT_ATTRS_BYTES = 256 * 1024
@@ -315,14 +316,19 @@ class _Reg:
     server's admission order counts: a client-chosen sequence can never beat
     another principal, even on a shared source name.
     """
-    __slots__ = ("by",)
+    __slots__ = ("by", "firsts")
 
     def __init__(self):
         # writer key -> (seq, event_id, rank, value, key, is_op, scope)
         self.by: dict[tuple, tuple] = {}
+        self.firsts: dict[tuple, tuple] = {}   # writer key -> rank of that writer's EARLIEST event here
 
     def set(self, ev: dict, value: Any = None) -> None:
         key, seq, eid = _writer_key(ev), int(ev["source_sequence"]), str(ev["event_id"])
+        rank = _rank(ev)
+        first = self.firsts.get(key)
+        if first is None or rank < first:
+            self.firsts[key] = rank            # min over ALL events, whichever order they arrive in
         cur = self.by.get(key)
         if cur is None or (seq, eid) > (cur[0], cur[1]):
             scope = ev.get("visibility_scope")
@@ -338,8 +344,8 @@ class _Reg:
 
     def primary(self, owner: str | None, vis=None) -> tuple | None:
         """The authoritative entry for a shared (commons) field, chosen by who wrote it,
-        never by who wrote last: an operator's value, else the owner's, else the earliest
-        writer's. Everyone else's values are only ``contributions``. ``vis`` limits the
+        never by who wrote last: an operator's value, else the owner's, else the writer who
+        wrote this field FIRST. Everyone else's values are only ``contributions``. ``vis`` limits the
         candidates to the entries the reader may see (a hidden value is never primary)."""
         ents = [e for e in self.by.values() if vis is None or vis(e)]
         if not ents:
@@ -350,7 +356,9 @@ class _Reg:
         own = [e for e in ents if e[4][1] == owner]
         if own:
             return max(own, key=lambda t: t[2])
-        return min(ents, key=lambda t: t[2])
+        # earliest FIRST write wins, so a later writer cannot displace an earlier one when the
+        # earlier one updates its own value (its latest rank moves, its first write does not)
+        return min(ents, key=lambda t: self.firsts.get(t[4], t[2]))
 
     def contributions(self, primary: tuple | None, limit: int = MAX_CONTRIBUTIONS, *,
                       owner: str | None = None, caller: str | None = None, vis=None) -> list:
@@ -465,6 +473,7 @@ class _Node(_Claims):
         self.commons = node_type in COMMONS_KINDS
         self.scope_by: dict[str, tuple] = {}      # commons only: actor -> (widest scope, is_op)
         self.fclaim: tuple | None = None          # commons only: (rank, actor) of the first FIELD-bearing write
+        self.fwriters: dict = {}                  # commons only: actor -> rank of its first field-bearing write
 
     def note_scope(self, ev: dict) -> None:
         """Commons nodes: remember the widest scope each writer used (their existence claim)."""
@@ -478,14 +487,25 @@ class _Node(_Claims):
         wide = scope if cur is None or SCOPE_RANK[scope] > SCOPE_RANK[cur[0]] else cur[0]
         self.scope_by[key] = (wide, _is_operator(actor))
 
-    def note_field_claim(self, ev: dict) -> None:
+    def note_field_claim(self, ev: dict, owns: bool = True) -> None:
         """Commons ownership belongs to the first writer of a FIELD (label/state/attr); an empty
         'ensure' never creates it."""
         actor = ev.get("actor") or {}
-        claim = (_rank(ev), actor.get("id"))
-        if self.fclaim is None or claim[0] < self.fclaim[0]:
+        rank = _rank(ev)
+        cur = self.fwriters.get(actor.get("id"))
+        if cur is None or rank < cur:
+            self.fwriters[actor.get("id")] = rank
+        claim = (rank, actor.get("id"))
+        if owns and (self.fclaim is None or claim[0] < self.fclaim[0]):
             self.fclaim = claim
             self._w = None
+
+    def view_owner(self, actors: set | None = None) -> str | None:
+        """The writer a reader treats as the owner: the earliest field-writer AMONG THE WRITERS THE
+        READER CAN SEE (``actors``; None = all). It equals the real owner whenever that one is
+        visible, and never depends on a writer the reader cannot see."""
+        cands = [(r, a) for a, r in self.fwriters.items() if actors is None or a in actors]
+        return min(cands, key=lambda t: t[0])[1] if cands else None
 
     def owner(self) -> str | None:
         if self.commons:
@@ -504,13 +524,15 @@ class _Node(_Claims):
                   if internal or can_see(principal, s, frozenset({actor}) if actor else frozenset())]
         return max(scopes, key=SCOPE_RANK.get) if scopes else None
 
-    def pick(self, reg: _Reg, vis=None) -> tuple | None:
-        return reg.primary(self.owner(), vis) if self.commons else reg.best()
+    def pick(self, reg: _Reg, vis=None, owner: Any = "") -> tuple | None:
+        if not self.commons:
+            return reg.best()
+        return reg.primary(self.view_owner() if owner == "" else owner, vis)
 
-    def attr_values(self, vis=None) -> dict:
+    def attr_values(self, vis=None, owner: Any = "") -> dict:
         out = {}
         for k, r in sorted(self.attrs.items()):
-            e = self.pick(r, vis)
+            e = self.pick(r, vis, owner)
             if e is not None or vis is None:
                 out[k] = e[3] if e else None
         return out
@@ -663,7 +685,7 @@ class GraphProjection:
                                     break
                             # tombstoned instances do not count, but the scan (and the set) stays bounded
                             if live >= MAX_INSTANCES_PER_TRIPLE or len(inst) >= MAX_TRIPLE_RECORDS:
-                                raise ValueError("too many writers for this edge")
+                                raise ValueError(_GENERIC_LIMIT)
                         recs = []
                     elif operator or aid in rec.writers():
                         recs = [rec]
@@ -703,7 +725,8 @@ class GraphProjection:
                     if pair not in rec.sources and (
                             len(rec.sources) >= MAX_SOURCES_PER_OBJECT
                             or sum(1 for p in rec.sources if p[1] == aid) >= MAX_SOURCES_PER_ACTOR_OBJECT):
-                        raise ValueError("too many distinct writers for this lineage object")
+                        raise ValueError(_GENERIC_LIMIT if isinstance(rec, _Node) and rec.commons
+                                         else "too many distinct writers for this lineage object")
                 if len(recs) == 1 and attrs:
                     self._check_attr_caps(recs[0], attrs, aid)
                 elif attrs:
@@ -728,6 +751,11 @@ class GraphProjection:
             return json.dumps(v, sort_keys=True, separators=(",", ":"))
 
         def check(table, kcap, bcap, what):
+            if what == "shared object":
+                # depends on every writer's data, hidden ones included: say nothing specific
+                if len(table) > kcap or sum(len(k) + len(v) for k, v in table.items()) > bcap:
+                    raise ValueError(_GENERIC_LIMIT)
+                return
             if len(table) > kcap:
                 raise ValueError(f"too many attrs keys (max {kcap})")
             if sum(len(k) + len(v) for k, v in table.items()) > bcap:
@@ -745,7 +773,7 @@ class GraphProjection:
             check(mine, MAX_TOTAL_ATTR_KEYS, MAX_TOTAL_ATTRS_BYTES, "writer's share")
             whole = {k: dump(v) for k, v in rec.attr_values().items()}
             whole.update(new)
-            check(whole, MAX_OBJECT_ATTR_KEYS, MAX_OBJECT_ATTRS_BYTES, "object")
+            check(whole, MAX_OBJECT_ATTR_KEYS, MAX_OBJECT_ATTRS_BYTES, "shared object")
         else:
             merged = {k: dump(v) for k, v in (rec.attr_values() if rec else {}).items()}
             merged.update(new)
@@ -804,9 +832,9 @@ class GraphProjection:
         pair = _writer_key(ev)
         if mode == "normal":
             self._touch(node, ev)
-            if node.commons and (op["op"] == "node.state" or op["label"] is not None
-                                 or op["state"] is not None or op["attrs"]):
-                node.note_field_claim(ev)
+        if node.commons and (op["op"] == "node.state" or op["label"] is not None
+                             or op["state"] is not None or op["attrs"]):
+            node.note_field_claim(ev, owns=mode == "normal")
         node.note_scope(ev)
         if op["op"] == "node.upsert":
             if op["label"] is not None:
@@ -973,11 +1001,23 @@ class GraphProjection:
         come from those visible values alone."""
         vis = None
         if node.commons and principal is not None:
-            def vis(e, _p=principal):
-                return _entry_visible(_p, e)
+            memo: dict = {}
+
+            def vis(e, _p=principal, _m=memo):
+                k = (e[6], e[4][1])             # visibility depends only on (scope, writer)
+                r = _m.get(k)
+                if r is None:
+                    r = _m[k] = _entry_visible(_p, e)
+                return r
         aid = (principal or {}).get("id")
-        owner = node.owner()
-        state, label = node.pick(node.state, vis), node.pick(node.label, vis)
+        owner = None
+        if node.commons:
+            actors = None
+            if vis is not None:             # writers with at least one value this reader may see
+                actors = {e[4][1] for reg in (node.label, node.state, *node.attrs.values())
+                          for e in reg.by.values() if vis(e)}
+            owner = node.view_owner(actors)
+        state, label = node.pick(node.state, vis, owner), node.pick(node.label, vis, owner)
         fields: dict = {"label": _prov(label), "state": None, "attrs": {}}
         if state:
             fields["state"] = _prov(state, {"value": state[3][0], "reason": state[3][1]})
@@ -992,7 +1032,7 @@ class GraphProjection:
         cattrs: dict = {}
         attrs: dict = {}
         for k, reg in sorted(node.attrs.items()):
-            ent = node.pick(reg, vis)
+            ent = node.pick(reg, vis, owner)
             lst = reg.contributions(ent, owner=owner, caller=aid, vis=vis) if node.commons else []
             if ent is None and not lst:
                 continue                      # every writer of this key is hidden from the reader
@@ -1029,7 +1069,7 @@ class GraphProjection:
         if contrib:
             out["contributions"] = contrib
         if internal:
-            out["owner"], out["co_writers"] = owner, list(node.co_writers())
+            out["owner"], out["co_writers"] = node.owner(), list(node.co_writers())
         return out
 
     def _edge_view(self, edge: _Edge, principal: Any = None, ctx: dict | None = None) -> dict:
@@ -1212,11 +1252,12 @@ class GraphProjection:
             start = self._nodes.get(root)
             if not self._node_visible(principal, start):
                 raise KeyError(root)
-            budget = MAX_RESPONSE_BYTES - len(json.dumps(self._node_view(start, principal)))
+            views: dict = {root: self._node_view(start, principal)}      # one render per node per read
+            budget = MAX_RESPONSE_BYTES - len(json.dumps(views[root]))
             seen: dict[str, int] = {root: 0}
             expansions: dict[str, list] = {}
             queue = deque([root])
-            truncated = False
+            truncated = full = False
             while queue:
                 nid = queue.popleft()
                 own, others, exhausted = self._expand(
@@ -1229,9 +1270,15 @@ class GraphProjection:
                     other = edge.to_id if edge.from_id == nid else edge.from_id
                     if other in seen:
                         continue
-                    cost = len(json.dumps(self._node_view(self._nodes[other], principal)))
-                    if len(seen) >= max_nodes or budget - cost < 0:
-                        truncated = True
+                    if len(seen) >= max_nodes or budget <= 0 or full:
+                        truncated = True       # exhausted: do not even render the neighbour
+                        continue
+                    view = views.get(other)
+                    if view is None:
+                        view = views[other] = self._node_view(self._nodes[other], principal)
+                    cost = len(json.dumps(view))
+                    if budget - cost < 0:
+                        truncated = full = True    # the byte budget is spent: stop rendering neighbours
                         continue
                     budget -= cost
                     seen[other] = seen[nid] + 1
@@ -1254,7 +1301,7 @@ class GraphProjection:
                         continue
                     budget -= cost
                     edges.append(view)
-            nodes = [{**self._node_view(self._nodes[n], principal), "depth": seen[n]} for n in sorted(seen)]
+            nodes = [{**views[n], "depth": seen[n]} for n in sorted(seen)]
             return {"root": root, "depth": depth, "nodes": nodes, "edges": edges,
                     "truncated": truncated,
                     "limits": {"max_depth": MAX_DEPTH, "max_nodes": max_nodes, "max_edges": max_edges,

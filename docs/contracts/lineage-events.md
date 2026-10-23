@@ -59,7 +59,9 @@ skipped and counted (`events_rejected`), never fatal.
   - **Ownership**: a commons node's owner is the writer of the first FIELD-bearing admitted write (label, state, attrs or
     `node.state`). An empty "ensure" never creates ownership (it only creates the shell), so pre-ensuring an id gains nothing.
   - **Primary value** of a commons field: an operator's value if any operator wrote it, else the node owner's, else the
-    earliest writer's - chosen among the values the READER can see. Everyone else's values are `contributions` (<= 5 per
+    writer who wrote THAT FIELD first (their first write on the key, so it is stable when they update) - chosen among the
+    values the READER can see; the owner a reader applies is the earliest field-writer among the writers visible to them, so
+    hidden writers never influence what a reader sees. Everyone else's values are `contributions` (<= 5 per
     field, one per distinct writer; operator first, then the owner, then the caller's own, then newest admission), never the
     primary, so overwriting a PR's label/state/url cannot replace what the creator said and spam principals cannot push the
     owner's entry out. A node view carries `fields.<name>` provenance `{value, writer, source, event_id, admission,
@@ -177,3 +179,18 @@ no Herdr code derives an agent state change from a session stop or pane close.
 Limitation: `room`/`mission` cannot yet be narrowed to actual members, and an operator key is trusted for all rooms/missions.
 The open (keyless loopback) listener is one shared `open-listener` principal. Principal ids are API-key digests, so a rotated key
 loses access to its own private nodes.
+
+### Known limitations (graph, T02)
+- **Owned-kind squat**: for owned kinds (`agent`, `task`, ...) whoever creates an id first owns it; operators can override.
+  A 403 on a changing write tells an authenticated key the id exists (reads reveal nothing).
+- **Private squat blocks edges**: a writer's `private` field write to a commons node (e.g. `pr:42`) makes another emitter's
+  empty ensure a no-op and its following `edge.add` a 403 (the edge needs an endpoint the caller can see); Pi swallows it, so the
+  Pi side counts/dead-letters `lineage_forbidden`. Resolution is operator-side (tombstone/override) today.
+- **Commons primary rule**: the primary value is the operator's, else the owner's, else the first writer of that field; an
+  owner who got there first holds it until an operator corrects it. Others' values are attributed `contributions`.
+- **Capacity errors** on a commons object (`lineage object limit reached`) are deliberately generic: they depend on data of
+  writers the caller cannot see. Exact parity is not attempted for owned objects (their caps count only the owner's data).
+- **Caps at scale** (200k nodes, 1M edges, 25k objects per principal) are enforced but not load-tested at that size; tombstoned
+  edge instances are not compacted (bounded by 64 records per triple and the global edge cap).
+- **Visibility has no room/mission membership resolution yet**: `private` = the writer only, `mission`/`room` = operators only,
+  `org` = any authenticated key. T08/T09 will wire room membership.

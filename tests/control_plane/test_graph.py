@@ -1533,3 +1533,137 @@ def test_tombstoned_instances_do_not_count_toward_the_instance_cap():
     feeds[0].send("edge.remove", {"edge_type": "produced", "from_id": "commit:c", "to_id": "pr:p", "reason": "done"})
     extra.edge("produced", "commit:c", "pr:p", nodes=False)       # a freed slot is usable
     assert repo.graph.snapshot() == rebuilt(repo).graph.snapshot()
+
+
+# ------------------------------------------------------------------ round 6
+def _apply(g, actor, source, seq, node, scope, attrs, et="node.upsert", payload=None, admit=True):
+    pl = payload or {"node_type": node.split(":")[0], "node_id": node, "attrs": attrs}
+    op = g.admit(actor, et, pl, source) if admit else {"mode": "normal"}
+    g.apply({"event_id": f"{source}-{seq}", "source": source, "source_sequence": seq, "event_type": et,
+             "payload": pl, "visibility_scope": scope, "actor": actor, "lineage_seq": g.next_seq(),
+             "lineage_mode": op["mode"], "ingest_timestamp": "2026-10-22T10:00:00+00:00"})
+
+
+def test_primary_fallback_is_the_first_writer_and_stable_under_updates():
+    repo, svc, _ = make()
+    fo, fl, fx = (feed_for(svc, n, P(n)) for n in ("o", "l", "x"))
+    fo.node("pr:1", attrs={"title": "t"})          # the owner writes a different key
+    fl.node("pr:1", attrs={"status": "L1"})
+    fx.node("pr:1", attrs={"status": "EVIL"})
+    fl.node("pr:1", attrs={"status": "L2"})        # the legitimate writer updates its own value
+    for g in (repo.graph, rebuilt(repo).graph):
+        n = g.get_node(OTHER, "pr:1")["node"]
+        assert n["attrs"]["status"] == "L2" and n["fields"]["attrs"]["status"]["writer"] == "key:l"
+        assert [c["value"] for c in n["contributions"]["attrs"]["status"]] == ["EVIL"]
+
+
+def test_commons_view_does_not_depend_on_writers_the_reader_cannot_see():
+    """Non-interference: removing a private-only writer's events changes nothing a reader sees."""
+    def build(with_hidden):
+        repo, svc, _ = make()
+        f = {n: feed_for(svc, n, P(n)) for n in ("V", "A", "B")}
+        if with_hidden:
+            f["V"].node("pr:1", scope="private", attrs={"q": 1}, label="hidden")
+        f["A"].node("pr:1", attrs={"k": "A1"})
+        f["B"].node("pr:1", attrs={"k": "B1"})
+        f["B"].node("pr:1", attrs={"j": "B"})
+        f["A"].node("pr:1", attrs={"k": "A2"})
+        n = repo.graph.get_node(OTHER, "pr:1")["node"]
+        n = json.loads(json.dumps(n))
+        # event ids are numbered per feed, so compare without them
+        for fld in (n["fields"]["attrs"].values()):
+            fld.pop("event_id"), fld.pop("admission"), fld.pop("admitted_at")
+        for lst in n.get("contributions", {}).get("attrs", {}).values():
+            for c in lst:
+                c.pop("event_id"), c.pop("admission"), c.pop("admitted_at")
+        for k in ("first_event_id", "last_event_id"):
+            n.pop(k)
+        n["fields"]["label"] = n["fields"]["state"] = None
+        return n
+    assert build(True) == build(False)
+
+
+def test_property_hidden_writers_never_change_what_a_reader_sees_of_commons():
+    """Random commons traffic: dropping the private-only victim's events leaves every other
+    principal's views of the commons nodes (node, neighborhood) identical, apart from event ids."""
+    rng = random.Random(7)
+    names = ["a", "b", "c", "op"]
+    for seed in range(40):
+        rng = random.Random(seed)
+        script = []
+        for step in range(40):
+            who = rng.choice(names + ["victim"])
+            node = rng.choice(["pr:1", "pr:2", "commit:c1"])
+            scope = "private" if who == "victim" else rng.choice(["org", "org", "mission"])
+            attrs = {rng.choice("xyz"): rng.choice("pqr")}
+            script.append((who, node, scope, attrs))
+
+        def view(include_victim):
+            g = GraphProjection()
+            counter = {}
+            for who, node, scope, attrs in script:
+                if who == "victim" and not include_victim:
+                    continue
+                actor = OPERATOR if who == "op" else P(who)
+                counter[who] = counter.get(who, 0) + 1
+                _apply(g, actor, who, counter[who], node, scope, attrs)
+            out = {}
+            for viewer in (OTHER, P("a"), OPERATOR):
+                for node in ("pr:1", "pr:2", "commit:c1"):
+                    try:
+                        n = g.get_node(viewer, node)["node"]
+                    except KeyError:
+                        out[(viewer["id"], node)] = None
+                        continue
+                    out[(viewer["id"], node)] = (n["label"], n["state"], n["attrs"], n["visibility_scope"],
+                                                 {k: (v or {}).get("writer") for k, v in n["fields"]["attrs"].items()},
+                                                 {k: [c["writer"] for c in v]
+                                                  for k, v in n.get("contributions", {}).get("attrs", {}).items()})
+            return out
+        assert view(True) == view(False), f"seed {seed}"
+
+
+def test_neighborhood_stops_rendering_neighbours_once_the_budget_is_spent():
+    import time
+    g = GraphProjection()
+    hub = P("hub")
+    _apply(g, hub, "sh", 0, "task:hub", "org", {}, payload={"node_type": "task", "node_id": "task:hub", "state": "running"})
+    seq = 0
+    for ni in range(120):
+        nid = f"pr:{ni}"
+        for w in range(16):
+            for s in range(4):
+                for half in range(2):
+                    seq += 1
+                    _apply(g, P(f"w{w}"), f"s{w}{s}", seq, nid, "org" if (w + s) % 3 else "private",
+                           {f"k{half}_{j}": f"v{w}{s}{j}" for j in range(64)}, admit=False)
+        seq += 1
+        _apply(g, hub, "sh", seq, nid, "org", {}, et="edge.add",
+               payload={"edge_type": "spawn", "from_id": "task:hub", "to_id": nid})
+    best = 9.0
+    for _ in range(3):
+        t = time.perf_counter()
+        r = g.neighborhood(OTHER, "task:hub", depth=1)
+        best = min(best, time.perf_counter() - t)
+    assert r["truncated"] is True
+    assert best < 0.3, f"neighborhood took {best:.3f}s"
+
+
+def test_admission_limit_errors_do_not_depend_on_hidden_writers():
+    from herdr_engineering.control_plane.graph import MAX_INSTANCES_PER_TRIPLE as CAP
+    repo, svc, _ = make()
+    fv = feed_for(svc, "v", V)
+    fv.node("commit:c")
+    fv.node("pr:p")
+    for i in range(CAP):
+        feed_for(svc, f"s{i}", P(f"w{i}")).edge("produced", "commit:c", "pr:p", scope="private", nodes=False)
+    with pytest.raises(ValueError) as ei:
+        feed_for(svc, "x", P("x")).edge("produced", "commit:c", "pr:p", nodes=False)
+    assert str(ei.value) == "lineage object limit reached"
+    # a commons attr overflow caused by other (possibly hidden) writers says the same
+    fo = feed_for(svc, "o", P("o"))
+    with pytest.raises(ValueError) as ei2:
+        for i in range(40):
+            feed_for(svc, f"big{i}", P(f"big{i}")).node("pr:q", scope="private",
+                                                         attrs={f"k{i}_{j}": "x" * 400 for j in range(30)})
+    assert str(ei2.value) == "lineage object limit reached"
