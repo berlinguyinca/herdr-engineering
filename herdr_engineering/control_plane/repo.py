@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import threading
 import time
 from uuid import uuid4
@@ -1695,18 +1696,64 @@ class ControlPlaneRepo:
     def record_token_usage(self, project, model, input_tokens=0, output_tokens=0, *,
                            reasoning_tokens=0, cache_read_tokens=0, duration_ms=None,
                            success=True, request_id=None, session_id=None,
-                           mission_id=None, key_id=None, source="llm-proxy"):
+                           mission_id=None, key_id=None, source="llm-proxy", v2=None):
+        """One usage record. ``v2`` (already whitelisted, see ``record_token_usage_row``)
+        makes it a schema-2 record whose unreported token fields stay None (unknown);
+        a v1 record keeps the old shape, with missing token counts stored as 0."""
         if not project:
             raise ValueError("project is required")
+        tokens = (input_tokens, output_tokens, reasoning_tokens, cache_read_tokens)
+        if v2 is None:
+            tokens = tuple(int(t or 0) for t in tokens)
         payload = {"project": project, "model": model or "unknown",
-                   "input_tokens": int(input_tokens or 0),
-                   "output_tokens": int(output_tokens or 0),
-                   "reasoning_tokens": int(reasoning_tokens or 0),
-                   "cache_read_tokens": int(cache_read_tokens or 0),
+                   "input_tokens": tokens[0], "output_tokens": tokens[1],
+                   "reasoning_tokens": tokens[2], "cache_read_tokens": tokens[3],
                    "duration_ms": duration_ms, "success": bool(success),
                    "request_id": request_id, "key_id": key_id, "source": source}
+        if v2 is not None:
+            payload.update(v2, schema=2, session_id=session_id)
         return self.record_event("token_usage", project, "token_usage.recorded",
                                  payload, mission_id=mission_id, session_id=session_id)
+
+    def record_token_usage_row(self, row):
+        """Record one usage row as posted to ``/api/v1/token-usage`` (or reported by the
+        proxy). Only known fields are kept, each type-checked; anything else in the row
+        (a prompt, a response, a key) is dropped, so no body text can be stored."""
+        if not isinstance(row, dict):
+            raise ValueError("usage row must be an object")
+        project = _usage_str(row.get("project"), 128) if isinstance(row.get("project"), str) else None
+        if not project:
+            raise ValueError("project is required")
+        model = _usage_str(row.get("model"), 256) or "unknown"
+        common = {"request_id": _usage_str(row.get("request_id"), 128),
+                  "session_id": _usage_id(row.get("session_id")),
+                  "mission_id": _usage_id(row.get("mission_id")),
+                  "key_id": _usage_str(row.get("key_id"), 128),
+                  "duration_ms": _usage_int(row.get("duration_ms"))}
+        tokens = [_usage_int(row.get(k)) for k in _TOKEN_FIELDS]
+        if row.get("schema") != 2:
+            return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
+                                           cache_read_tokens=tokens[3],
+                                           success=row.get("success", True), **common)
+        status = _usage_int(row.get("status"))
+        error_class = row.get("error_class") if row.get("error_class") in USAGE_ERROR_CLASSES else None
+        success = row.get("success")
+        if not isinstance(success, bool):
+            success = status is not None and 200 <= status < 300 and error_class is None
+        v2 = {"agent_id": _usage_id(row.get("agent_id")),
+              "upstream_model": _usage_str(row.get("upstream_model"), 256),
+              "route": row.get("route") if row.get("route") in ("fabric", "cpu", "upstream") else None,
+              "status": status, "error_class": error_class,
+              "usage_known": row.get("usage_known") is True,
+              "engine": _usage_str(row.get("engine"), 128)}
+        for k in ("fallback", "stream"):
+            v2[k] = row[k] if isinstance(row.get(k), bool) else None
+        for k in ("queue_ms", "ttft_ms", "gen_ms"):
+            v2[k] = _usage_int(row.get(k))
+        source = row.get("source") if row.get("source") in ("llm-proxy", "transcript") else "llm-proxy"
+        return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
+                                       cache_read_tokens=tokens[3], success=success,
+                                       source=source, v2=v2, **common)
 
     def token_analytics(self, project=None, since=None):
         """Aggregate token usage by project, model and day (UTC)."""
@@ -1801,8 +1848,9 @@ class ControlPlaneRepo:
 
     def llm_config(self):
         """What the LLM proxy needs: active key hashes and custom models."""
+        # The label is not secret; the proxy reads a session id from "session:<id>".
         return {"keys": [{"key_id": k["key_id"], "project": k["project"],
-                          "key_hash": k["key_hash"]}
+                          "key_hash": k["key_hash"], "label": k.get("label", "")}
                          for k in self._llm_keys() if not k.get("revoked")],
                 "custom_models": list(self.list_custom_models().values())}
 
@@ -1942,6 +1990,32 @@ def _payload(ev):
         except ValueError:
             p = {}
     return p if isinstance(p, dict) else {}
+
+
+_TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens")
+# The usage-record error taxonomy (docs/superpowers/specs/2026-10-23-llm-page-design.md).
+USAGE_ERROR_CLASSES = frozenset({
+    "auth_invalid_key", "request_invalid", "request_too_large", "model_project_mismatch",
+    "model_not_registered", "proxy_backpressure", "upstream_admission",
+    "upstream_rejected_metadata", "upstream_client_error", "upstream_server_error",
+    "upstream_unreachable", "stream_truncated", "client_disconnected"})
+_USAGE_ID = re.compile(r"^[A-Za-z0-9\-_.:/]{1,128}$")
+
+
+def _usage_int(value):
+    """A non-negative int, or None (unknown) for anything else (bools included)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    return int(value) if value >= 0 else None
+
+
+def _usage_str(value, limit):
+    return value if isinstance(value, str) and 0 < len(value) <= limit else None
+
+
+def _usage_id(value):
+    """Session/agent/mission ids: the gateway's metadata charset, else None."""
+    return value if isinstance(value, str) and _USAGE_ID.match(value) else None
 
 
 def _accumulate(bucket, p):

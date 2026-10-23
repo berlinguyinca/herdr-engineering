@@ -94,3 +94,11 @@ class DurableEventSink:
             self._ensure_store()
             if not self._run(self._store.append(_dict_to_event(ev))):
                 raise RuntimeError("durable event insert was not acknowledged")
+
+    def prune_events_before(self, entity_type: str, cutoff: datetime) -> None:
+        """Delete one entity type's durable events older than ``cutoff`` (retention)."""
+        with self._write_lock:
+            self._ensure_store()
+            self._run(self._store._conn.execute(
+                f"DELETE FROM {self._events_table} WHERE entity_type=$1 AND source_timestamp < $2",
+                entity_type, cutoff))

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import queue
 import re
@@ -29,6 +30,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
 from .redact import redact_payload
+
+log = logging.getLogger(__name__)
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
@@ -140,7 +143,7 @@ class ControlPlaneServer:
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 summary_config=None, summary_client=None):
+                 summary_config=None, summary_client=None, usage_retention=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -154,6 +157,9 @@ class ControlPlaneServer:
         other and are encrypted end-to-end via WireGuard.
         """
         self.repo = repo
+        from .retention import usage_retention_config
+        # control_plane.llm_proxy raw/rollup retention (validated; None = defaults).
+        self.usage_retention = usage_retention_config(usage_retention)
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row),
@@ -378,13 +384,23 @@ class ControlPlaneServer:
         self._httpd.serve_forever()
 
     def _sweep_loop(self, interval=300):
-        """Apply inspector age retention to idle sessions too (ingest only prunes the active one)."""
+        """Periodic retention, starting at once so re-hydrated expired rows do not linger."""
         while self._httpd is not None:
+            self.sweep_once()
             time.sleep(interval)
-            try:
-                self.repo.inspector.sweep()
-            except Exception:
-                pass
+
+    def sweep_once(self):
+        """Inspector age retention for idle sessions too (ingest only prunes the active
+        one) and token_usage raw retention (control_plane.llm_proxy.raw_retention_days)."""
+        from .retention import sweep_token_usage
+        try:
+            self.repo.inspector.sweep()
+        except Exception:
+            pass
+        try:
+            sweep_token_usage(self.repo, raw_retention_days=self.usage_retention["raw_retention_days"])
+        except Exception as exc:
+            log.warning("token_usage retention sweep failed: %s", type(exc).__name__)
 
     def wait_until_ready(self, timeout=5.0):
         self._ready.wait(timeout=timeout)
@@ -1398,13 +1414,7 @@ def _make_handler(server, public=False, operator=False):
             if resource == "token-usage" and len(parts) == 4:
                 rows = body.get("records") if isinstance(body.get("records"), list) else [body]
                 for row in rows[:500]:
-                    r.record_token_usage(
-                        row.get("project"), row.get("model"), row.get("input_tokens"),
-                        row.get("output_tokens"), reasoning_tokens=row.get("reasoning_tokens"),
-                        cache_read_tokens=row.get("cache_read_tokens"),
-                        duration_ms=row.get("duration_ms"), success=row.get("success", True),
-                        request_id=row.get("request_id"), session_id=row.get("session_id"),
-                        mission_id=row.get("mission_id"), key_id=row.get("key_id"))
+                    r.record_token_usage_row(row)  # whitelisted fields only, never bodies
                 return self._json({"ok": True, "recorded": min(len(rows), 500)})
             if resource == "llm" and len(parts) >= 5:
                 what = parts[4]
