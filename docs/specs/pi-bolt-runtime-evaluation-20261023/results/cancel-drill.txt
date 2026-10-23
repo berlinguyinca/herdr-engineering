@@ -1,9 +1,9 @@
-Cancel / crash drill, real binaries, bender (load >100), 2026-10-23. One attempt, manual, not a harness.
-1. pi-bolt (AOT), SIGTERM 12 s into a streaming reply: exit=143, process ended promptly.
-2. pi-bolt-jit, SIGKILL 12 s into a streaming reply: exit=137.
-3. Standard Pi 1.4.0 --continue afterwards: hit the 150 s timeout (exit=124) under load.
-INCONCLUSIVE for data safety: no session .jsonl existed after step 1 (print mode had not flushed one
-before the signal), so steps 2-3 had no session to corrupt or resume. What it shows: signals end the
-runtime with the conventional exit codes. What it does NOT show: no corrupted session after a kill,
-and no resume of a half-written session. Launcher-level behaviour (exit-code propagation, no replay
-after start) is covered by pi-engineering test/integration/pi-runtime-launcher.test.ts instead.
+Cancel / crash drill, real binaries, bender (load >100), 2026-10-23. Manual, one pass, stdin closed (</dev/null),
+flags: --no-extensions --thinking off --no-tools, private agent dir (deleted afterwards).
+(An earlier attempt hung on all arms because pi read inherited stdin; that was my invocation, not the runtime.)
+A pi-bolt complete turn "remember PELICAN-7":            exit=0, session 6 lines, 0 invalid
+B pi-bolt --continue, SIGKILL 10 s into a streaming reply: session 7 lines, 0 invalid (user turn kept, partial reply dropped)
+C standard Pi 1.4.0 --continue after the kill:            exit=0, remembered PELICAN-7, session 10 lines, 0 invalid
+D pi-bolt --continue, SIGTERM 8 s into a reply:           exit=143, session 12 lines, 0 invalid
+Result: PASS for session integrity after kill -9 and SIGTERM, and for resume on standard Pi (rollback path).
+Limit: one pass, extension-free, print mode; not a live Herdr mission and no side-effecting tools.
