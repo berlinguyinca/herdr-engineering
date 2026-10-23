@@ -289,3 +289,13 @@ def test_the_watch_thread_logs_a_repeated_failure_once(hr, monkeypatch):
     monkeypatch.setattr(stop, "wait", lambda t: (calls.append(t), len(calls) >= 4)[1])
     r.watch_loop(stop, threading.Lock())
     assert len(calls) == 4 and sum("helpers:" in m for m in hr.said) == 1
+
+
+# ------------------------------------------------------------------ re-review M-1, M-3
+def test_closing_a_helpers_network_also_drops_its_services_and_keys(hr):
+    d = fake_running(hr)
+    (d / "services.json").write_text(json.dumps([SVC]))
+    (d / "secrets.json").write_text(json.dumps({"gh_token": {"value": "Bearer X", "host": "api.github.com"}}))
+    hr.mk().close_allow(d)
+    assert (d / "allow.txt").read_text() == ""
+    assert json.loads((d / "services.json").read_text()) == [] and json.loads((d / "secrets.json").read_text()) == {}

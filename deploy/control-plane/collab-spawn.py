@@ -838,8 +838,17 @@ class Runner:
                 self.say(f"helper {d.name}: {trim(exc)}")
 
     def close_allow(self, d: Path) -> None:
-        if (d / "allow.txt").exists() and (d / "allow.txt").read_text():
-            write_private(d / "allow.txt", "")
+        """Fail closed: no tunnels (allow.txt) and no services (/svc ignores allow.txt for public upstreams)."""
+        closed = False
+        for name, empty in (("allow.txt", ""), ("services.json", "[]"), ("secrets.json", "{}")):
+            try:
+                cur = (d / name).read_text()
+            except OSError:
+                cur = None
+            if cur is not None and cur != empty:
+                write_private(d / name, empty)
+                closed = True
+        if closed:
             self.say(f"helper {d.name}: no host list from the service for a while; its network is closed")
 
     def load_backoff(self, live: dict) -> dict:
