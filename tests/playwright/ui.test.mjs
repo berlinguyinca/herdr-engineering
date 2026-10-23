@@ -167,6 +167,47 @@ test('activity uses compact expandable rows without hiding event detail', async 
   },{BURST:'0'});
 });
 
+test('activity uses wide space for filters, repetition summary, and keyboard-selected detail', async () => {
+  await withApp(async ({page,base}) => {
+    const types=['MissionStarted','HostHeartbeat','MissionStarted','ServiceRegistered','MissionStarted','HostHeartbeat'];
+    const events=types.map((event_type,index)=>({
+      event_id:`wide-event-${index}`,
+      event_type,
+      source_timestamp:new Date(Date.UTC(2026,9,22,12,0,index)).toISOString(),
+      entity_id:`entity-${index}`,
+      payload:{title:`Mission ${index}`,host_name:`host-${index}`,service_name:`service-${index}`,description:`Selected payload ${index}`},
+    }));
+    await page.route('**/api/v1/activity?limit=50',route=>route.fulfill({json:{events}}));
+    await page.setViewportSize({width:3840,height:2160});
+    await page.goto(`${base}/#/activity`);await page.locator('.ac-row').first().waitFor();
+
+    const desktop=await page.locator('.ac-workspace').evaluate(node=>({
+      columns:getComputedStyle(node).gridTemplateColumns.split(' ').length,
+      width:node.getBoundingClientRect().width,
+    }));
+    assert.equal(desktop.columns,2,'activity should use a summary/detail rail beside its chronological stream');
+    assert.ok(desktop.width>3200,`activity workspace should use the 4K canvas, got ${desktop.width}`);
+    assert.match(await page.locator('[data-event-filter="MissionStarted"]').innerText(),/3/);
+    assert.match(await page.locator('[data-repeat-type="MissionStarted"]').innerText(),/3/);
+    assert.deepEqual(await page.locator('.ac-row').evaluateAll(rows=>rows.map(row=>row.dataset.eventId)),events.map(event=>event.event_id),'filtering must not reorder the chronological source stream');
+
+    await page.locator('[data-event-filter="MissionStarted"]').focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await page.locator('.ac-row:visible').count(),3);
+    await page.locator('[data-event-filter="all"]').click();
+    const selected=page.locator('.ac-row summary').nth(1);
+    await selected.focus();
+    await page.keyboard.press('Enter');
+    assert.match(await page.locator('[data-activity-selected]').innerText(),/Host heartbeat/);
+    assert.match(await page.locator('[data-activity-selected]').innerText(),/wide-event-1/);
+
+    for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:768,height:1024},{width:390,height:844}]){
+      await page.setViewportSize(viewport);
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`activity overflowed at ${viewport.width}px`);
+    }
+  },{BURST:'0'});
+});
+
 test('analytics composes its existing views into a useful dashboard', async () => {
   await withApp(async ({page,base}) => {
     await page.goto(`${base}/#/analytics`);await page.locator('[data-analytics-links]').waitFor();
@@ -174,6 +215,33 @@ test('analytics composes its existing views into a useful dashboard', async () =
     assert.deepEqual(destinations,['#/analytics/models','#/analytics/hosts','#/analytics/tokens']);
     const boxes=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getBoundingClientRect().width));
     assert.ok(boxes.every(width=>width>200),'analytics destinations should use the available desktop row');
+  },{BURST:'0'});
+});
+
+test('analytics auto-fits operational panels without document overflow', async () => {
+  await withApp(async ({page,base}) => {
+    await page.setViewportSize({width:3840,height:2160});
+    await page.goto(`${base}/#/analytics`);await page.locator('.an-dashboard').waitFor();
+    const wide=await page.locator('.an-dashboard').evaluate(node=>({
+      columns:getComputedStyle(node).gridTemplateColumns.split(' ').length,
+      width:node.getBoundingClientRect().width,
+      panelWidths:[...node.children].map(panel=>panel.getBoundingClientRect().width),
+    }));
+    assert.ok(wide.columns>=4,`analytics should auto-fit at least four operational columns on 4K, got ${wide.columns}`);
+    assert.ok(wide.width>3200,`analytics should use the 4K canvas, got ${wide.width}`);
+    assert.ok(wide.panelWidths.every(width=>width>=280),'analytics panels should remain readable');
+    assert.equal(await page.locator('[data-analytics-panel]').count()>=5,true);
+
+    const analyticsLink=page.locator('[data-analytics-links] a').first();
+    await analyticsLink.focus();
+    assert.equal(await analyticsLink.evaluate(node=>document.activeElement===node),true,'analytics destinations should remain keyboard reachable');
+
+    for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:768,height:1024},{width:390,height:844}]){
+      await page.setViewportSize(viewport);
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`analytics overflowed at ${viewport.width}px`);
+    }
+    await page.setViewportSize({width:390,height:844});
+    assert.equal(await page.locator('.an-dashboard').evaluate(node=>getComputedStyle(node).gridTemplateColumns.split(' ').length),1);
   },{BURST:'0'});
 });
 
