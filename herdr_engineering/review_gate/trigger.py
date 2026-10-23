@@ -39,9 +39,11 @@ def ci_verdict_for(
       4. Any counted run failure/error/killed -> red, even if others are still
          running (no review should be spent). Failures are ``"run <n> <state>"``
          sorted by run number.
-      5. Any other non-success (running/pending/blocked, declined/skipped/
+      5. A required event with no run for ``sha`` -> pending: a missing
+         expected pipeline is never green.
+      6. Any other non-success (running/pending/blocked, declined/skipped/
          canceled, unknown state) -> pending; these need a wait or a human retry.
-      6. Otherwise (every counted run succeeded) -> green.
+      7. Otherwise (every required event has a run and all succeeded) -> green.
     """
     if snapshot_stale:
         return CiVerdict("pending", ())
@@ -58,6 +60,8 @@ def ci_verdict_for(
     failures = tuple(f"run {_num(r)} {r.get('state')}" for r in counted if r.get("state") in _RED)
     if failures:
         return CiVerdict("red", failures)
+    if any(ev not in latest for ev in enrollment.required_events):
+        return CiVerdict("pending", ())
     if all(r.get("state") == "success" for r in counted):
         return CiVerdict("green", ())
     return CiVerdict("pending", ())

@@ -77,3 +77,19 @@ def test_later_failure_after_success_is_red():
 
 def test_unknown_state_is_pending():
     assert verdict([row(1, "weird")]).result == "pending"
+
+
+TWO = RepoEnrollment(repo="o/r", required_events=("pull_request", "push"))
+
+
+def test_missing_required_event_is_pending():
+    assert verdict([row(1, "success", event="push")], TWO) == CiVerdict("pending", ())
+
+
+def test_every_required_event_successful_is_green():
+    rows = [row(1, "success", event="push"), row(2, "success")]
+    assert verdict(rows, TWO) == CiVerdict("green", ())
+
+
+def test_red_beats_a_missing_required_event():
+    assert verdict([row(4, "failure", event="push")], TWO) == CiVerdict("red", ("run 4 failure",))
