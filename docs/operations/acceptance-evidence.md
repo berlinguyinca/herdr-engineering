@@ -61,9 +61,10 @@ count above `max_xfail`, non-xfail skips, todo, or an unlisted e2e file (guarded
 Totals: Herdr 99 collected (97 pass + 2 strict xfail); Pi 82 (82 pass, of which 14 are `GAP:` tests that pass by
 asserting the *current, incomplete* behaviour; they are not evidence the feature works).
 
-Regression: Pi `lineage-emitter` + `herdr-yaml-lineage` unit tests 30/30. Herdr regression command: see the PR body for
-the final count; one first-run failure, `test_graph.py::test_neighborhood_stops_rendering_neighbours_once_the_budget_is_spent`,
-passed when re-run alone (load-sensitive; not touched by T16).
+Regression: Pi `lineage-emitter` + `herdr-yaml-lineage` unit tests 30/30. Herdr regression command: 2425 passed, 3 skipped, 1 xfailed, 1 failed in 10m44 - the failure is the known flaky
+`test_ci_api.py::test_telemetry_auth_limits_invalid_bundles_and_performance` (URLError). An earlier run also hit
+`test_graph.py::test_neighborhood_stops_rendering_neighbours_once_the_budget_is_spent`, which passed alone and in this run
+(load-sensitive; not touched by T16).
 
 ## Scenario -> evidence -> gaps
 
