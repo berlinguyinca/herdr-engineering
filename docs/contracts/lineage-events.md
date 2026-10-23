@@ -179,8 +179,11 @@ Rules (mirrors `autospec review-quorum`):
    (never satisfied). `pr` is a commons node, so untrusted writers' values are ignored.
 2. Only configured reviewers are read; anyone else's edges (approvals or blocks) are ignored, so junk cannot satisfy or block.
 3. A reviewer is the edge OWNER (server-authenticated), never a payload name; many review nodes of one identity count once.
+   `attrs.verdict`/`attrs.receipt_digest` and the edge's add/remove are read ONLY from the owner's own writes: an operator or
+   `co_writers` member re-adding the same edge key cannot flip a verdict, and only the reviewer can withdraw their own block.
 4. An approval is excluded if the reviewer owns a `produced` edge into the PR, or their `login` equals the `author` attr
-   written by a trusted writer.
+   written by a trusted writer (Pi emits it from the PR's `user.login`, pi-engineering PR for T06; absent when unknown, in which
+   case only the producing key is excluded).
 5. An approval needs `receipt_digest`; one digest backing two identities voids both (replay).
 6. A current-head `blocked` verdict from a configured reviewer blocks, even from the author; only a new head clears it.
 7. Verdicts for other heads are listed under `stale_reviewers`, never counted. A verdict that lands after the head moved is
@@ -189,7 +192,10 @@ Rules (mirrors `autospec review-quorum`):
    `hidden_reviewers`, but a hidden `blocked` still yields `status: blocked` (fail closed, existence disclosed).
 Statuses: `satisfied`, `insufficient` (re-review needed), `blocked`, `unknown_head`. Only `satisfied` passes.
 Known limits: reviewer independence is per configured principal id (one human with two keys is two reviewers); no
-reviewed-edge producer exists in Pi/AutoSpec yet; private/mission-scoped edges still count.
+reviewed-edge producer exists in Pi/AutoSpec yet and nothing consumes `rereview_required` yet; a verdict is bound to the head
+SHA, not the base, so a base-branch move does not invalidate it; private/mission-scoped edges still count; a hidden `blocked`
+discloses that it exists. Herdr ignores blocks from unconfigured principals (anti-DoS) whereas `autospec review-quorum` honours
+a block from anyone.
 
 ### Session rollover
 No containment edge type exists, so `attempt`/`session` nodes carry `attrs.agent_id` / `attrs.attempt_id`. A rollover is a new

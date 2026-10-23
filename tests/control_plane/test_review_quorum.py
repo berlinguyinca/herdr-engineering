@@ -307,3 +307,54 @@ def test_http_endpoint_requires_auth_and_hides_unknown_prs(http):
     server.review_quorum = None
     s, body = call(path, "viewkey")
     assert s == 404 and "not configured" in body["error"]
+
+
+def test_an_operator_or_cowriter_cannot_change_a_reviewers_verdict_under_their_identity(w):
+    w.head(sha(1))
+    w.review(R1, "review:a", sha(1))
+    w.review(R2, "review:b", sha(1))
+    assert w.q()["status"] == "satisfied"
+    flip = {"edge_type": "reviewed", "from_id": "review:a", "to_id": PR,
+            "attrs": {"commit": sha(1), "verdict": "blocked", "receipt_digest": "forged"}}
+    try:
+        w.feed.send("edge.add", flip, principal=OPERATOR)
+    except PermissionError:
+        pass
+    assert w.q()["status"] == "satisfied" and w.q()["counted"] == ["key:r1", "key:r2"]
+    w.feed.send("node.upsert", {"node_type": "review", "node_id": "review:a",
+                                "attrs": {"co_writers": ["key:attacker"]}}, principal=OPERATOR)
+    try:
+        w.feed.send("edge.add", flip, principal=ATTACKER)
+    except PermissionError:
+        pass
+    out = w.q()
+    assert out["status"] == "satisfied" and out["blocking"] == []
+
+
+def test_a_non_owner_cannot_retract_a_block(w):
+    w.head(sha(1))
+    w.review(R1, "review:a", sha(1))
+    w.review(R3, "review:c", sha(1), verdict="blocked")
+    assert w.q()["status"] == "blocked"
+    rm = {"edge_type": "reviewed", "from_id": "review:c", "to_id": PR, "reason": "retract", "attrs": {"commit": sha(1)}}
+    for who in (OPERATOR, ATTACKER, R1):
+        try:
+            w.feed.send("edge.remove", rm, principal=who)
+        except PermissionError:
+            pass
+    wild = {k: v for k, v in rm.items() if k != "attrs"}
+    for who in (OPERATOR, ATTACKER, R1):
+        try:
+            w.feed.send("edge.remove", wild, principal=who)
+        except PermissionError:
+            pass
+    assert w.q()["status"] == "blocked"
+
+
+def test_the_reviewer_can_retract_their_own_block(w):
+    w.head(sha(1))
+    w.review(R3, "review:c", sha(1), verdict="blocked")
+    assert w.q(cfg(1))["status"] == "blocked"
+    w.feed.send("edge.remove", {"edge_type": "reviewed", "from_id": "review:c", "to_id": PR,
+                                "reason": "withdrawn", "attrs": {"commit": sha(1)}}, principal=R3)
+    assert w.q(cfg(1))["status"] == "insufficient"

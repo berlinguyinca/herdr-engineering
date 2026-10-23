@@ -1224,6 +1224,34 @@ class GraphProjection:
             ctx: dict = {}
             return {"edges": [self._edge_view(e, principal, ctx) for e in matches[:MAX_NODE_EDGES]]}
 
+    @staticmethod
+    def _owner_attr(edge: _Edge, owner: str, name: str) -> Any:
+        """Newest value of attr ``name`` written by ``owner`` itself.
+
+        An operator or a ``co_writer`` may add to the same edge key, and the plain
+        :meth:`_Claims.attr_values` would report THEIR value under the owner's name; a verdict
+        is the reviewer's own statement, so only the reviewer's own entries are read.
+        """
+        reg = edge.attrs.get(name)
+        ents = [e for e in (reg.by.values() if reg else ()) if e[4][1] == owner]
+        return max(ents, key=lambda t: t[2])[3] if ents else None
+
+    def _owner_live(self, edge: _Edge, owner: str) -> bool:
+        """Does ``owner`` currently stand behind ``edge``? Only the owner's own add/remove count.
+
+        A remove by anyone else (operator, co_writer, wildcard) must not erase a reviewer's
+        ``blocked``, nor must another writer's add keep an edge the owner never made alive.
+        """
+        adds = [e for e in edge.adds.by.values() if e[4][1] == owner]
+        if not adds:
+            return False
+        add = max(adds, key=lambda t: t[2])
+        removes = [r for r in edge.removes.by.values() if r[4][1] == owner]
+        wild = self._wild.get(edge.key[:3])
+        if wild is not None:
+            removes += [r for r in wild.removes.by.values() if r[4][1] == owner]
+        return not removes or not _after(max(removes, key=lambda t: t[2]), add)
+
     def review_evidence(self, principal, pr_id: str, reviewer_ids, head_writers) -> dict:
         """Raw, UNFILTERED inputs for the head-bound review quorum of one PR (T06).
 
@@ -1253,16 +1281,15 @@ class GraphProjection:
             for rid in sorted(reviewer_ids):
                 for key in list(self._edges_by_owner.get(rid, ())):
                     e = self._edges.get(key)
-                    if (e is None or e.to_id != pr_id or e.owner() != rid or not self._live(e)
-                            or self._is_removed(e)):
+                    if e is None or e.to_id != pr_id or e.owner() != rid or not self._owner_live(e, rid):
                         continue
                     if e.edge_type == "produced":
                         authors.add(rid)
                     elif e.edge_type == "reviewed" and e.binding and e.binding[0] == "commit":
-                        attrs = e.attr_values()
                         reviews.append({
                             "reviewer": rid, "commit": e.binding[1], "from_id": e.from_id,
-                            "verdict": attrs.get("verdict"), "receipt_digest": attrs.get("receipt_digest"),
+                            "verdict": self._owner_attr(e, rid, "verdict"),
+                            "receipt_digest": self._owner_attr(e, rid, "receipt_digest"),
                             "event_id": e.adds.best()[1],
                             "visible": self._edge_visible(principal, e)})
             return {"pr": pr_id, "head": head[3] if head else None,
