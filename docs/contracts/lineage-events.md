@@ -211,7 +211,11 @@ when the envelope names `room_id` (resp. `room_id` AND `mission_id`) - so live i
   `room_id`, and `mission` scope only with a listed `room_id` AND a listed `mission_id`; otherwise it is refused with the
   usual 403 `lineage_forbidden`. **A key with no entry may write only `org`/`private` scopes (fail closed; this is the new
   default).** `"*"` in a list is an explicit opt-in for every id and for bare id-less scopes (the old behaviour; for trusted
-  fleet keys only). Operator keys are not restricted. Entries must name a configured key; malformed entries stop startup.
+  fleet keys only). Operator keys are not restricted, and an entry naming an operator-role key is
+  refused at startup (it would silently do nothing; the error never echoes the key). Entries must name a configured key;
+  malformed entries stop startup. **The lists are a cross-product, not pairs:** a key listed with `rooms: [A, B]` and
+  `missions: [M]` may write mission `M` in room `A` AND in room `B`. Keep the lists narrow (one room and its missions per
+  key, or one key per room) so a mission id is never allowed in a room that did not link it.
 - **Trust.** The room/mission/workspace named on an event is whatever the (authenticated) ingest key put in its envelope, now
   limited to what the operator listed for that key (above). Residue:
   ingest keys are fleet credentials, and they could already publish `org` lineage that every signed-in key reads. The new
@@ -277,4 +281,13 @@ panel lists by type instead of walking from a root.
   (so tabs and panes work from `mission` scope), but no `tab:`/`pane:` surface nodes, so "pane closed" notes stay empty until
   an emitter adds them (with `attrs.agent_id`). Pi does not put `workspace_id` on agent attrs, so link-grant filtering of
   tabs/panes does not apply to Pi data (the server-side workspace gate still does when `workspace_id` is on the envelope).
+- **Breaking: the listing needs `room_id`.** `GET /api/v1/collab/graph/nodes?node_type=...` without `room_id` is now 400
+  (it was briefly an all-rooms listing). The keyed `/api/v1/graph/nodes` listing is unchanged. The per-room index is walked in
+  admission order (no sort of the whole set), bounded by `SCAN_BUDGET`; a key allowed for a room can still fill that room's
+  own budget with its own nodes, which `truncated_reason: scan_budget` reports. Other rooms are unaffected.
+- **Stored pre-T08 mission events** that carry `mission_id` but no `room_id` have no room to bind to, so after a rebuild
+  they are the bare operator-only scope (fail closed; nothing leaks, members lose sight of them). To restore member access,
+  re-emit them with `room_id` (events are idempotent per `event_id`, so emit new event ids; the narrowest scope of an
+  object's events wins, so an object whose OLD events lack `room_id` stays operator-only until an operator re-creates it
+  under a new id or the old events are retired).
 - **Large rooms**: the Tabs panel makes three listing reads (agents, tabs, panes) at most every 8 s while open; not load-tested.

@@ -1347,9 +1347,10 @@ class GraphProjection:
             if contexts is None:
                 candidates = self._by_type.get(node_type, ())      # keyed API: first-seen order
             else:                                                  # one room: only what was addressed to it
+                # insertion (admission) order: no sort of the whole set, identical live and after rebuild
                 seen = {}
                 for c in sorted(contexts, key=repr):
-                    seen.update(dict.fromkeys(sorted(self._by_ctx.get(c, {}).get(node_type, ()))))
+                    seen.update(self._by_ctx.get(c, {}).get(node_type, {}))
                 candidates = seen
             for scanned, nid in enumerate(candidates):
                 if scanned >= SCAN_BUDGET:

@@ -563,7 +563,7 @@ def test_a_listing_that_hits_a_budget_says_which_and_counts_nothing_hidden(fab, 
         put(fab.feed, f"agent:a{i}", "room", room_id=fab.room)
     out = fab.s.graph_read(fab.bob, ["nodes"], {"node_type": "agent", "room_id": fab.room})
     assert out["truncated"] is True and out["truncated_reason"] == "scan_budget" and len(out["nodes"]) == 5
-    assert [n["id"] for n in out["nodes"]] == sorted(n["id"] for n in out["nodes"])           # deterministic
+    assert [n["id"] for n in out["nodes"]] == [f"agent:a{i}" for i in range(5)]    # admission order, no whole-set sort
     monkeypatch.setattr(G, "SCAN_BUDGET", 3000)
     monkeypatch.setattr(G, "EDGE_SCAN_TOTAL", 3)
     for i in range(7):

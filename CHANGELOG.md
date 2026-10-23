@@ -13,6 +13,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   operator-only and the keyed `/api/v1/graph` API is unchanged. No migration; reads only.
 - Room workbench: new read-only "Tabs" panel (`packages/collab-tabs.js`): primary agents as tabs, spawned subagents as
   panes, from recorded `spawn` lineage only. Closing a pane never changes the agent.
+- Breaking: `GET /api/v1/collab/graph/nodes` (listing) requires `room_id` (400 otherwise); a key with no
+  `control_plane.lineage_key_scopes` entry can no longer write `room`/`mission` scope (403 `lineage_forbidden`; `"*"` opts in);
+  mission scope needs `room_id`, so stored mission events without it become operator-only after rebuild.
 - Rollback: see `docs/contracts/lineage-events.md` ("T08 rollout and rollback").
 
 ### Lineage graph projection (T02, Herdr side)

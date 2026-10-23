@@ -2368,6 +2368,9 @@ def _cmd_cp_web(args) -> int:
                                for n in ("rooms", "missions"))):
                 raise SystemExit("fleet config control_plane.lineage_key_scopes: each entry must name a configured api key "
                                  "and hold only rooms/missions lists of non-empty strings")
+        if any((api_keys or {}).get(str(k)) == "operator" for k in raw_scopes):
+            raise SystemExit("fleet config control_plane.lineage_key_scopes: an entry names an operator-role key; operator keys "
+                             "are not restricted, so the entry would silently do nothing. Remove it or use a non-operator key")
         lineage_key_scopes = {str(k): v for k, v in raw_scopes.items()}
     if args.collab_cognito_group is None:
         args.collab_cognito_group = "local.dev"
