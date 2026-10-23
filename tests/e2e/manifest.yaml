@@ -5,10 +5,10 @@
 herdr:
   tests/e2e/test_smoke_harness.py: {scenario: harness, min_tests: 2}
   tests/e2e/test_runner_guards.py: {scenario: harness, min_tests: 4}
-  tests/e2e/test_s2_quorum.py: {scenario: s2, min_tests: 19}
+  tests/e2e/test_s2_quorum.py: {scenario: s2, min_tests: 20}
   tests/e2e/test_s3_room_graph.py: {scenario: s3, min_tests: 8}
-  tests/e2e/test_s4_external.py: {scenario: s4, min_tests: 14, max_xfail: 4}
-  tests/e2e/test_s5_steering_forks.py: {scenario: s5, min_tests: 14, max_xfail: 1}
+  tests/e2e/test_s4_external.py: {scenario: s4, min_tests: 14}
+  tests/e2e/test_s5_steering_forks.py: {scenario: s5, min_tests: 15, max_xfail: 1}
   tests/e2e/test_s6_chaos.py: {scenario: s6, min_tests: 27}
   tests/e2e/test_s7_integrity.py: {scenario: s7, min_tests: 23}
 pi:

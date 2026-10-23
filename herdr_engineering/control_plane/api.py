@@ -42,6 +42,8 @@ _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
 # T12: the one POST an ingest key may make besides /api/v1/ingest: acknowledging a steering request addressed to it.
 _STEER_ACK = re.compile(r"^/api/v1/steering/[^/]+/ack$")
+# T16 gap C: the second: ask for a re-review of a PR whose head has no quorum (ingest-role key; scoped in the handler).
+_REREVIEW = re.compile(r"^/api/v1/graph/nodes/[^/]+/review-quorum/rereview$")
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
 # back to "dev" in a local checkout / un-stamped image.
 _COMMIT = os.environ.get("HERDR_ENGINEERING_COMMIT", "dev")
@@ -220,6 +222,8 @@ class ControlPlaneServer:
                 "require TLS)")
         self.fleet_config = fleet_config
         self.review_quorum = review_quorum      # QuorumConfig | None (feature off)
+        from .review_quorum import RereviewLedger
+        self.rereview = RereviewLedger(repo)    # T16 gap C: durable re-review requests (the route 404s when the quorum is off)
         self.collab = collab
         self.collab_require_https = collab_require_https
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
@@ -775,14 +779,14 @@ def _make_handler(server, public=False, operator=False):
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
-            if path.startswith(("/api/v1/ci/", "/api/v1/reviews")) or _STEER_ACK.match(path):
+            if path.startswith(("/api/v1/ci/", "/api/v1/reviews")) or _STEER_ACK.match(path) or _REREVIEW.match(path):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin integration mutation refused")
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
-            min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path)
+            min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path) or _REREVIEW.match(path)
                        else "operator")
             err = self._require(min_role)
             if err:
@@ -1158,6 +1162,8 @@ def _make_handler(server, public=False, operator=False):
                     eid = _q(self.path, "entity_id")
                     if etype == "lineage":
                         return self._json({"error": "not found"}, 404)  # read via the scope-checked /api/v1/graph
+                    if etype == "review_request":
+                        return self._json({"error": "not found"}, 404)  # read through the review-quorum route
                     if etype and etype.startswith("collab"):
                         return self._json({"error": "not found"}, 404)  # HCN has its own authenticated API
                     if not etype or not eid:
@@ -1325,6 +1331,8 @@ def _make_handler(server, public=False, operator=False):
                     raise
             if resource == "steering":
                 return self._steering(parts, body)
+            if resource == "graph" and len(parts) == 8 and parts[4] == "nodes" and parts[6:] == ["review-quorum", "rereview"]:
+                return self._rereview(parts[5], body)
             if resource == "reviews":
                 from .reviews import ReviewService
                 reviews = ReviewService(r)
@@ -1452,11 +1460,38 @@ def _make_handler(server, public=False, operator=False):
             try:
                 if body is None and parts[4:] == ["pending"]:
                     return self._json(service.steering_pending(who, inst))
+                if body is None and len(parts) == 6 and parts[4] == "targets":
+                    cur = service.steering_current(who, parts[5], inst)
+                    return self._json(cur) if cur is not None else self._json({"error": "not found"}, 404)
                 if body is not None and len(parts) == 6 and parts[5] == "ack":
                     return self._json(service.steering_ack(who, parts[4], body, inst))
             except CollabError as exc:
                 return self._json({"error": exc.message, **getattr(exc, "extra", {})}, exc.status)
             return self._json({"error": "not found"}, 404)
+
+        def _rereview(self, pr_id, body):
+            """T16 gap C: ``POST /api/v1/graph/nodes/{pr}/review-quorum/rereview`` ``{"head"?: <full sha>}`` records that
+            the PR's CURRENT head needs another review round. Recording only: Herdr dispatches nothing. 201 new, 200 replay
+            (one request per PR head); 404 hidden/absent/feature off; 403 a key the operator did not name for this PR's
+            review evidence; 409 not needed / head moved / head unknown; 429 rate limited."""
+            from .review_quorum import RereviewError
+            if server.review_quorum is None:
+                return self._json({"error": "review quorum is not configured"}, 404)
+            principal = self._principal()
+            if not isinstance(body, dict) or set(body) - {"head"}:
+                return self._json({"error": "body may only carry head"}, 400)
+            head = body.get("head")
+            if head is not None and not (isinstance(head, str) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head)):
+                return self._json({"error": "head must be a full lowercase commit id"}, 400)
+            try:
+                status, out = server.rereview.request(server.repo.graph, principal, pr_id, server.review_quorum, head)
+            except KeyError:
+                return self._json({"error": "not found"}, 404)
+            except RereviewError as exc:
+                if exc.code == "not_permitted":
+                    logging.getLogger(__name__).warning("review quorum: %s refused a re-review request", principal.get("id"))
+                return self._json({"error": exc.message, "code": exc.code, **exc.extra}, exc.status)
+            return self._json(out, status)
 
         def _graph_get(self, parts):
             """Lineage graph reads (viewer level). Every result is filtered by the
@@ -1465,11 +1500,21 @@ def _make_handler(server, public=False, operator=False):
                 if server.review_quorum is None:
                     return self._json({"error": "review quorum is not configured"}, 404)
                 try:
-                    return self._json(pr_review_quorum(server.repo.graph, self._principal(), parts[5], server.review_quorum))
+                    out = pr_review_quorum(server.repo.graph, self._principal(), parts[5], server.review_quorum)
+                    # T16 gap C: the recorded ask for THIS head (None for any other), so the dispatcher can poll one read
+                    out["rereview_request"] = server.rereview.current(out["pr"], out.get("head"))
+                    return self._json(out)
                 except KeyError:
                     return self._json({"error": "not found"}, 404)
-            return self._json(read_graph(server.repo.graph, self._principal(), parts[4:],
-                                         lambda name: _q(self.path, name)))
+            out = read_graph(server.repo.graph, self._principal(), parts[4:], lambda name: _q(self.path, name))
+            if len(parts) == 6 and parts[4] == "nodes" and server.collab is not None and not server.collab_only:
+                # T16 gap A: an ingest key can read the node's CURRENT steering fence and gate digest (so a runtime
+                # can fill ResolvedTarget.fence). Only for a node this key could read: read_graph answered 404 for
+                # any other, and the same principal is used again here.
+                view = server.collab.node_steering_view(server.repo.graph, self._principal(), parts[5])
+                if view is not None:
+                    out = {**out, **view}
+            return self._json(out)
 
         def _agent_capabilities(self, session):
             operator = self._role() == "operator"

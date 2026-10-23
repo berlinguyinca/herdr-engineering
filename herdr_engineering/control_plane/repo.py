@@ -1957,7 +1957,7 @@ class ControlPlaneRepo:
                 "quarantined %d foreign 'collab' row(s) from the durable log (%s); they are kept in storage and "
                 "were NOT replayed; see `collab-repair`", len(self.collab_quarantine),
                 ", ".join(sorted(set(self.collab_quarantine_reasons))))
-        self._event_order = [t for t in self._event_order if t[0] != "collab"]
+        self._event_order = [t for t in self._event_order if t[0] not in ("collab", "review_request")]
         if durable:
             self.inspector.hydrate(durable)
 

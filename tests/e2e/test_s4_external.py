@@ -607,16 +607,14 @@ def test_only_an_exact_allow_list_of_routes_answers_the_external_agent_and_no_te
     assert w.roster("alice")[dana.id]["state"] != "active"
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: POST /rooms/{room}/workspaces/{link}/authorize answers an external agent 403 'forbidden' for a link "
-                                       "that exists in its room and 404 'not found' for one that does not, an existence oracle for workspace "
-                                       "link ids (low impact: ids are unguessable and the agent is refused either way). Desired: identical answers.")
-def test_gap_authorize_terminal_does_not_reveal_whether_a_workspace_link_exists(world):
+def test_authorize_terminal_does_not_reveal_whether_a_workspace_link_exists(world):
+    """Was a strict xfail (existence oracle: 403 for a link in the room, 404 for none). One answer now, audited either way."""
     w, p = world, world.p
     dana = w.enroll("Dana's Claude")
     lk = p.c("POST", f"/rooms/{w.room}/workspaces", {"host": "bender", "workspace_id": "ws-1"}, user="alice")["link_id"]
     real = _call(p, "POST", ["rooms", w.room, "workspaces", lk, "authorize"], {"action": "terminal"}, dana)
     fake = _call(p, "POST", ["rooms", w.room, "workspaces", "grant_" + "0" * 26, "authorize"], {"action": "terminal"}, dana)
-    assert (real.status, real.body) == (fake.status, fake.body)
+    assert (real.status, real.body) == (fake.status, fake.body) == (403, {"error": "forbidden"})
 
 
 # ======================================================================================== the keyed API and the public listener
@@ -791,10 +789,8 @@ def test_a_sponsor_can_revoke_their_agent_and_only_an_owner_can_invite_or_revoke
 # ======================================================================================== known gaps, written as strict xfails
 # Each asserts the DESIRED behaviour and fails today. They turn into failures (XPASS strict) the day the gap closes,
 # which forces the marker to be removed. (Review finding: these were prose in the evidence doc only.)
-@pytest.mark.xfail(strict=True, reason="GAP: tools/list advertises the same fixed menu to every external agent, including tools that are "
-                                       "ALWAYS refused for it (agents_list, task_create, tasks_inbox, task_update) and delegation tools the "
-                                       "agent was not invited to use. Desired: the menu lists only what the caller may call.")
-def test_gap_mcp_tool_menu_is_per_agent_and_lists_only_callable_tools(world):
+def test_mcp_tool_menu_is_per_agent_and_lists_only_callable_tools(world):
+    """Was a strict xfail: tools/list advertised one fixed menu, including tools always refused to the caller."""
     w, p = world, world.p
     dana = w.enroll("Dana's Claude")
     erin = w.enroll("Erin's Pi", harness_type="pi", proposals=False, lineage=False)
@@ -805,32 +801,38 @@ def test_gap_mcp_tool_menu_is_per_agent_and_lists_only_callable_tools(world):
     assert not menu(dana) & {"agents_list", "task_create", "tasks_inbox", "task_update"}
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: a delegation's budget has no turn/hop bound (max_turns, max_hops); the nearest field is "
-                                       "max_steps and an external agent cannot delegate onward at all. Desired: max_turns/max_hops are "
-                                       "accepted, echoed and enforced.")
-def test_gap_delegation_budget_carries_max_turns_and_max_hops(world):
+def test_delegation_budget_carries_max_turns_and_max_hops_and_the_turn_ceiling_closes_the_task(world):
+    """Was a strict xfail (no turn/hop bound). max_turns bounds the delegate's answers; max_hops is the chain-depth ceiling
+    (the delegate is hop 1 and an external agent has no route to delegate onward)."""
     w = world
     dana = w.enroll("Dana's Claude")
     ok = delegate(w, dana)                                                          # control: the existing budget shape is accepted
     assert ok.status in (200, 201), ok.body
     r = delegate(w, dana, budget={"max_proposals": 2, "max_steps": 4, "max_artifact_bytes": 4096, "max_tokens": 1000,
-                                  "max_turns": 3, "max_hops": 1})
+                                  "max_turns": 2, "max_hops": 1})
     assert r.status in (200, 201), r.body
-    assert r.body.get("task", r.body).get("budget", {}).get("max_turns") == 3
+    task = r.body.get("task", r.body)
+    assert task["bounds"]["budget"]["max_turns"] == 2 and task["bounds"]["budget"]["max_hops"] == 1
+    for bad in ({"max_turns": 0}, {"max_turns": 500}, {"max_hops": 0}, {"max_hops": 9}):
+        assert delegate(w, dana, budget=bad).status == 400
+    tid = task["task_id"]
+    assert respond(dana, tid, "accept", expected_version=inbox_version(dana, tid)).status == 200                   # turn 1
+    assert respond(dana, tid, "progress", expected_version=inbox_version(dana, tid)).status == 200                 # turn 2
+    over = respond(dana, tid, "progress", expected_version=inbox_version(dana, tid))                               # turn 3
+    assert over.status == 409 and over.body.get("code") == "budget_exhausted", over.body
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: the consultation edge runs thread -> subject, with asker and target only as thread attrs; "
-                                       "there is no edge from the asking person to the answering agent. Desired: an edge asker -> target "
-                                       "so 'who asked whom' is a graph fact.")
-def test_gap_consultation_edge_connects_the_asker_to_the_target_agent(world):
+def test_consultation_edge_connects_the_asker_to_the_target_agent(world):
+    """Was a strict xfail: only thread -> subject existed. Now asker -> target is a graph fact too (reference nodes, no text)."""
     w, p = world, world.p
     w.seed_node("task:s4-edge", "edge direction", 0)
     dana = w.enroll("Dana's Claude")
     ask = {"target": {"kind": "agent", "id": dana.id}, "subject": {"kind": "node", "node_id": "task:s4-edge"},
            "question": "who asked whom?", "idempotency_key": "gap-edge"}
     cid = p.c("POST", f"/rooms/{w.room}/consultations", ask, user="bob")["consultation"]["consult_id"]     # control: it was asked
-    thread = "thread:hcn-consult." + cid
-    edges = [e for e in p.edges(thread, key="operator") if e[0] == "consultation"]
-    assert edges, "control: the consultation edge exists"
-    touched = {x for e in edges for x in e[1:3]}
-    assert dana.id in json.dumps(sorted(touched)) and "bob" in json.dumps(sorted(touched)), edges
+    asker, target = f"thread:hcn-consult-asker.{cid}", f"thread:hcn-consult-target.{cid}"
+    assert ("consultation", asker, target) in p.edges(asker, key="operator"), "asker -> target, in that direction"
+    assert ("consultation", "thread:hcn-consult." + cid, "task:s4-edge") in p.edges("thread:hcn-consult." + cid, key="operator")
+    ref = lambda nid: p.node(nid, key="operator").body["node"]["attrs"]                    # noqa: E731
+    assert ref(asker)["ref"] == "bob" and ref(target)["ref"] == dana.id and ref(target)["kind"] == "agent"
+    assert "who asked whom?" not in json.dumps(p.hood(asker, key="operator").body)         # never the text

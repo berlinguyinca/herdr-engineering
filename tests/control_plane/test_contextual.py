@@ -287,8 +287,8 @@ def test_the_graph_records_who_asked_whom_about_what_but_never_the_text(cx):
     snap = json.dumps(cx.repo.graph.snapshot())
     assert node_id in snap and "why is this slow" not in snap and "private words" not in snap
     lin = cx.s.graph_read(cx.alice, ["lineage"], {"room_id": cx.room})
-    e = [x for x in lin["edges"] if x["edge_type"] == "consultation"]
-    assert len(e) == 1 and e[0]["from_id"] == node_id and e[0]["to_id"] == "task:a"
+    e = [x for x in lin["edges"] if x["edge_type"] == "consultation" and x["from_id"] == node_id]
+    assert len(e) == 1 and e[0]["to_id"] == "task:a"
     n = next(x for x in lin["nodes"] if x["id"] == node_id)
     assert n["state"] == "answered" and n["attrs"]["asked_by"] == "bob"
     # no ingest key can write, edit or point at that namespace
@@ -811,3 +811,35 @@ def test_a_rebuilt_projection_equals_the_live_one_including_links_and_threads(cx
     fresh = ControlPlaneRepo()
     fresh.import_state(json.loads(json.dumps(cx.repo.export_state(), default=str)))
     assert fresh.graph.snapshot() == live and not fresh.graph.events_rejected
+
+
+# ----------------------------------------------------------------------------- T16 gap D: the consultation edge asker -> target
+def test_the_graph_records_the_asker_and_the_target_as_an_edge_never_the_text(cx):
+    cx.s.add_member(cx.alice, cx.room, {"user_id": "mallory", "role": "contributor"})
+    c = ask(cx, target=("user", "mallory"))[1]["consultation"]
+    ask_node, tgt_node = ("thread:hcn-consult-asker." + c["consult_id"], "thread:hcn-consult-target." + c["consult_id"])
+    lin = cx.s.graph_read(cx.alice, ["lineage"], {"room_id": cx.room})
+    edges = [(e["edge_type"], e["from_id"], e["to_id"]) for e in lin["edges"] if e["edge_type"] == "consultation"]
+    assert ("consultation", ask_node, tgt_node) in edges                       # asker -> target, in that direction
+    assert ("consultation", "thread:hcn-consult." + c["consult_id"], "task:a") in edges      # the "about" edge is kept
+    nodes = {n["id"]: n for n in lin["nodes"]}
+    assert nodes[ask_node]["attrs"]["ref"] == "bob" and nodes[tgt_node]["attrs"]["ref"] == "mallory"
+    assert nodes[ask_node]["attrs"]["role"] == "asker" and nodes[tgt_node]["attrs"]["role"] == "target"
+    assert "why is this slow" not in json.dumps(cx.repo.graph.snapshot())
+    # the reference nodes belong to the service: no ingest key can write, edit or point an edge at them
+    with pytest.raises(PermissionError):
+        cx.feed.send("node.upsert", {"node_type": "thread", "node_id": ask_node, "label": "forged"}, "room", room_id=cx.room)
+    with pytest.raises(PermissionError):
+        cx.feed.send("edge.add", {"edge_type": "consultation", "from_id": ask_node, "to_id": "task:a"}, "room", room_id=cx.room)
+    with pytest.raises(PermissionError):
+        cx.feed.send("edge.add", {"edge_type": "consultation", "from_id": "task:a", "to_id": tgt_node}, "room", room_id=cx.room)
+
+
+def test_the_asker_target_edge_has_the_subjects_visibility(cx):
+    """Whoever cannot see the subject cannot see who asked whom either (same scope label as the thread)."""
+    cx.s.add_member(cx.alice, cx.room, {"user_id": "mallory", "role": "contributor"})
+    node(cx.feed, "task:other-room", label="elsewhere", room_id=cx.room2)
+    c = ask(cx, target=("user", "mallory"))[1]["consultation"]
+    ask_node = "thread:hcn-consult-asker." + c["consult_id"]
+    assert ask_node in {n["id"] for n in cx.s.graph_read(cx.alice, ["lineage"], {"room_id": cx.room})["nodes"]}
+    assert ask_node not in {n["id"] for n in cx.s.graph_read(cx.alice, ["lineage"], {"room_id": cx.room2})["nodes"]}

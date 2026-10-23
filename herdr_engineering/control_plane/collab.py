@@ -689,7 +689,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 "created_at": p["created_at"], "created_epoch": p["created_epoch"],
                 "updated_at": p["created_at"], "seq": seq}
             if p.get("bounds"):          # T11: a bounded delegation is this same task plus its bounds
-                self._tasks[p["task_id"]].update(bounds=p["bounds"], version=1, steps=0, tokens=0, proposals=0)
+                self._tasks[p["task_id"]].update(bounds=p["bounds"], version=1, steps=0, tokens=0, proposals=0, turns=0)
                 if p.get("idempotency_key"):
                     self._idem[(p["actor_agent_id"] or "user:" + p["actor_user_id"], p["room_id"],
                                 "deleg:" + p["idempotency_key"])] = (p["fingerprint"], p["task_id"])
@@ -700,6 +700,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 tk.update(status=p["status"], result=p.get("result"), updated_at=p["created_at"])
                 if "bounds" in tk:
                     tk["version"] += 1
+                    if str(p.get("action") or "").startswith("delegation.") and p.get("action") != "delegation.budget":
+                        tk["turns"] = tk.get("turns", 0) + 1            # the delegate answered (accept, complete, ...)
                     if p.get("idempotency_key"):
                         self._idem[(p["actor_agent_id"], p["room_id"], "resp:" + p["idempotency_key"])] = (
                             p["fingerprint"], tk["version"])
@@ -707,7 +709,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             tk = self._tasks.get(p["task_id"])
             if tk and "bounds" in tk:
                 tk.update(steps=tk["steps"] + 1, tokens=tk["tokens"] + p["tokens"], note=p.get("note"),
-                          updated_at=p["created_at"], version=tk["version"] + 1)
+                          updated_at=p["created_at"], version=tk["version"] + 1, turns=tk.get("turns", 0) + 1)
                 if p.get("idempotency_key"):
                     self._idem[(p["actor_agent_id"], p["room_id"], "resp:" + p["idempotency_key"])] = (
                         p["fingerprint"], tk["version"])
@@ -728,7 +730,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 prior.update(state="superseded", decided_at=p["created_at"], reason="superseded by " + pid)
             tk = self._tasks.get(p["task_id"])
             if tk and "bounds" in tk:
-                tk.update(proposals=tk["proposals"] + 1, steps=tk["steps"] + 1, version=tk["version"] + 1)
+                tk.update(proposals=tk["proposals"] + 1, steps=tk["steps"] + 1, version=tk["version"] + 1,
+                          turns=tk.get("turns", 0) + 1)
             if p.get("idempotency_key"):
                 self._idem[(p["actor_agent_id"], p["room_id"], "prop:" + p["idempotency_key"])] = (p["digest"], pid)
         elif t == "proposal_decided":
@@ -1630,6 +1633,14 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             self.stats["policy_denied"] += 1
             raise CollabError(403, "forbidden")
         return agent
+
+    def tool_profile(self, pr: Principal) -> dict:
+        """What the MCP menu may show this agent: ``{"external": bool, "proposals": bool}``. Read-only; a missing or
+        revoked agent is treated as an unprivileged external (the smallest menu)."""
+        with self._lock:
+            agent = self._agents.get(pr.id) if pr.is_agent else None
+            ext = (agent or {}).get("external")
+            return {"external": bool(ext) or agent is None, "proposals": bool(ext and ext.get("proposals"))}
 
     def _external_load(self, room_id: str) -> int:
         """Live external agents plus open invites in one room (what the per-room cap counts)."""
@@ -2751,11 +2762,18 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         per principal and link per TERMINAL_AUDIT_EVERY seconds, and at once after any denial or change."""
         with self._lock:
             room, _ = self._authorize(pr, room_id, "read", "workspace.access")
+            if action not in LINK_GRANTS:
+                raise CollabError(400, "unknown workspace action")      # before the lookup: says nothing about the link
             link = self._links.get(link_id)
             if link is None or link["room_id"] != room_id:
-                raise CollabError(404, "not found")
-            if action not in LINK_GRANTS:
-                raise CollabError(400, "unknown workspace action")
+                if not self._is_link_manager(pr, room):
+                    # T16 gap D: a caller who cannot manage links gets the SAME answer for an id that does not
+                    # exist as for one that exists but grants them nothing (no existence oracle); both audited.
+                    self._audit_denied(pr, f"workspace.{action}", "no_workspace_grant", room_id=room_id,
+                                       resource_id=str(link_id)[:64], project_ids=[room["project_id"]])
+                    self.stats["policy_denied"] += 1
+                    raise CollabError(403, "forbidden")
+                raise CollabError(404, "not found")                     # an owner lists every link anyway
             gate = (pr.key, link_id)
             if action == "terminal":
                 ok = self._terminal_ok(pr, room, link)
@@ -3440,7 +3458,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         return t, room, a
 
     def _task_usage(self, t: dict) -> dict:
-        return {"steps": t["steps"], "proposals": t["proposals"], "tokens_reported": t["tokens"]}
+        return {"steps": t["steps"], "proposals": t["proposals"], "tokens_reported": t["tokens"],
+                "turns": t.get("turns", 0)}
+
+    @staticmethod
+    def _turns_left(t: dict) -> bool:
+        """May the delegate send one more answer? (``max_turns`` is absent on tasks stored before it existed.)"""
+        return t.get("turns", 0) + 1 <= t["bounds"]["budget"].get("max_turns", dlg.DEFAULT_TURNS)
 
     def _proposal_state(self, p: dict) -> str:
         if p["state"] == "quarantined" and self._now() - p["created_epoch"] >= dlg.PROPOSAL_TTL:
@@ -3595,6 +3619,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         idempotency_key=ikey, fingerprint=fp, visibility_scope="room", outcome="allowed",
                         project_ids=[x["project_id"]], resource_id=task_id)
             b = t["bounds"]["budget"]
+            if action not in ("decline", "cancel", "fail") and not self._turns_left(t):
+                return self._exhaust(pr, t, task_id, base)          # the turn ceiling: the task is closed
             if action == "progress":
                 if t["steps"] + 1 > b["max_steps"] or t["tokens"] + tokens > b["max_tokens"]:
                     return self._exhaust(pr, t, task_id, base)
@@ -3652,7 +3678,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             self._audit_denied(pr, "delegation.proposal", "task_" + status, **audit)
             raise CollabError(409, f"the task is {status}: accept it first, and only while it is open", code="task_" + status)
         b = t["bounds"]["budget"]
-        if t["proposals"] >= b["max_proposals"] or t["steps"] + 1 > b["max_steps"]:
+        if t["proposals"] >= b["max_proposals"] or t["steps"] + 1 > b["max_steps"] or not self._turns_left(t):
             self._audit_denied(pr, "delegation.proposal", "budget_exhausted", **audit)
             raise CollabError(409, "the task's proposal or step budget is used up", code="budget_exhausted")
         mine = self._proposals_by_agent.get(pr.id, ())

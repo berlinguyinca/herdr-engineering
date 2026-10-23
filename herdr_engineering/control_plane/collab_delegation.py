@@ -28,6 +28,9 @@ MAX_ARTIFACT_BYTES = 32 * 1024              # one proposal's content (the log ro
 DEFAULT_ARTIFACT_BYTES = 16 * 1024
 MAX_PROPOSALS_PER_TASK = 5
 MAX_STEPS = 200                             # progress notes + proposals the delegate may send for one task
+MAX_TURNS = 200                             # answers (accept, progress, complete, proposal, ...) the delegate may send
+DEFAULT_TURNS = 60                          # also what a task stored before max_turns existed is held to
+MAX_HOPS = 3                                # delegation-chain depth ceiling; the delegate itself is hop 1
 MAX_TOKENS = 10_000_000                     # declarative: the server cannot measure an agent's token use
 MIN_SECONDS, MAX_SECONDS = 60.0, 24 * 3600.0
 MAX_SCOPE_PATHS = 20
@@ -50,7 +53,8 @@ DELEGATIONS_PER_10_MIN = 20                 # per room owner
 RESPONSES_PER_MINUTE = 60                   # per delegate: progress / accept / result calls
 DECISIONS_PER_MINUTE = 60                   # per room owner
 
-HCN_NODE_PREFIXES = ("task:hcn-delegation.", "artifact:hcn-proposal.", "thread:hcn-consult.")   # written only by the HCN service
+HCN_NODE_PREFIXES = ("task:hcn-delegation.", "artifact:hcn-proposal.", "thread:hcn-consult.",
+                     "thread:hcn-consult-")   # written only by the HCN service
 
 _ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _NODE = re.compile(r"[a-z]+:[A-Za-z0-9._:/@+=-]{1,190}\Z")
@@ -125,7 +129,8 @@ def parse_bounds(body: dict, now: float, hard_expiry: float, task_ttl: float) ->
         raise DelegationError(400, "scope and budget must be objects")
     if set(scope_in) - {"paths", "nodes", "questions"}:
         raise DelegationError(400, "unknown scope field")
-    if set(budget_in) - {"max_proposals", "max_steps", "max_artifact_bytes", "max_tokens"}:
+    if set(budget_in) - {"max_proposals", "max_steps", "max_artifact_bytes", "max_tokens",
+                                 "max_turns", "max_hops"}:
         raise DelegationError(400, "unknown budget field")
 
     def listing(name: str, cap: int) -> list:
@@ -167,7 +172,9 @@ def parse_bounds(body: dict, now: float, hard_expiry: float, task_ttl: float) ->
     budget = {"max_proposals": _span(budget_in, "max_proposals", 1, 1, MAX_PROPOSALS_PER_TASK),
               "max_steps": _span(budget_in, "max_steps", 20, 1, MAX_STEPS),
               "max_artifact_bytes": _span(budget_in, "max_artifact_bytes", DEFAULT_ARTIFACT_BYTES, 256, MAX_ARTIFACT_BYTES),
-              "max_tokens": _span(budget_in, "max_tokens", 100_000, 0, MAX_TOKENS)}
+              "max_tokens": _span(budget_in, "max_tokens", 100_000, 0, MAX_TOKENS),
+              "max_turns": _span(budget_in, "max_turns", DEFAULT_TURNS, 1, MAX_TURNS),
+              "max_hops": _span(budget_in, "max_hops", 1, 1, MAX_HOPS)}
     return {"scope": {"paths": paths, "nodes": nodes, "questions": questions}, "budget": budget,
             "expires_at": expires, "output_kinds": kinds}
 

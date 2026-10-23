@@ -66,6 +66,7 @@ EDGE_TYPES = frozenset(
 # indistinguishable lineage_forbidden, operators excepted (trusted, as for every other write).
 CROSS_LINK = "cross_link"
 CONSULT_PREFIX = "thread:hcn-consult."
+CONSULT_REF_PREFIX = "thread:hcn-consult-"      # the asker and target reference nodes of one consultation (service-written)
 BOUND_EDGE_TYPES = frozenset({"reviewed", "validated"})
 LINEAGE_EVENT_TYPES = ("node.upsert", "node.state", "edge.add", "edge.remove")
 # COMMONS kinds are shared identities that several independent emitters legitimately
@@ -840,7 +841,7 @@ class GraphProjection:
                 if op["edge_type"] == CROSS_LINK and not (operator or svc):
                     raise deny
                 if svc and (op["edge_type"] == CROSS_LINK or (
-                        op["edge_type"] == "consultation" and op["from_id"].startswith(CONSULT_PREFIX))):
+                        op["edge_type"] == "consultation" and op["from_id"].startswith((CONSULT_PREFIX, CONSULT_REF_PREFIX)))):
                     # the service already checked the person, the room and both endpoints; the graph only insists
                     # that the endpoints exist (an edge to a node nobody defined stays invisible anyway)
                     if any(n is None or n.claim is None for n in (frm, to)):

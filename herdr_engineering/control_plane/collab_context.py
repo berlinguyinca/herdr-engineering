@@ -33,6 +33,7 @@ CONTEXTUAL_KEYS = frozenset({
     "max_refs_per_read"})
 CONTEXT_EVENTS = frozenset({"consult_asked", "consult_answered", "consult_closed", "xlink_created", "xlink_revoked",
                             "xlink_published", "xlink_unpublished"})
+CONSULT_REF_PREFIX = "thread:hcn-consult-"
 CONSULT_PREFIX = "thread:hcn-consult."          # service-written graph nodes (also reserved in collab_delegation)
 MAX_NOTE = 200
 MAX_LIST = 100
@@ -576,6 +577,19 @@ class ContextMixin:
             steps = [("node.upsert", node, {"node_type": "thread", "node_id": node, "label": "consultation",
                                             "state": "open", "attrs": attrs}, 1, "1"),
                      ("edge.add", node, {"edge_type": "consultation", "from_id": node, "to_id": node_id}, 2, "2")]
+            # T16 gap D: "who asked whom" as a graph fact. Two reference nodes (one per end, same scope label as the
+            # thread, no text) and a `consultation` edge asker -> target, on their OWN source so the thread's
+            # sequences are untouched. Reference nodes, not the people's own nodes: a person has no node, and an
+            # external agent's own `agent:<id>` node is its to write (T10 namespace), so it may not exist.
+            ref_a, ref_t = CONSULT_REF_PREFIX + "asker." + cid, CONSULT_REF_PREFIX + "target." + cid
+            ref_steps = [
+                ("node.upsert", ref_a, {"node_type": "thread", "node_id": ref_a, "label": "asker", "state": "open",
+                                        "attrs": {"source": "hcn-consult", "role": "asker", "kind": "user",
+                                                  "ref": r["asker"], "consultation": node, "trust": "service-record"}}, 1, "a"),
+                ("node.upsert", ref_t, {"node_type": "thread", "node_id": ref_t, "label": "target", "state": "open",
+                                        "attrs": {"source": "hcn-consult", "role": "target", "kind": r["target_kind"],
+                                                  "ref": r["target_id"], "consultation": node, "trust": "service-record"}}, 2, "t"),
+                ("edge.add", ref_a, {"edge_type": "consultation", "from_id": ref_a, "to_id": ref_t}, 3, "e")]
             seqs = {"answered": 3, "declined": 4, "cancelled": 5}
             if state in seqs:
                 steps.append(("node.state", node, {"node_id": node, "state": state}, seqs[state], "s-" + state))
@@ -585,6 +599,10 @@ class ContextMixin:
                 sink({"schema_version": 2, "event_id": f"hcn-consult-{cid}-{tag}", "source": source, "source_sequence": n,
                       "entity_type": "lineage", "entity_id": entity, "event_type": etype, "payload": payload,
                       **scope}, principal, None)
+            for etype, entity, payload, n, tag in ref_steps:
+                sink({"schema_version": 2, "event_id": f"hcn-consult-{cid}-r{tag}", "source": "hcn-cr-" + cid[7:27],
+                      "source_sequence": n, "entity_type": "lineage", "entity_id": entity, "event_type": etype,
+                      "payload": payload, **scope}, principal, None)
         except Exception:                      # noqa: BLE001 - the consultation stands; a later state change republishes
             self.stats["lineage_failures"] += 1
             return False
