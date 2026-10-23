@@ -1,0 +1,6 @@
+# Expected suites of the T16 acceptance run (scripts/run-acceptance.sh). A file that runs fewer tests than min_tests,
+# zero tests, or is not listed here fails the run. Counts are set from observed runs when each scenario lands.
+herdr:
+  tests/e2e/test_smoke_harness.py: {scenario: harness, min_tests: 2}
+pi:
+  test/e2e/smoke-plane.e2e.test.ts: {scenario: harness, min_tests: 2}
