@@ -31,6 +31,7 @@ from .redact import redact_payload
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
+_SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
@@ -701,7 +702,7 @@ def _make_handler(server, public=False, operator=False):
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
-            if path.startswith(("/api/v1/ci/", "/api/v1/reviews")):
+            if path.startswith(("/api/v1/ci/", "/api/v1/reviews")) or _SUMMARY_FIX.match(path):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -1243,6 +1244,15 @@ def _make_handler(server, public=False, operator=False):
                 if receipt.get("error") in {"receipt_persistence_unavailable", "receipt_persistence_failed"}:
                     status = 503
                 return self._json({"ok": receipt["status"] == "delivered", **receipt}, status)
+            if resource == "sessions" and len(parts) == 7 and parts[5:] == ["summary", "fix"]:
+                from .summary_fix import SummaryFixRefused, fix_summary_item
+                actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
+                try:
+                    status, result = fix_summary_item(server.agent_summaries, r, server.dispatcher,
+                                                      parts[4], body, actor=actor)
+                except SummaryFixRefused as exc:
+                    return self._json(exc.body, exc.status)
+                return self._json(result, status)
             if resource == "sessions" and len(parts) == 6 and parts[5] in {"name", "summary"}:
                 sid = parts[4]
                 if r.get_session(sid) is None:
@@ -1326,7 +1336,8 @@ def _make_handler(server, public=False, operator=False):
         def _agent_capabilities(self, session):
             operator = self._role() == "operator"
             return {**session, "capabilities": {"rename_agent": operator,
-                                                "regenerate_summary": operator}}
+                                                "regenerate_summary": operator,
+                                                "fix_summary_item": operator}}
 
         def _named_inspector(self, data, sid):
             # Claim an existing provider preference before a helper/read path

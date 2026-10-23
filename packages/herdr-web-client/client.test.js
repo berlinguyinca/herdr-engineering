@@ -14,9 +14,12 @@ test('agent summary and rename requests preserve encoded identity and version', 
   await client.getAgentSummary('a:b');
   await client.regenerateAgentSummary('a:b');
   await client.renameAgent('a:b', 'Ada', 2);
-  assert.deepEqual(calls.map(c => c.url), ['/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/name']);
+  await client.fixSummaryItem('a:b', 'blockers', 1, 'CI is red');
+  assert.deepEqual(calls.map(c => c.url), ['/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/name', '/api/v1/sessions/a%3Ab/summary/fix']);
   assert.equal(calls[1].method, 'POST');
   assert.deepEqual(calls[2].body, { name: 'Ada', expected_version: 2 });
+  assert.equal(calls[3].method, 'POST');
+  assert.deepEqual(calls[3].body, { list: 'blockers', index: 1, text: 'CI is red' });
 });
 
 function fakeFetch(routes) {

@@ -88,3 +88,39 @@ in [the model benchmark](agent-summary-model-benchmark.md). Once that qualified
 capacity is advertised, this route can use it without changing the summary
 client; until then the explicitly authorized CPU fallback continues through the
 fabric proxy.
+
+## "Let the agent fix this" on blockers and next steps
+
+Operators see a **Let the agent fix this** button beside each item under
+*Blockers* and *Next steps* on the summary card (capability `fix_summary_item`;
+viewers do not get it). Pressing it calls
+`POST /api/v1/sessions/{id}/summary/fix` with `{list, index, text}`.
+
+- **Verified, not trusted.** The server re-reads the stored summary and requires
+  `summary[list][index] == text`; otherwise it returns 409 `reason: stale_item`
+  and nothing is sent. Only `blockers` and `next_steps` are accepted. The route
+  is operator-only, same-origin and `application/json` only (like the CI and
+  review POSTs).
+- **Grounded packet.** The original session receives a fixed instruction prefix
+  plus one JSON block marked as untrusted data: the item, the summary overview
+  and where-left-off, branch/worktree/commit/repository, PR and issue from the
+  inspector association, recent file and test facts, and the newest recorded
+  messages (redacted, the same bounds as summaries). The whole message is capped
+  at 6000 characters; the oldest messages are dropped first.
+- **Delivery.** It uses the same native `herdr agent prompt` path and durable
+  receipts as session messages. The operation id is derived from the session,
+  item and summary generation, so a double click, second tab or replay returns
+  the first receipt instead of prompting again. A transport failure may be
+  retried up to three times; a queued (unknown outcome) receipt is never resent.
+  Regenerating the summary allows a fresh request.
+- **Harnesses.** pi and claude sessions with a native conversation identity are
+  supported. Anything else returns 409 `reason: unsupported_harness`. Herdr
+  0.9.1's `agent prompt` itself is not harness-specific, but codex panes report
+  no `agent_session`, so delivery could never be confirmed.
+- **Dead sessions.** A session that is closed, has no terminal or is not ready
+  returns 409 `fallback: helper_unavailable`. Delivery to a helper agent is a
+  later change (`summary_fix.helper_fallback` is the seam).
+- **Audit.** Each new attempt records a durable `SummaryFixRequested` event with
+  the actor (`role`, and whether an API key or open mode authorized it),
+  session, list, index, request digest and operation id. The item text is not
+  copied into the audit event.
