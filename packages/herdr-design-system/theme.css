@@ -102,5 +102,8 @@
 @media (max-width: 900px) {
   :root[data-density] :is(button, select, input:not([type=checkbox]):not([type=radio]), summary, .gh-issue-title, .ov-row a, .ci-health-tree a) { min-height: 44px; }
   :root[data-density] :is(.ov-row a, .ci-health-tree a) { display: inline-flex; align-items: center; }
+  /* The 44px button plus cell padding must fit the bucket's actual column. */
+  :root[data-density] .ci-health-grid { width: max-content; table-layout: auto; }
+  :root[data-density] .ci-health-grid :is(td, thead th:not(.ci-health-project)) { width: 48px; min-width: 48px; }
   :root[data-density] .ci-health-cell { min-width: 44px; }
 }

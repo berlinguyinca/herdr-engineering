@@ -10,17 +10,8 @@ const REPO = path.resolve(import.meta.dirname, '..', '..');
 const PY = process.env.PYTHON
   || (fs.existsSync(path.join(REPO, '.venv', 'bin', 'python'))
     ? path.join(REPO, '.venv', 'bin', 'python') : 'python3');
-// Playwright resolves its own bundled browser (matching the pinned
-// devDependency). On dev boxes whose cached browser build lags the installed
-// Playwright version (this host has chromium-1243 while Playwright 1.64 wants
-// headless_shell-1248), fall back to a locally-pinned chromium. Override with
-// PLAYWRIGHT_CHROMIUM to force a specific executable.
-const EXE_FALLBACK = process.env.PLAYWRIGHT_CHROMIUM
-  || '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
-
-
-async function startServer(env = {}) {
-  const proc = spawn(PY, [path.join(REPO, 'tests', 'playwright', 'server.py')], {
+async function startServer(env = {}, fixture = 'server.py') {
+  const proc = spawn(PY, [path.join(REPO, 'tests', 'playwright', fixture)], {
     env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -47,21 +38,14 @@ async function launchBrowser() {
   if (process.env.PLAYWRIGHT_CHROMIUM) {
     return chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM, args });
   }
-  try {
-    return await chromium.launch({ headless: true, args }); // auto-detect bundled browser
-  } catch (err) {
-    if (fs.existsSync(EXE_FALLBACK)) {
-      return chromium.launch({ headless: true, executablePath: EXE_FALLBACK, args });
-    }
-    throw err;
-  }
+  return chromium.launch({ headless: true, args });
 }
 
 // Start a fresh server + browser, run `fn`, then tear both down. A fresh
 // server per test isolates the API rate budget (60s sliding window) so tests
 // are deterministic.
-async function withApp(fn, env = {}) {
-  const srv = await startServer(env);
+async function withApp(fn, env = {}, fixture = 'server.py') {
+  const srv = await startServer(env, fixture);
   let browser;
   try {
     browser = await launchBrowser();
@@ -126,4 +110,41 @@ test('density preserves mobile controls and representative route containment at 
       }
     }
   }, { BURST: '0' });
+});
+
+
+test('populated tablet heatmap keeps touch targets within their own bucket columns', async () => {
+  await withApp(async ({ page, base }) => {
+    await page.setViewportSize({ width: 768, height: 1080 });
+    await page.goto(`${base}/#/ci`);
+    await page.locator('.ci-health-cell').first().waitFor({ timeout: 45000 });
+    for (const width of [768, 701, 900, 390]) {
+      await page.setViewportSize({ width, height: 1080 });
+      for (const mode of ['14', '30']) {
+        await page.locator(`[data-health-mode="${mode}"]`).click();
+        for (const density of ['comfortable', 'compact', 'dense']) {
+          await page.getByRole('combobox', { name: 'Density' }).selectOption(density);
+          const geometry = await page.locator('.ci-health-grid:visible').first().evaluate(table => {
+            const cells = [...table.querySelectorAll('tbody tr:first-child td')];
+            const scroll = table.closest('[data-health-grid-scroll]');
+            return {
+              count: cells.length,
+              widths: cells.map(cell => cell.getBoundingClientRect().width),
+              contained: cells.every(cell => {
+                const bucket = cell.getBoundingClientRect();
+                const button = cell.querySelector('button').getBoundingClientRect();
+                return button.width >= 44 && button.height >= 44 && button.left >= bucket.left && button.right <= bucket.right;
+              }),
+              internalScroll: scroll.scrollWidth > scroll.clientWidth,
+              documentContained: document.documentElement.scrollWidth <= innerWidth,
+            };
+          });
+          assert.equal(geometry.count, Number(mode));
+          assert.ok(geometry.contained, `${width}px/${mode} days/${density}: targets exceed bucket columns ${geometry.widths}`);
+          assert.ok(geometry.internalScroll, `${width}px/${mode} days: heatmap scrolls internally`);
+          assert.ok(geometry.documentContained, `${width}px/${mode} days: document stays contained`);
+        }
+      }
+    }
+  }, {}, 'ci-health-server.py');
 });
