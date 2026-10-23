@@ -1224,6 +1224,52 @@ class GraphProjection:
             ctx: dict = {}
             return {"edges": [self._edge_view(e, principal, ctx) for e in matches[:MAX_NODE_EDGES]]}
 
+    def review_evidence(self, principal, pr_id: str, reviewer_ids, head_writers) -> dict:
+        """Raw, UNFILTERED inputs for the head-bound review quorum of one PR (T06).
+
+        The quorum decision must not depend on who asks (a private ``blocked`` edge a
+        viewer cannot see still blocks), so every candidate edge is included and carries a
+        ``visible`` flag the caller uses only to redact identities. KeyError if the PR node
+        is absent or hidden from ``principal``.
+
+        Bounded by construction: reviews are found through the by-owner index of the
+        CONFIGURED reviewer ids, never by scanning the PR's incident edges, so junk edges
+        from other principals cost nothing and cannot cause a denial of service.
+        ``head`` and ``author`` come only from the register entries of ``head_writers``
+        (the PR is a commons node: its primary value may be anyone's).
+        """
+        with self._lock:
+            node = self._nodes.get(pr_id)
+            if node is None or node.node_type != "pr" or not self._node_visible(principal, node):
+                raise KeyError(pr_id)
+
+            def trusted(name):
+                reg = node.attrs.get(name)
+                ents = [e for e in (reg.by.values() if reg else ())
+                        if e[4][1] in head_writers and isinstance(e[3], str)]
+                return max(ents, key=lambda t: t[2]) if ents else None
+            head, author = trusted("head_sha"), trusted("author")
+            reviews, authors = [], set()
+            for rid in sorted(reviewer_ids):
+                for key in list(self._edges_by_owner.get(rid, ())):
+                    e = self._edges.get(key)
+                    if (e is None or e.to_id != pr_id or e.owner() != rid or not self._live(e)
+                            or self._is_removed(e)):
+                        continue
+                    if e.edge_type == "produced":
+                        authors.add(rid)
+                    elif e.edge_type == "reviewed" and e.binding and e.binding[0] == "commit":
+                        attrs = e.attr_values()
+                        reviews.append({
+                            "reviewer": rid, "commit": e.binding[1], "from_id": e.from_id,
+                            "verdict": attrs.get("verdict"), "receipt_digest": attrs.get("receipt_digest"),
+                            "event_id": e.adds.best()[1],
+                            "visible": self._edge_visible(principal, e)})
+            return {"pr": pr_id, "head": head[3] if head else None,
+                    "head_event_id": head[1] if head else None,
+                    "author": author[3] if author else None,
+                    "reviews": reviews, "authors": sorted(authors)}
+
     def neighborhood(self, principal, root: str, *, depth: int = DEFAULT_DEPTH,
                      max_nodes: int = DEFAULT_NODES, max_edges: int = DEFAULT_EDGES,
                      direction: str = "both", edge_types: set | None = None,

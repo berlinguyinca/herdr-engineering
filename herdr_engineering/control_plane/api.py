@@ -32,6 +32,7 @@ from ..version import __version__
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .graph import DEFAULT_DEPTH, DEFAULT_EDGES, DEFAULT_NODES
+from .review_quorum import pr_review_quorum
 from .redact import redact_payload
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
@@ -133,7 +134,7 @@ class ControlPlaneServer:
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 summary_config=None, summary_client=None):
+                 summary_config=None, summary_client=None, review_quorum=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -209,6 +210,7 @@ class ControlPlaneServer:
                 f"{host!r} without collab_tls_terminated (bearer credentials "
                 "require TLS)")
         self.fleet_config = fleet_config
+        self.review_quorum = review_quorum      # QuorumConfig | None (feature off)
         self.collab = collab
         self.collab_require_https = collab_require_https
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
@@ -1394,6 +1396,13 @@ def _make_handler(server, public=False, operator=False):
                     direction=_q(self.path, "direction") or "both",
                     edge_types=set(kinds.split(",")) if kinds else None,
                     include_removed=_q(self.path, "include_removed") == "true"))
+            if len(parts) == 7 and parts[4] == "nodes" and parts[6] == "review-quorum":
+                if server.review_quorum is None:
+                    return self._json({"error": "review quorum is not configured"}, 404)
+                try:
+                    return self._json(pr_review_quorum(g, principal, parts[5], server.review_quorum))
+                except KeyError:
+                    return self._json({"error": "not found"}, 404)
             if len(parts) == 5 and parts[4] == "edge":
                 edge_type, frm, to = (_q(self.path, n) for n in ("edge_type", "from_id", "to_id"))
                 if not (edge_type and frm and to):

@@ -2446,6 +2446,7 @@ def _cmd_cp_web(args) -> int:
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              summary_config=cp.get("agent_summaries") or {},
+                             review_quorum=_review_quorum_config(cp),
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
@@ -2542,6 +2543,15 @@ def _apply_collab_config(args, cp) -> None:
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be a non-empty string")
             if getattr(args, dest) is None:
                 setattr(args, dest, value)
+
+
+def _review_quorum_config(cp):
+    """Parse control_plane.review_quorum (None = off); a bad block stops startup."""
+    from .control_plane.review_quorum import parse_config
+    try:
+        return parse_config(cp.get("review_quorum"))
+    except ValueError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
 
 
 def _load_cp_fleet_config(path_arg):

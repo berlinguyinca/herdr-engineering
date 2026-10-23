@@ -148,6 +148,49 @@ O's owner is a writer of E. Unrelated reviewers are never ranked against each ot
    should send `attrs.supersedes`.
 Stale edges are kept and flagged.
 
+### Head-bound review quorum (T06)
+Two different meanings of "stale" exist and must not be confused:
+- the graph edge flag `stale` (above) = "a later binding was admitted by a related edge". It is arrival-order based and
+  cannot know which commit is current;
+- the quorum's `stale_reviewers` = "bound to a commit other than the PR's CURRENT head". It is head-relative.
+After a force-push back to an earlier SHA the edge flag may say `stale: true` while the quorum counts that review again,
+because the SHA names the content. Gate on the quorum, show the flag only as a hint.
+
+`GET /api/v1/graph/nodes/{pr_id}/review-quorum` (viewer level; 404 when the PR is absent/hidden or the feature is off)
+DERIVES the quorum; it writes nothing and Herdr does not request reviews itself. `rereview_required` / `rereview_needed`
+are the re-review request: whoever owns review dispatch (Pi on `github.evidence_stale`, AutoSpec) polls or subscribes.
+
+Producer contract. Each independent reviewer publishes with its OWN ingest key (so reviewer identity is server-authenticated):
+`node.upsert review:<id>` then `edge.add reviewed review:<id> -> pr:<id>` with `attrs.commit` = the full 40/64-hex head it
+reviewed (the binding), `attrs.verdict` = `lgtm` | `blocked`, `attrs.receipt_digest` = the review receipt's verdict digest
+(autospec `verdict_digest`). A shared emitter key cannot create a quorum: all its reviews are one identity.
+
+Configuration (fleet config, `control_plane.review_quorum`, never from events):
+```yaml
+review_quorum:
+  required: 2                      # approvals needed at the current head, 1..16
+  trusted_head_writers: [key:<pi>] # principal ids whose head_sha / author writes define the PR's head
+  reviewers:                       # principal ids that may vote; login optional (recognises the PR author)
+    key:<reviewer-a>: {}
+    key:<author-human>: {login: some-login}
+```
+Rules (mirrors `autospec review-quorum`):
+1. The head is the newest `attrs.head_sha` written by a trusted writer and must be a full SHA, else status `unknown_head`
+   (never satisfied). `pr` is a commons node, so untrusted writers' values are ignored.
+2. Only configured reviewers are read; anyone else's edges (approvals or blocks) are ignored, so junk cannot satisfy or block.
+3. A reviewer is the edge OWNER (server-authenticated), never a payload name; many review nodes of one identity count once.
+4. An approval is excluded if the reviewer owns a `produced` edge into the PR, or their `login` equals the `author` attr
+   written by a trusted writer.
+5. An approval needs `receipt_digest`; one digest backing two identities voids both (replay).
+6. A current-head `blocked` verdict from a configured reviewer blocks, even from the author; only a new head clears it.
+7. Verdicts for other heads are listed under `stale_reviewers`, never counted. A verdict that lands after the head moved is
+   stale; one issued for a head not yet observed waits until a trusted writer reports that head.
+8. The decision is computed over ALL matching edges; identities of edges the caller cannot see are replaced by
+   `hidden_reviewers`, but a hidden `blocked` still yields `status: blocked` (fail closed, existence disclosed).
+Statuses: `satisfied`, `insufficient` (re-review needed), `blocked`, `unknown_head`. Only `satisfied` passes.
+Known limits: reviewer independence is per configured principal id (one human with two keys is two reviewers); no
+reviewed-edge producer exists in Pi/AutoSpec yet; private/mission-scoped edges still count.
+
 ### Session rollover
 No containment edge type exists, so `attempt`/`session` nodes carry `attrs.agent_id` / `attrs.attempt_id`. A rollover is a new
 `session:` node (and the old one's `node.state`); the `agent:` id and state are untouched. Closing a pane/tab emits nothing and

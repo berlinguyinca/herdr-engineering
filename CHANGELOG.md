@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Head-bound review quorum (T06)
+- `GET /api/v1/graph/nodes/{pr_id}/review-quorum`: derived, head-bound quorum over `reviewed` edges (stale verdicts never
+  counted, distinct configured reviewers, author/replay/forged-head defences, `rereview_required`). Config:
+  `control_plane.review_quorum` in the fleet config. Contract: `docs/contracts/lineage-events.md`. Rollback: remove the
+  block (endpoint answers 404); no schema or event change.
+
 ### Lineage graph projection (T02, Herdr side)
 - Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
 - Migration `0005_event_id_per_actor.sql`: `event_id` is unique per principal (global primary key dropped).
