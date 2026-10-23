@@ -15,6 +15,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 export const ACTION_LABEL = {
   pause: 'Pause', resume: 'Resume', stop_after_step: 'Stop after the current step', redirect: 'Redirect with an instruction',
   approve: 'Approve this gate', reject: 'Reject this gate',
+  fork: 'Fork an alternative implementation', promote: 'Promote this fork',
 };
 export const ACTION_HELP = {
   pause: 'Ask the agent to pause at its next safe boundary.',
@@ -23,6 +24,8 @@ export const ACTION_HELP = {
   redirect: 'Give the agent a short instruction. It is delivered as untrusted text from you, never as a system message.',
   approve: 'Approve the gate at exactly the digest or commit shown.',
   reject: 'Reject the gate at exactly the digest or commit shown.',
+  fork: 'Start a separate branch and worktree from a commit this item shows. The original and its evidence are never touched.',
+  promote: 'Push exactly the head shown and open a draft pull request for this fork. Nothing is merged or deleted; siblings are only marked superseded.',
 };
 export const STATUS_LOOK = {
   pending: ['◐', 'Waiting for a room owner to confirm'],
@@ -97,6 +100,8 @@ function summary(s) {
     + `<dt>Target</dt><dd><code>${esc(text(t.node_id))}</code> (${esc(text(t.node_type))})</dd>`
     + `<dt>Delivered only to</dt><dd><code>${esc(text(t.pinned_source, 'unknown'))}</code></dd>`
     + `${t.expected_digest ? `<dt>Digest</dt><dd><code>${esc(t.expected_digest)}</code></dd>` : ''}`
+    + `${s.params && s.params.base_sha ? `<dt>Fork from commit</dt><dd><code>${esc(s.params.base_sha)}</code>${s.params.label ? ` as “${esc(s.params.label)}”` : ''}</dd>` : ''}`
+    + `${s.params && s.params.expected_head ? `<dt>Promote exactly this head</dt><dd><code>${esc(s.params.expected_head)}</code>${s.params.origin ? ` (fork of <code>${esc(s.params.origin)}</code>)` : ''}</dd>` : ''}`
     + `<dt>Proposed by</dt><dd>${esc(text(s.proposed_by && s.proposed_by.id, 'unknown'))} ${when(s.proposed_at)}</dd>`
     + `${s.confirmed_by ? `<dt>Confirmed by</dt><dd>${esc(s.confirmed_by.id)}</dd>` : ''}`
     + `${s.reason ? `<dt>Reason</dt><dd>${esc(s.reason)}</dd>` : ''}</dl>`
@@ -130,9 +135,17 @@ export function renderProposeForm(w) {
   const radios = actions.map((a) => `<label class="wb-radio"><input type="radio" name="action" value="${esc(a)}" data-wb-field="action"${a === chosen ? ' checked' : ''}> ${esc(ACTION_LABEL[a] || a)}<span class="cx-msg"> ${esc(ACTION_HELP[a] || '')}</span></label>`).join('');
   const redirect = chosen === 'redirect'
     ? `<label class="cx-field">Instruction (untrusted text, up to ${MAX_INSTRUCTION} characters)<textarea class="cx-input" name="instruction" data-wb-field="instruction" maxlength="${MAX_INSTRUCTION}" rows="3" required>${esc(d.instruction)}</textarea></label>` : '';
+  const fcard = ((w.forks && w.forks.forks) || []).find((c) => c.approach_id === w.nodeId);
+  const bases = Object.entries((t.fork && t.fork.base_candidates) || {});
+  const fork = chosen === 'fork'
+    ? `<label class="cx-field">Start from commit<select class="cx-input" name="base_sha" data-wb-field="base_sha" required>${bases.map(([sha, where]) => `<option value="${esc(sha)}"${sha === d.base_sha ? ' selected' : ''}>${esc(short(sha, 12))} (${esc(where)})</option>`).join('')}</select></label>`
+      + `<label class="cx-field">Short label (optional)<input class="cx-input" name="label" data-wb-field="label" maxlength="80" value="${esc(d.label)}"></label>`
+      + `<p class="cx-msg">${t.fork ? `${esc(String(t.fork.existing_forks))} of ${esc(String(t.fork.max_forks_per_origin))} forks exist for this origin. ` : ''}The branch and worktree names are chosen by the agent's host, never by this form.</p>` : '';
+  const promote = chosen === 'promote'
+    ? `<p class="cx-msg">Promotes exactly <code>${esc(text(fcard ? fcard.head_sha : d.expected_head, 'unknown'))}</code>${fcard && fcard.readiness && !fcard.readiness.ready ? ' <strong>(not ready: see the comparison above)</strong>' : ''}. If the fork moves, the request is cancelled.</p>` : '';
   const gate = (chosen === 'approve' || chosen === 'reject')
     ? `<label class="cx-field">Digest or commit shown on the gate<input class="cx-input" name="digest" data-wb-field="digest" maxlength="128" required value="${esc(d.digest)}"></label>` : '';
-  return `<form data-wb-form="propose" class="cx-stack"><fieldset class="wb-fieldset"><legend>Propose a change to this run</legend>${radios}</fieldset>${redirect}${gate}`
+  return `<form data-wb-form="propose" class="cx-stack"><fieldset class="wb-fieldset"><legend>Propose a change to this run</legend>${radios}</fieldset>${redirect}${gate}${fork}${promote}`
     + `<label class="cx-field">Why (optional)<input class="cx-input" name="reason" data-wb-field="reason" maxlength="300" value="${esc(d.reason)}"></label>`
     + `<p class="cx-msg">${t.self_confirm ? 'A room owner confirms this next.' : 'A different room owner must confirm this before anything is sent.'} The target is fenced at <code>${esc(short(t.fence, 10))}</code>: if it changes first, the request is cancelled.</p>`
     + `<button type="submit" class="hd-btn hd-btn--sm"${w.busy ? ' disabled' : ''}>Propose</button></form>`;
@@ -157,10 +170,44 @@ export function renderSteering(w) {
 
 export function renderWorkbench(w) {
   if (!w || !w.nodeId) return '';
-  return `<div class="wb" aria-label="Comments and steering">${renderDiscussion(w)}${renderSteering(w)}</div>`;
+  return `<div class="wb" aria-label="Comments and steering">${renderDiscussion(w)}${renderForks(w)}${renderSteering(w)}</div>`;
 }
 
-export function freshDraft() { return { comment: '', action: 'pause', instruction: '', digest: '', reason: '' }; }
+export function freshDraft() { return { comment: '', action: 'pause', instruction: '', digest: '', reason: '', base_sha: '', label: '', expected_head: '' }; }
+
+// ---- forks (T13) --------------------------------------------------------------------------------------------------
+// Alternative implementations of one origin, side by side. Numbers the fork's own emitter reported (diff, paths, cost)
+// are always labelled as such and never decide anything; only trusted, head-bound evidence counts toward readiness.
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? String(v) : 'not reported');
+function forkRow(c, w) {
+  const ev = c.evidence || {};
+  const rd = c.readiness || { ready: false, blockers: [] };
+  const state = `${c.selected ? '✓ selected' : c.superseded ? '■ superseded' : `◇ ${text(c.state, 'unknown')}`}`;
+  const blockers = (rd.blockers || []).map((b) => `<li>${esc(text(b.message, b.code))}</li>`).join('');
+  const d = c.diff || {};
+  const can = w.writable && w.forks.can_propose && rd.ready && !c.superseded && !c.selected;
+  return `<tr data-wb-fork="${esc(c.approach_id)}"><th scope="row"><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-wb-act="pick-fork" data-wb-id="${esc(c.approach_id)}">${esc(text(c.label, c.approach_id))}</button><br><code>${esc(c.approach_id)}</code></th>`
+    + `<td>${esc(state)}</td><td><code>${esc(short(c.base_sha, 10) || '?')}</code> → <code>${esc(short(c.head_sha, 10) || '?')}</code><br><code>${esc(text(c.branch, 'no branch'))}</code></td>`
+    + `<td>${esc(num(d.files_changed))} files, +${esc(num(d.insertions))} −${esc(num(d.deletions))}<br><span class="cx-msg">reported by ${esc(text(c.provenance && c.provenance.writer, 'the fork'))}, not verified</span></td>`
+    + `<td>${esc(((c.impact && c.impact.modules) || []).join(', ') || 'not reported')}</td>`
+    + `<td>${esc(String(ev.counted_validations || 0))} trusted validation(s), ${esc(String(ev.counted_reviews || 0))} approval(s)${ev.blocking_reviews ? `, <strong>${esc(String(ev.blocking_reviews))} blocking</strong>` : ''}</td>`
+    + `<td>${rd.ready ? '<strong>✓ ready to promote</strong>' : `<strong>■ not ready</strong><ul class="cx-list">${blockers}</ul>`}`
+    + `${can ? `<br><button type="button" class="hd-btn hd-btn--sm" data-wb-act="promote-start" data-wb-id="${esc(c.approach_id)}">Propose promotion</button>` : ''}</td></tr>`;
+}
+export function renderForks(w) {
+  const f = w.forks;
+  if (!f || !Array.isArray(f.forks)) return w.forksError ? `<section class="wb-section" aria-label="Forks"><h4>Forks</h4><p class="cx-msg" role="alert">${esc(w.forksError)}</p></section>` : '';
+  const n = esc(text(f.origin && f.origin.id, w.nodeId));
+  const rows = f.forks.map((c) => forkRow(c, w)).join('');
+  const overlap = (f.overlap || []).map((o) => `<li><code>${esc(o.a)}</code> and <code>${esc(o.b)}</code> both touch ${esc((o.paths || []).slice(0, 8).join(', '))}${(o.paths || []).length > 8 ? '…' : ''}</li>`).join('');
+  const down = ((f.downstream && f.downstream.per_fork) || []).filter((x) => (x.evidence_left_on_other_head || []).length)
+    .map((x) => `<li><code>${esc(x.approach_id)}</code>: ${esc(String(x.evidence_left_on_other_head.length))} review/validation edge(s) on linked PRs are bound to another commit and would read as stale</li>`).join('');
+  return `<section class="wb-section" aria-label="Forks of ${n}"><h4>Alternative implementations of <code>${n}</code></h4>`
+    + `<p class="cx-msg">Forks keep the original branch and its evidence. Diff, paths and cost are reported by each fork's own emitter and are shown for orientation only; a promotion needs validation from a source the operator trusts, bound to the fork's exact head. ${f.quorum && f.quorum.status === 'unavailable' ? 'Review quorum is not available in this build.' : ''}</p>`
+    + `${f.truncated ? '<p class="cx-msg" role="status">More forks exist than are compared here.</p>' : ''}`
+    + `${rows ? `<div class="wb-table-wrap"><table class="lin-table"><caption class="cx-msg">One row per fork</caption><thead><tr><th scope="col">Fork</th><th scope="col">State</th><th scope="col">Base → head</th><th scope="col">Diff (self-reported)</th><th scope="col">Modules</th><th scope="col">Evidence</th><th scope="col">Promotion</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="cx-msg">No forks yet. Choose “Fork an alternative implementation” below.</p>'}`
+    + `${overlap ? `<h5>Overlapping files</h5><ul class="cx-list">${overlap}</ul>` : ''}${down ? `<h5>Downstream impact</h5><ul class="cx-list">${down}</ul>` : ''}</section>`;
+}
 
 // ---- request bodies (the only place a body is built; never from DOM text beyond these named fields) -------------------
 export function commentBody(anchor, textValue, key) {
@@ -171,6 +218,8 @@ export function proposalBody(nodeId, draft, target, key) {
   const body = { action: a, node_id: nodeId, expected_fence: target.fence, idempotency_key: key };
   if (a === 'redirect') body.instruction = String(draft.instruction);
   if (a === 'approve' || a === 'reject') body.expected_digest = String(draft.digest).trim();
+  if (a === 'fork') { body.base_sha = String(draft.base_sha || '').trim(); if (draft.label && draft.label.trim()) body.label = draft.label.trim(); }
+  if (a === 'promote') body.expected_head = String(draft.expected_head || '').trim();
   if (draft.reason && draft.reason.trim()) body.reason = String(draft.reason).trim();
   return body;
 }

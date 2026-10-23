@@ -3960,6 +3960,8 @@ class CollabService(WorkbenchMixin, ContextMixin):
                         return 200, self.comment_history(pr, rid, parts[3])
                     if parts[2:] == ["steering"]:
                         return 200, self.list_steering(pr, rid, query)
+                    if parts[2:] == ["forks"]:
+                        return 200, self.fork_comparison(pr, rid, query)
                     if parts[2:] == ["steering", "target"]:
                         return 200, self.steering_target(pr, rid, str(query.get("node_id", "")))
                     if parts[2:] == ["flow"]:
