@@ -10,6 +10,7 @@ Optional `X-API-Key` auth for multi-operator deployments (Spec §104).
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -27,6 +28,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
+from .envelope import EnvelopeConflict
 from .redact import redact_payload
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
@@ -489,6 +491,21 @@ def _make_handler(server, public=False, operator=False):
                 if secrets.compare_digest(supplied, candidate):
                     return role
             return None
+
+        def _principal(self):
+            """Who the request authenticated as (server-side actor of ingest envelopes).
+
+            The API key itself is never recorded, only a short digest so
+            events from one credential can be grouped.
+            """
+            if not server._keys:
+                return {"kind": "operator", "id": "open-listener", "authenticated_by": "open_listener"}
+            supplied = self.headers.get("X-API-Key", "")
+            for candidate, role in server._keys.items():
+                if secrets.compare_digest(supplied, candidate):
+                    digest = hashlib.sha256(candidate.encode()).hexdigest()[:12]
+                    return {"kind": role, "id": f"key:{digest}", "authenticated_by": "api_key"}
+            return {"kind": "unknown", "id": None, "authenticated_by": "none"}
 
         def _deny(self, status, message):
             """Send the error response, close the connection, and report the refusal.
@@ -956,6 +973,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._api_post(parts, resource)
             except KeyError:
                 return self._send_json(404, {"error": "not found"})
+            except EnvelopeConflict as exc:
+                return self._send_json(409, {"error": str(exc), "reason": "conflict"})
             except ValueError as exc:
                 message = "Invalid GitHub query." if resource == "github" else str(exc)
                 return self._send_json(400, {"error": message})
@@ -1094,6 +1113,8 @@ def _make_handler(server, public=False, operator=False):
                 if what == "models":
                     return self._json({"models": list(r.list_custom_models().values())})
                 return self._json({"error": "not found"}, 404)
+            if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
+                return self._json({"sources": r.ledger.source_states(), "server_time": r._stamp()})
             if resource == "ingest":
                 return self._json({"endpoint": "POST /api/v1/ingest",
                                    "entities": ["host", "session", "mission"]})
@@ -1304,9 +1325,9 @@ def _make_handler(server, public=False, operator=False):
                 # blanket key-hint redaction would mangle ``input_tokens`` and
                 # ``passed``.
                 if isinstance(body, dict) and body.get("entity_type") in ("inspector", "mission_activity"):
-                    entity = server.ingest.ingest(body)
+                    entity = server.ingest.ingest(body, principal=self._principal())
                 else:
-                    entity = server.ingest.ingest(redact_payload(body))
+                    entity = server.ingest.ingest(redact_payload(body), principal=self._principal())
                 if (server.agent_summaries and server.agent_summaries.config.enabled
                         and body.get("entity_type") == "inspector"):
                     payload = body.get("payload") or {}

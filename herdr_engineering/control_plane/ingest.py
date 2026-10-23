@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 
+from .envelope import current_envelope, normalize_envelope
 from .project_links import canonical_repository
 
 
@@ -37,7 +38,15 @@ class IngestService:
     def __init__(self, repo):
         self.repo = repo
 
-    def ingest(self, body: dict) -> dict:
+    def ingest(self, body: dict, principal: dict | None = None) -> dict:
+        """Apply one ingest body.
+
+        ``principal`` is the authenticated caller (``{kind, id, authenticated_by}``)
+        and becomes the ``actor`` of a schema_version 2 envelope. v1 bodies
+        (no/1 ``schema_version``) take the legacy path and ignore it.
+        Raises ``EnvelopeConflict`` (HTTP 409) when a v2 envelope contradicts
+        stored state.
+        """
         if not isinstance(body, dict):
             raise ValueError("body must be a JSON object")
         entity_type = body.get("entity_type")
@@ -63,6 +72,28 @@ class IngestService:
         if entity_type in {"plannotator_review", "ci_pipeline", "agent_identity", "agent_summary",
                            "custom_model", "llm_key", "token_usage"}:
             raise ValueError("provider-owned entity type is not accepted by generic ingestion")
+        env = normalize_envelope(body, principal, self.repo._stamp())
+        if env is None:
+            return self._dispatch(entity_type, entity_id, event_type, payload, source)
+        env["entity_type"] = entity_type
+        ledger = self.repo.ledger
+        ack = {"event_id": env["event_id"], "source": env["source"],
+               "source_sequence": env["source_sequence"]}
+        with ledger.lock:
+            if ledger.check(env) == "duplicate":
+                return {"entity_type": entity_type, "entity_id": entity_id,
+                        "event_type": event_type, "envelope": {**ack, "duplicate": True}}
+            token = current_envelope.set(env)
+            try:
+                result = self._dispatch(entity_type, entity_id, event_type, payload, source)
+            finally:
+                current_envelope.reset(token)
+            # Commit only after the event was applied (and, with a durable
+            # sink, acknowledged): a failed ingest leaves no ledger trace.
+            ledger.commit(env)
+        return {**result, "envelope": {**ack, "duplicate": False}}
+
+    def _dispatch(self, entity_type, entity_id, event_type, payload, source) -> dict:
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":
                 raise ValueError("invalid mission activity event_type")

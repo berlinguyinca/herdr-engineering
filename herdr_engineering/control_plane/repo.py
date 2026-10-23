@@ -20,6 +20,7 @@ import time
 from uuid import uuid4
 
 from .agent_identity import AgentIdentityRegistry
+from .envelope import SourceLedger, current_envelope, envelope_event_fields
 from .ids import new_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
@@ -148,12 +149,20 @@ class ControlPlaneRepo:
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
         self._ci_sequence = 0  # one bounded counter survives stream eviction
+        # Envelope v2 idempotency / sequence / freshness state (envelope.py).
+        self.ledger = SourceLedger(now=self._now, persist=self._persist_source_state)
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
         self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+
+    def _persist_source_state(self, state):
+        """Mirror per-source state to the durable sink when it supports it."""
+        mirror = getattr(self._sink, "record_source_state", None)
+        if callable(mirror):
+            mirror(state)
 
     def _persist_inspector(self, ev):
         """Persist inspector detail outside global streams; require capture ACKs."""
@@ -1582,6 +1591,22 @@ class ControlPlaneRepo:
                 "sequence": seq, "event_type": event_type,
                 "payload": payload or {},
             }
+            env = current_envelope.get()
+            if env is not None and not env.get("consumed") and env.get("entity_type") == entity_type:
+                # An envelope v2 ingest is in progress: this event carries it
+                # (emitter event_id, server-set actor/received_at) and must be
+                # durable before the ingest is acknowledged.
+                env["consumed"] = True
+                ev.update(envelope_event_fields(env))
+                ev["event_id"] = env["event_id"]
+                ev["schema_version"] = env["schema_version"]
+                ev["source_timestamp"] = env["occurred_at"] or env["received_at"]
+                ev["ingest_timestamp"] = env["received_at"]
+                ev["mission_id"] = mission_id or env.get("mission_id")
+                if env.get("claimed_actor") is not None:
+                    ev["payload"] = {**ev["payload"], "_envelope": {
+                        "claimed_actor": _bounded_claim(env["claimed_actor"])}}
+                require_durable = callable(getattr(self._sink, "record_required", None))
             if require_durable and self._sink is not None:
                 # Command side effects require persistence before submission. A
                 # legacy best-effort sink cannot establish this prerequisite.
@@ -1866,6 +1891,7 @@ class ControlPlaneRepo:
             t, i = key.split("|")
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
+        self.ledger.hydrate([e for stream in self._events.values() for e in stream])
         self._ci_sequence = max(int(state.get("ci_sequence", 0)),
                                 max((event.get("sequence", -1) + 1
                                      for key, stream in self._events.items()
@@ -1955,6 +1981,12 @@ def _deep_copy(d):
     if d is None:
         return None
     return copy.deepcopy(d)
+
+
+def _bounded_claim(value):
+    """A client-claimed actor is evidence of what was claimed, never trusted."""
+    text = json.dumps(value, default=str)
+    return value if len(text) <= 1024 else text[:1024]
 
 
 def _iso(ts):

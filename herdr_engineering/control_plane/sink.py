@@ -99,3 +99,21 @@ class DurableEventSink:
                 raise RuntimeError(
                     "durable event insert was not acknowledged "
                     "(event_id already stored)")
+
+    def record_source_state(self, state: dict) -> None:
+        """Best-effort upsert of per-source ingest state (fabric_event_sources)."""
+        import json
+        try:
+            with self._write_lock:
+                self._ensure_store()
+                self._run(self._store._conn.execute(
+                    "INSERT INTO fabric_event_sources "
+                    "(source, last_sequence, last_seen_at, gaps) VALUES ($1,$2,$3,$4) "
+                    "ON CONFLICT (source) DO UPDATE SET "
+                    "last_sequence=EXCLUDED.last_sequence, "
+                    "last_seen_at=EXCLUDED.last_seen_at, gaps=EXCLUDED.gaps",
+                    state["source"], state["last_sequence"],
+                    _parse_dt(state["last_seen_at"]), json.dumps(state["gaps"])))
+        except Exception:
+            log.exception("durable sink failed to persist source state %s",
+                          state.get("source"))
