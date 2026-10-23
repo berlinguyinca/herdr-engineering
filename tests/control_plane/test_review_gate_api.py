@@ -343,3 +343,38 @@ def test_ordinary_collab_post_still_works(collab_server):
     body = b'{"name": "proj"}'
     data = raw_exchange(collab_server, _collab_head(f"Content-Length: {len(body)}\r\n") + body)
     assert _responses(data) == 1 and b" 201 " in data.split(b"\r\n")[0]
+
+
+@pytest.fixture
+def ingest_gate_server(tmp_path, monkeypatch, monitor_starts):
+    monkeypatch.setattr(github_app, "GitHubAppClient", FakeApp)
+    keys = {"read": "viewer", "write": "operator", "agent-key": "agent", "ingest-key": "ingest"}
+    server = ControlPlaneServer(ControlPlaneRepo(), api_keys=keys,
+                                fleet_config=FakeFleet(gate_section(tmp_path)))
+    start(server)
+    yield server
+    server.shutdown()
+
+
+@pytest.mark.parametrize("key", ["agent-key", "ingest-key"])
+@pytest.mark.parametrize("entity_type,event_type,payload", [
+    ("pr_gate", "verdict", {"verdict": "PASS", "sha": "sha1"}),
+    ("pr_gate", "resume", {}),
+    ("pr_gate_author", "author_pinned", {"kind": "pi", "model": "forged"}),
+    ("review_job", "enqueued", {"job_id": "j1", "key": f"{REPO}#7", "sha": "sha1",
+                                "author_model": None, "enqueued_at": "2026-10-22T00:00:00+00:00"}),
+    ("pr_gate_x", "verdict", {"verdict": "PASS", "sha": "sha1"}),
+])
+def test_ingest_cannot_forge_gate_events(ingest_gate_server, key, entity_type, event_type, payload):
+    server = ingest_gate_server
+    pr = PrKey(REPO, 7)
+    server.gate_store.on_push(pr, "sha1")
+    server.gate_store.on_ci_green(pr, "sha1")
+    before = (request(server, "review-gate/prs"), request(server, "review-gate/queue"))
+    status, body = request(server, "ingest", {
+        "entity_type": entity_type, "entity_id": str(pr) if entity_type != "review_job" else "index",
+        "event_type": event_type, "payload": payload}, key=key, method="POST")
+    assert status == 400 and "reserved" in body["error"]
+    after = (request(server, "review-gate/prs"), request(server, "review-gate/queue"))
+    assert after == before
+    assert server.repo.stream("pr_gate_author", str(pr)) == []
