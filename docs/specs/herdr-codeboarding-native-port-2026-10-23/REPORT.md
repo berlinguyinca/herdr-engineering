@@ -1,55 +1,61 @@
-# Implementation report — Architecture Explorer, slice A + B + C (+ partial D01)
+# Implementation report — Architecture Explorer (phases A–F)
 
-Branch `feat/architecture-explorer` off `origin/main` 8c29a13e. Not complete: phases D02–D03 and E are NOT done.
-Nothing was deployed; the feature flag is off by default.
+Branch `feat/architecture-explorer` off `origin/main` 8c29a13e; draft PR #194. Nothing was deployed or merged; the feature flag is off by default.
+Every phase has working, tested code, but **the feature is not "complete"**: the gaps listed under *Known gaps* are real and some acceptance gates are only partly met (see the gate table).
 
 ## What was built
 | Task | Status | Where |
 |---|---|---|
 | A01–A04 audit | done | `audit.md` |
-| B01 vendor upstream | partial, deliberate | `herdr_engineering/architecture/_vendor/codeboarding_content_hash.py` (MIT, pinned 647fe6a7, notices in `THIRD_PARTY_NOTICES.md`). Only pure hashing is vendored. The `ast` import/symbol extractor is **new code**: upstream's engine needs a language server and emits no import edges. |
-| B02 isolated analyzer | done (one gap) | `runner.py`, `worker.py`, `gitsource.py`: `python3 -I` child, scrubbed env, rlimits (CPU/AS/FSIZE/NOFILE), wall timeout + process-group kill, cancellation, output cap, reads git blobs of a fixed commit with hooks/fsmonitor disabled, never executes analysed code. **Gap:** network namespace isolation (`unshare -rn`) is used only where permitted; on bender it is not, and the snapshot reports `network_isolated: false`. The worker performs no network I/O. |
-| B03 normalize | done | `extract.py`, `identity.py`: nodes (repo/package/module/class/function), edges (`contains`, `imports`) with source span, extractor, confidence, `inferred:false`, diagnostics. External imports produce no edge. No `calls` edges. |
-| B04 identity/dedupe | partial | Snapshot key = host, repo, commit, worktree, analyzer, config hash, toolchain hash; immutable (409 on conflict, idempotent on same graph). **No lease queue / job dedupe / debounce** yet. |
-| C01–C03 UI | done for Python | `packages/architecture-view.js`, `architecture-layout.js`, `architecture.css`, `app.js` nav, client methods. Graph + accessible table, drilldown to symbol and file:line (GitHub blob link when repo is github.com), edge evidence, search, bounded cursor pagination, partial/stale/failed/running notices, snapshot diff panel, light/dark/mobile/4K. |
-| D01 | partial | Snapshot-to-snapshot diff (API + UI). **No** GitHub PR/issue/CI overlay or PR link. |
-| D02, D03, E01, E02, E03 | **not started** | |
-| F01 | partial | tests, benchmarks, screenshots, notices, flag, rollback below. |
+| B01 vendor upstream | partial, deliberate | `_vendor/codeboarding_content_hash.py` (MIT, pinned 647fe6a7, `THIRD_PARTY_NOTICES.md`). Only pure hashing is vendored; the `ast` extractor is **new code** because upstream's engine needs a language server and emits no import edges. |
+| B02 isolated analyzer | done (one gap) | `runner.py`, `worker.py`, `gitsource.py`: `python3 -I` child, scrubbed env, rlimits, monotonic wall deadline + process-group kill, cancellation, output cap, reads git blobs of a fixed commit with hooks/fsmonitor off, never executes analysed code. **Gap:** `unshare -rn` network isolation is unavailable on bender, so snapshots report `network_isolated: false` (the worker performs no network I/O). |
+| B03 normalize | done | `extract.py`, `identity.py`: repo/package/module/class/function nodes; `contains` and `imports` edges with source span, extractor, confidence, `inferred`, diagnostics. JS/TS: module-level relative imports only (regex, confidence 0.9, snapshot stays `partial`). **No `calls` edges** and no JS/TS symbols. |
+| B04 identity, dedupe, queue | done | 7-field snapshot key, immutable publish (409 on conflict). Event-sourced job queue (`request_analysis` dedupes identical open requests and known full-SHA snapshots; `claim_analysis` leases, interactive first, expired leases reclaimable); `herdr-eng architecture serve` claim loop with `--checkout`, heartbeat and cancel. |
+| C01–C03 UI | done | `architecture-view.js`, `architecture-layout.js`, `architecture.css`, `app.js` nav, client methods. Graph + accessible table, drilldown to symbol and file:line, edge evidence, search, bounded pagination, partial/stale/failed/running notices, diff, themes/mobile/4K. |
+| D01 overlays | done (exact-commit only) | `overlays.py`: CI runs, review-gate PR head SHAs, sessions, missions, and issue mentions taken from explicit `#N` text (marked inferred). Link rule is exact canonical repo + full commit SHA; branch and cwd are not evidence. PRs link only if their head SHA equals the snapshot commit. |
+| D02 correlation | partial | Records with the 17 contract fields and an explicit `unknown` list; `flow` from `mission_source`. **Gaps:** sessions carry no `worktree_id`, so worktree-level correlation is absent; `autospec_ref` is always null and `issue_ref` only comes from mission text; no source exists for either (audit). |
+| D03 collaboration | done | Room annotations (`rooms/<id>/architecture-links`), guests get notes only and redacted. The explorer shows room counts; creating an annotation stays in the collab view because it needs collab auth. |
+| E01 incremental | done | Per-file facts cache outside the repo keyed by analyzer/config/toolchain/path/blob sha. Resolution is always global, so incremental output equals a full run (tested, and checked in the benchmark: identical graph hash). |
+| E02 cross-repo | done (conservative) | `crossrepo.py`: explicit mapping ⇒ verified edge; name match ⇒ inferred edge (0.6); stdlib skipped; names provided by several repos are listed as ambiguous, never linked. Limits: 8 snapshots, 5000 edges, 5 s. |
+| E03 explain | done, off by default | `explain.py`: needs `control_plane.architecture.explain` (strict YAML, http only for loopback). Sends derived facts only, never source text; redirects refused; citations to unknown edges are dropped; output is labelled inferred. The UI button appears only with the `architecture_explain_v1` capability. |
+| F01 verification | done, see Evidence | tests, benchmark, screenshots, flag, rollback. |
 
 ## Reuse
-Event envelope + `record_event(require_durable)`, artifact store, `canonical_repository`, route/auth roles + Origin/JSON guard, fleet-config flag pattern + `_health` capabilities, `app.js` NAV/ROUTES, `HerdrClient`, `herdr-empty/-error/-spinner`, design tokens, Playwright harness style. `SnapshotStore` and `collab-flow.js` were evaluated and rejected (mutable cache; people/agent layered layout). No new service, SPA, graph DB, scheduler or chat.
+Event envelope + `record_event(require_durable)`, artifact store, `canonical_repository`, `project_links` helpers, review-gate store, route/auth roles + Origin/JSON guard, fleet-config flag pattern + `_health` capabilities, `app.js` NAV/ROUTES, `HerdrClient`, `herdr-empty/-error/-spinner`, design tokens, Playwright harness style. No new service, SPA, graph DB, scheduler or chat. `SnapshotStore` and `collab-flow.js` were evaluated and rejected.
 
 ## Interfaces
-`GET /api/v1/architecture/{snapshots,analyses,diff}`, `.../snapshots/<id>/{children,nodes,nodes/<node>,nodes/<node>/edges}`; `POST .../snapshots` (operator or agent role, validated, ≤64 MiB), `POST .../analyses` (lifecycle events). CLI: `herdr-eng architecture analyze --repo . --url <cp> --api-key-file <f>`. Events: `architecture.snapshot.published`, `architecture.analysis.{requested,started,progress,completed,failed,cancelled}` on reserved streams `architecture_snapshot`/`architecture_job` (generic `/api/v1/ingest` refuses `architecture*`). `architecture.diff.completed` is not emitted (diffs are computed on read).
+GET `/api/v1/architecture/`: `snapshots`, `analyses[/<id>]`, `timeline`, `cross-repo`, `diff`, `snapshots/<id>/{children,nodes,nodes/<n>,nodes/<n>/edges,nodes/<n>/rooms,overlays,correlations}`, `sessions/<id>/changes`.
+POST: `snapshots`, `analyses`, `analyses/claim` (agent role), `analyses/request` (operator), `snapshots/<id>/nodes/<n>/explain` (operator, capability-gated). Collab: `rooms/<rid>/architecture-links` GET/POST.
+CLI: `herdr-eng architecture analyze` and `architecture serve`. Reserved event streams `architecture_snapshot`/`architecture_job`/`architecture_link`; generic `/api/v1/ingest` refuses `architecture*`.
 
 ## Flag and rollback
-Fleet config `control_plane.architecture.enabled: true` (strict keys; default off ⇒ routes 404, no capability, UI shows an explanatory empty state). No migration: snapshots live in the artifact store + event log, so rollback = set the flag false or revert the branch. Snapshots are held in memory and rebuilt from events at boot; graph bytes need the artifact blob (RustFS in production, in-process otherwise), so an in-memory-only control plane loses graph bytes on restart.
+Fleet config `control_plane.architecture.enabled: true` (strict keys; default off ⇒ routes 404, no capability, UI shows an explanatory empty state). Explain is a separate opt-in. No migration: rollback = set the flag false or revert the branch. Snapshots are rebuilt from events at boot; graph bytes need the artifact blob, so an in-memory-only control plane loses graph bytes on restart.
 
 ## Evidence
-- Python: `pytest tests/architecture` 38 passed; full `pytest` exit 0.
-- Node: `npm run test:client` + Playwright: `npm test` 401/402; the 1 failure is `tests/playwright/ui.test.mjs` "overview attention and saved layout…" — the file has the same 2 failures on a clean `origin/main` (reproduced), so they pre-date this work.
-- Playwright `tests/playwright/architecture.test.mjs` 12/12 against snapshots produced by the real analyzer (disabled, empty, failed/running, partial, stale, drilldown with exact source line, search, diff, keyboard, dark/light × wide/mobile/4K without horizontal overflow, WCAG AA contrast on headings/body/node labels, and Herdr's own graph).
-- Screenshots: `evidence/architecture-*.png`. Two defects (dark-mode headings, `app:null` source link) were found by looking at screenshots, not by the first test version, and fixed.
-- Benchmark `evidence/benchmark-herdr-self.json`, Herdr @ this branch, 258 Python files, 4,932 nodes, 5,824 edges, 5.0 MB canonical JSON, largest child peak RSS ≈ 55 MiB. Analysis wall time is **not reliable**: bender's load average was ~100 on 24 cores during the final run (cold isolated median 6.2 s; an earlier, less loaded run measured 2.7 s median, 4.1 s max; warm in-process was not faster than cold in either run, so the cold/warm split is within noise). Publish+validate+store ≈ 0.2–0.3 s; query p95 < 10 ms. Incremental timing: not implemented.
+- Python (final, host load average ~125 so some timing tests are flaky): `tests/architecture` 88 passed. Full `pytest` in two parts: 2160 passed before stopping at `tests/test_fabric.py::test_healthy_target_stays_active_past_ttl`, which fails identically on a clean `origin/main` (load-dependent, pre-existing); remaining files 723 passed + 1 failure (`test_fabric_agent.py::test_forwarder_restored_across_restart_stays_live`) that passes alone on this branch and on main; `tests/control_plane` + `tests/review_gate` 1715 passed.
+- Node: `npm test` 342 ok, 1 failed (`ci-health.test.mjs` colour assertion), which passes when rerun alone together with `ui.test.mjs`. The failing set differs from run to run under load; none touches the architecture code. Client unit tests pass.
+- Playwright `tests/playwright/architecture.test.mjs` 19/19 against snapshots from the real analyzer: disabled, empty, failed/running, partial, stale, drilldown with exact source line, search, diff, keyboard, themes × layouts with contrast checks, own-repo graph, request analysis, activity + timeline (the branch-only session is not linked), cross-repo (inferred only), explain (invented citation removed), explain absent without the capability, API-error state, loading state.
+- Screenshots: `evidence/architecture-*.png`. Defects found by looking at screenshots: dark-mode headings, an `app:null` source link, wrapping table columns.
+- Benchmark `evidence/benchmark-herdr-self.json` (Herdr, ~380 source files, 4,932 nodes, 5,824 edges, 5.0 MB canonical JSON, largest child peak RSS ≈ 49 MiB). The host was heavily loaded (load average ~100 on 24 cores), so absolute times are unreliable: cold isolated median ≈ 4 s. **Incremental:** with the parent commit cached, the next commit (14 changed files, 4 Python files re-parsed, 375 reused) took 0.65 s against 5.5 s for a full in-process run (≈ 8×), and the graph hash was identical to the full run. Query p95 under 3.5 ms on 5k nodes.
+- Earlier `ui.test.mjs` "overview attention and saved layout…" failures were reproduced on a clean `origin/main`; they pre-date this work.
 
 ## Acceptance gates (TESTS.md)
 | Gate | Result |
 |---|---|
-| Full baseline graph of a representative repo, visible in Workbench, verified symbol→source links | **Pass for Python** (Herdr). JavaScript (92 files) and TypeScript are reported as unsupported ⇒ snapshot is `partial`. Pi is TypeScript: unsupported. |
+| Full baseline graph of a representative repo, visible in the Workbench, verified symbol→source links | **Pass for Python** (Herdr). JS/TS gives imports only; Pi (TypeScript) therefore has module/import edges but no symbols. |
 | Same SHA/config ⇒ identical graph hash; parallel worktrees isolated | **Pass** (tests) |
-| Full vs incremental parity | **Not done** (E01) |
-| PR diff with provenance and uncertainty | **Partial**: snapshot diff + warnings; no GitHub PR linkage |
-| Mission/worker/worktree/parent-worker/issue links; autospec and non-autospec | **Not done** (D02). Audit found no source for `issue_ref`, `room_ref`, `autospec_ref`, `commit_sha` on Pi events. |
-| Unauthorized guests cannot view/analyse/comment | **Partial**: viewer/ingest roles cannot publish, anonymous refused, cross-origin refused (tested). Guest-room scoping and collaboration annotations are D03 and **untested**; the legacy `/api/v1` surface has no repo/host ACL (audit). |
-| Malicious fixture | **Pass** for symlinks (file and dir), config-hook/fsmonitor execution, path escapes, argument injection, oversize files, timeout + grandchild kill, cancellation, memory limit, env scrubbing, output cap. Prompt injection and secret redaction: not applicable to a no-LLM static extractor / not tested. |
-| UI states and a11y | **Mostly pass**: empty, disabled, partial, stale, failed, running, keyboard, table semantics, themes, layouts. Loading and API-error states are not covered by a test. |
-| Benchmarks | **Partial**: measured and reported; noisy host; no incremental |
-| CI green, reversible migrations, flag off, pinned upstream/notices | Flag off + pinned/notices **done**; no migration to reverse; **CI (Woodpecker) not yet run**. |
+| Full vs incremental parity | **Pass** (tests + benchmark parity check) |
+| PR diff with provenance and uncertainty | **Partial**: snapshot diff with warnings, and PRs link by head SHA. A PR's *base* SHA is not resolved automatically; the user picks the base snapshot. |
+| Mission/worker/worktree/parent-worker/issue links; autospec and non-autospec | **Partial**: mission, session, parent worker, flow (pi/autospec/herdr/unknown) and issue mentions work; worktree, `autospec_ref` and authoritative `issue_ref` have no record source and are reported as `unknown`. |
+| Unauthorized guests cannot view/analyse/comment | **Pass for the new surface** (tested: anonymous, cross-origin, viewer and ingest roles, guest redaction of room notes). The legacy `/api/v1` surface has no repo/host ACL (audit); the architecture routes follow the same role model. |
+| Malicious fixture | **Pass** for symlinks, config-hook/fsmonitor execution, path escapes, argument injection, oversize files, timeout + grandchild kill, cancellation, memory limit, env scrubbing, output cap. Explain: source text never sent, redirects refused, forged citations dropped. |
+| UI states and a11y | **Pass**: empty, disabled, loading, API error, partial, stale, failed, running, keyboard, table semantics, themes, layouts. |
+| Benchmarks | **Pass, noisy host**: measured and reported incl. incremental. |
+| CI green, reversible migrations, flag off, pinned upstream/notices | Flag off + pinned/notices **done**; no migration to reverse; **Woodpecker CI has not been run on the branch yet**, so "CI green" is **not** established. |
 
-**Do not read this as "feature complete".** It is a working, tested vertical slice for Python repositories.
-
-## Known risks / next work
-1. E01 incremental (vendor `fingerprint_diff.py`, parity fixtures); D02/D03 correlation and collaboration; lease queue + UI "request analysis".
-2. Optional LSP `calls` edges (pyright in the worker image; replace upstream pickle cache).
-3. Language coverage beyond Python (tree-sitter JS/TS) — herdr's own UI code is invisible today.
-4. Shared choke points `api.py`, `app.js`, `ingest.py` may conflict with sibling worktrees; edits there are minimal.
+## Known gaps
+1. No `calls` edges, no JS/TS/other-language symbols (a language-server or tree-sitter pass would be next).
+2. No worktree-level correlation, `autospec_ref` or authoritative `issue_ref`: no source data exists.
+3. PR base-SHA resolution needs a user-chosen base.
+4. Network namespace isolation is unavailable on bender.
+5. Woodpecker CI not run; shared choke points `api.py`, `app.js`, `ingest.py` may conflict with sibling worktrees.

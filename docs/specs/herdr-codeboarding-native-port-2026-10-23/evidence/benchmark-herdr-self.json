@@ -1,44 +1,59 @@
 {
   "repo": "/home/wohlgemuth/IdeaProjects/herdr-engineering-arch",
-  "rev": "c786dd99ff969a4e7c6c2f8aa87b63cb077bde68",
-  "runs": 7,
+  "rev": "c4cdb3b0aa8d925dbba04d969a90a1684b23c63f",
+  "runs": 3,
   "errors": 0,
   "graph": {
-    "nodes": 4932,
-    "edges": 5824,
-    "python_files": 258,
-    "canonical_json_bytes": 5020791,
+    "nodes": 5181,
+    "edges": 6304,
+    "python_files": 268,
+    "canonical_json_bytes": 5390742,
     "completeness": "partial"
   },
   "analysis_seconds": {
-    "cold_isolated_median": 6.218301548622549,
-    "cold_isolated_max": 11.792405462823808,
-    "warm_in_process_median": 5.571545748971403
+    "cold_isolated_median": 3.981348503381014,
+    "cold_isolated_max": 6.745813850313425,
+    "warm_in_process_median": 3.6977576399222016
   },
-  "peak_memory_mib_largest_child": 55.3,
-  "publish_validate_store_seconds": 0.1920561408624053,
+  "peak_memory_mib_largest_child": 49.5,
+  "publish_validate_store_seconds": 0.2607042007148266,
   "query_latency_ms": {
     "children": {
-      "p50": 0.048,
-      "p95": 2.345,
-      "max": 5.65
+      "p50": 0.259,
+      "p95": 19.239,
+      "max": 44.266
     },
     "search": {
-      "p50": 1.822,
-      "p95": 2.414,
-      "max": 6.165
+      "p50": 2.347,
+      "p95": 25.545,
+      "max": 64.492
     },
     "expand": {
-      "p50": 0.02,
-      "p95": 0.045,
-      "max": 0.133
+      "p50": 0.027,
+      "p95": 0.064,
+      "max": 3.323
     },
     "node": {
-      "p50": 0.006,
-      "p95": 0.009,
-      "max": 0.013
+      "p50": 0.01,
+      "p95": 0.013,
+      "max": 15.785
     }
   },
-  "incremental": "not implemented: every analysis is a full baseline; no parity or speedup measured",
+  "incremental": {
+    "parent": "5318922da7c44aac8d78f5bbf3651ad08b664d87",
+    "files_changed_between": 14,
+    "cache_fill_seconds": 4.269878534600139,
+    "first_incremental_seconds": 0.6499175112694502,
+    "first_incremental_reuse": {
+      "files": 379,
+      "reused": 375,
+      "parsed": 4
+    },
+    "steady_state_median_seconds": 0.707596255466342,
+    "full_median_seconds": 5.472324370406568,
+    "speedup_first_incremental": 8.42,
+    "graph_identical_to_full_run": true,
+    "note": "in-process timings (no spawn); host was under load, so only the ratio and parity are meaningful"
+  },
   "network_isolated": false
 }

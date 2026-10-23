@@ -24,6 +24,31 @@ def pct(xs, p):
     return xs[min(len(xs) - 1, int(len(xs) * p))]
 
 
+def incremental(a):
+    """Analyse REV~1 to fill the facts cache, then REV with the cache; compare to a cache-less full run of REV."""
+    import subprocess, tempfile
+    parent = subprocess.run(["git", "-C", a.repo, "rev-parse", f"{a.rev}~1"], capture_output=True, text=True).stdout.strip()
+    if not parent:
+        return {"skipped": "no parent commit"}
+    changed = subprocess.run(["git", "-C", a.repo, "diff", "--name-only", parent, a.rev], capture_output=True, text=True).stdout.split()
+    with tempfile.TemporaryDirectory() as cache:
+        t = time.perf_counter(); analyze.analyze_commit(a.repo, parent, "bench", a.repository_id, cache_dir=cache); seed = time.perf_counter() - t
+        runs, first = [], None
+        for _ in range(a.runs):
+            t = time.perf_counter(); inc = analyze.analyze_commit(a.repo, a.rev, "bench", a.repository_id, cache_dir=cache); runs.append(time.perf_counter() - t)
+            first = first or (runs[0], inc["snapshot"].get("reuse"))
+    full_t = []
+    for _ in range(a.runs):
+        t = time.perf_counter(); full = analyze.analyze_commit(a.repo, a.rev, "bench", a.repository_id); full_t.append(time.perf_counter() - t)
+    parity = identity.graph_hash(inc["graph"]) == identity.graph_hash(full["graph"])
+    return {"parent": parent, "files_changed_between": len(changed), "cache_fill_seconds": seed,
+            "first_incremental_seconds": first[0], "first_incremental_reuse": first[1],
+            "steady_state_median_seconds": statistics.median(runs), "full_median_seconds": statistics.median(full_t),
+            "speedup_first_incremental": round(statistics.median(full_t) / first[0], 2),
+            "graph_identical_to_full_run": parity,
+            "note": "in-process timings (no spawn); host was under load, so only the ratio and parity are meaningful"}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="."); ap.add_argument("--rev", default="HEAD")
@@ -58,6 +83,7 @@ def main():
         m = mods[i % len(mods)]
         t = time.perf_counter(); svc.expand(sid, m); lat["expand"].append(time.perf_counter() - t)
         t = time.perf_counter(); svc.node(sid, m); lat["node"].append(time.perf_counter() - t)
+    inc = incremental(a)
     report = {
         "repo": os.path.realpath(a.repo), "rev": snap["commit_sha"], "runs": a.runs, "errors": errors,
         "graph": {"nodes": snap["counts"]["nodes"], "edges": snap["counts"]["edges"], "python_files": snap["counts"]["python_files"],
@@ -68,7 +94,7 @@ def main():
         "publish_validate_store_seconds": publish_s,
         "query_latency_ms": {k: {"p50": round(statistics.median(v) * 1000, 3), "p95": round(pct(v, .95) * 1000, 3),
                                  "max": round(max(v) * 1000, 3)} for k, v in lat.items()},
-        "incremental": "not implemented: every analysis is a full baseline; no parity or speedup measured",
+        "incremental": inc,
         "network_isolated": res["sandbox"]["network_isolated"],
     }
     print(json.dumps(report, indent=2))
