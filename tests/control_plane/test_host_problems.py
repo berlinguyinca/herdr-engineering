@@ -61,8 +61,24 @@ def test_restored_latest_that_is_old_is_stale_not_fresh():
     assert "stale" in codes(host(last_seen=at, latest={"at": at, "cpu": 1}))
 
 
-def test_stale_from_last_seen_when_latest_missing():
-    assert codes({"host_id": "h", "last_seen": iso(NOW - 3600)}) == ["stale"]
+@pytest.mark.parametrize("latest", [None, "junk", []])
+def test_registered_without_telemetry_is_never_reported(latest):
+    h = {"host_id": "h", "last_seen": iso(NOW - 5)}
+    if latest is not None:
+        h["latest"] = latest
+    assert codes(h) == ["never_reported"]
+
+
+def test_latest_without_any_parseable_time_is_stale():
+    h = {"host_id": "h", "last_seen": "garbage", "latest": {"at": "nope", "cpu": 1}}
+    assert compute_problems(h, [], NOW) == [
+        {"code": "stale", "severity": "critical", "message": "No valid report time"}]
+    h["maintenance"] = True
+    assert codes(h) == []
+
+
+def test_mem_history_ignores_non_dict_entries():
+    assert codes(host(), [None, "x", 3] + mem_history(95)) == ["mem_pressure"]
 
 
 def test_maintenance_suppresses_stale_only():
@@ -238,3 +254,22 @@ def test_repo_healthy_host_empty_list():
     repo.record_host_metrics(hid, {"cpu": 5, "mem": 30, "disk": 10})
     h = repo.get_host(hid)
     assert h["problems"] == [] and h["problem_count"] == 0
+
+
+def test_repo_registered_but_silent_host_is_never_reported():
+    repo = ControlPlaneRepo(now=lambda: NOW)
+    hid = repo.register_host("beast", "100.64.0.5")
+    assert [p["code"] for p in repo.get_host(hid)["problems"]] == ["never_reported"]
+    listed = repo.list_hosts()[0]
+    assert listed["problem_count"] == 1 and listed["problems"][0]["code"] == "never_reported"
+
+
+def test_repo_mem_pressure_through_real_store_clock():
+    clock = [NOW]
+    repo = ControlPlaneRepo(now=lambda: clock[0])
+    hid = repo.register_host("bender", "100.64.0.9")
+    for _ in range(12):  # 30 s apart, 5.5 min
+        repo.record_host_metrics(hid, {"cpu": 5, "mem": 95, "disk": 10})
+        clock[0] += 30
+    clock[0] -= 30
+    assert "mem_pressure" in [p["code"] for p in repo.get_host(hid)["problems"]]

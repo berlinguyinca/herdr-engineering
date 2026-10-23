@@ -57,7 +57,7 @@ def _days(seconds):
 def _mem_sustained(history, now, t):
     cut = now - t.mem_window_s
     window = [(h.get("ts"), _num(h.get("mem"))) for h in history
-              if _num(h.get("ts")) is not None and h["ts"] >= cut]
+              if isinstance(h, dict) and _num(h.get("ts")) is not None and h["ts"] >= cut]
     if len(window) < 2 or any(m is None or m <= t.mem_pct for _, m in window):
         return False
     return min(ts for ts, _ in window) <= now - t.mem_window_s * 0.9
@@ -81,14 +81,16 @@ def compute_problems(host: dict, history: list[dict], now: float,
     latest = host.get("latest") if isinstance(host.get("latest"), dict) else None
     seen = [s for s in (_epoch(host.get("last_seen")),
                         _epoch(latest.get("at")) if latest else None) if s is not None]
-    if latest is None and not seen:
+    if latest is None:
         return [_p("never_reported", "critical", "Host has never reported")]
     problems = []
 
-    if seen and not host.get("maintenance"):
-        age = now - max(seen)
-        if age > t.stale_s:
-            problems.append(_p("stale", "critical", f"No report for {int(age // 60)} min"))
+    if not host.get("maintenance"):
+        if not seen:
+            problems.append(_p("stale", "critical", "No valid report time"))
+        elif now - max(seen) > t.stale_s:
+            problems.append(_p("stale", "critical",
+                               f"No report for {int((now - max(seen)) // 60)} min"))
 
     if latest:
         mounts = [m for m in latest.get("mounts") or []
