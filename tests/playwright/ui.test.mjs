@@ -177,6 +177,46 @@ test('analytics composes its existing views into a useful dashboard', async () =
   },{BURST:'0'});
 });
 
+test('4K operational views use the canvas while prose and catalog groups stay readable', async () => {
+  await withApp(async ({page,base}) => {
+    await page.setViewportSize({width:3840,height:2160});
+    await page.goto(`${base}/#/overview`);await page.locator('[data-overview=missions]').waitFor();
+    const overview=await page.evaluate(()=>{
+      const shell=document.querySelector('herdr-app-shell').shadowRoot;
+      const content=shell.querySelector('.hd-shell__content').getBoundingClientRect();
+      const intro=document.querySelector('.ov-intro').getBoundingClientRect();
+      const layout=getComputedStyle(document.querySelector('.ov-layout')).gridTemplateColumns.split(' ').length;
+      const missions=document.querySelector('[data-overview=missions]').getBoundingClientRect();
+      const fleet=document.querySelector('[data-overview=fleet]').getBoundingClientRect();
+      const hosts=document.querySelector('[data-overview=hosts]').getBoundingClientRect();
+      const activity=document.querySelector('[data-overview=activity]').getBoundingClientRect();
+      return {width:content.width,intro:intro.width,columns:layout,missions:missions.width,fleet:fleet.width,lastRowWidth:hosts.width+activity.width,overflow:document.documentElement.scrollWidth>innerWidth};
+    });
+    assert.ok(overview.width>=3400,`expected the 4K canvas after the sidebar, got ${overview.width}`);
+    assert.ok(overview.intro<900,`prose should retain a readable measure, got ${overview.intro}`);
+    assert.equal(overview.columns,4);
+    assert.ok(Math.abs(overview.missions-overview.fleet)<40,'the sparse mission and fleet panels should split the first row evenly');
+    assert.ok(overview.lastRowWidth>overview.width*.9,`last Overview row should use the canvas, got ${overview.lastRowWidth}`);
+    assert.equal(overview.overflow,false);
+    await page.goto(`${base}/#/herd`);await page.locator('.ss-group').first().waitFor();
+    const groupColumns=await page.locator('#ss-panel-current').evaluate(panel=>getComputedStyle(panel).gridTemplateColumns.split(' ').length);
+    assert.equal(groupColumns,2,'independent agent project groups should share a 4K row');
+    await page.goto(`${base}/#/activity`);await page.locator('.ac-row').first().waitFor();
+    assert.ok(await page.locator('.ac-list').evaluate(node=>node.getBoundingClientRect().width<1800),'chronological activity should remain a readable single flow');
+    await page.goto(`${base}/#/services`);await page.locator('.sc-group').first().waitFor();
+    assert.equal(await page.locator('#sc-results').evaluate(node=>getComputedStyle(node).gridTemplateColumns.split(' ').length),2,'service groups should share wide rows');
+    await page.goto(`${base}/#/topology`);await page.locator('.tx-group').first().waitFor();
+    assert.equal(await page.locator('#tx-results').evaluate(node=>getComputedStyle(node).gridTemplateColumns.split(' ').length),2,'topology groups should share wide rows');
+    await page.goto(`${base}/#/analytics`);await page.locator('.an-stage').waitFor();
+    assert.ok(await page.locator('.an-stage').evaluate(node=>node.getBoundingClientRect().width<1800),'linear stage bars should retain a readable width');
+    await page.setViewportSize({width:2560,height:1440});await page.goto(`${base}/#/overview`);await page.locator('[data-overview=missions]').waitFor();
+    assert.ok(await page.evaluate(()=>document.querySelector('herdr-app-shell').shadowRoot.querySelector('.hd-shell__content').getBoundingClientRect().width>2200),'2560px displays should also use the available canvas');
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+    await page.setViewportSize({width:390,height:844});await page.goto(`${base}/#/herd`);await page.locator('.ss-group').first().waitFor();
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  },{BURST:'0'});
+});
+
 test('pi-sourced mission detail renders by mission_key', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/missions`);

@@ -28,7 +28,7 @@ Reuse shell, existing tabs, trees, inspector and table semantics. Proposed share
 Target WCAG2.2AA as proposed acceptance standard. Preserve visible keyboard focus, semantic tables/disclosures and status text. Ensure drawer/split controls have accessible names and focus handling. Touch targets remain adequate even when desktop rows become compact. Honor existing reduced-motion tokens.
 
 ## Responsive behavior
-Operational views use available width; prose remains constrained inside them. Split panes depend on usable container width, with full-width selected detail on small screens. Proposed validation widths1920/1440/1280/768/390. Mobile is single-column with accessible navigation and expandable filters. Tables/heatmaps may scroll internally; document must not overflow horizontally.
+Operational views use all available width, including 2560px and 3840px displays; prose remains constrained inside them. Above2200px, independent operational groups may form additional columns while ordered timelines remain single-flow. Split panes depend on usable container width, with full-width selected detail on small screens. Validation widths3840/2560/1920/1440/1280/768/390. Mobile is single-column with accessible navigation and expandable filters. Tables/heatmaps may scroll internally; document must not overflow horizontally.
 
 ## Interaction states
 Keep loading distinct from empty/unavailable/stale/partial. Preserve provider coverage, history limitations and freshness. Refresh must preserve focus/selection/expansion and input state. Empty screens should omit inapplicable group actions while keeping meaningful filters discoverable.

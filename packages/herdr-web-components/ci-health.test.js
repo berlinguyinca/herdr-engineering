@@ -22,6 +22,11 @@ test('deduplicates provider identities without conflating providers or repositor
  const m=ciHealthModel(history([run(1,'running'),run(1,'success'),run(1,'failure',{provider_url:'https://other'}),run(1,'failure',{provider_repo_id:2,repository:'org/app2'})],{repos:[repo(),repo(1,{provider_url:'https://other'}),repo(2)]}),{scope:'all'},now);
  assert.equal(m.projects.length,3);assert.equal(m.selectedRows.length,3);assert.equal(new Set(m.selectedRows.map(r=>r.runKey)).size,3);assert.equal(m.counts.running,0);
 });
+test('duplicate repository names keep deterministic provider order',()=>{
+ const repos=[repo(2,{repository:'org/shared',provider_url:'https://z.example'}),repo(1,{repository:'org/shared',provider_url:'https://a.example'})];
+ const m=ciHealthModel(history([],{repos,coverage:{'https://z.example|2':{exhausted:true},'https://a.example|1':{exhausted:true}}}),{scope:'all'},now);
+ assert.deepEqual(m.projects.map(project=>project.identity),['org/shared · https://a.example #1','org/shared · https://z.example #2']);
+});
 test('mixed preserves completed failures and canceled/skipped/unknown remain neutral',()=>{
  const m=ciHealthModel(history([run(1,'failure'),run(2,'success'),run(3,'running'),run(4,'cancelled'),run(5,'skipped'),run(6,'unknown')]),{},now);
  const c=m.projects[0].cells.at(-1);assert.equal(c.state,'mixed');assert.equal(c.active,true);assert.equal(c.counts.failure,1);assert.equal(c.counts.canceled,1);
@@ -50,6 +55,15 @@ test('selection narrows already filtered window and parent latest is separate fr
 test('renderers escape content, expose exact counts and native disclosure hooks with bounded grid',()=>{
  const m=ciHealthModel(history([run(1,'failure',{branch:'<img src=x>',title:'<script>x</script>'})],{repos:[repo(1,{repository:'<svg onload=x>'})]}),{scope:'all'},now);
  const html=renderCiHeatmap(m)+renderCiTree(m,expandedTree(m));assert.doesNotMatch(html,/<script>|<img|<svg/);assert.match(html,/data-health-project=/);assert.match(html,/data-health-bucket=/);assert.match(html,/data-health-run=/);assert.match(html,/<details[^>]*data-health-disclosure=/);assert.match(html,/Exact counts/);assert.match(ciHealthStyles,/overflow.*auto/);assert.match(ciHealthStyles,/sticky/);
+});
+test('heatmap keeps provider identity accessible without repeating it in every visual row label',()=>{
+ const m=ciHealthModel(history([run(1,'failure')],{repos:[repo(1,{repository:'org/app',provider_url:'https://ci.example'})]}),{scope:'all'},now);
+ const html=renderCiHeatmap(m);
+ const visible=html.match(/<th scope="row" class="ci-health-project"[^>]*>([^<]*)<\/th>/)?.[1];
+ assert.equal(visible,'org/app');
+ assert.match(html,/aria-label="org\/app · https:\/\/ci\.example #1/);
+ assert.match(html,/Exact counts/);
+ assert.match(html,/org\/app · https:\/\/ci\.example #1/);
 });
 test('actual repository forge URL and row forge PR URL establish identity only for exact repository',()=>{
  const data=history([run(1,'success',{event:'pull_request',forge_url:'https://github.com/org/app1/pull/1200'}),run(2,'success',{event:'pull_request',forge_url:'https://github.com/org/app10/pull/1200'}),run(3,'success',{event:'pull_request',forge_url:'https://evil.example/org/app1/pull/1200'})],{repos:[repo(1,{forge_url:'https://github.com/org/app1'})]});
