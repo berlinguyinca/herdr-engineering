@@ -11,6 +11,30 @@ const outcome=row=>{const state=text(row.state||row.status).toLowerCase();if(['s
 const counts=runs=>{const result={success:0,failure:0,canceled:0,skipped:0,running:0,queued:0,unknown:0,total:runs.length};for(const run of runs)result[outcome(run)]++;return result;};
 const chronological=(a,b)=>(Number.isFinite(a.timestamp)?a.timestamp:-Infinity)-(Number.isFinite(b.timestamp)?b.timestamp:-Infinity)||Number(a.run_number)-Number(b.run_number)||a.runKey.localeCompare(b.runKey);
 const iso=value=>new Date(value).toISOString();
+const repositoryName=repo=>text(repo.repository||repo.full_name||repo.name)||'Repository unavailable';
+function projectLabels(inventory) {
+ const labels=new Map(),groups=new Map();
+ for(const [key,repo] of inventory){const name=repositoryName(repo);labels.set(key,name);if(!groups.has(name))groups.set(name,[]);groups.get(name).push({key,repo});}
+ for(const [name,group] of groups) {
+  if(group.length<2)continue;
+  const providers=group.map(row=>{const provider=instance(row.repo);try{const url=new URL(provider);return {...row,provider,host:url.host,path:`${url.host}${url.pathname.replace(/\/$/,'')}`};}catch{return {...row,provider,host:provider||'Provider unavailable',path:provider||'Provider unavailable'};}});
+  for(const row of providers) {
+   const peers=providers.filter(peer=>peer.key!==row.key),parts=row.host.split('.');
+   let suffix=row.host;
+   for(let size=Math.min(2,parts.length);size<=parts.length;size++) {
+    const candidate=parts.slice(-size).join('.');
+    if(peers.every(peer=>peer.host!==candidate&&!peer.host.endsWith(`.${candidate}`))){suffix=candidate;break;}
+   }
+   if(peers.some(peer=>peer.host===row.host)) {
+    suffix=row.path;
+    if(peers.some(peer=>peer.path===row.path&&peer.provider!==row.provider))suffix=row.provider;
+    if(peers.some(peer=>peer.provider===row.provider))suffix+=` #${repoId(row.repo)}`;
+   }
+   labels.set(row.key,`${name} · ${suffix}`);
+  }
+ }
+ return labels;
+}
 function pullRequest(row,repo) {
  let number=null;
  const explicit=row.pull_request_number??row.pr_number??(typeof row.pull_request==='object'?row.pull_request?.number:row.pull_request);
@@ -41,10 +65,11 @@ export function ciHealthModel(history={},options={},now=Date.now()) {
  const scope=['default','pr','all'].includes(options.scope)?options.scope:'default',buckets=windows(mode,now);
  const inventory=new Map();for(const repo of list(history.repos))inventory.set(projectKey(repo),{...repo});
  for(const row of list(history.pipelines)) {const key=projectKey(row);if(!inventory.has(key))inventory.set(key,{id:row.provider_repo_id,provider_url:row.provider_url,repository:row.repository,default_branch:row.default_branch,forge_url:row.forge_url});}
+ const labels=projectLabels(inventory);
  const dedup=new Map();for(const raw of list(history.pipelines)){const key=projectKey(raw),runKey=JSON.stringify([instance(raw),repoId(raw),raw.run_number??raw.id]);const normalized={...raw,projectKey:key,runKey,timestamp:time(raw.created_at??raw.created)};const old=dedup.get(runKey);if(!old||time(raw.updated_at)>=time(old.updated_at)||!Number.isFinite(time(old.updated_at)))dedup.set(runKey,normalized);}
  const terms=text(options.search).toLowerCase().trim().split(/\s+/).filter(Boolean),projects=[];
  for(const [key,repo] of inventory) {
-  const repository=text(repo.repository||repo.full_name||repo.name)||'Repository unavailable';
+  const repository=repositoryName(repo);
   if(options.repository&&![key,repository,repoId(repo),repo.repository_id].includes(text(options.repository)))continue;
   const coverage=history.coverage?.[key]??history.coverage?.[repoId(repo)]??{};
   const scopeUnavailable=scope==='default'&&!repo.default_branch;
@@ -62,7 +87,7 @@ export function ciHealthModel(history={},options={},now=Date.now()) {
   const runComplete=!scopeUnavailable&&!unknownTimestamps&&(exhausted||runs.length>=24&&completeAt(runs[0].timestamp));
   const cells=buckets.map((bucket,i)=>{if(mode==='runs'){const offset=24-runs.length,row=runs[i-offset];return makeCell(row?{...bucket,key:`run:${row.runKey}`}:bucket,row?[row]:[],runComplete);}return makeCell(bucket,runs.filter(row=>row.timestamp>=bucket.start&&(row.timestamp<bucket.end||row.timestamp===now&&bucket.end===now)),completeAt(bucket.start));});
   const identity=`${repository} · ${instance(repo)||'Provider unavailable'} #${repoId(repo)}`;
-  projects.push({key,repo,repository,label:repository,identity,runs,cells,counts:counts(runs),complete:cells.every(cell=>cell.complete),scopeUnavailable,coverage,unknownTimestamps});
+  projects.push({key,repo,repository,label:labels.get(key),identity,runs,cells,counts:counts(runs),complete:cells.every(cell=>cell.complete),scopeUnavailable,coverage,unknownTimestamps});
  }
  projects.sort(options.sort==='failures'?(a,b)=>b.counts.failure-a.counts.failure||a.label.localeCompare(b.label)||a.identity.localeCompare(b.identity):(a,b)=>a.label.localeCompare(b.label)||a.identity.localeCompare(b.identity));
  let selectedRows=projects.flatMap(project=>project.runs);const selection=options.selection||null;
