@@ -83,3 +83,18 @@ test('operator panel passes no permanent list and survives rows without owner or
   await panel.refresh();
   assert.ok(container.innerHTML.includes(`data-hp="${V6}"`)); assert.doesNotMatch(container.innerHTML, /Model endpoint/);
 });
+
+test('the operator cancels through the fleet route, an owner through the person route', async () => {
+  const calls = [];
+  const api = { cancelHelper: (id) => calls.push(['own', id]), fleetCancelHelper: (id) => calls.push(['fleet', id]) };
+  await helperAction(api, { cancelHelper: 'h1' }, { operator: true });
+  await helperAction(api, { cancelHelper: 'h2' });
+  assert.deepEqual(calls, [['fleet', 'h1'], ['own', 'h2']]);
+});
+
+test('CollabApi.fleetCancelHelper posts to fleet/helpers/{id}/cancel', async () => {
+  const seen = [];
+  const api = new CollabApi(() => ({ access: 't' }), async (url, init) => { seen.push([init.method, url]); return { ok: true, status: 200, json: async () => ({}) }; });
+  await api.fleetCancelHelper('a/b');
+  assert.deepEqual(seen, [['POST', '/api/v1/collab/fleet/helpers/a%2Fb/cancel']]);
+});
