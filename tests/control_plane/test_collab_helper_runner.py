@@ -90,6 +90,67 @@ def test_the_ssh_dir_shows_up_read_only_as_dot_ssh(home, tmp_path):
     assert r.returncode == 126 and "ran" not in r.stdout
 
 
+def operator_login(home):
+    """The operator's own harness homes: private memory, hooks and settings next to the login."""
+    login_files = {".claude": ".credentials" + ".json", ".codex": "auth" + ".json", ".pi/agent": "auth" + ".json"}
+    for d, cred in login_files.items():
+        (home / d).mkdir(parents=True, exist_ok=True)
+        (home / d / cred).write_text(f"OPERATOR-CRED-{d}")
+        (home / d / "CLAUDE.md").write_text("OPERATOR-MEMORY")
+        (home / d / "settings.json").write_text('{"hooks": "OPERATOR-HOOKS"}')
+    # claude keeps the operator's MCP connector tokens next to its login: only the login may be copied
+    (home / ".claude/.credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "LOGIN-TOKEN"},
+                                                                "mcpOAuth": {"gmail": "OPERATOR-MCP-TOKEN"}}))
+    (home / ".claude/projects").mkdir()
+    (home / ".claude/projects/mem.md").write_text("OPERATOR-MEMORY")
+    (home / ".claude.json").write_text('{"OPERATOR-JSON": 1}')
+
+
+def harness_dir(tmp_path):
+    hd = tmp_path / "priv" / "harness"
+    (hd / "claude").mkdir(parents=True)
+    hd.chmod(0o700)
+    (hd / "claude/.credentials.json").write_text("HELPER-CRED")
+    return hd
+
+
+PEEK = ('cat ~/.claude/CLAUDE.md ~/.claude/projects/mem.md ~/.codex/CLAUDE.md ~/.pi/agent/CLAUDE.md '
+        '~/.claude/settings.json ~/.claude.json 2>/dev/null; echo "cfg=$CLAUDE_CONFIG_DIR codex=$CODEX_HOME '
+        'pi=$PI_CODING_AGENT_DIR"; cat "$CLAUDE_CONFIG_DIR/.credentials.json" 2>/dev/null; echo; '
+        'touch "$CLAUDE_CONFIG_DIR/.claude.json" && echo writable')
+
+
+@needs_box
+def test_a_helper_box_sees_its_own_harness_login_and_none_of_the_operators_config(home, tmp_path):
+    operator_login(home)
+    plain = box(home, PEEK)                                            # a worker box: the operator's login, read-only
+    assert "OPERATOR-MEMORY" in plain.stdout and "OPERATOR-JSON" in plain.stdout
+    hd = harness_dir(tmp_path)
+    r = box(home, PEEK, HERDR_SANDBOX_HARNESS_DIR=str(hd))
+    assert r.returncode == 0, r.stderr
+    assert "OPERATOR" not in r.stdout                                  # no memory, hooks, settings, projects, login
+    assert "HELPER-CRED" in r.stdout and "writable" in r.stdout
+    inbox = f"{home}/.herdr-harness"
+    assert f"cfg={inbox}/claude codex={inbox}/codex pi={inbox}/pi" in r.stdout
+    assert (hd / "claude/.claude.json").exists()                       # the private copy, not the operator's
+
+
+@needs_box
+@pytest.mark.parametrize("bad", ["loose", "link", "relative", "empty", "missing", "operator"])
+def test_a_harness_dir_that_does_not_check_out_fails_closed(home, tmp_path, bad):
+    operator_login(home)
+    hd = harness_dir(tmp_path)
+    (tmp_path / "ln").symlink_to(hd)
+    if bad == "loose":
+        hd.chmod(0o755)
+    if bad == "operator":
+        (home / ".claude").chmod(0o700)
+    path = {"loose": str(hd), "link": str(tmp_path / "ln"), "relative": "priv/harness", "empty": "",
+            "missing": str(tmp_path / "nope"), "operator": str(home / ".claude")}[bad]
+    r = box(home, "echo ran", HERDR_SANDBOX_HARNESS_DIR=path)
+    assert r.returncode == 126 and "ran" not in r.stdout, r.stderr
+
+
 def test_both_sandbox_copies_are_identical():
     assert SANDBOX.read_bytes() == (ROOT / "packages/collab-scripts/sandbox.sh").read_bytes()
 
@@ -165,7 +226,11 @@ if "CONNECT" in task:
 m = re.search(r"read-only at (\S+)", task)
 view = sorted(os.listdir(m.group(1))) if m and os.path.isdir(m.group(1)) else None
 ssh = os.path.expanduser("~/.ssh")
-info = {"argv": sys.argv, "env": dict(os.environ), "stdin": task, "cwd": os.getcwd(), "connect": connect,
+cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+login = {"cfg": sorted(os.listdir(cfg)) if cfg and os.path.isdir(cfg) else None,
+         "cred": open(os.path.join(cfg, ".credentials.json")).read() if cfg and os.path.isfile(os.path.join(cfg, ".credentials.json")) else None,
+         "operator": [p for p in ("~/.claude", "~/.codex", "~/.pi", "~/.claude.json") if os.path.exists(os.path.expanduser(p))]}
+info = {"argv": sys.argv, "env": dict(os.environ), "stdin": task, "cwd": os.getcwd(), "connect": connect, "login": login,
         "ssh": sorted(os.listdir(ssh)) if os.path.isdir(ssh) else None, "view": view,
         "keys": {n: open(os.path.join(ssh, n)).read() for n in os.listdir(ssh)} if os.path.isdir(ssh) else {}}
 print("RESULT-JSON " + json.dumps(info))
@@ -263,6 +328,34 @@ def test_a_helper_runs_boxed_with_the_task_on_stdin_only_and_its_output_comes_ba
     assert not list(hr.state.iterdir()) and not Path(info["cwd"]).exists()
     assert any(" pane close " in f" {line} " for line in calls(hr))
     assert any(" pane run " in f" {x} " and x.endswith("| cat -v") for x in calls(hr))   # no raw escapes
+
+
+@needs_box
+def test_a_helper_runs_with_a_private_copy_of_only_the_harness_login(hr):
+    operator_login(hr.home)
+    h = ask(hr)
+    until(hr, finished(hr, h["helper_id"]))
+    info, res = report(hr, h["helper_id"])
+    assert info["login"]["operator"] == [] and "OPERATOR-MEMORY" not in res and "OPERATOR-HOOKS" not in res
+    assert json.loads(info["login"]["cred"]) == {"claudeAiOauth": {"accessToken": "LOGIN-TOKEN"}}   # the login only
+    assert "OPERATOR-MCP-TOKEN" not in json.dumps(info)
+    assert info["login"]["cfg"] == [".credentials.json"]
+    i = info["argv"].index("--setting-sources")                        # and no user/project/local settings
+    assert info["argv"][i + 1] == ""
+    assert not list(hr.state.iterdir())                                # the copy goes with the helper
+
+
+def test_helper_commands_isolate_each_harness_from_user_config(hr):
+    r = hr.mk(allow_tools=True)
+    prof = {"tools_allowed": True}
+    claude, _ = r.helper_command({"family": "claude-code", "model": None, "profile": prof})
+    codex, _ = r.helper_command({"family": "codex", "model": None, "profile": prof})
+    pi, _ = r.helper_command({"family": "pi", "model": None, "profile": prof})
+    assert claude == "claude -p --setting-sources ''"
+    assert codex.startswith("codex exec --ignore-user-config --ignore-rules ") and codex.endswith(" -")
+    assert pi.startswith("pi --no-extensions --no-skills --no-prompt-templates --no-context-files ")
+    for cmd in (claude, codex, pi):
+        assert "--bare" not in cmd                                     # --bare would turn off the OAuth login
 
 
 @needs_box
@@ -488,14 +581,14 @@ def test_model_ids_go_through_the_familys_flag_and_odd_ones_are_refused(hr):
     r = hr.mk(allow_tools=True)
     prof = {"tools_allowed": True}
     cmd, notes = r.helper_command({"family": "pi", "model": "qwen3:30b", "profile": prof})
-    assert cmd.startswith("pi --model qwen3:30b -p ") and cmd.endswith('-- "Task from a room member: $(cat)"')
+    assert cmd.startswith("pi --model qwen3:30b --no-extensions ") and cmd.endswith('-- "Task from a room member: $(cat)"')
     cmd, _ = r.helper_command({"family": "codex", "model": "gpt-5", "profile": prof})
-    assert cmd == runner.FAMILY_CMD_TOOLS["codex"]                     # only pi takes --model (gateway ids)
+    assert "--model" not in cmd and cmd.endswith(runner.FAMILY_CMD_TOOLS["codex"][len("codex exec"):])  # only pi takes --model
     cmd, notes = r.helper_command({"family": "claude-code", "model": "glm-5v", "profile": prof})
-    assert cmd == runner.FAMILY_CMD_TOOLS["claude-code"] and "--model" not in cmd
+    assert cmd == "claude -p --setting-sources ''" and "--model" not in cmd
     assert any("was not passed" in n for n in notes)
     cmd, _ = r.helper_command({"family": "claude-code", "model": None, "profile": {"tools_allowed": False}})
-    assert cmd == runner.FAMILY_CMD_TEXT_ONLY["claude-code"]            # the room does not allow tools
+    assert cmd.endswith(runner.FAMILY_CMD_TEXT_ONLY["claude-code"][len("claude -p"):]) and "--tools ''" in cmd  # no tools
     for bad in ("a b", "x;rm -rf /", "$(id)", "m" * 129, "", "q\n", "--x", "-m", ".hidden", ":x"):
         with pytest.raises(runner.Failure):
             r.helper_command({"family": "pi", "model": bad, "profile": prof})

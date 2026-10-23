@@ -102,6 +102,16 @@ ALLOW_LINE = re.compile(r"[A-Za-z0-9.:\[\]_-]{1,260}")
 HELPER_ROLES = ("reviewer", "debugger", "worker", "vision", "successor")
 # `--model ID` goes right after these. pi only: catalogue ids are gateway models, which claude and codex can't serve.
 MODEL_AFTER = {"pi": "pi"}
+# Helpers only: each harness ignores user/project config (the box has none of the operator's anyway: see
+# HELPER_LOGIN). Not --bare for claude: it turns off the OAuth login. Inserted right after the given prefix.
+HELPER_ISOLATION = {"claude-code": ("claude -p", "--setting-sources ''"),
+                    "codex": ("codex exec", "--ignore-user-config --ignore-rules"),
+                    "pi": ("pi", "--no-extensions --no-skills --no-prompt-templates --no-context-files")}
+# The only files a helper's harness gets from the operator's login: (family -> config dir env, default, files).
+# pi's models.json holds the custom (gateway) providers its --model ids need.
+HELPER_LOGIN = {"claude-code": ("claude", "CLAUDE_CONFIG_DIR", ".claude", (".credentials.json",)),
+                "codex": ("codex", "CODEX_HOME", ".codex", ("auth.json",)),
+                "pi": ("pi", "PI_CODING_AGENT_DIR", ".pi/agent", ("auth.json", "models.json"))}
 HELPER_RESULT_CAP = 20_000              # bytes of stdout returned; the rest is cut with a marker
 HELPER_CLAIM_STALE = 900.0              # a claim a previous process never started is failed after this long
 HELPERS_PER_HOST = 6                    # live helpers this host runs at once
@@ -244,6 +254,7 @@ def helper_run(d: Path) -> int:
             env["HERDR_SANDBOX_RO_BINDS"] = "\n".join(spec["ro_binds"])
         if spec.get("ssh_dir"):
             env["HERDR_SANDBOX_SSH_DIR"] = spec["ssh_dir"]
+        env["HERDR_SANDBOX_HARNESS_DIR"] = spec["harness_dir"]       # never the operator's own harness config
         h = subprocess.Popen(["bash", spec["sandbox"], spec["work"], spec["cmd"]], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=str(d))
 
@@ -825,6 +836,9 @@ class Runner:
         cmd = (FAMILY_CMD_TOOLS if tools else FAMILY_CMD_TEXT_ONLY).get(family) if isinstance(family, str) else None
         if not cmd:
             raise Failure(f"refused: {trim(family, 20)} helpers need tools, which this room or this runner does not allow")
+        prefix, flags = HELPER_ISOLATION.get(family, ("", ""))
+        if prefix and (cmd == prefix or cmd.startswith(prefix + " ")):
+            cmd = f"{prefix} {flags}{cmd[len(prefix):]}"
         notes: list[str] = []
         model = c.get("model")
         if model is not None:
@@ -900,6 +914,50 @@ class Runner:
             out[n] = {"value": v["value"], "host": v["host"]}
         return out
 
+    def harness_login(self, d: Path, family, hid: str) -> Path:
+        """A private config dir for the helper's harness holding ONLY its login file(s), copied from the operator's
+        (no CLAUDE.md, projects/ memory, hooks, plugins, skills or settings). The box shows it instead of the
+        operator's ~/.claude, ~/.codex and ~/.pi; teardown removes it with the helper's state dir."""
+        root = d / "harness"
+        root.mkdir(mode=0o700)
+        root.chmod(0o700)
+        for fam, (sub, env, default, files) in HELPER_LOGIN.items():
+            dst = root / sub
+            dst.mkdir(mode=0o700)
+            if fam != family:
+                continue
+            src = Path(os.environ[env]) if os.environ.get(env, "").startswith("/") else Path.home() / default
+            for n in files:
+                try:
+                    fd = os.open(src / n, os.O_RDONLY)
+                except OSError:
+                    continue                      # not signed in that way: the harness says so in the result
+                try:
+                    if stat.S_ISREG(os.fstat(fd).st_mode):
+                        with os.fdopen(fd, "rb", closefd=False) as fh:
+                            data = fh.read(4_000_000)
+                        if (fam, n) == ("claude-code", ".credentials.json"):
+                            data = self.claude_login_only(data, hid)
+                        if data is not None:
+                            write_private(dst / n, data)
+                    else:
+                        self.say(f"helper {hid}: {src / n} is not a regular file; not copied")
+                finally:
+                    os.close(fd)
+        return root
+
+    def claude_login_only(self, data: bytes, hid: str) -> bytes | None:
+        """claude's .credentials.json also holds the operator's MCP connector tokens (mcpOAuth): keep only the
+        claude.ai login."""
+        try:
+            login = json.loads(data).get("claudeAiOauth")
+        except (ValueError, AttributeError):
+            login = None
+        if not isinstance(login, dict):
+            self.say(f"helper {hid}: no claude.ai login in the claude credentials file; not copied")
+            return None
+        return json.dumps({"claudeAiOauth": login}).encode()
+
     def refresh_allow(self, d: Path, room: str) -> None:
         out = self.ok("GET", f"fleet/egress/{room}")
         lines = [x for x in out.get("allowlist") or [] if isinstance(x, str) and ALLOW_LINE.fullmatch(x)]
@@ -973,6 +1031,7 @@ class Runner:
                     write_private(ssh_dir / n, base64.b64decode(secrets[n], validate=True))
                 except (ValueError, binascii.Error):
                     self.say(f"helper {hid}: room secret {n} is not base64; not copied")
+        harness = self.harness_login(d, c.get("family"), hid)
         self.refresh_allow(d, room)
         sock_dir = Path(tempfile.mkdtemp(prefix="hh-", dir=self.sock_base()))
         st["sock_dir"] = str(sock_dir)
@@ -981,7 +1040,7 @@ class Runner:
             "sandbox": str(self.sandbox_path), "egress": str(self.sandbox_path.with_name("collab-egress.py")),
             "work": str(work), "cmd": cmd, "deadline": st["deadline"], "sock": str(sock_dir / "egress.sock"),
             "services": [sv["name"] for sv in services], "ro_binds": binds,
-            "ssh_dir": str(ssh_dir) if ssh_dir else None}))
+            "ssh_dir": str(ssh_dir) if ssh_dir else None, "harness_dir": str(harness)}))
         pane, tab, own_tab = self.helper_pane(c, name, link)
         st.update(pane=pane, phase="launching", since=time.time())
         self.save_state(d, st)
