@@ -252,6 +252,9 @@ class CollabService:
         self.max_rooms_per_project = max_rooms_per_project
         self.max_members_per_room = max_members_per_room
         self.max_log_events = max_log_events
+        # lineage replay for a member starts at their join time ("since_join", default) or covers the whole
+        # room history ("full"). Operator YAML: control_plane.collab.replay_history.
+        self.replay_history = "since_join"
         self.guest_ttl = guest_ttl
         self.default_grant_ttl = default_grant_ttl
         self.max_streams = max_streams_per_principal
@@ -417,7 +420,8 @@ class CollabService:
         elif t == "room_created":
             self._rooms[p["room_id"]] = {
                 "id": p["room_id"], "project_id": p["project_id"], "name": p["name"], "created_by": p["actor_user_id"],
-                "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq}},
+                "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq,
+                                                 "joined_at": p.get("created_at")}},
                 "grants": {}}
         elif t == "user_registered":
             self._users[p["user_id"]] = {"status": p["status"], "since": p["at"], "decided_by": p.get("decided_by"),
@@ -427,7 +431,8 @@ class CollabService:
             u.update(status=p["status"], decided_by=p["decided_by"], decided_at=p["at"], reason=p.get("reason"))
         elif t == "member_added":
             self._rooms[p["room_id"]]["members"][p["subject_user_id"]] = {
-                "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq}
+                "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq,
+                "joined_at": p.get("created_at")}
         elif t == "member_removed":
             room = self._rooms[p["room_id"]]
             room["members"].pop(p["subject_user_id"], None)
@@ -2344,15 +2349,20 @@ class CollabService:
         contexts = frozenset({("room", room_id, None), *(("mission", m, r) for r, m in access["room_missions"]
                                                          if r == room_id)})
         principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
+        since = None
+        if self.replay_history == "since_join":
+            with self._lock:
+                joined = ((self._rooms.get(room_id) or {}).get("members", {}).get(pr.id) or {}).get("joined_at")
+            if joined:            # a legacy member without a recorded join time sees the whole history
+                since = datetime.fromisoformat(joined).timestamp()
 
         def num(name, default):
             raw = query.get(name)
             if raw in (None, ""):
                 return default
-            try:
-                return int(raw)
-            except (TypeError, ValueError):
-                raise CollabError(400, f"{name} must be an integer") from None
+            if not re.fullmatch(r"[0-9]{1,9}", str(raw)):          # ASCII digits only, bounded
+                raise CollabError(400, f"{name} must be a non-negative integer")
+            return int(raw)
 
         def kinds(name, allowed):
             raw = query.get(name)
@@ -2368,14 +2378,15 @@ class CollabService:
             self._throttle(f"lineage:{pr.id}", 240, 60.0, "lineage")
         try:
             if parts == []:
-                return graph.room_lineage(principal, contexts, step=step, at=at,
+                return graph.room_lineage(principal, contexts, step=step, at=at, since=since,
                                           node_types=kinds("node_types", NODE_TYPES),
                                           edge_types=kinds("edge_types", EDGE_TYPES),
                                           limit=num("limit", 200), offset=num("offset", 0))
             if parts == ["timeline"]:
-                return graph.room_timeline(principal, contexts, step=step, at=at)
+                return graph.room_timeline(principal, contexts, step=step, at=at, since=since)
             if parts == ["events"]:
-                return graph.room_ledger(principal, contexts, cursor=num("cursor", 0), limit=num("limit", 200))
+                return graph.room_ledger(principal, contexts, cursor=num("cursor", 0), limit=num("limit", 200),
+                                         since=since)
         except ValueError as exc:
             raise CollabError(400, str(exc)) from None
         raise CollabError(404, "not found")

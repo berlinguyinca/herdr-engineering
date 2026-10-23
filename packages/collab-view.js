@@ -6,7 +6,7 @@ import { renderFlow } from './collab-flow.js';
 import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
 import {
-  filterGraph, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
+  filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
 } from './collab-lineage.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
 import { renderMarkdown } from './conversation-markdown.js';
@@ -804,25 +804,29 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     // ---- Lineage: graph, Gantt, replay and inspector. Read-only; the server filters every read by your CURRENT
     // membership. Live = the head of your ledger (refreshed while open); a replay position is static.
     const LIN = { step: null, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, pages: [], total: 0, next: null,
-      truncated: null, asOf: null, timeline: null, error: null, busy: false, at: 0, seq: 0, bound: false, layout: null,
+      truncated: null, asOf: null, timeline: null, error: null, timelineError: null, html: '', busy: false, at: 0, seq: 0, bound: false, layout: null,
       filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' } };
     const linModel = () => {
       const graphAll = mergePages(LIN.pages);
       const filtered = filterGraph(graphAll, LIN.filters);
-      return { graphAll, filtered, asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, busy: LIN.busy, view: LIN.view,
+      return { graphAll, filtered, asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, busy: LIN.busy, view: LIN.view,
         mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, total: LIN.total,
         graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
     };
-    const linFail = (e) => (/failed|404|not found/i.test(String(e && e.message)) ? 'No lineage is available for this room.' : 'Could not load the lineage. It will be retried.');
+    const linFail = (e) => (/failed|404|not found/i.test(String(e && e.message)) ? 'No lineage is available for this room.' : 'Could not load the lineage. Press Retry, or choose Live.');
     async function loadLineage(more = false) {
       const my = ++LIN.seq;
       LIN.busy = true; drawLineage(true);
       try {
-        const o = { step: LIN.step, offset: more ? LIN.next : 0 };
-        const [g, t] = await Promise.all([
-          api.lineage(roomId, o),
-          (LIN.view === 'gantt' || LIN.timeline) ? api.lineageTimeline(roomId, { step: LIN.step }).catch(() => null) : Promise.resolve(null)]);
+        const g = await api.lineage(roomId, { step: LIN.step, offset: more ? LIN.next : 0 });
         if (my !== LIN.seq || !alive) return;
+        let t = null;
+        LIN.timelineError = null;
+        if (LIN.view === 'gantt' || LIN.timeline) {
+          // the timeline is read at the position the graph answered for, so the two never disagree
+          try { t = await api.lineageTimeline(roomId, { step: g.as_of.head ? null : g.as_of.step }); } catch (e) { LIN.timelineError = 'The timeline could not be loaded.'; }
+          if (my !== LIN.seq || !alive) return;
+        }
         LIN.pages = more ? [...LIN.pages, g] : [g];
         LIN.total = g.total_nodes; LIN.next = g.next_offset; LIN.truncated = g.truncated_reason; LIN.asOf = g.as_of;
         if (t) LIN.timeline = t;
@@ -834,33 +838,36 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       const box = $('hcn-lineage');
       if (!box) return;
       if (!LIN.bound) bindLineage(box);
-      if (!force && LIN.step === null && !LIN.busy && Date.now() - LIN.at > 8000) { loadLineage(); }
+      // live refresh only at the head of page one: a replay is static and "Load more" pages must survive
+      if (!force && LIN.step === null && !LIN.busy && LIN.pages.length <= 1 && Date.now() - LIN.at > 8000) { loadLineage(); }
       else if (!force && !LIN.at && !LIN.busy) { loadLineage(); return; }
       const m = linModel();
       LIN.layout = layoutGraph(m.filtered);
       const html = renderLineage(m);
-      if (box.dataset.h === html) return;
+      if (LIN.html === html && box.innerHTML !== '') return;
       const a = document.activeElement;
-      const keep = a && box.contains(a) ? { sel: ['data-node', 'data-replay', 'data-view', 'data-mode', 'data-filter', 'data-clock'].map((k) => (a.hasAttribute(k) ? `[${k}="${CSS.escape(a.getAttribute(k))}"]` : (k === 'data-clock' && a.hasAttribute(k) ? '[data-clock]' : null))).find(Boolean), value: a.value, pos: a.selectionStart } : null;
-      box.dataset.h = html; box.innerHTML = html;
-      if (keep && keep.sel) {
-        const el = box.querySelector(keep.sel + (keep.sel.includes('data-filter="type"') || keep.sel.includes('data-filter="etype"') ? `[value="${CSS.escape(a.value)}"]` : ''));
-        if (el) { el.focus({ preventScroll: true }); if (typeof keep.pos === 'number' && el.setSelectionRange && el.type === 'search') try { el.setSelectionRange(keep.pos, keep.pos); } catch { /* not selectable */ } }
-      }
+      const key = a && box.contains(a) ? focusKey(a) : null;
+      const pos = key && typeof a.selectionStart === 'number' ? a.selectionStart : null;
+      LIN.html = html; box.innerHTML = html;
+      const sel = key && focusSelector(key);
+      const el = sel && box.querySelector(sel);
+      if (el) { el.focus({ preventScroll: true }); if (pos !== null && el.setSelectionRange && el.type === 'search') try { el.setSelectionRange(pos, pos); } catch { /* not selectable */ } }
     }
     function bindLineage(box) {
       LIN.bound = true;
-      const goStep = (t) => { LIN.step = t === 'live' ? null : t; LIN.sel = LIN.sel; loadLineage(); };
+      let slide = 0;
+      const goStep = (t) => { if (LIN.busy) return; LIN.step = t === 'live' ? null : t; if (LIN.step === null) LIN.pages = []; loadLineage(); };
       box.addEventListener('click', (e) => {
         const n = e.target.closest('[data-node]');
         if (n) { LIN.sel = n.dataset.node; LIN.focus = n.dataset.node; drawLineage(true); return; }
         const r = e.target.closest('[data-replay]');
+        if (e.target.closest('[data-retry]')) { loadLineage(); return; }
         if (r && r.dataset.replay !== 'slider') { goStep(replayTarget(LIN.asOf, r.dataset.replay)); return; }
         const v = e.target.closest('[data-view]');
         if (v) { LIN.view = v.dataset.view; if (LIN.view === 'gantt' && !LIN.timeline) loadLineage(); else drawLineage(true); return; }
         const md = e.target.closest('[data-mode]');
         if (md) { LIN.mode = md.dataset.mode; drawLineage(true); return; }
-        if (e.target.closest('[data-more]')) loadLineage(true);
+        if (e.target.closest('[data-more]') && !LIN.busy) loadLineage(true);
       });
       box.addEventListener('submit', (e) => { e.preventDefault(); });      // Enter in the search box filters; it never navigates
       box.addEventListener('input', (e) => {
@@ -873,7 +880,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       });
       box.addEventListener('change', (e) => {
         const t = e.target;
-        if (t.dataset.replay === 'slider') { goStep(replayTarget(LIN.asOf, 'slider', t.value)); return; }
+        if (t.dataset.replay === 'slider') { clearTimeout(slide); const v = t.value; slide = setTimeout(() => goStep(replayTarget(LIN.asOf, 'slider', v)), 150); return; }
         if (t.dataset.clock !== undefined) { LIN.clock = t.value; drawLineage(true); return; }
         const f = t.dataset.filter;
         if (f === 'type' || f === 'etype') {

@@ -296,7 +296,7 @@ panel lists by type instead of walking from a root.
 Read-only workbench for ONE room: a lineage graph, a Gantt timeline, a replay scrubber and a node inspector. It extends the
 T08 room page (`packages/collab-lineage.js`, sub-tab "Lineage" in `collab-view.js`) and the T08 collab read routes. No new
 dashboard, service, event store or table: **no migration**. The projection already derives from `fabric_events`; T09 keeps the
-applied events (`GraphProjection._log`, plus `_log_ctx`, an index by the room/mission context a scope names) in memory next to
+applied events (`GraphProjection._log_ctx`: one list per room/mission context a scope names, bounded, oldest evicted) in memory next to
 the graph, refilled by the same rebuild that refills the graph, so a restart loses nothing. A snapshot table can be added later
 without changing semantics (same argument as T02).
 
@@ -314,10 +314,11 @@ are 400 (`step`/`at` together, negative step, non-ISO `at`, unknown type, limit 
 - **Position** is a count of the READER's own visible ledger events (`step`, 0..`visible_events`), so no number reveals how many
   hidden events exist. Past the end clamps to now (silently). `at` (a timestamp without a zone is UTC) resolves, by server receipt time (never the emitter's
   `occurred_at`), to the number of visible events BEFORE the first one received after that instant: a prefix of admission order.
-- **Replay equals live at that point.** The graph at step k is a projection built from every stored lineage event (ALL rooms:
-  cross-room scope meets and last-writer fields resolve exactly as they did) with admission number <= that of the k-th visible
-  event. `apply` is commutative and idempotent, so this equals a projection that was fed those events live (tested at every
-  step, for several readers, and after a rebuild). The head (step = visible_events) is the live projection itself.
+- **Replay equals live at that point.** The graph at step k is a projection built from THIS ROOM's context events (the room and
+  its linked missions) with admission number <= that of the k-th visible event, read through the live projection's gate (which
+  supplies visibility, so another room's events are not needed). `apply` is commutative and idempotent, so the visible result
+  equals a projection that was fed those events live (tested at every step, for several readers, after a rebuild, and by a
+  300-seed randomized privacy check). Replay is per room: a flood in room A never costs or breaks room B. The head (step = visible_events) is the live projection itself.
 - **Replay never widens visibility.** (1) An event is shown only if its own scope label is visible to the reader and the object it
   concerns is visible to the reader NOW: for an edge event that is the exact edge instance it touched (its binding, and its writer's
   instance for a commons `from` node), never a sibling binding of the same triple; for a commons node event it is the writer's
@@ -327,11 +328,23 @@ are 400 (`step`/`at` together, negative step, non-ISO `at`, unknown type, limit 
   field private (or re-scopes an edge or node narrower) takes its past out of sight too. `stale`/`bindings` of the past never reveal a
   binding that is hidden now. What stays visible is only what the reader can see now in the same place: a value a writer published to
   the room and has since REPLACED with another room-visible value is shown at its own past position (that is what a replay is).
-  (3) Membership is the reader's membership at THIS request: someone added later can replay what
-  happened before they joined (like every other read); someone removed gets 404 at every step.
+  (3) Membership is the reader's membership at THIS request; someone removed gets 404 at every step. **An overwritten
+  room-visible value stays readable by whoever may read the room now**, including people who join later: replay shows a
+  value a writer published to the room and later replaced. What a late joiner may see of the past is operator policy,
+  `control_plane.collab.replay_history` in the fleet YAML: `since_join` (the default) starts a member's ledger and replay
+  at their join time (step 0 is the room as it stood when they joined; earlier events are folded into that baseline and not
+  listed); `full` lets every member replay the whole room history. A member whose join time was not recorded (state
+  from before this feature) gets `full`. Member responses never carry the global `admission` counter of a field.
 - **Budgets** (all report `truncated_reason`, never a count of hidden items): ledger window `LEDGER_SCAN_BUDGET` = newest 20,000
-  events of the room's contexts (`window_trimmed`; step 0 is then the state just before the window); a replay applies at most
-  `REPLAY_MAX_EVENTS` = 25,000 events (the whole prefix; over it is a generic 400, "now" is never capped); graph reads reuse
+  events of the room's contexts (`window_trimmed`; step 0 is then the state just before the window; when trimmed,
+  `visible_events` and the head `step` are rounded down to a multiple of 100 and `approximate` is true, so the count does not
+  reveal how many events in the window the reader may not see); a replay applies at most `REPLAY_MAX_EVENTS` = 25,000 of
+  THIS room's events (over it is a generic 400 that names no number, "now" is never capped); each room/mission context keeps
+  at most `LOG_MAX_PER_CONTEXT` = 100,000 events (the oldest tenth is evicted beyond that: the history floor; once a context
+  has evicted, past positions answer the generic 400 and the ledger is `truncated`, "now" still works). Visibility is
+  evaluated 128 events per hold of the live lock, so a viewer never stalls ingest for a whole scan. A head response
+  (graph, timeline, ledger) is computed against one state: if an event arrived while it was built it is retried, and the third
+  try runs under the lock. Graph reads reuse
   `SCAN_BUDGET`, `EDGE_SCAN_TOTAL`, `MAX_EDGES`, `MAX_RESPONSE_BYTES`; the timeline caps lanes (300) and markers (1000). At most
   two replayed projections are cached (keyed by position and invalidated when an event arrives); one replay is built at a time.
 - **Pagination.** `limit` (<= 1000) and `offset` page the room's visible nodes (types in fixed order, admission order inside a
@@ -362,12 +375,15 @@ Every id, label, attribute and reason is escaped for text and attribute contexts
 - T05 (canonical GitHub issue/PR linking and reconciliation) is not built: issue/PR nodes and `issue_link` edges are drawn when an
   emitter sends them, but no canonicalisation or reconciliation exists yet. T06's `review_quorum.py` is on a sibling branch and
   is not on this stack; stale/head-change come only from the T02 projection's own flags.
-- Replay cost is the whole prefix across all rooms (see budgets); beyond 25,000 events a past position answers 400. A busy
-  deployment needs the snapshot table mentioned above. Not load-tested at that size.
+- Replay cost is the room's prefix (see budgets); beyond 25,000 of its events a past position answers 400. A busy room needs
+  the snapshot table mentioned above. Not load-tested at that size. No visual-regression suite exists; layout is checked by
+  unit tests and a browser smoke run against a mocked API plus one real-HTTP pytest of the routes, not by screenshots.
+- There is no separate review/CI phase model. PR, review and CI objects appear as lanes of their node types (state spans from
+  `node.state`), `reviewed`/`validated` edges as markers, and revision changes as `head_change` markers; nothing else is inferred.
 - The inspector shows the node as of the chosen position, from the page's own response; it does not fetch `graph/nodes/{id}`.
 - Pi still does not send `room_id`, so Pi lineage appears here only once the T08 emitter prerequisites hold.
-- Memory: `_log` holds every applied lineage event (references to the dicts the projection already receives); replayed
-  projections are throw-away copies of at most the prefix.
+- Memory: each context list holds references to the dicts the projection already receives (bounded, see budgets); at most two
+  replayed projections are cached, each of at most `REPLAY_MAX_EVENTS` events.
 
 ### T09 rollout and rollback
 Code only, no migration: deploy the server, then the web files (`collab-lineage.js` is in the static map in `api.py`). Rollback:

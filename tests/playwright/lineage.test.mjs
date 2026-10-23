@@ -32,7 +32,7 @@ const TIMELINE = {
   markers: [{ kind: 'head_change', step: 4, at: T(7), claimed: null, edge_type: 'reviewed', from_id: 'review:r1', to_id: 'pr:p', binding: { commit: 'c2' }, stale: false }],
 };
 
-async function withPage(fn) {
+async function withPage(fn, opts = {}) {
   const server = createServer(async (req, res) => {
     if (req.url === '/') { res.setHeader('Content-Type', 'text/html'); res.end('<link rel="stylesheet" href="/collab.css"><div id="host"></div>'); return; }
     try { const file = new URL(`../../packages/${req.url.split('?')[0].slice(1)}`, import.meta.url); res.setHeader('Content-Type', req.url.endsWith('.css') ? 'text/css' : 'application/javascript'); res.end(await readFile(file)); }
@@ -56,8 +56,9 @@ async function withPage(fn) {
       else if (path === '/admin/users') body = { users: [] };
       else if (path === '/rooms/room-one') body = { room_id: 'room-one', name: 'Review', role: 'owner', members: [] };
       else if (path === '/rooms/room-one/state') body = { changed: true, seq: 1, next_cursor: 1, agents: [], tasks: [], events: [], flow: { nodes: [], edges: [], tasks: [] } };
-      else if (path === '/graph/lineage') body = lineage(url.searchParams.has('step') ? Number(url.searchParams.get('step')) : null);
-      else if (path === '/graph/lineage/timeline') body = TIMELINE;
+      else if (path === '/graph/lineage' && seen.failStep !== undefined && url.searchParams.get('step') === String(seen.failStep)) { await route.fulfill({ status: 500, json: { error: 'boom' } }); return; }
+      else if (path === '/graph/lineage') body = opts.lineage ? opts.lineage(url) : lineage(url.searchParams.has('step') ? Number(url.searchParams.get('step')) : null);
+      else if (path === '/graph/lineage/timeline') body = opts.timeline || TIMELINE;
       else if (path.startsWith('/graph/nodes')) body = { nodes: [], edges: [] };
       await route.fulfill({ json: body });
     });
@@ -155,4 +156,72 @@ test('lineage panel has no horizontal page overflow on a phone-width screen and 
   await page.locator('svg.lin-svg').waitFor();
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), true);
   assert.equal(await page.evaluate(() => [...document.querySelectorAll('.lin-svg *')].every((el) => getComputedStyle(el).animationName === 'none')), true);
+}));
+
+const active = (page) => page.evaluate(() => { const a = document.activeElement; return a ? (a.getAttribute('data-replay') ? `replay:${a.getAttribute('data-replay')}` : a.getAttribute('data-node') ? `node:${a.getAttribute('data-node')}` : a.getAttribute('data-view') ? `view:${a.getAttribute('data-view')}` : a.getAttribute('data-filter') ? `filter:${a.getAttribute('data-filter')}` : a.tagName) : null; });
+
+test('focus survives replay actions and re-renders (keyboard users keep their place)', async () => withPage(async (page) => {
+  await page.getByRole('tab', { name: 'Lineage', exact: true }).click();
+  await page.locator('svg.lin-svg g[data-node]').first().waitFor();
+  await page.getByRole('button', { name: /Back/ }).focus();
+  await page.keyboard.press('Enter');
+  await page.locator('.lin-replay__status', { hasText: 'event 4 of 5' }).waitFor();
+  assert.equal(await active(page), 'replay:prev', 'Back keeps focus after the replay loads');
+  await page.keyboard.press('Enter');
+  await page.locator('.lin-replay__status', { hasText: 'event 3 of 5' }).waitFor();
+  assert.equal(await active(page), 'replay:prev');
+  assert.equal(await page.locator('.lin-replay button[disabled]').count(), 0, 'busy never disables the controls');
+  await page.getByRole('button', { name: 'Live', exact: true }).focus();
+  await page.keyboard.press('Enter');
+  await page.locator('.lin-replay__status', { hasText: 'Live' }).waitFor();
+  assert.equal(await active(page), 'replay:live');
+  await page.locator('g[data-node]').first().focus();
+  await page.keyboard.press('Enter');
+  assert.match(await active(page), /^node:/, 'selecting a node keeps focus on it');
+  await page.getByRole('tab', { name: 'Gantt' }).focus();
+  await page.keyboard.press('ArrowLeft');
+  assert.equal(await active(page), 'view:graph');
+}));
+
+test('a failed replay keeps the controls, offers Retry and Live, and recovers', async () => withPage(async (page, seen) => {
+  await page.getByRole('tab', { name: 'Lineage', exact: true }).click();
+  await page.locator('svg.lin-svg g[data-node]').first().waitFor();
+  seen.failStep = 4;
+  await page.getByRole('button', { name: /Back/ }).click();
+  await page.getByRole('alert').filter({ hasText: 'Could not load the lineage' }).waitFor();
+  assert.equal(await page.getByRole('button', { name: 'Live', exact: true }).count(), 1, 'Live is still offered');
+  assert.equal(await page.getByRole('button', { name: 'Retry' }).count(), 1);
+  assert.doesNotMatch(await page.locator('#hcn-lineage').innerText(), /will be retried/);
+  seen.failStep = undefined;
+  await page.getByRole('button', { name: 'Retry' }).click();
+  await page.locator('.lin-replay__status', { hasText: 'event 4 of 5' }).waitFor();
+  seen.failStep = 4;
+  await page.getByRole('button', { name: /Start/ }).click();
+  await page.locator('.lin-replay__status', { hasText: 'before the first' }).waitFor();
+  seen.failStep = 0;
+  await page.getByRole('button', { name: /Next/ }).click();
+  await page.getByRole('button', { name: 'Live', exact: true }).click();
+  await page.locator('.lin-replay__status', { hasText: 'Live' }).waitFor();
+}));
+
+const BAD = '<img src=x onerror="window.__xss=7">';
+test('hostile text in EVERY field is shown as text and never runs', async () => withPage(async (page) => {
+  await page.getByRole('tab', { name: 'Lineage', exact: true }).click();
+  await page.locator('svg.lin-svg g[data-node]').first().waitFor();
+  await page.getByRole('button', { name: 'Show as table' }).click();
+  await page.getByRole('tab', { name: 'Gantt' }).click();
+  await page.locator('table.lin-table').first().waitFor();
+  assert.equal(await page.evaluate(() => window.__xss), undefined);
+  assert.equal(await page.locator('#hcn-lineage img, #hcn-lineage script, #hcn-lineage [onerror]').count(), 0);
+  assert.ok((await page.locator('#hcn-lineage').innerText()).includes(BAD));
+}, {
+  lineage: () => {
+    const n = (id, e = {}) => ({ id, node_type: id.split(':')[0], label: BAD, state: BAD, state_reason: BAD, attrs: { [BAD]: BAD }, visibility_scope: 'room', first_event_id: BAD, last_event_id: BAD, ...e });
+    return { as_of: { step: 2, visible_events: 2, head: true, event_id: BAD, received_at: BAD, window_trimmed: false },
+      nodes: [n(`task:${BAD}`), n('agent:b')], edges: [{ edge_type: 'spawn', from_id: `task:${BAD}`, to_id: 'agent:b', attrs: { [BAD]: BAD }, stale: false, removed: false, binding: { [BAD]: BAD } }],
+      total_nodes: 2, offset: 0, next_offset: null, truncated: false, truncated_reason: null };
+  },
+  timeline: { as_of: { step: 2, visible_events: 2, head: true }, truncated: false, truncated_reason: null,
+    lanes: [{ node_id: `task:${BAD}`, node_type: 'task', label: BAD, state: BAD, first_at: T(1), last_at: T(2), spans: [{ state: BAD, start: T(1), end: T(2), open: false, terminal: false, reason: BAD }] }],
+    markers: [{ kind: BAD, step: 1, at: T(1), claimed: BAD, edge_type: BAD, from_id: BAD, to_id: BAD, binding: { [BAD]: BAD }, stale: false }] },
 }));

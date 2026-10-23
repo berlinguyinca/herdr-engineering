@@ -17,6 +17,15 @@ from tests.control_plane.test_graph import OTHER
 from tests.control_plane.test_graph_membership import fab, put  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def _full_history(request):
+    """These tests use a fake collab clock that is years from the feed's real timestamps, so they ask for the
+    whole history; the since-join default is tested on its own below."""
+    if "fab" in request.fixturenames and "since_join" not in request.node.name:
+        fab = request.getfixturevalue("fab")
+        fab.s.replay_history = "full"
+
+
 def lin(w, who, *tail, room=None, **q):
     q = {"room_id": room or w.room, **q}
     return w.s.graph_read(who, ["lineage", *tail], {k: str(v) for k, v in q.items() if v is not None})
@@ -128,7 +137,7 @@ def test_a_later_narrowing_hides_the_past_too(fab):
     from herdr_engineering.control_plane.graph import GraphProjection, _lseq, _rank
     g = fab.repo.graph
     ungated = GraphProjection(keep_log=False)
-    for ev in sorted((e for e, _ in g._log if _lseq(e) <= 2), key=_rank):
+    for ev in sorted((e for ctx in g._log_ctx.values() for e, _ in ctx if _lseq(e) <= 2), key=_rank):
         ungated.apply(ev)
     assert "task:t" in json.dumps(ungated.room_graph(
         {"kind": "member", "id": "user:bob", "authenticated_by": "collab", "access": fab.s.graph_access(fab.bob)},
@@ -513,3 +522,212 @@ def test_replay_reads_while_events_arrive_never_error(fab):
         stop.set()
         th.join()
     assert not errors
+
+
+# ------------------------------------------------------------------ review round 2
+def _flood(f, room, n):
+    node(f, "task:a0", room_id=room)
+    for i in range(n):
+        f.send("node.state", {"node_id": "task:a0", "state": "running" if i % 2 else "done"}, "room", room_id=room)
+
+
+def test_a_busy_room_does_not_break_another_rooms_replay(fab, monkeypatch):
+    """Replay is per room: flooding room A past the cap leaves room B's replay and timeline intact, and the
+    refusal for A says nothing about volume."""
+    monkeypatch.setattr(graph_mod, "REPLAY_MAX_EVENTS", 30)
+    f = fab.feed
+    node(f, "task:b0", room_id=fab.room2)
+    node(f, "task:b1", state="running", room_id=fab.room2)
+    _flood(f, fab.room, 60)
+    st, msg = err(lin, fab, fab.alice, step=55)
+    assert st == 400 and not any(ch.isdigit() for ch in msg) and "25" not in msg
+    assert err(lin, fab, fab.alice, "timeline", step=55)[0] == 400
+    # room B (alice owns it too in this fixture? use whoever can read room2)
+    who = next((u for u in (fab.alice, fab.bob, fab.carol) if _can_read(fab, u, fab.room2)), None)
+    if who is None:
+        pytest.skip("fixture has no reader of room2")
+    got = lin(fab, who, room=fab.room2, step=1)
+    assert got["as_of"]["head"] is False and {n["id"] for n in got["nodes"]} == {"task:b0"}
+    assert lin(fab, who, "timeline", room=fab.room2, step=1)["as_of"]["step"] == 1
+
+
+def _can_read(fab, who, room):
+    try:
+        lin(fab, who, "events", room=room)
+        return True
+    except CollabError:
+        return False
+
+
+def test_a_viewer_never_holds_the_ingest_lock_for_a_whole_scan(fab, monkeypatch):
+    """The visibility scan yields the live lock every CHUNK events: ingest is never blocked for the length of
+    the scan (measured as the longest wait to acquire the lock while a slow scan runs)."""
+    import threading
+    import time
+    f, g = fab.feed, fab.repo.graph
+    _flood(f, fab.room, 2400)
+    real = g._event_visible
+
+    def slow(*a, **k):
+        time.sleep(0.0003)
+        return real(*a, **k)
+    monkeypatch.setattr(g, "_event_visible", slow)
+    waits, stop = [], threading.Event()
+
+    def probe():
+        while not stop.is_set():
+            t = time.perf_counter()
+            with g._lock:
+                pass
+            waits.append(time.perf_counter() - t)
+            time.sleep(0.002)
+    th = threading.Thread(target=probe)
+    th.start()
+    t0 = time.perf_counter()
+    lin(fab, fab.alice, "events")
+    total = time.perf_counter() - t0
+    stop.set()
+    th.join()
+    assert total > 0.5 and waits                       # the scan really was slow
+    assert max(waits) < total / 3, (max(waits), total)  # ...yet no single hold was close to it
+
+
+def test_head_count_is_rounded_when_the_window_is_trimmed(fab, monkeypatch):
+    monkeypatch.setattr(graph_mod, "LEDGER_SCAN_BUDGET", 150)
+    _flood(fab.feed, fab.room, 237)
+    a = lin(fab, fab.alice)["as_of"]
+    assert a["window_trimmed"] is True and a["approximate"] is True
+    assert a["visible_events"] % 100 == 0 and a["step"] % 100 == 0
+    assert lin(fab, fab.alice, "events")["visible_events"] % 100 == 0
+
+
+def test_members_do_not_get_the_global_admission_counter(fab):
+    f = fab.feed
+    put(f, "task:p", "room", label="x", attrs={"k": 1}, room_id=fab.room)
+    edge(f, "spawn", "task:p", "task:q", {"w": 1}, room_id=fab.room)
+    got = lin(fab, fab.bob)
+    assert "admission" not in json.dumps(got)
+    g = fab.repo.graph
+    assert "admission" in json.dumps(g._node_view(g._nodes["task:p"], None, internal=True))   # operators keep it
+
+
+def test_replay_since_join_starts_at_the_members_join_time(fab):
+    from datetime import UTC, datetime
+    f = fab.feed
+    put(f, "task:old", "room", label="before", room_id=fab.room)
+    put(f, "task:new", "room", label="after", room_id=fab.room)
+    ev = [e for e, _ in fab.repo.graph._log_ctx[("room", fab.room, None)]]
+    cut = sorted(float(datetime.fromisoformat(str(e["ingest_timestamp"])).timestamp()) for e in ev)[-1]
+    fab.s.replay_history = "full"
+    full = lin(fab, fab.bob, "events")
+    assert full["visible_events"] >= 2
+    fab.s.replay_history = "since_join"
+    m = fab.s._rooms[fab.room]["members"]["bob"]
+    m["joined_at"] = datetime.fromtimestamp(cut, UTC).isoformat()
+    got = lin(fab, fab.bob, "events")
+    assert got["visible_events"] < full["visible_events"]
+    assert "before" not in json.dumps(got["events"])
+    s0 = lin(fab, fab.bob, step=0)
+    assert s0["as_of"]["step"] == 0 and "task:old" in json.dumps(s0)     # step 0 = the state as of joining
+    m.pop("joined_at")
+    assert lin(fab, fab.bob, "events")["visible_events"] == full["visible_events"]       # legacy: full
+
+
+def test_a_context_log_is_bounded_and_replay_floors(fab, monkeypatch):
+    monkeypatch.setattr(graph_mod, "LOG_MAX_PER_CONTEXT", 50)
+    _flood(fab.feed, fab.room, 120)
+    g = fab.repo.graph
+    assert len(g._log_ctx[("room", fab.room, None)]) <= 50 and g._log_evicted[("room", fab.room, None)] > 0
+    assert err(lin, fab, fab.alice, step=2)[0] == 400
+    head = lin(fab, fab.alice)
+    assert head["as_of"]["head"] is True and lin(fab, fab.alice, "events")["truncated"] is True
+
+
+def test_query_numbers_are_ascii_digits_only(fab):
+    for bad in ("٣", "1_0", "+1", " 1", "-1", "1.0", "1" * 12):
+        for name in ("step", "limit", "cursor"):
+            tail = ("events",) if name == "cursor" else ()
+            assert err(lin, fab, fab.alice, *tail, **{name: bad})[0] == 400, (name, bad)
+
+
+def test_a_head_response_is_coherent_under_concurrent_ingest(fab):
+    import threading
+    import time
+    f = fab.feed
+    node(f, "task:c0", room_id=fab.room)
+    stop = threading.Event()
+
+    def writer():
+        i = 0
+        while not stop.is_set():
+            f.send("node.state", {"node_id": "task:c0", "state": "running" if i % 2 else "done"}, "room",
+                   room_id=fab.room)
+            i += 1
+            time.sleep(0.003)
+    th = threading.Thread(target=writer)
+    th.start()
+    try:
+        for _ in range(8):
+            v = lin(fab, fab.alice)
+            n = v["as_of"]["visible_events"]
+            ev = lin(fab, fab.alice, "events", limit=1)
+            assert ev["visible_events"] >= n                 # the ledger only grows
+            node_state = next(x for x in v["nodes"] if x["id"] == "task:c0")
+            assert node_state["last_event_id"] == v["as_of"]["event_id"]     # the graph IS the as_of state
+    finally:
+        stop.set()
+        th.join()
+
+
+# ---------------------------------------------------------------- real HTTP server
+from tests.control_plane.test_collab import BASE, clock, env, invite, make_room  # noqa: E402,F401
+from tests.control_plane.test_graph_membership import _key  # noqa: E402
+
+
+def _ingest(env, node, scope, seq, **ctx):
+    import http.client
+    body = {"schema_version": 2, "event_id": f"e-{node}", "source": "pi", "source_sequence": seq,
+            "entity_type": "lineage", "entity_id": node, "event_type": "node.upsert",
+            "payload": {"node_type": node.split(":")[0], "node_id": node, "label": "L"},
+            "visibility_scope": scope, "occurred_at": "2026-10-22T10:00:00Z", **ctx}
+    conn = http.client.HTTPConnection("127.0.0.1", env.api.port, timeout=5)
+    conn.request("POST", "/api/v1/ingest", json.dumps(body),
+                 {"X-API-Key": _key(env, "operator"), "Content-Type": "application/json"})
+    resp = conn.getresponse()
+    resp.read()
+    assert resp.status == 200
+    conn.close()
+
+
+def test_real_server_serves_lineage_views_replay_and_refusals(env):
+    env.svc.replay_history = "full"          # the fake collab clock is years from the real ingest times
+    _, room = make_room(env.api)
+    assert invite(env.api, room, "bob", "contributor")[0] in (200, 201)
+    _ingest(env, "task:h1", "room", 0, room_id=room)
+    _ingest(env, "task:h2", "room", 1, room_id=room)
+    url = f"{BASE}/graph/lineage"
+    s, head = env.api.call("GET", f"{url}?room_id={room}", user="alice")
+    assert s == 200 and head["as_of"]["head"] is True and head["as_of"]["visible_events"] == 2
+    assert "admission" not in json.dumps(head)
+    s, past = env.api.call("GET", f"{url}?room_id={room}&step=1", user="bob")
+    assert s == 200 and past["as_of"]["head"] is False and [n["id"] for n in past["nodes"]] == ["task:h1"]
+    s, tl = env.api.call("GET", f"{url}/timeline?room_id={room}", user="alice")
+    assert s == 200 and tl["as_of"]["step"] == head["as_of"]["step"]
+    s, ev = env.api.call("GET", f"{url}/events?room_id={room}&limit=1", user="alice")
+    assert s == 200 and len(ev["events"]) == 1 and ev["next_cursor"] == 1
+    assert env.api.call("GET", f"{url}?room_id={room}", user="mallory")[0] == 404
+    assert env.api.call("GET", f"{url}?room_id={room}")[0] == 401
+    assert env.api.call("GET", f"{url}?step=1", user="alice")[0] == 400
+    assert env.api.call("GET", f"{url}?room_id={room}&step=%D9%A3", user="alice")[0] == 400
+
+
+def test_views_are_identical_after_the_graph_is_rebuilt_from_exported_state(fab):
+    seed(fab)
+    tails = (("head", ()), ("tl", ("timeline",)), ("ev", ("events",)), ("old", ()))
+    def snap():
+        return {k: lin(fab, fab.bob, *t, **({"step": 3} if k == "old" else {})) for k, t in tails}
+    before = snap()
+    fresh = ControlPlaneRepo()
+    fresh.import_state(json.loads(json.dumps(fab.repo.export_state(), default=str)))
+    fab.s.graph_source = lambda: fresh.graph
+    assert snap() == before

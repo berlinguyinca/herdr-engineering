@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EDGE_STYLE, MAX_RENDER_NODES, buildGantt, filterGraph, fmtDuration, layoutGraph, mergePages, nextNode,
-  renderGanttSvg, renderGanttTable, renderGraphSvg, renderGraphTable, renderInspector, renderLineage, renderReplay,
-  replayTarget, replayText, shapeOf, stateLook,
+  renderGanttSvg, focusKey, focusSelector, renderGanttTable, renderGraphSvg, renderGraphTable, renderInspector, renderLineage, renderReplay,
+  nodeLabel, replayTarget, replayText, shapeOf, stateLook,
 } from '../collab-lineage.js';
 
 const node = (id, extra = {}) => ({ id, node_type: id.split(':')[0], label: extra.label ?? id.split(':')[1], state: extra.state ?? null, attrs: extra.attrs || {}, visibility_scope: 'room', ...extra });
@@ -135,7 +135,8 @@ test('replay controls: a range with spoken value text, step buttons, live button
   assert.match(replayText({ step: 10, visible_events: 10, head: true }), /^Live/);
   assert.match(replayText({ step: 0, visible_events: 4, head: false }), /before the first/);
   assert.match(renderReplay({ ...asOf, window_trimmed: true }), /Only the most recent events/);
-  assert.match(renderReplay(asOf, { busy: true }), /disabled/);
+  assert.doesNotMatch(renderReplay(asOf, { busy: true }), /disabled/, 'busy keeps focus on a live control');
+  assert.match(renderReplay(asOf, { busy: true }), /aria-busy="true"/);
   assert.match(renderReplay(null), /max="0"[^>]*disabled/);
 });
 
@@ -261,4 +262,32 @@ test('the lineage calls are one room, read-only GETs on the collab route', async
   assert.equal(calls[3][1], '/api/v1/collab/graph/lineage?room_id=room+1&at=2026-10-22T10%3A00%3A00Z&limit=200');
   assert.equal(calls[4][1], '/api/v1/collab/graph/lineage/timeline?room_id=room+1&step=7');
   assert.equal(calls[5][1], '/api/v1/collab/graph/lineage/events?room_id=room+1&limit=100&cursor=200');
+});
+
+test('focus keys round-trip to a selector for every control kind', () => {
+  const el = (a) => ({ getAttribute: (k) => (k in a ? a[k] : null) });
+  for (const [attrs, key, sel] of [
+    [{ 'data-replay': 'prev' }, 'replay:prev', '[data-replay="prev"]'],
+    [{ 'data-node': 'task:a"b' }, 'node:task:a"b', '[data-node="task:a\\"b"]'],
+    [{ 'data-view': 'gantt' }, 'view:gantt', '[data-view="gantt"]'],
+    [{ 'data-mode': 'table' }, 'mode:', '[data-mode]'],
+    [{ 'data-filter': 'type', value: 'task' }, 'filter:type:task', '[data-filter="type"][value="task"]'],
+    [{ 'data-filter': 'q' }, 'filter:q:', '[data-filter="q"]'],
+    [{ 'data-clock': '' }, 'clock:', '[data-clock]'],
+    [{ 'data-more': '1' }, 'more:', '[data-more]'],
+    [{ 'data-retry': '1' }, 'retry:', '[data-retry]'],
+  ]) { assert.equal(focusKey(el(attrs)), key); assert.equal(focusSelector(key), sel); }
+  assert.equal(focusKey(el({})), null);
+  assert.equal(focusSelector('nonsense:x'), null);
+});
+
+test('an error still renders the replay controls and a Retry button; no false "will be retried" claim', () => {
+  const html = renderLineage({ graphAll: { nodes: [], edges: [] }, filtered: { nodes: [], edges: [], match: new Set() }, asOf: { step: 3, visible_events: 5, head: false }, error: 'Could not load the lineage. Press Retry, or choose Live.', filters: { types: new Set(), edgeTypes: new Set() } });
+  assert.match(html, /data-replay="live"/);
+  assert.match(html, /data-retry/);
+  assert.doesNotMatch(html, /will be retried/);
+});
+
+test('node aria-labels are clipped', () => {
+  assert.ok(nodeLabel({ node_type: 'task', id: 'task:x', label: 'L'.repeat(900), state: 'running' }, { in: 1, out: 2 }).length <= 120);
 });
