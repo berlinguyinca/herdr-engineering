@@ -479,7 +479,7 @@ agent, host and port.
 * Unanswered requests stop counting after 24 h; a room can have at most 60 open.
 * **External hosts** lists every host a room may reach, with **Remove** (this also ends live approvals).
 * Removing a host, or an approval running out, also cuts tunnels that are **already open**: the runner rewrites
-  each running helper's allow file on its next watch, and the helper's proxy checks its open tunnels against that
+  each running helper's allow file on its next watch (within about 15 s, see *Panic switch*), and the helper's proxy checks its open tunnels against that
   file every 2 s (`--recheck`) and closes those no longer allowed (a name whose listed private address went is
   cut too). A tunnel with no traffic either way for 15 minutes is closed as well (`HELPER_TUNNEL_IDLE`).
 * Approvals are **per room**: every helper in the room can use an approved host.
@@ -491,8 +491,13 @@ lets that exact IP:port through, so approve one only when you mean the runner ho
 
 **Panic switch.** **Agents → Helpers → Pause all helpers** (`POST fleet/helpers/pause {"paused": true}`) refuses
 every new request with 503 and ends every live helper at once: records cancelled, credentials revoked, and the
-runner kills the boxes on its next cycle (about 10 s). The runner checks the switch first in every cycle, even
-when the rest of the cycle fails. **Resume helpers** turns it off. Each press is audited with who, when and which
+runner kills the boxes within about 15 s. The runner watches its helpers when a cycle starts, every 3 s
+(`WATCH_EVERY`) while the cycle places fleets (which can take minutes), and again at its end; cycles are 10 s
+apart, and stopping one box takes up to 6 s. This holds for revoke, cancel, expiry and profile changes too, and
+even when the rest of the cycle fails. If the runner cannot fetch the helper list, it cancels nothing on that
+alone, but each helper's own deadline still applies and after 30 s (`HELPER_LIST_GRACE`) every running helper's
+allow file is emptied (the same happens to one helper whose room host list cannot be fetched for 30 s): a service
+outage closes the network, it never leaves removed hosts usable. **Resume helpers** turns it off. Each press is audited with who, when and which
 way (`helpers.pause` / `helpers.resume`): in every project's audit (`GET audit?project_id=...`, with `paused`), and
 in approval mode also in the **People → Decision log** on the dashboard.
 

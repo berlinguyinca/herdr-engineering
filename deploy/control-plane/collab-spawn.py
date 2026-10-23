@@ -29,7 +29,7 @@ A rename made in herdr is only taken if it is a valid @name that is free (otherw
 Helpers (agents an agent starts with helper_spawn) run on THIS host only: each cycle the runner claims new ones once,
 starts a detached supervisor (`collab-spawn.py helper-run DIR`, task on its stdin) that runs the harness in the box
 with no network but its own egress proxy, watches running ones through their private state directories (stop on
-pause, revoke, cancel or expiry), posts each result and removes its pane, work directory and state. Every ten
+pause, revoke, cancel or expiry; a watch also runs every WATCH_EVERY seconds while fleets are placed), posts each result and removes its pane, work directory and state. Every ten
 minutes it also posts the gateway's model list (--gateway) for the service's model picker.
 Usage: collab-spawn.py [once] [--url URL] [--state-dir DIR] [--herdr BIN] [--ssh BIN] [--worker FILE] [--gateway URL]
 """
@@ -114,6 +114,9 @@ HELPER_LOGIN = {"claude-code": ("claude", "CLAUDE_CONFIG_DIR", ".claude", (".cre
                 "pi": ("pi", "PI_CODING_AGENT_DIR", ".pi/agent", ("auth.json", "models.json"))}
 HELPER_RESULT_CAP = 20_000              # bytes of stdout returned; the rest is cut with a marker
 HELPER_CLAIM_STALE = 900.0              # a claim a previous process never started is failed after this long
+WATCH_EVERY = 3.0                       # seconds between helper watches while the fleet path of a cycle runs
+HELPER_LIST_GRACE = 30.0                # without the service's helper list (or a room's host list) for this long,
+                                        # a running helper's allow file is emptied: it fails closed, not open
 CLAIM_BACKOFF = 60.0                    # a claim the service refused (429 and other errors) is not retried sooner
 HELPERS_PER_HOST = 6                    # live helpers this host runs at once
 HELPER_MARGIN = 30.0                    # stop before the server's expiry, so the result is still accepted
@@ -775,7 +778,13 @@ class Runner:
         cycle is a new process: all that is known about a running helper is in its private state directory."""
         if self.sandbox_path is None:
             return                        # a helper never runs unboxed, and never without its egress proxy
-        listing = self.ok("GET", "fleet/helpers")
+        try:
+            listing = self.ok("GET", "fleet/helpers")
+        except Failure:
+            self.watch_blind()
+            raise
+        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        write_private(self.state / "helpers-seen.json", json.dumps({"at": time.time()}))
         paused = listing.get("paused") is True
         rows = [h for h in listing.get("helpers") or [] if isinstance(h, dict)
                 and isinstance(h.get("helper_id"), str) and HELPER_ID.fullmatch(h["helper_id"])]
@@ -806,6 +815,32 @@ class Runner:
             busy += 1
             self.claim_and_start(h, backoff)
         self.save_backoff(backoff)
+
+    def watch_blind(self) -> None:
+        """The service's helper list could not be fetched. Nothing is cancelled on that alone (the service may be
+        restarting), but each helper's own deadline still applies, and after HELPER_LIST_GRACE seconds without
+        a list every running helper's allow file is emptied, so removed hosts do not stay usable."""
+        try:
+            seen = float(json.loads((self.state / "helpers-seen.json").read_text()).get("at") or 0)
+        except (OSError, ValueError, AttributeError, TypeError):
+            seen = 0.0
+        blind = time.time() - seen > HELPER_LIST_GRACE
+        for d in sorted(p for p in self.helpers_dir.iterdir() if p.is_dir()) if self.helpers_dir.is_dir() else []:
+            try:
+                st = self.load_state(d)
+                if st.get("phase") != "running":
+                    continue
+                if time.time() > float(st.get("deadline") or 0) + 15:
+                    self.end_helper(d, st, "failed", "timeout")
+                elif blind:
+                    self.close_allow(d)
+            except Exception as exc:                          # noqa: BLE001
+                self.say(f"helper {d.name}: {trim(exc)}")
+
+    def close_allow(self, d: Path) -> None:
+        if (d / "allow.txt").exists() and (d / "allow.txt").read_text():
+            write_private(d / "allow.txt", "")
+            self.say(f"helper {d.name}: no host list from the service for a while; its network is closed")
 
     def load_backoff(self, live: dict) -> dict:
         """Refused claims by helper id: {at, said}. Every cycle is a new process, so this is a state file; ids
@@ -988,10 +1023,25 @@ class Runner:
             return None
         return json.dumps({"claudeAiOauth": login}).encode()
 
-    def refresh_allow(self, d: Path, room: str) -> None:
-        out = self.ok("GET", f"fleet/egress/{room}")
+    def refresh_allow(self, d: Path, room: str, st: dict | None = None) -> None:
+        """The room's host list as the proxy's allow file. With `st` (a running helper), a failed fetch is
+        tolerated for HELPER_LIST_GRACE seconds since the last good one, then the file is emptied."""
+        try:
+            out = self.ok("GET", f"fleet/egress/{room}")
+        except Failure:
+            if st is not None and time.time() - float(st.get("allow_ok") or st.get("since") or 0) > HELPER_LIST_GRACE:
+                self.close_allow(d)
+            raise
         lines = [x for x in out.get("allowlist") or [] if isinstance(x, str) and ALLOW_LINE.fullmatch(x)]
-        write_private(d / "allow.txt", "".join(x + "\n" for x in lines))
+        new = "".join(x + "\n" for x in lines)
+        try:
+            same = (d / "allow.txt").read_text() == new
+        except OSError:
+            same = False
+        if not same:
+            write_private(d / "allow.txt", new)
+        if st is not None:
+            st["allow_ok"] = time.time()
 
     def harness_path(self) -> str:
         """PATH for the harness: the login shell's (a herdr pane's, where claude/codex/pi and node are found)
@@ -1181,7 +1231,10 @@ class Runner:
         elif not self.alive(st):
             self.end_helper(d, st, "failed", "sandbox-error")
         else:
-            self.refresh_allow(d, st["room_id"])
+            try:
+                self.refresh_allow(d, st["room_id"], st)
+            finally:
+                self.save_state(d, st)
 
     def drain_blocked(self, d: Path, st: dict) -> None:
         """New complete lines of the proxy's blocked log become host-access requests, one per host:port. A host
@@ -1341,11 +1394,39 @@ class Runner:
         self.say(f"catalogue: {models.get('count')} models")
 
     # ------------------------------------------------------------ one cycle
+    def watch_loop(self, stop: threading.Event, lock: threading.Lock) -> None:
+        """Helper watches (stop on pause, revoke, cancel, expiry, profile change; refresh host lists) every
+        WATCH_EVERY seconds for as long as the fleet path runs: a fleet start may take minutes."""
+        while True:
+            with lock:
+                try:
+                    self.helpers_cycle(claim=False)
+                except (Failure, OSError) as exc:
+                    self.say(f"helpers: {trim(exc)}")
+            if stop.wait(WATCH_EVERY):
+                return
+
     def once(self) -> None:
-        try:        # the panic switch, revokes and expiry apply first, whatever happens to the fleet path below
-            self.helpers_cycle(claim=False)
+        # the panic switch, revokes and expiry apply first and keep applying, whatever the fleet path does
+        stop, lock = threading.Event(), threading.Lock()
+        watcher = threading.Thread(target=self.watch_loop, args=(stop, lock), daemon=True)
+        watcher.start()
+        try:
+            eligible = self.fleet_cycle()
+        finally:
+            stop.set()
+            watcher.join()
+        try:
+            self.helpers_cycle(local_ok=self.host_id in eligible)       # watches again, then claims
         except (Failure, OSError) as exc:
             self.say(f"helpers: {trim(exc)}")
+        try:
+            self.catalogue_cycle()
+        except Failure as exc:
+            self.say(f"catalogue: {trim(exc)}")
+
+    def fleet_cycle(self) -> list[str]:
+        """Hosts, names and fleet starts; returns the hosts that accept automatic agents."""
         self.public_url = (self.ok("GET", "config") or {}).get("public_url", "")
         if not self.public_url.startswith("https://"):
             raise Failure("the service has no public https url to give agents")
@@ -1365,14 +1446,7 @@ class Runner:
                 self.handle(spec, eligible)
             elif status != 409:
                 self.say(f"claim {sp['spawn_id']}: {status}")
-        try:
-            self.helpers_cycle(local_ok=self.host_id in eligible)       # watches again, then claims
-        except (Failure, OSError) as exc:
-            self.say(f"helpers: {trim(exc)}")
-        try:
-            self.catalogue_cycle()
-        except Failure as exc:
-            self.say(f"catalogue: {trim(exc)}")
+        return eligible
 
 
 def default_url() -> tuple[str, str, str]:
