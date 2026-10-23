@@ -1,0 +1,44 @@
+{
+  "repo": "/home/wohlgemuth/IdeaProjects/herdr-engineering-arch",
+  "rev": "c786dd99ff969a4e7c6c2f8aa87b63cb077bde68",
+  "runs": 7,
+  "errors": 0,
+  "graph": {
+    "nodes": 4932,
+    "edges": 5824,
+    "python_files": 258,
+    "canonical_json_bytes": 5020791,
+    "completeness": "partial"
+  },
+  "analysis_seconds": {
+    "cold_isolated_median": 6.218301548622549,
+    "cold_isolated_max": 11.792405462823808,
+    "warm_in_process_median": 5.571545748971403
+  },
+  "peak_memory_mib_largest_child": 55.3,
+  "publish_validate_store_seconds": 0.1920561408624053,
+  "query_latency_ms": {
+    "children": {
+      "p50": 0.048,
+      "p95": 2.345,
+      "max": 5.65
+    },
+    "search": {
+      "p50": 1.822,
+      "p95": 2.414,
+      "max": 6.165
+    },
+    "expand": {
+      "p50": 0.02,
+      "p95": 0.045,
+      "max": 0.133
+    },
+    "node": {
+      "p50": 0.006,
+      "p95": 0.009,
+      "max": 0.013
+    }
+  },
+  "incremental": "not implemented: every analysis is a full baseline; no parity or speedup measured",
+  "network_isolated": false
+}
