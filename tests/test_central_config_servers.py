@@ -531,6 +531,7 @@ def test_replay_history_is_validated_in_the_collab_slice(tmp_path):
 
 def test_steering_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
     import argparse
+
     from herdr_engineering.control_plane.collab_workbench import normalize_steering
     assert normalize_steering(None)["enabled"] is False and normalize_steering(None)["kill_switch"] is False
     central = make_file(tmp_path, collab=dict(COLLAB, steering={"enabled": True, "kill_switch": False}))
