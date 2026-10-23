@@ -43,7 +43,7 @@ import json
 import re
 import threading
 from collections import deque
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 NODE_TYPES = frozenset(
@@ -77,6 +77,10 @@ MAX_SOURCES_PER_ACTOR_OBJECT = 4
 MAX_BINDINGS = 20                    # bindings listed per edge view
 SCAN_BUDGET = 3000                   # incident edges examined per node per read
 NEIGHBOR_SCAN_BUDGET = 500
+MAX_CONTRIBUTIONS = 5                # foreign values listed per commons field
+MAX_INSTANCES_PER_TRIPLE = 8         # per-writer instances of a commons-from edge
+MAX_OBJECT_ATTR_KEYS = 1024          # hard cap per object across all writers
+MAX_OBJECT_ATTRS_BYTES = 256 * 1024
 NODE_RESERVE_FRACTION = 0.8          # share of the node cap non-operators may fill
 MAX_WILDCARD_REMOVES = 10_000
 MAX_OBJECTS_PER_PRINCIPAL = 25_000   # fair-share quota of the global pool (operators exempt)
@@ -154,15 +158,19 @@ def binding_of(attrs: dict) -> tuple[str, str] | None:
     return None
 
 
-def validate_lineage(event_type: str, payload: Any) -> dict:
+def validate_lineage(event_type: str, payload: Any, *, strict: bool = True) -> dict:
     """Validate and normalise a lineage payload (ValueError => HTTP 400).
 
-    Pure: stores nothing.
+    Pure: stores nothing. ``strict`` (live ingest) rejects top-level ``_``-prefixed keys,
+    which are reserved for server metadata; replay passes ``strict=False`` because the stored
+    row carries the server's own ``_envelope``.
     """
     if event_type not in LINEAGE_EVENT_TYPES:
         raise ValueError(f"unknown lineage event_type {event_type!r}")
     if not isinstance(payload, dict):
         raise ValueError("lineage payload must be a JSON object")
+    if strict and any(isinstance(k, str) and k.startswith("_") for k in payload):
+        raise ValueError("payload keys starting with '_' are reserved")
     if event_type == "node.upsert":
         node_type = payload.get("node_type")
         if node_type not in NODE_TYPES:
@@ -205,6 +213,10 @@ def validate_lineage(event_type: str, payload: Any) -> dict:
             raise ValueError(f"{edge_type} edges require attrs.commit or attrs.plan_digest")
         op["ensure"] = not attrs or set(attrs) <= {"commit"} and edge_type in BOUND_EDGE_TYPES
         return op
+    writer = attrs.get("writer")
+    if writer is not None and (not isinstance(writer, str) or not 0 < len(writer) <= 128):
+        raise ValueError("attrs.writer must be a short string")
+    op["writer"] = writer
     reason = payload.get("reason")
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("edge.remove requires a reason")
@@ -255,11 +267,10 @@ def _ts(ev: dict) -> float:
 
 
 def _lseq(ev: dict) -> int:
-    """Server-assigned monotonic admission number (persisted in the envelope row)."""
+    """Server-assigned monotonic admission number. Read ONLY from the event dict's own
+    ``lineage_seq`` key, which the server sets (live ingest, or the repo copying it out of
+    the envelope metadata it persisted); never from the client-controlled payload."""
     val = ev.get("lineage_seq")
-    if val is None:
-        meta = (ev.get("payload") or {}).get("_envelope")
-        val = meta.get("lineage_seq") if isinstance(meta, dict) else None
     return val if isinstance(val, int) and not isinstance(val, bool) else 0
 
 
@@ -273,12 +284,18 @@ def _rank(ev: dict) -> tuple:
 
 
 def _mode(ev: dict) -> str:
-    """Admission decision persisted with the event: normal | foreign | noop."""
+    """Admission decision: normal | foreign | noop. Server-set top-level key only (see _lseq)."""
     val = ev.get("lineage_mode")
-    if val is None:
-        meta = (ev.get("payload") or {}).get("_envelope")
-        val = meta.get("lineage_mode") if isinstance(meta, dict) else None
     return val if val in ("foreign", "noop") else "normal"
+
+
+def _ekey(op: dict, writer_id: str | None) -> tuple:
+    """Edge instance key ``(type, from, to, binding, writer)``. ``binding`` only for
+    reviewed/validated; ``writer`` only when the ``from`` node is a shared COMMONS node
+    (then every writer has its own instance of the triple and none can squat another's)."""
+    bound = op["edge_type"] in BOUND_EDGE_TYPES
+    return (op["edge_type"], op["from_id"], op["to_id"], op["binding"] if bound else None,
+            writer_id if (op["from_type"] in COMMONS_KINDS and not bound) else None)
 
 
 def _writer_key(ev: dict) -> tuple:
@@ -295,18 +312,18 @@ class _Reg:
     Inside one (source, actor) the emitter's own ``source_sequence`` decides, so
     a late-arriving older event loses. Between different writers only the
     server's admission order counts: a client-chosen sequence can never beat
-    another principal.
+    another principal, even on a shared source name.
     """
     __slots__ = ("by",)
 
     def __init__(self):
-        self.by: dict[tuple, tuple] = {}     # writer key -> (seq, event_id, rank, value, key)
+        self.by: dict[tuple, tuple] = {}     # writer key -> (seq, event_id, rank, value, key, is_op)
 
     def set(self, ev: dict, value: Any = None) -> None:
         key, seq, eid = _writer_key(ev), int(ev["source_sequence"]), str(ev["event_id"])
         cur = self.by.get(key)
         if cur is None or (seq, eid) > (cur[0], cur[1]):
-            self.by[key] = (seq, eid, _rank(ev), value, key)
+            self.by[key] = (seq, eid, _rank(ev), value, key, _is_operator(ev.get("actor")))
 
     def best(self) -> tuple | None:
         return max(self.by.values(), key=lambda t: t[2]) if self.by else None
@@ -314,6 +331,44 @@ class _Reg:
     def value(self) -> Any:
         b = self.best()
         return b[3] if b else None
+
+    def primary(self, owner: str | None) -> tuple | None:
+        """The authoritative entry for a shared (commons) field, chosen by who wrote it,
+        never by who wrote last: an operator's value, else the creator's, else the earliest
+        writer's. Everyone else's values are only ``contributions``."""
+        ents = list(self.by.values())
+        if not ents:
+            return None
+        ops = [e for e in ents if e[5]]
+        if ops:
+            return max(ops, key=lambda t: t[2])
+        own = [e for e in ents if e[4][1] == owner]
+        if own:
+            return max(own, key=lambda t: t[2])
+        return min(ents, key=lambda t: t[2])
+
+    def contributions(self, primary: tuple | None, limit: int = MAX_CONTRIBUTIONS) -> list:
+        """Latest value of every writer other than the primary's, newest admission first."""
+        latest: dict = {}
+        for e in self.by.values():
+            if primary is not None and e[4][1] == primary[4][1]:
+                continue
+            cur = latest.get(e[4][1])
+            if cur is None or e[2] > cur[2]:
+                latest[e[4][1]] = e
+        return sorted(latest.values(), key=lambda t: t[2], reverse=True)[:limit]
+
+
+def _prov(entry: tuple | None, extra: dict | None = None) -> dict | None:
+    """Provenance of one register entry: who wrote it, from which source, in which event, when."""
+    if entry is None:
+        return None
+    out = {"value": entry[3], "writer": entry[4][1], "source": entry[4][0], "event_id": entry[1],
+           "admission": entry[2][0],
+           "admitted_at": datetime.fromtimestamp(entry[2][1], UTC).isoformat() if entry[2][1] else None}
+    if extra:
+        out.update(extra)
+    return out
 
 
 def _after(x: tuple, y: tuple) -> bool:
@@ -385,13 +440,45 @@ class _Node(_Claims):
         self.id, self.node_type = node_id, node_type
         self._init_claims()
         self.label, self.state = _Reg(), _Reg()   # state value = (state, reason)
+        self.commons = node_type in COMMONS_KINDS
+        self.scope_by: dict[str, tuple] = {}      # commons only: actor -> (narrowest scope, is_operator)
+
+    def note_scope(self, ev: dict) -> None:
+        """Commons nodes: each writer states its own scope (its narrowest)."""
+        if not self.commons:
+            return
+        actor = ev.get("actor") or {}
+        scope = ev.get("visibility_scope")
+        scope = scope if scope in SCOPE_RANK else "private"
+        key = actor.get("id")
+        cur = self.scope_by.get(key)
+        self.scope_by[key] = (scope if cur is None else _narrow(cur[0], scope), _is_operator(actor))
+
+    def eff_scope(self) -> str | None:
+        """Owned nodes: the narrowest scope any admitted event carried. COMMONS nodes: the
+        WIDEST scope any non-operator writer asked for (pre-creating a shared identity as
+        private cannot hide it from its real emitters); an operator who has written
+        moderates and, if so, decides (narrowest of the operators' own scopes)."""
+        if not self.commons:
+            return self.scope
+        if not self.scope_by:
+            return None
+        ops = [s for s, is_op in self.scope_by.values() if is_op]
+        if ops:
+            return min(ops, key=SCOPE_RANK.get)
+        return max((s for s, _ in self.scope_by.values()), key=SCOPE_RANK.get)
+
+    def pick(self, reg: _Reg) -> tuple | None:
+        return reg.primary(self.owner()) if self.commons else reg.best()
+
+    def attr_values(self) -> dict:
+        return {k: (e[3] if (e := self.pick(r)) else None) for k, r in sorted(self.attrs.items())}
 
 
 class _Edge(_Claims):
     def __init__(self, key: tuple):
         self.key = key
-        self.edge_type, self.from_id, self.to_id = key[:3]
-        self.binding = key[3] if len(key) > 3 else None
+        self.edge_type, self.from_id, self.to_id, self.binding, self.writer = key
         self._init_claims()
         self.adds, self.removes = _Reg(), _Reg()  # remove value = (reason, scope, actor_id)
 
@@ -407,6 +494,25 @@ class _Wild(_Claims):
 class _Group:
     """Visible live reviewed/validated edges into one subject, indexed once per read."""
     __slots__ = ("by_from", "by_owner", "sup_from", "sup_owner", "bindings", "truncated")
+
+
+def from_stored(event: dict) -> dict:
+    """Event dict for replay from a stored row.
+
+    The admission number and decision are read from the envelope metadata the SERVER wrote
+    (it overwrites any client ``_envelope`` when persisting) and become explicit event keys;
+    ``apply`` never looks inside the payload for them.
+    """
+    payload = event.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = {}
+    meta = payload.get("_envelope") if isinstance(payload, dict) else None
+    meta = meta if isinstance(meta, dict) else {}
+    return {**event, "payload": payload, "lineage_seq": meta.get("lineage_seq"),
+            "lineage_mode": meta.get("lineage_mode")}
 
 
 class GraphProjection:
@@ -453,7 +559,7 @@ class GraphProjection:
         cannot see an endpoint, is not a writer of the edge's ``from`` node,
         removes something that does not exist, or is at its object quota.
         """
-        op = validate_lineage(event_type, payload)
+        op = validate_lineage(event_type, payload, strict=True)
         operator = _is_operator(actor)
         aid = (actor or {}).get("id")
         deny = PermissionError("not permitted to modify this lineage object")
@@ -467,7 +573,9 @@ class GraphProjection:
                 rec = self._nodes.get(op["node_id"])
                 exists = rec is not None and rec.claim is not None
                 if not exists:
-                    if op["op"] == "node.state":
+                    # A state write to a missing COMMONS node creates it, exactly like an upsert,
+                    # so it is indistinguishable from the same write to a hidden existing one.
+                    if op["op"] == "node.state" and op["node_type"] not in COMMONS_KINDS:
                         raise (ValueError("node not found") if operator else deny)
                     self._check_create(operator, at_quota, nodes=True)
                     recs = []
@@ -493,13 +601,14 @@ class GraphProjection:
                         raise deny
                     if not (aid in frm.writers() or (frm.node_type in COMMONS_KINDS and not bound)):
                         raise deny
-                key = (op["edge_type"], op["from_id"], op["to_id"]) + \
-                    ((op["binding"],) if bound and op["binding"] else ())
                 wildcard = (op["op"] == "edge.remove" and bound and op["binding"] is None)
                 if op["op"] == "edge.add":
+                    key = _ekey(op, aid)
                     rec = self._edges.get(key)
                     if rec is None or rec.claim is None:
                         self._check_create(operator, at_quota, nodes=False)
+                        if key[4] is not None and len(self._by_triple.get(key[:3], ())) >= MAX_INSTANCES_PER_TRIPLE:
+                            raise ValueError("too many writers for this edge")
                         recs = []
                     elif operator or aid in rec.writers():
                         recs = [rec]
@@ -509,20 +618,25 @@ class GraphProjection:
                         op["mode"] = "noop"
                         return op
                 elif wildcard:
-                    tri = key[:3]
-                    existing = [e for e in (self._edges[k] for k in self._by_triple.get(tri, ()))
+                    tri = (op["edge_type"], op["from_id"], op["to_id"], None)
+                    existing = [e for e in (self._edges[k] for k in self._by_triple.get(tri[:3], ()))
                                 if self._live(e)]
                     if not existing:
                         raise (ValueError("edge not found") if operator else deny)
-                    wild = self._wild.get(tri)
+                    wild = self._wild.get(tri[:3])
                     if wild is None and len(self._wild) >= MAX_WILDCARD_REMOVES:
                         raise ValueError("too many wildcard removes")
                     recs = ([wild] if wild is not None and wild.claim is not None else []) + existing
                 else:
-                    rec = self._edges.get(key)
+                    target = op["writer"] or aid
+                    rec = self._edges.get(_ekey(op, target))
                     if rec is None or not self._live(rec):
                         raise (ValueError("edge not found") if operator else deny)
                     recs = [rec]
+                    if (not operator and rec.writer is not None and aid not in rec.writers()
+                            and (aid in frm.writers() or aid in to.writers())):
+                        # an owner of either endpoint may tombstone another writer's instance
+                        recs = []
                 if not operator:
                     for rec in recs:
                         if aid not in rec.writers():
@@ -535,9 +649,9 @@ class GraphProjection:
                             or sum(1 for p in rec.sources if p[1] == aid) >= MAX_SOURCES_PER_ACTOR_OBJECT):
                         raise ValueError("too many distinct writers for this lineage object")
                 if len(recs) == 1 and attrs:
-                    self._check_attr_caps(recs[0], attrs)
+                    self._check_attr_caps(recs[0], attrs, aid)
                 elif attrs:
-                    self._check_attr_caps(None, attrs)
+                    self._check_attr_caps(None, attrs, aid)
         return op
 
     def _check_create(self, operator: bool, at_quota: bool, *, nodes: bool) -> None:
@@ -551,14 +665,35 @@ class GraphProjection:
             raise ValueError("graph edge capacity reached")
 
     @staticmethod
-    def _check_attr_caps(rec: _Claims | None, attrs: dict) -> None:
-        merged = {k: json.dumps(v, sort_keys=True, separators=(",", ":"))
-                  for k, v in (rec.attr_values() if rec else {}).items()}
-        merged.update({k: json.dumps(v, sort_keys=True, separators=(",", ":")) for k, v in attrs.items()})
-        if len(merged) > MAX_TOTAL_ATTR_KEYS:
-            raise ValueError(f"too many attrs keys (max {MAX_TOTAL_ATTR_KEYS})")
-        if sum(len(k) + len(v) for k, v in merged.items()) > MAX_TOTAL_ATTRS_BYTES:
-            raise ValueError("attrs for this object exceed the total size cap")
+    def _check_attr_caps(rec: _Claims | None, attrs: dict, writer: str | None) -> None:
+        """Cap attrs per object. A COMMONS node is written by many keys, so each key is held to
+        its OWN registers (one writer cannot fill the budget of another) under a hard object cap."""
+        def dump(v):
+            return json.dumps(v, sort_keys=True, separators=(",", ":"))
+
+        def check(table, kcap, bcap, what):
+            if len(table) > kcap:
+                raise ValueError(f"too many attrs keys (max {kcap})")
+            if sum(len(k) + len(v) for k, v in table.items()) > bcap:
+                raise ValueError(f"attrs for this {what} exceed the total size cap")
+
+        new = {k: dump(v) for k, v in attrs.items()}
+        commons = isinstance(rec, _Node) and rec.commons
+        if commons:
+            mine = {}
+            for k, reg in rec.attrs.items():
+                ents = [e for e in reg.by.values() if e[4][1] == writer]
+                if ents:
+                    mine[k] = dump(max(ents, key=lambda t: t[2])[3])
+            mine.update(new)
+            check(mine, MAX_TOTAL_ATTR_KEYS, MAX_TOTAL_ATTRS_BYTES, "writer's share")
+            whole = {k: dump(v) for k, v in rec.attr_values().items()}
+            whole.update(new)
+            check(whole, MAX_OBJECT_ATTR_KEYS, MAX_OBJECT_ATTRS_BYTES, "object")
+        else:
+            merged = {k: dump(v) for k, v in (rec.attr_values() if rec else {}).items()}
+            merged.update(new)
+            check(merged, MAX_TOTAL_ATTR_KEYS, MAX_TOTAL_ATTRS_BYTES, "object")
 
     # ----------------------------------------------------------- mutation
     def apply(self, ev: dict) -> None:
@@ -568,7 +703,7 @@ class GraphProjection:
         and the admission ``mode`` travels with the event. ``ValueError`` if the
         payload no longer validates.
         """
-        op = validate_lineage(ev.get("event_type") or "", ev.get("payload") or {})
+        op = validate_lineage(ev.get("event_type") or "", ev.get("payload") or {}, strict=False)
         mode = _mode(ev)
         with self._lock:
             self.events_applied += 1
@@ -613,6 +748,7 @@ class GraphProjection:
         pair = _writer_key(ev)
         if mode == "normal":
             self._touch(node, ev)
+        node.note_scope(ev)
         if op["op"] == "node.upsert":
             if op["label"] is not None:
                 node.label.set(ev, op["label"])
@@ -634,8 +770,9 @@ class GraphProjection:
             self._node(nid, ntype)
         bound = op["binding"]
         pair = _writer_key(ev)
+        actor_id = (ev.get("actor") or {}).get("id")
         if op["op"] == "edge.add":
-            key = (etype, frm, to) + ((bound,) if etype in BOUND_EDGE_TYPES else ())
+            key = _ekey(op, actor_id)
             edge = self._edge(key)
             self._touch(edge, ev, key)
             edge.adds.set(ev)
@@ -650,7 +787,7 @@ class GraphProjection:
             wild.removes.set(ev, rem)
             wild.sources.add(pair)
             return
-        key = (etype, frm, to) + ((bound,) if etype in BOUND_EDGE_TYPES else ())
+        key = _ekey(op, op["writer"] or actor_id)       # a tombstone names the instance it removes
         edge = self._edge(key)
         self._touch(edge, ev, key)
         edge.removes.set(ev, rem)
@@ -767,18 +904,42 @@ class GraphProjection:
 
     # ------------------------------------------------------------ renders
     def _node_view(self, node: _Node, internal: bool = False) -> dict:
-        state = node.state.value()
+        """Plain values are the PRIMARY ones (see ``_Reg.primary`` for commons); ``fields`` gives
+        each one's provenance and ``contributions`` the other writers' values, so one writer's
+        value is never shown under another writer's name."""
+        state, label = node.pick(node.state), node.pick(node.label)
+        fields: dict = {"label": _prov(label), "state": None, "attrs": {}}
+        if state:
+            fields["state"] = _prov(state, {"value": state[3][0], "reason": state[3][1]})
+        contrib: dict = {}
+        for name, reg, ent in (("label", node.label, label), ("state", node.state, state)):
+            lst = reg.contributions(ent) if node.commons else []
+            if lst:
+                contrib[name] = [_prov(e, {"value": e[3][0], "reason": e[3][1]} if name == "state" else None)
+                                 for e in lst]
+        cattrs: dict = {}
+        for k, reg in sorted(node.attrs.items()):
+            ent = node.pick(reg)
+            fields["attrs"][k] = _prov(ent)
+            lst = reg.contributions(ent) if node.commons else []
+            if lst:
+                cattrs[k] = [_prov(e) for e in lst]
+        if cattrs:
+            contrib["attrs"] = cattrs
         out = {
             "id": node.id, "node_type": node.node_type,
-            "label": node.label.value(),
-            "state": state[0] if state else None,
-            "state_reason": state[1] if state else None,
+            "label": label[3] if label else None,
+            "state": state[3][0] if state else None,
+            "state_reason": state[3][1] if state else None,
             "attrs": node.attr_values(),
-            "visibility_scope": node.scope or "private",
+            "fields": fields,
+            "visibility_scope": node.eff_scope() or "private",
             "first_event_id": node.first[1] if node.first else None,
             "last_event_id": node.last[1] if node.last else None,
-            "source": node.last[0][2] if node.last else None,
+            "source": node.claim[0][2] if node.claim else None,
         }
+        if contrib:
+            out["contributions"] = contrib
         if internal:
             out["owner"], out["co_writers"] = node.owner(), list(node.co_writers())
         return out
@@ -793,8 +954,12 @@ class GraphProjection:
             "attrs": edge.attr_values(),
             "stale": self._is_stale(edge, principal, ctx), "removed": removed,
             "visibility_scope": edge.scope or "private",
-            "provenance": {"event_id": add[1], "source": add[2][2], "source_sequence": add[0]},
+            "provenance": {"event_id": add[1], "source": add[2][2], "source_sequence": add[0],
+                           "writer": add[4][1]},
+            "fields": {k: _prov(r.best()) for k, r in sorted(edge.attrs.items())},
         }
+        if edge.writer is not None:
+            out["writer"] = edge.writer
         if edge.binding is not None:
             grp = self._group(principal, edge.to_id, edge.edge_type, ctx)
             out["binding"] = {edge.binding[0]: edge.binding[1]}
@@ -814,8 +979,8 @@ class GraphProjection:
 
     # ---------------------------------------------------------- visibility
     def _node_visible(self, principal, node: _Node | None) -> bool:
-        return (node is not None and node.scope is not None
-                and can_see(principal, node.scope, node.writers()))
+        scope = node.eff_scope() if node is not None else None
+        return scope is not None and can_see(principal, scope, node.writers())
 
     def _edge_visible(self, principal, edge: _Edge) -> bool:
         """An edge is visible only if its own scope AND both endpoints are."""

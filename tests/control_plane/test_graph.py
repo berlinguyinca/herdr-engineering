@@ -8,7 +8,7 @@ import urllib.request
 import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
-from herdr_engineering.control_plane.graph import MAX_DEPTH, GraphProjection, can_see
+from herdr_engineering.control_plane.graph import MAX_DEPTH, GraphProjection, can_see, from_stored
 from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
@@ -135,7 +135,7 @@ def test_rebuild_is_order_independent():
         random.Random(seed).shuffle(events)
         g = GraphProjection()
         for e in events:
-            g.apply(e)
+            g.apply(from_stored(e))
         assert g.snapshot() == ref
 
 
@@ -467,9 +467,7 @@ def test_rebuild_from_durable_rows_equals_live_state():
     f.edge("handoff", "agent:a1", "task:t1", scope="org")
     f.send("edge.remove", {"edge_type": "handoff", "from_id": "agent:a1", "to_id": "task:t1", "reason": "r"})
     live = repo.graph.snapshot()
-    rows = [{**r, "ingest_timestamp": f"2026-10-22T10:00:{i:02d}+00:00",
-             "source_timestamp": f"2026-10-22T10:00:{i:02d}+00:00", "sequence": i}
-            for i, r in enumerate(conn.rows)]
+    rows = [{**r, "sequence": i} for i, r in enumerate(conn.rows)]
     streams, order = bridge._rebuild_events(rows)
     fresh = ControlPlaneRepo()
     fresh.import_state({"events": streams, "event_order": order})
@@ -650,7 +648,7 @@ def test_all_merges_commute_under_shuffle_live_and_after_export_import():
         random.Random(seed).shuffle(shuffled)                    # cross-entity interleavings too
         g = GraphProjection()
         for e in shuffled:
-            g.apply(e)
+            g.apply(from_stored(e))
         assert g.snapshot() == live, f"seed {seed}"
         state = repo.export_state()
         keys = list(state["events"])
@@ -968,17 +966,24 @@ def test_foreign_ensure_is_a_noop_and_cannot_resurrect_or_move_anything():
     repo, svc, _ = make()
     fa, fb = Feed(svc, "pia"), Feed(svc, "pib")
     fa.principal, fb.principal = A, B
-    pi_edge(fa, "produced", "commit:c", "pr:1")
-    fa.send("edge.remove", {"edge_type": "produced", "from_id": "commit:c", "to_id": "pr:1", "reason": "r"})
+    pi_edge(fa, "dependency", "task:c", "task:d")
+    fa.send("edge.remove", {"edge_type": "dependency", "from_id": "task:c", "to_id": "task:d", "reason": "r"})
     before = repo.graph.snapshot()
-    pi_edge(fb, "produced", "commit:c", "pr:1")               # foreign "ensure" of a removed edge
-    assert repo.graph.neighborhood(VIEWER, "pr:1")["edges"] == []
-    after = repo.graph.snapshot()
-    assert after["edges"] == before["edges"]
+    for nid in ("task:c", "task:d"):                          # B ensures A's (owned) nodes and edge
+        fb.send("node.upsert", {"node_type": "task", "node_id": nid})
+    with pytest.raises(PermissionError):                      # an edge FROM someone else's owned node
+        fb.send("edge.add", {"edge_type": "dependency", "from_id": "task:c", "to_id": "task:d"})
+    assert repo.graph.neighborhood(VIEWER, "task:c")["edges"] == []        # still removed
+    assert repo.graph.snapshot()["edges"] == before["edges"]
     assert rebuilt(repo).graph.snapshot() == repo.graph.snapshot()
-    with pytest.raises(PermissionError):                      # but changing the edge is refused
-        fb.send("edge.add", {"edge_type": "produced", "from_id": "commit:c", "to_id": "pr:1",
+    with pytest.raises(PermissionError):                      # changing it is refused
+        fb.send("edge.add", {"edge_type": "dependency", "from_id": "task:c", "to_id": "task:d",
                              "attrs": {"x": 1}})
+    # shared (commons) endpoints: each writer has its own instance, so neither can squat the other
+    pi_edge(fa, "produced", "commit:c", "pr:1")
+    pi_edge(fb, "produced", "commit:c", "pr:1")
+    inst = {e["writer"]: e["removed"] for e in repo.graph.get_edge(VIEWER, "produced", "commit:c", "pr:1")["edges"]}
+    assert inst == {A["id"]: False, B["id"]: False}
 
 
 def test_node_state_on_a_missing_node_is_refused_and_operator_objects_are_operator_owned():
@@ -1059,7 +1064,7 @@ def test_quota_and_rebuild_follow_the_pinned_owner_not_apply_order():
         shuffled = random.Random(seed).sample(events, len(events))
         g = GraphProjection()
         for e in shuffled:
-            g.apply(e)
+            g.apply(from_stored(e))
         assert g.snapshot() == live and g._owned == repo.graph._owned
 
 
@@ -1173,3 +1178,218 @@ def test_http_node_edge_filters_and_paging(http):
     assert [e["from_id"] for e in body["edges"]] == ["task:3"]
     assert call("/api/v1/graph/nodes/commit%3Ah?limit=0", vw)[0] == 400
     assert call("/api/v1/graph/nodes/commit%3Ah?edge_type=nope", vw)[0] == 400
+
+
+# ------------------------------------------------------------------ round 4
+def P(name):
+    return {"kind": "agent", "id": f"key:{name}", "authenticated_by": "api_key"}
+
+
+def feed_for(svc, source, principal):
+    f = Feed(svc, source)
+    f.principal = principal
+    return f
+
+
+def raw_lineage(svc, principal, event_id, source, seq, label, node="pr:o/r#z"):
+    return svc.ingest({
+        "schema_version": 2, "event_id": event_id, "source": source, "source_sequence": seq,
+        "entity_type": "lineage", "entity_id": node, "event_type": "node.upsert",
+        "payload": {"node_type": node.split(":")[0], "node_id": node, "label": label},
+        "visibility_scope": "org"}, principal)
+
+
+def test_client_cannot_forge_admission_mode_or_sequence():
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "gh", V), feed_for(svc, "evil", A)
+    for key in ("_envelope", "_lineage_seq"):
+        with pytest.raises(ValueError):
+            fa.send("node.upsert", {"node_type": "pr", "node_id": "pr:o/r#8", "label": "mine",
+                                    key: {"lineage_mode": "foreign", "lineage_seq": 0}})
+    # a forged envelope hidden inside attrs is ordinary data and cannot change the mode
+    fa.node("pr:o/r#7", label="mine", attrs={"_envelope": {"lineage_mode": "noop"}})
+    assert repo.graph.snapshot()["nodes"]["pr:o/r#7"]["label"] == "mine"
+    fa.node("pr:o/r#9", label="mine", attrs={"envelope": {"lineage_mode": "noop"}})
+    fv.node("pr:o/r#9", label="victim")
+    live = repo.graph.snapshot()
+    assert live == rebuilt(repo).graph.snapshot()
+    # an event whose payload carries a forged envelope is ignored by apply: only the
+    # server-set top-level keys count
+    g = GraphProjection()
+    g.apply({"event_id": "x", "source": "s", "source_sequence": 0, "event_type": "node.upsert",
+             "payload": {"node_type": "task", "node_id": "task:x", "label": "real",
+                         "_envelope": {"lineage_mode": "noop", "lineage_seq": 10**9}},
+             "visibility_scope": "org", "actor": A, "lineage_seq": 1})
+    assert g.snapshot()["nodes"]["task:x"]["label"] == "real"
+
+
+def test_commons_overwrite_keeps_primary_value_and_attributes_the_contribution():
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "gh", V), feed_for(svc, "evil", A)
+    fv.node("pr:o/r#5", label="Fix bug", state="open", attrs={"url": "https://good.example"})
+    fa.node("pr:o/r#5", label="FREE STUFF", state="merged", attrs={"url": "https://evil.example"})
+    for g in (repo.graph, rebuilt(repo).graph):
+        n = g.get_node(V, "pr:o/r#5")["node"]
+        assert (n["label"], n["state"], n["attrs"]["url"]) == ("Fix bug", "open", "https://good.example")
+        assert n["fields"]["label"]["writer"] == V["id"] and n["source"] == "gh"
+        other = [c for c in n["contributions"]["label"] if c["writer"] == A["id"]]
+        assert other and other[0]["value"] == "FREE STUFF" and other[0]["source"] == "evil"
+        assert n["contributions"]["state"][0]["value"] == "merged"
+    # an operator's value outranks the owner's
+    fo = feed_for(svc, "ops", OPERATOR)
+    fo.node("pr:o/r#5", state="closed")
+    assert repo.graph.get_node(V, "pr:o/r#5")["node"]["state"] == "closed"
+
+
+def test_precreating_a_commons_node_privately_cannot_hide_it():
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "gh", V), feed_for(svc, "evil", A)
+    fa.node("pr:o/r#6", scope="private", label="x")
+    fv.node("pr:o/r#6", scope="org", label="real", state="open")
+    for g in (repo.graph, rebuilt(repo).graph):
+        assert g.get_node(OTHER, "pr:o/r#6") is not None, "widest scope wins on commons"
+        assert g.get_node(OTHER, "pr:o/r#6")["node"]["state"] == "open"
+    # an owned kind keeps the narrowest scope (a co-writer cannot widen it)
+    fa.node("agent:s", scope="private", label="s")
+    with pytest.raises(KeyError):
+        repo.graph.get_node(V, "agent:s")
+
+
+def test_commons_from_edges_are_per_writer_and_removable_by_endpoint_owner():
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "gh", V), feed_for(svc, "evil", A)
+    fv.node("commit:abc", label="c")
+    fv.node("pr:p1", label="p")
+    fa.edge("produced", "commit:abc", "pr:p1", {"note": "fake"}, nodes=False)
+    fv.edge("produced", "commit:abc", "pr:p1", {"ci": "green"}, nodes=False)
+    for g in (repo.graph, rebuilt(repo).graph):
+        edges = g.get_node(V, "pr:p1")["edges"]
+        mine = [e for e in edges if e["writer"] == V["id"]]
+        theirs = [e for e in edges if e["writer"] == A["id"]]
+        assert len(mine) == 1 and mine[0]["attrs"] == {"ci": "green"}
+        assert len(theirs) == 1 and theirs[0]["attrs"] == {"note": "fake"}
+    # the victim's own remove only drops the victim's instance
+    fv.send("edge.remove", {"edge_type": "produced", "from_id": "commit:abc", "to_id": "pr:p1", "reason": "mine"})
+    left = repo.graph.get_node(V, "pr:p1")["edges"]
+    assert [e["writer"] for e in left] == [A["id"]]
+    fv.edge("produced", "commit:abc", "pr:p1", {"ci": "green"}, nodes=False)
+    # naming the writer lets an endpoint owner tombstone the squatter's instance
+    fv.send("edge.remove", {"edge_type": "produced", "from_id": "commit:abc", "to_id": "pr:p1",
+                            "attrs": {"writer": A["id"]}, "reason": "squat"})
+    assert [e["writer"] for e in repo.graph.get_node(V, "pr:p1")["edges"]] == [V["id"]]
+    assert repo.graph.snapshot() == rebuilt(repo).graph.snapshot()
+    # a stranger cannot
+    stranger = feed_for(svc, "x", P("stranger"))
+    with pytest.raises(PermissionError):
+        stranger.send("edge.remove", {"edge_type": "produced", "from_id": "commit:abc",
+                                      "to_id": "pr:p1", "attrs": {"writer": V["id"]},
+                                      "reason": "x"})
+
+
+def test_edge_instances_per_triple_are_bounded():
+    from herdr_engineering.control_plane.graph import MAX_INSTANCES_PER_TRIPLE
+    repo, svc, _ = make()
+    fv = feed_for(svc, "gh", V)
+    fv.node("commit:abc")
+    fv.node("pr:p1")
+    done = 0
+    with pytest.raises((PermissionError, ValueError)):
+        for i in range(MAX_INSTANCES_PER_TRIPLE + 3):
+            f = feed_for(svc, "s", P(f"w{i}"))
+            f.edge("produced", "commit:abc", "pr:p1", nodes=False)
+            done += 1
+    assert done == MAX_INSTANCES_PER_TRIPLE
+
+
+def test_node_state_does_not_reveal_whether_a_hidden_object_exists():
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "gh", V), feed_for(svc, "evil", A)
+    fa.node("pr:o/r#6", scope="private", label="x")
+    # hidden commons and missing commons behave identically: both accepted
+    assert fv.send("node.state", {"node_id": "pr:o/r#6", "state": "open"})["event_type"] == "node.state"
+    assert fv.send("node.state", {"node_id": "pr:o/r#none", "state": "open"})["event_type"] == "node.state"
+    # hidden and missing owned nodes are refused the same way
+    fa.node("agent:secret", scope="private", label="s")
+    errs = []
+    for nid in ("agent:secret", "agent:absent"):
+        with pytest.raises(PermissionError) as ei:
+            fv.send("node.state", {"node_id": nid, "state": "open"})
+        errs.append(str(ei.value))
+    assert errs[0] == errs[1]
+
+
+def test_attr_cap_exhaustion_on_commons_node_cannot_lock_out_the_victim():
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "gh", V), feed_for(svc, "evil", A)
+    fv.node("pr:p2", label="p", attrs={"a": 1})
+    refused = 0
+    for i in range(3000):           # fill key by key until the attacker is refused
+        try:
+            fa.node("pr:p2", attrs={f"junk{i}": "x" * 100})
+        except (PermissionError, ValueError):
+            refused += 1
+            break
+    assert refused == 1, "the attacker is capped per writer / per object"
+    assert fv.node("pr:p2", attrs={"ci": "green"})["event_type"] == "node.upsert"
+    assert repo.graph.get_node(V, "pr:p2")["node"]["attrs"]["ci"] == "green"
+    assert repo.graph.snapshot() == rebuilt(repo).graph.snapshot()
+
+
+def test_event_id_is_unique_per_principal_not_global():
+    repo, svc, _ = make()
+    raw_lineage(svc, A, "gh-delivery-123", "evil", 0, "squat")
+    # the victim's identical event_id (different or same source/seq) is a distinct event
+    ack = raw_lineage(svc, V, "gh-delivery-123", "gh", 0, "real")
+    assert ack["envelope"]["duplicate"] is False
+    ack = raw_lineage(svc, P("v2"), "gh-delivery-123", "evil", 0, "real2")
+    assert ack["envelope"]["duplicate"] is False       # sequence domain is per principal too
+    # the same principal replaying its own id is still a duplicate
+    assert raw_lineage(svc, A, "gh-delivery-123", "evil", 0, "squat")["envelope"]["duplicate"] is True
+    # ... and the same id with different content is still a conflict for that principal
+    from herdr_engineering.control_plane.envelope import EnvelopeConflict
+    with pytest.raises(EnvelopeConflict):
+        raw_lineage(svc, A, "gh-delivery-123", "evil", 0, "changed")
+
+
+def test_event_id_isolation_survives_ledger_eviction():
+    from herdr_engineering.control_plane.envelope import EnvelopeConflict
+    repo, svc, _ = make()
+    raw_lineage(svc, A, "gh-delivery-123", "evil", 0, "squat")
+    repo.ledger._events.clear()                         # as after eviction / restart
+    repo.ledger._sequences.clear()
+    ack = raw_lineage(svc, V, "gh-delivery-123", "gh", 0, "real")
+    assert ack["envelope"]["duplicate"] is False
+    # the attacker's own replay after eviction is still recognised as its duplicate or rejected
+    # without ever touching the victim's event
+    try:
+        raw_lineage(svc, A, "gh-delivery-123", "evil", 0, "squat")
+    except EnvelopeConflict:
+        pass
+    node = repo.graph.get_node(V, "pr:o/r#z")["node"]
+    assert {"squat", "real"} >= {c["value"] for c in node["contributions"]["label"]} | {node["label"]}
+    assert node["label"] == "squat" and node["contributions"]["label"][0]["value"] == "real"
+
+
+def test_shuffled_replay_with_commons_contributions_is_deterministic():
+    repo, svc, _ = make()
+    fv, fa, fb = feed_for(svc, "gh", V), feed_for(svc, "evil", A), feed_for(svc, "b", P("c"))
+    for i in range(5):
+        fv.node(f"pr:p{i}", label=f"v{i}", state="open", attrs={"k": i})
+        fa.node(f"pr:p{i}", label=f"a{i}", attrs={"k": 100 + i})
+        fa.send("node.upsert", {"node_type": "pr", "node_id": f"pr:p{i}"})
+        fb.send("node.upsert", {"node_type": "commit", "node_id": f"commit:c{i}", "label": "c"})
+        fv.send("node.upsert", {"node_type": "commit", "node_id": f"commit:c{i}"})
+        fa.send("node.state", {"node_id": f"pr:p{i}", "state": "closed"})
+        fb.edge("produced", f"commit:c{i}", f"pr:p{i}", nodes=False)
+        fv.edge("produced", f"commit:c{i}", f"pr:p{i}", nodes=False)
+    ref = repo.graph.snapshot()
+    evs = [from_stored(e) for e in rows(repo)]
+    assert evs
+    for seed in range(15):
+        random.Random(seed).shuffle(evs)
+        g = GraphProjection()
+        for e in evs:
+            g.apply(e)
+        assert g.snapshot() == ref
+    n = repo.graph.get_node(OPERATOR, "pr:p0")["node"]
+    assert n["label"] == "v0" and n["contributions"]["label"]

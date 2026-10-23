@@ -7,7 +7,7 @@ It extends the existing `Event` / `POST /api/v1/ingest` contract; v1 bodies keep
 | Field | Set by | Rule |
 |---|---|---|
 | `schema_version` | emitter | `2` for this contract. `1`/absent = legacy. `>2` is rejected (fail closed). |
-| `event_id` | emitter | Globally unique, stable across retries (an emitter retry reuses the id). |
+| `event_id` | emitter | Unique per authenticated principal (migration 0005), stable across retries (an emitter retry reuses the id). |
 | `source` | emitter | Existing `[a-z][a-z0-9_-]{0,31}` rule. Identifies the sequence domain. |
 | `source_sequence` | emitter | Integer >= 0, strictly increasing per `source`, assigned at emit time and persisted by the emitter so it survives restart. |
 | `occurred_at` | emitter | RFC 3339 UTC; stored as `source_timestamp`. |
@@ -45,4 +45,4 @@ It extends the existing `Event` / `POST /api/v1/ingest` contract; v1 bodies keep
 - Lost acknowledgement: if the durable insert already holds the `event_id` with the same `(source, source_sequence)`, the retry is acknowledged as a duplicate; a different identity is a 409.
 - Bounds: `source_sequence` <= 2^63-1; at most 64 gaps per source (oldest collapse into a coarser range, `gaps_truncated: true`); at most 1024 tracked sources (stalest evicted); 100k in-memory event index (database unique indexes are the backstop).
 - The durable write happens while holding the ledger lock (simple and atomic; serialises v2 ingests).
-- Sequence domain = (principal, source) (migration `0004_sequence_domain_per_principal.sql`: unique index on `(actor->>'id', source, source_sequence)`, `fabric_event_sources` keyed by `(source_actor, source)`). `GET /api/v1/ingest/sources` lists one entry per domain with an `actor` field (the key digest id). Until 0004 is applied the old global index still enforces the stricter rule. `event_id` itself remains one global namespace (it is the table's primary key), so emitters should not derive it from guessable inputs alone (mix in a per-key secret).
+- Sequence domain = (principal, source) (migration `0004_sequence_domain_per_principal.sql`: unique index on `(actor->>'id', source, source_sequence)`, `fabric_event_sources` keyed by `(source_actor, source)`). `GET /api/v1/ingest/sources` lists one entry per domain with an `actor` field (the key digest id). Until 0004 is applied the old global index still enforces the stricter rule. `event_id` is unique per principal too (migration `0005_event_id_per_actor.sql`: unique index on `(actor->>'id', event_id)`, the global primary key is dropped), so another key cannot squat a guessable id; idempotency, content-hash conflicts, the durable duplicate check (`EventStore.identity(event_id, actor_id)`) and the in-memory ledger are all keyed `(actor, event_id)`. Until 0005 is applied the old global primary key still enforces the stricter rule (inserts use a bare `ON CONFLICT DO NOTHING`, so the code works before and after).

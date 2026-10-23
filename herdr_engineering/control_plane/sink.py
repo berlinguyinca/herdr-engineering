@@ -104,11 +104,11 @@ class DurableEventSink:
                     "durable event insert was not acknowledged "
                     "(event_id already stored)")
 
-    def stored_identity(self, event_id: str):
-        """(source, source_sequence) of a stored event, or None when absent."""
+    def stored_identity(self, event_id: str, actor_id: str = ""):
+        """(source, source_sequence) of this principal's stored event, or None when absent."""
         with self._write_lock:
             self._ensure_store()
-            return self._run(self._store.identity(event_id))
+            return self._run(self._store.identity(event_id, actor_id))
 
     def record_source_state(self, state: dict) -> None:
         """Best-effort upsert of per-source ingest state (fabric_event_sources)."""

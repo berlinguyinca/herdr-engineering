@@ -187,14 +187,14 @@ class SourceLedger:
         self.freshness_seconds = freshness_seconds
         self._max_events = max_events
         self._persist = persist
-        self._events: OrderedDict[str, tuple] = OrderedDict()   # id -> (hash, source, seq, actor)
+        self._events: OrderedDict[tuple, tuple] = OrderedDict()   # (actor, id) -> (hash, source, seq, actor)
         self._sequences: dict[tuple[str, str, int], str] = {}   # (actor, source, seq) -> id
         self._sources: dict[tuple[str, str], dict] = {}
 
     # ------------------------------------------------------------ admission
     def check(self, env: dict) -> str:
         """``"new"`` or ``"duplicate"``; raises EnvelopeConflict on contradiction."""
-        known = self._events.get(env["event_id"])
+        known = self._events.get((_actor_id(env.get("actor")), env["event_id"]))
         if known is not None:
             # known[0] is None only for rows written before content digests
             # were stored in the envelope metadata: acknowledge by identity.
@@ -216,10 +216,10 @@ class SourceLedger:
         source, seq, eid = env["source"], env["source_sequence"], env["event_id"]
         actor = _actor_id(env.get("actor"))
         domain = (actor, source)
-        self._events[eid] = (env["content_hash"], source, seq, actor)
+        self._events[(actor, eid)] = (env["content_hash"], source, seq, actor)
         self._sequences[(actor, source, seq)] = eid
         while len(self._events) > self._max_events:
-            old_id, (_, old_source, old_seq, old_actor) = self._events.popitem(last=False)
+            (_, old_id), (_, old_source, old_seq, old_actor) = self._events.popitem(last=False)
             if self._sequences.get((old_actor, old_source, old_seq)) == old_id:
                 del self._sequences[(old_actor, old_source, old_seq)]
         if domain not in self._sources and len(self._sources) >= MAX_SOURCES:

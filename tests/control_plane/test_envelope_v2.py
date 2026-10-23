@@ -147,6 +147,12 @@ def test_typed_entity_carries_envelope_on_its_event():
 
 
 # ------------------------------------------------------------ durability
+def _actor_dom(r):
+    actor = r.get("actor")
+    actor = json.loads(actor) if isinstance(actor, str) else (actor or {})
+    return actor.get("id") or ""
+
+
 class V2Conn:
     """Fake asyncpg conn honouring the unique indexes and the v2 INSERT."""
 
@@ -156,7 +162,7 @@ class V2Conn:
     async def fetch(self, sql, *a):
         if "WHERE event_id" in sql:
             return [{"source": r.get("source"), "source_sequence": r.get("source_sequence")}
-                    for r in self.rows if r["event_id"] == a[0]]
+                    for r in self.rows if r["event_id"] == a[0] and _actor_dom(r) == a[1]]
         if "ORDER BY sequence" in sql:
             return [r for r in self.rows if (r["entity_type"], r["entity_id"]) == (a[0], a[1])]
         return []
@@ -169,17 +175,16 @@ class V2Conn:
             raise self.fail
         cols = [c.strip() for c in sql.split("(", 1)[1].split(")", 1)[0].split(",")]
         row = dict(zip(cols, a))
-        if any(r["event_id"] == row["event_id"] for r in self.rows):
+        # migration 0005: event_id unique per actor; 0004: (actor, source, seq) unique.
+        # Bare ON CONFLICT DO NOTHING absorbs BOTH violations and returns no row.
+        if any(r["event_id"] == row["event_id"] and _actor_dom(r) == _actor_dom(row)
+               for r in self.rows):
             return None
-        def domain(r):      # migration 0004: unique on (actor id, source, source_sequence)
-            actor = r.get("actor")
-            actor = json.loads(actor) if isinstance(actor, str) else (actor or {})
-            return (actor.get("id") or "", r.get("source"), r.get("source_sequence"))
-
-        if row.get("source") is not None and any(domain(r) == domain(row) for r in self.rows):
-            exc = Exception("duplicate key")
-            exc.sqlstate = "23505"
-            raise exc
+        if row.get("source") is not None and any(
+                (_actor_dom(r), r.get("source"), r.get("source_sequence"))
+                == (_actor_dom(row), row.get("source"), row.get("source_sequence"))
+                for r in self.rows):
+            return None
         self.rows.append(row)
         return {"event_id": row["event_id"]}
 
@@ -485,3 +490,19 @@ def test_per_principal_domain_survives_restart_and_durable_unique_index():
     with pytest.raises(EnvelopeConflict):
         IngestService(fresh).ingest(body(5, event_id="m-5b"), PRINCIPAL)
     assert IngestService(fresh).ingest(body(5, event_id="m-5"), PRINCIPAL)["envelope"]["duplicate"] is True
+
+
+def test_durable_event_id_is_per_principal_and_survives_ledger_loss():
+    other = {"kind": "agent", "id": "key:other", "authenticated_by": "api_key"}
+    conn = V2Conn()
+    repo = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
+    s = IngestService(repo)
+    s.ingest(body(0, event_id="shared-id"), other)
+    repo.ledger._events.clear()          # ledger evicted / restarted without hydrate
+    repo.ledger._sequences.clear()
+    ack = s.ingest(body(0, event_id="shared-id"), PRINCIPAL)
+    assert ack["envelope"]["duplicate"] is False
+    assert sorted(r["event_id"] for r in conn.rows) == ["shared-id", "shared-id"]
+    # the owner's own replay after eviction is recognised as a duplicate by (actor, id)
+    again = s.ingest(body(0, event_id="shared-id"), PRINCIPAL)
+    assert again["envelope"]["duplicate"] is True

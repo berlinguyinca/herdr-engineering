@@ -24,6 +24,7 @@ from .envelope import SourceLedger, envelope_event_fields
 from .graph import GraphProjection
 from .graph import _lseq as _graph_lseq
 from .graph import _rank as _graph_rank
+from .graph import from_stored as _graph_from_stored
 from .ids import new_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
@@ -1954,7 +1955,7 @@ class ControlPlaneRepo:
         rows = [e for key, stream in self._events.items() if key[0] == "lineage"
                 for e in stream if e.get("source") is not None
                 and e.get("source_sequence") is not None]
-        rows = [{**e, "payload": _payload(e)} for e in rows]
+        rows = [_graph_from_stored({**e, "payload": _payload(e)}) for e in rows]
         rows.sort(key=_graph_rank)          # admission order, independent of stream grouping
         for event in rows:
             try:

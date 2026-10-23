@@ -54,9 +54,22 @@ skipped and counted (`events_rejected`), never fatal.
 ### Node kinds: COMMONS vs OWNED
 - **COMMONS** (`commit pr issue ci artifact`): shared identities several emitters legitimately mention. Anyone with an
   ingest/agent key may create one, and write its fields (`label`/`state`/`attrs`): fields are per-`(source, actor)` registers
-  merged on read, latest admission wins. A non-writer's write is admitted as `foreign`: it merges fields but never touches the
-  node's scope, owner or first/last event ids, so nobody can hide or squat a commons node by writing it. Only an operator
-  moderates (operators may write anything, including `co_writers`).
+  kept separately and attributed. A non-writer's write is admitted as `foreign`: it never touches the node's owner or
+  first/last event ids. Only an operator moderates (operators may write anything, including `co_writers`).
+  - **Primary value** of a commons field: an operator's value if any operator wrote it, else the node owner's, else the
+    earliest writer's. Everyone else's values are `contributions` (<= 5 per field, latest admission first), never the primary,
+    so overwriting a PR's label/state/url cannot replace what the creator said. A node view carries `fields.<name>`
+    provenance `{value, writer, source, event_id, admission, admitted_at}` and, for commons, `contributions.<name>`.
+    `source` is the creator's source. Attr keys follow the same rule; attr budgets for commons are PER WRITER under a hard
+    per-object cap (1024 keys / 256 KiB) so a writer cannot fill a node and lock others out.
+  - **Scope of a commons node is the WIDEST scope any non-operator wrote** (an operator who has written decides, using their
+    narrowest), so pre-creating a commons node as `private` cannot hide it. Owned kinds keep the narrowest scope.
+  - Edges whose `from` node is commons and whose type is unbound (`produced`, `issue_link`, ...) are kept PER WRITER (at most 8
+    writers per triple); views carry `writer`. `edge.remove` removes the caller's own instance; `attrs.writer` names another
+    writer's instance, which the owner of either endpoint or an operator may tombstone.
+  - `node.state` on a missing commons node creates it (like an upsert), so hidden and missing commons nodes answer alike.
+  - Payload keys starting with `_` are reserved and rejected (400); the admission number/mode are server-set top-level fields
+    of the stored row and are never read from the client payload.
 - **OWNED** (every other kind: `agent attempt session mission plan task handoff pane tab thread worktree room workspace review
   message decision approach finding gate`): the creator owns it; only its writers may change it.
 - **Ensure**: a `node.upsert` with no `label`/`state`/`attrs` (and an `edge.add` with no attrs beyond the binding) on an
@@ -68,7 +81,8 @@ skipped and counted (`events_rejected`), never fatal.
 Two layers: `GraphProjection.admit` runs under the ledger lock BEFORE the envelope row is persisted; `apply` is a pure
 commutative merge that trusts stored events. A refused event is not persisted and its sequence is not consumed (retry allowed).
 - Each admitted lineage event gets a server-assigned monotonic **admission number** (`lineage_seq`) and an admission **mode**
-  (`normal` | `foreign` | `noop`), both stored in the envelope row (`payload._envelope`) and replayed. They are the cross-writer
+  (`normal` | `foreign` | `noop`), both stored in the envelope row's server metadata (`payload._envelope`, never
+  client-controlled) and replayed. They are the cross-writer
   ordering and the ownership clock; wall time, source names and client sequences decide neither. Rebuild applies rows in
   admission order; the result is order-independent anyway (shuffle-tested).
 - A node/edge's **owner** is the actor of its FIRST admitted event, whatever its role (so an operator-created object is

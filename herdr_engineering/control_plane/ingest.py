@@ -115,7 +115,7 @@ class IngestService:
             except EventAlreadyStored:
                 # Durable insert landed earlier but the ack was lost (or the
                 # in-memory index evicted it): same identity => already stored.
-                if self._stored_identity(env["event_id"]) != (env["source"], env["source_sequence"]):
+                if self._stored_identity(env["event_id"], (env.get("actor") or {}).get("id") or "") != (env["source"], env["source_sequence"]):
                     raise EnvelopeConflict("event_id already stored for a different source sequence") from None
                 ledger.commit(env)
                 return {**head, "envelope": {**ack, "duplicate": True}}
@@ -141,11 +141,11 @@ class IngestService:
             "lineage_seq": env.get("lineage_seq"), "lineage_mode": env.get("lineage_mode")})
         return {"entity_type": "lineage", "entity_id": entity_id, "event_type": event_type}
 
-    def _stored_identity(self, event_id):
+    def _stored_identity(self, event_id, actor_id=""):
         lookup = getattr(getattr(self.repo, "_sink", None), "stored_identity", None)
         if not callable(lookup):
             raise RuntimeError("durable event identity is unavailable")
-        found = lookup(event_id)
+        found = lookup(event_id, actor_id)
         if found is None:
             raise RuntimeError("durable event identity is unavailable")
         return tuple(found)

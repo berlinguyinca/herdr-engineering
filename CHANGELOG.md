@@ -7,6 +7,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Lineage graph projection (T02, Herdr side)
 - Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
+- Migration `0005_event_id_per_actor.sql`: `event_id` is unique per principal (global primary key dropped).
+- Lineage review round 4: admission mode/sequence are server-only (reserved `_` payload keys rejected); commons nodes keep
+  an owner/operator primary value with attributed `fields`/`contributions`, widest-scope visibility, per-writer attr budgets
+  and per-writer `from`-commons edge instances; `node.state` on a missing commons node creates it.
 - Lineage refusals are HTTP 403 `{"reason": "lineage_forbidden"}`; shared COMMONS nodes (commit/pr/issue/ci/artifact) and
   idempotent "ensure" upserts are accepted from any ingest key.
 - `lineage` envelope events (v2 only) project into a durable graph derived from `fabric_events`
