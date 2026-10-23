@@ -273,3 +273,16 @@ def test_repo_mem_pressure_through_real_store_clock():
         clock[0] += 30
     clock[0] -= 30
     assert "mem_pressure" in [p["code"] for p in repo.get_host(hid)["problems"]]
+
+
+def test_updates_old_when_never_recorded_and_host_older_than_two_weeks():
+    old = host(created_at=iso(NOW - 15 * 86400))
+    probs = [p for p in compute_problems(old, [], NOW) if p["code"] == "updates_old"]
+    assert probs == [{"code": "updates_old", "severity": "warning",
+                      "message": "Fleet update never recorded"}]
+    # a young host, or one with no creation time, is not flagged
+    assert "updates_old" not in codes(host(created_at=iso(NOW - 13 * 86400)))
+    assert "updates_old" not in codes(host())
+    # a recorded (recent) fleet update clears it
+    assert "updates_old" not in codes(host(created_at=iso(NOW - 30 * 86400),
+                                           fleet_update={"last_updated": iso(NOW - 86400)}))

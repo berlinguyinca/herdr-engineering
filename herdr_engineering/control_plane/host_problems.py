@@ -148,6 +148,12 @@ def compute_problems(host: dict, history: list[dict], now: float,
         if last is not None and now - last > t.updates_old_s:
             problems.append(_p("updates_old", "warning",
                                f"Last updated {_days(now - last)} d ago"))
+    elif fu is None:
+        # No fleet update has ever reported for this host: once it has been
+        # registered longer than the update-age limit, that is itself old.
+        created = _epoch(host.get("created_at"))
+        if created is not None and now - created > t.updates_old_s:
+            problems.append(_p("updates_old", "warning", "Fleet update never recorded"))
 
     problems.sort(key=lambda p: (_ORDER[p["severity"]], p["code"]))
     return problems
