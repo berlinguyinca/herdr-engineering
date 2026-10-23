@@ -89,6 +89,7 @@ def test_read_updates_macos_brew(monkeypatch):
 
 def test_versions_missing_tool_is_none(monkeypatch, tmp_path):
     monkeypatch.setattr(shutil, "which", lambda t: None)
+    monkeypatch.setattr(host_metrics, "_TOOL_DIRS", (str(tmp_path / "none"),))
     monkeypatch.setattr(host_metrics, "_run", lambda cmd, timeout=5.0: None)
     monkeypatch.setattr(host_metrics, "_PI_EXT_DIR", str(tmp_path / "nope"))
     v = read_versions()
@@ -107,7 +108,8 @@ def test_versions_parsed(monkeypatch, tmp_path):
     out = {"herdr": "herdr 0.9.1\n", "pi": "0.9.1\n", "autospec": "autospec 2.0\n",
            "tailscale": "1.76.0\n  tailscale commit: abc\n"}
     monkeypatch.setattr(shutil, "which", lambda t: f"/bin/{t}")
-    monkeypatch.setattr(host_metrics, "_run", lambda cmd, timeout=5.0: out.get(cmd[0]))
+    monkeypatch.setattr(host_metrics, "_run",
+                        lambda cmd, timeout=5.0: out.get(os.path.basename(cmd[0])))
     v = read_versions()
     assert v["pi"] == "0.9.1" and v["tailscale"] == "1.76.0"
     assert v["autospec"] == "2.0"
@@ -168,3 +170,20 @@ def test_brew_non_json_and_timeout_are_unknown(monkeypatch):
         _env(monkeypatch, "Darwin", {"brew"}, out)
         r = read_updates()
         assert r["manager"] == "brew" and r["outdated"] is None and r["packages"] == []
+
+
+def test_versions_find_tools_in_local_bin_without_path(monkeypatch, tmp_path):
+    """systemd user units have no ~/.local/bin on PATH: still found there."""
+    home = tmp_path / "home"
+    bindir = home / ".local" / "bin"
+    bindir.mkdir(parents=True)
+    for name, line in (("herdr", "herdr 0.9.1"), ("pi", "pi 1.4.0"), ("autospec", "autospec v2.3.1")):
+        stub = bindir / name
+        stub.write_text(f"#!/bin/sh\necho '{line}'\n")
+        stub.chmod(0o755)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(host_metrics, "_TOOL_DIRS", ("~/.local/bin", str(tmp_path / "usr-local-bin")))
+    monkeypatch.setattr(host_metrics, "_PI_EXT_DIR", str(tmp_path / "nope"))
+    v = read_versions()
+    assert v["herdr"] == "0.9.1" and v["pi"] == "1.4.0" and v["autospec"] == "2.3.1"

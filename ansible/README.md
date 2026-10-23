@@ -133,19 +133,31 @@ Per host, in order:
    touched, so the cron never ships whatever HEAD the main host has checked
    out), `tasks/pi-runtime.yml` (only with `-e pi_engineering_revision=<sha>`)
    and `tasks/fabric-systemd.yml`. During this run `fabric-agent.sh` leaves a
-   running agent alone (`HERDR_FABRIC_AGENT_NO_RESTART=1`; only releases that
-   contain this change honour it, so an older pinned revision still restarts
-   its agent once inside the script). After **all** of these succeed, and only
-   when an OS package, Homebrew or the herdr-eng release actually changed
-   (staging an already staged revision reports no change), the play re-reads
-   the busy state and restarts the fabric agent **once** (systemd user unit, or
-   launchd `kickstart` on macOS). If the host became busy (or unknown) since
-   the decision, the restart is skipped and the result is
-   `updated (agent restart deferred)`; the agent picks up the release at its
-   next restart. A small race remains: an agent that starts between the
-   re-check and the restart is still interrupted. On macOS the restart is
-   best-effort: a LaunchAgent that is not loaded prints a message and records
-   `updated (agent restart failed)`, never `failed:`. A failing update step
+   running agent alone (`HERDR_FABRIC_AGENT_NO_RESTART=1`). After **all** of
+   these succeed, and only when an OS package, Homebrew or the herdr-eng
+   release actually changed (staging an already staged revision reports no
+   change) or an earlier run left a restart pending, the play re-reads the busy
+   state and restarts the fabric agent (systemd user unit, or launchd
+   `kickstart` on macOS). If the host became busy (or unknown) since the
+   decision, the restart is skipped. A forced run (`fleet_update_force`) skips
+   that re-check and restarts. A small race remains: an agent that starts
+   between the re-check and the restart is still interrupted.
+   **Older pinned revisions restart on every run.** The script that runs is the
+   staged release's own `fabric-agent.sh`. A revision older than this change
+   (including a rollback to one) ignores `HERDR_FABRIC_AGENT_NO_RESTART`, so
+   its script restarts the agent whenever the herdr-eng step runs, before the
+   remaining steps and without the busy re-check. The role's own gated restart
+   then adds a second one when something changed.
+   **A missed restart is retried.** When the agent depends on something that
+   changed but was not restarted onto it (restart deferred because the host
+   became busy, a failed macOS restart, or a later step failing after staging),
+   the state file keeps `restart_pending: true`. Every following run that
+   reaches the update step restarts the agent, even if nothing else changed.
+   Until that restart happens, the result is `updated (agent restart pending)`
+   and `last updated` keeps its previous value, because the update is not
+   complete while the agent still runs the old code. On macOS the restart is
+   best-effort: a LaunchAgent that is not loaded prints a message, leaves the
+   restart pending and never records `failed:`. A failing update step
    yields `failed: <task name>`. Only the task name is recorded, never its
    output.
 4. **Always post** one host event (`POST /api/v1/ingest`, entity `host`,
@@ -166,8 +178,12 @@ Per host, in order:
 `failed: ...`, every remaining host of that run records
 `skipped: an earlier host failed` and changes nothing. Pass
 `-e fleet_update_stop_on_failure=false` to keep going. A host that is
-unreachable over SSH is dropped from the run and records nothing; its
-"last updated" ages until the 14-day Problem appears.
+unreachable over SSH when the run reaches it is dropped and records nothing;
+its "last updated" ages until the 14-day Problem appears. A host that drops
+**mid-update** (after facts were gathered) makes its one-host batch
+unreachable, and Ansible then ends the rest of the run: that host and every
+later host record nothing that night. This fails closed: nothing more is
+changed, and the hosts show the 14-day Problem if it keeps happening.
 
 **Security-only is best-effort for apt.** A package counts as a security
 update when `apt-get -s upgrade` would take its candidate from a `*-security`

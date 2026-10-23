@@ -287,3 +287,44 @@ def test_skipped_keeps_the_state_files_dates(tmp_path):
     out = _record(state, {"a": _host("skipped", reason="an earlier host failed")})
     assert out["a"]["payload"]["fleet_update"] == {
         "last_updated": "L", "deferred_since": "D", "result": "skipped: an earlier host failed"}
+
+
+# ---- restart_pending ----------------------------------------------------------
+
+def _decide_idle(state):
+    return fus.decide({"state_file": str(state), "now": NOW, "force": False,
+                       "max_defer_days": 7, "active_hosts": [],
+                       "hosts": {"beast": {"agents_running": None, "names": ["beast"]}}})["beast"]
+
+
+def test_restart_pending_is_set_kept_and_cleared(tmp_path):
+    state = tmp_path / "s.json"
+    prev = _iso(NOW - 3 * DAY)
+    state.write_text(json.dumps({"beast": {"last_updated": prev}}))
+    # night 1: staged, restart deferred (host became busy)
+    out = _record(state, {"beast": _host("updated", reason="agent restart deferred",
+                                         restart_pending=True, last_updated=prev)})
+    fu = out["beast"]["payload"]["fleet_update"]
+    assert fu["result"] == "updated (agent restart pending)"
+    assert fu["last_updated"] == prev  # not a complete update yet
+    assert json.loads(state.read_text())["beast"]["restart_pending"] is True
+    assert _decide_idle(state)["restart_pending"] is True  # night 2 retries
+    # night 2 deferred (busy): stays pending
+    _record(state, {"beast": _host("deferred", reason="agents running", restart_pending=False)})
+    assert json.loads(state.read_text())["beast"]["restart_pending"] is True
+    # night 3 failed before restarting: the play reports it still pending
+    _record(state, {"beast": _host("failed", reason="x", restart_pending=True)})
+    assert json.loads(state.read_text())["beast"]["restart_pending"] is True
+    # night 4: restarted
+    out = _record(state, {"beast": _host("updated", restart_pending=False)})
+    fu = out["beast"]["payload"]["fleet_update"]
+    assert fu == {"last_updated": _iso(NOW), "deferred_since": None, "result": "updated"}
+    assert json.loads(state.read_text())["beast"]["restart_pending"] is False
+    assert _decide_idle(state)["restart_pending"] is False
+
+
+def test_skipped_keeps_pending(tmp_path):
+    state = tmp_path / "s.json"
+    state.write_text(json.dumps({"beast": {"restart_pending": True}}))
+    _record(state, {"beast": _host("skipped", reason="an earlier host failed")})
+    assert json.loads(state.read_text())["beast"]["restart_pending"] is True

@@ -58,6 +58,7 @@
                'last_updated': none, 'deferred_since': none} }}
     fleet_update_outcome: "{{ 'skipped' if fleet_update_earlier_failed else 'deferred' }}"
     fleet_update_reason: ""
+    fleet_update_restart_done: false
 
 - name: "Fleet update: report the decision"
   ansible.builtin.debug:
@@ -129,20 +130,26 @@
       when: ansible_facts['system'] == 'Linux'
 
     # Every update step above succeeded. Restart only when something the agent
-    # depends on changed, so an idle host that is current is not restarted.
+    # depends on changed, or an earlier run left a restart pending (deferred,
+    # failed, or a later step failed after staging), so an idle host that is
+    # current is not restarted and a missed restart is retried.
     - name: "Fleet update: decide whether the agent needs a restart"
       ansible.builtin.set_fact:
         fleet_update_restart_needed: >-
           {{ (fleet_update_restart_agent | bool)
-             and ((fabric_agent_provision | default({}) is changed)
+             and ((fleet_update_decision.restart_pending | default(false) | bool)
+                  or (fabric_agent_provision | default({}) is changed)
                   or (fleet_update_security_install | default({}) is changed)
                   or (fleet_update_full_upgrade | default({}) is changed)
                   or (fleet_update_brew | default({}) is changed)) }}
 
     # The decision may be minutes old: an agent may have started meanwhile.
+    # A forced run (fleet_update_force) restarts regardless: no re-check.
     - name: "Fleet update: re-read busy state right before the restart"
       ansible.builtin.include_tasks: busy-probe.yml
-      when: fleet_update_restart_needed | bool
+      when:
+        - fleet_update_restart_needed | bool
+        - not (fleet_update_decision.forced | default(false) | bool)
 
     - name: "Fleet update: busy re-check"
       ansible.builtin.command:
@@ -156,13 +163,16 @@
       delegate_to: localhost
       become: false
       no_log: true
-      when: fleet_update_restart_needed | bool
+      when:
+        - fleet_update_restart_needed | bool
+        - not (fleet_update_decision.forced | default(false) | bool)
 
     - name: "Fleet update: defer the agent restart (host became busy or unknown)"
       ansible.builtin.set_fact:
         fleet_update_reason: "agent restart deferred"
       when:
         - fleet_update_restart_needed | bool
+        - not (fleet_update_decision.forced | default(false) | bool)
         - (fleet_update_recheck.stdout | from_json).busy != 'no'
 
     - name: "Fleet update: Restart the fabric agent (systemd user unit)"
@@ -178,6 +188,12 @@
         - fleet_update_reason != 'agent restart deferred'
         - ansible_facts['system'] == 'Linux'
         - (herdr_eng_resolve.stdout | default('not-found') | trim) != 'not-found'
+      register: fleet_update_systemd_restart
+
+    - name: "Fleet update: agent restarted (systemd)"
+      ansible.builtin.set_fact:
+        fleet_update_restart_done: true
+      when: fleet_update_systemd_restart is not skipped
 
     # Best-effort on macOS: a LaunchAgent that is not loaded (no GUI session,
     # never installed) must not turn a successful update into "failed".
@@ -213,6 +229,14 @@
         - fleet_update_kickstart is not skipped
         - fleet_update_kickstart.rc | default(0) != 0
 
+    - name: "Fleet update: agent restarted (launchd)"
+      ansible.builtin.set_fact:
+        fleet_update_restart_done: true
+      when:
+        - fleet_update_kickstart is defined
+        - fleet_update_kickstart is not skipped
+        - fleet_update_kickstart.rc | default(1) == 0
+
     - name: "Fleet update: mark updated"
       ansible.builtin.set_fact:
         fleet_update_outcome: updated
@@ -229,6 +253,17 @@
     fleet_update_report:
       outcome: "{{ fleet_update_outcome }}"
       reason: "{{ fleet_update_reason }}"
+      # The agent depends on something that changed (now or in an earlier run)
+      # but was not restarted onto it: kept in the state file, retried next run.
+      # (For deferred/skipped runs the helper keeps the state file's value.)
+      restart_pending: >-
+        {{ (fleet_update_restart_agent | bool)
+           and not (fleet_update_restart_done | default(false) | bool)
+           and ((fleet_update_decision.restart_pending | default(false) | bool)
+                or (fabric_agent_provision | default({}) is changed)
+                or (fleet_update_security_install | default({}) is changed)
+                or (fleet_update_full_upgrade | default({}) is changed)
+                or (fleet_update_brew | default({}) is changed)) }}
       maintenance: "{{ maintenance | default(false) | bool }}"
       pins: "{{ fleet_pins | default({}) }}"
       # a skipped host's previous dates come from the state file (record keeps them)

@@ -411,8 +411,10 @@ def test_herdr_eng_only_at_a_pinned_revision_and_restart_gated():
             assert "fleet_update_restart_needed | bool" in t["when"]
 
 
-@pytest.mark.parametrize("busy,expected", [(True, "agent restart deferred"), (False, "")])
-def test_restart_is_skipped_when_the_host_became_busy(tmp_path, busy, expected):
+@pytest.mark.parametrize("busy,forced,expected", [(True, False, "agent restart deferred"),
+                                                  (False, False, ""),
+                                                  (True, True, "")])
+def test_restart_is_skipped_when_the_host_became_busy(tmp_path, busy, forced, expected):
     """--check run of the role's restart section against a fake control plane."""
     import http.server
     import threading
@@ -439,7 +441,7 @@ def test_restart_is_skipped_when_the_host_became_busy(tmp_path, busy, expected):
     block = _update_block()["block"]
     start = next(i for i, t in enumerate(block) if "needs a restart" in t["name"])
     tasks = [t for t in block[start:] if "Restart the fabric agent" not in t["name"]
-             and "mark updated" not in t["name"]]
+             and "mark updated" not in t["name"] and "agent restarted" not in t["name"]]
     for t in tasks:
         if "include_tasks" in json.dumps(t):
             t["ansible.builtin.include_tasks"] = str(PROBE)
@@ -449,6 +451,7 @@ def test_restart_is_skipped_when_the_host_became_busy(tmp_path, busy, expected):
                       "fleet_update_helper": str(ROOT / "files" / "fleet-update-state.py"),
                       "fleet_update_control_plane_url": f"http://127.0.0.1:{srv.server_port}",
                       "fleet_update_host_id": "beast", "fleet_update_reason": "",
+                      "fleet_update_decision": {"forced": forced, "restart_pending": False},
                       "fleet_update_security_install": {"changed": True}},
              "tasks": tasks}]
     pb = tmp_path / "p.yml"
@@ -486,3 +489,58 @@ def test_stop_on_failure_gate_sees_an_earlier_serial_host(tmp_path, stop, expect
     assert r.returncode == 0, out
     assert "GATE h1=False" in out
     assert f"GATE h2={expected}" in out
+
+
+def test_pending_restart_is_retried_and_recorded():
+    need = _by_name("decide whether the agent needs a restart")[0]["ansible.builtin.set_fact"]
+    assert "fleet_update_decision.restart_pending" in need["fleet_update_restart_needed"]
+    report = _by_name("Collect this host's report")[0]["ansible.builtin.set_fact"]["fleet_update_report"]
+    pend = report["restart_pending"]
+    assert "not (fleet_update_restart_done" in pend
+    assert "fleet_update_decision.restart_pending" in pend and "fabric_agent_provision" in pend
+    done = [t for t in _tasks() if "agent restarted" in t["name"]]
+    assert len(done) == 2
+    for t in done:
+        assert t["ansible.builtin.set_fact"] == {"fleet_update_restart_done": True}
+    first = _by_name("this host's decision")[0]["ansible.builtin.set_fact"]
+    assert first["fleet_update_restart_done"] is False
+
+
+def test_force_skips_the_busy_recheck():
+    for frag in ("re-read busy state right before the restart", "busy re-check",
+                 "defer the agent restart"):
+        t = _by_name(frag)[0]
+        assert "not (fleet_update_decision.forced | default(false) | bool)" in t["when"], frag
+
+
+@pytest.mark.parametrize("done,pending", [(False, True), (True, False)])
+def test_collect_and_record_carry_restart_pending(tmp_path, done, pending):
+    """Role's Collect + Record tasks on localhost (state file in tmp only)."""
+    exe = _ansible("ansible-playbook")
+    if not exe:
+        pytest.skip("ansible-playbook not available")
+    tasks = [t for t in _load(ROLE / "tasks" / "main.yml")
+             if any(w in t.get("name", "") for w in ("Collect this host's report", "Record results"))]
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"beast": {"last_updated": "2026-10-01T00:00:00+00:00",
+                                           "restart_pending": True}}))
+    play = [{"hosts": "localhost", "gather_facts": False,
+             "vars": {**_defaults(), "fleet_update_helper": str(ROOT / "files" / "fleet-update-state.py"),
+                      "fleet_update_state_file": str(state), "fleet_update_host_id": "beast",
+                      "fleet_pins": {}, "fleet_update_outcome": "updated", "fleet_update_reason": "",
+                      "fleet_update_restart_done": done,
+                      "fleet_update_decision": {"last_updated": "2026-10-01T00:00:00+00:00",
+                                                "deferred_since": None, "restart_pending": True}},
+             "tasks": tasks}]
+    pb = tmp_path / "p.yml"
+    pb.write_text(yaml.safe_dump(play))
+    r = subprocess.run([exe, "-i", "localhost,", "-c", "local", str(pb)],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    saved = json.loads(state.read_text())["beast"]
+    assert saved["restart_pending"] is pending
+    if pending:
+        assert saved["result"] == "updated (agent restart pending)"
+        assert saved["last_updated"] == "2026-10-01T00:00:00+00:00"
+    else:
+        assert saved["result"] == "updated" and saved["last_updated"] != "2026-10-01T00:00:00+00:00"

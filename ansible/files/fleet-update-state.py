@@ -12,7 +12,8 @@ reading one JSON object on stdin and printing one JSON object on stdout:
           hosts not in this run keep their entries.
 
 State file (keyed by control-plane host id):
-  {"<host>": {"last_updated": iso|null, "deferred_since": iso|null, "result": str}}
+  {"<host>": {"last_updated": iso|null, "deferred_since": iso|null, "result": str,
+              "restart_pending": bool}}
 
 Outcomes: updated (reason = optional note, e.g. "agent restart deferred"),
 deferred, skipped (an earlier host failed), failed. Only "updated" moves
@@ -130,7 +131,8 @@ def decide(inp: dict) -> dict:
         prev = _entry(state, host)
         busy = busy_state(host, probe, inp.get("sessions"), **_busy_kwargs(inp))
         d = {"busy": busy, "forced": False, "last_updated": prev.get("last_updated"),
-             "deferred_since": prev.get("deferred_since")}
+             "deferred_since": prev.get("deferred_since"),
+             "restart_pending": prev.get("restart_pending") is True}
         if busy == "no":
             d.update(action="update", reason="")
         elif force:
@@ -194,22 +196,41 @@ def _write_state(path: Path, updates: dict) -> None:
 
 
 def record(inp: dict) -> dict:
+    """Per-host ingest bodies; writes the state file unless dry_run.
+
+    ``restart_pending`` (per host, from the play) means the agent depends on
+    something that changed but has not been restarted onto it yet (restart
+    deferred, failed, or a later step failed after staging). It is kept in the
+    state file until a run restarts the agent, so the next run retries even
+    when nothing changes then. While pending, an "updated" run does not move
+    last_updated (the update is not complete until the agent runs it) and its
+    result says so.
+    """
     now = _now(inp)
     state = load_state(inp["state_file"])
     bodies, updates = {}, {}
     for host, h in (inp.get("hosts") or {}).items():
+        prev = _entry(state, host)
         outcome = h.get("outcome")
         last, since = h.get("last_updated"), h.get("deferred_since")
+        reason = h.get("reason")
+        if outcome in ("deferred", "skipped"):  # nothing ran: the pending flag stays
+            pending = prev.get("restart_pending") is True
+        else:
+            pending = h.get("restart_pending") is True
         if outcome == "skipped":  # never probed/decided: keep what the state file has
-            prev = _entry(state, host)
             last, since = prev.get("last_updated"), prev.get("deferred_since")
         if outcome == "updated":
-            last, since = iso(now), None
+            since = None
+            if pending:
+                last, reason = prev.get("last_updated"), "agent restart pending"
+            else:
+                last = iso(now)
         elif outcome not in ("deferred", "skipped"):
             outcome = "failed"
         fu = {"last_updated": last, "deferred_since": since,
-              "result": _result(outcome, h.get("reason"))}
-        updates[host] = fu
+              "result": _result(outcome, reason)}
+        updates[host] = {**fu, "restart_pending": pending}
         bodies[host] = {"source": "fleet-update", "entity_type": "host",
                         "entity_id": host, "event_type": "host.fleet_update",
                         "payload": {"maintenance": _bool(h.get("maintenance")),

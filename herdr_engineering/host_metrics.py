@@ -514,8 +514,25 @@ def _first_line(out: str | None) -> str | None:
     return lines[0].strip() if lines and lines[0].strip() else None
 
 
+# The fabric agent's systemd user unit / launchd job has a minimal PATH without
+# ~/.local/bin (where herdr is installed), so these are probed as well.
+_TOOL_DIRS = ("~/.local/bin", "/usr/local/bin")
+
+
+def _find_tool(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in _TOOL_DIRS:
+        path = os.path.join(os.path.expanduser(d), name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
 def _tool_version(cmd: list[str]) -> str | None:
-    return _first_line(_run(cmd)) if shutil.which(cmd[0]) else None
+    path = _find_tool(cmd[0])
+    return _first_line(_run([path, *cmd[1:]])) if path else None
 
 
 _VERSION_RE = re.compile(r"\d+(?:\.\d+)+[\w.+-]*")
