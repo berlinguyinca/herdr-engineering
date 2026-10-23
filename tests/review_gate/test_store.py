@@ -356,3 +356,64 @@ def test_malformed_forged_events_never_break_the_fold():
     _forge(repo, "push", {})
     assert s.snapshot(KEY).head_sha == "A"
     assert s.snapshots()  # GET /prs must keep working
+
+
+def test_review_failed_escalates_from_reviewing():
+    _, s = make()
+    to_reviewing(s, "A")
+    assert s.on_review_failed(KEY, "A", "reviewer timed out")
+    snap = s.snapshot(KEY)
+    assert snap.state == State.ESCALATED
+    assert snap.reason == "reviewer timed out"
+    assert snap.review_rounds == 0
+
+
+def test_review_failed_reason_is_clipped_in_write_and_fold():
+    repo, s = make()
+    to_reviewing(s, "A")
+    assert s.on_review_failed(KEY, "A", "x" * 500)
+    assert len(s.snapshot(KEY).reason) == 200
+    repo2, s2 = make()
+    to_reviewing(s2, "A")
+    repo2.record_event("pr_gate", str(KEY), "review_failed", {"sha": "A", "reason": "y" * 500})
+    assert len(s2.snapshot(KEY).reason) == 200
+
+
+def test_review_failed_refused_when_stale_or_not_reviewing():
+    repo, s = make()
+    s.on_push(KEY, "A")
+    assert not s.on_review_failed(KEY, "A", "r")  # CI_PENDING
+    s.on_ci_green(KEY, "A")
+    assert not s.on_review_failed(KEY, "A", "r")  # CI_GREEN
+    s.on_review_started(KEY, "A", "m")
+    assert not s.on_review_failed(KEY, "B", "r")  # stale sha
+    assert s.on_verdict(KEY, fail("A"))
+    assert not s.on_review_failed(KEY, "A", "r")  # CHANGES_REQUESTED
+    s.on_push(KEY, "B")
+    s.on_ci_green(KEY, "B")
+    s.on_review_started(KEY, "B", "m")
+    assert s.on_verdict(KEY, Verdict("PASS", "B", (), "m"))
+    before = len(list(repo.stream("pr_gate", str(KEY))))
+    assert not s.on_review_failed(KEY, "B", "r")  # APPROVED
+    assert len(list(repo.stream("pr_gate", str(KEY)))) == before
+    assert s.snapshot(KEY).state == State.APPROVED
+
+
+def test_review_failed_event_cannot_be_forged():
+    repo, s = make()
+    to_reviewing(s, "A")
+    assert s.on_verdict(KEY, Verdict("PASS", "A", (), "m"))
+    _forge(repo, "review_failed", {"sha": "A", "reason": "boom"})
+    _forge(repo, "review_failed", {"reason": "no sha"})
+    _forge(repo, "review_failed", {"sha": "A", "reason": 5})
+    assert s.snapshot(KEY).state == State.APPROVED
+
+
+def test_resume_clears_review_failed_escalation():
+    _, s = make()
+    to_reviewing(s, "A")
+    assert s.on_review_failed(KEY, "A", "r")
+    assert s.resume(KEY)
+    snap = s.snapshot(KEY)
+    assert snap.state == State.CI_PENDING
+    assert snap.review_rounds == 0 and snap.ci_fix_rounds == 0 and snap.reason is None

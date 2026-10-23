@@ -45,6 +45,13 @@ def _payload(event: dict) -> dict:
     return payload
 
 
+_REASON_MAX = 200
+
+
+def _clip_reason(reason: str) -> str:
+    return redact_text(reason)[:_REASON_MAX]
+
+
 _REVIEWABLE = (State.CI_GREEN, State.REVIEW_QUEUED, State.REVIEWING)
 
 
@@ -103,6 +110,11 @@ def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
             state=State.ESCALATED if p.get("escalated") else State.CHANGES_REQUESTED,
             reason=p.get("reason"),
         )
+    if event_type == "review_failed":
+        reason = p.get("reason")
+        if not on_head or snap.state != State.REVIEWING or not isinstance(reason, str):
+            return snap
+        return replace(snap, state=State.ESCALATED, reason=_clip_reason(reason))
     if event_type == "merged":
         if not on_head or snap.state != State.APPROVED:
             return snap
@@ -249,6 +261,14 @@ class PipelineStore:
                 elif repeated:
                     payload.update(escalated=True, reason="repeated finding")
             return self._record(key, "verdict", payload)
+
+    def on_review_failed(self, key: PrKey, sha: str, reason: str) -> bool:
+        """The review could not complete: escalate without consuming a review round."""
+        with self._lock:
+            snap = self.snapshot(key)
+            if sha != snap.head_sha or snap.state != State.REVIEWING:
+                return False
+            return self._record(key, "review_failed", {"sha": sha, "reason": _clip_reason(reason)})
 
     def on_merged(self, key: PrKey, sha: str) -> bool:
         with self._lock:
