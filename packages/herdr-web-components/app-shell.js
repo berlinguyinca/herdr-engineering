@@ -51,8 +51,10 @@ export class HerdrAppShell extends HTMLElement {
     this._menuOpen = false;
     const nav = this.shadowRoot.querySelector('.hd-shell__nav');
     const menu = this.shadowRoot.querySelector('.hd-shell__menu');
+    const returnFocus = nav?.contains(this.shadowRoot.activeElement);
     nav?.setAttribute('data-open', 'false');
     menu?.setAttribute('aria-expanded', 'false');
+    if (returnFocus) menu?.focus();
   };
 
   _render() {

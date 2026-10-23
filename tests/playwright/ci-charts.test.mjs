@@ -66,7 +66,9 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     assert.deepEqual(await projects.locator('tbody tr').first().locator('th,td').allTextContents(),['Project Alpha','3','60000','60000','60000']);
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Storage is memory-only/);
     // New records and retained observations obey the same branch and period controls.
+    await page.locator('[data-ci-workspace="runs"]').click();
     await search.fill('');
+    await page.locator('[data-ci-workspace="tests"]').click();
     await page.locator('[data-ci-branch]').selectOption('feature');
     assert.match(await page.locator('.ci-performance').innerText(),/No successful runs with valid positive/);
     await page.locator('[data-ci-branch]').selectOption('main');
@@ -78,7 +80,9 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     await page.locator('[data-ci-period]').selectOption('7');
     assert.match(await page.locator('.ci-performance').innerText(),/3 successful runs/);
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Last 7 days/);
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.locator('#ig-tab-failed').click();
+    await page.locator('[data-ci-workspace="tests"]').click();
     assert.match(await page.locator('.ci-performance').innerText(),/3 successful runs/);
     await projects.focus();
     await page.evaluate(()=>{window.addRun();window.chartView.refresh();});

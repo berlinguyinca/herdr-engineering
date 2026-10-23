@@ -398,9 +398,9 @@ async function viewActivity() {
     .ac-row{border-bottom:1px solid var(--border-subtle)}.ac-row:last-child{border-bottom:0}.ac-row[open]{background:var(--bg)}
     .ac-row summary{display:grid;grid-template-columns:minmax(140px,220px) minmax(0,1fr) auto;gap:14px;align-items:center;padding:10px 12px;cursor:pointer;list-style-position:inside;font-size:13px}
     .ac-row summary strong{overflow-wrap:anywhere}.ac-kind,.ac-time{font-size:12px;color:var(--text-secondary)}.ac-time{white-space:nowrap}
-    .ac-detail{margin:0;padding:0 32px 12px;font-size:12px;line-height:1.5;color:var(--text-secondary);overflow-wrap:anywhere}
+    .ac-detail{margin:0;padding:0 32px 8px;font-size:12px;line-height:1.5;color:var(--text-secondary);overflow-wrap:anywhere}.ac-payload{margin:0 32px 12px;max-height:240px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.45;background:var(--surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:10px}
     .ac-row[data-muted=true]{opacity:.65}
-    @media(max-width:650px){.ac-row summary{grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;padding:12px}.ac-kind{grid-column:1}.ac-time{grid-column:2;grid-row:1/3}.ac-detail{padding:0 12px 12px}}
+    @media(max-width:650px){.ac-row summary{grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;padding:12px}.ac-kind{grid-column:1}.ac-time{grid-column:2;grid-row:1/3}.ac-detail{padding:0 12px 8px}.ac-payload{margin:0 12px 12px}}
   </style><h1>Activity</h1>` + await activityList(50);
 }
 
@@ -410,7 +410,9 @@ async function activityList(limit) {
   const t = titles(await missionTitles());
   return `<div class="ac-list">${events.map((e) => {
     const d = describeEvent(e, { missionTitles: t });
-    return `<details class="ac-row" data-muted="${d.muted}"><summary><strong>${esc(d.title)}</strong><span class="ac-kind">${esc(d.kind)}</span><time class="ac-time">${formatTimestamp(e.source_timestamp)}</time></summary><p class="ac-detail">${esc(d.detail)}</p></details>`;
+    const rawPayload=JSON.stringify(e.payload || {},null,2);
+    const payload=rawPayload.length>8000?`${rawPayload.slice(0,7999)}…`:rawPayload;
+    return `<details class="ac-row" data-muted="${d.muted}"><summary><strong>${esc(d.title)}</strong><span class="ac-kind">${esc(d.kind)}</span><time class="ac-time">${formatTimestamp(e.source_timestamp)}</time></summary><p class="ac-detail">${esc(d.detail)}</p><pre class="ac-payload" aria-label="Original event payload">${esc(payload)}</pre></details>`;
   }).join('')}</div>`;
 }
 

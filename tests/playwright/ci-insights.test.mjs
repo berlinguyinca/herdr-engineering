@@ -23,6 +23,10 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto(`${base}/#/ci`);
   assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-selected'),'true');
+  assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-controls'),'ci-workspace-health');
+  await page.locator('[data-ci-workspace="health"]').focus();await page.keyboard.press('ArrowRight');
+  assert.equal(await page.locator('[data-ci-workspace="runs"]').getAttribute('aria-selected'),'true');
+  assert.equal(await page.evaluate(()=>document.activeElement?.dataset.ciWorkspace),'runs');
   await page.locator('[data-ci-workspace="tests"]').click();
   const insights=page.locator('[data-ci-insights]');
   await page.waitForFunction(()=>document.querySelector('[data-ci-insights]')?.textContent.includes('4 test report attempts'));
@@ -41,7 +45,9 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   await page.getByRole('button',{name:'Run #3',exact:true}).click();
   const inspector=page.locator('.ig-inspector');
   await inspector.locator('[data-step="12"]').waitFor();
-  assert.equal(await insights.isVisible(),false);
+  await page.locator('[data-ci-workspace="tests"]').click();
+  assert.equal(await insights.isVisible(),true);
+  await page.locator('[data-ci-workspace="health"]').click();
   assert.equal(await inspector.locator('[data-step="12"]').evaluate(e=>getComputedStyle(e).borderLeftColor),'rgb(220, 53, 69)');
   assert.match(await inspector.innerText(),/Test results · 4 tests/);
   const box=await inspector.boundingBox();assert.ok(box.width>900,`Pipeline inspector too narrow: ${box.width}`);

@@ -83,45 +83,41 @@
 - [x] Run focused tests and confirm they pass.
 - [x] Commit.
 
-### Task 4: CI and Projects workspace composition
+### Task 4: CI workspace composition and Projects assessment
 
 **Files:**
 - Modify: `packages/integrations-view.js`
 - Modify: `packages/ci-health-view.js`
-- Modify: `packages/github-view.js`
 - Modify: `tests/playwright/ci-health.test.mjs`
 - Modify: `tests/playwright/ci-insights.test.mjs`
 - Modify: `tests/playwright/ui.test.mjs`
 
 **Interfaces:**
-- Produces: CI Health/Runs & pipelines/Tests workspace navigation and container-aware project/tree/inspector layouts.
+- Produces: CI Health & pipeline/Runs/Tests workspace navigation; records whether current Projects evidence supports a layout change.
 - Consumes: existing CI filters, five heatmap windows, compound run identity, report coverage and Projects repository/issue selection.
 
-- [x] Add browser assertions for workspace navigation, retained filter/selection state, wide split layout, narrow stacked layout and no duplicated provider-origin clutter.
-- [x] Run focused CI/Projects tests and confirm failures.
-- [x] Implement workspace navigation and responsive container layouts without combining independent history/report filters.
-- [x] Run focused CI/Projects tests and confirm they pass.
+- [x] Add browser assertions for workspace navigation, retained filter/selection state, wide pipeline layout, narrow stacked layout and no duplicated provider-origin clutter.
+- [x] Run focused CI tests and confirm failures.
+- [x] Implement workspace navigation without combining independent history/report filters; retain the existing Projects tree because synchronized issue data was unavailable for a grounded redesign.
+- [x] Run focused CI tests and confirm they pass.
 - [x] Commit.
 
-### Task 5: Analytics, Collaboration, responsive navigation and full verification
+### Task 5: Analytics, responsive navigation, Collaboration assessment and full verification
 
 **Files:**
 - Modify: `packages/app.js`
-- Modify: `packages/collab.css`
 - Modify: `packages/herdr-web-components/app-shell.js`
 - Modify: `tests/playwright/ui.test.mjs`
-- Modify: relevant Collaboration browser tests
 - Modify: `DESIGN.md`
 - Modify: `docs/evidence/dashboard-space/audit.md`
 
 **Interfaces:**
-- Produces: composed analytics panels, list/detail Collaboration landing, compact accessible mobile navigation and final measured evidence.
+- Produces: composed analytics panels, compact accessible mobile navigation, a documented Collaboration layout decision and final measured evidence.
 - Consumes: shared shell and density patterns from Tasks 1–4.
 
-- [x] Add browser assertions for analytics composition, mobile navigation access/focus, Collaboration workspace behavior and empty-state control suppression.
+- [x] Add browser assertions for analytics composition and mobile navigation access/focus; verify existing Collaboration workspace coverage before deciding whether a layout change is warranted.
 - [x] Run focused tests and confirm failures.
-- [x] Implement the remaining compositions and update the design/evidence documents with final measurements.
+- [x] Implement the remaining compositions and update the design/evidence documents with final measurements; retain Collaboration's established sparse-room layout.
 - [x] Run all JavaScript/browser tests, JavaScript syntax checks and diff checks.
 - [x] Capture and inspect screenshots at 1920×1080, 1440×900, 1280×800, 768×1024 and 390×844.
-- [ ] Request whole-branch code and visual review, resolve material findings through RED/GREEN, and commit.
-
+- [x] Request whole-branch code and visual review, resolve material findings through RED/GREEN, and commit.

@@ -130,24 +130,24 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='';
   let healthView=null;
-  let workspace='health';
+  let workspace=isCi && state.tab!=='current'?'runs':'health';
   const pending=new Map();
   const listenerController=new AbortController();
   const reviewCache=new Map();
   const title=isCi?'CI':'Reviews';
   container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles:''}<h1>${title}</h1><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
     <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
-    ${isCi?'<nav class="ig-workspaces" role="tablist" aria-label="CI workspace"><button type="button" role="tab" data-ci-workspace="health" aria-selected="true">Health</button><button type="button" role="tab" data-ci-workspace="runs" aria-selected="false">Runs & pipelines</button><button type="button" role="tab" data-ci-workspace="tests" aria-selected="false">Tests</button></nav><section class="ig-workspace" data-ci-workspace-panel="health"><div data-ci-health></div></section><section class="ig-workspace" data-ci-workspace-panel="runs" hidden>':''}
+    ${isCi?`<nav class="ig-workspaces" role="tablist" aria-label="CI workspace"><button type="button" role="tab" id="ci-tab-health" aria-controls="ci-workspace-health" data-ci-workspace="health" aria-selected="${workspace==='health'}" tabindex="${workspace==='health'?0:-1}">Health & pipeline</button><button type="button" role="tab" id="ci-tab-runs" aria-controls="ci-workspace-runs" data-ci-workspace="runs" aria-selected="${workspace==='runs'}" tabindex="${workspace==='runs'?0:-1}">Runs</button><button type="button" role="tab" id="ci-tab-tests" aria-controls="ci-workspace-tests" data-ci-workspace="tests" aria-selected="${workspace==='tests'}" tabindex="${workspace==='tests'?0:-1}">Tests</button></nav><section class="ig-workspace" id="ci-workspace-health" role="tabpanel" aria-labelledby="ci-tab-health" data-ci-workspace-panel="health" ${workspace==='health'?'':'hidden'}><div data-ci-health></div></section><section class="ig-workspace" id="ci-workspace-runs" role="tabpanel" aria-labelledby="ci-tab-runs" data-ci-workspace-panel="runs" ${workspace==='runs'?'':'hidden'}>`:''}
     <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
     ${repository || mission || session ? `<p class="ig-note">Filtered to ${esc(repository || mission || session)} · <a href="#/${kind}">Clear context</a></p>` : ''}
     <p class="ig-note" data-ig-count></p><div class="ig-layout"><section id="ig-results" role="tabpanel" aria-labelledby="ig-tab-${state.tab}"></section><aside class="ig-inspector" aria-label="Pipeline inspector" hidden></aside></div>
-    <div class="ig-pages"><button type="button" class="hd-btn" data-page="previous">Previous</button><span data-ig-page></span><button type="button" class="hd-btn" data-page="next">Next</button></div><div data-ig-runners></div>${isCi?'</section><section class="ig-workspace" data-ci-workspace-panel="tests" hidden><div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="0">All retained history</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div data-ci-insights></div><details class="ci-charts" data-ci-charts><summary>Run outcome & duration trends · observed history</summary><div class="ci-charts-body" data-ci-charts-body></div></details></section>':''}${!isCi ? '<details class="ig-runners"><summary>Start a review</summary><p>Start Plannotator from the project workspace with <code>herdr-plannotator --help</code>. Its review link and upstream decision appear here when the launcher is connected to this control plane.</p></details>' : ''}`;
+    <div class="ig-pages"><button type="button" class="hd-btn" data-page="previous">Previous</button><span data-ig-page></span><button type="button" class="hd-btn" data-page="next">Next</button></div><div data-ig-runners></div>${isCi?`</section><section class="ig-workspace" id="ci-workspace-tests" role="tabpanel" aria-labelledby="ci-tab-tests" data-ci-workspace-panel="tests" ${workspace==='tests'?'':'hidden'}><div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="0">All retained history</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div data-ci-insights></div><details class="ci-charts" data-ci-charts><summary>Run outcome & duration trends · observed history</summary><div class="ci-charts-body" data-ci-charts-body></div></details></section>`:''}${!isCi ? '<details class="ig-runners"><summary>Start a review</summary><p>Start Plannotator from the project workspace with <code>herdr-plannotator --help</code>. Its review link and upstream decision appear here when the launcher is connected to this control plane.</p></details>' : ''}`;
   const el=selector=>container.querySelector(selector);
   function selectWorkspace(next) {
     if(!isCi || !['health','runs','tests'].includes(next))return;
     workspace=next;
-    for(const button of container.querySelectorAll('[data-ci-workspace]'))button.setAttribute('aria-selected',String(button.dataset.ciWorkspace===workspace));
+    for(const button of container.querySelectorAll('[data-ci-workspace]')){const active=button.dataset.ciWorkspace===workspace;button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;}
     for(const panel of container.querySelectorAll('[data-ci-workspace-panel]'))panel.hidden=panel.dataset.ciWorkspacePanel!==workspace;
   }
   if(isCi){
@@ -267,7 +267,6 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       }
     }
     const inspector=el('.ig-inspector');inspector.hidden=!selected;
-    if(isCi){el('[data-ci-insights]').hidden=!!selected;el('[data-ci-charts]').hidden=!!selected;}
     if(selected) {
       const runReports=records(reportData?.reports).filter(r=>String(r.provider_repo_id??r.repository)===String(pipeline?.provider_repo_id??selected.providerId) && r.run_number===Number(selected.number));
       const next=JSON.stringify([testSearch,testPage,runReports,pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage]);
@@ -375,6 +374,12 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
     const index=tabs.findIndex(([key])=>key===state.tab);
     state.tab=tabs[event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:tabs.length-1))%tabs.length][0];state.page=0;event.preventDefault();draw();el(`[data-tab="${state.tab}"]`).focus();
+  });
+  if(isCi)container.querySelector('.ig-workspaces').addEventListener('keydown',event=>{
+    if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
+    const keys=['health','runs','tests'],index=keys.indexOf(workspace);
+    const next=keys[event.key==='Home'?0:event.key==='End'?keys.length-1:(index+(event.key==='ArrowRight'?1:keys.length-1))%keys.length];
+    event.preventDefault();selectWorkspace(next);el(`[data-ci-workspace="${next}"]`).focus();
   });
   if(isCi)for(const [selector,key] of [['[data-ci-repository]','repository'],['[data-ci-branch]','branch'],['[data-ci-period]','days']])el(selector).addEventListener('change',event=>{state[key]=event.target.value;state.page=0;draw();});
   container.addEventListener('input',event=>{if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
