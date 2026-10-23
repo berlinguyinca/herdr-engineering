@@ -33,6 +33,8 @@ from .redact import redact_payload
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
+# Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
+_TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
@@ -776,7 +778,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path):
+            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -1362,6 +1364,16 @@ def _make_handler(server, public=False, operator=False):
                 if receipt.get("error") in {"receipt_persistence_unavailable", "receipt_persistence_failed"}:
                     status = 503
                 return self._json({"ok": receipt["status"] == "delivered", **receipt}, status)
+            if resource == "sessions" and len(parts) == 6 and parts[5] == "terminal":
+                from .terminal_attach import AttachRefused, attach_commands
+                s = r.get_session(parts[4])
+                if s is None:
+                    return self._json({"error": "agent not found"}, 404)
+                try:
+                    return self._json(attach_commands(s, hosts=r.list_hosts(),
+                                                      peer=self.client_address[0]))
+                except AttachRefused as exc:
+                    return self._json(exc.body, exc.status)
             if resource == "sessions" and len(parts) == 7 and parts[5:] == ["summary", "fix"]:
                 from .summary_fix import SummaryFixRefused, fix_summary_item
                 actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
@@ -1456,7 +1468,8 @@ def _make_handler(server, public=False, operator=False):
             operator = self._role() == "operator"
             return {**session, "capabilities": {"rename_agent": operator,
                                                 "regenerate_summary": operator,
-                                                "fix_summary_item": operator}}
+                                                "fix_summary_item": operator,
+                                                "attach_terminal": operator}}
 
         def _named_inspector(self, data, sid):
             # Claim an existing provider preference before a helper/read path

@@ -5,6 +5,17 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Terminal button on agent pages
+- An agent page has a **Terminal** button (operator only). It shows the exact command
+  that attaches a terminal on the viewer's own machine to the agent's HerdR pane:
+  `ssh -t <host> "bash -lc 'herdr --session <s> agent attach <pane>'"` from another machine,
+  or `herdr --session <s> agent attach <pane>` on the agent's host, each with a Copy button.
+  The server builds it from the recorded session only (strict charsets, never client input)
+  and never runs it. `POST /api/v1/sessions/<id>/terminal`; see
+  `docs/operations/terminal-attach.md`. The old "Copy attach command" line
+  (`ssh host && herdr workspace focus ...`, which ran the second half locally) is gone
+  from the page.
+
 ### Central fleet config: deploy and servers
 - `deploy/control-plane/deploy.sh` renders the compose variables from the central
   fleet file into a transient 0600 env file (removed on exit, even on failure),
