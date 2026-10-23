@@ -9,15 +9,22 @@ touched) and every open, non-draft PR in it:
 2. ``CI_PENDING`` -> ``ci_verdict_for`` over the CI rows for this repo: green ->
    ``store.on_ci_green`` + ``queue.enqueue``; red -> ``store.on_ci_red`` + status
    ``failure``; otherwise wait.
-3. ``CI_GREEN`` / ``REVIEW_QUEUED`` -> ensure a job exists (``enqueue`` is
-   idempotent; ``None`` for a duplicate is normal). The store has no event that
-   produces ``REVIEW_QUEUED``, so after enqueueing the state stays ``CI_GREEN``,
-   which ``on_review_started`` accepts.
+3. When THIS tick moves the PR into ``CI_GREEN`` (``on_ci_green`` returned
+   True) -> ``queue.rearm`` (a fresh job even after a done/superseded one for
+   the same sha: operator resume without a push, head A -> B -> A). Already
+   ``CI_GREEN`` / ``REVIEW_QUEUED`` -> plain ``enqueue`` (dedupe; ``None`` is
+   normal). If that returns ``None`` and no live job exists for (key, sha) the
+   status says "cannot queue review" instead of "review queued". The store has
+   no event that produces ``REVIEW_QUEUED``, so after enqueueing the state
+   stays ``CI_GREEN``, which ``on_review_started`` accepts.
 4. ``APPROVED`` -> ``decide_merge``: ``merge`` -> status ``success``, then
    ``app.merge_pr(repo, number, head_sha)``; only a True result records
-   ``store.on_merged``. False (head moved / not mergeable) leaves the state
-   alone, sets status back to ``pending`` and calls ``app.update_branch`` once
-   per head SHA. A raising merge also reverts the status to ``pending``.
+   ``store.on_merged``. False (head moved / not mergeable) or a raise leaves
+   the state alone, sets status back to ``pending`` ("retrying at <time>") and
+   starts a per-(key, sha) exponential backoff on the injected clock (60 s,
+   doubling, capped at 900 s). While backing off neither ``success`` nor
+   ``merge_pr`` is repeated, so a stuck PR cannot flap statuses (GitHub caps
+   statuses per SHA+context). ``app.update_branch`` is tried once per head SHA.
    ``reject`` -> ``failure``; ``wait`` -> ``pending``.
 5. ``CHANGES_REQUESTED``, ``CI_RED`` and ``ESCALATED`` hold ``failure`` (the
    description says why); only ``store.resume`` clears an escalation.
@@ -48,6 +55,12 @@ Decisions and limits:
   when first seen, but only when known (kind != "unknown"): a first-wins pin of
   "unknown" would permanently disable same-model reviewer exclusion.
   ``PrInfo.author_login`` is never used as an identity.
+- Retargeting a PR to a different base keeps an approval for the same head
+  SHA (no new head means no re-review): known limitation.
+- A PR that leaves the open list (closed, merged elsewhere) has its queued
+  review cancelled. Detection uses an in-memory memo of PR numbers per repo,
+  so a PR closed while the service was down is not noticed.
+- The author is resolved once per (key, head SHA) and cached in memory.
 - Statuses are posted only when (state, description) changes for a SHA (kept
   in memory); the first ``pending`` for a new head SHA is always posted.
 - ``tick`` never raises. Errors are counted per repo / per PR and the loop goes
@@ -58,8 +71,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 from .config import RepoEnrollment, ReviewGateConfig
@@ -75,6 +90,10 @@ log = logging.getLogger(__name__)
 
 STATUS_CONTEXT = "herdr/review-gate"
 _CHECK_STATUS = {"green": "pass", "red": "fail", "pending": "pending"}
+MERGE_BACKOFF_FIRST = 60.0
+MERGE_BACKOFF_MAX = 900.0
+STOP_TIMEOUT = 5.0
+_WEDGED = "review gate: cannot queue review; push a commit or resume"
 
 
 def _rows_for(snapshot: dict, repo: str) -> list[dict]:
@@ -114,6 +133,7 @@ class GateService:
         queue: ReviewQueue,
         registry: AuthorRegistry,
         ci_snapshot: Callable[[], dict],
+        now: Callable[[], float] = time.time,
     ):
         self._config = config
         self._app = app
@@ -123,6 +143,12 @@ class GateService:
         self._ci_snapshot = ci_snapshot
         self._posted: dict[tuple[str, str], tuple[str, str]] = {}
         self._update_tried: set[tuple[PrKey, str]] = set()
+        self._now = now
+        # (key, sha) -> (retry_at, last_delay) after a refused/failed merge.
+        self._merge_backoff: dict[tuple[PrKey, str], tuple[float, float]] = {}
+        self._authors: dict[tuple[PrKey, str], str | None] = {}
+        self._seen: dict[str, set[int]] = {}
+        self._stop_timeout = STOP_TIMEOUT
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -142,7 +168,9 @@ class GateService:
             thread = self._thread
             self._stop.set()
         if thread is not None:
-            thread.join()
+            thread.join(self._stop_timeout)
+            if thread.is_alive():
+                log.warning("review gate: tick still running after stop(); thread left as daemon")
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -203,15 +231,24 @@ class GateService:
                     counts["errors"] += 1
 
     def _forget_closed(self, repo: str, prs: list[PrInfo]) -> None:
-        """Drop in-memory status/update memos for heads no longer open in ``repo``."""
+        """Cancel reviews of PRs that left the open list; drop memos of old heads."""
+        numbers = {pr.number for pr in prs}
+        for number in sorted(self._seen.get(repo, set()) - numbers):
+            try:
+                self._queue.cancel(PrKey(repo, number))
+            except Exception:  # noqa: BLE001 - best effort; retried never, logged
+                log.warning("review gate: could not cancel review for %s#%s", repo, number)
+        self._seen[repo] = numbers
         live = {(pr.number, pr.head_sha) for pr in prs}
         heads = {sha for _, sha in live}
         self._posted = {k: v for k, v in self._posted.items() if k[0] != repo or k[1] in heads}
-        self._update_tried = {
-            (key, sha)
-            for key, sha in self._update_tried
-            if key.repo != repo or (key.number, sha) in live
-        }
+
+        def keep(k: tuple[PrKey, str]) -> bool:
+            return k[0].repo != repo or (k[0].number, k[1]) in live
+
+        self._update_tried = {k for k in self._update_tried if keep(k)}
+        self._merge_backoff = {k: v for k, v in self._merge_backoff.items() if keep(k)}
+        self._authors = {k: v for k, v in self._authors.items() if keep(k)}
 
     # ---------------------------------------------------------------- per PR
     def _status(self, repo: str, sha: str, state: str, description: str, *, force=False) -> None:
@@ -220,10 +257,13 @@ class GateService:
         self._app.set_status(repo, sha, state, description, context=STATUS_CONTEXT)
         self._posted[(repo, sha)] = (state, description)
 
-    def _author_model(self, key: PrKey, head_ref: str) -> str | None:
+    def _author_model(self, key: PrKey, sha: str, head_ref: str) -> str | None:
+        if (key, sha) in self._authors:
+            return self._authors[(key, sha)]
         author = self._registry.author_of(key, head_ref)
         if author.kind != "unknown":
             self._registry.pin(key, author)  # first-wins; no-op once pinned
+        self._authors[(key, sha)] = author.model
         return author.model
 
     def _handle(
@@ -239,17 +279,22 @@ class GateService:
             self._status(repo, sha, "pending", "review gate: new head, waiting for CI", force=True)
             self._store.on_push(key, sha)
             self._queue.cancel(key, except_sha=sha)
-            self._author_model(key, pr.head_ref)
+            self._author_model(key, sha, pr.head_ref)
             snap = self._store.snapshot(key)
         if snap.head_sha != sha:  # store refused the push (e.g. merged meanwhile)
             return
 
         state = snap.state
+        rearmed = False
         if state == State.CI_PENDING:
             verdict = ci_verdict_for(sha, rows, enrollment, snapshot_stale=stale)
             if verdict.result == "green":
-                self._store.on_ci_green(key, sha)
-                state = State.CI_GREEN
+                if self._store.on_ci_green(key, sha):
+                    self._queue.rearm(key, sha, self._author_model(key, sha, pr.head_ref))
+                    counts["enqueued"] += 1
+                    rearmed = True
+                snap = self._store.snapshot(key)
+                state = snap.state
             elif verdict.result == "red":
                 self._store.on_ci_red(key, sha, verdict.failures)
                 snap = self._store.snapshot(key)
@@ -261,8 +306,9 @@ class GateService:
                 self._status(repo, sha, "pending", "review gate: waiting for CI")
                 return
         if state in (State.CI_GREEN, State.REVIEW_QUEUED):
-            if self._queue.enqueue(key, sha, self._author_model(key, pr.head_ref)) is not None:
-                counts["enqueued"] += 1
+            if not rearmed and not self._ensure_queued(key, sha, pr.head_ref, counts):
+                self._status(repo, sha, "failure", _WEDGED)
+                return
             self._status(repo, sha, "pending", "review gate: CI green, review queued")
         elif state == State.REVIEWING:
             self._status(repo, sha, "pending", "review gate: review in progress")
@@ -279,6 +325,13 @@ class GateService:
             )
         elif state == State.APPROVED:
             self._approved(enrollment, pr, key, snap, rows, stale, counts)
+
+    def _ensure_queued(self, key: PrKey, sha: str, head_ref: str, counts: dict) -> bool:
+        """Plain (deduping) enqueue; False when no live job exists for (key, sha)."""
+        if self._queue.enqueue(key, sha, self._author_model(key, sha, head_ref)) is not None:
+            counts["enqueued"] += 1
+            return True
+        return any(j["key"] == str(key) and j["sha"] == sha for j in self._queue.snapshot())
 
     def _approved(
         self,
@@ -313,22 +366,32 @@ class GateService:
         if decision.decision == "wait":
             self._status(repo, sha, "pending", "review gate: " + "; ".join(decision.reasons))
             return
+        backoff = self._merge_backoff.get((key, sha))
+        if backoff is not None and self._now() < backoff[0]:
+            return  # the "retrying at" pending status is already posted
         self._status(repo, sha, "success", "review gate: approved, CI green")
         try:
             merged = self._app.merge_pr(repo, pr.number, sha)
         except Exception:
-            self._revert_to_pending(repo, sha, "review gate: merge failed; retrying")
+            self._back_off(key, sha, "merge failed")
             raise
         if merged:
+            self._merge_backoff.pop((key, sha), None)
             if self._store.on_merged(key, sha):
                 counts["merged"] += 1
             return
-        self._revert_to_pending(
-            repo, sha, "review gate: merge refused (head moved / not mergeable)"
-        )
+        self._back_off(key, sha, "merge refused (head moved / not mergeable)")
         if (key, sha) not in self._update_tried:
             self._update_tried.add((key, sha))
             self._app.update_branch(repo, pr.number, sha)
+
+    def _back_off(self, key: PrKey, sha: str, why: str) -> None:
+        previous = self._merge_backoff.get((key, sha))
+        delay = MERGE_BACKOFF_FIRST if previous is None else min(previous[1] * 2, MERGE_BACKOFF_MAX)
+        retry_at = self._now() + delay
+        self._merge_backoff[(key, sha)] = (retry_at, delay)
+        when = datetime.fromtimestamp(retry_at, UTC).strftime("%H:%M:%SZ")
+        self._revert_to_pending(key.repo, sha, f"review gate: {why}; retrying at {when}")
 
     def _revert_to_pending(self, repo: str, sha: str, description: str) -> None:
         try:

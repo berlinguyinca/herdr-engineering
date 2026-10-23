@@ -84,6 +84,14 @@ class CI:
         self.rows[repo] = list(rows)
 
 
+class Clock:
+    def __init__(self, t=1_000_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
 def make(repos=(REPO,)):
     cp = ControlPlaneRepo()
     app = FakeApp()
@@ -98,7 +106,13 @@ def make(repos=(REPO,)):
         poll_seconds=5,
     )
     svc = GateService(
-        config=config, app=app, store=store, queue=queue, registry=registry, ci_snapshot=ci
+        config=config,
+        app=app,
+        store=store,
+        queue=queue,
+        registry=registry,
+        ci_snapshot=ci,
+        now=Clock(),
     )
     return svc, app, store, queue, registry, ci
 
@@ -119,6 +133,25 @@ def test_new_head_sets_pending_status_first():
     assert after_list[0][5] == STATUS_CONTEXT == "herdr/review-gate"
     assert store.snapshot(KEY).head_sha == A
     assert summary["prs"] == 1 and summary["errors"] == 0
+
+
+def test_failed_pending_status_records_nothing_for_new_head():
+    """The pending status for a new head is a precondition for everything else."""
+    svc, app, store, queue, registry, ci = make()
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+
+    def down(*a, **kw):
+        app.calls.append(("set_status_failed",))
+        raise GitHubAppError("unavailable", status=502)
+
+    app.set_status = down
+    summary = svc.tick()
+    assert summary["errors"] == 1 and summary["enqueued"] == 0
+    assert app.calls == [("open_prs", REPO), ("set_status_failed",)]
+    assert store.snapshot(KEY).head_sha is None
+    assert queue.snapshot() == []
+    assert registry._pinned(KEY) is None
 
 
 def test_green_ci_enqueues_exactly_one_review():
@@ -447,3 +480,161 @@ def test_ci_red_at_fix_cap_escalates_with_failure_status():
     assert app.last_status(A) == "failure"
     assert "escalated" in app.statuses(A)[-1][4]
     assert queue.snapshot() == []
+
+
+def finish_review_cap_escalation(store, sha):
+    store._review_cap = 1
+    assert store.on_review_started(KEY, sha, "reviewer-m")
+    bad = Finding("a.py", "bug", "nope", "high", "fix it", 1)
+    assert store.on_verdict(KEY, Verdict("FAIL", sha, (bad,), "reviewer-m"))
+    assert store.snapshot(KEY).state == State.ESCALATED
+
+
+def live_jobs(queue):
+    return [(j["key"], j["sha"]) for j in queue.snapshot()]
+
+
+def test_resume_without_push_after_review_cap_rearms_one_job():
+    svc, app, store, queue, _, ci = make()
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    job = queue.claim("w", "reviewer-m")
+    assert queue.complete(job.job_id, "w")
+    finish_review_cap_escalation(store, A)
+    svc.tick()
+    assert store.resume(KEY)
+    summary = svc.tick()
+    assert summary["enqueued"] == 1
+    assert live_jobs(queue) == [(str(KEY), A)]
+    assert store.snapshot(KEY).state == State.CI_GREEN
+    assert app.statuses(A)[-1][3:5] == ("pending", "review gate: CI green, review queued")
+    svc.tick()
+    assert live_jobs(queue) == [(str(KEY), A)]
+
+
+def test_head_a_b_a_ends_with_one_live_job_for_a():
+    svc, app, store, queue, _, ci = make()
+    ci.set(ci_row(A, "success"), ci_row(B, "success", n=2))
+    app.prs[REPO] = [pr(sha=A)]
+    svc.tick()
+    app.prs[REPO] = [pr(sha=B)]
+    svc.tick()
+    assert live_jobs(queue) == [(str(KEY), B)]
+    app.prs[REPO] = [pr(sha=A)]
+    svc.tick()
+    assert live_jobs(queue) == [(str(KEY), A)]
+    assert store.snapshot(KEY).state == State.CI_GREEN
+    svc.tick()
+    assert live_jobs(queue) == [(str(KEY), A)]
+
+
+def test_ci_green_without_live_job_says_cannot_queue():
+    svc, app, store, queue, _, ci = make()
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    # A worker completed the job but never recorded a verdict.
+    job = queue.claim("w", "reviewer-m")
+    assert queue.complete(job.job_id, "w")
+    svc.tick()
+    svc.tick()
+    assert store.snapshot(KEY).state == State.CI_GREEN
+    descs = [s[3:5] for s in app.statuses(A)]
+    wedged = ("failure", "review gate: cannot queue review; push a commit or resume")
+    assert descs[-1] == wedged
+    assert descs.count(wedged) == 1  # deduped
+
+
+def test_refused_merge_backs_off_exponentially():
+    svc, app, store, _, _, ci = make()
+    clock = svc._now
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    approve(store, KEY, A)
+    app.merge_result = False
+    base_status = len(app.statuses(A))
+    svc.tick()  # attempt 1: success, merge, pending(retry), update_branch
+    assert len(app.named("merge_pr")) == 1
+    assert [s[3] for s in app.statuses(A)[base_status:]] == ["success", "pending"]
+    assert "retrying at" in app.statuses(A)[-1][4]
+    assert len(app.named("update_branch")) == 1
+    for _ in range(5):  # inside the 60 s window
+        clock.t += 10
+        svc.tick()
+    assert len(app.named("merge_pr")) == 1
+    assert len(app.statuses(A)) == base_status + 2
+    clock.t += 11  # 61 s after the refusal
+    svc.tick()
+    assert len(app.named("merge_pr")) == 2
+    assert len(app.statuses(A)) == base_status + 4
+    assert len(app.named("update_branch")) == 1  # once per (key, sha)
+    clock.t += 119  # next window is 120 s
+    svc.tick()
+    assert len(app.named("merge_pr")) == 2
+    clock.t += 2
+    svc.tick()
+    assert len(app.named("merge_pr")) == 3
+    for _ in range(10):  # the delay caps at 900 s
+        clock.t += 901
+        svc.tick()
+    assert len(app.named("merge_pr")) == 13
+    # A new head resets the backoff.
+    app.merge_result = True
+    app.prs[REPO] = [pr(sha=B)]
+    ci.set(ci_row(B, "success", n=2))
+    svc.tick()
+    approve(store, KEY, B)
+    svc.tick()
+    assert app.named("merge_pr")[-1] == ("merge_pr", REPO, 7, B)
+    assert store.snapshot(KEY).state == State.MERGED
+
+
+def test_closed_pr_job_is_cancelled():
+    svc, app, _, queue, _, ci = make()
+    app.prs[REPO] = [pr(), pr(number=8)]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    assert len(queue.snapshot()) == 2
+    app.prs[REPO] = [pr(number=8)]  # PR 7 closed
+    svc.tick()
+    assert live_jobs(queue) == [(f"{REPO}#8", A)]
+
+
+def test_author_resolved_once_per_head():
+    svc, app, _, _, registry, ci = make()
+    calls = []
+    real = registry.author_of
+
+    def counting(key, head_ref):
+        calls.append((key, head_ref))
+        return real(key, head_ref)
+
+    registry.author_of = counting
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    for _ in range(4):
+        svc.tick()
+    assert len(calls) == 1
+
+
+def test_stop_times_out_on_a_stuck_tick(caplog):
+    svc, _, _, _, _, _ = make()
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stuck():
+        entered.set()
+        release.wait(30)
+        return {}
+
+    svc.tick = stuck
+    svc._stop_timeout = 0.2
+    svc.start()
+    assert entered.wait(5)
+    with caplog.at_level("WARNING"):
+        svc.stop()
+    assert "still running" in caplog.text
+    release.set()
+    svc._thread.join(5)

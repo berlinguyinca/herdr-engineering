@@ -187,3 +187,42 @@ def test_same_worker_can_reclaim_expired_job():
     again = q.claim("w", "m")
     assert again.job_id == first.job_id
     assert q.complete(first.job_id, "w") is True
+
+
+def test_rearm_after_done_creates_new_job():
+    q, _ = make()
+    job = q.enqueue(K1, "a" * 40, "m1")
+    claimed = q.claim("w", "m2")
+    assert q.complete(claimed.job_id, "w")
+    assert q.enqueue(K1, "a" * 40, "m1") is None  # replay guard still holds
+    again = q.rearm(K1, "a" * 40, "m1")
+    assert again.job_id != job.job_id and again.sha == "a" * 40
+    assert [j["job_id"] for j in q.snapshot()] == [again.job_id]
+
+
+def test_rearm_cancels_older_live_job_and_bypasses_supersession():
+    q, _ = make()
+    q.enqueue(K1, "a" * 40, None)
+    b = q.enqueue(K1, "b" * 40, None)
+    assert q.enqueue(K1, "a" * 40, None) is None  # superseded by b
+    a2 = q.rearm(K1, "a" * 40, None)  # head went back to A
+    live = q.snapshot()
+    assert [(j["job_id"], j["sha"]) for j in live] == [(a2.job_id, "a" * 40)]
+    assert b.job_id not in {j["job_id"] for j in live}
+
+
+def test_rearm_result_is_claimable():
+    q, _ = make()
+    j = q.rearm(K1, "a" * 40, "author-m")
+    assert q.claim("w", "author-m") is None  # same-model exclusion still applies
+    got = q.claim("w", "reviewer-m")
+    assert got is not None and got.job_id == j.job_id
+    assert q.complete(got.job_id, "w")
+
+
+def test_rearm_replaces_live_job_for_same_sha():
+    q, _ = make()
+    old = q.enqueue(K1, "a" * 40, None)
+    new = q.rearm(K1, "a" * 40, None)
+    assert [j["job_id"] for j in q.snapshot()] == [new.job_id]
+    assert new.job_id != old.job_id

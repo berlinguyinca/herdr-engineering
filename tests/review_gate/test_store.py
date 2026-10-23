@@ -262,3 +262,21 @@ def test_last_findings_retained_across_push():
     s.on_verdict(KEY, fail("A"))
     s.on_push(KEY, "B")
     assert len(s.snapshot(KEY).last_findings) == 1
+
+
+def test_review_started_is_idempotent_from_reviewing_for_current_head():
+    repo, s = make()
+    to_reviewing(s, "A")
+    before = s.snapshot(KEY)
+    # A worker died; its lease expired and a new worker claimed the same job.
+    assert s.on_review_started(KEY, "A", "m2")
+    after = s.snapshot(KEY)
+    assert after.state == State.REVIEWING
+    assert (after.review_rounds, after.ci_fix_rounds) == (
+        before.review_rounds,
+        before.ci_fix_rounds,
+    )
+    assert repo.stream("pr_gate", str(KEY))[-1]["event_type"] == "review_started"
+    assert s.on_verdict(KEY, Verdict("PASS", "A", (), "m2"))
+    s.on_push(KEY, "B")
+    assert s.on_review_started(KEY, "A", "m3") is False  # old head stays refused

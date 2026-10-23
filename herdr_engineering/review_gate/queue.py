@@ -16,6 +16,7 @@ Notes:
 - A sha is superseded once a later job with a different sha exists for the key
   (any state); enqueueing it again returns None. An explicit ``cancel`` with no
   later job still allows re-enqueueing the same sha (PR closed and reopened).
+- ``rearm`` bypasses that replay guard for a caller-asserted current head.
 - ``author_model`` is stored redacted and compared against the redacted
   ``reviewer_model``.
 - Every operation refolds the whole stream, so cost grows with event count.
@@ -129,15 +130,32 @@ class ReviewQueue:
             if last >= 0 and any(j["sha"] != sha for j in same_key[last + 1 :]):
                 return None  # superseded by a later job for a different sha
             self._cancel_locked(jobs, key, except_sha=sha)
-            payload = {
-                "job_id": uuid.uuid4().hex,
-                "key": str(key),
-                "sha": sha,
-                "author_model": redact_text(author_model) if author_model else None,
-                "enqueued_at": datetime.fromtimestamp(now, UTC).isoformat(),
-            }
-            self._record("enqueued", **payload)
-            return self._job(payload)
+            return self._new_job(key, sha, author_model, now)
+
+    def rearm(self, key: PrKey, sha: str, author_model: str | None) -> ReviewJob:
+        """Always create a fresh job for ``sha``, bypassing ``enqueue``'s replay guard.
+
+        Contract: the CALLER asserts ``sha`` is the PR's current head (the gate
+        service reads it from GitHub on the same tick). Every other live job for
+        the key, including a live one for the same sha, is cancelled, and a new
+        job is created even when a done, cancelled or superseded job for ``sha``
+        exists (operator resume with no push; head A -> B -> A).
+        """
+        with self._lock:
+            jobs = self._fold()
+            self._cancel_locked(jobs, key, except_sha=None)
+            return self._new_job(key, sha, author_model, self._now())
+
+    def _new_job(self, key: PrKey, sha: str, author_model: str | None, now: float) -> ReviewJob:
+        payload = {
+            "job_id": uuid.uuid4().hex,
+            "key": str(key),
+            "sha": sha,
+            "author_model": redact_text(author_model) if author_model else None,
+            "enqueued_at": datetime.fromtimestamp(now, UTC).isoformat(),
+        }
+        self._record("enqueued", **payload)
+        return self._job(payload)
 
     def claim(self, worker_id: str, reviewer_model: str) -> ReviewJob | None:
         with self._lock:

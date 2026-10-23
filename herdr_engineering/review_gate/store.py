@@ -145,7 +145,13 @@ class PipelineStore:
     def on_review_started(self, key: PrKey, sha: str, reviewer_model: str) -> bool:
         with self._lock:
             snap = self.snapshot(key)
-            if sha != snap.head_sha or snap.state not in (State.CI_GREEN, State.REVIEW_QUEUED):
+            # REVIEWING -> REVIEWING is allowed for the current head: a worker
+            # died, its lease expired and the queue re-offered the job.
+            if sha != snap.head_sha or snap.state not in (
+                State.CI_GREEN,
+                State.REVIEW_QUEUED,
+                State.REVIEWING,
+            ):
                 return False
             return self._record(
                 key, "review_started", {"sha": sha, "reviewer_model": reviewer_model}
