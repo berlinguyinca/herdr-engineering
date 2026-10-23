@@ -58,6 +58,6 @@ Status: PB-001 partially done, PB-002 partially done. No code changed. Standard 
 Caveats: `--version` may short-circuit before full app init; page cache was not dropped (no root), so "cold" is not covered; this is NOT ready-to-first-token and NOT acceptance evidence.
 
 ## Not yet done (explicitly)
-- Extension loading under Pi-Bolt: one attempt was inconclusive (worktree had no node_modules; `--list-models` does not load extensions). No compatibility claim is made.
+- Extension loading is now tested: see compatibility-matrix.md (loads under all three arms, no fallback). Tool/session/model behavior still untested.
 - Ready-to-first-token, tool-heavy tasks, concurrency 1/5/12/24, soak, collaboration, Autospec/Planotator gates, rollback drill.
-- Adapter code (PB-003..005), dashboard metrics (PB-012), issues PB-001..014 not yet filed in GitHub.
+- Adapter code (PB-003..005), dashboard metrics (PB-012), issues PB-001..014 are filed as herdr-engineering #180-#193.
