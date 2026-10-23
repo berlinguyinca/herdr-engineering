@@ -2,24 +2,96 @@
 // are never rendered. Every untrusted fragment passes through escapeHtml.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
+// ---- Shared safe linkifier -------------------------------------------------
+// Output is an escaped HTML string; no untrusted text is ever concatenated raw.
+const MAX_URL = 2048;
+const MAX_DISPLAY = 80;
+const MAX_LINK_TEXT = 200;
+const REL = 'noopener noreferrer nofollow';
+
+const cap = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}\u2026` : text);
+
+// Returns a parsed URL only for plain http(s) without userinfo, else null.
+export function parseWebUrl(value) {
+  if (typeof value !== 'string' || value.length > MAX_URL || /[\s\u0000-\u001f\u007f<>"`\\]/.test(value)) return null;
+  if (!/^https?:\/\//i.test(value)) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    if (url.username || url.password || !url.hostname) return null;
+    return url;
+  } catch { return null; }
+}
+
+// Removes trailing sentence punctuation and unbalanced closing brackets.
+// Returns [url, stripped]. Linear: bracket balance is counted once.
+export function splitTrailingPunctuation(raw) {
+  let end = raw.length;
+  let open = 0, close = 0, openSq = 0, closeSq = 0;
+  for (let i = 0; i < end; i++) {
+    const c = raw[i];
+    if (c === '(') open++; else if (c === ')') close++;
+    else if (c === '[') openSq++; else if (c === ']') closeSq++;
+  }
+  while (end > 0) {
+    const c = raw[end - 1];
+    if ('.,;:!?\'"}>'.includes(c)) end--;
+    else if (c === ')' && close > open) { close--; end--; }
+    else if (c === ']' && closeSq > openSq) { closeSq--; end--; }
+    else break;
+  }
+  return [raw.slice(0, end), raw.slice(end)];
+}
+
+const hostLabel = (url) => url.host.toLowerCase();
+const isLookalikeHost = (url, original) => url.hostname.includes('xn--') || /[^\x00-\x7f]/.test(original);
+
+function anchor(url, innerHtml, title) {
+  return `<a href="${esc(url.href)}" target="_blank" rel="${REL}" title="${esc(title)}">${innerHtml}</a>`;
+}
+
+// Bare URL in text -> anchor showing the (capped) URL; IDN hosts also show punycode.
+export function linkifyBare(raw) {
+  const [candidate, tail] = splitTrailingPunctuation(raw);
+  const url = parseWebUrl(candidate);
+  if (!url) return null;
+  const shown = cap(candidate, MAX_DISPLAY);
+  const puny = isLookalikeHost(url, candidate) ? ` <span class="md-link-host">(${esc(hostLabel(url))})</span>` : '';
+  return anchor(url, esc(shown), url.href) + puny + esc(tail);
+}
+
 function safeLink(value) {
   if (/[\s\u0000-\u001f\u007f]/.test(value)) return false;
   if (/^#/.test(value) || /^\/(?!\/)/.test(value)) return !value.includes('\\');
-  try { return ['https:', 'http:', 'mailto:'].includes(new URL(value).protocol); } catch { return false; }
+  return parseWebUrl(value) !== null || /^mailto:[^\s@]+@[^\s@]+$/i.test(value) && value.length <= MAX_URL;
 }
 
-function inline(text, depth = 0) {
+function markdownLink(label, target, depth) {
+  const web = parseWebUrl(target);
+  const labelHtml = inline(cap(label, MAX_LINK_TEXT), depth + 1, true);
+  if (!web) {
+    // Internal route, root path or mailto: keep the existing behaviour.
+    const internal = target.startsWith('#') || target.startsWith('/');
+    return `<a href="${esc(target)}" target="_blank" rel="${REL}"${internal ? '' : ` title="${esc(target)}"`}>${labelHtml}</a>`;
+  }
+  // The destination host is always visible so lookalike link text cannot hide it.
+  const sameAsHost = label.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '') === hostLabel(web);
+  const suffix = sameAsHost ? '' : ` <span class="md-link-host">(${esc(hostLabel(web))})</span>`;
+  return anchor(web, labelHtml, web.href) + suffix;
+}
+
+function inline(text, depth = 0, noLinks = false) {
   if (depth > 4) return esc(text);
-  const token = /`([^`\n]+)`|\[([^\]\n]+)\]\(([^\s)]+)\)|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*|~~([^~\n]+)~~/g;
+  const token = /`([^`\n]+)`|\[([^\]\n]{1,500})\]\(([^\s)]{1,2100})\)|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*|~~([^~\n]+)~~|(?<![A-Za-z0-9])(https?:\/\/[^\s<>`*"\\]{1,2100})/g;
   let out = '', end = 0;
   for (const m of text.matchAll(token)) {
     out += esc(text.slice(end, m.index));
     if (m[1] !== undefined) out += `<code>${esc(m[1])}</code>`;
-    else if (m[2] !== undefined) out += safeLink(m[3])
-      ? `<a href="${esc(m[3])}" target="_blank" rel="noopener noreferrer">${inline(m[2], depth + 1)}</a>` : esc(m[0]);
-    else if (m[4] !== undefined) out += `<strong>${inline(m[4], depth + 1)}</strong>`;
-    else if (m[5] !== undefined) out += `<em>${inline(m[5], depth + 1)}</em>`;
-    else out += `<del>${inline(m[6], depth + 1)}</del>`;
+    else if (m[2] !== undefined) out += !noLinks && safeLink(m[3]) ? markdownLink(m[2], m[3], depth) : esc(m[0]);
+    else if (m[4] !== undefined) out += `<strong>${inline(m[4], depth + 1, noLinks)}</strong>`;
+    else if (m[5] !== undefined) out += `<em>${inline(m[5], depth + 1, noLinks)}</em>`;
+    else if (m[6] !== undefined) out += `<del>${inline(m[6], depth + 1, noLinks)}</del>`;
+    else out += (noLinks ? null : linkifyBare(m[7])) ?? esc(m[0]);
     end = m.index + m[0].length;
   }
   return out + esc(text.slice(end));
