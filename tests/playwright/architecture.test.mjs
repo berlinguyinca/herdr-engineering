@@ -172,11 +172,10 @@ test('request analysis reports queued, then deduplicated', () => withApp({}, asy
   await page.goto(`${base}/#/architecture`);
   await page.locator('[data-request]').waitFor();
   await page.locator('[data-request] button[type=submit]').click();
-  await page.locator('[data-request-result]').getByText(/Queued|already exists|Already queued/).waitFor();
-  const first = await page.locator('[data-request-result]').innerText();
+  const result = page.locator('[data-request-result]');
+  await result.getByText(/^Queued \S+\./).waitFor();
   await page.locator('[data-request] button[type=submit]').click();
-  await page.waitForFunction(t => document.querySelector('[data-request-result]').innerText !== t, first).catch(() => {});
-  assert.match(await page.locator('[data-request-result]').innerText(), /Queued|already exists|Already queued/);
+  await result.getByText(/^Already queued/).waitFor();
 }));
 
 test('cross-repository lists inferred edges separately and never as verified', () => withApp({}, async (page, base) => {

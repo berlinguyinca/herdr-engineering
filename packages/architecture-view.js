@@ -99,7 +99,7 @@ export function mountArchitecture(root, client, opts = {}) {
   function corrBlock() {
     const c = st.corr, r = st.rooms, x = st.explain;
     const explainBtn = st.caps.includes('architecture_explain_v1') ? `<p><button type="button" data-explain>Explain (AI, from derived facts only)</button></p>` : '';
-    const xr = x ? (x.error ? `<p class="arch-notice failed" role="alert">${esc(x.error)}</p>` : `<div class="arch-explain" data-testid="arch-explain"><p><strong>Inferred explanation</strong> · model ${esc(x.model)} · source code not sent</p><p>${esc(x.explanation)}</p><p class="arch-note">Cited edges: ${x.cited_edges.length ? x.cited_edges.map(esc).join(', ') : 'none'}${x.dropped_citations.length ? ` · ${x.dropped_citations.length} unverifiable citation(s) removed` : ''}</p></div>`) : '';
+    const xr = x ? (x.pending ? '<p class="arch-notice running" role="status">Asking the configured route…</p>' : x.error ? `<p class="arch-notice failed" role="alert">${esc(x.error)}</p>` : `<div class="arch-explain" data-testid="arch-explain"><p><strong>Inferred explanation</strong> · model ${esc(x.model)} · source code not sent</p><p>${esc(x.explanation)}</p><p class="arch-note">Cited edges: ${x.cited_edges.length ? x.cited_edges.map(esc).join(', ') : 'none'}${x.dropped_citations.length ? ` · ${x.dropped_citations.length} unverifiable citation(s) removed` : ''}</p></div>`) : '';
     return `<h4>Agents that changed this</h4>${!c ? '<p class="arch-note">Loading…</p>' : c.correlations.length ? `<ul data-corr>${c.correlations.map(k => `<li>${esc(k.session_id)} · ${esc(k.flow)} · ${esc(k.change || '')}${k.parent_worker_id ? ' · parent ' + esc(k.parent_worker_id) : ''}${k.pr_ref ? ' · ' + esc(k.pr_ref) : ''}</li>`).join('')}</ul>` : `<p class="arch-note">${c.change === 'unknown' ? 'No earlier snapshot to compare with, so changes cannot be attributed.' : c.change === 'unchanged' ? 'Not changed by this commit.' : 'No agent recorded at this commit.'}</p>`}${c?.notes?.length ? c.notes.map(n => `<p class="arch-note">${esc(n)}</p>`).join('') : ''}
       <p class="arch-note" data-rooms>${r ? `Discussed in ${r.rooms.length} room(s).` : ''}</p>${explainBtn}${xr}`;
   }
@@ -153,7 +153,7 @@ export function mountArchitecture(root, client, opts = {}) {
     return `<section class="arch-cross" aria-label="Cross-repository dependencies"><h2>Cross-repository</h2>
       <button type="button" data-cross>Resolve across ${targets.length} repositories</button>
       ${c ? (c.error ? `<p class="arch-notice failed" role="alert">${esc(c.error)}</p>` : `<p data-testid="arch-cross-summary">${c.verified.length} verified · ${c.inferred.length} inferred · ${c.ambiguous.length} ambiguous${c.incomplete ? ' · incomplete (limit reached)' : ''}</p>
-      <h3>Verified (explicit mapping)</h3>${list(c.verified.slice(0, 30), 'None. A mapping is required to verify a dependency.', row)}
+      <h3>Verified (explicit mapping)</h3>${list(c.verified.slice(0, 30), 'None. Verified edges need an explicit mapping, which is only available through the API (map=importer|package|provider).', row)}
       <h3>Inferred (name match only)</h3>${list(c.inferred.slice(0, 30), 'None.', row)}
       ${c.warnings.map(w => `<p class="arch-note">${esc(w)}</p>`).join('')}`) : ''}</section>`;
   }
@@ -202,7 +202,7 @@ export function mountArchitecture(root, client, opts = {}) {
         const ids = crossTargets(st.snapshots, snap()).map(x => x.snapshot_id);
         st.cross = await client.getArchitectureCrossRepo(ids, [], {signal: ctl.signal}).catch(e => ({error: e.message})); render();
       } else if (t.dataset.explain !== undefined && st.detail) {
-        st.explain = {error: 'Asking the configured route…'}; render();
+        st.explain = {pending: true}; render();
         st.explain = await client.explainArchitectureNode(st.sid, st.detail.node.node_id, {signal: ctl.signal}).catch(e => ({error: e.message})); render();
       }
     } catch (e) { if (e.name !== 'AbortError') fail(e); }

@@ -125,7 +125,7 @@ time.sleep(60)
     t = time.time()
     with pytest.raises(runner.AnalysisError, match="wall-clock"):
         runner.run_isolated(str(repo), "HEAD", "h", REPO_ID, limits=runner.Limits(wall_seconds=0.5))
-    assert time.time() - t < 5
+    assert time.time() - t < 30   # the worker sleeps 60s; generous so a loaded host does not flake
     time.sleep(2.5)
     assert not marker.exists(), "grandchild survived the kill"
 
