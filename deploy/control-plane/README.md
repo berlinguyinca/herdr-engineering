@@ -176,7 +176,7 @@ Sessions started with `herdr-eng session run --project P -- <cmd>` mint a per-se
 `POST /api/v1/llm/keys` and revoke it at `/api/v1/llm/keys/<id>/revoke` when the command ends, so
 token analytics are per project without hand-sourcing a file. When this stack runs with
 `--api-keys`, the host running sessions needs an **operator** key in
-`HERDR_ENGINEERING_CONTROL_PLANE_KEY` or `~/.config/herdr-engineering/control-plane-key` (0600).
+`~/.config/herdr-engineering/control-plane-key` (0600).
 A key the host failed to revoke is named on stderr (`key_id`); revoke it with the same endpoint.
 See the README section "Sessions get the LLM env automatically".
 
