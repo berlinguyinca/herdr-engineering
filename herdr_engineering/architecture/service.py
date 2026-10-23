@@ -18,6 +18,9 @@ from .extract import EDGE_KINDS, NODE_KINDS
 
 ENTITY = "architecture_snapshot"
 JOB_ENTITY = "architecture_job"
+LINK_ENTITY = "architecture_link"
+MAX_LINKS_PER_ROOM = 200
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MAX_NODES = 250_000
 MAX_EDGES = 1_000_000
 MAX_LIMIT = 500
@@ -113,6 +116,7 @@ class ArchitectureService:
         self._meta: dict[str, dict] = {}
         self._graphs: dict[str, _Loaded] = {}
         self._jobs: dict[str, dict] = {}
+        self._links: dict[str, list[dict]] = defaultdict(list)       # room_id -> links (annotations)
         self._lock = threading.RLock()
         for (etype, eid), stream in list(getattr(repo, "_events", {}).items()):
             if etype == ENTITY and stream:
@@ -122,6 +126,8 @@ class ArchitectureService:
             elif etype == JOB_ENTITY:
                 for ev in stream:
                     self._apply(ev)
+            elif etype == LINK_ENTITY:
+                self._links[eid] = [ev["payload"] for ev in stream if ev["event_type"] == "architecture.link.created"]
 
     # ------------------------------------------------------------ publish
     def publish(self, body: dict) -> dict:
@@ -466,3 +472,58 @@ class ArchitectureService:
                 "changes": items[:max(1, min(int(limit), MAX_LIMIT))], "total": len(items), "incomplete": len(items) > limit,
                 "notes": ([] if prev else ["no earlier snapshot to compare against"])
                 + ["attribution is commit-level, not per-agent authorship"]}
+
+    # ----------------------------------------------------------- room annotations
+    def add_room_link(self, room_id: str, body: dict, author: str) -> dict:
+        """Called by CollabService AFTER it authorised the caller for this room. Links, never copies, graph data."""
+        bad = [k for k in (body or {}) if k not in ("snapshot_id", "node_id", "note", "idempotency_key")]
+        if bad:
+            raise ArchitectureError("unknown field")
+        sid, nid, note, key = (body or {}).get("snapshot_id"), body.get("node_id"), body.get("note", ""), body.get("idempotency_key")
+        if not (isinstance(sid, str) and isinstance(nid, str)):
+            raise ArchitectureError("snapshot_id and node_id are required")
+        if not isinstance(note, str) or len(note) > 500:
+            raise ArchitectureError("note must be at most 500 characters")
+        if key is not None and not (isinstance(key, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", key)):
+            raise ArchitectureError("invalid idempotency_key")
+        g = self._load(sid)                      # KeyError -> 404
+        if nid not in g.nodes:
+            raise KeyError(nid)
+        with self._lock:
+            rows = self._links[room_id]
+            link_id = "lnk_" + (identity.hash_obj([room_id, author, key])[:24] if key else uuid.uuid4().hex[:24])
+            prior = next((r for r in rows if r["link_id"] == link_id), None)
+            if prior:
+                if (prior["snapshot_id"], prior["node_id"], prior["note"]) != (sid, nid, _CONTROL.sub("", note).strip()):
+                    raise ArchitectureError("idempotency_key already used for a different link", 409)
+                return {"link_id": link_id, "replayed": True}
+            if len(rows) >= MAX_LINKS_PER_ROOM:
+                raise ArchitectureError("this room has too many architecture links", 400)
+            rec = {"link_id": link_id, "snapshot_id": sid, "node_id": nid, "note": _CONTROL.sub("", note).strip(),
+                   "author": author, "created_at": self.repo._stamp()}
+            self.repo.record_event(LINK_ENTITY, room_id, "architecture.link.created", rec, require_durable=True)
+            rows.append(rec)
+            return {"link_id": link_id, "replayed": False}
+
+    def room_links(self, room_id: str, redact: bool = False) -> dict:
+        out = []
+        for r in self._links.get(room_id, []):
+            row = {"link_id": r["link_id"], "note": r["note"], "created_at": r["created_at"]}
+            if not redact:
+                meta = self._meta.get(r["snapshot_id"])
+                node = None
+                try:
+                    node = self._load(r["snapshot_id"]).nodes.get(r["node_id"]) if meta else None
+                except (KeyError, ArchitectureError):
+                    node = None
+                row.update(snapshot_id=r["snapshot_id"], node_id=r["node_id"], author=r["author"],
+                           commit_sha=meta and meta["commit_sha"], available=node is not None,
+                           qualified_name=node and node["qualified_name"], kind=node and node["kind"],
+                           relative_path=node and node["relative_path"], line_start=node and node["line_start"])
+            out.append(row)
+        return {"links": out, "redacted": redact}
+
+    def node_rooms(self, sid: str, nid: str) -> dict:
+        """Which rooms discuss this entity (ids only; the notes stay behind the room's own permissions)."""
+        return {"rooms": sorted({rid for rid, rows in self._links.items() for r in rows
+                                 if r["snapshot_id"] == sid and r["node_id"] == nid})}

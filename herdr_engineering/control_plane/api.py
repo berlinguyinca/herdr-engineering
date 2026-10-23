@@ -254,6 +254,8 @@ class ControlPlaneServer:
         self.architecture = ArchitectureService(
             repo, enabled=self._architecture_enabled(fleet_config, architecture_enabled))
         self.architecture.gate_store_fn = lambda: self.gate_store
+        if collab is not None:
+            collab.architecture = self.architecture
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
 
@@ -1144,6 +1146,9 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(svc.search(sid, q("q") or "", q("kind"), q("cursor"), q("limit")))
                     if len(tail) == 2 and tail[0] == "nodes":
                         return self._json(svc.node(sid, tail[1]))
+                    if len(tail) == 3 and tail[0] == "nodes" and tail[2] == "rooms":
+                        svc._load(sid)
+                        return self._json(svc.node_rooms(sid, tail[1]))
                     if len(tail) == 3 and tail[0] == "nodes" and tail[2] == "edges":
                         return self._json(svc.expand(sid, tail[1], q("direction") or "both", q("kind"),
                                                      q("cursor"), q("limit")))
