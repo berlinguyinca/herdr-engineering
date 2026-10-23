@@ -995,8 +995,6 @@ def review(cfg: dict, repo: str, n: int, dry_run: bool, max_chunks: int | None =
         def one(item):
             i, ch, system, user = item
             v = review_chunk(gw, model, afams, i, system, user, ("docs", "code") if ch.docs_only else "code")
-            if ch.docs_only:                     # no code or tests in it: those claims hold vacuously
-                v = {**v, "checked": [*v["checked"], "code", "tests"]}
             say(f"chunk {i}/{len(chunks)} done in {v['_latency_s']}s: {len(v['blocking'])} blocking, "
                 f"{len(v['minor'])} minor")
             return v
@@ -1007,6 +1005,11 @@ def review(cfg: dict, repo: str, n: int, dry_run: bool, max_chunks: int | None =
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=par) as ex:
                 verdicts = list(ex.map(one, prepared))
+        # a docs/config chunk has no code or tests, so it does not narrow those claims -- but only when some other
+        # chunk did review code: a PR of nothing but docs/config is never called a code review
+        if any(not ch.docs_only for _, ch, _, _ in prepared):
+            verdicts = [{**v, "checked": [*v["checked"], "code", "tests"]} if ch.docs_only else v
+                        for (_, ch, _, _), v in zip(prepared, verdicts)]
         # the poster decides: aggregate, verify citations, never trust the model's own claims beyond narrowing
         findings, dropped, minor = [], [], []
         claims = [c for c in CLAIMABLE if all(c in v["checked"] for v in verdicts)]

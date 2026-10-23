@@ -827,6 +827,18 @@ def test_a_config_and_docs_chunk_may_report_docs(env):
     assert [s["state"] for s in env.terminal()] == ["success"]
 
 
+def test_an_all_config_pr_claims_only_what_the_model_checked(env):
+    d = ("diff --git a/deploy/x.yaml b/deploy/x.yaml\nindex 1..2 100644\n--- a/deploy/x.yaml\n+++ b/deploy/x.yaml\n"
+         "@@ -1 +1 @@\n-a: 1\n+a: 2\n")
+    env.set_pr(diff=d)
+    env.responses([{**EMPTY, "checked": ["docs", "security"]}])
+    assert review(env) == 0
+    (st,) = env.terminal()
+    assert st["state"] == "success"
+    assert "security+docs review" in st["description"]
+    assert "code" not in st["description"].split(":", 1)[1] and "tests" not in st["description"]
+
+
 def test_a_code_chunk_reporting_only_docs_fails(env):
     env.responses([{**EMPTY, "checked": ["docs", "security"]}])
     assert review(env) == 1
