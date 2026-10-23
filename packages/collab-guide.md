@@ -206,7 +206,9 @@ pass a command, path, environment or secret. The result comes back as **untruste
   (narrow the parent and the helper narrows too), works in that room only, and lives at most 2 hours. Removing
   or revoking the parent ends all its helpers.
 * **Sandboxed, no network.** Each helper runs in a fresh, private directory in a sandbox with no direct network.
-  A host that is not approved answers "access pending" and the operator is asked. Approvals last a day by
+  A host that is not approved answers "access pending" and the operator is asked to approve the request.
+  Hosts the owner lists in the profile need no approval: that is the owner's call, but private, loopback and
+  link-local addresses and `localhost` are refused. Approvals last a day by
   default, can be made permanent, and apply to the **whole room**.
 * **Limits:** 3 live helpers per agent, nesting depth 2, 20 helpers per person per hour (across all rooms),
   a successor chain of at most 5. Over a limit the request fails at once and says which limit.

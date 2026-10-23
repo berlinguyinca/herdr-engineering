@@ -20,7 +20,7 @@ GOOD = {
     "allowed_families": ["claude-code", "codex"],
     "allowed_models": ["sonnet", "haiku"],
     "tools_allowed": True,
-    "permanent_hosts": ["bender.example.org:22", "10.0.0.5:2222"],
+    "permanent_hosts": ["bender.example.org:22", "9.9.9.9:2222"],
     "services": [{"name": "search", "upstream_url": "https://api.example.org/v1",
                   "header": "X-Api-Key", "secret_name": "SEARCH_KEY"}],
     "ssh_secret_names": ["bender_ssh"],

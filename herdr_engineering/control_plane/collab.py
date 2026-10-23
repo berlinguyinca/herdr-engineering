@@ -17,6 +17,7 @@ from __future__ import annotations
 import bisect
 import copy
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -3175,6 +3176,20 @@ def _profile_strings(v: Any, field: str, rx: re.Pattern | None, limit: int, maxl
     return out
 
 
+def _internal_host(host: str) -> bool:
+    """A name or IP literal that points into the runner host or its network (not globally routable)."""
+    h = host.lower().rstrip(".")
+    if h == "localhost" or h.endswith(".localhost") or h.startswith("localhost."):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return not ip.is_global or ip.is_multicast or ip.is_unspecified or ip.is_loopback or ip.is_link_local
+
+
 def _normalize_profile(body: Any) -> dict:
     """Validate a room profile and return it in canonical form. Unknown keys are refused, so a
     secret value has no field to ride in on: services and ssh refer to secrets by NAME only."""
@@ -3201,6 +3216,9 @@ def _normalize_profile(body: Any) -> dict:
                                    for h in hosts))
     except CollabError:
         raise CollabError(400, "permanent_hosts has an invalid entry") from None
+    if any(_internal_host(h.rsplit(":", 1)[0]) for h in hosts):
+        # an owner's hosts skip operator approval, and the proxy lets a LISTED internal address through
+        raise CollabError(400, "permanent_hosts may not name loopback, private or link-local addresses")
     raw = body.get("services", [])
     if not isinstance(raw, list) or len(raw) > MAX_PROFILE_SERVICES:
         raise CollabError(400, f"services must be a list of at most {MAX_PROFILE_SERVICES}")

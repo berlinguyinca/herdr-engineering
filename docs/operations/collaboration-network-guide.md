@@ -418,7 +418,7 @@ fields are refused.
 | Families | which harnesses helpers may use: `claude-code`, `codex`, `pi`, `agent`. Empty means no helpers. |
 | Allowed models | ids the model picker may choose from (empty = any in the catalogue) |
 | Helpers may use tools | off by default; also needs `--allow-tools` on the runner |
-| Always-allowed hosts | `host:port` lines (at most 50), stored in canonical form (`a.org:0443` becomes `a.org:443`) |
+| Always-allowed hosts | `host:port` lines (at most 50), stored in canonical form (`a.org:0443` becomes `a.org:443`). These skip operator approval; loopback, private, link-local, CGNAT and other non-public IP literals and `localhost` names are refused (400) |
 | Services | `name \| https upstream URL \| header \| secret name`: the egress proxy adds the header with the secret's value, so the helper calls `$SVC_<NAME>_URL` and never holds the key |
 | SSH key names | secret names copied into the helper's `~/.ssh` (read-only) |
 | `spend_tokens_per_day` | stored, but **not enforced yet** (see *Residual risks*) |
@@ -459,7 +459,10 @@ agent, host and port.
 * **External hosts** lists every host a room may reach, with **Remove** (this also ends live approvals).
 * Approvals are **per room**: every helper in the room can use an approved host.
 
-Only the operator decides. The room owner, the agent and the helper all get 404 on these routes.
+Only the operator decides **host-access requests**: the room owner, the agent and the helper all get 404 on these
+routes. The owner's own *Always-allowed hosts* in the profile are a separate path that needs no approval (see
+*Residual risks*). The operator can still approve or promote a private address a helper asked for; the proxy then
+lets that exact IP:port through, so approve one only when you mean the runner host's network.
 
 **Panic switch.** **Agents → Helpers → Pause all helpers** (`POST fleet/helpers/pause {"paused": true}`) refuses
 every new request with 503 and ends every live helper at once: records cancelled, credentials revoked, and the
@@ -517,6 +520,11 @@ model only, never the task text or the result).
   from the box yet: there is no ProxyCommand through the relay.
 * **API keys bound to a service are usable** by every helper in the room. The helper cannot read the key: the
   proxy adds it and redacts it from responses. But it can make any request to that service that the key allows.
+* **Owner-listed hosts bypass operator approval.** A room owner (who may be a coworker, not you) can put any
+  public name or address on *Always-allowed hosts*, and every helper in the room can reach it at once. Which
+  public hosts are fine is the owner's call. Loopback, private, link-local, CGNAT and other non-public IP
+  literals, and `localhost` names, are refused, so an owner cannot open the runner host's own services (or a
+  cloud metadata address). A public name that resolves to a private address is still blocked by the proxy.
 * **Allowlisted hosts are room-wide.** Approving a host for one helper approves it for every helper in the room,
   for the approval's lifetime, and a helper can send anything it can see there (its work directory, a parent's
   read-only view, the SSH keys). The family model endpoints are always reachable.
