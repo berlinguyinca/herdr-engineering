@@ -4,7 +4,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
 import {
-  renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
+  createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
 import { applyMention, mentionAt, quiet, suggest } from './collab-mention.js';
 import {
@@ -209,10 +209,16 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           <span class="hd-card__title">${esc(r.name)}</span>
           <span class="cx-row cx-row--between">${pill(roleLabel(r.role), r.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}<span class="hd-card__sub">Open →</span></span></button>`).join('')}</div>`
         : '<div class="hd-empty">No rooms yet. Create your first one below.</div>'}
+      ${operator ? '<div id="hcn-helpers-panel"></div>' : ''}
       <section class="cx-section"><h2>New room</h2>
         <form id="hcn-new" class="hd-card cx-form"><label class="cx-field">Room name<input name="name" required maxlength="120" placeholder="e.g. Metabolomics review"></label>
           <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></section>`, strip);
-    document.querySelectorAll('[data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
+    document.querySelectorAll('#hcn-rooms [data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
+    if (operator && $('hcn-helpers-panel')) {   // all rooms' host requests, helpers and the panic switch; the operator is rarely a member of the rooms asking
+      const panel = createHelpersPanel({ container: $('hcn-helpers-panel'), api, operator, getRooms: async () => (await api.rooms()).rooms || [], go, hidden: () => document.hidden });
+      teardown = () => panel.destroy();
+      panel.start();
+    }
     $('hcn-new').onsubmit = async (ev) => {
       ev.preventDefault();
       const name = new FormData(ev.target).get('name');
