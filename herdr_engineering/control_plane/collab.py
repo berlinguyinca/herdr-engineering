@@ -2156,6 +2156,8 @@ class CollabService:
         par = self._agents.get(r["parent_agent_id"]) if r["parent_agent_id"] else None
         if par is not None and par["status"] != "active":
             return "parent ended"
+        if par is not None and self._effective(Principal("agent", r["parent_agent_id"], par["owner"]), room) is None:
+            return "parent lost access"                  # e.g. its grant in the room lapsed
         return None
 
     def list_helpers_for_runner(self, pr: Principal) -> dict:

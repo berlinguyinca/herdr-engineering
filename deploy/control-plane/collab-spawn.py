@@ -255,7 +255,7 @@ def helper_run(d: Path) -> int:
     spec = json.loads((d / "spec.json").read_text())
     task = sys.stdin.buffer.read(HELPER_STDIN_MAX + 1)
     sys.stdin.close()
-    res: dict = {"exit": None, "timed_out": False, "bytes": 0, "error": None, "stderr": ""}
+    res: dict = {"exit": None, "timed_out": False, "bytes": 0, "error": None, "stderr": "", "output_open": False}
     proxy = None
     try:
         if len(task) > HELPER_STDIN_MAX:        # never run on a cut-off task: fail, and say why
@@ -331,7 +331,7 @@ def helper_run(d: Path) -> int:
             # something outside the box still holds its output open: what was read may be cut off. Fail, never
             # return it as the helper's answer.
             res["error"] = "sandbox-error"
-            res["stderr"] = (res["stderr"] + "\n[output still open after the box exited; not used]")[-2000:]
+            res["output_open"] = True
         return 0
     finally:
         if proxy is not None and proxy.poll() is None:
@@ -1402,9 +1402,11 @@ class Runner:
             raw = (d / "out").read_bytes()[:HELPER_RESULT_CAP + 1]
         except OSError:
             raw = b""
-        total = res.get("bytes") if isinstance(res.get("bytes"), int) else len(raw)
+        if res.get("output_open") is True:                # possibly cut off: never posted as the helper's output
+            raw = b""
+        total = res.get("bytes") if isinstance(res.get("bytes"), int) and raw else len(raw)
         head = "".join(f"[{n}]\n" for n in st.get("notes") or [])
-        foot = []
+        foot = ["[output still open after the box exited; not used]"] if res.get("output_open") is True else []
         if total > HELPER_RESULT_CAP:
             foot.append("[output truncated at 20 KB]")
         if st.get("forbidden"):
@@ -1413,7 +1415,7 @@ class Runner:
             foot.append("[host access was requested for: " + ", ".join(st["asked"]) + "]")
         if st.get("stopped"):
             foot.append(f"[stopped: the room profile changed: {st['stopped']}]")
-        if res.get("exit") not in (0, None) and res.get("stderr"):
+        if (res.get("exit") not in (0, None) or res.get("output_open") is True) and res.get("stderr"):
             foot.append("[stderr]\n" + str(res["stderr"])[-1500:])
         # the WHOLE posted text fits in HELPER_RESULT_CAP bytes: notes and footers first, the output gets the rest
         head = RESULT_BAD.sub("", head).encode()[:HELPER_RESULT_CAP // 4].decode("utf-8", "ignore")

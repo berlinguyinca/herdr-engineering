@@ -118,6 +118,7 @@ if [ -n "${HERDR_SANDBOX_SSH_DIR+x}" ]; then
   if [ -d "$HOME/.ssh" ]; then             # a copy of the room's keys, never the operator's own keys
     oreal="$(cd "$HOME/.ssh" && pwd -P)"
     case "$sreal/" in "$oreal"/*) deny "the ssh directory must not be the operator's ~/.ssh" ;; esac
+    case "$oreal/" in "$sreal"/*) deny "the ssh directory must not contain the operator's ~/.ssh" ;; esac
   fi
   args+=(--ro-bind "$sreal" "$HOME/.ssh")
 fi
