@@ -139,6 +139,10 @@ class IngestService:
             "event_id": env["event_id"], "source": env["source"],
             "source_sequence": env["source_sequence"], "event_type": event_type,
             "payload": payload, "visibility_scope": env["visibility_scope"],
+            # the room/mission/workspace context a `room`/`mission` scope is resolved against
+            # (the same fields a rebuild reads back from the stored row)
+            "room_id": env.get("room_id"), "mission_id": env.get("mission_id"),
+            "workspace_id": env.get("workspace_id"),
             "actor": env.get("actor"), "ingest_timestamp": env["received_at"],
             "lineage_seq": env.get("lineage_seq"), "lineage_mode": env.get("lineage_mode")})
         return {"entity_type": "lineage", "entity_id": entity_id, "event_type": event_type}

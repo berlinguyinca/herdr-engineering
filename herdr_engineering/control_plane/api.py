@@ -31,7 +31,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from ..version import __version__
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
-from .graph import DEFAULT_DEPTH, DEFAULT_EDGES, DEFAULT_NODES
+from .graph import read_graph
 from .redact import redact_payload
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
@@ -233,6 +233,10 @@ class ControlPlaneServer:
         self._public_httpd = None
         if collab is not None:
             collab.hydrate(repo.take_collab_replay())
+            if not collab_only:
+                # membership-scoped lineage reads (lineage-events.md, "Scope semantics"): the
+                # isolated collab-only process never sees fabric data, so it serves none
+                collab.graph_source = lambda: repo.graph
         self.host = host
         self.port = port
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
@@ -453,6 +457,7 @@ _PUBLIC_STATIC = {
     "/collab-scripts.js": ("collab-scripts.js", "text/javascript"),
     "/collab-flow.js": ("collab-flow.js", "text/javascript"),
     "/collab-links.js": ("collab-links.js", "text/javascript"),
+    "/collab-tabs.js": ("collab-tabs.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
     "/conversation-markdown.js": ("conversation-markdown.js", "text/javascript"),
@@ -1363,46 +1368,8 @@ def _make_handler(server, public=False, operator=False):
         def _graph_get(self, parts):
             """Lineage graph reads (viewer level). Every result is filtered by the
             caller's principal; hidden and missing both answer 404."""
-            g = server.repo.graph
-            principal = self._principal()
-            if len(parts) >= 6 and parts[4] == "nodes" and len(parts) == 6:
-                def qi(name, default):
-                    raw = _q(self.path, name)
-                    if raw in (None, ""):
-                        return default
-                    try:
-                        return int(raw)
-                    except ValueError:
-                        raise ValueError(f"{name} must be an integer") from None
-                return self._json(g.get_node(
-                    principal, parts[5], edge_type=_q(self.path, "edge_type") or None,
-                    from_id=_q(self.path, "from_id") or None,
-                    limit=qi("limit", 200), offset=qi("offset", 0)))
-            if len(parts) == 7 and parts[4] == "nodes" and parts[6] in ("neighborhood", "subgraph"):
-                def num(name, default):
-                    raw = _q(self.path, name)
-                    if raw is None or raw == "":
-                        return default
-                    try:
-                        return int(raw)
-                    except ValueError:
-                        raise ValueError(f"{name} must be an integer") from None
-                kinds = _q(self.path, "edge_types")
-                return self._json(g.neighborhood(
-                    principal, parts[5], depth=num("depth", DEFAULT_DEPTH),
-                    max_nodes=num("max_nodes", DEFAULT_NODES),
-                    max_edges=num("max_edges", DEFAULT_EDGES),
-                    direction=_q(self.path, "direction") or "both",
-                    edge_types=set(kinds.split(",")) if kinds else None,
-                    include_removed=_q(self.path, "include_removed") == "true"))
-            if len(parts) == 5 and parts[4] == "edge":
-                edge_type, frm, to = (_q(self.path, n) for n in ("edge_type", "from_id", "to_id"))
-                if not (edge_type and frm and to):
-                    raise ValueError("edge_type, from_id and to_id are required")
-                return self._json(g.get_edge(principal, edge_type, frm, to,
-                                             commit=_q(self.path, "commit"),
-                                             plan_digest=_q(self.path, "plan_digest")))
-            return self._json({"error": "not found"}, 404)
+            return self._json(read_graph(server.repo.graph, self._principal(), parts[4:],
+                                         lambda name: _q(self.path, name)))
 
         def _agent_capabilities(self, session):
             operator = self._role() == "operator"

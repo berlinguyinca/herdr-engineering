@@ -4,6 +4,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
 import { renderLinks } from './collab-links.js';
+import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import {
@@ -548,8 +549,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['links', 'Workspaces']]), ...(canInvite ? [['people', 'People']] : [])];
+    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null };
+    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['links', 'Workspaces']]), ...(canInvite ? [['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
@@ -569,6 +570,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}</section>`}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-tabs" hidden aria-label="Primary agents and their subagents"><div id="hcn-tabs" aria-live="polite"></div></section>'}
       ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
@@ -763,6 +765,36 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       } catch { /* keep what is shown */ } finally { peopleBusy = false; }
     };
 
+    // Tabs and panes come from recorded spawn lineage around the room's linked workspaces and missions. The
+    // server filters every node by this person's membership; a failed or empty read just shows the empty state.
+    let tabsBusy = false;
+    const loadTabs = async () => {
+      if (tabsBusy || Date.now() - S.tabsAt < 8000) return;
+      tabsBusy = true;
+      try {
+        const roots = [...(S.links || []).map((l) => `workspace:${l.workspace_id}`), ...(S.missions || []).map((m) => `mission:${m.mission_id}`)].slice(0, 20);
+        const graphs = (await Promise.all(roots.map((r) => api.graphAround(r).catch(() => null)))).filter(Boolean);
+        S.tabs = buildTabsPanes(graphs, S.links || []);
+      } finally { S.tabsAt = Date.now(); tabsBusy = false; }
+    };
+    function drawTabs() {
+      const show = () => {
+        const box = $('hcn-tabs');
+        if (!box) return;
+        if (put('hcn-tabs', renderTabsPanes(S.tabs || { tabs: [], hidden_by_grant: 0 }, S.tabSel))) {
+          const ids = (S.tabs?.tabs || []).map((t) => t.agent_id);
+          box.querySelectorAll('[data-tab]').forEach((b) => {
+            b.onclick = () => { S.tabSel = b.dataset.tab; box.dataset.h = ''; drawTabs(); };
+            b.onkeydown = (e) => {
+              const to = nextTab(ids, b.dataset.tab, e.key);
+              if (to) { e.preventDefault(); S.tabSel = to; box.dataset.h = ''; drawTabs(); box.querySelector(`[data-tab="${CSS.escape(to)}"]`)?.focus(); }
+            };
+          });
+        }
+      };
+      show();
+      loadTabs().then(show);
+    }
     const setBadge = (k, n) => { const b = $(`hcn-b-${k}`); if (!b) return; b.hidden = !n; b.textContent = n > 99 ? '99+' : String(n); };
     const loadMine = async () => { try { S.mine = (await api.agents()).agents; } catch { /* keep the old list */ } };
     function paint() {
@@ -771,6 +803,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (sub === 'tasks') drawTasks();
       else if (sub === 'flow') drawFlow();
       else if (sub === 'links') put('hcn-links', renderLinks(S.links, S.missions));
+      else if (sub === 'tabs') drawTabs();
       else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); }
     }
     const paintPanel = async () => {

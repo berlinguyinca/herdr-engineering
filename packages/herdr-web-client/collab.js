@@ -110,6 +110,10 @@ export class CollabApi {
     return this.call('GET', `/rooms/${encodeURIComponent(room)}/state?since=${since}&cursor=${cursor}&wait=${wait}`, undefined, signal);
   }
   flow(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/flow`); }
+  // Lineage around one node, already filtered server-side by this person's room/mission membership.
+  graphAround(nodeId, depth = 3) {
+    return this.call('GET', `/graph/nodes/${encodeURIComponent(nodeId)}/neighborhood?depth=${depth}`);
+  }
   linkAgent(agentId, instanceId) { return this.call('POST', `/agents/${encodeURIComponent(agentId)}/link`, { instance_id: instanceId || null }); }
   createJoinToken(body) { return this.call('POST', '/agents/join-tokens', body); }
   joinTokens() { return this.call('GET', '/agents/join-tokens'); }

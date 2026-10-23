@@ -21,7 +21,11 @@ Merge rules:
   by the SERVER-set receipt time (then source name, sequence, event id), so a
   hostile or buggy source cannot win forever by claiming a huge sequence.
 * ``visibility_scope`` of a node/edge is the NARROWEST scope any event that
-  defined it carried (private < mission < room < org); it never widens.
+  defined it carried (private < mission < room < org); it never widens. A
+  ``room``/``mission`` scope that names its room/mission (envelope ``room_id`` /
+  ``mission_id``, plus ``workspace_id``) is a CONTEXTUAL label resolved against HCN
+  membership at read time (T08, see :func:`can_see`); contextual labels are
+  incomparable with each other, so two different ones meet at ``private``.
 * Ownership: the owner of a node/edge is the actor of its earliest non-operator
   event (else the earliest operator event). Writers = owner + ``co_writers``
   (an attr only operators may set). ``private`` objects are visible to writers.
@@ -227,19 +231,79 @@ def validate_lineage(event_type: str, payload: Any, *, strict: bool = True) -> d
 
 
 # ------------------------------------------------------------- visibility
+# A scope LABEL is a plain scope string, or for a ``room``/``mission`` scope that names its
+# context the tuple ``(scope, context_id, workspace_id|None)``. Labels form a meet-semilattice:
+# ``private`` < bare ``mission`` < bare ``room`` < ``org``; a contextual label sits strictly
+# between ``private`` and ``org`` and is incomparable with every other middle label, so the
+# meet of two different ones is ``private`` (fail closed, commutative, associative, idempotent).
+MAX_SCOPE_LABELS = 4         # distinct labels remembered per commons writer
+
+
+def scope_label(ev: dict):
+    """The visibility label of one stored/live event. Derived ONLY from the event's own
+    server-validated envelope fields, so live and rebuilt projections agree."""
+    scope = ev.get("visibility_scope")
+    if scope not in SCOPE_RANK:
+        return "private"
+    if scope in ("room", "mission"):
+        cid = ev.get("room_id" if scope == "room" else "mission_id")
+        if isinstance(cid, str) and cid and len(cid) <= MAX_ID:
+            ws = ev.get("workspace_id")
+            return (scope, cid, ws if isinstance(ws, str) and ws and len(ws) <= MAX_ID else None)
+    return scope
+
+
+def _base(label) -> str:
+    """The plain scope name of a label (what API responses show)."""
+    return label if isinstance(label, str) else label[0]
+
+
+def _lrank(label) -> int:
+    return SCOPE_RANK.get(_base(label), 0)
+
+
+def _ctx_visible(principal: dict, label: tuple) -> bool:
+    """Membership check of a contextual label. Operators are trusted for every room/mission (as
+    before); any other principal needs a server-built ``access`` snapshot of HCN membership."""
+    if principal.get("kind") == "operator":
+        return True
+    access = principal.get("access")
+    if principal.get("kind") != "member" or principal.get("authenticated_by") != "collab" \
+            or not isinstance(access, dict):
+        return False
+    scope, cid, ws = label
+    if scope == "room":
+        return cid in access["rooms"] and (ws is None or (cid, ws) in access["room_ws"])
+    return cid in access["missions"] and (ws is None or (cid, ws) in access["mission_ws"])
+
+
+def _widen_labels(cur: tuple, label) -> tuple:
+    """Join one label into a writer's remembered set (canonical, bounded, order-independent)."""
+    s = set(cur) | {label}
+    if "org" in s:
+        return ("org",)
+    if len(s) > 1:
+        s.discard("private")
+    return tuple(sorted(s, key=repr)[:MAX_SCOPE_LABELS])
+
+
 def _is_operator(actor: dict | None) -> bool:
     return bool(actor) and actor.get("kind") == "operator" \
         and actor.get("authenticated_by") not in (None, "none")
 
 
-def can_see(principal: dict | None, scope: str, writers: frozenset | None) -> bool:
+def can_see(principal: dict | None, scope, writers: frozenset | None) -> bool:
     """Fail-closed read check for one node or edge.
 
     There is no per-principal grant model yet (see the contract doc), so:
 
     * ``org``: any authenticated caller.
-    * ``room`` / ``mission``: only an ``operator`` principal (the sole role
-      with fleet-wide trust today); there is no room/mission membership.
+    * bare ``room`` / ``mission`` (no context id on the event): only an
+      ``operator`` principal. Fail closed.
+    * contextual ``(room|mission, id, workspace?)``: an operator, or a ``member``
+      principal (built by the HCN service for one request) whose current
+      membership covers that room/mission and, when the event names a workspace,
+      whose room holds a viewing link to it (see ``_ctx_visible``).
     * ``private``: only the object's writers (owner + operator-set
       ``co_writers``); nobody else, operators included.
     * anything unrecognised or an unauthenticated principal: hidden.
@@ -249,6 +313,8 @@ def can_see(principal: dict | None, scope: str, writers: frozenset | None) -> bo
         return False
     if scope == "org":
         return True
+    if isinstance(scope, tuple):
+        return _ctx_visible(principal, scope)
     if scope in ("room", "mission"):
         return principal.get("kind") == "operator"
     if scope == "private":
@@ -304,8 +370,17 @@ def _writer_key(ev: dict) -> tuple:
     return (str(ev["source"]), (ev.get("actor") or {}).get("id"))
 
 
-def _narrow(a: str, b: str) -> str:
-    return a if SCOPE_RANK.get(a, 0) <= SCOPE_RANK.get(b, 0) else b
+def _narrow(a, b):
+    """Meet of two scope labels (see the label notes above the visibility section)."""
+    if a == b:
+        return a
+    if a == "org":
+        return b
+    if b == "org":
+        return a
+    if isinstance(a, str) and isinstance(b, str):
+        return a if SCOPE_RANK.get(a, 0) <= SCOPE_RANK.get(b, 0) else b
+    return "private"
 
 
 class _Reg:
@@ -331,9 +406,8 @@ class _Reg:
             self.firsts[key] = rank            # min over ALL events, whichever order they arrive in
         cur = self.by.get(key)
         if cur is None or (seq, eid) > (cur[0], cur[1]):
-            scope = ev.get("visibility_scope")
             self.by[key] = (seq, eid, _rank(ev), value, key, _is_operator(ev.get("actor")),
-                            scope if scope in SCOPE_RANK else "private")
+                            scope_label(ev))
 
     def best(self) -> tuple | None:
         return max(self.by.values(), key=lambda t: t[2]) if self.by else None
@@ -421,8 +495,7 @@ class _Claims:
 
     def _touch(self, ev: dict) -> None:
         rank = _rank(ev)
-        scope = ev.get("visibility_scope")
-        scope = scope if scope in SCOPE_RANK else "private"
+        scope = scope_label(ev)
         self.scope = scope if self.scope is None else _narrow(self.scope, scope)
         actor = ev.get("actor") or {}
         claim = (rank, actor.get("id"), _is_operator(actor))
@@ -471,7 +544,7 @@ class _Node(_Claims):
         self._init_claims()
         self.label, self.state = _Reg(), _Reg()   # state value = (state, reason)
         self.commons = node_type in COMMONS_KINDS
-        self.scope_by: dict[str, tuple] = {}      # commons only: actor -> (widest scope, is_op)
+        self.scope_by: dict[str, tuple] = {}      # commons only: actor -> (labels it used, is_op)
         self.fclaim: tuple | None = None          # commons only: (rank, actor) of the first FIELD-bearing write
         self.fwriters: dict = {}                  # commons only: actor -> rank of its first field-bearing write
 
@@ -480,12 +553,9 @@ class _Node(_Claims):
         if not self.commons:
             return
         actor = ev.get("actor") or {}
-        scope = ev.get("visibility_scope")
-        scope = scope if scope in SCOPE_RANK else "private"
         key = actor.get("id")
         cur = self.scope_by.get(key)
-        wide = scope if cur is None or SCOPE_RANK[scope] > SCOPE_RANK[cur[0]] else cur[0]
-        self.scope_by[key] = (wide, _is_operator(actor))
+        self.scope_by[key] = (_widen_labels(cur[0] if cur else (), scope_label(ev)), _is_operator(actor))
 
     def note_field_claim(self, ev: dict, owns: bool = True) -> None:
         """Commons ownership belongs to the first writer of a FIELD (label/state/attr); an empty
@@ -512,7 +582,7 @@ class _Node(_Claims):
             return self.fclaim[1] if self.fclaim else None
         return super().owner()
 
-    def eff_scope(self, principal: Any = None, internal: bool = True) -> str | None:
+    def eff_scope(self, principal: Any = None, internal: bool = True):
         """Owned nodes: the narrowest scope any admitted event carried. COMMONS nodes: the widest
         scope among the writers the READER can see (``internal``: all writers). A node is as
         visible as its most visible writer - pre-creating a shared identity as private cannot hide
@@ -520,9 +590,9 @@ class _Node(_Claims):
         fields are: each value is gated by its own writer (``_entry_visible``)."""
         if not self.commons:
             return self.scope
-        scopes = [s for actor, (s, _) in self.scope_by.items()
+        scopes = [s for actor, (labels, _) in self.scope_by.items() for s in labels
                   if internal or can_see(principal, s, frozenset({actor}) if actor else frozenset())]
-        return max(scopes, key=SCOPE_RANK.get) if scopes else None
+        return max(scopes, key=lambda s: (_lrank(s), repr(s))) if scopes else None
 
     def pick(self, reg: _Reg, vis=None, owner: Any = "") -> tuple | None:
         if not self.commons:
@@ -866,8 +936,7 @@ class GraphProjection:
             edge._put_attrs(op["attrs"], ev)
             edge.sources.add(pair)
             return
-        rem = (op["reason"], ev.get("visibility_scope") if ev.get("visibility_scope") in SCOPE_RANK
-               else "private", (ev.get("actor") or {}).get("id"))
+        rem = (op["reason"], scope_label(ev), (ev.get("actor") or {}).get("id"))
         if etype in BOUND_EDGE_TYPES and bound is None:
             wild = self._wild.setdefault((etype, frm, to), _Wild())
             self._touch(wild, ev)
@@ -1061,7 +1130,7 @@ class GraphProjection:
             "state_reason": state[3][1] if state else None,
             "attrs": attrs,
             "fields": fields,
-            "visibility_scope": scope or "private",
+            "visibility_scope": _base(scope or "private"),
             "first_event_id": ids[0],
             "last_event_id": ids[1],
             "source": ids[2],
@@ -1081,7 +1150,7 @@ class GraphProjection:
             "edge_type": edge.edge_type, "from_id": edge.from_id, "to_id": edge.to_id,
             "attrs": edge.attr_values(),
             "stale": self._is_stale(edge, principal, ctx), "removed": removed,
-            "visibility_scope": edge.scope or "private",
+            "visibility_scope": _base(edge.scope or "private"),
             "provenance": {"event_id": add[1], "source": add[2][2], "source_sequence": add[0],
                            "writer": add[4][1]},
             "fields": {k: _prov(r.best()) for k, r in sorted(edge.attrs.items())},
@@ -1319,7 +1388,38 @@ class GraphProjection:
                     edges[repr(k)] = {**self._edge_view(e, None, ctx), "owner": e.owner(),
                                       "co_writers": list(e.co_writers())}
             wild = {repr(k): {"remove": [w.removes.best()[0], w.removes.best()[1], w.removes.best()[3]],
-                              "scope": w.scope, "owner": w.owner()}
+                              "scope": repr(w.scope), "owner": w.owner()}
                     for k, w in self._wild.items() if w.removes.best()}
             return {"nodes": nodes, "edges": edges, "wildcard_removes": wild,
                     "owned": dict(sorted(self._owned.items()))}
+
+
+def read_graph(graph: GraphProjection, principal: dict | None, parts: list[str], q) -> dict:
+    """The one read router for both front doors (the keyed fabric API and the HCN-authenticated
+    collab API). ``parts`` is the path after ``graph``; ``q(name)`` returns a query value or None.
+    KeyError (hidden or missing) => 404, ValueError => 400, exactly as for a keyed read."""
+    def num(name, default):
+        raw = q(name)
+        if raw in (None, ""):
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            raise ValueError(f"{name} must be an integer") from None
+    if len(parts) == 2 and parts[0] == "nodes":
+        return graph.get_node(principal, parts[1], edge_type=q("edge_type") or None,
+                              from_id=q("from_id") or None, limit=num("limit", MAX_NODE_EDGES),
+                              offset=num("offset", 0))
+    if len(parts) == 3 and parts[0] == "nodes" and parts[2] in ("neighborhood", "subgraph"):
+        kinds = q("edge_types")
+        return graph.neighborhood(
+            principal, parts[1], depth=num("depth", DEFAULT_DEPTH), max_nodes=num("max_nodes", DEFAULT_NODES),
+            max_edges=num("max_edges", DEFAULT_EDGES), direction=q("direction") or "both",
+            edge_types=set(kinds.split(",")) if kinds else None,
+            include_removed=q("include_removed") == "true")
+    if parts == ["edge"]:
+        edge_type, frm, to = (q(n) for n in ("edge_type", "from_id", "to_id"))
+        if not (edge_type and frm and to):
+            raise ValueError("edge_type, from_id and to_id are required")
+        return graph.get_edge(principal, edge_type, frm, to, commit=q("commit"), plan_digest=q("plan_digest"))
+    raise KeyError("not found")

@@ -5,6 +5,15 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Tabs/panes and membership-scoped lineage (T08, stacked on #165 and #164)
+- Lineage `room`/`mission` scopes now resolve to HCN membership: an event that names its `room_id` / `mission_id`
+  (and optionally `workspace_id`) is readable by that room's non-guest members / that mission's listed members (T07),
+  through the new `GET /api/v1/collab/graph/...` routes; everyone else still gets 404. Bare `room`/`mission` stay
+  operator-only and the keyed `/api/v1/graph` API is unchanged. No migration; reads only.
+- Room workbench: new read-only "Tabs" panel (`packages/collab-tabs.js`): primary agents as tabs, spawned subagents as
+  panes, from recorded `spawn` lineage only. Closing a pane never changes the agent.
+- Rollback: see `docs/contracts/lineage-events.md` ("T08 rollout and rollback").
+
 ### Lineage graph projection (T02, Herdr side)
 - Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
 - Migration `0005_event_id_per_actor.sql`: `event_id` is unique per principal (global primary key dropped).
