@@ -107,8 +107,8 @@ current head cannot be queued again; push a new commit.
   nothing prevents two instances from fighting.
 - **Config is read at startup.** Restart the server to change enrollment, caps
   or the App.
-- **Every new head is re-reviewed.** Approval does not carry over a rebase or
-  an identical re-push yet.
+- **Every new head SHA is re-reviewed.** Approval does not carry over to a new
+  SHA yet, even a rebase or amend with an identical diff.
 - **No reviewers or notifications yet** (see the note at the top).
 - **Scale.** Queue and PR state are refolded from the event log every tick,
   which is comfortable for roughly tens of open PRs.
