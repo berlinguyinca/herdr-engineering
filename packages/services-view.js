@@ -131,6 +131,7 @@ const styles = `<style>
 .sc-health [data-state=current] {color:var(--status-ok)}.sc-health [data-state=unavailable] {color:var(--status-attention)}
 .sc-detail {display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:18px;margin:24px 0}
 .sc-detail div {min-width:0;overflow-wrap:anywhere}.sc-detail dt {font-size:12px;color:var(--text-secondary)}.sc-detail dd {margin:5px 0;line-height:1.5}
+@media(min-width:2200px){.sc-controls .sc-search{flex:0 1 720px}.sc-controls{padding-right:max(0px,calc(100% - 1500px))}#sc-results{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}.sc-group{margin:0}}
 @media(max-width:650px){.sc-row {grid-template-columns:minmax(0,1fr);gap:12px}.sc-controls label {flex:1;min-width:140px}.sc-counts {gap:6px}.sc-counts button {font:inherit;color:inherit;text-align:left;cursor:pointer;padding:8px}.sc-group>summary span {display:block;margin:8px 0 0}}
 </style>`;
 

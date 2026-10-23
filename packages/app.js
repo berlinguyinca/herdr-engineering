@@ -400,6 +400,7 @@ async function viewActivity() {
     .ac-row summary strong{overflow-wrap:anywhere}.ac-kind,.ac-time{font-size:12px;color:var(--text-secondary)}.ac-time{white-space:nowrap}
     .ac-detail{margin:0;padding:0 32px 8px;font-size:12px;line-height:1.5;color:var(--text-secondary);overflow-wrap:anywhere}.ac-payload{margin:0 32px 12px;max-height:240px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.45;background:var(--surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:10px}
     .ac-row[data-muted=true]{opacity:.65}
+    @media(min-width:2200px){.ac-list{max-width:1600px}}
     @media(max-width:650px){.ac-row summary{grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;padding:12px}.ac-kind{grid-column:1}.ac-time{grid-column:2;grid-row:1/3}.ac-detail{padding:0 12px 8px}.ac-payload{margin:0 12px 12px}}
   </style><h1>Activity</h1>` + await activityList(50);
 }
@@ -423,7 +424,7 @@ async function viewAnalytics() {
   root.innerHTML = `
     <style>
       .an-links{display:grid;grid-template-columns:repeat(3,minmax(200px,1fr));gap:12px;margin:16px 0}.an-links a{display:flex;flex-direction:column;gap:4px;padding:14px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);text-decoration:none}.an-links strong{color:var(--text)}.an-links span{font-size:12px;color:var(--text-secondary)}
-      .an-stage{margin-top:18px}@media(max-width:720px){.an-links{grid-template-columns:minmax(0,1fr)}}
+      .an-stage{margin-top:18px}@media(min-width:2200px){.an-stage{max-width:1600px}}@media(max-width:720px){.an-links{grid-template-columns:minmax(0,1fr)}}
     </style>
     <h1>Analytics</h1>
     <div class="hd-grid">
