@@ -121,12 +121,26 @@ class IngestService:
         legacy = {k: clean_metrics({k: payload.get(k)}).get(k) for k in ("cpu", "mem", "disk")}
         cpu = sample.get("cpu") if sample is not None else legacy["cpu"]
         mem = sample.get("mem") if sample is not None else legacy["mem"]
-        host = self.repo.upsert_host(
-            entity_id,
-            payload.get("host_name") or payload.get("name") or entity_id,
-            payload.get("tailnet_ip") or payload.get("ip"),
-            cpu=cpu, mem=mem, status=status,
-            inventory=payload.get("inventory"))
+        name = payload.get("host_name") or payload.get("name")
+        ip = payload.get("tailnet_ip") or payload.get("ip")
+        inventory = payload.get("inventory")
+        # A routine heartbeat (known healthy host, same identity, no inventory)
+        # only refreshes liveness in memory: a durable HostHeartbeat per 30 s
+        # sample would grow the event log and the Activity feed without bound.
+        # Registration, identity changes, inventory and status transitions
+        # still go through upsert_host and are recorded as events.
+        existing = self.repo.get_host_record(entity_id)
+        if (existing is not None and status == "healthy"
+                and existing.get("status") == "healthy"
+                and (not name or name == existing.get("host_name"))
+                and (not ip or ip == existing.get("tailnet_ip"))
+                and not inventory):
+            self.repo.record_heartbeat(entity_id, cpu=cpu, mem=mem)
+            host = self.repo.get_host_record(entity_id) or existing
+        else:
+            host = self.repo.upsert_host(
+                entity_id, name or entity_id, ip,
+                cpu=cpu, mem=mem, status=status, inventory=inventory)
         if sample is not None or any(v is not None for v in state.values()):
             self.repo.record_host_metrics(entity_id, sample, **state)
             return host

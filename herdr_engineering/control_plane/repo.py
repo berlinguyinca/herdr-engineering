@@ -740,6 +740,12 @@ class ControlPlaneRepo:
         host = self._merged_hosts().get(self._canonical_host(host_id))
         return self._with_problems(host) if host is not None else None
 
+    def get_host_record(self, host_id):
+        """A copy of the stored record for exactly ``host_id`` (no alias merge, no problems)."""
+        with self._event_lock:
+            rec = self._hosts.get(host_id)
+            return _copy(rec) if rec is not None else None
+
     def _with_problems(self, host):
         """A copy of ``host`` carrying ``problems`` and ``problem_count`` (the store is untouched)."""
         history = self.host_history(host["host_id"], "1h")
@@ -748,13 +754,17 @@ class ControlPlaneRepo:
 
     def _merged_hosts(self):
         """Hosts keyed by canonical id; an alias contributes its freshest report."""
+        # Snapshot under the lock: ingest threads add hosts while a reader iterates.
+        with self._event_lock:
+            hosts = {hid: _copy(rec) for hid, rec in self._hosts.items()}
+            aliases = dict(self._host_aliases)
         merged = {}
-        for hid, rec in self._hosts.items():
-            if hid in self._host_aliases:
+        for hid, rec in hosts.items():
+            if hid in aliases:
                 continue
-            merged[hid] = _copy(rec)
-        for alias, canonical in self._host_aliases.items():
-            rec = self._hosts.get(alias)
+            merged[hid] = rec
+        for alias, canonical in aliases.items():
+            rec = hosts.get(alias)
             if rec is None:
                 continue
             base = merged.get(canonical)
@@ -811,18 +821,20 @@ class ControlPlaneRepo:
                             "missing": sum(c["missing"] for c in components)}}
 
     def record_heartbeat(self, host_id, tailnet_ip=None, cpu=None, mem=None):
-        h = self._hosts.get(host_id)
-        if h is None:
-            return False
-        h["last_seen"] = self._stamp()
-        h["status"] = "healthy"
-        if tailnet_ip is not None:
-            h["tailnet_ip"] = tailnet_ip
-        if cpu is not None:
-            h["cpu"] = cpu
-        if mem is not None:
-            h["mem"] = mem
-        return True
+        """Refresh liveness in memory only (no event): the per-sample hot path."""
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            if h is None:
+                return False
+            h["last_seen"] = self._stamp()
+            h["status"] = "healthy"
+            if tailnet_ip is not None:
+                h["tailnet_ip"] = tailnet_ip
+            if cpu is not None:
+                h["cpu"] = cpu
+            if mem is not None:
+                h["mem"] = mem
+            return True
 
     def mark_host_unavailable(self, host_id):
         h = self._hosts.get(host_id)

@@ -178,7 +178,9 @@ def test_durable_sink_ingest_survives_restart(seeded_db):
     IngestService(live).ingest({
         "entity_type": "host", "entity_id": "e2e-ingest-host",
         "event_type": "host.heartbeat",
-        "payload": {"cpu": 7, "mem": 33}})
+        # A changed tailnet IP is an identity change, so it is a durable event
+        # (a routine same-identity heartbeat refreshes liveness in memory only).
+        "payload": {"cpu": 7, "mem": 33, "tailnet_ip": "100.64.9.10"}})
 
     # Simulate a web restart: a brand-new repo hydrated from Postgres alone.
     fresh = ControlPlaneRepo()
@@ -187,7 +189,7 @@ def test_durable_sink_ingest_survives_restart(seeded_db):
     assert h is not None
     assert h["host_name"] == "ingest-host"
     assert h["cpu"] == 7
-    assert h["tailnet_ip"] == "100.64.9.9"
+    assert h["tailnet_ip"] == "100.64.9.10"
     # Both ingested events made it into the durable event log.
     stream = fresh.stream("host", "e2e-ingest-host")
     assert [e["event_type"] for e in stream] == [
