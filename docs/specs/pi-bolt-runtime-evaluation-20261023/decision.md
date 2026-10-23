@@ -57,15 +57,16 @@ used for magnitudes. Magnitudes above come from the lower-load repetitions 1-2.
 | 100% pass of lifecycle/session/permissions/plan gates/collaboration/issue linkage/routing/accounting/trace tests | PARTIAL: adapter, fallback and session restore pass; plan gates, collaboration, issue linkage, accounting, trace continuity NOT run under Pi-Bolt (need a full Herdr mission) |
 | No unreviewed security regressions, missing audit events, corrupted sessions | Sessions OK; security review of the binary's network behavior NOT done |
 | Statistically credible improvement in an important bottleneck without quality regression | Only for extension-free agents (CPU, RSS, startup: yes). For real engineering agents: regression |
-| Rollback to standard Pi without data loss or duplicate side effects | Config rollback and no-replay tested at the launcher level; NOT drilled with live missions |
+| Rollback to standard Pi without data loss or duplicate side effects | PASS live through the real launcher (results/rollback-drill.txt) and after kill -9/SIGTERM (results/cancel-drill.txt); NOT drilled inside a live Herdr mission |
 | Incompatibilities documented; unsupported hosts stay on standard | Yes (compatibility-matrix.md); automatic fallback implemented |
 | Production rollout requires human approval | Yes; nothing enabled |
 
 ## Limits of this evidence (read before deciding)
 - Host was heavily loaded (load 78-120) for the whole run; absolute numbers are not representative of an idle host. Re-run on a quiet host before any approval.
 - Cancel/crash: one manual extension-free drill PASSED (kill -9, SIGTERM, resume on standard Pi; results/cancel-drill.txt). Not a live mission.
+- Churn soak: 240 launches at 6-way concurrency, 0 failures, no RSS growth (results/soak-churn.txt); a multi-hour single-session soak was not run.
 - 24 concurrent no-op agents: 48/48 ok per arm; Pi-Bolt wall clearly lower, CPU ~10x lower (results/noop-c24.txt).
-- Not run: full Herdr mission with child agents and issue links, collaboration room with reconnect, long soak, gateway-side accounting rows (wire parity done), Autospec/Planotator/lineage gates under Pi-Bolt, crash recovery, extension-failure injection, macOS/beast/Apptainer hosts, OpenViking (not installed on bender), steady-state CPU/RSS after load, true cold start (page cache not dropped).
+- Not run: full Herdr mission with child agents and issue links, collaboration room with reconnect, long-lived-session soak, gateway-side accounting rows (wire parity done), Autospec/Planotator/lineage gates under Pi-Bolt, extension-failure injection, macOS/beast/Apptainer hosts, OpenViking (not installed on bender), steady-state CPU/RSS after load, true cold start (page cache not dropped).
 - Concurrency (5, 12) used 3 repetitions; interval estimates are wide. Tools and extension-load reps (3) are below the spec's 10 because each extension-loaded run takes minutes on this host.
 - Bundled mode (`pi-bolt compile`) was attempted and is blocked; it is the one mode that could remove the extension-load penalty.
 - Single model; reasoning-heavy models and long contexts untested.
