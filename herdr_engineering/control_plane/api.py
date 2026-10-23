@@ -29,7 +29,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
-from .redact import redact_payload
+from .redact import redact_ingest_body, redact_payload
 
 log = logging.getLogger(__name__)
 
@@ -1466,7 +1466,7 @@ def _make_handler(server, public=False, operator=False):
                 if isinstance(body, dict) and body.get("entity_type") in ("inspector", "mission_activity"):
                     entity = server.ingest.ingest(body)
                 else:
-                    entity = server.ingest.ingest(redact_payload(body))
+                    entity = server.ingest.ingest(redact_ingest_body(body))
                 if (server.agent_summaries and server.agent_summaries.config.enabled
                         and body.get("entity_type") == "inspector"):
                     payload = body.get("payload") or {}
