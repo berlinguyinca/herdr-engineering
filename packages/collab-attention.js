@@ -69,6 +69,7 @@ export function renderInbox(m) {
   const caps = Object.entries(c.not_shown_because_of_caps || {}).filter(([, n]) => n > 0);
   const sev = Object.entries(c.by_severity || {}).map(([k, n]) => `${esc(SEVERITY_LABEL[k] || k)} ${Number(n) || 0}`).join(', ');
   return `<section aria-label="Attention inbox">
+    ${m.notice ? `<p class="cx-msg" role="alert">${esc(m.notice)}</p>` : ''}
     <p class="cx-msg" role="status">${items.length ? `${items.length} item${items.length === 1 ? '' : 's'} need attention${sev ? ` (${sev})` : ''}.` : 'Nothing needs your attention.'}
       Ordered by severity, then items for you, then oldest first.</p>
     ${items.length ? `<ul class="cx-list" aria-label="Items that need attention">${items.map((i) => itemRow(i, m.canAct !== false)).join('')}</ul>` : ''}

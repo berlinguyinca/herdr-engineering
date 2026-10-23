@@ -964,3 +964,88 @@ def test_stage_ordering_documents_the_priority_rule():
              {"key": "c", "severity": "error", "for_you": False, "since": None},
              {"key": "d", "severity": "notice", "for_you": False, "since": "2025-01-01"}]
     assert [i["key"] for i in ins.order_items(items)] == ["c", "a", "d", "b"]
+
+
+# =============================================================================================== review round: gaps the first pass left
+def test_an_ack_about_a_hidden_node_leaks_neither_its_key_nor_its_id_to_anyone_else(fx):
+    f = fx
+    f.s.link_mission(f.alice, f.room, {"mission_id": "m-secret", "members": ["bob"]})
+    node(f.feed, "ci:h-secret-ci", state="failed", scope="mission", room_id=f.room, mission_id="m-secret")
+    it = inbox(f, f.bob)["items"][0]
+    assert it["key"] == "ci_failed|ci:h-secret-ci" and inbox(f, f.carol)["items"] == []
+    seen, room_seq = f.s.seq, dict(f.s._room_seq)
+    f.s.attention_ack(f.bob, f.room, {"key": it["key"], "fp": it["fp"]})
+    assert f.s.seq == seen + 1 and f.s._room_seq == room_seq                           # no long-poll wakes
+    project = f.s._rooms[f.room]["project_id"]
+    surfaces = {
+        "feed": f.s.read_events(f.carol, f.room, 0, 500),
+        "audit": f.s.audit(f.alice, project, 0, 500),
+        "state": f.s.room_state(f.carol, f.room, -1, 0, 0),
+        "carol_inbox": inbox(f, f.carol), "carol_progress": prog(f, f.carol), "carol_stats": stats(f, f.carol),
+    }
+    for name, out in surfaces.items():
+        blob = json.dumps(out, default=str)
+        assert "h-secret-ci" not in blob and "attn_" not in blob and it["key"] not in blob, name
+    assert f.s.attention_ack(f.carol, f.room, {"key": it["key"], "fp": it["fp"]}) == f.s.attention_ack(
+        f.carol, f.room, {"key": "ci_failed|ci:nothing-like-it", "fp": it["fp"]})      # carol cannot even probe whether the id exists
+
+
+def test_a_hidden_approval_moves_no_number_and_a_hidden_block_is_flagged_but_never_named(fx):
+    f = fx
+    f.s.link_mission(f.alice, f.room, {"mission_id": "m-secret", "members": ["bob"]})
+    f.s.quorum_config = QuorumConfig(2, {"key:r1": {"login": None}, "key:r2": {"login": None}}, frozenset({"key:op"}), ())
+    node(f.feed, "task:t1", state="running", room_id=f.room)
+    node(f.feed, PR1, attrs={"head_sha": H1, "author": "somebody"}, room_id=f.room, principal=OPERATOR)
+    edge(f.feed, "produced", "task:t1", PR1, room_id=f.room, principal=OPERATOR)
+    rev(f, R1, "a", H1)
+    d = hashlib.sha256(f"b{H1}".encode()).hexdigest()                                    # the second approval is mission-scoped
+    node(f.feed, "review:b", scope="mission", room_id=f.room, mission_id="m-secret", principal=R2)
+    edge(f.feed, "reviewed", "review:b", PR1,
+         {"commit": H1, "verdict": "lgtm", "receipt_digest": d, "receipt_binding": receipt_binding(PR1, H1, R2["id"], d)},
+         scope="mission", room_id=f.room, mission_id="m-secret", principal=R2)
+    seen_by_carol = task_row(prog(f, f.alice), "task:t1")
+    assert seen_by_carol["stage"] == "none" and not any(e["counted"] for e in seen_by_carol["evidence"])
+    alone = json.dumps(prog(f, f.alice), sort_keys=True)
+    assert "review:b" not in alone and "m-secret" not in alone
+    # the inbox follows T06's own status (decided over ALL reviews, so the merge gate is true): that adds nothing T06 does not already tell alice
+    assert inbox(f, f.alice)["items"] == [] and inbox(f, f.bob)["items"] == []
+    assert task_row(prog(f, f.bob), "task:t1")["stage"] == "verified"                    # whoever CAN see both approvals sees a verified task
+    # a hidden block: the reader is told one exists, never whose
+    node(f.feed, "review:c", scope="mission", room_id=f.room, mission_id="m-secret", principal=R2)
+    c = hashlib.sha256(f"c{H1}".encode()).hexdigest()
+    edge(f.feed, "reviewed", "review:c", PR1,
+         {"commit": H1, "verdict": "blocked", "receipt_digest": c, "receipt_binding": receipt_binding(PR1, H1, R2["id"], c)},
+         scope="mission", room_id=f.room, mission_id="m-secret", principal=R2)
+    carol = json.dumps(inbox(f, f.alice), sort_keys=True)
+    assert "review:c" not in carol and "key:r2" not in carol and "m-secret" not in carol
+    blocked = [i for i in inbox(f, f.alice)["items"] if i["category"] == "review_blocked"]
+    assert blocked and all(i["detail"].get("blocked_by_hidden") for i in blocked)
+
+
+def test_more_linked_missions_than_the_cap_are_flagged_not_silently_dropped(fx, monkeypatch):
+    f = fx
+    monkeypatch.setattr(ins, "MAX_MISSION_GROUPS", 3)
+    for i in range(5):
+        f.s.link_mission(f.alice, f.room, {"mission_id": f"m-{i}", "members": ["bob"]})
+        node(f.feed, f"task:mm{i}", state="running", scope="mission", room_id=f.room, mission_id=f"m-{i}")
+    out = prog(f, f.bob)
+    assert out["truncated"] == "mission_limit"
+    assert len(out["milestones"]) <= 3 + 1 and out["room"]["tasks"] <= 5
+    assert stats(f, f.bob)["truncated"] == "mission_limit"
+    assert inbox(f, f.bob)["truncated"] == "mission_limit"
+
+
+def test_a_pr_an_untrusted_writer_created_first_stays_unattested_even_after_a_trusted_writer_merges_it(fx):
+    f = fx
+    node(f.feed, "task:t1", state="done", room_id=f.room)
+    node(f.feed, "pr:github.com/o/r#1", state="open", room_id=f.room, principal=WRITER)       # the agent's own PR node
+    edge(f.feed, "produced", "task:t1", "pr:github.com/o/r#1", room_id=f.room, principal=WRITER)
+    node(f.feed, "pr:github.com/o/r#1", state="merged", room_id=f.room, principal=OPERATOR)  # a trusted writer marks it merged
+    out = prog(f)
+    t = task_row(out, "task:t1")
+    assert t["stage"] == "none" and out["room"]["complete"] == 0
+    assert [e["counted"] for e in t["evidence"]] == [False] and t["evidence"][0]["why_not"]
+    with pytest.raises(PermissionError):                                                      # and it cannot attach itself to a PR it does not own
+        node(f.feed, "task:t2", state="done", room_id=f.room)
+        merged_task(f, 9)
+        edge(f.feed, "produced", "task:t2", "pr:github.com/o/r#9", room_id=f.room)

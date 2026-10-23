@@ -1200,10 +1200,10 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       });
     }
     // ---- T15: attention inbox, evidence-based progress, analytics (server-derived; the page only shows them)
-    const ATT = { data: null, error: null, showQuiet: false, at: 0, prog: null, progError: null, stats: null, statsError: null, pat: 0 };
+    const ATT = { data: null, error: null, notice: null, showQuiet: false, at: 0, prog: null, progError: null, stats: null, statsError: null, pat: 0 };
     const attErr = (e) => (e && e.status === 403 ? 'The attention inbox, progress and analytics are not enabled for this room.' : 'Could not load this view. It will retry.');
     async function loadAttention(force) {
-      if (!force && Date.now() - ATT.at < 15000) return;
+      if (!force && Date.now() - ATT.at < 15000) { drawAttention(); return; }
       ATT.at = Date.now();
       try { ATT.data = await api.attention(roomId, ATT.showQuiet); ATT.error = null; setBadge('attention', (ATT.data.items || []).length); }
       catch (e) { ATT.error = attErr(e); }
@@ -1214,7 +1214,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (!h) return;
       if (!h.dataset.bound) {
         h.dataset.bound = '1';
-        const act = async (fn) => { try { await fn(); } catch (e) { ATT.error = e && e.status === 429 ? 'Too many changes; try again in a minute.' : 'That did not work.'; } await loadAttention(true); };
+        const act = async (fn) => { try { await fn(); ATT.notice = null; } catch (e) { ATT.notice = e && e.status === 429 ? 'Too many changes; try again in a minute.' : 'That did not work.'; } await loadAttention(true); };
         h.addEventListener('click', (e) => {
           const b = e.target.closest('[data-attn-act]');
           if (!b) return;
@@ -1228,7 +1228,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           if (sel && sel.value) act(() => api.attentionSnooze(roomId, snoozeBody(sel.dataset.attnKey, sel.dataset.attnFp, sel.value)));
         });
       }
-      put('hcn-attention', renderAttention({ data: ATT.data, error: ATT.error, showQuiet: ATT.showQuiet }));
+      put('hcn-attention', renderAttention({ data: ATT.data, error: ATT.error, notice: ATT.notice, showQuiet: ATT.showQuiet }));
     }
     async function loadProgress(force) {
       if (!force && Date.now() - ATT.pat < 30000) return;

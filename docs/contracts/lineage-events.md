@@ -820,7 +820,7 @@ A task is complete only when: a pull request it is attested to be linked to is m
 written by this room's service exists; or, with no attested PR, a validated edge from a trusted writer is bound to a commit. Reviewed or validated
 at the head without a merge counts as verified (credit `verified_credit`), never complete. A task whose state says done without evidence is listed as
 "reported done without evidence". State, labels, diff statistics and cost written by an agent about itself are never counted. With no evidence writer
-configured, progress says so instead of showing a number. Quorum counts only approvals the reader can see, so hidden approvals never move a number.
+configured, progress says so instead of showing a number. Progress treats a pull request as verified only when the approvals the reader can see reach the quorum, so hidden approvals never move a progress number. The inbox follows T06's own quorum status, which is decided over all reviews and names only reviewers the reader can see; a hidden block is flagged `blocked_by_hidden`, never named.
 
 ### Estimates
 Method `completion_interval_quantiles_v1`: nearest-rank 25th/50th/75th percentile of the gaps between evidence-timed completions (server receipt time),
@@ -843,4 +843,4 @@ long-poll exposes.
 Estimates assume a steady pace and are weak for small rooms. Erasing evidence by re-adding an unbound edge only understates progress. Evidence writers
 must be keys an agent does not control. Room-scoped pull requests written by a key that cannot see the room, and organization-scope nodes, are outside the
 reader's view and so not counted. T13 `forks.py` still reports the review quorum as absent (left unchanged here; follow-up). No Pi change was needed:
-Pi's ledger and mission adapter already supply the nodes this reads. Playwright was not run (no collab browser harness in the repo); the client is covered by pure renderer tests.
+Pi's ledger and mission adapter already supply the nodes this reads. The client renderers are covered by node tests and a Playwright smoke test (`tests/playwright/attention.test.mjs`); the assembled collab page was not driven end to end.

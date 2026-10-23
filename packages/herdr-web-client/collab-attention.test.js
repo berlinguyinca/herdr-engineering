@@ -83,3 +83,9 @@ test('request bodies and durations', () => {
   assert.equal(duration(7200), '2 h');
   assert.equal(duration(null), 'n/a');
 });
+
+test('a failed action is announced next to the list and does not hide it', () => {
+  const h = renderInbox({ notice: 'Too many changes; try again in a minute.', data: { items: [item()], counts: {} } });
+  assert.match(h, /role="alert">Too many changes/);
+  assert.match(h, /Items that need attention/);
+});
