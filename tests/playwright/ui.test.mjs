@@ -1230,3 +1230,21 @@ test('overview attention and saved layout stay keyboard usable through refresh a
   }
  },{BURST:'0'});
 });
+
+test('overview attention opens only the intended CI provider when repository and run IDs collide',async()=>{
+ await withApp(async({page,base})=>{
+  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed',updated_at:new Date().toISOString()};
+  const runs=[{...run,provider_url:'https://ci-a.example'},{...run,provider_url:'https://ci-b.example'}];
+  await page.route('**/api/v1/ci',route=>route.fulfill({json:{available:true,status:'connected',pipelines:{'org/repo':runs}}}));
+  await page.goto(`${base}/#/overview`);
+  const links=page.locator('[data-overview=attention] a[href*="/ci?"]');
+  await links.nth(1).waitFor();
+  assert.equal(new URL((await links.nth(1).getAttribute('href')).slice(1),base).searchParams.get('search'),'https://ci-b.example 12');
+  await links.nth(1).click();
+  await page.locator('#ig-tab-failed[aria-selected=true]').waitFor();
+  await page.locator('#ig-results [data-run]').waitFor();
+  assert.equal(await page.locator('#ig-results [data-run]').count(),1);
+  assert.deepEqual(JSON.parse(await page.locator('#ig-results [data-run]').getAttribute('data-run')),['https://ci-b.example','7','12']);
+  assert.equal(await page.locator('[data-ig-search]').inputValue(),'https://ci-b.example 12');
+ },{BURST:'0'});
+});

@@ -31,7 +31,7 @@ export function integrationEntries(data={},kind='ci') {
     id:kind==='reviews' ? String(record.review_id || record.id || '') : ciRunKey(record),
     tab:integrationOutcome(record,kind),
     project:short(record.project_id || record.project || record.repository) || 'Project not reported',
-    search:[record.title,record.repository,record.repository_id,record.project_id,record.project,record.branch,record.revision,record.run_number,record.review_id,record.status,record.state,record.mission_id,record.session_id].filter(v=>v!=null).join(' ').toLowerCase(),
+    search:[record.title,record.provider_url,record.repository,record.repository_id,record.project_id,record.project,record.branch,record.revision,record.run_number,record.review_id,record.status,record.state,record.mission_id,record.session_id].filter(v=>v!=null).join(' ').toLowerCase(),
   })).sort((a,b)=>integrationTimestamp(b.record.updated_at || b.record.created_at)-integrationTimestamp(a.record.updated_at || a.record.created_at));
 }
 export function selectIntegrations(entries,{tab='current',search='',repository='',mission='',session='',branch='',days=0}={}) {

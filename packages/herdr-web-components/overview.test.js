@@ -161,3 +161,21 @@ test('attention qualifies provider partial coverage even after successful source
   const states=Object.fromEntries(['projections','missions','sessions','services','hosts','ci','reviews','health','fleet'].map(key=>[key,{loaded:true}]));
   assert.equal(overview.overviewAttention({ci:{available:true,status:'partial',pipelines:{}}},states,now,now).complete,false);
 });
+
+test('recorded failed missions rank newest first rather than alphabetical title',()=>{
+  const result=overview.overviewAttention({missions:[
+    {mission_id:'a-older',title:'Alpha older failure',status:'failed',updated_at:'2026-10-20T10:00:00Z'},
+    {mission_id:'z-newer',title:'Zulu newer failure',status:'failed',updated_at:'2026-10-20T11:00:00Z'},
+  ]},{},now,now);
+  assert.deepEqual(result.items.map(item=>item.title),['Zulu newer failure','Alpha older failure']);
+  assert.equal(result.items[0].updated,Date.parse('2026-10-20T11:00:00Z'));
+});
+
+test('CI attention destinations retain provider identity when repository IDs and run numbers collide',()=>{
+  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed'};
+  const result=overview.overviewAttention({ci:{pipelines:{history:[{...run,provider_url:'https://ci-a.example'},{...run,provider_url:'https://ci-b.example'}]}}},{},now,now);
+  assert.equal(result.items.length,2);
+  const destinations=result.items.map(item=>new URL(item.href.slice(1),'https://dashboard.example'));
+  assert.deepEqual(destinations.map(url=>url.searchParams.get('search')),['https://ci-a.example 12','https://ci-b.example 12']);
+  for(const url of destinations)assert.equal(url.searchParams.get('repository'),'7');
+});

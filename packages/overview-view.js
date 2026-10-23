@@ -56,7 +56,7 @@ export function overviewAttention(data = {}, states = {}, received = Date.now(),
   };
   for(const entry of [...model.missions.attention,...model.missions.failed]) {
     if(snoozedUntil(data,entry.key)>now)continue;
-    add(`mission:${entry.key}`,entry.tab==='failed'?'critical':'warning',2,entry.title,human(entry.health || 'failed'),`#/missions/${encodeURIComponent(entry.key)}`,entry.projection?.activity_snapshot_at || entry.record?.updated_at,'projections');
+    add(`mission:${entry.key}`,entry.tab==='failed'?'critical':'warning',2,entry.title,human(entry.health || 'failed'),`#/missions/${encodeURIComponent(entry.key)}`,entry.projection?.activity_snapshot_at || entry.recorded?.updated_at,'projections');
   }
   for(const session of model.sessions.failed)if(session.session_id)add(`session:${session.session_id}`,'critical',1,session.display_name || session.title || session.agent_role || 'Failed agent','Agent reported failed',`#/herd/session/${encodeURIComponent(session.session_id)}`,session.updated_at || session.last_activity,'sessions');
   for(const kind of ['ci','reviews']) {
@@ -66,7 +66,7 @@ export function overviewAttention(data = {}, states = {}, received = Date.now(),
     seen.add(entry.id);
     if(entry.tab!=='failed' && entry.tab!=='changes')continue;
     const r=entry.record;
-    add(`${kind}:${entry.id}`,entry.tab==='failed'?'critical':'warning',entry.tab==='changes'?1:2,r.title || r.repository || (kind==='ci'?`CI run #${r.run_number}`:'Review'),`${human(r.state || r.status || r.decision)}${r.repository ? ` · ${r.repository}` : ''}${kind==='ci'?` · Run #${r.run_number}`:''}`,kind==='ci'?`#/ci?tab=failed&repository=${encodeURIComponent(r.provider_repo_id ?? r.repository_id ?? r.repository ?? '')}&search=${encodeURIComponent(r.run_number ?? '')}`:`#/reviews?tab=${entry.tab}&search=${encodeURIComponent(r.review_id || r.id || '')}`,r.updated_at || r.created_at,kind);
+    add(`${kind}:${entry.id}`,entry.tab==='failed'?'critical':'warning',entry.tab==='changes'?1:2,r.title || r.repository || (kind==='ci'?`CI run #${r.run_number}`:'Review'),`${human(r.state || r.status || r.decision)}${r.repository ? ` · ${r.repository}` : ''}${kind==='ci'?` · Run #${r.run_number}`:''}`,kind==='ci'?`#/ci?tab=failed&repository=${encodeURIComponent(r.provider_repo_id ?? r.repository_id ?? r.repository ?? '')}&search=${encodeURIComponent([r.provider_url,r.run_number].filter(value=>value!=null && value!=='').join(' '))}`:`#/reviews?tab=${entry.tab}&search=${encodeURIComponent(r.review_id || r.id || '')}`,r.updated_at || r.created_at,kind);
    }
   }
   for(const service of records(data.services))if(serviceScope(service)==='herdr' && serviceState(service,now)==='unavailable' && service.service_id)add(`service:${service.service_id}`,'critical',2,service.service_name || service.service_id,'Service reported unavailable',`#/services/${encodeURIComponent(service.service_id)}`,service.updated_at,'services');

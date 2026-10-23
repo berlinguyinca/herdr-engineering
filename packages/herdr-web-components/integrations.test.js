@@ -102,3 +102,11 @@ test('CI inspector entry identity distinguishes provider instances',()=>{
  ]}});
  assert.notEqual(entries[0].id,entries[1].id);
 });
+
+test('CI search narrows colliding repository and run IDs by provider URL',()=>{
+  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed'};
+  const entries=integrationEntries({pipelines:{history:[{...run,provider_url:'https://ci-a.example'},{...run,provider_url:'https://ci-b.example'}]}});
+  const selected=selectIntegrations(entries,{tab:'failed',repository:'7',search:'https://ci-b.example 12'});
+  assert.equal(selected.length,1);
+  assert.equal(selected[0].record.provider_url,'https://ci-b.example');
+});
