@@ -135,6 +135,22 @@ test('toggling a type filter on a graph above the draw cap is cheap: the layout 
     }
     assert.equal(await page.locator('#hcn-lineage svg.lin-svg g[data-node]').count(), 0, 'above the cap, so nothing is drawn');
     await page.evaluate(() => { window.__t = []; });
+    // Count calls instead of trusting a stopwatch: the layout of this graph costs only tens of milliseconds, which no budget can tell
+    // from noise, but a graph that is not drawn must not be laid out at all.
+    const cdp = await ctx.newCDPSession(page);
+    await cdp.send('Profiler.enable');
+    await cdp.send('Profiler.startPreciseCoverage', { callCount: true, detailed: false });
+    const layoutCalls = async () => {
+      const { result } = await cdp.send('Profiler.takePreciseCoverage');
+      let n = 0; let rendered = 0;
+      for (const sc of result) for (const fn of sc.functions) {
+        if (!/collab-lineage\.js/.test(sc.url)) continue;
+        if (fn.functionName === 'layoutGraph') n += fn.ranges[0].count;
+        if (fn.functionName === 'renderLineage') rendered += fn.ranges[0].count;
+      }
+      return { n, rendered };
+    };
+    await layoutCalls();      // takePreciseCoverage resets the counters: whatever the paging did is not counted below
     const box = page.locator('input[data-filter="type"][value="task"]');
     await box.focus();
     const times = [];
@@ -143,6 +159,9 @@ test('toggling a type filter on a graph above the draw cap is cheap: the layout 
       times.push(Math.round(t));
       await page.locator('input[data-filter="type"][value="task"]').focus();
     }
+    const after = await layoutCalls();
+    assert.ok(after.rendered >= 6, `the call counter works: renderLineage ran ${after.rendered} times for 6 toggles`);
+    assert.equal(after.n, 0, `layoutGraph ran ${after.n} times while a graph above the draw cap was filtered (nothing is drawn from its result)`);
     const med = median(times);
     console.log(JSON.stringify({ toggleFilterMs: times, median: med, hostSlowdown: Number(scale.toFixed(2)) }));
     report.toggle = { nodes: 3500, ms: times, median: med, hostSlowdown: Number(scale.toFixed(2)) };
