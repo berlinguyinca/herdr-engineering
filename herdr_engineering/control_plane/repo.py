@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from .agent_identity import AgentIdentityRegistry
 from .envelope import SourceLedger, envelope_event_fields
+from .graph import GraphProjection
 from .ids import new_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
@@ -157,6 +158,9 @@ class ControlPlaneRepo:
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+        # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
+        # from them on import_state; owns no storage of its own.
+        self.graph = GraphProjection()
 
     def _persist_source_state(self, state):
         """Mirror per-source state to the durable sink when it supports it."""
@@ -1894,6 +1898,7 @@ class ControlPlaneRepo:
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
         self.ledger.hydrate([e for stream in self._events.values() for e in stream])
+        self._rebuild_graph()
         self._ci_sequence = max(int(state.get("ci_sequence", 0)),
                                 max((event.get("sequence", -1) + 1
                                      for key, stream in self._events.items()
@@ -1932,6 +1937,24 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != "collab"]
         if durable:
             self.inspector.hydrate(durable)
+
+    def _rebuild_graph(self):
+        """Replay stored ``lineage`` envelope rows into a fresh projection.
+
+        Lineage is envelope-only: it never sits in the global feed. Rows that no
+        longer validate are skipped and counted, never fatal to startup.
+        """
+        graph = GraphProjection()
+        rows = [e for key, stream in self._events.items() if key[0] == "lineage"
+                for e in stream if e.get("source") is not None
+                and e.get("source_sequence") is not None]
+        for event in rows:
+            try:
+                graph.apply({**event, "payload": _payload(event)})
+            except ValueError:
+                graph.events_rejected += 1
+        self.graph = graph
+        self._event_order = [t for t in self._event_order if t[0] != "lineage"]
 
     def take_collab_replay(self):
         """Hand the diverted durable HCN events to the collaboration service (once)."""

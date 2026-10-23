@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from ..version import __version__
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
+from .graph import DEFAULT_DEPTH, DEFAULT_EDGES, DEFAULT_NODES
 from .redact import redact_payload
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
@@ -1091,6 +1092,8 @@ def _make_handler(server, public=False, operator=False):
                     # per-entity stream: /api/v1/events?entity_type=mission&entity_id=m1
                     etype = _q(self.path, "entity_type")
                     eid = _q(self.path, "entity_id")
+                    if etype == "lineage":
+                        return self._json({"error": "not found"}, 404)  # read via the scope-checked /api/v1/graph
                     if etype and etype.startswith("collab"):
                         return self._json({"error": "not found"}, 404)  # HCN has its own authenticated API
                     if not etype or not eid:
@@ -1121,6 +1124,8 @@ def _make_handler(server, public=False, operator=False):
                 if what == "models":
                     return self._json({"models": list(r.list_custom_models().values())})
                 return self._json({"error": "not found"}, 404)
+            if resource == "graph":
+                return self._graph_get(parts)
             if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
                 return self._json({"sources": r.ledger.source_states(), "server_time": r._stamp()})
             if resource == "ingest":
@@ -1346,6 +1351,39 @@ def _make_handler(server, public=False, operator=False):
                     if changed and r.get_session(sid) is not None:
                         server.agent_summaries.request(sid)
                 return self._json({"ok": True, "entity": entity})
+            return self._json({"error": "not found"}, 404)
+
+        def _graph_get(self, parts):
+            """Lineage graph reads (viewer level). Every result is filtered by the
+            caller's principal; hidden and missing both answer 404."""
+            g = server.repo.graph
+            principal = self._principal()
+            if len(parts) >= 6 and parts[4] == "nodes" and len(parts) == 6:
+                return self._json(g.get_node(principal, parts[5]))
+            if len(parts) == 7 and parts[4] == "nodes" and parts[6] in ("neighborhood", "subgraph"):
+                def num(name, default):
+                    raw = _q(self.path, name)
+                    if raw is None or raw == "":
+                        return default
+                    try:
+                        return int(raw)
+                    except ValueError:
+                        raise ValueError(f"{name} must be an integer") from None
+                kinds = _q(self.path, "edge_types")
+                return self._json(g.neighborhood(
+                    principal, parts[5], depth=num("depth", DEFAULT_DEPTH),
+                    max_nodes=num("max_nodes", DEFAULT_NODES),
+                    max_edges=num("max_edges", DEFAULT_EDGES),
+                    direction=_q(self.path, "direction") or "both",
+                    edge_types=set(kinds.split(",")) if kinds else None,
+                    include_removed=_q(self.path, "include_removed") == "true"))
+            if len(parts) == 5 and parts[4] == "edge":
+                edge_type, frm, to = (_q(self.path, n) for n in ("edge_type", "from_id", "to_id"))
+                if not (edge_type and frm and to):
+                    raise ValueError("edge_type, from_id and to_id are required")
+                return self._json(g.get_edge(principal, edge_type, frm, to,
+                                             commit=_q(self.path, "commit"),
+                                             plan_digest=_q(self.path, "plan_digest")))
             return self._json({"error": "not found"}, 404)
 
         def _agent_capabilities(self, session):

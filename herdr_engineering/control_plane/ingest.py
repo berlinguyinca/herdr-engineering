@@ -14,6 +14,7 @@ import re
 
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
+from .graph import validate_lineage
 from .project_links import canonical_repository
 from .sink import EventAlreadyStored
 
@@ -75,10 +76,12 @@ class IngestService:
                            "custom_model", "llm_key", "token_usage"}:
             raise ValueError("provider-owned entity type is not accepted by generic ingestion")
         env = normalize_envelope(body, principal, self.repo._stamp())
+        if env is None and entity_type == "lineage":
+            raise ValueError("lineage events require schema_version 2")
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type
-        self._prevalidate(entity_type, entity_id, payload)
+        self._prevalidate(entity_type, entity_id, payload, event_type)
         ledger = self.repo.ledger
         ack = {"event_id": env["event_id"], "source": env["source"],
                "source_sequence": env["source_sequence"]}
@@ -106,13 +109,25 @@ class IngestService:
                 ledger.commit(env)
                 return {**head, "envelope": {**ack, "duplicate": True}}
             try:
-                result = self._dispatch(entity_type, entity_id, event_type, payload, source,
-                                        record_generic=False)
+                if entity_type == "lineage":
+                    result = self._apply_lineage(entity_id, event_type, payload, env)
+                else:
+                    result = self._dispatch(entity_type, entity_id, event_type, payload, source,
+                                            record_generic=False)
             finally:
                 # The row is durable, so its (source, sequence) is consumed even
                 # if the handler then fails; the failure is reported once.
                 ledger.commit(env)
         return {**result, "envelope": {**ack, "duplicate": False}}
+
+    def _apply_lineage(self, entity_id, event_type, payload, env) -> dict:
+        """Project a persisted lineage envelope into the graph (never infers edges)."""
+        self.repo.graph.apply({
+            "event_id": env["event_id"], "source": env["source"],
+            "source_sequence": env["source_sequence"], "event_type": event_type,
+            "payload": payload, "visibility_scope": env["visibility_scope"],
+            "actor": env.get("actor")})
+        return {"entity_type": "lineage", "entity_id": entity_id, "event_type": event_type}
 
     def _stored_identity(self, event_id):
         lookup = getattr(getattr(self.repo, "_sink", None), "stored_identity", None)
@@ -124,10 +139,12 @@ class IngestService:
         return tuple(found)
 
     @staticmethod
-    def _prevalidate(entity_type, entity_id, payload) -> None:
+    def _prevalidate(entity_type, entity_id, payload, event_type="") -> None:
         """Reject what a handler would reject BEFORE the envelope is persisted."""
         if entity_type == "mission" and ":" in entity_id:
             raise ValueError("invalid mission id")
+        if entity_type == "lineage":
+            validate_lineage(event_type, payload)
         if entity_type in ("session", "mission"):
             _git_identity(payload)
         if entity_type == "service" and any(

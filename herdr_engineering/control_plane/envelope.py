@@ -32,7 +32,7 @@ _MAX_STR = 512
 # is stored as an envelope-only row: persisted for idempotency, sequence and
 # replay, but kept out of the global feed and out of state reconstruction.
 ENVELOPE_ONLY_TYPES = frozenset({"host", "session", "mission", "service",
-                                 "inspector", "mission_activity"})
+                                 "inspector", "mission_activity", "lineage"})
 MAX_SEQUENCE = 2**63 - 1          # PostgreSQL bigint
 MAX_GAPS_PER_SOURCE = 64
 MAX_SOURCES = 1024
