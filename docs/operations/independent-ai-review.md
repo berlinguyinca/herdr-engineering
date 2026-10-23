@@ -44,8 +44,9 @@ nothing; its replacement is reviewed on the next poll.
 
 - Correctness, security and tests, as the reviewer reports them in `checked`. The status names only the aspects
   that every chunk reported.
-- Every blocking finding must cite a file in the PR and a line shown in the diff. Findings that do not are
-  dropped and counted ("N uncited dropped").
+- Every blocking finding must cite a file in the PR. A finding on a PR file whose line is not shown in the diff
+  still blocks, marked "line unverified". A finding citing a file not in the PR is dropped, and the status says
+  "N finding(s) dropped (cited code not in the PR)".
 - Independence: the reviewer's family must differ from every model family in the commits' `Co-Authored-By`
   trailers (default author family: claude).
 
@@ -65,7 +66,7 @@ nothing; its replacement is reviewed on the next poll.
   - the content goes on stdin between random fences, labelled as data;
   - the reviewer has no GitHub access and no network beyond its model endpoint;
   - its output must be a strict schema, or the run fails;
-  - the poster decides the state, drops uncited findings, and lets the model narrow its claims but never widen
+  - the poster decides the state, drops findings on files outside the PR (and says so), and lets the model narrow its claims but never widen
     them;
   - one failed chunk fails the whole run.
 

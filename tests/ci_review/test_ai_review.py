@@ -384,18 +384,32 @@ def test_success_only_on_zero_blocking(env):
     assert st["description"].startswith("Blocked: 1 finding")
 
 
-def test_finding_citing_non_diff_line_is_dropped(env):
+def test_finding_in_a_diff_file_with_an_unverified_line_still_blocks(env):
     env.responses([{"blocking": [
-        {"file": "src/b.py", "line": 50, "summary": "imaginary", "why": "not in the diff"},
+        {"file": "src/b.py", "line": 50, "summary": "real bug, wrong line", "why": "not in a hunk"},
+        {"file": "nowhere.py", "line": 1, "summary": "imaginary", "why": "not in the PR"}],
+        "minor": [], "checked": ["code", "security"], "not_checked": []}])
+    assert review(env) == 0
+    (st,) = env.terminal()
+    assert st["state"] == "failure"
+    assert st["description"].startswith("Blocked: 1 finding")
+    (c,) = env.comments()
+    assert "real bug, wrong line" in c["body"] and "line unverified" in c["body"]
+    assert "nowhere.py" in c["body"] and "dropped" in c["body"].lower()
+
+
+def test_findings_citing_files_not_in_the_pr_are_dropped_and_said(env):
+    env.responses([{"blocking": [
         {"file": "nowhere.py", "line": 1, "summary": "imaginary", "why": "not in the PR"},
-        {"file": "src/b.py", "line": 9, "summary": "before hunk", "why": "not shown"}],
+        {"file": "other/x.py", "line": 3, "summary": "imaginary too", "why": "not in the PR"}],
         "minor": [], "checked": ["code", "security"], "not_checked": []}])
     assert review(env) == 0
     (st,) = env.terminal()
     assert st["state"] == "success"
-    assert "3 uncited dropped" in st["description"]
+    assert "2 findings dropped (cited code not in the PR)" in st["description"]
+    assert len(st["description"]) <= 140
     (c,) = env.comments()
-    assert "nowhere.py" in c["body"] and "dropped" in c["body"].lower()
+    assert "nowhere.py" in c["body"]
 
 
 def test_valid_citations_new_side_lines():
@@ -507,6 +521,9 @@ def test_status_text_truthful_and_short(env):
     long_label = "codex " + "m" * 200
     s = mod.success_text(long_label, ["code", "security", "tests"], dropped=12)
     assert len(s) <= 140 and "visual review not run" in s and "0 blocking" in s
+    assert "12 findings dropped (cited code not in the PR)" in s
+    one = mod.success_text("codex", ["code"], dropped=1)
+    assert "1 finding dropped (cited code not in the PR)" in one and len(one) <= 140
     f = mod.blocked_text(long_label, 3)
     assert len(f) <= 140 and f.startswith("Blocked: 3 findings")
 

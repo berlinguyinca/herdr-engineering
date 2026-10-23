@@ -516,12 +516,13 @@ def parse_verdict(text: str) -> dict:
     return v
 
 
-def cited(f: dict, index: dict[str, FileDiff]) -> bool:
+def cited_file(f: dict, index: dict[str, FileDiff]) -> FileDiff | None:
     path = f["file"].strip()
-    fd = index.get(path) or index.get(path.removeprefix("b/")) or index.get(path.removeprefix("a/"))
-    if fd is None or f["line"] < 1:
-        return False
-    return f["line"] in (fd.old_lines if fd.deleted else fd.new_lines)
+    return index.get(path) or index.get(path.removeprefix("b/")) or index.get(path.removeprefix("a/"))
+
+
+def line_shown(f: dict, fd: FileDiff) -> bool:
+    return f["line"] >= 1 and f["line"] in (fd.old_lines if fd.deleted else fd.new_lines)
 
 
 # ---------------- prompt ----------------
@@ -744,7 +745,8 @@ def fit(text: str, limit: int = DESC_MAX) -> str:
 
 
 def success_text(label: str, claims: list[str], dropped: int = 0) -> str:
-    tail = (f", {dropped} uncited dropped" if dropped else "") + " (visual review not run)"
+    tail = (f", {dropped} finding{'s' if dropped != 1 else ''} dropped (cited code not in the PR)" if dropped
+            else "") + " (visual review not run)"
     what = "+".join(claims) or "code"
     fixed = f": {what} review, 0 blocking{tail}"
     room = DESC_MAX - len("Approved by ") - len(fixed)
@@ -773,7 +775,8 @@ def comment_body(sha, label, chunks, findings, minor, dropped, claims, not_check
              f"Reviewed for: {'+'.join(claims)}. Visual review: not run.", ""]
     if findings:
         lines.append(f"**Blocking ({len(findings)})**")
-        lines += [f"- `{safe(f['file'], 200)}:{f['line']}` — {safe(f['summary'])}<br>why: {safe(f['why'], 800)}"
+        lines += [f"- `{safe(f['file'], 200)}:{f['line']}`" + (" (line unverified: not shown in the diff)"
+                  if f.get("line_unverified") else "") + f" — {safe(f['summary'])}<br>why: {safe(f['why'], 800)}"
                   for f in findings]
         lines.append("")
     if minor:
@@ -781,7 +784,7 @@ def comment_body(sha, label, chunks, findings, minor, dropped, claims, not_check
         lines += [f"- `{safe(f['file'], 200)}:{f['line']}` — {safe(f['summary'])}" for f in minor[:100]]
         lines.append("\n</details>\n")
     if dropped:
-        lines.append(f"**Dropped ({len(dropped)})**: blocking findings that cite no line of this diff, so they "
+        lines.append(f"**Dropped ({len(dropped)})**: blocking findings that cite a file not in this PR, so they "
                      "did not count:")
         lines += [f"- `{safe(f['file'], 200)}:{f['line']}` — {safe(f['summary'], 200)}" for f in dropped[:50]]
         lines.append("")
@@ -882,7 +885,13 @@ def review(cfg: dict, repo: str, n: int, dry_run: bool) -> int:
         claims = [c for c in CLAIMABLE if all(c in v["checked"] for v in verdicts)]
         for v in verdicts:
             for f in v["blocking"]:
-                (findings if cited(f, index) else dropped).append(f)
+                fd = cited_file(f, index)
+                if fd is None:                   # the file is not in this PR: dropped, and the status says so
+                    dropped.append(f)
+                elif line_shown(f, fd):
+                    findings.append({**f, "file": fd.path})
+                else:                            # a real file of the PR, a line the diff does not show: still blocks
+                    findings.append({**f, "file": fd.path, "line_unverified": True})
             minor += v["minor"]
             not_checked += [x for x in v["not_checked"] if x not in not_checked]
         if any("visual" in v["checked"] for v in verdicts):

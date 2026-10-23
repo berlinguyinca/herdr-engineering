@@ -41,11 +41,12 @@ Files:
    non-zero exit, a missing verdict file, a timeout or a sandbox error fails the whole run: exit 1, and nothing is
    posted except the earlier pending status.
 6. **Decides the state (the poster, not the model).**
-   - A blocking finding counts only if its `file` is in the diff and its `line` is a new-side line of a hunk (an
-     added or context line; for a deleted file, an old-side line). Others are dropped, counted in the status and
-     listed in the comment.
-   - `success` means every chunk completed and no counted blocking finding remains. Otherwise the state is
-     `failure`.
+   - A blocking finding whose `file` is in the diff always counts. If its `line` is not a new-side line of a hunk
+     (an added or context line; for a deleted file, an old-side line), it still blocks and the comment marks it
+     "line unverified". A wrong line number never turns a real finding into an approval.
+   - Only a blocking finding whose `file` is not in the PR at all is dropped. It is listed in the comment, and the
+     status says "N finding(s) dropped (cited code not in the PR)".
+   - `success` means every chunk completed and no blocking finding remains. Otherwise the state is `failure`.
    - The claims in the status are the aspects that every chunk listed in `checked`, intersected with
      `code, security, tests, docs, performance`. The model can narrow the claims but never widen them. `visual` is
      never claimed: there is no visual step, and `visual_review: true` is refused.
@@ -108,7 +109,7 @@ What is NOT isolated, or not verified yet:
 - **`sandbox.network: host`** gives the box the host network. Do not use it without a reason.
 - **Prompt injection can still win.** A diff that persuades the model to report no blocking findings gets a
   `success`. The poster's checks limit what an injection can do, but they cannot make the model honest:
-  - fake findings are dropped;
+  - findings citing files outside the PR are dropped, and the status says so;
   - a "do not check X" instruction shows in `checked`;
   - malformed output never passes.
 
