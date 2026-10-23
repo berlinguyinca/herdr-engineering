@@ -296,3 +296,9 @@ def test_host_requests_to_internal_addresses_are_marked(w, host, internal):
         pytest.skip("not a requestable spelling")
     row = w.s.list_egress(w.op)["requests"][0]
     assert row["internal"] is internal
+
+
+def test_the_operator_listing_names_rooms_whose_owner_listed_hosts(w):
+    w.s.set_room_profile(w.alice, w.room2, {"permanent_hosts": ["git.example.org:22"]})
+    out = w.s.list_egress(w.op)
+    assert out["requests"] == [] and out["rooms_with_hosts"] == [w.room2]
