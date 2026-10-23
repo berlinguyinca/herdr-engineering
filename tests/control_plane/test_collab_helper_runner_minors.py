@@ -279,3 +279,13 @@ def test_the_stop_reason_is_in_the_result(hr, tmp_path):
     d.mkdir()
     text = r.helper_result_text(d, {"stopped": "tools are no longer allowed in this room"})
     assert "[stopped: the room profile changed: tools are no longer allowed in this room]" in text
+
+
+def test_the_watch_thread_logs_a_repeated_failure_once(hr, monkeypatch):
+    import threading
+    r = failing(hr.mk(), "fleet/helpers")
+    stop = threading.Event()
+    calls = []
+    monkeypatch.setattr(stop, "wait", lambda t: (calls.append(t), len(calls) >= 4)[1])
+    r.watch_loop(stop, threading.Lock())
+    assert len(calls) == 4 and sum("helpers:" in m for m in hr.said) == 1
