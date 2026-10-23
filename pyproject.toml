@@ -37,3 +37,6 @@ testpaths = ["tests"]
 # tests/control_plane/ can share a basename with top-level tests (e.g.
 # test_artifacts.py) without an ``import file mismatch`` collection error.
 addopts = "--import-mode=importlib"
+
+[tool.setuptools.package-data]
+herdr_engineering = ["*.mjs"]

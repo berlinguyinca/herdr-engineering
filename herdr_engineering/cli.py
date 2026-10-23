@@ -243,6 +243,15 @@ def _build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--json", action="store_true")
     pd.set_defaults(func=_cmd_fleet_drift)
 
+    recovery = fsub.add_parser("recover", help="plan or apply staggered outage recovery for Pi sessions")
+    recovery.add_argument("recovery_command", nargs="?", choices=("plan", "apply", "run", "status"), default="plan")
+    recovery.add_argument("--pi-revision", help="opt in to this exact immutable Pi release before recovery (planning only)")
+    recovery.add_argument("--id", help="recovery plan ID (required for apply/status)")
+    recovery.add_argument("--inventory", help="fleet inventory path (planning only)")
+    recovery.add_argument("--host", help="fleet host filter (planning only)")
+    recovery.add_argument("--session", default="default", help="explicit native HerdR server session")
+    recovery.set_defaults(func=_cmd_fleet_recover)
+
     pr = fsub.add_parser("rollout", help="durable Pi runtime update and mission recovery")
     rsub = pr.add_subparsers(dest="rollout_command", required=True)
     for action in ("plan", "apply", "run", "status"):
@@ -900,6 +909,39 @@ def _cmd_fleet_update(args) -> int:
         if fs.get("rc") != 0 and fs.get("stderr"):
             print(f"  !! {fs['stderr']}")
     return 0 if report.get("ok") else 1
+
+
+def _cmd_fleet_recover(args) -> int:
+    from pathlib import Path
+
+    from .fleet import repo_root
+    from .fleet_rollout import inventory_targets
+    from .pi_recovery import RecoveryStore, apply_recovery, create_plan
+
+    store = RecoveryStore()
+    try:
+        if args.recovery_command in ("plan", "run"):
+            inventory_value = args.inventory or os.environ.get("HERDR_PI_RECOVERY_INVENTORY")
+            inventory = Path(inventory_value).expanduser() if inventory_value else repo_root() / "ansible/inventory/hosts.yml"
+            targets = [{**target, "session": args.session} for target in inventory_targets(inventory, args.host)]
+            report = create_plan(store, targets, progress=lambda event: print(event, file=sys.stderr, flush=True), revision=args.pi_revision or os.environ.get("HERDR_PI_RECOVERY_REVISION"), inventory=inventory)
+            if args.recovery_command == "run":
+                print("Recovery plan: " + report["id"], file=sys.stderr, flush=True)
+                report = apply_recovery(store, report["id"], progress=lambda event: print(event, file=sys.stderr, flush=True))
+        elif args.host or args.inventory or args.pi_revision or args.session != "default":
+            raise ValueError("apply/status use the frozen plan targets; planning flags are not allowed")
+        elif not args.id:
+            raise ValueError("--id is required for apply/status")
+        elif args.recovery_command == "apply":
+            report = apply_recovery(store, args.id, progress=lambda event: print(event, file=sys.stderr, flush=True))
+        else:
+            from .pi_recovery_verification import verify_recovery
+            report = verify_recovery(store, args.id, progress=lambda event: print(event, file=sys.stderr, flush=True))
+    except (OSError, ValueError, RuntimeError) as exc:
+        _print_json({"error": str(exc)})
+        return 1
+    _print_json(report)
+    return 2 if report.get("status") == "needs_verification" else 0
 
 
 def _cmd_fleet_rollout(args) -> int:

@@ -1,0 +1,20 @@
+id = "herdr.pi-recovery"
+name = "Pi Session Recovery"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Preview eligible Pi outage recovery through native HerdR controls"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "preview"
+title = "Preview Pi recovery"
+description = "Create a read-only recovery plan; apply explicitly with its ID"
+contexts = ["global"]
+command = ["herdr-pi-recover", "plan"]
+
+[[actions]]
+id = "recover"
+title = "Recover stalled Pi sessions"
+description = "Recover eligible outage-stalled sessions with verified models and a 60-second cooldown"
+contexts = ["global"]
+command = ["herdr-pi-recover", "run"]
