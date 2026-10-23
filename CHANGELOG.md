@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Lineage graph projection (T02, Herdr side)
+- `lineage` envelope events (v2 only) project into a durable graph derived from `fabric_events`
+  (no new table; rebuilt on hydrate). See `docs/contracts/lineage-events.md`.
+- `GET /api/v1/graph/nodes/{id}`, `.../neighborhood`, `/api/v1/graph/edge`: viewer-level reads,
+  visibility-filtered at every hop, depth/node/edge capped, fail closed.
+
 ### Event envelope v2 (T01, Herdr side)
 - `POST /api/v1/ingest` accepts `schema_version: 2` bodies per
   `docs/contracts/event-envelope-v2.md`: server-set `actor`/`received_at`,
