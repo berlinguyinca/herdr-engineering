@@ -180,3 +180,27 @@ test('CI attention destinations retain provider identity when repository IDs and
   assert.deepEqual(destinations.map(url=>url.searchParams.get('search')),['12','12']);
   for(const url of destinations)assert.equal(url.searchParams.get('repository'),'7');
 });
+
+test('large attention queues show only the six highest ranked items until expanded',()=>{
+  const missions=Array.from({length:196},(_,index)=>({mission_id:`failure-${index}`,title:`Failure ${index}`,status:'failed',updated_at:new Date(now-index*1000).toISOString()}));
+  const data={missions};
+  const collapsed=renderOverviewSection('attention',data,{},now,now);
+  assert.equal(overview.overviewAttention(data,{},now,now).items.length,196);
+  assert.equal((collapsed.match(/data-attention-key=/g)||[]).length,6);
+  assert.match(collapsed,/Showing 6 of 196 observed items/);
+  assert.match(collapsed,/aria-expanded="false" aria-controls="ov-attention-items"/);
+  assert.match(collapsed,/#\/missions\/failure-0/);
+  assert.doesNotMatch(collapsed,/#\/missions\/failure-6/);
+  assert.match(collapsed,/Partial coverage/);
+  const expanded=renderOverviewSection('attention',{...data,attentionExpanded:true},{},now,now);
+  assert.equal((expanded.match(/data-attention-key=/g)||[]).length,196);
+  assert.match(expanded,/aria-expanded="true" aria-controls="ov-attention-items"/);
+  assert.match(expanded,/Show fewer/);
+  assert.match(expanded,/class="ov-list ov-attention-list is-expanded"/);
+});
+
+test('short attention queues do not offer a redundant expansion control',()=>{
+  const html=renderOverviewSection('attention',{missions:[{mission_id:'one',title:'Failure',status:'failed'}]}, {},now,now);
+  assert.equal((html.match(/data-attention-key=/g)||[]).length,1);
+  assert.doesNotMatch(html,/data-attention-toggle/);
+});

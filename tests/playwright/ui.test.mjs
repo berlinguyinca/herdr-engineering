@@ -1332,3 +1332,49 @@ test('overview attention opens only the intended CI provider when repository and
   assert.equal(await page.locator('[data-ig-search]').inputValue(),'12');
  },{BURST:'0'});
 });
+
+test('large Overview attention queues keep cards close and expand within a keyboard-accessible scroll region',async()=>{
+ await withApp(async({page,base})=>{
+  let refreshed=false;
+  const missions=Array.from({length:196},(_,index)=>({mission_id:`failure-${index}`,title:`Failure ${index}`,status:'failed',updated_at:new Date(Date.now()-index*1000).toISOString()}));
+  await page.route('**/api/v1/missions',route=>route.fulfill({json:{missions:missions.map(record=>({...record,title:refreshed?`${record.title} refreshed`:record.title}))}}));
+  await page.route('**/api/v1/mission-activity',route=>route.fulfill({json:{activities:[]}}));
+  await page.route('**/api/v1/fleet/inventory',route=>route.fulfill({json:{components:[],hosts:[],summary:{drifted:0}}}));
+  await page.addInitScript(()=>localStorage.setItem('herdr.overview.layout.v1',JSON.stringify({order:['ci'],hidden:['sessions']})));
+  await page.clock.install();await page.goto(`${base}/#/overview`);
+  const attention=page.locator('[data-overview=attention]'),toggle=attention.locator('[data-attention-toggle]'),list=attention.locator('#ov-attention-items');
+  await page.waitForFunction(()=>document.querySelectorAll('[data-attention-key]').length===6);
+  await attention.getByText('Showing 6 of 196 observed items',{exact:true}).waitFor();
+  assert.equal(await attention.locator('[data-attention-key] a').first().getAttribute('href'),'#/missions/failure-0');
+  for(const width of [3840,2560,1920,768,390]) {
+   await page.setViewportSize({width,height:1080});
+   const collapsed=await page.evaluate(()=>({page:document.documentElement.scrollHeight,attention:document.querySelector('[data-overview=attention]').getBoundingClientRect().height,cards:document.querySelector('.ov-layout').getBoundingClientRect().top+scrollY,overflow:document.documentElement.scrollWidth>innerWidth}));
+   assert.equal(collapsed.overflow,false,`collapsed overflow at ${width}`);
+   assert.ok(collapsed.attention<1000,`Attention height ${collapsed.attention} at ${width}`);
+   assert.ok(collapsed.cards<1400,`cards start at ${collapsed.cards} at ${width}`);
+   assert.ok(collapsed.page<4500,`document height ${collapsed.page} at ${width}`);
+   await toggle.focus();await page.keyboard.press('Enter');
+   assert.equal(await toggle.getAttribute('aria-expanded'),'true');
+   assert.equal(await toggle.evaluate(element=>element===document.activeElement),true);
+   assert.equal(await attention.locator('[data-attention-key]').count(),196);
+   const expanded=await list.evaluate(element=>({height:element.clientHeight,scroll:element.scrollHeight,limit:innerHeight*.6,overflow:document.documentElement.scrollWidth>innerWidth}));
+   assert.ok(expanded.height<=expanded.limit+1);assert.ok(expanded.scroll>expanded.height);assert.equal(expanded.overflow,false);
+   assert.ok(await page.evaluate(()=>document.documentElement.scrollHeight)<collapsed.page+700);
+   if(width===390) {
+    await list.evaluate(element=>{element.scrollTop=200;element.focus({preventScroll:true});});
+    const scroll=await list.evaluate(element=>element.scrollTop);
+    refreshed=true;await page.clock.runFor(5500);
+    await attention.getByRole('link',{name:'Failure 0 refreshed',exact:true}).waitFor();
+    assert.equal(await list.evaluate(element=>element===document.activeElement),true);
+    assert.equal(await list.evaluate(element=>element.scrollTop),scroll);
+   }
+   await toggle.focus();await page.keyboard.press('Enter');
+   assert.equal(await toggle.getAttribute('aria-expanded'),'false');
+   assert.equal(await toggle.evaluate(element=>element===document.activeElement),true);
+   assert.equal(await attention.locator('[data-attention-key]').count(),6);
+  }
+  assert.equal(await page.locator('[data-overview=sessions]').isVisible(),false);
+  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'ci');
+  assert.deepEqual(await page.evaluate(()=>JSON.parse(localStorage.getItem('herdr.overview.layout.v1'))),{order:['ci'],hidden:['sessions']});
+ },{BURST:'0'});
+});

@@ -128,10 +128,12 @@ function missionRow(entry, canSnooze = false) {
 export function renderOverviewSection(section, data = {}, states = {}, received = Date.now(), now = Date.now()) {
   const model = overviewModel(data,received,now);
   if (section === 'attention') {
-    const attention=overviewAttention(data,states,received,now);
+    const attention=overviewAttention(data,states,received,now),expanded=data.attentionExpanded===true,limit=6;
+    const visible=expanded?attention.items:attention.items.slice(0,limit);
     return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2><span class="ov-tag">${attention.items.length ? `${attention.items.length}${attention.complete?'':'+'}` : attention.complete?'0':'—'} observed items</span></div>
       ${!attention.complete ? `<p class="ov-warning" role="status">Partial coverage: ${esc(attention.unavailable.map(key=>CARD_LABELS[key] || {projections:'Live missions',health:'Control plane'}[key] || key).join(', '))}. Loading, unavailable, or stale sources may contain more items; retained reports remain visible.</p>` : ''}
-      ${attention.items.length ? `<ul class="ov-list ov-attention-list">${attention.items.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
+      ${attention.items.length>limit ? `<div class="ov-attention-controls"><span class="ov-note">Showing ${visible.length} of ${attention.items.length} observed items</span><button type="button" data-attention-toggle aria-expanded="${expanded}" aria-controls="ov-attention-items">${expanded?'Show fewer':`Show all ${attention.items.length}`}</button></div>` : ''}
+      ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
   }
   if (section === 'missions') {
     const m = model.missions;
@@ -206,7 +208,7 @@ const styles = `<style>
 @media(min-width:2200px){.ov-layout{grid-template-columns:repeat(4,minmax(0,1fr))}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet],.ov-panel[data-overview=hosts],.ov-panel[data-overview=activity]{grid-column:span 2}}
 @media(max-width:1180px){.ov-layout{grid-template-columns:repeat(2,minmax(0,1fr))}.ov-panel[data-overview=missions]{grid-column:1/-1;grid-row:auto}.ov-panel[data-overview=fleet]{grid-column:1/-1}}
 @media(max-width:960px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:auto}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
-.ov-attention{margin-bottom:16px}.ov-attention-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:0 24px}.ov-panel[hidden]{display:none}.ov-customize{margin:0 0 16px;font-size:13px}.ov-customize>summary{cursor:pointer;width:fit-content;padding:8px 0}.ov-control-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0}.ov-control-row strong{min-width:145px}.ov-customize button{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 10px;cursor:pointer}.ov-customize button:disabled{opacity:.45;cursor:default}.ov-customize button:focus-visible,.ov-customize summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-layout:has(>[hidden]){grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr))}.ov-layout:has(>[hidden])>.ov-panel{grid-column:auto}
+.ov-attention{margin-bottom:16px}.ov-attention-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:0 24px}.ov-attention-list.is-expanded{max-height:min(60vh,560px);overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.ov-attention-controls{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px}.ov-attention-controls button{font:inherit;font-size:13px;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px 12px;min-height:44px;cursor:pointer}.ov-attention-controls button:focus-visible,.ov-attention-list:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-panel[hidden]{display:none}.ov-customize{margin:0 0 16px;font-size:13px}.ov-customize>summary{cursor:pointer;width:fit-content;padding:8px 0}.ov-control-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0}.ov-control-row strong{min-width:145px}.ov-customize button{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 10px;cursor:pointer}.ov-customize button:disabled{opacity:.45;cursor:default}.ov-customize button:focus-visible,.ov-customize summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-layout:has(>[hidden]){grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr))}.ov-layout:has(>[hidden])>.ov-panel{grid-column:auto}
 @media(max-width:960px){.ov-layout:has(>[hidden]){grid-template-columns:minmax(0,1fr)}.ov-control-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding-bottom:8px;border-bottom:1px solid var(--border)}.ov-control-row strong{grid-column:1/-1}.ov-customize button{min-height:44px;padding:8px 4px}}
 </style>`;
 
@@ -270,9 +272,14 @@ export function mountOverview(container, client) {
       const hadFocus=element.contains(focused);
       const href=hadFocus ? focused.closest('a')?.getAttribute('href') : null;
       const snooze=hadFocus ? focused.dataset?.snooze : null;
+      const attentionToggle=hadFocus && focused.hasAttribute('data-attention-toggle');
+      const attentionList=hadFocus && focused.id==='ov-attention-items';
+      const attentionScroll=element.querySelector('.ov-attention-list.is-expanded')?.scrollTop || 0;
       element.innerHTML=html;
+      const expandedList=element.querySelector('.ov-attention-list.is-expanded');
+      if(expandedList)expandedList.scrollTop=attentionScroll;
       if(hadFocus) {
-        const target=href ? [...element.querySelectorAll('a')].find(a=>a.getAttribute('href')===href) : snooze ? [...element.querySelectorAll('[data-snooze]')].find(button=>button.dataset.snooze===snooze) : null;
+        const target=attentionToggle ? element.querySelector('[data-attention-toggle]') : attentionList ? expandedList : href ? [...element.querySelectorAll('a')].find(a=>a.getAttribute('href')===href) : snooze ? [...element.querySelectorAll('[data-snooze]')].find(button=>button.dataset.snooze===snooze) : null;
         const fallback=element.querySelector('h2');
         if(fallback)fallback.tabIndex=-1;
         (target || fallback)?.focus({preventScroll:true});
@@ -314,6 +321,7 @@ export function mountOverview(container, client) {
     draw();refresh();clock=setInterval(draw,1000);
   }
   container.addEventListener('click',event=>{
+    if(event.target.closest?.('[data-attention-toggle]')){data.attentionExpanded=!data.attentionExpanded;draw();return;}
     const control=event.target.closest?.('[data-overview-action], [data-overview-reset]');
     if(control) {
       if(control.hasAttribute('data-overview-reset'))preferences=sanitizeOverviewPreferences();
