@@ -18,7 +18,7 @@ from pathlib import Path
 
 MODEL_ID = re.compile(r"[A-Za-z0-9_.:-]+\Z")
 OUTAGE = re.compile(
-    r"timeout|timed out|stream.*error|connection|overload|unavailable|no.*capacity|503|502|429|rate.limit|fetch failed|not.found|unknown.model",
+    r"timeout|timed out|stream.*error|stream ended without (?:a )?finish[_ ]reason|connection|overload|unavailable|no.*capacity|503|502|429|rate.limit|fetch failed|not.found|unknown.model",
     re.I,
 )
 

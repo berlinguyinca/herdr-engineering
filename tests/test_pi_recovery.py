@@ -1099,3 +1099,42 @@ def test_sidebar_cannot_hide_busy_or_approval_evidence(monkeypatch, sidebar):
         subprocess, "run", lambda *args, **kw: subprocess.CompletedProcess(args, 0, text, "")
     )
     assert pi_recovery_host.screen("default", "w1:p1")["promptReady"] is False
+
+
+@pytest.mark.parametrize(
+    "error_text",
+    [
+        "Stream ended without finish_reason",
+        "Error: stream ended without finish reason",
+        "STREAM ENDED WITHOUT A FINISH_REASON",
+    ],
+)
+def test_incomplete_stream_termination_is_recoverable_only_without_unreconciled_tools(error_text):
+    from herdr_engineering.pi_recovery_host import transcript_metadata
+
+    entries = [
+        {"type": "session", "id": "s"},
+        {"type": "model_change", "id": "m", "provider": "metabolomics", "modelId": "working"},
+        {
+            "type": "message",
+            "id": "e",
+            "parentId": "m",
+            "message": {
+                "role": "assistant",
+                "stopReason": "error",
+                "errorMessage": error_text,
+            },
+        },
+    ]
+    config = {"providers": {"metabolomics": {"models": [MODEL]}}}
+    result = transcript_metadata(entries, config)
+    assert result["failure"] == "inference"
+    assert result["failureEvidence"] == "current_inference_error"
+    entries[-1]["message"]["stopReason"] = "stop"
+    assert transcript_metadata(entries, config)["failure"] is None
+    entries[-1]["message"].update(
+        stopReason="error", content=[{"type": "toolCall", "id": "unresolved"}]
+    )
+    result = transcript_metadata(entries, config)
+    assert result["failure"] is None
+    assert result["failureEvidence"] == "unreconciled_tool_calls"
