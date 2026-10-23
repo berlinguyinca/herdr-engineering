@@ -36,6 +36,11 @@ In the first pass both Pi-Bolt arms hit the 120 s watchdog (no result); in later
 docs flag; the documented fix, `pi-bolt compile`, fails on this package (see compatibility-matrix.md). Net effect for the agents we actually run:
 **about 5-8x slower to ready, ~13x the CPU and ~2.6x the memory of standard Pi.** The startup win in A disappears and reverses.
 
+Later repetitions 3-5 ran when host load had risen to 181-270 (other workloads): standard Pi still became ready in 17.6, 28.6 s (1.4-1.5 CPU s, ~131 MiB);
+every Pi-Bolt and Pi-Bolt JIT run hit the 120 s watchdog (7 of 7 recorded, ~7 CPU s consumed in 120 s, i.e. the process was CPU-starved). These are
+censored and heavily load-confounded: they support the direction (Pi-Bolt does not finish loading this extension set where standard Pi does) but must not be
+used for magnitudes. Magnitudes above come from the lower-load repetitions 1-2.
+
 ## Correctness and compatibility
 - Session round-trip PASS: standard Pi -> Pi-Bolt -> standard Pi -> Pi-Bolt JIT on one session file; the remembered fact survived every hop, one session file, valid JSONL after each hop (`results/session-roundtrip.txt`). (A first attempt failed because my harness used the wrong resume flag; it failed on standard Pi too and was fixed.)
 - InferWeave provider URL, auth, model id and token streaming worked unchanged through Pi-Bolt in every scenario (gateway responses streamed; no auth or routing errors).
