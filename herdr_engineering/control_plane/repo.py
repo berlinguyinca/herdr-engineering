@@ -24,6 +24,7 @@ from .agent_identity import AgentIdentityRegistry
 from .host_metrics_store import ENTITY_TYPE as HOST_METRICS_ENTITY
 from .host_metrics_store import STATE_KEYS as HOST_STATE_KEYS
 from .host_metrics_store import HostMetricsStore, clean_metrics, clean_state
+from .host_problems import compute_problems
 from .ids import new_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
@@ -736,7 +737,14 @@ class ControlPlaneRepo:
         return hid
 
     def get_host(self, host_id):
-        return self._merged_hosts().get(self._canonical_host(host_id))
+        host = self._merged_hosts().get(self._canonical_host(host_id))
+        return self._with_problems(host) if host is not None else None
+
+    def _with_problems(self, host):
+        """A copy of ``host`` carrying ``problems`` and ``problem_count`` (the store is untouched)."""
+        history = self.host_history(host["host_id"], "1h")
+        problems = compute_problems(host, history, self._now())
+        return {**host, "problems": problems, "problem_count": len(problems)}
 
     def _merged_hosts(self):
         """Hosts keyed by canonical id; an alias contributes its freshest report."""
@@ -763,7 +771,8 @@ class ControlPlaneRepo:
         return merged
 
     def list_hosts(self):
-        return _sort_by(list(self._merged_hosts().values()), "host_name")
+        hosts = [self._with_problems(h) for h in self._merged_hosts().values()]
+        return _sort_by(hosts, "host_name")
 
     def fleet_inventory(self):
         """Host x component version matrix with drift against the fleet reference.
