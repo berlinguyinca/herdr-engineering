@@ -99,7 +99,7 @@ a pause control (the flow view has a "Pause motion" button with `aria-pressed`);
 | Viewports | desktop 1280x800, tablet 768x1024, mobile 375x667, reflow 320x568 |
 | Visual diff, page | 0.01% of pixels (autospec allows 0.1%; a whole-page percentage hid edges-gone at 0.05%, invisible inspector at 0.09%), per-channel tolerance 2 |
 | Visual diff, component | 0.05% of the component's own area (graph, node, inspector, logo, sub-tabs, log, Gantt, attention item, review pane) |
-| Baseline size | at most 6144 KB in total, 300 KB per file (3209 KB, biggest 101 KB now) |
+| Baseline size | at most 6144 KB in total, 300 KB per file (3439 KB, biggest 101 KB now) |
 | First render of a large graph | 6000 ms |
 | Filter key to next frame, p95 | 500 ms |
 | Type-filter toggle above the draw cap, median | 250 ms (measured 32 ms) |
@@ -133,8 +133,8 @@ now says so ("The server stopped reading here, so more nodes may exist") instead
 
 ## Screenshots
 
-PNGs live in `docs/assets/screenshots/`: 9 surfaces x 3 viewports x light and dark page captures, plus component captures cut by
-bounding box (72 files, 3209 KB). Capture is deterministic: the server clock and ingest stamps are fixed, the browser clock is
+PNGs live in `docs/assets/screenshots/`: 10 surfaces x 3 viewports x light and dark page captures, plus component captures cut by
+bounding box (80 files, 3439 KB). Capture is deterministic: the server clock and ingest stamps are fixed, the browser clock is
 fixed, reduced motion and `animation:none` are forced, the caret is hidden, scroll is reset on the lineage and Gantt surfaces, and
 random server ids are rewritten to stable tokens. **Fonts are bundled** (Liberation Sans and Mono, Regular and Bold, subset, under
 `tests/playwright/fonts/` with `OFL.txt`) and injected as `@font-face` data URLs for capture only (`bypassCSP`, because the page CSP
@@ -201,12 +201,16 @@ Found by the strengthened gates (second round):
   1 unmapped rule, and still passes in `--strict`, so it is not a blocker rule).
 - **Known accessibility rough edges left alone:** accept and reject use the browser's `window.confirm`; sub-tab accessible names
   include the badge count (for example "Tasks1"); sub-tab panels have no `aria-controls` or `tabpanel` role.
-- **Mutation check of the gates (second round).** Each previously surviving mutant was re-run against the strengthened gates: caught
-  N10, N1c, N2a, N3b, N3c, N4d, N5a, N5c, N8a-c, N9b, N9d, N9e, R5b, R10, R13c, S1-S6, X5-X8. Still surviving, with the reason:
-  N1b (the Attach button also has visible text, so removing its aria-label changes nothing: equivalent), N5b (a lone 10px button is
-  allowed by the WCAG 2.5.8 spacing exception: equivalent, not independently verified), N9a (+1 per channel, below the tolerance of 2,
-  by design), R13b (the older wrap rule is redundant with the newer one; removing both is caught), R7c (skipping the layout above
-  the draw cap saves about 17 ms at 3500 nodes, 32 ms against 49 ms measured, which no budget separates from noise).
+- **Mutation check of the gates (second round).** Each previously surviving mutant was re-run against the strengthened gates.
+  Caught: N10, N1c, N2a, N3b, N3c, N4d, N5a, N5b, N5c, N8a-c, N9b, N9d, N9e, R5b, R7c, R10, R13c, S1-S6, X5-X8. Three mutants
+  (N4d, N9e, S3) first survived because the mutant CSS was appended near the top of `collab.css` (line 3) and later rules of equal
+  specificity (lines 250, 252, 309) overrode it, so the defect never rendered; they were re-run with `!important`, which is not a
+  weakening of the gate. Still surviving, with the reason: N1b (the Attach button also has visible text, so removing its aria-label
+  changes nothing: equivalent), N9a (+1 per channel, below the tolerance of 2, by design), R13b (the older wrap rule is redundant
+  with the newer one; removing both, R13c, is caught).
+- **R7c** (the layout skip above the draw cap) is caught by counting `layoutGraph` calls through CDP precise coverage, not by timing:
+  the layout costs tens of milliseconds, which no budget separates from noise.
+- **N5b** (the Pause motion label gone, an empty box) was invisible to every gate until the flow surface joined the visual suite.
 - **Not covered by the pixel gate:** a change of one colour step (+1 per channel), and emoji or symbol glyphs that fall back to the host fonts.
 - **Search is client-side** and covers only loaded nodes; the server caps lineage paging at 3,000 nodes.
 - **Performance numbers come from a loaded host** (see above).
