@@ -326,6 +326,133 @@ fn roundtrip(args: &[String], arms: &BTreeMap<String, Arm>) -> bool {
     ok
 }
 
+
+/// Captured provider request: lowercase header map (auth redacted) and the JSON body.
+#[derive(Clone, Default)]
+struct Captured {
+    path: String,
+    headers: BTreeMap<String, String>,
+    body: serde_json::Value,
+}
+
+/// One-shot mock OpenAI-compatible server: records the first POST and answers with a streamed reply plus usage.
+fn mock_once(listener: std::net::TcpListener, key: &str) -> Captured {
+    listener.set_nonblocking(false).ok();
+    let (mut sock, _) = listener.accept().expect("accept");
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok();
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let (head_end, len) = loop {
+        let n = sock.read(&mut tmp).unwrap_or(0);
+        if n == 0 {
+            break (buf.len(), 0);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+            let len = head.lines().find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+            break (i + 4, len);
+        }
+    };
+    while buf.len() < head_end + len {
+        let n = sock.read(&mut tmp).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    let head = String::from_utf8_lossy(&buf[..head_end.min(buf.len())]).to_string();
+    let mut lines = head.lines();
+    let path = lines.next().unwrap_or("").to_string();
+    let mut headers = BTreeMap::new();
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            let k = k.trim().to_lowercase();
+            let v = v.trim().to_string();
+            if matches!(k.as_str(), "host" | "content-length" | "connection") {
+                continue;
+            }
+            let v = if k == "authorization" { if v == format!("Bearer {key}") { "Bearer <the configured key>".into() } else { "<different credential>".into() } } else { v };
+            headers.insert(k, v);
+        }
+    }
+    let body = serde_json::from_slice(&buf[head_end.min(buf.len())..]).unwrap_or(serde_json::Value::Null);
+    let chunk = |d: &str| format!("data: {d}\n\n");
+    let payload = [
+        chunk(r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},"finish_reason":null}]}"#),
+        chunk(r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8}}"#),
+        chunk("[DONE]"),
+    ]
+    .concat();
+    let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}", payload.len());
+    let _ = sock.write_all(resp.as_bytes());
+    Captured { path, headers, body }
+}
+
+/// `parity`: send the same prompt through every arm to a local mock provider and diff what reaches the wire.
+/// Gateway-side billing rows cannot be checked this way; this proves the request (headers, body, auth) is the same.
+fn parity(args: &[String], arms: &BTreeMap<String, Arm>) -> bool {
+    let key = "mock-key-not-a-secret";
+    let mut got: BTreeMap<String, Captured> = BTreeMap::new();
+    for (name, arm) in arms {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let agent = AgentDir::new(None).expect("agent dir");
+        let models = serde_json::json!({"providers": {"mock": {"api": "openai-completions", "baseUrl": format!("http://127.0.0.1:{port}/v1"), "apiKey": key, "authHeader": true,
+            "models": [{"id": "m", "name": "m", "reasoning": false, "input": ["text"], "contextWindow": 32768, "maxTokens": 1024, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}]}}});
+        fs::write(agent.0.join("models.json"), models.to_string()).unwrap();
+        let cwd = agent.0.join("work");
+        fs::create_dir(&cwd).unwrap();
+        let h = std::thread::spawn(move || mock_once(listener, key));
+        let o = spawn_one(&{ let mut a = arm.argv.clone(); a.extend(scenario_argv("noop", "mock/m")); a }, &agent.0, &cwd, &[], 120);
+        println!("{name:12} exit={} {}", o.exit, o.err_head);
+        match h.join() {
+            Ok(c) => {
+                got.insert(name.clone(), c);
+            }
+            Err(_) => println!("{name}: mock thread failed"),
+        }
+    }
+    let base = arms.keys().find(|n| n.as_str() == "standard-pi").and_then(|n| got.get(n)).cloned();
+    let mut ok = base.is_some();
+    if let Some(b) = &base {
+        // volatile fields that legitimately differ per run
+        // the system prompt names the harness, doc paths and cwd, so it differs by design: compare it separately
+        let norm = |v: &serde_json::Value| {
+            let mut v = v.clone();
+            if let Some(m) = v.as_object_mut() {
+                m.remove("prompt_cache_key");
+                if let Some(msgs) = m.get_mut("messages").and_then(|x| x.as_array_mut()) {
+                    for msg in msgs.iter_mut().filter(|x| x["role"] == "system") {
+                        msg["content"] = serde_json::Value::String("<system prompt compared separately>".into());
+                    }
+                }
+            }
+            v
+        };
+        let sys = |c: &Captured| c.body["messages"].as_array().and_then(|m| m.iter().find(|x| x["role"] == "system")).and_then(|x| x["content"].as_str()).unwrap_or("").to_string();
+        for (name, c) in &got {
+            if name == "standard-pi" { continue; }
+            let same_path = c.path == b.path;
+            let same_body = norm(&c.body) == norm(&b.body);
+            let mut diffs = vec![];
+            for k in b.headers.keys().chain(c.headers.keys()).collect::<std::collections::BTreeSet<_>>() {
+                if b.headers.get(k) != c.headers.get(k) { diffs.push(format!("{k}: std={:?} {name}={:?}", b.headers.get(k), c.headers.get(k))); }
+            }
+            println!("{name}: path_same={same_path} body_same_except_system_prompt={same_body} system_prompt_same={} (std {} bytes, {name} {} bytes) header_diffs={}", sys(c) == sys(b), sys(b).len(), sys(c).len(), diffs.len());
+            for d in &diffs { println!("  header {d}"); }
+            if !same_body {
+                println!("  body std : {}", serde_json::to_string(&norm(&b.body)).unwrap());
+                println!("  body {name}: {}", serde_json::to_string(&norm(&c.body)).unwrap());
+            }
+            ok &= same_path && same_body;
+        }
+    }
+    let _ = args;
+    println!("parity {}", if ok { "PASS: same path, auth and request body apart from the system prompt; headers differ only as listed" } else { "FAIL" });
+    ok
+}
+
 /// `plot --jsonl FILE --field NAME --title T --unit U --out FILE.svg`: bars per arm from measured rows.
 fn plot(args: &[String]) {
     let file = arg(args, "--jsonl").expect("--jsonl");
@@ -376,6 +503,9 @@ fn main() {
     let arms: BTreeMap<String, Arm> = serde_json::from_str(&fs::read_to_string(&runtimes).expect("runtimes file")).expect("runtimes json");
     if scenario == "roundtrip" {
         std::process::exit(if roundtrip(&args, &arms) { 0 } else { 1 });
+    }
+    if scenario == "parity" {
+        std::process::exit(if parity(&args, &arms) { 0 } else { 1 });
     }
     if scenario == "compat" {
         compat(&args, &arms);

@@ -51,3 +51,13 @@ Incompatibilities / risks logged so far
 6. `pi-bolt compile` cannot bundle the pi-engineering package today (relative imports outside the entry folder; optional `pi-blackhole` import).
 7. UNVERIFIED hypothesis: extension code importing `@earendil-works/pi-coding-agent` may resolve to the binary's bundled copy rather than the
    release's `node_modules` copy; not tested (the extension set loaded and registered identically, so no symptom was seen).
+
+## Wire parity (measured 2026-10-23, `results/parity.txt`)
+| Item | standard Pi 1.4.0 | Pi-Bolt / JIT | Verdict |
+|---|---|---|---|
+| Request path, method, JSON structure | chat/completions stream | identical | same |
+| Credential sent | configured key | same key | same |
+| System prompt | "…inside pi…" | "…inside Pi-Bolt…", Pi-Bolt doc paths | differs by design |
+| `user-agent` | `pi/1.4.0 (… node/v22.23.3 …)` | `pi/1.4.0 (… bun/1.4.3 …)` | differs; gateway attribution risk |
+| `x-stainless-runtime-version` | v22.23.3 | v26.3.0 | differs |
+| `accept-encoding`, `accept-language`, `sec-fetch-mode` | gzip, deflate / * / cors | adds br, zstd / absent / absent | differs |

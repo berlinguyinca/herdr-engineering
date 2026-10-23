@@ -44,7 +44,8 @@ used for magnitudes. Magnitudes above come from the lower-load repetitions 1-2.
 ## Correctness and compatibility
 - Session round-trip PASS: standard Pi -> Pi-Bolt -> standard Pi -> Pi-Bolt JIT on one session file; the remembered fact survived every hop, one session file, valid JSONL after each hop (`results/session-roundtrip.txt`). (A first attempt failed because my harness used the wrong resume flag; it failed on standard Pi too and was fixed.)
 - InferWeave provider URL, auth, model id and token streaming worked unchanged through Pi-Bolt in every scenario (gateway responses streamed; no auth or routing errors).
-  NOT verified: gateway-side accounting/billing rows, quotas, owner priority, session affinity.
+  Wire parity vs a local mock provider (`pi-runtime-bench parity`, results/parity.txt): same path, same auth credential, same request body apart from the system prompt (it names Pi-Bolt, its doc paths and the cwd). Headers differ: `user-agent` says `bun/1.4.3` instead of `node/v22.23.3`, `x-stainless-runtime-version`, `accept-encoding`, and two browser-style headers are absent. **A gateway rule keyed on user-agent or runtime headers would see Pi-Bolt as a different client**; check the gateway's identity-header handling before any canary.
+  NOT verified: gateway-side accounting/billing rows, quotas, owner priority, session affinity (needs gateway-side data).
 - Extension registration identical apart from Pi-Bolt's own `usage` command.
 - Adapter safety tested (pi-engineering `feat/pi-bolt-runtime-adapter`): 7 unit + 6 launcher integration tests, existing 28 session-auto-resume tests still pass.
   Covered: precedence, deterministic canary, unsupported host, unpinned/changed/mis-versioned binary all fall back to standard Pi before start,
@@ -64,7 +65,7 @@ used for magnitudes. Magnitudes above come from the lower-load repetitions 1-2.
 - Host was heavily loaded (load 78-120) for the whole run; absolute numbers are not representative of an idle host. Re-run on a quiet host before any approval.
 - Cancel/crash: one manual extension-free drill PASSED (kill -9, SIGTERM, resume on standard Pi; results/cancel-drill.txt). Not a live mission.
 - 24 concurrent no-op agents: 48/48 ok per arm; Pi-Bolt wall clearly lower, CPU ~10x lower (results/noop-c24.txt).
-- Not run: full Herdr mission with child agents and issue links, collaboration room with reconnect, long soak, gateway-side accounting parity, Autospec/Planotator/lineage gates under Pi-Bolt, crash recovery, extension-failure injection, macOS/beast/Apptainer hosts, OpenViking (not installed on bender), steady-state CPU/RSS after load, true cold start (page cache not dropped).
+- Not run: full Herdr mission with child agents and issue links, collaboration room with reconnect, long soak, gateway-side accounting rows (wire parity done), Autospec/Planotator/lineage gates under Pi-Bolt, crash recovery, extension-failure injection, macOS/beast/Apptainer hosts, OpenViking (not installed on bender), steady-state CPU/RSS after load, true cold start (page cache not dropped).
 - Concurrency (5, 12) used 3 repetitions; interval estimates are wide. Tools and extension-load reps (3) are below the spec's 10 because each extension-loaded run takes minutes on this host.
 - Bundled mode (`pi-bolt compile`) was attempted and is blocked; it is the one mode that could remove the extension-load penalty.
 - Single model; reasoning-heavy models and long contexts untested.
