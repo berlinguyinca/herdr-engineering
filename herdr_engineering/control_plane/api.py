@@ -243,6 +243,10 @@ class ControlPlaneServer:
                 # membership-scoped lineage reads (lineage-events.md, "Scope semantics"): the
                 # isolated collab-only process never sees fabric data, so it serves none
                 collab.graph_source = lambda: repo.graph
+                # External agents (T10) report lineage about themselves through the HCN route; the service
+                # builds the envelope, this only registers the room that enrollment bound it to.
+                self.ingest.reserved_node = collab.is_external_node
+                collab.lineage_sink = self._external_lineage
         self.host = host
         self.port = port
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
@@ -252,6 +256,14 @@ class ControlPlaneServer:
         self._httpd = None
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    def _external_lineage(self, envelope, principal):
+        """Ingest one envelope the HCN service built for an external agent. The principal's allowed room is
+        registered from the envelope's own room (which the service took from the enrollment), so the
+        existing per-principal scope check applies unchanged."""
+        self.ingest.key_scopes[principal["id"]] = {
+            "rooms": frozenset({envelope["room_id"]}), "missions": frozenset()}
+        return self.ingest.ingest(envelope, principal)
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError, UnsupportedError

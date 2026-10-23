@@ -45,6 +45,9 @@ class IngestService:
         # {principal_id: {"rooms": set, "missions": set}}. A key with no entry may write only
         # org/private scopes. "*" in a set is an explicit operator opt-in for every id (and for bare, id-less scopes).
         self.key_scopes = key_scopes if key_scopes is not None else {}
+        # T10: node ids inside an external agent's namespace belong to that agent alone. Set by the server
+        # to the HCN service's `is_external_node`; None = no external agents on this process.
+        self.reserved_node = None
 
     def _check_lineage_scope(self, env: dict) -> None:
         """Fail closed: a non-operator key may address a room or mission only if the operator listed it.
@@ -65,6 +68,17 @@ class IngestService:
         else:       # a mission is bound to the room that linked it: both must be addressed and allowed
             good = ok(env.get("room_id"), rooms) and ok(env.get("mission_id"), missions)
         if not good:
+            raise PermissionError("not permitted to modify this lineage object")
+
+    def _check_reserved_nodes(self, env: dict, event_type: str, payload: dict) -> None:
+        """Only an external agent itself (or an authenticated operator key) may write a node or edge
+        source inside that agent's namespace; anyone else is refused exactly like any lineage refusal."""
+        actor = env.get("actor") or {}
+        if self.reserved_node is None or actor.get("kind") == "external" or (
+                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
+            return
+        written = payload.get("from_id") if event_type.startswith("edge.") else payload.get("node_id")
+        if isinstance(written, str) and self.reserved_node(written):
             raise PermissionError("not permitted to modify this lineage object")
 
     def ingest(self, body: dict, principal: dict | None = None) -> dict:
@@ -106,6 +120,7 @@ class IngestService:
             raise ValueError("lineage events require schema_version 2")
         if env is not None and entity_type == "lineage":
             self._check_lineage_scope(env)
+            self._check_reserved_nodes(env, event_type, payload)
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type

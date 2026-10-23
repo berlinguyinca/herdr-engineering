@@ -116,6 +116,11 @@ export class CollabApi {
     const q = new URLSearchParams({ node_type: nodeType, room_id: room, limit: '500', ...(edgeType ? { edge_type: edgeType } : {}) });
     return this.call('GET', `/graph/nodes?${q}`);
   }
+  // External coworker / remote agents (T10). The invite code is returned once by inviteExternal.
+  externals(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/externals`); }
+  inviteExternal(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/invites`, body); }
+  revokeExternal(room, agentId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/${encodeURIComponent(agentId)}/revoke`, {}); }
+  revokeExternalInvite(room, inviteId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/invites/${encodeURIComponent(inviteId)}/revoke`, {}); }
   linkAgent(agentId, instanceId) { return this.call('POST', `/agents/${encodeURIComponent(agentId)}/link`, { instance_id: instanceId || null }); }
   createJoinToken(body) { return this.call('POST', '/agents/join-tokens', body); }
   joinTokens() { return this.call('GET', '/agents/join-tokens'); }

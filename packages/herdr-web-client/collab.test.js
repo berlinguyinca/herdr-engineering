@@ -97,3 +97,16 @@ test('renaming an agent posts the new name to the documented route', async () =>
   assert.deepEqual(calls[0].slice(0, 2), ['POST', '/api/v1/collab/agents/agent%201/rename']);
   assert.deepEqual(JSON.parse(calls[0][2]), { name: 'architect' });
 });
+
+test('remote-agent calls use the documented routes', async () => {
+  const calls = [];
+  const f = async (url, init) => { calls.push([init.method, url, init.body]); return { status: 200, ok: true, json: async () => ({}) }; };
+  const api = new CollabApi(() => ({ access: 'T' }), f);
+  await api.externals('r 1'); await api.inviteExternal('r1', { label: 'Dana', actions: ['read'] });
+  await api.revokeExternal('r1', 'agent_1'); await api.revokeExternalInvite('r1', 'collab_1');
+  assert.deepEqual(calls.map((c) => c.slice(0, 2)), [
+    ['GET', '/api/v1/collab/rooms/r%201/externals'], ['POST', '/api/v1/collab/rooms/r1/externals/invites'],
+    ['POST', '/api/v1/collab/rooms/r1/externals/agent_1/revoke'],
+    ['POST', '/api/v1/collab/rooms/r1/externals/invites/collab_1/revoke']]);
+  assert.deepEqual(JSON.parse(calls[1][2]), { label: 'Dana', actions: ['read'] });
+});
