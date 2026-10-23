@@ -2440,7 +2440,8 @@ def _cmd_cp_web(args) -> int:
             from .control_plane.collab import ApprovalPolicy
             approval = ApprovalPolicy(auto_groups=[args.collab_cognito_group],
                                       approver_groups=args.collab_approver_group)
-        collab = CollabService(auth, sink=sink, public_config=public, approval=approval)
+        collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
+                               summary_fix=getattr(args, "collab_summary_fix", None))
         if args.collab_only:
             collab.hydrate(sink.load())
     elif args.collab_users_file:
@@ -2531,6 +2532,8 @@ COLLAB_CONFIG_KEYS = {
     "open_signup": ("collab_open_signup", bool),
     "approver_groups": ("collab_approver_group", list),
     "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
+    # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
+    "summary_fix": ("collab_summary_fix", dict),
 }
 
 
@@ -2546,6 +2549,13 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
+        if kind is dict:
+            from .control_plane.collab import summary_fix_config
+            try:
+                setattr(args, dest, summary_fix_config(value))
+            except ValueError as exc:
+                raise SystemExit(f"fleet config {exc}") from None
+            continue
         if kind is list:
             if isinstance(value, str):
                 value = [value]
