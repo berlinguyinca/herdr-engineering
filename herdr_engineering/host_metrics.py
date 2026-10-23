@@ -29,11 +29,14 @@ TOP_N = 5
 _MIB = 1024 ** 2
 
 
-def _run(cmd: list[str], timeout: float = 5.0) -> str | None:
-    """Run ``cmd``; stdout on success, ``None`` on any failure or timeout."""
+def _run(cmd: list[str], timeout: float = 5.0,
+         env: dict[str, str] | None = None) -> str | None:
+    """Run ``cmd``; stdout on success, ``None`` on any failure or timeout.
+
+    ``env`` replaces the child's environment (``None`` inherits ours)."""
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              check=True).stdout
+                              check=True, env=env).stdout
     except Exception:  # noqa: BLE001 - missing tool, timeout, non-zero exit
         return None
 
@@ -423,8 +426,13 @@ class HostSampler:
 
 # --- slow report: updates, failed units, versions ---------------------------------
 
-MAX_PACKAGES = 50
-_PKG_TIMEOUT = 30.0  # `apt-get -s upgrade` / `brew outdated` read the whole dpkg/apt cache; can be slow
+MAX_PACKAGES = 50       # also caps failed_units
+MAX_PI_EXTENSIONS = 50
+_NAME_MAX = 64          # package / unit / extension names
+_VER_MAX = 64           # version strings
+# `apt-get -s upgrade` / `brew outdated` read the whole package cache: 20 s on an
+# idle box, more under load. They run on the agent's own slow thread.
+_PKG_TIMEOUT = 120.0
 _REBOOT_REQUIRED = "/var/run/reboot-required"
 _PI_EXT_DIR = os.path.expanduser("~/.pi/agent/extensions")
 _SUMMARY_RE = re.compile(r"^\d+ upgraded, \d+ newly installed", re.M)
@@ -433,9 +441,18 @@ _BREW_PATHS = ("/opt/homebrew/bin/brew", "/usr/local/bin/brew")  # launchd PATH 
 _INST_RE = re.compile(r"^Inst (\S+)(?: \[([^\]]*)\])? \((\S+) ([^)]*)\)")
 
 
+def _trunc(v, n):
+    return v[:n] if isinstance(v, str) else v
+
+
 def _updates(manager, outdated=None, security=None, packages=None) -> dict:
+    # Every field is bounded so the slow report stays under the control
+    # plane's 16 KiB state limit (a rejected report is dropped by the agent).
     return {"manager": manager, "outdated": outdated, "security": security,
-            "packages": (packages or [])[:MAX_PACKAGES]}
+            "packages": [{"name": _trunc(p.get("name"), _NAME_MAX),
+                          "from": _trunc(p.get("from"), _VER_MAX),
+                          "to": _trunc(p.get("to"), _VER_MAX)}
+                         for p in (packages or [])[:MAX_PACKAGES]]}
 
 
 def parse_apt_simulate(text: str) -> dict:
@@ -474,8 +491,8 @@ def _failed_units() -> list[str]:
     for line in (out or "").splitlines():
         f = re.sub(r"^[\s\u25cf*]+", "", line).split()  # drop the status bullet
         if f:
-            units.append(f[0])
-    return units
+            units.append(f[0][:_NAME_MAX])
+    return units[:MAX_PACKAGES]
 
 
 def _find_brew() -> str | None:
@@ -492,7 +509,11 @@ def read_updates() -> dict:
     try:
         if linux and shutil.which("apt-get"):
             res = _updates("apt")
-            out = _run(["apt-get", "-s", "upgrade"], timeout=_PKG_TIMEOUT)
+            # C locale for this one command so the English summary line that
+            # parse_apt_simulate looks for is printed on any host language
+            # (subprocess locale, not configuration).
+            out = _run(["apt-get", "-s", "upgrade"], timeout=_PKG_TIMEOUT,
+                       env={**os.environ, "LC_ALL": "C"})
             if out is not None:
                 res = parse_apt_simulate(out)
         elif platform.system() == "Darwin" and _find_brew():
@@ -546,10 +567,11 @@ def _version(line: str | None) -> str | None:
 
 def _pi_extensions() -> dict:
     """name -> version. A directory extension reports its package.json version;
-    a single-file extension (e.g. build-gate.ts) has no manifest, so ``None``."""
+    a single-file extension (e.g. build-gate.ts) has no manifest, so ``None``.
+    At most ``MAX_PI_EXTENSIONS`` entries; names and versions are truncated."""
     out = {}
     try:
-        entries = sorted(Path(_PI_EXT_DIR).iterdir())
+        entries = sorted(Path(_PI_EXT_DIR).iterdir())[:MAX_PI_EXTENSIONS]
     except OSError:
         return out
     for e in entries:
@@ -559,7 +581,7 @@ def _pi_extensions() -> dict:
                 ver = json.loads((e / "package.json").read_text()).get("version")
             except (OSError, ValueError, AttributeError):
                 ver = None
-        out[e.name] = ver
+        out[e.name[:_NAME_MAX]] = None if ver is None else str(ver)[:_VER_MAX]
     return out
 
 

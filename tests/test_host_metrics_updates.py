@@ -20,7 +20,7 @@ def _env(monkeypatch, system, tools, outputs, flag=None):
     monkeypatch.setattr(shutil, "which", lambda t: f"/usr/bin/{t}" if t in tools else None)
     monkeypatch.setattr(host_metrics, "_REBOOT_REQUIRED", str(flag) if flag else "/nonexistent")
     monkeypatch.setattr(host_metrics, "_run",
-                        lambda cmd, timeout=5.0: outputs.get(os.path.basename(cmd[0])))
+                        lambda cmd, timeout=5.0, env=None: outputs.get(os.path.basename(cmd[0])))
 
 
 def test_parse_apt_counts_security():
@@ -75,9 +75,9 @@ def test_apt_uses_longer_timeout(monkeypatch):
     seen = {}
     _env(monkeypatch, "Linux", {"apt-get"}, {})
     monkeypatch.setattr(host_metrics, "_run",
-                        lambda cmd, timeout=5.0: seen.setdefault(cmd[0], timeout) and None)
+                        lambda cmd, timeout=5.0, env=None: seen.setdefault(cmd[0], timeout) and None)
     read_updates()
-    assert seen["apt-get"] >= 30
+    assert seen["apt-get"] >= 120
 
 
 def test_read_updates_macos_brew(monkeypatch):
@@ -90,7 +90,7 @@ def test_read_updates_macos_brew(monkeypatch):
 def test_versions_missing_tool_is_none(monkeypatch, tmp_path):
     monkeypatch.setattr(shutil, "which", lambda t: None)
     monkeypatch.setattr(host_metrics, "_TOOL_DIRS", (str(tmp_path / "none"),))
-    monkeypatch.setattr(host_metrics, "_run", lambda cmd, timeout=5.0: None)
+    monkeypatch.setattr(host_metrics, "_run", lambda cmd, timeout=5.0, env=None: None)
     monkeypatch.setattr(host_metrics, "_PI_EXT_DIR", str(tmp_path / "nope"))
     v = read_versions()
     assert v["pi"] is None and v["autospec"] is None and v["tailscale"] is None
@@ -109,7 +109,7 @@ def test_versions_parsed(monkeypatch, tmp_path):
            "tailscale": "1.76.0\n  tailscale commit: abc\n"}
     monkeypatch.setattr(shutil, "which", lambda t: f"/bin/{t}")
     monkeypatch.setattr(host_metrics, "_run",
-                        lambda cmd, timeout=5.0: out.get(os.path.basename(cmd[0])))
+                        lambda cmd, timeout=5.0, env=None: out.get(os.path.basename(cmd[0])))
     v = read_versions()
     assert v["pi"] == "0.9.1" and v["tailscale"] == "1.76.0"
     assert v["autospec"] == "2.0"
@@ -187,3 +187,76 @@ def test_versions_find_tools_in_local_bin_without_path(monkeypatch, tmp_path):
     monkeypatch.setattr(host_metrics, "_PI_EXT_DIR", str(tmp_path / "nope"))
     v = read_versions()
     assert v["herdr"] == "0.9.1" and v["pi"] == "1.4.0" and v["autospec"] == "2.3.1"
+
+
+def test_package_scan_timeout_is_two_minutes():
+    assert host_metrics._PKG_TIMEOUT == 120.0
+
+
+def test_apt_runs_with_c_locale_keeping_path(monkeypatch):
+    seen = {}
+    _env(monkeypatch, "Linux", {"apt-get"}, {})
+
+    def fake(cmd, timeout=5.0, env=None):
+        seen[os.path.basename(cmd[0])] = env
+    monkeypatch.setattr(host_metrics, "_run", fake)
+    monkeypatch.setenv("PATH", "/custom/bin:/usr/bin")
+    read_updates()
+    env = seen["apt-get"]
+    assert env["LC_ALL"] == "C"
+    assert env["PATH"] == "/custom/bin:/usr/bin"  # the rest of the environment is kept
+
+
+def test_run_passes_env_to_subprocess(monkeypatch):
+    import subprocess
+    got = {}
+
+    def fake_run(cmd, **kw):
+        got.update(kw)
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert host_metrics._run(["x"], env={"LC_ALL": "C"}) == "ok"
+    assert got["env"] == {"LC_ALL": "C"}
+
+
+def test_failed_units_are_capped(monkeypatch):
+    out = "".join(f"u{i}.service loaded failed failed U{i}\n" for i in range(200))
+    _env(monkeypatch, "Linux", {"systemctl"}, {"systemctl": out})
+    units = read_updates()["failed_units"]
+    assert len(units) == host_metrics.MAX_PACKAGES
+    assert units[0] == "u0.service"
+
+
+def test_pi_extensions_are_capped_and_names_truncated(monkeypatch, tmp_path):
+    ext = tmp_path / "ext"
+    ext.mkdir()
+    for i in range(80):
+        (ext / f"e{i:03d}.ts").write_text("")
+    long = ext / ("x" * 200)
+    long.mkdir()
+    (long / "package.json").write_text('{"version": "' + "9" * 300 + '"}')
+    monkeypatch.setattr(host_metrics, "_PI_EXT_DIR", str(ext))
+    got = host_metrics._pi_extensions()
+    assert len(got) == host_metrics.MAX_PI_EXTENSIONS == 50
+    assert all(len(k) <= 64 for k in got)
+    assert all(v is None or len(v) <= 64 for v in got.values())
+
+
+def test_worst_case_slow_payload_fits_the_control_plane_limit(monkeypatch, tmp_path):
+    """Every slow field is bounded so ``clean_state`` (16 KiB) never rejects it."""
+    import json
+
+    from herdr_engineering.control_plane.host_metrics_store import MAX_STATE_BYTES
+    long = "p" * 200
+    apt = "".join(f"Inst {long}{i} [{long}] ({long} x/jammy-security [amd64])\n"
+                  for i in range(300))
+    units = "".join(f"{long}{i}.service loaded failed failed X\n" for i in range(300))
+    _env(monkeypatch, "Linux", {"apt-get", "systemctl"}, {"apt-get": apt, "systemctl": units})
+    u = read_updates()
+    assert len(json.dumps(u)) <= MAX_STATE_BYTES
+    ext = tmp_path / "ext"
+    ext.mkdir()
+    for i in range(300):
+        (ext / f"{long}{i}").mkdir()
+    monkeypatch.setattr(host_metrics, "_PI_EXT_DIR", str(ext))
+    assert len(json.dumps(host_metrics._pi_extensions())) <= MAX_STATE_BYTES

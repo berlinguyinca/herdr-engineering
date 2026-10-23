@@ -691,6 +691,42 @@ class AgentForwarder:
 # The agent
 # ---------------------------------------------------------------------------
 
+_SLOW_RETRY_S = (300.0, 900.0)  # then hourly
+
+
+def slow_incomplete(data: dict[str, Any] | None) -> bool:
+    """True when a slow read failed, or a known package manager gave no count."""
+    if not isinstance(data, dict):
+        return True
+    u = data.get("updates")
+    return isinstance(u, dict) and bool(u.get("manager")) and u.get("outdated") is None
+
+
+def slow_retry_delay(failures: int, slow_interval: float) -> float:
+    """Seconds until the next slow read after ``failures`` incomplete reads in a row."""
+    if failures <= 0:
+        return slow_interval
+    step = _SLOW_RETRY_S[failures - 1] if failures <= len(_SLOW_RETRY_S) else 3600.0
+    return min(step, slow_interval)
+
+
+def build_host_report(machine: str, host_name: str, tailnet_ip: str | None,
+                      telemetry: dict[str, Any], slow: dict[str, Any] | None) -> dict[str, Any]:
+    """The ``host.heartbeat`` ingest envelope: fast sample plus optional slow data."""
+    payload: dict[str, Any] = {
+        "host_name": host_name,
+        "tailnet_ip": tailnet_ip or None,
+        "cpu": telemetry.get("cpu"),
+        "mem": telemetry.get("mem"),
+        "disk": telemetry.get("disk"),
+        "telemetry": telemetry,
+    }
+    if slow:
+        payload.update(slow)
+    return {"source": "fabric-agent", "entity_type": "host", "entity_id": machine,
+            "event_type": "host.heartbeat", "payload": payload}
+
+
 @dataclass
 class AgentConfig:
     tailnet_ip: str
@@ -756,6 +792,9 @@ class FabricAgent:
         self._read_slow = lambda: {"updates": read_updates(), "versions": read_versions()}
         self._slow_data: dict[str, Any] | None = None
         self._slow_sent: float | None = None
+        # The slow-data object last posted (or dropped after a 4xx): a new read
+        # is due at once, the same one again only every host_slow_interval.
+        self._slow_handled: dict[str, Any] | None = None
         # Restore forwarders for loopback-only services survived a restart.
         for port_s, entry in self._store.items():
             if entry.get("fwd_port"):
@@ -1210,38 +1249,33 @@ class FabricAgent:
         return None
 
     def _report_host(self, telemetry: dict[str, Any], include_slow: bool,
-                     *, timeout: float = 2.0) -> bool:
-        """Best-effort host heartbeat to the control plane (never raises)."""
+                     *, timeout: float = 2.0) -> int | None:
+        """Best-effort host heartbeat to the control plane (never raises).
+
+        Returns the HTTP status, or ``None`` when nothing was posted or the
+        control plane could not be reached."""
         if not self.cfg.control_plane_url:
-            return False
+            return None
         try:
-            payload: dict[str, Any] = {
-                "host_name": self._machine,
-                "tailnet_ip": self.cfg.tailnet_ip or None,
-                "cpu": telemetry.get("cpu"),
-                "mem": telemetry.get("mem"),
-                "disk": telemetry.get("disk"),
-                "telemetry": telemetry,
-            }
-            if include_slow and self._slow_data:
-                payload.update(self._slow_data)
-            body = {"source": "fabric-agent", "entity_type": "host",
-                    "entity_id": self._machine, "event_type": "host.heartbeat",
-                    "payload": payload}
+            body = build_host_report(
+                self._machine, self._machine, self.cfg.tailnet_ip, telemetry,
+                self._slow_data if include_slow else None)
             url = f"{self.cfg.control_plane_url.rstrip('/')}/api/v1/ingest"
             req = urllib.request.Request(
                 url, data=json.dumps(body, default=str).encode(),
                 headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=timeout):
-                pass
-            return True
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return int(resp.status)
+        except urllib.error.HTTPError as exc:
+            log.warning("host telemetry report rejected: HTTP %s", exc.code)
+            return int(exc.code)
         except Exception as exc:  # control plane down: never break the agent
             log.warning("host telemetry report failed: %s", exc)
-            return False
+            return None
 
     def _host_tick(self, now: float | None = None) -> bool:
-        """One fast sample + post. Slow data rides along on the first post once
-        available, then every ``host_slow_interval``. Never raises."""
+        """One fast sample + post. Slow data rides along when it is new, and
+        again every ``host_slow_interval``. Never raises."""
         if not self.cfg.control_plane_url:
             return False
         now = time.monotonic() if now is None else now
@@ -1250,12 +1284,23 @@ class FabricAgent:
         except Exception as exc:  # noqa: BLE001
             log.warning("host sample failed: %s", exc)
             return False
-        slow_due = (self._slow_data is not None and (
-            self._slow_sent is None
-            or now - self._slow_sent >= self.cfg.host_slow_interval))
-        ok = self._report_host(telemetry, slow_due)
-        if ok and slow_due:
+        slow = self._slow_data
+        slow_due = slow is not None and (
+            slow is not self._slow_handled
+            or self._slow_sent is None
+            or now - self._slow_sent >= self.cfg.host_slow_interval)
+        status = self._report_host(telemetry, slow_due)
+        ok = status is not None and 200 <= status < 300
+        if slow_due and (ok or (status is not None and 400 <= status < 500)):
+            if not ok:
+                # The control plane refused this payload (e.g. an oversize
+                # ``updates``). Resending it would fail every heartbeat and
+                # freeze last_seen, so drop this slow set; the next tick posts
+                # the fast sample alone and the next slow read tries again.
+                log.warning("control plane rejected host slow data (HTTP %s); "
+                            "dropping it until the next slow read", status)
             self._slow_sent = now
+            self._slow_handled = slow
         return ok
 
     def _host_loop(self, stop: threading.Event) -> None:
@@ -1267,14 +1312,20 @@ class FabricAgent:
             stop.wait(self.cfg.host_report_interval)
 
     def _slow_loop(self, stop: threading.Event) -> None:
-        """Own thread: read_updates/read_versions may block ~30 s each."""
+        """Own thread: read_updates/read_versions may block up to minutes.
+
+        A read whose package count came back unknown (scan timed out or failed)
+        is retried after 5 min, then 15 min, then hourly."""
+        failures = 0
         while not stop.is_set():
             if self.cfg.control_plane_url:
+                data = None
                 try:
-                    self._slow_data = self._read_slow()
+                    data = self._slow_data = self._read_slow()
                 except Exception as exc:  # noqa: BLE001
                     log.warning("host slow telemetry failed: %s", exc)
-                stop.wait(self.cfg.host_slow_interval)
+                failures = failures + 1 if slow_incomplete(data) else 0
+                stop.wait(slow_retry_delay(failures, self.cfg.host_slow_interval))
             else:
                 stop.wait(min(self.cfg.host_report_interval, 5.0))
 

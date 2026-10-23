@@ -8,15 +8,16 @@ from herdr_engineering.fabric_agent import AgentConfig, FabricAgent
 
 
 class _Ingest:
-    def __init__(self):
+    def __init__(self, status=lambda body: 200):
         self.posts = []
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 n = int(self.headers.get("Content-Length", 0))
-                outer.posts.append((self.path, json.loads(self.rfile.read(n))))
-                self.send_response(200)
+                body = json.loads(self.rfile.read(n))
+                outer.posts.append((self.path, body))
+                self.send_response(status(body))
                 self.end_headers()
 
             def log_message(self, *a):
@@ -38,9 +39,9 @@ def _agent(tmp_path, url, tailnet_ip="100.1.2.3", **kw):
     cfg = AgentConfig(tailnet_ip=tailnet_ip, store_path=tmp_path / "s.json",
                       control_plane_url=url, **kw)
     a = FabricAgent(_Client(), cfg)
+    # The real HostSampler.sample() shape: flat numeric keys.
     a._sampler = type("S", (), {"sample": lambda self: {
-        "cpu": {"pct": 5.0}, "mem": {"pct": 40.0}, "disk": {"pct": 10.0},
-        "uptime": 1}})()
+        "cpu": 5.0, "mem": 40.0, "disk": 10.0, "uptime_s": 1, "agents_running": 2}})()
     a._read_slow = lambda: {"updates": {"manager": "apt"}, "versions": {"git": "2"}}
     return a
 
@@ -59,9 +60,10 @@ def test_agent_posts_host_event_with_telemetry(tmp_path):
         assert ev["event_type"] == "host.heartbeat"
         assert ev["entity_id"] == a._machine
         p = ev["payload"]
-        assert p["cpu"] == {"pct": 5.0} and p["mem"] == {"pct": 40.0}
-        assert p["disk"] == {"pct": 10.0}
-        assert p["telemetry"]["uptime"] == 1
+        assert p["cpu"] == 5.0 and p["mem"] == 40.0
+        assert p["disk"] == 10.0
+        assert p["telemetry"]["uptime_s"] == 1
+        assert p["telemetry"]["agents_running"] == 2
         assert p["host_name"] == a._machine and p["tailnet_ip"] == "100.1.2.3"
         assert "updates" not in p
     finally:
@@ -92,7 +94,7 @@ def test_control_plane_down_does_not_raise(tmp_path):
     port = s.getsockname()[1]
     s.close()
     a = _agent(tmp_path, f"http://127.0.0.1:{port}")
-    assert a._report_host({"cpu": {}}, True) is False
+    assert a._report_host({"cpu": 1.0}, True) is None
     assert a._host_tick(0.0) is False
 
 
@@ -110,7 +112,7 @@ def test_sampler_error_does_not_raise(tmp_path):
 def test_no_control_plane_url_posts_nothing(tmp_path):
     a = _agent(tmp_path, "")
     assert a._host_tick(0.0) is False
-    assert a._report_host({"cpu": {}}, False) is False
+    assert a._report_host({"cpu": 1.0}, False) is None
 
 
 def test_tailnet_ip_none_is_sent_as_null_not_string(tmp_path):
@@ -144,3 +146,77 @@ def test_threads_report_and_stop_with_run(tmp_path):
         assert any("updates" in b["payload"] for b in _host_posts(srv))
     finally:
         srv.close()
+
+
+def test_rejected_slow_payload_is_dropped_so_heartbeats_recover(tmp_path):
+    """A 4xx on a post carrying slow data (e.g. oversize ``updates``) must not
+    poison every later heartbeat: the slow set is dropped and the next tick
+    posts the fast sample alone."""
+    srv = _Ingest(status=lambda body: 400 if "updates" in body["payload"] else 200)
+    try:
+        a = _agent(tmp_path, srv.url, host_slow_interval=3600.0)
+        a._slow_data = {"updates": {"manager": "apt", "packages": ["x" * 20000]},
+                        "versions": {}}
+        assert a._host_tick(0.0) is False
+        assert a._host_tick(30.0) is True
+        assert a._host_tick(60.0) is True
+        has = ["updates" in b["payload"] for b in _host_posts(srv)]
+        assert has == [True, False, False]
+        # a fresh slow read is sent again (not held back for the hour)
+        a._slow_data = {"updates": {"manager": "apt", "outdated": 0}, "versions": {}}
+        assert a._host_tick(90.0) is False  # this fake server still rejects it
+        assert ["updates" in b["payload"] for b in _host_posts(srv)][3] is True
+    finally:
+        srv.close()
+
+
+def test_new_slow_data_is_sent_without_waiting_for_the_hour(tmp_path):
+    srv = _Ingest()
+    try:
+        a = _agent(tmp_path, srv.url, host_slow_interval=3600.0)
+        a._slow_data = {"updates": {"manager": "apt", "outdated": None}, "versions": {}}
+        a._host_tick(0.0)
+        a._host_tick(30.0)
+        a._slow_data = {"updates": {"manager": "apt", "outdated": 3}, "versions": {}}  # 5-min retry
+        a._host_tick(330.0)
+        has = ["updates" in b["payload"] for b in _host_posts(srv)]
+        assert has == [True, False, True]
+        assert _host_posts(srv)[2]["payload"]["updates"]["outdated"] == 3
+    finally:
+        srv.close()
+
+
+def test_slow_retry_delay_backs_off_while_updates_are_unknown():
+    from herdr_engineering.fabric_agent import slow_retry_delay
+    assert slow_retry_delay(0, 3600.0) == 3600.0
+    assert slow_retry_delay(1, 3600.0) == 300.0
+    assert slow_retry_delay(2, 3600.0) == 900.0
+    assert slow_retry_delay(3, 3600.0) == 3600.0
+    assert slow_retry_delay(9, 3600.0) == 3600.0
+    assert slow_retry_delay(1, 60.0) == 60.0  # never slower than the normal cadence
+
+
+def test_slow_incomplete_only_when_manager_known_and_count_unknown():
+    from herdr_engineering.fabric_agent import slow_incomplete
+    assert slow_incomplete(None) is True
+    assert slow_incomplete({"updates": {"manager": "apt", "outdated": None}}) is True
+    assert slow_incomplete({"updates": {"manager": "apt", "outdated": 0}}) is False
+    assert slow_incomplete({"updates": {"manager": None, "outdated": None}}) is False
+
+
+def test_slow_loop_retries_after_five_minutes_when_outdated_unknown(tmp_path):
+    a = _agent(tmp_path, "http://127.0.0.1:9")
+    reads = iter([{"updates": {"manager": "apt", "outdated": None}, "versions": {}},
+                  {"updates": {"manager": "apt", "outdated": 1}, "versions": {}}])
+    a._read_slow = lambda: next(reads)
+    waits = []
+
+    class Stop:
+        def is_set(self):
+            return len(waits) >= 2
+
+        def wait(self, t):
+            waits.append(t)
+
+    a._slow_loop(Stop())
+    assert waits == [300.0, 3600.0]
