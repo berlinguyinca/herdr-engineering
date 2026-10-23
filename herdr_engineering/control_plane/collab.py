@@ -1788,6 +1788,21 @@ class CollabService:
                 hosts.update(FAMILY_ENDPOINTS.get(fam, ()))
             return sorted(hosts)
 
+    def egress_entries(self, room_id: str) -> list[dict]:
+        """The allowlist with where each entry comes from: "permanent" (the profile; Remove takes it out),
+        "approved" (an unexpired approval; Remove ends it) or "model" (a family endpoint; it cannot be removed)."""
+        with self._lock:
+            profile = self._profile(room_id)
+            kinds: dict[str, str] = {}
+            for fam in profile["allowed_families"]:
+                for hp in FAMILY_ENDPOINTS.get(fam, ()):
+                    kinds[hp] = "model"
+            for hp in self._egress_live(room_id, self._now()):
+                kinds[hp] = "approved"
+            for hp in profile["permanent_hosts"]:
+                kinds[hp] = "permanent"
+            return [{"host_port": hp, "kind": kinds[hp]} for hp in sorted(kinds)]
+
     def request_egress(self, pr: Principal, room_id: str, agent_id: str, host: Any, port: Any) -> dict:
         self._require_operator(pr)
         hp = self._egress_host_port(host, port)
@@ -3099,7 +3114,8 @@ class CollabService:
                         with self._lock:
                             if parts[2] not in self._rooms:
                                 raise CollabError(404, "not found")
-                        return 200, {"allowlist": self.egress_allowlist(parts[2])}
+                        return 200, {"allowlist": self.egress_allowlist(parts[2]),
+                                     "entries": self.egress_entries(parts[2])}
                     if parts == ["fleet", "helpers"]:
                         return 200, self.list_helpers_for_runner(pr)
                     if parts == ["fleet", "spawns"]:
