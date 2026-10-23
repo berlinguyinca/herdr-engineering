@@ -1,0 +1,170 @@
+# Vendored, unmodified copy of autospec-design rules.yaml (berlinguyinca/autospec-design) pinned to commit 167ed87abfac8bcda2044927e4d4077373b90db8.
+# Re-vendor by copying the file again and updating this SHA; autospec-design-gates.sh reads it through .autospec/design-gates.yml.
+schema: 1
+pack: autospec-design
+description: >-
+  Machine-checkable design, motion, and device rules. Consumed by
+  scripts/autospec-design-gates.sh in autospec, which maps `check: auto` rule ids to
+  local commands and turns `check: vlm` and `check: review` rules into the critic
+  checklist for the visual-fidelity pass.
+
+# check:
+#   auto   — a command decides it; deterministic and blocking
+#   vlm    — needs a vision judgment against a rendered screenshot; advisory, gate on
+#            regression rather than absolute score, because vision judgments are noisy
+#   review — needs a human; cannot be automated away
+#
+# implements: the autospec rule id that already enforces this, where one exists.
+
+rules:
+  # ── tokens ────────────────────────────────────────────────────────────────────
+  - id: design.tokens.no-raw-color
+    title: Colors come from tokens, not raw hex
+    severity: blocker
+    check: auto
+    implements: UI_RAW_HEX
+
+  - id: design.tokens.spacing-on-scale
+    title: Spacing values sit on the declared scale
+    severity: major
+    check: auto
+    implements: UI_OFF_GRID_SPACING
+
+  - id: design.tokens.zindex-on-scale
+    title: z-index values come from the declared scale
+    severity: major
+    check: auto
+    implements: UI_AD_HOC_ZINDEX
+
+  - id: design.tokens.font-from-tokens
+    title: font-family references a token, not a generic stack
+    severity: major
+    check: auto
+    implements: UI_BANNED_FONT
+
+  # ── motion ────────────────────────────────────────────────────────────────────
+  - id: motion.reduced-motion-fallback
+    title: Declared motion has a prefers-reduced-motion fallback
+    severity: blocker
+    check: auto
+    implements: UI_NO_REDUCED_MOTION
+    wcag: ["2.3.3"]
+
+  - id: motion.no-unstoppable-animation
+    title: Animation over five seconds has a pause, stop, or hide control
+    severity: blocker
+    check: auto
+    implements: UI_INFINITE_ANIMATION
+    wcag: ["2.2.2"]
+
+  - id: motion.duration-from-scale
+    title: Durations and easings reference the motion scale
+    severity: major
+    check: auto
+    implements: UI_RAW_DURATION
+    note: >-
+      Needs a Motion section in the adopted DESIGN.md to check against. Skipped, not
+      passed, when the design language declares no duration scale.
+
+  - id: motion.happens-by-default
+    title: Motion actually occurs when reduced-motion is not requested
+    severity: major
+    check: auto
+    note: >-
+      The only rule in this pack that fails an inert UI rather than a wrong one. Every
+      other check — lint, fidelity, axe, the aesthetic rubric — passes a static,
+      animation-free page. Do not drop it as flaky; it is the anti-blandness gate.
+
+  - id: motion.no-flash
+    title: Nothing flashes more than three times per second
+    severity: blocker
+    check: auto
+    wcag: ["2.3.1"]
+
+  - id: motion.coherent
+    title: Motion reads as one system across screens
+    severity: minor
+    check: vlm
+
+  # ── device and input ──────────────────────────────────────────────────────────
+  - id: device.zoom-not-blocked
+    title: The viewport permits zoom
+    severity: blocker
+    check: auto
+    implements: UI_FIXED_VIEWPORT
+    wcag: ["1.4.4"]
+
+  - id: device.hover-has-equivalent
+    title: Every hover affordance has a focus and touch equivalent
+    severity: blocker
+    check: auto
+    implements: UI_HOVER_ONLY_AFFORDANCE
+    wcag: ["2.1.1"]
+
+  - id: device.reflow-at-320
+    title: Content reflows at 320 CSS px with no two-dimensional scrolling
+    severity: blocker
+    check: auto
+    wcag: ["1.4.10"]
+
+  - id: device.target-size
+    title: Touch targets meet the minimum size
+    severity: major
+    check: auto
+    wcag: ["2.5.8"]
+
+  - id: device.safe-area
+    title: Fixed and sticky elements respect safe-area insets
+    severity: major
+    check: vlm
+
+  - id: device.orientation
+    title: Rotation does not lose content or function
+    severity: major
+    check: auto
+    wcag: ["1.3.4"]
+
+  # ── composition, judged not computed ──────────────────────────────────────────
+  - id: composition.hierarchy
+    title: Visual hierarchy leads the eye to the primary action
+    severity: minor
+    check: vlm
+
+  - id: composition.states-complete
+    title: Default, hover, focus, loading, empty, error, and disabled all exist
+    severity: major
+    check: vlm
+
+  - id: composition.density
+    title: Density stays readable and touch-usable
+    severity: minor
+    check: vlm
+
+  # ── human review only ─────────────────────────────────────────────────────────
+  - id: a11y.alt-text-meaningful
+    title: Alternative text conveys the same information as the image
+    severity: blocker
+    check: review
+    wcag: ["1.1.1"]
+
+  - id: a11y.link-text-meaningful
+    title: Link text describes its destination out of context
+    severity: major
+    check: review
+    wcag: ["2.4.4"]
+
+  - id: a11y.reading-order
+    title: Reading and focus order match the visual order
+    severity: blocker
+    check: review
+    wcag: ["1.3.2", "2.4.3"]
+
+quality_gates:
+  - id: gate.no-blocker-auto-failures
+    description: >-
+      No rule with blocker severity and `check: auto` may fail.
+  - id: gate.review-not-auto-merged
+    description: >-
+      A `check: review` finding may never be recorded as auto-merged. Passing the
+      automated subset is necessary but not sufficient for WCAG 2.2 AA conformance —
+      automated engines decide only a minority of the AA success criteria.

@@ -41,3 +41,6 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
+
+# autospec / UI gate run output (never committed)
+.autospec/reports/
