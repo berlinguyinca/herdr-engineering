@@ -84,6 +84,10 @@ class IngestService:
             if any(isinstance(e, str) and self.service_node(e) for e in ends):
                 raise PermissionError("not permitted to modify this lineage object")
         if self.reserved_node is None or actor.get("kind") == "external" or (
+                # T14: the HCN service joins two nodes for a person; the edge is its own instance (writer =
+                # the room's service principal) and adds nothing to the endpoint's own namespace
+                actor.get("kind") == "collab" and event_type.startswith("edge.")
+                and payload.get("edge_type") == "cross_link") or (
                 actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
             return
         written = payload.get("from_id") if event_type.startswith("edge.") else payload.get("node_id")

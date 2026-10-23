@@ -585,3 +585,54 @@ def test_steering_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
     with pytest.raises(SystemExit):
         cli._apply_collab_config(argparse.Namespace(), {"collab": {"steering": {"kill_switch": "no"}}})
     assert "steering" in fcc.COLLAB_KEYS
+
+
+# ------------------------------------------------- T14 contextual chat / consultation / links (YAML only, default off)
+def test_contextual_settings_are_yaml_only_validated_and_off_by_default(tmp_path, monkeypatch, old_env):
+    import argparse
+
+    import herdr_engineering.control_plane.collab_cognito as cc
+    from herdr_engineering.control_plane.collab_context import normalize_contextual
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    assert "contextual" in fcc.COLLAB_KEYS and "contextual" in cli.COLLAB_CONFIG_KEYS
+    assert normalize_contextual(None)["enabled"] is False and normalize_contextual(None)["kill_switch"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, contextual={"enabled": True, "consultation": False}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["contextual"]["consultation"] is False
+    central.unlink()
+    for bad in ({"enabled": "yes"}, {"shell": True}, {"max_refs_per_read": 0}, "on"):
+        central = make_file(tmp_path, collab=dict(COLLAB, contextual=bad))
+        with pytest.raises(fcc.FleetConfigError, match="contextual"):
+            fcc.collab_values(fcc.load_fleet_config(central))
+        central.unlink()
+    args = argparse.Namespace()
+    cli._apply_collab_config(args, {"collab": {"contextual": {"enabled": True}}})
+    assert args.collab_contextual == {"enabled": True}
+    with pytest.raises(SystemExit):
+        cli._apply_collab_config(argparse.Namespace(), {"collab": {"contextual": {"kill_switch": "no"}}})
+    # the collab-only server: absent = off, set = on, and the section is re-read per request (hot kill switch)
+    _, off = _collab_slice(tmp_path)
+    svc_off = _run_web(monkeypatch, off, **_collab_only_args(tmp_path))["server_kw"]["collab"]
+    assert svc_off.contextual["enabled"] is False and svc_off.ctx_cfg()["enabled"] is False
+    d = tmp_path / "on"
+    d.mkdir()
+    _, on = _collab_slice(d, dict(COLLAB, contextual={"enabled": True}))
+    svc_on = _run_web(monkeypatch, on, **_collab_only_args(d))["server_kw"]["collab"]
+    assert svc_on.contextual["enabled"] is True and svc_on.ctx_cfg()["enabled"] is True      # a restart picks up an edit here
+
+
+def test_contextual_settings_reach_the_combined_server_too(tmp_path, monkeypatch, old_env):
+    import json as _json
+    users = tmp_path / "users.json"
+    users.write_text(_json.dumps({"alice": "0" * 64}))
+    for name, collab, want in (("unset", None, False), ("off", {"contextual": {"enabled": False}}, False),
+                               ("on", {"contextual": {"enabled": True}}, True)):
+        d = tmp_path / name
+        d.mkdir()
+        path = make_file(d, pg_dsn="", **({"collab": collab} if collab else {}))
+        seen = _run_web(monkeypatch, path, collab_users_file=str(users))
+        assert seen["server_kw"]["collab"].ctx_cfg()["enabled"] is want, name     # re-read from the YAML on every request
+    d = tmp_path / "typo"
+    d.mkdir()
+    bad = _run_web(monkeypatch, make_file(d, pg_dsn="", collab={"contextual": {"enabled": "true"}}), collab_users_file=str(users))
+    cfg = bad["server_kw"]["collab"].ctx_cfg()
+    assert cfg["enabled"] is False and cfg["kill_switch"] is True                  # an invalid section fails CLOSED

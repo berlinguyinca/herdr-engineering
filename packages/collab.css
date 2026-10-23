@@ -348,3 +348,15 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .wb-radio { display: block; padding: 2px 0; }
 .wb-confirm { border: 2px solid currentColor; padding: 8px; }
 @media (forced-colors: active) { .wb-confirm, .wb-fieldset { border-color: CanvasText; } }
+
+/* T14: context references, questions and cross-workspace links. A state is a glyph plus a word, never colour alone. */
+.ctx-ref { margin-top: 4px; }
+.ctx-chip { display: inline-flex; gap: 6px; align-items: center; max-width: 100%; padding: 2px 10px; border: 1px solid var(--hd-border, currentColor);
+  border-radius: 999px; background: transparent; color: inherit; font: inherit; font-size: 0.85em; overflow-wrap: anywhere; cursor: default; }
+button.ctx-chip { cursor: pointer; }
+button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.ctx-chip--hidden { border-style: dashed; }
+.ctx-attached { padding: 4px 0; }
+.ctx-consult, .ctx-link { border-top: 1px solid var(--hd-border, currentColor); padding-top: 8px; }
+.ctx-inbox { border: 1px solid var(--hd-border, currentColor); border-radius: 8px; padding: 8px; }
+@media (prefers-reduced-motion: reduce) { .ctx-chip { transition: none; } }

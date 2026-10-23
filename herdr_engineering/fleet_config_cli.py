@@ -183,6 +183,7 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
 COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
+                         "contextual",
                          "delegation_enabled"})
 
 
@@ -215,6 +216,11 @@ def collab_values(cfg: FleetConfig) -> dict:
     from .control_plane.collab_workbench import normalize_steering
     try:
         normalize_steering(collab.get("steering"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
+    from .control_plane.collab_context import normalize_contextual
+    try:
+        normalize_contextual(collab.get("contextual"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
     return dict(collab)

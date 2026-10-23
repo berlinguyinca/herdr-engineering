@@ -48,7 +48,7 @@ DELEGATIONS_PER_10_MIN = 20                 # per room owner
 RESPONSES_PER_MINUTE = 60                   # per delegate: progress / accept / result calls
 DECISIONS_PER_MINUTE = 60                   # per room owner
 
-HCN_NODE_PREFIXES = ("task:hcn-delegation.", "artifact:hcn-proposal.")   # written only by the HCN service
+HCN_NODE_PREFIXES = ("task:hcn-delegation.", "artifact:hcn-proposal.", "thread:hcn-consult.")   # written only by the HCN service
 
 _ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _NODE = re.compile(r"[a-z]+:[A-Za-z0-9._:/@+=-]{1,190}\Z")

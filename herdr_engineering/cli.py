@@ -2471,6 +2471,15 @@ def _cmd_cp_web(args) -> int:
                 section = _store.current().section("control_plane")
                 return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("steering")
             collab.steering_source = _steering_from_yaml
+        # T14: contextual chat, consultation and cross-workspace links. Same rule: YAML only, off by default, re-read
+        # per request when a fleet file is in use so `kill_switch: true` needs no restart.
+        from .control_plane.collab_context import normalize_contextual
+        collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
+        if fleet_store is not None:
+            def _contextual_from_yaml(_store=fleet_store):
+                section = _store.current().section("control_plane")
+                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("contextual")
+            collab.contextual_source = _contextual_from_yaml
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
@@ -2550,6 +2559,7 @@ COLLAB_CONFIG_KEYS = {
     "delegation_enabled": ("collab_delegation_enabled", bool),
     "replay_history": ("collab_replay_history", str),     # lineage replay: since_join (default) | full
     "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
+    "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
 }
 
 
@@ -2573,9 +2583,10 @@ def _apply_collab_config(args, cp) -> None:
             if not getattr(args, dest):
                 setattr(args, dest, list(value))
         elif kind is dict:
+            from .control_plane.collab_context import normalize_contextual
             from .control_plane.collab_workbench import normalize_steering
             try:
-                normalize_steering(value)
+                (normalize_contextual if key == "contextual" else normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))

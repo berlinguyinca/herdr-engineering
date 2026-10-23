@@ -5,6 +5,16 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Contextual chat, consultation and cross-workspace links (T14, stacked on T11 #172 and T12 #171)
+- Chat messages can carry one validated reference to a graph node, edge, comment or proposal. It is checked when posted and again for every
+  reader of every read; a reader who cannot see the target gets one fixed "hidden reference" and nothing else (agents, remote agents and guests always do).
+- Consultation: a member asks another member or a remote agent one bounded, expiring question about a graph node and gets one text answer
+  (never a task, proposal or action). The graph records who asked whom about what, never the text. New MCP tools `consult_inbox`, `consult_answer`.
+- Cross-workspace links: new edge kind `cross_link`, authorized on both ends and written only by the HCN service for one room; revocable and
+  self-expiring when the room loses a workspace grant. See `docs/contracts/lineage-events.md` ("T14").
+- New YAML `control_plane.collab.contextual` (everything off by default, `kill_switch`). No environment variable, no migration.
+- Rollback: `contextual.enabled: false`, or revert the PR.
+
 ### Bounded task delegation and artifact proposals (T11, stacked on #170, #167, #165, #164)
 - A room owner can delegate one bounded task (scope, budget, expiry, allowed output kinds) to a coworker's external agent invited with
   `proposals: true`. The agent answers only with an artifact proposal (patch, doc, analysis or link) that waits in quarantine; a room owner
