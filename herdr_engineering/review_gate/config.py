@@ -91,10 +91,12 @@ def _app(raw, check_key_file):
         raise ValueError("review_gate.app: private_key_file must be an absolute path")
     if check_key_file:
         try:
-            mode = stat.S_IMODE(os.stat(path).st_mode)
+            st = os.stat(path)  # follows symlinks
         except OSError:
             raise ValueError("private_key_file must exist and be mode 0600") from None
-        if mode != 0o600:
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("private_key_file must be a regular file")
+        if stat.S_IMODE(st.st_mode) != 0o600:
             raise ValueError("private_key_file must be mode 0600")
     return AppConfig(app_id, installation_id, path)
 
@@ -109,6 +111,8 @@ def _repo(raw):
     for key in ("required_events", "required_checks"):
         if key in raw:
             kw[key] = _str_tuple(raw, key, "review_gate.repos")
+    if "required_events" in kw and not kw["required_events"]:
+        raise ValueError("review_gate.repos: required_events must not be empty")
     for key in ("main_pipeline", "disabled_tests_file"):
         kw[key] = _opt_str(raw, key, "review_gate.repos")
     for key in ("review_cap", "ci_fix_cap"):
@@ -118,7 +122,11 @@ def _repo(raw):
 
 
 def parse_review_gate_section(raw, *, check_key_file=True) -> ReviewGateConfig:
-    """Validate a ``review_gate`` mapping; raises ValueError naming the problem."""
+    """Validate a ``review_gate`` mapping; raises ValueError naming the problem.
+
+    Null rule: ``app: null`` and ``repos: null`` are both treated as absent
+    (no app / no repos). ``enabled: true`` then fails because it requires an app.
+    """
     raw = _mapping(raw, "review_gate")
     _no_unknown(raw, _SECTION_KEYS, "review_gate")
     enabled = raw.get("enabled", False)
@@ -126,7 +134,9 @@ def parse_review_gate_section(raw, *, check_key_file=True) -> ReviewGateConfig:
         raise ValueError("review_gate: enabled must be a boolean")
     poll = _int(raw, "poll_seconds", "review_gate", 5) if "poll_seconds" in raw else 15
     app = _app(raw["app"], check_key_file) if raw.get("app") is not None else None
-    repos_raw = raw.get("repos", [])
+    repos_raw = raw.get("repos")
+    if repos_raw is None:
+        repos_raw = []
     if not isinstance(repos_raw, list):
         raise ValueError("review_gate: repos must be a list")
     repos = tuple(_repo(r) for r in repos_raw)

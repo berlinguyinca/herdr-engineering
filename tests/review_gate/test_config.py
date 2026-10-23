@@ -104,3 +104,76 @@ def test_fleet_config_rejects_unknown_review_gate_key(tmp_path):
     d["sections"]["control_plane"]["values"]["review_gate"] = {"bogus": 1}
     with pytest.raises(FleetConfigError, match="bogus"):
         load_fleet_config(write(tmp_path, d))
+
+
+def _with_key(tmp_path, key):
+    cfg = section(tmp_path)
+    cfg["control_plane"]["review_gate"]["app"]["private_key_file"] = str(key)
+    return cfg
+
+
+def test_key_directory_rejected(tmp_path):
+    d = tmp_path / "keydir"
+    d.mkdir()
+    d.chmod(0o600)
+    with pytest.raises(ValueError, match="regular file") as ei:
+        load_review_gate_config(_with_key(tmp_path, d))
+    assert str(d) not in str(ei.value)
+
+
+def test_symlink_to_good_key_accepted(tmp_path):
+    link = tmp_path / "link.pem"
+    link.symlink_to(key_file(tmp_path))
+    assert load_review_gate_config(_with_key(tmp_path, link)).enabled
+
+
+def test_symlink_to_loose_key_rejected(tmp_path):
+    other = tmp_path / "loose.pem"
+    other.write_text("x")
+    other.chmod(0o644)
+    link = tmp_path / "link.pem"
+    link.symlink_to(other)
+    with pytest.raises(ValueError, match="0600"):
+        load_review_gate_config(_with_key(tmp_path, link))
+
+
+def test_missing_key_file_rejected(tmp_path):
+    with pytest.raises(ValueError, match="private_key_file") as ei:
+        load_review_gate_config(_with_key(tmp_path, tmp_path / "nope.pem"))
+    assert str(tmp_path) not in str(ei.value)
+
+
+def test_empty_required_events_rejected_but_empty_checks_ok(tmp_path):
+    with pytest.raises(ValueError, match="required_events"):
+        load_review_gate_config(section(tmp_path, repos=[{"repo": "github.com/a/b", "required_events": []}]))
+    ok = section(tmp_path, repos=[{"repo": "github.com/a/b", "required_checks": []}])
+    assert load_review_gate_config(ok).repos[0].required_checks == ()
+
+
+@pytest.mark.parametrize("key", ["review_cap", "ci_fix_cap"])
+def test_bool_caps_rejected(tmp_path, key):
+    with pytest.raises(ValueError, match=key):
+        load_review_gate_config(section(tmp_path, repos=[{"repo": "github.com/a/b", key: True}]))
+
+
+def test_string_enabled_rejected(tmp_path):
+    with pytest.raises(ValueError, match="enabled"):
+        load_review_gate_config(section(tmp_path, enabled="false"))
+
+
+def test_non_list_repos_rejected(tmp_path):
+    with pytest.raises(ValueError, match="repos"):
+        load_review_gate_config(section(tmp_path, repos={"repo": "github.com/a/b"}))
+
+
+@pytest.mark.parametrize("bad", ["x", 3, ["a"]])
+def test_non_dict_section_rejected(bad):
+    with pytest.raises(ValueError, match="mapping"):
+        load_review_gate_config({"control_plane": {"review_gate": bad}})
+
+
+def test_null_app_and_repos_are_absent(tmp_path):
+    got = load_review_gate_config(section(tmp_path, enabled=False, app=None, repos=None))
+    assert got.app is None and got.repos == () and not got.enabled
+    with pytest.raises(ValueError, match="requires app"):
+        load_review_gate_config(section(tmp_path, app=None, repos=None))
