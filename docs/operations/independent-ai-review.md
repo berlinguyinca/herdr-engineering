@@ -86,6 +86,13 @@ next poll.
 - **The key lives on the host that runs the script.** It is read from `~/.pi/agent/models.json` and sent only
   as the `Authorization` header, to that provider's https `baseUrl` host. Redirects are not followed. The key is
   redacted from every message.
-- **The gateway is shared and slow for big prompts.** Chunks run one at a time. A 16 KB prompt took 70 to 170 s,
-  mostly reasoning; a 64 KB one took about 9 minutes, and once its route ended mid-answer. Route failures, 429s
-  and 5xx responses are retried with backoff. Measured figures for PR #160 are in the agent-helpers report.
+- **The gateway is shared, and its capacity comes and goes.** Chunks run one at a time. Measured on 2026-10-22
+  against PR #160 (40 files, 36 chunks at 24 KB):
+  - with thinking off (the default), deepseek answered in 15 to 31 s per chunk;
+  - with thinking on, it spent all 32,768 tokens reasoning and never answered (`finish_reason=length`);
+  - a 64 KB prompt was still reasoning after 13 minutes;
+  - routes sometimes ended mid-answer (`upstream_transport_error`), and qwen's single slot answered 429;
+  - for a while the gateway advertised no models at all.
+
+  Route failures, 429s and 5xx responses are retried with backoff. A model that is not advertised fails the run
+  before anything is posted.
