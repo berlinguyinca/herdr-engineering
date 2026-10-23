@@ -16,6 +16,7 @@ import http.client
 import json
 import os
 import secrets
+import site
 import socket
 import subprocess
 import sys
@@ -40,8 +41,40 @@ def load_acceptance() -> dict:
     return cfg
 
 
+def _siblings(marker: str) -> list[Path]:
+    return sorted(d for d in ROOT.parent.iterdir() if d.is_dir() and d != ROOT and (d / marker).exists())
+
+
+def _discover(marker: str, prefer_suffix: str | None = None) -> Path:
+    """Find a sibling checkout by what it CONTAINS (not by its directory name). With several candidates the one whose
+    name ends with this checkout's worktree suffix (herdr-t16 -> *-t16) wins; otherwise the choice must be unambiguous."""
+    found = _siblings(marker)
+    if prefer_suffix:
+        same = [d for d in found if d.name.endswith(prefer_suffix)]
+        if len(same) == 1:
+            return same[0]
+    if len(found) == 1:
+        return found[0]
+    built = [d for d in found if (d / "target" / "debug" / "autospec").exists()]      # AutoSpec: only a built checkout is usable
+    if marker.startswith("crates/") and len(built) == 1:
+        return built[0]
+    raise RuntimeError(f"cannot discover a sibling checkout containing {marker}: candidates {[d.name for d in found]}; "
+                       "set the path in tests/e2e/acceptance.local.yaml")
+
+
 def resolve(cfg: dict, key: str) -> Path:
-    p = Path(str(cfg[key])).expanduser()
+    """A configured path (relative to this checkout), or `auto` = discover the sibling checkout by content."""
+    value = str(cfg[key])
+    suffix = ROOT.name.rsplit("-", 1)[-1] if "-" in ROOT.name else None
+    if value == "auto":
+        if key == "pi_repo":
+            return _discover("src/runtime/herdr/lineage.ts", suffix)
+        if key == "autospec_repo":
+            return _discover("crates/autospec-cli", suffix)
+        if key == "autospec_bin":
+            return resolve(cfg, "autospec_repo") / "target" / "debug" / "autospec"
+        raise RuntimeError(f"{key}: `auto` is not supported")
+    p = Path(value).expanduser()
     return p if p.is_absolute() else (ROOT / p).resolve()
 
 
@@ -194,8 +227,11 @@ class Plane:
         if self.users:
             cmd += ["--collab-users-file", str(users)]
         self._log = open(self.log_path, "ab")
-        # cwd = repo root makes `herdr_engineering` importable without PYTHONPATH; the child inherits no config
-        self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=self._log, stderr=subprocess.STDOUT)
+        # cwd = repo root makes `herdr_engineering` importable without PYTHONPATH. The child gets an explicit, minimal
+        # environment (PATH to find python/git, HOME inside the scratch dir, PYTHONUSERBASE so the user-site asyncpg is found): no config, no credentials, no proxies.
+        self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=self._log, stderr=subprocess.STDOUT,
+                                     env={"PATH": os.environ["PATH"], "HOME": str(self.workdir),
+                                          "PYTHONUSERBASE": site.getuserbase()})   # lets python find user-site asyncpg
         deadline = time.time() + self.startup_timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:

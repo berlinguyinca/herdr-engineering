@@ -37,7 +37,7 @@ def postgres(tmp_path_factory, acceptance=None):
         pytest.fail("asyncpg is a declared dependency (pyproject.toml) and is missing from this python")
     db = pg.ThrowawayPostgres(bins, tmp_path_factory.mktemp("pg")).start()
     yield db
-    db.stop()
+    db.close()
 
 
 def _plane(tmp, name, **kw) -> Plane:
@@ -188,7 +188,7 @@ class TestRestartReplay:
             assert plane.sources()["sd"]["last_sequence"] == 1 and plane.sources()["sd"]["gaps"] == []
         finally:
             plane.stop()
-            db.stop()
+            db.close()
 
 
 # ================================================================================================ shared cast

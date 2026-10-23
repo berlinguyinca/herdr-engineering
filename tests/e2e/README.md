@@ -33,7 +33,20 @@ binaries (`initdb`, `pg_ctl`, `postgres`; dirs listed in `acceptance.yaml`), Nod
   `lineage_key_scopes`, `review_quorum`, `collab.{delegation_enabled,steering,contextual,insights}`, `pg_dsn`), the
   production configuration path, plus a generated collaboration users file. Keys and tokens come from `secrets` at run
   time; nothing secret-like is committed.
-* The only environment a child process sees is `PATH` (so the autospec/Pi children can find the fake `gh` shim).
+* No product behaviour is configured through the environment. Child processes get an explicit environment, listed
+  here exactly:
+
+  | child | environment it receives |
+  |---|---|
+  | Herdr control-plane (Herdr `harness.Plane`) | `PATH`, `HOME` (scratch dir), `PYTHONUSERBASE` (so python finds the user-site asyncpg) |
+  | Herdr control-plane (Pi-side `Plane`) | `PATH` |
+  | real `autospec review-quorum` (scenario 2) | `PATH` (prefixed with the fake `gh` dir), `HOME` (scratch dir) |
+  | `git` helpers in scenario 7 | `PATH`, `HOME` (scratch dir), `GIT_CONFIG_GLOBAL=/dev/null` |
+  | Pi plan CLI (scenarios 1, 2, 7) | `PATH`, `HOME` (scratch dir), `PI_CODING_AGENT_DIR`, `PI_ENGINEERING_STATE_DIR`, `PI_ENGINEERING_HOME` (Pi's own state/agent-dir inputs, pointed at scratch dirs for isolation; the Herdr connection itself comes from the YAML), plus `TEST_ALLOW_SPAWN_UNDER` for the fake Plannotator in the outside-world guard of scenario 1 (test plumbing) |
+  | Pi `git` calls in scenario 5 | the test process's full environment plus `GIT_TERMINAL_PROMPT=0` |
+  | Pi test processes themselves (`node --test`) | inherit the caller's environment; `test/support/isolatedState.ts` points Pi's state at scratch dirs |
+
+  The fake `gh` shims are found through `PATH` only; there is no `GH_*` configuration.
 
 ## Topology
 

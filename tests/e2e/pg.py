@@ -5,6 +5,7 @@ port, and is stopped (fast shutdown) by `stop()`. Migrations are the repo's own 
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 from pathlib import Path
 
@@ -25,7 +26,7 @@ class ThrowawayPostgres:
         self.data = self.root / "pgdata"
         # unix socket paths are length-limited, so the socket dir is short and separate
         import tempfile
-        self.sock = Path(tempfile.mkdtemp(prefix="t16pg-"))
+        self.sock = Path(tempfile.mkdtemp(prefix=f"t16pg-{os.getpid()}-"))
         self.started = False
 
     @property
@@ -78,3 +79,9 @@ class ThrowawayPostgres:
             subprocess.run([str(self.bins / "pg_ctl"), "-D", str(self.data), "-m", "fast", "-w", "stop"],
                            capture_output=True)
             self.started = False
+
+    def close(self) -> None:
+        """Final teardown: stop the cluster and remove the short socket dir this object created (and only that)."""
+        self.stop()
+        import shutil
+        shutil.rmtree(self.sock, ignore_errors=True)
