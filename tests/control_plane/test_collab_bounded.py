@@ -868,3 +868,180 @@ def test_a_hunk_header_with_a_huge_number_is_a_clean_refusal_not_a_crash():
     for url in ("https://example.org:99999/", "https://example.org:abc/", "https://[::1/", "https://" + "a" * 600 + ".org/"):
         with pytest.raises(dlg.DelegationError):
             dlg.check_link(url)
+
+
+# ---------------------------------------------------------------------------- review round 2 (independent review of PR #172)
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+
+_BOUNDS = {"scope": {"paths": ["src/"], "nodes": [], "questions": []}, "output_kinds": ["doc", "patch", "analysis", "link"],
+           "budget": {"max_artifact_bytes": 32768}}
+_ADVERSARIAL = {
+    "curl": "curl " * 6500, "curl_pipe": "curl |" * 5000, "ignore": "ignore all " * 2700, "spaces": " " * 32000 + "x",
+    "one_line": "a" * 32000, "diff_header": "diff --git a/" + "x b/" * 200 + "\n", "diff_header_long": "diff --git a/" + "a b/" * 5000 + "\n",
+    "hunks": "@@ -1 " * 5000, "newlines": "\n" * 32000, "index": "index " + "a" * 30000,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_ADVERSARIAL))
+@pytest.mark.parametrize("kind", ["doc", "patch"])
+def test_no_validator_regex_is_quadratic_on_adversarial_input(name, kind):
+    """Every pattern in the module, fed worst-case text at the size cap, finishes quickly (the unbounded
+    ``curl [^\\n|]*\\|`` cost about a second per submit)."""
+    start = time.perf_counter()
+    try:
+        dlg.build_proposal("t", _BOUNDS, {"kind": kind, "title": "t", "content": _ADVERSARIAL[name][:32768]})
+    except dlg.DelegationError:
+        pass
+    assert time.perf_counter() - start < 0.25
+
+
+def test_a_stale_closed_or_replayed_submission_is_never_parsed(world, monkeypatch):
+    w = world
+    d, pr, tid = make(w)
+    v = d.accept(tid)
+    good = d.propose(tid, kind="doc", title="t", content="hello", expected_version=v)
+    assert good[0] == 200
+    calls = []
+    real = dlg.build_proposal
+    monkeypatch.setattr(dlg, "build_proposal", lambda *a, **k: calls.append(1) or real(*a, **k))
+    again = d.propose(tid, kind="doc", title="t", content="hello", expected_version=v)         # exact resend
+    assert again[0] == 200 and again[2].get("replayed") is True and not calls
+    huge = "curl " * 6500
+    assert d.propose(tid, kind="doc", title="t", content=huge, expected_version=v + 5)[0] == 409   # stale
+    assert d.propose(tid, kind="doc", title="t", content=huge)[0] == 400                          # no version
+    assert not calls
+
+
+def test_the_content_is_parsed_outside_the_service_lock(world, monkeypatch):
+    w = world
+    d, pr, tid = make(w)
+    v = d.accept(tid)
+    held = []
+    real = dlg.build_proposal
+    monkeypatch.setattr(dlg, "build_proposal", lambda *a, **k: held.append(w.s._lock._is_owned()) or real(*a, **k))
+    assert d.propose(tid, kind="doc", title="t", content="hello", expected_version=v)[0] == 200
+    assert held == [False]
+
+
+@pytest.mark.parametrize("name", ["src/a.py ", "src/a.py ", "src/a.py　", " src/a.py", "src/a​.py", "src/a b.py", "src/a .py"])
+def test_a_diff_name_with_whitespace_or_invisible_characters_is_refused_not_stripped(name):
+    for text in (f"--- a/{name}\n+++ b/{name}\n@@ -1 +1 @@\n-a\n+b\n",
+                 f"diff --git a/{name} b/{name}\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-a\n+b\n"):
+        with pytest.raises(dlg.DelegationError):
+            dlg.parse_patch(text, ["src/"])
+    # a tab-separated timestamp is git's own convention and still fine
+    assert dlg.parse_patch("--- a/src/a.py\t2026-01-01 00:00\n+++ b/src/a.py\t\n@@ -1 +1 @@\n-a\n+b\n", ["src/"]) == ["src/a.py"]
+
+
+@pytest.mark.parametrize("text", [
+    "--- /dev/null\n+++ b/src/n\n@@ -1 +1 @@\n-a\n+b\n",                       # creation with a real old side
+    "--- /dev/null\n+++ b/src/n\n@@ -0,0 +1 @@\n+a\n@@ -0,0 +3 @@\n+b\n",     # two hunks for a creation
+    "--- a/src/n\n+++ /dev/null\n@@ -1 +1 @@\n-a\n+b\n",                       # deletion with a real new side
+    "--- a/src/n\n+++ b/src/n\n@@ -0,0 +1 @@\n+a\n",                           # -0,0 without /dev/null: git reads a creation
+    "--- a/src/n\n+++ b/src/n\n@@ -1 +0,0 @@\n-a\n",                           # +0,0 without /dev/null: git reads a deletion
+    "diff --git a/src/n b/src/n\nnew file mode 100644\n--- a/src/n\n+++ b/src/n\n@@ -1 +1 @@\n-a\n+b\n",
+    "diff --git a/src/n b/src/n\ndeleted file mode 100644\n--- a/src/n\n+++ b/src/n\n@@ -1 +1 @@\n-a\n+b\n",
+])
+def test_dev_null_headers_must_agree_with_the_hunk_ranges(text):
+    with pytest.raises(dlg.DelegationError):
+        dlg.parse_patch(text, ["src/"])
+
+
+def test_consistent_creation_and_deletion_are_accepted():
+    assert dlg.parse_patch("--- /dev/null\n+++ b/src/n\n@@ -0,0 +1,2 @@\n+a\n+b\n", ["src/"]) == ["src/n"]
+    assert dlg.parse_patch("--- a/src/n\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n", ["src/"]) == ["src/n"]
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_whatever_the_validator_accepts_git_apply_reads_the_same_way(tmp_path):
+    """A seeded fuzz of header shapes: for every patch we accept, git must see only in-scope plain-file edits."""
+    import random
+    rnd = random.Random(7)
+    scope = ["src/parser/", "docs/readme.md"]
+    paths = ["src/parser/a.py", "src/parser/sub/b.py", "docs/readme.md", "src/other.py", ".git/config", ".github/workflows/ci.yml",
+             "src/parser/GIT~1/x", "src/parser/a.py ", "src/parser/a .py", "src/parser//a.py", "src/parser/../../x"]
+    pre = ["", "", "new file mode 100644\n", "new file mode 120000\n", "deleted file mode 100644\n", "old mode 100644\nnew mode 100755\n",
+           "rename from x\nrename to y\n", "index 1234567..89abcde 100644\n", "GIT binary patch\nliteral 0\n"]
+    hunks = ["@@ -1 +1 @@\n-a\n+b\n", "@@ -0,0 +1,2 @@\n+a\n+b\n", "@@ -1,2 +0,0 @@\n-a\n-b\n", "@@ -1,2 +1,2 @@\n a\n-b\n+c\n"]
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    accepted = 0
+    for _ in range(400):
+        a = rnd.choice(paths)
+        b = a if rnd.random() < .85 else rnd.choice(paths)
+        o = rnd.choice([f"a/{a}", "/dev/null", f"a/{a}\t2020-01-01"])
+        n = rnd.choice([f"b/{b}", "/dev/null", f"b/{b}\t"])
+        text = (f"diff --git a/{a} b/{b}\n{rnd.choice(pre)}" if rnd.random() < .7 else "") + f"--- {o}\n+++ {n}\n{rnd.choice(hunks)}"
+        try:
+            touched = dlg.parse_patch(text, scope)
+        except dlg.DelegationError:
+            continue
+        accepted += 1
+        assert all(dlg.in_scope(t, scope) for t in touched)
+        run = subprocess.run(["git", "apply", "--numstat", "--summary", "-z"], input=text.encode(), capture_output=True, cwd=repo)
+        if run.returncode != 0:
+            continue
+        out = run.stdout.decode(errors="replace")
+        assert not any(w in out for w in ("mode change", "rename", "copy", "mode 120000", "mode 100755")), text
+        for tok in out.split("\0"):
+            if "\t" in tok:
+                assert dlg.in_scope(tok.split("\t")[-1], scope), (text, tok)
+    assert accepted > 20
+
+
+@pytest.mark.parametrize("path", [".github/actions/x/action.yml", ".GITHUB/Actions/x", ".gitlab-ci.yml", "a/.circleci/config.yml", "Jenkinsfile",
+                                  "sub/JENKINSFILE", ".pre-commit-config.yaml", ".githooks/pre-commit", ".husky/pre-push", "GIT~1/config",
+                                  "src/GIT~2", "a/PROGRA~1.exe", ".gitmodules"])
+def test_files_a_checkout_executes_are_never_a_valid_target(path):
+    with pytest.raises(dlg.DelegationError):
+        dlg.norm_path(path)
+    with pytest.raises(dlg.DelegationError):
+        dlg.norm_path(path.rstrip("/") + "/", allow_dir=True)
+
+
+def test_the_deny_list_is_not_reachable_from_a_delegation_request(world):
+    w = world
+    pr, out, _ = enroll(w, proposals=True)
+    for p in (".github/actions/", "Jenkinsfile", ".gitlab-ci.yml", "GIT~1/"):
+        with pytest.raises(CollabError) as e:
+            w.s.create_delegation(w.alice, w.room, body(target_agent_id=pr.id, scope={"paths": [p], "nodes": [], "questions": []}))
+        assert e.value.status == 400
+
+
+@pytest.mark.parametrize("content", ["a\r\nb\r\n", "a\rb", "a\r\n"])
+def test_crlf_text_is_refused_with_a_clear_error_not_converted(content):
+    with pytest.raises(dlg.DelegationError) as e:
+        dlg.build_proposal("t", _BOUNDS, {"kind": "doc", "title": "t", "content": content})
+    assert e.value.code == "crlf" and "LF" in e.value.message
+    with pytest.raises(dlg.DelegationError) as e:
+        dlg.build_proposal("t", _BOUNDS, {"kind": "patch", "title": "t", "content": "--- a/src/x\r\n+++ b/src/x\r\n@@ -1 +1 @@\r\n-a\r\n+b\r\n"})
+    assert e.value.code == "crlf"
+
+
+def test_the_task_list_shows_bounds_only_to_owners_not_to_guests_or_viewers(world):
+    w = world
+    d, pr, tid = make(w)
+    for who, sees in ((w.alice, True), (w.carol, False), (w.dave, False)):
+        rows = [t for t in w.s.list_tasks(who, w.room)["tasks"] if t["task_id"] == tid]
+        if not rows:
+            assert not sees
+            continue
+        assert ("bounds" in rows[0]) is sees and ("version" in rows[0]) is sees, who
+        assert "src/parser" not in json.dumps({k: v for k, v in rows[0].items() if k not in ("text",)}) or sees
+    # the delegate still sees its own bounds, in its own inbox
+    assert d.inbox()[2]["delegations"][0]["bounds"]["scope"]["paths"] == ["src/parser/"]
+
+
+def test_the_open_ingest_listener_is_not_an_operator_for_the_reserved_namespaces(world):
+    w = world
+    opened = {"kind": "operator", "id": "open-listener", "authenticated_by": "open_listener"}
+    keyed = {"kind": "operator", "id": "key:op", "authenticated_by": "api_key"}
+    for n, nid in enumerate(("task:hcn-delegation.t_squat", "artifact:hcn-proposal.prp_squat")):
+        env = {"schema_version": 2, "event_id": f"o{n}", "source": "zz", "source_sequence": n, "entity_type": "lineage", "entity_id": nid,
+               "event_type": "node.upsert", "payload": {"node_type": nid.split(":")[0], "node_id": nid}, "visibility_scope": "room",
+               "room_id": w.room}
+        with pytest.raises(PermissionError):
+            w.ing.ingest(env, opened)
+        w.ing.ingest({**env, "event_id": f"k{n}", "source_sequence": 100 + n}, keyed)      # a real operator key still may
