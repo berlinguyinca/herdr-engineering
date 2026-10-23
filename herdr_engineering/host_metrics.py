@@ -81,10 +81,10 @@ class HostSampler:
         out: dict = {}
         darwin = platform.system() == "Darwin"
         steps = ([self._mac_cpu, self._mac_mem, self._mac_uptime, self._mac_net,
-                  self._load, self._mounts_df]
+                  self._load, self._disk_pct, self._mounts_df]
                  if darwin else
                  [self._linux_cpu, self._linux_mem, self._linux_uptime,
-                  self._linux_net, self._load, self._mounts_proc])
+                  self._linux_net, self._load, self._disk_pct, self._mounts_proc])
         for step in steps:
             try:
                 out.update(step())
@@ -118,26 +118,30 @@ class HostSampler:
         if total <= 0:
             return None
         used = total - st.f_bfree * st.f_frsize
-        return {"path": path, "pct": _pct(used, total), "used_b": used, "total_b": total}
+        return {"path": path, "pct": _pct(used, total), "used_b": used, "total_b": total,
+                "_dev": (self._st_dev(path), total)}
 
-    def _disk_pick(self, mounts: list[dict]) -> dict:
-        """Cap the list and set ``disk`` to the mount holding the herdr data dir."""
-        out: dict = {}
-        if not mounts:
-            return out
-        data = _herdr_data_dir()
-        best = None
-        for m in mounts:
-            p = m["path"].rstrip("/") or "/"
-            if (data == p or data.startswith(p.rstrip("/") + "/")) and (
-                    best is None or len(p) > len(best["path"].rstrip("/") or "/")):
-                best = m
-        out["mounts"] = mounts[:MAX_MOUNTS]
-        if best is not None:
-            out["disk"] = best["pct"]
-            if best not in out["mounts"]:
-                out["mounts"] = out["mounts"][:MAX_MOUNTS - 1] + [best]
-        return out
+    def _st_dev(self, path: str):
+        try:
+            return os.stat(path).st_dev
+        except OSError:
+            return path
+
+    def _disk_pct(self) -> dict:
+        """``disk``: pct used of the fs holding the herdr data dir.
+
+        Independent of the mount list: statvfs on the nearest existing ancestor.
+        """
+        p = Path(_herdr_data_dir())
+        while not p.exists() and p != p.parent:
+            p = p.parent
+        u = self._usage(str(p))
+        return {"disk": u["pct"]} if u else {}
+
+    def _cap_mounts(self, mounts: list[dict]) -> dict:
+        mounts = [{k: v for k, v in m.items() if k != "_dev"}
+                  for m in sorted(mounts, key=lambda m: m["path"])[:MAX_MOUNTS]]
+        return {"mounts": mounts} if mounts else {}
 
     # -- linux -----------------------------------------------------------
     def _linux_cpu(self) -> dict:
@@ -148,7 +152,10 @@ class HostSampler:
         total = mi["MemTotal"]
         if total <= 0:
             return {}
-        used = total - mi["MemAvailable"]
+        avail = mi.get("MemAvailable")
+        if avail is None:
+            avail = mi["MemFree"] + mi.get("Buffers", 0) + mi.get("Cached", 0)
+        used = max(total - avail, 0)
         out = {"mem": _pct(used, total), "mem_used_b": used, "mem_total_b": total}
         st = mi.get("SwapTotal", 0)
         if st > 0:
@@ -185,13 +192,28 @@ class HostSampler:
                 continue
             if u:
                 mounts.append(u)
-        return self._disk_pick(mounts)
+        return self._cap_mounts(self._dedupe(mounts))
+
+    @staticmethod
+    def _dedupe(mounts: list[dict]) -> list[dict]:
+        """One entry per (st_dev, size): bind mounts share a device."""
+        seen, out = set(), []
+        for m in sorted(mounts, key=lambda m: m["path"]):
+            if m["_dev"] in seen:
+                continue
+            seen.add(m["_dev"])
+            out.append(m)
+        return out
 
     # -- macOS -----------------------------------------------------------
     def _mac_cpu(self) -> dict:
-        txt = self._run(["top", "-l", "1", "-n", "0"])
-        m = re.search(r"CPU usage:.*?([\d.]+)% idle", txt)
-        return {"cpu": round(100.0 - float(m.group(1)), 1)} if m else {}
+        # Ruling: macOS keeps `top` as the cpu source. The first `top` sample is
+        # since-boot, so take two and use the LAST "CPU usage" line (accurate over
+        # 1s). Hence cpu is present on the first sample() on macOS; the "no cpu on
+        # first call" rule applies to Linux deltas only.
+        txt = self._run(["top", "-l", "2", "-n", "0", "-s", "1"])
+        found = re.findall(r"CPU usage:.*?([\d.]+)% idle", txt)
+        return {"cpu": round(100.0 - float(found[-1]), 1)} if found else {}
 
     def _mac_mem(self) -> dict:
         total = int(self._run(["sysctl", "-n", "hw.memsize"]).strip())
@@ -249,4 +271,4 @@ class HostSampler:
             if u and not path.startswith(("/System/Volumes/VM", "/System/Volumes/Preboot",
                                           "/System/Volumes/Update")):
                 mounts.append(u)
-        return self._disk_pick(mounts)
+        return self._cap_mounts(self._dedupe(mounts))
