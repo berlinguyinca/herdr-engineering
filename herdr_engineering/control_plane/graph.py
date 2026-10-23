@@ -311,10 +311,7 @@ def _narrow(a: str, b: str) -> str:
 # Registers whose recent write history is kept (see _Reg.recent): only the PR head, so the
 # bookkeeping costs nothing for every other attribute.
 _TRACKED_ATTRS = frozenset({"head_sha"})
-_RECENT_WRITES = 8
-# A write that arrives after a higher-sequence one is a harmless late delivery when it is
-# within this many sequence numbers of it; further below it looks like an emitter restart.
-HEAD_REORDER_WINDOW = 32
+_RECENT_VALUES = 8
 
 
 class _Reg:
@@ -329,9 +326,11 @@ class _Reg:
 
     def __init__(self, track: bool = False):
         self.track = track
-        # tracked registers only: writer key -> top-N (rank, seq, event_id, value) by rank, a
-        # commutative summary (top-N of a set) so replay order cannot change it
-        self.recent: dict[tuple, list] = {}
+        # tracked registers only: writer key -> {value: [first_rank, last_rank, last_seq,
+        # last_event_id]}, one entry per DISTINCT value (so re-emits of one head cannot evict
+        # the evidence about another), at most _RECENT_VALUES values, oldest evicted first.
+        # min/max aggregates, so replay order cannot change it.
+        self.recent: dict[tuple, dict] = {}
         # writer key -> (seq, event_id, rank, value, key, is_op, scope)
         self.by: dict[tuple, tuple] = {}
         self.firsts: dict[tuple, tuple] = {}   # writer key -> rank of that writer's EARLIEST event here
@@ -346,12 +345,17 @@ class _Reg:
         last = self.lasts.get(key)
         if last is None or rank > last:
             self.lasts[key] = rank             # max over ALL events: order independent
-        if self.track:
-            hist = self.recent.setdefault(key, [])
-            if all(h[2] != eid for h in hist):
-                hist.append((rank, seq, eid, value))
-                hist.sort(key=lambda h: h[0], reverse=True)
-                del hist[_RECENT_WRITES:]
+        if self.track and isinstance(value, str) and value.strip():
+            hist = self.recent.setdefault(key, {})
+            ent = hist.get(value)
+            if ent is None:
+                hist[value] = [rank, rank, seq, eid]
+                if len(hist) > _RECENT_VALUES:
+                    del hist[min(hist, key=lambda v: hist[v][1])]
+            else:
+                ent[0] = min(ent[0], rank)
+                if rank > ent[1]:
+                    ent[1], ent[2], ent[3] = rank, seq, eid
         cur = self.by.get(key)
         if cur is None or (seq, eid) > (cur[0], cur[1]):
             scope = ev.get("visibility_scope")
@@ -1307,11 +1311,14 @@ class GraphProjection:
             def trusted_head():
                 """(value, event_id, state, candidate): the PR head from the trusted writers.
 
-                ``state`` is ``ok``, ``rebased`` (an emitter restart was recognised and its
-                new run adopted) or ``unverified`` (a lower-sequence write far below the
-                applied one arrived after it, with a different value: late delivery or a
-                restart, which only the writer or an operator can settle). ``candidate`` is the
-                event id an operator may acknowledge with a ``head_resync`` write.
+                A trusted writer's applied head is its highest-``source_sequence`` write. A
+                write admitted AFTER it (so lower in sequence) with a different value is only
+                harmless if that value is an OLD head the writer had already reported before
+                (a late redelivery). Any other lower-sequence different head, however near,
+                could equally be a restart that reset the sequence, so the head is
+                ``unverified`` (alert, never satisfied). It clears when the writer writes
+                past the applied sequence, or when an operator acknowledges the candidate
+                write with ``head_resync`` (``resynced``). Nothing is adopted automatically.
                 """
                 reg = node.attrs.get("head_sha")
                 if reg is None:
@@ -1323,23 +1330,16 @@ class GraphProjection:
                     if e[4][1] not in head_writers or not isinstance(e[3], str) or not e[3].strip():
                         continue
                     value, eid, rank = e[3], e[1], e[2]
-                    tail = [t for t in sorted(reg.recent.get(e[4], ()), key=lambda h: h[0])
-                            if t[0] > e[2] and isinstance(t[3], str) and t[3].strip()]
-                    far = [t for t in tail if t[3] != e[3] and e[0] - t[1] > HEAD_REORDER_WINDOW]
-                    if far:
-                        last = tail[-1]
-                        run = 1 if e[0] - last[1] > HEAD_REORDER_WINDOW and last[3] != e[3] else 0
-                        for prev, cur in zip(reversed(tail[:-1]), reversed(tail)):
-                            if run and prev[1] < cur[1] and e[0] - prev[1] > HEAD_REORDER_WINDOW:
-                                run += 1
-                            else:
-                                break
-                        if last[2] in acks or run >= 2:
-                            value, eid, rank = last[3], last[2], last[0]
+                    unknown = [(h[1], v, h[3]) for v, h in reg.recent.get(e[4], {}).items()
+                               if v != e[3] and h[1] > e[2] and h[0] > e[2]]
+                    if unknown:
+                        last_rank, last_value, last_eid = max(unknown)
+                        if last_eid in acks:
+                            value, eid, rank = last_value, last_eid, last_rank
                             if state == "ok":
-                                state = "rebased"
+                                state = "resynced"
                         else:
-                            state, candidate = "unverified", last[2]
+                            state, candidate = "unverified", last_eid
                     cands.append((rank, value, eid))
                 if not cands:
                     return None, None, "ok", None

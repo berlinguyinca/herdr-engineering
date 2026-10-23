@@ -182,17 +182,20 @@ ONE policy, two implementations: this route (workbench) and `autospec review-quo
 vector file `tests/control_plane/fixtures/review-quorum-vectors.json` (byte-identical to autospec's
 `crates/autospec-core/tests/fixtures/`); both suites load it. Rules:
 1. The head is the newest non-empty `attrs.head_sha` written by a trusted writer and must be a full SHA, else `unknown_head`.
-   `pr` is a commons node, so untrusted writers' values are ignored. A write that arrives AFTER a higher-sequence one from
-   the same writer is either a late delivery or an emitter restart that reset `source_sequence`:
-   - same head value, or within 32 sequence numbers of the applied write: a late/duplicate delivery. Ignored; the applied
-     head stands and nothing is poisoned (benign reordering never locks the PR).
-   - a different head far below (more than 32): suspected restart. Status `head_unverified` (response also carries
-     `head_unverified: true`, a human-readable `alert`, and for operators `resync_event_id`; one WARNING is logged per
-     observation; `autospec review-quorum request` exits 4 on it instead of reporting "not needed"). Never satisfied. It
-     clears when: (a) the writer writes past the applied sequence; (b) a second, increasing-sequence write follows (a restart
-     run is recognised, the newest value is adopted, `head_rebased: true`); or (c) an operator acknowledges the observed write
-     by writing `attrs.head_resync = "<resync_event_id>"` on the PR node (honoured only from an operator principal and only for
-     that exact write). No emitter epoch exists yet; with one (Pi), the 32-number heuristic could be replaced by an exact test.
+   `pr` is a commons node, so untrusted writers' values are ignored. A trusted writer's applied head is its highest
+   `source_sequence` write. A write admitted AFTER it (so lower in sequence) is either a late delivery or an emitter restart
+   that reset the sequence:
+   - same value as the applied head, or a head that writer had ALREADY reported before the applied write (an old head
+     redelivered late): ignored, nothing is poisoned. Evidence is kept per DISTINCT head (8 per writer), so re-emits of one
+     head cannot evict the evidence about another.
+   - any other head, however close in sequence, and however many such writes: status `head_unverified` (response also
+     carries `head_unverified: true`, a human-readable `alert`, and for operators `resync_event_id`; one WARNING is logged
+     per observation; `autospec review-quorum request` exits 4 on it instead of reporting "not needed"). Never satisfied.
+     It clears only when (a) the writer writes past the applied sequence (a plain reorder heals on its next write), or
+     (b) an operator acknowledges the observed write by writing `attrs.head_resync = "<resync_event_id>"` on the PR node
+     (operator principal only, that exact write only; the answer then carries `head_resynced: true`). A run of low-sequence
+     writes is NEVER adopted automatically. `autospec review-quorum verify-report` compares the report with the live PR head
+     from GitHub, which is the second defence.
 2. Only configured reviewers are read; anyone else's edges (approvals or blocks) are ignored, so junk cannot satisfy or block.
 3. A reviewer is the edge OWNER (server-authenticated), never a payload name. `verdict`/`receipt_*` and add/remove are read ONLY
    from the owner's own writes: an operator or `co_writers` member cannot flip a verdict or retract a block.

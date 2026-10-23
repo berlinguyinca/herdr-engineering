@@ -144,19 +144,19 @@ def evaluate(evidence: dict, config: QuorumConfig) -> dict:
     empty = {"counted": [], "blocking": [], "stale_reviewers": [], "rejected": [],
              "has_hidden_reviews": False, "blocked_by_hidden": False,
              "rereview_required": False, "rereview_needed": 0, "head_unverified": False, "alert": None,
-             "head_rebased": evidence.get("head_state") == "rebased"}
+             "head_resynced": evidence.get("head_state") == "resynced"}
     if head is None:
         return {**base, **empty, "status": "unknown_head"}
     if evidence.get("head_state") == "unverified":
-        # A trusted writer's lower-sequence write, far below the applied one, arrived later with
-        # a different head: a late delivery or an emitter restart. Which one is not knowable, so
-        # nothing passes and the response says so (``head_unverified``), until the writer
-        # writes past the applied sequence, a restart run is recognised, or an operator
-        # acknowledges the candidate write (``head_resync``).
+        # A trusted writer's lower-sequence write with a head it had not reported before arrived
+        # after a higher-sequence one: a late delivery or an emitter restart. Which one is not
+        # knowable, so nothing passes and the response says so (``head_unverified``), until the
+        # writer writes past the applied sequence or an operator acknowledges the candidate
+        # write (``head_resync``). verify-report's live-head comparison is the second defence.
         return {**base, **empty, "status": "head_unverified", "head_unverified": True,
-                "alert": ("the PR head cannot be verified: a trusted emitter wrote a different head "
-                          "at a much lower sequence after a higher one (restart or late delivery); "
-                          "re-sync it before relying on this quorum")}
+                "alert": ("the PR head cannot be verified: a trusted emitter wrote a head it had not "
+                          "reported before at a lower sequence after a higher one (restart or "
+                          "late delivery); re-sync it before relying on this quorum")}
     author = canonical_identity(evidence.get("author"))
     authors = {canonical_identity(a) for a in evidence.get("authors") or ()}
     target = canonical_target(evidence["pr"])
@@ -254,7 +254,7 @@ def evaluate(evidence: dict, config: QuorumConfig) -> dict:
                          if r in shown({r})],
             "has_hidden_reviews": hidden_any, "blocked_by_hidden": hidden_block,
             "head_unverified": False, "alert": None,
-            "head_rebased": evidence.get("head_state") == "rebased",
+            "head_resynced": evidence.get("head_state") == "resynced",
             "rereview_required": status == "insufficient",
             # from what THIS viewer can see only: a hidden approval must not shift the number
             "rereview_needed": max(config.required - len(visible_counted), 0) if status == "insufficient" else 0}

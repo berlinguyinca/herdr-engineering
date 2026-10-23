@@ -530,21 +530,43 @@ def head_at(w, value, seq, who=PI):
                 principal=who, seq=seq)
 
 
-def test_a_late_nearby_write_with_a_different_head_is_ignored_not_a_lock(w):
+def test_a_late_redelivery_of_an_old_head_or_the_same_head_is_ignored(w):
     head_at(w, sha(1), 10)
     head_at(w, sha(2), 12)
-    head_at(w, sha(3), 11)          # seq 11 delivered after seq 12
+    head_at(w, sha(1), 11)          # an old head the writer already reported, delivered late
+    head_at(w, sha(2), 3)           # the applied head again, far below: a plain duplicate
     out = w.q()
-    assert out["head"] == sha(2) and out["status"] != "head_unverified" and out["head_unverified"] is False
-    head_at(w, sha(4), 13)          # the writer carries on; nothing was poisoned
-    assert w.q()["head"] == sha(4)
+    assert out["head"] == sha(2) and out["head_unverified"] is False and out["status"] == "insufficient"
 
 
-def test_a_far_lower_write_with_the_same_head_is_a_duplicate_not_a_lock(w):
-    head_at(w, sha(2), 100)
+def test_a_nearby_late_write_with_a_new_head_is_flagged_until_the_writer_moves_on(w):
+    head_at(w, sha(1), 10)
+    head_at(w, sha(3), 12)
+    head_at(w, sha(2), 11)          # never reported before and lower than the applied one
+    out = w.q()
+    assert out["status"] == "head_unverified" and out["head_unverified"] is True and out["alert"]
+    head_at(w, sha(4), 13)          # the writer carries on: the applied sequence moves past it
+    out = w.q()
+    assert out["head"] == sha(4) and out["head_unverified"] is False
+
+
+def test_same_head_reemits_cannot_evict_the_evidence_of_a_suspect_write(w):
+    head_at(w, sha(1), 100)
     head_at(w, sha(2), 1)
+    assert w.q()["status"] == "head_unverified"
+    for i in range(12):
+        head_at(w, sha(1), 2 + i)               # re-emits of the applied head
+    assert w.q()["status"] == "head_unverified"
+    assert w.q()["head"] == sha(1)
+
+
+def test_two_distinct_new_heads_below_the_applied_one_are_flagged(w):
+    head_at(w, sha(1), 100)
+    head_at(w, sha(2), 1)
+    head_at(w, sha(3), 2)
     out = w.q()
-    assert out["head"] == sha(2) and out["status"] == "insufficient" and out["head_unverified"] is False
+    assert out["status"] == "head_unverified"
+    assert w.q()["resync_event_id"] == "pi-2"
 
 
 def test_a_suspected_restart_is_flagged_loudly_and_logged_once(w, caplog):
@@ -555,24 +577,23 @@ def test_a_suspected_restart_is_flagged_loudly_and_logged_once(w, caplog):
         again = w.q()
     assert out["status"] == "head_unverified" and out["head_unverified"] is True
     assert out["counted"] == [] and "re-sync" in out["alert"] and again["alert"] == out["alert"]
-    assert "resync_event_id" not in out or w.q(principal=VIEWER).get("resync_event_id") is None
     assert out["resync_event_id"] == "pi-1"                       # the operator sees what to acknowledge
     assert "resync_event_id" not in w.q(principal=VIEWER)         # nobody else does
     assert len([r for r in caplog.records if "unverified" in r.getMessage()]) == 1
 
 
-def test_a_run_of_writes_after_a_restart_is_recognised_and_adopted(w):
+def test_a_run_of_post_restart_writes_is_never_adopted_without_an_operator(w):
     head_at(w, sha(1), 100)
     head_at(w, sha(2), 1)
-    assert w.q()["status"] == "head_unverified"
-    head_at(w, sha(3), 2)                 # a second, increasing write: this is a restart, not a reorder
+    head_at(w, sha(2), 2)
+    head_at(w, sha(2), 3)
     out = w.q()
-    assert out["head"] == sha(3) and out["head_rebased"] is True and out["status"] == "insufficient"
+    assert out["status"] == "head_unverified" and out["head"] == sha(1) and "head_rebased" not in out
     w.repo._rebuild_graph()
-    assert w.q()["head"] == sha(3) and w.q()["head_rebased"] is True
-    head_at(w, sha(4), 101)               # past the old sequence: ordinary again
+    assert w.q()["status"] == "head_unverified"
+    head_at(w, sha(2), 101)               # the writer passes the old sequence: ordinary again
     out = w.q()
-    assert out["head"] == sha(4) and out["head_rebased"] is False
+    assert out["head"] == sha(2) and out["status"] == "insufficient" and out["head_unverified"] is False
 
 
 def test_an_operator_can_acknowledge_the_candidate_write_and_only_that_one(w):
@@ -584,15 +605,13 @@ def test_an_operator_can_acknowledge_the_candidate_write_and_only_that_one(w):
     assert w.q()["status"] == "head_unverified"
     w.feed.node(PR, principal=OPERATOR, attrs={"head_resync": "pi-1"})
     out = w.q()
-    assert out["head"] == sha(2) and out["head_rebased"] is True and out["status"] == "insufficient"
+    assert out["head"] == sha(2) and out["head_resynced"] is True and out["status"] == "insufficient"
     w.repo._rebuild_graph()
-    assert w.q()["head"] == sha(2)
-    # a NEW suspicious observation (lower than the last one) is not covered by the old ack
-    head_at(w, sha(3), 0 + 3)
-    head_at(w, sha(4), 2)
+    assert w.q()["head"] == sha(2) and w.q()["head_resynced"] is True
+    # a NEW suspect write is not covered by the old acknowledgement
+    head_at(w, sha(3), 2)
     out = w.q()
-    assert out["status"] == "head_unverified"
-    assert w.q()["resync_event_id"] == "pi-2"
+    assert out["status"] == "head_unverified" and w.q()["resync_event_id"] == "pi-2"
 
 
 def test_a_viewers_rereview_count_comes_only_from_what_the_viewer_can_see(w):

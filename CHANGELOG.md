@@ -6,10 +6,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ## [Unreleased]
 
 ### Head-bound review quorum (T06)
-- Review round 3: a late head write is no longer a permanent lock. Late/duplicate or nearby (<= 32) writes are ignored; a far
-  lower write with a different head is `head_unverified` with `head_unverified`/`alert` response fields, one log line, and
-  `resync_event_id` for operators; it clears by a higher write, a recognised restart run, or an operator `head_resync`
-  acknowledgement. `rereview_needed` counts only what the caller can see. Matching is ASCII-only (same as autospec;
+- Review round 4: head handling is conservative. A lower-sequence write after the applied one is ignored only if it repeats
+  the applied head or a head that writer already reported earlier; any other head makes the PR `head_unverified`
+  (`head_unverified`/`alert` fields, one log line, operator `resync_event_id`). It clears when the writer writes past the
+  applied sequence or an operator acknowledges the write with `attrs.head_resync`; a run of writes is never auto-adopted
+  (`head_rebased` is gone, `head_resynced` replaces it). Evidence is kept per distinct head so re-emits cannot evict it.
+- Review round 3: `rereview_needed` counts only what the caller can see. Matching is ASCII-only (same as autospec;
   `invalid_target`). Shared vectors grew to 32 cases.
 - `GET /api/v1/graph/nodes/{pr_id}/review-quorum`: derived, head-bound quorum over `reviewed` edges (stale verdicts never
   counted, distinct configured reviewers, author/replay/forged-head defences, `rereview_required`). Config:
