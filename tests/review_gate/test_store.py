@@ -54,10 +54,10 @@ def test_push_during_review_supersedes():
     _, s = make()
     to_reviewing(s, "A")
     s.on_verdict(KEY, fail("A"))
-    to_reviewing_b = s.on_push(KEY, "B")
-    assert to_reviewing_b
-    s.on_ci_green(KEY, "B")
-    s.on_review_started(KEY, "B", "m")
+    assert s.on_push(KEY, "B")
+    assert s.on_ci_green(KEY, "B")
+    assert s.on_review_started(KEY, "B", "m")
+    assert s.snapshot(KEY).state == State.REVIEWING
     rounds = s.snapshot(KEY).review_rounds
     assert s.on_push(KEY, "C")
     snap = s.snapshot(KEY)
@@ -145,8 +145,11 @@ def test_carry_over_different_patch_id_does_not():
 def test_finding_text_is_redacted():
     repo, s = make()
     to_reviewing(s, "A")
-    s.on_verdict(KEY, fail("A", Finding("a.py", "sec", "leak sk-" + "a" * 30, "high", "rotate")))
-    assert "sk-" + "a" * 30 not in str(repo.stream("pr_gate", str(KEY)))
+    secret = "sk-" + "a" * 30
+    assert s.on_verdict(KEY, fail("A", Finding("a.py", "sec", "leak " + secret, "high", "rotate")))
+    s.on_push(KEY, "B")
+    assert s.on_ci_red(KEY, "B", ["boom " + secret])
+    assert secret not in str(repo.stream("pr_gate", str(KEY)))
 
 
 def test_snapshot_rebuilds_from_events_after_restart():
@@ -155,3 +158,107 @@ def test_snapshot_rebuilds_from_events_after_restart():
     s.on_verdict(KEY, fail("A"))
     s.on_push(KEY, "B")
     assert PipelineStore(repo).snapshot(KEY) == s.snapshot(KEY)
+
+
+def test_repeat_detection_works_with_redacted_text():
+    _, s = make()
+    f = Finding("a.py", "sec", "leak sk-" + "b" * 30, "high", "rotate", 3)
+    to_reviewing(s, "A")
+    assert s.on_verdict(KEY, fail("A", f))
+    to_reviewing(s, "B")
+    assert s.on_verdict(KEY, fail("B", f))
+    assert s.snapshot(KEY).state == State.ESCALATED
+
+
+def _escalate_ci(s):
+    for sha in ("A", "B", "C"):
+        s.on_push(KEY, sha)
+        s.on_ci_red(KEY, sha, ["x"])
+    assert s.snapshot(KEY).state == State.ESCALATED
+
+
+def test_push_while_escalated_stays_escalated():
+    _, s = make()
+    _escalate_ci(s)
+    reason = s.snapshot(KEY).reason
+    assert s.on_push(KEY, "D")
+    snap = s.snapshot(KEY)
+    assert snap.state == State.ESCALATED and snap.head_sha == "D" and snap.reason == reason
+
+
+def test_ci_green_ignored_after_push_while_escalated():
+    _, s = make()
+    _escalate_ci(s)
+    s.on_push(KEY, "D")
+    assert s.on_ci_green(KEY, "D") is False
+    assert s.snapshot(KEY).state == State.ESCALATED
+
+
+def test_resume_after_push_while_escalated_returns_to_ci_pending_on_new_head():
+    _, s = make()
+    _escalate_ci(s)
+    s.on_push(KEY, "D")
+    assert s.resume(KEY)
+    snap = s.snapshot(KEY)
+    assert snap.state == State.CI_PENDING and snap.head_sha == "D"
+
+
+def test_illegal_state_rejections():
+    _, s = make()
+    s.on_push(KEY, "A")
+    s.on_ci_red(KEY, "A", ["x"])
+    assert s.on_ci_green(KEY, "A") is False  # same-SHA re-run ignored
+    assert s.on_verdict(KEY, fail("A")) is False
+    assert s.on_merged(KEY, "A") is False
+    assert s.snapshot(KEY).state == State.CI_RED
+
+
+def test_custom_caps_honoured():
+    _, s = make(review_cap=1, ci_fix_cap=1)
+    s.on_push(KEY, "A")
+    s.on_ci_red(KEY, "A", ["x"])
+    assert s.snapshot(KEY).state == State.ESCALATED
+    s.resume(KEY)
+    to_reviewing(s, "B")
+    s.on_verdict(KEY, fail("B"))
+    assert s.snapshot(KEY).state == State.ESCALATED
+
+
+def test_ci_fix_rounds_persist_across_pushes():
+    _, s = make()
+    for sha in ("A", "B"):
+        s.on_push(KEY, sha)
+        s.on_ci_red(KEY, sha, ["x"])
+    snap = s.snapshot(KEY)
+    assert snap.ci_fix_rounds == 2 and snap.state == State.CI_RED
+
+
+def test_resume_after_review_cap_escalation():
+    _, s = make(review_cap=1)
+    to_reviewing(s, "A")
+    s.on_verdict(KEY, fail("A"))
+    assert s.snapshot(KEY).state == State.ESCALATED
+    assert s.resume(KEY)
+    snap = s.snapshot(KEY)
+    assert snap.state == State.CI_PENDING and snap.review_rounds == 0
+
+
+def test_carry_over_wrong_sha_and_null_patch_id():
+    _, s = make()
+    to_reviewing(s, "A")
+    s.on_verdict(KEY, Verdict("PASS", "A", (), "m"), patch_id=None)
+    s.on_push(KEY, "B")
+    assert s.carry_over_approval(KEY, "B", "p1") is False
+    s2_repo, s2 = make()
+    to_reviewing(s2, "A")
+    s2.on_verdict(KEY, Verdict("PASS", "A", (), "m"), patch_id="p1")
+    s2.on_push(KEY, "B")
+    assert s2.carry_over_approval(KEY, "Z", "p1") is False
+
+
+def test_last_findings_retained_across_push():
+    _, s = make()
+    to_reviewing(s, "A")
+    s.on_verdict(KEY, fail("A"))
+    s.on_push(KEY, "B")
+    assert len(s.snapshot(KEY).last_findings) == 1

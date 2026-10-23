@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 
 from herdr_engineering.control_plane.redact import redact_text
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
@@ -29,15 +29,13 @@ class PrSnapshot:
     reason: str | None
 
 
-def _finding_dict(f: Finding) -> dict:
-    return {
-        "path": redact_text(f.path),
-        "category": f.category,
-        "message": redact_text(f.message),
-        "severity": f.severity,
-        "required_change": redact_text(f.required_change),
-        "line": f.line,
-    }
+def _redacted(f: Finding) -> Finding:
+    return replace(
+        f,
+        path=redact_text(f.path),
+        message=redact_text(f.message),
+        required_change=redact_text(f.required_change),
+    )
 
 
 def _payload(event: dict) -> dict:
@@ -49,6 +47,8 @@ def _payload(event: dict) -> dict:
 
 def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
     if event_type == "push":
+        if snap.state == State.ESCALATED:  # only an operator resume clears escalation
+            return replace(snap, head_sha=p["sha"])
         return replace(snap, head_sha=p["sha"], state=State.CI_PENDING, reason=None)
     if event_type == "ci_green":
         return replace(snap, state=State.CI_GREEN)
@@ -100,6 +100,7 @@ class PipelineStore:
         self._repo = repo
         self._review_cap = review_cap
         self._ci_fix_cap = ci_fix_cap
+        # Per store instance: serialises writers within one process only.
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ read
@@ -123,6 +124,8 @@ class PipelineStore:
             return self._record(key, "push", {"sha": sha, "superseded_sha": snap.head_sha})
 
     def on_ci_green(self, key: PrKey, sha: str) -> bool:
+        # Only legal from CI_PENDING: a same-SHA CI re-run after ci_red is
+        # ignored until a new push.
         with self._lock:
             snap = self.snapshot(key)
             if sha != snap.head_sha or snap.state != State.CI_PENDING:
@@ -153,16 +156,17 @@ class PipelineStore:
             snap = self.snapshot(key)
             if verdict.sha != snap.head_sha or snap.state != State.REVIEWING:
                 return False
+            findings = tuple(_redacted(f) for f in verdict.findings)
             payload: dict = {
                 "sha": verdict.sha,
                 "verdict": verdict.verdict,
                 "reviewer_model": verdict.reviewer_model,
                 "patch_id": patch_id,
-                "findings": [_finding_dict(f) for f in verdict.findings],
+                "findings": [asdict(f) for f in findings],
             }
             if verdict.verdict == "FAIL":
                 previous = {finding_fingerprint(f) for f in snap.last_findings}
-                repeated = any(finding_fingerprint(f) in previous for f in verdict.findings)
+                repeated = any(finding_fingerprint(f) in previous for f in findings)
                 if snap.review_rounds + 1 >= self._review_cap:
                     payload.update(escalated=True, reason="review cap reached")
                 elif repeated:
