@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import queue
 import re
@@ -34,6 +35,20 @@ from .redact import redact_payload
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
+# The only routes the `reviewer` role may POST (review gate workers), and only it:
+# an operator key is refused there too. Matched on the DECODED path with
+# fullmatch; the job id segment is validated (32 hex) by the handler (400).
+_REVIEWER_POST = re.compile(
+    r"/api/v1/review-gate/(?:claim|jobs/[^/]+/(?:heartbeat|result|failure))"
+)
+_CLAIM_FIELDS = ("job_id", "repo", "number", "sha", "messages", "lease_seconds", "attempt")
+_RESULT_OUTCOMES = frozenset({"recorded", "stale", "rejected"})
+_FAILURE_OUTCOMES = frozenset({"released", "escalated", "stale"})
+_REVIEWER_ID = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
+_REVIEWER_JOB_ID = re.compile(r"[0-9a-f]{32}")
+_REVIEWER_SMALL_BODY = 8 * 1024
+_REVIEWER_REASON_MAX = 500
+_log = logging.getLogger(__name__)
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
 # back to "dev" in a local checkout / un-stamped image.
 _COMMIT = os.environ.get("HERDR_ENGINEERING_COMMIT", "dev")
@@ -143,7 +158,9 @@ class ControlPlaneServer:
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
-        (read + mutate) / "ingest" (read + POST /api/v1/ingest only).
+        (read + mutate) / "ingest" (read + POST /api/v1/ingest only) /
+        "agent" (ingest + host-side tool routes) / "reviewer" (read + POST the
+        four review-gate worker routes only; no other role may POST those).
         No key configured = open (private-by-default bind).
 
         `allow_open` is an explicit opt-in that permits an unauthenticated
@@ -247,6 +264,7 @@ class ControlPlaneServer:
         self._ready = threading.Event()
         self._httpd = None
         self.gate_service = self.gate_store = self.gate_queue = None
+        self.gate_coordinator = self.gate_reviewer_config = None
         self._start_review_gate(repo, fleet_config)
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
@@ -276,6 +294,7 @@ class ControlPlaneServer:
         if sink is not None and not callable(getattr(sink, "record_required", None)):
             raise ValueError("review_gate: the event sink cannot make durable writes")
         from ..review_gate import github_app
+        from ..review_gate.coordinator import ReviewCoordinator
         from ..review_gate.queue import ReviewQueue
         from ..review_gate.registry import AuthorRegistry
         from ..review_gate.service import GateService
@@ -284,11 +303,25 @@ class ControlPlaneServer:
             repo,
             review_caps={e.repo: e.review_cap for e in config.repos},
             ci_fix_caps={e.repo: e.ci_fix_cap for e in config.repos})
-        self.gate_queue = ReviewQueue(repo)
+        # The queue's real lease and the lease a Claim reports must be one value.
+        self.gate_queue = ReviewQueue(repo, lease_seconds=config.reviewer.lease_seconds)
+        app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
         self.gate_service = GateService(
-            config=config, app=github_app.GitHubAppClient(config.app),
-            store=self.gate_store, queue=self.gate_queue, registry=AuthorRegistry(repo),
-            ci_snapshot=lambda: self.ci_monitor.snapshot(start=False))
+            config=config,
+            app=app,
+            store=self.gate_store,
+            queue=self.gate_queue,
+            registry=AuthorRegistry(repo),
+            ci_snapshot=lambda: self.ci_monitor.snapshot(start=False),
+        )
+        self.gate_reviewer_config = config.reviewer
+        self.gate_coordinator = ReviewCoordinator(
+            store=self.gate_store,
+            queue=self.gate_queue,
+            app=app,
+            config=config.reviewer,
+            enrolled={e.repo for e in config.repos},
+        )
         # The gate must work with no browser open, and snapshot(start=False) never
         # starts the poller, so the server starts the shared monitor itself.
         self.ci_monitor.start()
@@ -572,8 +605,11 @@ def _make_handler(server, public=False, operator=False):
             Role model (Spec §104): viewer = read-only; operator = read +
             mutate; ingest = read + POST /api/v1/ingest only (read-only
             everywhere else); agent = ingest plus exactly the host-side tool routes
-            (LLM key mint/revoke, review create/result). Unknown roles are treated as viewer (fail-closed
-            for mutations).
+            (LLM key mint/revoke, review create/result); reviewer = read-only plus
+            POST to exactly the four review-gate worker routes (claim, job
+            heartbeat/result/failure), which NO other role may POST, operator
+            included (so open/keyless mode cannot use them). Unknown roles are
+            treated as viewer (fail-closed for mutations).
 
             The return value MUST be truthy on refusal: callers do
             ``if self._require(...): return``. (It used to return the result of
@@ -583,6 +619,16 @@ def _make_handler(server, public=False, operator=False):
             role = self._role()
             if role is None:
                 return self._deny(401, "unauthorized")
+            if self.command == "POST" and self._is_reviewer_namespace():
+                # Decided on the DECODED path (routing unquotes), before the
+                # operator shortcut below: only `reviewer` gets past here.
+                if role != "reviewer":
+                    return self._deny(403, "reviewer role required")
+                if not _REVIEWER_POST.fullmatch("/".join(self._decoded_parts())):
+                    return self._deny(404, "not found")
+                return None
+            if role == "reviewer" and min_role != "viewer":
+                return self._deny(403, "read-only")
             if min_role == "operator":
                 if role == "operator":
                     return None
@@ -599,6 +645,19 @@ def _make_handler(server, public=False, operator=False):
                     return None
                 return self._deny(403, "read-only")
             return None
+
+        def _decoded_parts(self):
+            """Path segments unquoted exactly as ``_route_api`` routes them."""
+            return [unquote(seg) for seg in self.path.split("?")[0].split("/")]
+
+        def _is_reviewer_namespace(self):
+            """True for any POST target under review-gate/claim or review-gate/jobs."""
+            parts = self._decoded_parts()
+            return (
+                len(parts) > 4
+                and parts[:4] == ["", "api", "v1", "review-gate"]
+                and parts[4] in ("claim", "jobs")
+            )
 
         # ------------------------------------------------------------ routes
         # -------------------------------------------- public (collab-only) listener
@@ -1080,6 +1139,80 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "pull request is not escalated"}, 409)
             return self._json(_gate_pr(store.snapshot(key)))
 
+        def _reviewer_body(self, cap, fields):
+            """Read a reviewer route's JSON object body: ``(body, None)`` or ``(None, (status, error))``.
+
+            Fixed error strings only: nothing from the request is ever echoed back.
+            """
+            length = _content_length(self.headers.get("Content-Length"))
+            if not length:
+                return None, (400, "invalid request body")
+            if length > cap:
+                return None, (413, "request body too large")
+            try:
+                body = json.loads(self.rfile.read(length))
+            except (ValueError, RecursionError):
+                return None, (400, "invalid request body")
+            if not isinstance(body, dict) or set(body) != fields:
+                return None, (400, "invalid request body")
+            for name in sorted(fields & {"worker_id", "reviewer_model"}):
+                value = body[name]
+                if not isinstance(value, str) or not _REVIEWER_ID.fullmatch(value):
+                    return None, (400, f"invalid {name}")
+            if "output" in fields and not isinstance(body["output"], str):
+                return None, (400, "invalid output")
+            reason = body.get("reason", "")
+            if not isinstance(reason, str) or len(reason) > _REVIEWER_REASON_MAX:
+                return None, (400, "invalid reason")
+            return body, None
+
+        def _review_gate_worker(self, parts):
+            """POST review-gate/claim and review-gate/jobs/<job_id>/{heartbeat,result,failure}.
+
+            Reviewer role only (``_require`` enforced it; re-checked here as defence
+            in depth). Every refusal goes through ``_deny`` (Connection: close), so an
+            unread body can never be parsed as a next request.
+            """
+            if self._role() != "reviewer" or not _REVIEWER_POST.fullmatch("/".join(parts)):
+                return self._deny(403, "reviewer role required")
+            coord, cfg = server.gate_coordinator, server.gate_reviewer_config
+            if coord is None or cfg is None:
+                return self._deny(503, "review gate disabled")
+            action = "claim" if parts[4] == "claim" else parts[6]
+            job_id = None if action == "claim" else parts[5]
+            if job_id is not None and not _REVIEWER_JOB_ID.fullmatch(job_id):
+                return self._deny(400, "invalid job id")
+            fields = {
+                "claim": {"worker_id", "reviewer_model"},
+                "heartbeat": {"worker_id"},
+                "result": {"worker_id", "output"},
+                "failure": {"worker_id", "reason"},
+            }[action]
+            cap = cfg.max_output_bytes + 4 * 1024 if action == "result" else _REVIEWER_SMALL_BODY
+            body, error = self._reviewer_body(cap, fields)
+            if error is not None:
+                return self._deny(*error)
+            worker = body["worker_id"]
+            try:
+                if action == "claim":
+                    got = coord.claim(worker, body["reviewer_model"])
+                    job = None if got is None else {f: getattr(got, f) for f in _CLAIM_FIELDS}
+                    return self._json({"job": job})
+                if action == "heartbeat":
+                    return self._json({"ok": coord.heartbeat(job_id, worker) is True})
+                if action == "result":
+                    outcome = coord.submit(job_id, worker, body["output"])
+                    allowed = _RESULT_OUTCOMES
+                else:
+                    outcome = coord.fail(job_id, worker, body["reason"])
+                    allowed = _FAILURE_OUTCOMES
+                if not isinstance(outcome, str) or outcome not in allowed:
+                    raise TypeError("unexpected coordinator outcome")
+                return self._json({"outcome": outcome})
+            except Exception as exc:  # noqa: BLE001 - fixed 500, class name only in the log
+                _log.error("review gate %s failed: %s", action, type(exc).__name__)
+                return self._json({"error": "internal error"}, 500)
+
         def _api_get(self, parts, resource):
             r = server.repo
             if resource == "health":
@@ -1291,6 +1424,8 @@ def _make_handler(server, public=False, operator=False):
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
+            if resource == "review-gate" and len(parts) > 4 and parts[4] in ("claim", "jobs"):
+                return self._review_gate_worker(parts)
             if resource == "review-gate":
                 return self._review_gate_resume(parts)
             if resource == "ci" and len(parts) == 5 and parts[4] == "telemetry":
