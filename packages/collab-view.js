@@ -765,16 +765,17 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       } catch { /* keep what is shown */ } finally { peopleBusy = false; }
     };
 
-    // Tabs and panes come from recorded spawn lineage around the room's linked workspaces and missions. The
-    // server filters every node by this person's membership; a failed or empty read just shows the empty state.
+    // Tabs and panes come from recorded spawn lineage the server lets this person read in THIS room (room scope
+    // plus its linked missions). A failed or empty read just shows the empty state; nothing is guessed.
     let tabsBusy = false;
     const loadTabs = async () => {
       if (tabsBusy || Date.now() - S.tabsAt < 8000) return;
       tabsBusy = true;
       try {
-        const roots = [...(S.links || []).map((l) => `workspace:${l.workspace_id}`), ...(S.missions || []).map((m) => `mission:${m.mission_id}`)].slice(0, 20);
-        const graphs = (await Promise.all(roots.map((r) => api.graphAround(r).catch(() => null)))).filter(Boolean);
-        S.tabs = buildTabsPanes(graphs, S.links || []);
+        const none = { nodes: [], edges: [] };
+        const [agents, tabNodes, paneNodes] = await Promise.all([
+          api.graphList(roomId, 'agent', 'spawn'), api.graphList(roomId, 'tab'), api.graphList(roomId, 'pane')].map((p) => p.catch(() => none)));
+        S.tabs = buildTabsPanes([agents, tabNodes, paneNodes], S.links || []);
       } finally { S.tabsAt = Date.now(); tabsBusy = false; }
     };
     function drawTabs() {

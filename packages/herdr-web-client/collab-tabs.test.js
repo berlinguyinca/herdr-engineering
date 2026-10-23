@@ -100,3 +100,13 @@ test('merging several neighborhoods dedupes nodes and edges', () => {
   assert.equal(m.tabs.length, 1);
   assert.equal(m.tabs[0].panes.length, 1);
 });
+
+test('the graph list call is scoped to one room and uses the collab route', async () => {
+  const { CollabApi } = await import('./collab.js');
+  const calls = [];
+  const api = new CollabApi(() => ({ access: 'T' }), async (url, init) => { calls.push([init.method, url]); return { status: 200, ok: true, json: async () => ({}) }; });
+  await api.graphList('room 1', 'agent', 'spawn');
+  await api.graphList('room 1', 'pane');
+  assert.deepEqual(calls[0], ['GET', '/api/v1/collab/graph/nodes?node_type=agent&room_id=room+1&limit=500&edge_type=spawn']);
+  assert.deepEqual(calls[1], ['GET', '/api/v1/collab/graph/nodes?node_type=pane&room_id=room+1&limit=500']);
+});

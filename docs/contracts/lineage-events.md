@@ -175,10 +175,10 @@ A scope is a LABEL derived from the stored envelope fields of the event that car
 when the envelope names `room_id` (resp. `mission_id`) - so live ingest and rebuild read the same stored columns.
 | label | who can read |
 |---|---|
-| `org` | any authenticated caller (keyed API or signed-in person) |
+| `org` | any authenticated fleet KEY (keyed API). **Never a signed-in person**: the HCN route does not read `org` lineage |
 | `room` + `room_id` | operator keys; a signed-in, approved NON-GUEST member of that room (expired membership does not count) |
 | `mission` + `mission_id` | operator keys; a person on that mission's explicit member list (T07 `link_mission`) in a room where they are still a non-guest member |
-| either, plus `workspace_id` | as above AND that room holds a link to the workspace granting `status`, `tabs` or `panes` (revoking the grant, or unlinking, hides it) |
+| either, plus `workspace_id` | as above AND that room holds a link to the workspace granting `status`, `tabs` or `panes` (revoking the grant, or unlinking, hides it). Events of one object that name several workspaces need a link to EACH (at most 8, then the bare label) |
 | bare `room` / `mission` | operator keys only (fail closed; no member can satisfy a label that names nothing) |
 | `private` | only the object's writers (owner + operator-set `co_writers`) |
 | missing/unknown | treated as `private` at ingest; unauthenticated principals see nothing |
@@ -188,16 +188,19 @@ when the envelope names `room_id` (resp. `mission_id`) - so live ingest and rebu
   the HCN log and the lineage rows are both replayed (tested for every reader across grant and revoke).
 - **Who is a reader.** Only people (HCN user principals). Agents, guests, unapproved people and people with no non-guest room
   membership get one 404 for the whole route. Room access still never implies workspace terminal access.
-- **Front doors.** `GET /api/v1/collab/graph/nodes/{id}`, `.../nodes/{id}/neighborhood` (alias `subgraph`) and
-  `.../graph/edge` take the same parameters as the keyed `/api/v1/graph/...` routes and use the same `read_graph` router.
+- **Front doors.** `GET /api/v1/collab/graph/nodes/{id}`, `.../nodes/{id}/neighborhood` (alias `subgraph`),
+  `.../graph/edge` and the listing `.../graph/nodes?node_type=&edge_type=&limit=[&room_id=]` take the same parameters as the keyed `/api/v1/graph/...` routes and use the same `read_graph` router.
   They exist only when the collab service runs in the combined server (not `collab_only`, which by design never sees fabric
   data): in the isolated process the route is a plain 404. The keyed API still sees `room`/`mission` as operator-only.
-- **Meet rules** (a node/edge keeps the NARROWEST label of any event that defined it, never widening). Labels form a flat
-  semilattice: `private` < bare `mission` < bare `room` < `org`; a contextual label sits between `private` and `org` and is
-  incomparable with every other middle label, so two different ones (another room, a mission, a bare scope) meet at
-  `private` - writers only. A producer that re-scopes one node into a second room therefore hides it from both rooms
-  rather than leaking it into either. Commons nodes keep per-writer labels (at most 4 per writer) and every field stays
-  gated by its own writer's label, exactly as before.
+- **Meet rules** (a node/edge keeps the NARROWEST label of any event that defined it, never widening). Labels form a
+  semilattice: `private` < bare `mission` < bare `room` < contextual room `(room, id, workspaces)`; bare `mission` <
+  contextual mission; `org` on top for fleet keys. Two labels of the SAME room/mission union their workspace gates (more
+  gates = narrower), so a later event with no or a different workspace never makes the node vanish for a room that is
+  linked to all of them. Two DIFFERENT contexts (another room, a mission vs a room) meet at the bare label, which only
+  operators read: a producer that re-scopes one node into a second room hides it from both audiences rather than leaking it
+  into either. Commutativity, associativity and idempotence are tested over the whole label universe, together with
+  "the meet is never visible to someone who could not see both inputs" (`org` aside: it is fleet data, not people data).
+  Commons nodes keep per-writer labels (at most 4 per writer) and every field stays gated by its own writer's label.
 - **Trust.** The room/mission/workspace named on an event is whatever the (authenticated) ingest key put in its envelope:
   ingest keys are fleet credentials, and they could already publish `org` lineage that every signed-in key reads. The new
   capability is only that such a key can address content to a specific room's members; it shows attributed (`writer`,
@@ -207,8 +210,11 @@ when the envelope names `room_id` (resp. `mission_id`) - so live ingest and rebu
 
 ### Tabs and panes (T08)
 Read-only panel "Tabs" in the room page (`packages/collab-tabs.js`; model `buildTabsPanes`, renderer `renderTabsPanes`).
-It reads `GET /api/v1/collab/graph/nodes/{workspace:<id> | mission:<id>}/neighborhood` for each workspace and mission the
-room links, so it can only ever show what membership already allows.
+It reads `GET /api/v1/collab/graph/nodes?node_type=agent&edge_type=spawn&room_id=<room>` (plus `tab` and `pane` listings), the
+agents this person may see in THIS room (room scope plus the room's linked missions they belong to, with the visible `spawn`
+edges between them), so it can only ever show what membership already allows. The listing is bounded (500 nodes, 3000 ids
+examined) and never counts hidden nodes. Pi's lineage emitter defines no `workspace:`/`mission:` root node, which is why the
+panel lists by type instead of walking from a root.
 - An `agent:` node with no visible incoming `spawn` edge from another agent is a **primary agent -> tab**. An agent with one is
   a **subagent -> pane** under the nearest tab ancestor (depth shown). Several parents: the smallest id wins (deterministic).
   A spawn cycle is cut (the cyclic edge is ignored). Nothing is inferred from chat, names, order or timing.
@@ -217,7 +223,7 @@ room links, so it can only ever show what membership already allows.
   status is whatever the remote reported, it is labelled "Remote" and never has a terminal control.
 - **Closing a pane never kills an agent.** Surface state lives on a `tab:` / `pane:` node whose `attrs.agent_id` names the
   agent; `state: closed` only adds a "pane closed" note. The agent keeps its own reported state and stays listed.
-- Workspace-link grants refine the view: when an agent's `attrs.workspace_id` is linked, it is shown as a tab only with the
+- Workspace-link grants refine the view: when an agent's `attrs.workspace_id` is set and linked, it is shown as a tab only with the
   `tabs` grant and as a pane only with `panes`; otherwise it is counted ("N more are not shared") without names.
 - No terminal control exists on this page (click-to-inspect is T09 and needs `authorize_workspace`). `can_terminal` in the
   model is only the server's per-link answer.
@@ -248,7 +254,11 @@ room links, so it can only ever show what membership already allows.
   `/api/v1/graph` API still treats `room`/`mission` as operator-only. Agents and guests read no graph.
 - **Addressing is not authorization of the writer**: any ingest key may address a room it can name (see "Trust" above).
   A per-key allowed-room list in the fleet YAML is the next hardening step (not done).
-- **Pi is not known to set `room_id`/`mission_id` on lineage envelopes** (not verified in this PR); until it does, Pi lineage at
-  `room`/`mission` scope stays operator-only. `tab:`/`pane:` surface nodes need an emitter and an edge to be reachable from
-  the workspace/mission root, so pane state is empty until Pi emits them.
-- **Large rooms**: the Tabs panel makes one neighborhood read per linked workspace/mission (max 20, every 8 s while open).
+- **Pi (pi-t02 `src/runtime/herdr/lineage.ts`, read for this PR)** puts `mission_id` (and task/agent/workspace ids when it has
+  them) on the envelope and uses ONE configured `visibility_scope` for the whole emitter; it never sets `room_id`. So Pi lineage
+  becomes member-readable with `visibility: mission` plus a T07 mission link that lists the people; `room` scope needs a
+  `room_id` Pi does not send. It emits `agent`/`attempt`/`session`/`handoff`/`artifact` nodes and agent->agent `spawn` edges
+  (so tabs and panes work from `mission` scope), but no `tab:`/`pane:` surface nodes, so "pane closed" notes stay empty until
+  an emitter adds them (with `attrs.agent_id`). Pi does not put `workspace_id` on agent attrs, so link-grant filtering of
+  tabs/panes does not apply to Pi data (the server-side workspace gate still does when `workspace_id` is on the envelope).
+- **Large rooms**: the Tabs panel makes three listing reads (agents, tabs, panes) at most every 8 s while open; not load-tested.

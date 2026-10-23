@@ -8,7 +8,8 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Tabs/panes and membership-scoped lineage (T08, stacked on #165 and #164)
 - Lineage `room`/`mission` scopes now resolve to HCN membership: an event that names its `room_id` / `mission_id`
   (and optionally `workspace_id`) is readable by that room's non-guest members / that mission's listed members (T07),
-  through the new `GET /api/v1/collab/graph/...` routes; everyone else still gets 404. Bare `room`/`mission` stay
+  through the new `GET /api/v1/collab/graph/...` routes (node, neighborhood, edge and a per-room type listing);
+  everyone else still gets 404, and a signed-in person never reads `org` lineage. Bare `room`/`mission` stay
   operator-only and the keyed `/api/v1/graph` API is unchanged. No migration; reads only.
 - Room workbench: new read-only "Tabs" panel (`packages/collab-tabs.js`): primary agents as tabs, spawned subagents as
   panes, from recorded `spawn` lineage only. Closing a pane never changes the agent.

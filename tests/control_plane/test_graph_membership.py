@@ -178,44 +178,64 @@ def test_mission_events_with_a_workspace_need_the_mission_room_link(fab):
 
 
 # --------------------------------------------------------------------- graph-level rules
-def test_contextual_scopes_meet_at_private_and_never_widen(fab):
+def test_re_scoping_a_node_into_another_context_hides_it_from_both_audiences(fab):
     put(fab.feed, "task:x", "room", room_id=fab.room)
     put(fab.feed, "task:x", "room", room_id=fab.room2)          # same writer re-scopes it elsewhere
     for who in (fab.alice, fab.bob):
-        assert not visible(fab, who, "task:x")                   # private = its writer only
-    assert fab.repo.graph.get_node(WRITER, "task:x")["node"]["visibility_scope"] == "private"
+        assert not visible(fab, who, "task:x")                   # neither room's members
+    # operators keep seeing it (a bare room label), exactly as for any unresolvable room scope
+    assert fab.repo.graph.get_node(OPERATOR, "task:x")["node"]["visibility_scope"] == "room"
     put(fab.feed, "task:y", "room", room_id=fab.room)
     put(fab.feed, "task:y", "org")                               # a later org event cannot widen it
     assert visible(fab, fab.bob, "task:y") and not visible(fab, fab.mallory, "task:y")
 
 
-def test_neighborhood_reveals_only_what_the_member_may_see(fab):
+def test_one_room_across_two_workspaces_needs_a_link_to_each_and_never_vanishes(fab):
+    link(fab, ws="ws-1")
+    put(fab.feed, "agent:x", "room", room_id=fab.room, workspace_id="ws-1")
+    assert visible(fab, fab.bob, "agent:x")
+    put(fab.feed, "agent:x", "room", room_id=fab.room)                       # later event names no workspace
+    assert visible(fab, fab.bob, "agent:x")
+    put(fab.feed, "agent:x", "room", room_id=fab.room, workspace_id="ws-2")  # and one from the second workspace
+    assert not visible(fab, fab.bob, "agent:x")          # ws-2 is not linked to this room yet: fail closed
+    assert fab.repo.graph.get_node(OPERATOR, "agent:x")["node"]["id"] == "agent:x"   # but never "private": operators still see it
+    link(fab, ws="ws-2")
+    assert visible(fab, fab.bob, "agent:x")
+    assert not visible(fab, fab.mallory, "agent:x")
+
+
+def test_a_member_never_reads_org_lineage_and_neighborhoods_show_only_their_own_room(fab):
     f = fab.feed
     put(f, "task:org", "org")
     put(f, "task:mine", "room", room_id=fab.room)
+    put(f, "task:mine2", "room", room_id=fab.room)
     put(f, "task:theirs", "room", room_id=fab.room2)
-    f.edge("dependency", "task:org", "task:mine", scope="room", room_id=fab.room, nodes=False)
-    f.edge("dependency", "task:org", "task:theirs", scope="room", room_id=fab.room2, nodes=False)
-    bob = read(fab, fab.bob, "task:org", hood=True)
-    assert ids(bob) == {"task:org", "task:mine"}
-    assert not bob["truncated"]
-    alice = read(fab, fab.alice, "task:org", hood=True)
-    assert ids(alice) == {"task:org", "task:mine", "task:theirs"}
-    # a person in no room has no graph at all, even for org-scoped lineage
-    assert not visible(fab, fab.mallory, "task:org")
+    f.edge("dependency", "task:mine", "task:mine2", scope="room", room_id=fab.room, nodes=False)
+    f.edge("dependency", "task:mine", "task:theirs", scope="room", room_id=fab.room2, nodes=False)
+    f.edge("dependency", "task:mine", "task:org", scope="org", nodes=False)
+    bob = read(fab, fab.bob, "task:mine", hood=True)
+    assert ids(bob) == {"task:mine", "task:mine2"} and not bob["truncated"]
+    alice = read(fab, fab.alice, "task:mine", hood=True)
+    assert ids(alice) == {"task:mine", "task:mine2", "task:theirs"}      # her other room, still not org
+    for who in (fab.alice, fab.bob, fab.carol, fab.mallory):
+        assert not visible(fab, who, "task:org")                         # org is fleet data, not people data
+    # the fleet keys still read org lineage exactly as before
+    assert fab.repo.graph.get_node(VIEWER, "task:org")["node"]["visibility_scope"] == "org"
+    d = fab.s.dispatch
+    st, _ = d("GET", ["graph", "nodes", "task:org"], {}, {}, f"Bearer {USERS['bob']}", None)
+    assert st == 404
 
 
 def test_commons_fields_stay_per_writer_under_membership(fab):
     f = fab.feed
     put(f, "pr:github.com/o/r#1", "room", label="room label", room_id=fab.room)
-    put(f, "pr:github.com/o/r#1", "org", label="org label", principal=OTHER)
-    seen = read(fab, fab.bob, "pr:github.com/o/r#1")["node"]
-    texts = json.dumps(seen)
-    assert "room label" in texts and "org label" in texts
-    # a member of another room only gets the node via the org writer, never the room writer's field
-    fab.s.add_member(fab.alice, fab.room2, {"user_id": "mallory", "role": "viewer"})
-    other = json.dumps(read(fab, fab.mallory, "pr:github.com/o/r#1")["node"])
-    assert "org label" in other and "room label" not in other
+    put(f, "pr:github.com/o/r#1", "room", label="other label", room_id=fab.room2, principal=OTHER)
+    put(f, "pr:github.com/o/r#1", "org", label="org label", principal=OPERATOR)
+    bob = json.dumps(read(fab, fab.bob, "pr:github.com/o/r#1")["node"])
+    assert "room label" in bob and "other label" not in bob and "org label" not in bob
+    alice = json.dumps(read(fab, fab.alice, "pr:github.com/o/r#1")["node"])
+    assert "room label" in alice and "other label" in alice and "org label" not in alice
+    assert not visible(fab, fab.mallory, "pr:github.com/o/r#1")          # no writer of it is visible to her
 
 
 def test_a_hand_built_member_principal_is_not_trusted(fab):
@@ -232,9 +252,9 @@ def test_a_hand_built_member_principal_is_not_trusted(fab):
 def test_scope_label_is_derived_from_validated_event_fields_only():
     assert scope_label({"visibility_scope": "org", "room_id": "r"}) == "org"
     assert scope_label({"visibility_scope": "private", "room_id": "r"}) == "private"
-    assert scope_label({"visibility_scope": "room", "room_id": "r"}) == ("room", "r", None)
+    assert scope_label({"visibility_scope": "room", "room_id": "r"}) == ("room", "r", ())
     assert scope_label({"visibility_scope": "room", "mission_id": "m"}) == "room"
-    assert scope_label({"visibility_scope": "mission", "mission_id": "m", "workspace_id": "w"}) == ("mission", "m", "w")
+    assert scope_label({"visibility_scope": "mission", "mission_id": "m", "workspace_id": "w"}) == ("mission", "m", ("w",))
     assert scope_label({"visibility_scope": "bogus", "room_id": "r"}) == "private"
     assert scope_label({"visibility_scope": "room", "room_id": ""}) == "room"
     assert scope_label({"visibility_scope": "room", "room_id": 7}) == "room"
@@ -313,6 +333,12 @@ def test_rebuild_equals_live_for_every_reader_across_grant_and_revoke(fab):
                     out[name, node, "hood"] = json.dumps(read(fab, who, node, hood=True), sort_keys=True, default=str)
                 except CollabError as exc:
                     out[name, node] = out[name, node, "hood"] = exc.status
+            for room in (None, fab.room, fab.room2):
+                try:
+                    q = {"node_type": "task", "edge_type": "dependency", **({"room_id": room} if room else {})}
+                    out[name, "list", room] = json.dumps(fab.s.graph_read(who, ["nodes"], q), sort_keys=True, default=str)
+                except CollabError as exc:
+                    out[name, "list", room] = exc.status
         for key in (OPERATOR, VIEWER, OTHER, WRITER):
             for node in nodes:
                 try:
@@ -334,6 +360,7 @@ def test_rebuild_equals_live_for_every_reader_across_grant_and_revoke(fab):
     assert first["bob", "task:m1"] != 404 and first["carol", "task:m1"] == 404
     assert first["bob", "task:w1"] != 404 and first["bob", "task:w2"] == 404
     assert first["bob", "task:x"] == 404 and first["bob", "task:r2"] == 404
+    assert first["bob", "list", fab.room] != 404 and first["mallory", "list", fab.room] == 404
     # membership changes flow through both projections identically
     fab.s.add_member(fab.alice, fab.room, {"user_id": "mallory", "role": "viewer"})
     fab.s.remove_member(fab.alice, fab.room, "carol")
@@ -402,3 +429,91 @@ def test_real_server_serves_membership_scoped_lineage_over_the_collab_route(env)
         conn.request("GET", f"/api/v1/graph/nodes/{quote('task:http', safe='')}", headers={"X-API-Key": key})
         assert conn.getresponse().status == want
         conn.close()
+
+
+# ----------------------------------------------------------------------- label algebra
+def test_the_label_meet_is_a_semilattice_and_never_widens_anyone():
+    import itertools
+    import random
+
+    from herdr_engineering.control_plane.graph import _narrow
+    labels = ["private", "mission", "room", "org",
+              ("room", "R1", ()), ("room", "R1", ("a",)), ("room", "R1", ("b",)), ("room", "R1", ("a", "b")),
+              ("room", "R2", ()), ("mission", "M1", ()), ("mission", "M1", ("a",)), ("mission", "M2", ())]
+    for a, b in itertools.product(labels, labels):
+        assert _narrow(a, b) == _narrow(b, a)
+        assert _narrow(a, a) == a
+    for a, b, c in itertools.product(labels, repeat=3):
+        assert _narrow(_narrow(a, b), c) == _narrow(a, _narrow(b, c)), (a, b, c)
+    rng = random.Random(7)
+    for _ in range(300):
+        access = {"rooms": frozenset(x for x in ("R1", "R2") if rng.random() < .5),
+                  "missions": frozenset(x for x in ("M1", "M2") if rng.random() < .5),
+                  "room_ws": frozenset((r, w) for r in ("R1", "R2") for w in "ab" if rng.random() < .5),
+                  "mission_ws": frozenset((m, w) for m in ("M1", "M2") for w in "ab" if rng.random() < .5)}
+        member = {"kind": "member", "id": "user:x", "authenticated_by": "collab", "access": access}
+        for who in (member, OPERATOR, VIEWER):
+            for a, b in itertools.product(labels, labels):
+                if who is member and "org" in (a, b):
+                    continue          # `org` is fleet data: above every label for KEYS, not for people
+                if can_see(who, _narrow(a, b), frozenset()):
+                    assert can_see(who, a, frozenset()) and can_see(who, b, frozenset()), (who["kind"], a, b)
+    # a member never reads fleet `org`, whatever else they belong to
+    full = {"kind": "member", "id": "user:x", "authenticated_by": "collab",
+            "access": {"rooms": frozenset({"R1"}), "missions": frozenset(), "room_ws": frozenset(), "mission_ws": frozenset()}}
+    assert can_see(full, "org", None) is False and can_see(VIEWER, "org", None) is True
+
+
+# ------------------------------------------------------------------------- listing one room
+def test_listing_agents_is_scoped_to_one_room_and_its_missions(fab):
+    f = fab.feed
+    fab.s.link_mission(fab.alice, fab.room, {"mission_id": "m-1", "members": ["bob"]})
+    put(f, "agent:lead", "room", room_id=fab.room)
+    put(f, "agent:kid", "mission", mission_id="m-1")                   # Pi's shape: mission_id, no room_id
+    put(f, "agent:elsewhere", "room", room_id=fab.room2)
+    put(f, "agent:fleet", "org")
+    put(f, "agent:bare", "room")
+    f.edge("spawn", "agent:lead", "agent:kid", scope="mission", mission_id="m-1", nodes=False)
+    f.edge("spawn", "agent:lead", "agent:elsewhere", scope="room", room_id=fab.room2, nodes=False)
+
+    def listing(who, room=None):
+        q = {"node_type": "agent", "edge_type": "spawn", **({"room_id": room} if room else {})}
+        return fab.s.graph_read(who, ["nodes"], q)
+
+    bob = listing(fab.bob, fab.room)
+    assert ids(bob) == {"agent:lead", "agent:kid"}
+    assert [(e["from_id"], e["to_id"]) for e in bob["edges"]] == [("agent:lead", "agent:kid")]
+    # carol is in the room but not on the mission list: only the room's own agents
+    assert ids(listing(fab.carol, fab.room)) == {"agent:lead"}
+    # alice belongs to both rooms; asking for room2 gives room2's agents only, and no org or bare ones
+    assert ids(listing(fab.alice, fab.room2)) == {"agent:elsewhere"}
+    assert ids(listing(fab.alice)) == {"agent:lead", "agent:elsewhere"}
+    for who in (fab.mallory, fab.dave):
+        with pytest.raises(CollabError) as e:
+            listing(who, fab.room)
+        assert e.value.status == 404
+    with pytest.raises(CollabError) as e:
+        listing(fab.bob, fab.room2)                                    # not a member of that room
+    assert e.value.status == 404
+    with pytest.raises(CollabError) as e:
+        fab.s.graph_read(fab.bob, ["nodes"], {"node_type": "banana"})
+    assert e.value.status == 400
+    # the keyed API lists with its own rules (operators everything, viewers org only) and cannot take `contexts`
+    g = fab.repo.graph
+    assert ids(g.list_nodes(OPERATOR, "agent")) == {"agent:lead", "agent:kid", "agent:elsewhere", "agent:fleet", "agent:bare"}
+    assert ids(g.list_nodes(VIEWER, "agent")) == {"agent:fleet"}
+    # revoking the mission list takes the mission's agents out of the next listing
+    fab.s.unlink_mission(fab.alice, fab.room, "m-1")
+    assert ids(listing(fab.bob, fab.room)) == {"agent:lead"}
+
+
+def test_listing_is_bounded_and_does_not_count_hidden_nodes(fab):
+    for i in range(6):
+        put(fab.feed, f"agent:a{i}", "room", room_id=fab.room)
+        put(fab.feed, f"agent:h{i}", "room", room_id=fab.room2)
+    out = fab.repo.graph.list_nodes(OPERATOR, "agent", limit=4)
+    assert len(out["nodes"]) == 4 and out["truncated"] is True
+    mem = {"kind": "member", "id": "user:x", "authenticated_by": "collab",
+           "access": {"rooms": frozenset({fab.room}), "missions": frozenset(), "room_ws": frozenset(), "mission_ws": frozenset()}}
+    small = fab.repo.graph.list_nodes(mem, "agent", limit=6)
+    assert len(small["nodes"]) == 6 and small["truncated"] is False      # the six hidden ones are not counted

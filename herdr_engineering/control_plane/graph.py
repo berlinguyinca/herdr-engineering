@@ -24,8 +24,8 @@ Merge rules:
   defined it carried (private < mission < room < org); it never widens. A
   ``room``/``mission`` scope that names its room/mission (envelope ``room_id`` /
   ``mission_id``, plus ``workspace_id``) is a CONTEXTUAL label resolved against HCN
-  membership at read time (T08, see :func:`can_see`); contextual labels are
-  incomparable with each other, so two different ones meet at ``private``.
+  membership at read time (T08, see :func:`can_see`); see the label notes above
+  the visibility section for how two labels meet.
 * Ownership: the owner of a node/edge is the actor of its earliest non-operator
   event (else the earliest operator event). Writers = owner + ``co_writers``
   (an attr only operators may set). ``private`` objects are visible to writers.
@@ -232,11 +232,18 @@ def validate_lineage(event_type: str, payload: Any, *, strict: bool = True) -> d
 
 # ------------------------------------------------------------- visibility
 # A scope LABEL is a plain scope string, or for a ``room``/``mission`` scope that names its
-# context the tuple ``(scope, context_id, workspace_id|None)``. Labels form a meet-semilattice:
-# ``private`` < bare ``mission`` < bare ``room`` < ``org``; a contextual label sits strictly
-# between ``private`` and ``org`` and is incomparable with every other middle label, so the
-# meet of two different ones is ``private`` (fail closed, commutative, associative, idempotent).
+# context the tuple ``(scope, context_id, workspaces)`` where ``workspaces`` is a sorted tuple
+# of the workspace ids the audience's room must also be linked to (empty = no workspace gate).
+# Labels form a meet-semilattice (narrower = fewer readers):
+#   private < bare mission < bare room < contextual room (same id: MORE workspaces = narrower) < org
+#   bare mission < contextual mission (same id likewise) < org
+# A contextual room is NOT above a contextual mission or bare room-vs-mission mix beyond the
+# chain above, so the meet of two different contexts falls to the bare (operator-only) label of
+# their kind: a producer that re-scopes one node into another room/mission hides it from both
+# audiences, never leaks it into either. The meet is commutative, associative and idempotent.
+# ``org`` is never readable through a member principal (see ``can_see``).
 MAX_SCOPE_LABELS = 4         # distinct labels remembered per commons writer
+MAX_LABEL_WORKSPACES = 8     # more distinct workspaces than this fall to the bare label (fail closed)
 
 
 def scope_label(ev: dict):
@@ -249,7 +256,7 @@ def scope_label(ev: dict):
         cid = ev.get("room_id" if scope == "room" else "mission_id")
         if isinstance(cid, str) and cid and len(cid) <= MAX_ID:
             ws = ev.get("workspace_id")
-            return (scope, cid, ws if isinstance(ws, str) and ws and len(ws) <= MAX_ID else None)
+            return (scope, cid, (ws,) if isinstance(ws, str) and ws and len(ws) <= MAX_ID else ())
     return scope
 
 
@@ -271,10 +278,10 @@ def _ctx_visible(principal: dict, label: tuple) -> bool:
     if principal.get("kind") != "member" or principal.get("authenticated_by") != "collab" \
             or not isinstance(access, dict):
         return False
-    scope, cid, ws = label
+    scope, cid, wss = label
     if scope == "room":
-        return cid in access["rooms"] and (ws is None or (cid, ws) in access["room_ws"])
-    return cid in access["missions"] and (ws is None or (cid, ws) in access["mission_ws"])
+        return cid in access["rooms"] and all((cid, w) in access["room_ws"] for w in wss)
+    return cid in access["missions"] and all((cid, w) in access["mission_ws"] for w in wss)
 
 
 def _widen_labels(cur: tuple, label) -> tuple:
@@ -297,7 +304,7 @@ def can_see(principal: dict | None, scope, writers: frozenset | None) -> bool:
 
     There is no per-principal grant model yet (see the contract doc), so:
 
-    * ``org``: any authenticated caller.
+    * ``org``: any authenticated fleet key (never a ``member`` principal, see below).
     * bare ``room`` / ``mission`` (no context id on the event): only an
       ``operator`` principal. Fail closed.
     * contextual ``(room|mission, id, workspace?)``: an operator, or a ``member``
@@ -312,7 +319,8 @@ def can_see(principal: dict | None, scope, writers: frozenset | None) -> bool:
             or principal.get("kind") in (None, "unknown"):
         return False
     if scope == "org":
-        return True
+        # `org` is fleet data (any fleet KEY reads it); a signed-in PERSON does not, whatever rooms they are in
+        return principal.get("kind") != "member"
     if isinstance(scope, tuple):
         return _ctx_visible(principal, scope)
     if scope in ("room", "mission"):
@@ -380,7 +388,15 @@ def _narrow(a, b):
         return a
     if isinstance(a, str) and isinstance(b, str):
         return a if SCOPE_RANK.get(a, 0) <= SCOPE_RANK.get(b, 0) else b
-    return "private"
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        if a[:2] == b[:2]:                              # same room/mission: every workspace gate applies
+            union = tuple(sorted(set(a[2]) | set(b[2])))
+            return (a[0], a[1], union) if len(union) <= MAX_LABEL_WORKSPACES else a[0]
+        return a[0] if a[0] == b[0] else "mission"      # different contexts: bare, operator-only
+    ctx, bare = (a, b) if isinstance(a, tuple) else (b, a)
+    if ctx[0] == "room" or bare in ("private", "mission"):
+        return bare                                     # a bare label is below a contextual room, and
+    return "mission"                                    # bare room vs contextual mission meets at bare mission
 
 
 class _Reg:
@@ -659,6 +675,7 @@ class GraphProjection:
         # Insertion-ordered key sets; incident edges are walked newest first.
         self._out: dict[str, dict] = {}
         self._in: dict[str, dict] = {}
+        self._by_type: dict[str, dict] = {}         # node_type -> ids in first-seen order
         self._by_triple: dict[tuple, dict] = {}     # (type, from, to) -> keys (all bindings)
         self._subject: dict[tuple, dict] = {}       # (to_id, type) -> keys, bound types only
         self._edges_by_owner: dict[str, set] = {}   # actor id -> edge keys it owns
@@ -872,6 +889,7 @@ class GraphProjection:
         node = self._nodes.get(node_id)
         if node is None:
             node = self._nodes[node_id] = _Node(node_id, node_type)
+            self._by_type.setdefault(node_type, {})[node_id] = None
         return node
 
     def _touch(self, rec: _Claims, ev: dict, key: tuple | None = None) -> None:
@@ -1293,6 +1311,51 @@ class GraphProjection:
             ctx: dict = {}
             return {"edges": [self._edge_view(e, principal, ctx) for e in matches[:MAX_NODE_EDGES]]}
 
+    def list_nodes(self, principal, node_type: str, *, edge_type: str | None = None,
+                   limit: int = DEFAULT_NODES, contexts: frozenset | None = None) -> dict:
+        """The nodes of one type the caller may see (first-seen order, at most ``limit``), plus the visible
+        live ``edge_type`` edges between them. This is how a workbench finds its agents when the emitter
+        defines no workspace/mission root node. Visibility is checked per node and per edge; a hidden node
+        is never counted, so ``truncated`` (limit hit, or the ``SCAN_BUDGET`` of examined ids spent) says
+        nothing about hidden items. ``contexts`` (server-built, never from a client) narrows the list to nodes
+        whose visible scope names one of those ``(room|mission, id)`` pairs: one room's view of the graph."""
+        if node_type not in NODE_TYPES:
+            raise ValueError("unknown node_type")
+        if edge_type is not None and edge_type not in EDGE_TYPES:
+            raise ValueError("unknown edge_type")
+        if not isinstance(limit, int) or not 1 <= limit <= MAX_NODES:
+            raise ValueError(f"limit must be between 1 and {MAX_NODES}")
+        with self._lock:
+            views, truncated = {}, False
+            for scanned, nid in enumerate(self._by_type.get(node_type, ())):
+                if scanned >= SCAN_BUDGET:
+                    truncated = True
+                    break
+                node = self._nodes[nid]
+                if not self._node_visible(principal, node):
+                    continue
+                if contexts is not None:
+                    label = node.eff_scope(principal, internal=False) if node.commons else node.eff_scope()
+                    if not (isinstance(label, tuple) and label[:2] in contexts):
+                        continue
+                if len(views) >= limit:
+                    truncated = True
+                    break
+                views[nid] = self._node_view(node, principal)
+            edges, ctx, done = [], {}, set()
+            if edge_type is not None:
+                for nid in views:
+                    own, others, exhausted = self._expand(principal, nid, "out", {edge_type}, False, None,
+                                                          NEIGHBOR_SCAN_BUDGET)
+                    truncated = truncated or exhausted
+                    for edge in own + others:
+                        if edge.to_id in views and edge.key not in done and len(edges) < MAX_EDGES:
+                            done.add(edge.key)
+                            edges.append(self._edge_view(edge, principal, ctx))
+                        elif edge.to_id in views and edge.key not in done:
+                            truncated = True
+            return {"node_type": node_type, "nodes": list(views.values()), "edges": edges, "truncated": truncated}
+
     def neighborhood(self, principal, root: str, *, depth: int = DEFAULT_DEPTH,
                      max_nodes: int = DEFAULT_NODES, max_edges: int = DEFAULT_EDGES,
                      direction: str = "both", edge_types: set | None = None,
@@ -1394,7 +1457,8 @@ class GraphProjection:
                     "owned": dict(sorted(self._owned.items()))}
 
 
-def read_graph(graph: GraphProjection, principal: dict | None, parts: list[str], q) -> dict:
+def read_graph(graph: GraphProjection, principal: dict | None, parts: list[str], q, *,
+               contexts: frozenset | None = None) -> dict:
     """The one read router for both front doors (the keyed fabric API and the HCN-authenticated
     collab API). ``parts`` is the path after ``graph``; ``q(name)`` returns a query value or None.
     KeyError (hidden or missing) => 404, ValueError => 400, exactly as for a keyed read."""
@@ -1406,6 +1470,9 @@ def read_graph(graph: GraphProjection, principal: dict | None, parts: list[str],
             return int(raw)
         except ValueError:
             raise ValueError(f"{name} must be an integer") from None
+    if parts == ["nodes"]:
+        return graph.list_nodes(principal, q("node_type") or "", edge_type=q("edge_type") or None,
+                                limit=num("limit", DEFAULT_NODES), contexts=contexts)
     if len(parts) == 2 and parts[0] == "nodes":
         return graph.get_node(principal, parts[1], edge_type=q("edge_type") or None,
                               from_id=q("from_id") or None, limit=num("limit", MAX_NODE_EDGES),

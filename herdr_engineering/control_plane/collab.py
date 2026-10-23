@@ -2312,8 +2312,17 @@ class CollabService:
         if access is None:
             raise CollabError(404, "not found")
         principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
+        contexts = None
+        room_id = query.get("room_id")
+        if parts == ["nodes"] and room_id is not None:
+            # one room's view: its own scope plus the missions linked to it that this person belongs to
+            if room_id not in access["rooms"]:
+                raise CollabError(404, "not found")
+            with self._lock:
+                contexts = frozenset({("room", room_id), *(("mission", m) for (r, m), ms in self._missions.items()
+                                                           if r == room_id and pr.id in ms["members"])})
         try:
-            return read_graph(graph, principal, parts, lambda name: query.get(name))
+            return read_graph(graph, principal, parts, lambda name: query.get(name), contexts=contexts)
         except KeyError:
             raise CollabError(404, "not found") from None
         except ValueError as exc:
