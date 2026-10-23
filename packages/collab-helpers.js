@@ -28,9 +28,12 @@ export function renderEgressRequests(requests, { operator, rooms = null }) {
   if (!operator) return '';
   const open = (requests || []).filter((r) => r.state === 'open');
   if (!open.length) return '<div class="hd-empty">No host access requests.</div>';
-  const b = (act, label, cls = '') => `<button type="button" class="hd-btn hd-btn--sm${cls}" data-egress-act="${act}">${label}</button>`;
-  return `<ul class="cx-list">${open.map((r) => `<li data-id="${esc(r.id)}" data-room="${esc(r.room_id)}" data-hp="${esc(r.host_port)}"><span class="grow"><b>${esc(r.host_port)}</b><span class="cx-sub1">asked by agent ${esc(r.agent_id)}${rooms ? ` in ${renderRoomRef(r.room_id, rooms)}` : ''}</span></span>`
-    + `<span class="cx-row">${b('approve-1d', 'Approve 1 day')}${b('approve-1w', 'Approve 1 week')}${b('always', 'Always', ' hd-btn--ghost')}${b('deny', 'Deny', ' hd-btn--danger')}</span></li>`).join('')}</ul>`;
+  const b = (act, label, cls = '', ask = '') => `<button type="button" class="hd-btn hd-btn--sm${cls}" data-egress-act="${act}"${ask ? ` data-confirm="${esc(ask)}"` : ''}>${label}</button>`;
+  return `<ul class="cx-list">${open.map((r) => {
+    const ask = r.internal === true ? `${r.host_port} is a private/internal address. Let agents reach it?` : '';   // Deny never asks
+    return `<li data-id="${esc(r.id)}" data-room="${esc(r.room_id)}" data-hp="${esc(r.host_port)}"><span class="grow"><b>${esc(r.host_port)}</b>${r.internal === true ? ' <span class="hd-badge hd-badge--warn cx-internal" role="note">Warning: private/internal address</span>' : ''}<span class="cx-sub1">asked by agent ${esc(r.agent_id)}${rooms ? ` in ${renderRoomRef(r.room_id, rooms)}` : ''}</span></span>`
+      + `<span class="cx-row">${b('approve-1d', 'Approve 1 day', '', ask)}${b('approve-1w', 'Approve 1 week', '', ask)}${b('always', 'Always', ' hd-btn--ghost', ask)}${b('deny', 'Deny', ' hd-btn--danger')}</span></li>`;
+  }).join('')}</ul>`;
 }
 
 // The room's allowlist as the server returns it: a flat list of host:port (permanent hosts, unexpired
@@ -45,12 +48,20 @@ export function renderHostsTable(allowlist, requests, opts) {
   const kindOf = (h) => (perm && perm.includes(h) ? { hp: h, kind: 'always' }
     : live.has(h) ? { hp: h, kind: 'until', until: live.get(h) }
       : perm ? { hp: h, kind: 'model' } : { hp: h, kind: 'always' });
-  const rows = [...new Set(Array.isArray(allowlist) ? allowlist : [])].map(kindOf);
-  for (const [hp, until] of live) {
-    if (!rows.some((x) => x.hp === hp)) rows.push({ hp, kind: 'until', until });
+  let rows;
+  if (Array.isArray(opts.entries)) {            // current server: it labels each entry, nothing is guessed
+    rows = opts.entries.filter((e) => e && e.host_port).map((e) => (e.kind === 'permanent' ? { hp: e.host_port, kind: 'always' }
+      : e.kind === 'approved' ? { hp: e.host_port, kind: 'until', until: live.get(e.host_port) }
+        : e.kind === 'model' ? { hp: e.host_port, kind: 'model' } : { hp: e.host_port, kind: 'other' }));
+  } else {                                      // older server: flat allowlist, kinds derived
+    rows = [...new Set(Array.isArray(allowlist) ? allowlist : [])].map(kindOf);
+    for (const [hp, until] of live) {
+      if (!rows.some((x) => x.hp === hp)) rows.push({ hp, kind: 'until', until });
+    }
   }
+  const entried = Array.isArray(opts.entries);
   if (!rows.length) return '<div class="hd-empty">No external hosts.</div>';
-  const label = (r) => (r.kind === 'always' ? (perm ? 'Always' : 'Allowed') : r.kind === 'model' ? 'Model endpoint' : `Until ${esc(when(r.until))}`);
+  const label = (r) => (r.kind === 'always' ? (perm || entried ? 'Always' : 'Allowed') : r.kind === 'model' ? 'Model endpoint' : r.kind === 'other' ? 'Allowed' : `Until ${r.until ? esc(when(r.until)) : 'it expires'}`);
   return `<table class="cx-table"><thead><tr><th>Host</th><th>Access</th>${operator ? '<th></th>' : ''}</tr></thead><tbody>${rows.map((r) => `<tr data-room="${esc(room || '')}" data-hp="${esc(r.hp)}"><td>${esc(r.hp)}</td><td>${label(r)}</td>`
     + `${operator && r.kind !== 'model' ? '<td><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-egress-act="remove">Remove</button></td>' : ''}</tr>`).join('')}</tbody></table>`;
 }
@@ -129,12 +140,15 @@ export async function helperAction(api, ds, extra = {}) {
   }
 }
 
+const defaultConfirm = (m) => (typeof globalThis.confirm === 'function' ? globalThis.confirm(m) : false);   // no dialog available: fail closed
+
 // Click and submit handling for one open room. Returns an unbind function the room's teardown must
 // call, so a room visited earlier can never act on a click made in a later one.
 export function wireHelperHandlers(container, o) {
   const onClick = (ev) => {
     const b = ev.target.closest?.('[data-panic],[data-egress-act],[data-cancel-helper]');
     if (!b || !(o.operator || b.dataset.cancelHelper)) return;        // Cancel is for owners too; the server enforces
+    if (b.dataset.confirm && !(o.confirm || defaultConfirm)(b.dataset.confirm)) return;   // risky approvals need a second yes
     const row = b.closest('[data-id],[data-hp]');
     const rd = row ? row.dataset : {};
     // the top-level panel has no current room: each row carries the room of its own request / host
@@ -153,6 +167,7 @@ export function wireHelperHandlers(container, o) {
 }
 
 // ---- the operator's top-level Helpers panel: every room, not just the open one
+const MAX_ROOMS = 60;
 const ago = (s) => (s < 90 ? `${Math.max(0, Math.round(s))}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${Math.round(s / 3600)}h`);
 
 export function renderHelperList(helpers, rooms, now) {
@@ -167,12 +182,13 @@ export function renderHelpersPanel(st, { operator }) {
   if (!operator) return '';
   const rooms = st.rooms || [];
   const reqs = st.requests || [];
-  const hostRooms = Object.keys(st.allow || {}).filter((r) => (st.allow[r] || []).length);
+  const ent = st.entries || {};
+  const hostRooms = Object.keys(st.allow || {}).filter((r) => (Array.isArray(ent[r]) ? ent[r] : st.allow[r] || []).length);
   return `<section class="cx-section cx-helpers-panel"><h2>Helpers</h2>${st.error ? `<div class="hd-error" role="alert">${esc(st.error)}</div>` : ''}`
     + `${renderPanic(Boolean(st.paused), { operator })}`
     + `<div class="hd-card cx-stack"><div class="hd-card__title">Host access requests (all rooms)</div>${renderEgressRequests(reqs, { operator, rooms })}`
     + `<div class="hd-card__title">Helpers across rooms</div>${renderHelperList(st.helpers, rooms, st.now ?? Date.now() / 1000)}`
-    + `<div class="hd-card__title">External hosts</div>${hostRooms.length ? hostRooms.map((r) => `<div class="cx-sub1">${renderRoomRef(r, rooms)}</div>${renderHostsTable(st.allow[r], reqs.filter((q) => q.room_id === r), { operator, room: r, permanent: null, now: st.now })}`).join('') : '<div class="hd-empty">No external hosts.</div>'}</div></section>`;
+    + `<div class="hd-card__title">External hosts</div>${hostRooms.length ? hostRooms.map((r) => `<div class="cx-sub1">${renderRoomRef(r, rooms)}</div>${renderHostsTable(st.allow[r], reqs.filter((q) => q.room_id === r), { operator, room: r, permanent: null, entries: ent[r], now: st.now })}`).join('') : '<div class="hd-empty">No external hosts.</div>'}</div></section>`;
 }
 
 // Mounts the panel into its own container. All state and listeners belong to this instance, and
@@ -180,7 +196,7 @@ export function renderHelpersPanel(st, { operator }) {
 export function createHelpersPanel({ container, api, operator, getRooms, go, schedule = setTimeout, clear = clearTimeout, interval = 6000, hidden = () => false }) {
   if (!operator) return { refresh: async () => {}, start() {}, destroy() {} };
   let alive = true; let timer = null; let seq = 0;
-  const st = { paused: false, requests: [], helpers: [], allow: {}, rooms: [], error: '' };
+  const st = { paused: false, requests: [], helpers: [], allow: {}, entries: {}, rooms: [], error: '' };
   const draw = () => { if (alive) container.innerHTML = renderHelpersPanel(st, { operator }); };
   const refresh = async () => {
     if (!alive) return;
@@ -194,10 +210,13 @@ export function createHelpersPanel({ container, api, operator, getRooms, go, sch
     if (rq) st.requests = (rq.requests || []).filter((r) => r.state === 'open' || r.state === 'approved');
     if (hp) { st.helpers = hp.helpers || []; st.paused = Boolean(hp.paused); st.now = hp.now; }
     if (rm) st.rooms = rm;
-    const ids = [...new Set([...st.requests.map((r) => r.room_id), ...st.rooms.map((r) => r.room_id)])].slice(0, 40);
-    const lists = await Promise.all(ids.map((id) => api.egressAllowlist(id).then((x) => [id, x.allowlist || []]).catch(() => null)));
+    // rooms that hold hosts, rooms with a live request, then the operator's own rooms (first wins the cap)
+    const ids = [...new Set([...((rq && rq.rooms_with_hosts) || []), ...st.requests.map((r) => r.room_id), ...st.rooms.map((r) => r.room_id)])].filter(Boolean).slice(0, MAX_ROOMS);
+    const lists = await Promise.all(ids.map((id) => api.egressAllowlist(id).then((x) => [id, x]).catch(() => null)));
     if (!alive || mine !== seq) return;
-    st.allow = Object.fromEntries(lists.filter(Boolean));
+    const got = lists.filter(Boolean);
+    st.allow = Object.fromEntries(got.map(([id, x]) => [id, x.allowlist || []]));
+    st.entries = Object.fromEntries(got.filter(([, x]) => Array.isArray(x.entries)).map(([id, x]) => [id, x.entries]));
     st.error = errs[0] || '';
     draw();
   };
