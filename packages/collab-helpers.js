@@ -114,7 +114,7 @@ export function parseProfileForm(v, base = {}) {
 // One click handler for every button above (dataset of the clicked button, merged with its row's).
 export async function helperAction(api, ds, extra = {}) {
   if (ds.panic) return api.pauseHelpers(ds.panic === 'pause');
-  if (ds.cancelHelper) return api.cancelHelper(ds.cancelHelper);
+  if (ds.cancelHelper) return extra.operator ? api.fleetCancelHelper(ds.cancelHelper) : api.cancelHelper(ds.cancelHelper);   // the operator route cancels any owner's helper
   if (ds.profile === 'save') return api.setRoomProfile(ds.room, extra.profileBody);
   switch (ds.egressAct) {
     case 'approve-1d': return api.decideEgress(ds.id, 'approve', DAY);
@@ -138,7 +138,7 @@ export function wireHelperHandlers(container, o) {
     const row = b.closest('[data-id],[data-hp]');
     const rd = row ? row.dataset : {};
     // the top-level panel has no current room: each row carries the room of its own request / host
-    o.act(async () => { await helperAction(o.api, { ...rd, ...b.dataset, room: o.perRow ? rd.room : o.roomId }); await o.refresh(); });
+    o.act(async () => { await helperAction(o.api, { ...rd, ...b.dataset, room: o.perRow ? rd.room : o.roomId }, { operator: Boolean(o.operator) }); await o.refresh(); });
   };
   const onSubmit = (ev) => {
     if (ev.target.id !== 'hcn-profile' || !o.owner) return;
