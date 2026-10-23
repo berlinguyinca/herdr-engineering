@@ -201,6 +201,12 @@ Found by the strengthened gates (second round):
   1 unmapped rule, and still passes in `--strict`, so it is not a blocker rule).
 - **Known accessibility rough edges left alone:** accept and reject use the browser's `window.confirm`; sub-tab accessible names
   include the badge count (for example "Tasks1"); sub-tab panels have no `aria-controls` or `tabpanel` role.
+- **Mutation check of the gates (second round).** Each previously surviving mutant was re-run against the strengthened gates: caught
+  N10, N1c, N2a, N3b, N3c, N4d, N5a, N5c, N8a-c, N9b, N9d, N9e, R5b, R10, R13c, S1-S6, X5-X8. Still surviving, with the reason:
+  N1b (the Attach button also has visible text, so removing its aria-label changes nothing: equivalent), N5b (a lone 10px button is
+  allowed by the WCAG 2.5.8 spacing exception: equivalent, not independently verified), N9a (+1 per channel, below the tolerance of 2,
+  by design), R13b (the older wrap rule is redundant with the newer one; removing both is caught), R7c (skipping the layout above
+  the draw cap saves about 17 ms at 3500 nodes, 32 ms against 49 ms measured, which no budget separates from noise).
 - **Not covered by the pixel gate:** a change of one colour step (+1 per channel), and emoji or symbol glyphs that fall back to the host fonts.
 - **Search is client-side** and covers only loaded nodes; the server caps lineage paging at 3,000 nodes.
 - **Performance numbers come from a loaded host** (see above).
