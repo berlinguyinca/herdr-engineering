@@ -34,6 +34,9 @@ fleet_update_http_timeout: 10
 # entity_id = socket.gethostname(), which is the nodename fact, NOT the
 # inventory alias (e.g. `mac`). Override per host only if they differ.
 fleet_update_host_id: "{{ ansible_facts['nodename'] }}"
+# Extra names a session's host_id may carry for this host (sessions report
+# os.hostname() today; the short hostname and inventory alias also match).
+fleet_update_host_aliases: []
 
 # Per-host deferral/last-update state on the main host (controller user).
 fleet_update_state_file: "{{ lookup('env', 'HOME') }}/.local/share/herdr-engineering/fleet-update-state.json"

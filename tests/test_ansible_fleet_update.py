@@ -327,3 +327,15 @@ def test_record_and_post_tasks_send_typed_json(tmp_path):
                                  "deferred_since": "2026-10-20T00:00:00+00:00",
                                  "result": "deferred: agents running"}
     assert json.loads(state.read_text())["beast"]["result"] == "deferred: agents running"
+
+
+def test_herdr_eng_only_at_a_pinned_revision_and_restart_gated():
+    top = _load(ROLE / "tasks" / "main.yml")
+    block = next(t for t in top if t["name"].startswith("Update this host"))["block"]
+    fa = next(t for t in block if "fabric-agent.yml" in json.dumps(t))
+    assert fa["when"] == "herdr_engineering_revision is defined"
+    gv = _load(ROOT / "playbooks" / "group_vars" / "all.yml")
+    assert gv["fleet_update_herdr_engineering_revision"] == ""
+    for t in block:
+        if "Restart the fabric agent" in t["name"]:
+            assert "fleet_update_restart_needed | bool" in t["when"]

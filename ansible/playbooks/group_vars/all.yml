@@ -21,6 +21,11 @@ fleet_pins:
   # (build-gate.ts) have no version; do not pin them.
   pi_extensions: {}
 
+# herdr-eng release the nightly fleet update rolls out: a FULL commit id. Empty =
+# the fleet update leaves herdr-eng and the build-gate extension alone (it never
+# ships the main host's checked-out HEAD). Rollouts stay the operator's call.
+fleet_update_herdr_engineering_revision: ""
+
 # ---- fleet update cron on the main host (tasks/fleet-update-cron.yml) -------
 # The repo's ansible/ directory ON THE MAIN HOST; cron runs from it. Defaults to
 # the checkout site.yml runs from; override when converging from another machine.

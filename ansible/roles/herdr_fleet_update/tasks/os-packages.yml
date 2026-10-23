@@ -31,6 +31,7 @@
     name: "{{ fleet_update_security_pkgs.stdout_lines }}"
     state: latest  # noqa: package-latest -- deliberate: only the listed security packages
     only_upgrade: true
+  register: fleet_update_security_install
   environment:
     DEBIAN_FRONTEND: noninteractive
   when:
@@ -41,6 +42,7 @@
 - name: "OS packages (Debian): full upgrade (fleet_update_security_only=false)"
   ansible.builtin.apt:
     upgrade: "yes"
+  register: fleet_update_full_upgrade
   environment:
     DEBIAN_FRONTEND: noninteractive
   when:

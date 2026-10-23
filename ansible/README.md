@@ -114,7 +114,9 @@ Per host, in order:
    host is deferred with result `deferred: busy state unknown`. It never updates
    blind. `<id>` is `fleet_update_host_id`, default the `nodename` fact (what
    the agent reports as `socket.gethostname()`), not the inventory alias; set
-   it per host if they differ.
+   it per host if they differ. A session matches when its `host_id` is that id,
+   the short hostname, the inventory name or one of `fleet_update_host_aliases`
+   (sessions report `os.hostname()`, the same value as the agent).
 2. **Busy → defer.** No changes are made. `deferred_since` is recorded on the
    first deferral and kept across runs. After `fleet_update_max_defer_days` (7)
    the host still defers; nothing is forced. The control plane then shows
@@ -125,11 +127,14 @@ Per host, in order:
    `fleet_update_security_only: false` runs a full `apt upgrade`. macOS runs
    `brew update && brew upgrade`. Then the existing tasks run: the platform
    role (herdr pinned-version check, pi presence, pi-engineering and autospec
-   clones), `tasks/fabric-agent.yml` (herdr-eng at the controller's revision),
-   `tasks/pi-build-gate.yml`, `tasks/pi-runtime.yml` (only with
-   `-e pi_engineering_revision=<sha>`) and `tasks/fabric-systemd.yml`. Only
-   after all of these succeed is the fabric agent restarted (systemd user unit,
-   or launchd `kickstart` on macOS). A failing step yields
+   clones), `tasks/fabric-agent.yml` and `tasks/pi-build-gate.yml` (only at
+   the pinned `fleet_update_herdr_engineering_revision`, a full commit id, or
+   `-e herdr_engineering_revision=<sha>`; when it is empty, herdr-eng is not
+   touched, so the cron never ships whatever HEAD the main host has checked
+   out), `tasks/pi-runtime.yml` (only with `-e pi_engineering_revision=<sha>`)
+   and `tasks/fabric-systemd.yml`. Only after all of these succeed, and only
+   when an OS package or the herdr-eng release changed, is the fabric agent
+   restarted (systemd user unit, or launchd `kickstart` on macOS). A failing step yields
    `failed: <task name>`. Only the task name is recorded, never its output.
 4. **Always post** one host event (`POST /api/v1/ingest`, entity `host`,
    event `host.fleet_update`). It carries `pins` (from `fleet_pins`, unset pins
@@ -150,7 +155,8 @@ but writes neither the state file nor the event.
 `herdr_pinned_version`, the single herdr pin. `pi`, `autospec` and
 `pi_extensions` are empty (unpinned) until set. Write each value exactly as the
 host reports it. Pins are published so drift is judged against them. Enforced
-today: herdr-eng at the controller revision and the build-gate extension;
+today: herdr-eng and the build-gate extension at
+`fleet_update_herdr_engineering_revision` (when set);
 pi-engineering only when a revision is passed. The herdr/pi/autospec pins are
 **report-only**: the existing install tasks only check presence and clone
 `main`.

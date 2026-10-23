@@ -80,12 +80,13 @@ def busy_state(host_id, host_probe, sessions_probe) -> str:
         running = _count(latest.get("agents_running")) if isinstance(latest, dict) else None
         if running is not None and running > 0:
             return "yes"
+    names = {host_id, *(n for n in host_probe.get("names") or [] if isinstance(n, str) and n)}
     body = sessions_probe.get("json")
     rows = body.get("sessions") if isinstance(body, dict) else None
     if sessions_probe.get("status") != 200 or not isinstance(rows, list):
         return "unknown"
     for row in rows:
-        if (isinstance(row, dict) and row.get("host_id") == host_id
+        if (isinstance(row, dict) and row.get("host_id") in names
                 and row.get("status") == "active"):
             return "yes"
     return "no"

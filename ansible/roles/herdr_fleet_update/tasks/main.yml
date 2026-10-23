@@ -47,6 +47,8 @@
     fleet_update_probe:
       id: "{{ fleet_update_host_id }}"
       probe:
+        # every form a session's host_id may take for this host
+        names: "{{ ([fleet_update_host_id, ansible_facts['hostname'], inventory_hostname] + fleet_update_host_aliases) | unique }}"
         status: "{{ fleet_update_host_probe.status | default(-1) }}"
         json: "{{ fleet_update_host_probe.json | default(none) }}"
 
@@ -105,12 +107,31 @@
       ansible.builtin.include_role:
         name: "{{ 'herdr_linux' if ansible_facts['system'] == 'Linux' else 'herdr_macos' }}"
 
-    # herdr-eng (fabric agent) at the controller's exact revision.
+    # herdr-eng (fabric agent) + build-gate ONLY at an explicitly pinned
+    # revision: fabric-agent.yml would otherwise roll out whatever HEAD the
+    # main host's checkout is on, fleet-wide, every night.
+    - name: "Fleet update: select the pinned herdr-eng revision"
+      ansible.builtin.set_fact:
+        herdr_engineering_revision: "{{ fleet_update_herdr_engineering_revision }}"
+      when:
+        - herdr_engineering_revision is not defined
+        - fleet_update_herdr_engineering_revision | length > 0
+
+    - name: "Fleet update: herdr-eng skipped (no pinned revision)"
+      ansible.builtin.debug:
+        msg: >-
+          herdr-eng and the build-gate extension are not updated: set
+          fleet_update_herdr_engineering_revision (full commit id) or pass
+          -e herdr_engineering_revision=<sha>.
+      when: herdr_engineering_revision is not defined
+
     - name: "Fleet update: herdr-eng + fabric agent release"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/fabric-agent.yml"
+      when: herdr_engineering_revision is defined
 
     - name: "Fleet update: pi build-gate extension"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/pi-build-gate.yml"
+      when: herdr_engineering_revision is defined
 
     - name: "Fleet update: pi-engineering runtime (when a revision is selected)"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/pi-runtime.yml"
@@ -119,6 +140,16 @@
     - name: "Fleet update: converge fabric systemd units (Linux)"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/fabric-systemd.yml"
       when: ansible_facts['system'] == 'Linux'
+
+    # Restart only when something the agent depends on changed, so an idle
+    # host whose packages are current is not restarted every night.
+    - name: "Fleet update: decide whether the agent needs a restart"
+      ansible.builtin.set_fact:
+        fleet_update_restart_needed: >-
+          {{ (fabric_agent_provision | default({}) is changed)
+             or (fleet_update_security_install | default({}) is changed)
+             or (fleet_update_full_upgrade | default({}) is changed)
+             or (fleet_update_brew | default({}) is changed) }}
 
     - name: "Fleet update: Restart the fabric agent (systemd user unit)"
       ansible.builtin.systemd:
@@ -130,6 +161,7 @@
         XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
       when:
         - fleet_update_restart_agent | bool
+        - fleet_update_restart_needed | bool
         - ansible_facts['system'] == 'Linux'
         - (herdr_eng_resolve.stdout | default('not-found') | trim) != 'not-found'
 
@@ -140,6 +172,7 @@
       changed_when: true
       when:
         - fleet_update_restart_agent | bool
+        - fleet_update_restart_needed | bool
         - ansible_facts['system'] == 'Darwin'
 
     - name: "Fleet update: mark updated"

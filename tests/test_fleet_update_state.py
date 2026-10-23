@@ -237,3 +237,11 @@ def test_event_body_is_accepted_by_the_control_plane(tmp_path):
     assert host["maintenance"] is False
     assert host["fleet_update"]["deferred_since"] == since
     assert "updates_deferred" in {p["code"] for p in host.get("problems", [])}
+
+
+def test_session_under_an_alias_name_still_counts_as_busy(tmp_path):
+    rows = [{"host_id": "mac", "status": "active"}]
+    out = _decide(tmp_path / "s.json",
+                  {"Gerts-MBP.local": {"status": 404, "names": ["Gerts-MBP.local", "Gerts-MBP", "mac"]}},
+                  _sessions(*rows))
+    assert out["Gerts-MBP.local"]["action"] == "defer"
