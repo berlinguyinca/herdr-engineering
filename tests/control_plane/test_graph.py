@@ -240,7 +240,7 @@ def test_unknown_types_rejected_and_not_stored():
         with pytest.raises(ValueError):
             f.send(et, pl, entity_id="x")
     assert not [k for k in repo._events if k[0] == "lineage"]
-    assert repo.graph.snapshot() == {"nodes": {}, "edges": {}, "wildcard_removes": {}}
+    assert repo.graph.snapshot() == {"nodes": {}, "edges": {}, "wildcard_removes": {}, "owned": {}}
     # the sequence was not consumed by a rejected event
     assert f.send("node.upsert", {"node_type": "agent", "node_id": "agent:a"}, seq=0)["envelope"]["duplicate"] is False
 
@@ -509,8 +509,8 @@ def test_non_owner_cannot_modify_nodes_edges_or_narrow_scope():
     attempts = [
         lambda: hostile.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1", "label": "pwn"},
                              principal=OTHER),
-        lambda: hostile.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1"}, scope="private",
-                             principal=OTHER),
+        lambda: hostile.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1", "state": "failed"},
+                             scope="private", principal=OTHER),
         lambda: hostile.send("node.state", {"node_id": "agent:a1", "state": "failed"}, principal=OTHER),
         lambda: hostile.send("edge.add", {"edge_type": "spawn", "from_id": "agent:a1", "to_id": "agent:a2",
                                           "attrs": {"x": 1}}, principal=OTHER),
@@ -681,21 +681,24 @@ def test_attrs_caps_are_cumulative_not_per_event():
 def test_total_node_edge_and_source_caps(monkeypatch):
     from herdr_engineering.control_plane import graph as graph_mod
     repo, svc, f = make()
-    monkeypatch.setattr(graph_mod, "MAX_TOTAL_NODES", 3)
+    monkeypatch.setattr(graph_mod, "MAX_TOTAL_NODES", 5)       # non-operators may fill 80% (4)
     f.node("task:1")
     f.node("task:2")
     f.node("task:3")
+    f.node("task:4")
     with pytest.raises(ValueError, match="capacity"):
-        f.node("task:4")
+        f.node("task:5")
     f.node("task:3", label="existing nodes stay writable")
+    f.node("task:5", principal=OPERATOR)                        # the reserve is for operators
     monkeypatch.setattr(graph_mod, "MAX_TOTAL_EDGES", 1)
     f.edge("dependency", "task:1", "task:2")
     with pytest.raises(ValueError, match="capacity"):
         f.edge("dependency", "task:2", "task:3")
     monkeypatch.setattr(graph_mod, "MAX_SOURCES_PER_OBJECT", 2)
-    Feed(svc, source="s1").node("task:1")
+    Feed(svc, source="s1").node("task:1", label="1")
+    Feed(svc, source="s2").node("task:1", label="2")
     with pytest.raises(ValueError, match="too many distinct writers"):
-        Feed(svc, source="s2").node("task:1")
+        Feed(svc, source="s3").node("task:1", label="3")
 
 
 def test_response_size_is_capped(monkeypatch):
@@ -842,7 +845,7 @@ def test_refusals_are_indistinguishable_and_never_create_ownership():
         ("edge.add", {"edge_type": "spawn", "from_id": "agent:p", "to_id": "agent:q"}),      # unseen endpoint
         ("edge.add", {"edge_type": "spawn", "from_id": "agent:nope", "to_id": "agent:q"}),   # unknown endpoint
         ("edge.add", {"edge_type": "spawn", "from_id": "agent:pub", "to_id": "agent:q"}),    # not writer of from
-        ("node.upsert", {"node_type": "agent", "node_id": "agent:pub"}),                     # not writer of node
+        ("node.upsert", {"node_type": "agent", "node_id": "agent:pub", "label": "x"}),       # not writer of node
     ]
     for et, pl in attempts:
         with pytest.raises(PermissionError) as exc:
@@ -862,7 +865,7 @@ def test_ownership_is_pinned_to_admission_order_not_clock_or_source_name():
     fz, fo, fa = Feed(svc, "zeta"), Feed(svc, "op"), Feed(svc, "alpha")
     fz.send("node.upsert", {"node_type": "agent", "node_id": "agent:x"}, principal=V)
     with pytest.raises(PermissionError):                    # same instant, source sorts first
-        fa.send("node.upsert", {"node_type": "agent", "node_id": "agent:x"}, principal=A)
+        fa.send("node.upsert", {"node_type": "agent", "node_id": "agent:x", "label": "a"}, principal=A)
     fo.send("node.upsert", {"node_type": "agent", "node_id": "agent:x",
                             "attrs": {"co_writers": [B["id"]]}}, principal=OPERATOR)
     t[0] -= 5                                               # the clock steps back
@@ -880,7 +883,7 @@ def test_per_principal_quota_and_wildcard_cap(monkeypatch):
     monkeypatch.setattr(graph_mod, "MAX_OBJECTS_PER_PRINCIPAL", 3)
     for i in range(3):
         fv.send("node.upsert", {"node_type": "task", "node_id": f"task:v{i}"}, principal=V)
-    with pytest.raises(ValueError, match="quota"):
+    with pytest.raises(PermissionError):                        # at quota: same refusal as any forbidden write
         fv.send("node.upsert", {"node_type": "task", "node_id": "task:v3"}, principal=V)
     fv.send("node.upsert", {"node_type": "task", "node_id": "task:v0", "label": "update ok"}, principal=V)
     fa.send("node.upsert", {"node_type": "task", "node_id": "task:a0"}, principal=A)   # others unaffected
@@ -895,3 +898,278 @@ def test_per_principal_quota_and_wildcard_cap(monkeypatch):
     w.send("edge.remove", {"edge_type": "reviewed", "from_id": "review:0", "to_id": "pr:0", "reason": "r"})
     with pytest.raises(ValueError, match="wildcard"):
         w.send("edge.remove", {"edge_type": "reviewed", "from_id": "review:1", "to_id": "pr:1", "reason": "r"})
+
+
+# ------------------------------------------------- review round 3 regressions
+def pi_edge(feed, etype, a, b, attrs=None, scope="org"):
+    """Pi's emission pattern: ensure both endpoints, then the edge (lineage.ts edgeAdd)."""
+    for nid in (a, b):
+        feed.send("node.upsert", {"node_type": nid.split(":")[0], "node_id": nid}, scope)
+    payload = {"edge_type": etype, "from_id": a, "to_id": b}
+    if attrs:
+        payload["attrs"] = attrs
+    return feed.send("edge.add", payload, scope)
+
+
+def test_realistic_pi_batch_with_two_emitter_keys_is_fully_accepted():
+    repo, svc, _ = make()
+    fa, fb = Feed(svc, "pia"), Feed(svc, "pib")         # two emitter keys
+    fa.principal, fb.principal = A, B
+    pr, commit = "pr:github.com/o/r#1", "commit:0123abc"
+    issue = "issue:github.com/o/r#9"
+    fa.send("node.upsert", {"node_type": "agent", "node_id": "agent:main", "label": "Main", "state": "running"})
+    fa.send("node.upsert", {"node_type": "agent", "node_id": "agent:sub", "label": "Sub"})
+    fb.send("node.upsert", {"node_type": "agent", "node_id": "agent:rev", "label": "Reviewer"})
+    fb.send("node.upsert", {"node_type": "review", "node_id": "review:r1", "label": "Review"})
+    for step in (
+        lambda: pi_edge(fa, "spawn", "agent:main", "agent:sub"),
+        lambda: pi_edge(fa, "handoff", "agent:main", "agent:sub"),
+        lambda: pi_edge(fa, "produced", commit, pr),                       # commons -> commons, both emitters say it
+        lambda: pi_edge(fb, "produced", commit, pr),
+        lambda: pi_edge(fa, "issue_link", pr, issue),
+        lambda: pi_edge(fb, "issue_link", pr, issue),
+        lambda: pi_edge(fb, "reviewed", "review:r1", pr, {"commit": "0123abc"}),
+        lambda: pi_edge(fb, "reviewed", "review:r1", pr, {"commit": "0456def", "supersedes": ["0123abc"]}),
+        lambda: pi_edge(fb, "supersession", "agent:rev", "agent:rev2"),
+        lambda: pi_edge(fa, "validated", "ci:42", commit, {"commit": "0123abc"}),
+    ):
+        step()
+    # a second emitter ensuring (not changing) the first one's agent is a harmless no-op
+    fb.send("node.upsert", {"node_type": "agent", "node_id": "agent:main"})
+    snap = repo.graph.snapshot()
+    assert snap["nodes"]["agent:main"]["owner"] == A["id"] and snap["nodes"]["agent:main"]["label"] == "Main"
+    assert snap["nodes"][pr]["owner"] == A["id"]                           # commons: first writer, shared use
+    view = repo.graph.get_node(VIEWER, pr)
+    kinds = sorted((e["edge_type"], e["from_id"]) for e in view["edges"])
+    assert ("issue_link", pr) in kinds and ("produced", commit) in kinds and ("reviewed", "review:r1") in kinds
+    stale = {e["binding"]["commit"]: e["stale"] for e in view["edges"] if e["edge_type"] == "reviewed"}
+    assert stale == {"0123abc": True, "0456def": False}
+    assert rebuilt(repo).graph.snapshot() == repo.graph.snapshot()
+
+
+def test_commons_nodes_cannot_be_hidden_or_squatted_but_owned_ones_are_protected():
+    repo, svc, _ = make()
+    fa, fb = Feed(svc, "x"), Feed(svc, "y")
+    fa.node("commit:abc", principal=A)                        # attacker pre-creates the predictable id
+    fb.node("commit:abc", principal=B)                        # the real emitter's ensure succeeds
+    fb.send("node.upsert", {"node_type": "commit", "node_id": "commit:abc", "label": "real"}, scope="private",
+            principal=B)                                      # a foreign field write...
+    node = repo.graph.get_node(VIEWER, "commit:abc")["node"]
+    assert node["label"] == "real" and node["visibility_scope"] == "org"   # ...cannot narrow or hide it
+    with pytest.raises(PermissionError):                      # but an OWNED kind refuses a changing write
+        fa.node("agent:own", principal=A)
+        fb.send("node.upsert", {"node_type": "agent", "node_id": "agent:own", "label": "pwn"}, principal=B)
+    fb.send("node.upsert", {"node_type": "agent", "node_id": "agent:own"}, principal=B)   # ensure = ok
+    assert repo.graph.snapshot()["nodes"]["agent:own"]["owner"] == A["id"]
+    assert rebuilt(repo).graph.snapshot() == repo.graph.snapshot()
+
+
+def test_foreign_ensure_is_a_noop_and_cannot_resurrect_or_move_anything():
+    repo, svc, _ = make()
+    fa, fb = Feed(svc, "pia"), Feed(svc, "pib")
+    fa.principal, fb.principal = A, B
+    pi_edge(fa, "produced", "commit:c", "pr:1")
+    fa.send("edge.remove", {"edge_type": "produced", "from_id": "commit:c", "to_id": "pr:1", "reason": "r"})
+    before = repo.graph.snapshot()
+    pi_edge(fb, "produced", "commit:c", "pr:1")               # foreign "ensure" of a removed edge
+    assert repo.graph.neighborhood(VIEWER, "pr:1")["edges"] == []
+    after = repo.graph.snapshot()
+    assert after["edges"] == before["edges"]
+    assert rebuilt(repo).graph.snapshot() == repo.graph.snapshot()
+    with pytest.raises(PermissionError):                      # but changing the edge is refused
+        fb.send("edge.add", {"edge_type": "produced", "from_id": "commit:c", "to_id": "pr:1",
+                             "attrs": {"x": 1}})
+
+
+def test_node_state_on_a_missing_node_is_refused_and_operator_objects_are_operator_owned():
+    repo, svc, f = make()
+    with pytest.raises(PermissionError):
+        f.send("node.state", {"node_id": "agent:ghost", "state": "running"})
+    with pytest.raises(ValueError, match="not found"):
+        f.send("node.state", {"node_id": "agent:ghost", "state": "running"}, principal=OPERATOR)
+    assert not rows(repo)
+    Feed(svc, "op").send("node.upsert", {"node_type": "agent", "node_id": "agent:o", "label": "op"},
+                         principal=OPERATOR)
+    assert repo.graph.snapshot()["nodes"]["agent:o"]["owner"] == OPERATOR["id"]
+    with pytest.raises(PermissionError):
+        f.send("node.upsert", {"node_type": "agent", "node_id": "agent:o", "label": "mine"})
+    f.send("node.upsert", {"node_type": "agent", "node_id": "agent:o"})        # ensure ok
+
+
+def test_http_forbidden_is_distinguishable_from_auth_failure_and_uniform(http):
+    server, call, keys = http
+    op, vw, ing = list(keys)
+    ing2 = "in2-" + "k"
+    server._keys[ing2] = "ingest"
+    n = [0]
+
+    def post(key, et, payload, source="pi"):
+        n[0] += 1
+        return call("/api/v1/ingest", key, {
+            "schema_version": 2, "event_id": f"u{n[0]}", "source": source, "source_sequence": n[0],
+            "entity_type": "lineage", "entity_id": payload.get("node_id") or payload["from_id"],
+            "event_type": et, "payload": payload, "visibility_scope": "private"})
+
+    assert post(ing, "node.upsert", {"node_type": "agent", "node_id": "agent:secret", "label": "s"})[0] == 200
+    existing = post(ing2, "node.upsert", {"node_type": "agent", "node_id": "agent:secret", "label": "x"})
+    missing_state = post(ing2, "node.state", {"node_id": "agent:ghost", "state": "running"})
+    assert existing[0] == missing_state[0] == 403
+    assert existing[1] == missing_state[1] == {
+        "error": "not permitted to modify this lineage object", "reason": "lineage_forbidden"}
+    status, body = call("/api/v1/ingest", "bad-" + "key", {"schema_version": 2})
+    assert status == 401 and "reason" not in body                 # auth failures carry no lineage reason
+    # an ensure of the foreign private node is accepted: no existence oracle
+    assert post(ing2, "node.upsert", {"node_type": "agent", "node_id": "agent:secret"})[0] == 200
+    assert post(ing2, "node.upsert", {"node_type": "agent", "node_id": "agent:fresh"})[0] == 200
+
+
+def test_at_quota_refusals_are_identical_for_existing_and_missing(monkeypatch):
+    from herdr_engineering.control_plane import graph as graph_mod
+    monkeypatch.setattr(graph_mod, "MAX_OBJECTS_PER_PRINCIPAL", 2)
+    repo, svc, _ = make()
+    fv, fa = Feed(svc, "v"), Feed(svc, "a")
+    fv.send("node.upsert", {"node_type": "agent", "node_id": "agent:secret"}, scope="private", principal=V)
+    for i in range(2):
+        fa.send("node.upsert", {"node_type": "agent", "node_id": f"agent:m{i}"}, principal=A)
+    outcomes = []
+    for et, pl in (("node.upsert", {"node_type": "agent", "node_id": "agent:secret"}),
+                   ("node.upsert", {"node_type": "agent", "node_id": "agent:nothere"}),
+                   ("node.upsert", {"node_type": "agent", "node_id": "agent:secret", "label": "x"}),
+                   ("edge.add", {"edge_type": "spawn", "from_id": "agent:m0", "to_id": "agent:secret"}),
+                   ("edge.add", {"edge_type": "spawn", "from_id": "agent:m0", "to_id": "agent:nothere"})):
+        with pytest.raises(PermissionError) as exc:
+            fa.send(et, pl, principal=A)
+        outcomes.append(str(exc.value))
+    assert len(set(outcomes)) == 1
+
+
+def test_quota_and_rebuild_follow_the_pinned_owner_not_apply_order():
+    repo, svc, _ = make()
+    fb, fa, fo = Feed(svc, "sb"), Feed(svc, "sa"), Feed(svc, "so")
+    fb.send("node.upsert", {"node_type": "agent", "node_id": "agent:other"}, principal=B, entity_id="s1")
+    fa.send("node.upsert", {"node_type": "agent", "node_id": "agent:n", "label": "a"}, principal=A, entity_id="s2")
+    fo.send("node.upsert", {"node_type": "agent", "node_id": "agent:n", "attrs": {"co_writers": [B["id"]]}},
+            principal=OPERATOR, entity_id="s3")
+    fb.send("node.upsert", {"node_type": "agent", "node_id": "agent:n", "label": "b"}, principal=B, entity_id="s1")
+    live = repo.graph.snapshot()
+    assert live["owned"] == {A["id"]: 1, B["id"]: 1}
+    assert rebuilt(repo).graph.snapshot() == live
+    events = rows(repo)
+    for seed in range(10):
+        shuffled = random.Random(seed).sample(events, len(events))
+        g = GraphProjection()
+        for e in shuffled:
+            g.apply(e)
+        assert g.snapshot() == live and g._owned == repo.graph._owned
+
+
+def _bulk(g, actor, n, start=0):
+    """admit + apply n edges straight onto the projection (no HTTP)."""
+    for i in range(start, start + n):
+        pl = {"edge_type": "reviewed", "from_id": "agent:a", "to_id": "commit:h", "attrs": {"commit": f"c{i}"}}
+        op = g.admit(actor, "edge.add", pl, "s")
+        g.apply({"event_id": f"b{i}", "source": "s", "source_sequence": i, "event_type": "edge.add",
+                 "payload": pl, "visibility_scope": "org", "actor": actor,
+                 "lineage_seq": g.next_seq(), "lineage_mode": op["mode"],
+                 "ingest_timestamp": "2026-10-22T10:00:00+00:00"})
+
+
+def _hub():
+    import time
+    g = GraphProjection()
+    seq = [0]
+
+    def put(actor, et, pl):
+        seq[0] += 1
+        op = g.admit(actor, et, pl, "s0")
+        g.apply({"event_id": f"p{seq[0]}", "source": "s0", "source_sequence": seq[0], "event_type": et,
+                 "payload": pl, "visibility_scope": "org", "actor": actor, "lineage_seq": g.next_seq(),
+                 "lineage_mode": op["mode"], "ingest_timestamp": "2026-10-22T10:00:00+00:00"})
+
+    put(V, "node.upsert", {"node_type": "commit", "node_id": "commit:h"})
+    put(V, "node.upsert", {"node_type": "agent", "node_id": "agent:v"})
+    put(V, "edge.add", {"edge_type": "reviewed", "from_id": "agent:v", "to_id": "commit:h",
+                        "attrs": {"commit": "vv"}})
+    put(A, "node.upsert", {"node_type": "agent", "node_id": "agent:a"})
+    return g, time
+
+
+def test_review_fan_in_hub_reads_stay_fast_and_ingest_stays_linear():
+    g, time = _hub()
+    t = time.perf_counter()
+    _bulk(g, A, 2500)
+    first = time.perf_counter() - t
+    t = time.perf_counter()
+    _bulk(g, A, 2500, start=2500)
+    second = time.perf_counter() - t
+    assert second < max(first * 3.0, 0.5)                    # no quadratic growth in ingest
+    for read in (lambda: g.get_node(V, "commit:h"),
+                 lambda: g.neighborhood(V, "commit:h", depth=2, max_edges=2000),
+                 lambda: g.get_edge(V, "reviewed", "agent:v", "commit:h")):
+        t = time.perf_counter()
+        out = read()
+        assert time.perf_counter() - t < 0.5        # ~0.05-0.1 s idle; loose for a busy CI box
+    node = g.get_node(V, "commit:h")
+    assert node["edges_truncated"] is True
+    mine = [e for e in node["edges"] if e["from_id"] == "agent:v"][0]
+    assert mine["stale"] is False                             # unrelated reviewer cannot mark it stale
+    assert len(mine["bindings"]) <= 21 and mine["bindings_truncated"] is True
+    assert any(e["from_id"] == "agent:v" for e in g.neighborhood(V, "commit:h")["edges"])
+
+
+def test_flood_cannot_hide_a_victims_edge_and_pages_are_visible_only():
+    repo, svc, _ = make()
+    fv, fa = Feed(svc, "v"), Feed(svc, "a")
+    fv.node("commit:v", principal=V)
+    fv.node("task:real", principal=V)
+    fv.send("edge.add", {"edge_type": "produced", "from_id": "task:real", "to_id": "commit:v"}, principal=V)
+    n_org = 0
+    for i in range(400):
+        fa.send("node.upsert", {"node_type": "task", "node_id": f"task:a{i:04d}"}, principal=A)
+        private = i % 3 == 0
+        n_org += not private
+        fa.send("edge.add", {"edge_type": "produced", "from_id": f"task:a{i:04d}", "to_id": "commit:v"},
+                scope="private" if private else "org", principal=A)
+    g = repo.graph
+    page = g.get_node(V, "commit:v")
+    assert any(e["from_id"] == "task:real" for e in page["edges"])           # own edges are exempt
+    assert page["edges_truncated"] is True
+    returned_others = len(page["edges"]) - 1
+    assert page["edges_omitted"] == n_org - returned_others                  # visible items only
+    assert all(e["visibility_scope"] == "org" for e in page["edges"])        # hidden ones never show or count
+    # newest admission first, and a cursor reaches the rest without repeats
+    first_ids = [e["from_id"] for e in page["edges"] if e["from_id"] != "task:real"]
+    assert first_ids == sorted(first_ids, reverse=True)
+    p2 = g.get_node(V, "commit:v", offset=page["next_offset"])
+    assert not {e["from_id"] for e in page["edges"]} & {e["from_id"] for e in p2["edges"]}
+    only = g.get_node(V, "commit:v", from_id="task:real")
+    assert [e["from_id"] for e in only["edges"]] == ["task:real"] and only["edges_omitted"] == 0
+    assert g.get_node(V, "commit:v", edge_type="spawn")["edges"] == []
+    nb = g.neighborhood(V, "commit:v", depth=1, max_nodes=10)
+    assert "task:real" in {n["id"] for n in nb["nodes"]} and nb["truncated"] is True
+
+
+def test_http_node_edge_filters_and_paging(http):
+    server, call, keys = http
+    op, vw, ing = list(keys)
+    n = [0]
+
+    def post(et, payload):
+        n[0] += 1
+        return call("/api/v1/ingest", ing, {
+            "schema_version": 2, "event_id": f"f{n[0]}", "source": "pi", "source_sequence": n[0],
+            "entity_type": "lineage", "entity_id": payload.get("node_id") or payload["from_id"],
+            "event_type": et, "payload": payload, "visibility_scope": "org"})
+
+    post("node.upsert", {"node_type": "commit", "node_id": "commit:h"})
+    for i in range(5):
+        post("node.upsert", {"node_type": "task", "node_id": f"task:{i}"})
+        post("edge.add", {"edge_type": "produced", "from_id": f"task:{i}", "to_id": "commit:h"})
+    s, body = call("/api/v1/graph/nodes/commit%3Ah?limit=2", vw)
+    assert s == 200 and len(body["edges"]) == 2 and body["next_offset"] == 2 and body["edges_omitted"] >= 3
+    s, body = call("/api/v1/graph/nodes/commit%3Ah?limit=2&offset=4", vw)
+    assert s == 200 and len(body["edges"]) == 1 and body["next_offset"] is None
+    s, body = call("/api/v1/graph/nodes/commit%3Ah?from_id=task%3A3", vw)
+    assert [e["from_id"] for e in body["edges"]] == ["task:3"]
+    assert call("/api/v1/graph/nodes/commit%3Ah?limit=0", vw)[0] == 400
+    assert call("/api/v1/graph/nodes/commit%3Ah?edge_type=nope", vw)[0] == 400

@@ -118,11 +118,11 @@ class DurableEventSink:
                 self._ensure_store()
                 self._run(self._store._conn.execute(
                     "INSERT INTO fabric_event_sources "
-                    "(source, last_sequence, last_seen_at, gaps) VALUES ($1,$2,$3,$4) "
-                    "ON CONFLICT (source) DO UPDATE SET "
+                    "(source_actor, source, last_sequence, last_seen_at, gaps) VALUES ($1,$2,$3,$4,$5) "
+                    "ON CONFLICT (source_actor, source) DO UPDATE SET "
                     "last_sequence=EXCLUDED.last_sequence, "
                     "last_seen_at=EXCLUDED.last_seen_at, gaps=EXCLUDED.gaps",
-                    state["source"], state["last_sequence"],
+                    state.get("actor") or "", state["source"], state["last_sequence"],
                     _parse_dt(state["last_seen_at"]), json.dumps(state["gaps"])))
         except Exception:
             log.exception("durable sink failed to persist source state %s",

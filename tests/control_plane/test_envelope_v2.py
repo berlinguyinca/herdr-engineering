@@ -171,9 +171,12 @@ class V2Conn:
         row = dict(zip(cols, a))
         if any(r["event_id"] == row["event_id"] for r in self.rows):
             return None
-        if row.get("source") is not None and any(
-                (r.get("source"), r.get("source_sequence")) == (row["source"], row["source_sequence"])
-                for r in self.rows):
+        def domain(r):      # migration 0004: unique on (actor id, source, source_sequence)
+            actor = r.get("actor")
+            actor = json.loads(actor) if isinstance(actor, str) else (actor or {})
+            return (actor.get("id") or "", r.get("source"), r.get("source_sequence"))
+
+        if row.get("source") is not None and any(domain(r) == domain(row) for r in self.rows):
             exc = Exception("duplicate key")
             exc.sqlstate = "23505"
             raise exc
@@ -428,7 +431,10 @@ def test_gaps_and_sources_are_bounded():
 def test_http_sequence_collision_is_409_and_storage_errors_are_not_echoed():
     conn = V2Conn()
     repo = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
-    IngestService(repo).ingest(body(0, event_id="secret-other-event"), PRINCIPAL)
+    import hashlib   # the same key's earlier event: the sequence domain is (principal, source)
+    same_key = {"kind": "ingest", "id": "key:" + hashlib.sha256(b"ing-1").hexdigest()[:12],
+                "authenticated_by": "api_key"}
+    IngestService(repo).ingest(body(0, event_id="secret-other-event"), same_key)
     repo2 = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
     svr = ControlPlaneServer(repo2, api_keys={"ing-1": "ingest"})
     threading.Thread(target=svr.serve, daemon=True).start()
@@ -442,3 +448,40 @@ def test_http_sequence_collision_is_409_and_storage_errors_are_not_echoed():
         assert status == 500 and "internal-host" not in json.dumps(out)
     finally:
         svr.shutdown()
+
+
+OTHER_PRINCIPAL = {"kind": "agent", "id": "key:other", "authenticated_by": "api_key"}
+
+
+def test_sequence_domain_is_per_principal_and_source():
+    repo, s = svc()
+    s.ingest(body(5, event_id="attacker-5"), OTHER_PRINCIPAL)         # another key takes pi/5 first
+    mine = s.ingest(body(5, event_id="mine-5"), PRINCIPAL)             # not a collision for this key
+    assert mine["envelope"]["duplicate"] is False
+    with pytest.raises(EnvelopeConflict):                              # a true conflict inside one domain
+        s.ingest(body(5, event_id="mine-5b"), PRINCIPAL)
+    s.ingest(body(8, event_id="other-8"), OTHER_PRINCIPAL)             # gap opens in the other domain only
+    mine_state = repo.ledger.source_state("pi", PRINCIPAL["id"])
+    other_state = repo.ledger.source_state("pi", OTHER_PRINCIPAL["id"])
+    assert mine_state["gaps"] == [] and mine_state["actor"] == PRINCIPAL["id"]
+    assert [(g["from"], g["to"]) for g in other_state["gaps"]] == [(6, 7)]
+    listed = repo.ledger.source_states()
+    assert {(st["actor"], st["source"]) for st in listed} == {(PRINCIPAL["id"], "pi"), (OTHER_PRINCIPAL["id"], "pi")}
+    # an identical retry by the owning key is still a duplicate; by another key it is not a free pass
+    assert s.ingest(body(5, event_id="mine-5"), PRINCIPAL)["envelope"]["duplicate"] is True
+
+
+def test_per_principal_domain_survives_restart_and_durable_unique_index():
+    conn, repo, s = durable()
+    s.ingest(body(5, event_id="a-5"), OTHER_PRINCIPAL)
+    s.ingest(body(5, event_id="m-5"), PRINCIPAL)
+    assert len(conn.rows) == 2                                          # both stored under the (actor, source, seq) index
+    fresh = ControlPlaneRepo()
+    fresh.import_state({"events": {"task|t1": [
+        {**r, "payload": json.loads(r["payload"]), "ingest_timestamp": f"2026-10-22T10:00:0{i}+00:00"}
+        for i, r in enumerate(conn.rows)]}, "event_order": []})
+    assert {(st["actor"], st["source"]) for st in fresh.ledger.source_states()} == {
+        (PRINCIPAL["id"], "pi"), (OTHER_PRINCIPAL["id"], "pi")}
+    with pytest.raises(EnvelopeConflict):
+        IngestService(fresh).ingest(body(5, event_id="m-5b"), PRINCIPAL)
+    assert IngestService(fresh).ingest(body(5, event_id="m-5"), PRINCIPAL)["envelope"]["duplicate"] is True

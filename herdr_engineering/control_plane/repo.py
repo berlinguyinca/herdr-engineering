@@ -23,6 +23,7 @@ from .agent_identity import AgentIdentityRegistry
 from .envelope import SourceLedger, envelope_event_fields
 from .graph import GraphProjection
 from .graph import _lseq as _graph_lseq
+from .graph import _rank as _graph_rank
 from .ids import new_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
@@ -1611,6 +1612,8 @@ class ControlPlaneRepo:
                 meta = {"content_sha256": env["content_hash"]}
                 if env.get("lineage_seq") is not None:
                     meta["lineage_seq"] = env["lineage_seq"]
+                if env.get("lineage_mode"):
+                    meta["lineage_mode"] = env["lineage_mode"]
                 if env.get("claimed_actor") is not None:
                     meta["claimed_actor"] = _bounded_claim(env["claimed_actor"])
                 ev["payload"] = {**ev["payload"], "_envelope": meta}
@@ -1951,12 +1954,14 @@ class ControlPlaneRepo:
         rows = [e for key, stream in self._events.items() if key[0] == "lineage"
                 for e in stream if e.get("source") is not None
                 and e.get("source_sequence") is not None]
+        rows = [{**e, "payload": _payload(e)} for e in rows]
+        rows.sort(key=_graph_rank)          # admission order, independent of stream grouping
         for event in rows:
             try:
-                graph.apply({**event, "payload": _payload(event)})
+                graph.apply(event)
             except ValueError:
                 graph.events_rejected += 1
-        graph._seq = max([graph._seq] + [_graph_lseq({**e, "payload": _payload(e)}) for e in rows])
+        graph._seq = max([graph._seq] + [_graph_lseq(e) for e in rows])
         self.graph = graph
         self._event_order = [t for t in self._event_order if t[0] != "lineage"]
 

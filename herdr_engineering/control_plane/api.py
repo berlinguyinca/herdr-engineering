@@ -981,7 +981,11 @@ def _make_handler(server, public=False, operator=False):
             except SequenceCollision:
                 return self._send_json(409, {"error": "sequence conflict", "reason": "conflict"})
             except PermissionError:
-                return self._send_json(403, {"error": "not permitted to modify this lineage object"})
+                # "reason" lets an emitter tell a lineage refusal from an auth failure
+                # (which has no reason); the body is identical whether or not the
+                # object exists.
+                return self._send_json(403, {"error": "not permitted to modify this lineage object",
+                                             "reason": "lineage_forbidden"})
             except ValueError as exc:
                 message = "Invalid GitHub query." if resource == "github" else str(exc)
                 return self._send_json(400, {"error": message})
@@ -1361,7 +1365,18 @@ def _make_handler(server, public=False, operator=False):
             g = server.repo.graph
             principal = self._principal()
             if len(parts) >= 6 and parts[4] == "nodes" and len(parts) == 6:
-                return self._json(g.get_node(principal, parts[5]))
+                def qi(name, default):
+                    raw = _q(self.path, name)
+                    if raw in (None, ""):
+                        return default
+                    try:
+                        return int(raw)
+                    except ValueError:
+                        raise ValueError(f"{name} must be an integer") from None
+                return self._json(g.get_node(
+                    principal, parts[5], edge_type=_q(self.path, "edge_type") or None,
+                    from_id=_q(self.path, "from_id") or None,
+                    limit=qi("limit", 200), offset=qi("offset", 0)))
             if len(parts) == 7 and parts[4] == "nodes" and parts[6] in ("neighborhood", "subgraph"):
                 def num(name, default):
                     raw = _q(self.path, name)

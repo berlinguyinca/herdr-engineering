@@ -6,6 +6,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ## [Unreleased]
 
 ### Lineage graph projection (T02, Herdr side)
+- Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
+- Lineage refusals are HTTP 403 `{"reason": "lineage_forbidden"}`; shared COMMONS nodes (commit/pr/issue/ci/artifact) and
+  idempotent "ensure" upserts are accepted from any ingest key.
 - `lineage` envelope events (v2 only) project into a durable graph derived from `fabric_events`
   (no new table; rebuilt on hydrate). See `docs/contracts/lineage-events.md`.
 - `GET /api/v1/graph/nodes/{id}`, `.../neighborhood`, `/api/v1/graph/edge`: viewer-level reads,

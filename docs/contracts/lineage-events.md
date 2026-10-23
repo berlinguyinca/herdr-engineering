@@ -51,26 +51,45 @@ skipped and counted (`events_rejected`), never fatal.
   `reason`, oversize `attrs` (16 KiB, 64 keys) are all `ValueError` (400) and not stored. `entity_id` is not cross-checked.
 - Nothing is inferred. Raw lineage rows are NOT readable through `GET /api/v1/events?entity_type=lineage` (404); use the graph API.
 
+### Node kinds: COMMONS vs OWNED
+- **COMMONS** (`commit pr issue ci artifact`): shared identities several emitters legitimately mention. Anyone with an
+  ingest/agent key may create one, and write its fields (`label`/`state`/`attrs`): fields are per-`(source, actor)` registers
+  merged on read, latest admission wins. A non-writer's write is admitted as `foreign`: it merges fields but never touches the
+  node's scope, owner or first/last event ids, so nobody can hide or squat a commons node by writing it. Only an operator
+  moderates (operators may write anything, including `co_writers`).
+- **OWNED** (every other kind: `agent attempt session mission plan task handoff pane tab thread worktree room workspace review
+  message decision approach finding gate`): the creator owns it; only its writers may change it.
+- **Ensure**: a `node.upsert` with no `label`/`state`/`attrs` (and an `edge.add` with no attrs beyond the binding) on an
+  existing object you do not own is accepted and acknowledged as a `noop` - persisted for idempotency but applied as nothing
+  (so it cannot resurrect a removed edge, move scope or ownership). This is what Pi sends for every endpoint before every edge.
+  An ensure of a missing node creates it, so the answer is `ok` whether or not the object exists (no existence oracle).
+
 ### Writer model (ownership) and admission
 Two layers: `GraphProjection.admit` runs under the ledger lock BEFORE the envelope row is persisted; `apply` is a pure
 commutative merge that trusts stored events. A refused event is not persisted and its sequence is not consumed (retry allowed).
-- Each admitted lineage event gets a server-assigned monotonic **admission number** (`lineage_seq`), stored in the envelope row
-  (`payload._envelope.lineage_seq`) and replayed. It is the cross-writer ordering and the ownership clock; wall time, source
-  names and client sequences never decide either.
-- A node/edge's **owner** is the actor of its first admitted event (pinned: admission numbers only grow). **Writers** = owner
-  + `co_writers` (a node/edge attr, list of actor ids, max 8, settable only by `operator` principals). Operators may write
-  anything (but cannot remove what does not exist: 400).
-- A non-operator is refused with ONE indistinguishable `PermissionError` (HTTP 403, a single message) when it: is not a writer
-  of the target; cannot see (and is not the author of) either endpoint of an edge; is not a writer of the edge's `from` node
-  (so only an actor's writers can emit edges "from" it, e.g. a reviewer's reviews); removes an edge that does not exist (a
-  remove never creates ownership); or tries to set `co_writers`. Producers must upsert both endpoints before the edge.
-- Wildcard `edge.remove` (reviewed/validated without a binding) needs at least one existing binding and write access to every
-  existing binding of the triple; it applies to adds older than itself only.
-- Unowned ids are first-come: whoever creates an id first owns it (operators can override). A 403 on `node.upsert` for an
-  existing id tells an authenticated ingest key that the id exists; read access reveals nothing.
-- Capacity (ValueError -> 400): attrs <= 128 keys / 32 KiB TOTAL per object (per event 64 keys / 16 KiB), <= 16 distinct
-  (source, actor) writers per object, <= 200k nodes, <= 1M edges, <= 10k wildcard removes, and <= 50k objects created per
-  non-operator principal (fair share; the quota is rebuilt from events). Responses are capped at 2 MiB (`truncated: true`).
+- Each admitted lineage event gets a server-assigned monotonic **admission number** (`lineage_seq`) and an admission **mode**
+  (`normal` | `foreign` | `noop`), both stored in the envelope row (`payload._envelope`) and replayed. They are the cross-writer
+  ordering and the ownership clock; wall time, source names and client sequences decide neither. Rebuild applies rows in
+  admission order; the result is order-independent anyway (shuffle-tested).
+- A node/edge's **owner** is the actor of its FIRST admitted event, whatever its role (so an operator-created object is
+  operator-owned until an operator sets `co_writers`). Writers = owner + `co_writers` (attr, list of actor ids, max 8,
+  operator-only). Per-principal object quota is charged to the pinned owner, so it is identical live and after rebuild.
+- A non-operator is refused with ONE indistinguishable `PermissionError` - HTTP 403 with body
+  `{"error": "not permitted to modify this lineage object", "reason": "lineage_forbidden"}` (an auth failure has no `reason`,
+  so emitters should dead-letter `lineage_forbidden`, not treat it as a credentials problem) - when it: changes (non-ensure) an
+  OWNED object it is not a writer of; changes an edge it does not own; cannot see (and is not the author of) an endpoint of
+  an edge; is not a writer of the edge's `from` node (exception: a COMMONS `from` node for an unbound edge type, so
+  `produced`/`issue_link` between shared nodes work; `reviewed`/`validated` always need the `from` node's writer); removes an
+  edge that does not exist (a remove never creates ownership); `node.state` on a missing node; sets `co_writers`; or is at its
+  object quota (identical for existing and missing targets).
+- Wildcard `edge.remove` needs at least one existing binding and write access to every existing binding of the triple; it
+  applies to adds older than itself only.
+- Unowned ids are first-come: for OWNED kinds whoever creates an id first owns it (a squatter can pre-create `agent:<id>`;
+  operators can override). A 403 on a changing write to an existing id tells an authenticated key that the id exists; reads
+  reveal nothing.
+- Capacity (ValueError -> 400): attrs <= 128 keys / 32 KiB TOTAL per object (per event 64 keys / 16 KiB), <= 64 distinct
+  `(source, actor)` writers per object and <= 4 per actor, <= 200k nodes (non-operators may fill 80%), <= 1M edges, <= 10k
+  wildcard removes, <= 25k objects owned per non-operator principal. Responses are capped at 2 MiB.
 
 ### Merge rules
 - Every mutable field (label, state, each attr key, an edge's add, an edge's remove) is a last-writer-wins register per
@@ -108,11 +127,16 @@ No containment edge type exists, so `attempt`/`session` nodes carry `attrs.agent
 no Herdr code derives an agent state change from a session stop or pane close.
 
 ### Read API (viewer level, any valid key; open listener behaves as an operator)
-- `GET /api/v1/graph/nodes/{node_id}` - node + its visible incident edges (capped at 200).
+- `GET /api/v1/graph/nodes/{node_id}[?edge_type=&from_id=&limit=<=200&offset=]` - node + a page of its visible incident edges.
+  The caller's own edges come first and are exempt from the page cut; the rest are newest admission first. `edges_omitted`
+  counts visible edges not returned (never hidden ones); `next_offset` pages on; at most 3000 incident edges are examined per
+  read (`scan_exhausted`). Neighborhood traversal follows own edges first, then newest first (500 examined per node).
 - `GET /api/v1/graph/nodes/{node_id}/neighborhood?depth=2&max_nodes=200&max_edges=500&direction=both|out|in&edge_types=a,b&include_removed=true`
   (alias `/subgraph`). Caps: depth 5, nodes 1000, edges 2000; out of range => 400. `truncated: true` when a cap cut visible results.
 - `GET /api/v1/graph/edge?edge_type=&from_id=&to_id=[&commit=|&plan_digest=]` - edge(s) with provenance
-  (`event_id`, `source`, `source_sequence` of the winning add, and `removal` when tombstoned).
+  (`event_id`, `source`, `source_sequence` of the winning add, and `removal` when tombstoned). `bindings` lists at most 20
+  distinct visible bindings of the subject (`bindings_truncated`); reads index a subject's reviews once per request, so cost is
+  linear in the subject's visible reviews, not quadratic.
 - Ids contain `:`, `/`, `#`: percent-encode them.
 - Hidden and missing are both 404 (writes: 403 for a non-writer). The visibility check runs for every node and edge at every hop, an edge is visible only if
   its own scope and BOTH endpoints are visible, hidden nodes are never expanded, and `truncated`/limits are computed over visible

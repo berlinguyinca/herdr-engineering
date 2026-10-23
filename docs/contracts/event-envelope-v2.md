@@ -22,7 +22,7 @@ It extends the existing `Event` / `POST /api/v1/ingest` contract; v1 bodies keep
 
 ## Server rules
 1. **Idempotency**: same `event_id` + identical content => acknowledged, not re-applied (`duplicate: true`). Same `event_id` + different content => `409 conflict`, original preserved.
-2. **Sequence**: `(source, source_sequence)` already seen with a different `event_id` => `409`. A jump greater than 1 records a **gap** in per-source state (`last_sequence`, `last_seen_at`, `gaps: [{from,to,seen_at}]`) and accepts the event; a later arrival inside a gap closes it (out-of-order replay is allowed).
+2. **Sequence**: the sequence domain is `(actor.id, source)` (the authenticated principal plus the `source` string), so two principals may use the same `source` without burning each other's sequences, gaps or freshness. `(source, source_sequence)` already seen IN THE SAME DOMAIN with a different `event_id` => `409`. A jump greater than 1 records a **gap** in per-source state (`last_sequence`, `last_seen_at`, `gaps: [{from,to,seen_at}]`) and accepts the event; a later arrival inside a gap closes it (out-of-order replay is allowed).
 3. **Freshness/provenance**: per-source state is queryable; a source with no events within its freshness window is reported `stale`, never `healthy` by default.
 4. **Durability**: an append failure is an error, never reported as a duplicate. Replay (`read_stream`) returns events with all v2 fields.
 5. **No fabrication**: the server never synthesizes progress, spawn edges or heartbeats.
@@ -45,3 +45,4 @@ It extends the existing `Event` / `POST /api/v1/ingest` contract; v1 bodies keep
 - Lost acknowledgement: if the durable insert already holds the `event_id` with the same `(source, source_sequence)`, the retry is acknowledged as a duplicate; a different identity is a 409.
 - Bounds: `source_sequence` <= 2^63-1; at most 64 gaps per source (oldest collapse into a coarser range, `gaps_truncated: true`); at most 1024 tracked sources (stalest evicted); 100k in-memory event index (database unique indexes are the backstop).
 - The durable write happens while holding the ledger lock (simple and atomic; serialises v2 ingests).
+- Sequence domain = (principal, source) (migration `0004_sequence_domain_per_principal.sql`: unique index on `(actor->>'id', source, source_sequence)`, `fabric_event_sources` keyed by `(source_actor, source)`). `GET /api/v1/ingest/sources` lists one entry per domain with an `actor` field (the key digest id). Until 0004 is applied the old global index still enforces the stricter rule. `event_id` itself remains one global namespace (it is the table's primary key), so emitters should not derive it from guessable inputs alone (mix in a per-key secret).

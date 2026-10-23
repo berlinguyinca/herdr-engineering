@@ -96,7 +96,9 @@ class IngestService:
                 # Ownership/capacity gate: runs under the ledger lock and BEFORE
                 # the row is persisted, so a refused change is never stored and
                 # its sequence is not consumed. Raises PermissionError (403).
-                self.repo.graph.admit(env["actor"], event_type, payload, env["source"])
+                decision = self.repo.graph.admit(env["actor"], event_type, payload, env["source"])
+                if decision["mode"] != "normal":
+                    env["lineage_mode"] = decision["mode"]
                 # Server-assigned monotonic admission number, persisted with the
                 # row: ownership and cross-writer ordering never depend on the
                 # wall clock, source names or client sequences.
@@ -136,7 +138,7 @@ class IngestService:
             "source_sequence": env["source_sequence"], "event_type": event_type,
             "payload": payload, "visibility_scope": env["visibility_scope"],
             "actor": env.get("actor"), "ingest_timestamp": env["received_at"],
-            "lineage_seq": env.get("lineage_seq")})
+            "lineage_seq": env.get("lineage_seq"), "lineage_mode": env.get("lineage_mode")})
         return {"entity_type": "lineage", "entity_id": entity_id, "event_type": event_type}
 
     def _stored_identity(self, event_id):

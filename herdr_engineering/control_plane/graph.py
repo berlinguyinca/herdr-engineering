@@ -38,6 +38,7 @@ Nothing here infers edges; only explicit ``edge.add`` events create them.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import threading
@@ -54,6 +55,11 @@ EDGE_TYPES = frozenset(
     "supersession reviewed produced validated".split())
 BOUND_EDGE_TYPES = frozenset({"reviewed", "validated"})
 LINEAGE_EVENT_TYPES = ("node.upsert", "node.state", "edge.add", "edge.remove")
+# COMMONS kinds are shared identities that several independent emitters legitimately
+# mention (a commit, a PR, an issue, a CI run, a published artifact): anyone may create
+# them and write their fields; nobody can hide one by writing it. Every other kind is
+# OWNED by whoever created it. See docs/contracts/lineage-events.md.
+COMMONS_KINDS = frozenset({"commit", "pr", "issue", "ci", "artifact"})
 
 # Narrowest first.
 SCOPE_RANK = {"private": 0, "mission": 1, "room": 2, "org": 3}
@@ -66,9 +72,14 @@ MAX_TOTAL_ATTR_KEYS = 128            # per node/edge, across all events
 MAX_TOTAL_ATTRS_BYTES = 32 * 1024    # per node/edge, across all events
 MAX_REASON = 512
 MAX_WRITERS = 8                      # co_writers and supersedes list length
-MAX_SOURCES_PER_OBJECT = 16          # distinct (source, actor) writers per object
+MAX_SOURCES_PER_OBJECT = 64          # distinct (source, actor) writers per object
+MAX_SOURCES_PER_ACTOR_OBJECT = 4
+MAX_BINDINGS = 20                    # bindings listed per edge view
+SCAN_BUDGET = 3000                   # incident edges examined per node per read
+NEIGHBOR_SCAN_BUDGET = 500
+NODE_RESERVE_FRACTION = 0.8          # share of the node cap non-operators may fill
 MAX_WILDCARD_REMOVES = 10_000
-MAX_OBJECTS_PER_PRINCIPAL = 50_000   # fair-share quota of the global pool (operators exempt)
+MAX_OBJECTS_PER_PRINCIPAL = 25_000   # fair-share quota of the global pool (operators exempt)
 MAX_TOTAL_NODES = 200_000
 MAX_TOTAL_EDGES = 1_000_000
 DEFAULT_DEPTH, MAX_DEPTH = 2, 5
@@ -162,9 +173,11 @@ def validate_lineage(event_type: str, payload: Any) -> dict:
         state = payload.get("state")
         if state is not None and (not isinstance(state, str) or not _STATE_RE.fullmatch(state)):
             raise ValueError("invalid state")
-        return {"op": "node.upsert", "node_type": node_type, "node_id": nid,
-                "label": _opt_text(payload.get("label"), "label", MAX_LABEL),
-                "state": state, "attrs": _attrs(payload.get("attrs"))}
+        label = _opt_text(payload.get("label"), "label", MAX_LABEL)
+        attrs = _attrs(payload.get("attrs"))
+        return {"op": "node.upsert", "node_type": node_type, "node_id": nid, "label": label,
+                "state": state, "attrs": attrs,
+                "ensure": label is None and state is None and not attrs}
     if event_type == "node.state":
         kind, nid = _node_id(payload.get("node_id"), "node_id")
         state = payload.get("state")
@@ -190,6 +203,7 @@ def validate_lineage(event_type: str, payload: Any) -> dict:
     if event_type == "edge.add":
         if edge_type in BOUND_EDGE_TYPES and bound is None:
             raise ValueError(f"{edge_type} edges require attrs.commit or attrs.plan_digest")
+        op["ensure"] = not attrs or set(attrs) <= {"commit"} and edge_type in BOUND_EDGE_TYPES
         return op
     reason = payload.get("reason")
     if not isinstance(reason, str) or not reason.strip():
@@ -258,6 +272,15 @@ def _rank(ev: dict) -> tuple:
     return (_lseq(ev), _ts(ev), str(ev["source"]), int(ev["source_sequence"]), str(ev["event_id"]))
 
 
+def _mode(ev: dict) -> str:
+    """Admission decision persisted with the event: normal | foreign | noop."""
+    val = ev.get("lineage_mode")
+    if val is None:
+        meta = (ev.get("payload") or {}).get("_envelope")
+        val = meta.get("lineage_mode") if isinstance(meta, dict) else None
+    return val if val in ("foreign", "noop") else "normal"
+
+
 def _writer_key(ev: dict) -> tuple:
     return (str(ev["source"]), (ev.get("actor") or {}).get("id"))
 
@@ -305,27 +328,31 @@ class _Claims:
 
     def _init_claims(self) -> None:
         self.scope: str | None = None
-        self.claim: tuple | None = None    # (rank, actor_id) of the first admitted event
+        self.claim: tuple | None = None    # (rank, actor_id, is_operator) of the first admitted event
         self.first = self.last = None      # (rank, event_id)
-        self.sources: set[tuple] = set()
+        self.sources: set[tuple] = set()   # (source, actor) pairs that wrote a register
         self.attrs: dict[str, _Reg] = {}
+        self._w: frozenset | None = None   # cached writers()
 
     def _touch(self, ev: dict) -> None:
         rank = _rank(ev)
         scope = ev.get("visibility_scope")
         scope = scope if scope in SCOPE_RANK else "private"
         self.scope = scope if self.scope is None else _narrow(self.scope, scope)
-        claim = (rank, (ev.get("actor") or {}).get("id"))
+        actor = ev.get("actor") or {}
+        claim = (rank, actor.get("id"), _is_operator(actor))
         if self.claim is None or claim[0] < self.claim[0]:
             self.claim = claim
+            self._w = None
         if self.first is None or rank < self.first[0]:
             self.first = (rank, ev["event_id"])
         if self.last is None or rank > self.last[0]:
             self.last = (rank, ev["event_id"])
-        self.sources.add(_writer_key(ev))
 
     def owner(self) -> str | None:
-        """Actor of the first admitted event (pinned: admission numbers only grow)."""
+        """Actor of the FIRST admitted event, whatever its role (pinned: admission
+        numbers only grow). An operator-created object is operator-owned until an
+        operator sets ``co_writers``."""
         return self.claim[1] if self.claim else None
 
     def co_writers(self) -> tuple:
@@ -336,14 +363,18 @@ class _Claims:
         return tuple(sorted(v for v in (val or []) if isinstance(v, str)))
 
     def writers(self) -> frozenset:
-        out = set(self.co_writers())
-        if self.owner():
-            out.add(self.owner())
-        return frozenset(out)
+        if self._w is None:
+            out = set(self.co_writers())
+            if self.owner():
+                out.add(self.owner())
+            self._w = frozenset(out)
+        return self._w
 
     def _put_attrs(self, attrs: dict, ev: dict) -> None:
         for k, v in attrs.items():
             self.attrs.setdefault(k, _Reg()).set(ev, v)
+        if "co_writers" in attrs:
+            self._w = None
 
     def attr_values(self) -> dict:
         return {k: r.value() for k, r in sorted(self.attrs.items())}
@@ -373,6 +404,11 @@ class _Wild(_Claims):
         self.removes = _Reg()
 
 
+class _Group:
+    """Visible live reviewed/validated edges into one subject, indexed once per read."""
+    __slots__ = ("by_from", "by_owner", "sup_from", "sup_owner", "bindings", "truncated")
+
+
 class GraphProjection:
     """Thread-safe lineage graph. Mutated only through :meth:`apply`."""
 
@@ -381,9 +417,13 @@ class GraphProjection:
         self._nodes: dict[str, _Node] = {}
         self._edges: dict[tuple, _Edge] = {}
         self._wild: dict[tuple, _Wild] = {}
-        self._out: dict[str, set] = {}
-        self._in: dict[str, set] = {}
-        self._owned: dict[str, int] = {}
+        # Insertion-ordered key sets; incident edges are walked newest first.
+        self._out: dict[str, dict] = {}
+        self._in: dict[str, dict] = {}
+        self._by_triple: dict[tuple, dict] = {}     # (type, from, to) -> keys (all bindings)
+        self._subject: dict[tuple, dict] = {}       # (to_id, type) -> keys, bound types only
+        self._edges_by_owner: dict[str, set] = {}   # actor id -> edge keys it owns
+        self._owned: dict[str, int] = {}            # actor id -> objects it owns (operators exempt)
         self._seq = 0
         self.events_applied = 0
         self.events_rejected = 0
@@ -399,94 +439,116 @@ class GraphProjection:
         """Pre-persist gate for a live event. Raises ValueError (invalid / over
         capacity / nothing to remove for an operator) or PermissionError.
 
-        A non-operator is refused with ONE indistinguishable PermissionError when
-        it is not a writer of the target, cannot see an endpoint, is not a writer
-        of the edge's ``from`` node, or tries to remove something that does not
-        exist: so refusal never reveals whether the object exists.
+        Returns the normalised op with ``op["mode"]``, the admission decision that
+        is persisted with the event and honoured on replay:
+
+        * ``normal``  - an ordinary write by a writer (or any creation).
+        * ``foreign`` - a non-writer's field write to a COMMONS node: its field
+          registers merge, but it never touches scope, ownership or event ids.
+        * ``noop``    - an "ensure" (no label/state/attrs) of an object someone
+          else owns: accepted and acknowledged, applied as nothing.
+
+        A non-operator is refused with ONE indistinguishable PermissionError
+        (HTTP 403 ``lineage_forbidden``) when it is not a writer of the target,
+        cannot see an endpoint, is not a writer of the edge's ``from`` node,
+        removes something that does not exist, or is at its object quota.
         """
         op = validate_lineage(event_type, payload)
         operator = _is_operator(actor)
         aid = (actor or {}).get("id")
         deny = PermissionError("not permitted to modify this lineage object")
         attrs = op.get("attrs") or {}
+        op["mode"] = "normal"
         with self._lock:
-            if not operator and "co_writers" in attrs:
+            if not operator and (not aid or "co_writers" in attrs):
                 raise deny
-            if not operator and (not aid or self._owned.get(aid, 0) >= MAX_OBJECTS_PER_PRINCIPAL) \
-                    and self._would_create(op):
-                if not aid:
-                    raise deny
-                raise ValueError("per-principal object quota reached")
+            at_quota = not operator and self._owned.get(aid, 0) >= MAX_OBJECTS_PER_PRINCIPAL
             if op["op"] in ("node.upsert", "node.state"):
                 rec = self._nodes.get(op["node_id"])
-                if rec is None:
-                    if len(self._nodes) >= MAX_TOTAL_NODES:
-                        raise ValueError("graph node capacity reached")
-                elif not operator and rec.owner() is not None and aid not in rec.writers():
-                    raise deny
-                recs = [rec]
+                exists = rec is not None and rec.claim is not None
+                if not exists:
+                    if op["op"] == "node.state":
+                        raise (ValueError("node not found") if operator else deny)
+                    self._check_create(operator, at_quota, nodes=True)
+                    recs = []
+                elif operator or aid in rec.writers():
+                    recs = [rec]
+                else:
+                    if at_quota:
+                        raise deny
+                    if op["op"] == "node.upsert" and op["ensure"]:
+                        op["mode"] = "noop"
+                        return op
+                    if op["node_type"] not in COMMONS_KINDS:
+                        raise deny
+                    op["mode"] = "foreign"
+                    recs = [rec]
             else:
                 frm, to = self._nodes.get(op["from_id"]), self._nodes.get(op["to_id"])
+                bound = op["edge_type"] in BOUND_EDGE_TYPES
                 if not operator:
                     # the author of an endpoint can always use it, whatever its scope
-                    if any(n is None or n.scope is None or not (
+                    if any(n is None or n.claim is None or not (
                             aid in n.writers() or self._node_visible(actor, n)) for n in (frm, to)):
                         raise deny
-                    if aid not in frm.writers():
+                    if not (aid in frm.writers() or (frm.node_type in COMMONS_KINDS and not bound)):
                         raise deny
                 key = (op["edge_type"], op["from_id"], op["to_id"]) + \
-                    ((op["binding"],) if op["edge_type"] in BOUND_EDGE_TYPES and op["binding"] else ())
-                wildcard = (op["op"] == "edge.remove" and op["edge_type"] in BOUND_EDGE_TYPES
-                            and op["binding"] is None)
+                    ((op["binding"],) if bound and op["binding"] else ())
+                wildcard = (op["op"] == "edge.remove" and bound and op["binding"] is None)
                 if op["op"] == "edge.add":
                     rec = self._edges.get(key)
-                    if rec is None and len(self._edges) >= MAX_TOTAL_EDGES:
-                        raise ValueError("graph edge capacity reached")
-                    recs = [rec]
+                    if rec is None or rec.claim is None:
+                        self._check_create(operator, at_quota, nodes=False)
+                        recs = []
+                    elif operator or aid in rec.writers():
+                        recs = [rec]
+                    elif at_quota or not op["ensure"]:
+                        raise deny
+                    else:
+                        op["mode"] = "noop"
+                        return op
                 elif wildcard:
                     tri = key[:3]
-                    existing = [self._edges[k] for k in self._out.get(tri[1], ()) if k[:3] == tri
-                                and self._live(self._edges[k])]
+                    existing = [e for e in (self._edges[k] for k in self._by_triple.get(tri, ()))
+                                if self._live(e)]
                     if not existing:
                         raise (ValueError("edge not found") if operator else deny)
                     wild = self._wild.get(tri)
                     if wild is None and len(self._wild) >= MAX_WILDCARD_REMOVES:
                         raise ValueError("too many wildcard removes")
-                    recs = [wild] + existing
+                    recs = ([wild] if wild is not None and wild.claim is not None else []) + existing
                 else:
                     rec = self._edges.get(key)
                     if rec is None or not self._live(rec):
                         raise (ValueError("edge not found") if operator else deny)
                     recs = [rec]
-            pair = (source, aid)
-            for rec in recs:
-                if rec is None:
-                    continue
-                if (not operator and op["op"].startswith("edge") and rec.owner() is not None
-                        and aid not in rec.writers()):
-                    raise deny
-                if source and pair not in rec.sources and len(rec.sources) >= MAX_SOURCES_PER_OBJECT:
-                    raise ValueError("too many distinct writers for this lineage object")
-            if len(recs) == 1 and recs[0] is not None and attrs:
-                self._check_attr_caps(recs[0], attrs)
-            elif attrs:
-                self._check_attr_caps(None, attrs)
+                if not operator:
+                    for rec in recs:
+                        if aid not in rec.writers():
+                            raise deny
+            if attrs or op["op"] in ("node.state", "edge.remove") or op.get("label") or op.get("state"):
+                pair = (source, aid)
+                for rec in recs:
+                    if pair not in rec.sources and (
+                            len(rec.sources) >= MAX_SOURCES_PER_OBJECT
+                            or sum(1 for p in rec.sources if p[1] == aid) >= MAX_SOURCES_PER_ACTOR_OBJECT):
+                        raise ValueError("too many distinct writers for this lineage object")
+                if len(recs) == 1 and attrs:
+                    self._check_attr_caps(recs[0], attrs)
+                elif attrs:
+                    self._check_attr_caps(None, attrs)
         return op
 
-    def _would_create(self, op: dict) -> bool:
-        if op["op"] in ("node.upsert", "node.state"):
-            return op["node_id"] not in self._nodes
-        if op["op"] == "edge.add":
-            return True
-        return False
-
-    def _touch(self, rec: _Claims, ev: dict) -> None:
-        """Record an event on ``rec``; its first event charges the creator's quota."""
-        first = rec.claim is None
-        rec._touch(ev)
-        aid = (ev.get("actor") or {}).get("id")
-        if first and aid and not _is_operator(ev.get("actor")):
-            self._owned[aid] = self._owned.get(aid, 0) + 1
+    def _check_create(self, operator: bool, at_quota: bool, *, nodes: bool) -> None:
+        if not operator and at_quota:
+            raise PermissionError("not permitted to modify this lineage object")
+        if nodes:
+            cap = MAX_TOTAL_NODES if operator else int(MAX_TOTAL_NODES * NODE_RESERVE_FRACTION)
+            if len(self._nodes) >= cap:
+                raise ValueError("graph node capacity reached")
+        elif len(self._edges) >= MAX_TOTAL_EDGES:
+            raise ValueError("graph edge capacity reached")
 
     @staticmethod
     def _check_attr_caps(rec: _Claims | None, attrs: dict) -> None:
@@ -502,14 +564,18 @@ class GraphProjection:
     def apply(self, ev: dict) -> None:
         """Apply one stored lineage event dict. Commutative and idempotent.
 
-        Does not authorize or enforce capacity: only admitted events are stored.
-        ``ValueError`` if the payload no longer validates.
+        Does not authorize or enforce capacity: only admitted events are stored,
+        and the admission ``mode`` travels with the event. ``ValueError`` if the
+        payload no longer validates.
         """
         op = validate_lineage(ev.get("event_type") or "", ev.get("payload") or {})
+        mode = _mode(ev)
         with self._lock:
             self.events_applied += 1
+            if mode == "noop":
+                return
             if op["op"] in ("node.upsert", "node.state"):
-                self._apply_node(op, ev)
+                self._apply_node(op, ev, mode)
             else:
                 self._apply_edge(op, ev)
 
@@ -519,50 +585,86 @@ class GraphProjection:
             node = self._nodes[node_id] = _Node(node_id, node_type)
         return node
 
-    def _apply_node(self, op: dict, ev: dict) -> None:
+    def _touch(self, rec: _Claims, ev: dict, key: tuple | None = None) -> None:
+        """Record an event on ``rec``. Ownership is charged to the pinned owner, so the
+        quota and the by-owner index depend only on the final state, never on replay order."""
+        before = (rec.claim[1], rec.claim[2]) if rec.claim else None
+        rec._touch(ev)
+        after = (rec.claim[1], rec.claim[2])
+        if before != after:
+            if before is not None:
+                self._release(before, key)
+            if after[0] and not after[1]:
+                self._owned[after[0]] = self._owned.get(after[0], 0) + 1
+            if key is not None and after[0]:
+                self._edges_by_owner.setdefault(after[0], set()).add(key)
+
+    def _release(self, owner: tuple, key: tuple | None) -> None:
+        aid, is_op = owner
+        if aid and not is_op:
+            self._owned[aid] = self._owned.get(aid, 1) - 1
+            if self._owned[aid] <= 0:
+                del self._owned[aid]
+        if key is not None and aid and aid in self._edges_by_owner:
+            self._edges_by_owner[aid].discard(key)
+
+    def _apply_node(self, op: dict, ev: dict, mode: str) -> None:
         node = self._node(op["node_id"], op["node_type"])
-        self._touch(node, ev)
+        pair = _writer_key(ev)
+        if mode == "normal":
+            self._touch(node, ev)
         if op["op"] == "node.upsert":
             if op["label"] is not None:
                 node.label.set(ev, op["label"])
             if op["state"] is not None:
                 node.state.set(ev, (op["state"], None))
             node._put_attrs(op["attrs"], ev)
+            if op["label"] is not None or op["state"] is not None or op["attrs"]:
+                node.sources.add(pair)
         else:
             node.state.set(ev, (op["state"], op["reason"]))
+            node.sources.add(pair)
 
     def _apply_edge(self, op: dict, ev: dict) -> None:
         etype, frm, to = op["edge_type"], op["from_id"], op["to_id"]
-        # Endpoints may arrive before their node.upsert. A placeholder is created
-        # (type from the id prefix) but is NOT touched by the edge event: it has
+        # Endpoints may arrive before their node.upsert (replay order). A placeholder is
+        # created (type from the id prefix) but is NOT touched by the edge event: it has
         # no scope, so it stays invisible until a node event defines it.
         for nid, ntype in ((frm, op["from_type"]), (to, op["to_type"])):
             self._node(nid, ntype)
         bound = op["binding"]
+        pair = _writer_key(ev)
         if op["op"] == "edge.add":
-            edge = self._edge((etype, frm, to) + ((bound,) if etype in BOUND_EDGE_TYPES else ()))
-            self._touch(edge, ev)
+            key = (etype, frm, to) + ((bound,) if etype in BOUND_EDGE_TYPES else ())
+            edge = self._edge(key)
+            self._touch(edge, ev, key)
             edge.adds.set(ev)
             edge._put_attrs(op["attrs"], ev)
+            edge.sources.add(pair)
             return
         rem = (op["reason"], ev.get("visibility_scope") if ev.get("visibility_scope") in SCOPE_RANK
                else "private", (ev.get("actor") or {}).get("id"))
         if etype in BOUND_EDGE_TYPES and bound is None:
-            tri = (etype, frm, to)
-            wild = self._wild.setdefault(tri, _Wild())
+            wild = self._wild.setdefault((etype, frm, to), _Wild())
             self._touch(wild, ev)
             wild.removes.set(ev, rem)
+            wild.sources.add(pair)
             return
-        edge = self._edge((etype, frm, to) + ((bound,) if etype in BOUND_EDGE_TYPES else ()))
-        self._touch(edge, ev)
+        key = (etype, frm, to) + ((bound,) if etype in BOUND_EDGE_TYPES else ())
+        edge = self._edge(key)
+        self._touch(edge, ev, key)
         edge.removes.set(ev, rem)
+        edge.sources.add(pair)
 
     def _edge(self, key: tuple) -> _Edge:
         edge = self._edges.get(key)
         if edge is None:
             edge = self._edges[key] = _Edge(key)
-            self._out.setdefault(key[1], set()).add(key)
-            self._in.setdefault(key[2], set()).add(key)
+            self._out.setdefault(key[1], {})[key] = None
+            self._in.setdefault(key[2], {})[key] = None
+            self._by_triple.setdefault(key[:3], {})[key] = None
+            if key[0] in BOUND_EDGE_TYPES:
+                self._subject.setdefault((key[2], key[0]), {})[key] = None
         return edge
 
     # --------------------------------------------------------- derivation
@@ -587,58 +689,81 @@ class GraphProjection:
         val = reg.value() if reg else None
         return set([val] if isinstance(val, str) else (val or []))
 
-    def _related(self, edge: _Edge, other: _Edge) -> bool:
-        """May ``other`` make ``edge`` stale? Only the same reviewer (same ``from``
-        node, which only its writers can add edges from) or an author who is a
-        writer of ``edge`` itself. Unrelated reviewers are never ranked against
-        each other; they only appear side by side in ``bindings``."""
-        return other.from_id == edge.from_id or (other.owner() is not None
-                                                  and other.owner() in edge.writers())
+    def _group(self, principal: Any, to_id: str, etype: str, ctx: dict) -> _Group:
+        """Index the live edges of one subject that ``principal`` can see (built once per read).
 
-    def _is_stale(self, edge: _Edge, principal: Any = None) -> bool:
+        Visibility is applied while indexing, so every aggregate - and therefore
+        every ``stale`` flag and ``bindings`` list - is relative to the caller;
+        a hidden edge cannot be inferred from them.
+        """
+        ck = (to_id, etype)
+        grp = ctx.get(ck)
+        if grp is not None:
+            return grp
+        grp = _Group()
+        by_from: dict[str, list] = {}
+        by_owner: dict[str, list] = {}
+        grp.sup_from, grp.sup_owner = {}, {}
+        seen: set[str] = set()
+        for key in self._subject.get(ck, ()):
+            e = self._edges[key]
+            if e.binding is None or not self._live(e) or self._is_removed(e):
+                continue
+            if principal is not None and not self._edge_visible(principal, e):
+                continue
+            ent = (e.adds.best(), e, e.binding[1])
+            by_from.setdefault(e.from_id, []).append(ent)
+            if e.owner():
+                by_owner.setdefault(e.owner(), []).append(ent)
+            seen.add(e.binding[1])
+            for v in self._supersedes(e):
+                grp.sup_from.setdefault(e.from_id, {}).setdefault(v, set()).add(e.binding[1])
+                if e.owner():
+                    grp.sup_owner.setdefault(e.owner(), {}).setdefault(v, set()).add(e.binding[1])
+        for lst in list(by_from.values()) + list(by_owner.values()):
+            lst.sort(key=lambda t: t[0][2], reverse=True)
+        grp.by_from, grp.by_owner = by_from, by_owner
+        ordered = sorted(seen)
+        grp.truncated = len(ordered) > MAX_BINDINGS
+        grp.bindings = ordered[:MAX_BINDINGS]
+        ctx[ck] = grp
+        return grp
+
+    def _is_stale(self, edge: _Edge, principal: Any, ctx: dict) -> bool:
         """Is ``edge`` (reviewed/validated) outdated, as seen by ``principal``?
 
-        Only edges the principal can see take part (``principal=None`` means the
-        server-internal view over everything), so a hidden edge can never be
-        inferred from another edge's flag. Staleness is by binding identity:
-        for each RELATED (see ``_related``) other live edge O of the same type
-        and subject with a different binding, ``edge`` is stale when
+        Only edges the principal can see take part. Staleness is by binding
+        identity against RELATED edges only (same ``from_id``, or whose owner is a
+        writer of ``edge``): another live edge O of the same type and subject with a
+        different binding makes ``edge`` stale when
         * O declares ``attrs.supersedes`` containing edge's binding value; or
         * neither side declares a supersession of the other and O's add was
-          admitted later than edge's (implicit order: server admission).
+          admitted later than edge's (implicit order).
         An edge that itself declares it supersedes O is never made stale by O.
-        The server cannot know commit order; emitters that can deliver late
-        should state it with ``attrs.supersedes``.
         """
         if edge.edge_type not in BOUND_EDGE_TYPES or not self._live(edge) or edge.binding is None:
             return False
+        grp = self._group(principal, edge.to_id, edge.edge_type, ctx)
         mine = edge.binding[1]
+        writers = edge.writers()
+        for table, ids in ((grp.sup_from, (edge.from_id,)), (grp.sup_owner, tuple(writers))):
+            for i in ids:
+                if any(b != mine for b in table.get(i, {}).get(mine, ())):
+                    return True
         my_sup = self._supersedes(edge)
         my_add = edge.adds.best()
-        for other in self._peers(edge, principal):
-            if other.binding == edge.binding or not self._related(edge, other):
-                continue
-            theirs = other.binding[1]
-            if mine in self._supersedes(other):
-                return True
-            if theirs in my_sup:
-                continue
-            if _after(other.adds.best(), my_add):
-                return True
+        lists = [grp.by_from.get(edge.from_id, [])] + [grp.by_owner.get(w, []) for w in writers]
+        for lst in lists:
+            steps = 0
+            for add, other, value in lst:
+                if other is edge or value == mine or value in my_sup:
+                    continue
+                steps += 1
+                if _after(add, my_add):
+                    return True
+                if add[2] < my_add[2] or steps >= 16:
+                    break
         return False
-
-    def _peers(self, edge: _Edge, principal: Any) -> list:
-        out = []
-        for key in self._in.get(edge.to_id, ()):
-            other = self._edges[key]
-            if other is edge or other.edge_type != edge.edge_type or other.binding is None:
-                continue
-            if not self._live(other) or self._is_removed(other):
-                continue
-            if principal is not None and not self._edge_visible(principal, other):
-                continue
-            out.append(other)
-        return out
 
     # ------------------------------------------------------------ renders
     def _node_view(self, node: _Node, internal: bool = False) -> dict:
@@ -658,20 +783,26 @@ class GraphProjection:
             out["owner"], out["co_writers"] = node.owner(), list(node.co_writers())
         return out
 
-    def _edge_view(self, edge: _Edge, principal: Any = None) -> dict:
+    def _edge_view(self, edge: _Edge, principal: Any = None, ctx: dict | None = None) -> dict:
+        ctx = {} if ctx is None else ctx
         add = edge.adds.best()
         rem = self._effective_remove(edge)
         removed = self._is_removed(edge)
         out = {
             "edge_type": edge.edge_type, "from_id": edge.from_id, "to_id": edge.to_id,
             "attrs": edge.attr_values(),
-            "stale": self._is_stale(edge, principal), "removed": removed,
+            "stale": self._is_stale(edge, principal, ctx), "removed": removed,
             "visibility_scope": edge.scope or "private",
             "provenance": {"event_id": add[1], "source": add[2][2], "source_sequence": add[0]},
         }
         if edge.binding is not None:
+            grp = self._group(principal, edge.to_id, edge.edge_type, ctx)
             out["binding"] = {edge.binding[0]: edge.binding[1]}
-            out["bindings"] = sorted({o.binding[1] for o in self._peers(edge, principal)} | {edge.binding[1]})
+            listed = list(grp.bindings)
+            if edge.binding[1] not in listed:
+                listed = sorted(listed + [edge.binding[1]])
+            out["bindings"] = listed
+            out["bindings_truncated"] = grp.truncated
         if removed and rem:
             reason, scope, actor_id = rem[3]
             # The remove event's own scope gates its details; a caller who cannot
@@ -693,40 +824,107 @@ class GraphProjection:
                 and self._node_visible(principal, self._nodes.get(edge.to_id)))
 
     # -------------------------------------------------------------- reads
-    def get_node(self, principal, node_id: str) -> dict:
-        """Node detail plus its visible incident edges. KeyError if absent OR hidden."""
+    def _expand(self, principal, nid: str, direction: str, edge_types, include_removed: bool,
+                from_id: str | None, budget: int) -> tuple[list, list, bool]:
+        """Visible incident edges of ``nid``: (own, others, scan_exhausted).
+
+        ``own`` are edges the caller is a writer of (never crowded out); ``others``
+        are the rest, newest admission first. At most ``budget`` incident edges are
+        examined, newest first, so a flood of old edges cannot hide recent ones and
+        a read costs O(budget). Only visible edges are ever counted or returned.
+        """
+        aid = (principal or {}).get("id")
+        outs = self._out.get(nid, {}) if direction in ("both", "out") else {}
+        ins = self._in.get(nid, {}) if direction in ("both", "in") else {}
+
+        def ok(edge: _Edge) -> bool:
+            if edge_types is not None and edge.edge_type not in edge_types:
+                return False
+            if from_id is not None and edge.from_id != from_id:
+                return False
+            if not include_removed and self._is_removed(edge):
+                return False
+            return self._edge_visible(principal, edge)
+
+        own, seen_own = [], set()
+        mine = self._edges_by_owner.get(aid, set()) if aid else set()
+        cand = mine if len(mine) <= len(outs) + len(ins) else itertools.chain(outs, ins)
+        for key in cand:
+            if key in mine and (key in outs or key in ins) and key not in seen_own:
+                edge = self._edges[key]
+                if self._live(edge) and ok(edge):
+                    own.append(edge)
+                    seen_own.add(key)
+        others, scanned = [], 0
+        exhausted = False
+        for key in itertools.chain(reversed(outs), reversed(ins)):
+            if scanned >= budget:
+                exhausted = True
+                break
+            scanned += 1
+            if key in seen_own:
+                continue
+            edge = self._edges[key]
+            if self._live(edge) and ok(edge):
+                others.append(edge)
+        others.sort(key=lambda e: e.adds.best()[2], reverse=True)
+        own.sort(key=lambda e: e.adds.best()[2], reverse=True)
+        return own, others, exhausted
+
+    def get_node(self, principal, node_id: str, *, edge_type: str | None = None,
+                 from_id: str | None = None, limit: int = MAX_NODE_EDGES, offset: int = 0) -> dict:
+        """Node detail plus a page of its visible incident edges. KeyError if absent OR hidden.
+
+        Edges the caller writes come first and are exempt from the page cut; the
+        rest are newest admission first. ``edges_omitted`` counts visible edges
+        not returned (over visible items only); ``next_offset`` pages through them.
+        """
+        if edge_type is not None and edge_type not in EDGE_TYPES:
+            raise ValueError("unknown edge_type filter")
+        if not isinstance(limit, int) or not 1 <= limit <= MAX_NODE_EDGES:
+            raise ValueError(f"limit must be between 1 and {MAX_NODE_EDGES}")
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be >= 0")
         with self._lock:
             node = self._nodes.get(node_id)
             if not self._node_visible(principal, node):
                 raise KeyError(node_id)
-            keys = sorted(self._out.get(node_id, set()) | self._in.get(node_id, set()), key=repr)
-            budget = MAX_RESPONSE_BYTES
+            own, others, exhausted = self._expand(
+                principal, node_id, "both", {edge_type} if edge_type else None, False, from_id, SCAN_BUDGET)
+            ctx: dict = {}
             view = self._node_view(node)
-            budget -= len(json.dumps(view))
-            edges, truncated = [], False
-            for k in keys:
-                if not self._edge_visible(principal, self._edges[k]):
-                    continue
-                ev = self._edge_view(self._edges[k], principal)
+            budget = MAX_RESPONSE_BYTES - len(json.dumps(view))
+            page_own = own[:MAX_NODE_EDGES] if offset == 0 else []
+            page_oth = others[offset:offset + limit]
+            edges, byte_cut = [], False
+            for e in page_own + page_oth:
+                ev = self._edge_view(e, principal, ctx)
                 budget -= len(json.dumps(ev))
-                if len(edges) >= MAX_NODE_EDGES or budget < 0:
-                    truncated = True
+                if budget < 0:
+                    byte_cut = True
                     break
                 edges.append(ev)
-            return {"node": view, "edges": edges, "edges_truncated": truncated}
+            returned = len(edges)
+            omitted = max(0, len(own) + len(others) - returned - (0 if offset == 0 else min(offset, len(others))))
+            more = offset + limit < len(others)
+            return {"node": view, "edges": edges,
+                    "edges_truncated": bool(more or byte_cut or exhausted or len(own) > MAX_NODE_EDGES),
+                    "edges_omitted": omitted, "scan_exhausted": exhausted,
+                    "next_offset": offset + limit if more else None}
 
     def get_edge(self, principal, edge_type: str, from_id: str, to_id: str,
                  commit: str | None = None, plan_digest: str | None = None) -> dict:
         """Provenance of the visible edge(s) of a triple (optionally one binding)."""
         with self._lock:
-            matches = [e for e in self._edges.values()
-                       if e.key[:3] == (edge_type, from_id, to_id) and self._edge_visible(principal, e)
+            matches = [e for e in (self._edges[k] for k in self._by_triple.get((edge_type, from_id, to_id), ()))
+                       if self._edge_visible(principal, e)
                        and (commit is None or e.binding == ("commit", commit))
                        and (plan_digest is None or e.binding == ("plan_digest", plan_digest))]
             if not matches:
                 raise KeyError("edge")
             matches.sort(key=lambda e: e.adds.best()[2])
-            return {"edges": [self._edge_view(e, principal) for e in matches[:MAX_NODE_EDGES]]}
+            ctx: dict = {}
+            return {"edges": [self._edge_view(e, principal, ctx) for e in matches[:MAX_NODE_EDGES]]}
 
     def neighborhood(self, principal, root: str, *, depth: int = DEFAULT_DEPTH,
                      max_nodes: int = DEFAULT_NODES, max_edges: int = DEFAULT_EDGES,
@@ -736,8 +934,11 @@ class GraphProjection:
 
         A hidden or unknown root is KeyError (indistinguishable). A hidden node
         is never expanded, listed, counted, or revealed as an edge endpoint;
-        ``truncated`` reflects only visible items so it leaks nothing. The
-        response is also bounded by ``MAX_RESPONSE_BYTES``.
+        ``truncated`` reflects only visible items so it leaks nothing. At each node
+        the caller's own edges are followed first, then the rest newest first, so a
+        flood of edges cannot crowd out recent or own ones. The response is bounded
+        by ``MAX_RESPONSE_BYTES`` and each node examines at most
+        ``NEIGHBOR_SCAN_BUDGET`` incident edges.
         """
         if not isinstance(depth, int) or depth < 0 or depth > MAX_DEPTH:
             raise ValueError(f"depth must be between 0 and {MAX_DEPTH}")
@@ -755,25 +956,18 @@ class GraphProjection:
                 raise KeyError(root)
             budget = MAX_RESPONSE_BYTES - len(json.dumps(self._node_view(start)))
             seen: dict[str, int] = {root: 0}
+            expansions: dict[str, list] = {}
             queue = deque([root])
             truncated = False
             while queue:
                 nid = queue.popleft()
+                own, others, exhausted = self._expand(
+                    principal, nid, direction, edge_types, include_removed, None, NEIGHBOR_SCAN_BUDGET)
+                expansions[nid] = (own, others)
+                truncated = truncated or exhausted
                 if seen[nid] >= depth:
                     continue
-                keys: set = set()
-                if direction in ("both", "out"):
-                    keys |= self._out.get(nid, set())
-                if direction in ("both", "in"):
-                    keys |= self._in.get(nid, set())
-                for key in sorted(keys, key=repr):
-                    edge = self._edges[key]
-                    if edge_types is not None and edge.edge_type not in edge_types:
-                        continue
-                    if not include_removed and self._is_removed(edge):
-                        continue
-                    if not self._edge_visible(principal, edge):
-                        continue
+                for edge in own + others:
                     other = edge.to_id if edge.from_id == nid else edge.from_id
                     if other in seen:
                         continue
@@ -784,17 +978,18 @@ class GraphProjection:
                     budget -= cost
                     seen[other] = seen[nid] + 1
                     queue.append(other)
-            edges = []
-            for nid in sorted(seen):
-                for key in sorted(self._out.get(nid, set()), key=repr):
-                    edge = self._edges[key]
-                    if edge.to_id not in seen or not self._edge_visible(principal, edge):
+            ctx: dict = {}
+            edges, done = [], set()
+            # the caller's own edges first, then the rest newest first, so a flood cannot crowd either out
+            ordered = [e for nid in sorted(expansions) for e in expansions[nid][0]] + sorted(
+                (e for nid in sorted(expansions) for e in expansions[nid][1]),
+                key=lambda e: e.adds.best()[2], reverse=True)
+            if True:
+                for edge in ordered:
+                    if edge.key in done or edge.from_id not in seen or edge.to_id not in seen:
                         continue
-                    if edge_types is not None and edge.edge_type not in edge_types:
-                        continue
-                    if not include_removed and self._is_removed(edge):
-                        continue
-                    view = self._edge_view(edge, principal)
+                    done.add(edge.key)
+                    view = self._edge_view(edge, principal, ctx)
                     cost = len(json.dumps(view))
                     if len(edges) >= max_edges or budget - cost < 0:
                         truncated = True
@@ -811,13 +1006,15 @@ class GraphProjection:
     def snapshot(self) -> dict:
         """Unfiltered canonical state (tests and rebuild equality; never served)."""
         with self._lock:
+            ctx: dict = {}
             nodes = {n.id: self._node_view(n, internal=True) for n in self._nodes.values()}
             edges = {}
             for k, e in self._edges.items():
                 if self._live(e):
-                    edges[repr(k)] = {**self._edge_view(e), "owner": e.owner(),
+                    edges[repr(k)] = {**self._edge_view(e, None, ctx), "owner": e.owner(),
                                       "co_writers": list(e.co_writers())}
             wild = {repr(k): {"remove": [w.removes.best()[0], w.removes.best()[1], w.removes.best()[3]],
                               "scope": w.scope, "owner": w.owner()}
-                    for k, w in self._wild.items()}
-            return {"nodes": nodes, "edges": edges, "wildcard_removes": wild}
+                    for k, w in self._wild.items() if w.removes.best()}
+            return {"nodes": nodes, "edges": edges, "wildcard_removes": wild,
+                    "owned": dict(sorted(self._owned.items()))}
