@@ -29,8 +29,18 @@ import re
 from typing import Any
 
 from . import ids
-from .forks import (FORK_ORIGIN_TYPES, SHA_RE, ForkBlocked, base_candidates, clean_text, comparison,
-                    normalize_forks, origin_of, promotion_check, sibling_ids)
+from .forks import (
+    FORK_ORIGIN_TYPES,
+    SHA_RE,
+    ForkBlocked,
+    base_candidates,
+    clean_text,
+    comparison,
+    normalize_forks,
+    origin_of,
+    promotion_check,
+    sibling_ids,
+)
 from .redact import redact_text
 
 # ------------------------------------------------------------------ limits

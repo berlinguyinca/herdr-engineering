@@ -8,8 +8,12 @@ from __future__ import annotations
 import pytest
 
 from herdr_engineering.control_plane.collab import CollabError
-from herdr_engineering.control_plane.collab_workbench import DEFAULT_ACTIONS, STEER_ACTIONS, normalize_steering
-from herdr_engineering.control_plane.forks import comparison, normalize_forks, promotion_check
+from herdr_engineering.control_plane.collab_workbench import (
+    DEFAULT_ACTIONS,
+    STEER_ACTIONS,
+    normalize_steering,
+)
+from herdr_engineering.control_plane.forks import normalize_forks, promotion_check
 from tests.control_plane.test_collab_links import link, w  # noqa: F401
 from tests.control_plane.test_collab_tasks import USERS, code, svc, user  # noqa: F401
 from tests.control_plane.test_graph import OPERATOR, WRITER
@@ -484,7 +488,6 @@ def test_nothing_in_a_fork_or_promote_delivery_is_a_command(fk):
     confirm(fk, fk.alice, propose(fk, fk.bob, "promote", a, expected_head=H1, reason="looks good"))
     item = pending(fk)[0]
     assert set(item["params"]) == {"expected_head", "origin", "head", "siblings"}
-    blob = repr(item)
     for word in ("argv", "shell", "command", "merge", "force"):
         assert word not in item and word not in item["params"]
     assert "--" not in repr(item["params"])
