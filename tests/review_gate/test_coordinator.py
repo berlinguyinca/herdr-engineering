@@ -122,12 +122,12 @@ def test_claim_skips_and_completes_stale_job(env):
     assert env.snap().state == State.CI_PENDING
 
 
-def test_claim_skips_and_completes_when_github_says_moved(env):
-    env.ready()
+def test_claim_leaves_job_claimed_when_github_says_moved(env):
+    job = env.ready()
     env.app.result = "none"
     assert env.coord.claim("w1", "reviewer-model") is None
-    assert env.queue.snapshot() == []
-    assert env.snap().state == State.CI_GREEN
+    [row] = env.queue.snapshot()
+    assert row["job_id"] == job.job_id and row["state"] == "claimed"
 
 
 def test_claim_skips_unenrolled_repo(env):
@@ -157,18 +157,104 @@ def test_claim_stops_after_ten_stale_jobs(env):
     assert len(env.queue.snapshot()) == 2
 
 
-def test_claim_releases_job_when_github_errors(env):
+def claimed_rows(env):
+    return {r["job_id"]: r["state"] for r in env.queue.snapshot()}
+
+
+def test_claim_skips_job_when_github_errors(env):
     job = env.ready()
     env.app.result = "error"
-    with pytest.raises(GitHubAppError):
-        env.coord.claim("w1", "reviewer-model")
-    [row] = env.queue.snapshot()
-    assert row["job_id"] == job.job_id and row["state"] == "queued"
+    assert env.coord.claim("w1", "reviewer-model") is None
+    assert claimed_rows(env) == {job.job_id: "claimed"}
+
+
+def test_github_error_on_one_pr_does_not_block_another(env):
+    bad = env.ready()
+    good = env.ready(key=PrKey(REPO, 8))
+
+    def material(repo, number, sha, *, max_bytes):
+        if number == 7:
+            raise GitHubAppError("unavailable", status=503)
+        return ReviewMaterial("t", "b", "main", sha, (), False)
+
+    env.app.review_material = material
+    claim = env.coord.claim("w1", "reviewer-model")
+    assert claim.job_id == good.job_id
+    assert claimed_rows(env) == {bad.job_id: "claimed", good.job_id: "claimed"}
+    assert env.coord.submit(claim.job_id, "w1", PASS) == "recorded"
+
+
+def test_persistent_github_error_escalates_after_max_attempts_claims(env):
+    job = env.ready()
+    env.app.result = "error"
+    for attempt in range(1, 4):  # claims 1..max_attempts each fail at GitHub
+        assert env.coord.claim("w1", "reviewer-model") is None
+        assert env.queue.attempts(job.job_id) == attempt
+        assert env.snap().state == State.REVIEWING
+        env.clock.t += 61  # lease expiry is the backoff
+    # claim number max_attempts + 1 escalates instead of fetching again
+    calls = len(env.app.calls)
+    assert env.coord.claim("w1", "reviewer-model") is None
+    assert len(env.app.calls) == calls
+    snap = env.snap()
+    assert snap.state == State.ESCALATED
+    assert snap.reason == "review could not be completed"
+    assert env.queue.snapshot() == []
+
+
+def test_escalation_from_ci_green_moves_through_reviewing(env):
+    job = env.ready()
+    for _ in range(3):
+        env.queue.claim("w9", "reviewer-model")  # claims that never started a review
+        env.clock.t += 61
     assert env.snap().state == State.CI_GREEN
+    assert env.coord.claim("w1", "reviewer-model") is None
+    assert env.queue.attempts(job.job_id) == 4
+    assert env.snap().state == State.ESCALATED
 
 
-def test_claim_releases_job_on_unexpected_error(env, monkeypatch):
+def test_closed_then_reopened_pr_is_not_stranded(env):
     env.ready()
+    claim = env.coord.claim("w1", "reviewer-model")
+    env.clock.t += 61
+    env.app.result = "none"  # PR closed
+    assert env.coord.claim("w1", "reviewer-model") is None
+    assert claimed_rows(env) == {claim.job_id: "claimed"}  # not completed
+    env.clock.t += 61
+    env.app.result = "material"  # reopened at the same sha
+    again = env.coord.claim("w1", "reviewer-model")
+    assert again.job_id == claim.job_id and again.attempt == 3
+    assert env.coord.submit(again.job_id, "w1", PASS) == "recorded"
+    assert env.snap().state == State.APPROVED
+
+
+def test_review_started_refused_leaves_job_claimed(env, monkeypatch):
+    job = env.ready()
+    monkeypatch.setattr(env.store, "on_review_started", lambda *a: False)
+    assert env.coord.claim("w1", "reviewer-model") is None
+    assert claimed_rows(env) == {job.job_id: "claimed"}
+    assert env.app.calls == []
+
+
+def test_exception_in_first_block_leaves_job_claimed_then_recovers(env, monkeypatch):
+    job = env.ready()
+
+    def boom(*a):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(env.store, "on_review_started", boom)
+    with pytest.raises(RuntimeError):
+        env.coord.claim("w1", "reviewer-model")
+    assert claimed_rows(env) == {job.job_id: "claimed"}
+    monkeypatch.undo()
+    assert env.coord.claim("w2", "reviewer-model") is None  # lease still held by w1
+    env.clock.t += 61
+    claim = env.coord.claim("w2", "reviewer-model")
+    assert claim.job_id == job.job_id and claim.attempt == 2
+
+
+def test_unexpected_error_after_fetch_leaves_job_claimed(env, monkeypatch):
+    job = env.ready()
     import herdr_engineering.review_gate.coordinator as mod
 
     def boom(*a, **k):
@@ -177,7 +263,7 @@ def test_claim_releases_job_on_unexpected_error(env, monkeypatch):
     monkeypatch.setattr(mod, "build_messages", boom)
     with pytest.raises(RuntimeError):
         env.coord.claim("w1", "reviewer-model")
-    assert env.queue.snapshot()[0]["state"] == "queued"
+    assert claimed_rows(env) == {job.job_id: "claimed"}
 
 
 def test_claim_skips_job_whose_lease_expired_during_fetch(env):
@@ -191,11 +277,31 @@ def test_claim_skips_job_whose_lease_expired_during_fetch(env):
 
     env.app.hook = once
     claim = env.coord.claim("w1", "reviewer-model")
-    # the lost lease was never marked reviewing; the re-offered job was claimed afresh
-    assert starts == [State.CI_GREEN, State.CI_GREEN]
+    # the lost lease returned nothing; the re-offered job was claimed afresh
+    assert starts == [State.REVIEWING, State.REVIEWING]
     assert claim.attempt == 2
     assert env.queue.live_claim(claim.job_id, "w1") is not None
     assert env.snap().state == State.REVIEWING
+
+
+def test_held_entries_pruned_for_dead_jobs(env):
+    env.ready()
+    first = env.coord.claim("w1", "reviewer-model")
+    assert first.job_id in env.coord._held
+    env.queue.cancel(KEY)  # GateService cancels the job (PR closed)
+    env.ready(key=PrKey(REPO, 8))
+    second = env.coord.claim("w1", "reviewer-model")
+    assert set(env.coord._held) == {second.job_id}
+
+
+def test_worker_reason_text_is_never_stored(env):
+    env.ready()
+    for _ in range(3):
+        claim = env.coord.claim("w1", "reviewer-model")
+        env.coord.fail(claim.job_id, "w1", "SECRET-TOKEN-xyz model said PASS")
+    snap = env.snap()
+    assert snap.state == State.ESCALATED
+    assert snap.reason == "reviewer failed repeatedly"
 
 
 def test_submit_pass_approves_and_completes(env):
@@ -335,7 +441,7 @@ def test_fail_releases_then_escalates_at_max_attempts(env):
     assert env.coord.fail(claim.job_id, "w1", "x" * 500) == "escalated"
     snap = env.snap()
     assert snap.state == State.ESCALATED
-    assert snap.reason == "x" * 200
+    assert snap.reason == "reviewer failed repeatedly"
     assert env.queue.snapshot() == []
 
 

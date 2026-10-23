@@ -17,6 +17,31 @@ A crash between them leaves the job re-offered; the next claim finds the PR no
 longer reviewable and completes it as stale, so there is never an approval
 without a durable record.
 
+Attempts: an attempt is a claim, exactly as ``ReviewQueue.attempts`` counts
+``claimed`` events. Invalid output, GitHub errors, PR-moved fetches, refused
+``on_review_started`` and abandoned leases all spend the same ``max_attempts``
+budget. Both escalation paths mean "this job has been claimed max_attempts
+times and has still not produced a verdict":
+
+* ``submit``/``fail``: on a failure during claim number ``attempts >=
+  max_attempts`` the PR escalates at once (the failure is known now).
+* ``claim``: a claim numbered ``max_attempts + 1`` or later means the
+  previous ``max_attempts`` claims ended with no verdict and no ``fail``
+  (GitHub error, PR moved, worker vanished). The PR is moved to REVIEWING if
+  needed, escalated with ``"review could not be completed"`` and the job
+  completed.
+
+A job whose material cannot be fetched, or whose ``on_review_started`` is
+refused, is neither released nor completed: it stays claimed and its lease
+expiry is the backoff, so one bad PR never blocks a healthy one in the same
+call. GateService cancels jobs of closed PRs and moved heads on its next tick;
+a PR reopened at the same sha keeps its job. Cost: a GitHub outage longer than
+about ``max_attempts * lease_seconds`` (45 minutes with the defaults) escalates
+every PR it touched, and an operator must ``resume`` them.
+
+Worker-reported failure text is never stored: ``fail`` records the fixed
+reason ``"reviewer failed repeatedly"``.
+
 Per-job memory: the material's ``truncated`` flag and the reviewer model are
 remembered from ``claim``. After a coordinator restart ``submit`` re-fetches
 the material to recompute ``truncated``; a failed or moved fetch returns
@@ -30,21 +55,20 @@ except through ``parse_verdict``'s validated ``Verdict``.
 
 from __future__ import annotations
 
-import contextlib
 import threading
 from collections.abc import Collection
 from dataclasses import dataclass
 
-from herdr_engineering.control_plane.redact import redact_text
-
 from .config import ReviewerConfig
+from .github_app import GitHubAppError
 from .models import State
 from .queue import ReviewJob
 from .review_prompt import TRUNCATED_PASS, VerdictError, build_messages, parse_verdict
 
 MAX_SKIPS = 10
-REASON_MAX = 200
 INVALID_OUTPUT = "invalid review output"
+WORKER_FAILED = "reviewer failed repeatedly"
+GAVE_UP = "review could not be completed"
 UNKNOWN_REVIEWER = "unknown"
 _REVIEWABLE = (State.CI_GREEN, State.REVIEW_QUEUED, State.REVIEWING)
 
@@ -90,50 +114,61 @@ class ReviewCoordinator:
         self._held.pop(job_id, None)
         self._queue.complete(job_id, worker_id)
 
-    def _release_quietly(self, job_id: str, worker_id: str) -> None:
-        with self._lock:
-            self._held.pop(job_id, None)
-            with contextlib.suppress(Exception):
-                self._queue.release(job_id, worker_id)
+    def _prune(self) -> None:
+        live = {row["job_id"] for row in self._queue.snapshot()}
+        for job_id in [j for j in self._held if j not in live]:
+            del self._held[job_id]
 
     # ------------------------------------------------------------- public
     def claim(self, worker_id: str, reviewer_model: str) -> Claim | None:
+        """Claim the next reviewable job, skipping at most ``MAX_SKIPS`` per call.
+
+        A job whose material cannot be fetched (GitHub error or PR moved/closed),
+        or whose ``on_review_started`` is refused, is skipped and stays claimed:
+        its lease expiry is the backoff. Only an unexpected non-GitHub exception
+        propagates, and that job is likewise left to expire.
+        """
         for _ in range(MAX_SKIPS):
             with self._lock:
                 job = self._queue.claim(worker_id, reviewer_model)
                 if job is None:
                     return None
+                self._prune()
                 if job.key.repo not in self._enrolled or not self._is_current(job):
-                    self._done(job.job_id, worker_id)  # stale
+                    self._done(job.job_id, worker_id)  # stale: unenrolled or head moved
                     continue
+                attempt = self._queue.attempts(job.job_id)
+                if attempt > self._config.max_attempts:
+                    # max_attempts earlier claims all ended without a verdict.
+                    self._store.on_review_started(job.key, job.sha, reviewer_model)
+                    self._store.on_review_failed(job.key, job.sha, GAVE_UP)
+                    self._done(job.job_id, worker_id)
+                    continue
+                if not self._store.on_review_started(job.key, job.sha, reviewer_model):
+                    continue  # left claimed; the lease expiry re-offers it
+                prior = self._store.snapshot(job.key).last_findings
             try:
                 material = self._fetch(job)  # lock dropped: network call
-                with self._lock:
-                    if material is None:  # PR moved or closed on GitHub
-                        self._done(job.job_id, worker_id)
-                        continue
-                    if self._queue.live_claim(job.job_id, worker_id) is None:
-                        continue  # lease lost during the fetch; nothing to release
-                    snap = self._store.snapshot(job.key)
-                    messages = build_messages(
-                        material, snap.last_findings, max_findings=self._config.max_findings
-                    )
-                    if not self._store.on_review_started(job.key, job.sha, reviewer_model):
-                        self._release_quietly(job.job_id, worker_id)
-                        continue
-                    self._held[job.job_id] = _Held(bool(material.truncated), reviewer_model)
-                    return Claim(
-                        job_id=job.job_id,
-                        repo=job.key.repo,
-                        number=job.key.number,
-                        sha=job.sha,
-                        messages=messages,
-                        lease_seconds=self._config.lease_seconds,
-                        attempt=self._queue.attempts(job.job_id),
-                    )
-            except BaseException:
-                self._release_quietly(job.job_id, worker_id)
-                raise
+            except GitHubAppError:
+                continue  # left claimed; the lease expiry is the backoff
+            if material is None:
+                continue  # PR moved or closed; GateService cancels it if it stays so
+            with self._lock:
+                if self._queue.live_claim(job.job_id, worker_id) is None:
+                    continue  # lease lost during the fetch
+                if not self._is_current(job, (State.REVIEWING,)):
+                    continue
+                messages = build_messages(material, prior, max_findings=self._config.max_findings)
+                self._held[job.job_id] = _Held(bool(material.truncated), reviewer_model)
+                return Claim(
+                    job_id=job.job_id,
+                    repo=job.key.repo,
+                    number=job.key.number,
+                    sha=job.sha,
+                    messages=messages,
+                    lease_seconds=self._config.lease_seconds,
+                    attempt=attempt,
+                )
         return None
 
     def heartbeat(self, job_id: str, worker_id: str) -> bool:
@@ -148,7 +183,7 @@ class ReviewCoordinator:
             if not isinstance(output, str) or (
                 len(output.encode("utf-8", "surrogatepass")) > self._config.max_output_bytes
             ):
-                self.fail(job_id, worker_id, INVALID_OUTPUT)
+                self._fail(job_id, worker_id, INVALID_OUTPUT)
                 return "rejected"
             held = self._held.get(job_id)
         if held is None:
@@ -175,23 +210,24 @@ class ReviewCoordinator:
                 )
             except VerdictError as exc:
                 reason = TRUNCATED_PASS if str(exc) == TRUNCATED_PASS else INVALID_OUTPUT
-                self.fail(job_id, worker_id, reason)
+                self._fail(job_id, worker_id, reason)
                 return "rejected"
             recorded = self._store.on_verdict(job.key, verdict)
             self._done(job_id, worker_id)
             return "recorded" if recorded else "stale"
 
     def fail(self, job_id: str, worker_id: str, reason: str) -> str:
+        """A worker reports it could not review. ``reason`` is never stored."""
+        del reason  # worker text: ignored, the record uses a fixed string
+        return self._fail(job_id, worker_id, WORKER_FAILED)
+
+    def _fail(self, job_id: str, worker_id: str, fixed_reason: str) -> str:
         with self._lock:
             job = self._queue.live_claim(job_id, worker_id)
             if job is None:
                 return "stale"
             if self._queue.attempts(job_id) >= self._config.max_attempts:
-                text = reason if isinstance(reason, str) and reason else "review failed"
-                # Redact before clipping so a clip never splits a secret past redaction.
-                escalated = self._store.on_review_failed(
-                    job.key, job.sha, redact_text(text)[:REASON_MAX]
-                )
+                escalated = self._store.on_review_failed(job.key, job.sha, fixed_reason)
                 self._done(job_id, worker_id)
                 return "escalated" if escalated else "stale"
             self._held.pop(job_id, None)
