@@ -1,0 +1,12 @@
+# T16 acceptance configuration. The ONLY configuration of the suite: paths and limits, no environment variables.
+# Relative paths resolve against the herdr-engineering checkout root. To point a run at other checkouts, copy this
+# file to tests/e2e/acceptance.local.yaml (untracked) and edit it; that file wins when present.
+version: 1
+pi_repo: ../pi-t16                              # integrated Pi release-candidate worktree
+autospec_repo: ../autospec-t06                  # AutoSpec checkout holding the Rust CLI
+autospec_bin: ../autospec-t06/target/debug/autospec
+node: node
+startup_timeout_seconds: 30
+request_timeout_seconds: 10
+postgres:                                       # throwaway cluster for the restart/replay scenario (scenario 6)
+  bin_dirs: [/usr/lib/postgresql/18/bin, /usr/lib/postgresql/17/bin, /usr/lib/postgresql/16/bin]
