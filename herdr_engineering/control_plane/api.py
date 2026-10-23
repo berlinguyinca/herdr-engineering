@@ -1026,8 +1026,11 @@ def _make_handler(server, public=False, operator=False):
                     or parts[-1] != "resume"):
                 return self._json({"error": "not found"}, 404)
             from ..review_gate.models import PrKey
+            from .project_links import canonical_repository
+            # Same canonical form as the enrollment config (lowercase owner/name).
+            repo = canonical_repository("/".join(parts[5:-2])) or ""
             try:
-                key = PrKey.parse(f"{'/'.join(parts[5:-2])}#{parts[-2]}")
+                key = PrKey.parse(f"{repo}#{parts[-2]}")
             except ValueError:
                 return self._json({"error": "not found"}, 404)
             store = server.gate_store

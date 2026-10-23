@@ -416,3 +416,11 @@ def test_sink_without_required_writes_fails_loud(tmp_path, monkeypatch, monitor_
         ControlPlaneServer(ControlPlaneRepo(sink=LegacySink()), api_keys={"read": "viewer"},
                            fleet_config=FakeFleet(gate_section(tmp_path)))
     assert not any(t.name == "review-gate" for t in threading.enumerate())
+
+
+def test_resume_accepts_a_mixed_case_repo(gate_server):
+    key = escalate(gate_server)
+    path = "review-gate/prs/github.com/Acme/Widget/7/resume"
+    status, snap = request(gate_server, path, {}, key="write", method="POST")
+    assert status == 200 and snap["key"] == str(key)
+    assert gate_server.gate_store.snapshot(key).state.value != "escalated"
