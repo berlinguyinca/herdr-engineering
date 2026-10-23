@@ -44,11 +44,11 @@ class AuthorRegistry:
         self._lock = threading.RLock()
 
     def _pinned(self, key: PrKey) -> Author | None:
-        pinned = None
+        # First-wins on read as well as on write: a later pin event is ignored.
         for event in self._repo.stream(ENTITY, str(key)):
             if event["event_type"] == "author_pinned":
-                pinned = Author(**_payload(event))
-        return pinned
+                return Author(**_payload(event))
+        return None
 
     def pin(self, key: PrKey, author: Author) -> None:
         with self._lock:

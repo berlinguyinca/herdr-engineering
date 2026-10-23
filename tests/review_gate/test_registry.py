@@ -122,3 +122,12 @@ def test_session_without_pi_marker_or_pane_is_unknown_but_keeps_ids():
     repo.upsert_session("a", host_id="h", model="m", branch="feat/x")
     a = reg.author_of(KEY, "feat/x")
     assert (a.kind, a.session_id, a.host_id, a.model) == ("unknown", "a", "h", "m")
+
+
+def test_first_pin_event_wins_on_read():
+    repo = ControlPlaneRepo()
+    repo.record_event("pr_gate_author", str(KEY), "author_pinned", {"kind": "pi", "model": "first"})
+    repo.record_event(
+        "pr_gate_author", str(KEY), "author_pinned", {"kind": "pi", "model": "second"}
+    )
+    assert AuthorRegistry(repo).author_of(KEY, "feat/x").model == "first"
