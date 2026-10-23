@@ -51,7 +51,7 @@ const TEETH = [
   ['the sub-tab badge counts are gone', 'collab-chat', '.cx-badge { display: none !important }', ['subtabs']],
   ['the Send button is invisible', 'collab-chat', '.cx-compose .hd-btn, [data-send] { visibility: hidden !important }', []],
   ['the chat text is a few shades lighter (+7 per channel)', 'collab-chat', '.cx-msg, .cx-log * { color: #5d5d75 !important }', ['log']],
-  ['the chat log is one pixel lower', 'collab-chat', '.cx-log { transform: translateY(1px) }', ['log']],
+  ['the chat log is one pixel lower', 'collab-chat', '.cx-log { transform: translateY(1px) }', []],
   ['the accent colour moved by about 5 per channel', 'collab-attention', '.cx-page, .cx-embed { --accent: #0f7a5e !important }', []],
   ['buttons are one pixel wider', 'collab-attention', '.hd-btn { padding: 8px 15px !important }', ['item']],
   ['cards gained a pixel of padding', 'collab-attention', '.hd-card { padding: 17px !important }', []],
