@@ -233,6 +233,12 @@ class ControlPlaneServer:
         # collab service, so the local owner needs no sign-in.
         self.collab_operator_url = collab_operator_url.rstrip("/") if collab_operator_url else None
         self.collab_dashboard_hosts = frozenset(h.lower() for h in collab_dashboard_hosts)
+        # "Let the agent fix this" on a dead session: start a text-only helper through the collab
+        # service's summary-fix room (it answers 409 helper_unavailable when none is configured).
+        from .summary_fix import http_helper_spawner, inprocess_helper_spawner
+        self.summary_fix_helper = (
+            inprocess_helper_spawner(collab, operator_user) if collab is not None and operator_user
+            else http_helper_spawner(self.collab_operator_url) if self.collab_operator_url else None)
         if collab_only and public_port is None:
             raise ValueError("collab-only mode needs the public collaboration port")
         self.public_port = public_port
@@ -1361,7 +1367,8 @@ def _make_handler(server, public=False, operator=False):
                 actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
                 try:
                     status, result = fix_summary_item(server.agent_summaries, r, server.dispatcher,
-                                                      parts[4], body, actor=actor)
+                                                      parts[4], body, actor=actor,
+                                                      helper_spawner=server.summary_fix_helper)
                 except SummaryFixRefused as exc:
                     return self._json(exc.body, exc.status)
                 return self._json(result, status)
