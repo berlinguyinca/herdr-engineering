@@ -12,6 +12,7 @@ import re
 import stat
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -106,8 +107,16 @@ def transcript_metadata(entries, config):
         and OUTAGE.search(str(message.get("errorMessage", "")))
         else None
     )
+    failure_evidence = "current_inference_error" if failure else "no_current_inference_error"
     if pending_calls or unsafe_error_turn or branched:
         failure = None
+        failure_evidence = (
+            "unreconciled_tool_calls"
+            if pending_calls
+            else "error_turn_tool_calls"
+            if unsafe_error_turn
+            else "ambiguous_branch_history"
+        )
     return {
         "sessionId": header.get("id"),
         "model": model,
@@ -115,10 +124,11 @@ def transcript_metadata(entries, config):
         "requiredContext": max(selected["contextWindow"], usage + 8192)
         if selected and type(selected.get("contextWindow")) is int
         else None,
-        "requiresVision": vision or bool(selected and "image" in selected.get("input", [])),
+        "requiresVision": vision,
         "requiresReasoning": selected.get("reasoning") is True if selected else True,
         "lastAssistantId": last_message.get("id") if last_message else None,
         "failure": failure,
+        "failureEvidence": failure_evidence,
         "models": [
             {k: m.get(k) for k in ("id", "contextWindow", "input", "reasoning")}
             for m in providers.get("metabolomics", {}).get("models", [])
@@ -126,12 +136,22 @@ def transcript_metadata(entries, config):
     }
 
 
-def inspect(home, pid, session_id, shell_pid=None):
+def inspect(home, pid, session_id, shell_pid=None, native_path=None):
     if not re.fullmatch(r"[0-9a-f-]{36}", session_id):
         raise ValueError("invalid conversation identity")
     birth = process_birth(pid)
     root = home / ".pi/agent/sessions"
-    matches = list(root.glob("*/*_" + session_id + ".jsonl"))
+    if native_path is not None:
+        path = Path(native_path)
+        if (
+            not path.is_absolute()
+            or not path.resolve().is_relative_to(root.resolve())
+            or path.suffix != ".jsonl"
+        ):
+            raise ValueError("conversation outside bounded same-user store")
+        matches = [path]
+    else:
+        matches = list(root.glob("*/*_" + session_id + ".jsonl"))
     if len(matches) != 1:
         raise ValueError("conversation file missing or ambiguous")
     path = owned_file(matches[0])
@@ -156,7 +176,7 @@ def inspect(home, pid, session_id, shell_pid=None):
     }
 
 
-def screen(session, pane):
+def screen(session, pane, expected_model=None):
     if not re.fullmatch(r"[A-Za-z0-9_.:-]+", session) or not re.fullmatch(
         r"[A-Za-z0-9_.:-]+", pane
     ):
@@ -180,11 +200,45 @@ def screen(session, pane):
         check=True,
     )
     text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout)
+    full_text = text
+    lines = text.splitlines()
+    # Pi's split view appends a sidebar. Only a repeated, aligned editor border
+    # can establish its boundary; a user-entered separator is not sufficient.
+    columns = {}
+    for index, line in enumerate(lines):
+        for column, char in enumerate(line):
+            if char in "│┃" and re.fullmatch(r"\s*[─━]{10,}\s*", line[:column]):
+                columns.setdefault(column, []).append(index)
+    aligned = [(column, rows) for column, rows in columns.items() if len(rows) >= 2]
+    if len(aligned) == 1:
+        column, rows = aligned[0]
+        if all(
+            len(line) > column and line[column] in "│┃" for line in lines[rows[-2] : rows[-1] + 1]
+        ):
+            text = "\n".join(line[:column] for line in lines)
     acknowledgements = re.findall(
         r"(?:^|\n)\s*Model:\s*((?:metabolomics/)?[A-Za-z0-9_.:-]+)\s*(?:\n|$)", text
     )
+    if isinstance(expected_model, str) and MODEL_ID.fullmatch(expected_model):
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            match = re.fullmatch(r"\s*Model:\s*((?:metabolomics/)?[A-Za-z0-9_.:-]+)\s*", line)
+            if not match:
+                continue
+            value = match[1]
+            for following in lines[index + 1 : index + 4]:
+                if value in (expected_model, "metabolomics/" + expected_model):
+                    acknowledgements.append(value)
+                    break
+                if not re.fullmatch(r"[A-Za-z0-9_.:-]+", following.strip()):
+                    break
+                value += following.strip()
+            if value in (expected_model, "metabolomics/" + expected_model):
+                acknowledgements.append(value)
     model_picker = bool(
-        re.search(r"select.*model|choose.*model|tab.*scope.*all/scoped|enter to select", text, re.I)
+        re.search(
+            r"select.*model|choose.*model|tab.*scope.*all/scoped|enter to select", full_text, re.I
+        )
     )
     borders = [
         i for i, line in enumerate(text.splitlines()) if re.fullmatch(r"\s*[─━]{10,}\s*", line)
@@ -195,23 +249,23 @@ def screen(session, pane):
     picker = bool(
         re.search(
             r"select.*model|choose.*model|allow.*deny|approve|permission required|esc to cancel|enter to select",
-            text,
+            full_text,
             re.I,
         )
     )
     busy = bool(
         re.search(
             r"(?:^|\n)\s*(?:[─━]+\s*)?(?:[^\w\s]\s*)?(?:Working\s*[·•]|Compacting[.…])|esc to interrupt",
-            text,
+            full_text,
             re.I,
         )
     )
-    operator_paused = bool(re.search(r"PAUSED\s*\(operator\)|operator[- ]paused", text, re.I))
+    operator_paused = bool(re.search(r"PAUSED\s*\(operator\)|operator[- ]paused", full_text, re.I))
     return {
         "modelAck": acknowledgements[-1] if acknowledgements else None,
         "operatorPausedUI": operator_paused,
-        "reloadAck": "Reloaded keybindings, extensions, skills, prompts, themes, and context files"
-        in text,
+        "reloadAck": "Reloadedkeybindings,extensions,skills,prompts,themes,andcontextfiles"
+        in re.sub(r"\s+", "", text),
         "busyUI": busy,
         "promptReady": blank_prompt
         and not picker
@@ -219,6 +273,7 @@ def screen(session, pane):
         and not busy
         and not operator_paused,
         "modelPicker": model_picker,
+        "modelScopeBlocked": model_picker and bool(re.search(r"no matching models", text, re.I)),
     }
 
 
@@ -285,8 +340,14 @@ def probe(home, model, opener=None):
             "model": model,
             "evidence": "validated_tool_call" if healthy else "invalid_completion",
         }
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError):
-        return {"healthy": False, "model": model, "evidence": "probe_failed"}
+    except urllib.error.HTTPError as error:
+        return {"healthy": False, "model": model, "evidence": "http_" + str(error.code)}
+    except TimeoutError:
+        return {"healthy": False, "model": model, "evidence": "timeout"}
+    except OSError:
+        return {"healthy": False, "model": model, "evidence": "transport_error"}
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError):
+        return {"healthy": False, "model": model, "evidence": "invalid_completion"}
 
 
 def main():
@@ -301,17 +362,32 @@ def main():
                 raise ValueError("installed runtime root unavailable")
             result = {"root": str(root)}
         elif action == "inspect":
-            result = inspect(home, fields["pid"], fields["sessionId"], fields.get("shellPid"))
+            result = inspect(
+                home,
+                fields["pid"],
+                fields["sessionId"],
+                fields.get("shellPid"),
+                fields.get("nativePath"),
+            )
         elif action == "screen":
-            result = screen(fields["session"], fields["pane"])
+            result = screen(fields["session"], fields["pane"], fields.get("expectedModel"))
         elif action == "probe":
             result = probe(home, fields["model"])
         else:
             raise ValueError("unsupported metadata operation")
         print(json.dumps(result))
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-        print(json.dumps({"error": "same-user recovery metadata unavailable"}))
-        sys.exit(1)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        codes = {
+            "conversation file missing or ambiguous": "transcript_missing_or_ambiguous",
+            "conversation header mismatch": "transcript_header_mismatch",
+            "conversation outside bounded same-user store": "transcript_scope_or_size",
+            "process belongs to another user": "process_owner_mismatch",
+            "process changed during metadata read": "process_changed",
+        }
+        code = codes.get(str(error), "metadata_unavailable")
+        if isinstance(error, json.JSONDecodeError):
+            code = "metadata_invalid_json"
+        print(json.dumps({"error": code}))
 
 
 if __name__ == "__main__":

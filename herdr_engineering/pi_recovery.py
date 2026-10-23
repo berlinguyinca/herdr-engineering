@@ -31,6 +31,49 @@ IDENTITY = ("paneId", "terminalId", "sessionId", "instanceId", "pid", "birth", "
 TERMINAL = {"DONE", "COMPLETE", "COMPLETED", "CANCELLED", "CANCELED"}
 
 
+class EvidenceError(ValueError):
+    def __init__(self, code):
+        self.code = (
+            code
+            if code
+            in {
+                "transcript_missing_or_ambiguous",
+                "transcript_header_mismatch",
+                "transcript_scope_or_size",
+                "process_owner_mismatch",
+                "process_changed",
+                "metadata_unavailable",
+                "metadata_invalid_json",
+            }
+            else "metadata_unavailable"
+        )
+        super().__init__(self.code)
+
+
+def error_code(error):
+    if isinstance(error, EvidenceError):
+        return error.code
+    codes = {
+        "session/process ownership changed": "session_identity_changed",
+        "owned mission state changed since planning": "mission_fence_changed",
+        "conversation changed since recovery planning": "conversation_changed",
+        "no compatible model passed live tool-call probe": "no_healthy_compatible_model",
+        "foreground PID does not identify exactly one live Pi control instance": "control_instance_unavailable_or_ambiguous",
+        "native pane identity changed during foreground verification": "native_identity_changed",
+        "pane changed while reading recovery metadata": "native_identity_changed",
+        "current runtime or UI reports active/paused work": "session_became_busy_or_paused",
+        "session no longer at a settled prompt": "session_not_settled",
+        "model picker scope excludes selected model": "model_scope_blocked",
+    }
+    if str(error) in codes:
+        return codes[str(error)]
+    if isinstance(error, TimeoutError):
+        return "control_timeout"
+    if isinstance(error, ConnectionError):
+        return "control_transport_failure"
+    return "evidence_unavailable"
+
+
 class RecoveryStore(RolloutStore):
     def __init__(self, root=None):
         super().__init__(root or Path.home() / ".local/state/herdr-engineering/pi-recovery")
@@ -70,7 +113,10 @@ class RecoveryTransport(PiTransport):
 
     def host(self, target, action, **fields):
         source = Path(__file__).with_name("pi_recovery_host.py").read_text()
-        return self._json(target, ["python3", "-c", source, action, json.dumps(fields)])
+        result = self._json(target, ["python3", "-c", source, action, json.dumps(fields)])
+        if result.get("error"):
+            raise EvidenceError(result["error"])
+        return result
 
     def sessions(self, target, root):
         # The stock CLI uses a 1.5s status timeout; owned mission refresh can take longer.
@@ -83,24 +129,59 @@ class RecoveryTransport(PiTransport):
             self._plan_cache[key] = rows
         return rows
 
+    def target_sessions(self, target, root, pids):
+        # Use the native same-user client, scoped to foreground processes already
+        # attested by HerdR. Do not hydrate every other session during apply.
+        script = "import {pathToFileURL} from 'node:url'; const m=await import(pathToFileURL(process.argv[1]+'/src/sessionControl/SessionControl.ts').href); const pids=new Set(JSON.parse(process.argv[2])); const ds=(await m.discoverSessions()).filter(d=>pids.has(d.pid)); console.log(JSON.stringify(await Promise.all(ds.map(async descriptor=>{try{const reply=await m.requestSession(descriptor,{version:1,op:'status'},20000); return {descriptor,reachable:reply.ok&&reply.data.instanceId===descriptor.instanceId,reply};}catch{return {descriptor,reachable:false,error:'session_unresponsive'};}}))));"
+        return self._json(
+            target, ["node", "--input-type=module", "-e", script, root, json.dumps(pids)]
+        )
+
     def observe(self, target, pane):
         root = self.host(target, "root")["root"]
         agents = [a for a in self.native(target) if a.get("pane_id") == pane]
         if len(agents) != 1 or agents[0].get("agent") != "pi":
             raise ValueError("native Pi pane identity unavailable")
         agent = agents[0]
-        rows = _rows(self, target, root)
+        process = self.process_info(target, pane)
+        pids = sorted(
+            {
+                p["pid"]
+                for p in process["foreground_processes"]
+                if type(p.get("pid")) is int and p["pid"] > 0
+            }
+        )
+        rows = _rows(self, target, root) if self._plan_cache is not None else []
+        matches = [
+            r for r in rows if r["descriptor"].get("pid") in pids and r.get("reachable") is True
+        ]
+        if len(matches) != 1:
+            rows = self.target_sessions(target, root, pids)
+            if not isinstance(rows, list) or any(
+                not isinstance(r, dict) or not isinstance(r.get("descriptor"), dict) for r in rows
+            ):
+                raise ValueError("invalid Pi session inventory")
         session, proof = _foreground_identity(self, target, agent, rows)
         descriptor, data = _live(rows, session, proof["pid"])
         process = self.process_info(target, pane)
+        reference = agent.get("agent_session") or {}
         metadata = self.host(
             target,
             "inspect",
             pid=proof["pid"],
             sessionId=session,
             shellPid=process.get("shell_pid"),
+            nativePath=reference.get("value") if reference.get("kind") == "path" else None,
         )
-        metadata.update(self.host(target, "screen", session=target["session"], pane=pane))
+        metadata.update(
+            self.host(
+                target,
+                "screen",
+                session=target["session"],
+                pane=pane,
+                expectedModel=metadata.get("model"),
+            )
+        )
         if not metadata.get("birth") or not metadata.get("owned"):
             raise ValueError("same-user process birth proof unavailable")
         # Host metadata read must not cross a pane occupant change.
@@ -128,7 +209,8 @@ class RecoveryTransport(PiTransport):
         }
 
     def probe(self, target, model):
-        return self.host(target, "probe", model=model["id"]).get("healthy") is True
+        self.last_probe = self.host(target, "probe", model=model["id"])
+        return self.last_probe.get("healthy") is True
 
     def _native_action(self, target, pane, arguments, expected_type):
         reply = self._json(target, ["herdr", "--session", target["session"], *arguments])
@@ -364,8 +446,13 @@ def _create_plan(store, targets, *, transport, progress, revision, inventory):
                             entry["status"] = "bootstrap_required"
                     else:
                         entry.update(status="eligible", candidates=models)
-                except (ValueError, OSError, KeyError, subprocess.SubprocessError):
-                    entry["reason"] = "native identity or session metadata unavailable"
+                except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
+                    entry["errorCode"] = error_code(error)
+                    entry["reason"] = (
+                        "native identity or session metadata unavailable ("
+                        + entry["errorCode"]
+                        + ")"
+                    )
         except (ValueError, OSError, subprocess.SubprocessError):
             plan["hosts"][target["host"]]["error"] = "native host inventory unavailable"
     with store.lock():
@@ -549,7 +636,22 @@ def apply_recovery(
                 if reason:
                     raise ValueError(reason)
                 models = compatible(current)
-                model = next((m for m in models if transport.probe(target, m)), None)
+                model = None
+                entry["modelProbes"] = []
+                for candidate in models:
+                    healthy = transport.probe(target, candidate)
+                    detail = getattr(transport, "last_probe", {})
+                    evidence = detail.get("evidence", "passed" if healthy else "failed")
+                    if not isinstance(evidence, str) or not re.fullmatch(
+                        r"[a-z0-9_]{1,50}", evidence
+                    ):
+                        evidence = "unknown"
+                    entry["modelProbes"].append(
+                        {"model": candidate["id"], "healthy": healthy, "evidence": evidence}
+                    )
+                    if healthy:
+                        model = candidate
+                        break
                 if model is None:
                     raise ValueError("no compatible model passed live tool-call probe")
                 current = _fresh(transport, target, entry)
@@ -672,7 +774,9 @@ def apply_recovery(
                             target, entry["paneId"], "/model metabolomics/" + model["id"]
                         )
                         sleep(0.5)
-                        current = _fresh(transport, target, entry)
+                        current = _fresh(transport, target, entry, settled=False)
+                        if current.get("modelScopeBlocked") is True:
+                            raise ValueError("model picker scope excludes selected model")
                     if current.get("modelAck") not in (model["id"], "metabolomics/" + model["id"]):
                         raise ValueError("exact model acknowledgement unavailable; inspect pane")
                     if (
@@ -689,10 +793,13 @@ def apply_recovery(
                 entry["reason"] = (
                     "submission accepted; meaningful progress requires subsequent verification"
                 )
-            except (ValueError, OSError, KeyError, subprocess.SubprocessError):
+            except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
+                entry["errorCode"] = error_code(error)
                 entry.update(
                     status="unknown" if attempted else "blocked",
-                    reason="recovery could not be verified; inspect native session before retry",
+                    reason="recovery could not be verified ("
+                    + entry["errorCode"]
+                    + "); inspect native session before retry",
                 )
             finally:
                 if attempted:

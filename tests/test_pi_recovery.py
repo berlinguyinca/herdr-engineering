@@ -799,3 +799,303 @@ def test_explicit_run_combines_plan_and_apply(tmp_path, monkeypatch, capsys):
     assert args.func(args) == 2  # Accepted submission still needs progress verification.
     assert len(wire.events) == 2
     assert "Recovery plan:" in capsys.readouterr().err
+
+
+def test_prior_vision_model_without_image_evidence_allows_text_model():
+    from herdr_engineering.pi_recovery_host import transcript_metadata
+
+    model = {**MODEL, "input": ["text", "image"]}
+    entries = [
+        {"type": "session", "id": "s"},
+        {"type": "model_change", "id": "m", "provider": "metabolomics", "modelId": "working"},
+        {
+            "type": "message",
+            "id": "e",
+            "parentId": "m",
+            "message": {
+                "role": "assistant",
+                "stopReason": "error",
+                "errorMessage": "inference timeout",
+            },
+        },
+    ]
+    metadata = transcript_metadata(entries, {"providers": {"metabolomics": {"models": [model]}}})
+    assert metadata["requiresVision"] is False
+    entries[-1]["message"]["content"] = [{"type": "image"}]
+    assert (
+        transcript_metadata(entries, {"providers": {"metabolomics": {"models": [model]}}})[
+            "requiresVision"
+        ]
+        is True
+    )
+
+
+def test_side_panel_preserves_empty_editor_but_not_draft(monkeypatch):
+    import subprocess
+
+    from herdr_engineering import pi_recovery_host
+
+    text = "────────────│ Mission\n            │ sidebar\n────────────│ status"
+    monkeypatch.setattr(
+        subprocess, "run", lambda *args, **kw: subprocess.CompletedProcess(args, 0, text, "")
+    )
+    assert pi_recovery_host.screen("default", "w1:p1")["promptReady"] is True
+    text = "────────────│ Mission\nuser draft  │ sidebar\n────────────│ status"
+    assert pi_recovery_host.screen("default", "w1:p1")["promptReady"] is False
+
+
+def test_capacity_probe_reports_safe_http_status(tmp_path):
+    import json
+    import urllib.error
+
+    from herdr_engineering.pi_recovery_host import probe
+
+    path = tmp_path / ".pi/agent/models.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "metabolomics": {
+                        "baseUrl": "https://example.org/v1",
+                        "apiKey": "private-key",
+                        "models": [{"id": "working"}],
+                    }
+                }
+            }
+        )
+    )
+
+    def saturated(*args, **kwargs):
+        raise urllib.error.HTTPError(
+            "https://example.org/v1", 429, "private upstream detail", {}, None
+        )
+
+    result = probe(tmp_path, "working", opener=saturated)
+    assert result["evidence"] == "http_429"
+    assert "private" not in json.dumps(result)
+
+
+def test_preflight_error_code_is_specific_without_dumping_private_data(tmp_path):
+    wire, store, plan = setup(tmp_path)
+    wire.state["birth"] = "new"
+    result = apply(wire, store, plan)["sessions"][0]
+    assert result["errorCode"] == "session_identity_changed"
+
+
+@pytest.mark.parametrize("planning", [True, False])
+def test_native_observation_refreshes_only_target_control(planning):
+    from herdr_engineering.pi_recovery import RecoveryTransport
+
+    state = Wire().state
+    descriptor = {"pid": 42, "sessionId": "session1", "instanceId": "instance1"}
+    live = {
+        "descriptor": descriptor,
+        "reachable": True,
+        "reply": {
+            "ok": True,
+            "data": {
+                **descriptor,
+                "currentTool": None,
+                "missionSource": "runtime",
+                "missions": [],
+                "runtime": {},
+            },
+        },
+    }
+
+    class NativeWire(RecoveryTransport):
+        def __init__(self):
+            super().__init__()
+            self.target_reads = 0
+            self._plan_cache = {} if planning else None
+
+        def host(self, target, action, **fields):
+            if action == "root":
+                return {"root": "/release"}
+            if action == "screen":
+                return {"promptReady": True}
+            return {**state, "owned": True}
+
+        def native(self, target):
+            return [
+                {
+                    "agent": "pi",
+                    "pane_id": "w1:p1",
+                    "terminal_id": "term1",
+                    "revision": 1,
+                    "state_change_seq": 1,
+                    "agent_status": "idle",
+                }
+            ]
+
+        def process_info(self, target, pane):
+            return {"pane_id": pane, "foreground_processes": [{"pid": 42}], "shell_pid": 10}
+
+        def sessions(self, target, root):
+            assert planning, "apply must not refresh unrelated sessions"
+            return [{"descriptor": descriptor, "reachable": False}]
+
+        def target_sessions(self, target, root, pids):
+            assert pids == [42]
+            self.target_reads += 1
+            return [live]
+
+    wire = NativeWire()
+    assert wire.observe(TARGET, "w1:p1")["sessionId"] == "session1"
+    assert wire.target_reads == 1
+
+
+def test_native_transcript_path_disambiguates_only_with_matching_header(tmp_path, monkeypatch):
+    import json
+
+    from herdr_engineering import pi_recovery_host
+
+    session = "00000000-0000-0000-0000-000000000001"
+    root = tmp_path / ".pi/agent/sessions"
+    for directory in ("one", "two"):
+        folder = root / directory
+        folder.mkdir(parents=True)
+        (folder / ("timestamp_" + session + ".jsonl")).write_text(
+            json.dumps({"type": "session", "id": session, "cwd": "/repo"}) + "\n"
+        )
+    config = tmp_path / ".pi/agent/models.json"
+    config.write_text('{"providers":{}}')
+    monkeypatch.setattr(pi_recovery_host, "process_birth", lambda pid: "same-birth")
+    chosen = root / "one" / ("timestamp_" + session + ".jsonl")
+    with pytest.raises(ValueError, match="ambiguous"):
+        pi_recovery_host.inspect(tmp_path, 42, session)
+    assert pi_recovery_host.inspect(tmp_path, 42, session, native_path=str(chosen))[
+        "sessionPath"
+    ] == str(chosen)
+    chosen.write_text(json.dumps({"type": "session", "id": "wrong"}) + "\n")
+    with pytest.raises(ValueError, match="header"):
+        pi_recovery_host.inspect(tmp_path, 42, session, native_path=str(chosen))
+
+
+def test_wrapped_acknowledgements_match_only_observed_model(monkeypatch):
+    import subprocess
+
+    from herdr_engineering import pi_recovery_host
+
+    text = "Model: work\ning\nReloaded keybindings, extensions, skills,\nprompts, themes, and context files\n────────────\n\n────────────"
+    monkeypatch.setattr(
+        subprocess, "run", lambda *args, **kw: subprocess.CompletedProcess(args, 0, text, "")
+    )
+    result = pi_recovery_host.screen("default", "w1:p1", expected_model="working")
+    assert result["modelAck"] == "working" and result["reloadAck"] is True
+    assert (
+        pi_recovery_host.screen("default", "w1:p1", expected_model="other")["modelAck"] != "other"
+    )
+
+
+@pytest.mark.parametrize(
+    "error_text",
+    ["no capacity on this deployment; gateway advises an alternate model", "capacity_unavailable"],
+)
+def test_capacity_errors_are_recognized_without_bypassing_tool_guards(error_text):
+    from herdr_engineering.pi_recovery_host import transcript_metadata
+
+    entries = [
+        {"type": "session", "id": "s"},
+        {"type": "model_change", "id": "m", "provider": "metabolomics", "modelId": "working"},
+        {
+            "type": "message",
+            "id": "e",
+            "parentId": "m",
+            "message": {"role": "assistant", "stopReason": "error", "errorMessage": error_text},
+        },
+    ]
+    config = {"providers": {"metabolomics": {"models": [MODEL]}}}
+    assert transcript_metadata(entries, config)["failure"] == "inference"
+    entries[-1]["message"]["content"] = [{"type": "toolCall", "id": "unresolved"}]
+    result = transcript_metadata(entries, config)
+    assert result["failure"] is None and result["failureEvidence"] == "unreconciled_tool_calls"
+
+
+def test_scoped_picker_stops_after_verified_reload_without_guessing(tmp_path):
+    wire, store, plan = setup(tmp_path)
+    original = wire.command
+
+    def keys(target, pane, key):
+        wire.events.append((wire.clock.now(), key))
+        wire.state.update(modelPicker=False, promptReady=True)
+
+    def command(*args):
+        if args[-1] == "/reload":
+            wire.events.append((wire.clock.now(), "/reload"))
+            wire.state["reloadAck"] = True
+        else:
+            original(*args)
+            wire.state.update(
+                modelPicker=True, modelScopeBlocked=True, promptReady=False, modelAck=None
+            )
+
+    wire.keys = keys
+    wire.command = command
+    result = apply(wire, store, plan)["sessions"][0]
+    assert result["errorCode"] == "model_scope_blocked"
+    assert [text for _, text in wire.events] == [
+        "/model metabolomics/working",
+        "esc",
+        "/reload",
+        "/model metabolomics/working",
+    ]
+
+
+def test_target_lookup_preserves_native_default_legacy_root_discovery(tmp_path):
+    from herdr_engineering.pi_recovery import RecoveryTransport
+
+    module = tmp_path / "src/sessionControl/SessionControl.ts"
+    module.parent.mkdir(parents=True)
+    module.write_text(
+        "export function sessionControlRoot(){return '/short-root';} export async function discoverSessions(...args){if(args.length)throw Error('default discovery bypassed');return [{pid:42,instanceId:'legacy',sessionId:'session'}];} export async function requestSession(){return {ok:true,data:{instanceId:'legacy'}};}"
+    )
+    result = RecoveryTransport().target_sessions(TARGET, str(tmp_path), [42])
+    assert result[0]["reachable"] is True and result[0]["descriptor"]["instanceId"] == "legacy"
+
+
+def test_companion_sets_its_own_stage_repository_from_any_cwd(tmp_path):
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    helper = tmp_path / "python"
+    helper.write_text(
+        "#!"
+        + sys.executable
+        + "\nimport json,os,subprocess,sys\nif sys.argv[1]=='-c':sys.exit(subprocess.call([sys.executable,*sys.argv[1:]]))\nprint(json.dumps({'repo':os.environ.get('HERDR_ENGINEERING_REPO')}))\n"
+    )
+    helper.chmod(0o700)
+    env = {
+        **os.environ,
+        "HERDR_PI_RECOVERY_PYTHON": str(helper),
+        "HERDR_ENGINEERING_REPO": "/wrong-repo",
+    }
+    result = subprocess.run(
+        [str(root / "scripts/herdr-pi-recover"), "--help"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(result.stdout)["repo"] == str(root)
+
+
+@pytest.mark.parametrize(
+    "sidebar", ["esc to interrupt", "approve this tool", "tab scope (all/scoped)"]
+)
+def test_sidebar_cannot_hide_busy_or_approval_evidence(monkeypatch, sidebar):
+    import subprocess
+
+    from herdr_engineering import pi_recovery_host
+
+    text = "────────────│ Mission\n            │ " + sidebar + "\n────────────│ status"
+    monkeypatch.setattr(
+        subprocess, "run", lambda *args, **kw: subprocess.CompletedProcess(args, 0, text, "")
+    )
+    assert pi_recovery_host.screen("default", "w1:p1")["promptReady"] is False
