@@ -6,7 +6,7 @@ import {recordOutcome} from './record-state.js';
 import {ciRunKey} from './ci-performance.js';
 import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
-import {renderCiPipeline,ciPipelineStyles} from './ci-pipeline.js';
+import {renderCiPipeline,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
 import {mountCiHealth} from './ci-health-view.js';
 
 const text = value => typeof value === 'string' ? value : '';
@@ -107,21 +107,24 @@ export function activePiSessions(sessions) {
     && text(s.host_id) && text(s.terminal_id) && text(s.herdr_session)
     && s.interactive_ready!==false && !s.launch_pending);
 }
-export function renderPipeline(pipeline,{loading=false,error='',log=null,logError='',step='',actionMessage='',debugSessions=null,debugSessionId='',debugMessage=''}={}) {
+export function renderPipeline(pipeline,{loading=false,error='',log=null,logError='',step='',actionMessage='',debugSessions=null,debugSessionId='',debugMessage='',collapseSuccess=false,zoom=1}={}) {
   if (!pipeline) return loading ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">Select a run to inspect its steps and logs.</p>';
   const tasks=records(pipeline.tasks);
   const completed=tasks.filter(t=>integrationOutcome(t)!=='current').length;
-  return `<div class="ig-heading"><h2>Run #${esc(pipeline.run_number ?? '')}</h2><button type="button" class="hd-btn" data-close-inspector>Close</button></div>
+  return `<div class="ig-heading"><h2>Run #${esc(pipeline.run_number ?? '')}</h2><button type="button" class="hd-btn" data-close-inspector><span class="ig-back-label">Back to runs</span><span class="ig-close-label">Close</span></button></div>
     <p class="ig-note">${esc(pipeline.repository || '')}${pipeline.branch ? ` · ${esc(pipeline.branch)}` : ''}${pipeline.revision ? ` · <code>${esc(pipeline.revision)}</code>` : ''} · ${esc(human(stateOf(pipeline)) || 'Status unknown')} · ${elapsed(pipeline)}</p>
     <div class="ig-links">${external(pipeline.url,'Open in Woodpecker')}${pipeline.can_retry ? '<button class="hd-btn" type="button" data-ci-action="retry">Retry run</button>' : ''}${pipeline.can_cancel ? '<button class="hd-btn" type="button" data-ci-action="cancel">Cancel run</button>' : ''}</div>
     ${error ? `<p class="ig-warning" role="status">${esc(error)} Showing the last received details.</p>` : ''}${actionMessage ? `<p role="status" class="ig-note">${esc(actionMessage)}</p>` : ''}
     ${integrationOutcome(pipeline)==='failed' ? `<details class="ig-debug" data-debug-disclosure><summary>Debug with Pi</summary><p class="ig-note">Send the failed revision, step details and bounded log output to a Pi agent you choose.</p>${debugSessions===null ? '<p class="ig-note">Open this section to load active Pi agents.</p>' : `<label class="ig-note">Target Pi agent<select data-debug-session aria-label="Target Pi agent"><option value="">Choose an agent…</option>${debugSessions.map(s=>`<option value="${esc(s.session_id)}" ${s.session_id===debugSessionId?'selected':''}>${esc(short(s.display_name || s.title || s.summary || s.cwd || s.session_id,100))}${s.host_id?` · ${esc(short(s.host_id,60))}`:''}</option>`).join('')}</select></label>${!debugSessions.length ? '<p class="ig-note">No active Pi agents with verified messaging are available.</p>' : ''}<button type="button" class="hd-btn" data-debug-send ${!debugSessionId?'disabled':''}>Send to Pi</button>`}${debugMessage ? `<p class="ig-note" role="status">${esc(debugMessage)}</p>` : ''}</details>` : ''}
-    ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress>${renderCiPipeline(pipeline,{step})}` : (!Array.isArray(pipeline.tasks) && loading && !error ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
+    ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress><div class="ci-pipeline-controls" role="group" aria-label="Pipeline display"><button type="button" class="hd-btn" data-collapse-success aria-pressed="${collapseSuccess}">${collapseSuccess?'Expand successful steps':'Collapse successful steps'}</button><button type="button" class="hd-btn" data-pipeline-zoom="out" aria-label="Zoom out" ${zoom<=.75?'disabled':''}>−</button><button type="button" class="hd-btn" data-pipeline-zoom="reset" aria-label="Reset zoom">${Math.round(zoom*100)}%</button><button type="button" class="hd-btn" data-pipeline-zoom="in" aria-label="Zoom in" ${zoom>=1.5?'disabled':''}>+</button></div>${renderCiPipeline(pipeline,{step,collapseSuccess,zoom})}` : (!Array.isArray(pipeline.tasks) && loading && !error ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
     ${step ? `<h3>Step log</h3>${logError ? `<p class="ig-warning" role="status">${esc(logError)}</p>` : ''}${log===null ? '<p class="ig-note" role="status">Loading step output…</p>' : `<p class="ig-note">${age(log.checked_at,'Log checked')}${log.truncated?' · Output truncated':''}</p>${log.available===false ? `<p class="ig-note">${esc(log.error || 'Log output is not available yet.')}</p>` : `<pre class="ig-log" tabindex="0" aria-label="Step output">${esc(text(log.log)) || 'No output reported yet.'}</pre>`}`}` : ''}`;
 }
 
 const styles=`<style>
 .ig-intro,.ig-note{color:var(--text-secondary);font-size:12px;line-height:1.6}.ig-intro{font-size:13px;max-width:85ch}.ig-note{margin:7px 0}.ig-warning{color:var(--status-attention);font-size:13px;line-height:1.6;overflow-wrap:anywhere}.ig-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0}.ig-tabs button{font:inherit;padding:10px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);cursor:pointer}.ig-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.ig-tabs strong{margin-left:6px}.ig-controls{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}.ig-controls label{display:flex;flex-direction:column;gap:6px;font-size:13px}.ig-controls label:first-child{flex:1;min-width:160px}.ig-controls input,.ig-controls select{padding:9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}.ig-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:18px}.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}.ig-group,.ig-inspector{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);min-width:0;overflow-wrap:anywhere}.ig-group{margin-bottom:12px}.ig-group h2{font-size:14px;margin:0;padding:12px 16px}.ig-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;padding:14px 16px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ig-main{min-width:0}.ig-title{font-size:14px;font-weight:600;line-height:1.5;text-align:left}.ig-title:is(button){border:0;padding:0;background:none;color:var(--accent);cursor:pointer;font-family:inherit}.ig-title:is(button):hover{text-decoration:underline}.ig-state{display:flex;flex-direction:column;gap:5px;font-size:12px;line-height:1.5;max-width:170px}.ig-state strong{font-weight:500}.ig-state span{color:var(--text-secondary)}.ig-links{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;align-items:center}.ig-debug{font-size:12px;margin:16px 0}.ig-debug summary{cursor:pointer;font-weight:600}.ig-debug select{display:block;padding:8px;max-width:100%;width:100%;margin:6px 0 10px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm)}.ig-debug button:disabled{opacity:.45;cursor:default}.ig-review-details{margin-top:12px;font-size:12px}.ig-review-details summary{cursor:pointer}.ig-review-feedback{white-space:pre-wrap;overflow-wrap:anywhere}.ig-summary{font-size:12px;line-height:1.6;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ig-pages,.ig-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.ig-pages[hidden]{display:none}.ig-pages button:disabled{opacity:.45;cursor:default}.ig-pages{justify-content:flex-start;font-size:12px;margin:18px 0}.ig-inspector{padding:16px;align-self:start}.ig-heading h2{font-size:17px;margin:0}.ig-inspector h3{font-size:14px}.ig-sync{display:flex;flex-direction:column;gap:5px;font-size:12px}.ig-sync progress,.ig-inspector progress{width:100%;height:6px;accent-color:var(--accent)}.ig-steps{display:flex;flex-direction:column;margin:12px 0}.ig-steps button{font:inherit;display:flex;justify-content:space-between;gap:12px;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;cursor:pointer;font-size:12px;overflow-wrap:anywhere}.ig-steps button[aria-pressed=true]{border-color:var(--accent)}.ig-steps small{display:block;color:var(--text-secondary);margin-top:4px}.ig-log{max-height:400px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:12px}.ig-runners{margin:16px 0;color:var(--text-secondary);font-size:12px}.ig-runners summary{cursor:pointer}.ig-empty{padding:22px;color:var(--text-secondary);font-size:13px}
+.ci-workspace-tabs{position:sticky;top:0;z-index:5;background:var(--bg);padding:6px 0}.ci-workspace-tabs~[role=tabpanel][hidden]{display:none}.ci-pipeline-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0}.ci-pipeline-success summary{cursor:pointer;font-size:12px;padding:10px 0}.ci-comparison{margin:18px 0;min-width:0}.ci-comparison-scroll{overflow:auto;max-height:320px}.ci-comparison table{width:100%;border-collapse:collapse;font-size:12px}.ci-comparison th,.ci-comparison td{padding:8px;border-bottom:1px solid var(--border);text-align:left;min-width:90px;overflow-wrap:anywhere}.ci-comparison thead th{position:sticky;top:0;background:var(--surface)}.ig-active-pipeline,.ig-comparison-panel{min-width:0}.ci-compare-control{display:flex;flex-direction:column;gap:8px;font-size:12px;margin:16px 0}.ci-compare-control select{max-width:100%;padding:8px;background:var(--surface);color:var(--text);border:1px solid var(--border)}.ig-back-label{display:none}
+@media(min-width:1250px){.ig-inspector:has(.ci-comparison){display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.45fr);gap:18px}.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(280px,.3fr) minmax(0,1fr);align-items:start}.ig-layout>.ig-inspector{grid-row:auto;grid-column:2;position:sticky;top:65px;max-height:calc(100dvh - 100px);overflow:auto}.ig-layout:has(.ig-inspector:not([hidden]))>#ig-results{max-height:calc(100dvh - 100px);overflow:auto;position:sticky;top:65px}.ci-health-pipeline-slot>.ig-inspector{position:sticky;top:65px;max-height:calc(100dvh - 100px);overflow:auto}.ci-health-lower{align-items:start}.ci-health-lower>.ci-health-tree{position:sticky;top:65px;max-height:calc(100dvh - 100px);overflow:auto}}
+@media(max-width:700px){[data-ci-focused=true] #ci-workspace-runs #ig-results,[data-ci-focused=true] #ci-workspace-runs>.ig-tabs,[data-ci-focused=true] #ci-workspace-runs>.ig-controls,[data-ci-focused=true] #ci-workspace-runs>.ig-pages,[data-ci-focused=true] [data-health-tree],[data-ci-focused=true] [data-health-map],[data-ci-focused=true] .ci-health-controls,[data-ci-focused=true] .ci-health-layout,[data-ci-focused=true] .ci-health-status,[data-ci-focused=true] .ci-health-selection{display:none}.ig-inspector .ig-heading{position:sticky;top:0;background:var(--surface);z-index:4;padding:8px 0}.ig-back-label{display:inline}.ig-close-label{display:none}.ci-pipeline-controls button{min-height:44px}}
 @media(max-width:900px){.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}}@media(max-width:550px){.ig-row{grid-template-columns:minmax(0,1fr);gap:8px}.ig-state{max-width:none}.ig-tabs button{padding:9px 12px}}
 </style>`;
 
@@ -133,7 +136,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   let timer=null,clock=null,signature='',detailSignature='',chartSignature='';
   let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='';
-  let healthView=null;
+  let healthView=null,workspace=tab==='current'?'health':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
+  const observedDetails=new Map();
   let performanceData=null,performanceError='',performanceDays=14;
   const pending=new Map();
   const listenerController=new AbortController();
@@ -160,6 +164,18 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const slot=el('[data-health-pipeline-slot]');
     if(slot)slot.append(el('.ig-inspector'));
   }
+  if(isCi){
+    const panels={};
+    const nav=document.createElement('div');nav.className='ig-tabs ci-workspace-tabs';nav.setAttribute('role','tablist');nav.setAttribute('aria-label','CI workspace');
+    nav.innerHTML=['health','runs','tests'].map((key,index)=>`<button type="button" role="tab" data-ci-workspace="${key}" id="ci-workspace-tab-${key}" aria-controls="ci-workspace-${key}" aria-selected="${index===0}" tabindex="${index===0?0:-1}">${key[0].toUpperCase()+key.slice(1)}</button>`).join('');
+    el('[data-ci-health]').before(nav);
+    for(const key of ['health','runs','tests']){const panel=document.createElement('section');panel.id=`ci-workspace-${key}`;panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',`ci-workspace-tab-${key}`);panel.hidden=key!=='health';panels[key]=panel;container.append(panel);}
+    panels.health.append(el('[data-ci-health]'));
+    for(const selector of ['.ig-tabs:not(.ci-workspace-tabs)','.ig-controls:not(.ci-report-filters)','.ci-report-filters','[data-ci-insights]','[data-ci-charts]','[data-ig-count]','.ig-layout','.ig-pages','[data-ig-runners]']){
+      const node=el(selector);if(!node)continue;if(selector==='.ci-report-filters'){nav.after(node);continue;}panels[selector==='[data-ci-insights]'?'tests':'runs'].append(node);
+    }
+    nav.addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;const keys=['health','runs','tests'],i=keys.indexOf(workspace);workspace=keys[event.key==='Home'?0:event.key==='End'?2:(i+(event.key==='ArrowRight'?1:2))%3];event.preventDefault();draw();el(`[data-ci-workspace="${workspace}"]`).focus();},{signal:listenerController.signal});
+  }
   const reviewVersion=record=>JSON.stringify([record.updated_at,record.status,record.decision]);
   const ciObservations=()=>{
     const recent=Object.entries(data?.pipelines||{}).flatMap(([repository,runs])=>records(runs).map(r=>({...r,repository:r.repository||repository})));
@@ -172,7 +188,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   })} : data||{},kind);
   function replace(element,html) {
     const focused=document.activeElement;
-    const focusKey=element.contains(focused) ? ['data-run','data-step','data-close-inspector','data-ci-action','data-ci-test-search','data-ci-test-page'].find(k=>focused.hasAttribute(k)) : null;
+    const focusKey=element.contains(focused) ? ['data-run','data-step','data-close-inspector','data-ci-action','data-ci-test-search','data-ci-test-page','data-collapse-success','data-pipeline-zoom','data-ci-compare'].find(k=>focused.hasAttribute(k)) : null;
     const focusValue=focusKey ? focused.getAttribute(focusKey) : null;
     const reviewFocus=element.contains(focused) && focused.tagName==='SUMMARY' ? focused.closest('[data-review-details]')?.dataset.reviewDetails : null;
     const linkFocus=element.contains(focused) && focused.tagName==='A' ? focused.getAttribute('href') : null;
@@ -180,6 +196,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const debugFocus=element.contains(focused) && focused.closest('[data-debug-disclosure]') ? (focused.hasAttribute('data-debug-session')?'select':focused.tagName==='SUMMARY'?'summary':focused.hasAttribute('data-debug-send')?'button':null) : null;
     const openReviews=new Set([...element.querySelectorAll('[data-review-details][open]')].map(e=>e.dataset.reviewDetails));
     const testInput=element.querySelector('[data-ci-test-search]'),selection=testInput&&document.activeElement===testInput?[testInput.selectionStart,testInput.selectionEnd]:null;
+    const paneScroll=element.scrollTop;
+    const graphScroll=[...element.querySelectorAll('.ci-pipeline-scroll')].map(node=>[node.scrollLeft,node.scrollTop]);
+    const successOpen=[...element.querySelectorAll('.ci-pipeline-success')].map(node=>node.open);
     const logElement=element.querySelector('.ig-log');
     const logScroll=logElement?.scrollTop;
     const atEnd=logElement && logElement.scrollHeight-logElement.clientHeight-logElement.scrollTop<8;
@@ -191,6 +210,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(reviewFocus)[...element.querySelectorAll('[data-review-details]')].find(e=>e.dataset.reviewDetails===reviewFocus)?.querySelector('summary')?.focus({preventScroll:true});
     if(linkFocus)[...element.querySelectorAll('a')].find(e=>e.getAttribute('href')===linkFocus)?.focus({preventScroll:true});
     if(selection){const input=element.querySelector('[data-ci-test-search]');input?.setSelectionRange(...selection);}
+    element.scrollTop=paneScroll;
+    [...element.querySelectorAll('.ci-pipeline-scroll')].forEach((node,i)=>{if(graphScroll[i]){node.scrollLeft=graphScroll[i][0];node.scrollTop=graphScroll[i][1];}});
+    [...element.querySelectorAll('.ci-pipeline-success')].forEach((node,i)=>node.open=!!successOpen[i]);
     const nextLog=element.querySelector('.ig-log');
     if(nextLog && logScroll!=null)nextLog.scrollTop=atEnd?nextLog.scrollHeight:logScroll;
   }
@@ -267,11 +289,20 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       }
     }
     const inspector=el('.ig-inspector');inspector.hidden=!selected;
-    if(isCi){el('[data-ci-insights]').hidden=!!selected;el('[data-ci-charts]').hidden=!!selected;}
+    if(isCi){
+      for(const key of ['health','runs','tests']){el(`#ci-workspace-${key}`).hidden=workspace!==key;const button=el(`[data-ci-workspace="${key}"]`);button.setAttribute('aria-selected',String(workspace===key));button.tabIndex=workspace===key?0:-1;}
+      const target=workspace==='runs'?el('.ig-layout'):el('[data-health-pipeline-slot]');if(target && inspector.parentNode!==target)target.append(inspector);
+      container.dataset.ciFocused=selected?'true':'false';
+      el('[data-ci-insights]').hidden=false;el('[data-ci-charts]').hidden=false;
+    }
     if(selected) {
       const runReports=records(reportData?.reports).filter(r=>String(r.provider_repo_id??r.repository)===String(pipeline?.provider_repo_id??selected.providerId) && r.run_number===Number(selected.number));
-      const next=JSON.stringify([testSearch,testPage,runReports,pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage]);
-      if(detailSignature!==next){detailSignature=next;replace(inspector,renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage})+renderCiRunReports(runReports,{search:testSearch,page:testPage}));healthView?.selectedRun(pipeline);}
+      const candidates=ciObservations().pipelines.filter(record=>sameCiRepository(pipeline,record)&&ciRunKey(record)!==selected.id).slice(0,100);
+      const compared=candidates.find(record=>ciRunKey(record)===comparisonKey);
+      const comparison=compared?ciComparisonModel(pipeline,{...observedDetails.get(comparisonKey),...compared,tasks:compared.tasks??observedDetails.get(comparisonKey)?.tasks}):null;
+      const compareHtml=`<label class="ci-compare-control">Compare observed run<select data-ci-compare aria-label="Compare observed run"><option value="">No comparison</option>${candidates.map(record=>`<option value="${esc(ciRunKey(record))}" ${ciRunKey(record)===comparisonKey?'selected':''}>Run #${esc(record.run_number)} · ${esc(record.state||record.status||'Unknown')} · ${esc(record.branch||'Branch not reported')}</option>`).join('')}</select></label>${comparisonKey&&!compared?'<p class="ig-note">Compared run is no longer in retained observations.</p>':''}${renderCiComparison(comparison)}`;
+      const next=JSON.stringify([collapseSuccess,zoom,compareHtml,testSearch,testPage,runReports,pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage]);
+      if(detailSignature!==next){detailSignature=next;replace(inspector,'<div class="ig-active-pipeline">'+renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,collapseSuccess,zoom})+renderCiRunReports(runReports,{search:testSearch,page:testPage})+'</div><div class="ig-comparison-panel">'+compareHtml+'</div>');healthView?.selectedRun(pipeline);}
     }
     tick();
   }
@@ -289,7 +320,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     request('pipeline',signal=>client.getCiPipeline(selected.providerId,selected.number,{signal}),response=>{
       if(selected?.id!==key)return;
       if(!response?.pipeline)throw new Error('Pipeline response is unavailable');
-      pipeline=pipelineDetails(response.pipeline,{...pipeline,repository:selected.repository,run_number:selected.number});detailError='';
+      pipeline=pipelineDetails(response.pipeline,{...pipeline,repository:selected.repository,run_number:selected.number});detailError='';observedDetails.set(key,pipeline);if(observedDetails.size>30)observedDetails.delete(observedDetails.keys().next().value);
     },()=>{if(selected?.id===key)detailError='Pipeline details could not refresh.';});
     if(selectedStep)request('log',signal=>client.getCiLog(selected.providerId,selected.number,selectedStep,{signal}),response=>{
       if(selected?.id===key && step===selectedStep){log=response;logError='';}
@@ -321,7 +352,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const entry=integrationEntries({pipelines:{history:[record]}})[0];
     if(!entry)return;
     if(selected?.id===entry.id){el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});return;}
-    testPage=0;testSearch='';cancelDetail();
+    listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();
     selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number};
     pipeline=record;debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';
     draw();refreshDetail();el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});
@@ -329,6 +360,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   container.addEventListener('click',async event=>{
     if(disposed)return;
     const button=event.target.closest('button');if(!button)return;
+    if(button.hasAttribute('data-ci-workspace')){workspace=button.dataset.ciWorkspace;draw();return;}
+    if(button.hasAttribute('data-collapse-success')){collapseSuccess=!collapseSuccess;draw();return;}
+    if(button.hasAttribute('data-pipeline-zoom')){zoom=pipelineZoom(button.dataset.pipelineZoom==='reset'?1:Math.round((zoom+(button.dataset.pipelineZoom==='in'?.25:-.25))*100)/100);draw();return;}
     if(button.dataset.ciTestPage){testPage=Math.max(0,testPage+(button.dataset.ciTestPage==='next'?1:-1));draw();}
     if(button.dataset.ciFailurePage){failurePage=Math.max(0,failurePage+(button.dataset.ciFailurePage==='next'?1:-1));draw();el(`[data-ci-failure-page="${button.dataset.ciFailurePage}"]`)?.focus();}
     if(button.dataset.tab){state.tab=button.dataset.tab;state.page=0;draw();}
@@ -337,7 +371,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       const entry=entries().find(e=>e.id===button.dataset.run);if(!entry)return;
       healthView?.setLayout?.('pipeline');openCiRun(entry.record);
     }
-    if(button.hasAttribute('data-close-inspector')){cancelDetail();selected=null;pipeline=null;healthView?.selectedRun(null);draw();}
+    if(button.hasAttribute('data-close-inspector')){const lastRunId=selected?.id;cancelDetail();selected=null;pipeline=null;healthView?.selectedRun(null);healthView?.setLayout('split');draw();if(isCi && workspace==='health')[...container.querySelectorAll('[data-health-run]')].find(button=>button.dataset.healthRun===healthOriginKey)?.focus({preventScroll:true});window.scrollTo({top:listScroll});if(isCi && workspace==='runs')[...container.querySelectorAll('[data-run]')].find(button=>button.dataset.run===lastRunId)?.focus({preventScroll:true});}
     if(button.hasAttribute('data-step')){pending.get('log')?.abort();pending.delete('log');step=button.dataset.step;log=null;logError='';draw();refreshDetail();}
     if(button.hasAttribute('data-debug-send') && selected && debugSessionId && !pending.has('debug')) {
       const target={...selected},sessionId=debugSessionId;
@@ -379,8 +413,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       debugSessions=activePiSessions(response.sessions);debugMessage='';
     },()=>{if(selected?.id===key){debugSessions=[];debugMessage='Pi agents could not load. Reopen this run to retry.';}});
   },{capture:true,signal:listenerController.signal});
-  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
-  container.querySelector('.ig-tabs').addEventListener('keydown',event=>{
+  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
+  container.querySelector('.ig-tabs:not(.ci-workspace-tabs)').addEventListener('keydown',event=>{
     if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
     const index=tabs.findIndex(([key])=>key===state.tab);
     state.tab=tabs[event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:tabs.length-1))%tabs.length][0];state.page=0;event.preventDefault();draw();el(`[data-tab="${state.tab}"]`).focus();

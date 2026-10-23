@@ -46,7 +46,11 @@ test('CI health integrates real paginated history, PR drilldown, old filtered ru
   await page.waitForFunction(()=>document.querySelector('[data-ci-health]')?.textContent.includes('PR #1200'));
   await page.locator('[data-health-mode="30"]').click();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
-  assert.equal(await page.locator('[data-health-map] [data-health-grid-scroll]').first().evaluate(e=>e.scrollWidth<=e.clientWidth+1),true,'30 daily columns should fit desktop overview');
+  const gridScroll=page.locator('[data-health-map] [data-health-grid-scroll]').first();
+  assert.equal(await gridScroll.evaluate(e=>getComputedStyle(e).overflowX),'auto');
+  assert.ok(await page.locator('.ci-health-grid td').first().evaluate(e=>e.getBoundingClientRect().width)>=36,'Daily columns retain readable minimum widths');
+  assert.equal(await page.locator('.ci-health-grid thead th').first().evaluate(e=>getComputedStyle(e).position),'sticky');
+  assert.equal(await page.locator('.ci-health-grid tbody th').first().evaluate(e=>getComputedStyle(e).position),'sticky');
   mkdirSync(path.join(root,'artifacts/ci-health'),{recursive:true});
   await page.screenshot({path:path.join(root,'artifacts/ci-health/desktop.png'),fullPage:true});
   await page.setViewportSize({width:390,height:844});

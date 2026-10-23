@@ -35,6 +35,7 @@ test('native CI charts follow context/search across tabs and preserve focus thro
       window.chartView=mountIntegrations(document.querySelector('#app'),client,{repository:'github.com/org/app'});
       window.addRun=()=>window.chartSnapshot.pipelines['org/app'].push(row(window.chartSnapshot.pipelines['org/app'].length+1,'success'));
     });
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.waitForFunction(()=>document.querySelector('[data-ci-charts-body]')?.textContent.includes('3 matching runs'));
     assert.equal(await page.locator('[data-ci-charts]').getAttribute('open'),null);
     await page.locator('[data-ci-charts]>summary').focus();
@@ -115,6 +116,7 @@ test('cache health loads independently, switches windows safely and keeps access
       window.resolveCache=()=>{const pending=window.pendingCache.splice(0);for(const {options,resolve} of pending)resolve({...window.cacheData,days:options.days});};
       window.cacheView=mountIntegrations(document.querySelector('#app'),window.cacheClient);
     });
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.locator('[data-ci-charts]>summary').click();
     await page.waitForFunction(()=>document.querySelector('[data-ci-charts-body]')?.textContent.includes('Loading cache health'));
     await page.evaluate(()=>window.resolveCache());
