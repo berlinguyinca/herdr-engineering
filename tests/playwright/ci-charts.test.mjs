@@ -28,9 +28,10 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     await page.goto(`http://127.0.0.1:${server.address().port}`);
     await page.evaluate(async()=>{
       const {mountIntegrations}=await import('/integrations-view.js');
-      const row=(run_number,state,branch='main')=>({run_number,state,branch,repository:'org/app',repository_id:'github.com/org/app',created_at:'2026-10-20T12:00:00Z',started_at:1792497600,finished_at:1792497660});
+      const row=(run_number,state,branch='main')=>({run_number,state,branch,project_id:'Project Alpha',language:'JavaScript',mission_key:'pi:one',session_id:'session-one',url:`https://ci.example/org/app/${run_number}`,repository:'org/app',repository_id:'github.com/org/app',created_at:new Date().toISOString(),started_at:1792497600,finished_at:1792497660});
       window.chartSnapshot={available:true,status:'partial',stale:true,pipelines:{'org/app':[row(1,'success'),row(2,'failure','feature'),row(3,'running'),{...row(4,'success'),repository_id:'other-forge.example/org/app'}]}};
-      const client={getCi:async()=>window.chartSnapshot};
+      window.chartHistory={reports:[],pipelines:[{...row(1,'success'),provider_url:'https://ci.example',url:undefined}],scope:{persistence:'memory_only',pipeline_limit:1000}};
+      const client={getCi:async()=>window.chartSnapshot,getCiReports:async()=>window.chartHistory};
       window.chartView=mountIntegrations(document.querySelector('#app'),client,{repository:'github.com/org/app'});
       window.addRun=()=>window.chartSnapshot.pipelines['org/app'].push(row(window.chartSnapshot.pipelines['org/app'].length+1,'success'));
     });
@@ -38,7 +39,7 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     assert.equal(await page.locator('[data-ci-charts]').getAttribute('open'),null);
     await page.locator('[data-ci-charts]>summary').focus();
     await page.keyboard.press('Enter');
-    assert.equal(await page.locator('[data-ci-charts] svg[role="img"]').count(),2);
+    assert.equal(await page.locator('[data-ci-charts] svg[role="img"]').count(),5);
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Reports are stale/);
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Some repositories have incomplete reports/);
     await page.locator('#ig-tab-finished').click();
@@ -58,6 +59,29 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     assert.equal(await page.locator('[data-ci-chart-data]').getAttribute('open'),'');
     assert.equal(await page.evaluate(()=>document.activeElement===document.querySelector('[data-ci-chart-data]>summary')),true);
     assert.ok(await page.locator('[data-ci-chart-data] tbody tr').count()>0);
+    const projects=page.getByRole('region',{name:'Project execution statistics',exact:true});
+    assert.deepEqual(await projects.locator('tbody tr').first().locator('th,td').allTextContents(),['Project Alpha','3','60000','60000','60000']);
+    assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Storage is memory-only/);
+    // New records and retained observations obey the same branch and period controls.
+    await search.fill('');
+    await page.locator('[data-ci-branch]').selectOption('feature');
+    assert.match(await page.locator('.ci-performance').innerText(),/No successful runs with valid positive/);
+    await page.locator('[data-ci-branch]').selectOption('main');
+    await page.evaluate(()=>{
+      window.chartHistory.pipelines.push({run_number:100,state:'success',project_id:'Old project',language:'Rust',repository:'org/app',repository_id:'github.com/org/app',branch:'main',created_at:'2020-01-01T00:00:00Z',started_at:1792497600,finished_at:1792497720});
+      window.chartView.refresh();
+    });
+    await page.waitForFunction(()=>document.querySelector('.ci-performance')?.textContent.includes('4 successful runs'));
+    await page.locator('[data-ci-period]').selectOption('7');
+    assert.match(await page.locator('.ci-performance').innerText(),/3 successful runs/);
+    assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Last 7 days/);
+    await page.locator('#ig-tab-failed').click();
+    assert.match(await page.locator('.ci-performance').innerText(),/3 successful runs/);
+    await projects.focus();
+    await page.evaluate(()=>{window.addRun();window.chartView.refresh();});
+    await page.waitForFunction(()=>document.querySelector('.ci-performance')?.textContent.includes('4 successful runs'));
+    assert.equal(await projects.evaluate(node=>node===document.activeElement),true);
+    await page.locator('[data-ci-chart-data]>summary').focus();
     await page.keyboard.press('Enter');
     await page.setViewportSize({width:390,height:844});
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);

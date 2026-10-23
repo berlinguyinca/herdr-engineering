@@ -439,3 +439,14 @@ def test_pipeline_retains_only_reported_dependency_and_duration_metadata():
     assert detail["tasks"][0]["duration"] == 4
     assert detail["tasks"][1]["depends_on"] == ["Checkout"]
     assert "depends_on" not in detail["tasks"][2]
+
+
+def test_repositories_preserve_explicit_provider_language():
+    p = _provider({'/api/user/repos': [{**REPO, 'language': 'Rust'}]})
+    assert p.repos()[0]['language'] == 'Rust'
+
+
+@pytest.mark.parametrize('language', ['tok', 'Rust tok', 'Rust\nGo', {'name': 'Rust'}, 'x' * 101])
+def test_repository_language_never_exposes_credentials_or_malformed_metadata(language):
+    p = _provider({'/api/user/repos': [{**REPO, 'language': language}]})
+    assert p.repos()[0]['language'] is None
