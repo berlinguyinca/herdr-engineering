@@ -419,6 +419,10 @@ async function viewAnalytics() {
     client.analytics('missions'), client.analytics('models'), client.analytics('hosts'),
   ]);
   root.innerHTML = `
+    <style>
+      .an-links{display:grid;grid-template-columns:repeat(3,minmax(200px,1fr));gap:12px;margin:16px 0}.an-links a{display:flex;flex-direction:column;gap:4px;padding:14px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);text-decoration:none}.an-links strong{color:var(--text)}.an-links span{font-size:12px;color:var(--text-secondary)}
+      .an-stage{margin-top:18px}@media(max-width:720px){.an-links{grid-template-columns:minmax(0,1fr)}}
+    </style>
     <h1>Analytics</h1>
     <div class="hd-grid">
       <herdr-metric label="Missions" value="${missions.total}"></herdr-metric>
@@ -426,9 +430,8 @@ async function viewAnalytics() {
       <herdr-metric label="Models" value="${Object.keys(models.models).length}"></herdr-metric>
       <herdr-metric label="Hosts healthy" value="${hosts.healthy} / ${hosts.total}"></herdr-metric>
     </div>
-    <p style="margin-top:12px"><a href="#/analytics/tokens">Token usage by project &rarr;</a></p>
-    <h3 style="margin-top:20px">Missions by stage</h3>
-    ${stageBars(missions.by_stage)}`;
+    <nav class="an-links" data-analytics-links aria-label="Analytics views"><a href="#/analytics/models"><strong>Models</strong><span>Agent distribution by model</span></a><a href="#/analytics/hosts"><strong>Hosts</strong><span>Reported fleet health</span></a><a href="#/analytics/tokens"><strong>Token usage</strong><span>Requests and tokens by project</span></a></nav>
+    <section class="an-stage"><h3>Missions by stage</h3>${stageBars(missions.by_stage)}</section>`;
 }
 
 async function viewAnalyticsMissions() { await viewAnalytics(); }

@@ -36,12 +36,14 @@ test('native CI charts follow context/search across tabs and preserve focus thro
       window.addRun=()=>window.chartSnapshot.pipelines['org/app'].push(row(window.chartSnapshot.pipelines['org/app'].length+1,'success'));
     });
     await page.waitForFunction(()=>document.querySelector('[data-ci-charts-body]')?.textContent.includes('3 matching runs'));
+    await page.locator('[data-ci-workspace="tests"]').click();
     assert.equal(await page.locator('[data-ci-charts]').getAttribute('open'),null);
     await page.locator('[data-ci-charts]>summary').focus();
     await page.keyboard.press('Enter');
     assert.equal(await page.locator('[data-ci-charts] svg[role="img"]').count(),5);
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Reports are stale/);
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Some repositories have incomplete reports/);
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.locator('#ig-tab-finished').click();
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/3 matching runs/);
     const search=page.locator('[data-ig-search]');
@@ -52,6 +54,7 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     await page.evaluate(()=>{window.addRun();window.chartView.refresh();});
     await page.waitForFunction(()=>document.querySelector('[data-ci-charts-body]')?.textContent.includes('3 matching runs'));
     assert.equal(await page.evaluate(()=>document.activeElement?.hasAttribute('data-ig-search')),true);
+    await page.locator('[data-ci-workspace="tests"]').click();
     const dataSummary=page.locator('[data-ci-chart-data]>summary');
     await dataSummary.focus();await page.keyboard.press('Enter');
     await page.evaluate(()=>{window.addRun();window.chartView.refresh();});

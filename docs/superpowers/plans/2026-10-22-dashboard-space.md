@@ -39,11 +39,11 @@
 - Produces: shell content region that is fluid up to 1600px and an Overview grid with mission, fleet and secondary panels assigned explicit responsive areas.
 - Consumes: existing `herdr-app-shell`, `data-overview` panel keys and route behavior.
 
-- [ ] Add browser assertions for a content inner width above 1350px at 1920px, no overflow at 390px, mission/fleet/secondary panel placement, and unchanged Overview links.
-- [ ] Run the focused test and confirm it fails on the 1080px ceiling/current grid.
-- [ ] Implement the fluid shell and three-column Overview composition, retaining readable intro width and mobile single-column behavior.
-- [ ] Run focused Overview/UI tests and confirm they pass.
-- [ ] Commit with a Lore-compatible `feat(ui)` message.
+- [x] Add browser assertions for a content inner width above 1350px at 1920px, no overflow at 390px, mission/fleet/secondary panel placement, and unchanged Overview links.
+- [x] Run the focused test and confirm it fails on the 1080px ceiling/current grid.
+- [x] Implement the fluid shell and three-column Overview composition, retaining readable intro width and mobile single-column behavior.
+- [x] Run focused Overview/UI tests and confirm they pass.
+- [x] Commit with a Lore-compatible `feat(ui)` message.
 
 ### Task 2: Compact catalog controls and rows
 
@@ -59,11 +59,11 @@
 - Produces: consistent compact heading/filter rows and desktop record rows with secondary metadata available in disclosures/details.
 - Consumes: Task 1 fluid shell; existing filter, grouping, focus and refresh contracts.
 
-- [ ] Add browser assertions for first-record vertical position, visible record density, filter wrapping, long-content containment and preserved keyboard focus.
-- [ ] Run focused catalog tests and confirm density assertions fail.
-- [ ] Compact controls and catalog rows without changing state classification or link targets.
-- [ ] Run focused catalog tests and confirm they pass.
-- [ ] Commit.
+- [x] Add browser assertions for first-record vertical position, visible record density, filter wrapping, long-content containment and preserved keyboard focus.
+- [x] Run focused catalog tests and confirm density assertions fail.
+- [x] Compact controls and catalog rows without changing state classification or link targets.
+- [x] Run focused catalog tests and confirm they pass.
+- [x] Commit.
 
 ### Task 3: Activity timeline and workspace height
 
@@ -77,11 +77,11 @@
 - Produces: compact expandable activity rows and agent panes sized from remaining viewport height.
 - Consumes: existing event descriptions, activity ordering, activity JSON disclosures and workspace mobile tabs.
 
-- [ ] Add browser assertions for collapsed event density, expandable full detail, remaining-height workspace, composer reachability and mobile pane behavior.
-- [ ] Run focused tests and confirm failures against cards/75vh sizing.
-- [ ] Implement timeline semantics and `calc(100dvh - …)` workspace sizing with safe minimums.
-- [ ] Run focused tests and confirm they pass.
-- [ ] Commit.
+- [x] Add browser assertions for collapsed event density, expandable full detail, remaining-height workspace, composer reachability and mobile pane behavior.
+- [x] Run focused tests and confirm failures against cards/75vh sizing.
+- [x] Implement timeline semantics and `calc(100dvh - …)` workspace sizing with safe minimums.
+- [x] Run focused tests and confirm they pass.
+- [x] Commit.
 
 ### Task 4: CI and Projects workspace composition
 
@@ -97,11 +97,11 @@
 - Produces: CI Health/Runs & pipelines/Tests workspace navigation and container-aware project/tree/inspector layouts.
 - Consumes: existing CI filters, five heatmap windows, compound run identity, report coverage and Projects repository/issue selection.
 
-- [ ] Add browser assertions for workspace navigation, retained filter/selection state, wide split layout, narrow stacked layout and no duplicated provider-origin clutter.
-- [ ] Run focused CI/Projects tests and confirm failures.
-- [ ] Implement workspace navigation and responsive container layouts without combining independent history/report filters.
-- [ ] Run focused CI/Projects tests and confirm they pass.
-- [ ] Commit.
+- [x] Add browser assertions for workspace navigation, retained filter/selection state, wide split layout, narrow stacked layout and no duplicated provider-origin clutter.
+- [x] Run focused CI/Projects tests and confirm failures.
+- [x] Implement workspace navigation and responsive container layouts without combining independent history/report filters.
+- [x] Run focused CI/Projects tests and confirm they pass.
+- [x] Commit.
 
 ### Task 5: Analytics, Collaboration, responsive navigation and full verification
 
@@ -118,10 +118,10 @@
 - Produces: composed analytics panels, list/detail Collaboration landing, compact accessible mobile navigation and final measured evidence.
 - Consumes: shared shell and density patterns from Tasks 1–4.
 
-- [ ] Add browser assertions for analytics table alignment, mobile navigation access/focus, Collaboration list/detail use and empty-state control suppression.
-- [ ] Run focused tests and confirm failures.
-- [ ] Implement the remaining compositions and update the design/evidence documents with final measurements.
-- [ ] Run all JavaScript/browser tests, JavaScript syntax checks and diff checks.
-- [ ] Capture and inspect screenshots at 1920×1080, 1440×900, 1280×800, 768×1024 and 390×844.
+- [x] Add browser assertions for analytics composition, mobile navigation access/focus, Collaboration workspace behavior and empty-state control suppression.
+- [x] Run focused tests and confirm failures.
+- [x] Implement the remaining compositions and update the design/evidence documents with final measurements.
+- [x] Run all JavaScript/browser tests, JavaScript syntax checks and diff checks.
+- [x] Capture and inspect screenshots at 1920×1080, 1440×900, 1280×800, 768×1024 and 390×844.
 - [ ] Request whole-branch code and visual review, resolve material findings through RED/GREEN, and commit.
 

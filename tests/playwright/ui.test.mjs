@@ -166,6 +166,16 @@ test('activity uses compact expandable rows without hiding event detail', async 
   },{BURST:'0'});
 });
 
+test('analytics composes its existing views into a useful dashboard', async () => {
+  await withApp(async ({page,base}) => {
+    await page.goto(`${base}/#/analytics`);await page.locator('[data-analytics-links]').waitFor();
+    const destinations=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getAttribute('href')));
+    assert.deepEqual(destinations,['#/analytics/models','#/analytics/hosts','#/analytics/tokens']);
+    const boxes=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getBoundingClientRect().width));
+    assert.ok(boxes.every(width=>width>200),'analytics destinations should use the available desktop row');
+  },{BURST:'0'});
+});
+
 test('pi-sourced mission detail renders by mission_key', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/missions`);
@@ -865,6 +875,11 @@ test('overview keeps healthy panels through partial errors and links to the exac
   assert.ok(desktopLayout.fleet.top<desktopLayout.sessions.bottom,'fleet status should share the upper overview region');
   assert.ok(Math.abs(desktopLayout.sessions.top-desktopLayout.ci.top)<2,'secondary overview panels should align in a desktop row');
   await page.setViewportSize({width:390,height:844});await page.goto(`${base}/#/overview`);await page.locator('[data-overview=sessions] .ov-row').waitFor();
+  const menu=page.locator('herdr-app-shell .hd-shell__menu');
+  await menu.waitFor();assert.equal(await menu.getAttribute('aria-expanded'),'false');
+  assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),false);
+  await menu.click();assert.equal(await menu.getAttribute('aria-expanded'),'true');
+  assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),true);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
  },{BURST:'0',SERVICE_CATALOG:'1'});
 });
@@ -1006,18 +1021,22 @@ test('CI catalog keeps filters and step inspection through refresh and shows sta
     await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{...running,tasks:[{id:1,name:'Compile',state:'success'},{id:2,name:'Test spectra',state:'running'}]}}}));
     await page.route('**/api/v1/ci/log?*',r=>{logReads++;return r.fulfill({json:{available:true,log:`<script>unsafe()</script>\nChecking spectrum ${logReads}`,checked_at:new Date().toISOString()}});});
     await page.goto(`${base}/#/ci`);
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.getByRole('button',{name:'Run #42',exact:true}).click();
     await page.getByRole('button',{name:'Test spectra running'}).click();
     await page.waitForFunction(()=>document.querySelector('.ig-log')?.textContent.includes('Checking spectrum'));
     assert.equal(await page.locator('.ig-log script').count(),0);
     assert.equal(await page.locator('[data-ci-action]').count(),0);
+    await page.locator('[data-ci-workspace="runs"]').click();
     const search=page.getByRole('searchbox',{name:'Search runs'});await search.fill('spectra');await search.focus();
     const before=logReads;authError=true;
     await page.waitForFunction(()=>document.body.innerText.includes('Woodpecker authentication failed'),{},{timeout:12000});
     assert.ok(reads>=2);assert.ok(logReads>before);
     assert.equal(await search.inputValue(),'spectra');assert.equal(await search.evaluate(e=>e===document.activeElement),true);
+    await page.locator('[data-ci-workspace="health"]').click();
     assert.equal(await page.locator('[data-step="2"]').getAttribute('aria-pressed'),'true');
     assert.match(await bodyText(page),/Showing last received records/);
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.getByRole('tab',{name:/^Failed/}).click();
     await page.getByRole('button',{name:'Run #41',exact:true}).waitFor();
     assert.equal(await page.getByRole('button',{name:'Run #42',exact:true}).count(),0);
@@ -1084,11 +1103,13 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
       };
     });
     await page.goto(`${base}/#/ci?tab=failed`);
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.getByRole('button',{name:'Run #42',exact:true}).waitFor();
     await page.evaluate(()=>{window.location.hash='/reviews';});
     await page.getByRole('heading',{name:'Reviews',exact:true}).waitFor();
     assert.equal(await page.evaluate(()=>window.integrationListeners.slice(0,3).every(l=>l.signal?.aborted)),true);
     await page.evaluate(()=>{window.location.hash='/ci?tab=failed';});
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.getByRole('button',{name:'Run #42',exact:true}).click();
     await page.getByText('Debug with Pi',{exact:true}).click();
     const select=page.getByRole('combobox',{name:'Target Pi agent'});

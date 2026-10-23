@@ -1,7 +1,7 @@
 # Design
 
 ## Source of truth
-Status: Draft. Date:2026-10-22. Surfaces: HerdR dashboard and embedded operational views. Existing canonical tokens and component rules remain authoritative; this draft records audit proposals, not approved implementation. Evidence: packages/herdr-design-system/README.md, theme.css, app-shell.js, route/view sources, live screenshots and docs/evidence/dashboard-space/audit.md. No prior root DESIGN.md existed.
+Status: Active. Date:2026-10-22. Surfaces: HerdR dashboard and embedded operational views. Existing canonical tokens and component rules remain authoritative. Evidence: packages/herdr-design-system/README.md, theme.css, app-shell.js, route/view sources, responsive browser captures and docs/evidence/dashboard-space/audit.md. No prior root DESIGN.md existed.
 
 ## Brand
 Retain light neutral surfaces, green brand actions, restrained borders and semantic outcome colors. Trust comes from exact identities, provenance and visible freshness/coverage. Avoid decorative cards, giant counters and artificial data used to fill space.
@@ -40,6 +40,5 @@ Short operational language; lead with entity and state. Put verbose technical ID
 VanillaJS/Web Components, existing CSS tokens, no new dependencies. Preserve route/API/data contracts and test report durability. Implement incrementally only after a chosen design; capture responsive and interaction evidence for each phase. This audit changed no production UI.
 
 ## Open questions
-- [ ] Operator: should compact density become the default or remain an opt-in? Affects row spacing and persistence.
-- [ ] Operator: accept recommended adaptive layout versus width-only change? Affects scope/order.
-- [ ] Designer/implementer: approve concrete Overview/CI wireframes and breakpoints after measuring typical content.
+- [ ] Operator: should a user-selectable comfortable density be added later? Compact desktop density is now the default; mobile retains larger spacing.
+- [ ] Designer/implementer: evaluate container-query splits for populated Projects data when GitHub synchronization is available.

@@ -31,3 +31,11 @@ Read-only live inspection of http://dev.lan, release f7f7bdbd35ad. All 14 primar
 4. Analytics composition, Collaboration/workspace height and mobile navigation.
 
 Targets above are proposed acceptance criteria, not measured improvements. Capture before/after at1920×1080,1440×900,1280×800,768×1024 and390×844. Assert no page overflow, visible focus, preserved selection/expansion/filter state under refresh, correct split/list navigation, reachable composer and unchanged data/freshness semantics. Compare first-row position, visible records, scroll distance and content width. Existing tests should remain green; add behavioral tests only for changed interactions. No dependencies needed.
+
+## Implemented measurements
+
+The adaptive layout implementation was captured with the real local control-plane browser fixture at1920×1080,1440×900,1280×800,768×1024 and390×844. The shell content box measures1648px at1920px, up from1128px in the live baseline (**46.1% more horizontal canvas**). It measures1207px at1440,1047px at1280,535px at768 and390px at390. Every measured viewport had document scroll width equal to viewport width.
+
+Fixture Overview height at1920 fell to1104px from the live-baseline2115px sample, although record counts differed and this number is directional rather than a controlled performance metric. The revised fixture pages measured: Agents1080px, Missions1080px, Activity2112px for50 expandable records, Analytics1080px and default CI Health1080px. The live Activity baseline was8316px for50 card records. Responsive screenshots were visually inspected under `artifacts/dashboard-space/after/`.
+
+Implemented scope: fluid shell, three-column Overview, compact Agents/Missions/Services/Topology controls and rows, expandable Activity timeline, remaining-height agent workspace, CI Health/Runs/Tests workspaces, Analytics destinations and collapsed mobile navigation. Projects keeps its existing collapsible repository navigation; a populated issue split remains an open evaluation because the inspected deployment reported GitHub synchronization unavailable. Collaboration keeps its established room layout; wide shell space is available without inventing content for a sparse room list.
