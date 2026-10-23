@@ -224,6 +224,7 @@ fn compat(args: &[String], arms: &BTreeMap<String, Arm>) {
     let label = arg(args, "--label").unwrap_or_else(|| "compat".into());
     let probe = fs::canonicalize(arg(args, "--probe").unwrap_or_else(|| "probe".into())).expect("probe dir");
     let mut results: BTreeMap<String, Option<ProbeOut>> = BTreeMap::new();
+    let mut costs: BTreeMap<String, (f64, f64, f64)> = BTreeMap::new();
     for (name, arm) in arms {
         let agent = AgentDir::new(None).expect("agent dir");
         let mut pk: Vec<String> = packages.clone();
@@ -240,7 +241,8 @@ fn compat(args: &[String], arms: &BTreeMap<String, Arm>) {
         argv.extend(["-p".into(), "hi".into(), "--no-session".into()]);
         let o = spawn_one(&argv, &agent.0, &agent.0, &env, 120);
         let parsed = fs::read_to_string(&out).ok().and_then(|t| serde_json::from_str::<ProbeOut>(&t).ok());
-        println!("{name:12} exit={} wall_ms={:.0} loaded={}", o.exit, o.wall_ms, parsed.is_some());
+        println!("{name:12} exit={} wall_ms={:.0} cpu_s={:.1} maxrss_MiB={:.0} loaded={}", o.exit, o.wall_ms, o.cpu_s, o.maxrss_mib, parsed.is_some());
+        costs.insert(name.clone(), (o.wall_ms, o.cpu_s, o.maxrss_mib));
         results.insert(name.clone(), parsed);
     }
     let base = results.get("standard-pi").cloned().flatten();
@@ -256,7 +258,8 @@ fn compat(args: &[String], arms: &BTreeMap<String, Arm>) {
         let (add_t, miss_t) = (diff(&r.tools, &b.tools), diff(&b.tools, &r.tools));
         println!("{name}: commands={} tools={} fallback={:?} runtime={} extra_commands={add_c:?} missing_commands={miss_c:?} extra_tools={add_t:?} missing_tools={miss_t:?} err={:?}",
             r.commands.len(), r.tools.len(), r.fallback, if r.bun { "bun" } else { "node" }, r.err);
-        rows.push(serde_json::json!({"label": label, "arm": name, "loaded": true, "commands": r.commands.len(), "tools": r.tools.len(), "fallback": r.fallback,
+        let (wall_ms, cpu_s, maxrss_mib) = costs.get(name).copied().unwrap_or_default();
+        rows.push(serde_json::json!({"label": label, "arm": name, "loaded": true, "wall_ms": wall_ms, "cpu_s": cpu_s, "maxrss_mib": maxrss_mib, "commands": r.commands.len(), "tools": r.tools.len(), "fallback": r.fallback,
             "extra_commands": add_c, "missing_commands": miss_c, "extra_tools": add_t, "missing_tools": miss_t, "err": r.err, "packages": packages}));
     }
     if let Some(o) = arg(args, "--out") {
