@@ -265,3 +265,30 @@ sections:
 4. **Session id join.** May `herdr-eng session run` record a `{session_id, llm_key_id}` association when the free-form `--session` differs from the dashboard id?
 5. **Route.** May `#/llm` replace `#/analytics/tokens`, which would redirect, with the Analytics card pointing to `#/llm`?
 6. **Failure samples.** Should the capability ship at all (it stays off by default), and which error classes may it capture?
+
+### Defaults chosen, change on request (2026-10-23)
+
+The operator had not answered the questions above when slice 1 was built, so the doc's own recommendations stand as defaults. Each can be changed on request.
+
+1. **Coverage:** (a). pi sessions that call the gateway directly get transcript-only tokens (slice 5). No pi provider is repointed at the proxy.
+2. **Retention:** raw records 14 days, hourly rollups 400 days, configurable as `control_plane.llm_proxy.raw_retention_days` / `rollup_retention_days`. Samples stay unbuilt (item 6).
+3. **Store:** usage stays in the existing event stream. The dormant `token_usage` SQL table stays unused.
+4. **Session id join:** no association event is recorded (see "Slice 1 notes" below).
+5. **Route:** `#/llm` will **coexist** with `#/analytics/tokens` for now. This overrides the redirect in the UI sketch until the operator decides.
+6. **Failure samples:** not built. `samples.enabled` stays false and the samples route will not exist.
+
+### Slice 1 notes (proxy enrichment, as built)
+
+- **Record.** The proxy reports every finished request as a `schema: 2` record with the fields in the data model, plus `upstream_model` (the id actually sent upstream). `model` stays the requested id, so `by_model` in `/api/v1/analytics/tokens` is unchanged. v1 records (no `schema`) keep their old shape, with missing token counts stored as 0.
+- **Whitelist.** `POST /api/v1/token-usage` and the proxy both go through `repo.record_token_usage_row`. It keeps only known fields and type-checks each one: ints ≥ 0 or null, error classes from the taxonomy, ids in the gateway metadata charset. Any other field (a prompt, a response, a key) is dropped.
+- **Recorded rejections.** The proxy now records its own `429 proxy_backpressure`, the pre-dispatch `503`/`403`, and the `400`/`413` request errors. These records carry `route: null`.
+- **401s are not recorded.** They have no project to attribute them to, and recording them would let an anonymous caller write records. This is a deviation from the taxonomy row `auth_invalid_key`, which stays reserved.
+- **`upstream_rejected_metadata` is not distinguished.** Telling it apart would mean matching upstream body text, which is a guess. An upstream 400 is recorded as `upstream_client_error`.
+- **Info classes are not error classes.** `usage_missing`, `empty_completion` and `fallback_to_cpu` are left out of `error_class`, so that the error rate (`error_class != null`) counts real failures only. They can be derived: `usage_known=false`, `output_tokens == 0`, `fallback=true`.
+- **`client_disconnected`** is detected by a dedicated wrapper around client writes. `stream_truncated` covers any upstream read failure after the headers were sent.
+- **`success`** = 2xx status and `error_class == null`. A stream cut off after a 200 is recorded with `status: 200` and `error_class: stream_truncated`.
+- **`duration_ms`** now runs from the start of the slot wait to the last byte, so it includes `queue_ms`. It used to start after `acquire()`.
+- **`engine` is always null.** No OpenAI-compatible upstream signal for it was found. Nothing is assumed about any engine.
+- **Session id.** The id comes from the `X-InferWeave-Session-ID` or `X-Session-Id` header, then from the key label `session:<id>` (`llm_config` now carries the non-secret `label`), else null. The gateway-bucket fallback `<project>:<key_id>` is not a session and is never recorded as one.
+- **Join check (Decision 4): unverified.** `session_env` labels the key `session:<--session or --mission or pid…>`. Nothing in this repo calls `herdr-eng session run` except tests, so no launcher is known to pass the dashboard session id. The join holds only when the launcher passes it. Decision 4 stays open.
+- **Retention.** `ControlPlaneServer.sweep_once` runs at startup and then every 5 minutes. It drops `token_usage` events older than `raw_retention_days` from memory and deletes them from `fabric_events` (`DurableEventSink.prune_events_before`). No other entity type is touched. `rollup_retention_days` is validated but has no effect until rollups exist (slice 2). A bad value stops `control-plane web` at startup.
