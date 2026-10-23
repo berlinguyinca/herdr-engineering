@@ -14,6 +14,7 @@
 # mounts at /data; deploy.sh passes it).
 # Usage: collab-sync.sh once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR]
 #          [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]
+# Unless --certbot is explicit, Certbot is read from the ACME directory's sibling DIR-venv.
 set -euo pipefail
 USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]"
 ACTION="${1:-once}"; [ $# -gt 0 ] && shift
@@ -24,7 +25,7 @@ CERT_DIR="$HOME/.local/share/herdr-engineering/collab-edge-certs"
 CERT_NAME="localdev.mcp.metabolomics.us"
 ACME="$HOME/.local/share/herdr-engineering/collab-acme"
 CERT_SRC=""
-CERTBOT="$HOME/.local/share/herdr-engineering/collab-acme-venv/bin/certbot"
+CERTBOT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config needs a value}"; shift 2 ;;
@@ -39,6 +40,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 CERT_SRC="${CERT_SRC:-$ACME/config/live/$CERT_NAME}"
+CERTBOT="${CERTBOT:-${ACME}-venv/bin/certbot}"
 read -r POOL GROUP OPERATOR < <(python3 - "$CONFIG" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["collab"]

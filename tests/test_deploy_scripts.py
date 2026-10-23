@@ -431,6 +431,41 @@ def test_collab_renewal_dry_run_skips_certbot_random_sleep(env):
     )
 
 
+def test_collab_custom_acme_dir_derives_its_certbot_venv(env):
+    _with_collab(env)
+    config = env["tmp"] / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(env["central"]), config)
+    acme = env["tmp"] / "tenant-acme"
+    certbot = Path(f"{acme}-venv/bin/certbot")
+    certbot.parent.mkdir(parents=True)
+    certbot.write_text("#!/bin/sh\nprintf 'custom:%s\\n' \"$*\"\n")
+    certbot.chmod(0o755)
+
+    sync = ROOT / "deploy" / "control-plane" / "collab-sync.sh"
+    r = run(sync, env, "renew-check", "--config", str(config), "--acme-dir", str(acme))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("custom:renew --dry-run --no-random-sleep-on-renew ")
+    assert f"--config-dir {acme}/config" in r.stdout
+
+
+def test_collab_explicit_certbot_overrides_custom_acme_derivation(env):
+    _with_collab(env)
+    config = env["tmp"] / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(env["central"]), config)
+    acme = env["tmp"] / "tenant-acme"
+    certbot = env["tmp"] / "operator-bin/certbot"
+    certbot.parent.mkdir(parents=True)
+    certbot.write_text("#!/bin/sh\nprintf 'explicit:%s\\n' \"$*\"\n")
+    certbot.chmod(0o755)
+
+    sync = ROOT / "deploy" / "control-plane" / "collab-sync.sh"
+    r = run(sync, env, "renew-check", "--config", str(config), "--acme-dir", str(acme),
+            "--certbot", str(certbot))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("explicit:renew --dry-run --no-random-sleep-on-renew ")
+    assert f"--config-dir {acme}/config" in r.stdout
+
+
 def test_collab_sync_provisions_the_operators_invitees_from_the_slice_not_env(env):
     # #119 (third origin/main merge): the operator, pool and group reach collab-provision.py as
     # flags from the slice; main's HERDR_COLLAB_OPERATOR_USER / _POOL / _GROUP env is ignored.
