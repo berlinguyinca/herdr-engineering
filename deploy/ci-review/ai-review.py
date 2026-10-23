@@ -68,6 +68,9 @@ DEFAULTS: dict = {
         "models_file": "~/.pi/agent/models.json",
         "model": "deepseek_v4-flash-modality-text-quant-mxfp4",   # an id the gateway advertises (GET /models)
         "max_tokens": 32768,                     # reasoning models need headroom before they answer
+        # false sends chat_template_kwargs.enable_thinking=false (llama.cpp). Measured: with thinking, deepseek used
+        # all 32768 tokens reasoning on 24 KB chunks (finish_reason=length); without, 15-30 s per chunk
+        "thinking": False,
         "temperature": 0.2,
         "response_format": "json_schema",        # json_schema | json_object | none
         "timeout_s": 900,                        # longest silence on the connection (socket read timeout)
@@ -465,6 +468,8 @@ class Gateway:
                                              {"role": "user", "content": user}],
                 self.max_tokens_field: self.r["max_tokens"], "temperature": self.r["temperature"],
                 "stream": True}   # tokens (reasoning too) keep a slow answer alive past the gateway's idle limit
+        if not self.r["thinking"]:
+            body["chat_template_kwargs"] = {"enable_thinking": False}
         if self.r["response_format"] == "json_schema":
             body["response_format"] = {"type": "json_schema",
                                        "json_schema": {"name": "verdict", "strict": True, "schema": VERDICT_SCHEMA}}
@@ -553,7 +558,8 @@ def chunk_context(gh: Gh, repo: str, sha: str, chunk: Chunk, index: dict, cfg: d
     return "\n".join(out)
 
 
-def review_chunk(gw: Gateway, model: str, afams: set[str], i: int, system: str, user: str, need: str) -> dict:
+def review_chunk(gw: Gateway, model: str, afams: set[str], i: int, system: str, user: str,
+                 need: str | tuple[str, ...]) -> dict:
     """One chat completion. Truncated (finish_reason=length) or empty answers are retried once, then fail."""
     for attempt in (1, 2):
         a = gw.chat(model, system, user)
@@ -711,7 +717,9 @@ def skip_reason(fd: FileDiff, globs: list[str]) -> str | None:
     return None
 
 
-DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
+# prose and configuration: a chunk of only these has no source code to review
+DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc", ".yaml", ".yml", ".toml", ".json", ".ini", ".cfg", ".conf",
+                ".service", ".timer")
 
 
 def is_doc(path: str) -> bool:
@@ -725,7 +733,7 @@ class Chunk:
 
     @property
     def docs_only(self) -> bool:
-        """Prose only: the reviewer must say it reviewed the docs; there is no code or test in it to review."""
+        """Prose/config only: the reviewer must say it reviewed the docs (or code); there is no source code in it."""
         return all(is_doc(f) for f in self.files)
 
 
@@ -818,7 +826,7 @@ VERDICT_SCHEMA = {"type": "object", "additionalProperties": False, "required": l
                                  "not_checked": {"type": "array", "items": {"type": "string"}}}}
 
 
-def parse_verdict(text: str, need: str = "code") -> dict:
+def parse_verdict(text: str, need: str | tuple[str, ...] = "code") -> dict:
     """The reviewer's whole answer must be one JSON object of exactly this shape (optionally the whole answer in
     one ```json fence). Anything else raises ReviewFailed."""
     t = text.strip()
@@ -845,8 +853,9 @@ def parse_verdict(text: str, need: str = "code") -> dict:
         if not isinstance(v[k], list) or len(v[k]) > LIST_MAX or not all(
                 isinstance(x, str) and len(x) <= TEXT_MAX for x in v[k]):
             raise ReviewFailed(f"verdict.{k} must be a list of strings")
-    if need not in v["checked"]:
-        raise ReviewFailed(f"the reviewer did not say it reviewed the {need}")
+    needs = (need,) if isinstance(need, str) else need
+    if not any(x in v["checked"] for x in needs):
+        raise ReviewFailed(f"the reviewer did not say it reviewed the {' or '.join(needs)}")
     return v
 
 
@@ -985,7 +994,7 @@ def review(cfg: dict, repo: str, n: int, dry_run: bool, max_chunks: int | None =
 
         def one(item):
             i, ch, system, user = item
-            v = review_chunk(gw, model, afams, i, system, user, "docs" if ch.docs_only else "code")
+            v = review_chunk(gw, model, afams, i, system, user, ("docs", "code") if ch.docs_only else "code")
             if ch.docs_only:                     # no code or tests in it: those claims hold vacuously
                 v = {**v, "checked": [*v["checked"], "code", "tests"]}
             say(f"chunk {i}/{len(chunks)} done in {v['_latency_s']}s: {len(v['blocking'])} blocking, "

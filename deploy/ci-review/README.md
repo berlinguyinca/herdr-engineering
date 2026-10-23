@@ -40,7 +40,9 @@ is refused, and nothing from models.json is run.
 - There are two messages. The `system` message holds the instructions. The `user` message holds everything from
   the PR between two random fence lines: title, description, file list, diff, and the full-file context.
 - `response_format` is `json_schema`, the strict verdict schema; the gateway accepts it.
-- `max_tokens` is 32768, because reasoning models think first.
+- `max_tokens` is 32768. Thinking is off by default (`reviewer.thinking: false` sends
+  `chat_template_kwargs.enable_thinking=false`). With thinking on, deepseek spent all 32768 tokens reasoning on
+  24 KB chunks and never answered (`finish_reason=length`); with it off, it answered in 15 to 30 s per chunk.
 - `stream: true`. The gateway ends a request that produces no tokens for a while (`inference_idle_timeout`), and
   reasoning tokens keep a slow answer alive. Only `content` deltas count as the answer; `reasoning_content` is
   ignored.
@@ -77,8 +79,9 @@ is refused, and nothing from models.json is run.
    - The answer must be one JSON object with exactly `blocking`, `minor`, `checked` and `not_checked`; one
      whole-answer `` ```json `` fence is tolerated. Each finding has exactly `file`, `line` (an integer),
      `summary` and `why`.
-   - `checked` must include `code`. For a chunk of prose only (`.md`, `.rst`, `.txt`, `.adoc`) it must include
-     `docs` instead, and that chunk counts as covering code and tests, since it has none.
+   - `checked` must include `code`. A chunk with no source code may report `docs` instead, and counts as covering
+     code and tests, since it has none. That means only prose and config files: `.md`, `.rst`, `.txt`, `.adoc`,
+     `.yaml`, `.yml`, `.toml`, `.json`, `.ini`, `.cfg`, `.conf`, `.service`, `.timer`.
    - Anything else fails the whole run: exit 1, and nothing is posted except the earlier pending status.
 6. **Decides the state (the poster, not the model).**
    - A blocking finding whose `file` is in the diff always counts. If its `line` is not a new-side line of a hunk

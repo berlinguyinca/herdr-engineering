@@ -568,6 +568,15 @@ def test_a_plain_json_answer_to_a_stream_request_is_accepted(env):
     assert [s["state"] for s in env.terminal()] == ["success"]
 
 
+def test_thinking_is_off_by_default_and_can_be_turned_on(env):
+    assert review(env) == 0
+    assert env.rev_calls()[0]["chat_template_kwargs"] == {"enable_thinking": False}
+    env.reset()
+    env.config({"reviewer": {"model": MODEL, "thinking": True}})
+    assert review(env) == 0
+    assert "chat_template_kwargs" not in env.rev_calls()[0]
+
+
 def test_the_request_streams(env):
     assert review(env) == 0
     (chat,) = env.rev_calls()
@@ -807,6 +816,15 @@ def test_a_docs_only_chunk_may_report_docs_instead_of_code(env):
     assert "code+security review" in st["description"]
     calls = env.rev_calls()
     assert len(calls) >= 2 and "docs/guide.md" in user_text(calls[0]) and "src/a.py" not in user_text(calls[0])
+
+
+def test_a_config_and_docs_chunk_may_report_docs(env):
+    d = ("diff --git a/deploy/x.yaml b/deploy/x.yaml\nindex 1..2 100644\n--- a/deploy/x.yaml\n+++ b/deploy/x.yaml\n"
+         "@@ -1 +1 @@\n-a: 1\n+a: 2\n") + DOC_DIFF
+    env.set_pr(diff=d)
+    env.responses([{**EMPTY, "checked": ["docs", "security"]}])
+    assert review(env) == 0
+    assert [s["state"] for s in env.terminal()] == ["success"]
 
 
 def test_a_code_chunk_reporting_only_docs_fails(env):

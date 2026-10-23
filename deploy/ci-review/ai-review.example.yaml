@@ -18,6 +18,9 @@ reviewer:
   # every author family; the status names the id the gateway reports having used.
   model: deepseek_v4-flash-modality-text-quant-mxfp4
   max_tokens: 32768                      # reasoning models think first; too little gives finish_reason=length
+  # false sends chat_template_kwargs.enable_thinking=false. With thinking on, deepseek spent all 32768 tokens
+  # reasoning on 24 KB chunks (finish_reason=length, so the chunk fails); with it off, 15-30 s per chunk.
+  thinking: false
   temperature: 0.2
   response_format: json_schema           # json_schema | json_object | none (the gateway accepts json_schema)
   timeout_s: 900                         # longest silence on the connection
