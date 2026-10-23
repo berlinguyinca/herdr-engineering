@@ -713,6 +713,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._public()
             if self._is_collab_path():
                 return self._collab()
+            # Unambiguous framing, as on the public/operator listeners: this server reads
+            # only Content-Length, so a chunked or doubly-sized body would be parsed as
+            # the next request on a keep-alive connection.
+            if (len(self.headers.get_all("Content-Length") or []) > 1
+                    or "Transfer-Encoding" in self.headers):
+                return self._deny(400, "ambiguous request framing")
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
             # The ingest route is reachable by the ingest role; every other
@@ -1492,15 +1498,21 @@ def _make_handler(server, public=False, operator=False):
 
         # ---------------------------------------------------------- helpers
         def _read_json(self):
-            length = int(self.headers.get("Content-Length") or 0)
-            if not length:
-                return None
-            if length > _MAX_JSON_BODY:
-                raise ValueError("request body too large")
             try:
-                return json.loads(self.rfile.read(length))
-            except (ValueError, json.JSONDecodeError):
-                raise ValueError("invalid JSON body")
+                length = int(self.headers.get("Content-Length") or 0)
+                if not length:
+                    return None
+                if length > _MAX_JSON_BODY:
+                    raise ValueError("request body too large")
+                try:
+                    return json.loads(self.rfile.read(length))
+                except (ValueError, json.JSONDecodeError):
+                    raise ValueError("invalid JSON body") from None
+            except ValueError:
+                # The body may be unread or only partly read: never reuse the connection,
+                # or the leftover bytes would be parsed as the next request.
+                self.close_connection = True
+                raise
 
         def _json(self, data, status=200):
             payload = json.dumps(data).encode()
@@ -1508,6 +1520,8 @@ def _make_handler(server, public=False, operator=False):
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
             return None

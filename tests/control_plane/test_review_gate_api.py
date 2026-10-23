@@ -269,3 +269,41 @@ def test_trailing_slash_routes(gate_server):
     assert request(gate_server, "review-gate/prs/")[0] == 200
     assert request(gate_server, "review-gate/queue/")[0] == 200
     assert request(gate_server, "review-gate/queue/x")[0] == 404
+
+
+SMUGGLED = b"GET /api/v1/review-gate/prs HTTP/1.1\r\nHost: x\r\nX-API-Key: read\r\n\r\n"
+
+
+def _responses(data):
+    return data.count(b"HTTP/1.1 ") + data.count(b"HTTP/1.0 ")
+
+
+def _post_head(extra):
+    return (f"POST /api/v1/review-gate/prs/{REPO}/7/resume HTTP/1.1\r\nHost: x\r\n"
+            f"X-API-Key: write\r\nContent-Type: application/json\r\n{extra}\r\n").encode()
+
+
+def test_chunked_resume_is_rejected_with_one_response(gate_server):
+    escalate(gate_server)
+    chunk = b"%x\r\n" % len(SMUGGLED) + SMUGGLED + b"\r\n0\r\n\r\n"
+    data = raw_exchange(gate_server, _post_head("Transfer-Encoding: chunked\r\n") + chunk)
+    assert _responses(data) == 1 and data.startswith(b"HTTP/1.") and b" 400 " in data.split(b"\r\n")[0]
+    assert gate_server.gate_store.snapshot(PrKey(REPO, 7)).state.value == "escalated"
+
+
+def test_duplicate_content_length_is_rejected(gate_server):
+    data = raw_exchange(gate_server, _post_head("Content-Length: 0\r\nContent-Length: 5\r\n") + SMUGGLED)
+    assert _responses(data) == 1 and b" 400 " in data.split(b"\r\n")[0]
+
+
+def test_oversize_content_length_closes_connection(gate_server):
+    escalate(gate_server)
+    data = raw_exchange(gate_server, _post_head("Content-Length: 5000000\r\n") + SMUGGLED)
+    assert _responses(data) == 1 and b" 400 " in data.split(b"\r\n")[0]
+    assert b"Connection: close" in data
+
+
+def test_ordinary_resume_still_works_after_framing_rejections(gate_server):
+    escalate(gate_server)
+    raw_exchange(gate_server, _post_head("Transfer-Encoding: chunked\r\n") + b"0\r\n\r\n")
+    assert request(gate_server, RESUME, {}, key="write", method="POST")[0] == 200
