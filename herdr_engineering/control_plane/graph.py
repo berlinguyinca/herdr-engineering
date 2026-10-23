@@ -1453,7 +1453,7 @@ class GraphProjection:
             scope = node.eff_scope(principal, internal=False) if node.commons else node.scope
             wss = tuple(scope[3]) if isinstance(scope, tuple) else ()
             return {"node_id": node_id, "node_type": node.node_type, "label": view["label"], "state": view["state"],
-                    "workspaces": wss}
+                    "workspaces": wss, "scope": scope}
 
     def steer_facts(self, principal, node_id: str) -> dict:
         """What a steering request is fenced on, as ``principal`` sees it. KeyError if absent OR hidden.

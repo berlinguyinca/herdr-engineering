@@ -650,8 +650,13 @@ control_plane:
 Other keys: `max_question_chars`, `max_answer_chars`, `consults_per_10min`, `max_open_per_target`, `max_open_per_asker`,
 `max_open_per_room`, `links_per_10min`, `max_links_per_room`, `max_refs_per_read`. Unknown keys, wrong types and an unreadable
 section are refused (the last fails CLOSED: everything off). The kill switch stops creation, stops answering, removes the MCP
-tools, renders every reference as hidden, and removes `cross_link` edges from the Lineage views. **Revoking a link and cancelling a
-question always work.** The node and ledger reads of the keyed graph API are history and are not filtered.
+tools, renders every reference as hidden, empties `GET .../consultations` and `GET .../xlinks` (`enabled: false`), and removes `cross_link`
+edges and their ledger events from EVERY collab graph read (`lineage`, `lineage/timeline`, `lineage/events`, `nodes`, `nodes/{id}`,
+neighborhood, subgraph, `edge`). **Revoking a link and cancelling a question always work.** The keyed (operator/ingest) graph API
+is not behind the collab switch. If the central fleet file is deleted or unparseable AFTER having been valid, `collab.contextual`
+and `collab.steering` (the hot-reloaded switches) fail CLOSED (feature off, error logged once); `control_plane.config_failure_mode: last_good`
+is the explicit opt-in to keep the last good value instead. `delegation_enabled` is read once at start, so it cannot change under a bad file;
+any future hot-reloaded switch (forks) must read through `FleetConfigStore.secure_section`.
 
 ### 1. Context references in chat
 `POST /api/v1/collab/rooms/{room}/messages` accepts one optional `context`, exactly one of
@@ -716,25 +721,30 @@ Remote agents use MCP `consult_inbox` / `consult_answer` (listed only while the 
 | stale reference after rescope / removal / retraction | resolved at read, never cached server-side | rescope + comment tests |
 | cross-room link creation or leakage | one-room reader at create; per-room edge instance; reads gated by scope AND both endpoints | `test_a_link_is_per_room_and_never_leaks_into_another`, `test_both_ends_must_be_visible_and_in_different_granted_workspaces` |
 | link forging / squatting / tombstoning by an emitter | `cross_link` writable only by the room service principal; removal likewise; per-room key | `test_an_ingest_key_can_neither_forge_squat_nor_tombstone_a_link` |
-| link outlives its authorization | lapse sweep on unlink, grant drop and member removal; no resurrection | `test_unlinking_a_workspace_or_dropping_its_grant_lapses_the_link_for_good`, `test_removing_the_creator_ends_their_links` |
+| link outlives its authorization | lapse sweep on unlink, grant drop and member removal, and on every lineage read; no resurrection; at READ time a link shows only while active AND its creator is authorized AND both grants hold, so a down graph or a disabled creator never leaves it visible | `test_unlinking_a_workspace_or_dropping_its_grant_lapses_the_link_for_good`, `test_removing_the_creator_ends_their_links`, `test_a_revoked_link_is_hidden_at_once_even_with_the_graph_down_and_the_retraction_is_durable`, `test_a_disabled_creator_lapses_the_link_for_every_reader_and_the_next_read_sweeps_it` |
 | consultation spam / DoS | TTL, open caps per target/asker/room, rate limits, one answer, size caps | `test_limits_expiry_and_a_departed_asker` |
 | prompt injection through question or answer | text only; labelled untrusted; no task/proposal/message/graph write by the responder; spoofing characters stripped; the subject is withheld from remote agents | `test_an_external_agent_is_asked_in_text_only_and_never_sees_the_subject`, `test_a_member_asks_another_member_and_gets_one_text_answer` |
 | spoofed system message | server-set `asked_by` / `created_by`; the reference is a separate field, never part of the text; bodies naming an identity are refused | `test_who_may_ask_and_whom`, `test_who_may_link`, `collab-context.test.js` |
 | stale consultation | void when the asker leaves or the subject leaves the asker's sight; expiry | `test_a_subject_that_leaves_the_askers_sight_voids_the_question`, limits test |
 | notification / feed content leak | there is no notification channel; question and answer are never in the feed, the graph or another person's list | `test_the_graph_records_who_asked_whom_about_what_but_never_the_text`, `test_a_member_asks_…` |
 | kill switch | default off; per-request; fails closed; revoke/cancel still work | `test_the_switch_is_off_by_default_and_off_means_hidden_and_refused`, `test_switch_off_hides_links_from_the_lineage_but_revoking_still_works`, `tests/test_central_config_servers.py` |
-| restart / graph outage | event-sourced; unpublished links and tombstones retried | `test_a_sink_that_was_down_catches_up_and_a_restart_keeps_the_state`, `test_a_failed_tombstone_is_retried_after_a_restart` |
+| restart / graph outage | event-sourced; the pending publish/retract set is derived from the durable records and flushed at server start, every 30 s, and on lineage reads | `test_a_sink_that_was_down_catches_up_and_a_restart_keeps_the_state`, `test_a_restart_retries_a_retraction_the_graph_never_got` |
+| consultation thread reveals asker/target to people who cannot see the subject | the thread node and edge carry the SUBJECT's own scope label (room or mission, plus workspace); if that label cannot be carried nothing is published | `test_the_consultation_thread_is_visible_exactly_to_those_who_see_the_subject`, `test_a_subject_whose_scope_cannot_be_carried_publishes_no_thread` |
+| existence probing through consultation errors | unknown target, yourself, a target who cannot see the subject and a hidden subject are one `404 not found` | `test_one_answer_for_every_reason_a_question_cannot_be_asked` |
+| invisible / bidi / tag characters in questions, answers, notes | the external-agent sanitizer (`clean_text`: tag chars, soft hyphen, U+180E, all Cc/Cf/Cs/Co/Cn), over-long refused | `test_untrusted_text_is_cleaned_like_an_external_agents` |
+| unreadable fleet file keeps a switch on | hot switches fail closed unless `config_failure_mode: last_good` | `tests/test_central_config_servers.py::test_a_deleted_or_unparseable_fleet_file_turns_security_switches_off`, `..._the_feature_off`, `..._last_good_is_an_explicit_operator_opt_in` |
 
 ### Limitations
 - A remote agent is never told which node a question is about (the asker must put what it needs in the text), and A2A has no
   consultation method (MCP and REST only).
 - Consultation expiry is computed, not pushed: the graph thread node stays `open` (with `expires_at`) after expiry.
 - Chat chips are resolved when a message is fetched; a chip already on screen is not re-resolved until the room is reloaded.
-- The thread node and `consultation` edge show who asked whom about which node to everyone who can see the subject (not the text).
+- The thread node and `consultation` edge show who asked whom about which node to exactly the people who can see the subject (not the text). A subject whose label names several workspaces gets no thread node.
+- Chat text from people is not run through the invisible-character sanitizer (it would break ZWJ emoji); questions, answers and link notes are.
+- Counts in a graph read (`total`, page sizes) are computed before the link filter and can still reveal that a withheld link exists.
 - A link is a person's assertion, not proof that the two items are related. Only node-to-node links; a consultation is about a node.
 - Endpoint workspaces come from the node's scope label: a node whose events name no workspace (or several) cannot be a link endpoint.
-- The kill switch hides links in the Lineage views and ('Lineage' panel and `graph/lineage` routes); the keyed node/ledger reads keep
-  the history. Only the combined server (graph + lineage sink) offers these routes; a `--collab-only` process answers 409/404.
+- The kill switch hides links in every collab graph read; the keyed operator/ingest graph API is not behind it. Only the combined server (graph + lineage sink) offers these routes; a `--collab-only` process answers 409/404.
 - Operators can write `cross_link` (trusted, like every other write). No Pi change is needed or made; Pi emitters cannot write the kind.
 
 ## Forks and promotion (T13)

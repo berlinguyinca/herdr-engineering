@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import re
 import secrets
 import stat
@@ -26,6 +27,8 @@ ALL_ROLE = "all"
 # Read directly by the control-plane web process; never served to any host.
 CONTROL_PLANE_SECTION = "control_plane"
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_log = logging.getLogger(__name__)
+FAIL_CLOSED, LAST_GOOD = "fail_closed", "last_good"
 
 
 class FleetConfigError(ValueError):
@@ -202,6 +205,10 @@ class FleetConfigStore:
         try:
             new = load_fleet_config(self.path)
         except FleetConfigError as exc:
+            if self.last_error != str(exc)[:200]:        # log the transition once, never the values
+                _log.error("fleet config %s is unusable (%s); security-relevant switches %s", self.path.name,
+                           str(exc)[:200], "keep the last good value" if self.failure_mode() == LAST_GOOD
+                           else "FAIL CLOSED")
             self.last_error = str(exc)[:200]
             self._sig = sig
             return False
@@ -216,6 +223,27 @@ class FleetConfigStore:
             if self._signature() != self._sig:
                 self._reload_locked()
             return self._config
+
+    def failure_mode(self) -> str:
+        """What a security-relevant switch does while the file is deleted or unparseable AFTER having been valid:
+        ``fail_closed`` (default: feature off) or ``last_good`` (only when the operator wrote
+        ``control_plane.config_failure_mode: last_good`` in the last good file)."""
+        try:
+            mode = self._config.section(CONTROL_PLANE_SECTION).get("config_failure_mode")
+        except FleetConfigError:
+            return FAIL_CLOSED
+        return LAST_GOOD if mode == LAST_GOOD else FAIL_CLOSED
+
+    def secure_section(self, name: str = CONTROL_PLANE_SECTION) -> dict:
+        """Values for a security-relevant switch (collab.contextual, steering, forks, delegation). Raises
+        FleetConfigError while the latest load failed and the operator did not opt for ``last_good``: callers treat
+        that as 'feature off'. A plain ``current()`` still serves the last good config for everything else."""
+        with self._lock:
+            if self._signature() != self._sig:
+                self._reload_locked()
+            if self.last_error is not None and self.failure_mode() != LAST_GOOD:
+                raise FleetConfigError("fleet config unreadable: failing closed")
+            return self._config.section(name)
 
     def record_applied(self, host_id: str, revision: str) -> None:
         with self._lock:
