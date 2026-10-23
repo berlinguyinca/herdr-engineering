@@ -119,6 +119,7 @@ HELPERS_PER_HOST = 6                    # live helpers this host runs at once
 HELPER_MARGIN = 30.0                    # stop before the server's expiry, so the result is still accepted
 MAX_EGRESS_ASKS = 20                    # host-access requests one helper may cause
 HELPER_STDIN_MAX = 256_000
+HELPER_TUNNEL_IDLE = 900.0              # the egress proxy closes a helper's tunnel silent this long (reasoning can be slow)
 FINISH_BODY_MAX = 48 * 1024             # the service refuses bodies over 64 KiB (413): stay well below
 FINISH_ATTEMPTS = 3                     # refused finishes before only {"status": "failed"} is posted
 # what the service strips from a result anyway (all control characters but \t and \n, C1, U+2028/9): stripped here
@@ -231,6 +232,15 @@ def helper_prompt(role: str, ro_binds: list[str]) -> str:
                                else "\n\n--- task ---\n")
 
 
+def proxy_argv(spec: dict, d: Path) -> list[str]:
+    """The helper's egress proxy. It re-reads allow.txt for open tunnels every 2 s (its default --recheck), so a
+    removed or expired host is cut off at once, and drops a tunnel idle for HELPER_TUNNEL_IDLE seconds."""
+    return [sys.executable, spec["egress"], "serve", "--sock", spec["sock"],
+            "--allow-file", str(d / "allow.txt"), "--secrets-file", str(d / "secrets.json"),
+            "--services-file", str(d / "services.json"), "--log", str(d / "blocked.jsonl"),
+            "--idle-timeout", str(HELPER_TUNNEL_IDLE)]
+
+
 def helper_run(d: Path) -> int:
     """`collab-spawn.py helper-run DIR`: the supervisor of one helper. The runner starts it in its own session and
     hands it the task on stdin; it starts the helper's egress proxy, runs the harness in the box with the task on
@@ -245,10 +255,7 @@ def helper_run(d: Path) -> int:
     try:
         sock = spec["sock"]
         with open(d / "proxy.err", "ab") as perr:
-            proxy = subprocess.Popen([sys.executable, spec["egress"], "serve", "--sock", sock,
-                                      "--allow-file", str(d / "allow.txt"), "--secrets-file", str(d / "secrets.json"),
-                                      "--services-file", str(d / "services.json"), "--log", str(d / "blocked.jsonl")],
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=perr)
+            proxy = subprocess.Popen(proxy_argv(spec, d), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=perr)
         for _ in range(100):
             if (os.path.exists(sock) and stat.S_ISSOCK(os.stat(sock).st_mode)) or proxy.poll() is not None:
                 break

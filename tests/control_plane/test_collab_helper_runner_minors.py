@@ -7,7 +7,13 @@ import json
 
 import pytest
 
-from tests.control_plane.test_collab_egress import load_egress
+from tests.control_plane.test_collab_egress import (  # noqa: F401
+    Echo,
+    Proxy,
+    echo,
+    load_egress,
+    short_dir,
+)
 from tests.control_plane.test_collab_helper_runner import hr  # noqa: F401
 from tests.control_plane.test_collab_spawn import WORKER, calls, rig, runner  # noqa: F401
 from tests.control_plane.test_collab_tasks import svc  # noqa: F401
@@ -82,3 +88,53 @@ def test_a_successor_starts_from_the_handoff_note():
     p = runner.helper_prompt("successor", [])
     assert "Continue the work from the handoff below" in p and p.endswith("--- handoff from the agent you replace ---\n")
     assert runner.helper_prompt("worker", []).endswith("--- task ---\n")
+
+
+# ------------------------------------------------------------------ the proxy cuts tunnels that lost approval (item 1)
+def closed_within(s, seconds):
+    s.settimeout(seconds)
+    try:
+        return s.recv(10) == b""
+    except ConnectionResetError:
+        return True
+    except TimeoutError:
+        return False
+
+
+def test_an_open_tunnel_is_cut_when_its_host_leaves_the_allow_file(short_dir, echo):
+    p = Proxy(short_dir, args=["--recheck", "0.2"])
+    try:
+        other = Echo()
+        p.allow.write_text(f"127.0.0.1:{echo.port}\n127.0.0.1:{other.port}\n")
+        a, sa = p.connect(f"127.0.0.1:{echo.port}")
+        b, sb = p.connect(f"127.0.0.1:{other.port}")
+        assert sa == sb == 200
+        a.sendall(b"x")
+        assert a.recv(1) == b"x"
+        p.allow.write_text(f"127.0.0.1:{other.port}\n")             # Remove / expiry of the first host
+        assert closed_within(a, 5)
+        b.sendall(b"y")
+        assert b.recv(1) == b"y"                                   # the still-approved tunnel keeps working
+        b.close()
+        other.close()
+    finally:
+        p.stop()
+
+
+def test_a_tunnel_by_name_is_cut_when_its_listed_internal_address_goes(short_dir, echo):
+    p = Proxy(short_dir, args=["--recheck", "0.2"])
+    try:
+        p.allow.write_text(f"localhost:{echo.port}\n127.0.0.1:{echo.port}\n")
+        a, st = p.connect(f"localhost:{echo.port}")
+        assert st == 200
+        p.allow.write_text(f"localhost:{echo.port}\n")             # the name stays, its loopback address does not
+        assert closed_within(a, 5)
+    finally:
+        p.stop()
+
+
+def test_helper_proxies_get_an_idle_timeout(tmp_path):
+    argv = runner.proxy_argv({"egress": "/x/collab-egress.py", "sock": "/s/egress.sock"}, tmp_path)
+    i = argv.index("--idle-timeout")
+    assert float(argv[i + 1]) == runner.HELPER_TUNNEL_IDLE and 300 <= runner.HELPER_TUNNEL_IDLE <= 3600
+    assert "--allow-file" in argv and str(tmp_path / "allow.txt") in argv
