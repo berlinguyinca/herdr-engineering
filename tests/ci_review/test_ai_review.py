@@ -660,6 +660,26 @@ def test_pr_controlled_paths_stay_inside_the_fence(env):
     assert inject not in trusted and "x\n" not in trusted
 
 
+def test_a_pr_with_nothing_reviewable_is_never_approved(env):
+    only_skipped = DIFF[DIFF.index("diff --git a/uv.lock"):]
+    env.set_pr(diff=only_skipped)
+    assert review(env) == 1
+    assert env.rev_calls() == [] and env.terminal() == [] and env.comments() == []
+
+
+def test_checkout_bounded_by_unpacked_size(env):
+    tar = env.tmp / "bomb.tar.gz"
+    with tarfile.open(tar, "w:gz") as tf:
+        body = b"\0" * (3 * 1024 * 1024)            # compresses to a few KB
+        info = tarfile.TarInfo("acme-widget-aaaaaaa/big.bin")
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    env.write_state({**env.read_state(), "tarball": str(tar)})
+    env.config({"sandbox": {"checkout_max_mb": 2}})
+    assert review(env) == 1
+    assert env.rev_calls() == [] and env.terminal() == []
+
+
 # ---------- dry run and poll ----------
 
 def test_dry_run_posts_nothing(env):

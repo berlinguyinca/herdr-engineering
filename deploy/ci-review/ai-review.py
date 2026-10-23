@@ -51,6 +51,7 @@ CLAIMABLE = ("code", "security", "tests", "docs", "performance")
 LIST_MAX = 200                       # findings per list in one verdict; more is malformed
 TEXT_MAX = 4000                      # characters per finding field; more is malformed
 COMMENT_MAX = 60000
+CHECKOUT_MEMBERS_MAX = 200_000       # entries in the checkout tarball
 OUTPUT_MAX = 4_000_000               # bytes of the reviewer's stdout / verdict file that are read                  # GitHub refuses comment bodies over 65536 characters
 LAST_RESULT: dict | None = None      # the last review's outcome (tests, --dry-run inspection)
 
@@ -648,13 +649,21 @@ class Run:
     def checkout(self, gh: Gh, repo: str, sha: str) -> None:
         tgz = self.priv / "src.tar.gz"
         gh.tarball(repo, sha, tgz)
-        if tgz.stat().st_size > self.cfg["sandbox"]["checkout_max_mb"] * 1024 * 1024:
+        cap = self.cfg["sandbox"]["checkout_max_mb"] * 1024 * 1024
+        if tgz.stat().st_size > cap:
             raise ReviewFailed("the checkout tarball is larger than sandbox.checkout_max_mb")
         self.src = self.dir / "src"
         self.src.mkdir(mode=0o700)
         try:
             with tarfile.open(tgz) as tf:
-                members = tf.getmembers()
+                members = []
+                total = 0
+                for m in tf:                   # bound the UNPACKED size and member count before extracting
+                    total += max(m.size, 0)
+                    members.append(m)
+                    if total > cap or len(members) > CHECKOUT_MEMBERS_MAX:
+                        raise ReviewFailed("the checkout unpacks to more than sandbox.checkout_max_mb "
+                                           f"(or more than {CHECKOUT_MEMBERS_MAX} entries)")
                 for m in members:              # strip GitHub's "owner-repo-sha/" top directory
                     m.name = m.name.split("/", 1)[1] if "/" in m.name else ""
                 tf.extractall(self.src, members=[m for m in members if m.name], filter="data")
@@ -861,6 +870,9 @@ def review(cfg: dict, repo: str, n: int, dry_run: bool) -> int:
             else:
                 review_files.append(f)
         chunks = make_chunks(review_files, cfg["chunk_bytes"])
+        if not chunks:                           # all binary/generated: no review ran, so nothing may claim one
+            raise ReviewFailed("nothing reviewable in the diff (every file is binary or skipped); "
+                               "this PR needs a human review")
         say(f"{len(files)} file(s), {len(review_files)} reviewed, {len(chunks)} chunk(s)")
         pend = cfg["post_pending"]
         if pend:
