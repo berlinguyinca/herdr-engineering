@@ -80,9 +80,16 @@ function markdownLink(label, target, depth) {
   return anchor(web, labelHtml, web.href) + suffix;
 }
 
+const LINK_SYNTAX_MAX = 30000;
+const TOKEN_WITH_LINKS = /`([^`\n]+)`|\[([^\]\n]{1,500})\]\(([^\s)]{1,2100})\)|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*|~~([^~\n]+)~~|(?<![A-Za-z0-9])(https?:\/\/[^\s<>`*"\\]{1,2100})/g;
+// same groups, the link alternative can never match (groups 2 and 3 stay undefined)
+const TOKEN_NO_LINKS = /`([^`\n]+)`|(\b\B)()|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*|~~([^~\n]+)~~|(?<![A-Za-z0-9])(https?:\/\/[^\s<>`*"\\]{1,2100})/g;
+
 function inline(text, depth = 0, noLinks = false) {
   if (depth > 4) return esc(text);
-  const token = /`([^`\n]+)`|\[([^\]\n]{1,500})\]\(([^\s)]{1,2100})\)|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*|~~([^~\n]+)~~|(?<![A-Za-z0-9])(https?:\/\/[^\s<>`*"\\]{1,2100})/g;
+  // The markdown-link alternative scans up to ~2600 characters per '[': only try it when a link can exist and the
+  // text is of chat size, so a 100k-character "[[[[" message cannot make the page stall.
+  const token = text.length <= LINK_SYNTAX_MAX && text.includes('](') && text.includes(')') ? TOKEN_WITH_LINKS : TOKEN_NO_LINKS;
   let out = '', end = 0;
   for (const m of text.matchAll(token)) {
     out += esc(text.slice(end, m.index));
