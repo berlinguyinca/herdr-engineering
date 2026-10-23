@@ -76,12 +76,16 @@ def test_remove_also_revokes_a_live_approval(w):
     assert "api.example.org:443" not in w.s.egress_allowlist(w.room)
 
 
-def test_allowlist_is_per_room_and_always_has_family_endpoints(w):
+def test_allowlist_is_per_room_and_has_the_endpoints_of_the_rooms_families_only(w):
     w.s.decide_egress(w.op, ask(w)["id"], "approve")
     assert "api.example.org:443" not in w.s.egress_allowlist(w.room2)
-    for hosts in FAMILY_ENDPOINTS.values():
-        assert set(hosts) <= set(w.s.egress_allowlist(w.room2))
     assert FAMILY_ENDPOINTS["claude-code"] == ["api.anthropic.com:443"]
+    every = {h for hosts in FAMILY_ENDPOINTS.values() for h in hosts}
+    assert not every & set(w.s.egress_allowlist(w.room2))            # no families allowed: no model endpoint
+    w.s.set_room_profile(w.alice, w.room2, {"allowed_families": ["claude-code", "agent"]})
+    assert every & set(w.s.egress_allowlist(w.room2)) == {"api.anthropic.com:443"}
+    w.s.set_room_profile(w.alice, w.room2, {"allowed_families": ["pi", "codex"]})
+    assert every & set(w.s.egress_allowlist(w.room2)) == {"api.openai.com:443", "llm.metabolomics.us:443"}
 
 
 def test_permanent_hosts_from_the_profile_are_listed(w):

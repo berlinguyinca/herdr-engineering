@@ -454,8 +454,9 @@ with no group or other bits. Never put secret values in the profile, in task tex
 proxy tunnels only the room's allowlist:
 * the always-allowed hosts;
 * unexpired approvals;
-* each family's model endpoint, which is always on the list: `api.anthropic.com:443`, `api.openai.com:443`
-  and `llm.metabolomics.us:443`.
+* the model endpoint of each family the room's profile allows, which is always on the list: `api.anthropic.com:443`
+  (claude-code), `api.openai.com:443` (codex) and `llm.metabolomics.us:443` (pi, the gateway); none for `agent`.
+  A room that allows no family gets none of them.
 
 Hosts are `name:port`, `IPv4:port` or a bracketed IPv6 literal `[2001:db8::1]:port`, always in canonical form
 (lowercase, `0443` becomes `443`, IPv6 in its short spelling, no zone id), in requests, approvals, the profile
@@ -547,7 +548,7 @@ model only, never the task text or the result).
   tunnels and for service upstreams (`/svc`) alike.
 * **Allowlisted hosts are room-wide.** Approving a host for one helper approves it for every helper in the room,
   for the approval's lifetime, and a helper can send anything it can see there (its work directory, a parent's
-  read-only view, the SSH keys). The family model endpoints are always reachable.
+  read-only view, the SSH keys). The model endpoints of the families the room allows are always reachable.
 * **The harness login is readable** in the box, and the model endpoint is always allowed. A helper box does
   **not** get the operator's `~/.claude`, `~/.codex`, `~/.pi` or `~/.claude.json` (no CLAUDE.md, auto-memory,
   `projects/`, hooks, plugins, skills or settings; workers still get them read-only, 5.1e). The runner makes a
