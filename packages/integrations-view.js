@@ -129,6 +129,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='';
   let healthView=null;
+  let performanceData=null,performanceError='',performanceDays=14;
   const pending=new Map();
   const listenerController=new AbortController();
   const reviewCache=new Map();
@@ -138,9 +139,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     ${isCi?'<div data-ci-health></div>':''}
     <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
-    ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="0">All retained history</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div data-ci-insights></div>' : ''}
+    ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="0">All retained history</option><option value="7">Last 7 days</option><option value="14">Last 14 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div data-ci-insights></div>' : ''}
     ${repository || mission || session ? `<p class="ig-note">Filtered to ${esc(repository || mission || session)} · <a href="#/${kind}">Clear context</a></p>` : ''}
-    ${isCi ? '<details class="ci-charts" data-ci-charts><summary>Run durations · histograms, project & language averages</summary><div class="ci-charts-body" data-ci-charts-body></div></details>' : ''}
+    ${isCi ? '<details class="ci-charts" data-ci-charts><summary>Run durations · project, language & cache health</summary><div class="ig-controls ci-cache-controls"><label>Cache and trend window<select data-ci-performance-window><option value="7">Last 7 days</option><option value="14" selected>Last 14 days</option></select></label><p class="ci-chart-note">Cache and regression windows are limited to 7 or 14 days within the selected period.</p></div><div class="ci-charts-body" data-ci-charts-body></div></details>' : ''}
     <p class="ig-note" data-ig-count></p><div class="ig-layout"><section id="ig-results" role="tabpanel" aria-labelledby="ig-tab-${state.tab}"></section><aside class="ig-inspector" aria-label="Pipeline inspector" hidden></aside></div>
     <div class="ig-pages"><button type="button" class="hd-btn" data-page="previous">Previous</button><span data-ig-page></span><button type="button" class="hd-btn" data-page="next">Next</button></div><div data-ig-runners></div>${!isCi ? '<details class="ig-runners"><summary>Start a review</summary><p>Start Plannotator from the project workspace with <code>herdr-plannotator --help</code>. Its review link and upstream decision appear here when the launcher is connected to this control plane.</p></details>' : ''}`;
   const el=selector=>container.querySelector(selector);
@@ -200,7 +201,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(healthElement.dataset.signature!==healthKey){healthElement.dataset.signature=healthKey;const issuesOpen=healthElement.querySelector('details')?.open;healthElement.innerHTML=health;if(issuesOpen && healthElement.querySelector('details'))healthElement.querySelector('details').open=true;}
     const all=entries(),filtered=selectIntegrations(all,state),pageSize=20;
     state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
-    const nextSignature=JSON.stringify([state,data,reportData,[...reviewCache]]);
+    const nextSignature=JSON.stringify([state,data,reportData,performanceData,performanceError,performanceDays,[...reviewCache]]);
     if(isCi) {
       const observations=ciObservations();
       const model=ciInsightsModel(observations,state);
@@ -212,7 +213,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       }
       for(const [selector,field,label] of [['[data-ci-repository]','repository','All repositories'],['[data-ci-branch]','branch','All branches']]){
         const select=el(selector),values=new Map();
-        for(const r of [...observations.pipelines,...records(observations.reports)]) {const value=field==='repository'?String(r.provider_repo_id??r.repository_id??r.repository??''):text(r.branch);if(value)values.set(value,field==='repository'?`${r.repository||value} (${value})`:value);}
+        for(const r of [...observations.pipelines,...records(observations.reports),...records(performanceData?.cache_groups),...records(performanceData?.execution_trends)]) {const value=field==='repository'?String(r.provider_repo_id??r.repository_id??r.repository??''):text(r.branch);if(value)values.set(value,field==='repository'?`${r.repository||value} (${value})`:value);}
         if(state[field])values.set(state[field],values.get(state[field])||state[field]);
         const options=`<option value="">${label}</option>`+[...values].sort((a,b)=>a[1].localeCompare(b[1])).map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join('');
         if(select.innerHTML!==options)select.innerHTML=options;select.value=state[field];
@@ -227,7 +228,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       }
       if(isCi) {
         const chart=el('[data-ci-charts-body]');
-        const html=data ? renderCiCharts(ciChartModel(selectIntegrations(all,{...state,tab:'all'})),{
+        const html=data ? renderCiCharts(ciChartModel(selectIntegrations(all,{...state,tab:'all'}),{data:performanceData,filters:state,loading:performanceData===null&&!performanceError&&typeof client.getCiPerformance==='function',error:performanceError}),{
           retained:!!reportData,days:state.days,scope:reportData?.scope,stale:!!data.stale,partial:data.status==='partial'||Object.keys(data.repo_errors || {}).length>0,
         }) : '<p class="ci-chart-note">Waiting for CI reports…</p>';
         if(chartSignature!==html) {
@@ -289,7 +290,17 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       if(selected?.id===key && step===selectedStep){log=response;logError='';}
     },()=>{if(selected?.id===key && step===selectedStep)logError='Step output could not refresh.';});
   }
+  function refreshPerformance(reset=false) {
+    if(!isCi || typeof client.getCiPerformance!=='function')return;
+    if(reset){pending.get('performance')?.abort();pending.delete('performance');performanceData=null;performanceError='';}
+    request('performance',signal=>client.getCiPerformance({days:performanceDays,branch:state.branch||undefined,signal}),response=>{
+      if(response?.schema_version!==1 || response.days!==performanceDays || !Array.isArray(response.cache_groups) || !Array.isArray(response.execution_trends) || !Array.isArray(response.alerts))throw new Error('Invalid CI performance response');
+      performanceData=response;performanceError='';
+    },()=>{performanceError='Cache health could not refresh.';});
+    if(reset)draw();
+  }
   function refresh() {
+    refreshPerformance();
     if(isCi && typeof client.getCiReports==='function')request('reports',signal=>client.getCiReports({signal}),response=>{
       if(!Array.isArray(response?.reports)||!Array.isArray(response?.pipelines))throw new Error('Invalid CI history response');
       reportData=response;reportsError='';
@@ -369,7 +380,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const index=tabs.findIndex(([key])=>key===state.tab);
     state.tab=tabs[event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:tabs.length-1))%tabs.length][0];state.page=0;event.preventDefault();draw();el(`[data-tab="${state.tab}"]`).focus();
   });
-  if(isCi)for(const [selector,key] of [['[data-ci-repository]','repository'],['[data-ci-branch]','branch'],['[data-ci-period]','days']])el(selector).addEventListener('change',event=>{state[key]=event.target.value;state.page=0;draw();});
+  if(isCi)for(const [selector,key] of [['[data-ci-repository]','repository'],['[data-ci-branch]','branch'],['[data-ci-period]','days']])el(selector).addEventListener('change',event=>{state[key]=event.target.value;state.page=0;if(key==='days'&&[7,14].includes(Number(state.days))){performanceDays=Number(state.days);el('[data-ci-performance-window]').value=String(performanceDays);}if(key==='days'||key==='branch')refreshPerformance(true);draw();});
+  if(isCi)el('[data-ci-performance-window]').addEventListener('change',event=>{performanceDays=Number(event.target.value);if(Number(state.days)===7&&performanceDays===14){state.days='14';el('[data-ci-period]').value='14';}refreshPerformance(true);});
   container.addEventListener('input',event=>{if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
   el('[data-ig-search]').addEventListener('input',event=>{state.search=event.target.value;state.page=0;draw();});
   el('[data-ig-group]').addEventListener('change',event=>{state.group=event.target.value;draw();});
