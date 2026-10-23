@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Alternative implementation forks, comparison and promotion (T13, stacked on T12)
+- New steering actions `fork` and `promote` (opt-in via `steering.actions` and `steering.forks.enabled`), a comparison read model
+  `GET /api/v1/collab/rooms/{id}/forks`, and a Forks panel in the room workbench. Fork preserves the original; nothing is deleted.
+- Promotion is two-step and human-confirmed, promotes exactly one fork at an exact head, and never merges. See `docs/contracts/lineage-events.md` ("T13").
+- Rollback: revert the PR (code only; no migration).
+
 ### Lineage graph, Gantt timeline and replay (T09, stacked on #167, #165, #164)
 - Room workbench: new read-only "Lineage" panel (`packages/collab-lineage.js`): layered lineage graph, Gantt timeline with
   head-change and stale markers, replay scrubber, filters and node inspector, each with a table alternative; keyboard

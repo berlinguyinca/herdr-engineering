@@ -149,6 +149,7 @@ export class CollabApi {
   retractComment(room, id, revision) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/comments/${encodeURIComponent(id)}/retract`, { expected_revision: revision }); }
   commentHistory(room, id) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/comments/${encodeURIComponent(id)}/history`); }
   steeringTarget(room, nodeId) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/steering/target?${new URLSearchParams({ node_id: nodeId })}`); }
+  forks(room, nodeId) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/forks?${new URLSearchParams({ node_id: nodeId })}`); }
   steeringList(room, nodeId) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/steering${nodeId ? `?${new URLSearchParams({ node_id: nodeId })}` : ''}`); }
   proposeSteering(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/steering`, body); }
   confirmSteering(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/steering/${encodeURIComponent(id)}/confirm`, body); }

@@ -515,3 +515,43 @@ Other keys: `max_instruction_chars`, `propose_per_10min`, `confirm_per_10min`, `
 - Every offer, redeliveries included, is a `steer_delivered` audit event with its `delivery` number; the counter is rebuilt from those events on restart.
 - `GET /api/v1/steering/pending?instance_id=<id>`: when the target node carries an `instance_id` attribute, only a caller presenting that id is offered the request, so two Pi instances sharing one key do not consume each other's requests. Nodes without the attribute keep key-only pinning.
 - The steering routes refuse (403, `authentication_required`) on an open listener, which has no principal to pin to.
+
+## Forks and promotion (T13)
+
+Alternative implementations reuse the existing vocabulary; there is no second store.
+
+- A fork is an OWNED node `approach:<id>` (written by the Pi emitter) plus a `fork` edge from the origin
+  (`attempt`, `agent`, `task` or another `approach`) to it. Siblings are approaches that share an origin.
+- A decision is a `supersession` edge winner -> loser. Nothing is ever deleted; the loser is only marked
+  `superseded`, the winner `selected`.
+- Approach attrs (all self-reported by the fork's own emitter, shown as `source: approach_owner, verified: false`
+  and never used to gate anything): `approach_id, origin_id, mission_id, task_id, base_sha, head_sha, branch, repo,
+  worktree_id, files_changed, insertions, deletions, touched_paths, elapsed_s, cost_usd, tokens, pr, pushed_head`.
+- Fork and promote are steering actions (T12 flow: propose, a different member confirms, keyed delivery to the
+  node owner's key, ack). They are not in the default `actions`; both the `actions` list and
+  `control_plane.collab.steering.forks.enabled: true` must opt in. YAML under `steering.forks`:
+  `enabled`, `max_forks_per_origin` (5), `max_open_forks_per_room` (20), `require_validation` (true),
+  `min_reviews` (0), `evidence_writers` (principals trusted to write validation/review evidence), `max_compared` (10).
+- `fork` needs a `base_sha` that the graph shows for the origin. `promote` needs a live, non-superseded approach
+  with a full `head_sha` and `expected_head`; readiness is re-checked at propose, confirm and delivery.
+- Evidence that counts: `validated` / `reviewed` (verdict `lgtm`) edges bound to the exact head, not stale or removed,
+  written by an `evidence_writers` principal. A `blocked` edge from such a writer blocks promotion.
+- Promotion race: the earliest confirmation wins, an acked-applied promotion closes the group, and Pi holds a
+  cross-process claim per origin. Pi pushes exactly the confirmed sha (never forced), opens a DRAFT PR, links it
+  (T05) and acks `applied` only after all three. It never merges.
+- `GET /api/v1/collab/rooms/{id}/forks?node_id=` returns the comparison read model (403 `forks_disabled` when off).
+
+| Threat | Control | Test |
+|---|---|---|
+| Fork flood, disk | per-origin and per-room caps on both sides, free-disk floor on Pi | `test_forks.py`, `herdr-forks.test.ts` (limits) |
+| Fork of a node the actor cannot see | target resolved through room visibility, 404 otherwise | `test_forks.py` |
+| Stale, superseded or unvalidated promotion | `promotion_check` at propose, confirm, delivery; Pi checks head | `test_forks.py`, promotion tests |
+| Comparison forged by the fork's agent | self-reported labels, only operator-listed writers count | `test_forks.py` |
+| Promotion race | confirmation order plus Pi registry claim | race tests (both repos) |
+| Branch or path injection | Pi derives every name from the steering id; sha-only params | `parseForkParams`, derived-name test |
+| Closing siblings destroys work | siblings only marked, dirs and branches kept | promotion test |
+| Confused deputy across rooms | room checked on propose, delivery and Pi | wrong-room tests |
+
+Limitations: T06 review quorum is not on this stack (comparison reports `quorum: unavailable`); independent
+evidence writers must be keys that can see room-scoped nodes, i.e. operator keys; an older Pi ignores the new actions
+and Herdr re-offers up to 5 times.

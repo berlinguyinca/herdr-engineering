@@ -805,7 +805,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     // ---- Lineage: graph, Gantt, replay and inspector. Read-only; the server filters every read by your CURRENT
     // membership. Live = the head of your ledger (refreshed while open); a replay position is static.
     // Comments and steering for the selected node (collab-workbench.js). The server checks every one of these again.
-    const WB = { at: 0, edge: null, nodeId: null, comments: [], target: null, steers: [], error: null, steerError: null, notice: null, draft: freshDraft(),
+    const WB = { at: 0, edge: null, nodeId: null, comments: [], target: null, forks: null, forksError: null, steers: [], error: null, steerError: null, notice: null, draft: freshDraft(),
       editing: null, history: null, confirming: null, busy: false, seq: 0 };
     const wbModel = () => ({ ...WB, me: me.user_id, isOwner: info.role === 'owner',
       writable: canPost && (LIN.step === null || !!(LIN.asOf && LIN.asOf.head)),
@@ -826,12 +826,20 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (!node) { WB.nodeId = null; return; }
       const my = ++WB.seq;
       WB.nodeId = node; WB.at = Date.now();
-      const [c, t, st] = await Promise.allSettled([api.comments(roomId, { anchor: WB.edge ? { kind: 'edge', ...WB.edge } : { kind: 'node', node_id: node } }), api.steeringTarget(roomId, node), api.steeringList(roomId, node)]);
+      const forkable = /^(attempt|agent|task|approach):/.test(node);
+      const [c, t, st, fk] = await Promise.allSettled([api.comments(roomId, { anchor: WB.edge ? { kind: 'edge', ...WB.edge } : { kind: 'node', node_id: node } }), api.steeringTarget(roomId, node), api.steeringList(roomId, node),
+        forkable ? api.forks(roomId, node) : Promise.reject(new Error('not forkable'))]);
       if (my !== WB.seq || !alive || LIN.sel !== node) return;
       WB.comments = c.status === 'fulfilled' && Array.isArray(c.value.comments) ? c.value.comments : [];
       if (c.status === 'rejected') WB.error = 'Comments could not be loaded for this item.'; else if (!keep) WB.error = null;
       WB.target = t.status === 'fulfilled' && t.value && typeof t.value.fence === 'string' ? t.value : null;
       WB.steers = st.status === 'fulfilled' && Array.isArray(st.value.steering) ? st.value.steering : [];
+      WB.forks = fk.status === 'fulfilled' && fk.value && Array.isArray(fk.value.forks) ? fk.value : null;       // 403 forks_disabled / 404 simply show nothing
+      WB.forksError = forkable && fk.status === 'rejected' && fk.reason && fk.reason.status && ![403, 404].includes(fk.reason.status) ? 'Forks could not be loaded for this item.' : null;
+      const mine = WB.forks && WB.forks.forks.find((x) => x.approach_id === node);
+      if (mine && mine.head_sha) WB.draft.expected_head = mine.head_sha;
+      const bc = WB.target && WB.target.fork ? Object.keys(WB.target.fork.base_candidates || {}) : [];
+      if (bc.length && !bc.includes(WB.draft.base_sha)) WB.draft.base_sha = bc[0];
       if (t.status === 'rejected') WB.steerError = 'Steering details could not be loaded for this item.'; else if (!keep) WB.steerError = null;
       drawLineage(true);
     }
@@ -839,7 +847,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       LIN.sel = id; LIN.focus = id;
       if (!id) { WB.nodeId = null; WB.seq += 1; return; }
       if (WB.nodeId !== id) {
-        Object.assign(WB, { nodeId: id, edge: null, comments: [], target: null, steers: [], error: null, steerError: null, notice: null, editing: null, history: null, confirming: null, draft: freshDraft() });
+        Object.assign(WB, { nodeId: id, edge: null, comments: [], target: null, forks: null, forksError: null, steers: [], error: null, steerError: null, notice: null, editing: null, history: null, confirming: null, draft: freshDraft() });
         loadWorkbench();
       }
     }
@@ -855,6 +863,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     function wbAct(act, id) {
       const c = WB.comments.find((x) => x.comment_id === id);
       const s = WB.steers.find((x) => x.steering_id === id);
+      if (act === 'pick-fork' && id) { pickNode(id); drawLineage(true); return; }
+      if (act === 'promote-start' && id) { pickNode(id); WB.draft.action = 'promote'; drawLineage(true); return; }
       if (act === 'edge-clear') { WB.edge = null; WB.editing = null; WB.history = null; loadWorkbench(); return; }
       if (act === 'edit' && c) { WB.editing = { id, text: c.text || '' }; drawLineage(true); }
       else if (act === 'edit-cancel') { WB.editing = null; drawLineage(true); }
