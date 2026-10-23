@@ -100,7 +100,7 @@ _PROFILE_BAD_HEADERS = frozenset({"host", "content-length", "transfer-encoding",
                                   "proxy-authorization", "te", "trailer"})
 _PROFILE_KEYS = frozenset({"allowed_families", "allowed_models", "tools_allowed", "permanent_hosts", "services",
                            "ssh_secret_names", "spend_tokens_per_day", "limits"})
-# The model endpoint each harness family must reach; merged into every room's host allowlist.
+# The model endpoint each harness family must reach; merged into the host allowlist of rooms that allow that family.
 FAMILY_ENDPOINTS: dict[str, list[str]] = {
     "claude-code": ["api.anthropic.com:443"],
     "codex": ["api.openai.com:443"],
@@ -1760,11 +1760,13 @@ class CollabService:
                 if r["room_id"] == room_id and r["state"] == "approved" and r["expires_at"] > now}
 
     def egress_allowlist(self, room_id: str) -> list[str]:
-        """Permanent hosts, unexpired approvals and every family's model endpoint."""
+        """Permanent hosts, unexpired approvals and the model endpoint of each family the room allows (helpers of
+        other families never start there, so their endpoints are not opened)."""
         with self._lock:
-            hosts = set(self._profile(room_id)["permanent_hosts"]) | self._egress_live(room_id, self._now())
-            for eps in FAMILY_ENDPOINTS.values():
-                hosts.update(eps)
+            profile = self._profile(room_id)
+            hosts = set(profile["permanent_hosts"]) | self._egress_live(room_id, self._now())
+            for fam in profile["allowed_families"]:
+                hosts.update(FAMILY_ENDPOINTS.get(fam, ()))
             return sorted(hosts)
 
     def request_egress(self, pr: Principal, room_id: str, agent_id: str, host: Any, port: Any) -> dict:
