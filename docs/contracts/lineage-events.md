@@ -312,17 +312,22 @@ are 400 (`step`/`at` together, negative step, non-ISO `at`, unknown type, limit 
 
 ### Replay semantics
 - **Position** is a count of the READER's own visible ledger events (`step`, 0..`visible_events`), so no number reveals how many
-  hidden events exist. Past the end clamps to now (silently). `at` resolves, by server receipt time (never the emitter's
+  hidden events exist. Past the end clamps to now (silently). `at` (a timestamp without a zone is UTC) resolves, by server receipt time (never the emitter's
   `occurred_at`), to the number of visible events BEFORE the first one received after that instant: a prefix of admission order.
 - **Replay equals live at that point.** The graph at step k is a projection built from every stored lineage event (ALL rooms:
   cross-room scope meets and last-writer fields resolve exactly as they did) with admission number <= that of the k-th visible
   event. `apply` is commutative and idempotent, so this equals a projection that was fed those events live (tested at every
   step, for several readers, and after a rebuild). The head (step = visible_events) is the live projection itself.
 - **Replay never widens visibility.** (1) An event is shown only if its own scope label is visible to the reader and the object it
-  concerns is visible to the reader NOW. (2) A replayed projection reads through the CURRENT projection: a node or edge in the
-  past is visible only if it is also visible now (tombstones are history and ignored; a later narrowing is not). So re-scoping
-  a node to private, or into another room, hides its past from this room too; `stale`/`bindings` of the past never reveal a
-  binding that is hidden now. (3) Membership is the reader's membership at THIS request: someone added later can replay what
+  concerns is visible to the reader NOW: for an edge event that is the exact edge instance it touched (its binding, and its writer's
+  instance for a commons `from` node), never a sibling binding of the same triple; for a commons node event it is the writer's
+  CURRENT value of every field the event carried. (2) A replayed projection reads through the CURRENT projection: a node or
+  edge in the past is visible only if it is also visible now (tombstones are history and ignored; a later narrowing is not), and a commons
+  field value of the past is shown only if the same writer's current value of that field is visible, so a writer who later makes a
+  field private (or re-scopes an edge or node narrower) takes its past out of sight too. `stale`/`bindings` of the past never reveal a
+  binding that is hidden now. What stays visible is only what the reader can see now in the same place: a value a writer published to
+  the room and has since REPLACED with another room-visible value is shown at its own past position (that is what a replay is).
+  (3) Membership is the reader's membership at THIS request: someone added later can replay what
   happened before they joined (like every other read); someone removed gets 404 at every step.
 - **Budgets** (all report `truncated_reason`, never a count of hidden items): ledger window `LEDGER_SCAN_BUDGET` = newest 20,000
   events of the room's contexts (`window_trimmed`; step 0 is then the state just before the window); a replay applies at most
@@ -330,7 +335,9 @@ are 400 (`step`/`at` together, negative step, non-ISO `at`, unknown type, limit 
   `SCAN_BUDGET`, `EDGE_SCAN_TOTAL`, `MAX_EDGES`, `MAX_RESPONSE_BYTES`; the timeline caps lanes (300) and markers (1000). At most
   two replayed projections are cached (keyed by position and invalidated when an event arrives); one replay is built at a time.
 - **Pagination.** `limit` (<= 1000) and `offset` page the room's visible nodes (types in fixed order, admission order inside a
-  type); a page also carries the edges between its nodes and the nodes of earlier pages.
+  type); a page also carries the edges between its nodes and the nodes of earlier pages. The `SCAN_BUDGET` of examined ids is shared
+  round-robin between node types, so one busy kind cannot starve the others. The web page does not pass `node_types` (it filters
+  client-side over what was loaded).
 
 ### Timeline
 Spans come from recorded `node.upsert`/`node.state` states (a span ends at the next state; a terminal state `done failed cancelled

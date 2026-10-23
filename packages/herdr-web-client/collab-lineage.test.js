@@ -217,6 +217,12 @@ test('inspector escapes everything, links neighbours as buttons, shows stale and
   assert.match(renderInspector(mergePages([{ nodes: [node('attempt:a1')], edges: [] }]), 'attempt:a1', TL), /State history/);
 });
 
+test('the filter form has no inline handler (the page CSP forbids it) and says what it is for', () => {
+  const html = renderLineage({ graphAll: sample(), filtered: filterGraph(sample(), {}), asOf: { step: 1, visible_events: 1, head: true }, timeline: null, error: null, busy: false, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' }, total: 5, graphTruncated: null, width: 800 });
+  assert.ok(!/ on[a-z]+=/i.test(html.replace(/<svg[\s\S]*<\/svg>/, '')));
+  assert.match(html, /<form class="lin-filters cx-stack" role="search" aria-label="Filter the lineage"/);
+});
+
 test('the whole panel renders live, replayed, errored, empty and in both modes', () => {
   const graphAll = sample();
   const base = { graphAll, filtered: filterGraph(graphAll, {}), asOf: { step: 2, visible_events: 5, head: false }, timeline: TL, error: null, busy: false, view: 'graph', mode: 'visual', clock: 'recorded', sel: 'agent:lead', focus: null, filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' }, total: 5, graphTruncated: null, width: 800 };

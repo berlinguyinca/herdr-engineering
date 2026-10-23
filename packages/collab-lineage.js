@@ -283,7 +283,7 @@ export function renderFilters(graphAll, f = {}) {
   const etypes = [...new Set(graphAll.edges.map((e) => e.edge_type))].sort();
   const states = [...new Set(graphAll.nodes.map((n) => text(n.state, 'none')))].sort();
   const chk = (name, vals, set) => vals.map((v) => `<label class="cx-check"><input type="checkbox" data-filter="${name}" value="${esc(v)}"${set instanceof Set && set.has(v) ? ' checked' : ''}> ${esc(v)}</label>`).join('');
-  return `<form class="lin-filters cx-stack" role="search" aria-label="Filter the lineage" onsubmit="return false">`
+  return `<form class="lin-filters cx-stack" role="search" aria-label="Filter the lineage" data-lineage-filters>`
     + `<label class="cx-field">Search ids, names and states<input class="cx-input" type="search" data-filter="q" value="${esc(text(f.q))}" maxlength="120" autocomplete="off"></label>`
     + `<fieldset class="cx-checks"><legend>Node types</legend>${chk('type', types, f.types) || '<span class="cx-msg">none</span>'}</fieldset>`
     + `<fieldset class="cx-checks"><legend>Link types</legend>${chk('etype', etypes, f.edgeTypes) || '<span class="cx-msg">none</span>'}</fieldset>`

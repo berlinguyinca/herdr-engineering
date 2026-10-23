@@ -862,6 +862,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         if (md) { LIN.mode = md.dataset.mode; drawLineage(true); return; }
         if (e.target.closest('[data-more]')) loadLineage(true);
       });
+      box.addEventListener('submit', (e) => { e.preventDefault(); });      // Enter in the search box filters; it never navigates
       box.addEventListener('input', (e) => {
         const f = e.target.dataset.filter;
         if (f === 'q') { LIN.filters.q = e.target.value; drawLineage(true); }

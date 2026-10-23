@@ -89,6 +89,20 @@ test('lineage graph: renders, hostile ids stay text, keyboard selects and the in
   assert.ok(seen.every((r) => r.method === 'GET' || !r.path.includes('/graph')), 'the lineage page only reads');
 }));
 
+test('search filters in place: Enter does not navigate and typing keeps focus', async () => withPage(async (page) => {
+  await page.getByRole('tab', { name: 'Lineage', exact: true }).click();
+  await page.locator('svg.lin-svg g[data-node]').first().waitFor();
+  const before = page.url();
+  const box = page.getByRole('searchbox');
+  await box.fill('lead');
+  await box.press('Enter');
+  assert.equal(page.url(), before);
+  assert.equal(await page.evaluate(() => document.activeElement.getAttribute('data-filter')), 'q', 'focus stays in the search box');
+  assert.equal(await page.locator('svg.lin-svg g[data-node]').count(), 2, 'the hit and its one-hop neighbour');
+  await box.fill('');
+  assert.equal(await page.locator('svg.lin-svg g[data-node]').count(), 5);
+}));
+
 test('lineage text alternatives: table view lists the same nodes and links', async () => withPage(async (page) => {
   await page.getByRole('tab', { name: 'Lineage', exact: true }).click();
   await page.locator('svg.lin-svg').waitFor();

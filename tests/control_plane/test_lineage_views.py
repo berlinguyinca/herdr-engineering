@@ -13,6 +13,7 @@ from herdr_engineering.control_plane.collab import CollabError
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane.test_collab_links import link, w  # noqa: F401
 from tests.control_plane.test_collab_tasks import USERS, code, svc  # noqa: F401
+from tests.control_plane.test_graph import OTHER
 from tests.control_plane.test_graph_membership import fab, put  # noqa: F401
 
 
@@ -413,3 +414,102 @@ def test_http_route_wiring_matches_graph_read(fab):
     st, got = fab.s.dispatch("GET", ["graph", "lineage"], {"room_id": fab.room, "step": "3"}, {},
                              f"Bearer {USERS['bob']}", None)
     assert st == 200 and got["as_of"]["step"] == 3
+
+
+# ------------------------------------------------------------------ review round 1
+def _everywhere(fab, who, n):
+    """Every read a person can make about a room, at every position up to `n`: one blob to grep."""
+    out = [json.dumps(lin(fab, who, "events", limit=500))]
+    for step in [None, *range(0, n + 1)]:
+        out += [json.dumps(lin(fab, who, step=step)), json.dumps(lin(fab, who, "timeline", step=step))]
+    return "\n".join(out)
+
+
+def test_a_sibling_binding_does_not_keep_a_narrowed_edge_instance_visible(fab):
+    f = fab.feed
+    pr = "pr:github.com/o/r#5"
+    put(f, pr, "room", label="PR", room_id=fab.room)
+    edge(f, "reviewed", "review:r", pr, {"commit": "c1"}, room_id=fab.room)       # a sibling binding that stays visible
+    edge(f, "reviewed", "review:r", pr, {"commit": "c-x"}, room_id=fab.room)
+    edge(f, "reviewed", "review:r", pr, {"commit": "c-x"}, scope="private")       # the same instance, narrowed
+    put(f, "task:z", "room", room_id=fab.room)
+    blob = _everywhere(fab, fab.bob, 8)
+    assert "c-x" not in blob and "c1" in blob
+
+
+def test_a_commons_value_its_writer_made_private_leaves_the_past_too(fab):
+    f = fab.feed
+    pr = "pr:github.com/o/r#7"
+    put(f, pr, "room", label="room label", room_id=fab.room)
+    put(f, "task:keep", "room", room_id=fab.room)
+    put(f, pr, "private", label="secret label")                                   # the same writer takes it back
+    put(f, pr, "room", label="other label", principal=OTHER, room_id=fab.room)    # another writer's value stays public
+    put(f, "task:after", "room", room_id=fab.room)
+    blob = _everywhere(fab, fab.bob, 6)
+    assert "room label" not in blob and "secret label" not in blob
+    assert "other label" in json.dumps(lin(fab, fab.bob))                          # and is shown, live and replayed
+    assert "other label" in json.dumps(lin(fab, fab.bob, step=3))
+
+
+def test_a_commons_value_still_public_is_shown_in_the_past_at_its_own_position(fab):
+    f = fab.feed
+    pr = "pr:github.com/o/r#8"
+    put(f, pr, "room", label="v1", room_id=fab.room)
+    put(f, "task:keep", "room", room_id=fab.room)
+    put(f, pr, "room", label="v2", room_id=fab.room)
+    put(f, "task:after", "room", room_id=fab.room)
+    assert any(n["label"] == "v1" for n in lin(fab, fab.bob, step=2)["nodes"])
+    assert any(n["label"] == "v2" for n in lin(fab, fab.bob)["nodes"])
+
+
+def test_a_timestamp_without_a_zone_is_utc(fab, monkeypatch):
+    clock = iter(f"2026-10-22T10:00:{i:02d}+00:00" for i in range(60))
+    monkeypatch.setattr(fab.repo, "_stamp", lambda: next(clock))
+    for i in range(4):
+        put(fab.feed, f"task:t{i}", "room", room_id=fab.room)
+    stamp = lin(fab, fab.bob, "events")["events"][1]["received_at"]
+    assert stamp.endswith("+00:00")
+    assert lin(fab, fab.bob, at=stamp)["as_of"]["step"] == 2
+    assert lin(fab, fab.bob, at=stamp[:-6])["as_of"]["step"] == 2
+
+
+def test_the_scan_budget_is_shared_fairly_between_node_types(fab, monkeypatch):
+    f = fab.feed
+    for i in range(10):
+        put(f, f"agent:a{i}", "room", room_id=fab.room)
+    for i in range(3):
+        put(f, f"task:t{i}", "room", room_id=fab.room)
+    monkeypatch.setattr(graph_mod, "SCAN_BUDGET", 6)
+    got = lin(fab, fab.bob)
+    assert got["truncated_reason"] == "scan_budget"
+    assert {n["id"] for n in got["nodes"] if n["node_type"] == "task"} == {"task:t0", "task:t1", "task:t2"}
+
+
+def test_replay_reads_while_events_arrive_never_error(fab):
+    import threading
+    f = fab.feed
+    pr = "pr:github.com/o/r#3"
+    put(f, pr, "room", label="p", room_id=fab.room)
+    for i in range(10):
+        put(f, f"task:t{i}", "room", room_id=fab.room)
+    stop, errors = threading.Event(), []
+
+    def writer():
+        i = 0
+        while not stop.is_set() and i < 400:
+            put(f, pr, "room" if i % 2 else "private", label=f"l{i}", room_id=fab.room)
+            put(f, f"task:w{i}", "room", room_id=fab.room)
+            i += 1
+    th = threading.Thread(target=writer)
+    th.start()
+    try:
+        for _ in range(60):
+            lin(fab, fab.bob, step=5)
+            lin(fab, fab.bob, "timeline", step=7)
+            lin(fab, fab.bob, "events", limit=50)
+    except Exception as exc:       # noqa: BLE001 - any error here is the bug
+        errors.append(exc)
+    finally:
+        stop.set()
+        th.join()
+    assert not errors

@@ -1126,32 +1126,49 @@ class GraphProjection:
         gated by the scope ITS writer gave it: a reader sees the node shell (id, type, widest
         visible scope) plus only the fields of writers it may see, and ids/sources/event ids
         come from those visible values alone."""
-        vis = None
+        mk = None
         if node.commons and principal is not None:
             memo: dict = {}
+            live = self._gate._nodes.get(node.id) if self._gate is not None else None
 
-            def vis(e, _p=principal, _m=memo):
+            def base(e, _p=principal, _m=memo):
                 k = (e[6], e[4][1])             # visibility depends only on (scope, writer)
                 r = _m.get(k)
                 if r is None:
                     r = _m[k] = _entry_visible(_p, e)
                 return r
+
+            def mk(live_reg, _b=base, _p=principal):
+                """Visibility of one register's entries. In a REPLAYED projection a past value is shown only if
+                the same writer's CURRENT value of that field is visible too: a writer who later made a field
+                private takes its past back out of sight."""
+                if self._gate is None:
+                    return _b
+                return lambda e: _b(e) and live_reg is not None and e[4] in live_reg.by \
+                    and _entry_visible(_p, live_reg.by[e[4]])
+
+            def lreg(name, key=None):
+                if live is None:
+                    return None
+                return live.attrs.get(key) if name == "attrs" else getattr(live, name)
         aid = (principal or {}).get("id")
         owner = None
         if node.commons:
             actors = None
-            if vis is not None:             # writers with at least one value this reader may see
-                actors = {e[4][1] for reg in (node.label, node.state, *node.attrs.values())
-                          for e in reg.by.values() if vis(e)}
+            if mk is not None:              # writers with at least one value this reader may see
+                regs = [(node.label, lreg("label")), (node.state, lreg("state")),
+                        *((r, lreg("attrs", k)) for k, r in node.attrs.items())]
+                actors = {e[4][1] for reg, lr in regs for e in reg.by.values() if mk(lr)(e)}
             owner = node.view_owner(actors)
-        state, label = node.pick(node.state, vis, owner), node.pick(node.label, vis, owner)
+        vstate, vlabel = (mk(lreg("state")), mk(lreg("label"))) if mk else (None, None)
+        state, label = node.pick(node.state, vstate, owner), node.pick(node.label, vlabel, owner)
         fields: dict = {"label": _prov(label), "state": None, "attrs": {}}
         if state:
             fields["state"] = _prov(state, {"value": state[3][0], "reason": state[3][1]})
         contrib: dict = {}
         seen_entries = [e for e in (label, state) if e]
-        for name, reg, ent in (("label", node.label, label), ("state", node.state, state)):
-            lst = reg.contributions(ent, owner=owner, caller=aid, vis=vis) if node.commons else []
+        for name, reg, ent, rv in (("label", node.label, label, vlabel), ("state", node.state, state, vstate)):
+            lst = reg.contributions(ent, owner=owner, caller=aid, vis=rv) if node.commons else []
             seen_entries += lst
             if lst:
                 contrib[name] = [_prov(e, {"value": e[3][0], "reason": e[3][1]} if name == "state" else None)
@@ -1159,8 +1176,9 @@ class GraphProjection:
         cattrs: dict = {}
         attrs: dict = {}
         for k, reg in sorted(node.attrs.items()):
-            ent = node.pick(reg, vis, owner)
-            lst = reg.contributions(ent, owner=owner, caller=aid, vis=vis) if node.commons else []
+            av = mk(lreg("attrs", k)) if mk else None
+            ent = node.pick(reg, av, owner)
+            lst = reg.contributions(ent, owner=owner, caller=aid, vis=av) if node.commons else []
             if ent is None and not lst:
                 continue                      # every writer of this key is hidden from the reader
             attrs[k] = ent[3] if ent else None
@@ -1520,9 +1538,29 @@ class GraphProjection:
         if not can_see(principal, scope_label(ev), frozenset({actor}) if actor else frozenset()):
             return False
         if op["op"] in ("node.upsert", "node.state"):
-            return self._node_visible(principal, self._nodes.get(op["node_id"]))
-        return any(self._edge_gate(principal, k)
-                   for k in self._by_triple.get((op["edge_type"], op["from_id"], op["to_id"]), ()))
+            node = self._nodes.get(op["node_id"])
+            if not self._node_visible(principal, node):
+                return False
+            return not node.commons or self._commons_event_visible(principal, ev, op, node)
+        # the exact edge instance this event touched (not any sibling binding or writer instance of the triple)
+        if op["op"] == "edge.add":
+            keys = [_ekey(op, actor)]
+        elif op["edge_type"] in BOUND_EDGE_TYPES and op["binding"] is None:       # a wildcard remove names no instance
+            keys = list(self._by_triple.get((op["edge_type"], op["from_id"], op["to_id"]), ()))
+        else:
+            keys = [_ekey(op, op.get("writer") or actor)]
+        return any(self._edge_gate(principal, k) for k in keys)
+
+    @staticmethod
+    def _commons_event_visible(principal, ev: dict, op: dict, node: _Node) -> bool:
+        """A commons field is visible through its writer's CURRENT value of that field: an event that wrote a
+        value its writer has since made private is not shown (the past must not undo that)."""
+        key = _writer_key(ev)
+        regs = [node.state] if op["op"] == "node.state" else [
+            *([node.label] if op.get("label") is not None else []),
+            *([node.state] if op.get("state") is not None else []),
+            *[node.attrs[k] for k in (op.get("attrs") or {}) if k in node.attrs]]
+        return all(key in reg.by and _entry_visible(principal, reg.by[key]) for reg in regs)
 
     def _room_entries(self, principal, contexts) -> tuple[list, int, bool]:
         """The visible events addressed to ``contexts`` in admission order: ``(entries, base, trimmed)``.
@@ -1564,7 +1602,8 @@ class GraphProjection:
     @staticmethod
     def _parse_at(value: str) -> float:
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).timestamp()      # no zone means UTC, never server-local
         except (AttributeError, ValueError):
             raise ValueError("at must be an ISO-8601 timestamp") from None
 
@@ -1658,16 +1697,25 @@ class GraphProjection:
         if not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be >= 0")
         with self._lock:
-            ids, reason, scanned = [], None, 0
-            for t in sorted(NODE_TYPES):
-                if node_types is not None and t not in node_types:
-                    continue
+            reason = None
+            kinds = [t for t in sorted(NODE_TYPES) if node_types is None or t in node_types]
+            iters = {}
+            for t in kinds:
                 seen: dict = {}
                 for c in sorted(contexts, key=repr):
                     seen.update(self._by_ctx.get(c, {}).get(t, {}))
-                for nid in seen:
+                iters[t] = iter(seen)
+            found: dict[str, list] = {t: [] for t in kinds}
+            scanned, active = 0, list(kinds)
+            while active:                       # round-robin: one busy type cannot starve the others of the budget
+                for t in list(active):
+                    nid = next(iters[t], None)
+                    if nid is None:
+                        active.remove(t)
+                        continue
                     if scanned >= SCAN_BUDGET:
                         reason = "scan_budget"
+                        active = []
                         break
                     scanned += 1
                     node = self._nodes[nid]
@@ -1675,9 +1723,8 @@ class GraphProjection:
                         continue
                     label = node.eff_scope(principal, internal=False) if node.commons else node.eff_scope()
                     if isinstance(label, tuple) and label[:3] in contexts:
-                        ids.append(nid)
-                if reason:
-                    break
+                        found[t].append(nid)
+            ids = [nid for t in kinds for nid in found[t]]
             rank = {nid: i for i, nid in enumerate(ids)}
             budget = MAX_RESPONSE_BYTES
             nodes, served = [], []
@@ -1724,7 +1771,8 @@ class GraphProjection:
         entries, base, trimmed = self._room_entries(principal, contexts)
         k, upto = self._position(entries, base, step, at)
         past = self.projection_at(upto)
-        return {"as_of": self._as_of(entries, k, trimmed), **past.room_graph(principal, contexts, **kw)}
+        with self._lock:     # the replayed graph reads live state through its gate: hold the live lock (RLock) too
+            return {"as_of": self._as_of(entries, k, trimmed), **past.room_graph(principal, contexts, **kw)}
 
     def room_timeline(self, principal, contexts, *, step: int | None = None, at: str | None = None) -> dict:
         """Gantt data from the reader's visible events up to a replay position: one lane per node whose
@@ -1736,6 +1784,10 @@ class GraphProjection:
         entries, base, trimmed = self._room_entries(principal, contexts)
         k, upto = self._position(entries, base, step, at)
         past = self.projection_at(upto)
+        with self._lock:     # the replayed graph reads live state through its gate: hold the live lock (RLock) too
+            return self._timeline_of(principal, past, entries, k, trimmed)
+
+    def _timeline_of(self, principal, past, entries: list, k: int, trimmed: bool) -> dict:
         shown = entries[:k]
         lanes: dict[str, dict] = {}
         markers: list[dict] = []
