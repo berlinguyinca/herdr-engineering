@@ -138,10 +138,35 @@ _HELPER_BAD = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")   # all c
 
 
 class CollabError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, reason: str | None = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.reason = reason          # a stable machine-readable code, for callers that branch on it
+
+
+# control_plane.collab.summary_fix: the operator's standing room and requester agent that start a
+# text-only helper when a summary's owning agent cannot be woken (summary_fix.helper_fallback).
+SUMMARY_FIX_KEYS = frozenset({"room_id", "requester_agent_id"})
+_SUMMARY_FIX_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_SUMMARY_FIX_OP = re.compile(r"^summary-fix-[0-9a-f]{40}-[0-9]{1,2}$")
+MAX_SUMMARY_FIX_LIST = 50
+
+
+def summary_fix_config(value: Any) -> dict | None:
+    """Validate ``control_plane.collab.summary_fix``; None when absent. Ids only, never a credential."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("control_plane.collab.summary_fix must be a mapping with room_id and requester_agent_id")
+    unknown = sorted(str(k) for k in set(value) - SUMMARY_FIX_KEYS)
+    if unknown:
+        raise ValueError("control_plane.collab.summary_fix: unknown keys: " + ", ".join(unknown))
+    for key in sorted(SUMMARY_FIX_KEYS):
+        v = value.get(key)
+        if not isinstance(v, str) or not _SUMMARY_FIX_ID.match(v):
+            raise ValueError(f"control_plane.collab.summary_fix.{key} must be a collaboration id")
+    return {k: value[k] for k in SUMMARY_FIX_KEYS}
 
 
 def _digest(value: str) -> str:
@@ -269,8 +294,12 @@ class CollabService:
                  max_rooms_per_project: int = 50, max_members_per_room: int = 100,
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
                  default_grant_ttl: float = 30 * 24 * 3600.0,
-                 approval: ApprovalPolicy | None = None):
+                 approval: ApprovalPolicy | None = None, summary_fix: dict | None = None):
         self.auth = authenticator
+        try:
+            self.summary_fix = summary_fix_config(summary_fix)
+        except ValueError as exc:
+            raise CollabError(400, str(exc)) from None
         self.approval = approval
         self._users: dict[str, dict] = {}       # approval mode: user id -> {status, since, decided_by, decided_at, reason}
         self._sink = sink
@@ -324,6 +353,7 @@ class CollabService:
         self._helpers: dict[str, dict] = {}                  # helper id -> helper request
         self._helper_by_agent: dict[str, dict] = {}          # helper's own agent id -> its request
         self._helper_text: dict[str, dict] = {}              # helper id -> task text waiting for its request event
+        self._helper_by_op: dict[str, dict] = {}             # summary-fix operation id -> its helper (replay safety)
         self._helpers_paused = False                         # the panic switch
         self._catalogue: list[dict] = []                     # normalized model catalogue the runner posted
         self._helper_minted: set[str] = set()                # agents a claim minted (a helper agent, linked or not)
@@ -601,7 +631,10 @@ class CollabService:
                 "task": extra.get("task"), "depth": p["depth"], "chain": p["chain"], "status": "requested",
                 "created_epoch": p["created_epoch"], "expires_epoch": p["expires_epoch"], "claimed_epoch": None,
                 "finished_epoch": None, "helper_agent_id": None, "actions": [], "result": None, "error": None,
-                "reason": None, "parent_actions": list(p.get("parent_actions") or []), "error_text": None}
+                "reason": None, "parent_actions": list(p.get("parent_actions") or []), "error_text": None,
+                "operation_id": p.get("operation_id")}
+            if p.get("operation_id"):
+                self._helper_by_op[p["operation_id"]] = self._helpers[p["helper_id"]]
         elif t == "helper_claimed":
             r = self._helpers.get(p["helper_id"])
             if r is not None:
@@ -1944,8 +1977,9 @@ class CollabService:
         self.stats["policy_denied"] += 1
         raise CollabError(status, message)
 
-    def request_helper(self, pr: Principal, body: dict) -> dict:
-        """The calling agent asks for a helper in one of its rooms. Over a limit it is refused, never queued."""
+    def request_helper(self, pr: Principal, body: dict, *, operation_id: str | None = None) -> dict:
+        """The calling agent asks for a helper in one of its rooms. Over a limit it is refused, never queued.
+        ``operation_id`` is set only by request_summary_fix_helper (never from a request body)."""
         if not pr.is_agent:
             raise CollabError(403, "forbidden: only agents start helpers")
         if not isinstance(body, dict) or set(body) - _HELPER_FIELDS - _HELPER_IGNORED:
@@ -2016,11 +2050,82 @@ class CollabService:
                     owner_user_id=pr.owner, parent_agent_id=parent, role=role, family=family, model=model,
                     depth=depth, chain=chain, parent_actions=sorted(self._effective(pr, room)[0]),
                     created_epoch=now, expires_epoch=now + HELPER_TTL, action="helper.request", outcome="allowed",
-                    project_ids=[room["project_id"]], resource_id=hid))
+                    project_ids=[room["project_id"]], resource_id=hid,
+                    **({"operation_id": operation_id, "origin": "summary-fix"} if operation_id else {})))
             except CollabError:
                 self._helper_text.pop(hid, None)     # never left waiting for a request that was not written
                 raise
             return self._helper_view(self._helpers[hid])
+
+    # A summary's owning agent cannot be woken: the dashboard (as the operator) asks for a text-only helper
+    # through the one configured room and requester agent. The requester's own grant and the room profile
+    # stay authoritative (request_helper re-checks them); this only adds who may ask on its behalf.
+    def _summary_fix_requester(self, pr: Principal) -> tuple[Principal, str]:
+        cfg = self.summary_fix
+        if cfg is None:
+            raise CollabError(409, "no summary-fix room is configured (control_plane.collab.summary_fix)",
+                              "helper_unavailable")
+        room = self._rooms.get(cfg["room_id"])
+        agent = self._agents.get(cfg["requester_agent_id"])
+        if room is None or agent is None or agent["owner"] != pr.id:
+            raise CollabError(409, "the configured summary-fix room or requester agent does not exist or is not "
+                                   "the operator's", "helper_misconfigured")
+        now = self._now()
+        if agent["status"] != "active" or not self._ok(agent["owner"]):
+            raise CollabError(409, "the summary-fix requester agent is revoked", "helper_misconfigured")
+        if now >= agent["expires_at"]:
+            raise CollabError(409, "the summary-fix requester agent's credential expired; connect a new agent and "
+                                   "update control_plane.collab.summary_fix", "helper_requester_expired")
+        grant = room["grants"].get(cfg["requester_agent_id"])
+        if grant is not None and grant["expires_at"] is not None and now >= grant["expires_at"]:
+            raise CollabError(409, "the summary-fix requester agent's grant in its room expired; grant spawn_helpers "
+                                   "again", "helper_grant_expired")
+        # no spawn_helpers at all is request_helper's own 403 below; more than it is refused here
+        if grant is not None and "spawn_helpers" in grant["actions"] and set(grant["actions"]) - {"spawn_helpers"}:
+            raise CollabError(409, "the summary-fix requester agent may hold only spawn_helpers in its room",
+                              "helper_overgranted")
+        if self._profile(room["id"])["tools_allowed"]:
+            raise CollabError(409, "the summary-fix room lets helpers use tools; turn that off",
+                              "helper_tools_allowed")
+        return Principal("agent", cfg["requester_agent_id"], agent["owner"]), room["id"]
+
+    def request_summary_fix_helper(self, pr: Principal, body: dict) -> dict:
+        """Operator only (POST fleet/summary-fix/helper {operation_id, task}). The same operation id
+        returns the helper it already started, whatever became of it: one item and summary generation
+        never starts two helpers."""
+        self._require_operator(pr)
+        if not isinstance(body, dict) or set(body) - {"operation_id", "task"}:
+            raise CollabError(400, "summary-fix helpers take operation_id and task only")
+        op = body.get("operation_id")
+        if not isinstance(op, str) or not _SUMMARY_FIX_OP.match(op):
+            raise CollabError(400, "invalid operation_id")
+        with self._lock:
+            self._expire_helpers()
+            done = self._helper_by_op.get(op)
+            if done is not None:
+                return {**self._helper_view(done), "replayed": True}
+            requester, room_id = self._summary_fix_requester(pr)
+            try:
+                out = self.request_helper(requester, {"room_id": room_id, "role": "worker", "task": body.get("task")},
+                                          operation_id=op)
+            except CollabError as exc:
+                if exc.reason is None:
+                    exc.reason = ("helper_limit" if exc.status == 429 else "helpers_paused" if exc.status == 503
+                                  else "helper_refused" if exc.status in (403, 404) else None)
+                raise
+            return {**out, "replayed": False}
+
+    def list_summary_fix_helpers(self, pr: Principal) -> dict:
+        """Operator only (GET fleet/summary-fix/helpers): recent summary-fix helpers, finished ones too, with
+        their result. The result is the helper's untrusted text; it is shown, never applied."""
+        self._require_operator(pr)
+        with self._lock:
+            self._expire_helpers()
+            rows = sorted((r for r in self._helpers.values() if r.get("operation_id")),
+                          key=lambda r: (-r["created_epoch"], r["helper_id"]))[:MAX_SUMMARY_FIX_LIST]
+            return {"configured": self.summary_fix is not None,
+                    "helpers": [{**self._helper_view(r), "operation_id": r["operation_id"], "result": r["result"],
+                                 "error_text": r.get("error_text"), "untrusted": True} for r in rows]}
 
     def _helper_for(self, pr: Principal, helper_id: Any) -> dict:
         r = self._helpers.get(helper_id) if isinstance(helper_id, str) else None
@@ -2762,6 +2867,8 @@ class CollabService:
             r = self._helpers.pop(hid)
             if r["helper_agent_id"] and self._helper_by_agent.get(r["helper_agent_id"]) is r:
                 del self._helper_by_agent[r["helper_agent_id"]]
+            if r.get("operation_id") and self._helper_by_op.get(r["operation_id"]) is r:
+                del self._helper_by_op[r["operation_id"]]
         for rid in [i for i, r in self._requests.items() if not r["open"] and now - r["created_epoch"] > REQUEST_TTL]:
             r = self._requests.pop(rid)
             self._requests_by_room[r["room_id"]].discard(rid)
@@ -3124,6 +3231,8 @@ class CollabService:
                                      "entries": self.egress_entries(parts[2])}
                     if parts == ["fleet", "helpers"]:
                         return 200, self.list_helpers_for_runner(pr)
+                    if parts == ["fleet", "summary-fix", "helpers"]:
+                        return 200, self.list_summary_fix_helpers(pr)
                     if parts == ["fleet", "spawns"]:
                         st = str(query["status"]) if "status" in query else None
                         return 200, self.list_spawns(pr, st)
@@ -3194,6 +3303,8 @@ class CollabService:
                         return 200, self.set_catalogue(pr, body.get("models"))
                     if parts == ["fleet", "helpers", "pause"]:
                         return 200, self.set_helpers_paused(pr, body.get("paused"))
+                    if parts == ["fleet", "summary-fix", "helper"]:
+                        return 202, self.request_summary_fix_helper(pr, body)
                     if n == 4 and parts[1] == "helpers" and parts[3] == "claim":
                         return 200, self.claim_helper(pr, parts[2])
                     if n == 4 and parts[1] == "helpers" and parts[3] == "cancel":
@@ -3257,7 +3368,7 @@ class CollabService:
                         return self.post_message(pr, rid, body)
             raise CollabError(404, "not found")
         except CollabError as exc:
-            return exc.status, {"error": exc.message}
+            return exc.status, {"error": exc.message, **({"reason": exc.reason} if exc.reason else {})}
 
 
 CATALOGUE_MAX = 500

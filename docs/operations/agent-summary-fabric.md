@@ -117,10 +117,64 @@ viewers do not get it). Pressing it calls
   supported. Anything else returns 409 `reason: unsupported_harness`. Herdr
   0.9.1's `agent prompt` itself is not harness-specific, but codex panes report
   no `agent_session`, so delivery could never be confirmed.
-- **Dead sessions.** A session that is closed, has no terminal or is not ready
-  returns 409 `fallback: helper_unavailable`. Delivery to a helper agent is a
-  later change (`summary_fix.helper_fallback` is the seam).
+- **Dead sessions: a text-only helper.** When the session is closed, has no
+  terminal or is not ready, the same packet (with a helper prefix: propose a fix
+  as text, nothing is applied) goes to a sandboxed helper in the operator's
+  standing **summary-fix** collab room, through that room's requester agent. The
+  API answers 202 `{status: "helper_started", delivery: "helper", helper_id,
+  tools: false}`, and the card says *Started a helper (no tools): result appears
+  under Helpers* with a link to **Collaboration → Helpers → Summary fixes**,
+  where the helper's result (at most 20 KB, as the runner returns it) is shown as
+  untrusted text. It is never applied, run or sent to anyone. Without a
+  configured room the API keeps the 409 `fallback: helper_unavailable`.
+- **Configuring the room** (once). As the operator, in the collaboration
+  dashboard: create a room (for example `summary-fix`), connect an agent for it
+  (for example `summary-fixer`, harness `claude-code` or `pi`), grant it **only**
+  *Start helpers* (`spawn_helpers`) in that room, tick the helper family under
+  **Helper profile** and leave *Helpers may use tools* off. Then add the two ids
+  to the central fleet file and re-render the collab slice:
+
+  ```yaml
+  control_plane:
+    values:
+      collab:
+        summary_fix:
+          room_id: collab_…            # the room's id
+          requester_agent_id: collab_… # the agent's id (an id, never its credential)
+  ```
+
+  **Renewal.** The requester is checked like any agent: its credential lives 30
+  days from connecting, and its room grant lapses after 30 days unless the owner
+  picks a later date (up to a year). The requester never uses its credential,
+  but an expired one still refuses (409 `helper_requester_expired`: connect a new
+  agent, grant it `spawn_helpers`, update `requester_agent_id`, re-render the
+  slice and restart collab), and an expired grant refuses with 409
+  `helper_grant_expired` (grant `spawn_helpers` again, with a later expiry).
+
+  Only these two keys are accepted; anything else stops the collab service at
+  start-up with `summary_fix: unknown keys`. The collab service refuses to start
+  a helper (409, nothing is started) when the agent is not the operator's, is
+  revoked or expired, holds anything besides `spawn_helpers` in the room
+  (`helper_overgranted`), or when the room lets helpers use tools
+  (`helper_tools_allowed`). The usual helper checks still apply to the requester:
+  without `spawn_helpers` or an allowed family it is `helper_refused` (409); over
+  a limit 429 `helper_limit`; with the panic switch on 503 `helpers_paused`; an
+  unreachable collab service is 502 `helper_unreachable`. The dashboard reaches
+  the room through `collab_operator_url` (operator listener route `POST
+  fleet/summary-fix/helper`, 404 on the public site; `GET
+  fleet/summary-fix/helpers` lists the results).
+- **Replay safety for helpers.** The helper is requested under the same
+  operation id the wake path would use (`summary-fix-<digest>-<attempt>`). The
+  collab service stores it with the helper and returns that helper again for the
+  same id (also after a restart), so a double click, a second tab or a crash
+  between the start and the audit never starts a second helper. Once a helper
+  took an item, the same item and summary generation is never also sent to the
+  agent, even if the agent comes back; regenerate the summary for a fresh
+  request.
 - **Audit.** Each new attempt records a durable `SummaryFixRequested` event with
+  `delivery: "wake"` (prompted the session; written before sending) or
+  `delivery: "helper"` (written once the helper id is known, with `helper_id`),
   the actor (`role`, and whether an API key or open mode authorized it),
   session, list, index, request digest and operation id. The item text is not
-  copied into the audit event.
+  copied into the audit event. The collab log separately audits
+  `helper.request` with the operation id.
