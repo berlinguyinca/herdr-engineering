@@ -48,6 +48,10 @@ class IngestService:
         # T10: node ids inside an external agent's namespace belong to that agent alone. Set by the server
         # to the HCN service's `is_external_node`; None = no external agents on this process.
         self.reserved_node = None
+        # T11: ids only the HCN service writes (delegation task and accepted-proposal nodes). Set by the server to
+        # the HCN service's `is_hcn_node`; checked on EVERY endpoint of an edge, so an ingest key cannot attach
+        # a fake `produced` edge to an accepted artifact either.
+        self.service_node = None
 
     def _check_lineage_scope(self, env: dict) -> None:
         """Fail closed: a non-operator key may address a room or mission only if the operator listed it.
@@ -74,7 +78,12 @@ class IngestService:
         """Only an external agent itself (or an authenticated operator key) may write a node or edge
         source inside that agent's namespace; anyone else is refused exactly like any lineage refusal."""
         actor = env.get("actor") or {}
-        if self.reserved_node is None or actor.get("kind") == "external" or (
+        if self.service_node is not None and actor.get("kind") != "collab" and not (
+                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
+            ends = (payload.get("from_id"), payload.get("to_id")) if event_type.startswith("edge.") else (payload.get("node_id"),)
+            if any(isinstance(e, str) and self.service_node(e) for e in ends):
+                raise PermissionError("not permitted to modify this lineage object")
+        if self.reserved_node is None or actor.get("kind") in ("external", "collab") or (
                 actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
             return
         written = payload.get("from_id") if event_type.startswith("edge.") else payload.get("node_id")

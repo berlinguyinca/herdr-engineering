@@ -275,6 +275,16 @@ answers 404 because it has no graph). The service builds the envelope; the agent
 - The Tabs panel does not trust `attrs.external` for verified status. A tab is "Remote" with provenance only when the server's
   roster (`GET /rooms/{id}/externals`) lists the agent; a node that merely says `attrs.external` is shown "self-declared".
 
+### Accepted proposals (T11)
+When a room owner accepts an artifact proposal (`docs/operations/bounded-delegation.md`) the HCN service writes, with principal kind
+`collab` (`collab:room:<room id>`, room scope, registered for that one room exactly like the T10 external principal):
+`node.upsert task:hcn-delegation.<task id>` (`attrs.source = hcn-delegation`, `delegate_agent`, `delegated_by`),
+`node.upsert artifact:hcn-proposal.<proposal id>` (`state = accepted`; `attrs`: `kind`, `digest`, `bytes`, `delegate_agent`, `delegate_label`,
+`delegated_by`, `accepted_by`, `accepted_at`, `delegation_id`, `trust = accepted-untrusted-content`, `applied = false`, `executable = false`,
+`link_host` for links; never the content) and `edge.add produced task -> artifact`. Event ids are `hcn-<proposal id>-<n>` with source `hcn-<proposal id suffix>`
+and sequence `n` (1-3), so a retry is a duplicate. The two id prefixes are reserved: `Ingest.service_node` refuses any other writer (an
+authenticated operator key excepted) on a node id or on either endpoint of an edge. `artifact` stays a COMMONS kind for every other id.
+
 ### T08 rollout and rollback
 - Code-only, no migration. Deploy order: server first (new read routes and label handling), then the web files
   (`collab-tabs.js` is served from the static map in `api.py`). Emitters need no change to keep today's behaviour; to make

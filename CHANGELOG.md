@@ -5,6 +5,16 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Bounded task delegation and artifact proposals (T11, stacked on #170, #167, #165, #164)
+- A room owner can delegate one bounded task (scope, budget, expiry, allowed output kinds) to a coworker's external agent invited with
+  `proposals: true`. The agent answers only with an artifact proposal (patch, doc, analysis or link) that waits in quarantine; a room owner
+  accepts or rejects it with the digest of what was reviewed. Accepting records `task:hcn-delegation.*` and `artifact:hcn-proposal.*` nodes and a
+  `produced` edge in the lineage graph; nothing is ever applied. Same checks over REST, MCP (4 tools) and A2A (`tasks/get|list|cancel`, `message/send` with a `taskId`).
+- New YAML kill switch `control_plane.collab.delegation_enabled` (default `false`; works for the combined and `--collab-only` servers). No environment variable.
+- Extends the existing task store, event log and external credentials; new log events are additive; no migration. A key whose role is spelled
+  `external` or `collab` is now an unprivileged ingest principal. See `docs/operations/bounded-delegation.md` and the T11 addendum of the HCN threat model.
+- Rollback: `delegation_enabled: false`, or revert the PR.
+
 ### Tabs/panes and membership-scoped lineage (T08, stacked on #165 and #164)
 - Lineage `room`/`mission` scopes now resolve to HCN membership: an event that names its `room_id` / `mission_id`
   (and optionally `workspace_id`) is readable by that room's non-guest members / that mission's listed members (T07),

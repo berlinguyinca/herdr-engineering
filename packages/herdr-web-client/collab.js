@@ -121,6 +121,13 @@ export class CollabApi {
   inviteExternal(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/invites`, body); }
   revokeExternal(room, agentId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/${encodeURIComponent(agentId)}/revoke`, {}); }
   revokeExternalInvite(room, inviteId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/invites/${encodeURIComponent(inviteId)}/revoke`, {}); }
+  // Bounded delegation and artifact proposals (T11). Owner side only; a proposal's content is untrusted text.
+  delegations(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/delegations`); }
+  delegate(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/delegations`, body); }
+  cancelDelegation(room, taskId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/tasks/${encodeURIComponent(taskId)}/cancel`, {}); }
+  proposals(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/proposals`); }
+  proposal(room, id) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/proposals/${encodeURIComponent(id)}`); }
+  decideProposal(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/proposals/${encodeURIComponent(id)}/decide`, body); }
   linkAgent(agentId, instanceId) { return this.call('POST', `/agents/${encodeURIComponent(agentId)}/link`, { instance_id: instanceId || null }); }
   createJoinToken(body) { return this.call('POST', '/agents/join-tokens', body); }
   joinTokens() { return this.call('GET', '/agents/join-tokens'); }
