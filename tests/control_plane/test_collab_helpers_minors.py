@@ -286,6 +286,27 @@ def test_guests_see_no_grant_or_revoke_of_helper_agents_through_claim_and_finish
     assert any(e.get("agent_id") == info["agent_id"] for e in w.s.read_events(w.dave, w.room, first, 200)["events"])
 
 
+def test_the_operator_listing_names_rooms_whose_owner_listed_hosts(w):
+    w.s.set_room_profile(w.alice, w.room2, {"permanent_hosts": ["git.example.org:22"]})
+    out = w.s.list_egress(w.op)
+    assert out["requests"] == [] and out["rooms_with_hosts"] == [w.room2]
+
+
+def test_the_room_allowlist_says_what_kind_each_entry_is(w):
+    r = w.s.request_egress(w.op, w.room, "a1", "api.example.org", 443)
+    w.s.decide_egress(w.op, r["id"], "approve")
+    w.s.set_room_profile(w.alice, w.room, {"allowed_families": ["claude-code"],
+                                           "permanent_hosts": ["git.example.org:22", "api.anthropic.com:443"]})
+    st, out = call(w, "GET", ["fleet", "egress", w.room], operator="mallory")
+    kinds = {e["host_port"]: e["kind"] for e in out["entries"]}
+    assert st == 200 and kinds == {"git.example.org:22": "permanent", "api.anthropic.com:443": "permanent",
+                                   "api.example.org:443": "approved"}
+    w.s.set_room_profile(w.alice, w.room, {"allowed_families": ["claude-code"]})
+    out = call(w, "GET", ["fleet", "egress", w.room], operator="mallory")[1]
+    assert {e["host_port"]: e["kind"] for e in out["entries"]}["api.anthropic.com:443"] == "model"
+    assert out["allowlist"] == sorted(e["host_port"] for e in out["entries"])      # the old list stays
+
+
 @pytest.mark.parametrize("host,internal", [("api.example.org", False), ("10.0.0.1", True), ("127.0.0.1", True),
                                            ("[::ffff:a00:1]", True), ("[fd00::1]", True), (f"[{V6}]", False),
                                            ("0x7f.1", True)])
@@ -296,9 +317,3 @@ def test_host_requests_to_internal_addresses_are_marked(w, host, internal):
         pytest.skip("not a requestable spelling")
     row = w.s.list_egress(w.op)["requests"][0]
     assert row["internal"] is internal
-
-
-def test_the_operator_listing_names_rooms_whose_owner_listed_hosts(w):
-    w.s.set_room_profile(w.alice, w.room2, {"permanent_hosts": ["git.example.org:22"]})
-    out = w.s.list_egress(w.op)
-    assert out["requests"] == [] and out["rooms_with_hosts"] == [w.room2]
