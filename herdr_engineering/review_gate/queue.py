@@ -9,6 +9,16 @@ default ``time.time``. Lease expiry is evaluated at fold time, so an expired
 claim is simply offered again (keeping its FIFO position). Invariants: at most
 one live (queued/claimed) job per PrKey; ``complete`` succeeds only for the
 current, unexpired holder.
+
+Notes:
+- One ReviewQueue per repo is assumed: the lock is per instance, not per store.
+- ``complete`` returns False for an expired but un-reclaimed lease (lease lost).
+- A sha is superseded once a later job with a different sha exists for the key
+  (any state); enqueueing it again returns None. An explicit ``cancel`` with no
+  later job still allows re-enqueueing the same sha (PR closed and reopened).
+- ``author_model`` is stored redacted and compared against the redacted
+  ``reviewer_model``.
+- Every operation refolds the whole stream, so cost grows with event count.
 """
 
 from __future__ import annotations
@@ -111,9 +121,13 @@ class ReviewQueue:
         with self._lock:
             jobs = self._fold()
             now = self._now()
-            for j in jobs.values():
-                if j["key"] == str(key) and j["sha"] == sha and j["state"] != "cancelled":
+            same_key = [j for j in jobs.values() if j["key"] == str(key)]
+            for j in same_key:
+                if j["sha"] == sha and j["state"] != "cancelled":
                     return None  # queued, claimed or done
+            last = max((i for i, j in enumerate(same_key) if j["sha"] == sha), default=-1)
+            if last >= 0 and any(j["sha"] != sha for j in same_key[last + 1 :]):
+                return None  # superseded by a later job for a different sha
             self._cancel_locked(jobs, key, except_sha=sha)
             payload = {
                 "job_id": uuid.uuid4().hex,
@@ -128,10 +142,11 @@ class ReviewQueue:
     def claim(self, worker_id: str, reviewer_model: str) -> ReviewJob | None:
         with self._lock:
             now = self._now()
+            reviewer = redact_text(reviewer_model)
             for j in self._fold().values():
                 if self._effective(j, now) != "queued":
                     continue
-                if j["author_model"] and j["author_model"] == reviewer_model:
+                if j["author_model"] and j["author_model"] == reviewer:
                     continue
                 self._record(
                     "claimed",

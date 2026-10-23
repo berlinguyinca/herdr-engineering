@@ -1,4 +1,5 @@
 import threading
+import time
 
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.review_gate.models import PrKey
@@ -101,6 +102,14 @@ def test_depth_counts_only_unclaimed():
 
 def test_concurrent_claims_never_double_assign():
     q, _ = make()
+    orig = q._repo.stream
+
+    def slow_stream(*a):
+        events = orig(*a)
+        time.sleep(0.01)  # widen the read-then-record window; only the lock closes it
+        return events
+
+    q._repo.stream = slow_stream
     for k, s in ((K1, "a"), (K2, "b"), (K3, "c")):
         q.enqueue(k, s * 40, None)
     got, lock = [], threading.Lock()
@@ -139,3 +148,42 @@ def test_cancel_except_sha_and_snapshot_fields():
     (row,) = q.snapshot()
     assert row["state"] == "claimed" and row["claimed_by"] == "w"
     assert row["lease_expires_at"] is not None
+
+
+def test_stale_sha_replay_is_rejected():
+    q, _ = make()
+    q.enqueue(K1, "a" * 40, None)
+    b = q.enqueue(K1, "b" * 40, None)
+    assert q.enqueue(K1, "a" * 40, None) is None
+    assert q.depth() == 1
+    assert q.claim("w", "m").job_id == b.job_id
+
+
+def test_explicit_cancel_allows_reenqueue_of_same_sha():
+    q, _ = make()
+    first = q.enqueue(K1, "a" * 40, None)
+    assert q.cancel(K1) == 1
+    again = q.enqueue(K1, "a" * 40, None)
+    assert again is not None and again.job_id != first.job_id
+
+
+def test_complete_at_lease_boundary():
+    q, clock = make(lease_seconds=900)
+    q.enqueue(K1, "a" * 40, None)
+    job = q.claim("w", "m")
+    clock.t += 899
+    assert q.complete(job.job_id, "w") is True
+    q.enqueue(K2, "b" * 40, None)
+    job2 = q.claim("w", "m")
+    clock.t += 900  # exactly at expiry: lease is lost
+    assert q.complete(job2.job_id, "w") is False
+
+
+def test_same_worker_can_reclaim_expired_job():
+    q, clock = make()
+    q.enqueue(K1, "a" * 40, None)
+    first = q.claim("w", "m")
+    clock.t += 901
+    again = q.claim("w", "m")
+    assert again.job_id == first.job_id
+    assert q.complete(first.job_id, "w") is True
