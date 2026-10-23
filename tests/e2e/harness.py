@@ -237,7 +237,7 @@ class Plane:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"{self.name} exited during startup:\n{self.tail()}")
             try:
-                if self.call("GET", "/api/v1/ingest/sources", key="viewer").status == 200:
+                if self.call("GET", "/api/v1/ingest/sources", key="operator").status == 200:
                     break
             except OSError:
                 pass
@@ -330,7 +330,7 @@ class Plane:
         from urllib.parse import quote, urlencode
         return self.get(f"/api/v1/graph/nodes/{quote(nid, safe='')}/neighborhood?" + urlencode({"depth": depth, **q}), key=key)
 
-    def sources(self, key: str = "viewer") -> dict:
+    def sources(self, key: str = "operator") -> dict:
         return {s["source"]: s for s in self.get("/api/v1/ingest/sources", key=key).body.get("sources", [])}
 
     def edges(self, nid: str, *, key: str = "operator", depth: int = 1) -> list[tuple]:
