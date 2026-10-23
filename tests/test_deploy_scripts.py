@@ -332,14 +332,14 @@ def _with_collab(e, collab=COLLAB, cert_dir=_DEFAULT):
         cpv["collab"] = dict(collab)
     if cert_dir is not None:
         cpv["compose"]["HERDR_COLLAB_CERT_DIR"] = cert_dir
-    # collab-sync.sh's default certbot layout under the fake HOME (#115): a lineage to copy
-    # and a certbot to put in the renew unit. Nothing runs certbot.
-    acme = e["home"] / ".local/share/inferweave/bender-failover/acme"
+    # collab-sync.sh's HerdR-owned certbot layout under the fake HOME (#115): a lineage
+    # to copy and a certbot to put in the renew unit. Nothing runs certbot.
+    acme = e["home"] / ".local/share/herdr-engineering/collab-acme"
     live = acme / "config/live/localdev.mcp.metabolomics.us"
     live.mkdir(parents=True)
     (live / "fullchain.pem").write_text("not a real cert\n")
     (live / "privkey.pem").write_text("not a real key\n")
-    certbot = acme.parent / "acme-venv/bin/certbot"
+    certbot = e["home"] / ".local/share/herdr-engineering/collab-acme-venv/bin/certbot"
     certbot.parent.mkdir(parents=True)
     certbot.write_text("#!/bin/sh\nexit 0\n")
     certbot.chmod(0o755)
@@ -396,6 +396,23 @@ def test_collab_sync_reads_pool_and_group_from_the_slice_not_env(env):
     assert "us-west-2_TESTPOOL" in log and "FROMENV" not in log
     r = run(sync, env, "once", "--config", str(env["tmp"] / "missing.json"))
     assert r.returncode != 0 and "control_plane.collab" in r.stderr
+
+
+def test_collab_sync_defaults_to_herdr_owned_renewal_state(env):
+    _with_collab(env)
+    config = env["tmp"] / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(env["central"]), config)
+    sync = ROOT / "deploy" / "control-plane" / "collab-sync.sh"
+    r = run(sync, env, "install", "--config", str(config),
+            "--cert-dir", str(env["tmp"] / "edge-certs"))
+    assert r.returncode == 0, r.stderr
+
+    renew_unit = (env["home"] / ".config/systemd/user/herdr-collab-cert-renew.service").read_text()
+    certbot = env["home"] / ".local/share/herdr-engineering/collab-acme-venv/bin/certbot"
+    acme = env["home"] / ".local/share/herdr-engineering/collab-acme"
+    assert f'ExecStart="{certbot}" renew' in renew_unit
+    assert f'--config-dir "{acme}/config"' in renew_unit
+    assert "inferweave/bender-failover" not in renew_unit
 
 
 def test_collab_sync_provisions_the_operators_invitees_from_the_slice_not_env(env):
@@ -626,7 +643,12 @@ def test_collab_deploy_hands_the_cert_dir_from_the_central_config_to_collab_sync
     assert not (env["tmp"] / "from-env").exists()
     units = env["home"] / ".config/systemd/user"
     assert f'--cert-dir "{certs}"' in (units / "herdr-collab-sync.service").read_text()   # quoted paths
-    assert 'certbot" renew' in (units / "herdr-collab-cert-renew.service").read_text()
+    renew_unit = (units / "herdr-collab-cert-renew.service").read_text()
+    certbot = env["home"] / ".local/share/herdr-engineering/collab-acme-venv/bin/certbot"
+    acme = env["home"] / ".local/share/herdr-engineering/collab-acme"
+    assert f'ExecStart="{certbot}" renew' in renew_unit
+    assert f'--config-dir "{acme}/config"' in renew_unit
+    assert "inferweave/bender-failover" not in renew_unit
     # #119: the invite provisioner reads collab-public's log in the data dir deploy.sh mounts
     data_dir = env["home"] / ".local/share/herdr-engineering/collab"
     unit = (units / "herdr-collab-sync.service").read_text()
