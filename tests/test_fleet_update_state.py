@@ -245,3 +245,45 @@ def test_session_under_an_alias_name_still_counts_as_busy(tmp_path):
                   {"Gerts-MBP.local": {"status": 404, "names": ["Gerts-MBP.local", "Gerts-MBP", "mac"]}},
                   _sessions(*rows))
     assert out["Gerts-MBP.local"]["action"] == "defer"
+
+
+def test_prefiltered_active_hosts_and_agents_running(tmp_path):
+    hosts = {"beast": {"agents_running": None, "names": ["beast", "b"]},
+             "fry": {"agents_running": 3, "names": ["fry"]},
+             "bender": {"agents_running": None, "names": ["bender"]}}
+    out = fus.decide({"state_file": str(tmp_path / "s.json"), "now": NOW, "force": False,
+                      "max_defer_days": 7, "active_hosts": ["b"], "hosts": hosts})
+    assert out["beast"]["busy"] == "yes"
+    assert out["fry"]["busy"] == "yes"
+    assert out["bender"]["busy"] == "no"
+    out = fus.decide({"state_file": str(tmp_path / "s.json"), "now": NOW, "force": False,
+                      "max_defer_days": 7, "active_hosts": None, "hosts": hosts})
+    assert out["bender"]["busy"] == "unknown" and out["fry"]["busy"] == "yes"
+
+
+def test_busy_recheck_command():
+    assert fus.busy({"host_id": "beast", "host": {"agents_running": 0},
+                     "active_hosts": []}) == {"busy": "no"}
+    assert fus.busy({"host_id": "beast", "host": {}, "active_hosts": ["beast"]})["busy"] == "yes"
+    assert fus.busy({"host_id": "beast", "host": {}, "active_hosts": None})["busy"] == "unknown"
+
+
+def test_skipped_and_noted_results(tmp_path):
+    prev = _iso(NOW - 5 * DAY)
+    out = _record(tmp_path / "s.json", {
+        "a": _host("skipped", reason="an earlier host failed", last_updated="ignored"),
+        "b": _host("updated", reason="agent restart deferred")})
+    assert out["a"]["payload"]["fleet_update"] == {  # empty state file: nothing to keep
+        "last_updated": None, "deferred_since": None, "result": "skipped: an earlier host failed"}
+    assert prev
+    assert out["b"]["payload"]["fleet_update"]["result"] == "updated (agent restart deferred)"
+    assert out["b"]["payload"]["fleet_update"]["last_updated"] == _iso(NOW)
+    assert out["a"]["source"] == "fleet-update"
+
+
+def test_skipped_keeps_the_state_files_dates(tmp_path):
+    state = tmp_path / "s.json"
+    state.write_text(json.dumps({"a": {"last_updated": "L", "deferred_since": "D", "result": "x"}}))
+    out = _record(state, {"a": _host("skipped", reason="an earlier host failed")})
+    assert out["a"]["payload"]["fleet_update"] == {
+        "last_updated": "L", "deferred_since": "D", "result": "skipped: an earlier host failed"}

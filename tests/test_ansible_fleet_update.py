@@ -66,14 +66,18 @@ def test_pins_reuse_the_single_herdr_pin():
     assert hits == [ROOT / "playbooks" / "group_vars" / "all.yml"]
 
 
+PROBE = ROLE / "tasks" / "busy-probe.yml"
+
+
 def test_every_http_call_uses_the_host_id_var_and_is_no_log():
-    uris = [t for t in _tasks() if "ansible.builtin.uri" in t]
+    uris = [t for p in (ROLE / "tasks" / "main.yml", PROBE) for t in _tasks(p)
+            if "ansible.builtin.uri" in t]
     assert len(uris) == 3  # sessions GET, host GET, ingest POST
     for t in uris:
         assert t["no_log"] is True, t["name"]  # may carry X-API-Key into the cron log
         assert t["delegate_to"] == "localhost" and t["become"] is False, t["name"]
         assert t["ansible.builtin.uri"]["headers"].startswith("{{ fleet_update_request_headers")
-    host_get = _by_name("read this host's control-plane record")[0]
+    host_get = _by_name("read this host's control-plane record", PROBE)[0]
     assert "fleet_update_host_id" in host_get["ansible.builtin.uri"]["url"]
     assert "inventory_hostname" not in host_get["ansible.builtin.uri"]["url"]
     d = _defaults()
@@ -82,11 +86,10 @@ def test_every_http_call_uses_the_host_id_var_and_is_no_log():
 
 def test_reads_may_run_in_check_mode_writes_may_not():
     for frag in ("read active sessions", "read this host's control-plane record"):
-        t = _by_name(frag)[0]
+        t = _by_name(frag, PROBE)[0]
         assert t["check_mode"] is False and t["failed_when"] is False
         assert t["ansible.builtin.uri"]["method"] == "GET"
-    sessions = _by_name("read active sessions")[0]
-    assert sessions["run_once"] is True
+    sessions = _by_name("read active sessions", PROBE)[0]
     assert sessions["ansible.builtin.uri"]["url"].endswith("/api/v1/sessions?status=active")
     post = _by_name("Post the fleet-update event")[0]
     assert post["ansible.builtin.uri"]["method"] == "POST"
@@ -94,7 +97,24 @@ def test_reads_may_run_in_check_mode_writes_may_not():
     assert "check_mode" not in post
     record = _by_name("Record results")[0]
     assert "'dry_run': ansible_check_mode" in record["ansible.builtin.command"]["stdin"]
-    assert record["run_once"] is True and record["delegate_to"] == "localhost"
+    assert record["delegate_to"] == "localhost"
+
+
+def test_control_plane_data_is_prefiltered_and_never_logged():
+    """No session row (cmdline/cwd/summary) or host record reaches output."""
+    keep = _by_name("keep only host ids of active sessions", PROBE)[0]["ansible.builtin.set_fact"]
+    assert "map(attribute='host_id')" in keep["fleet_update_active_hosts"]
+    assert set(keep["fleet_update_busy_input"]) == {"agents_running", "names"}
+    for frag in ("Decide update vs defer", "busy re-check"):
+        t = _by_name(frag)[0]
+        assert t["no_log"] is True, frag
+        stdin = t["ansible.builtin.command"]["stdin"]
+        assert "fleet_update_sessions_probe" not in stdin and "fleet_update_host_probe" not in stdin
+    for p in (ROLE / "tasks" / "main.yml", PROBE):
+        for t in _tasks(p):
+            if "no_log" not in t:
+                text = json.dumps(t)
+                assert "_probe.json" not in text or "set_fact" in text, t["name"]
 
 
 def test_event_post_is_tolerant_and_never_sends_telemetry():
@@ -120,23 +140,72 @@ def test_decision_feeds_from_both_signals_and_force():
     decide = _by_name("Decide update vs defer")[0]
     stdin = decide["ansible.builtin.command"]["stdin"]
     for key in ("fleet_update_force | bool", "fleet_update_max_defer_days",
-                "fleet_update_sessions_probe", "fleet_update_state_file"):
+                "fleet_update_active_hosts", "fleet_update_busy_input", "fleet_update_state_file"):
         assert key in stdin, key
-    assert decide["check_mode"] is False and decide["run_once"] is True
+    assert decide["check_mode"] is False
 
 
-def test_updates_only_on_update_decision_with_rescue_and_restart_last():
+def _update_block():
     top = _load(ROLE / "tasks" / "main.yml")
-    block = next(t for t in top if t["name"].startswith("Update this host"))
+    return next(t for t in top if t["name"].startswith("Update this host"))
+
+
+def test_updates_only_on_update_decision_with_rescue_and_single_gated_restart():
+    block = _update_block()
     assert block["when"] == "fleet_update_decision.action == 'update'"
     names = [t["name"] for t in block["block"]]
-    restart = [i for i, n in enumerate(names) if "Restart the fabric agent" in n]
-    assert restart and restart[-1] >= len(names) - 3
-    assert any("fabric-systemd.yml" in json.dumps(t) for t in block["block"])
-    assert any("fabric-agent.yml" in json.dumps(t) for t in block["block"])
+    restarts = [i for i, n in enumerate(names) if "Restart the fabric agent" in n]
+    updates = [i for i, t in enumerate(block["block"]) if any(
+        f in json.dumps(t) for f in ("os-packages.yml", "fabric-agent.yml", "pi-build-gate.yml",
+                                     "pi-runtime.yml", "fabric-systemd.yml", "include_role"))]
+    assert restarts and min(restarts) > max(updates)  # only after every update step
+    fa = next(t for t in block["block"] if "fabric-agent.yml" in json.dumps(t))
+    assert fa["vars"] == {"fabric_agent_defer_restart": True}
+    need = _by_name("decide whether the agent needs a restart")[0]["ansible.builtin.set_fact"]
+    assert "is changed" in need["fleet_update_restart_needed"]
+    for t in block["block"]:
+        if "Restart the fabric agent" in t["name"]:
+            assert "fleet_update_restart_needed | bool" in t["when"]
+            assert "fleet_update_reason != 'agent restart deferred'" in t["when"]
     rescue = json.dumps(block["rescue"])
     assert "ansible_failed_task.name" in rescue
     assert "stderr" not in rescue and ".msg" not in rescue  # no secrets in the reason
+
+
+def test_busy_is_rechecked_right_before_the_restart():
+    names = [t["name"] for t in _update_block()["block"]]
+    i = names.index("Fleet update: re-read busy state right before the restart")
+    assert names[i + 1] == "Fleet update: busy re-check"
+    assert "defer the agent restart" in names[i + 2]
+    assert names.index("Fleet update: Restart the fabric agent (systemd user unit)") > i + 2
+
+
+def test_fabric_agent_scripts_honour_no_restart():
+    for script in ("fabric-agent.sh", "fabric-agent-macos.sh"):
+        text = (REPO / "scripts" / script).read_text()
+        assert '"${HERDR_FABRIC_AGENT_NO_RESTART:-}" = "1"' in text, script
+    fa = (ROOT / "tasks" / "fabric-agent.yml").read_text()
+    assert "HERDR_FABRIC_AGENT_NO_RESTART" in fa and "fabric_agent_defer_restart" in fa
+    assert "changed_when: true" not in fa.split("Install the selected HerdR release")[1].split("- name:")[0]
+
+
+def test_macos_restart_is_best_effort():
+    k = _by_name("Restart the fabric agent (macOS launchd)")[0]
+    assert k["failed_when"] is False
+    note = _by_name("note the failed macOS restart")[0]
+    assert note["ansible.builtin.set_fact"]["fleet_update_reason"] == "agent restart failed"
+
+
+def test_serial_and_stop_on_failure():
+    play = _load(PLAYBOOK)[0]
+    assert play["serial"] == 1
+    assert _defaults()["fleet_update_stop_on_failure"] is True
+    gate = _by_name("did an earlier host of this run fail")[0]["ansible.builtin.set_fact"]
+    expr = gate["fleet_update_earlier_failed"]
+    assert "fleet_update_stop_on_failure | bool" in expr and "'failed'" in expr
+    assert "not ansible_check_mode" in expr
+    decide = _by_name("Decide update vs defer")[0]
+    assert decide["when"] == "not fleet_update_earlier_failed"
 
 
 def test_os_packages_security_only_and_full_upgrade_opt_in():
@@ -319,6 +388,7 @@ def test_record_and_post_tasks_send_typed_json(tmp_path):
     assert path == "/api/v1/ingest"
     assert {k.lower(): v for k, v in headers.items()}.get("x-api-key") == "sekrit-key-123"
     assert body["entity_id"] == "beast" and body["entity_type"] == "host"
+    assert body["source"] == "fleet-update"  # never a liveness source
     p = body["payload"]
     assert p["maintenance"] is False
     assert "telemetry" not in p
@@ -339,3 +409,80 @@ def test_herdr_eng_only_at_a_pinned_revision_and_restart_gated():
     for t in block:
         if "Restart the fabric agent" in t["name"]:
             assert "fleet_update_restart_needed | bool" in t["when"]
+
+
+@pytest.mark.parametrize("busy,expected", [(True, "agent restart deferred"), (False, "")])
+def test_restart_is_skipped_when_the_host_became_busy(tmp_path, busy, expected):
+    """--check run of the role's restart section against a fake control plane."""
+    import http.server
+    import threading
+
+    exe = _ansible("ansible-playbook")
+    if not exe:
+        pytest.skip("ansible-playbook not available")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            rows = [{"host_id": "beast", "status": "active", "cmdline": "SECRETCMD"}] if busy else []
+            body = json.dumps({"sessions": rows} if "sessions" in self.path else {}).encode()
+            self.send_response(200 if "sessions" in self.path else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    block = _update_block()["block"]
+    start = next(i for i, t in enumerate(block) if "needs a restart" in t["name"])
+    tasks = [t for t in block[start:] if "Restart the fabric agent" not in t["name"]
+             and "mark updated" not in t["name"]]
+    for t in tasks:
+        if "include_tasks" in json.dumps(t):
+            t["ansible.builtin.include_tasks"] = str(PROBE)
+    tasks.append({"name": "show", "ansible.builtin.debug": {"msg": "REASON=[{{ fleet_update_reason }}]"}})
+    play = [{"hosts": "localhost", "gather_facts": True,
+             "vars": {**_defaults(),
+                      "fleet_update_helper": str(ROOT / "files" / "fleet-update-state.py"),
+                      "fleet_update_control_plane_url": f"http://127.0.0.1:{srv.server_port}",
+                      "fleet_update_host_id": "beast", "fleet_update_reason": "",
+                      "fleet_update_security_install": {"changed": True}},
+             "tasks": tasks}]
+    pb = tmp_path / "p.yml"
+    pb.write_text(yaml.safe_dump(play))
+    r = subprocess.run([exe, "-v", "--check", "-i", "localhost,", "-c", "local", str(pb)],
+                       capture_output=True, text=True, timeout=120)
+    srv.shutdown()
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert f"REASON=[{expected}]" in out
+    assert "SECRETCMD" not in out
+
+
+@pytest.mark.parametrize("stop,expected", [(True, "True"), (False, "False")])
+def test_stop_on_failure_gate_sees_an_earlier_serial_host(tmp_path, stop, expected):
+    """Only set_fact/debug tasks: two local hosts, serial 1, the first one failed."""
+    exe = _ansible("ansible-playbook")
+    if not exe:
+        pytest.skip("ansible-playbook not available")
+    gate = _by_name("did an earlier host of this run fail")[0]
+    play = [{"hosts": "all", "serial": 1, "gather_facts": False,
+             "vars": {"fleet_update_stop_on_failure": stop},
+             "tasks": [
+                 gate,
+                 {"name": "show", "ansible.builtin.debug": {
+                     "msg": "GATE {{ inventory_hostname }}={{ fleet_update_earlier_failed }}"}},
+                 {"name": "first host fails", "ansible.builtin.set_fact": {
+                     "fleet_update_outcome": "failed"}, "when": "inventory_hostname == 'h1'"}]}]
+    pb = tmp_path / "p.yml"
+    pb.write_text(yaml.safe_dump(play))
+    inv = tmp_path / "inv.ini"
+    inv.write_text("h1 ansible_connection=local\nh2 ansible_connection=local\n")
+    r = subprocess.run([exe, "-i", str(inv), str(pb)], capture_output=True, text=True, timeout=120)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "GATE h1=False" in out
+    assert f"GATE h2={expected}" in out

@@ -10,8 +10,9 @@ herdr_pinned_version: "0.9.1"
 
 # Versions the fleet is pinned to. Published to the control plane on every
 # fleet-update run so version drift is judged against these, not the fleet
-# majority. Write each value exactly as the host reports it (`pi --version`,
-# `autospec --version`, an extension's package.json version). An empty value
+# majority. Write each value as the version number ("0.9.1"): hosts report the
+# version token of `herdr/pi/autospec --version` and an extension's package.json
+# version. An empty value
 # means "not pinned": it is not published and never shows as drift.
 fleet_pins:
   herdr: "{{ herdr_pinned_version }}"

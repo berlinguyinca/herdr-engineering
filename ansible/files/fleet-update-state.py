@@ -6,12 +6,17 @@ reading one JSON object on stdin and printing one JSON object on stdout:
 
   decide  busy signal + deferral state -> per host {action: update|defer, ...}.
           Reads the state file, never writes it.
+  busy    one host's busy state right before the agent restart.
   record  per host outcome -> per host control-plane ingest body; writes the
           state file (unless dry_run) under an exclusive lock, merging so
           hosts not in this run keep their entries.
 
 State file (keyed by control-plane host id):
   {"<host>": {"last_updated": iso|null, "deferred_since": iso|null, "result": str}}
+
+Outcomes: updated (reason = optional note, e.g. "agent restart deferred"),
+deferred, skipped (an earlier host failed), failed. Only "updated" moves
+last_updated and clears deferred_since; the others keep the previous values.
 
 Busy rules: a host is busy when its control-plane record reports
 latest.agents_running > 0 OR the control plane lists an active session for it.
@@ -71,25 +76,48 @@ def _count(v):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
-def busy_state(host_id, host_probe, sessions_probe) -> str:
-    """'yes' | 'no' | 'unknown' (see module docstring)."""
-    host_probe = host_probe if isinstance(host_probe, dict) else {}
+def _active_hosts(sessions_probe):
+    """Host ids with an active session, or None when the list is unreadable."""
     sessions_probe = sessions_probe if isinstance(sessions_probe, dict) else {}
-    if host_probe.get("status") == 200 and isinstance(host_probe.get("json"), dict):
-        latest = host_probe["json"].get("latest")
-        running = _count(latest.get("agents_running")) if isinstance(latest, dict) else None
-        if running is not None and running > 0:
-            return "yes"
-    names = {host_id, *(n for n in host_probe.get("names") or [] if isinstance(n, str) and n)}
     body = sessions_probe.get("json")
     rows = body.get("sessions") if isinstance(body, dict) else None
     if sessions_probe.get("status") != 200 or not isinstance(rows, list):
+        return None
+    return [r.get("host_id") for r in rows
+            if isinstance(r, dict) and r.get("status") == "active"]
+
+
+def _agents_running(host_probe):
+    if "agents_running" in host_probe:
+        return _count(host_probe.get("agents_running"))
+    if host_probe.get("status") == 200 and isinstance(host_probe.get("json"), dict):
+        latest = host_probe["json"].get("latest")
+        return _count(latest.get("agents_running")) if isinstance(latest, dict) else None
+    return None
+
+
+def busy_state(host_id, host_probe, sessions_probe=None, *, active_hosts=...) -> str:
+    """'yes' | 'no' | 'unknown' (see module docstring).
+
+    ``host_probe``: {"agents_running": n|None, "names": [...]} as the play sends
+    it (pre-filtered: no host record reaches this process), or a raw
+    {"status", "json"} probe. ``active_hosts``: host ids with an active session,
+    None = unreadable; when omitted it is derived from a raw ``sessions_probe``.
+    """
+    host_probe = host_probe if isinstance(host_probe, dict) else {}
+    running = _agents_running(host_probe)
+    if running is not None and running > 0:
+        return "yes"
+    if active_hosts is ...:
+        active_hosts = _active_hosts(sessions_probe)
+    if not isinstance(active_hosts, list):
         return "unknown"
-    for row in rows:
-        if (isinstance(row, dict) and row.get("host_id") in names
-                and row.get("status") == "active"):
-            return "yes"
-    return "no"
+    names = {host_id, *(n for n in host_probe.get("names") or [] if isinstance(n, str) and n)}
+    return "yes" if any(h in names for h in active_hosts if isinstance(h, str)) else "no"
+
+
+def _busy_kwargs(inp):
+    return {"active_hosts": inp["active_hosts"]} if "active_hosts" in inp else {}
 
 
 def decide(inp: dict) -> dict:
@@ -100,7 +128,7 @@ def decide(inp: dict) -> dict:
     out = {}
     for host, probe in (inp.get("hosts") or {}).items():
         prev = _entry(state, host)
-        busy = busy_state(host, probe, inp.get("sessions"))
+        busy = busy_state(host, probe, inp.get("sessions"), **_busy_kwargs(inp))
         d = {"busy": busy, "forced": False, "last_updated": prev.get("last_updated"),
              "deferred_since": prev.get("deferred_since")}
         if busy == "no":
@@ -139,7 +167,7 @@ def clean_pins(pins) -> dict:
 
 def _result(outcome, reason) -> str:
     if outcome == "updated":
-        return "updated"
+        return f"updated ({reason})"[:RESULT_MAX] if reason else "updated"
     text = f"{outcome}: {reason or 'unknown'}"
     return text[:RESULT_MAX]
 
@@ -167,18 +195,22 @@ def _write_state(path: Path, updates: dict) -> None:
 
 def record(inp: dict) -> dict:
     now = _now(inp)
+    state = load_state(inp["state_file"])
     bodies, updates = {}, {}
     for host, h in (inp.get("hosts") or {}).items():
         outcome = h.get("outcome")
         last, since = h.get("last_updated"), h.get("deferred_since")
+        if outcome == "skipped":  # never probed/decided: keep what the state file has
+            prev = _entry(state, host)
+            last, since = prev.get("last_updated"), prev.get("deferred_since")
         if outcome == "updated":
             last, since = iso(now), None
-        elif outcome != "deferred":
+        elif outcome not in ("deferred", "skipped"):
             outcome = "failed"
         fu = {"last_updated": last, "deferred_since": since,
               "result": _result(outcome, h.get("reason"))}
         updates[host] = fu
-        bodies[host] = {"source": "ansible-fleet-update", "entity_type": "host",
+        bodies[host] = {"source": "fleet-update", "entity_type": "host",
                         "entity_id": host, "event_type": "host.fleet_update",
                         "payload": {"maintenance": _bool(h.get("maintenance")),
                                     "pins": clean_pins(h.get("pins")),
@@ -188,12 +220,21 @@ def record(inp: dict) -> dict:
     return bodies
 
 
+def busy(inp: dict) -> dict:
+    """Re-check one host right before an agent restart: {"busy": yes|no|unknown}."""
+    return {"busy": busy_state(inp["host_id"], inp.get("host"), inp.get("sessions"),
+                               **_busy_kwargs(inp))}
+
+
+COMMANDS = {"decide": decide, "record": record, "busy": busy}
+
+
 def main(argv) -> int:
-    if len(argv) != 2 or argv[1] not in ("decide", "record"):
-        print("usage: fleet-update-state.py decide|record < input.json", file=sys.stderr)
+    if len(argv) != 2 or argv[1] not in COMMANDS:
+        print("usage: fleet-update-state.py decide|record|busy < input.json", file=sys.stderr)
         return 2
     inp = json.load(sys.stdin)
-    out = decide(inp) if argv[1] == "decide" else record(inp)
+    out = COMMANDS[argv[1]](inp)
     json.dump(out, sys.stdout, sort_keys=True)
     sys.stdout.write("\n")
     return 0

@@ -8,7 +8,7 @@ import { configBadge } from './fleet-config-badge.js';
 
 export const RANGES = ['1h', '24h', '7d'];
 const PINNED = ['herdr', 'pi', 'autospec'];
-const VERSION_KEYS = ['herdr', 'pi', 'autospec', 'tailscale'];
+const VERSION_KEYS = ['herdr', 'herdr_eng', 'pi', 'autospec', 'tailscale'];
 
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 const obj = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : null);

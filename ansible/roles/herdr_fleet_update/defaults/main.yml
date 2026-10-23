@@ -15,6 +15,9 @@ fleet_update_security_only: true
 fleet_update_max_defer_days: 7
 # true overrides "agents running" AND "busy state unknown" (operator decision).
 fleet_update_force: false
+# Once one host records "failed: ...", the remaining hosts of the run record
+# "skipped: an earlier host failed" and change nothing. false = keep going.
+fleet_update_stop_on_failure: true
 
 # Inventory flag: exempt the host from stale alarms. Sent explicitly on every
 # run (the control plane keeps the old value when the key is missing).

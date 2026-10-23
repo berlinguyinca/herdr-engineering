@@ -21,7 +21,7 @@ function reportingHost(over = {}) {
       },
     },
     updates: { manager: 'apt', outdated: 12, security: 2, packages: [{ name: 'openssl', from: '3.0.1', to: '3.0.2' }], reboot_required: true, failed_units: ['foo.service'] },
-    versions: { herdr: '1.2.0', pi: '0.9', autospec: '2.0', tailscale: '1.80', pi_extensions: { a: '1', b: '2' } },
+    versions: { herdr: '1.2.0', herdr_eng: '0.1.0', pi: '0.9', autospec: '2.0', tailscale: '1.80', pi_extensions: { a: '1', b: '2' } },
     pins: { herdr: '1.2.0', pi: '1.0', pi_extensions: { a: '1', b: '9' } },
     fleet_update: { last_updated: '2026-10-20T03:00:00Z' },
     maintenance: false,
@@ -157,6 +157,8 @@ test('pins drift marker on differing versions including pi extensions', () => {
   assert.match(html, /data-version="pi\/b"[^>]*data-drift="true"/);
   assert.match(html, /data-version="pi\/a"[^>]*data-drift="false"/);
   assert.match(html, /data-version="tailscale"[^>]*data-drift="false"/);
+  // herdr-eng is shown but never pinned (the herdr pin is the Herdr binary)
+  assert.match(html, /data-version="herdr_eng"[^>]*data-drift="false"><td>herdr_eng<\/td><td>0\.1\.0/);
   assert.match(html, /Last fleet update/);
 });
 

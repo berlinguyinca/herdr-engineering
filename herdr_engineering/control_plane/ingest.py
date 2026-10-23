@@ -33,6 +33,14 @@ def _git_identity(payload):
     return {"repository_id": next(iter(identities), None), "commit_sha": commit_sha}
 
 
+# Sources whose host events prove the host is alive: its fabric agent, and the
+# herdr feed plugin on the host (deploy/herdr-cp-feed-plugin posts host.heartbeat
+# / host.inventory with no source, i.e. the default "herdr"). Any other source
+# may only update host state keys (see IngestService._ingest_host_state).
+LIVENESS_SOURCES = frozenset({"fabric-agent", "herdr"})
+_AGENT_ONLY_HOST_KEYS = ("telemetry", "cpu", "mem", "disk", "inventory")
+
+
 class IngestService:
     """Translates lifecycle event envelopes into idempotent repo mutations."""
 
@@ -75,7 +83,7 @@ class IngestService:
             result = self.repo.mission_activity.ingest(entity_id, payload, source=source)
             return {"entity_type": entity_type, "entity_id": entity_id, **result}
         if entity_type == "host":
-            return self._ingest_host(entity_id, event_type, payload)
+            return self._ingest_host(entity_id, event_type, payload, source)
         if entity_type == "session":
             return self._ingest_session(entity_id, event_type, payload,
                                         source)
@@ -100,7 +108,9 @@ class IngestService:
         return {"entity_type": entity_type, "entity_id": entity_id,
                 "event_type": event_type}
 
-    def _ingest_host(self, entity_id, event_type, payload) -> dict:
+    def _ingest_host(self, entity_id, event_type, payload, source="herdr") -> dict:
+        if source not in LIVENESS_SOURCES:
+            return self._ingest_host_state(entity_id, payload)
         status = ("unavailable" if "unavailable" in event_type.lower()
                   else "healthy")
         # Validate everything before touching the host: a bad sample is a 400
@@ -126,6 +136,20 @@ class IngestService:
                 "cpu_pct": legacy.get("cpu"), "mem_pct": legacy.get("mem"),
                 "disk_pct": legacy.get("disk")})
         return host
+
+    def _ingest_host_state(self, entity_id, payload) -> dict:
+        """A host event from a source that is not the host's own agent (e.g. the
+        Ansible fleet update on the main host): it may only set host STATE keys.
+        It never touches liveness (status, last_seen), identity (host_name, ip)
+        or metrics, and never creates a host the agent has not registered."""
+        bad = sorted(k for k in _AGENT_ONLY_HOST_KEYS if k in payload)
+        if bad:
+            raise ValueError("host metrics/inventory are accepted from the host agent only: "
+                             + ", ".join(bad))
+        state = {k: clean_state(k, payload.get(k)) for k in STATE_KEYS}
+        self.repo.record_host_metrics(entity_id, None, **state)
+        return self.repo.get_host(entity_id) or {"entity_id": entity_id,
+                                                  "ignored": "unknown host"}
 
     def _ingest_session(self, entity_id, event_type, payload,
                         source="herdr") -> dict:

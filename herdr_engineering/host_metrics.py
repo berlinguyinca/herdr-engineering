@@ -518,6 +518,15 @@ def _tool_version(cmd: list[str]) -> str | None:
     return _first_line(_run(cmd)) if shutil.which(cmd[0]) else None
 
 
+_VERSION_RE = re.compile(r"\d+(?:\.\d+)+[\w.+-]*")
+
+
+def _version(line: str | None) -> str | None:
+    """The version token of a ``--version`` line ("herdr 0.9.1" -> "0.9.1"); None if absent."""
+    m = _VERSION_RE.search(line) if line else None
+    return m.group(0) if m else None
+
+
 def _pi_extensions() -> dict:
     """name -> version. A directory extension reports its package.json version;
     a single-file extension (e.g. build-gate.ts) has no manifest, so ``None``."""
@@ -540,10 +549,14 @@ def _pi_extensions() -> dict:
 def read_versions() -> dict:
     """Versions of the fleet tooling; ``None`` when a tool is absent."""
     try:
-        from .version import __version__ as herdr
+        from .version import __version__ as herdr_eng
     except Exception:  # noqa: BLE001
-        herdr = None
-    return {"herdr": herdr, "pi": _tool_version(["pi", "--version"]),
+        herdr_eng = None
+    # "herdr" is the Herdr binary (what herdr_pinned_version pins); the
+    # herdr-engineering package is "herdr_eng".
+    return {"herdr": _version(_tool_version(["herdr", "--version"])),
+            "herdr_eng": herdr_eng,
+            "pi": _version(_tool_version(["pi", "--version"])),
             "pi_extensions": _pi_extensions(),
-            "autospec": _tool_version(["autospec", "--version"]),
+            "autospec": _version(_tool_version(["autospec", "--version"])),
             "tailscale": _tool_version(["tailscale", "--version"])}

@@ -132,10 +132,22 @@ Per host, in order:
    `-e herdr_engineering_revision=<sha>`; when it is empty, herdr-eng is not
    touched, so the cron never ships whatever HEAD the main host has checked
    out), `tasks/pi-runtime.yml` (only with `-e pi_engineering_revision=<sha>`)
-   and `tasks/fabric-systemd.yml`. Only after all of these succeed, and only
-   when an OS package or the herdr-eng release changed, is the fabric agent
-   restarted (systemd user unit, or launchd `kickstart` on macOS). A failing step yields
-   `failed: <task name>`. Only the task name is recorded, never its output.
+   and `tasks/fabric-systemd.yml`. During this run `fabric-agent.sh` leaves a
+   running agent alone (`HERDR_FABRIC_AGENT_NO_RESTART=1`; only releases that
+   contain this change honour it, so an older pinned revision still restarts
+   its agent once inside the script). After **all** of these succeed, and only
+   when an OS package, Homebrew or the herdr-eng release actually changed
+   (staging an already staged revision reports no change), the play re-reads
+   the busy state and restarts the fabric agent **once** (systemd user unit, or
+   launchd `kickstart` on macOS). If the host became busy (or unknown) since
+   the decision, the restart is skipped and the result is
+   `updated (agent restart deferred)`; the agent picks up the release at its
+   next restart. A small race remains: an agent that starts between the
+   re-check and the restart is still interrupted. On macOS the restart is
+   best-effort: a LaunchAgent that is not loaded prints a message and records
+   `updated (agent restart failed)`, never `failed:`. A failing update step
+   yields `failed: <task name>`. Only the task name is recorded, never its
+   output.
 4. **Always post** one host event (`POST /api/v1/ingest`, entity `host`,
    event `host.fleet_update`). It carries `pins` (from `fleet_pins`, unset pins
    omitted), the full `fleet_update` object
@@ -144,7 +156,23 @@ Per host, in order:
    (`false` included), because the control plane keeps the old value when the
    key is missing. It never sends `telemetry`, so the agent's samples are not
    touched. If the control plane is unreachable, the run prints a warning and
-   the update still counts.
+   the update still counts. The control plane treats this event as state only:
+   it never changes the host's status or last-seen time and never creates a
+   host the agent has not registered (only the agent's own heartbeats prove a
+   host is alive).
+
+**One host at a time.** The play runs `serial: 1`. With
+`fleet_update_stop_on_failure: true` (the default), once a host records
+`failed: ...`, every remaining host of that run records
+`skipped: an earlier host failed` and changes nothing. Pass
+`-e fleet_update_stop_on_failure=false` to keep going. A host that is
+unreachable over SSH is dropped from the run and records nothing; its
+"last updated" ages until the 14-day Problem appears.
+
+**Security-only is best-effort for apt.** A package counts as a security
+update when `apt-get -s upgrade` would take its candidate from a `*-security`
+suite. When a newer candidate exists in `-updates`, apt installs that one, so
+a security run can pull a non-security version of an affected package.
 
 State for step 2 lives on the main host in
 `~/.local/share/herdr-engineering/fleet-update-state.json` (keyed by host id,
@@ -153,13 +181,17 @@ but writes neither the state file nor the event.
 
 **Pins** (`playbooks/group_vars/all.yml`): `fleet_pins.herdr` reuses
 `herdr_pinned_version`, the single herdr pin. `pi`, `autospec` and
-`pi_extensions` are empty (unpinned) until set. Write each value exactly as the
-host reports it. Pins are published so drift is judged against them. Enforced
+`pi_extensions` are empty (unpinned) until set. Write each value as the
+version number (`0.9.1`, not `herdr 0.9.1`): hosts report the version token of
+`herdr --version`, `pi --version`, `autospec --version` and an extension's
+package.json, and herdr-engineering itself as `herdr_eng` (shown, never
+pinned). Pins are published so drift is judged against them. Enforced
 today: herdr-eng and the build-gate extension at
 `fleet_update_herdr_engineering_revision` (when set);
 pi-engineering only when a revision is passed. The herdr/pi/autospec pins are
-**report-only**: the existing install tasks only check presence and clone
-`main`.
+**report-only**: the existing install tasks only check presence, and the base
+role clones pi-engineering and autospec at `main` (pre-existing). herdr-eng is
+not updated by default (`fleet_update_herdr_engineering_revision` is empty).
 
 **Maintenance.** Set `maintenance: true` for a host in private inventory
 (`host_vars/<host>.yml`, see `inventory/hosts.example.yml`) to exempt it from

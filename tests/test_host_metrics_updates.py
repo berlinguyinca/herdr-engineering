@@ -93,8 +93,9 @@ def test_versions_missing_tool_is_none(monkeypatch, tmp_path):
     monkeypatch.setattr(host_metrics, "_PI_EXT_DIR", str(tmp_path / "nope"))
     v = read_versions()
     assert v["pi"] is None and v["autospec"] is None and v["tailscale"] is None
+    assert v["herdr"] is None and v["herdr_eng"]
     assert v["pi_extensions"] == {}
-    assert set(v) == {"herdr", "pi", "pi_extensions", "autospec", "tailscale"}
+    assert set(v) == {"herdr", "herdr_eng", "pi", "pi_extensions", "autospec", "tailscale"}
 
 
 def test_versions_parsed(monkeypatch, tmp_path):
@@ -103,15 +104,25 @@ def test_versions_parsed(monkeypatch, tmp_path):
     (ext / "pkg" / "package.json").write_text('{"version": "1.2.3"}')
     (ext / "build-gate.ts").write_text("// x")
     monkeypatch.setattr(host_metrics, "_PI_EXT_DIR", str(ext))
-    out = {"pi": "0.9.1\n", "autospec": "autospec 2.0\n",
+    out = {"herdr": "herdr 0.9.1\n", "pi": "0.9.1\n", "autospec": "autospec 2.0\n",
            "tailscale": "1.76.0\n  tailscale commit: abc\n"}
     monkeypatch.setattr(shutil, "which", lambda t: f"/bin/{t}")
     monkeypatch.setattr(host_metrics, "_run", lambda cmd, timeout=5.0: out.get(cmd[0]))
     v = read_versions()
     assert v["pi"] == "0.9.1" and v["tailscale"] == "1.76.0"
-    assert v["autospec"] == "autospec 2.0"
+    assert v["autospec"] == "2.0"
     assert v["pi_extensions"] == {"build-gate.ts": None, "pkg": "1.2.3"}
-    assert v["herdr"]
+    assert v["herdr"] == "0.9.1"
+    assert v["herdr_eng"]
+
+
+def test_version_token():
+    from herdr_engineering.host_metrics import _version
+    assert _version("herdr 0.9.1") == "0.9.1"
+    assert _version("pi v1.4.0-rc.1 (build abc)") == "1.4.0-rc.1"
+    assert _version("2.1.306 (Claude Code)") == "2.1.306"
+    assert _version("autospec dev") is None
+    assert _version("") is None and _version(None) is None
 
 
 def test_failed_unit_name_starting_with_x(monkeypatch):

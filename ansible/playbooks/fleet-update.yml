@@ -19,6 +19,10 @@
 #       -e fleet_update_force=true -l beast
 - name: "HerdR Engineering fleet update (from the main host)"
   hosts: herdr_fleet
+  # One host at a time: limits the blast radius of a bad update, and with
+  # fleet_update_stop_on_failure (default true) the first failure turns the
+  # remaining hosts of the run into "skipped: an earlier host failed".
+  serial: 1
   gather_facts: false
   become: "{{ herdr_engineering_become | default((ansible_user | default(lookup('env', 'USER'), true)) != 'root') }}"
   environment:
@@ -27,9 +31,19 @@
     herdr_engineering_repo_root: "{{ playbook_dir }}/../.."
     fabric_agent_gateway_url: "http://dev.lan:29999"
   tasks:
+    # With serial: 1 an unreachable host would end the whole run (Ansible stops
+    # when every host of a batch failed), so an offline host is dropped from
+    # this run instead. It records nothing; its "last updated" ages until the
+    # 14-day Problem shows.
     - name: "Gather facts as the connection user (no become)"
       ansible.builtin.setup:
       become: false
+      ignore_unreachable: true
+      register: fleet_update_setup
+
+    - name: "Skip an unreachable host (the rest of the fleet still runs)"
+      ansible.builtin.meta: end_host
+      when: fleet_update_setup.unreachable | default(false)
 
     - name: "Record the fleet user's home + uid for paths/ownership"
       ansible.builtin.set_fact:
