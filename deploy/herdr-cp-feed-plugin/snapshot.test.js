@@ -9,7 +9,7 @@ import { mkdirSync, existsSync } from "node:fs";
 import { collectSnapshot, createSnapshotPublisher, publishSnapshot, main } from "./snapshot.js";
 import { loadHostConfig } from "./host-config.js";
 
-const collect = (env, options) => collectSnapshot(env, { resolveModel: async () => null, ...options });
+const collect = (env, options) => collectSnapshot(env, { resolveModel: async () => null, collectTranscript:async()=>({envelopes:[]}), ...options });
 
 const server = name => ({ name, running: true, socket_path: `/sessions/${name}/herdr.sock` });
 const pane = (index = 0) => ({ pane_id: `w1:p${index}`, terminal_id: `term_${index}`, agent: "pi", cwd: "/work/real", agent_status: "idle", revision: 5 });
@@ -286,4 +286,132 @@ test("an empty api key (open control plane) sends no X-API-Key header at all", a
   });
   assert.equal(calls.length, 1);
   assert.equal("X-API-Key" in calls[0].headers, false);
+});
+
+test('transcript envelopes do not affect session counts or snapshot limits', async () => {
+  const result=await collect({}, {queryNative:reader([server('eng')],Array.from({length:130},(_,i)=>pane(i))),metadata:async()=>({}),
+    collectTranscript:async (_server,_pane,id)=>({status:'recording',truncated:false,envelopes:[{entity_type:'inspector',entity_id:id,event_type:'inspector.transcript',payload:{events:[{kind:'message',role:'user',text:'hi',event_id:id}]}}]})});
+  assert.equal(result.summary.sessions,128);
+  assert.equal(result.envelopes.filter(e=>e.entity_type==='session').length,128);
+  assert.equal(result.envelopes.filter(e=>e.entity_type==='inspector').length,128);
+});
+
+test('publisher acknowledges transcript only after all events accepted and separates snapshot cache',async()=>{
+  let accepted=false,acks=0;
+  const transcript={entity_type:'inspector',entity_id:'same',payload:{events:[{event_id:'e'}]},onPublished:()=>acks++};
+  const snapshot={entity_type:'session',entity_id:'same',payload:{status:'working'}};
+  const publish=createSnapshotPublisher({fetcher:async()=>({ok:true,json:async()=>({ok:true,entity:{accepted:accepted?1:0,duplicates:0,rejected:accepted?[]:[{error:'bad'}]}})})});
+  assert.equal((await publish({},[snapshot,transcript])).errors,1); assert.equal(acks,0);
+  accepted=true;
+  assert.equal((await publish({},[snapshot,transcript])).posted,1); assert.equal(acks,1);
+  assert.equal((await publish({},[snapshot,transcript])).posted,0); assert.equal(acks,2);
+});
+
+test('snapshot remembers exact native transcript identity and adds retained activity without inflating sessions',async()=>{
+  const remembered=[],seen=[];
+  const native={agent:'codex',kind:'path',value:'/native/explicit.jsonl',nativeId:'native-id'};
+  const result=await collect({}, {
+    queryNative:reader([server('eng')],[pane()]),metadata:async()=>({}),
+    collectTranscript:async()=>({status:'recording',envelopes:[],identity:native}),
+    sessionTracker:{remember:value=>remembered.push(value),collect:async ids=>{seen.push(...ids);return {envelopes:[{entity_type:'inspector',payload:{events:[{kind:'message',text:'helper'}]}}]};}},
+  });
+  assert.equal(remembered.length,1);
+  assert.equal(remembered[0].identity,native);
+  assert.deepEqual(seen,[result.envelopes[0].entity_id]);
+  assert.equal(result.summary.sessions,1);
+  assert.equal(result.envelopes.length,2);
+  assert.equal(JSON.stringify(result.envelopes).includes('/native/explicit.jsonl'),false);
+});
+
+test('retained transcripts drain even when the native registry is unavailable',async()=>{
+  const activity={entity_type:'inspector',payload:{events:[]}};
+  const result=await collect({}, {
+    queryNative:async()=>null,
+    sessionTracker:{remember:()=>assert.fail('no identity'),collect:async seen=>{assert.equal(seen.size,0);return {envelopes:[activity]};}},
+  });
+  assert.equal(result.summary.sessions,0);
+  assert.equal(result.summary.errors,1);
+  assert.deepEqual(result.envelopes,[activity]);
+});
+
+function repairFixture({changeAt,change,reportOk=true,agent='pi'}={}) {
+  const nativeId='11111111-1111-4111-8111-111111111111';
+  const initial={...pane(),agent},identity={agent,kind:'path',value:agent==='claude'?`/native/claude/${nativeId}.jsonl`:'/native/pi/session.jsonl',nativeId:null};
+  let proofs=0,reported=false;
+  const reports=[];
+  const queryNative=async(_binary,args)=>{
+    if(args[0]==='session')return {sessions:[server('eng')]};
+    if(args.includes('snapshot'))return {result:{snapshot:{agents:[initial]}}};
+    if(args.includes('get')) {
+      proofs++;
+      return {result:{pane:{...initial,...(changeAt && proofs>=changeAt && change==='terminal'?{terminal_id:'term_reused'}:{}),...(changeAt && proofs>=changeAt && change==='agent'?{agent:'claude'}:{}),...(reported?{agent_session:{agent,kind:agent==='claude'?'id':'path',value:agent==='claude'?nativeId:identity.value}}:{})}}};
+    }
+    if(args.includes('process-info'))return {result:{process_info:{foreground_processes:[{pid:changeAt && proofs>=changeAt && change==='pid'?99:42}]}}};
+    throw new Error('unexpected query');
+  };
+  const reportNative=async(binary,args)=>{reports.push({binary,args});reported=reportOk;return {ok:reportOk};};
+  return {reports,run:()=>collect({HERDR_BIN:'/fixture/herdr'}, {queryNative,metadata:async()=>({}),collectTranscript:async()=>({status:'recording',identity,envelopes:[]}),reportNative,now:()=>1700000000000})};
+}
+
+test('verified recovered identity is reported with a transparent source and read back before publication',async()=>{
+  const f=repairFixture();const result=await f.run();
+  assert.equal(f.reports.length,1);
+  assert.equal(f.reports[0].binary,'/fixture/herdr');
+  assert.deepEqual(f.reports[0].args.slice(0,9),['--session','eng','pane','report-agent-session','w1:p0','--source','herdr:engineering-transcript','--agent','pi']);
+  const args=f.reports[0].args;
+  assert.ok(Number.isSafeInteger(Number(args[args.indexOf('--seq')+1])));
+  assert.equal(args[args.indexOf('--agent-session-path')+1],'/native/pi/session.jsonl');
+  assert.deepEqual(result.envelopes[0].payload.agent_session,{agent:'pi',kind:'path',value:'/native/pi/session.jsonl'});
+  assert.equal(result.envelopes[0].payload.transcript.identity_repair,'repaired');
+});
+
+test('Claude recovery reports its verified transcript UUID as native identity',async()=>{
+  const f=repairFixture({agent:'claude'});const result=await f.run();
+  const args=f.reports[0].args;
+  assert.equal(args[args.indexOf('--agent-session-id')+1],'11111111-1111-4111-8111-111111111111');
+  assert.equal(result.envelopes[0].payload.agent_session.kind,'id');
+  assert.equal(result.envelopes[0].payload.transcript.identity_repair,'repaired');
+});
+
+test('native identity repair skips reused terminals, changed agents and changed foreground processes',async()=>{
+  for(const change of ['terminal','agent','pid']) {
+    const f=repairFixture({changeAt:2,change});const result=await f.run();
+    assert.equal(f.reports.length,0,change);
+    assert.equal(result.envelopes[0].payload.agent_session,undefined,change);
+    assert.equal(result.envelopes[0].payload.transcript.identity_repair,'binding_changed',change);
+  }
+});
+
+test('a rejected native identity report never claims that messaging was repaired',async()=>{
+  const f=repairFixture({reportOk:false});const result=await f.run();
+  assert.equal(f.reports.length,1);
+  assert.equal(result.envelopes[0].payload.agent_session,undefined);
+  assert.equal(result.envelopes[0].payload.transcript.identity_repair,'report_rejected');
+});
+
+test('post-report pane reuse is rejected before publishing a recovered native identity',async()=>{
+  const f=repairFixture({changeAt:3,change:'pid'});const result=await f.run();
+  assert.equal(f.reports.length,1);
+  assert.equal(result.envelopes[0].payload.agent_session,undefined);
+  assert.equal(result.envelopes[0].payload.transcript.identity_repair,'binding_changed');
+});
+
+test('already-known native identities are never reported or replaced',async()=>{
+  const existing={agent:'pi',kind:'id',value:'existing-identity'};
+  const result=await collect({}, {
+    queryNative:reader([server('eng')],[{...pane(),agent_session:existing}]),metadata:async()=>({}),
+    collectTranscript:async()=>({status:'recording',identity:{agent:'pi',kind:'path',value:'/native/session.jsonl'},envelopes:[]}),
+    reportNative:async()=>assert.fail('must preserve known native identity'),
+  });
+  assert.deepEqual(result.envelopes[0].payload.agent_session,existing);
+  assert.equal(result.envelopes[0].payload.transcript.identity_repair,undefined);
+});
+
+test('dry-run explicitly disables native identity metadata reports',async()=>{
+  let observed;
+  assert.equal(await main(['--dry-run'],{}, {
+    collect:async(_env,options)=>{observed=options;return {envelopes:[],summary:{errors:0}};},
+    inventoryEnvelope:async()=>null,loadEnvelope:()=>null,
+  }),0);
+  assert.equal(observed?.reportNative,false);
 });

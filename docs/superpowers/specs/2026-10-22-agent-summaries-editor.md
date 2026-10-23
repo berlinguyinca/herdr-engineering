@@ -1,0 +1,31 @@
+# Agents, automatic summaries and expanded editing
+
+## Requested outcome
+
+The dashboard calls its session views **Agents**. Every agent has a persistent globally unique human-readable name, shared with Collaboration and reference completion. Each recorded conversation has an automatically refreshed summary and a clear account of where work stopped. The conversation workspace and shared message editor can expand to fullscreen; Markdown and JSON are pleasant to read and edit.
+
+## Boundaries
+
+- Preserve existing identifiers, URLs and API contracts; Sessions becomes Agents in user-facing labels. Distinguish a stable agent name from its generated topic/summary.
+- One dashboard-global `AgentIdentityRegistry.allocate(identity, preferred_name)` / `rename(identity, name, expected_version)` reserves normalized names with acknowledged persistence before publication. Replay reservations before allocations. Preserve provider names separately; late provider metadata never replaces a claimed display name. Verified Collaboration mappings share this display name while retaining their existing routing handles and permission boundaries. Helpers use explicit stable identities.
+- Summary fields: overview, discussed, decisions, completed, where_left_off, next_steps, blockers, plus model, generated_at, source revision/message count/IDs and coverage. Unknown facts remain empty, not invented. Mark missing/partial recording explicitly.
+- Generate from bounded redacted user/assistant messages and explicit activity facts; exclude hidden reasoning and system/developer instructions. Treat transcript text as untrusted quoted input, never executable instructions.
+- `summary_source(session_id)` returns chronological viewer-safe sanitized full bounded messages, stable source IDs, coverage and content fingerprint. Fingerprints include conversation identity and message content, not tool mutation revisions. Cache with model/prompt/schema versions and recheck immediately before commit. Explicit activity facts may accompany a conversation-triggered run.
+- One worker starts after restoration with the dashboard server, closes/joins during shutdown, and is absent from Collaboration-only processes. Defaults: queue 256 agents, model concurrency 1, message debounce 5 seconds, request timeout 15 seconds, retry backoff 30–300 seconds. States: disabled, pending, ready, stale, failed, no_data. Retain last valid summaries with original coverage/provenance after source expiry or inference failure.
+- Separate `agent_summary` projection uses acknowledged persistence and replay outside the inspector retention path and generic activity/SSE payloads. Source through viewer-authorized message access only, never operator-only content; model output is re-redacted. Preserve citations to supplied message IDs and reject unknown citations. Label AI-generated summaries and expose age/coverage.
+- Use a small self-hosted Qwen model behind an explicitly configured OpenAI-compatible endpoint; never route an unknown alias through the proxy's default upstream. Selected CPU artifact: official Qwen2.5-1.5B-Instruct Q4_K_M, revision `91cad51170dc346986eccefdc2dd33a9da36ead9`, SHA256 `6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e` (1,117,320,736 bytes). Pin official llama.cpp CPU server digest `sha256:8c74db29f1a2bef3f0a331b52c4d6214601dfceed4bee0b94cc48b3b23ff257d`; four CPUs, 3 GiB RAM, a 256 MiB server prompt-cache cap, one inference slot, 8192-token context. The CPU deployment uses a 6,000-character source budget, 120-second timeout and output cap of 350 tokens. The 0.6B candidate was rejected for false completion claims. Record measured quality and latency in the operations benchmark report; do not promise two seconds. Nibbler is reachable through its previously trusted IP but GPU memory is occupied by an existing workload. No commercial/large-model fallback without explicit configuration.
+- Expanded editing initially covers messages and notes. User clarification about remote workspace-file editing is pending; no remote file writes are assumed. Include undo/redo, indentation, find/replace, wrap, line/character information, Markdown preview, JSON format/validation and collapsible safe JSON rendering. Preserve drafts, selection and keyboard/IME behavior. Escape restores focus after fullscreen.
+- Share editor/renderers between Agents and Collaboration. Do not add frontend package dependencies. Model runtime/weights are separate infrastructure explicitly requested by the user.
+- Existing recording identity gaps, messaging host-route gap, upload delivery and non-Codex helper discovery remain explicit outstanding work; this extension must not hide them or fabricate transcripts/summaries.
+
+## Architecture
+
+Use a small naming registry integrated with existing session projection/events. A background summary service reads InspectorStore through its supported API, calls a configurable OpenAI-compatible endpoint outside locks, and persists validated summary events through the existing durable sink. The web API exposes summary/status and operator rename/regeneration actions. The UI shows a compact summary card and a shared expanded editor. CPU inference is separately managed and internal-network-only.
+
+## Acceptance evidence
+
+Names remain unique across collisions, concurrent allocations and restoration. Summary tests exercise debounce/cache, no-data, partial coverage, stale results, inference failure and injection/invalid JSON/citations. Browser tests exercise fullscreen/focus/drafts, JSON validation/tree rendering, Markdown escaping, navigation naming and summary states. Benchmark a representative synthetic continuation summary with the actual small model and record p50/p95 rather than promise an unmeasured couple of seconds.
+
+## Retained conversation paging
+
+Conversation and activity use independent filtered history requests, buffers and pagination cursors. A page of coding activity must not hide retained conversation messages. Epoch changes reset both histories; an activity-only window gap preserves conversation history. Store retention and missing-source coverage remain explicit.

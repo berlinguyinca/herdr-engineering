@@ -41,7 +41,7 @@ export function overviewModel(data = {}, received = Date.now(), now = Date.now()
 const eventLabels = {
   MissionStarted:'Mission started', MissionEnded:'Mission finished', MissionFailed:'Mission failed',
   MissionCompleted:'Mission finished', MissionCancelled:'Mission canceled',
-  SessionStarted:'Session started', SessionTerminated:'Session stopped', SessionFailed:'Session failed',
+  SessionStarted:'Agent started', SessionTerminated:'Agent stopped', SessionFailed:'Agent failed',
   HostUnavailable:'Host unavailable', ArtifactRegistered:'Artifact saved',
   PlannotatorReviewCompleted:'Review completed', PlannotatorReviewFailed:'Review failed',
   CIPipelineFinished:'CI run finished', CIPipelineFailed:'CI run failed',
@@ -51,7 +51,7 @@ function eventLabel(event) {
   if (['MissionUpdated','MissionStageChanged','SessionUpdated'].includes(event.event_type)) {
     const payload=event.payload || {};
     const outcome=recordOutcome({...payload,status:payload.to || payload.status});
-    if (outcome === 'failed' || outcome === 'finished') return `${event.event_type.startsWith('Session') ? 'Session' : 'Mission'} reported ${outcome}`;
+    if (outcome === 'failed' || outcome === 'finished') return `${event.event_type.startsWith('Session') ? 'Agent' : 'Mission'} reported ${outcome}`;
   }
   return null;
 }
@@ -67,14 +67,14 @@ const empty = label => `<p class="ov-note">${esc(label)}</p>`;
 function availability(keys, states) {
   return keys.map(key => {
     const state = states[key];
-    const label = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Sessions',services:'Services',hosts:'Hosts',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews'}[key];
+    const label = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Agents',services:'Services',hosts:'Hosts',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews'}[key];
     if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: Could not refresh.${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
     if (!state?.loaded) return `<p class="ov-note" role="status">Loading ${esc(label.toLowerCase())}…</p>`;
     return '';
   }).join('');
 }
 function historyLinks(base, counts) {
-  return `<nav class="ov-history" aria-label="${base === 'missions' ? 'Mission' : 'Session'} history">${link(`#/${base}?tab=unconfirmed`,`${counts.unconfirmed.length} unconfirmed`)}${link(`#/${base}?tab=failed`,`${counts.failed.length} failed`)}${link(`#/${base}?tab=finished`,`${counts.finished.length} finished / closed`)}</nav>`;
+  return `<nav class="ov-history" aria-label="${base === 'missions' ? 'Mission' : 'Agent'} history">${link(`#/${base}?tab=unconfirmed`,`${counts.unconfirmed.length} unconfirmed`)}${link(`#/${base}?tab=failed`,`${counts.failed.length} failed`)}${link(`#/${base}?tab=finished`,`${counts.finished.length} finished / closed`)}</nav>`;
 }
 const SNOOZE_MS = 24 * 3600 * 1000;
 const snoozedUntil = (data, key) => (data.snoozed instanceof Map ? data.snoozed.get(key) : 0) || 0;
@@ -101,11 +101,11 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   }
   if (section === 'sessions') {
     const s = model.sessions;
-    return `<div class="ov-heading"><h2>Sessions</h2>${link('#/herd','All sessions →')}</div>${availability(['sessions'],states)}${states.sessions?.loaded ? `
-      <div class="ov-metrics">${metric(s.current.length,'Recently reported sessions','#/herd?tab=current')}</div>
-      <p class="ov-note">Open sessions reported in the last 15 minutes. Older reports are available in Unconfirmed.</p>
-      ${s.current.length ? `<ul class="ov-list">${s.current.slice(0,5).map(session=>`<li class="ov-row"><div>${link(`#/herd/session/${encodeURIComponent(session.session_id)}`,short(session.title || session.summary || session.agent_role || 'Agent session'))}<p>${esc(short(session.cwd || session.branch || session.model || 'Workspace not reported'))}</p></div><span class="ov-tag">Last reported ${esc(human(session.status) || 'unknown')}<br>${esc(session.host_id || 'Host unknown')} · ${ageMarkup(session.last_activity || session.updated_at,now)}</span></li>`).join('')}</ul>` : empty('No recently reported open sessions.')}
-      ${s.current.length > 5 ? empty(`Showing 5 of ${s.current.length} current sessions.`) : ''}${historyLinks('herd',s)}` : ''}`;
+    return `<div class="ov-heading"><h2>Agents</h2>${link('#/herd','All agents →')}</div>${availability(['sessions'],states)}${states.sessions?.loaded ? `
+      <div class="ov-metrics">${metric(s.current.length,'Recently reported agents','#/herd?tab=current')}</div>
+      <p class="ov-note">Open agents reported in the last 15 minutes. Older reports are available in Unconfirmed.</p>
+      ${s.current.length ? `<ul class="ov-list">${s.current.slice(0,5).map(session=>`<li class="ov-row"><div>${link(`#/herd/session/${encodeURIComponent(session.session_id)}`,short(session.display_name || session.title || session.summary || session.agent_role || 'Agent'))}<p>${esc(short(session.cwd || session.branch || session.model || 'Workspace not reported'))}</p></div><span class="ov-tag">Last reported ${esc(human(session.status) || 'unknown')}<br>${esc(session.host_id || 'Host unknown')} · ${ageMarkup(session.last_activity || session.updated_at,now)}</span></li>`).join('')}</ul>` : empty('No recently reported open agents.')}
+      ${s.current.length > 5 ? empty(`Showing 5 of ${s.current.length} current agents.`) : ''}${historyLinks('herd',s)}` : ''}`;
   }
   if (section === 'ci' || section === 'reviews') {
     const isCi=section==='ci', snapshot=data[section], entries=integrationEntries(snapshot,section);
@@ -155,8 +155,10 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
 }
 
 const styles = `<style>
-.ov-sub{font-size:13px;margin:14px 0 0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;overflow-wrap:anywhere}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:1/-1}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:14px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:10px 13px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:25px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:16px;padding:11px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.5}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:4px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:16px;border-top:1px solid var(--border-subtle);padding-top:12px;margin-top:12px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
-@media(max-width:750px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
+.ov-sub{font-size:13px;margin:14px 0 0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-wrap:anywhere}.ov-panel[data-overview=missions]{grid-column:span 2}.ov-panel[data-overview=fleet]{grid-column:3}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:9px 12px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:23px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:14px;padding:9px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.45}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:3px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:14px;border-top:1px solid var(--border-subtle);padding-top:10px;margin-top:10px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
+@media(min-width:2200px){.ov-layout{grid-template-columns:repeat(4,minmax(0,1fr))}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet],.ov-panel[data-overview=hosts],.ov-panel[data-overview=activity]{grid-column:span 2}}
+@media(max-width:1180px){.ov-layout{grid-template-columns:repeat(2,minmax(0,1fr))}.ov-panel[data-overview=missions]{grid-column:1/-1;grid-row:auto}.ov-panel[data-overview=fleet]{grid-column:1/-1}}
+@media(max-width:960px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:auto}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
 </style>`;
 
 const SNOOZE_KEY = 'herdr.snoozedMissions';

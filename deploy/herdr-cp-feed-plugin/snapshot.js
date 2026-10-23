@@ -3,6 +3,7 @@
 import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { basename } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { herdrBin } from "./enrich.js";
 import { hostIdentity } from "./emit.js";
@@ -10,6 +11,8 @@ import { loadHostConfig, HostConfigUnavailable } from "./host-config.js";
 import { gitMetadata } from "./git-metadata.js";
 import { createInventoryReporter, createLoadReporter } from "./inventory.js";
 import { createModelResolver } from "./session-model.js";
+import { createTranscriptCollector } from "./session-transcript.js";
+import { createSessionTracker } from "./session-helpers.js";
 
 const TERMINAL_STATES = new Set([
   "failed", "error", "crashed", "finished", "complete", "completed", "closed",
@@ -25,18 +28,77 @@ function query(binary, args) {
   });
 }
 
-let defaultModelResolver = null;
+function reportNativeIdentity(binary, args) {
+  return new Promise(resolve => {
+    execFile(binary, args, {timeout:5000, maxBuffer:64*1024}, error => resolve({ok:!error}));
+  });
+}
 
-export async function collectSnapshot(env, { queryNative = query, metadata = gitMetadata, now = Date.now, resolveModel } = {}) {
+async function nativeProof(queryNative, binary, server, paneId) {
+  const detail = await queryNative(binary, ["--session",server,"pane","get",paneId]);
+  const processes = await queryNative(binary, ["--session",server,"pane","process-info","--pane",paneId]);
+  const pane = detail?.result?.pane || detail?.pane;
+  const rows = (processes?.result?.process_info || processes?.process_info)?.foreground_processes;
+  if (!pane || !Array.isArray(rows) || rows.length === 0 || rows.length > 32
+    || rows.some(row => !Number.isSafeInteger(row?.pid) || row.pid <= 0)) return null;
+  return {pane, pids:[...new Set(rows.map(row => row.pid))].sort((a,b)=>a-b).join(":")};
+}
+const sameBinding = (proof, pane) => proof?.pane?.terminal_id === pane.terminal_id
+  && proof.pane.agent === pane.agent && (!proof.pane.pane_id || proof.pane.pane_id === pane.pane_id);
+let lastIdentitySequence = 0;
+async function repairNativeIdentity({queryNative, reportNative, binary, server, pane, before, identity, now}) {
+  if (!before || !sameBinding(before,pane) || before.pane.agent_session) return {status:"binding_changed"};
+  if (identity.agent !== pane.agent || identity.kind !== "path" || typeof identity.value !== "string"
+    || !identity.value.startsWith("/") || /[\x00-\x1f]/.test(identity.value)) return {status:"identity_unavailable"};
+  const current = await nativeProof(queryNative,binary,server,pane.pane_id);
+  if (!sameBinding(current,pane) || current.pids !== before.pids || current.pane.agent_session) return {status:"binding_changed"};
+  const nativeId = identity.nativeId || (pane.agent === "claude" ? basename(identity.value,".jsonl") : null);
+  const useId = ["codex","claude"].includes(pane.agent) && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(nativeId || "");
+  if (pane.agent === "claude" && !useId) return {status:"identity_unavailable"};
+  const expected = {agent:pane.agent,kind:useId?"id":"path",value:useId?nativeId:identity.value};
+  const sequence = Math.max(lastIdentitySequence+1,Math.floor(now()*1000));
+  if (!Number.isSafeInteger(sequence) || sequence < 1) return {status:"report_rejected"};
+  lastIdentitySequence = sequence;
+  const args = ["--session",server,"pane","report-agent-session",pane.pane_id,
+    "--source","herdr:engineering-transcript","--agent",pane.agent,"--seq",String(sequence),
+    useId?"--agent-session-id":"--agent-session-path",expected.value];
+  const reported = await reportNative(binary,args);
+  if (reported?.ok !== true) return {status:"report_rejected"};
+  const after = await nativeProof(queryNative,binary,server,pane.pane_id);
+  if (!sameBinding(after,pane) || after.pids !== before.pids) return {status:"binding_changed"};
+  const actual = after.pane.agent_session;
+  if (!actual || actual.agent !== expected.agent || actual.kind !== expected.kind || actual.value !== expected.value) return {status:"report_unverified"};
+  return {status:"repaired",identity:actual};
+}
+
+let defaultModelResolver = null;
+let defaultTranscriptCollector = null;
+let defaultSessionTracker = null;
+
+export async function collectSnapshot(env, { queryNative = query, metadata = gitMetadata, now = Date.now, resolveModel, collectTranscript, sessionTracker, reportNative } = {}) {
+  const useDefaultCollector = !collectTranscript;
+  reportNative ??= useDefaultCollector ? reportNativeIdentity : null;
+  collectTranscript ??= (defaultTranscriptCollector ??= createTranscriptCollector({env,
+    queryProcess: (server, paneId) => queryNative(herdrBin(env), ["--session", server, "pane", "process-info", "--pane", paneId]),
+  }));
+  if (sessionTracker === undefined && useDefaultCollector) sessionTracker = (defaultSessionTracker ??= createSessionTracker({collectTranscript}));
   resolveModel ??= (defaultModelResolver ??= createModelResolver({
     queryProcess: (server, paneId) => queryNative(herdrBin(env), ["--session", server, "pane", "process-info", "--pane", paneId]),
   }));
   const summary = { servers: 0, sessions: 0, linked: 0, skipped: 0, errors: 0, truncated: false };
   const envelopes = [];
+  const seen = new Set();
+  const drain = async () => {
+    if (!sessionTracker) return;
+    const retained = await sessionTracker.collect(seen).catch(() => ({envelopes:[], errors:1}));
+    envelopes.push(...retained.envelopes);
+    if (retained.truncated) summary.truncated = true;
+    summary.errors += retained.errors || 0;
+  };
   const deadline = now() + 20000;
   const binary = herdrBin(env);
   const registry = await queryNative(binary, ["session", "list", "--json"]);
-  if (!Array.isArray(registry?.sessions)) return { envelopes, summary: { ...summary, errors: 1 } };
+  if (!Array.isArray(registry?.sessions)) { summary.errors++; await drain(); return { envelopes, summary }; }
   const candidates = registry.sessions.filter(row => row?.running === true);
   if (candidates.length > 8) summary.truncated = true;
   const names = new Map();
@@ -65,7 +127,7 @@ export async function collectSnapshot(env, { queryNative = query, metadata = git
       paneCounts.set(pane?.pane_id, (paneCounts.get(pane?.pane_id) || 0) + 1);
     }
     for (const pane of snapshot.agents) {
-      if (envelopes.length >= 128 || now() >= deadline) { summary.truncated = true; break; }
+      if (summary.sessions >= 128 || now() >= deadline) { summary.truncated = true; break; }
       if (!pane || typeof pane.pane_id !== "string" || !pane.pane_id || pane.pane_id.length > 200
         || typeof pane.terminal_id !== "string" || !/^term_[A-Za-z0-9_-]{1,128}$/.test(pane.terminal_id)
         || terminalCounts.get(pane.terminal_id) !== 1 || paneCounts.get(pane.pane_id) !== 1
@@ -84,13 +146,31 @@ export async function collectSnapshot(env, { queryNative = query, metadata = git
       for (const key of ["revision", "state_change_seq", "interactive_ready", "launch_pending", "agent_session"]) {
         if (pane[key] !== undefined && pane[key] !== null) payload[key] = pane[key];
       }
+      const sessionId = ["herdr", host, server.name, pane.pane_id].map(encodeURIComponent).join(":");
       envelopes.push({ source: "herdr", entity_type: "session",
-        entity_id: ["herdr", host, server.name, pane.pane_id].map(encodeURIComponent).join(":"),
+        entity_id: sessionId,
         event_type: "session.snapshot", payload });
+      summary.sessions++;
+      // Only repair absent identities, using stable native terminal/process proof.
+      // This publishes metadata; it never starts, resumes, or prompts an agent.
+      const canRepair = reportNative && !pane.agent_session && ["codex","claude","pi"].includes(pane.agent);
+      const before = canRepair ? await nativeProof(queryNative,binary,server.name,pane.pane_id).catch(()=>null) : null;
+      const transcript = await collectTranscript(server.name, pane, sessionId).catch(() => ({status:"unavailable", envelopes:[]}));
+      if (transcript.status) payload.transcript = {status:transcript.status, truncated:!!transcript.truncated};
+      if (canRepair && transcript.identity) {
+        const repair = await repairNativeIdentity({queryNative,reportNative,binary,server:server.name,pane,before,identity:transcript.identity,now})
+          .catch(()=>({status:"report_rejected"}));
+        payload.transcript ??= {};
+        payload.transcript.identity_repair = repair.status;
+        if (repair.identity) payload.agent_session = repair.identity;
+      }
+      envelopes.push(...transcript.envelopes);
+      seen.add(sessionId);
+      if (transcript.identity) sessionTracker?.remember({sessionId, server:server.name, paneId:pane.pane_id, identity:transcript.identity});
       if (identity.repository_id && identity.commit_sha) summary.linked++;
     }
   }
-  summary.sessions = envelopes.length;
+  await drain();
   return { envelopes, summary };
 }
 
@@ -103,22 +183,30 @@ export function createSnapshotPublisher({ fetcher = fetch, now = Date.now, maxEn
     // Stop at the first failure rather than multiplying timeouts during outages.
     for (const envelope of envelopes) {
       const body = JSON.stringify(envelope);
-      const previous = sent.get(envelope.entity_id);
+      const key = `${envelope.entity_type || ""}:${envelope.entity_id}`;
+      const previous = sent.get(key);
       const terminal = TERMINAL_STATES.has(String(envelope.payload?.status || "").trim().toLowerCase());
-      if (previous?.body === body && (terminal || now() - previous.at < 300000)) { unchanged++; continue; }
+      if (previous?.body === body && (terminal || now() - previous.at < 300000)) { envelope.onPublished?.(); unchanged++; continue; }
       try {
         const response = await fetcher(`${url}/api/v1/ingest`, {
           method: "POST", headers, body,
           redirect: "error", signal: AbortSignal.timeout(2000),
         });
-        await response.body?.cancel();
-        if (!response.ok) {
+        let inspectorAccepted = true;
+        if (response.ok && envelope.entity_type === "inspector") {
+          const result = await response.json();
+          const entity = result?.entity;
+          inspectorAccepted = result?.ok === true && Array.isArray(entity?.rejected) && entity.rejected.length === 0
+            && entity.accepted + entity.duplicates === envelope.payload.events.length;
+        } else await response.body?.cancel();
+        if (!response.ok || !inspectorAccepted) {
           const failure = { posted, unchanged, errors: 1 };
           if (response.status === 401 || response.status === 403) failure.authRejected = true;
           return failure;
         }
-        sent.delete(envelope.entity_id);
-        sent.set(envelope.entity_id, { body, at: now() });
+        sent.delete(key);
+        sent.set(key, { body, at: now() });
+        envelope.onPublished?.();
         while (sent.size > Math.max(1, maxEntries)) sent.delete(sent.keys().next().value);
         posted++;
       } catch { return { posted, unchanged, errors: 1 }; }
@@ -174,7 +262,7 @@ export async function main(args = process.argv.slice(2), env = process.env, deps
   process.once("SIGTERM", stop);
   try {
     do {
-      const result = await collect(env);
+      const result = await collect(env, {reportNative:dryRun ? false : undefined});
       // Fleet version inventory rides the same publisher; it is throttled by TTL.
       const inventory = await inventoryEnvelope(hostIdentity(env)).catch(() => null);
       if (inventory) result.envelopes.push(inventory);

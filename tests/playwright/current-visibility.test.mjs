@@ -62,14 +62,14 @@ test('current catalogs expire unchanged reports locally and keep history reachab
     assert.equal(await page.locator('#services .sc-row').count(),1);
     assert.equal(await page.locator('#sc-history').getAttribute('open'),null);
     assert.match(await page.locator('#mc-tab-current').innerText(),/2/);
-    assert.match(await page.locator('#overview [data-overview="sessions"]').innerText(),/1\s+Recently reported sessions/);
+    assert.match(await page.locator('#overview [data-overview="sessions"]').innerText(),/1\s+Recently reported agents/);
     await page.clock.runFor(2000);
     assert.equal(await page.locator('#services .sc-row').count(),0);
     assert.equal(await page.locator('#sessions [data-session-id]').count(),0);
     assert.equal(await page.locator('#missions [data-mission-key]').count(),0);
     assert.match(await page.locator('#mc-tab-current').innerText(),/0/);
     assert.match(await page.locator('#mc-tab-unconfirmed').innerText(),/2/);
-    assert.match(await page.locator('#overview [data-overview="sessions"]').innerText(),/0\s+Recently reported sessions/);
+    assert.match(await page.locator('#overview [data-overview="sessions"]').innerText(),/0\s+Recently reported agents/);
     await page.locator('#ss-tab-unconfirmed').click();
     assert.equal(await page.locator('#sessions [data-session-id="session-live"]').count(),1);
     await page.locator('#ss-tab-finished').click();

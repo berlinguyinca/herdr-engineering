@@ -6,9 +6,8 @@ It is not a second event bus:
 
 * transport  = ``POST /api/v1/ingest`` with ``entity_type="inspector"``;
 * redaction  = :mod:`.redact` at the ingest boundary;
-* durability = the repo's existing sink, for *low-volume summary kinds only*
-  (capabilities / association / model / lifecycle / test results / preferences);
-  high-volume bodies live in bounded in-memory rings and are never persisted;
+* durability = the existing sink for bounded, redacted conversation, tool
+  activity, file diffs, usage and summaries; reasoning remains memory-only;
 * roles      = the server's viewer / operator / ingest roles.
 
 Reasoning is capability-dependent: it is accepted only when the emitter declared
@@ -31,8 +30,9 @@ KINDS = frozenset({
     "capabilities", "message", "reasoning", "tool", "file", "test", "usage",
     "association", "model", "lifecycle",
 })
-#: Kinds mirrored to the durable sink (low volume, no large bodies).
-DURABLE_KINDS = frozenset({"capabilities", "association", "model", "lifecycle", "test"})
+#: Capture must be committed before acknowledging emitter checkpoints.
+REQUIRED_DURABLE_KINDS = frozenset({"message", "tool", "file", "usage"})
+DURABLE_KINDS = REQUIRED_DURABLE_KINDS | frozenset({"capabilities", "association", "model", "lifecycle", "test"})
 VIEWS = ("all", "conversation", "reasoning", "tools", "files", "tests", "usage")
 _VIEW_KINDS = {
     "conversation": {"message"},
@@ -99,7 +99,9 @@ _SENSITIVE_CMD = re.compile(
     r"(\bprintenv\b|\benv\b\s*($|\||;)|\bcat\s+\S*(\.env|id_rsa|\.pem|credentials)|"
     r"\.ssh/|\.aws/|\bsecrets?\b|\bpasswd\b|\bkeychain\b)", re.IGNORECASE)
 
-_SESSION_ID = re.compile(r"^[A-Za-z0-9_.:@\-]{1,128}$")
+_SESSION_ID = re.compile(r"[A-Za-z0-9_.:@\-]{1,128}")
+# Native pane separators are escaped inside the canonical herdr identity.
+_CANONICAL_SESSION_ID = re.compile(r"herdr:[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+:(?:[A-Za-z0-9_.-]|%3A)+")
 _MAX_NUM = 2 ** 53
 MAX_SUBS_PER_SESSION = 16
 MAX_SUBS_TOTAL = 512
@@ -342,8 +344,9 @@ class InspectorStore:
     # --------------------------------------------------------------- ingest
     def ingest(self, session_id: str, payload: dict, *, persist: bool = True) -> dict:
         """Ingest one envelope payload (``{"events": [...]}`` or a single event)."""
-        if not isinstance(session_id, str) or not _SESSION_ID.match(session_id):
-            raise ValueError("entity_id must be a session id (1-128 chars of [A-Za-z0-9_.:@-])")
+        if (not isinstance(session_id, str) or len(session_id) > 128 or
+                not (_SESSION_ID.fullmatch(session_id) or _CANONICAL_SESSION_ID.fullmatch(session_id))):
+            raise ValueError("entity_id must be a valid session id (1-128 chars; canonical pane %3A escapes allowed)")
         events = payload.get("events") if isinstance(payload, dict) else None
         if events is None:
             events = [payload]
@@ -357,6 +360,12 @@ class InspectorStore:
             for i, ev in enumerate(events):
                 try:
                     status = self._ingest_one(sess, ev, persist)
+                except RuntimeError:
+                    # A partially persisted batch is retried by the emitter. Keep
+                    # successful entries bounded while leaving the failed id unseen.
+                    self._enforce(sess)
+                    self._enforce_global(keep=session_id)
+                    raise
                 except ValueError as exc:
                     self.stats["rejected"] += 1
                     result["rejected"].append({"index": i, "error": str(exc)})
@@ -388,7 +397,7 @@ class InspectorStore:
             raise ValueError(f"malformed {kind} event") from exc
         if eid:  # only remember ids of events that were actually accepted
             sess.seen[eid] = True
-            while len(sess.seen) > _MAX_SEEN_IDS:
+            while len(sess.seen) > max(_MAX_SEEN_IDS, self._limits_for(sess)[0]):
                 sess.seen.popitem(last=False)
         return status
 
@@ -397,9 +406,21 @@ class InspectorStore:
         base = {
             "agent_id": _s(ev.get("agent_id"), 128) or "main",
             "parent_agent_id": _s(ev.get("parent_agent_id"), 128),
+            "event_id": _s(ev.get("event_id"), 128),
             "ts": _ts(ev.get("ts"), self._clock()),
         }
         flagged = bool(ev.get("sensitive"))
+        if kind == "file":
+            flagged = flagged or bool(_SENSITIVE_PATH.search(data.get("path") or ""))
+        elif kind == "tool":
+            live = sess.tools.get(data["call_id"])
+            flagged = flagged or self._cmd_sensitive(data) or bool(live and live["sensitive"])
+            if data["phase"] == "end" and "duration_ms" not in data and live and live.get("t0") is not None:
+                data["duration_ms"] = int((self._clock() - live["t0"]) * 1000)
+        if persist and kind in REQUIRED_DURABLE_KINDS and (
+                kind != "message" or data["role"] in ("user", "assistant")):
+            # Commit before any projection mutation, publication or retry-id update.
+            self._persist_detail(sess, kind, base, data, flagged, data["_flags"])
         sess.last_event = self._clock()
         sess.last_ingest = _now_iso()
         if sess.ended and kind == "lifecycle" and data.get("phase") in ("started", "restored", "restarted"):
@@ -442,8 +463,6 @@ class InspectorStore:
             dropped = data.get("dropped")
             if isinstance(dropped, int) and dropped > 0:
                 sess.client_dropped += dropped
-        if kind == "file":
-            flagged = flagged or bool(_SENSITIVE_PATH.search(data.get("path") or ""))
         self._store(sess, kind, base, data, flagged, persist)
         return "ok"
 
@@ -462,7 +481,7 @@ class InspectorStore:
 
     def _sanitize(self, kind: str, ev: dict) -> dict:
         d: dict = {}
-        flags = {"redacted": False, "truncated": False}
+        flags = {"redacted": bool(ev.get("redacted")), "truncated": bool(ev.get("truncated"))}
 
         def text(key: str, src: str | None = None, limit: int | None = None):
             val, trunc, red = self._text(ev.get(src or key), limit)
@@ -490,6 +509,8 @@ class InspectorStore:
         elif kind == "message":
             sstr("message_id", 128)
             role = ev.get("role")
+            if role not in (None, "user", "assistant", "system"):
+                raise ValueError("message.role must be user|assistant|system")
             d["role"] = role if role in ("user", "assistant", "system") else "assistant"
             text("text")
         elif kind == "reasoning":
@@ -572,11 +593,12 @@ class InspectorStore:
             for k in ("mission_id", "handoff_id", "handoff_from", "parent_session_id",
                       "worktree", "branch"):
                 sstr(k, 512)
-            pr = ev.get("pr")
-            if isinstance(pr, dict):
-                d["pr"] = {"number": pr["number"] if _finite(pr.get("number")) and isinstance(pr.get("number"), int) else None,
-                           "url": redact_text(_s(pr.get("url"), 1024) or ""),
-                           "repo": _s(pr.get("repo"), 256)}
+            for key in ("pr", "issue"):
+                ref = ev.get(key)
+                if isinstance(ref, dict):
+                    d[key] = {"number": ref["number"] if _finite(ref.get("number")) and isinstance(ref.get("number"), int) else None,
+                              "url": redact_text(_s(ref.get("url"), 1024) or ""),
+                              "repo": _s(ref.get("repo"), 256)}
         elif kind == "model":
             for k in ("model", "provider", "previous_model"):
                 sstr(k, 256)
@@ -620,21 +642,36 @@ class InspectorStore:
             "sensitive": flagged, "redacted": flags["redacted"],
             "truncated": flags["truncated"], "data": data, "size": 0,
         }
+        if persist and kind in DURABLE_KINDS - REQUIRED_DURABLE_KINDS:
+            self._persist_detail(sess, kind, base, data, flagged, flags)
         sess.next_seq += 1
         entry["size"] = self._size(data)
         sess.bytes += entry["size"]
         sess.events.append(entry)
         sess.by_seq[entry["seq"]] = entry
         self._touch(sess, entry, account=False)
-        if persist and kind in DURABLE_KINDS and self._persist:
-            self._safe_persist({
-                "entity_type": "inspector", "entity_id": sess.session_id,
-                "event_type": f"inspector.{kind}", "session_id": sess.session_id,
-                "source_timestamp": base["ts"],
-                "payload": {**{k: v for k, v in data.items() if k != "failures"},
-                            "agent_id": base["agent_id"], "kind": kind, "sensitive": flagged},
-            })
         return entry
+
+    def _persist_detail(self, sess: _Session, kind: str, base: dict, data: dict,
+                        flagged: bool, flags: dict) -> None:
+        if not self._persist:
+            return
+        durable = {
+            "entity_type": "inspector", "entity_id": sess.session_id,
+            "event_type": f"inspector.{kind}", "session_id": sess.session_id,
+            "source_timestamp": base["ts"],
+            "payload": {**{k: v for k, v in data.items() if k not in ("failures", "_flags")},
+                        "agent_id": base["agent_id"], "parent_agent_id": base["parent_agent_id"],
+                        "event_id": base["event_id"], "kind": kind, "sensitive": flagged,
+                        **flags, "_received_at": self._clock(), "_sequence": sess.rev},
+        }
+        if kind in REQUIRED_DURABLE_KINDS:
+            try:
+                self._persist(durable)
+            except Exception as exc:
+                raise RuntimeError("inspector persistence unavailable") from exc
+        else:
+            self._safe_persist(durable)
 
     def _touch(self, sess: _Session, entry: dict, *, account: bool = True) -> None:
         if account:
@@ -980,11 +1017,33 @@ class InspectorStore:
 
     # ------------------------------------------------------------- hydrate
     def hydrate(self, events: list[dict]) -> int:
-        """Rebuild durable summary state (and preferences) after a restart."""
+        """Restore bounded capture and summaries in original receive/mutation order."""
+        def received_at(ev):
+            p = ev.get("payload")
+            value = p.get("_received_at") if isinstance(p, dict) else None
+            if _finite(value):
+                return min(value, self._clock())
+            for key in ("ingest_timestamp", "source_timestamp"):
+                raw = _iso_of(ev.get(key))
+                if raw:
+                    try:
+                        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                        return min(dt.replace(tzinfo=dt.tzinfo or UTC).timestamp(), self._clock())
+                    except (ValueError, OverflowError, OSError):
+                        pass
+            return self._clock()
+
+        def order(ev):
+            p = ev.get("payload")
+            seq = p.get("_sequence") if isinstance(p, dict) else None
+            if not _finite(seq):
+                seq = ev.get("sequence")
+            return received_at(ev), seq if _finite(seq) else 0
+
         n = 0
-        for ev in sorted(events, key=lambda e: (e.get("source_timestamp") or "", e.get("sequence") or 0)):
+        for ev in sorted(events, key=order):
             p = ev.get("payload") or {}
-            if isinstance(p, str):
+            if not isinstance(p, dict):
                 continue
             sid = ev.get("entity_id")
             et = ev.get("event_type", "")
@@ -992,13 +1051,26 @@ class InspectorStore:
                 if et == "inspector.preferences":
                     self.set_prefs(p.get("prefs") or {}, None if p.get("scope") == "global" else sid,
                                    persist=False)
-                elif et.startswith("inspector.") and p.get("kind") in DURABLE_KINDS:
-                    body = {k: v for k, v in p.items() if k not in ("kind", "agent_id", "sensitive")}
-                    self.ingest(sid, {"kind": p["kind"], "agent_id": p.get("agent_id"),
-                                      "sensitive": bool(p.get("sensitive")),
-                                      "ts": _iso_of(ev.get("source_timestamp")), **body,
-                                      **({"phase": "end"} if p["kind"] == "test" else {})},
-                                persist=False)
+                elif isinstance(et, str) and et.startswith("inspector.") and p.get("kind") in DURABLE_KINDS:
+                    if p["kind"] == "message" and p.get("role") not in ("user", "assistant"):
+                        continue
+                    with self._lock:
+                        before_seq = (self._sessions[sid].next_seq
+                                      if isinstance(sid, str) and sid in self._sessions else 0)
+                        result = self.ingest(sid, {**p, "ts": _iso_of(ev.get("source_timestamp")),
+                                                  **({"phase": "end"} if p["kind"] == "test" else {})},
+                                             persist=False)
+                        if not result["accepted"]:
+                            continue
+                        sess = self._sessions[sid]
+                        # Replay keeps the server receive clock, never the untrusted source time.
+                        recv = received_at(ev)
+                        # Mutated tools retain their original creation age, even
+                        # with newer messages behind them. Flags are sanitized above.
+                        if sess.events and sess.next_seq > before_seq:
+                            sess.events[-1]["recv"] = recv
+                        sess.last_event = recv
+                        self._enforce(sess)
                 else:
                     continue
                 n += 1

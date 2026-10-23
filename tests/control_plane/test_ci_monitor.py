@@ -159,3 +159,65 @@ def test_incremental_refresh_keeps_unprocessed_repository_visible():
     finally:
         release.set()
         worker.join(3)
+
+
+def test_observation_dedup_covers_inventory_larger_than_retained_history():
+    from herdr_engineering.control_plane.ci_reports import PIPELINE_LIMIT
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+
+    repo = ControlPlaneRepo()
+    monitor = CIMonitor(on_observation=repo.observe_ci_pipeline)
+    rows = [{'repository': 'org/app', 'provider_repo_id': 17, 'run_number': number,
+             'state': 'success'} for number in range(1, PIPELINE_LIMIT + 2)]
+    assert monitor._persist_observations({'org/app': rows}) is None
+    written = repo.export_state()['ci_sequence']
+    assert written == PIPELINE_LIMIT + 1
+    assert len(repo.ci_reports()['pipelines']) == PIPELINE_LIMIT
+    # Canonical fingerprints also ignore JSON object key insertion order.
+    equivalent = [dict(reversed(list(row.items()))) for row in rows]
+    assert monitor._persist_observations({'org/app': equivalent}) is None
+    assert repo.export_state()['ci_sequence'] == written
+    rows[0] = {**rows[0], 'state': 'failure'}
+    assert monitor._persist_observations({'org/app': rows}) is None
+    assert repo.export_state()['ci_sequence'] == written + 1
+    # A disappeared observation is forgotten and persisted if it reappears.
+    assert monitor._persist_observations({}) is None
+    assert monitor._observation_fingerprints == {}
+    assert monitor._persist_observations({'org/app': [rows[1]]}) is None
+    assert repo.export_state()["ci_sequence"] == written + 2
+    assert len(monitor._observation_fingerprints) == 1
+
+
+def test_observation_fingerprints_remember_only_successful_persistence(tmp_path):
+    import json
+
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+
+    class DiskJournal:
+        def record_required(self, event):
+            with (tmp_path / 'observations.jsonl').open('a') as stream:
+                stream.write(json.dumps(event) + '\n')
+
+    repo = ControlPlaneRepo(sink=DiskJournal())
+    monitor = CIMonitor(on_observation=repo.observe_ci_pipeline)
+    row = {'repository': 'org/app', 'provider_repo_id': 17, 'run_number': 1, 'state': 'running'}
+    snapshot = {'org/app': [row]}
+    journal = tmp_path / 'observations.jsonl'
+    journal.mkdir()
+    assert 'persisted' in monitor._persist_observations(snapshot)
+    assert monitor._observation_fingerprints == {}
+    journal.rmdir()
+    assert monitor._persist_observations(snapshot) is None
+    assert len(journal.read_text().splitlines()) == 1
+    assert monitor._persist_observations(snapshot) is None
+    assert len(journal.read_text().splitlines()) == 1
+    # Failed changed results must retry as well as failed first observations.
+    saved = journal.read_text()
+    journal.unlink()
+    journal.mkdir()
+    snapshot['org/app'][0] = {**row, 'state': 'failure'}
+    assert 'persisted' in monitor._persist_observations(snapshot)
+    journal.rmdir()
+    journal.write_text(saved)
+    assert monitor._persist_observations(snapshot) is None
+    assert len(journal.read_text().splitlines()) == 2

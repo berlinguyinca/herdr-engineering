@@ -8,6 +8,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
 import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
 import { mountInspector } from './inspector-view.js';
+import { mountSessionWorkspace } from './session-workspace.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
@@ -48,7 +49,7 @@ const NAV = [
   { path: '/overview', label: 'Overview' },
   { path: '/topology', label: 'Topology' },
   { path: '/missions', label: 'Missions' },
-  { path: '/herd', label: 'Sessions' },
+  { path: '/herd', label: 'Agents' },
   { path: '/services', label: 'Services' },
   { path: '/local-services', label: 'Local services' },
   { path: '/system-services', label: 'System services' },
@@ -204,7 +205,7 @@ async function viewMission(parts, revision) {
       const open = new Map([...history.querySelectorAll('details[data-history-panel]')].map(el => [el.dataset.historyPanel, el.open]));
       history.innerHTML = `<h2>Recorded history</h2>
     <div style="margin:8px 0"><herdr-status stage="${esc(m.status)}"></herdr-status>
-      <span class="hd-card__sub"> · ${sessions} sessions · ${esc(m.stage || 'Stage not recorded')} · created ${esc(formatTimestamp(m.created_at))}</span></div>
+      <span class="hd-card__sub"> · ${sessions} agents · ${esc(m.stage || 'Stage not recorded')} · created ${esc(formatTimestamp(m.created_at))}</span></div>
     <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
     <details class="hd-card" data-history-panel="brief"><summary>Recorded mission brief</summary>
       <p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.title || '')}</p>
@@ -212,7 +213,7 @@ async function viewMission(parts, revision) {
       ${m.cwd && m.cwd !== scope ? `<p style="overflow-wrap:anywhere"><code>${esc(m.cwd)}</code></p>` : ''}
       <herdr-ident kind="mission" id="${esc(m.mission_id)}"></herdr-ident>
     </details>
-    <details class="hd-card" data-history-panel="sessions"><summary>Recorded sessions · ${sessions}</summary>${sessionsHtml}</details>
+    <details class="hd-card" data-history-panel="sessions"><summary>Recorded agents · ${sessions}</summary>${sessionsHtml}</details>
     <details class="hd-card" data-history-panel="timeline"><summary>Timeline</summary><herdr-timeline id="mission-timeline"></herdr-timeline></details>
     <details class="hd-card" data-history-panel="events"><summary>Event stream</summary><div id="mission-stream">${streamHtml}</div></details>`;
       history.querySelectorAll('details[data-history-panel]').forEach(el => { if (open.has(el.dataset.historyPanel)) el.open = open.get(el.dataset.historyPanel); });
@@ -232,11 +233,11 @@ async function viewMission(parts, revision) {
 
 async function missionSessions(m) {
   const list = m.sessions || [];
-  if (!list.length) return '<herdr-empty message="No sessions on this mission yet"></herdr-empty>';
+  if (!list.length) return '<herdr-empty message="No agents on this mission yet"></herdr-empty>';
   const t = titles(await missionTitles());
   return list.map((s) => `
     <div class="hd-card">
-      <div class="hd-card__title"><a href="#/herd/session/${esc(encodeURIComponent(s.session_id))}">${esc(s.agent_role || 'agent session')}</a></div>
+      <div class="hd-card__title"><a href="#/herd/session/${esc(encodeURIComponent(s.session_id))}">${esc(s.display_name || s.agent_role || 'Agent')}</a></div>
       <div style="margin:6px 0"><herdr-status stage="${esc(s.status)}"></herdr-status></div>
       <div class="hd-card__sub">${esc(sessionSummary(s, t))}</div>
     </div>`).join('');
@@ -254,27 +255,34 @@ async function viewSession(parts, revision) {
   try {
     const s = await client.getSession(id, {signal: controller.signal});
     if (revision !== renderRevision || controller.signal.aborted) return;
-    if (!s) { root.innerHTML = '<herdr-error message="Session not found"></herdr-error>'; return; }
+    if (!s) { root.innerHTML = '<herdr-error message="Agent not found"></herdr-error>'; return; }
     const outcome = recordOutcome(s);
     const terminal = outcome === 'failed' || outcome === 'finished';
     const reportedStatus = terminal && statusOutcome(s.status) !== outcome ? s.stage : s.status;
     const clip = value => typeof value === 'string' ? value.slice(0, 180) : '';
     const project = typeof s.cwd === 'string' ? s.cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
     const attach = typeof s.attach === 'string' ? s.attach : '';
-    const fields = [['Session ID',s.session_id],['Last reported status',s.status],['Stage',s.stage],['Directory',s.cwd],['Git branch',s.branch],['PID',s.pid],['Command line',s.cmdline],['Model',s.model],['Last reported',formatTimestamp(s.updated_at)]].filter(([,v])=>v != null && v !== '');
+    const fields = [['Agent ID',s.session_id],['Last reported status',s.status],['Stage',s.stage],['Directory',s.cwd],['Git branch',s.branch],['PID',s.pid],['Command line',s.cmdline],['Model',s.model],['Last reported',formatTimestamp(s.updated_at)]].filter(([,v])=>v != null && v !== '');
     root.innerHTML = `<style>.sd-head{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:14px 0}.sd-meta{color:var(--text-secondary);line-height:1.6;overflow-wrap:anywhere}.sd-details{margin:14px 0;overflow-wrap:anywhere}.sd-details summary{cursor:pointer;font-weight:600}.sd-details dl{display:grid;grid-template-columns:minmax(100px,auto) minmax(0,1fr);gap:8px 16px}.sd-details dt{color:var(--text-secondary)}.sd-details dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.sd-title{overflow-wrap:anywhere}@media(max-width:600px){.sd-details dl{display:block}.sd-details dd{margin:4px 0 12px}}</style>
-      <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Sessions</a>
-      <h1 class="sd-title">${esc(clip(s.agent_role) || 'Agent session')}${project ? ` · ${esc(clip(project))}` : ''}</h1>
+      <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Agents</a>
+      <h1 class="sd-title">${esc(clip(s.display_name || s.agent_role) || 'Agent')}${project ? ` · ${esc(clip(project))}` : ''}</h1>
       <div class="sd-head"><strong>${esc(reportedStatus ? `Last reported ${String(reportedStatus).replaceAll('_',' ').toLowerCase()}` : 'Status unknown')} · ${esc(formatTimestamp(s.updated_at))}</strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
-      <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} session · recorded inspection remains available.` : 'Session status reflects the last report; it is not a live process check.'}</p>
+      <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.` : 'Agent status reflects the last report; it is not a live process check.'}</p>
       ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       ${relatedIntegrationLinks(s,'session',s.session_id)}
-      <details class="hd-card sd-details" id="session-details"><summary>Session details and attachment</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}${attach ? `<div class="hd-inline"><code style="flex:1;overflow-wrap:anywhere">${esc(attach)}</code><button class="hd-btn" id="copy-attach">Copy attach command</button></div>` : ''}</details>
-      <h2>Inspection</h2><div id="inspector-host"></div>
-      ${!terminal ? `<details class="hd-card sd-details"><summary>Send a message</summary><form id="msg-form" class="hd-inline"><input id="msg-input" aria-label="Message to session" placeholder="Steer the session…" style="flex:1;min-width:0;padding:8px"><button type="submit" class="hd-btn">Send</button></form></details>` : ''}
+      <details class="hd-card sd-details" id="session-details"><summary>Agent details and attachment</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}${attach ? `<div class="hd-inline"><code style="flex:1;overflow-wrap:anywhere">${esc(attach)}</code><button class="hd-btn" id="copy-attach">Copy attach command</button></div>` : ''}</details>
+      <div id="session-workspace-host"></div>
+      <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
       <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream"><span class="muted">Loading recorded events…</span></div></details>`;
-    disposeInspector = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
+    const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s, {onRename: profile => { s.display_name = profile.display_name; const title = root.querySelector('.sd-title'); if (title) title.textContent = `${profile.display_name}${project ? ` · ${clip(project)}` : ''}`; }});
+    let disposeAdvanced = null;
+    const advanced = document.getElementById('advanced-inspector');
+    advanced.addEventListener('toggle', () => {
+      if (advanced.open && !disposeAdvanced) disposeAdvanced = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
+      else if (!advanced.open && disposeAdvanced) { disposeAdvanced(); disposeAdvanced = null; document.getElementById('inspector-host').replaceChildren(); }
+    });
+    disposeInspector = () => { disposeWorkspace(); if (disposeAdvanced) disposeAdvanced(); };
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();
@@ -293,14 +301,9 @@ async function viewSession(parts, revision) {
     streamList('session',s.session_id).then(html=>{if(stream.isConnected && revision===renderRevision)stream.innerHTML=html;}).catch(()=>{if(stream.isConnected)stream.innerHTML='<span class="muted">Recorded events could not load.</span>';});
     const copyBtn = document.getElementById('copy-attach');
     if (copyBtn) copyBtn.addEventListener('click',()=>copyText(attach,copyBtn));
-    document.getElementById('msg-form')?.addEventListener('submit',async event=>{
-      event.preventDefault();const input=document.getElementById('msg-input');if(!input.value.trim())return;
-      try {await client.sendMessage(s.session_id,input.value.trim());input.value='';const html=await streamList('session',s.session_id);if(stream.isConnected)stream.innerHTML=html;}
-      catch(error){if(stream.isConnected)alert(error.message);}
-    });
   } catch (error) {
     if (revision !== renderRevision) return;
-    throw new Error(controller.signal.aborted ? 'Session details could not load. Try again.' : error.message);
+    throw new Error(controller.signal.aborted ? 'Agent details could not load. Try again.' : error.message);
   } finally {
     clearTimeout(deadline);
     if (sessionRequest === controller) sessionRequest = null;
@@ -390,27 +393,28 @@ async function viewHost(parts) {
 }
 
 async function viewActivity() {
-  root.innerHTML = '<h1>Activity</h1>' + await activityList(50);
+  root.innerHTML = `<style>
+    .ac-list{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+    .ac-row{border-bottom:1px solid var(--border-subtle)}.ac-row:last-child{border-bottom:0}.ac-row[open]{background:var(--bg)}
+    .ac-row summary{display:grid;grid-template-columns:minmax(140px,220px) minmax(0,1fr) auto;gap:14px;align-items:center;padding:10px 12px;cursor:pointer;list-style-position:inside;font-size:13px}
+    .ac-row summary strong{overflow-wrap:anywhere}.ac-kind,.ac-time{font-size:12px;color:var(--text-secondary)}.ac-time{white-space:nowrap}
+    .ac-detail{margin:0;padding:0 32px 8px;font-size:12px;line-height:1.5;color:var(--text-secondary);overflow-wrap:anywhere}.ac-payload{margin:0 32px 12px;max-height:240px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.45;background:var(--surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:10px}
+    .ac-row[data-muted=true]{opacity:.65}
+    @media(min-width:2200px){.ac-list{max-width:1600px}}
+    @media(max-width:650px){.ac-row summary{grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;padding:12px}.ac-kind{grid-column:1}.ac-time{grid-column:2;grid-row:1/3}.ac-detail{padding:0 12px 8px}.ac-payload{margin:0 12px 12px}}
+  </style><h1>Activity</h1>` + await activityList(50);
 }
 
 async function activityList(limit) {
   const { events } = await client.activity(limit);
   if (!events.length) return '<herdr-empty message="No activity yet"></herdr-empty>';
   const t = titles(await missionTitles());
-  return events.map((e) => {
+  return `<div class="ac-list">${events.map((e) => {
     const d = describeEvent(e, { missionTitles: t });
-    const meta = `<div class="hd-card__sub">${esc(d.kind)} · ${formatTimestamp(e.source_timestamp)}</div>`;
-    if (d.muted) {
-      // Low-signal events (e.g. heartbeats) get a compact, de-emphasised row.
-      return `<div class="hd-card" style="opacity:.6">
-        <div class="hd-card__title">${esc(d.title)}</div>
-        <div class="hd-card__sub">${esc(d.detail)}</div>${meta}</div>`;
-    }
-    return `<div class="hd-card">
-      <div class="hd-card__title">${esc(d.title)}</div>
-      <div class="hd-card__sub">${esc(d.detail)}</div>${meta}
-    </div>`;
-  }).join('');
+    const rawPayload=JSON.stringify(e.payload || {},null,2);
+    const payload=rawPayload.length>8000?`${rawPayload.slice(0,7999)}…`:rawPayload;
+    return `<details class="ac-row" data-muted="${d.muted}"><summary><strong>${esc(d.title)}</strong><span class="ac-kind">${esc(d.kind)}</span><time class="ac-time">${formatTimestamp(e.source_timestamp)}</time></summary><p class="ac-detail">${esc(d.detail)}</p><pre class="ac-payload" aria-label="Original event payload">${esc(payload)}</pre></details>`;
+  }).join('')}</div>`;
 }
 
 async function viewAnalytics() {
@@ -418,6 +422,10 @@ async function viewAnalytics() {
     client.analytics('missions'), client.analytics('models'), client.analytics('hosts'),
   ]);
   root.innerHTML = `
+    <style>
+      .an-links{display:grid;grid-template-columns:repeat(3,minmax(200px,1fr));gap:12px;margin:16px 0}.an-links a{display:flex;flex-direction:column;gap:4px;padding:14px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);text-decoration:none}.an-links strong{color:var(--text)}.an-links span{font-size:12px;color:var(--text-secondary)}
+      .an-stage{margin-top:18px}@media(min-width:2200px){.an-stage{max-width:1600px}}@media(max-width:720px){.an-links{grid-template-columns:minmax(0,1fr)}}
+    </style>
     <h1>Analytics</h1>
     <div class="hd-grid">
       <herdr-metric label="Missions" value="${missions.total}"></herdr-metric>
@@ -425,19 +433,18 @@ async function viewAnalytics() {
       <herdr-metric label="Models" value="${Object.keys(models.models).length}"></herdr-metric>
       <herdr-metric label="Hosts healthy" value="${hosts.healthy} / ${hosts.total}"></herdr-metric>
     </div>
-    <p style="margin-top:12px"><a href="#/analytics/tokens">Token usage by project &rarr;</a></p>
-    <h3 style="margin-top:20px">Missions by stage</h3>
-    ${stageBars(missions.by_stage)}`;
+    <nav class="an-links" data-analytics-links aria-label="Analytics views"><a href="#/analytics/models"><strong>Models</strong><span>Agent distribution by model</span></a><a href="#/analytics/hosts"><strong>Hosts</strong><span>Reported fleet health</span></a><a href="#/analytics/tokens"><strong>Token usage</strong><span>Requests and tokens by project</span></a></nav>
+    <section class="an-stage"><h3>Missions by stage</h3>${stageBars(missions.by_stage)}</section>`;
 }
 
 async function viewAnalyticsMissions() { await viewAnalytics(); }
 async function viewAnalyticsModels() {
   const { models, total_sessions } = await client.analytics('models');
-  root.innerHTML = `<h1>Model analytics</h1><p>${total_sessions} total sessions</p><div class="hd-grid">` +
+  root.innerHTML = `<h1>Model analytics</h1><p>${total_sessions} total agents</p><div class="hd-grid">` +
     Object.entries(models).map(([model, u]) => `
       <div class="hd-card">
         <div class="hd-card__title">${esc(model)}</div>
-        <div class="hd-card__sub">${u.sessions} session(s) · ${u.messages} messages</div>
+        <div class="hd-card__sub">${u.sessions} agent(s) · ${u.messages} messages</div>
       </div>`).join('') + '</div>';
 }
 async function viewAnalyticsTokens() {

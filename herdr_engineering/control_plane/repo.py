@@ -19,8 +19,9 @@ import threading
 import time
 from uuid import uuid4
 
+from .agent_identity import AgentIdentityRegistry
 from .ids import new_id
-from .inspector import InspectorStore
+from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
 from .service_catalog import (
@@ -127,6 +128,9 @@ class ControlPlaneRepo:
         self._host_aliases = {str(k): str(v) for k, v in (host_aliases or {}).items() if k and v and k != v}
         self._command_lock = threading.RLock()
         self._event_lock = threading.RLock()
+        self._agent_projection_lock = threading.RLock()
+        self._agent_records = {}
+        self._agent_sequence = 0
         self._sink = sink
         self._now = now or (lambda: time.time())
         self._missions = {}
@@ -143,15 +147,16 @@ class ControlPlaneRepo:
         self._telemetry = {}  # host_id -> [sample, ...]
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
+        self._ci_sequence = 0  # one bounded counter survives stream eviction
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
+        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
 
     def _persist_inspector(self, ev):
-        """Mirror low-volume inspector summaries to the existing durable sink only
-        (never into the in-memory event streams or the global SSE feed)."""
+        """Persist inspector detail outside global streams; require capture ACKs."""
         if self._sink is None:
             return
         ev = dict(ev)
@@ -159,7 +164,13 @@ class ControlPlaneRepo:
         ev.setdefault("schema_version", 1)
         ev["ingest_timestamp"] = self._stamp()
         ev["sequence"] = int(time.time() * 1000)
-        self._sink.record(ev)
+        if ev.get("event_type") in {f"inspector.{kind}" for kind in REQUIRED_DURABLE_KINDS}:
+            required = getattr(self._sink, "record_required", None)
+            if not callable(required):
+                raise RuntimeError("inspector persistence requires an acknowledged sink")
+            required(ev)
+        else:
+            self._sink.record(ev)
 
     # ------------------------------------------------------------------ ids
     def subscribe(self, listener):
@@ -262,13 +273,60 @@ class ControlPlaneRepo:
         return record
 
     def get_session(self, session_id):
-        return self._present_host_id(_copy(self._sessions.get(session_id)))
+        return self._named_session(self._present_host_id(_copy(self._sessions.get(session_id))))
 
     def list_sessions(self, status=None):
-        out = [self._present_host_id(_copy(s)) for s in self._sessions.values()]
+        records = list(self._sessions.values())
+        out = [self._named_session(self._present_host_id(_copy(s))) for s in records]
         if status:
             out = [s for s in out if s["status"] == status]
         return _sort_by(out, "created_at", reverse=True)
+
+    def _named_session(self, record):
+        if record is None:
+            return None
+        profile = self.agent_identities.allocate(record["session_id"], record.get("name"))
+        return {**record, "display_name": profile["display_name"],
+                "agent_handle": profile["handle"], "name_version": profile["version"]}
+
+    def rename_agent(self, session_id, name, expected_version):
+        if session_id not in self._sessions:
+            raise KeyError(session_id)
+        self.list_sessions()  # Reserve existing agents' preferred names before renaming.
+        return self.agent_identities.rename(session_id, name, expected_version)
+
+    def _persist_agent_projection(self, event):
+        """Acknowledged private projections never enter activity or global SSE."""
+        event = copy.deepcopy(event)
+        event.setdefault("event_id", new_id("event"))
+        event.setdefault("schema_version", 1)
+        event.setdefault("source_timestamp", self._stamp())
+        event["ingest_timestamp"] = self._stamp()
+        with self._agent_projection_lock:
+            sequence = max(self._agent_sequence + 1, int(self._now() * 1_000_000))
+            event["sequence"] = sequence
+            if self._sink is not None:
+                required = getattr(self._sink, "record_required", None)
+                if not callable(required):
+                    raise RuntimeError("agent projections require acknowledged persistence")
+                required(event)
+            self._agent_sequence = sequence
+            self._agent_records[(event["entity_type"], event["entity_id"])] = event
+
+    def persist_agent_summary(self, event):
+        sid = event["session_id"]
+        if sid not in self._sessions or not isinstance(event.get("summary"), dict):
+            raise ValueError("summary requires an existing agent and structured content")
+        self._persist_agent_projection({"entity_type": "agent_summary", "entity_id": sid,
+                                        "event_type": "agent_summary.updated",
+                                        "payload": {"summary": event["summary"]}})
+
+    def agent_summary_events(self):
+        with self._agent_projection_lock:
+            return [{"kind": "agent_summary", "session_id": sid,
+                     "summary": copy.deepcopy(_payload(event)["summary"])}
+                    for (kind, sid), event in self._agent_records.items()
+                    if kind == "agent_summary" and isinstance(_payload(event).get("summary"), dict)]
 
     def session_action(self, session_id, action, *, operation_id=None):
         if action not in _SESSION_ACTIONS:
@@ -808,7 +866,18 @@ class ControlPlaneRepo:
                        agent_session=None, revision=None, interactive_ready=None,
                        launch_pending=None, state_change_seq=None,
                        repository_id=None, commit_sha=None,
-                       parent_session_id=None, name=None):
+                       transcript=None, parent_session_id=None, name=None):
+        if transcript is not None:
+            if (not isinstance(transcript, dict) or transcript.get("status") not in (
+                    "recording", "unsupported", "identity_unavailable", "unreadable", "unavailable") or
+                    not isinstance(transcript.get("truncated", False), bool)):
+                raise ValueError("transcript requires a supported status and boolean truncated flag")
+            repair = transcript.get("identity_repair")
+            if repair is not None and repair not in (
+                    "repaired", "binding_changed", "identity_unavailable", "report_rejected", "report_unverified"):
+                raise ValueError("transcript identity_repair must be a supported status")
+            transcript = {"status": transcript["status"], "truncated": transcript.get("truncated", False),
+                          **({"identity_repair": repair} if repair is not None else {})}
         stamp = self._stamp()
         existing = self._sessions.get(session_id)
         if (existing is not None and host_id is not None
@@ -825,7 +894,7 @@ class ControlPlaneRepo:
                   "interactive_ready": interactive_ready, "launch_pending": launch_pending,
                   "state_change_seq": state_change_seq,
                   "repository_id": repository_id, "commit_sha": commit_sha,
-                  "parent_session_id": _label(parent_session_id, session_id), "name": _label(name)}
+                  "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name)}
         if existing is None:
             rec = {"session_id": session_id, "mission_id": mission_id,
                    "host_id": host_id, "agent_role": agent_role,
@@ -875,7 +944,7 @@ class ControlPlaneRepo:
                               "summary", "attach", "pane_id", "terminal_id", "herdr_session",
                               "machine", "agent_session", "revision", "interactive_ready",
                               "launch_pending", "state_change_seq", "repository_id", "commit_sha",
-                              "parent_session_id", "name") if existing.get(k) is not None}},
+                              "transcript", "parent_session_id", "name") if existing.get(k) is not None}},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)
@@ -1363,6 +1432,137 @@ class ControlPlaneRepo:
             return True
         return False
 
+    # ---------------------------------------------------------- CI history
+    def record_ci_telemetry(self, records):
+        """Persist validated observations, with retry-safe retained operation IDs."""
+        with self._event_lock:
+            pending, duplicates = {}, 0
+            for record in records:
+                identifier = record['operation_id']
+                stream = self._events.get(('ci_telemetry', identifier), [])
+                previous = stream[-1]['payload'] if stream else pending.get(identifier)
+                if previous is not None:
+                    if {k: v for k, v in previous.items() if k != 'ingested_at'} != record:
+                        raise ValueError('Conflicting CI telemetry operation ID.')
+                    duplicates += 1
+                else:
+                    pending[identifier] = copy.deepcopy(record)
+            for identifier, record in pending.items():
+                record['ingested_at'] = self._stamp()
+                try:
+                    self.record_event('ci_telemetry', identifier, 'CITelemetryReceived', record,
+                                      require_durable=True)
+                except Exception:
+                    raise RuntimeError('CI telemetry persistence is unavailable.') from None
+                self._trim_ci_history('ci_telemetry')
+            view = self.ci_performance()
+            return dict(accepted=len(pending), duplicates=duplicates,
+                        scope=view['scope'], coverage=view['coverage'])
+
+    def ci_performance(self, repository=None, branch=None, days=14, *, inventory=None):
+        from .ci_performance import performance
+        with self._event_lock:
+            records = [copy.deepcopy(stream[-1]['payload'])
+                       for (kind, _), stream in self._events.items()
+                       if kind == 'ci_telemetry' and stream]
+            pipelines = self.ci_reports()['pipelines']
+            if inventory is not None:
+                from .project_links import annotate_ci_history
+                # Resolve inventory identities before calculating group membership.
+                # Annotate both sources so exact-run enrichment cannot reintroduce
+                # an older/unresolved identity after telemetry has been resolved.
+                records = annotate_ci_history({'repos': inventory, 'pipelines': records}, self)['pipelines']
+                pipelines = annotate_ci_history({'repos': inventory, 'pipelines': pipelines}, self)['pipelines']
+            return performance(records, pipelines, now=self._now(),
+                               persistence='durable_sink' if self._sink is not None else 'memory_only',
+                               repository=repository, branch=branch, days=days)
+
+    def ingest_ci_report(self, body):
+        from .ci_reports import normalize_report, reconcile_report_identities
+        with self._event_lock:
+            report = normalize_report(body, self._stamp())
+            existing = self._events.get(("ci_report", report["report_id"]))
+            if existing:
+                return copy.deepcopy(existing[-1]["payload"])
+            history = self.ci_reports()
+            projected = copy.deepcopy(report)
+            reconcile_report_identities([projected], history["pipelines"])
+            attempts = [row.get("attempt", 1) for row in history["reports"]
+                        if (row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
+                           (projected["repository"], str(projected["provider_repo_id"]), projected["run_number"])]
+            report["attempt"] = max(attempts, default=0) + 1
+            report["ingested_at"] = self._stamp()
+            self.record_event("ci_report", report["report_id"], "CITestReportReceived", report,
+                              require_durable=True)
+            self._trim_ci_history("ci_report")
+            return copy.deepcopy(report)
+
+    def observe_ci_pipeline(self, row):
+        row = redact_payload(copy.deepcopy(row))
+        key = f"{row.get('provider_repo_id') or row.get('repository')}:{row.get('run_number')}"
+        with self._event_lock:
+            previous = self._events.get(("ci_observation", key), [])
+            if previous and previous[-1]["payload"] == row:
+                return
+            self.record_event("ci_observation", key, "CIPipelineObserved", row,
+                              require_durable=True)
+            self._trim_ci_history("ci_observation")
+
+    def _trim_ci_history(self, kind=None):
+        from .ci_performance import RECORD_LIMIT
+        from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
+        keep = set()
+        kinds = {kind} if kind is not None else {"ci_report", "ci_observation", "ci_telemetry"}
+        arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
+        for kind, limit in (("ci_report", REPORT_LIMIT), ("ci_observation", PIPELINE_LIMIT),
+                            ("ci_telemetry", RECORD_LIMIT)):
+            if kind not in kinds:
+                continue
+            keys = [key for key in self._events if key[0] == kind]
+            for key in keys:
+                for event in self._events[key]:
+                    if isinstance(event.get("payload"), str):
+                        event["payload"] = json.loads(event["payload"])
+            keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
+                                      arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
+                      reverse=True)
+            size = 0
+            for key in keys[:limit]:
+                latest = self._events[key][-1]
+                size += len(json.dumps(latest).encode())
+                if size > HISTORY_BYTES:
+                    break
+                self._events[key] = [latest]
+                keep.add(key)
+            for key in keys:
+                if key not in keep:
+                    del self._events[key]
+        self._event_order = [entry for entry in self._event_order
+                             if entry[0] not in kinds
+                             or ((entry[0], entry[1]) in keep and
+                                 entry[2] == self._events[(entry[0], entry[1])][-1]["sequence"])]
+
+    def ci_reports(self):
+        from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
+        with self._event_lock:
+            arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
+            def rows(kind):
+                events = [stream[-1] for (etype, _), stream in self._events.items()
+                          if etype == kind and stream]
+                events.sort(key=lambda event: (event.get("ingest_timestamp", ""), arrivals.get(
+                    (event["entity_type"], event["entity_id"], event["sequence"]), -1)), reverse=True)
+                return [copy.deepcopy(event["payload"]) for event in events]
+            reports, pipelines = rows("ci_report"), rows("ci_observation")
+            from .ci_reports import reconcile_report_identities
+            reconcile_report_identities(reports, pipelines)
+            return {"reports": reports, "pipelines": pipelines,
+                    "scope": {"kind": "retained_observations", "complete": False,
+                              "persistence": "durable_sink" if self._sink is not None else "memory_only",
+                              "report_limit": REPORT_LIMIT, "pipeline_limit": PIPELINE_LIMIT,
+                              "byte_limit_per_kind": HISTORY_BYTES,
+                              "report_count": len(reports), "pipeline_count": len(pipelines),
+                              "description": "Uploaded test reports and observed provider runs only; missing reports do not mean zero tests."}}
+
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
                      mission_id=None, session_id=None, require_durable=False, publish=True):
@@ -1370,6 +1570,8 @@ class ControlPlaneRepo:
             key = (entity_type, entity_id)
             stream = self._events.setdefault(key, [])
             seq = max((e.get("sequence", -1) for e in stream), default=-1) + 1
+            if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
+                seq = max(seq, self._ci_sequence)
             ev = {
                 "event_id": new_id("event"),
                 "schema_version": 1,
@@ -1383,7 +1585,14 @@ class ControlPlaneRepo:
             if require_durable and self._sink is not None:
                 # Command side effects require persistence before submission. A
                 # legacy best-effort sink cannot establish this prerequisite.
-                self._sink.record_required(ev)
+                try:
+                    self._sink.record_required(ev)
+                except Exception:
+                    if entity_type in {"ci_report", "ci_observation", "ci_telemetry"} and not stream:
+                        self._events.pop(key, None)
+                    raise
+            if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
+                self._ci_sequence = seq + 1
             stream.append(ev)
             self._event_order.append((entity_type, entity_id, seq))
             if self._sink is not None and not require_durable:
@@ -1549,7 +1758,8 @@ class ControlPlaneRepo:
         return [{k: v for k, v in key.items() if k != "key_hash"}
                 for key in self._llm_keys()]
 
-    def upsert_custom_model(self, name, base_url, upstream_model=None, project=None):
+    def upsert_custom_model(self, name, base_url, upstream_model=None, project=None, *,
+                            fabric_model=None, context_window=8192):
         if not name or not base_url:
             raise ValueError("name and base_url are required")
         if not str(base_url).startswith(("http://", "https://")):
@@ -1557,6 +1767,14 @@ class ControlPlaneRepo:
         payload = {"name": name, "base_url": base_url.rstrip("/"),
                    "upstream_model": upstream_model or name, "project": project,
                    "deleted": False}
+        if fabric_model is not None:
+            if (not isinstance(fabric_model, str) or not fabric_model
+                    or len(fabric_model) > 256 or not fabric_model.isprintable()
+                    or any(c.isspace() for c in fabric_model)):
+                raise ValueError("fabric_model must be a bounded model identity without whitespace")
+            if type(context_window) is not int or not 1 <= context_window <= 1048576:
+                raise ValueError("context_window must be an integer between 1 and 1048576")
+            payload.update(fabric_model=fabric_model, context_window=context_window)
         return self.record_event("custom_model", name, "custom_model.upserted", payload)
 
     def delete_custom_model(self, name):
@@ -1627,6 +1845,8 @@ class ControlPlaneRepo:
             "events": {f"{t}|{i}": [dict(e) for e in s]
                        for (t, i), s in self._events.items()},
             "event_order": list(self._event_order),
+            "ci_sequence": self._ci_sequence,
+            "agent_projections": copy.deepcopy(list(self._agent_records.values())),
         }
 
     def import_state(self, state):
@@ -1646,6 +1866,31 @@ class ControlPlaneRepo:
             t, i = key.split("|")
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
+        self._ci_sequence = max(int(state.get("ci_sequence", 0)),
+                                max((event.get("sequence", -1) + 1
+                                     for key, stream in self._events.items()
+                                     if key[0] in {"ci_report", "ci_observation", "ci_telemetry"}
+                                     for event in stream), default=0))
+        self._trim_ci_history()
+        # Replay durable naming reservations before any session is presented.
+        # Summary continuity lives outside transcript retention and public feeds.
+        projections = list(state.get("agent_projections", []))
+        self._agent_records = {}
+        self._agent_sequence = 0
+        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
+        private_types = {"agent_identity", "agent_summary"}
+        for key in [k for k in self._events if k[0] in private_types]:
+            projections.extend(self._events.pop(key))
+        self._event_order = [row for row in self._event_order if row[0] not in private_types]
+        for event in projections:
+            if event.get("entity_type") not in private_types:
+                continue
+            event = {**event, "payload": _payload(event)}
+            key = (event["entity_type"], event["entity_id"])
+            self._agent_records[key] = event
+            self._agent_sequence = max(self._agent_sequence, int(event.get("sequence") or 0))
+        self.agent_identities.hydrate([event for (kind, _), event in self._agent_records.items()
+                                       if kind == "agent_identity"])
         # Inspector summaries ride the durable log as ``inspector`` streams;
         # move them into the bounded store instead of the unbounded raw streams.
         durable = []
