@@ -11,9 +11,9 @@ import { CFG, launch, openReal, startRealServer } from './ui-gates-lib.mjs';
 import { staticAudit, focusIndicatorAudit, summarize } from './a11y-checks.mjs';
 import { STATES } from './ui-gates-states.mjs';
 
-let srv; let browser;
-before(async () => { srv = await startRealServer({}); browser = await launch(); });
-after(async () => { await browser?.close(); srv?.stop(); });
+let browser;
+before(async () => { browser = await launch(); });
+after(async () => { await browser?.close(); });
 
 const RUNS = [
   ['desktop light', { viewport: CFG.viewports.desktop, colorScheme: 'light' }],
@@ -24,6 +24,9 @@ const RUNS = [
 for (const [label, opts] of RUNS) {
   test(`every control in every state is accessible: ${label}`, async () => {
     const bad = []; let audited = 0; let focused = 0;
+    // acknowledging an attention item is server state, so each run gets its own server: a shared one ran out of items to acknowledge
+    const srv = await startRealServer({});
+    try {
     // a fresh page per state: states must not depend on what an earlier one left open
     for (const st of STATES) {
       const { ctx, page } = await openReal(browser, srv.info, 'alice', { ...opts, reducedMotion: 'reduce' });
@@ -40,5 +43,6 @@ for (const [label, opts] of RUNS) {
     }
     assert.deepEqual(bad, [], `\n${bad.join('\n')}`);
     assert.ok(audited >= 150 && focused >= 100, `the audit really covered the page: ${audited} controls, ${focused} focused`);
+    } finally { srv.stop(); }
   });
 }
