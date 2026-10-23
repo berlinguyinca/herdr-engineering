@@ -21,6 +21,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,16 @@ class _RateLimiter:
 
 
 _FLEET_CONFIG_PATH = "/api/v1/fleet/config"
+
+
+def _gate_pr(snap):
+    """A PrSnapshot as plain JSON (no approved_patch_id; findings are already redacted)."""
+    return {
+        "key": str(snap.key), "head_sha": snap.head_sha, "state": snap.state.value,
+        "review_rounds": snap.review_rounds, "ci_fix_rounds": snap.ci_fix_rounds,
+        "reason": snap.reason, "approved_sha": snap.approved_sha,
+        "last_findings": [asdict(f) for f in snap.last_findings],
+    }
 
 
 class ControlPlaneServer:
@@ -224,8 +235,47 @@ class ControlPlaneServer:
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._httpd = None
+        self.gate_service = self.gate_store = self.gate_queue = None
+        self._start_review_gate(repo, fleet_config)
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    def _start_review_gate(self, repo, fleet_config):
+        """Build and start the PR review gate when the central config enables it.
+
+        Last step of construction, so no earlier failure leaks the gate thread. An
+        enabled-but-invalid config raises ValueError (the same fail-loud stance as
+        the bind/collab checks above): a half-configured gate never starts.
+        """
+        if fleet_config is None:
+            return
+        from ..fleet_config import FleetConfigError
+        from ..review_gate.config import load_review_gate_config
+        try:
+            section = fleet_config.current().section("control_plane")
+        except FleetConfigError:
+            return  # no control_plane section: nothing to enable
+        config = load_review_gate_config({"control_plane": section})
+        if not config.enabled:
+            return
+        from ..review_gate import github_app
+        from ..review_gate.queue import ReviewQueue
+        from ..review_gate.registry import AuthorRegistry
+        from ..review_gate.service import GateService
+        from ..review_gate.store import PipelineStore
+        self.gate_store = PipelineStore(
+            repo,
+            review_caps={e.repo: e.review_cap for e in config.repos},
+            ci_fix_caps={e.repo: e.ci_fix_cap for e in config.repos})
+        self.gate_queue = ReviewQueue(repo)
+        self.gate_service = GateService(
+            config=config, app=github_app.GitHubAppClient(config.app),
+            store=self.gate_store, queue=self.gate_queue, registry=AuthorRegistry(repo),
+            ci_snapshot=lambda: self.ci_monitor.snapshot(start=False))
+        # The gate must work with no browser open, and snapshot(start=False) never
+        # starts the poller, so the server starts the shared monitor itself.
+        self.ci_monitor.start()
+        self.gate_service.start()
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError, UnsupportedError
@@ -318,6 +368,8 @@ class ControlPlaneServer:
         self._ready.wait(timeout=timeout)
 
     def shutdown(self):
+        if self.gate_service is not None:
+            self.gate_service.stop()
         self.ci_monitor.close()
         self.github_monitor.close()
         if self._operator_httpd:
@@ -666,7 +718,7 @@ def _make_handler(server, public=False, operator=False):
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
-            if path.startswith(("/api/v1/ci/", "/api/v1/reviews")):
+            if path.startswith(("/api/v1/ci/", "/api/v1/reviews", "/api/v1/review-gate/")):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -937,6 +989,34 @@ def _make_handler(server, public=False, operator=False):
                 message = "GitHub service is unavailable." if resource == "github" else str(exc)
                 return self._send_json(500, {"error": message})
 
+        def _review_gate_get(self, parts):
+            if server.gate_service is None or len(parts) != 5:
+                return self._json({"error": "not found"}, 404)
+            if parts[4] == "prs":
+                return self._json([_gate_pr(snap) for snap in server.gate_store.snapshots()])
+            if parts[4] == "queue":
+                return self._json({"depth": server.gate_queue.depth(),
+                                   "jobs": server.gate_queue.snapshot()})
+            return self._json({"error": "not found"}, 404)
+
+        def _review_gate_resume(self, parts):
+            # /api/v1/review-gate/prs/<github.com>/<owner>/<name>/<number>/resume
+            # (the canonical repo's slashes stay literal; %2F inside a segment works too)
+            if (server.gate_service is None or len(parts) < 8 or parts[4] != "prs"
+                    or parts[-1] != "resume"):
+                return self._json({"error": "not found"}, 404)
+            from ..review_gate.models import PrKey
+            try:
+                key = PrKey.parse(f"{'/'.join(parts[5:-2])}#{parts[-2]}")
+            except ValueError:
+                return self._json({"error": "not found"}, 404)
+            store = server.gate_store
+            if key not in store.known_keys():
+                return self._json({"error": "not found"}, 404)
+            if not store.resume(key):
+                return self._json({"error": "pull request is not escalated"}, 409)
+            return self._json(_gate_pr(store.snapshot(key)))
+
         def _api_get(self, parts, resource):
             r = server.repo
             if resource == "health":
@@ -1095,6 +1175,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"available": True, "reviews": summaries,
                                    "total": len(rows), "has_more": offset + limit < len(rows),
                                    "offset": offset, "checked_at": r._stamp()})
+            if resource == "review-gate":
+                return self._review_gate_get(parts)
             if resource == "tests":
                 return self._json(_tests_view())
             return self._json({"error": "not found"}, 404)
@@ -1111,6 +1193,8 @@ def _make_handler(server, public=False, operator=False):
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
+            if resource == "review-gate":
+                return self._review_gate_resume(parts)
             body = self._read_json() or {}
             if resource == "ci" and len(parts) == 5 and parts[4] == "debug":
                 from ..errors import HerdrEngineeringError

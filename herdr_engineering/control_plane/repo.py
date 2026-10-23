@@ -1469,6 +1469,12 @@ class ControlPlaneRepo:
     def stream(self, entity_type, entity_id):
         return [_copy(e) for e in self._events.get((entity_type, entity_id), [])]
 
+    def entity_ids(self, entity_type):
+        """Ids of every entity of ``entity_type`` that has at least one event."""
+        with self._event_lock:
+            return [eid for (etype, eid), stream in self._events.items()
+                    if etype == entity_type and stream]
+
     def recent_events(self, limit=50):
         out = []
         by_sequence = {}

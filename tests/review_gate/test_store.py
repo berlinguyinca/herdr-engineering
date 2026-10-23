@@ -280,3 +280,23 @@ def test_review_started_is_idempotent_from_reviewing_for_current_head():
     assert s.on_verdict(KEY, Verdict("PASS", "A", (), "m2"))
     s.on_push(KEY, "B")
     assert s.on_review_started(KEY, "A", "m3") is False  # old head stays refused
+
+
+def test_known_keys_and_snapshots_enumerate_seen_prs():
+    _, store = make()
+    other = PrKey.parse("github.com/acme/widgets#3")
+    store.on_push(KEY, "a" * 40)
+    store.on_push(other, "b" * 40)
+    assert store.known_keys() == [other, KEY]
+    assert [s.key for s in store.snapshots()] == [other, KEY]
+
+
+def test_per_repo_cap_overrides_default():
+    _, store = make(ci_fix_cap=3, ci_fix_caps={KEY.repo: 1})
+    store.on_push(KEY, "a" * 40)
+    store.on_ci_red(KEY, "a" * 40, ["lint"])
+    assert store.snapshot(KEY).state == State.ESCALATED
+    elsewhere = PrKey.parse("github.com/acme/other#1")
+    store.on_push(elsewhere, "c" * 40)
+    store.on_ci_red(elsewhere, "c" * 40, ["lint"])
+    assert store.snapshot(elsewhere).state != State.ESCALATED

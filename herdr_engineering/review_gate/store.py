@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 
 from herdr_engineering.control_plane.redact import redact_text
@@ -96,10 +96,21 @@ def _fold(snap: PrSnapshot, event_type: str, p: dict) -> PrSnapshot:
 
 
 class PipelineStore:
-    def __init__(self, repo: ControlPlaneRepo, *, review_cap: int = 4, ci_fix_cap: int = 3):
+    def __init__(
+        self,
+        repo: ControlPlaneRepo,
+        *,
+        review_cap: int = 4,
+        ci_fix_cap: int = 3,
+        review_caps: Mapping[str, int] | None = None,
+        ci_fix_caps: Mapping[str, int] | None = None,
+    ):
+        """Caps default to ``review_cap``/``ci_fix_cap``; ``*_caps`` override per canonical repo."""
         self._repo = repo
         self._review_cap = review_cap
         self._ci_fix_cap = ci_fix_cap
+        self._review_caps = dict(review_caps or {})
+        self._ci_fix_caps = dict(ci_fix_caps or {})
         # Per store instance: serialises writers within one process only.
         self._lock = threading.RLock()
 
@@ -110,6 +121,19 @@ class PipelineStore:
             for event in self._repo.stream(ENTITY, str(key)):
                 snap = _fold(snap, event["event_type"], _payload(event))
             return snap
+
+    def known_keys(self) -> list[PrKey]:
+        """Every PR the gate has recorded events for, sorted by repo and number."""
+        keys = []
+        for entity_id in self._repo.entity_ids(ENTITY):
+            try:
+                keys.append(PrKey.parse(entity_id))
+            except ValueError:
+                continue
+        return sorted(keys, key=lambda k: (k.repo, k.number))
+
+    def snapshots(self) -> list[PrSnapshot]:
+        return [self.snapshot(k) for k in self.known_keys()]
 
     def _record(self, key: PrKey, event_type: str, payload: dict) -> bool:
         self._repo.record_event(ENTITY, str(key), event_type, payload)
@@ -138,7 +162,7 @@ class PipelineStore:
             if sha != snap.head_sha or snap.state not in (State.CI_PENDING, State.CI_GREEN):
                 return False
             payload: dict = {"sha": sha, "failures": [redact_text(f) for f in failures]}
-            if snap.ci_fix_rounds + 1 >= self._ci_fix_cap:
+            if snap.ci_fix_rounds + 1 >= self._ci_fix_caps.get(key.repo, self._ci_fix_cap):
                 payload.update(escalated=True, reason="ci fix cap reached")
             return self._record(key, "ci_red", payload)
 
@@ -173,7 +197,7 @@ class PipelineStore:
             if verdict.verdict == "FAIL":
                 previous = {finding_fingerprint(f) for f in snap.last_findings}
                 repeated = any(finding_fingerprint(f) in previous for f in findings)
-                if snap.review_rounds + 1 >= self._review_cap:
+                if snap.review_rounds + 1 >= self._review_caps.get(key.repo, self._review_cap):
                     payload.update(escalated=True, reason="review cap reached")
                 elif repeated:
                     payload.update(escalated=True, reason="repeated finding")
