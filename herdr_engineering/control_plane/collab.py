@@ -283,6 +283,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         self._by_cred: dict[str, str] = {}      # credential digest -> agent id
         self._agent_projects: dict[str, set] = defaultdict(set)  # projects an agent was ever granted into
         self._pending: dict[str, dict] = {}     # enrollment code digest -> record
+        self._quick: dict[str, str] = {}        # exact-resend fingerprint -> proposal id (memory only)
         self._idem: dict[tuple, tuple] = {}     # (principal, room, key) -> (fingerprint, seq)
         self._hits: dict[str, list[float]] = defaultdict(list)
         self._streams: dict[str, int] = defaultdict(int)
@@ -3166,7 +3167,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         eff = self._effective(Principal("agent", t["by_id"], creator["owner"]), room)
         return bool(eff and "instruct" in eff[0])
 
-    def _task_json(self, tid: str, t: dict) -> dict:
+    def _task_json(self, tid: str, t: dict, *, bounds: bool = False) -> dict:
         a = self._agents.get(t["target"], {})
         return {"task_id": tid, "room_id": t["room_id"], "target_agent_id": t["target"],
                 "target_name": a.get("name"), "text": t["text"], "status": self._task_status(t),
@@ -3174,16 +3175,18 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 "requested_by": {"type": t["by_kind"], "id": t["by_id"], "owner_user_id": t["by_owner"]},
                 "started_by_user_id": t["root"],
                 "created_at": t["created_at"], "updated_at": t["updated_at"],
-                **({"bounds": t["bounds"], "version": t["version"]} if "bounds" in t else {})}
+                **({"bounds": t["bounds"], "version": t["version"]} if bounds and "bounds" in t else {})}
 
     def list_tasks(self, pr: Principal, room_id: str, limit: int = 100) -> dict:
         with self._lock:
             _, first = self._authorize(pr, room_id, "read", "task.list")
             self._no_external(pr)
+            eff = self._effective(pr, self._rooms[room_id])
+            owner = bool(eff and "invite" in eff[0])        # a delegation's bounds are for owners and its delegate only
             rows = [(t["seq"], tid, t) for tid, t in self._tasks.items()
                     if t["room_id"] == room_id and t["seq"] >= first]
             rows.sort(key=lambda r: r[0], reverse=True)
-            out = [dict(self._task_json(tid, t), untrusted=True) for _, tid, t in rows[:limit]]
+            out = [dict(self._task_json(tid, t, bounds=owner), untrusted=True) for _, tid, t in rows[:limit]]
         return {"tasks": out}
 
     def cancel_task(self, pr: Principal, room_id: str, task_id: str) -> dict:
@@ -3295,7 +3298,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 "size": p["size"], "created_at": p["created_at"], "promoted": p["promoted"]}
 
     def _delegation_view(self, tid: str, t: dict) -> dict:
-        out = self._task_json(tid, t)
+        out = self._task_json(tid, t, bounds=True)
         out.update(usage=self._task_usage(t), delegation=True,
                    proposals=[self._proposal_brief(self._proposals[i]) for i in self._proposals_by_task.get(tid, ())])
         return out
@@ -3456,27 +3459,21 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                                                  action="delegation.budget", **{**base, "idempotency_key": None}))
         raise CollabError(409, "the task's budget is used up; it is closed", code="budget_exhausted")
 
-    def submit_proposal(self, pr: Principal, task_id: Any, body: dict) -> dict:
-        """The delegate's ONLY output: a proposal that goes to quarantine. Nothing here touches a workspace or
-        the graph. Every limit (kind, scope, size, count, steps, expiry, rate) is enforced here, once."""
-        self._need_delegation()
-        with self._lock:
-            t, room, a = self._delegate_task(pr, task_id)
-            room_id, x = room["id"], a["external"]
-            audit = dict(room_id=room_id, project_ids=[x["project_id"]], resource_id=task_id, agent_id=pr.id)
-            if set(body) - {"kind", "title", "content", "url", "refs", "supersedes", "expected_version", "idempotency_key"}:
-                self._audit_denied(pr, "delegation.proposal", "forged_identity", **audit)
-                self.stats["forged_identity"] += 1
-                raise CollabError(400, "identity and scope are derived from the credential, not the request")
-            try:
-                rec = dlg.build_proposal(task_id, t["bounds"], body)
-            except dlg.DelegationError as exc:
-                self._audit_denied(pr, "delegation.proposal", exc.code or "invalid", **audit)
-                self.stats["policy_denied"] += 1
-                raise self._refuse(exc) from None
-            ikey, ver, sup = body.get("idempotency_key"), body.get("expected_version"), body.get("supersedes")
-            if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
-                raise CollabError(400, "invalid idempotency_key")
+    def _submit_gate(self, pr: Principal, task_id: Any, body: dict, rec: dict | None):
+        """Every cheap check of a submission, run under the lock. It runs twice: once BEFORE the content is parsed
+        (so a stale, closed, exhausted or replayed submission costs no parsing) and once more with the parsed
+        record, immediately before the commit (so nothing changed while the lock was released for the parse)."""
+        t, room, a = self._delegate_task(pr, task_id)
+        room_id, x = room["id"], a["external"]
+        audit = dict(room_id=room_id, project_ids=[x["project_id"]], resource_id=task_id, agent_id=pr.id)
+        if set(body) - {"kind", "title", "content", "url", "refs", "supersedes", "expected_version", "idempotency_key"}:
+            self._audit_denied(pr, "delegation.proposal", "forged_identity", **audit)
+            self.stats["forged_identity"] += 1
+            raise CollabError(400, "identity and scope are derived from the credential, not the request")
+        ikey, ver, sup = body.get("idempotency_key"), body.get("expected_version"), body.get("supersedes")
+        if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
+            raise CollabError(400, "invalid idempotency_key")
+        if rec is not None:
             pid = rec["proposal_id"]
             if ikey is not None and (prior := self._idem.get((pr.id, room_id, "prop:" + ikey))) and prior[0] != rec["digest"]:
                 raise CollabError(409, "idempotency_key already used for a different proposal")
@@ -3484,39 +3481,88 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             if same and same["task_id"] == task_id:             # the same content again: a replay, costs nothing
                 return {"proposal_id": pid, "state": self._proposal_state(same), "digest": rec["digest"],
                         "version": t["version"], "replayed": True}
-            if isinstance(ver, bool) or not isinstance(ver, int):
-                raise CollabError(400, "expected_version is required", code="version_required")
-            if ver != t["version"]:
-                self._audit_denied(pr, "delegation.proposal", "stale_task_state", **audit)
-                raise CollabError(409, f"stale task state: the task is at version {t['version']}", code="stale_task_state")
-            status = self._task_status(t)
-            if status != "accepted":
-                self._audit_denied(pr, "delegation.proposal", "task_" + status, **audit)
-                raise CollabError(409, f"the task is {status}: accept it first, and only while it is open", code="task_" + status)
-            b = t["bounds"]["budget"]
-            if t["proposals"] >= b["max_proposals"] or t["steps"] + 1 > b["max_steps"]:
-                self._audit_denied(pr, "delegation.proposal", "budget_exhausted", **audit)
-                raise CollabError(409, "the task's proposal or step budget is used up", code="budget_exhausted")
-            mine = self._proposals_by_agent.get(pr.id, ())
-            sponsor_total = sum(len(self._proposals_by_agent.get(i, ())) for i in self._externals_by_sponsor(x["sponsor"]))
-            quarantined = sum(1 for i in self._proposals_by_room.get(room_id, ())
-                              if self._proposal_state(self._proposals[i]) == "quarantined")
-            if (len(mine) >= dlg.MAX_PROPOSALS_PER_AGENT or sponsor_total >= dlg.MAX_PROPOSALS_PER_SPONSOR
-                    or quarantined >= dlg.MAX_QUARANTINED_PER_ROOM):
-                self._audit_denied(pr, "delegation.proposal", "quota", **audit)
-                self.stats["rate_limited"] += 1
-                raise CollabError(429, "too many proposals; the room owner must decide the open ones first", code="quota")
-            if sup is not None:
-                prior_p = self._proposals.get(sup) if isinstance(sup, str) else None
-                if (not prior_p or prior_p["task_id"] != task_id or prior_p["agent_id"] != pr.id
-                        or self._proposal_state(prior_p) != "quarantined"):
-                    raise CollabError(409, "supersedes must name your own undecided proposal for this task", code="cannot_supersede")
+        else:                                                    # replay of a body already accepted, without parsing it
+            quick = self._quick_key(task_id, body)
+            pid = self._quick.get(quick) if quick else None
+            same = self._proposals.get(pid) if pid else None
+            if same and same["task_id"] == task_id:
+                return {"proposal_id": pid, "state": self._proposal_state(same), "digest": same["digest"],
+                        "version": t["version"], "replayed": True}
+        if isinstance(ver, bool) or not isinstance(ver, int):
+            raise CollabError(400, "expected_version is required", code="version_required")
+        if ver != t["version"]:
+            self._audit_denied(pr, "delegation.proposal", "stale_task_state", **audit)
+            raise CollabError(409, f"stale task state: the task is at version {t['version']}", code="stale_task_state")
+        status = self._task_status(t)
+        if status != "accepted":
+            self._audit_denied(pr, "delegation.proposal", "task_" + status, **audit)
+            raise CollabError(409, f"the task is {status}: accept it first, and only while it is open", code="task_" + status)
+        b = t["bounds"]["budget"]
+        if t["proposals"] >= b["max_proposals"] or t["steps"] + 1 > b["max_steps"]:
+            self._audit_denied(pr, "delegation.proposal", "budget_exhausted", **audit)
+            raise CollabError(409, "the task's proposal or step budget is used up", code="budget_exhausted")
+        mine = self._proposals_by_agent.get(pr.id, ())
+        sponsor_total = sum(len(self._proposals_by_agent.get(i, ())) for i in self._externals_by_sponsor(x["sponsor"]))
+        quarantined = sum(1 for i in self._proposals_by_room.get(room_id, ())
+                          if self._proposal_state(self._proposals[i]) == "quarantined")
+        if (len(mine) >= dlg.MAX_PROPOSALS_PER_AGENT or sponsor_total >= dlg.MAX_PROPOSALS_PER_SPONSOR
+                or quarantined >= dlg.MAX_QUARANTINED_PER_ROOM):
+            self._audit_denied(pr, "delegation.proposal", "quota", **audit)
+            self.stats["rate_limited"] += 1
+            raise CollabError(429, "too many proposals; the room owner must decide the open ones first", code="quota")
+        if sup is not None:
+            prior_p = self._proposals.get(sup) if isinstance(sup, str) else None
+            if (not prior_p or prior_p["task_id"] != task_id or prior_p["agent_id"] != pr.id
+                    or self._proposal_state(prior_p) != "quarantined"):
+                raise CollabError(409, "supersedes must name your own undecided proposal for this task", code="cannot_supersede")
+        return t, x, audit
+
+    @staticmethod
+    def _quick_key(task_id: str, body: dict) -> str | None:
+        """A cheap fingerprint of the submitted fields (no parsing), used only to recognise an exact resend."""
+        try:
+            raw = json.dumps([task_id] + [body.get(k) for k in ("kind", "title", "content", "url", "refs")],
+                             sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def submit_proposal(self, pr: Principal, task_id: Any, body: dict) -> dict:
+        """The delegate's ONLY output: a proposal that goes to quarantine. Nothing here touches a workspace or
+        the graph. Every limit (kind, scope, size, count, steps, expiry, rate) is enforced here, once. The
+        cheap checks run first and the content is parsed OUTSIDE the service lock."""
+        self._need_delegation()
+        with self._lock:
+            first = self._submit_gate(pr, task_id, body, None)
+            if isinstance(first, dict):
+                return first
+            bounds = first[0]["bounds"]
+        try:
+            rec = dlg.build_proposal(task_id, bounds, body)
+        except dlg.DelegationError as exc:
+            with self._lock:
+                _, room, a = self._delegate_task(pr, task_id)
+                self._audit_denied(pr, "delegation.proposal", exc.code or "invalid", room_id=room["id"],
+                                   project_ids=[a["external"]["project_id"]], resource_id=task_id, agent_id=pr.id)
+                self.stats["policy_denied"] += 1
+            raise self._refuse(exc) from None
+        with self._lock:
+            second = self._submit_gate(pr, task_id, body, rec)
+            if isinstance(second, dict):
+                return second
+            t, x, audit = second
+            if t["bounds"] != bounds:
+                raise CollabError(409, "the task changed while the proposal was checked", code="stale_task_state")
+            ikey, sup = body.get("idempotency_key"), body.get("supersedes")
+            pid, room_id = rec["proposal_id"], audit["room_id"]
             self._throttle("prop:" + pr.id, dlg.PROPOSALS_PER_10_MIN, 600.0, "proposal")
             self._commit("proposal_submitted", self._actor(
                 pr, project_id=x["project_id"], room_id=room_id, task_id=task_id, sponsor=x["sponsor"],
                 supersedes=sup, idempotency_key=ikey, created_epoch=self._now(), visibility_scope="room",
                 action="delegation.proposal", outcome="allowed", project_ids=[x["project_id"]], resource_id=pid,
                 **{k: rec[k] for k in ("proposal_id", "digest", "kind", "title", "content", "url", "refs", "size", "flags")}))
+            if (qk := self._quick_key(task_id, body)):
+                self._quick[qk] = pid
             return {"proposal_id": pid, "state": "quarantined", "digest": rec["digest"], "version": t["version"]}
 
     def _externals_by_sponsor(self, sponsor: str) -> list[str]:

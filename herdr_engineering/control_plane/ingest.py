@@ -79,7 +79,8 @@ class IngestService:
         source inside that agent's namespace; anyone else is refused exactly like any lineage refusal."""
         actor = env.get("actor") or {}
         if self.service_node is not None and actor.get("kind") != "collab" and not (
-                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
+                actor.get("kind") == "operator"
+                and actor.get("authenticated_by") not in (None, "none", "open_listener")):   # an open listener is no operator here
             ends = (payload.get("from_id"), payload.get("to_id")) if event_type.startswith("edge.") else (payload.get("node_id"),)
             if any(isinstance(e, str) and self.service_node(e) for e in ends):
                 raise PermissionError("not permitted to modify this lineage object")
