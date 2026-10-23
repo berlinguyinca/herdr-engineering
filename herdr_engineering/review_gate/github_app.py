@@ -200,14 +200,17 @@ class GitHubAppClient:
             data = self._send("GET", f"/repos/{slug}/pulls?state=open&per_page=100&page={page}")
             if not isinstance(data, list):
                 raise GitHubAppError("invalid_response")
+            bad_item = False
             for item in data:
                 try:
                     out.append(PrInfo(number=int(item["number"]), head_sha=str(item["head"]["sha"]),
                                       head_ref=str(item["head"]["ref"]), base_ref=str(item["base"]["ref"]),
                                       author_login=str((item.get("user") or {}).get("login", "")),
                                       draft=bool(item.get("draft", False))))
-                except (KeyError, TypeError, ValueError):
-                    raise GitHubAppError("invalid_response") from None
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    bad_item = True
+                if bad_item:
+                    raise GitHubAppError("invalid_response")
             if len(data) < 100:
                 return out
         raise GitHubAppError("invalid_response")  # cap reached with a full page: never truncate silently

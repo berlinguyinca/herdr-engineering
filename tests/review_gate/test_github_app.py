@@ -366,3 +366,62 @@ def test_open_prs_cap_is_not_silent_and_null_user_tolerated(keypair):
     ghost["user"] = None
     c, _ = client_for(cfg, {("GET", "/repos/acme/widget/pulls"): Resp(200, [ghost])})
     assert c.open_prs(REPO)[0].author_login == ""
+
+
+def _mk(cfg, routes):
+    return client_for(cfg, routes)[0]
+
+
+def _garbage_key(cfg):
+    open(cfg.private_key_file, "w").write("not a key")
+    return GitHubAppClient(cfg, client=FakeOpener({}))
+
+
+_P = "/repos/acme/widget/pulls"
+_NEEDS_TOKEN = ("POST", "/app/installations/99/access_tokens")
+# (name, builder(cfg) -> callable raising GitHubAppError)
+RAISE_SITES = [
+    ("mint_failure", lambda cfg: _garbage_key(cfg).installation_token),
+    ("token_missing_fields", lambda cfg: GitHubAppClient(
+        cfg, client=FakeOpener({_NEEDS_TOKEN: Resp(201, {"nope": 1})})).installation_token),
+    ("token_http_500", lambda cfg: GitHubAppClient(
+        cfg, client=FakeOpener({_NEEDS_TOKEN: http_error(500)})).installation_token),
+    ("http_401", lambda cfg: (lambda c: lambda: c.open_prs(REPO))(_mk(cfg, {("GET", _P): http_error(401)}))),
+    ("http_404", lambda cfg: (lambda c: lambda: c.open_prs(REPO))(_mk(cfg, {("GET", _P): http_error(404)}))),
+    ("http_429", lambda cfg: (lambda c: lambda: c.open_prs(REPO))(_mk(cfg, {("GET", _P): http_error(429)}))),
+    ("network_error", lambda cfg: (lambda c: lambda: c.open_prs(REPO))(_mk(cfg, {("GET", _P): OSError("down")}))),
+    ("non_json", lambda cfg: (lambda c: lambda: c.open_prs(REPO))(_mk(cfg, {("GET", _P): Resp(200, b"{{")}))),
+    ("oversized", lambda cfg: (lambda c: lambda: c.open_prs(REPO))(
+        _mk(cfg, {("GET", _P): Resp(200, b"[" + b" " * (5 * 1024 * 1024))}))),
+    ("prs_not_list", lambda cfg: (lambda c: lambda: c.open_prs(REPO))(_mk(cfg, {("GET", _P): Resp(200, {})}))),
+    ("pr_bad_number", lambda cfg: (lambda c: lambda: c.open_prs(REPO))(
+        _mk(cfg, {("GET", _P): Resp(200, [dict(pr(1, "c" * 40), number="x")])}))),
+    ("pr_item_not_dict", lambda cfg: (lambda c: lambda: c.open_prs(REPO))(_mk(cfg, {("GET", _P): Resp(200, ["x"])}))),
+    ("pr_cap", lambda cfg: (lambda c: lambda: c.open_prs(REPO))(
+        _mk(cfg, {("GET", _P): Resp(200, [pr(i, "c" * 40) for i in range(100)])}))),
+    ("status_http_422", lambda cfg: (lambda c: lambda: c.set_status(REPO, "a" * 40, "success", "d"))(
+        _mk(cfg, {("POST", "/repos/acme/widget/statuses/"): http_error(422)}))),
+    ("merge_http_403", lambda cfg: (lambda c: lambda: c.merge_pr(REPO, 1, "a" * 40))(
+        _mk(cfg, {("PUT", _P + "/1/merge"): http_error(403)}))),
+    ("update_branch_http_422", lambda cfg: (lambda c: lambda: c.update_branch(REPO, 1, "a" * 40))(
+        _mk(cfg, {("PUT", _P + "/1/update-branch"): http_error(422)}))),
+    ("patch_files_missing", lambda cfg: (lambda c: lambda: c.patch_id(REPO, "1" * 40, "2" * 40))(
+        _mk(cfg, {("GET", "/repos/acme/widget/compare/"): Resp(200, {})}))),
+    ("patch_too_many", lambda cfg: (lambda c: lambda: c.patch_id(REPO, "1" * 40, "2" * 40))(
+        _mk(cfg, {("GET", "/repos/acme/widget/compare/"): files_resp([f(f"f{i}", "@@ -1 +1 @@\n") for i in range(300)])}))),
+    ("patch_no_blob_sha", lambda cfg: (lambda c: lambda: c.patch_id(REPO, "1" * 40, "2" * 40))(
+        _mk(cfg, {("GET", "/repos/acme/widget/compare/"): files_resp([f("x")])}))),
+    ("patch_file_not_dict", lambda cfg: (lambda c: lambda: c.patch_id(REPO, "1" * 40, "2" * 40))(
+        _mk(cfg, {("GET", "/repos/acme/widget/compare/"): files_resp(["x"])}))),
+]
+
+
+@pytest.mark.parametrize("name,build", RAISE_SITES, ids=[n for n, _ in RAISE_SITES])
+def test_every_raise_site_is_unchained(keypair, name, build):
+    cfg, _ = keypair
+    call = build(cfg)
+    with pytest.raises(GitHubAppError) as ei:
+        call()
+    assert ei.value.__context__ is None
+    assert ei.value.__cause__ is None
+    assert ei.value.__suppress_context__ is True
