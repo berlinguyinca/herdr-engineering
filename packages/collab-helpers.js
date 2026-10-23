@@ -18,12 +18,18 @@ export function renderPanic(paused, { operator }) {
 
 const when = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleString() : '');
 
-export function renderEgressRequests(requests, { operator }) {
+// A room as a link when the viewer can open it (it is in their room list), else plain escaped text.
+export function renderRoomRef(roomId, rooms) {
+  const r = (rooms || []).find((x) => x.room_id === roomId);
+  return r ? `<a href="#/room/${encodeURIComponent(roomId)}" data-go="/room/${esc(encodeURIComponent(roomId))}">${esc(r.name || roomId)}</a>` : esc(roomId);
+}
+
+export function renderEgressRequests(requests, { operator, rooms = null }) {
   if (!operator) return '';
   const open = (requests || []).filter((r) => r.state === 'open');
   if (!open.length) return '<div class="hd-empty">No host access requests.</div>';
   const b = (act, label, cls = '') => `<button type="button" class="hd-btn hd-btn--sm${cls}" data-egress-act="${act}">${label}</button>`;
-  return `<ul class="cx-list">${open.map((r) => `<li data-id="${esc(r.id)}" data-room="${esc(r.room_id)}" data-hp="${esc(r.host_port)}"><span class="grow"><b>${esc(r.host_port)}</b><span class="cx-sub1">asked by agent ${esc(r.agent_id)}</span></span>`
+  return `<ul class="cx-list">${open.map((r) => `<li data-id="${esc(r.id)}" data-room="${esc(r.room_id)}" data-hp="${esc(r.host_port)}"><span class="grow"><b>${esc(r.host_port)}</b><span class="cx-sub1">asked by agent ${esc(r.agent_id)}${rooms ? ` in ${renderRoomRef(r.room_id, rooms)}` : ''}</span></span>`
     + `<span class="cx-row">${b('approve-1d', 'Approve 1 day')}${b('approve-1w', 'Approve 1 week')}${b('always', 'Always', ' hd-btn--ghost')}${b('deny', 'Deny', ' hd-btn--danger')}</span></li>`).join('')}</ul>`;
 }
 
@@ -117,7 +123,9 @@ export function wireHelperHandlers(container, o) {
     const b = ev.target.closest?.('[data-panic],[data-egress-act]');
     if (!b || !o.operator) return;
     const row = b.closest('[data-id],[data-hp]');
-    o.act(async () => { await helperAction(o.api, { ...(row ? row.dataset : {}), ...b.dataset, room: o.roomId }); await o.refresh(); });
+    const rd = row ? row.dataset : {};
+    // the top-level panel has no current room: each row carries the room of its own request / host
+    o.act(async () => { await helperAction(o.api, { ...rd, ...b.dataset, room: o.perRow ? rd.room : o.roomId }); await o.refresh(); });
   };
   const onSubmit = (ev) => {
     if (ev.target.id !== 'hcn-profile' || !o.owner) return;
@@ -129,4 +137,71 @@ export function wireHelperHandlers(container, o) {
   container.addEventListener('click', onClick);
   container.addEventListener('submit', onSubmit);
   return () => { container.removeEventListener('click', onClick); container.removeEventListener('submit', onSubmit); };
+}
+
+// ---- the operator's top-level Helpers panel: every room, not just the open one
+const ago = (s) => (s < 90 ? `${Math.max(0, Math.round(s))}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${Math.round(s / 3600)}h`);
+
+export function renderHelperList(helpers, rooms, now) {
+  if (!(helpers || []).length) return '<div class="hd-empty">No helpers are running.</div>';
+  return `<table class="cx-table"><thead><tr><th>Role</th><th>Status</th><th>Requester</th><th>Room</th><th>Age</th><th>Expires</th></tr></thead><tbody>${helpers.map((h) => `<tr data-helper="${esc(h.helper_id)}">`
+    + `<td>${esc(h.role)}${h.task ? `<span class="cx-sub1">${esc(String(h.task).slice(0, 160))}</span>` : ''}</td><td>${esc(h.status)}</td><td>${esc(h.requester_agent_id)}</td><td>${renderRoomRef(h.room_id, rooms)}</td>`
+    + `<td>${h.created_epoch ? esc(ago(now - h.created_epoch)) : ''}</td><td>${esc(when(h.expires_epoch))}</td></tr>`).join('')}</tbody></table>`;
+}
+
+// state: { paused, requests, helpers, allow: {roomId: [host...]}, rooms, now, error }
+export function renderHelpersPanel(st, { operator }) {
+  if (!operator) return '';
+  const rooms = st.rooms || [];
+  const reqs = st.requests || [];
+  const hostRooms = Object.keys(st.allow || {}).filter((r) => (st.allow[r] || []).length);
+  return `<section class="cx-section cx-helpers-panel"><h2>Helpers</h2>${st.error ? `<div class="hd-error" role="alert">${esc(st.error)}</div>` : ''}`
+    + `${renderPanic(Boolean(st.paused), { operator })}`
+    + `<div class="hd-card cx-stack"><div class="hd-card__title">Host access requests (all rooms)</div>${renderEgressRequests(reqs, { operator, rooms })}`
+    + `<div class="hd-card__title">Helpers across rooms</div>${renderHelperList(st.helpers, rooms, st.now ?? Date.now() / 1000)}`
+    + `<div class="hd-card__title">External hosts</div>${hostRooms.length ? hostRooms.map((r) => `<div class="cx-sub1">${renderRoomRef(r, rooms)}</div>${renderHostsTable(st.allow[r], reqs.filter((q) => q.room_id === r), { operator, room: r, permanent: [], now: st.now })}`).join('') : '<div class="hd-empty">No external hosts.</div>'}</div></section>`;
+}
+
+// Mounts the panel into its own container. All state and listeners belong to this instance, and
+// destroy() unbinds them, so remounting (or leaving the page) can never leave a stale handler behind.
+export function createHelpersPanel({ container, api, operator, getRooms, go, schedule = setTimeout, clear = clearTimeout, interval = 6000, hidden = () => false }) {
+  if (!operator) return { refresh: async () => {}, start() {}, destroy() {} };
+  let alive = true; let timer = null; let seq = 0;
+  const st = { paused: false, requests: [], helpers: [], allow: {}, rooms: [], error: '' };
+  const draw = () => { if (alive) container.innerHTML = renderHelpersPanel(st, { operator }); };
+  const refresh = async () => {
+    if (!alive) return;
+    const mine = ++seq;
+    const errs = [];
+    const [rq, hp, rm] = await Promise.all([
+      api.egressRequests().catch((e) => { errs.push(e.message); return null; }),
+      api.helpers().catch((e) => { errs.push(e.message); return null; }),
+      Promise.resolve().then(getRooms).catch(() => null)]);
+    if (!alive || mine !== seq) return;
+    if (rq) st.requests = (rq.requests || []).filter((r) => r.state === 'open' || r.state === 'approved');
+    if (hp) { st.helpers = hp.helpers || []; st.paused = Boolean(hp.paused); st.now = hp.now; }
+    if (rm) st.rooms = rm;
+    const ids = [...new Set([...st.requests.map((r) => r.room_id), ...st.rooms.map((r) => r.room_id)])].slice(0, 40);
+    const lists = await Promise.all(ids.map((id) => api.egressAllowlist(id).then((x) => [id, x.allowlist || []]).catch(() => null)));
+    if (!alive || mine !== seq) return;
+    st.allow = Object.fromEntries(lists.filter(Boolean));
+    st.error = errs[0] || '';
+    draw();
+  };
+  const unbind = wireHelperHandlers(container, {
+    api, roomId: null, perRow: true, operator, owner: false,
+    act: async (fn) => { try { await fn(); } catch (e) { st.error = e.message; draw(); } },
+    refresh, getProfile: () => null, setProfile() {}, onError() {}, readForm: () => ({}),
+  });
+  const onGo = (ev) => {
+    const a = ev.target.closest?.('a[data-go]');
+    if (!a || !go) return;
+    ev.preventDefault?.(); go(a.dataset.go);
+  };
+  container.addEventListener('click', onGo);
+  const loop = async () => { await refresh(); if (alive) timer = schedule(loop, hidden() ? interval * 3 : interval); };
+  return {
+    refresh, start() { loop(); },
+    destroy() { alive = false; clear(timer); unbind(); container.removeEventListener('click', onGo); },
+  };
 }

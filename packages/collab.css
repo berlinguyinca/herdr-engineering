@@ -284,3 +284,5 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-table th, .cx-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border, rgba(128,128,128,.25)); overflow-wrap: anywhere; }
 .cx-tree { list-style: none; margin: 4px 0 0; padding-left: 16px; border-left: 1px solid var(--border, rgba(128,128,128,.35)); }
 .cx-helpers { margin-top: 8px; }
+.cx-helpers-panel { margin-top: 18px; }
+.cx-helpers-panel .cx-sub1 { display: block; }
