@@ -226,6 +226,8 @@ the helpers your agents started, and cancel one, with `GET helpers`, `GET helper
 * **Successors:** when a successor starts, a predecessor that is itself a helper ends, and its handoff note is
   kept as its result. Your own (root) agent is not stopped: end it yourself once its successor runs.
 * **Panic switch:** the operator can pause all helpers; that stops every running helper at once.
+* **SSH keys need their own kind.** The operator stores an SSH key with `collab-secrets.py set ROOM NAME --ssh`;
+  only such entries reach a helper's `~/.ssh`, and one secret name cannot be both a service's key and an SSH key.
 * **Know before you grant it:** an SSH key the room gives helpers can be read by them. A helper can print it,
   and the agent that asked then has it, so grant **Start helpers** in such a room only to agents of people you
   would give the key to. API keys bound to a service cannot be read by the helper, but it can use them. Everything

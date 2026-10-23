@@ -496,6 +496,12 @@ agent, host and port.
   sees 403.
 * Unanswered requests stop counting after 24 h; a room can have at most 60 open.
 * **External hosts** lists every host a room may reach, with **Remove** (this also ends live approvals).
+  `GET fleet/egress/{room}` returns `entries: [{host_port, kind}]` beside the plain `allowlist`; `kind` is
+  `permanent` (the profile), `approved` (an unexpired approval) or `model` (a family endpoint, which Remove cannot
+  take out). `GET fleet/egress` marks each request `internal: true` when its host is not a public address
+  (private, loopback, link-local, numeric spellings, IPv4 inside IPv6 such as `[::ffff:a00:1]`), and lists
+  `rooms_with_hosts`, the rooms whose owner listed always-allowed hosts, so they stay visible after request rows
+  are pruned (8 days).
 * Removing a host, or an approval running out, also cuts tunnels that are **already open**: the runner rewrites
   each running helper's allow file on its next watch (within about 15 s, see *Panic switch*), and the helper's proxy checks its open tunnels against that
   file every 2 s (`--recheck`) and closes those no longer allowed (a name whose listed private address went is
@@ -514,8 +520,10 @@ runner kills the boxes within about 15 s. The runner watches its helpers when a 
 apart, and stopping one box takes up to 6 s. This holds for revoke, cancel, expiry and profile changes too, and
 even when the rest of the cycle fails. If the runner cannot fetch the helper list, it cancels nothing on that
 alone, but each helper's own deadline still applies and after 30 s (`HELPER_LIST_GRACE`) every running helper's
-allow file is emptied (the same happens to one helper whose room host list cannot be fetched for 30 s): a service
-outage closes the network, it never leaves removed hosts usable. **Resume helpers** turns it off. Each press is audited with who, when and which
+allow file is emptied, and its services and their keys are dropped too (the same happens to one helper whose room
+host list cannot be fetched for 30 s): a service outage closes the network, it never leaves removed hosts usable.
+The helper's egress proxy is stopped on its own (pid and start time recorded in `proxy.json`), so it never
+outlives a supervisor that died. **Resume helpers** turns it off. Each press is audited with who, when and which
 way (`helpers.pause` / `helpers.resume`): in every project's audit (`GET audit?project_id=...`, with `paused`), and
 in approval mode also in the **People → Decision log** on the dashboard.
 
@@ -572,8 +580,8 @@ so those run on their own default model and the result says so.
 
 Over a limit a request fails at once with 429 and says which limit; nothing is queued. Every request, refusal,
 claim, finish, cancel, pause and host decision is in the audit log and the room's event feed (ids, role and
-model only, never the task text or the result). Guests never see helper events in the feed (their cursor still moves past
-them).
+model only, never the task text or the result). Guests never see helper events in the feed, nor the grant or revoke of a
+helper's own agent (their cursor still moves past them).
 
 **Residual risks** (known, not fixed; an external security review is **still pending**):
 * **SSH keys are readable by the helper.** A key listed in the profile is a plain file in the box's `~/.ssh`, so
@@ -608,6 +616,19 @@ them).
   `pi --no-extensions --no-skills --no-prompt-templates --no-context-files`); `claude --bare` is not used because
   it turns off the OAuth login. The copy is writable (claude writes its state there) and is deleted with the
   helper.
+* **The harness login is a writable copy.** claude may refresh its OAuth token inside the helper's copy; with
+  refresh-token rotation that could invalidate the operator's own stored refresh token. Untested.
+* **The service key is bound to a host, not a port or path**, and only the exact stored value (and the bare
+  credential after a scheme word) is stripped from responses: an upstream that echoes the key in another
+  encoding gets it back to the helper.
+* **Harness binary directories are bound read-only into every box**: the directory of each harness binary and of
+  its resolved target under `$HOME` (on the development workstation, all of `~/.local/bin`). Everything in those
+  directories is readable by every helper; re-check what lives there on the runner host.
+* **pi may not start in a box.** On the development workstation `pi` is a shell wrapper that runs node from a
+  directory the box does not bind, so pi helpers fail there. Check `file "$(command -v pi)"` on the runner host
+  before allowing the `pi` family.
+* **A claimed helper whose runner state is lost** (state directory deleted, host rebuilt) holds its live slots
+  until its 2 h expiry; cancel it from **Agents → Helpers** to free them sooner.
 * **Helpers run on the runner's own host.** A parent whose pane is on another herdr machine still gets its
   helpers locally.
 * **Nested spawning is server-side only.** Helpers have no MCP in the box, so depth 2 happens only if the runner
