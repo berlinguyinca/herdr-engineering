@@ -6,7 +6,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 
 const DAY = 86400;
 export const FAMILIES = ['claude-code', 'codex', 'pi', 'agent'];   // collab.py SPAWN_FAMILIES
-const MODEL_ENDPOINTS = new Set(['api.anthropic.com:443', 'api.openai.com:443', 'llm.metabolomics.us:443']);   // FAMILY_ENDPOINTS: always allowed
+const LIVE = new Set(['requested', 'claimed', 'running']);   // collab.py _HELPER_LIVE
 const lines = (v) => String(v ?? '').split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
 
 export function renderPanic(paused, { operator }) {
@@ -33,21 +33,33 @@ export function renderEgressRequests(requests, { operator, rooms = null }) {
     + `<span class="cx-row">${b('approve-1d', 'Approve 1 day')}${b('approve-1w', 'Approve 1 week')}${b('always', 'Always', ' hd-btn--ghost')}${b('deny', 'Deny', ' hd-btn--danger')}</span></li>`).join('')}</ul>`;
 }
 
-// Permanent hosts from the profile plus approvals that have not expired.
-export function renderHostsTable(permanent, requests, opts) {
+// The room's allowlist as the server returns it: a flat list of host:port (permanent hosts, unexpired
+// approvals and the model endpoints of the room's allowed families). The list does not mark which is which,
+// so the kind is derived: an approved request still unexpired is "until"; with the profile's permanent
+// hosts known (`opts.permanent` an array) a host that is neither is the server's own family endpoint;
+// with them unknown (null: the profile is not readable) it is just "allowed" and offers Remove.
+export function renderHostsTable(allowlist, requests, opts) {
   const { operator, room, now = Date.now() / 1000 } = opts;
-  // `permanent` is the room's allowlist (permanent + live + model endpoints) or just its permanent hosts
+  const perm = Array.isArray(opts.permanent) ? opts.permanent : null;
   const live = new Map((requests || []).filter((r) => r.state === 'approved' && r.expires_at > now).map((r) => [r.host_port, r.expires_at]));
-  const rows = [...new Set(permanent || [])].map((h) => (MODEL_ENDPOINTS.has(h) ? { hp: h, kind: 'model' } : live.has(h) && !(opts.permanent || []).includes(h) ? { hp: h, kind: 'until', until: live.get(h) } : { hp: h, kind: 'always' }));
+  const kindOf = (h) => (perm && perm.includes(h) ? { hp: h, kind: 'always' }
+    : live.has(h) ? { hp: h, kind: 'until', until: live.get(h) }
+      : perm ? { hp: h, kind: 'model' } : { hp: h, kind: 'always' });
+  const rows = [...new Set(Array.isArray(allowlist) ? allowlist : [])].map(kindOf);
   for (const [hp, until] of live) {
     if (!rows.some((x) => x.hp === hp)) rows.push({ hp, kind: 'until', until });
   }
   if (!rows.length) return '<div class="hd-empty">No external hosts.</div>';
-  return `<table class="cx-table"><thead><tr><th>Host</th><th>Access</th>${operator ? '<th></th>' : ''}</tr></thead><tbody>${rows.map((r) => `<tr data-room="${esc(room || '')}" data-hp="${esc(r.hp)}"><td>${esc(r.hp)}</td><td>${r.kind === 'always' ? 'Always' : r.kind === 'model' ? 'Model endpoint' : `Until ${esc(when(r.until))}`}</td>`
+  const label = (r) => (r.kind === 'always' ? (perm ? 'Always' : 'Allowed') : r.kind === 'model' ? 'Model endpoint' : `Until ${esc(when(r.until))}`);
+  return `<table class="cx-table"><thead><tr><th>Host</th><th>Access</th>${operator ? '<th></th>' : ''}</tr></thead><tbody>${rows.map((r) => `<tr data-room="${esc(room || '')}" data-hp="${esc(r.hp)}"><td>${esc(r.hp)}</td><td>${label(r)}</td>`
     + `${operator && r.kind !== 'model' ? '<td><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-egress-act="remove">Remove</button></td>' : ''}</tr>`).join('')}</tbody></table>`;
 }
 
-export function renderHelperTree(parentAgentId, flow, helpers, { operator } = {}) {
+export const helperIsLive = (h) => LIVE.has(h && h.status);
+const cancelBtn = (h) => `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-cancel-helper="${esc(h.helper_id)}">Cancel</button>`;
+
+// Cancel is shown to the operator and to the helper's owner (the server decides; this only hides the button).
+export function renderHelperTree(parentAgentId, flow, helpers, { operator, viewerId } = {}) {
   const byAgent = new Map((helpers || []).map((h) => [h.helper_agent_id, h]));
   const seen = new Set();
   const kids = (id) => (flow.nodes || []).filter((n) => n.kind === 'agent' && n.parent_agent_id === id);
@@ -58,7 +70,7 @@ export function renderHelperTree(parentAgentId, flow, helpers, { operator } = {}
     if (!list.length) return '';
     return `<ul class="cx-tree">${list.map((n) => {
       const h = byAgent.get(n.agent_id);
-      return `<li><b>@${esc(n.name)}</b>${h ? ` <span class="cx-sub1">${esc(h.status)}${operator && h.task ? ` · ${esc(h.task)}` : ''}</span>` : ''}${level(n.agent_id)}</li>`;
+      return `<li><b>@${esc(n.name)}</b>${h ? ` <span class="cx-sub1">${esc(h.status)}${operator && h.task ? ` · ${esc(h.task)}` : ''}</span>${helperIsLive(h) && h.helper_id && (operator || (viewerId && h.owner === viewerId)) ? ` ${cancelBtn(h)}` : ''}` : ''}${level(n.agent_id)}</li>`;
     }).join('')}</ul>`;
   };
   const inner = level(parentAgentId);
@@ -71,7 +83,7 @@ const field = (label, html) => `<label class="cx-field">${label}${html}</label>`
 export function renderProfileEditor(profile, { owner }) {
   if (!owner) return '';
   const p = profile || {};
-  const svc = (p.services || []).map((s) => `${s.name} | ${s.upstream_url} | ${s.header} | ${s.secret_name}`).join('\n');
+  const svc = (p.services || []).filter((s) => s && s.upstream_url).map((s) => `${s.name} | ${s.upstream_url} | ${s.header} | ${s.secret_name}`).join('\n');
   return `<form id="hcn-profile" class="cx-stack">
     <p class="cx-msg">Secrets are named here, never typed here. Their values live in files on the host and are set with the host CLI; this page cannot read or change them.</p>
     <fieldset class="cx-checks"><legend>Agent families helpers may use</legend>${FAMILIES.map((f) => `<label class="cx-check"><input type="checkbox" name="allowed_families" value="${esc(f)}"${(p.allowed_families || []).includes(f) ? ' checked' : ''}> ${esc(f)}</label>`).join('')}</fieldset>
@@ -102,6 +114,7 @@ export function parseProfileForm(v, base = {}) {
 // One click handler for every button above (dataset of the clicked button, merged with its row's).
 export async function helperAction(api, ds, extra = {}) {
   if (ds.panic) return api.pauseHelpers(ds.panic === 'pause');
+  if (ds.cancelHelper) return api.cancelHelper(ds.cancelHelper);
   if (ds.profile === 'save') return api.setRoomProfile(ds.room, extra.profileBody);
   switch (ds.egressAct) {
     case 'approve-1d': return api.decideEgress(ds.id, 'approve', DAY);
@@ -120,8 +133,8 @@ export async function helperAction(api, ds, extra = {}) {
 // call, so a room visited earlier can never act on a click made in a later one.
 export function wireHelperHandlers(container, o) {
   const onClick = (ev) => {
-    const b = ev.target.closest?.('[data-panic],[data-egress-act]');
-    if (!b || !o.operator) return;
+    const b = ev.target.closest?.('[data-panic],[data-egress-act],[data-cancel-helper]');
+    if (!b || !(o.operator || b.dataset.cancelHelper)) return;        // Cancel is for owners too; the server enforces
     const row = b.closest('[data-id],[data-hp]');
     const rd = row ? row.dataset : {};
     // the top-level panel has no current room: each row carries the room of its own request / host
@@ -144,9 +157,9 @@ const ago = (s) => (s < 90 ? `${Math.max(0, Math.round(s))}s` : s < 5400 ? `${Ma
 
 export function renderHelperList(helpers, rooms, now) {
   if (!(helpers || []).length) return '<div class="hd-empty">No helpers are running.</div>';
-  return `<table class="cx-table"><thead><tr><th>Role</th><th>Status</th><th>Requester</th><th>Room</th><th>Age</th><th>Expires</th></tr></thead><tbody>${helpers.map((h) => `<tr data-helper="${esc(h.helper_id)}">`
+  return `<table class="cx-table"><thead><tr><th>Role</th><th>Status</th><th>Requester</th><th>Room</th><th>Age</th><th>Expires</th><th></th></tr></thead><tbody>${helpers.map((h) => `<tr data-helper="${esc(h.helper_id)}">`
     + `<td>${esc(h.role)}${h.task ? `<span class="cx-sub1">${esc(String(h.task).slice(0, 160))}</span>` : ''}</td><td>${esc(h.status)}</td><td>${esc(h.requester_agent_id)}</td><td>${renderRoomRef(h.room_id, rooms)}</td>`
-    + `<td>${h.created_epoch ? esc(ago(now - h.created_epoch)) : ''}</td><td>${esc(when(h.expires_epoch))}</td></tr>`).join('')}</tbody></table>`;
+    + `<td>${h.created_epoch ? esc(ago(now - h.created_epoch)) : ''}</td><td>${esc(when(h.expires_epoch))}</td><td>${helperIsLive(h) ? cancelBtn(h) : ''}</td></tr>`).join('')}</tbody></table>`;
 }
 
 // state: { paused, requests, helpers, allow: {roomId: [host...]}, rooms, now, error }
@@ -159,7 +172,7 @@ export function renderHelpersPanel(st, { operator }) {
     + `${renderPanic(Boolean(st.paused), { operator })}`
     + `<div class="hd-card cx-stack"><div class="hd-card__title">Host access requests (all rooms)</div>${renderEgressRequests(reqs, { operator, rooms })}`
     + `<div class="hd-card__title">Helpers across rooms</div>${renderHelperList(st.helpers, rooms, st.now ?? Date.now() / 1000)}`
-    + `<div class="hd-card__title">External hosts</div>${hostRooms.length ? hostRooms.map((r) => `<div class="cx-sub1">${renderRoomRef(r, rooms)}</div>${renderHostsTable(st.allow[r], reqs.filter((q) => q.room_id === r), { operator, room: r, permanent: [], now: st.now })}`).join('') : '<div class="hd-empty">No external hosts.</div>'}</div></section>`;
+    + `<div class="hd-card__title">External hosts</div>${hostRooms.length ? hostRooms.map((r) => `<div class="cx-sub1">${renderRoomRef(r, rooms)}</div>${renderHostsTable(st.allow[r], reqs.filter((q) => q.room_id === r), { operator, room: r, permanent: null, now: st.now })}`).join('') : '<div class="hd-empty">No external hosts.</div>'}</div></section>`;
 }
 
 // Mounts the panel into its own container. All state and listeners belong to this instance, and

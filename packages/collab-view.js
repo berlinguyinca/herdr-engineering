@@ -724,7 +724,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (operator) {
         try { S.egress = ((await api.egressRequests()).requests || []).filter((r) => r.room_id === roomId); } catch { /* keep the old list */ }
         try { const h = await api.helpers(); S.helpers = h.helpers || []; S.paused = Boolean(h.paused); } catch { /* keep */ }
-      }
+      } else { try { S.helpers = (await api.myHelpers()).helpers || []; } catch { /* guests and old servers: no helper list */ } }
       if (operator) { try { S.allow = (await api.egressAllowlist(roomId)).allowlist || []; } catch { /* keep */ } }
       if (canInvite) { try { S.profile = await api.roomProfile(roomId); } catch { /* not readable: keep */ } }
     };
@@ -732,7 +732,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (operator) {
         put('hcn-panic', renderPanic(S.paused, { operator }));
         put('hcn-egress', renderEgressRequests(S.egress, { operator }));
-        put('hcn-hosts-table', renderHostsTable(S.allow || [], S.egress, { operator, room: roomId, permanent: S.profile ? S.profile.permanent_hosts : [] }));
+        put('hcn-hosts-table', renderHostsTable(S.allow || [], S.egress, { operator, room: roomId, permanent: S.profile && Array.isArray(S.profile.permanent_hosts) ? S.profile.permanent_hosts : null }));
       }
       if (canInvite && S.profile) put('hcn-profile-box', renderProfileEditor(S.profile, { owner: canInvite }));
     };
@@ -760,7 +760,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         onNode: (n) => {
           const mine = flow.edges.filter((e) => e.from === n.id || e.to === n.id).map((e) => `${esc(flow.nodes.find((x) => x.id === e.from)?.name)} → ${esc(flow.nodes.find((x) => x.id === e.to)?.name)}: ${esc(Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}`);
           const f = n.fabric ? `<br>Fabric session ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}${n.fabric.parent_session_id ? ` · started by session ${esc(n.fabric.parent_session_id)}` : ''}` : '';
-          showDetail(`<b>${esc(n.kind === 'agent' ? `@${n.name}` : n.name)}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}${n.kind === 'agent' ? renderHelperTree(n.agent_id, flow, S.helpers, { operator }) : ''}`);
+          showDetail(`<b>${esc(n.kind === 'agent' ? `@${n.name}` : n.name)}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}${n.kind === 'agent' ? renderHelperTree(n.agent_id, flow, S.helpers, { operator, viewerId: me && me.user_id }) : ''}`);
         },
         onEdge: (e) => {
           const ts = flow.tasks.filter((t) => t.from === e.from && t.to === e.to).slice(0, 5);
