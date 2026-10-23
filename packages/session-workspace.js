@@ -131,11 +131,11 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     const provenance=coverage ? `${coverage.status==='partial'?'Partial recording':'Recorded window only'} · ${Number(coverage.message_count ?? value.source_message_count ?? 0)} messages${coverage.reasons?.length?` · ${coverage.reasons.join(', ')}`:''}` : 'Recording coverage is unavailable.';
     const fixable=new Set(canFix()?['next_steps','blockers']:[]);
     const item=(key,text,index)=>{
-      if(!fixable.has(key))return `<li>${esc(text)}</li>`;
+      if(!fixable.has(key))return `<li class="conversation-markdown">${renderMarkdown(String(text))}</li>`;
       const fix=fixStates.get(fixKey(key,text));
       const label=fix?.state==='sending'?'Sending…':fix?.state==='sent'?'Sent to agent':fix?.state==='queued'?'Queued for agent':'Let the agent fix this';
       const locked=['sending','sent','queued'].includes(fix?.state);
-      return `<li>${esc(text)} <button type="button" class="sw-summary-fix" data-fix-summary data-list="${key}" data-index="${index}"${locked?' disabled':''}>${label}</button>${fix?.message?`<span class="sw-summary-fix-status" ${fix.state==='error'?'role="alert"':'role="status"'}>${esc(fix.message)}</span>`:''}</li>`;
+      return `<li class="conversation-markdown">${renderMarkdown(String(text))} <button type="button" class="sw-summary-fix" data-fix-summary data-list="${key}" data-index="${index}"${locked?' disabled':''}>${label}</button>${fix?.message?`<span class="sw-summary-fix-status" ${fix.state==='error'?'role="alert"':'role="status"'}>${esc(fix.message)}</span>`:''}</li>`;
     };
     const summaryHost=$('[data-agent-summary]');
     const detailsOpen=summaryHost.querySelector('details')?.open;

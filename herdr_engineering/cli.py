@@ -2320,6 +2320,22 @@ def _parse_host_aliases(raw: str) -> dict[str, str]:
     return {a.strip(): c.strip() for a, c in pairs if a.strip() and c.strip()}
 
 
+def _require_durable_review_gate(cp: dict, dsn) -> None:
+    """An enabled review gate needs Postgres (``control_plane.pg_dsn``).
+
+    Gate state (PR states, review queue, author pins) is event-sourced and
+    written with ``require_durable=True``. Without a DSN the repo has no sink,
+    those writes would live only in memory and a restart would forget every
+    approval and escalation, so the real server refuses to start. The check
+    lives here, where the DSN is known: a ``ControlPlaneServer`` built directly
+    on an in-memory ``ControlPlaneRepo()`` (tests, embedding) is not refused.
+    """
+    gate = cp.get("review_gate")
+    if not dsn and isinstance(gate, dict) and gate.get("enabled") is True:
+        raise SystemExit("control_plane.review_gate needs durable storage: set "
+                         "control_plane.pg_dsn, or disable the review gate")
+
+
 def _cmd_cp_web(args) -> int:
     """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
 
@@ -2366,6 +2382,7 @@ def _cmd_cp_web(args) -> int:
     inspector_limits = cp.get("inspector_limits") or {}
     if not isinstance(inspector_limits, dict):
         raise SystemExit("fleet config control_plane.inspector_limits must be a mapping")
+    _require_durable_review_gate(cp, dsn)
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory

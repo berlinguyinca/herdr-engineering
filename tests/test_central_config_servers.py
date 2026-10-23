@@ -498,3 +498,31 @@ def test_dashboard_host_names_are_a_collab_config_key():
     cli._apply_collab_config(args, {"collab": {"dashboard_hosts": ["dev.lan"]}})
     assert args.collab_dashboard_host == ["dev.lan"]
     assert "dashboard_hosts" in fcc.COLLAB_KEYS
+
+
+# ------------------------------------------------------------- review gate durability
+
+def _gate(tmp_path, enabled=True):
+    key = tmp_path / "app.pem"
+    key.write_text("not-a-real-key")
+    key.chmod(0o600)
+    return {"enabled": enabled,
+            "app": {"app_id": 1, "installation_id": 2, "private_key_file": str(key)},
+            "repos": [{"repo": "github.com/acme/widget"}]}
+
+
+def test_web_refuses_enabled_review_gate_without_durable_storage(tmp_path, monkeypatch, old_env):
+    path = make_file(tmp_path, pg_dsn=None, review_gate=_gate(tmp_path))
+    with pytest.raises(SystemExit, match="review_gate needs durable storage"):
+        _run_web(monkeypatch, path)
+
+
+def test_web_starts_enabled_review_gate_with_a_dsn(tmp_path, monkeypatch, old_env):
+    path = make_file(tmp_path, review_gate=_gate(tmp_path))
+    seen = _run_web(monkeypatch, path)
+    assert seen["sink_dsn"]
+
+
+def test_web_without_dsn_is_fine_when_review_gate_disabled(tmp_path, monkeypatch, old_env):
+    path = make_file(tmp_path, pg_dsn=None, review_gate=_gate(tmp_path, enabled=False))
+    assert "sink_dsn" not in _run_web(monkeypatch, path)

@@ -1,0 +1,11 @@
+[Unit]
+Description=Look for pull request heads without an Independent AI review every five minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Unit=herdr-ai-review.service
+
+[Install]
+WantedBy=timers.target

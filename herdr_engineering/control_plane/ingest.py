@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 
+from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
 from .project_links import canonical_repository
 
 
@@ -63,6 +64,10 @@ class IngestService:
         if entity_type in {"plannotator_review", "ci_pipeline", "agent_identity", "agent_summary",
                            "custom_model", "llm_key", "token_usage"}:
             raise ValueError("provider-owned entity type is not accepted by generic ingestion")
+        # The review gate's streams decide merges; a forged verdict/resume/pin
+        # would merge unreviewed code, so they are reserved for the gate itself.
+        if entity_type.strip().lower().startswith(RESERVED_ENTITY_PREFIXES):
+            raise ValueError("reserved review-gate entity type is not accepted by generic ingestion")
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":
                 raise ValueError("invalid mission activity event_type")
