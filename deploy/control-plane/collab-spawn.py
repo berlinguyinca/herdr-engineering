@@ -1453,12 +1453,17 @@ class Runner:
     def watch_loop(self, stop: threading.Event, lock: threading.Lock) -> None:
         """Helper watches (stop on pause, revoke, cancel, expiry, profile change; refresh host lists) every
         WATCH_EVERY seconds for as long as the fleet path runs: a fleet start may take minutes."""
+        last = None
         while True:
             with lock:
                 try:
                     self.helpers_cycle(claim=False)
+                    last = None
                 except (Failure, OSError) as exc:
-                    self.say(f"helpers: {trim(exc)}")
+                    msg = f"helpers: {trim(exc)}"
+                    if msg != last:                   # an outage is logged once, not every WATCH_EVERY seconds
+                        self.say(msg)
+                    last = msg
             if stop.wait(WATCH_EVERY):
                 return
 
