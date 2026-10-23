@@ -19,7 +19,7 @@ import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
 import { renderFleetMatrix } from './fleet-view.js';
-import { renderHostDetail, RANGES } from './host-view.js';
+import { renderHostDetail, renderHostCard, HOST_CARD_STYLE, RANGES } from './host-view.js';
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
@@ -351,15 +351,8 @@ async function viewHosts() {
   const driftedOnly = route().query.get('drift') === '1';
   const now = Date.now();
   root.innerHTML = `<h1>Hosts</h1>
-    ${configNotice(cfg)}
-    <div class="hd-grid">` + hosts.map((h) => {
-      const fresh = reportFreshness(h.last_seen, now) === 'current';
-      return `<div class="hd-card">
-      <div class="hd-card__title"><a href="#/hosts/${esc(h.host_id)}">${esc(h.host_name)}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${fresh ? esc(h.status) : 'stalled'}"></herdr-status> ${configBadge(cfg, h)}</div>
-      <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code> · ` : ''}${fresh ? 'seen' : '<strong>no report since</strong>'} ${h.last_seen ? formatTimestamp(h.last_seen) : 'never'}</div>
-      ${Number.isFinite(h.cpu) || Number.isFinite(h.mem) ? `<div class="hd-card__sub">${[Number.isFinite(h.cpu) ? `CPU ${h.cpu}%` : '', Number.isFinite(h.mem) ? `memory ${h.mem}%` : ''].filter(Boolean).join(' · ')}</div>` : ''}
-    </div>`; }).join('') + `</div>
+    ${HOST_CARD_STYLE}${configNotice(cfg)}
+    <div class="hd-grid">` + hosts.map((h) => renderHostCard(h, { now, cfg })).join('') + `</div>
     <h2 style="margin-top:24px">Fleet versions</h2>
     <p class="hd-card__sub"><a href="#/hosts${driftedOnly ? '' : '?drift=1'}">${driftedOnly ? 'Show all components' : 'Show only components that differ'}</a></p>
     ${renderFleetMatrix(matrix, { driftedOnly })}`;

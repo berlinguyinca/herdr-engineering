@@ -196,3 +196,52 @@ test('header shows uptime, agents, maintenance and range picker', () => {
   const h = reportingHost(); delete h.latest.agents_running;
   assert.doesNotMatch(render(h), /agents running/);
 });
+
+// ---- Task 8: list cards ----
+import { renderHostCard } from '../host-view.js';
+
+test('card shows cpu, memory, disk and gpu meters from latest', () => {
+  const html = renderHostCard(reportingHost(), { now: NOW });
+  for (const k of ['cpu', 'mem', 'disk', 'gpu']) assert.match(html, new RegExp(`data-meter="${k}"`));
+  assert.match(html, /width:88%/);
+  assert.match(html, /<herdr-status stage="healthy">/);
+  assert.match(html, /<code>100\.64\.0\.7<\/code>/);
+  assert.doesNotMatch(html, /hv-cardproblem/);
+});
+
+test('gpu meter absent without gpus', () => {
+  const h = reportingHost(); h.latest.gpus = [];
+  assert.doesNotMatch(renderHostCard(h, { now: NOW }), /data-meter="gpu"/);
+});
+
+test('problem badge shows count and most severe message; none at zero', () => {
+  const h = reportingHost({ problem_count: 2, problems: [
+    { severity: 'warning', code: 'a', message: 'disk <b>high</b>' },
+    { severity: 'critical', code: 'b', message: 'gpu lost' }] });
+  const html = renderHostCard(h, { now: NOW });
+  assert.match(html, /data-problem-badge[^>]*data-severity="critical"/);
+  assert.match(html, /title="gpu lost"/);
+  assert.match(html, />2 problems</);
+  assert.doesNotMatch(html, /<b>/);
+  assert.doesNotMatch(renderHostCard(reportingHost(), { now: NOW }), /data-problem-badge/);
+});
+
+test('stale host renders stalled; no latest renders no telemetry, never healthy', () => {
+  const stale = reportingHost({ last_seen: iso(3_600_000) }); stale.latest.at = iso(3_600_000);
+  assert.match(renderHostCard(stale, { now: NOW }), /stage="stalled"/);
+  const none = renderHostCard({ host_id: 'x', host_name: 'x', status: 'healthy', last_seen: iso(1000), latest: null }, { now: NOW });
+  assert.match(none, /No telemetry/);
+  assert.doesNotMatch(none, /stage="healthy"/);
+  assert.doesNotMatch(none, /data-meter/);
+});
+
+test('card escapes name, shows not reported for null tailnet, clamps bad values', () => {
+  const h = reportingHost({ host_name: '<img src=x onerror=1>', tailnet_ip: null });
+  h.latest.cpu = 250; h.latest.mem = NaN; h.latest.disk = -5; h.latest.gpus = [{ util_pct: Infinity }];
+  const html = renderHostCard(h, { now: NOW });
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /not reported/);
+  assert.doesNotMatch(html, /null|NaN|Infinity/);
+  assert.match(html, /width:100%/);
+  assert.match(html, /width:0%/);
+});

@@ -4,6 +4,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { formatTimestamp } from './herdr-web-components/format.js';
 import { reportFreshness, reportTimestamp } from './record-state.js';
+import { configBadge } from './fleet-config-badge.js';
 
 export const RANGES = ['1h', '24h', '7d'];
 const PINNED = ['herdr', 'pi', 'autospec'];
@@ -211,4 +212,52 @@ export function renderHostDetail(host, history, { range = '1h', now = Date.now()
     ? gauges(latest, points) + topConsumers(latest)
     : '<herdr-empty message="No telemetry reported"></herdr-empty>';
   return `${STYLE}${header(h, latest, stage, r, now)}${problemsStrip(problems)}${body}${updatesSection(h)}${versionsSection(h)}`;
+}
+
+// ---- Hosts list card ----
+export const HOST_CARD_STYLE = `<style>
+.hv-meters{display:grid;gap:4px;margin:8px 0 2px}.hv-meter{display:grid;grid-template-columns:3.2rem 1fr 2.8rem;gap:6px;align-items:center;font-size:.75rem;color:var(--text-secondary)}
+.hv-meter__bar{height:6px;border-radius:3px;background:var(--surface-2);overflow:hidden}.hv-meter__bar i{display:block;height:100%;background:var(--accent,#2563eb)}.hv-meter span:last-child{text-align:right}
+</style>`;
+
+const clamp100 = (v) => Math.min(100, Math.max(0, num(v)));
+function meter(key, label, value) {
+  const v = num(value);
+  if (v == null) return '';
+  const w = Math.round(clamp100(v) * 10) / 10;
+  return `<div class="hv-meter" data-meter="${key}"><span>${label}</span><div class="hv-meter__bar" role="meter" aria-label="${label}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${w}"><i style="width:${w}%"></i></div><span>${w}%</span></div>`;
+}
+
+function problemBadge(host) {
+  const problems = list(host.problems).filter((p) => obj(p));
+  const count = num(host.problem_count) ?? problems.length;
+  if (!(count > 0)) return '';
+  const top = problems.find((p) => p.severity === 'critical') || problems[0];
+  const sev = problems.some((p) => p.severity === 'critical') ? 'critical' : 'warning';
+  const msg = top ? (top.message ?? top.code ?? '') : '';
+  const n = Math.floor(count);
+  return `<span class="hv-badge hv-badge--${sev === 'critical' ? 'crit' : 'warn'}" data-problem-badge data-severity="${sev}"${msg ? ` title="${esc(msg)}"` : ''}>${n} problem${n === 1 ? '' : 's'}</span>`
+    + (msg ? `<div class="hd-card__sub" data-problem-text>${esc(msg)}</div>` : '');
+}
+
+export function renderHostCard(host, { now = Date.now(), cfg = null } = {}) {
+  const h = obj(host) || {};
+  const latest = obj(h.latest);
+  const problems = list(h.problems).filter((p) => obj(p));
+  const stage = healthStage(h, latest, problems, now);
+  const fresh = stage !== 'stalled' && stage !== 'unknown';
+  const id = encodeURIComponent(String(h.host_id ?? ''));
+  const gpuUtils = latest ? list(latest.gpus).map((g) => num(obj(g)?.util_pct)).filter((v) => v != null) : [];
+  const mounts = latest ? list(latest.mounts).filter((m) => obj(m)) : [];
+  const disk = latest ? (num(latest.disk) ?? num(mounts.find((m) => m.path === '/')?.pct)) : null;
+  const meters = latest
+    ? [meter('cpu', 'CPU', latest.cpu), meter('mem', 'Memory', latest.mem), meter('disk', 'Disk', disk), gpuUtils.length ? meter('gpu', 'GPU', Math.max(...gpuUtils)) : ''].join('')
+    : '';
+  const seen = h.last_seen ? esc(formatTimestamp(h.last_seen)) : 'never';
+  return `<div class="hd-card" data-host-card>
+      <div class="hd-card__title"><a href="#/hosts/${esc(id)}">${show(h.host_name ?? h.host_id, 'Unnamed host')}</a></div>
+      <div style="margin:6px 0"><herdr-status stage="${esc(stage)}"></herdr-status> ${latest ? '' : '<span class="hv-badge hv-badge--crit">No telemetry</span> '}${configBadge(cfg, h)} ${problemBadge(h)}</div>
+      <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code>` : 'not reported'} · ${fresh ? 'seen' : '<strong>no report since</strong>'} ${seen}</div>
+      ${meters ? `<div class="hv-meters">${meters}</div>` : ''}
+    </div>`;
 }
