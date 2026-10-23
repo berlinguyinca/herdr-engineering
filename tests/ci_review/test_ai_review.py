@@ -196,6 +196,18 @@ class Gateway:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def sse(self, events, done=True):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"  \n")                     # the gateway's keep-alive padding
+                for e in events:
+                    self.wfile.write(b"data: " + json.dumps(e).encode() + b"\n\n")
+                if done:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                self.close_connection = True
+
             def do_GET(self):
                 gw.requests.append({"method": "GET", "path": self.path, "headers": dict(self.headers), "body": ""})
                 if self.path == "/v1/models":
@@ -218,8 +230,19 @@ class Gateway:
                 if "status" in r and r["status"] != 200:
                     return self.reply(r["status"], r.get("json", {"error": {"message": r.get("error", "err")}}),
                                       headers=r.get("headers"))
+                if "sse_error" in r:
+                    return self.sse([{"error": r["sse_error"]}], done=False)
                 content = r["content"] if isinstance(r["content"], str) else json.dumps(r["content"])
-                self.reply(200, {"id": "x", "object": "chat.completion", "model": r.get("model", req["model"]),
+                used = r.get("model", req["model"])
+                if req.get("stream") and not r.get("json"):
+                    half = len(content) // 2
+                    ev = [{"model": used, "choices": [{"index": 0, "delta": {"reasoning_content": "thinking..."}}]},
+                          {"model": used, "choices": [{"index": 0, "delta": {"content": content[:half]}}]},
+                          {"model": used, "choices": [{"index": 0, "delta": {"content": content[half:]}}]},
+                          {"model": used, "choices": [{"index": 0, "delta": {},
+                                                       "finish_reason": r.get("finish_reason", "stop")}]}]
+                    return self.sse(ev)
+                self.reply(200, {"id": "x", "object": "chat.completion", "model": used,
                                  "choices": [{"index": 0, "finish_reason": r.get("finish_reason", "stop"),
                                               "message": {"role": "assistant", "content": content}}],
                                  "usage": {"prompt_tokens": 100, "completion_tokens": 20}})
@@ -296,7 +319,8 @@ class Env:
         self.write_state(st)
 
     def responses(self, rs):
-        self.gw.responses = [r if isinstance(r, dict) and ("content" in r or "status" in r) else {"content": r}
+        self.gw.responses = [r if isinstance(r, dict) and ("content" in r or "status" in r or "sse_error" in r)
+                             else {"content": r}
                              for r in rs]
 
     def config(self, extra):
@@ -507,6 +531,32 @@ def test_empty_content_then_a_verdict_succeeds(env):
     env.responses([{"content": "", "finish_reason": "stop"}, {"content": EMPTY}])
     assert review(env) == 0
     assert [s["state"] for s in env.terminal()] == ["success"]
+
+
+def test_an_sse_error_event_fails_the_run(env):
+    env.responses([{"sse_error": {"code": "inference_idle_timeout", "message": f"stream idle {KEY}"}}])
+    assert review(env) == 1
+    assert env.terminal() == []
+
+
+def test_a_stream_error_is_retried_like_a_5xx(env):
+    env.responses([{"sse_error": {"code": "upstream_transport_error", "message": "route ended; retry"}},
+                   {"content": EMPTY}])
+    assert review(env) == 0
+    assert [s["state"] for s in env.terminal()] == ["success"]
+    assert len(env.rev_calls()) == 2 and len(env.sleeps) == 1
+
+
+def test_a_plain_json_answer_to_a_stream_request_is_accepted(env):
+    env.responses([{"content": EMPTY, "json": True}])
+    assert review(env) == 0
+    assert [s["state"] for s in env.terminal()] == ["success"]
+
+
+def test_the_request_streams(env):
+    assert review(env) == 0
+    (chat,) = env.rev_calls()
+    assert chat["stream"] is True
 
 
 def test_the_request_asks_for_the_verdict_schema_and_headroom(env):

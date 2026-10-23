@@ -69,7 +69,8 @@ DEFAULTS: dict = {
         "max_tokens": 32768,                     # reasoning models need headroom before they answer
         "temperature": 0.2,
         "response_format": "json_schema",        # json_schema | json_object | none
-        "timeout_s": 900,                        # per request
+        "timeout_s": 900,                        # longest silence on the connection (socket read timeout)
+        "deadline_s": 1800,                      # longest one streamed answer may take
         "retries": 4,                            # extra attempts on 429 / 5xx / connection errors
         "backoff_s": 5.0,                        # first backoff; doubles; Retry-After wins (capped at 60 s)
         "parallel": 1,                           # chunks in flight at once; the gateway is shared
@@ -353,7 +354,49 @@ class Gateway:
         self.max_tokens_field = mtf if mtf in ("max_tokens", "max_completion_tokens") else "max_tokens"
         self.r = r
 
-    def _once(self, method: str, sub: str, body: dict | None) -> tuple[int, dict, bytes]:
+    def _sse(self, resp) -> dict:
+        """A streamed chat completion, assembled into the non-streamed shape. Reasoning deltas only keep the
+        connection alive; only `content` deltas are the answer. An error event fails the chunk."""
+        content, model, finish, usage, size = [], None, "", {}, 0
+        deadline = time.monotonic() + float(self.r["deadline_s"])
+        while True:
+            line = resp.readline(1_000_000)
+            if not line:
+                break
+            size += len(line)
+            if size > RESPONSE_MAX or time.monotonic() > deadline:
+                raise ReviewFailed("the gateway's stream ran past the size or time limit (reviewer.deadline_s)")
+            text = line.decode("utf-8", "replace").strip()
+            if not text.startswith("data:"):
+                continue
+            data = text[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                ev = json.loads(data)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            if "error" in ev:
+                err = ev["error"] if isinstance(ev["error"], dict) else {"message": ev["error"]}
+                # the request was accepted and the route failed mid-answer (route ended, idle timeout): retried
+                raise Transient(f"the gateway's stream failed: {redact(err.get('code', ''))} "
+                                f"{redact(str(err.get('message', ''))[:200])}")
+            if isinstance(ev.get("model"), str):
+                model = ev["model"]
+            if isinstance(ev.get("usage"), dict):
+                usage = ev["usage"]
+            for ch in ev.get("choices") or []:
+                d = ch.get("delta") or {} if isinstance(ch, dict) else {}
+                if isinstance(d.get("content"), str):
+                    content.append(d["content"])
+                if isinstance(ch, dict) and ch.get("finish_reason"):
+                    finish = str(ch["finish_reason"])
+        return {"model": model, "usage": usage,
+                "choices": [{"finish_reason": finish, "message": {"content": "".join(content)}}]}
+
+    def _once(self, method: str, sub: str, body: dict | None) -> tuple[int, dict, bytes | dict]:
         conn = http.client.HTTPSConnection(self.host, self.port, context=ssl.create_default_context(),
                                            timeout=float(self.r["timeout_s"]))
         headers = {"Authorization": f"Bearer {self.key}", "Accept": "application/json"}
@@ -364,8 +407,10 @@ class Gateway:
         try:
             conn.request(method, self.base + sub, body=data, headers=headers)
             resp = conn.getresponse()
-            raw = resp.read(RESPONSE_MAX)
-            return resp.status, {k.lower(): v for k, v in resp.getheaders()}, raw
+            headers = {k.lower(): v for k, v in resp.getheaders()}
+            if 200 <= resp.status < 300 and headers.get("content-type", "").startswith("text/event-stream"):
+                return resp.status, headers, self._sse(resp)
+            return resp.status, headers, resp.read(RESPONSE_MAX)
         except (OSError, http.client.HTTPException) as e:
             raise Transient(f"{type(e).__name__}: {redact(e)}") from None
         finally:
@@ -380,11 +425,15 @@ class Gateway:
             except Transient as e:
                 why = str(e)
             else:
+                if 200 <= status < 300 and isinstance(raw, dict):
+                    return raw
                 if 200 <= status < 300:
                     try:
                         return json.loads(raw)
                     except ValueError:
-                        raise ReviewFailed(f"the gateway answered {sub} with something that is not JSON") from None
+                        what = redact(raw[:160].decode("utf-8", "replace")).replace("\n", " ")
+                        raise ReviewFailed(f"the gateway answered {sub} with something that is not JSON "
+                                           f"({headers.get('content-type', '?')}, {len(raw)} bytes: {what!r})") from None
                 if 300 <= status < 400:
                     raise ReviewFailed(f"the gateway answered {status} (a redirect); not followed")
                 snippet = redact(raw[:300].decode("utf-8", "replace"))
@@ -407,7 +456,8 @@ class Gateway:
     def chat(self, model: str, system: str, user: str) -> Answer:
         body = {"model": model, "messages": [{"role": "system", "content": system},
                                              {"role": "user", "content": user}],
-                self.max_tokens_field: self.r["max_tokens"], "temperature": self.r["temperature"], "stream": False}
+                self.max_tokens_field: self.r["max_tokens"], "temperature": self.r["temperature"],
+                "stream": True}   # tokens (reasoning too) keep a slow answer alive past the gateway's idle limit
         if self.r["response_format"] == "json_schema":
             body["response_format"] = {"type": "json_schema",
                                        "json_schema": {"name": "verdict", "strict": True, "schema": VERDICT_SCHEMA}}

@@ -20,7 +20,8 @@ reviewer:
   max_tokens: 32768                      # reasoning models think first; too little gives finish_reason=length
   temperature: 0.2
   response_format: json_schema           # json_schema | json_object | none (the gateway accepts json_schema)
-  timeout_s: 900                         # per request
+  timeout_s: 900                         # longest silence on the connection
+  deadline_s: 1800                       # longest one streamed answer may take
   retries: 4                             # extra attempts on 429, 5xx and connection errors
   backoff_s: 5                           # doubles each retry; a Retry-After header wins (capped at 60 s)
   parallel: 1                            # chunks in flight at once; the gateway is shared
