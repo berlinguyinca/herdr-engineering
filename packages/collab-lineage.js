@@ -300,12 +300,12 @@ export function replayText(asOf) {
     : `Replay: event ${asOf.step} of ${asOf.visible_events}${when}. Read-only; events after this point are not shown.`;
 }
 
-export function renderReplay(asOf, { busy = false } = {}) {
+export function renderReplay(asOf, { busy = false, queued = false } = {}) {
   const n = asOf ? asOf.visible_events : 0;
   const k = asOf ? asOf.step : 0;
   // Busy keeps every control enabled (so focus is never lost to a disabled button); the handler ignores clicks.
   const dis = !n ? ' disabled' : '';
-  const trimmed = asOf && asOf.window_trimmed ? '<p class="cx-msg">Only the most recent events of this room are scrubbable; counts are rounded and earlier history is summarised in position 0.</p>' : '';
+  const trimmed = asOf && asOf.window_trimmed ? '<p class="cx-msg">Only the newest events you can see are scrubbable, and a replay shows those events alone; older history is not part of it.</p>' : '';
   return `<div class="lin-replay" role="group" aria-label="Replay"${busy ? ' aria-busy="true"' : ''}>`
     + `<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-replay="first"${dis}>⏮ Start</button>`
     + `<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-replay="prev"${dis}>◀ Back</button>`
@@ -313,7 +313,7 @@ export function renderReplay(asOf, { busy = false } = {}) {
     + `<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-replay="next"${dis}>Next ▶</button>`
     + `<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-replay="last"${dis}>End ⏭</button>`
     + `<button type="button" class="hd-btn hd-btn--sm" data-replay="live"${asOf && asOf.head ? ' aria-pressed="true"' : ''}>Live</button>`
-    + `<output class="lin-replay__status" role="status" aria-live="polite">${esc(replayText(asOf))}</output>${trimmed}</div>`;
+    + `<output class="lin-replay__status" role="status" aria-live="polite">${busy ? (queued ? 'Loading. Your latest choice will load next.' : 'Loading the position.') : esc(replayText(asOf))}</output>${trimmed}</div>`;
 }
 
 // Re-rendering replaces the panel's HTML, so the focused control is remembered by a stable key and found again.
@@ -522,13 +522,14 @@ export function renderInspector(graph, id, tl = null) {
 }
 
 // ---- whole panel -------------------------------------------------------------------------------------------------
+const notice = (m) => (m.notice ? `<p class="cx-msg" role="status">${esc(m.notice)}</p>` : '');
 export function renderLineage(m) {
   const a = m.graphAll;
   if (m.error) {
-    return `${renderReplay(m.asOf, { busy: m.busy })}<div class="cx-msg" role="alert">${esc(m.error)} `
+    return `${renderReplay(m.asOf, { busy: m.busy, queued: m.queued })}<div class="cx-msg" role="alert">${esc(m.error)} `
       + `<button type="button" class="hd-btn hd-btn--sm" data-retry="1">Retry</button></div>`;
   }
-  if (!a.nodes.length && !m.timeline) return `${renderReplay(m.asOf, { busy: m.busy })}<div class="hd-empty">No lineage is shown for this room yet. Lineage appears only from recorded events you are allowed to see.</div>`;
+  if (!a.nodes.length && !m.timeline) return `${renderReplay(m.asOf, { busy: m.busy, queued: m.queued })}${notice(m)}<div class="hd-empty">No lineage is shown for this room yet. Lineage appears only from recorded events you are allowed to see.</div>`;
   const view = m.filtered;
   const layout = layoutGraph(view);
   const graphPane = m.mode === 'table' ? renderGraphTable(view, { sel: m.sel })
@@ -542,7 +543,7 @@ export function renderLineage(m) {
       + `${m.timelineError ? `<p class="cx-msg" role="alert">${esc(m.timelineError)} <button type="button" class="hd-btn hd-btn--sm" data-retry="1">Retry</button></p>` : ''}`
       + `${renderGanttLegend()}${m.mode === 'table' ? '' : `<div class="cx-scroll lin-scroll" role="region" tabindex="0" aria-label="Gantt timeline">${gantt ? renderGanttSvg(gantt, { width: m.width }) : ''}</div>`}${gantt ? renderGanttTable(gantt) : ''}`
     : `<div class="cx-row"><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-mode="${m.mode === 'table' ? 'visual' : 'table'}">${m.mode === 'table' ? 'Show graph' : 'Show as table'}</button><span class="cx-msg">${view.nodes.length} nodes, ${view.edges.length} links shown</span></div>${renderGraphLegend()}${trunc}${graphPane}`;
-  return `${renderReplay(m.asOf, { busy: m.busy })}`
+  return `${renderReplay(m.asOf, { busy: m.busy, queued: m.queued })}${notice(m)}`
     + `<div class="lin-grid2"><div class="cx-stack">${renderFilters(a, m.filters)}`
     + `<div role="tablist" aria-label="Lineage views" class="cx-stabs">${tab('graph', 'Graph')}${tab('gantt', 'Gantt')}</div>`
     + `<div role="tabpanel" aria-label="${m.view === 'gantt' ? 'Gantt' : 'Graph'}" class="cx-stack">${body}</div></div>`

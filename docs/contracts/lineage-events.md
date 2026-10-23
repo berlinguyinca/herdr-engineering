@@ -305,7 +305,7 @@ without changing semantics (same argument as T02).
 |---|---|
 | `GET /api/v1/collab/graph/lineage?room_id=&[step=\|at=]&limit=&offset=&node_types=&edge_types=` | `as_of`, `nodes` (every node type of the room view), `edges` among them, `total_nodes`, `next_offset`, `truncated`/`truncated_reason` |
 | `GET .../graph/lineage/timeline?room_id=&[step=\|at=]` | `as_of`, `lanes` (per node: `spans` = recorded state periods with `open`/`terminal`), `markers` (edge events; `kind` `edge`\|`edge_removed`\|`head_change`; `stale`), `range`, `truncated_reason` |
-| `GET .../graph/lineage/events?room_id=&cursor=&limit=` | the reader's visible ledger page: allow-listed fields only (no raw `attrs`), `step` 1.. , `next_cursor` |
+| `GET .../graph/lineage/events?room_id=&cursor=<opaque token>&limit=` | the reader's visible ledger page: allow-listed fields only (no raw `attrs`), `step` 1.. , `next_cursor` |
 They exist only in `CollabService.graph_read` (never in the keyed `/api/v1/graph`, so a fleet key gets no unbudgeted replay), only in
 the combined server (`collab_only` => 404), and a non-member, guest, agent or unknown room all answer the same 404. Bad parameters
 are 400 (`step`/`at` together, negative step, non-ISO `at`, unknown type, limit out of range). Reads are rate limited per person (240/min, 429).
@@ -314,11 +314,13 @@ are 400 (`step`/`at` together, negative step, non-ISO `at`, unknown type, limit 
 - **Position** is a count of the READER's own visible ledger events (`step`, 0..`visible_events`), so no number reveals how many
   hidden events exist. Past the end clamps to now (silently). `at` (a timestamp without a zone is UTC) resolves, by server receipt time (never the emitter's
   `occurred_at`), to the number of visible events BEFORE the first one received after that instant: a prefix of admission order.
-- **Replay equals live at that point.** The graph at step k is a projection built from THIS ROOM's context events (the room and
-  its linked missions) with admission number <= that of the k-th visible event, read through the live projection's gate (which
-  supplies visibility, so another room's events are not needed). `apply` is commutative and idempotent, so the visible result
-  equals a projection that was fed those events live (tested at every step, for several readers, after a rebuild, and by a
-  300-seed randomized privacy check). Replay is per room: a flood in room A never costs or breaks room B. The head (step = visible_events) is the live projection itself.
+- **Replay equals live at that point.** The graph at step k is a projection built from the reader's first k visible events
+  of this room (the room and its linked missions), read through the live projection's gate (which supplies visibility).
+  `apply` is commutative and idempotent, so the visible result equals a projection that was fed those events live (tested at
+  every step, for several readers, after a rebuild, and by a randomized privacy check). Replay is per room: a flood in room A
+  never costs or breaks room B. Steps are exact and self-consistent: every step from 0 to the head is replayable, the head's
+  step is the real count of events in the window, and no rounding is ever exposed. When the window is trimmed (below), a replay
+  shows the window's own events alone, so an object created before the window appears only once an in-window event names it.
 - **Replay never widens visibility.** (1) An event is shown only if its own scope label is visible to the reader and the object it
   concerns is visible to the reader NOW: for an edge event that is the exact edge instance it touched (its binding, and its writer's
   instance for a commons `from` node), never a sibling binding of the same triple; for a commons node event it is the writer's
@@ -329,24 +331,29 @@ are 400 (`step`/`at` together, negative step, non-ISO `at`, unknown type, limit 
   binding that is hidden now. What stays visible is only what the reader can see now in the same place: a value a writer published to
   the room and has since REPLACED with another room-visible value is shown at its own past position (that is what a replay is).
   (3) Membership is the reader's membership at THIS request; someone removed gets 404 at every step. **An overwritten
-  room-visible value stays readable by whoever may read the room now**, including people who join later: replay shows a
-  value a writer published to the room and later replaced. What a late joiner may see of the past is operator policy,
-  `control_plane.collab.replay_history` in the fleet YAML: `since_join` (the default) starts a member's ledger and replay
-  at their join time (step 0 is the room as it stood when they joined; earlier events are folded into that baseline and not
-  listed); `full` lets every member replay the whole room history. A member whose join time was not recorded (state
-  from before this feature) gets `full`. Member responses never carry the global `admission` counter of a field.
-- **Budgets** (all report `truncated_reason`, never a count of hidden items): ledger window `LEDGER_SCAN_BUDGET` = newest 20,000
-  events of the room's contexts (`window_trimmed`; step 0 is then the state just before the window; when trimmed,
-  `visible_events` and the head `step` are rounded down to a multiple of 100 and `approximate` is true, so the count does not
-  reveal how many events in the window the reader may not see); a replay applies at most `REPLAY_MAX_EVENTS` = 25,000 of
-  THIS room's events (over it is a generic 400 that names no number, "now" is never capped); each room/mission context keeps
-  at most `LOG_MAX_PER_CONTEXT` = 100,000 events (the oldest tenth is evicted beyond that: the history floor; once a context
-  has evicted, past positions answer the generic 400 and the ledger is `truncated`, "now" still works). Visibility is
-  evaluated 128 events per hold of the live lock, so a viewer never stalls ingest for a whole scan. A head response
-  (graph, timeline, ledger) is computed against one state: if an event arrived while it was built it is retried, and the third
-  try runs under the lock. Graph reads reuse
+  room-visible value stays readable by whoever may read the room, including people who join later, when
+  `replay_history` is `full`.** What a late joiner may see of the past is operator policy, `control_plane.collab.replay_history`
+  in the fleet YAML: `since_join` (the default, strict) starts a member's ledger and replay at their join time: events are
+  filtered one by one by receipt time (no assumption that timestamps are monotonic), step 0 is an empty graph, and the head
+  shows CURRENT values only, with the identity and time of any event from before the join (`first_event_id`, `last_event_id`,
+  `event_id`, `admitted_at`) set to null; an overwritten pre-join value is never shown. `full` lets every member replay the
+  whole retained room history. A member's join time is the `created_at` the server stamped on the `room_created` or
+  `member_added` event, so members from before this feature get the join time of that event; if no join time can be read at
+  all, `since_join` fails closed (history starts at the moment of the request). Re-adding a member (also a role change) starts
+  a new join time. Member responses never carry the global `admission` counter of a field.
+- **Budgets** (all report `truncated_reason`, never a count of hidden items): the ledger window is the newest
+  `LEDGER_SCAN_BUDGET` = 20,000 events THE READER MAY SEE (the room's log is scanned newest first, in chunks, until that many
+  visible events are found or it is exhausted; `window_trimmed` says it was cut), so the window and every count in it
+  (`visible_events`, the head `step`) are in the reader's own units and cannot be used to infer hidden volume. Page tokens
+  (`next_cursor`) are opaque, masked, bound to the reader and room and tamper-checked (HMAC), so paging reveals nothing
+  either. A replay applies at most `REPLAY_MAX_EVENTS` = 25,000 of the READER'S visible events (a hidden event costs
+  nothing; over it is a generic 400, "now" is never capped). Each room/mission context keeps at most
+  `LOG_MAX_PER_CONTEXT` = 100,000 events (the oldest tenth is evicted beyond that: the history floor); after an eviction the
+  window is flagged trimmed and replay covers what is retained. Visibility is evaluated 128 events per hold of the live lock,
+  so a viewer never stalls ingest for a whole scan. A head response (graph, timeline, ledger) is computed against one state:
+  if an event arrived while it was built it is retried, and the third try runs under the lock. Graph reads reuse
   `SCAN_BUDGET`, `EDGE_SCAN_TOTAL`, `MAX_EDGES`, `MAX_RESPONSE_BYTES`; the timeline caps lanes (300) and markers (1000). At most
-  two replayed projections are cached (keyed by position and invalidated when an event arrives); one replay is built at a time.
+  two replayed projections are cached (keyed by reader, position and the count of applied events); one replay is built at a time.
 - **Pagination.** `limit` (<= 1000) and `offset` page the room's visible nodes (types in fixed order, admission order inside a
   type); a page also carries the edges between its nodes and the nodes of earlier pages. The `SCAN_BUDGET` of examined ids is shared
   round-robin between node types, so one busy kind cannot starve the others. The web page does not pass `node_types` (it filters
@@ -375,7 +382,7 @@ Every id, label, attribute and reason is escaped for text and attribute contexts
 - T05 (canonical GitHub issue/PR linking and reconciliation) is not built: issue/PR nodes and `issue_link` edges are drawn when an
   emitter sends them, but no canonicalisation or reconciliation exists yet. T06's `review_quorum.py` is on a sibling branch and
   is not on this stack; stale/head-change come only from the T02 projection's own flags.
-- Replay cost is the room's prefix (see budgets); beyond 25,000 of its events a past position answers 400. A busy room needs
+- Replay cost is the reader's visible prefix (see budgets); beyond 25,000 visible events a past position answers 400. A busy room needs
   the snapshot table mentioned above. Not load-tested at that size. No visual-regression suite exists; layout is checked by
   unit tests and a browser smoke run against a mocked API plus one real-HTTP pytest of the routes, not by screenshots.
 - There is no separate review/CI phase model. PR, review and CI objects appear as lanes of their node types (state spans from

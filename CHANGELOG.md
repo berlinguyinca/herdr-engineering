@@ -13,7 +13,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   Replay at a position equals the live projection at that point and never shows what the reader cannot see now.
   No migration, no new table (derived from the stored lineage events). See `docs/contracts/lineage-events.md` ("T09").
 - Replay is per room (a busy room cannot break another's), visibility is scanned in 128-event chunks so viewers do not stall
-  ingest, member responses no longer carry the global `admission` counter, trimmed windows report rounded counts, and the new
+  ingest, member responses no longer carry the global `admission` counter, the ledger window is counted in the reader's own visible events (exact steps, opaque page tokens), and the new
   operator YAML `control_plane.collab.replay_history` (`since_join` default | `full`) sets how far back a member may replay.
 - Rollback: revert the PR (code only).
 

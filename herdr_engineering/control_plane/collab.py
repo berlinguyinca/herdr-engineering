@@ -2353,8 +2353,10 @@ class CollabService:
         if self.replay_history == "since_join":
             with self._lock:
                 joined = ((self._rooms.get(room_id) or {}).get("members", {}).get(pr.id) or {}).get("joined_at")
-            if joined:            # a legacy member without a recorded join time sees the whole history
+            try:
                 since = datetime.fromisoformat(joined).timestamp()
+            except (TypeError, ValueError):
+                since = self._now()        # no recorded join time: fail closed, history starts now
 
         def num(name, default):
             raw = query.get(name)
@@ -2363,6 +2365,14 @@ class CollabService:
             if not re.fullmatch(r"[0-9]{1,9}", str(raw)):          # ASCII digits only, bounded
                 raise CollabError(400, f"{name} must be a non-negative integer")
             return int(raw)
+
+        def token(name):
+            raw = query.get(name)
+            if raw in (None, ""):
+                return None
+            if not re.fullmatch(r"[0-9a-f]{32}", str(raw)):
+                raise CollabError(400, f"{name} is not a valid page token")
+            return str(raw)
 
         def kinds(name, allowed):
             raw = query.get(name)
@@ -2385,7 +2395,7 @@ class CollabService:
             if parts == ["timeline"]:
                 return graph.room_timeline(principal, contexts, step=step, at=at, since=since)
             if parts == ["events"]:
-                return graph.room_ledger(principal, contexts, cursor=num("cursor", 0), limit=num("limit", 200),
+                return graph.room_ledger(principal, contexts, cursor=token("cursor"), limit=num("limit", 200),
                                          since=since)
         except ValueError as exc:
             raise CollabError(400, str(exc)) from None

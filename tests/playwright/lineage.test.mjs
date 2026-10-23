@@ -57,6 +57,7 @@ async function withPage(fn, opts = {}) {
       else if (path === '/rooms/room-one') body = { room_id: 'room-one', name: 'Review', role: 'owner', members: [] };
       else if (path === '/rooms/room-one/state') body = { changed: true, seq: 1, next_cursor: 1, agents: [], tasks: [], events: [], flow: { nodes: [], edges: [], tasks: [] } };
       else if (path === '/graph/lineage' && seen.failStep !== undefined && url.searchParams.get('step') === String(seen.failStep)) { await route.fulfill({ status: 500, json: { error: 'boom' } }); return; }
+      else if (path === '/graph/lineage' && seen.delay) { await new Promise((r) => setTimeout(r, seen.delay)); body = lineage(url.searchParams.has('step') ? Number(url.searchParams.get('step')) : null); }
       else if (path === '/graph/lineage') body = opts.lineage ? opts.lineage(url) : lineage(url.searchParams.has('step') ? Number(url.searchParams.get('step')) : null);
       else if (path === '/graph/lineage/timeline') body = opts.timeline || TIMELINE;
       else if (path.startsWith('/graph/nodes')) body = { nodes: [], edges: [] };
@@ -202,6 +203,28 @@ test('a failed replay keeps the controls, offers Retry and Live, and recovers', 
   await page.getByRole('button', { name: /Next/ }).click();
   await page.getByRole('button', { name: 'Live', exact: true }).click();
   await page.locator('.lin-replay__status', { hasText: 'Live' }).waitFor();
+}));
+
+test('a position chosen while loading is queued and applied next; a second failure falls back to Live', async () => withPage(async (page, seen) => {
+  await page.getByRole('tab', { name: 'Lineage', exact: true }).click();
+  await page.locator('svg.lin-svg g[data-node]').first().waitFor();
+  seen.delay = 400;
+  await page.getByRole('button', { name: /Back/ }).click();                       // step 4 in flight
+  await page.locator('.lin-replay__status', { hasText: 'Loading' }).waitFor();
+  await page.getByRole('button', { name: /Start/ }).click();                      // queued while busy, not dropped
+  await page.locator('.lin-replay__status', { hasText: 'latest choice will load next' }).waitFor();
+  seen.delay = 0;
+  await page.locator('.lin-replay__status', { hasText: 'before the first' }).waitFor();
+  assert.ok(seen.some((r) => r.path === '/graph/lineage' && r.q.step === '0'), 'the queued position was requested');
+  seen.failStep = 4;
+  await page.getByRole('button', { name: 'Live', exact: true }).click();
+  await page.locator('.lin-replay__status', { hasText: 'Live' }).waitFor();
+  await page.getByRole('button', { name: /Back/ }).click();
+  await page.getByRole('button', { name: 'Retry' }).waitFor();
+  await page.getByRole('button', { name: 'Retry' }).click();                      // fails again: automatic fallback
+  await page.getByText('so Live is shown').waitFor();
+  await page.locator('.lin-replay__status', { hasText: 'Live' }).waitFor();
+  assert.equal(await page.locator('svg.lin-svg g[data-node]').count(), 5);
 }));
 
 const BAD = '<img src=x onerror="window.__xss=7">';

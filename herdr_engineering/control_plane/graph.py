@@ -42,9 +42,11 @@ Nothing here infers edges; only explicit ``edge.add`` events create them.
 """
 from __future__ import annotations
 
+import hmac
 import itertools
 import json
 import re
+import secrets
 import threading
 import time
 from collections import deque
@@ -701,7 +703,8 @@ class GraphProjection:
         # that the reader cannot see now (no widening by replay)
         self._gate = gate
         self._replay_lock = threading.Lock()
-        self._replay_cache: dict[int, tuple[int, GraphProjection]] = {}
+        self._replay_cache: dict[tuple, GraphProjection] = {}
+        self._cursor_key = secrets.token_bytes(32)
         self._nodes: dict[str, _Node] = {}
         self._edges: dict[tuple, _Edge] = {}
         self._wild: dict[tuple, _Wild] = {}
@@ -1573,37 +1576,31 @@ class GraphProjection:
             *[node.attrs[k] for k in (op.get("attrs") or {}) if k in node.attrs]]
         return all(key in reg.by and _entry_visible(principal, reg.by[key]) for reg in regs)
 
-    def _room_entries(self, principal, contexts, since: float | None = None) -> tuple[list, int, bool]:
-        """The visible events addressed to ``contexts`` in admission order: ``(entries, base, trimmed)``.
-        Only the newest ``LEDGER_SCAN_BUDGET`` events of a context are examined (``trimmed``; so is a context
-        whose oldest events were evicted), so a busy room cannot make the read cost more than the budget and
-        other rooms are never touched. ``base`` is the admission number just before the examined window, or
-        of the last visible event before ``since`` (a viewer's join time): replay's step 0.
-        The live lock is held only to copy references and then for ``CHUNK`` events at a time, so a viewer
-        never stalls ingest for the length of the whole scan."""
+    def _room_entries(self, principal, contexts, since: float | None = None) -> tuple[list, bool]:
+        """The newest ``LEDGER_SCAN_BUDGET`` events the reader may see that are addressed to ``contexts``, in
+        admission order: ``(entries, trimmed)``. The window is counted in the READER'S visible events (the log is
+        scanned newest first until enough visible ones are found or it is exhausted), so its size never
+        correlates with how many hidden events there are. ``since`` (a join time) drops earlier events one by
+        one, never by position. ``trimmed`` also covers a context whose oldest events were evicted. The live
+        lock is held for ``CHUNK`` events at a time, so a viewer never stalls ingest for a whole scan."""
         with self._lock:
             parts, trimmed = [], False
             for c in sorted(contexts, key=repr):
-                lst = self._log_ctx.get(c, ())
+                parts.extend(self._log_ctx.get(c, ()))
                 trimmed = trimmed or bool(self._log_evicted.get(c))
-                if len(lst) > LEDGER_SCAN_BUDGET:
-                    lst, trimmed = lst[-LEDGER_SCAN_BUDGET:], True
-                parts.extend(lst)
         parts.sort(key=lambda t: _rank(t[0]))
-        if len(parts) > LEDGER_SCAN_BUDGET:
-            parts, trimmed = parts[-LEDGER_SCAN_BUDGET:], True
-        base = max(0, _lseq(parts[0][0]) - 1) if trimmed and parts else 0
-        entries = []
-        for i in range(0, len(parts), CHUNK):
+        got: list = []                                   # newest first
+        i = len(parts)
+        while i > 0 and len(got) <= LEDGER_SCAN_BUDGET:
+            lo = max(0, i - CHUNK)
             with self._lock:
-                entries.extend((ev, op) for ev, op in parts[i:i + CHUNK] if self._event_visible(principal, ev, op))
+                got.extend((ev, op) for ev, op in reversed(parts[lo:i])
+                           if (since is None or _ts(ev) >= since) and self._event_visible(principal, ev, op))
+            i = lo
             time.sleep(0.0002)       # a lock is not fair: really hand it to a waiting ingest before re-taking it
-        if since is not None:
-            before = [e for e in entries if _ts(e[0]) < since]
-            if before:
-                base = max(base, _lseq(before[-1][0]))
-            entries = entries[len(before):]
-        return entries, base, trimmed
+        if len(got) > LEDGER_SCAN_BUDGET or (i > 0 and len(got) >= LEDGER_SCAN_BUDGET):
+            trimmed = True
+        return got[:LEDGER_SCAN_BUDGET][::-1], trimmed
 
     @staticmethod
     def _iso(value: Any) -> str | None:
@@ -1632,93 +1629,101 @@ class GraphProjection:
             raise ValueError("at must be an ISO-8601 timestamp") from None
 
     @staticmethod
-    def _position(entries: list, base: int, step: int | None, at: str | None) -> tuple[int, int | None]:
-        """Resolve a replay position to ``(k, upto)``: ``k`` visible events are included; ``upto`` is the
-        admission number the projection is cut at (``None`` = the current projection). ``at`` counts the
-        visible events BEFORE the first one received after that instant (server receipt time, never the
-        emitter's claim), so it is a prefix and never skips an earlier event."""
+    def _position(entries: list, step: int | None, at: str | None) -> int:
+        """Resolve a replay position to ``k``, the number of the reader's visible events included (0..n; every
+        value is replayable). ``at`` counts the visible events BEFORE the first one received after that instant
+        (server receipt time, never the emitter's claim), so it is a prefix and never skips an earlier event."""
         n = len(entries)
         if step is not None and at is not None:
             raise ValueError("give step or at, not both")
         if step is not None:
             if not isinstance(step, int) or isinstance(step, bool) or step < 0:
                 raise ValueError("step must be a non-negative integer")
-            k = min(step, n)
-        elif at is not None:
+            return min(step, n)
+        if at is not None:
             t = GraphProjection._parse_at(at)
             k = 0
             for ev, _ in entries:
                 if _ts(ev) > t:
                     break
                 k += 1
-        else:
-            k = n
-        if k >= n:
-            return n, None
-        return k, (_lseq(entries[k - 1][0]) if k else base)
+            return k
+        return n
 
-    def projection_at(self, upto: int | None, contexts=frozenset()) -> GraphProjection:
-        """The graph as it was after the lineage event with admission number ``upto``, built from the events of
-        THIS ROOM's contexts only (so another room's volume never costs or breaks this one), read through THIS
-        projection's visibility. ``None`` is now. ``apply`` is commutative and idempotent, and everything the
-        reader may see passes the live gate, so the visible result equals a projection fed those events live.
-        Capped per room (``REPLAY_MAX_EVENTS``; the same generic error says nothing about volume), unavailable
-        once the room's oldest events were evicted, and cached (at most two projections)."""
-        if upto is None:
+    def _replay(self, principal, contexts, entries: list, k: int) -> GraphProjection:
+        """The graph after the first ``k`` of the reader's visible events, built from those events alone, read
+        through THIS projection's visibility (``apply`` is commutative and idempotent). The cap counts the
+        reader's own visible events, so it says nothing about hidden volume. Cached (two projections)."""
+        if k >= len(entries):
             return self
-        key = (upto, frozenset(contexts))
+        if k > REPLAY_MAX_EVENTS:
+            raise ValueError("replay is not available for this position")
+        key = (principal.get("id"), frozenset(contexts), k, _lseq(entries[0][0]) if entries else 0,
+               _lseq(entries[k - 1][0]) if k else 0, self.events_applied)
         with self._replay_lock:
-            with self._lock:
-                size = sum(len(self._log_ctx.get(c, ())) + self._log_evicted.get(c, 0) for c in contexts)
-                hit = self._replay_cache.get(key)
-                if hit and hit[0] == size:
-                    return hit[1]
-                if any(self._log_evicted.get(c) for c in contexts):
-                    raise ValueError("replay is not available for this position")
-                events = [ev for c in sorted(contexts, key=repr) for ev, _ in self._log_ctx.get(c, ())
-                          if _lseq(ev) <= upto]
-            if len(events) > REPLAY_MAX_EVENTS:
-                raise ValueError("replay is not available for this position")
+            hit = self._replay_cache.get(key)
+            if hit:
+                return hit
             past = GraphProjection(keep_log=False, gate=self)
-            for ev in sorted(events, key=_rank):
+            for ev, _op in entries[:k]:
                 try:
                     past.apply(ev)
                 except ValueError:
                     past.events_rejected += 1
-            self._replay_cache[key] = (size, past)
+            self._replay_cache[key] = past
             while len(self._replay_cache) > 2:
                 self._replay_cache.pop(next(iter(self._replay_cache)))
             return past
 
     def _as_of(self, entries: list, k: int, trimmed: bool) -> dict:
         last = entries[k - 1][0] if k else None
-        n = len(entries)
-        if trimmed:     # an exact count of a trimmed window would say how much of it the reader may not see
-            n = n // 100 * 100
-        return {"step": n if k >= len(entries) and trimmed else k, "visible_events": n, "head": k >= len(entries),
-                "approximate": bool(trimmed),
+        return {"step": k, "visible_events": len(entries), "head": k >= len(entries),
                 "event_id": str(last["event_id"]) if last else None,
                 "received_at": self._iso(last.get("ingest_timestamp") or last.get("received_at")) if last else None,
                 "window_trimmed": trimmed}
 
-    def room_ledger(self, principal, contexts, *, cursor: int = 0, limit: int = LEDGER_DEFAULT,
+    def _cursor_pad(self, principal, contexts) -> bytes:
+        return hmac.new(self._cursor_key, repr((principal.get("id"), sorted(contexts, key=repr))).encode(),
+                        "sha256").digest()
+
+    def _cursor_make(self, principal, contexts, lseq: int) -> str:
+        """An opaque, reader- and room-bound page token: the admission number it stands for is masked, so a
+        token (like a step number) reveals nothing about the events the reader cannot see."""
+        pad = self._cursor_pad(principal, contexts)
+        ct = (lseq ^ int.from_bytes(pad[:8], "big")).to_bytes(8, "big")
+        tag = hmac.new(pad, ct, "sha256").digest()[:8]
+        return (ct + tag).hex()
+
+    def _cursor_read(self, principal, contexts, token) -> int:
+        pad = self._cursor_pad(principal, contexts)
+        try:
+            raw = bytes.fromhex(str(token))
+        except ValueError:
+            raise ValueError("invalid cursor") from None
+        if len(raw) != 16 or not hmac.compare_digest(hmac.new(pad, raw[:8], "sha256").digest()[:8], raw[8:]):
+            raise ValueError("invalid cursor")
+        return int.from_bytes(raw[:8], "big") ^ int.from_bytes(pad[:8], "big")
+
+    def room_ledger(self, principal, contexts, *, cursor: str | None = None, limit: int = LEDGER_DEFAULT,
                     since: float | None = None) -> dict:
         """A page of the events this reader may see in one room, in admission order. ``step`` numbers the
-        reader's OWN visible events (1-based), so no number reveals how many hidden events exist."""
+        reader's OWN visible events (1-based) and the page token is opaque, so nothing reveals how many hidden
+        events exist."""
         if not isinstance(limit, int) or not 1 <= limit <= LEDGER_MAX:
             raise ValueError(f"limit must be between 1 and {LEDGER_MAX}")
-        if not isinstance(cursor, int) or cursor < 0:
-            raise ValueError("cursor must be >= 0")
+        after = self._cursor_read(principal, contexts, cursor) if cursor not in (None, "") else None
+
         def compute():
             return self._room_entries(principal, contexts, since)
 
         def finish(state):
-            entries, _base, trimmed = state
-            page = entries[cursor:cursor + limit]
-            more = cursor + limit < len(entries)
-            return {"events": [self._event_view(cursor + i + 1, ev, op) for i, (ev, op) in enumerate(page)],
-                    "visible_events": len(entries) // 100 * 100 if trimmed else len(entries),
-                    "approximate": bool(trimmed), "next_cursor": cursor + limit if more else None,
+            entries, trimmed = state
+            start = 0 if after is None else sum(1 for ev, _ in entries if _lseq(ev) <= after)
+            page = entries[start:start + limit]
+            more = start + limit < len(entries)
+            return {"events": [self._event_view(start + i + 1, ev, op) for i, (ev, op) in enumerate(page)],
+                    "visible_events": len(entries),
+                    "next_cursor": self._cursor_make(principal, contexts, _lseq(page[-1][0])) if more else None,
                     "truncated": trimmed, "truncated_reason": "scan_budget" if trimmed else None}
         return self._coherent(compute, finish)
 
@@ -1821,17 +1826,44 @@ class GraphProjection:
                 if self.events_applied == seen:
                     return finish(state)
 
+    @staticmethod
+    def _strip_pre_join(out: dict, post: set) -> dict:
+        """``replay_history: since_join``: current values are shown, but the identity and time of any event that
+        is not among the reader's post-join events (an older value's history) is dropped."""
+        def fix(d):
+            if isinstance(d, dict) and d.get("event_id") is not None and d["event_id"] not in post:
+                d["event_id"] = None
+                if "admitted_at" in d:
+                    d["admitted_at"] = None
+        for n in out.get("nodes", ()):
+            for k in ("first_event_id", "last_event_id"):
+                if n.get(k) is not None and n[k] not in post:
+                    n[k] = None
+            f = n.get("fields") or {}
+            for v in (f.get("label"), f.get("state"), *(f.get("attrs") or {}).values()):
+                fix(v)
+            for lst in (n.get("contributions") or {}).values():
+                for v in (lst.values() if isinstance(lst, dict) else [lst]):
+                    for e in (v if isinstance(v, list) else [v]):
+                        fix(e)
+        for e in out.get("edges", ()):
+            fix(e.get("provenance"))
+            for v in (e.get("fields") or {}).values():
+                fix(v)
+        return out
+
     def room_lineage(self, principal, contexts, *, step: int | None = None, at: str | None = None,
                      since: float | None = None, **kw) -> dict:
         """The room graph at a position in the reader's event ledger (default: now)."""
         def compute():
-            entries, base, trimmed = self._room_entries(principal, contexts, since)
-            k, upto = self._position(entries, base, step, at)
-            return entries, k, trimmed, self.projection_at(upto, contexts)
+            entries, trimmed = self._room_entries(principal, contexts, since)
+            k = self._position(entries, step, at)
+            return entries, k, trimmed, self._replay(principal, contexts, entries, k)
 
         def finish(state):
             entries, k, trimmed, past = state
-            return {"as_of": self._as_of(entries, k, trimmed), **past.room_graph(principal, contexts, **kw)}
+            out = {"as_of": self._as_of(entries, k, trimmed), **past.room_graph(principal, contexts, **kw)}
+            return self._strip_pre_join(out, {ev["event_id"] for ev, _ in entries}) if since is not None else out
         return self._coherent(compute, finish)
 
     def room_timeline(self, principal, contexts, *, step: int | None = None, at: str | None = None,
@@ -1843,9 +1875,9 @@ class GraphProjection:
         own flag as the reader sees it at that position, never a client guess. Times are server receipt times
         (``at``) with the emitter's claim alongside (``claimed``); nothing is inferred or invented."""
         def compute():
-            entries, base, trimmed = self._room_entries(principal, contexts, since)
-            k, upto = self._position(entries, base, step, at)
-            return entries, k, trimmed, self.projection_at(upto, contexts)
+            entries, trimmed = self._room_entries(principal, contexts, since)
+            k = self._position(entries, step, at)
+            return entries, k, trimmed, self._replay(principal, contexts, entries, k)
 
         def finish(state):
             entries, k, trimmed, past = state

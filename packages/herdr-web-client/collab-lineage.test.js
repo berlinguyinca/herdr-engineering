@@ -134,7 +134,7 @@ test('replay controls: a range with spoken value text, step buttons, live button
   assert.equal(replayTarget(asOf, 'slider', 'junk'), 3);
   assert.match(replayText({ step: 10, visible_events: 10, head: true }), /^Live/);
   assert.match(replayText({ step: 0, visible_events: 4, head: false }), /before the first/);
-  assert.match(renderReplay({ ...asOf, window_trimmed: true }), /Only the most recent events/);
+  assert.match(renderReplay({ ...asOf, window_trimmed: true }), /Only the newest events you can see/);
   assert.doesNotMatch(renderReplay(asOf, { busy: true }), /disabled/, 'busy keeps focus on a live control');
   assert.match(renderReplay(asOf, { busy: true }), /aria-busy="true"/);
   assert.match(renderReplay(null), /max="0"[^>]*disabled/);
@@ -290,4 +290,10 @@ test('an error still renders the replay controls and a Retry button; no false "w
 
 test('node aria-labels are clipped', () => {
   assert.ok(nodeLabel({ node_type: 'task', id: 'task:x', label: 'L'.repeat(900), state: 'running' }, { in: 1, out: 2 }).length <= 120);
+});
+
+test('the replay status says a choice is queued while loading', () => {
+  assert.match(renderReplay({ step: 1, visible_events: 5, head: false }, { busy: true, queued: true }), /latest choice will load next/);
+  assert.match(renderReplay({ step: 1, visible_events: 5, head: false }, { busy: true }), /Loading the position/);
+  assert.match(renderLineage({ graphAll: { nodes: [], edges: [] }, filtered: { nodes: [], edges: [], match: new Set() }, asOf: { step: 5, visible_events: 5, head: true }, notice: 'That position could not be loaded, so Live is shown.', filters: { types: new Set(), edgeTypes: new Set() } }), /so Live is shown/);
 });

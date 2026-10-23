@@ -1,4 +1,4 @@
-# ruff: noqa: F811  (pytest fixtures are imported by name from the sibling test modules)
+# ruff: noqa: F811, E701  (pytest fixtures are imported by name; the randomized generator is terse)
 """T09: room lineage graph, Gantt timeline, ledger and replay (read-only, membership-scoped).
 
 Cast as in test_graph_membership (alice owner, bob contributor, carol viewer, dave guest, mallory in no room)."""
@@ -300,8 +300,10 @@ def test_ledger_pages_and_scan_budget(fab, monkeypatch):
     cut = lin(fab, fab.bob, "events", limit=50)
     assert cut["truncated"] and cut["truncated_reason"] == "scan_budget" and len(cut["events"]) == 5
     assert [e["node_id"] for e in cut["events"]] == [f"task:t{i}" for i in range(4, 9)]     # the newest window
-    # replay inside a trimmed window: step 0 is the state just before the window, head is now
-    assert len(lin(fab, fab.bob, step=0)["nodes"]) == 4
+    # inside a trimmed window replay shows the window's own events only; head is the live graph
+    assert cut["window_trimmed"] if "window_trimmed" in cut else True
+    assert lin(fab, fab.bob)["as_of"]["step"] == 5 == lin(fab, fab.bob)["as_of"]["visible_events"]
+    assert len(lin(fab, fab.bob, step=0)["nodes"]) == 0 and len(lin(fab, fab.bob, step=3)["nodes"]) == 3
     assert len(lin(fab, fab.bob)["nodes"]) == 9
 
 
@@ -592,13 +594,71 @@ def test_a_viewer_never_holds_the_ingest_lock_for_a_whole_scan(fab, monkeypatch)
     assert max(waits) < total / 3, (max(waits), total)  # ...yet no single hold was close to it
 
 
-def test_head_count_is_rounded_when_the_window_is_trimmed(fab, monkeypatch):
+def test_a_trimmed_window_has_exact_self_consistent_steps(fab, monkeypatch):
+    """The window is N of the READER'S OWN visible events: head step == visible_events == what paging returns,
+    and every step from 0 to the head is replayable (no rounding is exposed)."""
     monkeypatch.setattr(graph_mod, "LEDGER_SCAN_BUDGET", 150)
     _flood(fab.feed, fab.room, 237)
     a = lin(fab, fab.alice)["as_of"]
-    assert a["window_trimmed"] is True and a["approximate"] is True
-    assert a["visible_events"] % 100 == 0 and a["step"] % 100 == 0
-    assert lin(fab, fab.alice, "events")["visible_events"] % 100 == 0
+    assert a["window_trimmed"] is True and a["head"] is True and a["step"] == a["visible_events"] == 150
+    assert "approximate" not in a
+    got, cur = 0, None
+    while True:
+        e = lin(fab, fab.alice, "events", limit=40, cursor=cur)
+        got += len(e["events"])
+        cur = e["next_cursor"]
+        if cur is None:
+            break
+    assert got == 150
+    h = lin(fab, fab.alice, step=150)
+    assert h["as_of"]["head"] is True and h["as_of"]["step"] == 150
+    for k in (0, 1, 75, 149):
+        r = lin(fab, fab.alice, step=k)
+        assert r["as_of"]["step"] == k and r["as_of"]["head"] is False
+
+
+def test_hidden_events_neither_shift_the_window_nor_the_paging(fab, monkeypatch):
+    """Paging cannot be used to count what the reader may not see: with hidden events interleaved, the window
+    still holds N visible events and the pages sum to exactly N."""
+    monkeypatch.setattr(graph_mod, "LEDGER_SCAN_BUDGET", 40)
+    f = fab.feed
+    for i in range(30):
+        put(f, f"task:h{i}", "room", room_id=fab.room)
+        put(f, f"task:h{i}", "private")                       # then hidden from bob (both its events)
+    for i in range(70):
+        put(f, f"task:v{i}", "room", room_id=fab.room)
+    v = lin(fab, fab.bob, "events", limit=500)
+    assert len(v["events"]) == 40 == v["visible_events"] and v["truncated"]
+
+
+def test_the_replay_cap_counts_the_readers_visible_events_only(fab, monkeypatch):
+    monkeypatch.setattr(graph_mod, "REPLAY_MAX_EVENTS", 20)
+    f = fab.feed
+    for i in range(9):
+        put(f, f"task:h{i}", "room", room_id=fab.room)
+    for i in range(9):
+        put(f, f"task:h{i}", "private")                       # 9 now hidden from carol
+    for i in range(14):
+        put(f, f"task:v{i}", "room", room_id=fab.room)
+    n = lin(fab, fab.carol)["as_of"]["visible_events"]
+    assert n == 14
+    assert all(lin(fab, fab.carol, step=k)["as_of"]["step"] == k for k in range(n))     # hidden ones cost nothing
+    monkeypatch.setattr(graph_mod, "REPLAY_MAX_EVENTS", 5)
+    assert lin(fab, fab.carol, step=5)["as_of"]["step"] == 5 and err(lin, fab, fab.carol, step=9)[0] == 400
+
+
+def test_page_tokens_are_opaque_bound_to_the_reader_and_tamper_proof(fab):
+    f = fab.feed
+    for i in range(6):
+        put(f, f"task:t{i}", "room", room_id=fab.room)
+    tok = lin(fab, fab.bob, "events", limit=2)["next_cursor"]
+    assert isinstance(tok, str) and len(tok) == 32 and not tok.isdigit()
+    assert lin(fab, fab.bob, "events", limit=2, cursor=tok)["events"][0]["step"] == 3
+    assert err(lin, fab, fab.carol, "events", cursor=tok)[0] == 400          # another reader's token
+    flipped = ("0" if tok[0] != "0" else "1") + tok[1:]
+    assert err(lin, fab, fab.bob, "events", cursor=flipped)[0] == 400
+    for bad in ("3", "zz", "-1", tok + "0"):
+        assert err(lin, fab, fab.bob, "events", cursor=bad)[0] == 400
 
 
 def test_members_do_not_get_the_global_admission_counter(fab):
@@ -611,36 +671,54 @@ def test_members_do_not_get_the_global_admission_counter(fab):
     assert "admission" in json.dumps(g._node_view(g._nodes["task:p"], None, internal=True))   # operators keep it
 
 
-def test_replay_since_join_starts_at_the_members_join_time(fab):
+def test_replay_since_join_hides_the_pre_join_history_strictly(fab):
+    """since_join: events are filtered one by one (timestamps need not be monotonic); an overwritten pre-join
+    value never appears; the current value is shown WITHOUT pre-join provenance."""
     from datetime import UTC, datetime
     f = fab.feed
-    put(f, "task:old", "room", label="before", room_id=fab.room)
+    put(f, "task:old", "room", label="old-secret", room_id=fab.room)
+    put(f, "task:old", "room", label="current-label", room_id=fab.room)       # overwrites the pre-join value
+    put(f, "task:mid", "room", label="mid", room_id=fab.room)
+    ctx = fab.repo.graph._log_ctx[("room", fab.room, None)]
+    stamps = sorted(datetime.fromisoformat(str(e["ingest_timestamp"])).timestamp() for e, _ in ctx)
+    cut = stamps[2] - 1e-6           # join just before the third event
     put(f, "task:new", "room", label="after", room_id=fab.room)
-    ev = [e for e, _ in fab.repo.graph._log_ctx[("room", fab.room, None)]]
-    cut = sorted(float(datetime.fromisoformat(str(e["ingest_timestamp"])).timestamp()) for e in ev)[-1]
     fab.s.replay_history = "full"
     full = lin(fab, fab.bob, "events")
-    assert full["visible_events"] >= 2
     fab.s.replay_history = "since_join"
     m = fab.s._rooms[fab.room]["members"]["bob"]
     m["joined_at"] = datetime.fromtimestamp(cut, UTC).isoformat()
     got = lin(fab, fab.bob, "events")
-    assert got["visible_events"] < full["visible_events"]
-    assert "before" not in json.dumps(got["events"])
-    s0 = lin(fab, fab.bob, step=0)
-    assert s0["as_of"]["step"] == 0 and "task:old" in json.dumps(s0)     # step 0 = the state as of joining
-    m.pop("joined_at")
-    assert lin(fab, fab.bob, "events")["visible_events"] == full["visible_events"]       # legacy: full
+    assert 0 < got["visible_events"] < full["visible_events"] == 4
+    assert "old-secret" not in json.dumps([got, lin(fab, fab.bob, step=0), lin(fab, fab.bob, "timeline")])
+    head = lin(fab, fab.bob)
+    old = next(n for n in head["nodes"] if n["id"] == "task:old")
+    assert old["label"] == "current-label"                       # current values are shown...
+    assert old["first_event_id"] is None and old["fields"]["label"]["event_id"] is None      # ...without history
+    assert old["fields"]["label"]["admitted_at"] is None
+    assert lin(fab, fab.bob, step=0)["nodes"] == []                   # step 0 = nothing from before the join
+    # non-monotonic stamps: filtering is per event, not a prefix slice
+    ctx[0][0]["ingest_timestamp"] = datetime.fromtimestamp(cut + 100, UTC).isoformat()   # an early event stamped late
+    assert lin(fab, fab.bob, "events")["visible_events"] == got["visible_events"] + 1
+    m.pop("joined_at")                                       # truly missing join time: fail closed (history starts now)
+    assert lin(fab, fab.bob, "events")["visible_events"] == 0
+    fab.s.replay_history = "full"
+    assert lin(fab, fab.bob, "events")["visible_events"] == 4
 
 
-def test_a_context_log_is_bounded_and_replay_floors(fab, monkeypatch):
+def test_a_context_log_is_bounded_and_replay_stays_usable(fab, monkeypatch):
     monkeypatch.setattr(graph_mod, "LOG_MAX_PER_CONTEXT", 50)
     _flood(fab.feed, fab.room, 120)
     g = fab.repo.graph
-    assert len(g._log_ctx[("room", fab.room, None)]) <= 50 and g._log_evicted[("room", fab.room, None)] > 0
-    assert err(lin, fab, fab.alice, step=2)[0] == 400
-    head = lin(fab, fab.alice)
-    assert head["as_of"]["head"] is True and lin(fab, fab.alice, "events")["truncated"] is True
+    key = ("room", fab.room, None)
+    assert len(g._log_ctx[key]) <= 50 and g._log_evicted[key] > 0
+    head = lin(fab, fab.alice)["as_of"]
+    n = head["visible_events"]
+    assert head["head"] is True and head["step"] == n == len(g._log_ctx[key]) and head["window_trimmed"] is True
+    for k in (0, 1, n // 2, n - 1):                          # every position below the head is replayable
+        assert lin(fab, fab.alice, step=k)["as_of"]["step"] == k
+    assert lin(fab, fab.alice, "timeline", step=1)["as_of"]["step"] == 1
+    assert lin(fab, fab.alice, "events")["truncated"] is True
 
 
 def test_query_numbers_are_ascii_digits_only(fab):
@@ -714,7 +792,7 @@ def test_real_server_serves_lineage_views_replay_and_refusals(env):
     s, tl = env.api.call("GET", f"{url}/timeline?room_id={room}", user="alice")
     assert s == 200 and tl["as_of"]["step"] == head["as_of"]["step"]
     s, ev = env.api.call("GET", f"{url}/events?room_id={room}&limit=1", user="alice")
-    assert s == 200 and len(ev["events"]) == 1 and ev["next_cursor"] == 1
+    assert s == 200 and len(ev["events"]) == 1 and len(ev["next_cursor"]) == 32
     assert env.api.call("GET", f"{url}?room_id={room}", user="mallory")[0] == 404
     assert env.api.call("GET", f"{url}?room_id={room}")[0] == 401
     assert env.api.call("GET", f"{url}?step=1", user="alice")[0] == 400
@@ -731,3 +809,66 @@ def test_views_are_identical_after_the_graph_is_rebuilt_from_exported_state(fab)
     fresh.import_state(json.loads(json.dumps(fab.repo.export_state(), default=str)))
     fab.s.graph_source = lambda: fresh.graph
     assert snap() == before
+
+
+# ------------------------------------------------------------ randomized privacy check
+import random  # noqa: E402
+import re  # noqa: E402
+
+
+def _fuzz_events(fab, rnd, n_events):
+    f = fab.feed
+    pool = [f"task:n{i}" for i in range(5)] + [f"pr:github.com/o/r#{i}" for i in range(2)]
+    prs = [p for p in pool if p.startswith("pr:")]
+    hidden_tokens = []
+    ctxs = [("room", {"room_id": fab.room}, True), ("room", {"room_id": fab.room}, True),
+            ("private", {"room_id": fab.room}, False), ("room", {"room_id": fab.room2}, False),
+            ("room", {"room_id": fab.room, "workspace_id": "ws-unlinked"}, False)]
+    for i in range(n_events):
+        scope, ctx, vis = rnd.choice(ctxs)
+        nid = rnd.choice(pool)
+        kind = rnd.choice(["upsert", "state", "edge", "edge", "upsert"])
+        tok = f"hid{i}x"
+        if kind == "upsert":
+            lbl = tok if not vis else f"vis{i}"
+            if not vis: hidden_tokens.append(lbl)
+            f.known.add(nid)
+            f.send("node.upsert", {"node_type": nid.split(":")[0], "node_id": nid, "label": lbl, **({"state": tok} if not vis and rnd.random()<.5 else {}), **({"attrs": {"k": tok}} if not vis and rnd.random()<.5 else {})}, scope, **ctx)
+            if not vis: hidden_tokens += [tok]
+        elif kind == "state":
+            st = tok if not vis else f"vs{i}"
+            if not vis: hidden_tokens.append(st)
+            if nid in f.known:
+                f.send("node.state", {"node_id": nid, "state": st, "reason": tok if not vis else "r"}, scope, **ctx)
+                if not vis: hidden_tokens.append(tok)
+        else:
+            a, b = rnd.sample(pool, 2)
+            if a in f.known and b in f.known:
+                et = rnd.choice(["spawn", "reviewed", "dependency"])
+                if et == "reviewed":
+                    b = rnd.choice(prs)
+                    if b not in f.known: continue
+                    p = {"edge_type": et, "from_id": "review:r1" if "review:r1" in f.known or True else a, "to_id": b, "attrs": {"commit": tok if not vis else f"vc{i}"}}
+                    if not vis: hidden_tokens.append(tok)
+                    f.known.add("review:r1")
+                else:
+                    p = {"edge_type": et, "from_id": a, "to_id": b}
+                try:
+                    f.send("edge.add", p, scope, **ctx)
+                except Exception:
+                    pass
+    return hidden_tokens
+
+@pytest.mark.parametrize("seed_", range(60))
+def test_randomized_replay_never_leaks_hidden_tokens(fab, seed_):
+    rnd = random.Random(seed_)
+    # reviewer node visible
+    put(fab.feed, "review:r1", "room", label="R", room_id=fab.room)
+    toks = _fuzz_events(fab, rnd, 40)
+    for who in (fab.bob, fab.carol):
+        n = lin(fab, who)["as_of"]["visible_events"]
+        blob = _everywhere(fab, who, n)
+        fab.s._hits.clear()
+        leaked = [t for t in set(toks) if re.search(re.escape(t) + r"(?![0-9])", blob)]
+        assert not leaked, (seed_, leaked)
+
