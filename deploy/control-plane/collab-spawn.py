@@ -954,10 +954,17 @@ class Runner:
         return {k: v for k, v in data.items() if isinstance(k, str) and (isinstance(v, str) or (
             isinstance(v, dict) and isinstance(v.get("value"), str) and isinstance(v.get("host"), str)))}
 
-    def proxy_secrets(self, services: list[dict], secrets: dict, hid: str) -> dict:
+    @staticmethod
+    def profile_services(prof: dict) -> list[dict]:
+        return [sv for sv in prof.get("services") or [] if isinstance(sv, dict)
+                and isinstance(sv.get("name"), str) and SERVICE_NAME.fullmatch(sv["name"])
+                and isinstance(sv.get("secret_name"), str) and SECRET_NAME.fullmatch(sv["secret_name"])]
+
+    def proxy_secrets(self, services: list[dict], secrets: dict, hid: str, say=None) -> dict:
         """The header values the helper's egress proxy may attach: only those bound (collab-secrets.py --host) to
         the host of the service's upstream_url. The room owner sets upstream_url, so a service repointed
         elsewhere does not get the key. The proxy checks the same again."""
+        say = say or self.say
         out = {}
         for sv in services:
             n = sv["secret_name"]
@@ -965,7 +972,7 @@ class Runner:
             if v is None:
                 continue
             if not isinstance(v, dict):
-                self.say(f"helper {hid}: room secret {n} has no bound host; service {sv['name']} gets no key "
+                say(f"helper {hid}: room secret {n} has no bound host; service {sv['name']} gets no key "
                          f"(store it again with collab-secrets.py set ROOM {n} --host HOST)")
                 continue
             try:
@@ -973,7 +980,7 @@ class Runner:
             except ValueError:
                 host = ""
             if canon_host(host) != canon_host(v["host"]):
-                self.say(f"helper {hid}: room secret {n} is bound to {trim(v['host'], 80)}, not "
+                say(f"helper {hid}: room secret {n} is bound to {trim(v['host'], 80)}, not "
                          f"{trim(host, 80) or '(no host)'}; service {sv['name']} gets no key")
                 continue
             out[n] = {"value": v["value"], "host": v["host"]}
@@ -1093,15 +1100,15 @@ class Runner:
             if p.is_dir() and not p.is_symlink():
                 binds.append(str(p))
         secrets = self.room_secrets(room)
-        services = [sv for sv in prof.get("services") or [] if isinstance(sv, dict)
-                    and isinstance(sv.get("name"), str) and SERVICE_NAME.fullmatch(sv["name"])
-                    and isinstance(sv.get("secret_name"), str) and SECRET_NAME.fullmatch(sv["secret_name"])]
+        services = self.profile_services(prof)
         write_private(d / "services.json", json.dumps(services))
         write_private(d / "secrets.json", json.dumps(self.proxy_secrets(services, secrets, hid)))
         ssh_dir = None
         # key files are plain (base64) strings only: a header value listed as an ssh name is never written out
         keys = [n for n in prof.get("ssh_secret_names") or [] if isinstance(n, str) and SECRET_NAME.fullmatch(n)
                 and isinstance(secrets.get(n), str)]
+        # what the helper was started with, so a later watch can tell when the room profile took it away
+        st.update(family=c.get("family"), tools=prof.get("tools_allowed") is True and self.allow_tools, ssh_keys=keys)
         if keys:
             ssh_dir = d / "ssh"
             ssh_dir.mkdir(mode=0o700)
@@ -1230,11 +1237,58 @@ class Runner:
             self.end_helper(d, st, "failed", "timeout")
         elif not self.alive(st):
             self.end_helper(d, st, "failed", "sandbox-error")
+        elif (why := self.profile_taken_away(st, row)) is not None:
+            st["stopped"] = why
+            self.end_helper(d, st, "failed", "profile-changed")
         else:
+            self.refresh_services(d, st, row)
             try:
                 self.refresh_allow(d, st["room_id"], st)
             finally:
                 self.save_state(d, st)
+
+    @staticmethod
+    def profile_taken_away(st: dict, row: dict) -> str | None:
+        """Why the room profile, as it is now, no longer allows what the helper was started with; None if it does."""
+        prof = row.get("profile") if isinstance(row.get("profile"), dict) else None
+        if prof is None:
+            return None
+        fams = prof.get("allowed_families")
+        if isinstance(fams, list) and st.get("family") not in fams:
+            return f"its family {trim(st.get('family'), 20)} is no longer allowed in this room"
+        if st.get("tools") is True and prof.get("tools_allowed") is not True:
+            return "tools are no longer allowed in this room"
+        names = {n for n in prof.get("ssh_secret_names") or [] if isinstance(n, str)}
+        if any(k not in names for k in st.get("ssh_keys") or []):
+            return "an ssh key it holds was removed from the room profile"
+        return None
+
+    def refresh_services(self, d: Path, st: dict, row: dict) -> None:
+        """The room's services and the keys bound to them, as they are now, for the proxy (it reads both files on
+        every request, so a change applies without a restart). A file is rewritten only when it changes, and the
+        reasons a key is withheld are logged only then."""
+        prof = row.get("profile") if isinstance(row.get("profile"), dict) else None
+        if prof is None:
+            return
+        hid = st.get("helper_id", d.name)
+        services = self.profile_services(prof)
+        notes: list[str] = []
+        files = {"services.json": json.dumps(services),
+                 "secrets.json": json.dumps(self.proxy_secrets(services, self.room_secrets(st.get("room_id")), hid,
+                                                               say=notes.append))}
+        changed = False
+        for name, text in files.items():
+            try:
+                same = (d / name).read_text() == text
+            except OSError:
+                same = False
+            if not same:
+                write_private(d / name, text)
+                changed = True
+        if changed:
+            for n in notes:
+                self.say(n)
+            self.say(f"helper {hid}: room services updated")
 
     def drain_blocked(self, d: Path, st: dict) -> None:
         """New complete lines of the proxy's blocked log become host-access requests, one per host:port. A host
@@ -1291,6 +1345,8 @@ class Runner:
             foot.append("[blocked, these resolve only to non-public addresses: " + ", ".join(st["forbidden"]) + "]")
         if st.get("asked"):
             foot.append("[host access was requested for: " + ", ".join(st["asked"]) + "]")
+        if st.get("stopped"):
+            foot.append(f"[stopped: the room profile changed: {st['stopped']}]")
         if res.get("exit") not in (0, None) and res.get("stderr"):
             foot.append("[stderr]\n" + str(res["stderr"])[-1500:])
         # the WHOLE posted text fits in HELPER_RESULT_CAP bytes: notes and footers first, the output gets the rest

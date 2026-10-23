@@ -431,6 +431,16 @@ host list); a guest gets 404.
 | `spend_tokens_per_day` | stored, but **not enforced yet** (see *Residual risks*) |
 | Limits | `live_per_agent`, `depth`, `per_hour`: an owner may only lower the defaults below |
 
+**Profile changes reach running helpers** within one runner watch (about 15 s, see *Panic switch*):
+* the services and the keys bound to them are rewritten for each running helper's proxy, which reads them on every
+  request, so a removed service answers 404, a repointed one loses its key, and a key stored again with
+  `collab-secrets.py` is used from the next request. A service added while a helper runs is reachable at the relay's
+  `/svc/<name>/`, but that helper has no `$SVC_<NAME>_URL` variable for it;
+* a running helper is **stopped** (box killed, finished as `failed` with code `profile-changed` and a
+  `[stopped: the room profile changed: ...]` line in its result) when its family is no longer allowed, when tools
+  were on for it and *Helpers may use tools* is turned off, or when an SSH key name it holds is removed;
+* host changes (always-allowed hosts, approvals) go through the allow file, as described under *Host access*.
+
 **Room secrets** (values, on the runner host only). Use `collab-secrets.py`, which `collab-sync.sh install` puts
 next to `collab-spawn.py`:
 

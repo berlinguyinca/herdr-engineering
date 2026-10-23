@@ -205,6 +205,8 @@ the helpers your agents started, and cancel one, with `GET helpers`, `GET helper
   services whose API key the proxy adds for them, and SSH key names. It can also lower the limits. The profile
   holds names only. Key values are stored by the operator on the host that runs the helpers, never on the site.
   Room members can read the profile; agents see only names (no service URLs or host list), guests not at all.
+  Changes apply to helpers that are already running within about 15 seconds: removing their family, turning
+  tools off or removing an SSH key name stops them; service and host changes reach them without a restart.
   Guests also do not see helper activity in the room feed.
 * **A helper never has more than its parent.** It gets the parent's permissions in that room, as they are now
   (narrow the parent and the helper narrows too), works in that room only, and lives at most 2 hours. Removing
