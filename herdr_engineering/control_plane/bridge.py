@@ -18,6 +18,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from .events import V2_COLUMNS
 from .service_catalog import normalize_project, normalize_source_port, track_availability
 
 
@@ -119,6 +120,16 @@ class PostgresSource(DurableSource):
         return self._load()["events"]
 
 
+def _v2_value(name: str, value: Any) -> Any:
+    """Envelope v2 column from a fabric_events row (jsonb arrives as str)."""
+    if name in ("actor", "evidence_refs") and isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value
+
+
 def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
     """Fold fabric_events rows into repo's {stream: [event]} + chronological order."""
     streams: dict = {}
@@ -140,6 +151,8 @@ def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
             "session_id": row.get("session_id"),
             "sequence": seq, "event_type": row.get("event_type"),
             "payload": row.get("payload") or {},
+            **{name: _v2_value(name, row.get(name))
+               for name in V2_COLUMNS if row.get(name) is not None},
         })
         order.append((etype, eid, seq))
     for stream in streams.values():

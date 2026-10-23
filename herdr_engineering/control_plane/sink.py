@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Any
 
 from .bridge import _LoopRunner
-from .events import Event, EventStore
+from .events import V2_COLUMNS, Event, EventStore
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ def _dict_to_event(ev: dict) -> Event:
         sequence=ev.get("sequence", 0),
         event_type=ev.get("event_type", ""),
         payload=ev.get("payload") or {},
+        **{name: ev.get(name) for name in V2_COLUMNS},
     )
 
 
@@ -92,5 +93,9 @@ class DurableEventSink:
         # permits one operation per connection, including reconnection.
         with self._write_lock:
             self._ensure_store()
+            # append() returns False only for an existing event_id; any write
+            # error propagates from here unchanged.
             if not self._run(self._store.append(_dict_to_event(ev))):
-                raise RuntimeError("durable event insert was not acknowledged")
+                raise RuntimeError(
+                    "durable event insert was not acknowledged "
+                    "(event_id already stored)")
