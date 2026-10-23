@@ -5,12 +5,13 @@ import { grantSummary, renderLinks } from '../collab-links.js';
 test('links render escaped, with the primary marker and without a terminal control', () => {
   const html = renderLinks([
     { workspace_id: '<img onerror=x>', host: 'bender', is_primary: true, grants: ['status', 'tabs'], can_terminal: false },
-    { workspace_id: 'ws-2', host: 'beast', is_primary: false, grants: [], can_terminal: true },
+    { workspace_id: 'ws-2', host: 'beast', is_primary: false, grants: [], can_terminal: true, host_verified: false },
   ], [{ mission_id: 'm-<1>' }]);
   assert.ok(!html.includes('<img'));
   assert.ok(html.includes('&lt;img onerror=x&gt;') && html.includes('m-&lt;1&gt;'));
   assert.ok(html.includes('Primary room') && html.includes('You may open the terminal'));
   assert.ok(html.includes('nothing shared'));
+  assert.equal(html.split('Host not verified').length - 1, 1, 'only the link marked host_verified:false says so');
   assert.ok(!/<button|<a /.test(html), 'read-only: nothing to click, no terminal link');
 });
 

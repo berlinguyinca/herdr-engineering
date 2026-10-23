@@ -282,6 +282,9 @@ class CollabService:
         self._links: dict[str, dict] = {}                    # link id -> room/workspace link
         self._links_by_room: dict[str, list] = defaultdict(list)
         self._primary: dict[tuple, str] = {}                 # (host, workspace id) -> link id of its primary room
+        self._hosts: dict[str, dict] = {}                    # host registry: host -> {owners, gen}
+        self._term_gate: dict[tuple, tuple] = {}             # (principal, link) -> (last audited allow, fingerprint); memory only
+        self._room_link_seq: dict[str, int] = {}             # room id -> sequence of its latest link change (people only)
         self._missions: dict[tuple, dict] = {}               # (room id, mission id) -> scoped mission link
         self._housekept = 0.0
         self._room_seq: dict[str, int] = {}                  # room id -> sequence of its latest change
@@ -326,11 +329,15 @@ class CollabService:
             self._seq += 1
             self._log.append(ev)
             self._apply(ev)
-            self._touch_rooms(payload, ev["sequence"])
+            self._touch_rooms(payload, ev["sequence"], event_type)
             self._cv.notify_all()
             return ev
 
-    def _touch_rooms(self, p: dict, seq: int) -> None:
+    _LINK_EVENTS = frozenset({"workspace_linked", "workspace_unlinked", "workspace_link_updated",
+                              "workspace_primary_set", "workspace_primary_cleared",
+                              "mission_linked", "mission_unlinked"})
+
+    def _touch_rooms(self, p: dict, seq: int, event_type: str = "") -> None:
         """Remember which rooms an event changed, so a room's long-poll wakes only for its own news."""
         rooms = set()
         if isinstance(p.get("room_id"), str):
@@ -338,8 +345,12 @@ class CollabService:
         rooms.update(r for r in (p.get("room_ids") or ()) if isinstance(r, str))
         if isinstance(p.get("agent_id"), str):
             rooms |= self._rooms_by_agent.get(p["agent_id"], set())
+        if event_type == "workspace_terminal_authorized":
+            return                                  # an audit record only: wakes nobody
+        # Link changes are shown to people only (never guests or agents), so they wake only people's polls.
+        target = self._room_link_seq if event_type in self._LINK_EVENTS else self._room_seq
         for r in rooms:
-            self._room_seq[r] = seq
+            target[r] = seq
 
     @property
     def seq(self) -> int:
@@ -422,6 +433,9 @@ class CollabService:
             for aid in [a for a in room["grants"] if self._agents.get(a, {}).get("owner") == p["subject_user_id"]]:
                 room["grants"].pop(aid, None)
                 self._rooms_by_agent[aid].discard(p["room_id"])
+            gone = p["subject_user_id"]                # re-adding them later must not restore a terminal right
+            self._prune_terminal(p["room_id"], lambda k: k == f"user:{gone}" or (
+                k.startswith("agent:") and self._agents.get(k[6:], {}).get("owner") == gone))
             for rid in self._requests_by_room.get(p["room_id"], ()):   # their pending requests die with their membership
                 rq = self._requests[rid]
                 if rq["requester"] == p["subject_user_id"]:
@@ -466,11 +480,13 @@ class CollabService:
             self._by_cred[p["secret_digest"]] = p["agent_id"]
         elif t == "agent_revoked":
             self._agents[p["agent_id"]]["status"] = "revoked"
+            self._prune_terminal(None, lambda k: k == "agent:" + p["agent_id"])
             for rid in self._requests_by_agent.get(p["agent_id"], ()):
                 self._requests[rid]["open"] = False
         elif t in ("agent_grant_revoked", "agent_grant_expired"):
             self._rooms[p["room_id"]]["grants"].pop(p["agent_id"], None)
             self._rooms_by_agent[p["agent_id"]].discard(p["room_id"])
+            self._prune_terminal(p["room_id"], lambda k: k == "agent:" + p["agent_id"])
         elif t == "agent_access_requested":
             for rid in self._requests_by_room.get(p["room_id"], ()):       # one open request per agent per room
                 rq = self._requests[rid]
@@ -508,8 +524,10 @@ class CollabService:
                 "link_id": p["link_id"], "room_id": p["room_id"], "workspace_id": p["workspace_id"],
                 "host": p["host"], "linked_by": p["actor_user_id"], "created_at": p["created_at"],
                 "is_primary": bool(p["is_primary"]), "grants": list(p["grants"]),
-                "terminal_principals": list(p.get("terminal_principals") or [])}
+                "terminal_principals": list(p.get("terminal_principals") or []),
+                "host_proof": p.get("host_proof")}
             self._links_by_room[p["room_id"]].append(p["link_id"])
+            self._demote(p.get("demoted_link_id"))
             if p["is_primary"]:
                 self._primary[(p["host"], p["workspace_id"])] = p["link_id"]
         elif t == "workspace_unlinked":
@@ -523,10 +541,14 @@ class CollabService:
             lk = self._links.get(p["link_id"])
             if lk:
                 lk.update(grants=list(p["grants"]), terminal_principals=list(p.get("terminal_principals") or []))
+                if "host_proof" in p:
+                    lk["host_proof"] = p["host_proof"]
         elif t == "workspace_primary_set":
             lk = self._links.get(p["link_id"])
             if lk:
+                self._demote(p.get("demoted_link_id"))
                 lk["is_primary"] = True
+                lk["host_proof"] = p.get("host_proof") or lk.get("host_proof")
                 self._primary[(lk["host"], lk["workspace_id"])] = p["link_id"]
         elif t == "workspace_primary_cleared":
             lk = self._links.get(p["link_id"])
@@ -534,6 +556,14 @@ class CollabService:
                 lk["is_primary"] = False
                 if self._primary.get((lk["host"], lk["workspace_id"])) == p["link_id"]:
                     self._primary.pop((lk["host"], lk["workspace_id"]), None)
+        elif t in ("host_registered", "host_unregistered"):
+            if t == "host_registered":
+                self._hosts[p["host"]] = {"owners": list(p["owners"]), "gen": seq}
+            else:
+                self._hosts.pop(p["host"], None)
+            for lk in self._links.values():          # a primary whose host proof no longer holds is gone
+                if lk["host"] == p["host"] and lk["is_primary"] and not self._proof_ok(lk):
+                    self._demote(lk["link_id"])
         elif t == "mission_linked":
             self._missions[(p["room_id"], p["mission_id"])] = {
                 "mission_id": p["mission_id"], "room_id": p["room_id"], "members": list(p["members"]),
@@ -573,6 +603,24 @@ class CollabService:
         if t in _FEED_TYPES:
             for rid in {p.get("room_id"), *p.get("room_ids", ())} - {None}:
                 self._by_room[rid].append(ev)
+
+    def _demote(self, link_id: str | None) -> None:
+        lk = self._links.get(link_id) if link_id else None
+        if lk:
+            lk["is_primary"] = False
+            if self._primary.get((lk["host"], lk["workspace_id"])) == link_id:
+                self._primary.pop((lk["host"], lk["workspace_id"]), None)
+
+    def _prune_terminal(self, room_id: str | None, gone) -> None:
+        """Drop named terminal principals that no longer qualify; no principals left = no terminal grant."""
+        for lk in self._links.values():
+            if room_id is not None and lk["room_id"] != room_id:
+                continue
+            keep = [k for k in lk["terminal_principals"] if not gone(k)]
+            if len(keep) != len(lk["terminal_principals"]):
+                lk["terminal_principals"] = keep
+                if not keep:
+                    lk["grants"] = [g for g in lk["grants"] if g != "terminal"]
 
     # ------------------------------------------------------ authentication
     def authenticate(self, authorization: str, device: str | None) -> Principal:
@@ -1743,6 +1791,9 @@ class CollabService:
                     if not self.still_valid(pr):
                         raise CollabError(401, "unauthorized")
                     cur = self._room_seq.get(room_id, 0)
+                    m_now = None if pr.is_agent else self._member(self._rooms[room_id], pr.id)
+                    if m_now and m_now["role"] != "guest":
+                        cur = max(cur, self._room_link_seq.get(room_id, 0))
                     left = deadline - time.monotonic()
                     if since < 0 or cur != since or left <= 0:
                         break
@@ -1903,15 +1954,74 @@ class CollabService:
     # -- room <-> workspace and mission links
     # Room access NEVER implies workspace access. A link only says which metadata scopes room members
     # may see; the terminal needs its own explicit grant on the link, and the effective permission is
-    # the intersection of user/agent role, room grant, link grant and the named terminal principals.
+    # the intersection of user/agent role, room grant, link grant, the named terminal principals and a
+    # proof that the linker controls the host. HOST REGISTRY: the operator maps host -> owning users
+    # (register_host). A link may carry `terminal` and/or `is_primary` only with such a proof (the
+    # linker is a registered owner of the host, or is the operator and the host is registered); with no
+    # registry entry both are refused. The proof (registry generation) is recorded in the link event
+    # and rechecked on every use: unregistering or re-registering the host, or removing the user from
+    # its owners, ends it. Metadata-only links need no proof and are reported `host_verified: false`.
+    def register_host(self, pr: Principal, host: str, body: dict) -> dict:
+        """Operator only. owners = users who control this host's workspaces; an empty list unregisters it."""
+        self._require_user(pr)
+        if not pr.admin:
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "forbidden")
+        host = self._require_host(host)
+        owners = body.get("owners")
+        if (not isinstance(owners, list) or len(owners) > 20 or not all(isinstance(u, str) for u in owners)):
+            raise CollabError(400, "owners must be a list of at most 20 user ids")
+        owners = sorted(set(owners))
+        with self._lock:
+            self._throttle("hostreg:" + pr.id, 60, 3600.0, "host registry")
+            if not owners:
+                if host not in self._hosts:
+                    raise CollabError(404, "not found")
+                self._commit("host_unregistered", self._actor(
+                    pr, host=host, action="host.unregister", outcome="allowed", project_ids=[], resource_id=host))
+                return {"host": host, "owners": []}
+            if not all(self._ok(u) for u in owners):
+                raise CollabError(404, "unknown user")
+            if len(self._hosts) >= 200 and host not in self._hosts:
+                raise CollabError(429, "too many hosts")
+            self._commit("host_registered", self._actor(
+                pr, host=host, owners=owners, action="host.register", outcome="allowed",
+                project_ids=[], resource_id=host))
+        return {"host": host, "owners": owners}
+
+    def list_host_registry(self, pr: Principal) -> dict:
+        self._require_user(pr)
+        if not pr.admin:
+            raise CollabError(403, "forbidden")
+        with self._lock:
+            return {"hosts": [{"host": h, "owners": list(e["owners"])} for h, e in sorted(self._hosts.items())]}
+
+    def _proof_for(self, pr: Principal, host: str) -> dict | None:
+        entry = self._hosts.get(host)
+        if entry is None or pr.is_agent:
+            return None
+        if pr.admin:
+            return {"user": pr.id, "via": "operator", "gen": entry["gen"]}
+        if pr.id in entry["owners"]:
+            return {"user": pr.id, "via": "owner", "gen": entry["gen"]}
+        return None
+
+    def _proof_ok(self, lk: dict) -> bool:
+        proof, entry = lk.get("host_proof"), self._hosts.get(lk["host"])
+        return bool(proof and entry and proof["gen"] == entry["gen"]
+                    and (proof["via"] == "operator" or proof["user"] in entry["owners"]))
+
     def _is_link_manager(self, pr: Principal, room: dict) -> bool:
         m = self._member(room, pr.id) if not pr.is_agent else None
         return bool(m and m["role"] == "owner")
 
     def _terminal_ok(self, pr: Principal, room: dict, link: dict) -> bool:
         """Pure check (no audit): may this principal open the linked workspace's terminal?"""
-        if "terminal" not in link["grants"]:
+        if "terminal" not in link["grants"] or not self._proof_ok(link):
             return False
+        prover = self._member(room, link["host_proof"]["user"])
+        if not prover or prover["role"] != "owner" or not self._ok(link["host_proof"]["user"]):
+            return False                      # whoever vouched for the host must still own the room
         eff = self._effective(pr, room)
         if eff is None or "read" not in eff[0]:
             return False
@@ -1921,16 +2031,18 @@ class CollabService:
         if pr.is_agent:
             agent = self._agents.get(pr.id)
             m = self._member(room, agent["owner"]) if agent else None
-            # the agent needs the room's execute right AND its owner must be named too and be allowed a terminal
             return bool(m and m["role"] in TERMINAL_ROLES and "execute" in eff[0]
                         and f"user:{agent['owner']}" in named)
         m = self._member(room, pr.id)
         return bool(m and m["role"] in TERMINAL_ROLES)
 
+    TERMINAL_AUDIT_EVERY = 600.0
+
     def authorize_workspace(self, pr: Principal, room_id: str, link_id: str, action: str) -> dict:
         """The one place that answers 'may this principal do `action` on the workspace linked to this room?'
         action is status, tabs, panes or terminal. Fails closed: anything unknown is a 404, anything not
-        explicitly granted a 403, and both are audited."""
+        explicitly granted a 403, and both are audited. Allowed terminal use is audited too, at most once
+        per principal and link per TERMINAL_AUDIT_EVERY seconds, and at once after any denial or change."""
         with self._lock:
             room, _ = self._authorize(pr, room_id, "read", "workspace.access")
             link = self._links.get(link_id)
@@ -1938,17 +2050,33 @@ class CollabService:
                 raise CollabError(404, "not found")
             if action not in LINK_GRANTS:
                 raise CollabError(400, "unknown workspace action")
-            if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
-                ok = False
-            elif action == "terminal":
+            gate = (pr.key, link_id)
+            if action == "terminal":
                 ok = self._terminal_ok(pr, room, link)
+            elif pr.is_agent or (self._member(room, pr.id) or {}).get("role") == "guest":
+                ok = False                                  # same audience as the links in room_state: people, not guests
             else:
-                ok = action in link["grants"]       # _authorize already proved membership / the agent's grant
+                ok = action in link["grants"]
             if not ok:
+                self._term_gate.pop(gate, None)
                 self._audit_denied(pr, f"workspace.{action}", "no_workspace_grant", room_id=room_id,
                                    resource_id=link_id, project_ids=[room["project_id"]])
                 self.stats["policy_denied"] += 1
                 raise CollabError(403, "forbidden")
+            if action == "terminal":
+                eff = self._effective(pr, room)
+                fp = (tuple(sorted(eff[0])), tuple(link["grants"]), tuple(link["terminal_principals"]),
+                      link["host_proof"]["gen"])
+                last = self._term_gate.get(gate)
+                now = self._now()
+                if last is None or last[1] != fp or now - last[0] >= self.TERMINAL_AUDIT_EVERY:
+                    self._commit("workspace_terminal_authorized", self._actor(
+                        pr, project_id=room["project_id"], room_id=room_id, link_id=link_id,
+                        action="workspace.terminal", outcome="allowed", project_ids=[room["project_id"]],
+                        resource_id=link_id))                  # a log failure raises 503: no audit, no terminal
+                    if len(self._term_gate) > 10_000:
+                        self._term_gate.clear()
+                    self._term_gate[gate] = (now, fp)
             return {"allowed": True, "link_id": link_id, "workspace_id": link["workspace_id"],
                     "host": link["host"], "action": action}
 
@@ -1956,7 +2084,7 @@ class CollabService:
         out = {"link_id": lk["link_id"], "room_id": lk["room_id"], "workspace_id": lk["workspace_id"],
                "host": lk["host"], "is_primary": lk["is_primary"], "grants": list(lk["grants"]),
                "linked_by": lk["linked_by"], "created_at": lk["created_at"],
-               "can_terminal": self._terminal_ok(pr, room, lk)}
+               "host_verified": self._proof_ok(lk), "can_terminal": self._terminal_ok(pr, room, lk)}
         if manager:
             out["terminal_principals"] = list(lk["terminal_principals"])
         return out
@@ -1983,6 +2111,12 @@ class CollabService:
     def _no_guest(self, pr: Principal, room: dict) -> None:
         if (self._member(room, pr.id) or {}).get("role") == "guest":
             raise CollabError(403, "forbidden")
+
+    def _link_budget(self, pr: Principal, room_id: str) -> None:
+        """Every mutating link/mission call spends from a per-person and a per-room budget, so one owner
+        cannot fill the shared log."""
+        self._throttle("wslink:" + pr.id, 120, 600.0, "workspace link")
+        self._throttle("wsroom:" + room_id, 300, 3600.0, "workspace link changes for this room")
 
     def list_workspace_links(self, pr: Principal, room_id: str) -> dict:
         self._require_user(pr)
@@ -2017,19 +2151,22 @@ class CollabService:
                 raise CollabError(400, "invalid terminal_principals")
         return grants, tp
 
-    def _make_primary(self, pr: Principal, room: dict, lk: dict, demote_other: bool) -> None:
-        """Make `lk` its workspace's primary. Another primary is a 409 unless `demote_other`, which only the
-        operator or the other room's owner may do. The 409 never names the other room."""
-        cur_id = self._primary.get((lk["host"], lk["workspace_id"]))
-        if cur_id is None or cur_id == lk["link_id"]:
-            return
-        other = self._links[cur_id]
-        orm = self._rooms[other["room_id"]]
+    PRIMARY_UNAVAILABLE = "primary is not available for this workspace"
+
+    def _claim_primary(self, pr: Principal, host: str, ws: str, own_link_id: str, demote_other: bool):
+        """Decide (no commit) whether `pr` may make (host, ws) primary for this link. Returns the proof and
+        the link to demote in the SAME event, or raises one generic 409 that is identical whether the slot is
+        taken, the host unregistered or the caller not its owner."""
+        proof = self._proof_for(pr, host)
+        if proof is None:
+            raise CollabError(409, self.PRIMARY_UNAVAILABLE)
+        cur_id = self._primary.get((host, ws))
+        if cur_id is None or cur_id == own_link_id:
+            return proof, None
+        orm = self._rooms[self._links[cur_id]["room_id"]]
         if not demote_other or not (pr.admin or self._is_link_manager(pr, orm)):
-            raise CollabError(409, "this workspace already has a primary room")
-        self._commit("workspace_primary_cleared", self._actor(
-            pr, project_id=orm["project_id"], room_id=orm["id"], link_id=cur_id, action="workspace.demote",
-            outcome="allowed", reason="demoted_by_new_primary", project_ids=[orm["project_id"]], resource_id=cur_id))
+            raise CollabError(409, self.PRIMARY_UNAVAILABLE)
+        return proof, (cur_id, orm)
 
     def link_workspace(self, pr: Principal, room_id: str, body: dict) -> dict:
         self._require_user(pr)
@@ -2049,18 +2186,27 @@ class CollabService:
                 raise CollabError(409, "this workspace is already linked to the room")
             if len(ids_here) >= MAX_LINKS_PER_ROOM:
                 raise CollabError(429, "workspace link limit reached for this room")
-            self._throttle("wslink:" + pr.id, 120, 600.0, "workspace link")
+            self._link_budget(pr, room_id)
+            proof, demote = self._proof_for(pr, host), None
+            if "terminal" in grants and proof is None:
+                raise CollabError(403, "a terminal grant needs a host registered to you")
             if primary:
-                cur = self._primary.get((host, ws))
-                if cur is not None:
-                    self._make_primary(pr, room, {"link_id": "", "host": host, "workspace_id": ws},
-                                       body.get("demote_other", False))
+                proof, demote = self._claim_primary(pr, host, ws, "", body.get("demote_other", False))
             lid = ids.new_id("grant")
+            extra = self._demote_fields(demote)
             self._commit("workspace_linked", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, link_id=lid, workspace_id=ws, host=host,
-                is_primary=primary, grants=grants, terminal_principals=tp, action="workspace.link",
-                outcome="allowed", project_ids=[room["project_id"]], resource_id=lid))
+                is_primary=primary, grants=grants, terminal_principals=tp, host_proof=proof,
+                action="workspace.link", outcome="allowed", resource_id=lid,
+                **extra, project_ids=[room["project_id"], *([extra["demoted_project_id"]] if extra else [])]))
             return self._link_view(pr, room, self._links[lid], True)
+
+    @staticmethod
+    def _demote_fields(demote) -> dict:
+        if not demote:
+            return {}
+        cur_id, orm = demote
+        return {"demoted_link_id": cur_id, "room_ids": [orm["id"]], "demoted_project_id": orm["project_id"]}
 
     def _own_link(self, pr: Principal, room_id: str, link_id: str, audit_action: str) -> tuple[dict, dict]:
         room, _ = self._authorize(pr, room_id, "invite", audit_action)
@@ -2073,6 +2219,7 @@ class CollabService:
         self._require_user(pr)
         with self._lock:
             room, lk = self._own_link(pr, room_id, link_id, "workspace.unlink")
+            self._link_budget(pr, room_id)
             self._commit("workspace_unlinked", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, link_id=link_id, action="workspace.unlink",
                 outcome="allowed", project_ids=[room["project_id"]], resource_id=link_id))
@@ -2080,18 +2227,21 @@ class CollabService:
 
     def set_workspace_primary(self, pr: Principal, room_id: str, link_id: str, body: dict) -> dict:
         self._require_user(pr)
-        primary, demote = body.get("primary", True), body.get("demote_other", False)
-        if not isinstance(primary, bool) or not isinstance(demote, bool):
+        primary, demote_other = body.get("primary", True), body.get("demote_other", False)
+        if not isinstance(primary, bool) or not isinstance(demote_other, bool):
             raise CollabError(400, "primary and demote_other must be booleans")
         with self._lock:
             room, lk = self._own_link(pr, room_id, link_id, "workspace.primary")
             if primary and not lk["is_primary"]:
-                self._make_primary(pr, room, lk, demote)
+                self._link_budget(pr, room_id)
+                proof, demote = self._claim_primary(pr, lk["host"], lk["workspace_id"], link_id, demote_other)
+                extra = self._demote_fields(demote)
                 self._commit("workspace_primary_set", self._actor(
-                    pr, project_id=room["project_id"], room_id=room_id, link_id=link_id,
-                    action="workspace.primary", outcome="allowed", project_ids=[room["project_id"]],
-                    resource_id=link_id))
+                    pr, project_id=room["project_id"], room_id=room_id, link_id=link_id, host_proof=proof,
+                    action="workspace.primary", outcome="allowed", resource_id=link_id,
+                    **extra, project_ids=[room["project_id"], *([extra["demoted_project_id"]] if extra else [])]))
             elif not primary and lk["is_primary"]:
+                self._link_budget(pr, room_id)
                 self._commit("workspace_primary_cleared", self._actor(
                     pr, project_id=room["project_id"], room_id=room_id, link_id=link_id,
                     action="workspace.demote", outcome="allowed", reason="demoted_by_owner",
@@ -2103,10 +2253,17 @@ class CollabService:
         with self._lock:
             room, lk = self._own_link(pr, room_id, link_id, "workspace.grants")
             grants, tp = self._grants_body(pr, room, body)
+            self._link_budget(pr, room_id)
+            extra = {}
+            if "terminal" in grants:
+                proof = self._proof_for(pr, lk["host"])
+                if proof is None:
+                    raise CollabError(403, "a terminal grant needs a host registered to you")
+                extra["host_proof"] = proof
             self._commit("workspace_link_updated", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, link_id=link_id, grants=grants,
                 terminal_principals=tp, old_grants=list(lk["grants"]), action="workspace.grants",
-                outcome="allowed", project_ids=[room["project_id"]], resource_id=link_id))
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=link_id, **extra))
             return self._link_view(pr, room, self._links[link_id], True)
 
     def list_room_missions(self, pr: Principal, room_id: str) -> dict:
@@ -2135,7 +2292,7 @@ class CollabService:
                 raise CollabError(409, "this mission is already linked to the room")
             if sum(1 for r, _ in self._missions if r == room_id) >= MAX_MISSIONS_PER_ROOM:
                 raise CollabError(429, "mission link limit reached for this room")
-            self._throttle("mslink:" + pr.id, 120, 600.0, "mission link")
+            self._link_budget(pr, room_id)
             self._commit("mission_linked", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, mission_id=mid, members=sorted(set(members)),
                 action="mission.link", outcome="allowed", project_ids=[room["project_id"]], resource_id=mid))
@@ -2147,6 +2304,7 @@ class CollabService:
             room, _ = self._authorize(pr, room_id, "invite", "mission.unlink")
             if (room_id, mission_id) not in self._missions:
                 raise CollabError(404, "not found")
+            self._link_budget(pr, room_id)
             self._commit("mission_unlinked", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, mission_id=mission_id,
                 action="mission.unlink", outcome="allowed", project_ids=[room["project_id"]],
@@ -2598,6 +2756,8 @@ class CollabService:
                         raise CollabError(404, "not found")
                     if parts == ["fleet", "hosts"]:
                         return 200, self.list_fleet_hosts(pr)
+                    if parts == ["fleet", "host-registry"]:
+                        return 200, self.list_host_registry(pr)
                     if parts == ["fleet", "agent-links"]:
                         return 200, self.agent_links(pr)
                     if parts == ["fleet", "spawns"]:
@@ -2654,6 +2814,8 @@ class CollabService:
                         return 200, self.report_fleet_hosts(pr, body)
                     if n == 3 and parts[1] == "hosts":
                         return 200, self.set_fleet_host(pr, parts[2], body)
+                    if n == 3 and parts[1] == "host-registry":
+                        return 200, self.register_host(pr, parts[2], body)
                     if parts == ["fleet", "spawns"]:
                         return 201, self.request_spawn(pr, body)
                     if parts == ["fleet", "task-activity"]:
