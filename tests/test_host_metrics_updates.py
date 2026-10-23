@@ -6,7 +6,11 @@ from pathlib import Path
 
 from herdr_engineering import host_metrics
 from herdr_engineering.host_metrics import (
-    parse_apt_simulate, parse_brew_outdated, read_updates, read_versions)
+    parse_apt_simulate,
+    parse_brew_outdated,
+    read_updates,
+    read_versions,
+)
 
 FX = Path(__file__).parent / "fixtures" / "host_metrics"
 

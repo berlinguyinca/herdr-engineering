@@ -65,7 +65,7 @@ def test_macos_branch_uses_vm_stat_and_sysctl(monkeypatch):
             if argv[2] == "vm.swapusage":
                 return _fx("swapusage.txt")
             if argv[2] == "kern.boottime":
-                return "{ sec = %d, usec = 0 } Mon" % boot
+                return f"{{ sec = {boot}, usec = 0 }} Mon"
         raise OSError("unavailable")
     monkeypatch.setattr(s, "_run", run)
     out = s.sample()
