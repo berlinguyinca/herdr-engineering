@@ -1190,3 +1190,43 @@ test('hosts page lists the fleet version matrix and flags the host that differs'
     assert.ok(!/superpowers/.test(await bodyText(page)), 'in-sync rows hide under the drift filter');
   });
 });
+
+test('overview attention and saved layout stay keyboard usable through refresh at every workspace width',async()=>{
+ await withApp(async({page,base})=>{
+  let blocked=true;
+  await page.route('**/api/v1/mission-activity',r=>r.fulfill({json:{activities:[liveProjection({activity:{health:blocked?'blocked':'active'}})]}}));
+  await page.addInitScript(()=>{if(!localStorage.getItem('herdr.overview.layout.v1'))localStorage.setItem('herdr.overview.layout.v1',JSON.stringify({order:['ci','attention','ci','health','unknown'],hidden:['attention','health','ci']}));});
+  await page.clock.install();await page.goto(`${base}/#/overview`);
+  const attention=page.locator('[data-overview=attention]');
+  await attention.locator('a[href*="missions/"]').waitFor();
+  assert.equal(await attention.isVisible(),true);
+  assert.equal(await page.locator('[data-overview=ci]').isVisible(),false);
+  await page.locator('.ov-customize summary').focus();await page.keyboard.press('Enter');
+  const showCi=page.getByRole('button',{name:'Show CI builds',exact:true});
+  await showCi.focus();await page.keyboard.press('Enter');
+  const hideCi=page.getByRole('button',{name:'Hide CI builds',exact:true});
+  assert.equal(await hideCi.evaluate(el=>el===document.activeElement),true);
+  await page.getByRole('button',{name:'Move CI builds down',exact:true}).focus();await page.keyboard.press('Enter');
+  assert.equal(await page.getByRole('button',{name:'Move CI builds down',exact:true}).evaluate(el=>el===document.activeElement),true);
+  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'missions');
+  // Reload with the saved preferences rather than reconstructing the layout.
+  await page.goto(`${base}/#/activity`);await page.getByRole('heading',{name:'Activity',exact:true}).waitFor();await page.goto(`${base}/#/overview`);await page.getByRole('heading',{name:'Overview',exact:true}).waitFor();
+  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'missions');
+  const target=attention.locator('a[href*="missions/"]');await target.focus();
+  await page.clock.runFor(5500);
+  assert.equal(await target.evaluate(el=>el===document.activeElement),true,await page.evaluate(()=>document.activeElement.outerHTML));
+  blocked=false;await page.clock.runFor(5500);
+  await page.waitForFunction(()=>!document.querySelector('[data-overview=attention] a[href*="missions/"]'));
+  assert.equal(await page.evaluate(()=>document.querySelector('[data-overview=attention] h2')===document.activeElement),true,await page.locator('#view').innerText());
+  await page.locator('.ov-customize summary').click();
+  await page.getByRole('button',{name:'Reset layout',exact:true}).click();
+  assert.deepEqual(await page.locator('.ov-layout > section').evaluateAll(cards=>cards.map(card=>card.dataset.overview)),['missions','fleet','sessions','ci','reviews','services','hosts','activity']);
+  assert.equal(await page.locator('.ov-layout > section[hidden]').count(),0);
+  for(const width of [3840,2560,1920,768,390]) {
+   await page.setViewportSize({width,height:1080});
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`overflow at ${width}`);
+   const layout=await page.evaluate(()=>({attention:document.querySelector('[data-overview=attention]').getBoundingClientRect().top,cards:document.querySelector('.ov-layout').getBoundingClientRect().top,footer:document.querySelector('.ov-health').getBoundingClientRect().top,bottom:document.querySelector('.ov-layout').getBoundingClientRect().bottom}));
+   assert.ok(layout.attention<layout.cards);assert.ok(layout.footer>=layout.bottom);
+  }
+ },{BURST:'0'});
+});
