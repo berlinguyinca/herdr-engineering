@@ -1,0 +1,169 @@
+---
+# Tailscale: install, run tailscaled, and join the tailnet ONLY when the node is
+# not already logged in. A host that is already "Running" is left alone (no
+# re-tag, no re-up). The auth key never appears in argv, logs or task results:
+# it is written to a short-lived 0600 file consumed via --auth-key=file:<path>
+# (Tailscale >= 1.62) and removed afterwards; every task that touches it is
+# no_log. macOS is best-effort: failures there are reported, never fatal.
+
+- name: "Install Tailscale (Debian/Ubuntu: official apt repository)"
+  when:
+    - tailscale_install | bool
+    - ansible_facts['system'] == 'Linux'
+    - ansible_facts['os_family'] == 'Debian'
+  block:
+    - name: "Ensure apt prerequisites for the Tailscale repository"
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+
+    - name: "Install the Tailscale apt signing key"
+      ansible.builtin.get_url:
+        url: "{{ tailscale_apt_base_url }}/{{ ansible_facts['distribution'] | lower }}/{{ ansible_facts['distribution_release'] }}.noarmor.gpg"
+        dest: "{{ tailscale_apt_keyring }}"
+        mode: "0644"
+
+    - name: "Add the Tailscale apt repository"
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [signed-by={{ tailscale_apt_keyring }}]
+          {{ tailscale_apt_base_url }}/{{ ansible_facts['distribution'] | lower }}
+          {{ ansible_facts['distribution_release'] }} main
+        filename: tailscale
+        state: present
+
+    - name: "Install the tailscale package"
+      ansible.builtin.apt:
+        name: tailscale
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+- name: "Run tailscaled at boot (Linux systemd)"
+  ansible.builtin.systemd:
+    name: tailscaled
+    enabled: true
+    state: started
+  when:
+    - ansible_facts['system'] == 'Linux'
+    - tailscale_install | bool
+
+- name: "Install Tailscale on macOS (Homebrew formula, best-effort)"
+  community.general.homebrew:
+    name: tailscale
+    state: present
+  when:
+    - tailscale_install | bool
+    - ansible_facts['system'] == 'Darwin'
+  ignore_errors: true
+  register: tailscale_brew
+
+- name: "Report macOS install result"
+  ansible.builtin.debug:
+    msg: >-
+      Tailscale install via Homebrew failed or Homebrew is missing; macOS is
+      best-effort. Install Tailscale manually (app or brew) and re-run.
+  when:
+    - ansible_facts['system'] == 'Darwin'
+    - tailscale_brew is failed
+
+- name: "Probe Tailscale state (read-only)"
+  ansible.builtin.command: tailscale status --json
+  register: tailscale_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Derive Tailscale backend state"
+  ansible.builtin.set_fact:
+    tailscale_backend_state: >-
+      {{ (tailscale_probe.stdout | from_json).get('BackendState', 'Unknown')
+         if (tailscale_probe.rc | default(127)) == 0
+            and (tailscale_probe.stdout | default('')) is match('\s*\{')
+         else 'NotRunning' }}
+
+- name: "Report Tailscale state"
+  ansible.builtin.debug:
+    msg: "tailscale: {{ 'up' if tailscale_backend_state == 'Running' else 'down/not-logged-in (' ~ tailscale_backend_state ~ ')' }}"
+
+- name: "Note that the node would join the tailnet (check mode)"
+  ansible.builtin.debug:
+    msg: "check mode: tailscale is not Running; a real run would join the tailnet with tags {{ tailscale_tags | join(',') }}."
+  when:
+    - tailscale_backend_state != 'Running'
+    - ansible_check_mode
+
+- name: "Require an auth key to join the tailnet"
+  ansible.builtin.fail:
+    msg: >-
+      This node is not on the tailnet and no tailscale_auth_key was provided.
+      Supply it from Ansible Vault (inventory/group_vars/herdr_fleet/vault.yml)
+      or with -e at run time. The key is never printed.
+  when:
+    - tailscale_backend_state != 'Running'
+    - not ansible_check_mode
+    - ansible_facts['system'] == 'Linux'
+    - (tailscale_auth_key | default('') | length) == 0
+
+- name: "Skip the join on macOS without an auth key (non-fatal)"
+  ansible.builtin.debug:
+    msg: >-
+      This macOS node is not on the tailnet and no tailscale_auth_key was
+      provided; skipping the join (best-effort on macOS). The key is never printed.
+  when:
+    - tailscale_backend_state != 'Running'
+    - not ansible_check_mode
+    - ansible_facts['system'] == 'Darwin'
+    - (tailscale_auth_key | default('') | length) == 0
+
+- name: "Join the tailnet (only when not logged in)"
+  when:
+    - tailscale_backend_state != 'Running'
+    - not ansible_check_mode
+    - (tailscale_auth_key | default('') | length) > 0
+  block:
+    - name: "Create a short-lived private file for the auth key"
+      ansible.builtin.tempfile:
+        state: file
+        prefix: tsauth.
+      register: tailscale_key_file
+      no_log: true
+
+    - name: "Write the auth key (0600)"
+      ansible.builtin.copy:
+        content: "{{ tailscale_auth_key }}"
+        dest: "{{ tailscale_key_file.path }}"
+        mode: "0600"
+      no_log: true
+
+    - name: "Run tailscale up"
+      ansible.builtin.command:
+        argv:
+          - tailscale
+          - up
+          - "--auth-key=file:{{ tailscale_key_file.path }}"
+          - "--hostname={{ tailscale_hostname }}"
+          - "--advertise-tags={{ tailscale_tags | join(',') }}"
+      no_log: true
+      changed_when: true
+      register: tailscale_up
+      failed_when: tailscale_up.rc != 0 and ansible_facts['system'] == 'Linux'
+
+    - name: "Report macOS join failure (non-fatal)"
+      ansible.builtin.debug:
+        msg: >-
+          tailscale up did not succeed on macOS (daemon/app may not be running);
+          best-effort only. Start Tailscale and re-run, or join manually.
+      when:
+        - ansible_facts['system'] == 'Darwin'
+        - tailscale_up.rc != 0
+  always:
+    - name: "Remove the auth key file"
+      ansible.builtin.file:
+        path: "{{ tailscale_key_file.path }}"
+        state: absent
+      when: tailscale_key_file.path is defined
+      no_log: true

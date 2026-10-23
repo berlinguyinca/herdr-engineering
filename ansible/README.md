@@ -37,12 +37,48 @@ ansible_python_interpreter: /usr/bin/python3
 - Herdr at the pinned compatible version (`0.9.1`);
 - Pi + provider config pointing all lab LLM work at `https://llm.metabolomics.us`;
 - `berlinguyinca/pi-engineering`, `berlinguyinca/autospec`;
-- Tailscale connectivity check (informational, non-fatal; no embedded auth keys);
+- Tailscale (`roles/tailscale`): install, `tailscaled`, and join the tailnet only when the node is not logged in (auth key from Ansible Vault);
 - `vim`, `mc`, `btop`;
 - HerdR Engineering state + artifact directories.
 
 Existing Herdr/Pi/Tailscale config is merged/backed up, never overwritten
 wholesale. No secrets live in the inventory or any committed file.
+
+## Tailscale role
+
+`roles/tailscale` runs in `site.yml` before the platform role. Linux
+(Debian/Ubuntu) installs from the official `pkgs.tailscale.com` apt repository
+and enables `tailscaled`; macOS uses the Homebrew `tailscale` formula.
+
+- **Already-joined hosts are left alone.** The role reads
+  `tailscale status --json`; only when `BackendState != "Running"` does it run
+  `tailscale up --hostname=<inventory_hostname> --advertise-tags=tag:fleet`.
+  No re-tag, no re-up, so a second run changes nothing. `--check` never joins.
+- **Auth key from Vault, never Git.** Variable `tailscale_auth_key`, required
+  only for hosts not yet on the tailnet. On the main host create (not committed):
+
+  ```bash
+  cd ansible
+  mkdir -p inventory/group_vars/herdr_fleet
+  printf 'tailscale_auth_key: tskey-auth-XXXX\n' > inventory/group_vars/herdr_fleet/vault.yml
+  ansible-vault encrypt inventory/group_vars/herdr_fleet/vault.yml
+  ansible-playbook -i inventory/hosts.yml playbooks/site.yml --ask-vault-pass
+  # or: --vault-password-file ~/.herdr-vault-pass  (mode 0600)
+  ```
+
+  or pass `-e tailscale_auth_key=...` at run time. The key is written to a
+  short-lived 0600 file consumed via `--auth-key=file:<path>` (needs
+  Tailscale >= 1.62, so it never shows in `ps`), removed afterwards, and every
+  task touching it is `no_log`. A node that must join without a key fails on
+  Linux with a fixed message that never prints the key.
+- **ACL prerequisite.** `tag:fleet` must exist under `tagOwners` in the
+  Tailscale access rules. Create the auth key in the admin console as
+  reusable, pre-authorized, with tag `tag:fleet`; a 90-day expiry is
+  recommended (rotate the Vault file on renewal). Nodes already joined keep
+  working after the key expires.
+- **macOS is best-effort.** Install and join failures (no Homebrew, daemon/app
+  not running, no key) are reported but never fail the play. Use
+  `-e herdr_engineering_become=false` for the user-scoped brew path.
 
 ## Usage
 
