@@ -84,12 +84,14 @@ function drifted(versions, pins) {
   return out;
 }
 
+const BADGE_CSS = `.hv-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.75rem;border:1px solid var(--border-subtle);background:var(--surface-2)}
+.hv-badge--warn{color:var(--status-attention,#9a6700)}.hv-badge--crit{color:var(--status-failed,#b42318)}`;
+const NO_TELEMETRY = '<span class="hv-badge hv-badge--crit">No telemetry reported</span>';
+
 const STYLE = `<style>
 .hv-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0 4px}.hv-head h1{margin:0;overflow-wrap:anywhere}
 .hv-meta{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--text-secondary);font-size:.8125rem;margin-bottom:12px}.hv-meta code{overflow-wrap:anywhere}
-.hv-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.75rem;border:1px solid var(--border-subtle);background:var(--surface-2)}
-.hv-badge--warn{color:var(--status-attention,#9a6700)}.hv-badge--crit{color:var(--status-failed,#b42318)}
-.hv-problems{list-style:none;margin:0 0 16px;padding:0;display:grid;gap:6px}.hv-problem{display:flex;gap:10px;align-items:baseline;padding:8px 12px;border-radius:var(--radius-sm);border:1px solid var(--border-subtle);border-left:4px solid var(--status-attention,#9a6700);background:var(--surface);overflow-wrap:anywhere}
+${BADGE_CSS}.hv-problems{list-style:none;margin:0 0 16px;padding:0;display:grid;gap:6px}.hv-problem{display:flex;gap:10px;align-items:baseline;padding:8px 12px;border-radius:var(--radius-sm);border:1px solid var(--border-subtle);border-left:4px solid var(--status-attention,#9a6700);background:var(--surface);overflow-wrap:anywhere}
 .hv-problem[data-severity=critical]{border-left-color:var(--status-failed,#b42318)}.hv-problem strong{font-size:.75rem;text-transform:uppercase;letter-spacing:.04em;flex:0 0 auto}
 .hv-problem[data-severity=critical] strong{color:var(--status-failed,#b42318)}.hv-problem[data-severity=warning] strong{color:var(--status-attention,#9a6700)}
 .hv-range{display:flex;gap:6px;align-items:center;margin:4px 0 10px;font-size:.8125rem}.hv-range a{padding:3px 10px;border-radius:999px;border:1px solid var(--border-subtle);color:var(--text-secondary);text-decoration:none}.hv-range a[aria-current=true]{background:var(--accent-weak);color:var(--accent);font-weight:600}
@@ -116,7 +118,7 @@ function header(host, latest, stage, range, now) {
   const picker = RANGES.map((r) => `<a href="#/hosts/${esc(id)}?range=${r}"${r === range ? ' aria-current="true"' : ''}>${r}</a>`).join('');
   return `<div class="hv-head"><h1>${show(host.host_name ?? host.host_id, 'Unnamed host')}</h1>
     <herdr-status stage="${esc(stage)}"></herdr-status>
-    ${latest ? '' : '<span class="hv-badge hv-badge--crit">No telemetry reported</span>'}
+    ${latest ? '' : NO_TELEMETRY}
     ${host.maintenance === true ? '<span class="hv-badge hv-badge--warn">Maintenance</span>' : ''}</div>
     <div class="hv-meta">${meta}</div>
     <nav class="hv-range" aria-label="History range">History ${picker}</nav>`;
@@ -216,6 +218,7 @@ export function renderHostDetail(host, history, { range = '1h', now = Date.now()
 
 // ---- Hosts list card ----
 export const HOST_CARD_STYLE = `<style>
+${BADGE_CSS}
 .hv-meters{display:grid;gap:4px;margin:8px 0 2px}.hv-meter{display:grid;grid-template-columns:3.2rem 1fr 2.8rem;gap:6px;align-items:center;font-size:.75rem;color:var(--text-secondary)}
 .hv-meter__bar{height:6px;border-radius:3px;background:var(--surface-2);overflow:hidden}.hv-meter__bar i{display:block;height:100%;background:var(--accent,#2563eb)}.hv-meter span:last-child{text-align:right}
 </style>`;
@@ -245,7 +248,6 @@ export function renderHostCard(host, { now = Date.now(), cfg = null } = {}) {
   const latest = obj(h.latest);
   const problems = list(h.problems).filter((p) => obj(p));
   const stage = healthStage(h, latest, problems, now);
-  const fresh = stage !== 'stalled' && stage !== 'unknown';
   const id = encodeURIComponent(String(h.host_id ?? ''));
   const gpuUtils = latest ? list(latest.gpus).map((g) => num(obj(g)?.util_pct)).filter((v) => v != null) : [];
   const mounts = latest ? list(latest.mounts).filter((m) => obj(m)) : [];
@@ -256,8 +258,8 @@ export function renderHostCard(host, { now = Date.now(), cfg = null } = {}) {
   const seen = h.last_seen ? esc(formatTimestamp(h.last_seen)) : 'never';
   return `<div class="hd-card" data-host-card>
       <div class="hd-card__title"><a href="#/hosts/${esc(id)}">${show(h.host_name ?? h.host_id, 'Unnamed host')}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${esc(stage)}"></herdr-status> ${latest ? '' : '<span class="hv-badge hv-badge--crit">No telemetry</span> '}${configBadge(cfg, h)} ${problemBadge(h)}</div>
-      <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code>` : 'not reported'} · ${fresh ? 'seen' : '<strong>no report since</strong>'} ${seen}</div>
+      <div style="margin:6px 0"><herdr-status stage="${esc(stage)}"></herdr-status> ${latest ? '' : `${NO_TELEMETRY} `}${configBadge(cfg, h)} ${problemBadge(h)}</div>
+      <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code>` : 'not reported'} · ${stage === 'stalled' ? `<strong>no report since</strong> ${seen}` : latest ? `seen ${seen}` : `registered, no telemetry · last seen ${seen}`}</div>
       ${meters ? `<div class="hv-meters">${meters}</div>` : ''}
     </div>`;
 }

@@ -17,7 +17,7 @@ import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
-import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
+import { recordOutcome, statusOutcome } from './record-state.js';
 import { renderFleetMatrix } from './fleet-view.js';
 import { renderHostDetail, renderHostCard, HOST_CARD_STYLE, RANGES } from './host-view.js';
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';

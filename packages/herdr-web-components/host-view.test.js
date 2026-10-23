@@ -245,3 +245,21 @@ test('card escapes name, shows not reported for null tailnet, clamps bad values'
   assert.match(html, /width:100%/);
   assert.match(html, /width:0%/);
 });
+
+import { HOST_CARD_STYLE } from '../host-view.js';
+
+test('list page style carries the shared badge rules', () => {
+  assert.match(HOST_CARD_STYLE, /\.hv-badge\{/);
+  assert.match(HOST_CARD_STYLE, /\.hv-badge--crit/);
+});
+
+test('recently seen host without latest is not "no report since"; wording matches detail', () => {
+  const host = { host_id: 'x', host_name: 'x', last_seen: iso(1000), latest: null };
+  const card = renderHostCard(host, { now: NOW });
+  assert.doesNotMatch(card, /no report since/);
+  assert.match(card, /registered, no telemetry/);
+  assert.match(card, /No telemetry reported/);
+  assert.match(renderHostDetail(host, [], { now: NOW }), /No telemetry reported/);
+  const stale = reportingHost({ last_seen: iso(3_600_000) }); stale.latest.at = iso(3_600_000);
+  assert.match(renderHostCard(stale, { now: NOW }), /no report since/);
+});
