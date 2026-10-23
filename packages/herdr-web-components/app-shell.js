@@ -11,6 +11,7 @@ export class HerdrAppShell extends HTMLElement {
   constructor() {
     super();
     this._nav = [];
+    this._menuOpen = false;
     this.attachShadow({ mode: 'open' });
   }
 
@@ -47,6 +48,13 @@ export class HerdrAppShell extends HTMLElement {
         (path !== '/' && path.startsWith(a.getAttribute('data-path') + '/'));
       a.classList.toggle('active', active);
     });
+    this._menuOpen = false;
+    const nav = this.shadowRoot.querySelector('.hd-shell__nav');
+    const menu = this.shadowRoot.querySelector('.hd-shell__menu');
+    const returnFocus = nav?.contains(this.shadowRoot.activeElement);
+    nav?.setAttribute('data-open', 'false');
+    menu?.setAttribute('aria-expanded', 'false');
+    if (returnFocus) menu?.focus();
   };
 
   _render() {
@@ -58,13 +66,18 @@ export class HerdrAppShell extends HTMLElement {
       <style>${SHARED}</style>
       <div class="hd-shell">
         <aside class="hd-shell__sidebar">
-          <div class="hd-shell__brand">${escapeHtml(brand)}</div>
-          <nav class="hd-shell__nav" aria-label="Primary">${links}</nav>
+          <div class="hd-shell__brand"><span>${escapeHtml(brand)}</span><button class="hd-shell__menu" type="button" aria-expanded="false" aria-controls="primary-navigation">Menu</button></div>
+          <nav class="hd-shell__nav" id="primary-navigation" data-open="false" aria-label="Primary">${links}</nav>
         </aside>
         <main class="hd-shell__main"><div class="hd-shell__content">
           <slot></slot>
         </div></main>
       </div>`;
+    this.shadowRoot.querySelector('.hd-shell__menu')?.addEventListener('click', () => {
+      this._menuOpen = !this._menuOpen;
+      this.shadowRoot.querySelector('.hd-shell__nav')?.setAttribute('data-open', String(this._menuOpen));
+      this.shadowRoot.querySelector('.hd-shell__menu')?.setAttribute('aria-expanded', String(this._menuOpen));
+    });
   }
 }
 
@@ -76,20 +89,27 @@ const SHARED = `
   flex-shrink: 0; border-right: 1px solid var(--border-subtle);
   display: flex; flex-direction: column; }
 .hd-shell__brand { display: flex; align-items: center; padding: 16px;
+  justify-content: space-between; gap: 12px;
   font-weight: 600; font-size: 0.95rem;
   border-bottom: 1px solid var(--border-subtle); }
+.hd-shell__menu { display: none; font: inherit; padding: 6px 10px; color: var(--text-secondary);
+  background: var(--surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); cursor: pointer; }
 .hd-shell__nav { display: flex; flex-direction: column; gap: 2px; padding: 8px; }
 .hd-shell__link { display: flex; padding: 8px 10px; border-radius: var(--radius-sm);
   color: var(--text-secondary); text-decoration: none; font-size: 0.875rem; }
 .hd-shell__link:hover { background: var(--surface-hover); text-decoration: none; }
 .hd-shell__link.active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }
 .hd-shell__main { flex: 1; min-width: 0; }
-.hd-shell__content { max-width: var(--content-max); margin: 0 auto; padding: 24px; }
+.hd-shell__content { max-width: min(1600px, calc(100vw - var(--sidebar-width) - 48px)); margin: 0 auto; padding: 24px; }
 @media (max-width: 720px) {
   .hd-shell { flex-direction: column; }
   .hd-shell__sidebar { width: 100%; border-right: none;
     border-bottom: 1px solid var(--border-subtle); }
-  .hd-shell__nav { flex-direction: row; overflow-x: auto; }
+  .hd-shell__brand { padding: 10px 16px; }
+  .hd-shell__menu { display: inline-flex; }
+  .hd-shell__nav { display: none; grid-template-columns: repeat(2,minmax(0,1fr)); max-height: 55vh; overflow-y: auto; }
+  .hd-shell__nav[data-open=true] { display: grid; }
+  .hd-shell__content { max-width: none; padding: 16px; }
 }`;
 
 function escapeHtml(s) {

@@ -6,7 +6,7 @@ import {reportTimestamp} from './record-state.js';
 
 const timestamp=value=>new Date(reportTimestamp(value)).getTime();
 
-export function ciChartModel(entries = [], performance = {}) {
+export function ciChartModel(entries = []) {
   const rows=Array.isArray(entries) ? entries.filter(e=>e?.record && typeof e.record==='object' && !Array.isArray(e.record) && ['current','failed','finished'].includes(e.tab)) : [];
   const days=new Map(), durations=[];
   let undated=0, unmeasured=0;
@@ -24,7 +24,7 @@ export function ciChartModel(entries = [], performance = {}) {
   }
   const ordered=[...days.values()].sort((a,b)=>a.day.localeCompare(b.day));
   durations.sort((a,b)=>a.finishedAt-b.finishedAt || String(a.id).localeCompare(String(b.id)));
-  return {performance:ciPerformanceModel(rows,performance),total:rows.length,undated,older:ordered.slice(0,-14).reduce((sum,d)=>sum+d.current+d.failed+d.finished,0),days:ordered.slice(-14),
+  return {performance:ciPerformanceModel(rows),total:rows.length,undated,older:ordered.slice(0,-14).reduce((sum,d)=>sum+d.current+d.failed+d.finished,0),days:ordered.slice(-14),
     measured:durations.length,unmeasured,durations:durations.slice(-20)};
 }
 const labels={finished:'Finished',failed:'Failed',current:'Open / unknown'};

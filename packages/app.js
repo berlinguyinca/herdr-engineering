@@ -393,27 +393,27 @@ async function viewHost(parts) {
 }
 
 async function viewActivity() {
-  root.innerHTML = '<h1>Activity</h1>' + await activityList(50);
+  root.innerHTML = `<style>
+    .ac-list{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+    .ac-row{border-bottom:1px solid var(--border-subtle)}.ac-row:last-child{border-bottom:0}.ac-row[open]{background:var(--bg)}
+    .ac-row summary{display:grid;grid-template-columns:minmax(140px,220px) minmax(0,1fr) auto;gap:14px;align-items:center;padding:10px 12px;cursor:pointer;list-style-position:inside;font-size:13px}
+    .ac-row summary strong{overflow-wrap:anywhere}.ac-kind,.ac-time{font-size:12px;color:var(--text-secondary)}.ac-time{white-space:nowrap}
+    .ac-detail{margin:0;padding:0 32px 8px;font-size:12px;line-height:1.5;color:var(--text-secondary);overflow-wrap:anywhere}.ac-payload{margin:0 32px 12px;max-height:240px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.45;background:var(--surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:10px}
+    .ac-row[data-muted=true]{opacity:.65}
+    @media(max-width:650px){.ac-row summary{grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;padding:12px}.ac-kind{grid-column:1}.ac-time{grid-column:2;grid-row:1/3}.ac-detail{padding:0 12px 8px}.ac-payload{margin:0 12px 12px}}
+  </style><h1>Activity</h1>` + await activityList(50);
 }
 
 async function activityList(limit) {
   const { events } = await client.activity(limit);
   if (!events.length) return '<herdr-empty message="No activity yet"></herdr-empty>';
   const t = titles(await missionTitles());
-  return events.map((e) => {
+  return `<div class="ac-list">${events.map((e) => {
     const d = describeEvent(e, { missionTitles: t });
-    const meta = `<div class="hd-card__sub">${esc(d.kind)} · ${formatTimestamp(e.source_timestamp)}</div>`;
-    if (d.muted) {
-      // Low-signal events (e.g. heartbeats) get a compact, de-emphasised row.
-      return `<div class="hd-card" style="opacity:.6">
-        <div class="hd-card__title">${esc(d.title)}</div>
-        <div class="hd-card__sub">${esc(d.detail)}</div>${meta}</div>`;
-    }
-    return `<div class="hd-card">
-      <div class="hd-card__title">${esc(d.title)}</div>
-      <div class="hd-card__sub">${esc(d.detail)}</div>${meta}
-    </div>`;
-  }).join('');
+    const rawPayload=JSON.stringify(e.payload || {},null,2);
+    const payload=rawPayload.length>8000?`${rawPayload.slice(0,7999)}…`:rawPayload;
+    return `<details class="ac-row" data-muted="${d.muted}"><summary><strong>${esc(d.title)}</strong><span class="ac-kind">${esc(d.kind)}</span><time class="ac-time">${formatTimestamp(e.source_timestamp)}</time></summary><p class="ac-detail">${esc(d.detail)}</p><pre class="ac-payload" aria-label="Original event payload">${esc(payload)}</pre></details>`;
+  }).join('')}</div>`;
 }
 
 async function viewAnalytics() {
@@ -421,6 +421,10 @@ async function viewAnalytics() {
     client.analytics('missions'), client.analytics('models'), client.analytics('hosts'),
   ]);
   root.innerHTML = `
+    <style>
+      .an-links{display:grid;grid-template-columns:repeat(3,minmax(200px,1fr));gap:12px;margin:16px 0}.an-links a{display:flex;flex-direction:column;gap:4px;padding:14px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);text-decoration:none}.an-links strong{color:var(--text)}.an-links span{font-size:12px;color:var(--text-secondary)}
+      .an-stage{margin-top:18px}@media(max-width:720px){.an-links{grid-template-columns:minmax(0,1fr)}}
+    </style>
     <h1>Analytics</h1>
     <div class="hd-grid">
       <herdr-metric label="Missions" value="${missions.total}"></herdr-metric>
@@ -428,9 +432,8 @@ async function viewAnalytics() {
       <herdr-metric label="Models" value="${Object.keys(models.models).length}"></herdr-metric>
       <herdr-metric label="Hosts healthy" value="${hosts.healthy} / ${hosts.total}"></herdr-metric>
     </div>
-    <p style="margin-top:12px"><a href="#/analytics/tokens">Token usage by project &rarr;</a></p>
-    <h3 style="margin-top:20px">Missions by stage</h3>
-    ${stageBars(missions.by_stage)}`;
+    <nav class="an-links" data-analytics-links aria-label="Analytics views"><a href="#/analytics/models"><strong>Models</strong><span>Agent distribution by model</span></a><a href="#/analytics/hosts"><strong>Hosts</strong><span>Reported fleet health</span></a><a href="#/analytics/tokens"><strong>Token usage</strong><span>Requests and tokens by project</span></a></nav>
+    <section class="an-stage"><h3>Missions by stage</h3>${stageBars(missions.by_stage)}</section>`;
 }
 
 async function viewAnalyticsMissions() { await viewAnalytics(); }

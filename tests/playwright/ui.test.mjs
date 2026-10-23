@@ -151,6 +151,32 @@ test('overview survives a heavy event burst without rate limiting', async () => 
   });
 });
 
+test('activity uses compact expandable rows without hiding event detail', async () => {
+  await withApp(async ({ page, base }) => {
+    const events=Array.from({length:12},(_,index)=>({event_id:`event-${index}`,event_type:'ServiceUpdated',source_timestamp:new Date(Date.now()-index*1000).toISOString(),payload:{service_name:`service-${index}`,host_id:'bender',status:'healthy',description:`Detailed event payload ${index}`,diagnostics:{attempt:index,trace:`trace-${index}`}}}));
+    await page.route('**/api/v1/activity?limit=50',route=>route.fulfill({json:{events}}));
+    await page.goto(`${base}/#/activity`);await page.locator('.ac-row').first().waitFor();
+    const geometry=await page.locator('.ac-row').first().evaluate(row=>({height:row.getBoundingClientRect().height,width:row.getBoundingClientRect().width}));
+    assert.ok(geometry.height<=64,`expected a compact collapsed activity row, got ${geometry.height}`);
+    assert.equal(await page.locator('.ac-row').count(),12);
+    await page.locator('.ac-row summary').first().click();
+    assert.match(await page.locator('.ac-row').first().innerText(),/Detailed event payload 0/);
+    assert.match(await page.locator('.ac-row').first().innerText(),/"trace": "trace-0"/);
+    await page.setViewportSize({width:390,height:844});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  },{BURST:'0'});
+});
+
+test('analytics composes its existing views into a useful dashboard', async () => {
+  await withApp(async ({page,base}) => {
+    await page.goto(`${base}/#/analytics`);await page.locator('[data-analytics-links]').waitFor();
+    const destinations=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getAttribute('href')));
+    assert.deepEqual(destinations,['#/analytics/models','#/analytics/hosts','#/analytics/tokens']);
+    const boxes=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getBoundingClientRect().width));
+    assert.ok(boxes.every(width=>width>200),'analytics destinations should use the available desktop row');
+  },{BURST:'0'});
+});
+
 test('pi-sourced mission detail renders by mission_key', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/missions`);
@@ -790,6 +816,9 @@ test('sessions tabs keep closed records separate, retain filters and encode exac
   const writes=[],errors=[];page.on('request',r=>{if(r.method()!=='GET')writes.push(r.url());});page.on('pageerror',e=>errors.push(e.message));
   await page.clock.install();await page.goto(`${base}/#/herd`);
   await page.waitForFunction(()=>document.querySelector('#ss-tab-current [data-count]')?.textContent==='25');
+  const catalogGeometry=await page.locator('.ss-row').first().evaluate(row=>({top:row.getBoundingClientRect().top,height:row.getBoundingClientRect().height}));
+  assert.ok(catalogGeometry.top<=330,`expected records near the top of the viewport, got ${catalogGeometry.top}`);
+  assert.ok(catalogGeometry.height<=96,`expected compact desktop agent rows, got ${catalogGeometry.height}`);
   assert.equal(await page.locator('.ss-row').count(),20);await page.locator('#ss-next').click();assert.equal(await page.locator('.ss-row').count(),5);
   await page.locator('#ss-tab-current').focus();await page.keyboard.press('ArrowRight');
   assert.equal(await page.locator('#ss-tab-unconfirmed').getAttribute('aria-selected'),'true');
@@ -836,7 +865,29 @@ test('overview keeps healthy panels through partial errors and links to the exac
   await page.locator('#mc-tab-finished[aria-selected=true]').waitFor();await page.locator('.mc-row').waitFor();assert.match(await page.locator('.mc-row').innerText(),/Closed mission/);
   await page.goto(`${base}/#/overview`);await page.locator('a[href="#/services?status=unavailable"]').waitFor();await page.locator('a[href="#/services?status=unavailable"]').click();
   await page.locator('#sc-status').waitFor();assert.equal(await page.locator('#sc-status').inputValue(),'unavailable');
+  await page.setViewportSize({width:1920,height:1080});await page.goto(`${base}/#/overview`);await page.locator('[data-overview=sessions] .ov-row').waitFor();
+  const desktopLayout=await page.evaluate(()=>{
+   const content=document.querySelector('herdr-app-shell').shadowRoot.querySelector('.hd-shell__content').getBoundingClientRect();
+   const box=key=>document.querySelector(`[data-overview=${key}]`).getBoundingClientRect();
+   return {contentWidth:content.width,missions:box('missions'),fleet:box('fleet'),sessions:box('sessions'),ci:box('ci')};
+  });
+  assert.ok(desktopLayout.contentWidth>=1400,`expected operational content to use desktop width, got ${desktopLayout.contentWidth}`);
+  assert.ok(desktopLayout.missions.width>desktopLayout.sessions.width,'current missions should remain the primary overview panel');
+  assert.ok(desktopLayout.fleet.top<desktopLayout.sessions.bottom,'fleet status should share the upper overview region');
+  assert.ok(Math.abs(desktopLayout.sessions.top-desktopLayout.ci.top)<2,'secondary overview panels should align in a desktop row');
+  await page.setViewportSize({width:768,height:1024});await page.goto(`${base}/#/overview`);await page.locator('[data-overview=sessions] .ov-row').waitFor();
+  const tabletColumns=await page.locator('.ov-layout').evaluate(layout=>getComputedStyle(layout).gridTemplateColumns.split(' ').length);
+  assert.equal(tabletColumns,1,'tablet content should collapse before cards become too narrow beside the sidebar');
   await page.setViewportSize({width:390,height:844});await page.goto(`${base}/#/overview`);await page.locator('[data-overview=sessions] .ov-row').waitFor();
+  const menu=page.locator('herdr-app-shell .hd-shell__menu');
+  await menu.waitFor();assert.equal(await menu.getAttribute('aria-expanded'),'false');
+  assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),false);
+  await menu.click();assert.equal(await menu.getAttribute('aria-expanded'),'true');
+  assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),true);
+  await page.locator('herdr-app-shell .hd-shell__link[data-path="/analytics"]').click();
+  await page.getByRole('heading',{name:'Analytics',exact:true}).waitFor();
+  assert.equal(await menu.getAttribute('aria-expanded'),'false');
+  assert.equal(await menu.evaluate(button=>button===button.getRootNode().activeElement),true);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
  },{BURST:'0',SERVICE_CATALOG:'1'});
 });
@@ -978,18 +1029,22 @@ test('CI catalog keeps filters and step inspection through refresh and shows sta
     await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{...running,tasks:[{id:1,name:'Compile',state:'success'},{id:2,name:'Test spectra',state:'running'}]}}}));
     await page.route('**/api/v1/ci/log?*',r=>{logReads++;return r.fulfill({json:{available:true,log:`<script>unsafe()</script>\nChecking spectrum ${logReads}`,checked_at:new Date().toISOString()}});});
     await page.goto(`${base}/#/ci`);
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.getByRole('button',{name:'Run #42',exact:true}).click();
     await page.getByRole('button',{name:'Test spectra running'}).click();
     await page.waitForFunction(()=>document.querySelector('.ig-log')?.textContent.includes('Checking spectrum'));
     assert.equal(await page.locator('.ig-log script').count(),0);
     assert.equal(await page.locator('[data-ci-action]').count(),0);
+    await page.locator('[data-ci-workspace="runs"]').click();
     const search=page.getByRole('searchbox',{name:'Search runs'});await search.fill('spectra');await search.focus();
     const before=logReads;authError=true;
     await page.waitForFunction(()=>document.body.innerText.includes('Woodpecker authentication failed'),{},{timeout:12000});
     assert.ok(reads>=2);assert.ok(logReads>before);
     assert.equal(await search.inputValue(),'spectra');assert.equal(await search.evaluate(e=>e===document.activeElement),true);
+    await page.locator('[data-ci-workspace="health"]').click();
     assert.equal(await page.locator('[data-step="2"]').getAttribute('aria-pressed'),'true');
     assert.match(await bodyText(page),/Showing last received records/);
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.getByRole('tab',{name:/^Failed/}).click();
     await page.getByRole('button',{name:'Run #41',exact:true}).waitFor();
     assert.equal(await page.getByRole('button',{name:'Run #42',exact:true}).count(),0);
@@ -1056,11 +1111,13 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
       };
     });
     await page.goto(`${base}/#/ci?tab=failed`);
+    assert.equal(await page.locator('[data-ci-workspace="runs"]').getAttribute('aria-selected'),'true');
     await page.getByRole('button',{name:'Run #42',exact:true}).waitFor();
     await page.evaluate(()=>{window.location.hash='/reviews';});
     await page.getByRole('heading',{name:'Reviews',exact:true}).waitFor();
     assert.equal(await page.evaluate(()=>window.integrationListeners.slice(0,3).every(l=>l.signal?.aborted)),true);
     await page.evaluate(()=>{window.location.hash='/ci?tab=failed';});
+    assert.equal(await page.locator('[data-ci-workspace="runs"]').getAttribute('aria-selected'),'true');
     await page.getByRole('button',{name:'Run #42',exact:true}).click();
     await page.getByText('Debug with Pi',{exact:true}).click();
     const select=page.getByRole('combobox',{name:'Target Pi agent'});
