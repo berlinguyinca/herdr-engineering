@@ -83,3 +83,38 @@ def test_ipv6_in_the_profile_is_canonical_and_internal_ones_are_refused(w):
     for bad in ("https://[::1]/", "https://[fd00::1]/v1"):
         assert code(w.s.set_room_profile, w.alice, w.room, {"services": [
             {"name": "x", "upstream_url": bad, "header": "Authorization", "secret_name": "k"}]}) == 400, bad
+
+
+# ------------------------------------------------------------------ per-person limits (review item 4)
+def test_one_person_holds_at_most_six_live_helpers(w):
+    agents = [w.root] + [w.agent("alice", actions=("read", "post", "spawn_helpers"), name=f"lead{i}")[0]
+                         for i in range(2)]
+    for a in agents[:2]:
+        for _ in range(3):
+            ask(w, a)
+    with pytest.raises(collab.CollabError) as e:
+        ask(w, agents[2])
+    assert e.value.status == 429 and "person" in e.value.message
+    assert collab.HELPERS_PER_OWNER_LIVE == 6
+    bob_agent, _ = w.agent("bob", actions=("read", "post", "spawn_helpers"), name="bobs")
+    assert ask(w, bob_agent)["status"] == "requested"                  # somebody else is not affected
+
+
+def test_an_unclaimed_request_expires_after_ten_minutes_and_frees_its_slot(w):
+    hs = [ask(w) for _ in range(3)]
+    assert code(ask, w) == 429
+    w.s.clock.t += collab.HELPER_CLAIM_WINDOW - 1
+    assert code(ask, w) == 429
+    w.s.clock.t += 2
+    assert ask(w)["status"] == "requested"
+    assert {w.s.helper_status(w.root, h["helper_id"])["status"] for h in hs} == {"expired"}
+    assert w.s._helpers[hs[0]["helper_id"]]["reason"] == "not claimed in time"
+    assert code(w.s.claim_helper, w.op, hs[0]["helper_id"]) == 409
+    assert collab.HELPER_CLAIM_WINDOW == 600
+
+
+def test_a_claimed_helper_does_not_expire_with_the_claim_window(w):
+    rec = ask(w)
+    run(w, rec["helper_id"])
+    w.s.clock.t += collab.HELPER_CLAIM_WINDOW + 5
+    assert w.s.helper_status(w.root, rec["helper_id"])["status"] == "claimed"

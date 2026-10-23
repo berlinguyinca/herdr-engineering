@@ -216,8 +216,9 @@ the helpers your agents started, and cancel one, with `GET helpers`, `GET helper
   link-local addresses and `localhost` are refused when the profile is saved, and a public name that resolves to
   a private address is blocked by the proxy. The operator binds each service key to one host; a service pointed
   anywhere else gets no key.
-* **Limits:** 3 live helpers per agent, nesting depth 2, 20 helpers per person per hour (across all rooms),
-  a successor chain of at most 5. Over a limit the request fails at once and says which limit.
+* **Limits:** 3 live helpers per agent and 6 per person (across all rooms), nesting depth 2, 20 helpers per
+  person per hour (across all rooms), a successor chain of at most 5. Over a limit the request fails at once and
+  says which limit. A request that no host starts within 10 minutes expires.
 * **Panic switch:** the operator can pause all helpers; that stops every running helper at once.
 * **Know before you grant it:** an SSH key the room gives helpers can be read by them. A helper can print it,
   and the agent that asked then has it, so grant **Start helpers** in such a room only to agents of people you

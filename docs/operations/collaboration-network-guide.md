@@ -516,7 +516,10 @@ so those run on their own default model and the result says so.
 | Requests per person per hour, across all rooms (cancelled ones count) | 20 | profile `per_hour`, counted against the requesting room's value |
 | Helper lifetime (and its credential's) | 2 h | `HELPER_TTL` |
 | Successor chain (successors of successors) | 5 | `MAX_SUCCESSOR_CHAIN` |
+| Live helpers per person (all their agents, all rooms) | 6 | `HELPERS_PER_OWNER_LIVE` |
 | Live helpers in total / per runner host | 24 / 6 | `HELPERS_GLOBAL_LIVE` / `HELPERS_PER_HOST` |
+| A request no runner claimed | expires after 10 minutes (status `expired`, reason "not claimed in time"), freeing its slot | `HELPER_CLAIM_WINDOW` |
+| A claim the service refused (for example 429 "agent limit reached") | not retried for 60 s; logged once per distinct answer | `CLAIM_BACKOFF` (runner) |
 | Task text | 8000 characters, no control characters except newline and tab | |
 | Result | 20 KB from the runner (32,000 characters stored at most); control characters other than newline and tab are stripped, and the finish request stays under 48 KiB. A refused finish (any status but 404/409) keeps the helper and is retried each cycle; after 3 refusals only `failed` / "result could not be delivered" is posted | `FINISH_ATTEMPTS` |
 | Host approval | 24 h by default, at most 30 days; a denial is remembered 1 h | |
