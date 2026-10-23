@@ -137,7 +137,7 @@ class IngestService:
             **{k: payload.get(k) for k in (
                 "pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
                 "revision", "interactive_ready", "launch_pending", "state_change_seq",
-                "transcript", "parent_session_id", "name")})
+                "transcript", "parent_session_id", "name", "runtime")})
 
     def _ingest_mission(self, entity_id, event_type, payload,
                         source="herdr") -> dict:
