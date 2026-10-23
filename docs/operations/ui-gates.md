@@ -11,7 +11,7 @@ Nothing here uses environment variables. Budgets live in `tests/playwright/ui-ga
 ## Commands
 
 ```bash
-# every UI gate (about 8 minutes on a busy host)
+# every UI gate
 npm run test:ui-gates
 
 # one gate at a time
@@ -107,7 +107,8 @@ there and review the PNG diff in the PR. A miss writes `<name>.actual.png` and `
 
 ## Defects the gates found, and fixed here
 
-Each has a test that fails without the fix.
+Each was found by a failing gate (or a measurement taken before the fix) and is covered by a gate now. The revert-the-fix-and-rerun
+check was not done for every item; the numbers quoted below (contrast ratios, 2161 px overflow, filter latency) are from the runs that found them.
 
 1. `/collab-context.js` and `/collab-workbench.js` were 404 on the real listener (missing from the static allowlist in
    `control_plane/api.py`), so the page could not start. Mocked tests never saw it.
@@ -139,7 +140,11 @@ Each has a test that fails without the fix.
   include the badge count (for example "Tasks1"); sub-tab panels have no `aria-controls` or `tabpanel` role.
 - **Search is client-side** and covers only loaded nodes; the server caps lineage paging at 3,000 nodes.
 - **Performance numbers come from a loaded host** (see above).
+- **Screenshot determinism is not exact.** Two fresh captures of the lineage surface differed by 59 pixels (0.006%) once; the
+  determinism test allows a fifth of the budget rather than zero and the cause was not isolated. The deterministic server stamps
+  ingest with a stepping clock that only advances per `ControlPlaneRepo._now()` call; stamps are fixed once seeding ends, but if
+  a later read path starts calling `_now()` before seeding finishes on a slower CI host, Gantt ongoing durations could move.
 - **Scenario 7 checks that belong to the e2e harness, not here:** cross-repo issues, the Plannotator digest and PR head SHA checks.
   The UI half (stale-head evidence is displayed distinctly from current evidence) is gated here.
-- **Pre-existing failures outside this change:** three CI-dashboard tests already fail on the base branch
+- **Pre-existing failures outside this change:** on the base branch (`feat/t16-release-gates`) three CI-dashboard tests fail too (and one more, "activity uses compact expandable rows...", failed once there under load but passes on this branch)
   ("CI reports publish over HTTP...", "CI catalog keeps filters...", "failed CI run sends debugging context...").
