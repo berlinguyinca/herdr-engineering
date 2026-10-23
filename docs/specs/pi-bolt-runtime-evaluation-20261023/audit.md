@@ -15,7 +15,8 @@ Status: PB-001 partially done, PB-002 partially done. No code changed. Standard 
 |---|---|
 | pi | 1.3.0 (bender) |
 | herdr | 0.9.1 |
-| pi-bolt | not installed |
+| pi-bolt | bolt-v1.0.0 (Pi 1.4.0) installed privately in ~/.local/share/pi-bolt-eval, off PATH; SHA256 and Ed25519 signature verified (key from same repo = trust-on-first-use) |
+| pi 1.4.0 (baseline arm) | private npm prefix ~/.local/share/pi-bolt-eval/pi-1.4.0; fleet stays on 1.3.0 |
 
 ## Verified Herdr integration points that mention `pi`
 - `deploy/control-plane/collab-spawn.py:64-75` and `packages/collab-scripts/join.sh:109-115`: hard-coded `pi -p ...` commands, `FAMILY_BIN`.
@@ -42,5 +43,21 @@ Status: PB-001 partially done, PB-002 partially done. No code changed. Standard 
 | Hosts | bender, beast (Linux); Mac | Apple silicon only on macOS | low | PB-011 | pending |
 | Supply chain | npm pi | signed release + bundled Bun/JSC (LGPL) | medium | PB-002 | pending |
 
-## Blocked / needs decision
-Running benchmarks requires installing a third-party native binary. Not done.
+## pi-engineering seams (verified in origin/main 96dfd2b)
+- `src/runtime/AgentRuntime.ts` is the orchestration seam (`legacy` | `herdr`), NOT a Pi-binary selector. Reuse its contract tests; do not add a second runtime type there.
+- `HerdrAgentRuntime` asks Herdr to start agent kind `"pi"`; the binary is whatever Herdr/PATH resolves.
+- The managed launcher `~/.pi/agent/bin/pi` execs the release's `node_modules/.bin/pi`; `scripts/install-session-auto-resume.ts` hooks it and copies a node script that imports Pi's `SessionManager`. Runtime selection belongs in this launcher path. INCOMPATIBILITY to resolve: that wrapper runs under node and imports the Pi npm package, so a compiled binary cannot simply replace `.bin/pi` without keeping the wrapper in front.
+
+## Measured so far (bench/startup.py, results/*.jsonl)
+`--version`, isolated empty agent dir, no extensions, 12 reps after 2 warmups, arms interleaved, bender with load average ~86 (NOISY, not clean):
+| arm | wall median | wall p95 | CPU s median | peak RSS median |
+|---|---|---|---|---|
+| standard-pi 1.4.0 (node 22) | 1525 ms | 4211 ms | 0.409 | 97 MiB |
+| pi-bolt 1.0.0 | 69 ms | 119 ms | 0.019 | 26 MiB |
+| pi-bolt-jit 1.0.0 | 54 ms | 185 ms | 0.020 | 27 MiB |
+Caveats: `--version` may short-circuit before full app init; page cache was not dropped (no root), so "cold" is not covered; this is NOT ready-to-first-token and NOT acceptance evidence.
+
+## Not yet done (explicitly)
+- Extension loading under Pi-Bolt: one attempt was inconclusive (worktree had no node_modules; `--list-models` does not load extensions). No compatibility claim is made.
+- Ready-to-first-token, tool-heavy tasks, concurrency 1/5/12/24, soak, collaboration, Autospec/Planotator gates, rollback drill.
+- Adapter code (PB-003..005), dashboard metrics (PB-012), issues PB-001..014 not yet filed in GitHub.
