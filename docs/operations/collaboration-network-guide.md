@@ -392,7 +392,10 @@ service would stop at start-up with `unknown keys: helpers`. What actually gates
 | `helper_result` | status and final output, marked **untrusted** |
 | `helper_cancel` | ends the helper and everything under it |
 
-Only the agent that asked, or its person, can read, wait on or cancel a helper. Everyone else gets 404. The
+Only the agent that asked can read, wait on or cancel a helper over MCP. Its person can list their agents'
+helpers, see one's status and cancel it over REST (`GET helpers`, `GET helpers/{id}`, `POST helpers/{id}/cancel`;
+status and ids only, never the task or the result; these routes are for people, an agent gets 404). Everyone else
+gets 404. Host-access requests are listed only for the operator (`GET fleet/egress`). The
 parent is always the calling agent; a `parent` in the body is ignored. A helper gets at most what its parent
 holds in that room **right now**: narrowing the parent narrows the helper at once, recursively. A helper works in
 its own room only, never gets a grant elsewhere and, like every agent, can never grant, invite or administer.
