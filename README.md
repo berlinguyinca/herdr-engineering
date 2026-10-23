@@ -321,6 +321,54 @@ Deployed on **bender**, the control-plane stack serves the HerdR UI at
   `tailscale serve --https=443 http://127.0.0.1:8080` on bender (gives an HTTPS
   URL) — the app itself does not do TLS termination.
 
+#### Host telemetry
+
+The **Hosts** page (list cards plus a per-host detail page) shows how each
+fleet machine is doing: CPU, memory, swap, disk and per-mount usage, load,
+uptime, network rates, GPU (NVIDIA, ROCm, Apple), top processes, the number of
+running agents, and an hourly report of pending/security package updates,
+reboot-required, failed systemd units and tool versions (herdr, pi, autospec,
+herdr-eng, pi extensions) with drift against the fleet's pins. A range picker
+(1h / 24h / 7d) switches the sparklines; a host that is registered but has
+never reported says so instead of showing zeros.
+
+- **Source.** The fabric agent on each host samples every 30 s and posts to the
+  control plane; the slow package/unit/version report runs hourly. Both
+  intervals are YAML only: `fabric.host_report_interval` (default `30`) and
+  `fabric.host_slow_interval` (default `3600`) seconds.
+- **Retention.** Raw samples are kept in memory for 48 h. Each closed 5-minute
+  bucket becomes one averaged rollup point, persisted and kept for 7 days
+  (the bucket open at shutdown is lost). A range query returns at most 300 points.
+- **API.** `GET /api/v1/hosts/<id>` returns the host with `latest`, `updates`,
+  `versions`, `pins`, `fleet_update`, `maintenance`, `problems` and
+  `problem_count`. `GET /api/v1/hosts/<id>/telemetry?range=1h|24h|7d` returns
+  `{"samples": [...], "range": ...}` (any other range is a 400); without
+  `range`, `?limit=N` (1..500, default 100) returns the newest raw samples.
+- **Liveness.** Only the fabric agent's (and herdr's) own events refresh a
+  host's last-seen time. State-only sources such as the fleet update post
+  pins, versions and results without making a silent host look alive.
+
+Problems are computed on the server; each has a code and a severity:
+
+| Code | Severity | Raised when |
+|---|---|---|
+| `never_reported` | critical | the host is registered but has no telemetry |
+| `stale` | critical | no report for more than 15 min (not while `maintenance` is set) |
+| `disk_critical` / `disk_warn` | critical / warning | any mount at 95% / 85% or more |
+| `mem_pressure` | warning | memory above 90% for 5 min (swap above 50% is noted) |
+| `gpu_hot` | warning | a GPU above 85 C |
+| `failed_units` | warning | failed systemd units |
+| `security_updates` | warning | security updates pending |
+| `reboot_required` | warning | a reboot is required |
+| `version_drift` | warning | a reported version differs from its pin |
+| `updates_deferred` | warning | fleet update deferred a busy host for over 7 d |
+| `updates_old` | warning | last successful fleet update over 14 d ago |
+| `updates_unknown` | warning | package update status could not be determined |
+
+Joining hosts to the tailnet, the daily fleet update (security-only apt, busy
+host deferral, pins, maintenance flag, forcing one host) and the Ansible Vault
+setup are documented in [`ansible/README.md`](ansible/README.md).
+
 #### Repeatable deploys
 
 Deploys go through scripts, not hand-built compose overrides. The **central
