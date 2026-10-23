@@ -3,6 +3,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
+import { renderLinks } from './collab-links.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import {
@@ -547,8 +548,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [] };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents']]), ...(canInvite ? [['people', 'People']] : [])];
+    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null };
+    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['links', 'Workspaces']]), ...(canInvite ? [['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
@@ -568,6 +569,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}</section>`}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
@@ -768,6 +770,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       setBadge('tasks', S.tasks.filter((t) => ['pending', 'accepted'].includes(t.status)).length);
       if (sub === 'tasks') drawTasks();
       else if (sub === 'flow') drawFlow();
+      else if (sub === 'links') put('hcn-links', renderLinks(S.links, S.missions));
       else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); }
     }
     const paintPanel = async () => {
@@ -788,6 +791,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     // ---- one long-poll feeds every panel (replaces five timers); it sleeps while the tab is hidden
     const apply = (s) => {
       if (s.agents) { S.agents = s.agents; S.agents.forEach((a) => agentName.set(a.agent_id, a.name)); }
+      S.links = s.links ?? null; S.missions = s.missions ?? null;
       S.tasks = s.tasks || []; S.flow = s.flow || null; S.requests = s.requests || null;
       S.agents.forEach(a=>agentName.set(a.agent_id,namedAgent(a).display_name || a.name));
       addEvents(s.events || []);
