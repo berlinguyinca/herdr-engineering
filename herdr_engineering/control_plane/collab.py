@@ -74,6 +74,15 @@ MAX_OPEN_INVITES = 50
 _FEED_TYPES = frozenset({"message", "member_added", "member_removed",
                          "agent_granted", "agent_revoked", "agent_grant_revoked", "agent_renamed",
                          "task_created", "task_updated"})
+# Room <-> Herdr workspace links. A link is what room members may SEE of a workspace; the
+# terminal is a separate, explicit grant that is never implied by room membership.
+LINK_VIEW_GRANTS = frozenset({"status", "tabs", "panes"})       # metadata only, never terminal bytes
+LINK_GRANTS = LINK_VIEW_GRANTS | {"terminal"}
+DEFAULT_LINK_GRANTS = ("status",)                               # minimal by default
+MAX_LINKS_PER_ROOM = 50
+MAX_MISSIONS_PER_ROOM = 100
+MAX_TERMINAL_PRINCIPALS = 20
+TERMINAL_ROLES = frozenset({"owner", "contributor"})            # viewers and guests never get a terminal
 MAX_TASK_TEXT = 4000
 TASK_TTL = 24 * 3600.0           # a task nobody finished in a day is expired
 MAX_TASK_DEPTH = 3               # human -> agent -> agent -> agent
@@ -270,6 +279,10 @@ class CollabService:
         self._requests_by_room: dict[str, set] = defaultdict(set)
         self._requests_by_agent: dict[str, set] = defaultdict(set)
         self._rooms_by_agent: dict[str, set] = defaultdict(set)
+        self._links: dict[str, dict] = {}                    # link id -> room/workspace link
+        self._links_by_room: dict[str, list] = defaultdict(list)
+        self._primary: dict[tuple, str] = {}                 # (host, workspace id) -> link id of its primary room
+        self._missions: dict[tuple, dict] = {}               # (room id, mission id) -> scoped mission link
         self._housekept = 0.0
         self._room_seq: dict[str, int] = {}                  # room id -> sequence of its latest change
         self._fleet_flags: dict[str, bool] = {}              # host -> may it receive automatic agents (default yes)
@@ -490,6 +503,43 @@ class CollabService:
                 "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
             self._agent_projects[p["agent_id"]].add(p["project_id"])
             self._rooms_by_agent[p["agent_id"]].add(p["room_id"])
+        elif t == "workspace_linked":
+            self._links[p["link_id"]] = {
+                "link_id": p["link_id"], "room_id": p["room_id"], "workspace_id": p["workspace_id"],
+                "host": p["host"], "linked_by": p["actor_user_id"], "created_at": p["created_at"],
+                "is_primary": bool(p["is_primary"]), "grants": list(p["grants"]),
+                "terminal_principals": list(p.get("terminal_principals") or [])}
+            self._links_by_room[p["room_id"]].append(p["link_id"])
+            if p["is_primary"]:
+                self._primary[(p["host"], p["workspace_id"])] = p["link_id"]
+        elif t == "workspace_unlinked":
+            lk = self._links.pop(p["link_id"], None)
+            if lk:
+                if p["link_id"] in self._links_by_room.get(lk["room_id"], []):
+                    self._links_by_room[lk["room_id"]].remove(p["link_id"])
+                if self._primary.get((lk["host"], lk["workspace_id"])) == p["link_id"]:
+                    self._primary.pop((lk["host"], lk["workspace_id"]), None)
+        elif t == "workspace_link_updated":
+            lk = self._links.get(p["link_id"])
+            if lk:
+                lk.update(grants=list(p["grants"]), terminal_principals=list(p.get("terminal_principals") or []))
+        elif t == "workspace_primary_set":
+            lk = self._links.get(p["link_id"])
+            if lk:
+                lk["is_primary"] = True
+                self._primary[(lk["host"], lk["workspace_id"])] = p["link_id"]
+        elif t == "workspace_primary_cleared":
+            lk = self._links.get(p["link_id"])
+            if lk:
+                lk["is_primary"] = False
+                if self._primary.get((lk["host"], lk["workspace_id"])) == p["link_id"]:
+                    self._primary.pop((lk["host"], lk["workspace_id"]), None)
+        elif t == "mission_linked":
+            self._missions[(p["room_id"], p["mission_id"])] = {
+                "mission_id": p["mission_id"], "room_id": p["room_id"], "members": list(p["members"]),
+                "linked_by": p["actor_user_id"], "created_at": p["created_at"]}
+        elif t == "mission_unlinked":
+            self._missions.pop((p["room_id"], p["mission_id"]), None)
         elif t == "fleet_host_set":
             self._fleet_flags[p["host"]] = bool(p["auto_agents"])
         elif t == "fleet_spawn_requested":
@@ -1705,6 +1755,11 @@ class CollabService:
             out["agents"] = [] if guest else self.list_room_agents(pr, room_id)["agents"]
             out["tasks"] = self.list_tasks(pr, room_id)["tasks"]
             out["flow"] = None if guest else self.room_flow(pr, room_id)
+            with self._lock:                      # quiet reads: people only, never guests or agents
+                visible = not pr.is_agent and not guest
+                room_now = self._rooms[room_id]
+                out["links"] = self._links_visible(pr, room_now) if visible else None
+                out["missions"] = self._missions_visible(pr, room_now) if visible else None
             with self._lock:                      # ask quietly: a denied call would log an event and wake every waiter
                 eff = self._effective(pr, self._rooms[room_id])
                 may_review = not pr.is_agent and bool(eff and "invite" in eff[0])
@@ -1844,6 +1899,259 @@ class CollabService:
                     out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
                                 "owner_user_id": a["owner"], "actions": g["actions"]})
         return {"agents": out}
+
+    # -- room <-> workspace and mission links
+    # Room access NEVER implies workspace access. A link only says which metadata scopes room members
+    # may see; the terminal needs its own explicit grant on the link, and the effective permission is
+    # the intersection of user/agent role, room grant, link grant and the named terminal principals.
+    def _is_link_manager(self, pr: Principal, room: dict) -> bool:
+        m = self._member(room, pr.id) if not pr.is_agent else None
+        return bool(m and m["role"] == "owner")
+
+    def _terminal_ok(self, pr: Principal, room: dict, link: dict) -> bool:
+        """Pure check (no audit): may this principal open the linked workspace's terminal?"""
+        if "terminal" not in link["grants"]:
+            return False
+        eff = self._effective(pr, room)
+        if eff is None or "read" not in eff[0]:
+            return False
+        named = set(link["terminal_principals"])
+        if pr.key not in named:
+            return False
+        if pr.is_agent:
+            agent = self._agents.get(pr.id)
+            m = self._member(room, agent["owner"]) if agent else None
+            # the agent needs the room's execute right AND its owner must be named too and be allowed a terminal
+            return bool(m and m["role"] in TERMINAL_ROLES and "execute" in eff[0]
+                        and f"user:{agent['owner']}" in named)
+        m = self._member(room, pr.id)
+        return bool(m and m["role"] in TERMINAL_ROLES)
+
+    def authorize_workspace(self, pr: Principal, room_id: str, link_id: str, action: str) -> dict:
+        """The one place that answers 'may this principal do `action` on the workspace linked to this room?'
+        action is status, tabs, panes or terminal. Fails closed: anything unknown is a 404, anything not
+        explicitly granted a 403, and both are audited."""
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "workspace.access")
+            link = self._links.get(link_id)
+            if link is None or link["room_id"] != room_id:
+                raise CollabError(404, "not found")
+            if action not in LINK_GRANTS:
+                raise CollabError(400, "unknown workspace action")
+            if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
+                ok = False
+            elif action == "terminal":
+                ok = self._terminal_ok(pr, room, link)
+            else:
+                ok = action in link["grants"]       # _authorize already proved membership / the agent's grant
+            if not ok:
+                self._audit_denied(pr, f"workspace.{action}", "no_workspace_grant", room_id=room_id,
+                                   resource_id=link_id, project_ids=[room["project_id"]])
+                self.stats["policy_denied"] += 1
+                raise CollabError(403, "forbidden")
+            return {"allowed": True, "link_id": link_id, "workspace_id": link["workspace_id"],
+                    "host": link["host"], "action": action}
+
+    def _link_view(self, pr: Principal, room: dict, lk: dict, manager: bool) -> dict:
+        out = {"link_id": lk["link_id"], "room_id": lk["room_id"], "workspace_id": lk["workspace_id"],
+               "host": lk["host"], "is_primary": lk["is_primary"], "grants": list(lk["grants"]),
+               "linked_by": lk["linked_by"], "created_at": lk["created_at"],
+               "can_terminal": self._terminal_ok(pr, room, lk)}
+        if manager:
+            out["terminal_principals"] = list(lk["terminal_principals"])
+        return out
+
+    def _links_visible(self, pr: Principal, room: dict) -> list[dict]:
+        """Links this person may see: owners see all; others only links that grant them something."""
+        manager = self._is_link_manager(pr, room)
+        return [self._link_view(pr, room, lk, manager)
+                for lid in self._links_by_room.get(room["id"], ())
+                if (lk := self._links[lid]) and (manager or lk["grants"])]
+
+    def _missions_visible(self, pr: Principal, room: dict) -> list[dict]:
+        manager = self._is_link_manager(pr, room)
+        out = []
+        for (rid, mid), ms in self._missions.items():
+            if rid != room["id"]:
+                continue
+            if manager or pr.id in ms["members"]:
+                out.append({"mission_id": mid, "room_id": rid, "linked_by": ms["linked_by"],
+                            "created_at": ms["created_at"],
+                            **({"members": list(ms["members"])} if manager else {})})
+        return out
+
+    def _no_guest(self, pr: Principal, room: dict) -> None:
+        if (self._member(room, pr.id) or {}).get("role") == "guest":
+            raise CollabError(403, "forbidden")
+
+    def list_workspace_links(self, pr: Principal, room_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "workspace.list")
+            self._no_guest(pr, room)
+            return {"links": self._links_visible(pr, room)}
+
+    def _grants_body(self, pr: Principal, room: dict, body: dict) -> tuple[list, list]:
+        grants = body.get("grants", list(DEFAULT_LINK_GRANTS))
+        if (not isinstance(grants, list) or len(grants) > len(LINK_GRANTS)
+                or not all(isinstance(g, str) and g in LINK_GRANTS for g in grants)):
+            raise CollabError(400, "grants must be a subset of status, tabs, panes, terminal")
+        grants = sorted(set(grants))
+        tp = body.get("terminal_principals", [])
+        if (not isinstance(tp, list) or len(tp) > MAX_TERMINAL_PRINCIPALS
+                or not all(isinstance(x, str) and _KEY_RE.fullmatch(x) for x in tp)):
+            raise CollabError(400, "invalid terminal_principals")
+        tp = sorted(set(tp))
+        if ("terminal" in grants) != bool(tp):
+            raise CollabError(400, "terminal needs named terminal_principals, and they need the terminal grant")
+        for key in tp:
+            kind, _, ident = key.partition(":")
+            if kind == "user":
+                m = self._member(room, ident)
+                if not m or m["role"] not in TERMINAL_ROLES:
+                    raise CollabError(400, "terminal principals must be owners or contributors of the room")
+            elif kind == "agent":
+                if ident not in room["grants"]:
+                    raise CollabError(400, "terminal agents must hold a grant in the room")
+            else:
+                raise CollabError(400, "invalid terminal_principals")
+        return grants, tp
+
+    def _make_primary(self, pr: Principal, room: dict, lk: dict, demote_other: bool) -> None:
+        """Make `lk` its workspace's primary. Another primary is a 409 unless `demote_other`, which only the
+        operator or the other room's owner may do. The 409 never names the other room."""
+        cur_id = self._primary.get((lk["host"], lk["workspace_id"]))
+        if cur_id is None or cur_id == lk["link_id"]:
+            return
+        other = self._links[cur_id]
+        orm = self._rooms[other["room_id"]]
+        if not demote_other or not (pr.admin or self._is_link_manager(pr, orm)):
+            raise CollabError(409, "this workspace already has a primary room")
+        self._commit("workspace_primary_cleared", self._actor(
+            pr, project_id=orm["project_id"], room_id=orm["id"], link_id=cur_id, action="workspace.demote",
+            outcome="allowed", reason="demoted_by_new_primary", project_ids=[orm["project_id"]], resource_id=cur_id))
+
+    def link_workspace(self, pr: Principal, room_id: str, body: dict) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "workspace.link")
+            host, ws = body.get("host"), body.get("workspace_id")
+            if not isinstance(host, str) or not _FLEET_HOST.fullmatch(host):
+                raise CollabError(400, "invalid host")
+            if not isinstance(ws, str) or not _KEY_RE.fullmatch(ws):
+                raise CollabError(400, "invalid workspace_id")
+            primary = body.get("is_primary", False)
+            if not isinstance(primary, bool) or not isinstance(body.get("demote_other", False), bool):
+                raise CollabError(400, "is_primary and demote_other must be booleans")
+            grants, tp = self._grants_body(pr, room, body)
+            ids_here = self._links_by_room.get(room_id, ())
+            if any(self._links[i]["host"] == host and self._links[i]["workspace_id"] == ws for i in ids_here):
+                raise CollabError(409, "this workspace is already linked to the room")
+            if len(ids_here) >= MAX_LINKS_PER_ROOM:
+                raise CollabError(429, "workspace link limit reached for this room")
+            self._throttle("wslink:" + pr.id, 120, 600.0, "workspace link")
+            if primary:
+                cur = self._primary.get((host, ws))
+                if cur is not None:
+                    self._make_primary(pr, room, {"link_id": "", "host": host, "workspace_id": ws},
+                                       body.get("demote_other", False))
+            lid = ids.new_id("grant")
+            self._commit("workspace_linked", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, link_id=lid, workspace_id=ws, host=host,
+                is_primary=primary, grants=grants, terminal_principals=tp, action="workspace.link",
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=lid))
+            return self._link_view(pr, room, self._links[lid], True)
+
+    def _own_link(self, pr: Principal, room_id: str, link_id: str, audit_action: str) -> tuple[dict, dict]:
+        room, _ = self._authorize(pr, room_id, "invite", audit_action)
+        lk = self._links.get(link_id)
+        if lk is None or lk["room_id"] != room_id:
+            raise CollabError(404, "not found")
+        return room, lk
+
+    def unlink_workspace(self, pr: Principal, room_id: str, link_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, lk = self._own_link(pr, room_id, link_id, "workspace.unlink")
+            self._commit("workspace_unlinked", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, link_id=link_id, action="workspace.unlink",
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=link_id))
+        return {"ok": True}
+
+    def set_workspace_primary(self, pr: Principal, room_id: str, link_id: str, body: dict) -> dict:
+        self._require_user(pr)
+        primary, demote = body.get("primary", True), body.get("demote_other", False)
+        if not isinstance(primary, bool) or not isinstance(demote, bool):
+            raise CollabError(400, "primary and demote_other must be booleans")
+        with self._lock:
+            room, lk = self._own_link(pr, room_id, link_id, "workspace.primary")
+            if primary and not lk["is_primary"]:
+                self._make_primary(pr, room, lk, demote)
+                self._commit("workspace_primary_set", self._actor(
+                    pr, project_id=room["project_id"], room_id=room_id, link_id=link_id,
+                    action="workspace.primary", outcome="allowed", project_ids=[room["project_id"]],
+                    resource_id=link_id))
+            elif not primary and lk["is_primary"]:
+                self._commit("workspace_primary_cleared", self._actor(
+                    pr, project_id=room["project_id"], room_id=room_id, link_id=link_id,
+                    action="workspace.demote", outcome="allowed", reason="demoted_by_owner",
+                    project_ids=[room["project_id"]], resource_id=link_id))
+            return self._link_view(pr, room, self._links[link_id], True)
+
+    def set_workspace_grants(self, pr: Principal, room_id: str, link_id: str, body: dict) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, lk = self._own_link(pr, room_id, link_id, "workspace.grants")
+            grants, tp = self._grants_body(pr, room, body)
+            self._commit("workspace_link_updated", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, link_id=link_id, grants=grants,
+                terminal_principals=tp, old_grants=list(lk["grants"]), action="workspace.grants",
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=link_id))
+            return self._link_view(pr, room, self._links[link_id], True)
+
+    def list_room_missions(self, pr: Principal, room_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "mission.list")
+            self._no_guest(pr, room)
+            return {"missions": self._missions_visible(pr, room)}
+
+    def link_mission(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """Tie a room to a mission id (an opaque string from Pi). Only the listed room members see the link."""
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "mission.link")
+            mid, members = body.get("mission_id"), body.get("members", [])
+            if not isinstance(mid, str) or not _KEY_RE.fullmatch(mid):
+                raise CollabError(400, "invalid mission_id")
+            if (not isinstance(members, list) or len(members) > self.max_members_per_room
+                    or not all(isinstance(u, str) for u in members)):
+                raise CollabError(400, "members must be a list of user ids")
+            for u in members:
+                m = self._member(room, u)
+                if not m or m["role"] == "guest":
+                    raise CollabError(400, "mission members must be non-guest members of the room")
+            if (room_id, mid) in self._missions:
+                raise CollabError(409, "this mission is already linked to the room")
+            if sum(1 for r, _ in self._missions if r == room_id) >= MAX_MISSIONS_PER_ROOM:
+                raise CollabError(429, "mission link limit reached for this room")
+            self._throttle("mslink:" + pr.id, 120, 600.0, "mission link")
+            self._commit("mission_linked", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, mission_id=mid, members=sorted(set(members)),
+                action="mission.link", outcome="allowed", project_ids=[room["project_id"]], resource_id=mid))
+            return {"mission_id": mid, "room_id": room_id, "members": sorted(set(members))}
+
+    def unlink_mission(self, pr: Principal, room_id: str, mission_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "mission.unlink")
+            if (room_id, mission_id) not in self._missions:
+                raise CollabError(404, "not found")
+            self._commit("mission_unlinked", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, mission_id=mission_id,
+                action="mission.unlink", outcome="allowed", project_ids=[room["project_id"]],
+                resource_id=mission_id))
+        return {"ok": True}
 
     # -- tasks (work for agents)
     def _task_status(self, t: dict) -> str:
@@ -2317,6 +2625,10 @@ class CollabService:
                         return 200, self.list_tasks(pr, rid)
                     if parts[2:] == ["flow"]:
                         return 200, self.room_flow(pr, rid)
+                    if parts[2:] == ["workspaces"]:
+                        return 200, self.list_workspace_links(pr, rid)
+                    if parts[2:] == ["missions"]:
+                        return 200, self.list_room_missions(pr, rid)
                     if parts[2:] == ["state"]:
                         wait = _int(query, "wait", 0, 0, 10)
                         return 200, self.room_state(pr, rid, _int(query, "since", -1, -1),
@@ -2391,6 +2703,20 @@ class CollabService:
                         return 200, self.approve_all_requests(pr, rid, body)
                     if n == 5 and parts[2] == "agent-requests" and parts[4] == "decide":
                         return 200, self.decide_agent_request(pr, rid, parts[3], body)
+                    if parts[2:] == ["workspaces"]:
+                        return 201, self.link_workspace(pr, rid, body)
+                    if n == 5 and parts[2] == "workspaces" and parts[4] == "unlink":
+                        return 200, self.unlink_workspace(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "workspaces" and parts[4] == "primary":
+                        return 200, self.set_workspace_primary(pr, rid, parts[3], body)
+                    if n == 5 and parts[2] == "workspaces" and parts[4] == "grants":
+                        return 200, self.set_workspace_grants(pr, rid, parts[3], body)
+                    if n == 5 and parts[2] == "workspaces" and parts[4] == "authorize":
+                        return 200, self.authorize_workspace(pr, rid, parts[3], str(body.get("action", "")))
+                    if parts[2:] == ["missions"]:
+                        return 201, self.link_mission(pr, rid, body)
+                    if n == 5 and parts[2] == "missions" and parts[4] == "unlink":
+                        return 200, self.unlink_mission(pr, rid, parts[3])
                     if parts[2:] == ["tasks"]:
                         return 201, self.create_task(pr, rid, body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":
