@@ -2382,6 +2382,11 @@ def _cmd_cp_web(args) -> int:
     inspector_limits = cp.get("inspector_limits") or {}
     if not isinstance(inspector_limits, dict):
         raise SystemExit("fleet config control_plane.inspector_limits must be a mapping")
+    from .control_plane.retention import usage_retention_config
+    try:
+        usage_retention = usage_retention_config(cp.get("llm_proxy"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
@@ -2464,6 +2469,7 @@ def _cmd_cp_web(args) -> int:
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              summary_config=cp.get("agent_summaries") or {},
+                             usage_retention=usage_retention,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
