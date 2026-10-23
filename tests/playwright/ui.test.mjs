@@ -151,6 +151,21 @@ test('overview survives a heavy event burst without rate limiting', async () => 
   });
 });
 
+test('activity uses compact expandable rows without hiding event detail', async () => {
+  await withApp(async ({ page, base }) => {
+    const events=Array.from({length:12},(_,index)=>({event_id:`event-${index}`,event_type:'ServiceUpdated',source_timestamp:new Date(Date.now()-index*1000).toISOString(),payload:{service_name:`service-${index}`,host_id:'bender',status:'healthy',description:`Detailed event payload ${index}`}}));
+    await page.route('**/api/v1/activity?limit=50',route=>route.fulfill({json:{events}}));
+    await page.goto(`${base}/#/activity`);await page.locator('.ac-row').first().waitFor();
+    const geometry=await page.locator('.ac-row').first().evaluate(row=>({height:row.getBoundingClientRect().height,width:row.getBoundingClientRect().width}));
+    assert.ok(geometry.height<=64,`expected a compact collapsed activity row, got ${geometry.height}`);
+    assert.equal(await page.locator('.ac-row').count(),12);
+    await page.locator('.ac-row summary').first().click();
+    assert.match(await page.locator('.ac-row').first().innerText(),/Detailed event payload 0/);
+    await page.setViewportSize({width:390,height:844});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  },{BURST:'0'});
+});
+
 test('pi-sourced mission detail renders by mission_key', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/missions`);

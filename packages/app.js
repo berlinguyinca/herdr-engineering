@@ -393,27 +393,25 @@ async function viewHost(parts) {
 }
 
 async function viewActivity() {
-  root.innerHTML = '<h1>Activity</h1>' + await activityList(50);
+  root.innerHTML = `<style>
+    .ac-list{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+    .ac-row{border-bottom:1px solid var(--border-subtle)}.ac-row:last-child{border-bottom:0}.ac-row[open]{background:var(--bg)}
+    .ac-row summary{display:grid;grid-template-columns:minmax(140px,220px) minmax(0,1fr) auto;gap:14px;align-items:center;padding:10px 12px;cursor:pointer;list-style-position:inside;font-size:13px}
+    .ac-row summary strong{overflow-wrap:anywhere}.ac-kind,.ac-time{font-size:12px;color:var(--text-secondary)}.ac-time{white-space:nowrap}
+    .ac-detail{margin:0;padding:0 32px 12px;font-size:12px;line-height:1.5;color:var(--text-secondary);overflow-wrap:anywhere}
+    .ac-row[data-muted=true]{opacity:.65}
+    @media(max-width:650px){.ac-row summary{grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;padding:12px}.ac-kind{grid-column:1}.ac-time{grid-column:2;grid-row:1/3}.ac-detail{padding:0 12px 12px}}
+  </style><h1>Activity</h1>` + await activityList(50);
 }
 
 async function activityList(limit) {
   const { events } = await client.activity(limit);
   if (!events.length) return '<herdr-empty message="No activity yet"></herdr-empty>';
   const t = titles(await missionTitles());
-  return events.map((e) => {
+  return `<div class="ac-list">${events.map((e) => {
     const d = describeEvent(e, { missionTitles: t });
-    const meta = `<div class="hd-card__sub">${esc(d.kind)} · ${formatTimestamp(e.source_timestamp)}</div>`;
-    if (d.muted) {
-      // Low-signal events (e.g. heartbeats) get a compact, de-emphasised row.
-      return `<div class="hd-card" style="opacity:.6">
-        <div class="hd-card__title">${esc(d.title)}</div>
-        <div class="hd-card__sub">${esc(d.detail)}</div>${meta}</div>`;
-    }
-    return `<div class="hd-card">
-      <div class="hd-card__title">${esc(d.title)}</div>
-      <div class="hd-card__sub">${esc(d.detail)}</div>${meta}
-    </div>`;
-  }).join('');
+    return `<details class="ac-row" data-muted="${d.muted}"><summary><strong>${esc(d.title)}</strong><span class="ac-kind">${esc(d.kind)}</span><time class="ac-time">${formatTimestamp(e.source_timestamp)}</time></summary><p class="ac-detail">${esc(d.detail)}</p></details>`;
+  }).join('')}</div>`;
 }
 
 async function viewAnalytics() {
