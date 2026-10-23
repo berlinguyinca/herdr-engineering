@@ -341,7 +341,7 @@ def _with_collab(e, collab=COLLAB, cert_dir=_DEFAULT):
     (live / "privkey.pem").write_text("not a real key\n")
     certbot = e["home"] / ".local/share/herdr-engineering/collab-acme-venv/bin/certbot"
     certbot.parent.mkdir(parents=True)
-    certbot.write_text("#!/bin/sh\nexit 0\n")
+    certbot.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\"\n")
     certbot.chmod(0o755)
     e["central"].unlink()
     fcc.write_private_file(e["central"], yaml.safe_dump(data, sort_keys=False))
@@ -413,6 +413,22 @@ def test_collab_sync_defaults_to_herdr_owned_renewal_state(env):
     assert f'ExecStart="{certbot}" renew' in renew_unit
     assert f'--config-dir "{acme}/config"' in renew_unit
     assert "inferweave/bender-failover" not in renew_unit
+
+
+def test_collab_renewal_dry_run_skips_certbot_random_sleep(env):
+    _with_collab(env)
+    config = env["tmp"] / "collab-config.json"
+    fcc.render_collab(fcc.load_fleet_config(env["central"]), config)
+    sync = ROOT / "deploy" / "control-plane" / "collab-sync.sh"
+    r = run(sync, env, "renew-check", "--config", str(config))
+    assert r.returncode == 0, r.stderr
+
+    acme = env["home"] / ".local/share/herdr-engineering/collab-acme"
+    assert r.stdout.strip() == (
+        "renew --dry-run --no-random-sleep-on-renew --non-interactive "
+        "--cert-name localdev.mcp.metabolomics.us "
+        f"--config-dir {acme}/config --work-dir {acme}/work --logs-dir {acme}/logs"
+    )
 
 
 def test_collab_sync_provisions_the_operators_invitees_from_the_slice_not_env(env):

@@ -125,7 +125,7 @@ UNIT
 }
 
 certbot_dry_run() {   # proves the renewal path end to end against Let's Encrypt staging
-  "$CERTBOT" renew --dry-run --non-interactive --cert-name "$CERT_NAME" --config-dir "$ACME/config" --work-dir "$ACME/work" --logs-dir "$ACME/logs"
+  "$CERTBOT" renew --dry-run --no-random-sleep-on-renew --non-interactive --cert-name "$CERT_NAME" --config-dir "$ACME/config" --work-dir "$ACME/work" --logs-dir "$ACME/logs"
 }
 
 # Starts the fleets the dashboard owner asks for on their own hosts, over herdr (see collab-spawn.py).
