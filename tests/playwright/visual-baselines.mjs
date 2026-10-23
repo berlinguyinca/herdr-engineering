@@ -38,9 +38,9 @@ export const SURFACES = [
   { slug: 'collab-rooms', hash: '/rooms', proof: '#hcn-rooms' },
   { slug: 'collab-chat', sub: 'chat', proof: '#hcn-log', regions: [{ name: 'logo', selector: '.cx-logo' }, { name: 'subtabs', selector: '.cx-stabs' }, { name: 'log', selector: '#hcn-log' }] },
   { slug: 'collab-tabs', sub: 'tabs', proof: '#hcn-tabs [role=tab]' },
-  { slug: 'collab-lineage', sub: 'lineage', proof: 'svg.lin-svg g[data-node]', steps: selectNode,
+  { slug: 'collab-lineage', sub: 'lineage', proof: 'svg.lin-svg g[data-node]', steps: selectNode, resetScroll: true,
     regions: [{ name: 'graph', selector: '.lin-scroll' }, { name: 'node', selector: 'g[data-node="attempt:a1"]' }, { name: 'inspector', selector: '.lin-inspector' }] },
-  { slug: 'collab-lineage-gantt', sub: 'lineage', proof: 'svg.lin-svg', steps: async (page) => { await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role=img]').waitFor(); },
+  { slug: 'collab-lineage-gantt', sub: 'lineage', proof: 'svg.lin-svg', resetScroll: true, steps: async (page) => { await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role=img]').waitFor(); },
     regions: [{ name: 'gantt', selector: 'svg.lin-svg[role=img]' }] },
   { slug: 'collab-attention', sub: 'attention', proof: '.cx-attn-item', regions: [{ name: 'item', selector: '.cx-attn-item' }] },
   { slug: 'collab-progress', sub: 'progress', proof: '#hcn-p-progress' },
@@ -112,9 +112,9 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     await page.evaluate(() => document.fonts.ready);
     await page.waitForTimeout(600);
     await page.evaluate(NORMALIZE);
-    // focusing a node scrolls the page by a run-dependent fraction of a pixel; start every capture from the top
-    await page.evaluate(() => { window.scrollTo(0, 0); document.scrollingElement.scrollTop = 0; });
-    await page.waitForTimeout(100);
+    // selecting a node scrolls the page by a run-dependent pixel; those surfaces are captured from the top (the chat, which scrolls to
+    // its newest message on purpose, is not touched)
+    if (surface.resetScroll) { await page.evaluate(() => { window.scrollTo(0, 0); document.scrollingElement.scrollTop = 0; }); await page.waitForTimeout(100); }
     await assertBundledFonts(page, ctx);
     const height = Math.min(MAX_HEIGHT, await page.evaluate(() => Math.max(document.documentElement.scrollHeight, innerHeight)));
     const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: CFG.viewports[viewport].width, height }, animations: 'disabled', caret: 'hide' }), regions: {} };
