@@ -161,3 +161,22 @@ test('GitHub narrow detail focuses Back and restores document list scroll',async
   assert.equal(await page.locator('.gh-issue-list').evaluate(e=>getComputedStyle(e).overflowY),'hidden');
  }
 }));
+
+test('GitHub desktop selection enters narrow detail with focus and returns to a visible selected row',async()=>withApp(async(page,base)=>{
+ const rows=Array.from({length:20},(_,i)=>issue(i+1));
+ await page.route('**/api/v1/github?*',route=>route.fulfill({json:snapshot({repositories:[repository('busy',20)]})}));
+ await page.route('**/api/v1/github/issues?*',route=>route.fulfill({json:snapshot({issues:rows})}));
+ await page.route('**/api/v1/github/issue?*',route=>{const number=Number(new URL(route.request().url()).searchParams.get('number'));return route.fulfill({json:snapshot({issue:{...rows[number-1],body:'Resized description\n'.repeat(180)}})});});
+ await page.setViewportSize({width:1920,height:1080});await page.goto(`${base}/#/github`);
+ for(const number of [1,12]){
+  await page.setViewportSize({width:1920,height:1080});
+  const item=page.getByRole('button',{name:`Issue ${number}`,exact:true});await item.click();await page.locator('[data-gh-body]').waitFor();
+  await page.setViewportSize({width:390,height:844});
+  await page.waitForFunction(()=>document.activeElement?.hasAttribute('data-gh-close'),null,{timeout:1500});
+  assert.equal(await page.locator('.gh-issue-list').isVisible(),false);
+  await page.evaluate(()=>scrollBy(0,1000));
+  await page.getByRole('button',{name:'Back to issues',exact:true}).click();
+  assert.equal(await item.evaluate(e=>e===document.activeElement),true);
+  const row=await item.boundingBox();assert.ok(row.y>=0&&row.y+row.height<=844,`selected issue ${number} must return within the viewport: ${JSON.stringify(row)}`);
+ }
+}));

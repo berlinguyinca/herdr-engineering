@@ -96,9 +96,20 @@ export function mountGithub(container,client) {
   <div class="gh-layout"><details class="gh-repositories" ${window.matchMedia('(min-width:851px)').matches?'open':''}><summary>Repositories · most open issues first</summary><div class="gh-repository-content"><div class="gh-controls"><label>Search repositories<input type="search" data-gh-repo-search placeholder="Owner or repository"></label></div><button type="button" class="hd-btn gh-all-repos" data-gh-all-repositories>All repositories</button><p class="gh-note" data-gh-repo-count></p><ul class="gh-repo-list" data-gh-repositories></ul><div class="gh-pages" data-gh-repo-pages><button type="button" class="hd-btn" data-gh-repo-page="previous">Previous</button><span data-gh-repo-page-label></span><button type="button" class="hd-btn" data-gh-repo-page="next">Next</button></div></div></details>
   <section class="gh-main"><div class="gh-heading"><h2 data-gh-scope>All repositories</h2></div><div class="gh-tabs" role="tablist" aria-label="Issue classification">${tabs.map(([key,label])=>`<button type="button" role="tab" id="gh-tab-${key}" data-gh-tab="${key}" aria-controls="gh-issue-panel" aria-selected="${key==='all'}" tabindex="${key==='all'?0:-1}">${label}<small data-gh-tab-count="${key}">…</small></button>`).join('')}</div><div class="gh-controls"><label>Search open issues<input type="search" data-gh-issue-search placeholder="Issue title or number"></label></div><p class="gh-section-label" data-gh-issue-count role="status"></p><p class="gh-warning" data-gh-issue-error role="status"></p><div class="gh-issue-layout"><div class="gh-issue-list" id="gh-issue-panel" role="tabpanel" aria-labelledby="gh-tab-all"></div><aside class="gh-inspector" data-gh-inspector aria-label="Issue inspector" hidden></aside></div><div class="gh-pages" data-gh-issue-pages><button type="button" class="hd-btn" data-gh-issue-page="previous">Previous</button><span data-gh-issue-page-label></span><button type="button" class="hd-btn" data-gh-issue-page="next">Next</button></div></section></div>`;
  const el=selector=>container.querySelector(selector);
- const narrow=()=>window.matchMedia('(max-width:1249px)').matches;
+ const narrowViewport=window.matchMedia('(max-width:1249px)');
+ const narrow=()=>narrowViewport.matches;
  function sizeWorkspace(){const layout=el('.gh-layout');layout.style.setProperty('--gh-workspace-top',`${Math.max(16,layout.getBoundingClientRect().top+window.scrollY)}px`);layout.style.setProperty('--gh-repository-heading',`${el('.gh-repositories>summary').getBoundingClientRect().height}px`);}
  window.addEventListener('resize',sizeWorkspace,{signal:listeners.signal});
+ narrowViewport.addEventListener('change',event=>{
+  if(!selected)return;
+  if(!event.matches){listScroll=null;return;}
+  // Measure the return position in the new document layout before focusing detail.
+  const layout=el('.gh-layout'),inspector=el('[data-gh-inspector]');inspector.hidden=true;layout.classList.remove('gh-detail-open');
+  [...container.querySelectorAll('[data-gh-issue]')].find(node=>node.dataset.ghIssue===selected.key)?.scrollIntoView({block:'center'});
+  listScroll=window.scrollY;layout.classList.add('gh-detail-open');inspector.hidden=false;
+  el('[data-gh-inspector]').scrollIntoView({block:'start'});el('[data-gh-close]').focus({preventScroll:true});
+  sizeWorkspace();
+ },{signal:listeners.signal});
  const cancel=key=>{requests.get(key)?.abort();requests.delete(key);};
  function replace(element,html,key,signature) {
   if(signatures.get(key)===signature)return;signatures.set(key,signature);
