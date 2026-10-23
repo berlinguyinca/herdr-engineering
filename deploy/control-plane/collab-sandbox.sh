@@ -114,7 +114,13 @@ if [ -n "${HERDR_SANDBOX_SSH_DIR+x}" ]; then
   case "$SSHD" in /*) ;; *) deny "the ssh directory must be an absolute path" ;; esac
   if [ -L "$SSHD" ] || [ ! -d "$SSHD" ]; then deny "the ssh directory must be a directory, not a link"; fi
   [ "$(stat -c '%u %a' "$SSHD")" = "$(id -u) 700" ] || deny "the ssh directory must be yours with mode 0700"
-  args+=(--ro-bind "$SSHD" "$HOME/.ssh")
+  sreal="$(cd "$SSHD" && pwd -P)"
+  if [ -d "$HOME/.ssh" ]; then             # a copy of the room's keys, never the operator's own keys
+    oreal="$(cd "$HOME/.ssh" && pwd -P)"
+    case "$sreal/" in "$oreal"/*) deny "the ssh directory must not be the operator's ~/.ssh" ;; esac
+    case "$oreal/" in "$sreal"/*) deny "the ssh directory must not contain the operator's ~/.ssh" ;; esac
+  fi
+  args+=(--ro-bind "$sreal" "$HOME/.ssh")
 fi
 args+=(--bind "$WORK" "$WORK" --chdir "$WORK"
        --clearenv --setenv PATH "$(dirname "$(command -v claude 2>/dev/null || echo /usr/bin/x)"):$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"

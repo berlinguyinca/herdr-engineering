@@ -177,7 +177,20 @@ export function renderHelperList(helpers, rooms, now) {
     + `<td>${h.created_epoch ? esc(ago(now - h.created_epoch)) : ''}</td><td>${esc(when(h.expires_epoch))}</td><td>${helperIsLive(h) ? cancelBtn(h) : ''}</td></tr>`).join('')}</tbody></table>`;
 }
 
-// state: { paused, requests, helpers, allow: {roomId: [host...]}, rooms, now, error }
+// Helpers started by "Let the agent fix this" on a dead session (dashboard summaries). The result is the
+// helper's own text: untrusted, shown escaped, never applied or run.
+const FIX_RESULT_CHARS = 20000;
+export function renderSummaryFixResults(rows, now) {
+  if (!(rows || []).length) return '<div class="hd-empty">No summary-fix helpers yet.</div>';
+  return `<ul class="cx-list cx-fix-results">${rows.map((h) => {
+    const text = typeof h.result === 'string' ? h.result.slice(0, FIX_RESULT_CHARS) : '';
+    const err = typeof h.error_text === 'string' && h.error_text ? `<span class="cx-sub1">${esc(h.error_text.slice(0, 500))}</span>` : '';
+    return `<li data-helper="${esc(h.helper_id)}"><span class="grow"><b>${esc(h.status)}</b> <span class="cx-sub1">${h.created_epoch ? `${esc(ago(now - h.created_epoch))} ago` : ''} · ${esc(h.helper_id)}</span>${err}`
+      + `${text ? `<details><summary>Result (untrusted text, not applied)</summary><pre class="cx-pre">${esc(text)}</pre></details>` : ''}</span>${helperIsLive(h) ? cancelBtn(h) : ''}</li>`;
+  }).join('')}</ul>`;
+}
+
+// state: { paused, requests, helpers, allow: {roomId: [host...]}, rooms, now, error, fixes }
 export function renderHelpersPanel(st, { operator }) {
   if (!operator) return '';
   const rooms = st.rooms || [];
@@ -188,6 +201,7 @@ export function renderHelpersPanel(st, { operator }) {
     + `${renderPanic(Boolean(st.paused), { operator })}`
     + `<div class="hd-card cx-stack"><div class="hd-card__title">Host access requests (all rooms)</div>${renderEgressRequests(reqs, { operator, rooms })}`
     + `<div class="hd-card__title">Helpers across rooms</div>${renderHelperList(st.helpers, rooms, st.now ?? Date.now() / 1000)}`
+    + `${Array.isArray(st.fixes) ? `<div class="hd-card__title">Summary fixes</div>${renderSummaryFixResults(st.fixes, st.now ?? Date.now() / 1000)}` : ''}`
     + `<div class="hd-card__title">External hosts</div>${hostRooms.length ? hostRooms.map((r) => `<div class="cx-sub1">${renderRoomRef(r, rooms)}</div>${renderHostsTable(st.allow[r], reqs.filter((q) => q.room_id === r), { operator, room: r, permanent: null, entries: ent[r], now: st.now })}`).join('') : '<div class="hd-empty">No external hosts.</div>'}</div></section>`;
 }
 
@@ -196,20 +210,23 @@ export function renderHelpersPanel(st, { operator }) {
 export function createHelpersPanel({ container, api, operator, getRooms, go, schedule = setTimeout, clear = clearTimeout, interval = 6000, hidden = () => false }) {
   if (!operator) return { refresh: async () => {}, start() {}, destroy() {} };
   let alive = true; let timer = null; let seq = 0;
-  const st = { paused: false, requests: [], helpers: [], allow: {}, entries: {}, rooms: [], error: '' };
+  const st = { paused: false, requests: [], helpers: [], allow: {}, entries: {}, rooms: [], error: '', fixes: null };
   const draw = () => { if (alive) container.innerHTML = renderHelpersPanel(st, { operator }); };
   const refresh = async () => {
     if (!alive) return;
     const mine = ++seq;
     const errs = [];
-    const [rq, hp, rm] = await Promise.all([
+    const [rq, hp, rm, fx] = await Promise.all([
       api.egressRequests().catch((e) => { errs.push(e.message); return null; }),
       api.helpers().catch((e) => { errs.push(e.message); return null; }),
-      Promise.resolve().then(getRooms).catch(() => null)]);
+      Promise.resolve().then(getRooms).catch(() => null),
+      // older servers have no such route: the section just stays hidden
+      typeof api.summaryFixHelpers === 'function' ? api.summaryFixHelpers().catch(() => null) : null]);
     if (!alive || mine !== seq) return;
     if (rq) st.requests = (rq.requests || []).filter((r) => r.state === 'open' || r.state === 'approved');
     if (hp) { st.helpers = hp.helpers || []; st.paused = Boolean(hp.paused); st.now = hp.now; }
     if (rm) st.rooms = rm;
+    if (fx) st.fixes = fx.configured || (fx.helpers || []).length ? fx.helpers || [] : null;
     // rooms that hold hosts, rooms with a live request, then the operator's own rooms (first wins the cap)
     const ids = [...new Set([...((rq && rq.rooms_with_hosts) || []), ...st.requests.map((r) => r.room_id), ...st.rooms.map((r) => r.room_id)])].filter(Boolean).slice(0, MAX_ROOMS);
     const lists = await Promise.all(ids.map((id) => api.egressAllowlist(id).then((x) => [id, x]).catch(() => null)));

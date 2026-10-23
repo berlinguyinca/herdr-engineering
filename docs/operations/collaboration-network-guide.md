@@ -417,6 +417,16 @@ agent, owned by the parent's person and living no longer than the helper. Then t
 The helper's own credential is never written anywhere. Helpers run without MCP for now: a helper cannot report
 progress, read the room, or start helpers of its own from the box (see *Residual risks*).
 
+**Summary-fix helpers (dashboard).** "Let the agent fix this" on a dashboard summary whose agent is not
+running starts a helper through one standing room the operator configures as
+`control_plane.collab.summary_fix: {room_id, requester_agent_id}` (ids only; this is the only nested key
+`control_plane.collab` accepts, and it refuses unknown sub-keys). The requester must be the operator's own agent,
+hold **only** `spawn_helpers` there, and the room must not let helpers use tools. The dashboard asks over the
+operator listener (`POST fleet/summary-fix/helper {operation_id, task}`, 404 on the public site); the helper is a
+`worker` with the summary packet as its task, and the same operation id always returns the same helper. Results are
+listed for the operator under **Helpers → Summary fixes** (`GET fleet/summary-fix/helpers`) as untrusted text and
+are never applied. Setup and error codes: `docs/operations/agent-summary-fabric.md`.
+
 **Room profile** (**Agents → Helper profile**, owner only; `POST rooms/{id}/profile` replaces the whole profile).
 The profile holds names and policy, never secret values. There is no field a value could ride in on: unknown
 fields are refused. Who reads it (`GET rooms/{id}/profile`): the room's owner, contributors and viewers see all of it;

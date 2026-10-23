@@ -7,6 +7,7 @@ import {parseJson,renderJson} from './conversation-json.js';
 import {selectEvents, linkedAgents, githubLinks, referenceSuggestions, pendingOperation} from './session-workspace-model.js';
 import {randomString} from './herdr-web-client/collab.js';
 import {recordOutcome} from './record-state.js';
+import {fixOutcome, fixError, FIX_LABELS, FIX_LOCKED} from './summary-fix-status.js';
 
 const MAX_EVENTS=2000;
 const PAGE=200;
@@ -133,9 +134,10 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     const item=(key,text,index)=>{
       if(!fixable.has(key))return `<li class="conversation-markdown">${renderMarkdown(String(text))}</li>`;
       const fix=fixStates.get(fixKey(key,text));
-      const label=fix?.state==='sending'?'Sending…':fix?.state==='sent'?'Sent to agent':fix?.state==='queued'?'Queued for agent':'Let the agent fix this';
-      const locked=['sending','sent','queued'].includes(fix?.state);
-      return `<li class="conversation-markdown">${renderMarkdown(String(text))} <button type="button" class="sw-summary-fix" data-fix-summary data-list="${key}" data-index="${index}"${locked?' disabled':''}>${label}</button>${fix?.message?`<span class="sw-summary-fix-status" ${fix.state==='error'?'role="alert"':'role="status"'}>${esc(fix.message)}</span>`:''}</li>`;
+      const label=FIX_LABELS[fix?.state] || 'Let the agent fix this';
+      const locked=FIX_LOCKED.has(fix?.state);
+      const link=fix?.link?` <a href="${esc(fix.link.href)}">${esc(fix.link.label)}</a>`:'';
+      return `<li class="conversation-markdown">${renderMarkdown(String(text))} <button type="button" class="sw-summary-fix" data-fix-summary data-list="${key}" data-index="${index}"${locked?' disabled':''}>${label}</button>${fix?.message?`<span class="sw-summary-fix-status" ${fix.state==='error'?'role="alert"':'role="status"'}>${esc(fix.message)}${link}</span>`:''}</li>`;
     };
     const summaryHost=$('[data-agent-summary]');
     const detailsOpen=summaryHost.querySelector('details')?.open;
@@ -149,23 +151,17 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     const text=agentSummary?.[list]?.[index];
     if(typeof text!=='string' || typeof client.fixSummaryItem!=='function')return;
     const key=fixKey(list,text);
-    if(['sending','sent','queued'].includes(fixStates.get(key)?.state))return;
+    if(FIX_LOCKED.has(fixStates.get(key)?.state))return;
     fixStates.set(key,{state:'sending',message:''});paintSummary();
     try{
       const receipt=await client.fixSummaryItem(session.session_id,list,index,text);
       if(disposed)return;
-      fixStates.set(key,receipt.status==='delivered'?{state:'sent',message:'Delivered to the agent. Watch the conversation for its reply.'}
-        :receipt.status==='queued'?{state:'queued',message:'Queued; delivery is not confirmed yet.'}
-        :{state:'error',message:`Not delivered: ${receipt.error || receipt.status || 'unknown error'}.`});
+      fixStates.set(key,fixOutcome(receipt));
     }catch(err){
       if(disposed)return;
-      const body=err.body || {};
-      const message=body.fallback==='helper_unavailable'?`${err.message} Start the agent again, then retry.`
-        :body.reason==='stale_item'?'This item changed since it was shown. The summary was refreshed; try again.'
-        :body.reason==='unsupported_harness'?err.message
-        :`Could not send to the agent: ${err.message}`;
-      fixStates.set(key,{state:'error',message});
-      if(body.reason==='stale_item')loadSummary();
+      const outcome=fixError(err);
+      fixStates.set(key,outcome);
+      if(outcome.reload)loadSummary();
     }finally{if(!disposed)paintSummary();}
   });
   async function loadSummary(){

@@ -512,6 +512,43 @@ def test_dashboard_host_names_are_a_collab_config_key():
     assert "dashboard_hosts" in fcc.COLLAB_KEYS
 
 
+SUMMARY_FIX = {"room_id": "collab_room1", "requester_agent_id": "collab_agent1"}
+
+
+def test_summary_fix_room_is_a_validated_collab_config_key():
+    import argparse
+    args = argparse.Namespace()
+    cli._apply_collab_config(args, {"collab": {"summary_fix": dict(SUMMARY_FIX)}})
+    assert args.collab_summary_fix == SUMMARY_FIX
+    for bad in ({"room_id": "collab_room1"}, dict(SUMMARY_FIX, api_key="hca_x"), "collab_room1",
+                dict(SUMMARY_FIX, room_id=""), dict(SUMMARY_FIX, requester_agent_id="bad id")):
+        with pytest.raises(SystemExit, match="summary_fix"):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"summary_fix": bad}})
+
+
+def test_summary_fix_room_rides_in_the_collab_slice(tmp_path):
+    import json as _json
+    out = tmp_path / "collab.json"
+    fcc.render_collab(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, summary_fix=SUMMARY_FIX))), out)
+    assert _json.loads(out.read_text())["sections"]["control_plane"]["values"]["collab"]["summary_fix"] == SUMMARY_FIX
+    out.unlink()
+    (tmp_path / "fleet-config.yaml").unlink()
+    bad = make_file(tmp_path, collab=dict(COLLAB, summary_fix=dict(SUMMARY_FIX, secret="s3cret")))
+    with pytest.raises(fcc.FleetConfigError, match="summary_fix: unknown keys: secret"):
+        fcc.render_collab(fcc.load_fleet_config(bad), out)
+
+
+def test_collab_service_refuses_a_malformed_summary_fix_config():
+    from herdr_engineering.control_plane.collab import (
+        CollabError,
+        CollabService,
+        StaticTokenAuthenticator,
+    )
+    with pytest.raises(CollabError):
+        CollabService(StaticTokenAuthenticator({}), summary_fix={"room_id": 3})
+    assert CollabService(StaticTokenAuthenticator({}), summary_fix=SUMMARY_FIX).summary_fix == SUMMARY_FIX
+
+
 # ------------------------------------------------------------- review gate durability
 
 def _gate(tmp_path, enabled=True):

@@ -9,6 +9,7 @@ import { defineComponents } from './herdr-web-components/index.js';
 import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
 import { mountInspector } from './inspector-view.js';
 import { mountSessionWorkspace } from './session-workspace.js';
+import { mountTerminalAttach } from './terminal-attach.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
@@ -261,7 +262,6 @@ async function viewSession(parts, revision) {
     const reportedStatus = terminal && statusOutcome(s.status) !== outcome ? s.stage : s.status;
     const clip = value => typeof value === 'string' ? value.slice(0, 180) : '';
     const project = typeof s.cwd === 'string' ? s.cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
-    const attach = typeof s.attach === 'string' ? s.attach : '';
     const fields = [['Agent ID',s.session_id],['Last reported status',s.status],['Stage',s.stage],['Directory',s.cwd],['Git branch',s.branch],['PID',s.pid],['Command line',s.cmdline],['Model',s.model],['Last reported',formatTimestamp(s.updated_at)]].filter(([,v])=>v != null && v !== '');
     root.innerHTML = `<style>.sd-head{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:14px 0}.sd-meta{color:var(--text-secondary);line-height:1.6;overflow-wrap:anywhere}.sd-details{margin:14px 0;overflow-wrap:anywhere}.sd-details summary{cursor:pointer;font-weight:600}.sd-details dl{display:grid;grid-template-columns:minmax(100px,auto) minmax(0,1fr);gap:8px 16px}.sd-details dt{color:var(--text-secondary)}.sd-details dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.sd-title{overflow-wrap:anywhere}@media(max-width:600px){.sd-details dl{display:block}.sd-details dd{margin:4px 0 12px}}</style>
       <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Agents</a>
@@ -271,7 +271,8 @@ async function viewSession(parts, revision) {
       ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       ${relatedIntegrationLinks(s,'session',s.session_id)}
-      <details class="hd-card sd-details" id="session-details"><summary>Agent details and attachment</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}${attach ? `<div class="hd-inline"><code style="flex:1;overflow-wrap:anywhere">${esc(attach)}</code><button class="hd-btn" id="copy-attach">Copy attach command</button></div>` : ''}</details>
+      <div id="session-terminal" class="sd-details"></div>
+      <details class="hd-card sd-details" id="session-details"><summary>Agent details</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}</details>
       <div id="session-workspace-host"></div>
       <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
       <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream"><span class="muted">Loading recorded events…</span></div></details>`;
@@ -282,7 +283,8 @@ async function viewSession(parts, revision) {
       if (advanced.open && !disposeAdvanced) disposeAdvanced = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
       else if (!advanced.open && disposeAdvanced) { disposeAdvanced(); disposeAdvanced = null; document.getElementById('inspector-host').replaceChildren(); }
     });
-    disposeInspector = () => { disposeWorkspace(); if (disposeAdvanced) disposeAdvanced(); };
+    const disposeTerminal = mountTerminalAttach(document.getElementById('session-terminal'), client, s, {copyText});
+    disposeInspector = () => { disposeWorkspace(); disposeTerminal(); if (disposeAdvanced) disposeAdvanced(); };
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();
@@ -299,8 +301,6 @@ async function viewSession(parts, revision) {
     }
     const stream = document.getElementById('session-stream');
     streamList('session',s.session_id).then(html=>{if(stream.isConnected && revision===renderRevision)stream.innerHTML=html;}).catch(()=>{if(stream.isConnected)stream.innerHTML='<span class="muted">Recorded events could not load.</span>';});
-    const copyBtn = document.getElementById('copy-attach');
-    if (copyBtn) copyBtn.addEventListener('click',()=>copyText(attach,copyBtn));
   } catch (error) {
     if (revision !== renderRevision) return;
     throw new Error(controller.signal.aborted ? 'Agent details could not load. Try again.' : error.message);

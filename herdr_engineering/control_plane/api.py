@@ -36,6 +36,8 @@ log = logging.getLogger(__name__)
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
+# Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
+_TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
@@ -239,6 +241,12 @@ class ControlPlaneServer:
         # collab service, so the local owner needs no sign-in.
         self.collab_operator_url = collab_operator_url.rstrip("/") if collab_operator_url else None
         self.collab_dashboard_hosts = frozenset(h.lower() for h in collab_dashboard_hosts)
+        # "Let the agent fix this" on a dead session: start a text-only helper through the collab
+        # service's summary-fix room (it answers 409 helper_unavailable when none is configured).
+        from .summary_fix import http_helper_spawner, inprocess_helper_spawner
+        self.summary_fix_helper = (
+            inprocess_helper_spawner(collab, operator_user) if collab is not None and operator_user
+            else http_helper_spawner(self.collab_operator_url) if self.collab_operator_url else None)
         if collab_only and public_port is None:
             raise ValueError("collab-only mode needs the public collaboration port")
         self.public_port = public_port
@@ -786,7 +794,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path):
+            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -1372,12 +1380,23 @@ def _make_handler(server, public=False, operator=False):
                 if receipt.get("error") in {"receipt_persistence_unavailable", "receipt_persistence_failed"}:
                     status = 503
                 return self._json({"ok": receipt["status"] == "delivered", **receipt}, status)
+            if resource == "sessions" and len(parts) == 6 and parts[5] == "terminal":
+                from .terminal_attach import AttachRefused, attach_commands
+                s = r.get_session(parts[4])
+                if s is None:
+                    return self._json({"error": "agent not found"}, 404)
+                try:
+                    return self._json(attach_commands(s, hosts=r.list_hosts(),
+                                                      peer=self.client_address[0]))
+                except AttachRefused as exc:
+                    return self._json(exc.body, exc.status)
             if resource == "sessions" and len(parts) == 7 and parts[5:] == ["summary", "fix"]:
                 from .summary_fix import SummaryFixRefused, fix_summary_item
                 actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
                 try:
                     status, result = fix_summary_item(server.agent_summaries, r, server.dispatcher,
-                                                      parts[4], body, actor=actor)
+                                                      parts[4], body, actor=actor,
+                                                      helper_spawner=server.summary_fix_helper)
                 except SummaryFixRefused as exc:
                     return self._json(exc.body, exc.status)
                 return self._json(result, status)
@@ -1459,7 +1478,8 @@ def _make_handler(server, public=False, operator=False):
             operator = self._role() == "operator"
             return {**session, "capabilities": {"rename_agent": operator,
                                                 "regenerate_summary": operator,
-                                                "fix_summary_item": operator}}
+                                                "fix_summary_item": operator,
+                                                "attach_terminal": operator}}
 
         def _named_inspector(self, data, sid):
             # Claim an existing provider preference before a helper/read path
