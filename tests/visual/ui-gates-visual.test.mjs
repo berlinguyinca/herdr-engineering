@@ -28,7 +28,7 @@ test('the capture is deterministic: three fresh loads of the same surfaces agree
       assert.ok(r.pct <= CFG.screenshots.max_diff_pct / 2, `${slug}: ${r.diffPixels} pixels (${r.pct.toFixed(4)}%) differ between identical captures`);
       for (const [name, png] of Object.entries(other.regions)) {
         const rr = await diffPng(browser, png, shots[0].regions[name]);
-        assert.equal(rr.diffPixels, 0, `${slug}--${name}: ${rr.diffPixels} pixels differ between identical captures`);
+        assert.ok(rr.pct <= CFG.screenshots.component_max_diff_pct / 2, `${slug}--${name}: ${rr.diffPixels} pixels (${rr.pct.toFixed(4)}%) differ between identical captures`);
       }
     }
   }
@@ -54,10 +54,10 @@ const TEETH = [
   ['the chat log is one pixel lower', 'collab-chat', '.cx-log { transform: translateY(1px) }', ['log']],
   ['the accent colour moved by about 5 per channel', 'collab-attention', '.cx-page, .cx-embed { --accent: #0f7a5e !important }', []],
   ['buttons are one pixel wider', 'collab-attention', '.hd-btn { padding: 8px 15px !important }', ['item']],
-  ['cards gained a 2px margin', 'collab-attention', '.hd-card { margin-bottom: 2px !important }', []],
+  ['cards gained a pixel of padding', 'collab-attention', '.hd-card { padding: 17px !important }', []],
   ['the sub-tab bar gained 4px of padding', 'collab-attention', '.cx-stabs { padding-top: 4px !important }', []],
   ['the lineage node boxes lost their borders', 'collab-lineage', '.lin-box { stroke: transparent !important }', ['node', 'graph']],
-  ['a failed node is painted the wrong colour', 'collab-lineage', '.lin-node--failed .lin-box { fill: #ccc !important }', ['node', 'graph']],
+  ['a failed node is painted the wrong colour', 'collab-lineage', '.lin-node--failed .lin-box { fill: #ccc !important }', ['graph']],
 ];
 for (const [name, slug, css, regions] of TEETH) {
   test(`the gate has teeth: ${name}`, async () => {

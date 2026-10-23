@@ -120,9 +120,13 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: CFG.viewports[viewport].width, height }, animations: 'disabled', caret: 'hide' }), regions: {} };
     if (regions) {
       for (const r of surface.regions || []) {
+        // by bounding box, not locator.screenshot(): that waits for the element to be visible, which would make a test that hides
+        // the element (the gate's own teeth tests) time out instead of producing the picture that must fail the compare
         const loc = page.locator(r.selector).first();
         await loc.scrollIntoViewIfNeeded();
-        out.regions[r.name] = await loc.screenshot({ animations: 'disabled', caret: 'hide' });
+        const box = await loc.boundingBox();
+        const off = await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
+        out.regions[r.name] = await page.screenshot({ clip: { x: box.x + off.x, y: box.y + off.y, width: box.width, height: box.height }, fullPage: true, animations: 'disabled', caret: 'hide' });
       }
     }
     return out;
