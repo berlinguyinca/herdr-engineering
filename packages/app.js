@@ -19,7 +19,7 @@ import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { renderFleetMatrix } from './fleet-view.js';
-import { renderHostDetail, renderHostCard, HOST_CARD_STYLE, RANGES } from './host-view.js';
+import { renderHostDetail, renderHostCard, HOST_CARD_STYLE, RANGES, safeHostId } from './host-view.js';
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
@@ -359,7 +359,8 @@ async function viewHosts() {
 }
 
 async function viewHost(parts, revision) {
-  const id = encodeURIComponent(decodeURIComponent(parts[1]));
+  const id = safeHostId(parts[1]);
+  if (!id) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
   const requested = route().query.get('range');
   const range = RANGES.includes(requested) ? requested : '1h';
   // Only the host fetch may fail the page; missing history degrades to empty sparklines.

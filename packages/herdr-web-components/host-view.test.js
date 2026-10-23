@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderHostDetail, sparkline, formatUptime, formatBytes } from '../host-view.js';
+import { renderHostDetail, sparkline, formatUptime, formatBytes, safeHostId } from '../host-view.js';
 
 const NOW = Date.parse('2026-10-23T12:00:00Z');
 const iso = (msAgo) => new Date(NOW - msAgo).toISOString();
@@ -264,4 +264,48 @@ test('recently seen host without latest is not "no report since"; wording matche
   assert.match(renderHostDetail(host, [], { now: NOW }), /No telemetry reported/);
   const stale = reportingHost({ last_seen: iso(3_600_000) }); stale.latest.at = iso(3_600_000);
   assert.match(renderHostCard(stale, { now: NOW }), /no report since/);
+});
+
+test('safeHostId re-encodes a route segment and rejects malformed percent-encoding', () => {
+  assert.equal(safeHostId('beast'), 'beast');
+  assert.equal(safeHostId('my%20host'), 'my%20host');
+  assert.equal(safeHostId('a/b'), 'a%2Fb');
+  assert.equal(safeHostId('%E0%A4%A'), null);
+  assert.equal(safeHostId('100%'), null);
+});
+
+// Produced by the real Python pipeline (collector -> agent payload -> ingest ->
+// repo); tests/control_plane/test_host_telemetry_end_to_end.py fails when the
+// pipeline output drifts from this committed copy.
+test('renders the pipeline-produced host fixture with every section and real numbers', async () => {
+  const { readFileSync } = await import('node:fs');
+  const fixture = JSON.parse(readFileSync(new URL('../../tests/fixtures/host_telemetry/host_detail.json', import.meta.url), 'utf8'));
+  const { host, history } = fixture;
+  const html = renderHostDetail(host, history, { range: '1h', now: Date.parse(host.last_seen) + 30_000 });
+  const section = (name) => {
+    const m = html.match(new RegExp(`data-section="${name}"[\\s\\S]*?(?=data-section="|$)`));
+    assert.ok(m, `section ${name} rendered`);
+    return m[0];
+  };
+  assert.match(section('cpu'), /50%/);
+  assert.match(section('cpu'), /Load 1\.5 \/ 1\.3 \/ 1/);
+  assert.match(section('memory'), /75%/);
+  assert.match(section('memory'), /Swap 50%/);
+  assert.match(section('gpu'), /37%/);
+  assert.match(section('gpu'), /61 °C/);
+  assert.match(section('disk'), /40%/);
+  assert.match(section('disk'), /<code>\/data<\/code>/);
+  assert.match(section('top'), /<code>python3<\/code>/);
+  assert.match(section('top'), /dev:5173/);
+  assert.match(section('updates'), /data-field="outdated">0</);
+  assert.match(section('versions'), /auth-helper/);
+  assert.doesNotMatch(section('versions'), /differs from pin/);
+  assert.match(html, /3 agents running/);
+  assert.match(html, /Network in /);
+  assert.doesNotMatch(html, /data-section="problems"/);
+  // two history points; cpu has one (the first reading has no cpu delta), so only a placeholder
+  for (const key of ['mem', 'disk', 'gpu_util_pct']) assert.match(html, new RegExp(`data-series="${key}"><svg`));
+  assert.match(html, /data-series="cpu">/);
+  const visible = html.replace(/<style>[\s\S]*?<\/style>/g, '');
+  assert.doesNotMatch(visible, /\bnull\b|\bundefined\b|\bNaN\b/);
 });

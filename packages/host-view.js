@@ -7,6 +7,16 @@ import { reportFreshness, reportTimestamp } from './record-state.js';
 import { configBadge } from './fleet-config-badge.js';
 
 export const RANGES = ['1h', '24h', '7d'];
+
+/** The URL-encoded host id for a `#/hosts/<id>` route segment, or null when the
+ *  segment is not valid percent-encoding (decodeURIComponent would throw). */
+export function safeHostId(segment) {
+  try {
+    return encodeURIComponent(decodeURIComponent(String(segment ?? '')));
+  } catch {
+    return null;
+  }
+}
 const PINNED = ['herdr', 'pi', 'autospec'];
 const VERSION_KEYS = ['herdr', 'herdr_eng', 'pi', 'autospec', 'tailscale'];
 
