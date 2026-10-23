@@ -13,14 +13,13 @@ import hashlib
 import json
 import os
 import shutil
-import stat
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
-from tests.e2e.harness import E2E, ROOT, principal_id, sha40
+from tests.e2e.harness import E2E, sha40
 
 REPO_SLUG, PR_NUM = "acme/widgets", 7
 PR = f"pr:github.com/{REPO_SLUG}#{PR_NUM}"
@@ -180,7 +179,7 @@ def test_without_a_trusted_author_nobody_can_be_vetted_and_an_untrusted_writer_c
     assert world.quorum()["status"] == "unknown_author" and world.quorum()["counted"] == []
     world.pi_pr(H1, author="Author-Login", key="attacker")   # an untrusted key "supplies" an author to unlock the quorum
     q = world.quorum()
-    assert q["status"] == "unknown_author" and q["counted"] == [] 
+    assert q["status"] == "unknown_author" and q["counted"] == []
     world.pi_pr(H1, author="Author-Login")                    # positive control: the trusted writer's author unlocks it
     q = world.quorum()
     assert q["status"] == "satisfied" and len(counted(q)) == 2
@@ -225,10 +224,11 @@ def test_head_change_invalidates_old_verdicts_and_the_real_cli_requests_rereview
     p = world.plane
     world.pi_pr(H1)
     world.publish("r1", H1)
-    world.publish("r2", "%s" % H1)
+    world.publish("r2", H1)
     assert world.quorum()["status"] == "satisfied"
-    req = lambda: world.run("request", "--config", world.cfgs["pi"], "--pr-node", PR, "--state-dir", world.tmp / "state",
-                            "--scratch-dir", world.tmp / "scratch")
+    def req():
+        return world.run("request", "--config", world.cfgs["pi"], "--pr-node", PR, "--state-dir", world.tmp / "state",
+                         "--scratch-dir", world.tmp / "scratch")
     r = req()
     assert r.returncode == 0 and json.loads(r.stdout)["outcome"].startswith("not_needed")     # control: nothing stale yet
     assert not world.dispatch_log.exists()

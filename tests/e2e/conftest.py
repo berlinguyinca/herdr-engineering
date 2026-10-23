@@ -1,9 +1,6 @@
 """Fixtures for the T16 acceptance suite (marker `e2e`). See README.md."""
 from __future__ import annotations
 
-import shutil
-import subprocess
-
 import pytest
 
 from tests.e2e import harness

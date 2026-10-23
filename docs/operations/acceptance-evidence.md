@@ -36,7 +36,7 @@ count above `max_xfail`, Pi `GAP:` tests above `max_gap`, an xfail that is not `
 
 ## Result of the full run (2026-10-23, after the review round)
 
-`scripts/run-acceptance.sh` exit 0, wall clock 7m14 (Herdr side dominated by the Postgres chaos suite). The runner prints
+`scripts/run-acceptance.sh` exit 0, wall clock 7-10 min, load dependent (Herdr side dominated by the Postgres chaos suite). The runner prints
 **pass / strict-xfail / GAP as separate columns**; a GAP test passes by asserting the *current, incomplete* behaviour and is
 not counted as a pass.
 

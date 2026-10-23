@@ -218,7 +218,7 @@ class Plane:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self) -> "Plane":
+    def start(self) -> Plane:
         assert not self.alive(), "already running"
         fleet, users = self._write_config()
         self.port = free_port()
@@ -269,7 +269,7 @@ class Plane:
             self.proc.kill()
             self.proc.wait(5)
 
-    def restart(self) -> "Plane":
+    def restart(self) -> Plane:
         self.stop()
         return self.start()
 
