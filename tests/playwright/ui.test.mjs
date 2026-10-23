@@ -176,7 +176,7 @@ test('activity uses wide space for filters, repetition summary, and keyboard-sel
       event_type,
       source_timestamp:new Date(Date.UTC(2026,9,22,12,0,index)).toISOString(),
       entity_id:`entity-${index}`,
-      payload:{title:`Mission ${index}`,host_name:`host-${index}`,service_name:`service-${index}`,description:`Selected payload ${index}`},
+      payload:{title:`Mission ${index}`,host_name:`host-${index}`,service_name:`service-${index}`,description:`Selected payload ${index}`,...(event_type===longType?{revision:`revision-${'x'.repeat(180)}`}:{})},
     }));
     await page.route('**/api/v1/activity?limit=50',route=>route.fulfill({json:{events}}));
     await page.setViewportSize({width:3840,height:2160});
@@ -216,7 +216,7 @@ test('activity uses wide space for filters, repetition summary, and keyboard-sel
     await page.keyboard.press('Enter');
     assert.equal(await page.locator('[data-activity-selected] h2').innerText(),longType);
 
-    for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:1301,height:900},{width:1200,height:900},{width:1150,height:900},{width:1101,height:900},{width:901,height:900},{width:768,height:1024},{width:390,height:844}]){
+    for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:1301,height:900},{width:1300,height:900},{width:1200,height:900},{width:1150,height:900},{width:1101,height:900},{width:901,height:900},{width:768,height:1024},{width:390,height:844}]){
       await page.setViewportSize(viewport);
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`activity overflowed at ${viewport.width}px`);
       if([2560,1301,1200,768,390].includes(viewport.width)){
@@ -225,6 +225,10 @@ test('activity uses wide space for filters, repetition summary, and keyboard-sel
           const box=status.getBoundingClientRect();const style=getComputedStyle(status);
           return style.position==='fixed'&&style.overflow==='hidden'&&box.width<=1&&box.left>=0&&box.right<=innerWidth;
         }),true,`screen-reader selection status must stay clipped outside intrinsic workspace sizing at ${viewport.width}px`);
+      }
+      if(viewport.width===1301){
+        assert.equal(await page.locator('[data-activity-selected] .ac-selected-detail').evaluate(detail=>detail.scrollWidth<=detail.clientWidth),true,'selected revision metadata should wrap inside the 1301px inspector');
+        assert.equal(await page.locator('[data-activity-selected] .ac-payload').evaluate(payload=>payload.scrollWidth<=payload.clientWidth),true,'selected JSON should wrap inside the 1301px inspector');
       }
       if([1301,901,390].includes(viewport.width)){
         assert.equal(await page.locator(`[data-repeat-type="${longType}"]`).evaluate(row=>{
