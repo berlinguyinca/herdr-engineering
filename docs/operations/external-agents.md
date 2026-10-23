@@ -40,3 +40,17 @@ Code-only; new events (`join_token_created` with an `external` block, `external_
 older code, which would treat an enrolled external as an ordinary agent limited by its grant. Roll back by reverting the PR;
 to cut access first, revoke the agents (or let the 24 h credentials lapse). Web-only rollback removes the invite form and the
 virtual tab; the server roster stays.
+
+## Known limitations
+- Revocation is checked before a lineage event is handed to the ingest path, not inside it: an event already past that check can
+  still be stored in the same instant as the revocation.
+- The lineage budget (2000 events per credential) and presence are in memory and reset on restart; the graph's own
+  per-principal quota remains the hard cap.
+- Lineage needs the combined server. In the production split (dashboard in front of an isolated `--collab-only` service) the
+  lineage route answers 404; enrollment, presence, chat, the roster and revocation work there.
+- An external agent can only link its own nodes (`spawn`); connecting it into local lineage (a handoff from a local agent) needs
+  an operator key, because ordinary keys cannot see room-scoped nodes.
+- A bridge reference client is not part of this change; the protocol above is what a bridge implements.
+- The browser smoke test (`tests/playwright/external-agent-tab.test.mjs`) covers the virtual-tab renderer only. The invite
+  form, the revoke button handler and the chat rendering of an `external` sender are exercised by unit tests and review, not in a
+  real browser against a live server.

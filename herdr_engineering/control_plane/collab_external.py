@@ -25,7 +25,6 @@ EXTERNAL_ACTIONS = frozenset({"read", "post"})
 DEFAULT_EXTERNAL_ACTIONS = ("read",)               # nothing is writable unless the owner ticks it
 
 MAX_EXTERNALS_PER_ROOM = 25                         # live agents + open invites in one room
-MAX_EXTERNALS_PER_OWNER = 50                        # across all rooms the owner sponsors
 INVITE_TTL_DEFAULT = 3600.0
 INVITE_TTL_MIN, INVITE_TTL_MAX = 60.0, 24 * 3600.0
 CRED_TTL_DEFAULT = 24 * 3600.0

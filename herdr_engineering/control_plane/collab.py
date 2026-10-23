@@ -833,7 +833,8 @@ class CollabService:
 
     @staticmethod
     def _actor(pr: Principal, **extra) -> dict:
-        return {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None, **extra}
+        return {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None,
+                "actor_kind": "external" if pr.external else pr.kind, **extra}
 
     def _require_user(self, pr: Principal) -> None:
         if pr.is_agent:
@@ -1495,12 +1496,12 @@ class CollabService:
             "code_digest": None, "join_digest": digest, "device_id": device, "harness_type": declared,
             "name": name, "parent_agent_id": None, "instance_id": None, "secret_digest": _digest(cred),
             "expires_at_epoch": hard, "external": block, "room_id": x["room_id"],
-            "action": "external.enroll", "outcome": "allowed",
+            "actor_kind": "external", "action": "external.enroll", "outcome": "allowed",
             "project_ids": [x["project_id"]], "resource_id": aid})
         self._commit("agent_granted", {
             "actor_user_id": owner, "actor_agent_id": None, "project_id": x["project_id"],
             "room_id": x["room_id"], "agent_id": aid, "actions": list(x["actions"]), "expires_at": hard,
-            "action": "external.grant", "outcome": "allowed",
+            "actor_kind": "user", "action": "external.grant", "outcome": "allowed",
             "project_ids": [x["project_id"]], "resource_id": aid})
         return {"agent_id": aid, "kind": "external", "name": name, "credential": cred, "device_id": device,
                 "expires_at": hard, "room_id": x["room_id"], "actions": list(x["actions"]),
@@ -1642,6 +1643,12 @@ class CollabService:
         a = self._agents.get(aid) if aid else None
         return bool(a and a.get("external"))
 
+    def _refuse_lineage(self, pr: Principal, room_id: str) -> None:
+        with self._lock:
+            x = (self._agents.get(pr.id) or {}).get("external") or {}
+            self._audit_denied(pr, "external.lineage", "forbidden_node", room_id=room_id,
+                               project_ids=[x["project_id"]] if x else [], agent_id=pr.id)
+
     def external_lineage(self, pr: Principal, body: dict) -> dict:
         """Lineage an external agent reports about ITSELF. The server builds the envelope: room scope
         and room id come from the enrollment, the actor from the credential, the source from the agent
@@ -1683,12 +1690,14 @@ class CollabService:
         attrs_in = payload.get("attrs") if isinstance(payload.get("attrs"), dict) else {}
         if op["op"] in ("node.upsert", "node.state"):
             if op["node_type"] not in ext.LINEAGE_NODE_TYPES or not ext.owns_node(aid, op["node_id"]):
+                self._refuse_lineage(pr, room_id)
                 raise CollabError(403, "an external agent may only write its own agent/attempt/session nodes")
             entity = op["node_id"]
         else:
             if (op["edge_type"] not in ext.LINEAGE_EDGE_TYPES or op["from_type"] not in ext.LINEAGE_NODE_TYPES
                     or op["to_type"] not in ext.LINEAGE_NODE_TYPES
                     or not (ext.owns_node(aid, op["from_id"]) and ext.owns_node(aid, op["to_id"]))):
+                self._refuse_lineage(pr, room_id)
                 raise CollabError(403, "an external agent may only link its own nodes with spawn edges")
             entity = op["from_id"]
         clean_attrs = {}
@@ -1728,6 +1737,7 @@ class CollabService:
         try:
             res = self.lineage_sink(envelope, principal)
         except PermissionError:
+            self._refuse_lineage(pr, room_id)
             raise CollabError(403, "not permitted to modify this lineage object") from None
         except ValueError as exc:
             raise CollabError(400, str(exc)) from None
@@ -3137,6 +3147,7 @@ class CollabService:
                 out.append({"sequence": ev["sequence"], "event_type": ev["event_type"],
                             "action": p["action"], "outcome": p["outcome"], "reason": p.get("reason"),
                             "actor_user_id": p.get("actor_user_id"), "actor_agent_id": p.get("actor_agent_id"),
+                            "actor_kind": p.get("actor_kind"),
                             "room_id": p.get("room_id"), "resource_id": p.get("resource_id"),
                             "created_at": p["created_at"], "correlation_id": p.get("correlation_id")})
             nxt = out[-1]["sequence"] if out else cursor
