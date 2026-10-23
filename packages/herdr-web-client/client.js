@@ -216,6 +216,22 @@ export class HerdrClient {
   getArchitectureNode(sid, nid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}`, {}, signal); }
   expandArchitectureNode(sid, nid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/edges`, params, signal); }
   diffArchitecture(base, head, { signal, ...params } = {}) { return this._arch('diff', { base, head, ...params }, signal); }
+  getArchitectureOverlays(sid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/overlays`, {}, signal); }
+  getArchitectureCorrelations(sid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/correlations`, params, signal); }
+  getArchitectureNodeRooms(sid, nid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/rooms`, {}, signal); }
+  getArchitectureTimeline(repositoryId, { signal, ...params } = {}) { return this._arch('timeline', { repository_id: repositoryId, ...params }, signal); }
+  getArchitectureCrossRepo(snapshotIds, mappings = [], { signal } = {}) {
+    const q = new URLSearchParams();
+    for (const id of snapshotIds) q.append('snapshot', id);
+    for (const m of mappings) q.append('map', `${m.importer}|${m.package}|${m.provider}`);
+    return this.request(`/api/v1/architecture/cross-repo?${q}`, { signal });
+  }
+  requestArchitectureAnalysis(body, { signal } = {}) {
+    return this.request('/api/v1/architecture/analyses/request', { method: 'POST', body, signal });
+  }
+  explainArchitectureNode(sid, nid, { signal } = {}) {
+    return this.request(`/api/v1/architecture/snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/explain`, { method: 'POST', body: {}, signal });
+  }
 
   // -- ci / test runs (leaf types for the topology view) -------------------
   getCi({ signal } = {}) {

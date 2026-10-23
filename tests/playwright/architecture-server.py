@@ -4,6 +4,8 @@ on a throwaway git repository (and optionally on this checkout), not hand-writte
 ARCH_MODE: data (default) | empty | disabled | failed.  ARCH_SELF=1 also publishes this repo's HEAD.
 Prints PORT=<n> when ready.
 """
+import http.server
+import json
 import os
 import subprocess
 import sys
@@ -46,19 +48,62 @@ def build_fixture(root):
     return first, analyze.analyze_commit(str(root), "HEAD", "beast", RID)
 
 
+class FakeLLM(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        facts = json.loads(body["messages"][1]["content"].split("\n", 1)[1])
+        real = facts["edges"][0]["id"] if facts["edges"] else "e_" + "0" * 20
+        text = f"This node is imported by a sibling [{real}] and by a made-up edge [e_ffffffffffffffffffff]."
+        out = json.dumps({"choices": [{"message": {"content": text}}]}).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+
+    def log_message(self, *a):
+        pass
+
+
+def seed_activity(svr, repo, head):
+    from types import SimpleNamespace
+    repo.upsert_session("pi:s1", host_id="beast", agent_role="implementer", source="pi", repository_id=RID, commit_sha=head, parent_session_id="pi:root")
+    repo.upsert_session("branchy", host_id="beast", repository_id=RID, branch="main", cwd="/x")
+    repo.observe_ci_pipeline({"provider_repo_id": "9", "repository": "fixture", "run_number": 5, "state": "success", "branch": "main",
+                              "repository_id": RID, "commit_sha": head, "url": "https://ci.example/5"})
+    gate = SimpleNamespace(snapshots=lambda: [SimpleNamespace(key=SimpleNamespace(repo=RID, number=17), head_sha=head,
+                                                              state=SimpleNamespace(value="ci_pending"))])
+    svr.architecture.gate_store_fn = lambda: gate
+
+
 def main():
     mode = os.environ.get("ARCH_MODE", "data")
     repo = ControlPlaneRepo()
-    svr = ControlPlaneServer(repo, architecture_enabled=mode != "disabled")
+    explain = None
+    if mode == "data":
+        llm = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeLLM)
+        threading.Thread(target=llm.serve_forever, daemon=True).start()
+        explain = {"enabled": True, "url": f"http://127.0.0.1:{llm.server_address[1]}/v1/chat/completions", "model": "fake"}
+    svr = ControlPlaneServer(repo, architecture_enabled=mode != "disabled", architecture_explain=explain)
     if mode in {"data", "failed"}:
         tmp = tempfile.mkdtemp(prefix="arch-fixture-")
         first, second = build_fixture(tmp)
         time.sleep(1.1)  # created_at has 1s resolution: make the second snapshot the newer one
         second["snapshot"]["created_at"] = "2099-01-01T00:00:00+00:00"
+        from herdr_engineering.architecture import identity
         for s in (first, second):
-            from herdr_engineering.architecture import identity
             s["snapshot"]["graph_hash"] = identity.graph_hash(s["graph"])
             svr.architecture.publish(s)
+        if mode == "data":
+            seed_activity(svr, repo, second["snapshot"]["commit_sha"])
+            lib = Path(tmp, "..", "arch-lib-" + str(os.getpid())).resolve(); lib.mkdir()
+            git(lib, "init", "-q", "-b", "main"); Path(lib, "fixturelib").mkdir()
+            Path(lib, "fixturelib/__init__.py").write_text("def f():\n    pass\n")
+            git(lib, "add", "-A"); git(lib, "commit", "-q", "-m", "lib")
+            svr.architecture.publish(analyze.analyze_commit(str(lib), "HEAD", "beast", "github.com/example/lib"))
+            Path(tmp, "app/uses.py").write_text("import fixturelib\n")
+            git(tmp, "add", "-A"); git(tmp, "commit", "-q", "-m", "three")
+            third = analyze.analyze_commit(str(tmp), "HEAD", "beast", RID)
+            third["snapshot"]["created_at"] = "2099-06-01T00:00:00+00:00"
+            third["snapshot"]["graph_hash"] = identity.graph_hash(third["graph"])
+            svr.architecture.publish(third)
+            seed_activity(svr, repo, third["snapshot"]["commit_sha"])
         if os.environ.get("ARCH_SELF") == "1":
             svr.architecture.publish(analyze.analyze_commit(str(_REPO), "HEAD", "bender",
                                                            "github.com/berlinguyinca/herdr-engineering"))

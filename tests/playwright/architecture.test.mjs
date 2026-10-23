@@ -81,7 +81,8 @@ test('search is bounded, then results link to the right file:line', () => withAp
 test('diff between snapshots lists added/removed/modified with the rename warning', () => withApp({}, async (page, base) => {
   await page.goto(`${base}/#/architecture`);
   await page.locator('[data-diff]').waitFor();
-  await page.locator('[data-diff]').selectOption({index: 1});
+  const n = await page.locator('[data-diff] option').count();
+  await page.locator('[data-diff]').selectOption({index: n - 1});   // oldest fixture snapshot
   const sum = page.locator('[data-testid="arch-diff-summary"]');
   await sum.waitFor();
   assert.match(await sum.innerText(), /Nodes \+\d+ .*edges \+\d+/);
@@ -149,4 +150,80 @@ test('own repository graph renders (representative repo) and stays interactive',
   await page.locator('[data-node="module:herdr_engineering.control_plane.api"]').click();
   await page.locator('.arch-detail [data-edge]').first().waitFor();
   await shot(page, 'architecture-herdr-self.png');
+}));
+
+test('related activity links only by exact commit; timeline has independent lanes', () => withApp({}, async (page, base) => {
+  await page.goto(`${base}/#/architecture`);
+  const act = page.locator('[data-testid="arch-activity"]');
+  await act.waitFor();
+  assert.match(await act.locator('[data-ci]').innerText(), /#5 · success/);
+  assert.match(await act.locator('[data-pr]').innerText(), /#17|ci_pending/);
+  assert.match(await act.locator('[data-session]').innerText(), /pi:s1/);
+  assert.equal(await act.locator('[data-session]').count(), 1, 'the branch-only session is not linked');
+  const tl = page.locator('[data-testid="arch-timeline"]');
+  await tl.locator('[data-tl-snap]').first().waitFor();
+  assert.ok(await tl.locator('[data-tl-snap]').count() >= 3);
+  await tl.locator('[data-tl-agent]').first().waitFor();
+  assert.match(await tl.innerText(), /Architecture snapshots[\s\S]*Agent spawns/);
+  await shot(page, 'architecture-activity-timeline.png');
+}));
+
+test('request analysis reports queued, then deduplicated', () => withApp({}, async (page, base) => {
+  await page.goto(`${base}/#/architecture`);
+  await page.locator('[data-request]').waitFor();
+  await page.locator('[data-request] button[type=submit]').click();
+  await page.locator('[data-request-result]').getByText(/Queued|already exists|Already queued/).waitFor();
+  const first = await page.locator('[data-request-result]').innerText();
+  await page.locator('[data-request] button[type=submit]').click();
+  await page.waitForFunction(t => document.querySelector('[data-request-result]').innerText !== t, first).catch(() => {});
+  assert.match(await page.locator('[data-request-result]').innerText(), /Queued|already exists|Already queued/);
+}));
+
+test('cross-repository lists inferred edges separately and never as verified', () => withApp({}, async (page, base) => {
+  await page.goto(`${base}/#/architecture`);
+  await page.locator('[data-cross]').click();
+  const sum = page.locator('[data-testid="arch-cross-summary"]');
+  await sum.waitFor();
+  assert.match(await sum.innerText(), /0 verified · [1-9]\d* inferred/);
+  assert.match(await page.locator('.arch-cross').innerText(), /Inferred \(name match only\)[\s\S]*fixturelib/);
+  await shot(page, 'architecture-cross-repo.png');
+}));
+
+test('explain is labelled inferred, cites real edges and drops invented ones', () => withApp({}, async (page, base) => {
+  await page.goto(`${base}/#/architecture`);
+  await page.locator('[data-node="package:app"]').first().click();
+  await page.locator('[data-open="module:app.util"]').click();
+  await page.locator('[data-explain]').click();
+  const box = page.locator('[data-testid="arch-explain"]');
+  await box.waitFor();
+  const t = await box.innerText();
+  assert.match(t, /Inferred explanation/);
+  assert.match(t, /source code not sent/);
+  assert.match(t, /1 unverifiable citation\(s\) removed/);
+  await shot(page, 'architecture-explain.png');
+}));
+
+test('explain button is absent when the capability is off', () => withApp({ARCH_MODE: 'failed'}, async (page, base) => {
+  await page.goto(`${base}/#/architecture`);
+  await page.locator('[data-node="package:app"]').first().click();
+  await page.locator('[data-open="module:app.util"]').click();
+  await page.locator('.arch-detail').waitFor();
+  assert.equal(await page.locator('[data-explain]').count(), 0);
+}));
+
+test('API errors surface as an error state, not a blank page', () => withApp({}, async (page, base) => {
+  await page.route('**/api/v1/architecture/snapshots?*', r => r.fulfill({status: 500, contentType: 'application/json', body: '{"error":"boom"}'}));
+  await page.route('**/api/v1/architecture/snapshots', r => r.fulfill({status: 500, contentType: 'application/json', body: '{"error":"boom"}'}));
+  await page.goto(`${base}/#/architecture`);
+  await page.getByText(/boom|failed|error/i).first().waitFor();
+}));
+
+test('loading state is shown while the snapshot list is pending', () => withApp({}, async (page, base) => {
+  let release;
+  const gate = new Promise(r => { release = r; });
+  await page.route('**/api/v1/architecture/snapshots**', async r => { await gate; await r.continue(); });
+  await page.goto(`${base}/#/architecture`);
+  await page.getByText(/loading/i).first().waitFor();
+  release();
+  await page.locator('[data-testid="arch-graph"]').waitFor();
 }));

@@ -55,3 +55,11 @@
 .arch-diff-list { list-style: none; padding: 0; font-size: .85rem; font-family: var(--font-mono, monospace); } .arch-diff-list li { overflow-wrap: anywhere; }
 .chg-added::before { content: "+ "; color: var(--status-ok, #0d9d6c); } .chg-removed::before { content: "− "; color: var(--status-failed, #dc2626); } .chg-modified::before { content: "~ "; color: var(--status-attention, #d97706); }
 .arch-table td:nth-child(2), .arch-table td:nth-child(4), .arch-table th:nth-child(2), .arch-table th:nth-child(4) { white-space: nowrap; overflow-wrap: normal; }
+.arch section { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--a-border); }
+.arch section h2 { font-size: 1.05rem; margin: 0 0 6px; color: var(--a-fg); }
+.arch section h3 { font-size: .85rem; margin: 10px 0 4px; color: var(--a-muted); }
+.arch section ul { margin: 0; padding-left: 18px; font-size: .85rem; overflow-wrap: anywhere; }
+.arch-lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.arch-request form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+.arch-request label { display: flex; flex-direction: column; gap: 4px; font-size: .8rem; color: var(--a-muted); }
+.arch-explain { border-left: 3px solid var(--a-accent); padding-left: 10px; margin-top: 8px; font-size: .85rem; }
