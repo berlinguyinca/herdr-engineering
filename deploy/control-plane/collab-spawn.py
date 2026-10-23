@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import errno
 import ipaddress
 import json
 import os
@@ -113,6 +114,7 @@ HELPER_LOGIN = {"claude-code": ("claude", "CLAUDE_CONFIG_DIR", ".claude", (".cre
                 "codex": ("codex", "CODEX_HOME", ".codex", ("auth.json",)),
                 "pi": ("pi", "PI_CODING_AGENT_DIR", ".pi/agent", ("auth.json", "models.json"))}
 HELPER_RESULT_CAP = 20_000              # bytes of stdout returned; the rest is cut with a marker
+HELPER_DRAIN_WAIT = 5.0                 # seconds the output readers get to drain after the box exits
 HELPER_CLAIM_STALE = 900.0              # a claim a previous process never started is failed after this long
 WATCH_EVERY = 3.0                       # seconds between helper watches while the fleet path of a cycle runs
 HELPER_LIST_GRACE = 30.0                # without the service's helper list (or a room's host list) for this long,
@@ -318,12 +320,18 @@ def helper_run(d: Path) -> int:
             except subprocess.TimeoutExpired:
                 h.kill()
                 rc = h.wait()
+        until = time.monotonic() + HELPER_DRAIN_WAIT
         for t in threads[1:]:
-            t.join(timeout=5)
+            t.join(timeout=max(0.0, until - time.monotonic()))
         res["exit"] = rc
         res["stderr"] = tail.decode("utf-8", "replace")[-2000:]
         if rc == 126 and not res["timed_out"]:
             res["error"] = "sandbox-error"
+        if any(t.is_alive() for t in threads[1:]):
+            # something outside the box still holds its output open: what was read may be cut off. Fail, never
+            # return it as the helper's answer.
+            res["error"] = "sandbox-error"
+            res["stderr"] = (res["stderr"] + "\n[output still open after the box exited; not used]")[-2000:]
         return 0
     finally:
         if proxy is not None and proxy.poll() is None:
@@ -1042,8 +1050,11 @@ class Runner:
             src = Path(os.environ[env]) if os.environ.get(env, "").startswith("/") else Path.home() / default
             for n in files:
                 try:
-                    fd = os.open(src / n, os.O_RDONLY)
-                except OSError:
+                    # never through a link (it could point anywhere) and never blocking on a fifo
+                    fd = os.open(src / n, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                except OSError as e:
+                    if e.errno == errno.ELOOP:
+                        self.say(f"helper {hid}: {src / n} is a link; not copied")
                     continue                      # not signed in that way: the harness says so in the result
                 try:
                     fst = os.fstat(fd)
@@ -1273,11 +1284,7 @@ class Runner:
         except (OSError, ValueError):
             res = None
         if isinstance(res, dict):
-            ok = res.get("exit") == 0 and res.get("timed_out") is not True
-            err = None if ok else ("timeout" if res.get("timed_out") is True else
-                                   res.get("error") if res.get("error") in ("sandbox-error",) else
-                                   f"the helper exited with status {res.get('exit')}")
-            self.end_helper(d, st, "done" if ok else "failed", err)
+            self.end_helper(d, st, *self.helper_outcome(res))
         elif paused or row is None or row.get("status") not in ("claimed", "running"):
             self.end_helper(d, st, "failed", "cancelled")
         elif time.time() > float(st.get("deadline") or 0) + 15:
@@ -1373,6 +1380,18 @@ class Runner:
                     asked.append(key)
             off += len(raw)
         st["log_off"] = off
+
+    @staticmethod
+    def helper_outcome(res: dict) -> tuple[str, str | None]:
+        """(status, error) from the supervisor's result.json: done only for exit 0, in time, with no error noted
+        (a sandbox error, or output still open after exit, fails even when the exit status was 0)."""
+        if res.get("exit") == 0 and res.get("timed_out") is not True and res.get("error") is None:
+            return "done", None
+        if res.get("timed_out") is True:
+            return "failed", "timeout"
+        if res.get("error") == "sandbox-error":
+            return "failed", "sandbox-error"
+        return "failed", f"the helper exited with status {res.get('exit')}"
 
     def helper_result_text(self, d: Path, st: dict) -> str:
         try:

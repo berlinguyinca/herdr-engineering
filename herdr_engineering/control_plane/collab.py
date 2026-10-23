@@ -2026,6 +2026,10 @@ class CollabService:
         r = self._helpers.get(helper_id) if isinstance(helper_id, str) else None
         # an agent: the one that asked, or the one the helper works under (for a successor: its predecessor's parent)
         mine = pr.id in (r["requester_agent_id"], r["parent_agent_id"]) if r and pr.is_agent else bool(r) and r["owner"] == pr.id
+        if mine and pr.is_agent:
+            # and is still in the helper's room now: an agent taken out of it (or whose owner left) reads nothing
+            room = self._rooms.get(r["room_id"])
+            mine = room is not None and self._effective(pr, room) is not None
         if not mine:
             raise CollabError(404, "not found")
         return r
