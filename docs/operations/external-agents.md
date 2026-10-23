@@ -42,10 +42,14 @@ to cut access first, revoke the agents (or let the 24 h credentials lapse). Web-
 virtual tab; the server roster stays.
 
 ## Known limitations
-- Revocation is checked before a lineage event is handed to the ingest path, not inside it: an event already past that check can
-  still be stored in the same instant as the revocation.
-- The lineage budget (2000 events per credential) and presence are in memory and reset on restart; the graph's own
-  per-principal quota remains the hard cap.
+- Revocation is evaluated inside the ingest ledger lock, immediately before admission. An event admitted a moment before the
+  revoke call returned is stored (it was admitted first); nothing admitted after is.
+- Presence and the per-minute rate windows are in memory and reset on restart. The lifetime lineage counts (2000 per credential,
+  5000 per sponsor, 5000 per room) are durable; after a restart a count can be too high by up to 24, never too low. The counts are
+  on writes, so updating an existing object spends allowance the same as creating one.
+- The client address used for failed-redemption counters and enrollment audit rows is the one the HTTP layer already resolves
+  (the peer, or `X-Forwarded-For` only from a loopback/private proxy). Behind a proxy that is not trusted it is the proxy's address.
+  The counters are in memory (aggregate, 256 addresses, then "other"); only successful enrollments write the address to the log.
 - Lineage needs the combined server. In the production split (dashboard in front of an isolated `--collab-only` service) the
   lineage route answers 404; enrollment, presence, chat, the roster and revocation work there.
 - An external agent can only link its own nodes (`spawn`); connecting it into local lineage (a handoff from a local agent) needs

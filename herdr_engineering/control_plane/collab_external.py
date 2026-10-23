@@ -16,6 +16,7 @@ here and escaped again by every renderer.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from .redact import redact_text
 
@@ -38,8 +39,14 @@ EXTERNAL_STATUSES = ("idle", "working", "waiting", "blocked", "done", "failed")
 MAX_ACTIVITY = 140
 MAX_LABEL = 40
 
-LINEAGE_PER_MINUTE = 60
-LINEAGE_MAX_EVENTS = 2000                           # per credential lifetime (in memory; the graph quota is the hard cap)
+LINEAGE_PER_MINUTE = 60                             # a sliding window kept in memory (a restart forgets it)
+LINEAGE_MAX_EVENTS = 2000                           # per credential, lifetime; the count survives a restart
+# Graph objects live for ever and external agents are separate principals, so the per-principal graph quota
+# does not bound them as a group. These do: lifetime counts of lineage writes per sponsor and per room.
+LINEAGE_MAX_PER_SPONSOR = 5000
+LINEAGE_MAX_PER_ROOM = 5000
+USAGE_RESERVE_STEP = 25                             # a counter is made durable this far AHEAD of its value
+ATTR_KEY = re.compile(r"[A-Za-z0-9_.-]{1,64}")      # same alphabet as ids; anything else is refused
 LINEAGE_NODE_TYPES = frozenset({"agent", "attempt", "session"})
 LINEAGE_EDGE_TYPES = frozenset({"spawn"})
 # Attrs an external agent may never set: they decide how the UI classifies or filters the node, or who else
@@ -50,19 +57,35 @@ RESERVED_ATTRS = frozenset({
 LINEAGE_BODY_FIELDS = frozenset({"event_id", "source_sequence", "event_type", "payload", "occurred_at"})
 
 _INVISIBLE = re.compile(
-    "[\x00-\x1f\x7f-\x9f"                 # C0, DEL, C1
-    "­؜ᅟᅠ឴឵᠎"      # soft hyphen, Arabic letter mark, Hangul/Khmer fillers, Mongolian
-    "​-‏ -‮⁠-⁯"           # zero width, bidi marks/overrides, line/para separators, isolates
-    "ㅤ﻿ﾠ￹-￻]")
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f"               # C0, DEL, C1
+    "\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e"   # soft hyphen, CGJ, Arabic mark, fillers, Mongolian
+    "\u200b-\u200f\u2028-\u202e\u2060-\u206f"    # zero width (incl. ZWJ/ZWNJ), bidi, separators, isolates
+    "\u2800\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffc"  # braille blank, fillers, variation selectors, object mark
+    "\U0001d173-\U0001d17a"                # musical formatting characters
+    "\U000e0000-\U000e007f\U000e0100-\U000e01ef]")  # tag characters, variation selectors supplement
 _SPACES = re.compile(r"\s+")
+_BAD_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
 
 
-def clean_text(value: object, limit: int) -> str:
-    """Display-safe text from an untrusted source: invisible and direction-changing characters removed,
-    whitespace collapsed, secrets redacted, then truncated. Never raises."""
+def _strip(value: str) -> str:
+    # The explicit set catches what we know; the category sweep catches formatting, private-use,
+    # surrogate and unassigned code points we did not think of.
+    value = _INVISIBLE.sub("", value)
+    return "".join(c for c in value if c in "\n\t" or unicodedata.category(c) not in _BAD_CATEGORIES)
+
+
+def clean_text(value: object, limit: int, multiline: bool = False) -> str:
+    """Display-safe text from an untrusted source: invisible and direction-changing characters removed
+    (zero-width joiners too, so a label cannot hide a second one), whitespace collapsed, secrets
+    redacted, then truncated. ``multiline`` keeps line breaks (chat). Never raises."""
     if not isinstance(value, str):
         return ""
-    text = _SPACES.sub(" ", _INVISIBLE.sub("", value)).strip()
+    text = _strip(value)
+    if multiline:
+        text = "\n".join(_SPACES.sub(" ", line).strip() for line in text.replace("\r", "").split("\n"))
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    else:
+        text = _SPACES.sub(" ", text).strip()
     return redact_text(text)[:limit].strip()
 
 

@@ -81,8 +81,12 @@ class IngestService:
         if isinstance(written, str) and self.reserved_node(written):
             raise PermissionError("not permitted to modify this lineage object")
 
-    def ingest(self, body: dict, principal: dict | None = None) -> dict:
+    def ingest(self, body: dict, principal: dict | None = None, valid=None) -> dict:
         """Apply one ingest body.
+
+        ``valid`` (T10) is an optional zero-argument callable evaluated inside the ledger lock,
+        immediately before a lineage envelope is admitted: a falsy result refuses the event exactly
+        like any lineage refusal, so a credential revoked while its request was in flight cannot land.
 
         ``principal`` is the authenticated caller (``{kind, id, authenticated_by}``)
         and becomes the ``actor`` of a schema_version 2 envelope. v1 bodies
@@ -136,6 +140,8 @@ class IngestService:
             if ledger.check(env) == "duplicate":
                 return {**head, "envelope": {**ack, "duplicate": True}}
             if entity_type == "lineage":
+                if valid is not None and not valid():
+                    raise PermissionError("not permitted to modify this lineage object")
                 # Ownership/capacity gate: runs under the ledger lock and BEFORE
                 # the row is persisted, so a refused change is never stored and
                 # its sequence is not consumed. Raises PermissionError (403).

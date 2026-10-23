@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import bisect
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -103,10 +104,11 @@ _HANDLE_BAD = re.compile(r"[^a-z0-9\-]")
 
 
 class CollabError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, code: str | None = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.code = code            # a stable machine-readable reason for refusals a client can act on
 
 
 def _digest(value: str) -> str:
@@ -304,7 +306,12 @@ class CollabService:
         self._joins_by_id: dict[str, str] = {}               # join id -> digest
         self._externals_by_room: dict[str, list] = defaultdict(list)   # room id -> external agent ids (T10)
         self._presence: dict[str, dict] = {}                 # external agent id -> last heartbeat; memory only, by design
-        self._lineage_count: dict[str, int] = defaultdict(int)         # external agent id -> lineage events accepted
+        # Lineage write counters per ("agent"|"sponsor"|"room", id). Each is made durable AHEAD of its value
+        # (reserve-ahead rows in the log), so after a restart a count can be too high by up to
+        # USAGE_RESERVE_STEP-1 but never too low.
+        self._usage: dict[tuple, int] = defaultdict(int)
+        self._usage_reserved: dict[tuple, int] = defaultdict(int)
+        self.redeem_failures: dict[str, int] = {}      # failed invite redemptions per client address (bounded)
         self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
         self._msg_room: dict[str, str] = {}                  # message event id -> room id
         self.stats = defaultdict(int)
@@ -401,6 +408,8 @@ class CollabService:
                 self._seq = ev["sequence"]
                 self._log.append(ev)
                 self._apply(ev)
+            for k, v in self._usage_reserved.items():
+                self._usage[k] = max(self._usage[k], v)      # restart: the durable ceiling, never lower than used
             known = {ev["payload"].get(k) for ev in parsed
                      for k in ("actor_user_id", "subject_user_id", "user_id", "owner_user_id")}
             mark = getattr(self.auth, "mark_known", None)
@@ -418,7 +427,10 @@ class CollabService:
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
-        if t == "project_created":
+        if t == "external_usage_reserved":
+            k = (p["scope"], p["key"])
+            self._usage_reserved[k] = max(self._usage_reserved[k], int(p["reserved"]))
+        elif t == "project_created":
             self._projects[p["project_id"]] = {"name": p["name"], "members": {p["actor_user_id"]: "manager"}}
         elif t == "project_member_added":
             self._projects[p["project_id"]]["members"][p["subject_user_id"]] = p["role"]
@@ -1324,10 +1336,30 @@ class CollabService:
                     project_ids=[], resource_id=join_id))
         return {"ok": True}
 
-    def redeem_join_token(self, body: dict) -> dict:
+    @staticmethod
+    def _client_label(client: object) -> str:
+        """The address the HTTP layer resolved (its existing proxy convention), or "unknown". Only a
+        parseable IP is kept, so the counter and audit rows cannot be filled with free text."""
+        try:
+            return str(ipaddress.ip_address(str(client).strip())) if client else "unknown"
+        except ValueError:
+            return "unknown"
+
+    def _redeem_failed(self, client: object) -> None:
+        """Count a failed invite redemption per client address. Aggregate only (never one log row per
+        attempt, so unauthenticated traffic cannot grow the log); bounded at 256 addresses."""
+        self.stats["auth_failures"] += 1
+        who = self._client_label(client)
+        if who not in self.redeem_failures and len(self.redeem_failures) >= 256:
+            who = "other"
+        self.redeem_failures[who] = self.redeem_failures.get(who, 0) + 1
+
+    def redeem_join_token(self, body: dict, client: str | None = None) -> dict:
         """Public, token-authenticated: one use = one new agent for the token's owner."""
         token = body.get("token")
         if not isinstance(token, str) or not token.startswith("hcj_") or len(token) > 80:
+            with self._lock:
+                self._redeem_failed(client)
             raise CollabError(401, "unauthorized")
         digest = _digest(token)
         instance = body.get("instance_id")
@@ -1335,11 +1367,11 @@ class CollabService:
             rec = self._joins.get(digest)
             if (rec is None or rec["revoked"] or self._now() >= rec["expires_at"]
                     or rec["uses"] >= rec["max_uses"] or not self._ok(rec["owner"])):
-                self.stats["auth_failures"] += 1
+                self._redeem_failed(client)
                 raise CollabError(401, "unauthorized")
             self._throttle("join:" + digest, 120, 60.0, "join")
             if rec.get("external"):
-                return self._redeem_external(rec, digest, body)
+                return self._redeem_external(rec, digest, body, client)
             owner = rec["owner"]
             self._agent_slots(owner)
             name = self._agent_names(owner, rec["prefix"], 1)[0]
@@ -1468,7 +1500,7 @@ class CollabService:
                     project_ids=[room["project_id"]], resource_id=join_id))
         return {"ok": True}
 
-    def _redeem_external(self, rec: dict, digest: str, body: dict) -> dict:
+    def _redeem_external(self, rec: dict, digest: str, body: dict, client: str | None = None) -> dict:
         """Called with the lock held, after the token passed every check. One use = one external agent,
         bound to the invite's room, granted exactly the invite's actions and no more."""
         unknown = set(body) - {"token", "harness_type", "instance_id"}
@@ -1478,7 +1510,7 @@ class CollabService:
         room = self._rooms.get(x["room_id"])
         m = self._member(room, owner) if room else None
         if not m or "invite" not in ROLE_ACTIONS[m["role"]]:
-            self.stats["auth_failures"] += 1
+            self._redeem_failed(client)
             raise CollabError(401, "unauthorized")          # the sponsor no longer owns the room
         if self._external_load(x["room_id"]) - 1 >= ext.MAX_EXTERNALS_PER_ROOM:   # this invite is already counted
             raise CollabError(429, "this room has as many external agents as it allows")
@@ -1496,7 +1528,8 @@ class CollabService:
             "code_digest": None, "join_digest": digest, "device_id": device, "harness_type": declared,
             "name": name, "parent_agent_id": None, "instance_id": None, "secret_digest": _digest(cred),
             "expires_at_epoch": hard, "external": block, "room_id": x["room_id"],
-            "actor_kind": "external", "action": "external.enroll", "outcome": "allowed",
+            "actor_kind": "external", "client_ip": self._client_label(client),
+            "action": "external.enroll", "outcome": "allowed",
             "project_ids": [x["project_id"]], "resource_id": aid})
         self._commit("agent_granted", {
             "actor_user_id": owner, "actor_agent_id": None, "project_id": x["project_id"],
@@ -1643,6 +1676,36 @@ class CollabService:
         a = self._agents.get(aid) if aid else None
         return bool(a and a.get("external"))
 
+    def _usage_take(self, items: list[tuple]) -> None:
+        """Count one lineage write against each ``(scope, key, cap)`` or refuse the lot. Called with the
+        lock held. A counter is made durable ahead of its value, so what a restart restores is never lower
+        than what was used. All the log rows are written before any counter moves."""
+        for scope, key, cap in items:
+            if self._usage[(scope, key)] >= cap:
+                self.stats["rate_limited"] += 1
+                raise CollabError(429, f"external lineage quota for this {scope} is used up",
+                                  code="external_lineage_quota:" + scope)
+        for scope, key, _ in items:
+            k = (scope, key)
+            if self._usage[k] + 1 > self._usage_reserved[k]:
+                self._commit("external_usage_reserved", {
+                    "actor_user_id": None, "actor_agent_id": None, "scope": scope, "key": key,
+                    "reserved": self._usage[k] + ext.USAGE_RESERVE_STEP})
+        for scope, key, _ in items:
+            self._usage[(scope, key)] += 1
+
+    def _usage_give_back(self, items: list[tuple]) -> None:
+        with self._lock:
+            for scope, key, _ in items:
+                self._usage[(scope, key)] = max(0, self._usage[(scope, key)] - 1)
+
+    def _credential_live(self, aid: str) -> bool:
+        """Is this external agent's credential still good right now? Read without the service lock: it is
+        evaluated inside the ingest ledger lock, and a lock-free read of a status that only ever moves from
+        active to revoked cannot deadlock against it."""
+        a = self._agents.get(aid)
+        return bool(a and a["status"] == "active" and self._now() < a["external"]["hard_expiry"])
+
     def _refuse_lineage(self, pr: Principal, room_id: str) -> None:
         with self._lock:
             x = (self._agents.get(pr.id) or {}).get("external") or {}
@@ -1673,9 +1736,6 @@ class CollabService:
             if room is None or self._effective(pr, room) is None:
                 raise CollabError(404, "not found")
             self._throttle("lin:" + pr.id, ext.LINEAGE_PER_MINUTE, 60.0, "lineage")
-            if self._lineage_count[pr.id] >= ext.LINEAGE_MAX_EVENTS:
-                self.stats["rate_limited"] += 1
-                raise CollabError(429, "lineage budget for this credential is used up; ask the owner to re-invite")
             room_id, label, sponsor = x["room_id"], x["label"], x["sponsor"]
         event_id, seq, etype = body.get("event_id"), body.get("source_sequence"), body.get("event_type")
         if (not isinstance(event_id, str) or not _KEY_RE.match(event_id)
@@ -1704,6 +1764,8 @@ class CollabService:
         for k, v in attrs_in.items():
             if len(clean_attrs) >= 16:
                 raise CollabError(400, "too many attrs (16 at most)")
+            if not isinstance(k, str) or not ext.ATTR_KEY.fullmatch(k):
+                raise CollabError(400, "attr names are 1-64 of A-Za-z0-9._-")
             if k in ext.RESERVED_ATTRS or k.startswith("_"):
                 raise CollabError(400, f"attrs.{k} is not allowed")
             if isinstance(v, str):
@@ -1734,22 +1796,33 @@ class CollabService:
         if body.get("occurred_at") is not None:
             envelope["occurred_at"] = body["occurred_at"]
         principal = {"kind": "external", "id": "external:" + aid, "authenticated_by": "collab"}
+        items = [("agent", aid, ext.LINEAGE_MAX_EVENTS), ("sponsor", sponsor, ext.LINEAGE_MAX_PER_SPONSOR),
+                 ("room", room_id, ext.LINEAGE_MAX_PER_ROOM)]
+        with self._lock:
+            self._usage_take(items)           # refused here, before the graph sees anything
         try:
-            res = self.lineage_sink(envelope, principal)
+            res = self.lineage_sink(envelope, principal, lambda: self._credential_live(aid))
         except PermissionError:
+            self._usage_give_back(items)
+            if not self._credential_live(aid):            # revoked or expired while the request was in flight
+                with self._lock:
+                    self._audit_denied(pr, "external.lineage", "revoked_in_flight", room_id=room_id,
+                                       project_ids=[x["project_id"]], agent_id=aid)
+                raise CollabError(401, "unauthorized") from None
             self._refuse_lineage(pr, room_id)
             raise CollabError(403, "not permitted to modify this lineage object") from None
         except ValueError as exc:
+            self._usage_give_back(items)
             raise CollabError(400, str(exc)) from None
         except Exception as exc:
+            self._usage_give_back(items)
             if type(exc).__name__ == "EnvelopeConflict":
                 raise CollabError(409, str(exc)) from None
             self.stats["lineage_failures"] += 1
             raise CollabError(503, "lineage is unavailable") from None
         dup = bool(((res or {}).get("envelope") or {}).get("duplicate"))
-        with self._lock:
-            if not dup:
-                self._lineage_count[aid] += 1
+        if dup:
+            self._usage_give_back(items)      # a replay writes nothing, so it costs nothing
         return {"accepted": True, "duplicate": dup}
 
     def _file_request(self, owner: str, room_id: str, agent_id: str, actions: list[str]) -> str | None:
@@ -3034,6 +3107,10 @@ class CollabService:
             if not isinstance(text, str):
                 raise CollabError(400, "text must be a string")
             clean = _CONTROL.sub("", text)
+            if pr.external:               # untrusted: no invisible, direction-changing or tag characters
+                if len(text) > MAX_TEXT:
+                    raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
+                clean = ext.clean_text(text, MAX_TEXT, multiline=True)
             if not clean.strip() or len(clean) > MAX_TEXT:
                 raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
             reply = body.get("in_reply_to")
@@ -3147,7 +3224,7 @@ class CollabService:
                 out.append({"sequence": ev["sequence"], "event_type": ev["event_type"],
                             "action": p["action"], "outcome": p["outcome"], "reason": p.get("reason"),
                             "actor_user_id": p.get("actor_user_id"), "actor_agent_id": p.get("actor_agent_id"),
-                            "actor_kind": p.get("actor_kind"),
+                            "actor_kind": p.get("actor_kind"), "client_ip": p.get("client_ip"),
                             "room_id": p.get("room_id"), "resource_id": p.get("resource_id"),
                             "created_at": p["created_at"], "correlation_id": p.get("correlation_id")})
             nxt = out[-1]["sequence"] if out else cursor
@@ -3196,13 +3273,14 @@ class CollabService:
 
     # --------------------------------------------------------------- routing
     def dispatch(self, method: str, parts: list[str], query: dict, body: dict,
-                 authorization: str, device: str | None, operator: str | None = None):
+                 authorization: str, device: str | None, operator: str | None = None,
+                 client: str | None = None):
         """parts: path segments after /api/v1/collab. Returns (status, json) or a Stream."""
         try:
             if parts == ["agents", "enrollment", "complete"] and method == "POST":
                 return 201, self.complete_enrollment(body)
             if parts == ["agents", "join"] and method == "POST":
-                return 201, self.redeem_join_token(body)         # the token IS the authentication
+                return 201, self.redeem_join_token(body, client)  # the token IS the authentication
             if parts == ["agents", "join-link"] and method == "POST":
                 return 200, self.link_joined(body)
             if parts == ["config"] and method == "GET":
@@ -3392,7 +3470,7 @@ class CollabService:
                         return self.post_message(pr, rid, body)
             raise CollabError(404, "not found")
         except CollabError as exc:
-            return exc.status, {"error": exc.message}
+            return exc.status, ({"error": exc.message, "code": exc.code} if exc.code else {"error": exc.message})
 
 
 def _finite_expiry(exp: Any, now: float) -> float | None:

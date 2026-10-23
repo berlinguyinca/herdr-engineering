@@ -37,9 +37,9 @@ def fab(w):
     ing = IngestService(repo, key_scopes={})
     ing.reserved_node = w.s.is_external_node
 
-    def sink(envelope, principal):
+    def sink(envelope, principal, valid=None):
         ing.key_scopes[principal["id"]] = {"rooms": frozenset({envelope["room_id"]}), "missions": frozenset()}
-        return ing.ingest(envelope, principal)
+        return ing.ingest(envelope, principal, valid=valid)
     w.s.lineage_sink = sink
     w.s.graph_source = lambda: repo.graph
     w.repo, w.ing = repo, ing
