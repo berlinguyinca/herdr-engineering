@@ -1385,13 +1385,21 @@ def _make_handler(server, public=False, operator=False):
             service = server.collab
             if service is None or server.collab_only or service.graph_source is None:
                 return self._json({"error": "not found"}, 404)
-            who = self._principal().get("id")
+            principal = self._principal()
+            if principal.get("authenticated_by") != "api_key":
+                return self._json({"error": "steering delivery needs an authenticated API key; "
+                                            "an open listener has no principal to pin a request to",
+                                   "code": "authentication_required"}, 403)
+            who = principal.get("id")
+            inst = _q(self.path, "instance_id")
+            if inst is not None and not re.fullmatch(r"[A-Za-z0-9._:\-]{1,128}", inst):
+                return self._json({"error": "invalid instance_id"}, 400)
             from .collab import CollabError
             try:
                 if body is None and parts[4:] == ["pending"]:
-                    return self._json(service.steering_pending(who))
+                    return self._json(service.steering_pending(who, inst))
                 if body is not None and len(parts) == 6 and parts[5] == "ack":
-                    return self._json(service.steering_ack(who, parts[4], body))
+                    return self._json(service.steering_ack(who, parts[4], body, inst))
             except CollabError as exc:
                 return self._json({"error": exc.message, **getattr(exc, "extra", {})}, exc.status)
             return self._json({"error": "not found"}, 404)

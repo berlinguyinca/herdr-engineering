@@ -598,3 +598,113 @@ def test_keyed_http_delivery_is_pinned_to_the_target_owner_and_acks_are_authenti
         assert call("POST", "/api/v1/steering/x/anything", "in-a", {})[0] == 403         # ingest keys do nothing else
     finally:
         server.shutdown()
+
+
+# ================================================================= review follow-ups
+def test_retract_and_moderate_are_exempt_from_the_revision_cap_and_rate_limit(wb):
+    wb.s.steering = normalize_steering({**ON, "comments_per_10min": 600})
+    cid = wb.s.add_comment(wb.bob, wb.room, {"anchor": anchor(), "text": "a", "idempotency_key": k()})[1]["comment"]["comment_id"]
+    for i in range(9):
+        wb.s.revise_comment(wb.bob, wb.room, cid, "edit", {"text": f"b{i}", "expected_revision": i + 1})
+    assert code(wb.s.revise_comment, wb.bob, wb.room, cid, "edit", {"text": "zz", "expected_revision": 10}) == 429
+    assert wb.s.revise_comment(wb.bob, wb.room, cid, "retract", {"expected_revision": 10})["comment"]["retracted"]
+    c2 = wb.s.add_comment(wb.bob, wb.room, {"anchor": anchor(), "text": "a", "idempotency_key": k()})[1]["comment"]["comment_id"]
+    for i in range(9):
+        wb.s.revise_comment(wb.bob, wb.room, c2, "edit", {"text": f"b{i}", "expected_revision": i + 1})
+    out = wb.s.revise_comment(wb.alice, wb.room, c2, "retract", {"expected_revision": 10})["comment"]
+    assert out["retracted"] and out["moderated"]
+
+
+def test_only_open_steering_requests_count_toward_the_room_cap(wb, monkeypatch):
+    from herdr_engineering.control_plane import collab_workbench as m
+    monkeypatch.setattr(m, "MAX_STEERS_PER_ROOM", 2)
+    a = propose(wb, wb.bob, "pause")
+    propose(wb, wb.bob, "resume")
+    t = target(wb, wb.bob)
+    body = {"action": "stop_after_step", "node_id": "attempt:a1", "expected_fence": t["fence"]}
+    assert code(wb.s.propose_steering, wb.bob, wb.room, {**body, "idempotency_key": k()}) == 429
+    wb.s.reject_steering(wb.bob, wb.room, a["steering_id"], {})
+    assert wb.s.propose_steering(wb.bob, wb.room, {**body, "idempotency_key": k()})[0] == 201
+
+
+def test_retracted_comments_do_not_lock_the_room(wb, monkeypatch):
+    from herdr_engineering.control_plane import collab_workbench as m
+    monkeypatch.setattr(m, "MAX_COMMENTS_PER_ROOM", 2)
+    ids = [wb.s.add_comment(wb.bob, wb.room, {"anchor": anchor(), "text": f"c{i}", "idempotency_key": k()})[1]["comment"]["comment_id"]
+           for i in range(2)]
+    assert code(wb.s.add_comment, wb.bob, wb.room, {"anchor": anchor(), "text": "x", "idempotency_key": k()}) == 429
+    wb.s.revise_comment(wb.alice, wb.room, ids[0], "retract", {"expected_revision": 1})
+    assert wb.s.add_comment(wb.bob, wb.room, {"anchor": anchor(), "text": "x", "idempotency_key": k()})[0] == 201
+
+
+def test_comments_follow_the_master_switch_unless_set_explicitly(wb):
+    body = lambda: {"anchor": anchor(), "text": "hi", "idempotency_key": k()}      # noqa: E731
+    for cfg in ({}, {"enabled": False}, {"enabled": True, "kill_switch": True}):
+        wb.s.steering = normalize_steering(cfg)
+        assert code(wb.s.add_comment, wb.bob, wb.room, body()) == 403, cfg
+    wb.s.steering = normalize_steering({"comments_enabled": True})                  # explicit, master switch off
+    cid = wb.s.add_comment(wb.bob, wb.room, body())[1]["comment"]["comment_id"]
+    wb.s.steering = normalize_steering({"enabled": True, "kill_switch": True, "comments_enabled": False})
+    assert code(wb.s.add_comment, wb.bob, wb.room, body()) == 403
+    assert wb.s.revise_comment(wb.bob, wb.room, cid, "retract", {"expected_revision": 1})["comment"]["retracted"]
+
+
+def test_ack_after_the_delivery_window_is_refused(wb):
+    st = propose(wb, wb.bob, "pause")
+    confirm(wb, wb.alice, st)
+    assert len(pending(wb)) == 1
+    wb.s.clock.t += 301
+    assert err(wb.s.steering_ack, "key:writer", st["steering_id"], {"outcome": "applied"})[:2] == (410, "expired")
+
+
+def test_redeliveries_are_audited_and_the_counter_survives_a_restart(wb):
+    st = propose(wb, wb.bob, "pause")
+    confirm(wb, wb.alice, st)
+    pending(wb)
+    pending(wb)
+    assert wb.s._steers[st["steering_id"]]["deliveries"] == 2
+    again = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), now=wb.s.clock)
+    again.graph_source = wb.s.graph_source
+    again.steering = normalize_steering(ON)
+    again.hydrate(wb.s._log)
+    assert again._steers[st["steering_id"]]["deliveries"] == 2
+    pid = wb.s._rooms[wb.room]["project_id"]
+    aud = [e["action"] for e in wb.s.audit(wb.alice, pid, 0, 500)["events"] if e["action"].startswith("steer.")]
+    assert aud == ["steer.propose", "steer.confirm", "steer.deliver", "steer.redeliver"]
+
+
+def test_two_instances_sharing_a_key_do_not_consume_each_others_requests(wb):
+    node(wb.feed, "attempt:i1", state="running", attrs={"instance_id": "inst-1"}, room_id=wb.room)
+    st = propose(wb, wb.bob, "pause", nid="attempt:i1")
+    confirm(wb, wb.alice, st)
+    assert wb.s.steering_pending("key:writer", "inst-2")["steering"] == []
+    assert wb.s.steering_pending("key:writer")["steering"] == []
+    assert wb.s._steers[st["steering_id"]]["status"] == "confirmed"                # still waiting for the right one
+    assert code(wb.s.steering_ack, "key:writer", st["steering_id"], {"outcome": "stale"}, "inst-2") == 404
+    got = wb.s.steering_pending("key:writer", "inst-1")["steering"]
+    assert [i["steering_id"] for i in got] == [st["steering_id"]]
+    assert code(wb.s.steering_ack, "key:writer", st["steering_id"], {"outcome": "stale"}, "inst-2") == 404
+    assert wb.s.steering_ack("key:writer", st["steering_id"], {"outcome": "applied"}, "inst-1")["status"] == "acked"
+
+
+def test_steering_routes_refuse_an_open_listener(svc):
+    import http.client
+    import threading
+
+    from herdr_engineering.control_plane.api import ControlPlaneServer
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    svc.steering = normalize_steering(ON)
+    server = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=svc, allow_open=True)
+    threading.Thread(target=server.serve, daemon=True).start()
+    server.wait_until_ready()
+    try:
+        for method, path, body in (("GET", "/api/v1/steering/pending", None),
+                                   ("POST", "/api/v1/steering/x/ack", json.dumps({"outcome": "applied"}))):
+            c = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+            c.request(method, path, body, {"Content-Type": "application/json"})
+            r = c.getresponse()
+            data = json.loads(r.read() or b"{}")
+            c.close()
+            assert r.status in (403, 404) and (r.status == 404 or data.get("code") == "authentication_required")
+    finally:
+        server.shutdown()

@@ -53,7 +53,7 @@ test('comment actions: own edit/retract, owner moderation, none when read-only',
 
 test('retracted comments show no text but keep their history reachable', () => {
   const html = renderDiscussion(model({ comments: [comment({ retracted: true, moderated: true, text: null })] }));
-  assert.ok(html.includes('removed by a room owner') && html.includes('data-wb-act="history"') && !html.includes('why?'));
+  assert.ok(html.includes('removed by a room owner') && html.includes('earlier text remains in history') && html.includes('data-wb-act="history"') && !html.includes('why?'));
 });
 
 test('steering shows why it is unavailable and offers only the server-listed actions', () => {

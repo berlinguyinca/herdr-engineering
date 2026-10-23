@@ -470,7 +470,7 @@ Closed set of actions: `pause`, `resume`, `stop_after_step`, `redirect` (the onl
 control_plane:
   collab:
     steering:
-      enabled: false          # default: OFF. Comments are on by default (comments_enabled: true).
+      enabled: false          # default: OFF. Comments follow this switch (and kill_switch) unless comments_enabled is set.
       kill_switch: false      # true stops proposal, confirmation and delivery at once
       actions: [pause, resume, stop_after_step, redirect, approve, reject]
       confirm_roles: [owner]  # owner and/or contributor
@@ -479,7 +479,7 @@ control_plane:
       delivery_ttl_seconds: 300
 ```
 Other keys: `max_instruction_chars`, `propose_per_10min`, `confirm_per_10min`, `max_open_per_target`, `max_open_per_room`,
-`comments_enabled`, `comments_per_10min`, `max_comment_chars`, `max_comment_revisions`. Unknown keys or wrong types stop startup
+`comments_enabled` (unset: comments follow `enabled` and `kill_switch`; an explicit true or false decides alone; retract and moderate always work), `comments_per_10min`, `max_comment_chars`, `max_comment_revisions`. Unknown keys or wrong types stop startup
 (and the rendered collab slice). When a fleet config file is in use the service re-reads this section on every request, so editing
 `kill_switch: true` takes effect without a restart; an unreadable or invalid section fails CLOSED (steering and comments off).
 
@@ -507,3 +507,11 @@ Other keys: `max_instruction_chars`, `propose_per_10min`, `confirm_per_10min`, `
 - Only the combined server has a graph: the dashboard proxy to an isolated `collab_only` process answers 404 for comments and steering.
 - No visual-regression suite exists; the UI is covered by unit tests and a Playwright run against a mocked API.
 - The UI for links (edges) offers comments only (steering targets are nodes).
+
+### Review follow-ups (T12)
+- Retract and moderate are exempt from `max_comment_revisions` and from the comment rate limit; only edits count.
+- Only OPEN steering requests count toward the per-room cap; closed ones are history. Retracted comments do not count toward the room or item comment caps (an owner can always free room by removing comments).
+- `POST /api/v1/steering/<id>/ack` answers 410 (`expired`) once the delivery window has closed.
+- Every offer, redeliveries included, is a `steer_delivered` audit event with its `delivery` number; the counter is rebuilt from those events on restart.
+- `GET /api/v1/steering/pending?instance_id=<id>`: when the target node carries an `instance_id` attribute, only a caller presenting that id is offered the request, so two Pi instances sharing one key do not consume each other's requests. Nodes without the attribute keep key-only pinning.
+- The steering routes refuse (403, `authentication_required`) on an open listener, which has no principal to pin to.

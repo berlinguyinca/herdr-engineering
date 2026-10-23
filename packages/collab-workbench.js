@@ -53,7 +53,7 @@ function renderComment(c, w) {
   const who = `${esc(text(c.author && c.author.id, 'unknown'))}`;
   const meta = `<span class="wb-who">${who}</span> ${when(c.created_at)}${c.edited ? ' <span class="cx-msg">(edited)</span>' : ''}`;
   if (c.retracted) {
-    return `<li class="wb-comment" data-wb-comment="${esc(c.comment_id)}"><p class="cx-msg">${meta}: ${c.moderated ? 'removed by a room owner' : 'retracted by the author'}.</p>`
+    return `<li class="wb-comment" data-wb-comment="${esc(c.comment_id)}"><p class="cx-msg">${meta}: ${c.moderated ? 'removed by a room owner' : 'retracted by the author'} (earlier text remains in history).</p>`
       + `<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-wb-act="history" data-wb-id="${esc(c.comment_id)}">History</button>${renderHistory(c, w)}</li>`;
   }
   const body = editing

@@ -1411,7 +1411,7 @@ class GraphProjection:
                     "owner": None if node.commons else view.get("owner"), "superseded": superseded,
                     "scan_exhausted": bool(exhausted),
                     "attrs": {k: view["attrs"].get(k) for k in
-                              ("plan_digest", "digest", "commit", "head_sha", "attempt_id", "fencing_token")
+                              ("plan_digest", "digest", "commit", "head_sha", "attempt_id", "fencing_token", "instance_id")
                               if isinstance(view["attrs"].get(k), (str, int))}}
 
     def get_edge(self, principal, edge_type: str, from_id: str, to_id: str,

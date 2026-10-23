@@ -97,7 +97,7 @@ def normalize_steering(raw: Any) -> dict:
     cfg = {"enabled": False, "kill_switch": False, "actions": list(STEER_ACTIONS), "confirm_roles": ["owner"],
            "self_confirm": False, "proposal_ttl_seconds": 900, "delivery_ttl_seconds": 300,
            "max_instruction_chars": 1000, "propose_per_10min": 10, "confirm_per_10min": 30,
-           "max_open_per_target": 3, "max_open_per_room": 50, "comments_enabled": True,
+           "max_open_per_target": 3, "max_open_per_room": 50, "comments_enabled": None,
            "comments_per_10min": 30, "max_comment_chars": 2000, "max_comment_revisions": 10}
     ranges = {"proposal_ttl_seconds": (30, 86400), "delivery_ttl_seconds": (30, 86400),
               "max_instruction_chars": (1, 2000), "propose_per_10min": (1, 200), "confirm_per_10min": (1, 200),
@@ -194,6 +194,15 @@ class WorkbenchMixin:
         except Exception:
             return {**normalize_steering(None), "enabled": False, "kill_switch": True, "comments_enabled": False}
 
+    @staticmethod
+    def _comments_on(cfg: dict) -> bool:
+        """Comments follow the steering master switch (`enabled` and not `kill_switch`) unless
+        `comments_enabled` is set explicitly, in which case that value alone decides."""
+        explicit = cfg.get("comments_enabled")
+        if explicit is not None:
+            return bool(explicit)
+        return bool(cfg["enabled"] and not cfg["kill_switch"])
+
     def _steer_on(self, cfg: dict) -> None:
         if not cfg["enabled"] or cfg["kill_switch"]:
             self.stats["steering_refused_disabled"] += 1
@@ -243,8 +252,9 @@ class WorkbenchMixin:
                          deliver_until_epoch=p["deliver_until_epoch"])
             elif t == "steer_rejected" and r["status"] in ("pending", "confirmed", "delivered"):
                 r.update(status=p["kind"], closed_reason=p.get("reason"), closed_by=p.get("actor_user_id"))
-            elif t == "steer_delivered" and r["status"] == "confirmed":
-                r.update(status="delivered", delivered_epoch=p["epoch"], deliveries=max(1, r["deliveries"]))
+            elif t == "steer_delivered" and r["status"] in ("confirmed", "delivered"):
+                r.update(status="delivered", delivered_epoch=p["epoch"],
+                         deliveries=max(r["deliveries"] + 1 if "delivery" not in p else p["delivery"], 1))
             elif t == "steer_acked" and r["status"] in ("confirmed", "delivered"):
                 r.update(status="acked", ack={"outcome": p["ack_outcome"], "note": p.get("note"), "epoch": p["epoch"]})
         return True
@@ -290,7 +300,7 @@ class WorkbenchMixin:
         with self._lock:
             room, _ = self._authorize(pr, room_id, "post", "comment.add")
             graph, reader = self._wb_graph(pr, room_id)
-            if not cfg["comments_enabled"]:
+            if not self._comments_on(cfg):
                 raise WorkbenchError(403, "comments are disabled by the operator")
             bad = [k for k in body if k not in ("anchor", "text", "idempotency_key")]
             if bad:
@@ -306,9 +316,11 @@ class WorkbenchMixin:
                 if prior[0] != fp:
                     raise WorkbenchError(409, "idempotency_key already used for a different comment")
                 return 200, {"comment": self._comment_view(self._comments[prior[1]]), "replayed": True}
-            if len(self._comments_by_room.get(room_id, ())) >= MAX_COMMENTS_PER_ROOM:
+            if sum(1 for i in self._comments_by_room.get(room_id, ()) if not self._comments[i]["retracted"]) \
+                    >= MAX_COMMENTS_PER_ROOM:
                 raise WorkbenchError(429, "this room has reached its comment limit")
-            if len(self._comments_by_anchor.get((room_id, akey), ())) >= MAX_COMMENTS_PER_ANCHOR:
+            if sum(1 for i in self._comments_by_anchor.get((room_id, akey), ())
+                   if not self._comments[i]["retracted"]) >= MAX_COMMENTS_PER_ANCHOR:
                 raise WorkbenchError(429, "this item has reached its comment limit")
             self._throttle("comment:" + pr.key, cfg["comments_per_10min"], 600.0, "comment")
             self._throttle("comment-room:" + room_id, cfg["comments_per_10min"] * 5, 600.0, "comment")
@@ -332,7 +344,7 @@ class WorkbenchMixin:
             c = self._comments.get(comment_id)
             if c is None or c["room_id"] != room_id or not graph.anchor_visible(reader, c["anchor"]):
                 raise WorkbenchError(404, "not found")
-            if not cfg["comments_enabled"]:
+            if kind != "retract" and not self._comments_on(cfg):
                 raise WorkbenchError(403, "comments are disabled by the operator")
             owner = (self._member(room, pr.id) or {}).get("role") == "owner"
             allowed = {"edit": ("expected_revision", "text"), "retract": ("expected_revision",)}[kind]
@@ -348,14 +360,15 @@ class WorkbenchMixin:
             if isinstance(expected, bool) or not isinstance(expected, int) or expected != len(c["revisions"]):
                 raise WorkbenchError(409, "comment changed since you read it", code="stale_revision",
                                      revision=len(c["revisions"]))
-            if len(c["revisions"]) >= cfg["max_comment_revisions"]:
+            if kind == "edit" and len(c["revisions"]) >= cfg["max_comment_revisions"]:
                 raise WorkbenchError(429, "this comment has reached its revision limit")
             text = None
             if kind == "edit":
                 text = _clean(body.get("text"), "text", cfg["max_comment_chars"])
                 if text == c["revisions"][-1]["text"]:
                     raise WorkbenchError(400, "text is unchanged")
-            self._throttle("comment:" + pr.key, cfg["comments_per_10min"], 600.0, "comment")
+            if kind == "edit":                      # retracting and moderating are never rate limited
+                self._throttle("comment:" + pr.key, cfg["comments_per_10min"], 600.0, "comment")
             actual = "moderate" if kind == "retract" and c["author"] != pr.id else kind
             self._commit("comment_revised", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, comment_id=comment_id, kind=actual, text=text,
@@ -569,9 +582,9 @@ class WorkbenchMixin:
 
     def _steer_caps(self, cfg: dict, room_id: str, node_id: str) -> None:
         rows = [self._steers[i] for i in self._steers_by_room.get(room_id, ())]
-        if len(rows) >= MAX_STEERS_PER_ROOM:
-            raise WorkbenchError(429, "this room has reached its steering history limit")
         open_rows = [r for r in rows if self._steer_status(r) in ("pending", "confirmed", "delivered")]
+        if len(open_rows) >= MAX_STEERS_PER_ROOM:          # closed requests are history, not load
+            raise WorkbenchError(429, "this room has reached its open steering limit")
         if len(open_rows) >= cfg["max_open_per_room"]:
             raise WorkbenchError(429, "too many open steering requests in this room")
         if sum(1 for r in open_rows if r["node_id"] == node_id) >= cfg["max_open_per_target"]:
@@ -710,7 +723,7 @@ class WorkbenchMixin:
             return None
 
     # ------------------------------------------------- delivery (keyed API)
-    def steering_pending(self, principal_id: str | None) -> dict:
+    def steering_pending(self, principal_id: str | None, instance_id: str | None = None) -> dict:
         """Confirmed requests for the graph principal that owns the target node. Re-validated at fetch: the
         feature is still on, proposer and confirmer still hold their rights, the room still exists, and the
         target still matches its fence. Anything else is closed (fenced/rejected) or skipped, never delivered."""
@@ -741,17 +754,18 @@ class WorkbenchMixin:
                     continue
                 reader = self._reader_for(graph, r["confirmed_by"], r["room_id"])
                 facts = self._facts_or_none(graph, reader, r["node_id"]) if reader else None
+                pinned = (facts or {}).get("attrs", {}).get("instance_id")
+                if pinned is not None and pinned != instance_id:
+                    continue                       # another Pi instance registered this node; leave it for that one
                 if (facts is None or self._fence_of(facts) != r["fence"] or r["action"] not in self._eligible(cfg, facts)
                         or facts["owner"] != principal_id):
                     self._close_steer(r, "fenced", None, "target_changed_before_delivery")
                     continue
-                if r["status"] == "confirmed":
-                    self._commit("steer_delivered", {
-                        "actor_user_id": None, "actor_agent_id": None, "project_id": room["project_id"],
-                        "room_id": r["room_id"], "steer_id": sid, "epoch": self._now(), "visibility_scope": "room",
-                        "action": "steer.deliver", "outcome": "allowed", "project_ids": [room["project_id"]],
-                        "resource_id": sid})
-                r["deliveries"] += 1
+                self._commit("steer_delivered", {          # every offer is audited, redeliveries included
+                    "actor_user_id": None, "actor_agent_id": None, "project_id": room["project_id"],
+                    "room_id": r["room_id"], "steer_id": sid, "epoch": self._now(), "visibility_scope": "room",
+                    "action": "steer.deliver" if r["deliveries"] == 0 else "steer.redeliver", "outcome": "allowed",
+                    "delivery": r["deliveries"] + 1, "instance_id": pinned, "project_ids": [room["project_id"]], "resource_id": sid})
                 out.append(self._delivery(r, room))
         return {"notice": STEER_NOTICE if out else None, "steering": out}
 
@@ -773,10 +787,12 @@ class WorkbenchMixin:
                 "confirmed_by": {"type": "user", "id": r["confirmed_by"], "at_epoch": r["confirmed_epoch"]},
                 "valid_until_epoch": r["deliver_until_epoch"], "delivery": r["deliveries"]}
 
-    def steering_ack(self, principal_id: str | None, steer_id: str, body: dict) -> dict:
-        return self._wb_call(self._steering_ack, principal_id, steer_id, body)
+    def steering_ack(self, principal_id: str | None, steer_id: str, body: dict,
+                     instance_id: str | None = None) -> dict:
+        return self._wb_call(self._steering_ack, principal_id, steer_id, body, instance_id)
 
-    def _steering_ack(self, principal_id: str | None, steer_id: str, body: dict) -> dict:
+    def _steering_ack(self, principal_id: str | None, steer_id: str, body: dict,
+                      instance_id: str | None = None) -> dict:
         if [k for k in body if k not in ("outcome", "note")]:
             raise WorkbenchError(400, "unknown field")
         outcome = body.get("outcome")
@@ -787,12 +803,17 @@ class WorkbenchMixin:
             r = self._steers.get(steer_id) if isinstance(steer_id, str) else None
             if r is None or not principal_id or r["owner"] != principal_id:
                 raise WorkbenchError(404, "not found")             # only the pinned target principal
+            pin = (r["fence_facts"].get("attrs") or {}).get("instance_id")
+            if pin is not None and pin != instance_id:
+                raise WorkbenchError(404, "not found")             # ...and, when the node names one, its instance
             if r["status"] == "acked":
                 if r["ack"]["outcome"] == outcome:
                     return {"steering_id": steer_id, "status": "acked", "replayed": True}
                 raise WorkbenchError(409, "already acknowledged with a different outcome")
             if r["status"] not in ("confirmed", "delivered"):
                 raise WorkbenchError(409, f"request is {r['status']}", code=r["status"])
+            if self._now() >= r["deliver_until_epoch"]:
+                raise WorkbenchError(410, "delivery window has closed; the request expired", code="expired")
             room = self._rooms[r["room_id"]]
             self._throttle("steer-ack:" + principal_id, 600, 60.0, "steering ack")
             self._commit("steer_acked", {
