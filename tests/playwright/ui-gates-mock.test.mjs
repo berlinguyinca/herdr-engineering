@@ -45,6 +45,7 @@ async function withPage(behaviour, fn) {
         if (state.delay) await new Promise((r) => setTimeout(r, state.delay));
         if (state.lineageFail && state.lineageCalls <= state.lineageFail) { await route.fulfill({ status: 500, json: { error: 'boom' } }); return; }
         body = state.empty ? { ...lineage(), nodes: [], edges: [], total_nodes: 0 } : lineage();
+        if (state.truncated) body = { ...body, truncated: true, truncated_reason: state.truncated, next_offset: state.truncatedNext ?? null };
       } else if (path === '/graph/lineage/timeline') body = { as_of: { step: 2, visible_events: 2, head: true }, lanes: [], markers: [], truncated: false, truncated_reason: null };
       else if (path === '/rooms/room-one/comments' && method === 'GET') body = { comments: [{ kind: 'comment', trust: 'untrusted', comment_id: 'c1', room_id: 'room-one', anchor: { kind: 'node', node_id: 'attempt:a1' }, author: { type: 'user', id: 'bob' }, created_at: T, revision: 1, edited: false, retracted: false, moderated: false, text: LONG }], has_more: false };
       else if (path === '/rooms/room-one/steering/target') body = { node_id: 'attempt:a1', node_type: 'attempt', state: 'running', superseded: false, fence: FENCE, pinned_source: 'key:abc', steering_enabled: true, actions: ['pause', 'redirect'], can_propose: true, can_confirm: true, self_confirm: false };
@@ -113,3 +114,25 @@ test('300-character unbroken labels, comments and instructions never cause horiz
   const o = await overflowAudit(page);
   assert.ok(o.scrollWidth <= o.clientWidth + 1, `overflow: ${o.scrollWidth} > ${o.clientWidth}: ${o.offenders.join(', ')}`);
 }));
+
+// What the server ran out of decides what the page may claim: `scan_budget` means nodes may be missing, `edge_budget` means every node
+// came back but links were left out. A page that says "more nodes may exist" for an edges-only cut is wrong in the other direction.
+for (const [reason, claims, denies] of [['scan_budget', /more nodes may exist/, /left out some links/], ['edge_budget', /left out some links/, /more nodes may exist/], ['response_bytes', /left out some links/, /more nodes may exist/]]) {
+  test(`a graph cut at "${reason}" with no next page says the right thing`, async () => {
+    await withPage({ truncated: reason }, async (page) => {
+      await page.locator('svg.lin-svg g[data-node]').first().waitFor();
+      const t = await page.locator('#hcn-lineage').innerText();
+      assert.match(t, claims, `says: ${t.slice(0, 200)}`);
+      assert.doesNotMatch(t, denies);
+      assert.equal(await page.locator('[data-more]').count(), 0, 'no Load more when the server will give no more');
+      assert.ok(await page.locator('#hcn-lineage [role=status]', { hasText: /Showing/ }).count() >= 1, 'it is announced in a status region');
+    });
+  });
+}
+test('a graph with more pages to load offers Load more, whatever the reason', async () => {
+  await withPage({ truncated: 'limit', truncatedNext: 2 }, async (page) => {
+    await page.locator('svg.lin-svg g[data-node]').first().waitFor();
+    assert.equal(await page.locator('[data-more]').count(), 1);
+    assert.doesNotMatch(await page.locator('#hcn-lineage').innerText(), /more nodes may exist|left out some links/);
+  });
+});
