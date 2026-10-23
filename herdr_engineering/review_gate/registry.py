@@ -8,7 +8,8 @@ Rules (sessions record no repo, so these are heuristics):
   herdr pane (``pane_id`` set, the ``pane:<host>:<pane>`` link collab agents
   use) -> ``"collab"``; no matching session -> ``"unknown"``. A matching
   session with neither marker is also ``"unknown"`` but keeps its identifiers;
-- ``pin`` records the first resolution on stream ``pr_gate_author`` so it
+- ties on ``updated_at`` -> the first in ``list_sessions`` order;
+- ``pin`` is first-wins and records the first resolution on stream ``pr_gate_author`` so it
   survives the session's death; a pinned author wins on later lookups.
 """
 
@@ -18,6 +19,7 @@ import json
 import threading
 from dataclasses import asdict
 
+from herdr_engineering.control_plane.redact import redact_text
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 from .models import Author, PrKey
@@ -50,9 +52,12 @@ class AuthorRegistry:
 
     def pin(self, key: PrKey, author: Author) -> None:
         with self._lock:
-            if self._pinned(key) == author:
+            if self._pinned(key) is not None:  # first pin wins
                 return
-            self._repo.record_event(ENTITY, str(key), "author_pinned", asdict(author))
+            fields = {
+                k: redact_text(v) if isinstance(v, str) else v for k, v in asdict(author).items()
+            }
+            self._repo.record_event(ENTITY, str(key), "author_pinned", fields)
 
     def author_of(self, key: PrKey, head_ref: str) -> Author:
         with self._lock:

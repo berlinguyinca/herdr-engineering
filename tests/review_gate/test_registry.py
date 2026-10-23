@@ -60,11 +60,65 @@ def test_pinned_author_survives_session_removal():
     assert AuthorRegistry(repo).author_of(KEY, "feat/x") == first
 
 
-def test_pin_is_idempotent():
+def test_pin_is_first_wins_and_idempotent():
     repo, reg = make()
     a = Author(kind="collab", model="m", session_id="s1")
     reg.pin(KEY, a)
     reg.pin(KEY, a)
     assert len(repo.stream("pr_gate_author", str(KEY))) == 1
     reg.pin(KEY, Author(kind="pi", session_id="s2"))
-    assert reg.author_of(KEY, "b") == Author(kind="pi", session_id="s2")
+    assert len(repo.stream("pr_gate_author", str(KEY))) == 1
+    assert reg.author_of(KEY, "b") == a
+
+
+def test_pin_redacts_secret_looking_strings():
+    repo, reg = make()
+    secret = "sk-" + "a" * 30
+    reg.pin(KEY, Author(kind="pi", model=secret))
+    assert secret not in str(repo.stream("pr_gate_author", str(KEY)))
+    assert reg.author_of(KEY, "b").model != secret
+
+
+def clocked():
+    t = [1000.0]
+    return ControlPlaneRepo(now=lambda: t[0]), t
+
+
+def test_recency_is_deterministic_with_injected_clock():
+    repo, t = clocked()
+    reg = AuthorRegistry(repo)
+    repo.upsert_session("a", host_id="h", branch="feat/x", pane_id="1")
+    t[0] += 10
+    repo.upsert_session("b", host_id="h", branch="feat/x", pane_id="2")
+    assert reg.author_of(KEY, "feat/x").session_id == "b"
+    t[0] += 10
+    repo.upsert_session("a", host_id="h", branch="feat/x", pane_id="1")
+    assert reg.author_of(KEY, "feat/x").session_id == "a"
+
+
+def test_tie_on_activity_picks_first_in_list_sessions_order():
+    repo, _ = clocked()
+    reg = AuthorRegistry(repo)
+    repo.upsert_session("a", host_id="h", branch="feat/x", pane_id="1")
+    repo.upsert_session("b", host_id="h", branch="feat/x", pane_id="2")
+    expected = repo.list_sessions()[0]["session_id"]
+    assert reg.author_of(KEY, "feat/x").session_id == expected
+
+
+def test_missing_cwd_still_matches():
+    repo, reg = make()
+    repo.upsert_session("a", host_id="h", branch="feat/x", pane_id="1")
+    assert reg.author_of(KEY, "feat/x").session_id == "a"
+
+
+def test_trailing_slash_cwd_matches_repo_name():
+    repo, reg = make()
+    repo.upsert_session("a", host_id="h", branch="feat/x", pane_id="1", cwd="/work/widgets/")
+    assert reg.author_of(KEY, "feat/x").session_id == "a"
+
+
+def test_session_without_pi_marker_or_pane_is_unknown_but_keeps_ids():
+    repo, reg = make()
+    repo.upsert_session("a", host_id="h", model="m", branch="feat/x")
+    a = reg.author_of(KEY, "feat/x")
+    assert (a.kind, a.session_id, a.host_id, a.model) == ("unknown", "a", "h", "m")
