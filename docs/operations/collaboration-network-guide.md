@@ -510,7 +510,7 @@ so those run on their own default model and the result says so.
 | Successor chain (successors of successors) | 5 | `MAX_SUCCESSOR_CHAIN` |
 | Live helpers in total / per runner host | 24 / 6 | `HELPERS_GLOBAL_LIVE` / `HELPERS_PER_HOST` |
 | Task text | 8000 characters, no control characters except newline and tab | |
-| Result | 20 KB from the runner (32,000 characters stored at most) | |
+| Result | 20 KB from the runner (32,000 characters stored at most); control characters other than newline and tab are stripped, and the finish request stays under 48 KiB. A refused finish (any status but 404/409) keeps the helper and is retried each cycle; after 3 refusals only `failed` / "result could not be delivered" is posted | `FINISH_ATTEMPTS` |
 | Host approval | 24 h by default, at most 30 days; a denial is remembered 1 h | |
 | Open host requests | 60 per room; 20 per helper | |
 | MCP waits | 20 s each, 2 at a time per agent | |
