@@ -181,6 +181,7 @@ test('activity uses wide space for filters, repetition summary, and keyboard-sel
     await page.route('**/api/v1/activity?limit=50',route=>route.fulfill({json:{events}}));
     await page.setViewportSize({width:3840,height:2160});
     await page.goto(`${base}/#/activity`);await page.locator('.ac-row').first().waitFor();
+    await page.waitForTimeout(300); // let the initial seeded SSE refresh settle before interaction assertions
 
     const desktop=await page.locator('.ac-workspace').evaluate(node=>({
       columns:getComputedStyle(node).gridTemplateColumns.split(' ').length,
@@ -210,10 +211,21 @@ test('activity uses wide space for filters, repetition summary, and keyboard-sel
     assert.match(await page.locator('[data-activity-selected]').innerText(),/wide-event-0/);
     assert.equal(await page.locator('.ac-row[data-event-id="wide-event-0"]').isVisible(),true,'selected detail should reconcile to an event that remains visible');
     await page.locator('[data-event-filter="all"]').click();
+    const longSelection=page.locator(`[data-event-type="${longType}"] summary`).first();
+    await longSelection.focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await page.locator('[data-activity-selected] h2').innerText(),longType);
 
     for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:1301,height:900},{width:1200,height:900},{width:1150,height:900},{width:1101,height:900},{width:901,height:900},{width:768,height:1024},{width:390,height:844}]){
       await page.setViewportSize(viewport);
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`activity overflowed at ${viewport.width}px`);
+      if([2560,1301,1200,768,390].includes(viewport.width)){
+        assert.equal(await page.locator('[data-activity-selected] h2').evaluate(heading=>heading.scrollWidth<=heading.clientWidth),true,`selected long event heading should wrap at ${viewport.width}px`);
+        assert.equal(await page.locator('[data-activity-selection-status]').evaluate(status=>{
+          const box=status.getBoundingClientRect();const style=getComputedStyle(status);
+          return style.position==='fixed'&&style.overflow==='hidden'&&box.width<=1&&box.left>=0&&box.right<=innerWidth;
+        }),true,`screen-reader selection status must stay clipped outside intrinsic workspace sizing at ${viewport.width}px`);
+      }
       if([1301,901,390].includes(viewport.width)){
         assert.equal(await page.locator(`[data-repeat-type="${longType}"]`).evaluate(row=>{
           const label=row.querySelector('span');
