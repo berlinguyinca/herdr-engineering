@@ -103,7 +103,9 @@ def test_required_command_receipt_propagates_database_failure_before_delivery():
     receipt = repo.send_message(sid, "hello", dispatcher=deliver)
     assert receipt["error"] == "receipt_persistence_failed"
     assert calls == []
-    assert repo.get_session(sid)["messages"] == 0
+    # Inspect the receipt's counter without attempting a separate durable name
+    # allocation against the deliberately unavailable database.
+    assert repo.export_state()["sessions"][sid]["messages"] == 0
 
 
 def test_sink_reconnects_a_closed_database_connection(monkeypatch):

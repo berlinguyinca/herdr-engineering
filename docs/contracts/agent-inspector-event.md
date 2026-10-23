@@ -16,6 +16,11 @@ boundary, and the existing SSE/REST conventions.
 }
 ```
 
+Session IDs retain their exact identity, including canonical uppercase `%3A`
+pane separators such as `herdr:bender:default:w1Z%3ApF`. IDs are limited to
+128 characters; malformed, nested, slash and control-character escapes are rejected.
+URL paths must encode the full ID once more (`%3A` becomes `%253A`).
+
 A single event may also be sent directly (`event_type` = the kind below,
 `payload` = the event body). Batching is preferred to keep overhead low.
 
@@ -43,7 +48,7 @@ Per-kind bodies (all fields optional unless stated):
 - `file` — `{path (required), op: "read"|"write"|"edit"|"delete", call_id, diff (unified), additions, deletions}`
 - `test` — `{run_id (required), command, phase: "start"|"end", passed, failed, skipped, duration_ms, failures: [{name, message, file, line}]}`
 - `usage` — `{input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, context_tokens, context_window, model}`
-- `association` — `{mission_id, handoff_id, handoff_from, parent_session_id, worktree, branch, pr: {number, url, repo}}`
+- `association` — `{mission_id, handoff_id, handoff_from, parent_session_id, worktree, branch, pr: {number, url, repo}, issue: {number, url, repo}}`
 - `model` — `{model, provider, previous_model, reason: "switch"|"handoff"|"fallback"}`
 - `lifecycle` — `{phase: "started"|"restored"|"restarted"|"interrupted"|"ended", restored_from_seq}`
 
@@ -71,13 +76,28 @@ Per-kind bodies (all fields optional unless stated):
   `incomplete: true`. Success is never inferred.
 - **Usage** `input/output/reasoning/cache_read_tokens` are *per-request* deltas
   (the server sums them); `context_tokens`/`context_window` are the current value.
-- **Durability:** only low-volume summary kinds (`capabilities`, `association`,
-  `model`, `lifecycle`, `test` results with up to 20 failure names) and
-  preferences are written to the existing durable sink (as `inspector` events,
-  never into the in-memory feed or the global SSE stream). Bodies live only in
-  the bounded ring and do not survive a control-plane restart; emitters should
-  send `lifecycle: restored` plus fresh `association`/`capabilities` when they
-  reconnect.
+- **Durability:** bounded, redacted user/assistant message bodies, tool phases
+  (including arguments and output), file changes/diffs, usage deltas, low-volume
+  summary kinds (`capabilities`, `association`, `model`, `lifecycle`, `test`
+  results with up to 20 failure names) and preferences use the existing durable
+  sink. They never enter the global SSE stream. System messages and reasoning
+  are not persisted; developer messages are rejected. Tool start/update/end
+  events replay in receive/mutation order into one entry per call, preserving
+  retry IDs, output bounds and access controls. Each update retains its bounded
+  latest tail; the read projection shows the most recent output for that call.
+  Restored conversations preserve attribution, sensitivity/redaction/truncation
+  flags and source timestamps, ordered by original server receive time and sequence.
+  Receive-time age, per-session count/byte limits and global caps apply on replay;
+  restarting does not extend retention. The existing append-only sink controls
+  physical log retention separately from this bounded read projection.
+  Persisted `event_id` keys restore a bounded retry window (at least 1024 events,
+  or the configured ring event capacity when larger); older retries outside that
+  window may be accepted. With a sink configured, conversation, tool, file and
+  usage events are
+  acknowledged only after `record_required` succeeds; a failed write returns a
+  retryable server error and does not mutate, publish or deduplicate that event.
+  Summary writes remain best-effort. Emitters should send
+  `lifecycle: restored` plus fresh `association`/`capabilities` on reconnect.
 
 ## Read API (viewer role or above)
 

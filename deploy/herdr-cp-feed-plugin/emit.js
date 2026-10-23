@@ -32,6 +32,7 @@ import { join } from "node:path";
 import { readHostJson } from "./host-config.js";
 import { pathToFileURL } from "node:url";
 import { enrichSession, resolveSessionEnv } from "./enrich.js";
+import { recordSessionBinding } from "./session-helpers.js";
 
 const EVENT_JSON = "HERDR_PLUGIN_EVENT_JSON";
 
@@ -306,6 +307,9 @@ async function main() {
   // via the herdr CLI + git, then send everything. Enrichment is best-effort.
   const enriched = await Promise.all(
     envelopes.map((e) => enrichSession(env, e).catch(() => e)));
+  // Retain exact identities locally before any network request. The snapshot
+  // companion can drain a short session even after its pane has disappeared.
+  for (const envelope of enriched) recordSessionBinding(envelope);
   const url = resolveUrl(env);
   if (!url) {
     process.stderr.write("[herdr-cp-feed] host config unavailable: no host.json; run `herdr-eng fleet join`\n");

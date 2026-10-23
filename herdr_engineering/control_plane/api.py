@@ -127,7 +127,8 @@ class ControlPlaneServer:
                  collab_require_https=False, fleet_config=None, ci_actions=False,
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
-                 operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=()):
+                 operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
+                 summary_config=None, summary_client=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -144,7 +145,8 @@ class ControlPlaneServer:
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row),
-                                    actions_enabled=ci_actions)
+                                    actions_enabled=ci_actions,
+                                    on_observation=repo.observe_ci_pipeline)
         if github_monitor is None:
             from ..github import GitHubMonitor
             github_monitor = GitHubMonitor()
@@ -154,6 +156,15 @@ class ControlPlaneServer:
             from .bridge import load_into
             load_into(repo, source)
         self.source = source
+        self.agent_summaries = None
+        self._summary_stop = threading.Event()
+        self._summary_scanner = None
+        if not collab_only:
+            from .agent_summaries import AgentSummaryService
+            self.agent_summaries = AgentSummaryService(repo, summary_config or {},
+                                                       persist=repo.persist_agent_summary,
+                                                       model_client=summary_client)
+            self.agent_summaries.hydrate(repo.agent_summary_events())
         # Optional durable object store (RustFS / S3). When wired, artifact
         # payloads are stored content-addressed here instead of the repo's
         # in-memory blob stand-in, so they survive a web restart.
@@ -302,6 +313,10 @@ class ControlPlaneServer:
             self.public_port = self._public_httpd.server_address[1]
             threading.Thread(target=self._public_httpd.serve_forever, daemon=True).start()
         self._ready.set()
+        if self.agent_summaries and self.agent_summaries.config.enabled:
+            self.agent_summaries.start()
+            self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
+            self._summary_scanner.start()
         threading.Thread(target=self._sweep_loop, daemon=True).start()
         self._httpd.serve_forever()
 
@@ -317,7 +332,25 @@ class ControlPlaneServer:
     def wait_until_ready(self, timeout=5.0):
         self._ready.wait(timeout=timeout)
 
+    def _summary_loop(self):
+        while not self._summary_stop.is_set():
+            try:
+                for session in self.repo.list_sessions():
+                    if self._summary_stop.is_set():
+                        break
+                    sid = session["session_id"]
+                    if self.repo.inspector.has_session(sid):
+                        self.agent_summaries.request(sid)
+            except Exception:
+                pass  # Retain continuity notes through temporary storage/model outages.
+            self._summary_stop.wait(2)
+
     def shutdown(self):
+        self._summary_stop.set()
+        if self._summary_scanner:
+            self._summary_scanner.join(timeout=2)
+        if self.agent_summaries:
+            self.agent_summaries.close()
         self.ci_monitor.close()
         self.github_monitor.close()
         if self._operator_httpd:
@@ -370,6 +403,7 @@ def _fabric_enriched_flow(repo, payload: bytes) -> bytes:
                               "agent_role": sess.get("agent_role"), "mission_id": sess.get("mission_id"),
                               "mission_title": (mission or {}).get("title"), "cwd": sess.get("cwd"),
                               "branch": sess.get("branch"), "name": sess.get("name"),
+                              "display_name": sess.get("display_name"), "agent_handle": sess.get("agent_handle"),
                               "parent_session_id": sess.get("parent_session_id")}
         return json.dumps(flow).encode()
     except Exception:           # the flow view must never break because fabric data is odd
@@ -414,6 +448,10 @@ _PUBLIC_STATIC = {
     "/collab-scripts.js": ("collab-scripts.js", "text/javascript"),
     "/collab-flow.js": ("collab-flow.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
+    "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
+    "/conversation-markdown.js": ("conversation-markdown.js", "text/javascript"),
+    "/conversation-json.js": ("conversation-json.js", "text/javascript"),
+    "/conversation.css": ("conversation.css", "text/css"),
     "/guide": ("collab-guide.html", "text/html; charset=utf-8"),
     "/collab-guide.js": ("collab-guide.js", "text/javascript"),
     "/collab-guide.md": ("collab-guide.md", "text/markdown; charset=utf-8"),
@@ -957,13 +995,19 @@ def _make_handler(server, public=False, operator=False):
                 return self._inspector_global_get(parts)
             if resource == "sessions" and len(parts) > 5 and parts[5] == "inspector":
                 return self._inspector_get(parts)
+            if resource == "sessions" and len(parts) == 6 and parts[5] == "summary":
+                if r.get_session(parts[4]) is None:
+                    return self._json({"error": "agent not found"}, 404)
+                return self._json(server.agent_summaries.get(parts[4]))
             if resource == "sessions":
                 if len(parts) > 4:
                     s = r.get_session(parts[4])
+                    if s:
+                        s = self._agent_capabilities(s)
                     return self._json(s) if s else self._json(
                         {"error": "not found"}, 404)
                 status = _q(self.path, "status")
-                return self._json({"sessions": r.list_sessions(status)})
+                return self._json({"sessions": [self._agent_capabilities(s) for s in r.list_sessions(status)]})
             if resource == "services":
                 if len(parts) > 4:
                     s = r.get_service(parts[4])
@@ -1067,6 +1111,32 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server.github_monitor.repositories(**query))
             if resource == "ci":
                 what = parts[4] if len(parts) > 4 else ""
+                if what == "performance" and len(parts) == 5:
+                    from .ci_performance import annotate_performance
+                    raw_days = _q(self.path, "days") or "14"
+                    if raw_days not in ('7', '14'):
+                        raise ValueError('CI performance days must be 7 or 14.')
+                    days = int(raw_days)
+                    snapshot = server.ci_monitor.snapshot(start=False)
+                    view = r.ci_performance(repository=_q(self.path, "repository") or None,
+                                            branch=_q(self.path, "branch") or None, days=days,
+                                            inventory=snapshot.get('repos', []))
+                    view['scope']['stale'] = view['scope']['stale'] or bool(snapshot.get('stale'))
+                    try:
+                        languages = server.github_monitor.repository_languages(start=False)
+                    except Exception:
+                        languages = {}
+                    return self._json(annotate_performance(view, r, snapshot.get('repos', []),
+                        languages if isinstance(languages, dict) else {}))
+                if what == "history":
+                    from .project_links import annotate_ci_history, cached_github_languages
+                    return self._json(annotate_ci_history(server.ci_monitor.history(), r,
+                        repository_languages=cached_github_languages(server.github_monitor)))
+                if what == "reports":
+                    from .project_links import annotate_ci_history, cached_github_languages
+                    view = {**r.ci_reports(), "repos": server.ci_monitor.snapshot().get("repos", [])}
+                    return self._json(annotate_ci_history(view, r,
+                        repository_languages=cached_github_languages(server.github_monitor)))
                 if what == "pipeline":
                     return self._json(server.ci_monitor.detail(
                         _q(self.path, "repository"), _q(self.path, "number")))
@@ -1075,8 +1145,9 @@ def _make_handler(server, public=False, operator=False):
                         _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step")))
                 if what:
                     return self._json({"error": "not found"}, 404)
-                from .project_links import annotate_ci
-                return self._json(annotate_ci(server.ci_monitor.snapshot(), r))
+                from .project_links import annotate_ci, cached_github_languages
+                return self._json(annotate_ci(server.ci_monitor.snapshot(), r,
+                    repository_languages=cached_github_languages(server.github_monitor)))
             if resource == "reviews":
                 from .reviews import ReviewService
                 reviews = ReviewService(r)
@@ -1108,7 +1179,15 @@ def _make_handler(server, public=False, operator=False):
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
+            if resource == "ci" and len(parts) == 5 and parts[4] == "telemetry":
+                from .ci_performance import MAX_REQUEST_BYTES, validate_ci_telemetry
+                length = int(self.headers.get('Content-Length') or 0)
+                if not 0 < length <= MAX_REQUEST_BYTES:
+                    raise ValueError('Invalid CI telemetry bundle size.')
+                return self._json(r.record_ci_telemetry(validate_ci_telemetry(self._read_json())))
             body = self._read_json() or {}
+            if resource == "ci" and len(parts) == 5 and parts[4] == "reports":
+                return self._json(r.ingest_ci_report(body))
             if resource == "ci" and len(parts) == 5 and parts[4] == "debug":
                 from ..errors import HerdrEngineeringError
                 from .ci_debug import debug_ci
@@ -1160,6 +1239,17 @@ def _make_handler(server, public=False, operator=False):
                 if receipt.get("error") in {"receipt_persistence_unavailable", "receipt_persistence_failed"}:
                     status = 503
                 return self._json({"ok": receipt["status"] == "delivered", **receipt}, status)
+            if resource == "sessions" and len(parts) == 6 and parts[5] in {"name", "summary"}:
+                sid = parts[4]
+                if r.get_session(sid) is None:
+                    return self._json({"error": "agent not found"}, 404)
+                if parts[5] == "summary":
+                    return self._json(server.agent_summaries.request(sid, force=True), 202)
+                from .agent_identity import AgentIdentityConflict
+                try:
+                    return self._json(r.rename_agent(sid, body.get("name"), body.get("expected_version")))
+                except AgentIdentityConflict as exc:
+                    return self._json({"error": str(exc)}, 409)
             if resource == "sessions" and len(parts) == 6 and parts[5] == "actions":
                 s = r.get_session(parts[4])
                 if s is None:
@@ -1200,7 +1290,9 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"ok": True})
                 if what == "models" and len(parts) == 5:
                     r.upsert_custom_model(body.get("name"), body.get("base_url"),
-                                          body.get("upstream_model"), body.get("project"))
+                                          body.get("upstream_model"), body.get("project"),
+                                          fabric_model=body.get("fabric_model"),
+                                          context_window=body.get("context_window", 8192))
                     return self._json({"ok": True})
                 if what == "models" and len(parts) == 7 and parts[6] == "delete":
                     r.delete_custom_model(parts[5])
@@ -1215,8 +1307,35 @@ def _make_handler(server, public=False, operator=False):
                     entity = server.ingest.ingest(body)
                 else:
                     entity = server.ingest.ingest(redact_payload(body))
+                if (server.agent_summaries and server.agent_summaries.config.enabled
+                        and body.get("entity_type") == "inspector"):
+                    payload = body.get("payload") or {}
+                    events = payload.get("events", [payload]) if isinstance(payload, dict) else []
+                    changed = body.get("event_type") == "inspector.message" or any(
+                        isinstance(event, dict) and event.get("kind") == "message" for event in events)
+                    sid = body.get("entity_id")
+                    if changed and r.get_session(sid) is not None:
+                        server.agent_summaries.request(sid)
                 return self._json({"ok": True, "entity": entity})
             return self._json({"error": "not found"}, 404)
+
+        def _agent_capabilities(self, session):
+            operator = self._role() == "operator"
+            return {**session, "capabilities": {"rename_agent": operator,
+                                                "regenerate_summary": operator}}
+
+        def _named_inspector(self, data, sid):
+            # Claim an existing provider preference before a helper/read path
+            # can allocate the primary agent's default display identity.
+            server.repo.get_session(sid)
+            data["capabilities"] = {**data.get("capabilities", {}),
+                                    "can_manage_agents": self._role() == "operator"}
+            for agent in (data.get("summary") or {}).get("agents", []):
+                aid = agent.get("agent_id") or "main"
+                identity = sid if aid == "main" else f"{sid}#agent:{aid}"
+                profile = server.repo.agent_identities.allocate(identity)
+                agent.update(display_name=profile["display_name"], agent_handle=profile["handle"])
+            return data
 
         # ---------------------------------------------------- agent inspector
         def _inspector_global_get(self, parts):
@@ -1238,15 +1357,15 @@ def _make_handler(server, public=False, operator=False):
                     if not store.has_session(sid):
                         if server.repo.get_session(sid) is None:
                             return self._json({"error": "session not found"}, 404)
-                        return self._json(_empty_inspector(store, sid))
-                    return self._json(store.query(
+                        return self._json(self._named_inspector(_empty_inspector(store, sid), sid))
+                    return self._json(self._named_inspector(store.query(
                         sid, role, view=_q(self.path, "view") or "all",
                         q=_q(self.path, "q"), agent_id=_q(self.path, "agent_id"),
                         status=_q(self.path, "status"),
                         since_rev=_qint(self.path, "since_rev", 0),
                         limit=_qint(self.path, "limit", 200),
                         before_seq=(_qint(self.path, "before_seq", -1)
-                                    if _q(self.path, "before_seq") else None)))
+                                    if _q(self.path, "before_seq") else None)), sid))
                 if tail[0] == "events" and len(tail) == 2:
                     if not tail[1].isdigit():
                         return self._json({"error": "invalid sequence"}, 400)

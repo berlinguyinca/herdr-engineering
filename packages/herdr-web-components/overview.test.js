@@ -45,7 +45,7 @@ test('actual repository terminal reports are visible without treating ordinary r
     {event_type:'MissionUpdated',payload:{status:'active',stage:'complete'}},{event_type:'MissionStageChanged',payload:{to:'failed'}},{event_type:'SessionUpdated',payload:{status:'stopped'}}];
   assert.equal(meaningfulEvents(events).length,3);
   const html=renderOverviewSection('activity',{events},{activity:{loaded:true}},now,now);
-  assert.match(html,/Mission reported finished/);assert.match(html,/Mission reported failed/);assert.match(html,/Session reported finished/);
+  assert.match(html,/Mission reported finished/);assert.match(html,/Mission reported failed/);assert.match(html,/Agent reported finished/);
 });
 test('overview suppresses telemetry noise and bounds untrusted summaries', () => {
   const events=[{event_type:'HostHeartbeat'},{event_type:'mission_activity.snapshot'},{event_type:'ServiceRegistered'},...Array.from({length:20},()=>({event_type:'MissionEnded',entity_type:'mission',entity_id:'private-id',payload:{title:'<script>'+ 'prompt '.repeat(1000)}}))];

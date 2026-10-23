@@ -223,3 +223,49 @@ def test_parent_and_name_survive_rebuilding_from_the_event_log():
     rebuilt = _reconstruct_from_events({"session:bender:s1": events})
     sessions = next(x for x in rebuilt if isinstance(x, dict) and "bender:s1" in x)
     assert sessions["bender:s1"]["parent_session_id"] == "bender:s0" and sessions["bender:s1"]["name"] == "helper-1"
+
+
+def test_session_recording_status_and_explicit_parent_survive_updates_and_restore():
+    from herdr_engineering.control_plane.bridge import _reconstruct_from_events
+
+    svc = make_svc()
+    parent = "herdr:bender:default:w1Z%3ApF"
+    def emit(payload):
+        return svc.ingest({"entity_type": "session", "entity_id": "helper",
+                           "event_type": "session.updated", "payload": payload})
+
+    emit({"host_id": "bender", "parent_session_id": parent,
+          "transcript": {"status": "recording", "truncated": True, "text": "must not be stored"}})
+    emit({"model": "new-model"})
+    current = svc.repo.get_session("helper")
+    assert current["transcript"] == {"status": "recording", "truncated": True}
+    assert current["parent_session_id"] == parent
+    emit({"transcript": {"status": "unreadable", "truncated": False}})
+    events = svc.repo.stream("session", "helper")
+    assert all("must not be stored" not in str(event) for event in events)
+    _, sessions, _, _, _ = _reconstruct_from_events({"session|helper": events})
+    assert sessions["helper"]["transcript"] == {"status": "unreadable", "truncated": False}
+    assert sessions["helper"]["parent_session_id"] == parent
+
+
+@pytest.mark.parametrize("metadata", [
+    {"transcript": "recording"}, {"transcript": {"status": "invented"}},
+    {"transcript": {"status": "recording", "truncated": "false"}},
+])
+def test_invalid_session_transcript_metadata_does_not_mutate_session(metadata):
+    svc = make_svc()
+    with pytest.raises(ValueError):
+        svc.ingest({"entity_type": "session", "entity_id": "helper",
+                    "event_type": "session.started", "payload": metadata})
+    assert svc.repo.get_session("helper") is None
+
+
+def test_session_retains_validated_identity_repair_status():
+    svc = make_svc()
+    svc.ingest({"entity_type": "session", "entity_id": "helper", "event_type": "session.updated",
+                "payload": {"transcript": {"status": "recording", "identity_repair": "report_unverified"}}})
+    assert svc.repo.get_session("helper")["transcript"]["identity_repair"] == "report_unverified"
+    with pytest.raises(ValueError):
+        svc.ingest({"entity_type": "session", "entity_id": "bad", "event_type": "session.updated",
+                    "payload": {"transcript": {"status": "recording", "identity_repair": "invented"}}})
+    assert svc.repo.get_session("bad") is None

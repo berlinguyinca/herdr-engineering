@@ -27,6 +27,10 @@ log = logging.getLogger("herdr.llm_proxy")
 FORWARDED_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models")
 MISS_RELOAD_SECONDS = 2.0
 MAX_BODY = 16 * 1024 * 1024
+CATALOG_TTL_SECONDS = 10.0
+CATALOG_TIMEOUT_SECONDS = 3.0
+MAX_CATALOG_BODY = 1024 * 1024
+REGISTERED_MODEL_HEADER = "x-herdr-require-registered-model"
 # Gateway admission buckets requests by user+client+session+agent and rejects metadata
 # over 128 bytes or outside this set with a 400, so only forward values it accepts.
 _META_OK = re.compile(r"^[A-Za-z0-9\-_.:/]{1,128}$")
@@ -79,6 +83,9 @@ class ProxyState:
         self._inflight: dict[str, int] = {}
         self.configure_limits(max_inflight=max_inflight, wait_seconds=wait_seconds)
         self._last = 0.0
+        self._catalog_lock = threading.Lock()
+        self._catalog_last = float("-inf")
+        self._catalog: list[dict] = []
 
     def refresh(self, force: bool = False) -> None:
         if not force and time.monotonic() - self._last < self.refresh_seconds:
@@ -141,12 +148,83 @@ class ProxyState:
         with self._lock:
             return self._inflight.get(project, 0)
 
-    def route(self, model: str | None) -> tuple[str, str | None, str | None]:
-        """(base_url, bearer, upstream model name) for ``model``."""
+    def custom_model(self, model: str | None) -> dict | None:
         with self._lock:
             custom = self._models.get(model or "")
+            return dict(custom) if custom else None
+
+    def _fabric_catalog(self) -> list[dict]:
+        # Catalog I/O never holds the key/routing/admission lock. Concurrent
+        # refresh contenders use CPU while the first request refreshes evidence.
+        if time.monotonic() - self._catalog_last < CATALOG_TTL_SECONDS:
+            return self._catalog
+        if not self._catalog_lock.acquire(blocking=False):
+            return []
+        conn = None
+        try:
+            if time.monotonic() - self._catalog_last < CATALOG_TTL_SECONDS:
+                return self._catalog
+            parts = urlsplit(self.upstream + "/v1/models")
+            cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+            conn = cls(parts.hostname, parts.port, timeout=CATALOG_TIMEOUT_SECONDS)
+            conn.request("GET", parts.path, headers={"Authorization": f"Bearer {self.upstream_key}"})
+            response = conn.getresponse()
+            if response.status != 200:
+                raise ValueError("catalog unavailable")
+            raw = response.read(MAX_CATALOG_BODY + 1)
+            if len(raw) > MAX_CATALOG_BODY:
+                raise ValueError("catalog too large")
+            payload = json.loads(raw)
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+                raise ValueError("invalid catalog")
+            self._catalog = data
+        except Exception:
+            # No stale success on failure, redirects, or malformed metadata.
+            self._catalog = []
+        finally:
+            self._catalog_last = time.monotonic()
+            if conn:
+                conn.close()
+            self._catalog_lock.release()
+        return self._catalog
+
+    def _fabric_model(self, custom: dict) -> str | None:
+        wanted = custom.get("fabric_model")
+        if not isinstance(wanted, str) or not wanted:
+            return None
+        catalog = self._fabric_catalog()
+        matches = [item for item in catalog if item.get("id") == wanted]
+        if not matches:
+            matches = [item for item in catalog if isinstance(item.get("aliases"), list)
+                       and wanted in item["aliases"]]
+        if len(matches) != 1:
+            return None
+        item = matches[0]
+        context = item.get("ctx_per_request")
+        if context is None:
+            context = item.get("x_context_window")
+        slots = item.get("slots")
+        required = custom.get("context_window", 8192)
+        if (not isinstance(item.get("id"), str) or not item["id"] or item.get("x_group")
+                or item.get("x_state") not in ("hot", "warm")
+                or item.get("x_modality") not in (None, "", "text", "chat")
+                or type(context) is not int or type(required) is not int or context < required
+                or type(slots) is not int or slots <= 0):
+            return None
+        return item["id"]
+
+    def custom_route(self, custom: dict, model: str | None) -> tuple[str, str | None, str | None]:
+        concrete = self._fabric_model(custom)
+        if concrete:
+            return self.upstream, self.upstream_key, concrete
+        return custom["base_url"], None, custom.get("upstream_model") or model
+
+    def route(self, model: str | None) -> tuple[str, str | None, str | None]:
+        """(base_url, bearer, upstream model name) for ``model``."""
+        custom = self.custom_model(model)
         if custom:
-            return custom["base_url"], None, custom.get("upstream_model") or model
+            return self.custom_route(custom, model)
         return self.upstream, self.upstream_key, model
 
 
@@ -248,48 +326,89 @@ def make_handler(state: ProxyState):
                 self.wfile.write(payload)
                 return
             try:
-                return self._forward_slotted(key, raw, body)
+                complete = self._forward_slotted(key, raw, body)
             finally:
                 state.release(project)
+            if complete:
+                # Release admission before the client observes response completion.
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                except OSError:
+                    self.close_connection = True
 
         def _forward_slotted(self, key: dict, raw: bytes, body: dict | None):
             started = time.monotonic()
             model = body.get("model") if body else None
-            base, bearer, upstream_model = state.route(model)
+            custom = state.custom_model(model)
+            guarded = self.headers.get(REGISTERED_MODEL_HEADER, "").lower() == "true"
+            if guarded and custom is None:
+                return self._json(503, {"error": {"code": "model_not_registered",
+                                                 "message": "required model is not registered"}})
+            if (custom and (guarded or custom.get("fabric_model")) and custom.get("project")
+                    and custom["project"] != key["project"]):
+                return self._json(403, {"error": {"code": "model_project_mismatch"}})
+            base, bearer, upstream_model = (state.custom_route(custom, model) if custom
+                                            else (state.upstream, state.upstream_key, model))
+            policy = bool(custom and custom.get("fabric_model"))
+            route_kind = "fabric" if policy and bearer is not None else "cpu"
             stream = bool(body and body.get("stream"))
-            if body is not None:
-                if upstream_model and upstream_model != model:
-                    body["model"] = upstream_model
-                if stream:  # make the upstream report usage on the final chunk
-                    opts = dict(body.get("stream_options") or {})
-                    opts["include_usage"] = True
-                    body["stream_options"] = opts
-                raw = json.dumps(body).encode()
-            parts = urlsplit(base + self.path)
-            conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-            headers = {k: v for k, v in self.headers.items()
-                       if k.lower() not in HOP_HEADERS and k.lower() not in _IDENTITY_HEADERS}
-            headers.update(self._identity_headers(key))
-            headers["Content-Length"] = str(len(raw))
-            if bearer:
-                headers["Authorization"] = f"Bearer {bearer}"
-            usage, status, reported = {}, 502, False
+            fallback = bool(policy and bearer is not None and not stream)
+            usage, status, reported, sent_headers = {}, 502, False, False
+            conn = None
             try:
-                conn = conn_cls(parts.hostname, parts.port, timeout=600)
-                conn.request(self.command, parts.path + (f"?{parts.query}" if parts.query else ""),
-                             body=raw or None, headers=headers)
-                resp = conn.getresponse()
+                while True:
+                    outbound = dict(body) if body is not None else None
+                    if outbound is not None:
+                        if upstream_model:
+                            outbound["model"] = upstream_model
+                        if stream:
+                            opts = dict(outbound.get("stream_options") or {})
+                            opts["include_usage"] = True
+                            outbound["stream_options"] = opts
+                        raw = json.dumps(outbound).encode()
+                    parts = urlsplit(base + self.path)
+                    conn_cls = (http.client.HTTPSConnection if parts.scheme == "https"
+                                else http.client.HTTPConnection)
+                    headers = {k: v for k, v in self.headers.items()
+                               if k.lower() not in HOP_HEADERS and k.lower() not in _IDENTITY_HEADERS
+                               and k.lower() != REGISTERED_MODEL_HEADER}
+                    headers.update(self._identity_headers(key))
+                    headers["Content-Length"] = str(len(raw))
+                    if bearer:
+                        headers["Authorization"] = f"Bearer {bearer}"
+                    try:
+                        conn = conn_cls(parts.hostname, parts.port, timeout=10 if fallback else 600)
+                        conn.request(self.command, parts.path + (f"?{parts.query}" if parts.query else ""),
+                                     body=raw or None, headers=headers)
+                        resp = conn.getresponse()
+                        if not fallback or resp.status not in {429, 503}:
+                            break
+                    except (OSError, http.client.HTTPException):
+                        if not fallback:
+                            raise
+                    conn.close()
+                    fallback = False
+                    route_kind = "cpu"
+                    base, bearer, upstream_model = (custom["base_url"], None,
+                                                    custom.get("upstream_model") or model)
                 status = resp.status
                 self.send_response(status)
+                if policy:
+                    self.send_header("X-Herdr-LLM-Route", route_kind)
                 ctype = resp.getheader("Content-Type", "application/json")
                 self.send_header("Content-Type", ctype)
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
+                sent_headers = True
                 tail = b""
                 collected = bytearray()
                 while True:
                     chunk = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
                     if not chunk:
+                        # read1() can return EOF without enforcing Content-Length.
+                        # Never mark a truncated upstream body as a complete reply.
+                        if resp.length is not None and resp.length > 0:
+                            raise http.client.IncompleteRead(b"", resp.length)
                         break
                     self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                     self.wfile.flush()
@@ -303,15 +422,20 @@ def make_handler(state: ProxyState):
                 if self.command == "POST" and body is not None:
                     self._report(key, model, usage, status, started)
                     reported = True
-                self.wfile.write(b"0\r\n\r\n")
+                return True
             except Exception as exc:
-                log.warning("forward failed: %s", exc)
-                if status == 502:
+                status = 502
+                log.warning("forward failed: %s", type(exc).__name__)
+                if sent_headers:
+                    self.close_connection = True
+                else:
                     try:
                         self._json(502, {"error": "upstream unavailable"})
                     except Exception:
                         pass
             finally:
+                if conn:
+                    conn.close()
                 if self.command == "POST" and body is not None and not reported:
                     self._report(key, model, usage, status, started)
 

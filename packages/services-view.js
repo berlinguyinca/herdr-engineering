@@ -114,23 +114,24 @@ function serviceRow(s) {
 const styles = `<style>
 .sc-intro {color:var(--text-secondary); max-width:80ch; line-height:1.6}
 .sc-history>summary {cursor:pointer;color:var(--text-secondary);font-size:13px}.sc-history .sc-counts {margin:12px 0}
-.sc-counts {display:flex; flex-wrap:wrap; gap:12px; margin:20px 0}
+.sc-counts {display:flex; flex-wrap:wrap; gap:8px; margin:12px 0}
 .sc-counts button {font:inherit;color:inherit;text-align:left;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 14px;font-size:13px}
 .sc-counts strong {font-size:20px;margin-right:5px}
-.sc-controls {display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin:20px 0}
+.sc-controls {display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:12px 0}
 .sc-controls label {display:flex;flex-direction:column;gap:5px;font-size:13px}
 .sc-controls input[type=search],.sc-controls select {border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px;background:var(--surface);color:var(--text);font:inherit;max-width:100%}
 .sc-controls .sc-search {flex:1;min-width:190px}.sc-controls .sc-check {flex-direction:row;align-items:center;min-height:38px}
 .sc-toolbar {display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin:15px 0;font-size:13px}
 .sc-group {border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);margin:12px 0;overflow:hidden}
-.sc-group>summary {cursor:pointer;padding:16px;font-weight:600;overflow-wrap:anywhere}
+.sc-group>summary {cursor:pointer;padding:11px 13px;font-weight:600;overflow-wrap:anywhere}
 .sc-group>summary span {font-weight:400;font-size:12px;color:var(--text-secondary);margin-left:12px}
-.sc-row {display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1.2fr);gap:20px;padding:16px;border-top:1px solid var(--border-subtle);font-size:13px;overflow-wrap:anywhere}
+.sc-row {display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1.2fr);gap:16px;padding:11px 13px;border-top:1px solid var(--border-subtle);font-size:13px;overflow-wrap:anywhere}
 .sc-name {font-size:14px;font-weight:600}.sc-row p {margin:6px 0;line-height:1.5}.sc-meta {color:var(--text-secondary);font-size:12px}
 .sc-location,.sc-health {display:flex;flex-direction:column;gap:7px}.sc-health strong {font-size:12px}
 .sc-health [data-state=current] {color:var(--status-ok)}.sc-health [data-state=unavailable] {color:var(--status-attention)}
 .sc-detail {display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:18px;margin:24px 0}
 .sc-detail div {min-width:0;overflow-wrap:anywhere}.sc-detail dt {font-size:12px;color:var(--text-secondary)}.sc-detail dd {margin:5px 0;line-height:1.5}
+@media(min-width:2200px){.sc-controls .sc-search{flex:0 1 720px}.sc-controls{padding-right:max(0px,calc(100% - 1500px))}#sc-results{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}.sc-group{margin:0}}
 @media(max-width:650px){.sc-row {grid-template-columns:minmax(0,1fr);gap:12px}.sc-controls label {flex:1;min-width:140px}.sc-counts {gap:6px}.sc-counts button {font:inherit;color:inherit;text-align:left;cursor:pointer;padding:8px}.sc-group>summary span {display:block;margin:8px 0 0}}
 </style>`;
 
@@ -150,7 +151,7 @@ export function renderServiceDetails(s) {
     <p><strong>${stateLabel(s)}</strong> · ${esc(serviceReason(s))} Last report <span data-service-age>${esc(lastSeen(s))}</span>.</p>
     ${s.lifecycle?.archived ? '<p class="sc-intro">Archived services are hidden from the current catalog. A healthy report restores this service automatically; its history is retained.</p>' : ''}
     <dl class="sc-detail">${fields.map(([k,v])=>`<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>
-    <p>${endpoint(s)}</p>${reportedText(s.session_id) ? `<p><a data-owning-session href="#/herd/session/${esc(encodeURIComponent(s.session_id))}">Owning session →</a></p>` : ''}`;
+    <p>${endpoint(s)}</p>${reportedText(s.session_id) ? `<p><a data-owning-session href="#/herd/session/${esc(encodeURIComponent(s.session_id))}">Owning agent →</a></p>` : ''}`;
 }
 
 // Keep an open detail page honest even when the provider stops updating.

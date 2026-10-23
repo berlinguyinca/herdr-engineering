@@ -19,6 +19,9 @@ class DurableFixture:
     def record(self, event):
         self.rows.append(copy.deepcopy(event))
 
+    def record_required(self, event):
+        self.record(event)
+
     def events(self):
         return self.rows
 

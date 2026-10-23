@@ -1,8 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {createServer} from 'node:http';
 
 import { HerdrClient, ApiError } from './client.js';
 import { connectEvents } from './events.js';
+
+test('agent summary and rename requests preserve encoded identity and version', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    calls.push({ url, method: opts.method, body: opts.body && JSON.parse(opts.body) });
+    return { ok: true, status: 200, text: async () => '{}' };
+  } });
+  await client.getAgentSummary('a:b');
+  await client.regenerateAgentSummary('a:b');
+  await client.renameAgent('a:b', 'Ada', 2);
+  assert.deepEqual(calls.map(c => c.url), ['/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/name']);
+  assert.equal(calls[1].method, 'POST');
+  assert.deepEqual(calls[2].body, { name: 'Ada', expected_version: 2 });
+});
 
 function fakeFetch(routes) {
   return async (url, opts) => {
@@ -57,6 +72,16 @@ test('ApiError carries status and body on non-2xx', async () => {
     assert.equal(err.message, 'forbidden');
     return true;
   });
+});
+
+test('sendMessage retains an explicit operation identity across retries', async () => {
+  const bodies=[];
+  const client=new HerdrClient('',{fetchImpl:async(url,options)=>{
+    bodies.push(JSON.parse(options.body));return {ok:true,status:200,text:async()=>'{"status":"delivered"}'};
+  }});
+  await client.sendMessage('herdr:h:default:w1%3Ap1','hello',[],'message-1');
+  await client.sendMessage('herdr:h:default:w1%3Ap1','hello',[],'message-1');
+  assert.deepEqual(bodies.map(b=>b.operation_id),['message-1','message-1']);
 });
 
 test('calls fetch detached so native Window.fetch does not throw', async () => {
@@ -220,4 +245,41 @@ test('GitHub failures retain the shared structured error contract', async () => 
     assert.equal(error.message, 'Integration service is unavailable.');
     return true;
   });
+});
+
+test('CI report history reads use viewer GET and forward cancellation',async()=>{
+ const calls=[];
+ const server=createServer((req,res)=>{calls.push({url:req.url,method:req.method});res.setHeader('Content-Type','application/json');res.end(JSON.stringify({reports:[],pipelines:[]}));});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try {
+  const client=new HerdrClient(`http://127.0.0.1:${server.address().port}`);
+  assert.deepEqual(await client.getCiReports(),{reports:[],pipelines:[]});
+  assert.deepEqual(calls[0],{url:'/api/v1/ci/reports',method:'GET'});
+  const controller=new AbortController();
+  const request=client.getCiReports({signal:controller.signal});controller.abort();
+  await assert.rejects(request,{name:'AbortError'});
+ } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
+
+test('CI heatmap history uses the viewer endpoint and supports cancellation',async()=>{
+ const calls=[];
+ const server=createServer((req,res)=>{calls.push({url:req.url,method:req.method});res.setHeader('Content-Type','application/json');res.end(JSON.stringify({repos:[],pipelines:[],coverage:{}}));});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try {
+  const client=new HerdrClient(`http://127.0.0.1:${server.address().port}`);
+  assert.deepEqual(await client.getCiHistory(),{repos:[],pipelines:[],coverage:{}});
+  assert.deepEqual(calls[0],{url:'/api/v1/ci/history',method:'GET'});
+  const controller=new AbortController();
+  const request=client.getCiHistory({signal:controller.signal});controller.abort();
+  await assert.rejects(request,{name:'AbortError'});
+ } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
+
+test('CI performance uses bounded-window viewer GET filters and forwards cancellation',async()=>{
+  const calls=[];const client=new HerdrClient('',{fetchImpl:async(url,options)=>{calls.push({url,options});return {ok:true,status:200,text:async()=>'{"cache_groups":[],"execution_trends":[],"alerts":[]}'};}});
+  const controller=new AbortController();
+  assert.deepEqual(await client.getCiPerformance({days:7,repository:'org/app',branch:'feature & cache',signal:controller.signal}),{cache_groups:[],execution_trends:[],alerts:[]});
+  assert.equal(calls[0].url,'/api/v1/ci/performance?days=7&repository=org%2Fapp&branch=feature+%26+cache');
+  assert.equal(calls[0].options.method,'GET');assert.equal(calls[0].options.signal,controller.signal);
+  await client.getCiPerformance();assert.equal(calls[1].url,'/api/v1/ci/performance?days=14');
 });

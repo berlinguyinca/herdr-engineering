@@ -1,0 +1,399 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1060" viewBox="0 0 1320 1060"><rect width="1320" height="1060" fill="#f5f6f8"/><style>text{font-family:Arial,sans-serif;fill:#253247}.small{font-size:12px}.muted{fill:#677487}.strong{font-weight:700}</style>
+<text x="32" y="36" font-size="23" class="strong">HerdR / CI project health</text>
+<text x="32" y="61" font-size="12" class="muted">WIREFRAME · illustrative data · proposed layout</text>
+<rect x="32" y="82" width="142" height="36" rx="6" fill="#e8f5f1" stroke="#13977c"/>
+<text x="45" y="105" font-size="13" class="strong">Last 24 hours</text>
+<rect x="184" y="82" width="140" height="36" rx="6" fill="#fff" stroke="#dde2e9"/>
+<text x="197" y="105" font-size="13" class="">Last 24 runs</text>
+<rect x="334" y="82" width="94" height="36" rx="6" fill="#fff" stroke="#dde2e9"/>
+<text x="347" y="105" font-size="13" class="">7 days</text>
+<rect x="438" y="82" width="102" height="36" rx="6" fill="#fff" stroke="#dde2e9"/>
+<text x="451" y="105" font-size="13" class="">14 days</text>
+<rect x="550" y="82" width="102" height="36" rx="6" fill="#fff" stroke="#dde2e9"/>
+<text x="563" y="105" font-size="13" class="">30 days</text>
+<text x="990" y="105" font-size="12" class="muted">Oct 21, 15:00 → Oct 22, 15:00 UTC</text>
+<rect x="32" y="136" width="380" height="34" rx="6" fill="#fff" stroke="#dde2e9"/>
+<text x="45" y="158" font-size="13" class="muted">Search projects…</text>
+<rect x="428" y="136" width="240" height="34" rx="6" fill="#fff" stroke="#dde2e9"/>
+<text x="441" y="158" font-size="13" class="">Scope: All runs (PRs included) ▾</text>
+<rect x="684" y="136" width="202" height="34" rx="6" fill="#fff" stroke="#dde2e9"/>
+<text x="697" y="158" font-size="13" class="">Sort: Failures first ▾</text>
+<text x="907" y="158" font-size="13" class="">□ Only projects with failures</text>
+<rect x="32" y="188" width="1256" height="332" rx="6" fill="#fff" stroke="#dde2e9"/>
+<text x="49" y="213" font-size="11" class="strong">PROJECT</text>
+<text x="1048" y="213" font-size="11" class="strong">FAIL / DECIDED</text>
+<text x="1187" y="213" font-size="11" class="strong">LATEST</text>
+<text x="332" y="213" font-size="10" class="muted">15</text>
+<text x="360" y="213" font-size="10" class="muted">16</text>
+<text x="388" y="213" font-size="10" class="muted">17</text>
+<text x="416" y="213" font-size="10" class="muted">18</text>
+<text x="444" y="213" font-size="10" class="muted">19</text>
+<text x="472" y="213" font-size="10" class="muted">20</text>
+<text x="500" y="213" font-size="10" class="muted">21</text>
+<text x="528" y="213" font-size="10" class="muted">22</text>
+<text x="556" y="213" font-size="10" class="muted">23</text>
+<text x="584" y="213" font-size="10" class="muted">00</text>
+<text x="612" y="213" font-size="10" class="muted">01</text>
+<text x="640" y="213" font-size="10" class="muted">02</text>
+<text x="668" y="213" font-size="10" class="muted">03</text>
+<text x="696" y="213" font-size="10" class="muted">04</text>
+<text x="724" y="213" font-size="10" class="muted">05</text>
+<text x="752" y="213" font-size="10" class="muted">06</text>
+<text x="780" y="213" font-size="10" class="muted">07</text>
+<text x="808" y="213" font-size="10" class="muted">08</text>
+<text x="836" y="213" font-size="10" class="muted">09</text>
+<text x="864" y="213" font-size="10" class="muted">10</text>
+<text x="892" y="213" font-size="10" class="muted">11</text>
+<text x="920" y="213" font-size="10" class="muted">12</text>
+<text x="948" y="213" font-size="10" class="muted">13</text>
+<text x="976" y="213" font-size="10" class="muted">14</text>
+<text x="49" y="249" font-size="14" class="strong">▾ InferWeave</text>
+<text x="1058" y="249" font-size="13" class="">3 / 28</text>
+<text x="1187" y="249" font-size="12" class="" style="fill:#167cad">Running</text>
+<rect x="330" y="230" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="337" y="248" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="358" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="365" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="386" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="393" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="414" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="421" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="442" y="230" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="449" y="248" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="470" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="477" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="498" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="505" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="526" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="533" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="554" y="230" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="561" y="248" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="582" y="230" width="23" height="26" rx="3" fill="#f9dbdf" stroke="#f9dbdf"/>
+<text x="589" y="248" font-size="14" class="" style="fill:#ca3546">×</text>
+<rect x="610" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="617" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="638" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="645" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="666" y="230" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="673" y="248" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="694" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="701" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="722" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="729" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="750" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="757" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="778" y="230" width="23" height="26" rx="3" fill="#f9dbdf" stroke="#f9dbdf"/>
+<text x="785" y="248" font-size="14" class="" style="fill:#ca3546">×</text>
+<rect x="806" y="230" width="23" height="26" rx="3" fill="#fff0ce" stroke="#946300"/>
+<text x="813" y="248" font-size="14" class="" style="fill:#946300">!</text>
+<rect x="834" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="841" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="862" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="869" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="890" y="230" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="897" y="248" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="918" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="925" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="946" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="953" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="974" y="230" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="981" y="248" font-size="14" class="" style="fill:#238636">✓</text>
+<circle cx="994" cy="233" r="4" fill="#1786bd" stroke="white"/>
+<text x="49" y="286" font-size="14" class="strong">▾ Augur</text>
+<text x="1058" y="286" font-size="13" class="">6 / 35</text>
+<text x="1187" y="286" font-size="12" class="" style="fill:#ca3546">Failed</text>
+<rect x="330" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="337" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="358" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="365" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="386" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="393" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="414" y="267" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="421" y="285" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="442" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="449" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="470" y="267" width="23" height="26" rx="3" fill="#f9dbdf" stroke="#f9dbdf"/>
+<text x="477" y="285" font-size="14" class="" style="fill:#ca3546">×</text>
+<rect x="498" y="267" width="23" height="26" rx="3" fill="#f9dbdf" stroke="#f9dbdf"/>
+<text x="505" y="285" font-size="14" class="" style="fill:#ca3546">×</text>
+<rect x="526" y="267" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="533" y="285" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="554" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="561" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="582" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="589" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="610" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="617" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="638" y="267" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="645" y="285" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="666" y="267" width="23" height="26" rx="3" fill="#f9dbdf" stroke="#f9dbdf"/>
+<text x="673" y="285" font-size="14" class="" style="fill:#ca3546">×</text>
+<rect x="694" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="701" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="722" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="729" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="750" y="267" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="757" y="285" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="778" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="785" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="806" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="813" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="834" y="267" width="23" height="26" rx="3" fill="#f9dbdf" stroke="#f9dbdf"/>
+<text x="841" y="285" font-size="14" class="" style="fill:#ca3546">×</text>
+<rect x="862" y="267" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="869" y="285" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="890" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="897" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="918" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="925" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="946" y="267" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="953" y="285" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="974" y="267" width="23" height="26" rx="3" fill="#f9dbdf" stroke="#f9dbdf"/>
+<text x="981" y="285" font-size="14" class="" style="fill:#ca3546">×</text>
+<text x="49" y="323" font-size="14" class="strong">▾ MassWiki</text>
+<text x="1058" y="323" font-size="13" class="">0 / 12</text>
+<text x="1187" y="323" font-size="12" class="" style="fill:#238636">Passed</text>
+<rect x="330" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="337" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="358" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="365" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="386" y="304" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="393" y="322" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="414" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="421" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="442" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="449" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="470" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="477" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="498" y="304" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="505" y="322" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="526" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="533" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="554" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="561" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="582" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="589" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="610" y="304" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="617" y="322" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="638" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="645" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="666" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="673" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="694" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="701" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="722" y="304" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="729" y="322" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="750" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="757" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="778" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="785" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="806" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="813" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="834" y="304" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="841" y="322" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="862" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="869" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="890" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="897" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="918" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="925" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="946" y="304" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="953" y="322" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="974" y="304" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="981" y="322" font-size="14" class="" style="fill:#238636">✓</text>
+<text x="49" y="360" font-size="14" class="strong">▾ Carpy</text>
+<text x="1058" y="360" font-size="13" class="">0 / 1*</text>
+<text x="1187" y="360" font-size="12" class="" style="fill:#238636">Passed</text>
+<rect x="330" y="341" width="23" height="26" rx="3" fill="#ece7f6" stroke="#ece7f6"/>
+<text x="337" y="359" font-size="14" class="" style="fill:#72628e">?</text>
+<rect x="358" y="341" width="23" height="26" rx="3" fill="#ece7f6" stroke="#ece7f6"/>
+<text x="365" y="359" font-size="14" class="" style="fill:#72628e">?</text>
+<rect x="386" y="341" width="23" height="26" rx="3" fill="#ece7f6" stroke="#ece7f6"/>
+<text x="393" y="359" font-size="14" class="" style="fill:#72628e">?</text>
+<rect x="414" y="341" width="23" height="26" rx="3" fill="#ece7f6" stroke="#ece7f6"/>
+<text x="421" y="359" font-size="14" class="" style="fill:#72628e">?</text>
+<rect x="442" y="341" width="23" height="26" rx="3" fill="#ece7f6" stroke="#ece7f6"/>
+<text x="449" y="359" font-size="14" class="" style="fill:#72628e">?</text>
+<rect x="470" y="341" width="23" height="26" rx="3" fill="#ece7f6" stroke="#ece7f6"/>
+<text x="477" y="359" font-size="14" class="" style="fill:#72628e">?</text>
+<rect x="498" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="505" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="526" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="533" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="554" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="561" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="582" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="589" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="610" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="617" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="638" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="645" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="666" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="673" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="694" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="701" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="722" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="729" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="750" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="757" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="778" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="785" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="806" y="341" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="813" y="359" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="834" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="841" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="862" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="869" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="890" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="897" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="918" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="925" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="946" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="953" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="974" y="341" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="981" y="359" font-size="14" class="" style="fill:#8793a2">–</text>
+<text x="49" y="397" font-size="14" class="strong">▾ CTS</text>
+<text x="1058" y="397" font-size="13" class="">2 / 9</text>
+<text x="1187" y="397" font-size="12" class="" style="fill:#238636">Passed</text>
+<rect x="330" y="378" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="337" y="396" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="358" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="365" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="386" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="393" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="414" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="421" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="442" y="378" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="449" y="396" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="470" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="477" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="498" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="505" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="526" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="533" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="554" y="378" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="561" y="396" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="582" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="589" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="610" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="617" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="638" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="645" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="666" y="378" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="673" y="396" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="694" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="701" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="722" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="729" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="750" y="378" width="23" height="26" rx="3" fill="#fff0ce" stroke="#fff0ce"/>
+<text x="757" y="396" font-size="14" class="" style="fill:#946300">!</text>
+<rect x="778" y="378" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="785" y="396" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="806" y="378" width="23" height="26" rx="3" fill="#fff0ce" stroke="#fff0ce"/>
+<text x="813" y="396" font-size="14" class="" style="fill:#946300">!</text>
+<rect x="834" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="841" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="862" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="869" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="890" y="378" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="897" y="396" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="918" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="925" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="946" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="953" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="974" y="378" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="981" y="396" font-size="14" class="" style="fill:#238636">✓</text>
+<text x="49" y="434" font-size="14" class="strong">▾ Go modules</text>
+<text x="1058" y="434" font-size="13" class="">1 / 5</text>
+<text x="1187" y="434" font-size="12" class="" style="fill:#ca3546">Failed</text>
+<rect x="330" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="337" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="358" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="365" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="386" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="393" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="414" y="415" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="421" y="433" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="442" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="449" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="470" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="477" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="498" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="505" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="526" y="415" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="533" y="433" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="554" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="561" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="582" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="589" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="610" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="617" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="638" y="415" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="645" y="433" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="666" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="673" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="694" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="701" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="722" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="729" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="750" y="415" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="757" y="433" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="778" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="785" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="806" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="813" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="834" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="841" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="862" y="415" width="23" height="26" rx="3" fill="#eef0f3" stroke="#eef0f3"/>
+<text x="869" y="433" font-size="14" class="" style="fill:#8793a2">–</text>
+<rect x="890" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="897" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="918" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="925" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="946" y="415" width="23" height="26" rx="3" fill="#d8efdf" stroke="#d8efdf"/>
+<text x="953" y="433" font-size="14" class="" style="fill:#238636">✓</text>
+<rect x="974" y="415" width="23" height="26" rx="3" fill="#f9dbdf" stroke="#f9dbdf"/>
+<text x="981" y="433" font-size="14" class="" style="fill:#ca3546">×</text>
+<text x="49" y="475" font-size="12" class="muted">✓ Passed    ! Mixed    × Failed    ● Active    – No runs    ? Incomplete history</text>
+<text x="49" y="501" font-size="12" class="muted">117 projects · * observed only / incomplete · [ Expand overview ↕ ]</text>
+<rect x="32" y="538" width="1256" height="42" rx="6" fill="#e8f5f1" stroke="#b5dacf"/>
+<text x="48" y="564" font-size="13" class="strong">Selection: InferWeave · Oct 22, 08:00–09:00 UTC    × Clear selection</text>
+<text x="32" y="610" font-size="18" class="strong">Run explorer</text>
+<text x="760" y="610" font-size="12" class="muted">[ Tree + pipeline ] [ Tree only ] [ Pipeline only ]</text>
+<rect x="32" y="626" width="413" height="357" rx="6" fill="#fff" stroke="#dde2e9"/>
+<rect x="461" y="626" width="827" height="357" rx="6" fill="#fff" stroke="#dde2e9"/>
+<text x="48" y="654" font-size="12" class="muted">GROUP BY  Project → PR / branch → run</text>
+<text x="48" y="690" font-size="14" class="strong">▾ InferWeave / inferweave · provider 116</text>
+<text x="48" y="712" font-size="12" class="muted">Selected hour: 1 / 3 failed · latest passed</text>
+<text x="65" y="746" font-size="14" class="strong">▾ PR #1200 · CI reports</text>
+<text x="82" y="769" font-size="11" class="muted">Latest within selection: passed · 1 / 3 failed</text>
+<rect x="76" y="786" width="352" height="34" rx="6" fill="#e8f5f1" stroke="#b5dacf"/>
+<text x="89" y="808" font-size="13" class="">✓ Run #1772   ca30a7cb    6m 09s</text>
+<text x="89" y="846" font-size="12" class="" style="fill:#ca3546">× Run #1771   earlier revision    4m 32s</text>
+<text x="65" y="887" font-size="13" class="">▸ main · latest running</text>
+<text x="65" y="922" font-size="13" class="">▸ PR #1199 · latest passed</text>
+<text x="48" y="962" font-size="11" class="muted">Expand a run to load workflows and steps.</text>
+<text x="480" y="654" font-size="15" class="strong">InferWeave / PR #1200 / Run #1772</text>
+<text x="480" y="678" font-size="12" class="muted">Passed · ca30a7cb · Open in Woodpecker ↗</text>
+<rect x="480" y="704" width="174" height="67" rx="6" fill="#fff" stroke="#b5dacf"/>
+<text x="492" y="730" font-size="14" class="strong">Checkout</text>
+<text x="492" y="752" font-size="12" class="" style="fill:#238636">✓ Passed</text>
+<rect x="674" y="704" width="174" height="67" rx="6" fill="#fff" stroke="#b5dacf"/>
+<text x="686" y="730" font-size="14" class="strong">Slurm tests</text>
+<text x="686" y="752" font-size="12" class="" style="fill:#238636">✓ Passed</text>
+<rect x="868" y="704" width="174" height="67" rx="6" fill="#fff" stroke="#b5dacf"/>
+<text x="880" y="730" font-size="14" class="strong">Rust tests</text>
+<text x="880" y="752" font-size="12" class="" style="fill:#238636">✓ Passed</text>
+<rect x="1062" y="704" width="174" height="67" rx="6" fill="#fff" stroke="#b5dacf"/>
+<text x="1074" y="730" font-size="14" class="strong">Build</text>
+<text x="1074" y="752" font-size="12" class="" style="fill:#238636">✓ Passed</text>
+<rect x="480" y="791" width="787" height="64" rx="6" fill="#f7faf8" stroke="#dde2e9"/>
+<text x="495" y="817" font-size="14" class="strong">Native test report</text>
+<text x="495" y="840" font-size="13" class="">264 passed · 0 failed · 0 skipped     [ Explore tests → ]</text>
+<rect x="480" y="874" width="787" height="88" rx="6" fill="#f7f8fa" stroke="#dde2e9"/>
+<text x="495" y="899" font-size="13" class="strong">Selected step / log</text>
+<text x="495" y="922" font-size="12" class="muted">Choose a pipeline step to inspect its output.</text>
+<text x="495" y="946" font-size="11" class="muted">Tree expansion and selection persist through refresh.</text>
+<text x="32" y="1013" font-size="12" class="muted">Default scope: default-branch builds. Switch explicitly to PRs or All runs to explore pull requests.</text>
+<text x="32" y="1036" font-size="12" class="muted">24 runs uses run order, not shared time. Historical cells stay marked incomplete until coverage is verified.</text>
+</svg>

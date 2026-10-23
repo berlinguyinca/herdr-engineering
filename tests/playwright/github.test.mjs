@@ -34,6 +34,11 @@ test('GitHub projects show ranked repos, old open issues, measured progress and 
  await page.getByRole('button',{name:'Old but open <img src=x>',exact:true}).click();await page.locator('[data-gh-body]').waitFor();
  assert.equal(details,1);assert.equal(await page.locator('[data-gh-inspector] script').count(),0);assert.equal(await page.locator('#gh-issue-panel img').count(),0);
  assert.match(await page.locator('[data-gh-inspector]').innerText(),/readiness has not been verified/);
+ await page.setViewportSize({width:3840,height:2160});
+ const wide=await page.evaluate(()=>{const repo=document.querySelector('.gh-repositories').getBoundingClientRect(),list=document.querySelector('.gh-issue-list').getBoundingClientRect(),inspector=document.querySelector('[data-gh-inspector]').getBoundingClientRect();return {repo:repo.width,list:list.width,inspector:inspector.width,overflow:document.documentElement.scrollWidth>innerWidth};});
+ assert.ok(wide.repo>=280&&wide.repo<=360,`repository rail should stay scannable, got ${wide.repo}`);
+ assert.ok(wide.list>900&&wide.inspector>1200,'populated issue list and inspector should share the wide canvas');assert.equal(wide.overflow,false);
+ for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:768,height:1024}]){await page.setViewportSize(viewport);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`GitHub should not overflow at ${viewport.width}px`);}
  const search=page.getByRole('searchbox',{name:'Search open issues'});await search.fill('Old');await search.focus();
  const before=listReads;await page.waitForTimeout(5500);assert.ok(listReads>before);assert.equal(details,1);assert.equal(await search.evaluate(e=>e===document.activeElement),true);
  await page.getByRole('tab',{name:/^Blocked/}).click();await page.getByRole('button',{name:'Blocked work',exact:true}).waitFor();

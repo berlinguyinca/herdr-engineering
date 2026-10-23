@@ -1,0 +1,9 @@
+#!/bin/sh
+# Companion entry point: reads existing Python dependencies, never installs into them.
+set -eu
+recovery_python=${HERDR_PI_RECOVERY_PYTHON:-python3}
+recovery_root=$("$recovery_python" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent.parent)' "$0")
+PYTHONPATH="$recovery_root${PYTHONPATH:+:$PYTHONPATH}"
+HERDR_ENGINEERING_REPO="$recovery_root"
+export PYTHONPATH HERDR_ENGINEERING_REPO
+exec "$recovery_python" -m herdr_engineering.cli fleet recover "$@"

@@ -112,7 +112,7 @@ heartbeat, so finished/failed notices do not repeat while their record remains
 in the bounded cache; a changed terminal record is still published.
 
 Install all runtime files together: `herdr-plugin.toml`, `package.json`,
-`emit.js`, `enrich.js`, `git-metadata.js`, `host-config.js`, `inventory.js`, `session-model.js`, and `snapshot.js`. The snapshot
+`emit.js`, `enrich.js`, `git-metadata.js`, `host-config.js`, `inventory.js`, `session-model.js`, `session-transcript.js`, `session-helpers.js`, and `snapshot.js`. The snapshot
 companion can run under systemd or launchd independently of native Herdr and
 Pi processes; deploying it requires no native session restart.
 
@@ -125,6 +125,29 @@ host ID and `HERDR_BIN`; the control-plane URL and key are never set here. On ma
 use launchd to run the same command with the installed Node executable; a
 private wrapper can load the same environment file before execution. Activate
 the companion only after the receiving backend supports these payload fields.
+
+## Fleet rollout and native hooks
+
+`deploy/deploy-fleet-agents.sh` ships the complete runtime bundle and installs
+native integrations for installed Codex, Claude Code, and Pi CLIs on each host.
+It uses the host's `herdr integration install TARGET` command, which merges
+existing hooks/settings. Before each installation it stores existing managed
+configuration and hook files in a private directory under
+`~/.local/state/herdr-engineering/hook-backups/`. Installer output stays in that
+directory, with mode 0600, rather than appearing in deployment logs. Failed
+installations restore the managed files and make the rollout exit nonzero;
+other installed integrations are still attempted. Missing runtime CLIs are
+reported as skipped; an installed CLI with missing configuration is a failure.
+Custom `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, and `PI_CODING_AGENT_DIR` paths are
+respected when provided in the remote execution environment.
+
+Repeated installation is safe and preserves unrelated hooks and settings.
+Only the companion feeds restart during rollout. Native agents are never
+restarted or sent input. Hook installation applies on the runtime's next
+start/resume; it cannot by itself identify a conversation already running
+without its native session metadata. The rollout reports hook installation,
+not proof that every existing session has emitted its transcript. Verify
+recording separately through the live session API after deployment.
 
 ## Files
 

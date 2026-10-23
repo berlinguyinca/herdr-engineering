@@ -1,0 +1,17 @@
+[Unit]
+Description=Relay native InferWeave Hive CI reports to HerdR
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/IdeaProjects/herdr-ci-report-relay-runtime
+Environment=PYTHONPATH=%h/IdeaProjects/herdr-ci-report-relay-runtime
+EnvironmentFile=-%h/.config/herdr-engineering/ci-report-relay.env
+StateDirectory=herdr-ci-report-relay
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/python3 -m herdr_engineering.ci_report_relay --source-host hive --source-dir /quobyte/metabolomicsgrp/it/server/woodpecker/artifacts/herdr-inferweave-v1 --control-plane http://dev.lan --allow-open --state-dir %S/herdr-ci-report-relay --once
+TimeoutStartSec=7min
+NoNewPrivileges=yes
+PrivateTmp=yes
