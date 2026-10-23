@@ -118,3 +118,31 @@ def test_a_claimed_helper_does_not_expire_with_the_claim_window(w):
     run(w, rec["helper_id"])
     w.s.clock.t += collab.HELPER_CLAIM_WINDOW + 5
     assert w.s.helper_status(w.root, rec["helper_id"])["status"] == "claimed"
+
+
+# ------------------------------------------------------------------ the panic switch in the audit log (review item 5)
+def test_pause_and_resume_appear_in_every_projects_audit_with_who_when_and_state(w):
+    w.s.clock.t += 5
+    w.s.set_helpers_paused(w.op, True)
+    w.s.set_helpers_paused(w.op, False)
+    pid = w.s._rooms[w.room]["project_id"]
+    rows = [e for e in w.s.audit(w.alice, pid, 0, 500)["events"] if e["event_type"] == "helpers_paused"]
+    assert [(e["action"], e["paused"], e["actor_user_id"]) for e in rows] == [
+        ("helpers.pause", True, "mallory"), ("helpers.resume", False, "mallory")]
+    assert all(e["created_at"] for e in rows)
+
+
+def test_pause_and_resume_appear_in_the_operators_user_log(tmp_path):
+    from tests.control_plane.test_collab import Clock
+    from tests.control_plane.test_collab_approval import OpenAuth, who
+    s = collab.CollabService(OpenAuth(), sink=collab.FileEventLog(str(tmp_path / "log")), now=Clock(),
+                             approval=collab.ApprovalPolicy(auto_groups=["local.dev"]))
+    op = who(s, "op")
+    op.admin = True
+    s.set_helpers_paused(op, True)
+    s.set_helpers_paused(op, False)
+    log = s.user_log(op)["log"]
+    rows = [r for r in log if str(r["action"]).startswith("helpers.")]
+    assert [(r["action"], r["status"], r["by"], r["user_id"]) for r in rows] == [
+        ("helpers.resume", "resumed", "op", "op"), ("helpers.pause", "paused", "op", "op")]     # newest first
+    assert all(r["at"] for r in rows)

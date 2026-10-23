@@ -999,11 +999,18 @@ class CollabService:
         if self.approval is None or not pr.admin:
             raise CollabError(404, "not found")
         with self._lock:
-            rows = [{"at": e["payload"].get("at"), "user_id": e["payload"]["user_id"],
-                     "email": self._user_email.get(e["payload"]["user_id"]), "action": e["payload"].get("action"),
-                     "status": e["payload"]["status"], "by": e["payload"].get("decided_by"),
-                     "reason": e["payload"].get("reason")}
-                    for e in reversed(self._log) if e["event_type"] in ("user_registered", "user_decided")]
+            rows = []
+            for e in reversed(self._log):
+                p = e["payload"]
+                if e["event_type"] in ("user_registered", "user_decided"):
+                    rows.append({"at": p.get("at"), "user_id": p["user_id"], "email": self._user_email.get(p["user_id"]),
+                                 "action": p.get("action"), "status": p["status"], "by": p.get("decided_by"),
+                                 "reason": p.get("reason")})
+                elif e["event_type"] == "helpers_paused":       # the panic switch: who pressed it, when, which way
+                    rows.append({"at": p.get("created_at"), "user_id": p.get("actor_user_id"),
+                                 "email": self._user_email.get(p.get("actor_user_id")), "action": p.get("action"),
+                                 "status": "paused" if p.get("paused") else "resumed", "by": p.get("actor_user_id"),
+                                 "reason": "all helpers paused" if p.get("paused") else "helpers resumed"})
         return {"log": rows[:300]}
 
     def decide_user(self, pr: Principal, uid: str, action: str, body: dict) -> dict:
@@ -2908,7 +2915,8 @@ class CollabService:
                 # Agent lifecycle events carry no project: they appear in a project's
                 # audit only if that agent has (or had) a grant in one of its rooms.
                 aid = p.get("agent_id")
-                if not (project_id in p.get("project_ids", ())
+                # the panic switch is global: it ends helpers in every project, so every project's audit shows it
+                if not (project_id in p.get("project_ids", ()) or ev["event_type"] == "helpers_paused"
                         or (aid and project_id in self._agent_projects.get(aid, ()))):
                     continue
                 if len(out) >= limit:
@@ -2921,6 +2929,8 @@ class CollabService:
                             "created_at": p["created_at"], "correlation_id": p.get("correlation_id")})
                 if ev["event_type"].startswith("helper_"):
                     out[-1]["helper"] = {"helper_id": p.get("helper_id"), "role": p.get("role"), "model": p.get("model")}
+                elif ev["event_type"] == "helpers_paused":
+                    out[-1]["paused"] = bool(p.get("paused"))
             nxt = out[-1]["sequence"] if out else cursor
         return {"events": out, "next_cursor": nxt, "has_more": more}
 

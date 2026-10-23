@@ -485,7 +485,9 @@ lets that exact IP:port through, so approve one only when you mean the runner ho
 **Panic switch.** **Agents → Helpers → Pause all helpers** (`POST fleet/helpers/pause {"paused": true}`) refuses
 every new request with 503 and ends every live helper at once: records cancelled, credentials revoked, and the
 runner kills the boxes on its next cycle (about 10 s). The runner checks the switch first in every cycle, even
-when the rest of the cycle fails. **Resume helpers** turns it off.
+when the rest of the cycle fails. **Resume helpers** turns it off. Each press is audited with who, when and which
+way (`helpers.pause` / `helpers.resume`): in every project's audit (`GET audit?project_id=...`, with `paused`), and
+in approval mode also in the **People → Decision log** on the dashboard.
 
 **Ending.** Each of these ends the helper and its whole subtree (children, grandchildren, and successors that
 have not taken over yet), each step audited:
