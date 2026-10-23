@@ -2947,7 +2947,8 @@ class CollabService:
             feed = self._by_room.get(room_id, [])
             lo = bisect.bisect_right(feed, max(cursor, first - 1), key=lambda e: e["sequence"])
             for ev in feed[lo:]:
-                if guest and ev["event_type"].startswith("helper_"):
+                if guest and (ev["event_type"].startswith("helper_") or (
+                        ev["event_type"].startswith("agent_") and ev["payload"].get("agent_id") in self._helper_minted)):
                     nxt = ev["sequence"]              # a guest never sees helpers, but the cursor moves past them
                     continue
                 if len(out) >= limit:
