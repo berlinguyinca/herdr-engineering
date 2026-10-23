@@ -226,7 +226,9 @@ def helper_prompt(role: str, ro_binds: list[str]) -> str:
              '403 "access pending" and the operator is asked. Retry such a host a few times a minute at most, and say so '
              "in your answer if it stays blocked."]
     lines += [f"The requesting agent's work directory is visible read-only at {b}" for b in ro_binds]
-    return "\n".join(lines) + "\n\n--- task ---\n"
+    # a successor's task is the handoff note its predecessor wrote; the service ends the predecessor at the claim
+    return "\n".join(lines) + ("\n\n--- handoff from the agent you replace ---\n" if role == "successor"
+                               else "\n\n--- task ---\n")
 
 
 def helper_run(d: Path) -> int:
@@ -1065,7 +1067,8 @@ class Runner:
         pane, tab, own_tab = self.helper_pane(c, name, link)
         st.update(pane=pane, phase="launching", since=time.time())
         self.save_state(d, st)
-        self.launch_helper(d, st, helper_prompt(role, binds) + c["task"])
+        note = (c.get("handoff") or {}).get("text") if role == "successor" and isinstance(c.get("handoff"), dict) else None
+        self.launch_helper(d, st, helper_prompt(role, binds) + (note if isinstance(note, str) else c["task"]))
         status, out = self.api("POST", f"fleet/helpers/{hid}/finish", {"status": "running"})
         if status != 200:
             raise Failure(f"could not mark the helper running: {status} {trim(out.get('error', ''))}")

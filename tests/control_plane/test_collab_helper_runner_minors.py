@@ -76,3 +76,9 @@ def test_a_429_at_claim_backs_off_and_is_logged_once_per_distinct_answer(hr, mon
     mk().helpers_cycle()
     assert sum(hid in m and "429" in m for m in hr.said) == 2
     assert not (hr.state / hid).exists()
+
+
+def test_a_successor_starts_from_the_handoff_note():
+    p = runner.helper_prompt("successor", [])
+    assert "Continue the work from the handoff below" in p and p.endswith("--- handoff from the agent you replace ---\n")
+    assert runner.helper_prompt("worker", []).endswith("--- task ---\n")
