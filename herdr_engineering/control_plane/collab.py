@@ -2070,9 +2070,16 @@ class CollabService:
         if room is None or agent is None or agent["owner"] != pr.id:
             raise CollabError(409, "the configured summary-fix room or requester agent does not exist or is not "
                                    "the operator's", "helper_misconfigured")
-        if agent["status"] != "active" or self._now() >= agent["expires_at"] or not self._ok(agent["owner"]):
-            raise CollabError(409, "the summary-fix requester agent is revoked or expired", "helper_misconfigured")
+        now = self._now()
+        if agent["status"] != "active" or not self._ok(agent["owner"]):
+            raise CollabError(409, "the summary-fix requester agent is revoked", "helper_misconfigured")
+        if now >= agent["expires_at"]:
+            raise CollabError(409, "the summary-fix requester agent's credential expired; connect a new agent and "
+                                   "update control_plane.collab.summary_fix", "helper_requester_expired")
         grant = room["grants"].get(cfg["requester_agent_id"])
+        if grant is not None and grant["expires_at"] is not None and now >= grant["expires_at"]:
+            raise CollabError(409, "the summary-fix requester agent's grant in its room expired; grant spawn_helpers "
+                                   "again", "helper_grant_expired")
         # no spawn_helpers at all is request_helper's own 403 below; more than it is refused here
         if grant is not None and "spawn_helpers" in grant["actions"] and set(grant["actions"]) - {"spawn_helpers"}:
             raise CollabError(409, "the summary-fix requester agent may hold only spawn_helpers in its room",

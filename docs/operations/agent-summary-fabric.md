@@ -143,6 +143,14 @@ viewers do not get it). Pressing it calls
           requester_agent_id: collab_… # the agent's id (an id, never its credential)
   ```
 
+  **Renewal.** The requester is checked like any agent: its credential lives 30
+  days from connecting, and its room grant lapses after 30 days unless the owner
+  picks a later date (up to a year). The requester never uses its credential,
+  but an expired one still refuses (409 `helper_requester_expired`: connect a new
+  agent, grant it `spawn_helpers`, update `requester_agent_id`, re-render the
+  slice and restart collab), and an expired grant refuses with 409
+  `helper_grant_expired` (grant `spawn_helpers` again, with a later expiry).
+
   Only these two keys are accepted; anything else stops the collab service at
   start-up with `summary_fix: unknown keys`. The collab service refuses to start
   a helper (409, nothing is started) when the agent is not the operator's, is

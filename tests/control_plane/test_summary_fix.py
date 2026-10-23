@@ -406,6 +406,20 @@ def test_requester_without_the_right_grant_or_room_is_refused(harness, tmp_path,
     assert h.sent == [] and h.audits() == [] and room.helpers() == []
 
 
+def test_expired_requester_credential_or_grant_says_which(harness, tmp_path):
+    room = FixRoom(tmp_path)
+    h = dead_harness(harness, room)
+    grant = room.s._rooms[room.room]['grants'][room.agent_id]
+    grant['expires_at'] = room.s._now() - 1
+    status, result = h.post(ITEM)
+    assert status == 409 and result['fallback'] == 'helper_grant_expired' and 'grant' in result['error']
+    grant['expires_at'] = None
+    room.s._agents[room.agent_id]['expires_at'] = room.s._now() - 1
+    status, result = h.post(ITEM)
+    assert status == 409 and result['fallback'] == 'helper_requester_expired' and 'credential expired' in result['error']
+    assert room.helpers() == [] and h.audits() == []
+
+
 def test_helper_limits_and_the_panic_switch_are_reported(harness, tmp_path):
     room = FixRoom(tmp_path, profile={'allowed_families': ['claude-code'], 'limits': {'live_per_agent': 1}})
     h = dead_harness(harness, room)
