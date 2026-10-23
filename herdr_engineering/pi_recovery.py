@@ -24,6 +24,7 @@ from .fleet_rollout import (
 
 CONTINUE = (
     "Continue the previously requested unfinished work after the inference outage. "
+    "Resume existing mission IDs from this conversation; do not create duplicate missions. "
     "First reconcile the existing transcript and completed tool actions; do not repeat "
     "completed side effects. Preserve operator pauses, cancellations and approval gates."
 )
@@ -137,7 +138,7 @@ class RecoveryTransport(PiTransport):
             target, ["node", "--input-type=module", "-e", script, root, json.dumps(pids)]
         )
 
-    def observe(self, target, pane):
+    def observe(self, target, pane, *, baseline=None):
         root = self.host(target, "root")["root"]
         agents = [a for a in self.native(target) if a.get("pane_id") == pane]
         if len(agents) != 1 or agents[0].get("agent") != "pi":
@@ -172,6 +173,7 @@ class RecoveryTransport(PiTransport):
             sessionId=session,
             shellPid=process.get("shell_pid"),
             nativePath=reference.get("value") if reference.get("kind") == "path" else None,
+            baseline=baseline,
         )
         metadata.update(
             self.host(
@@ -439,6 +441,10 @@ def _create_plan(store, targets, *, transport, progress, revision, inventory):
                         identity=proof(observed),
                         baseline=observed.get("lastAssistantId"),
                         missionFence=mission_fence(observed),
+                        requirements={
+                            key: observed.get(key)
+                            for key in ("requiredContext", "requiresVision", "requiresReasoning")
+                        },
                     )
                     if reason or not models:
                         entry["reason"] = reason or "no compatible configured model"
@@ -559,7 +565,12 @@ def upgrade_session(plan, entry, current, target, root, transport, save, now, sl
                 entry["instanceId"] = observed["instanceId"]
             elif observed["instanceId"] != expected["instanceId"]:
                 raise ValueError("unexpected control handler replacement")
-            receipt = _operation(plan, entry, key, key, fields, transport, target, root, save)
+            try:
+                receipt = _operation(plan, entry, key, key, fields, transport, target, root, save)
+            except (ConnectionError, subprocess.TimeoutExpired):
+                if key == "reload" and now() < deadline:
+                    continue  # Rediscover custody, then poll the same receipt; never reissue reload.
+                raise
         if receipt["status"] != "succeeded" or (
             key == "prepare" and receipt.get("result", {}).get("status") != "ready"
         ):

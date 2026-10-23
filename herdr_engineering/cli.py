@@ -935,7 +935,8 @@ def _cmd_fleet_recover(args) -> int:
         elif args.recovery_command == "apply":
             report = apply_recovery(store, args.id, progress=lambda event: print(event, file=sys.stderr, flush=True))
         else:
-            report = store.read(args.id)
+            from .pi_recovery_verification import verify_recovery
+            report = verify_recovery(store, args.id, progress=lambda event: print(event, file=sys.stderr, flush=True))
     except (OSError, ValueError, RuntimeError) as exc:
         _print_json({"error": str(exc)})
         return 1

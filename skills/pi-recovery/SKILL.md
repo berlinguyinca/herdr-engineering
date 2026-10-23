@@ -29,10 +29,25 @@ source installation, `herdr-eng fleet recover` exposes the same interface.
    plan and apply and prints the plan ID before attempting recovery. The default
    command remains preview-only. The menu's **Recover stalled Pi sessions** action
    invokes this explicit run.
-5. Read `herdr-pi-recover status --id ID`. `accepted` proves submission,
-   not completed work. Verify the native pane/mission's subsequent meaningful
-   progress before declaring recovery. `unknown` must be inspected; a timeout
-   never justifies replay. A second plan cannot replay the same failed turn.
+5. Read `herdr-pi-recover status --id ID`. Status verifies up to ten oldest
+   interactive entries, starting checks within a 60-second budget, and stores
+   content-free evidence locally. `progress_verified` requires a new completed
+   assistant turn or successful tool result descending from the recorded baseline
+   under the exact live session/process identity; it does not mean the task is
+   complete. `inference_failed`, `verification_waiting`, and `verification_unknown`
+   distinguish errors, absent progress, and missing proof. Native auto-fallback is
+   reported with the actual compatible gateway model and `modelChanged`, checked
+   against the original requirements or a conservative recorded candidate envelope;
+   absent original requirements leave fallback progress unverified. Status never
+   falsely confirms the originally selected model.
+
+   Status never prompts, reloads, resumes, or probes a model. It may read an existing
+   pending maintenance operation by its durable ID; a successful reload receipt
+   remains separate from work progress and never clears the no-replay journal.
+   Typed mission progress remains pending separate authoritative verification.
+   During an active recovery batch, status returns the ledger with verification
+   deferred. Repeat status to cover the next oldest entries. A timeout never
+   justifies replay; a second plan cannot replay the same failed turn.
 
 Use the same controller and default state directory for all operators. This is
 not a distributed lock across independently operated fleet controllers. Do not

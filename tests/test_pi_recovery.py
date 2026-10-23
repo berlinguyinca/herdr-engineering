@@ -654,7 +654,7 @@ def test_upgrade_never_overrides_completed_or_paused_evidence(tmp_path):
     assert plan["sessions"][0]["reason"] == "operator-paused or terminal mission preserved"
 
 
-@pytest.mark.parametrize("async_reply", [False, True, "gap"])
+@pytest.mark.parametrize("async_reply", [False, True, "gap", "transport_gap"])
 def test_opted_in_upgrade_is_fenced_before_exact_mission_resume(tmp_path, monkeypatch, async_reply):
     from herdr_engineering import pi_recovery
 
@@ -675,6 +675,7 @@ def test_opted_in_upgrade_is_fenced_before_exact_mission_resume(tmp_path, monkey
     requests = []
     receipts = {}
     gap_pending = False
+    status_failed = False
     original_observe = wire.observe
 
     def observe(*args):
@@ -687,10 +688,17 @@ def test_opted_in_upgrade_is_fenced_before_exact_mission_resume(tmp_path, monkey
     wire.observe = observe
 
     def maintenance(target, source, instance, request):
-        nonlocal gap_pending
+        nonlocal gap_pending, status_failed
         requests.append(request)
         if request["action"] == "status":
             assert request["expectedInstanceId"] == "reloaded-instance"
+            if (
+                async_reply == "transport_gap"
+                and receipts[request["operationId"]]["maintenance"]["action"] == "reload"
+                and not status_failed
+            ):
+                status_failed = True
+                raise ConnectionError("control socket changed after observation")
             return receipts[request["operationId"]]
         if request["action"] == "reload":
             wire.state["runtime"].update(

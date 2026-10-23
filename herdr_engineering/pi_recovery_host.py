@@ -58,6 +58,92 @@ def process_birth(pid):
     return birth
 
 
+def recovery_progress(entries, baseline):
+    """Content-free evidence from a new assistant descending from the recorded turn."""
+    result = {
+        "baselinePresent": False,
+        "baselineAncestor": False,
+        "assistant": None,
+        "successfulToolResults": [],
+    }
+    indexed = {}
+    positions = {}
+    for index, entry in enumerate(entries):
+        entry_id = entry.get("id")
+        if entry.get("type") == "session" or not isinstance(entry_id, str):
+            continue
+        if entry_id in indexed:
+            return result
+        indexed[entry_id] = entry
+        positions[entry_id] = index
+    if not isinstance(baseline, str) or baseline not in indexed:
+        return result
+    result["baselinePresent"] = True
+    assistants = [
+        e
+        for e in entries
+        if e.get("type") == "message"
+        and e.get("message", {}).get("role") == "assistant"
+        and e.get("id") in positions
+        and positions[e["id"]] > positions[baseline]
+    ]
+    if not assistants:
+        result["baselineAncestor"] = True
+        return result
+    latest = assistants[-1]
+
+    def descends(entry, ancestor):
+        while entry.get("id") != ancestor:
+            parent = entry.get("parentId")
+            if parent not in indexed or positions[parent] >= positions.get(entry.get("id"), -1):
+                return False
+            entry = indexed[parent]
+        return True
+
+    result["baselineAncestor"] = descends(latest, baseline)
+    if not result["baselineAncestor"]:
+        return result
+    message = latest["message"]
+
+    def identifier(value):
+        return (
+            value
+            if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_./:-]{1,256}", value)
+            else None
+        )
+
+    result["assistant"] = {
+        "id": identifier(latest["id"]),
+        "provider": identifier(message.get("provider")),
+        "model": identifier(message.get("model")),
+        "stopReason": message.get("stopReason")
+        if message.get("stopReason") in ("stop", "error", "toolUse", "aborted", "length")
+        else "unknown",
+    }
+    calls = (
+        {
+            p.get("id")
+            for p in message.get("content", [])
+            if isinstance(p, dict) and p.get("type") == "toolCall"
+        }
+        if isinstance(message.get("content"), list)
+        else set()
+    )
+    for entry in entries[positions[latest["id"]] + 1 :]:
+        tool = entry.get("message", {})
+        if (
+            entry.get("type") == "message"
+            and tool.get("role") == "toolResult"
+            and tool.get("isError") is False
+            and tool.get("toolCallId") in calls
+            and identifier(entry.get("id"))
+            and descends(entry, latest["id"])
+        ):
+            result["successfulToolResults"].append(entry["id"])
+    result["successfulToolResults"] = result["successfulToolResults"][-20:]
+    return result
+
+
 def transcript_metadata(entries, config):
     header = entries[0]
     model = None
@@ -136,7 +222,7 @@ def transcript_metadata(entries, config):
     }
 
 
-def inspect(home, pid, session_id, shell_pid=None, native_path=None):
+def inspect(home, pid, session_id, shell_pid=None, native_path=None, baseline=None):
     if not re.fullmatch(r"[0-9a-f-]{36}", session_id):
         raise ValueError("invalid conversation identity")
     birth = process_birth(pid)
@@ -173,6 +259,7 @@ def inspect(home, pid, session_id, shell_pid=None, native_path=None):
         "birth": birth,
         "sessionPath": str(path),
         "sessionCwd": entries[0].get("cwd"),
+        "progressEvidence": recovery_progress(entries, baseline) if baseline is not None else None,
     }
 
 
@@ -368,6 +455,7 @@ def main():
                 fields["sessionId"],
                 fields.get("shellPid"),
                 fields.get("nativePath"),
+                fields.get("baseline"),
             )
         elif action == "screen":
             result = screen(fields["session"], fields["pane"], fields.get("expectedModel"))

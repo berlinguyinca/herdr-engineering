@@ -17,6 +17,9 @@ herdr-pi-recover status --id PLAN_ID
 
 The controller preserves at least 60 seconds after every recovery attempt,
 including interrupted runs. Accepted submission is not proof of completed work.
+Status performs bounded native reads to verify new assistant/tool progress and
+reports current inference failures without resubmitting work. It leaves uncertain
+maintenance and typed mission completion distinct from verified interactive progress.
 See `skills/pi-recovery/SKILL.md` for prerequisites and exclusion rules.
 
 ## Isolated activation
