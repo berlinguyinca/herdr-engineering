@@ -34,6 +34,7 @@ sections:
       #   reviewers:
       #     "key:REDACTED": {}
       #     "key:REDACTED2": {login: "reviewer-login"}
+      #   reviewer_groups: []                       # e.g. [["key:REDACTED", "key:REDACTED2"]] = one person
       # OPTIONAL: the public collaboration container (only when the host has the marker
       # ~/.config/herdr-engineering/collab-enabled). Public identifiers only - deploy.sh
       # hands exactly this mapping (nothing else from this file) to collab-public, and

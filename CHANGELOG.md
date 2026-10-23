@@ -8,7 +8,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Head-bound review quorum (T06)
 - `GET /api/v1/graph/nodes/{pr_id}/review-quorum`: derived, head-bound quorum over `reviewed` edges (stale verdicts never
   counted, distinct configured reviewers, author/replay/forged-head defences, `rereview_required`). Config:
-  `control_plane.review_quorum` in the fleet config. Contract: `docs/contracts/lineage-events.md`. Rollback: remove the
+  `control_plane.review_quorum` in the fleet config. One policy shared with `autospec review-quorum` via
+  `tests/control_plane/fixtures/review-quorum-vectors.json`; statuses `unknown_head`, `head_unverified` (emitter sequence
+  reset), `unknown_author`; digests are 64-hex and bound; `reviewer_groups`. Contract: `docs/contracts/lineage-events.md`. Rollback: remove the
   block (endpoint answers 404); no schema or event change.
 
 ### Lineage graph projection (T02, Herdr side)

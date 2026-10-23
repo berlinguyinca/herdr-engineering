@@ -9,7 +9,10 @@ import pytest
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
-from herdr_engineering.control_plane.review_quorum import QuorumConfig, parse_config, pr_review_quorum
+import hashlib
+
+from herdr_engineering.control_plane.review_quorum import (QuorumConfig, parse_config, pr_review_quorum,
+                                                           receipt_binding)
 
 from .test_graph import Feed
 
@@ -30,10 +33,14 @@ def sha(n):
     return f"{n:02x}" * 20
 
 
-def cfg(required=2, reviewers=None, writers=("key:pi",)):
+def cfg(required=2, reviewers=None, writers=("key:pi",), groups=()):
     reviewers = reviewers or {"key:r1": {}, "key:r2": {}, "key:r3": {}, "key:pi": {}, "key:human": {"login": "Author-Login"}}
     return QuorumConfig(required, {k: {"login": (v.get("login") or "").lower() or None} for k, v in reviewers.items()},
-                        frozenset(writers))
+                        frozenset(writers), tuple(tuple(g) for g in groups))
+
+
+def hexdigest(text):
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 class World:
@@ -44,12 +51,16 @@ class World:
     def head(self, value, who=PI):
         self.feed.node(PR, attrs={"head_sha": value}, principal=who)
 
-    def review(self, who, node, commit, verdict="lgtm", digest=True, scope="org"):
+    def review(self, who, node, commit, verdict="lgtm", digest=True, scope="org", binding=True, pr=PR):
         attrs = {"commit": commit, "verdict": verdict}
         if digest:
-            attrs["receipt_digest"] = digest if isinstance(digest, str) else f"digest-{node}-{commit[:6]}"
+            d = digest if isinstance(digest, str) else hexdigest(f"{node}-{commit}")
+            attrs["receipt_digest"] = d
+            if binding:
+                attrs["receipt_binding"] = binding if isinstance(binding, str) else receipt_binding(
+                    pr, commit, who["id"], d)
         self.feed.node(node, principal=who, scope=scope)
-        return self.feed.edge("reviewed", node, PR, attrs, principal=who, scope=scope)
+        return self.feed.edge("reviewed", node, pr, attrs, principal=who, scope=scope)
 
     def q(self, config=None, principal=OPERATOR):
         return pr_review_quorum(self.repo.graph, principal, PR, config or cfg())
@@ -58,7 +69,7 @@ class World:
 @pytest.fixture
 def w():
     world = World()
-    world.feed.node(PR, label="PR 7", principal=PI)
+    world.feed.node(PR, label="PR 7", principal=PI, attrs={"author": "somebody-else"})
     return world
 
 
@@ -93,7 +104,7 @@ def test_verdict_arriving_after_the_head_moved_is_not_counted(w):
     w.review(R1, "review:a", sha(1))                   # issued for sha(1), lands late
     w.review(R2, "review:b", sha(1))
     out = w.q()
-    assert out["status"] == "insufficient" and out["counted_total"] == 0
+    assert out["status"] == "insufficient" and out["counted"] == []
 
 
 def test_a_verdict_for_a_head_not_yet_observed_waits_for_the_head(w):
@@ -179,10 +190,10 @@ def test_unconfigured_principals_are_ignored_both_ways(w):
 
 def test_a_shared_receipt_digest_voids_both_approvals(w):
     w.head(sha(1))
-    w.review(R1, "review:a", sha(1), digest="same-receipt")
-    w.review(R2, "review:b", sha(1), digest="same-receipt")
+    w.review(R1, "review:a", sha(1), digest=hexdigest("same-receipt"))
+    w.review(R2, "review:b", sha(1), digest=hexdigest("same-receipt"))
     out = w.q()
-    assert out["status"] == "insufficient" and out["counted_total"] == 0
+    assert out["status"] == "insufficient" and out["counted"] == []
     assert {r["reason"] for r in out["rejected"]} == {"replayed_receipt"}
 
 
@@ -210,7 +221,8 @@ def test_a_hidden_block_still_blocks_and_is_not_named_to_a_viewer(w):
     w.review(R3, "review:c", sha(1), verdict="blocked", scope="private")
     out = w.q(principal=actor("viewer", "viewer"))
     assert out["status"] == "blocked"
-    assert out["blocking"] == [] and out["hidden_reviewers"] == 1 and out["blocking_total"] == 1
+    assert out["blocking"] == [] and out["has_hidden_reviews"] and out["blocked_by_hidden"]
+    assert "hidden_reviewers" not in out and "blocking_total" not in out and "counted_total" not in out
     assert w.q(principal=R3)["blocking"] == ["key:r3"]
 
 
@@ -358,3 +370,155 @@ def test_the_reviewer_can_retract_their_own_block(w):
     w.feed.send("edge.remove", {"edge_type": "reviewed", "from_id": "review:c", "to_id": PR,
                                 "reason": "withdrawn", "attrs": {"commit": sha(1)}}, principal=R3)
     assert w.q(cfg(1))["status"] == "insufficient"
+
+
+# --------------------------------------------------------------------------
+# shared conformance vectors (also loaded by autospec's cargo suite)
+# --------------------------------------------------------------------------
+VECTORS = json.loads((__import__("pathlib").Path(__file__).parent / "fixtures" /
+                      "review-quorum-vectors.json").read_text())["cases"]
+
+
+@pytest.mark.parametrize("case", [c for c in VECTORS if "herdr" in c["applies"]], ids=lambda c: c["name"])
+def test_shared_policy_vectors(case):
+    w = World()
+    target = case["target"]
+    w.feed.node(target, principal=PI)
+    w.feed.node(target, principal=PI, attrs={"head_sha": case["head"]})
+    pol = case["policy"]
+    if pol["pr_author"]:
+        w.feed.node(target, principal=PI, attrs={"author": pol["pr_author"]})
+    ids = {v["reviewer"] for v in case["votes"]}
+    eligible = pol.get("eligible_reviewers") or sorted(ids)
+    logins = pol.get("reviewer_logins", {})
+    reviewers = {r: {"login": logins.get(r)} for r in set(eligible) | set(logins)}
+    groups = [[g for g in grp] for grp in pol.get("reviewer_groups", [])]
+    # a voter outside the configured set is simply never read, which is the policy for ineligible ones
+    for g in groups:
+        for member in g:
+            reviewers.setdefault(member, {"login": None})
+    config = QuorumConfig(pol["required"], {k: {"login": (v["login"] or "").lower() or None}
+                                            for k, v in reviewers.items()},
+                          frozenset({"key:pi"}), tuple(tuple(g) for g in groups))
+    for n, v in enumerate(case["votes"]):
+        who = {"kind": "agent", "id": v["reviewer"], "authenticated_by": "api_key"}
+        node = f"review:v{n}"
+        attrs = {"commit": v["commit"], "verdict": v["verdict"]}
+        for src, dst in (("receipt_digest", "receipt_digest"), ("receipt_binding", "receipt_binding")):
+            if v.get(src) is not None:
+                attrs[dst] = v[src]
+        w.feed.node(node, principal=who)
+        w.feed.edge("reviewed", node, v["target"], attrs, principal=who)
+    out = pr_review_quorum(w.repo.graph, OPERATOR, target, config)
+    exp = case["expect"]
+    assert (out["status"], out["counted"], out["blocking"]) == (exp["status"], exp["counted"], exp["blocking"]), out
+
+
+def test_every_vector_names_the_implementations_it_applies_to():
+    assert len(VECTORS) >= 20
+    assert all(set(c["applies"]) <= {"rust", "herdr"} and c["applies"] for c in VECTORS)
+    assert sum("herdr" in c["applies"] for c in VECTORS) >= 20
+
+
+def test_a_trusted_emitter_restart_that_resets_its_sequence_freezes_the_head_as_unverified(w):
+    w.feed.send("node.upsert", {"node_type": "pr", "node_id": PR, "attrs": {"head_sha": sha(1)}},
+                principal=PI, seq=100)
+    w.review(R1, "review:a", sha(1))
+    w.review(R2, "review:b", sha(1))
+    assert w.q()["status"] == "satisfied"
+    # Pi restarts, its sequence restarts at 1 and it reports the REAL new head
+    w.feed.send("node.upsert", {"node_type": "pr", "node_id": PR, "attrs": {"head_sha": sha(2)}},
+                principal=PI, seq=1)
+    out = w.q()
+    assert out["status"] == "head_unverified" and out["status"] != "satisfied"
+    # a write at a higher sequence than the frozen one re-syncs it
+    w.feed.send("node.upsert", {"node_type": "pr", "node_id": PR, "attrs": {"head_sha": sha(2)}},
+                principal=PI, seq=101)
+    out = w.q()
+    assert out["head"] == sha(2) and out["status"] == "insufficient"
+
+
+def test_head_unverified_is_stable_across_rebuild(w):
+    w.feed.send("node.upsert", {"node_type": "pr", "node_id": PR, "attrs": {"head_sha": sha(1)}},
+                principal=PI, seq=100)
+    w.feed.send("node.upsert", {"node_type": "pr", "node_id": PR, "attrs": {"head_sha": sha(2)}},
+                principal=PI, seq=1)
+    before = w.q()["status"]
+    w.repo._rebuild_graph()
+    assert before == w.q()["status"] == "head_unverified"
+
+
+def test_clearing_the_author_with_an_empty_string_does_not_forget_it_and_unknown_fails_closed(w):
+    w.head(sha(1))
+    w.review(HUMAN, "review:h", sha(1))
+    w.review(R1, "review:a", sha(1))
+    c = cfg(1, reviewers={"key:r1": {}, "key:human": {"login": "somebody-else"}})
+    assert w.q(c)["counted"] == ["key:r1"]              # author excluded
+    w.feed.node(PR, principal=PI, attrs={"author": ""})  # trusted writer blanks it
+    out = w.q(c)
+    assert out["status"] == "unknown_author" and out["counted"] == []
+
+
+def test_a_pr_without_any_author_never_passes(w):
+    fresh = World()
+    fresh.feed.node(PR, principal=PI, attrs={"head_sha": sha(1)})
+    fresh.review(R1, "review:a", sha(1))
+    assert fresh.q(cfg(1))["status"] == "unknown_author"
+
+
+def test_bot_author_matches_its_alias_and_verdict_case_is_normalised(w):
+    w.head(sha(1))
+    w.feed.node(PR, principal=PI, attrs={"author": "Dependabot[bot]"})
+    w.review(R1, "review:a", sha(1), verdict="LGTM")
+    c = cfg(1, reviewers={"key:r1": {"login": "dependabot"}, "key:r2": {}})
+    assert w.q(c)["status"] == "insufficient"
+    w.review(R2, "review:b", sha(1), verdict=" Lgtm ")
+    assert w.q(c)["counted"] == ["key:r2"]
+
+
+def test_digest_must_be_hex_and_bound_to_target_commit_and_reviewer(w):
+    w.head(sha(1))
+    w.review(R1, "review:a", sha(1), digest="x1", binding=False)
+    d = hexdigest("shared")
+    w.review(R2, "review:b", sha(1), digest=d, binding=receipt_binding(PR, sha(1), "key:r1", d))  # copied binding
+    assert w.q()["counted"] == []
+    w.review(R3, "review:c", sha(1), digest=d)
+    assert w.q()["counted"] == ["key:r3"]
+
+
+def test_one_person_with_two_keys_counts_once_when_grouped(w):
+    w.head(sha(1))
+    w.review(R1, "review:a", sha(1))
+    w.review(R2, "review:b", sha(1))
+    assert w.q(cfg(2))["status"] == "satisfied"
+    assert w.q(cfg(2, groups=[["key:r1", "key:r2"]]))["status"] == "insufficient"
+    with pytest.raises(ValueError):
+        parse_config({"required": 1, "reviewers": ["a", "b"], "trusted_head_writers": ["p"],
+                      "reviewer_groups": [["a", "b"], ["b"]]})
+
+
+def test_a_private_approval_is_not_disclosed_or_named_to_a_viewer(w):
+    w.head(sha(1))
+    w.review(R1, "review:a", sha(1))
+    w.review(R2, "review:b", sha(1), scope="private")
+    seen = w.q(principal=VIEWER)
+    assert seen["counted"] == ["key:r1"] and "counted_total" not in seen and seen["has_hidden_reviews"]
+    assert w.q(principal=R2)["counted"] == ["key:r1", "key:r2"]
+
+
+def test_route_accepts_a_differently_cased_pr_id(w):
+    w.head(sha(1))
+    out = pr_review_quorum(w.repo.graph, OPERATOR, PR.upper().replace("PR:", "pr:", 1), cfg())
+    assert out["pr"] == PR
+
+
+def test_many_edges_from_one_reviewer_stay_cheap(w):
+    import time
+    w.head(sha(1))
+    for i in range(1500):
+        w.feed.node(f"review:{i}", principal=R1)
+        w.feed.edge("reviewed", f"review:{i}", PR, {"commit": sha(1), "verdict": "lgtm",
+                                                    "receipt_digest": hexdigest(str(i))}, principal=R1, nodes=False)
+    t = time.time()
+    out = w.q()
+    assert time.time() - t < 5 and out["status"] == "insufficient"

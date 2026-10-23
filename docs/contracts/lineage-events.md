@@ -160,10 +160,12 @@ because the SHA names the content. Gate on the quorum, show the flag only as a h
 DERIVES the quorum; it writes nothing and Herdr does not request reviews itself. `rereview_required` / `rereview_needed`
 are the re-review request: whoever owns review dispatch (Pi on `github.evidence_stale`, AutoSpec) polls or subscribes.
 
-Producer contract. Each independent reviewer publishes with its OWN ingest key (so reviewer identity is server-authenticated):
-`node.upsert review:<id>` then `edge.add reviewed review:<id> -> pr:<id>` with `attrs.commit` = the full 40/64-hex head it
-reviewed (the binding), `attrs.verdict` = `lgtm` | `blocked`, `attrs.receipt_digest` = the review receipt's verdict digest
-(autospec `verdict_digest`). A shared emitter key cannot create a quorum: all its reviews are one identity.
+Producer contract. Each independent reviewer publishes with its OWN ingest key (reviewer identity is server-authenticated;
+a shared emitter key is one identity): `node.upsert review:<id>` then `edge.add reviewed review:<id> -> pr:<id>` with
+`attrs.commit` (full head SHA, the binding), `attrs.verdict` (`lgtm`|`blocked`, case-insensitive), `attrs.receipt_digest`
+(64 hex) and `attrs.receipt_binding` = `sha256("pr-review-receipt-v1\0" lower(pr node id) "\0" commit "\0" reviewer principal
+id "\0" receipt_digest)`. `autospec review-quorum publish` does this. Consumer: `autospec review-quorum request` polls this
+route and runs the configured review dispatch once per (PR, head) when `rereview_required` is true.
 
 Configuration (fleet config, `control_plane.review_quorum`, never from events):
 ```yaml
@@ -173,29 +175,34 @@ review_quorum:
   reviewers:                       # principal ids that may vote; login optional (recognises the PR author)
     key:<reviewer-a>: {}
     key:<author-human>: {login: some-login}
+  reviewer_groups:                 # optional: ids of ONE person/organisation count once
+    - [key:<alice-laptop>, key:<alice-ci>]
 ```
-Rules (mirrors `autospec review-quorum`):
-1. The head is the newest `attrs.head_sha` written by a trusted writer and must be a full SHA, else status `unknown_head`
-   (never satisfied). `pr` is a commons node, so untrusted writers' values are ignored.
+ONE policy, two implementations: this route (workbench) and `autospec review-quorum` (merge gating) are pinned by the shared
+vector file `tests/control_plane/fixtures/review-quorum-vectors.json` (byte-identical to autospec's
+`crates/autospec-core/tests/fixtures/`); both suites load it. Rules:
+1. The head is the newest non-empty `attrs.head_sha` written by a trusted writer and must be a full SHA, else `unknown_head`.
+   `pr` is a commons node, so untrusted writers' values are ignored. If a trusted writer's newest-admitted head write lost to an
+   older one by `source_sequence` (an emitter restart that reset its sequence) the register is frozen on a replaced value:
+   status `head_unverified`, never satisfied, until that writer writes at a higher sequence.
 2. Only configured reviewers are read; anyone else's edges (approvals or blocks) are ignored, so junk cannot satisfy or block.
-3. A reviewer is the edge OWNER (server-authenticated), never a payload name; many review nodes of one identity count once.
-   `attrs.verdict`/`attrs.receipt_digest` and the edge's add/remove are read ONLY from the owner's own writes: an operator or
-   `co_writers` member re-adding the same edge key cannot flip a verdict, and only the reviewer can withdraw their own block.
-4. An approval is excluded if the reviewer owns a `produced` edge into the PR, or their `login` equals the `author` attr
-   written by a trusted writer (Pi emits it from the PR's `user.login`, pi-engineering PR for T06; absent when unknown, in which
-   case only the producing key is excluded).
-5. An approval needs `receipt_digest`; one digest backing two identities voids both (replay).
-6. A current-head `blocked` verdict from a configured reviewer blocks, even from the author; only a new head clears it.
-7. Verdicts for other heads are listed under `stale_reviewers`, never counted. A verdict that lands after the head moved is
-   stale; one issued for a head not yet observed waits until a trusted writer reports that head.
-8. The decision is computed over ALL matching edges; identities of edges the caller cannot see are replaced by
-   `hidden_reviewers`, but a hidden `blocked` still yields `status: blocked` (fail closed, existence disclosed).
-Statuses: `satisfied`, `insufficient` (re-review needed), `blocked`, `unknown_head`. Only `satisfied` passes.
-Known limits: reviewer independence is per configured principal id (one human with two keys is two reviewers); no
-reviewed-edge producer exists in Pi/AutoSpec yet and nothing consumes `rereview_required` yet; a verdict is bound to the head
-SHA, not the base, so a base-branch move does not invalidate it; private/mission-scoped edges still count; a hidden `blocked`
-discloses that it exists. Herdr ignores blocks from unconfigured principals (anti-DoS) whereas `autospec review-quorum` honours
-a block from anyone.
+3. A reviewer is the edge OWNER (server-authenticated), never a payload name. `verdict`/`receipt_*` and add/remove are read ONLY
+   from the owner's own writes: an operator or `co_writers` member cannot flip a verdict or retract a block.
+4. Blocks first, never dropped: a configured reviewer's `blocked` at the head, at a head prefix or at an unparseable commit
+   blocks (fail closed); at another full head it is stale. Many review nodes of one identity count once.
+5. An approval is excluded if the reviewer owns a `produced` edge into the PR, or their configured `login` equals the `author`
+   attr written by a trusted writer (`x[bot]` equals `x`). A missing/blank author is `unknown_author` (never satisfied; a blank
+   write does not clear a known author, it just carries no value).
+6. An approval needs a 64-hex `receipt_digest` and a `receipt_binding` that recomputes; one digest backing two groups voids both.
+7. Verdicts for other heads are `stale_reviewers`, never counted; a verdict that lands after the head moved is stale; one issued
+   for a head not yet observed waits until a trusted writer reports that head.
+8. The decision is computed over ALL matching edges. A caller sees names only of reviewers whose edges it can see; it also gets
+   `has_hidden_reviews` and `blocked_by_hidden` (a hidden block still yields `blocked`; existence is disclosed, counts are not).
+Statuses: `satisfied`, `insufficient` (re-review needed), `blocked`, `unknown_head`, `head_unverified`, `unknown_author`. Only
+`satisfied` passes. PR ids are matched exactly, then lower-cased.
+Residual: the binding is not a signature (a colluding key can recompute it); two unlisted keys of one person count twice;
+a verdict is bound to the head SHA, not the base; private/mission-scoped edges still count; Herdr ignores blocks from
+unconfigured principals (anti-DoS) while autospec, with no `eligible_reviewers`, honours a block from anyone.
 
 ### Session rollover
 No containment edge type exists, so `attempt`/`session` nodes carry `attrs.agent_id` / `attrs.attempt_id`. A rollover is a new

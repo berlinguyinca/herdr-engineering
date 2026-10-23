@@ -316,12 +316,13 @@ class _Reg:
     server's admission order counts: a client-chosen sequence can never beat
     another principal, even on a shared source name.
     """
-    __slots__ = ("by", "firsts")
+    __slots__ = ("by", "firsts", "lasts")
 
     def __init__(self):
         # writer key -> (seq, event_id, rank, value, key, is_op, scope)
         self.by: dict[tuple, tuple] = {}
         self.firsts: dict[tuple, tuple] = {}   # writer key -> rank of that writer's EARLIEST event here
+        self.lasts: dict[tuple, tuple] = {}    # writer key -> rank of that writer's LATEST event here (kept or not)
 
     def set(self, ev: dict, value: Any = None) -> None:
         key, seq, eid = _writer_key(ev), int(ev["source_sequence"]), str(ev["event_id"])
@@ -329,6 +330,9 @@ class _Reg:
         first = self.firsts.get(key)
         if first is None or rank < first:
             self.firsts[key] = rank            # min over ALL events, whichever order they arrive in
+        last = self.lasts.get(key)
+        if last is None or rank > last:
+            self.lasts[key] = rank             # max over ALL events: order independent
         cur = self.by.get(key)
         if cur is None or (seq, eid) > (cur[0], cur[1]):
             scope = ev.get("visibility_scope")
@@ -1272,11 +1276,24 @@ class GraphProjection:
                 raise KeyError(pr_id)
 
             def trusted(name):
+                """(value, event_id, regressed): newest non-empty string from a trusted writer.
+
+                ``regressed`` is True when a trusted writer's newest-ADMITTED write of this field
+                lost to an older-admitted one by sequence (an emitter restart that reset its
+                ``source_sequence``): the register is frozen on a value the writer has since
+                replaced, so it cannot be called current.
+                """
                 reg = node.attrs.get(name)
                 ents = [e for e in (reg.by.values() if reg else ())
-                        if e[4][1] in head_writers and isinstance(e[3], str)]
-                return max(ents, key=lambda t: t[2]) if ents else None
-            head, author = trusted("head_sha"), trusted("author")
+                        if e[4][1] in head_writers and isinstance(e[3], str) and e[3].strip()]
+                if not ents:
+                    return None, None, False
+                best = max(ents, key=lambda t: t[2])
+                regressed = any(reg.lasts.get(e[4], e[2]) > e[2] for e in reg.by.values()
+                                if e[4][1] in head_writers)
+                return best[3], best[1], regressed
+            head, head_event, head_regressed = trusted("head_sha")
+            author, _, _ = trusted("author")
             reviews, authors = [], set()
             for rid in sorted(reviewer_ids):
                 for key in list(self._edges_by_owner.get(rid, ())):
@@ -1290,11 +1307,11 @@ class GraphProjection:
                             "reviewer": rid, "commit": e.binding[1], "from_id": e.from_id,
                             "verdict": self._owner_attr(e, rid, "verdict"),
                             "receipt_digest": self._owner_attr(e, rid, "receipt_digest"),
+                            "receipt_binding": self._owner_attr(e, rid, "receipt_binding"),
                             "event_id": e.adds.best()[1],
                             "visible": self._edge_visible(principal, e)})
-            return {"pr": pr_id, "head": head[3] if head else None,
-                    "head_event_id": head[1] if head else None,
-                    "author": author[3] if author else None,
+            return {"pr": pr_id, "head": head, "head_event_id": head_event,
+                    "head_regressed": head_regressed, "author": author,
                     "reviews": reviews, "authors": sorted(authors)}
 
     def neighborhood(self, principal, root: str, *, depth: int = DEFAULT_DEPTH,
