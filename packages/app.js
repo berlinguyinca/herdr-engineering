@@ -15,6 +15,7 @@ import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountTopology } from './topology-view.js';
+import { mountArchitecture } from './architecture-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
 import { renderFleetMatrix } from './fleet-view.js';
@@ -48,6 +49,7 @@ const root = document.getElementById('view');
 const NAV = [
   { path: '/overview', label: 'Overview' },
   { path: '/topology', label: 'Topology' },
+  { path: '/architecture', label: 'Architecture' },
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Agents' },
   { path: '/services', label: 'Services' },
@@ -80,6 +82,7 @@ const ROUTES = {
   '/ci': viewIntegrations,
   '/reviews': viewIntegrations,
   '/topology': viewTopology,
+  '/architecture': viewArchitecture,
   '/missions': viewMissions,
   '/missions/:id': viewMission,
   '/herd': viewSessions,
@@ -137,6 +140,11 @@ async function render() {
 // ------------------------------------------------------------- topology
 async function viewTopology() {
   dashboardView = mountTopology(root, client, {status: route().query.get('status') || 'current'});
+}
+
+async function viewArchitecture() {
+  const q = route().query;
+  dashboardView = mountArchitecture(root, client, {snapshot: q.get('snapshot') || '', parent: q.get('parent') || '', q: q.get('q') || ''});
 }
 
 async function viewOverview() {
