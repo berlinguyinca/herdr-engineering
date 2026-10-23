@@ -82,6 +82,49 @@ def run_node_file(node: str, pi: Path, rel: str) -> dict:
             "tail": out[-800:] if code else ""}
 
 
+def judge(manifest: dict, res: dict, pi_results: dict, tags: set | None, pi_files_on_disk: list[str]) -> list[str]:
+    """Pure verdict over the collected results (unit-tested in tests/e2e/test_runner_guards.py)."""
+    failures: list[str] = []
+    for fname, spec in manifest["herdr"].items():
+        if tags and spec["scenario"] not in tags:
+            continue
+        row = res["files"].get(Path(fname).name)
+        if not row or row["tests"] == 0:
+            failures.append(f"herdr {fname}: ran ZERO tests")
+            continue
+        if row["tests"] < spec["min_tests"]:
+            failures.append(f"herdr {fname}: ran {row['tests']} tests, expected at least {spec['min_tests']}")
+        if row["failed"] or row["skipped"]:
+            failures.append(f"herdr {fname}: {row['failed']} failed, {row['skipped']} skipped (only strict xfail may skip)")
+        if row["xfailed"] > spec.get("max_xfail", 0):
+            failures.append(f"herdr {fname}: {row['xfailed']} xfail, manifest allows {spec.get('max_xfail', 0)}")
+    unknown = sorted(set(res["files"]) - {Path(f).name for f in manifest["herdr"]})
+    if unknown and not tags:
+        failures.append(f"herdr test files not in manifest.yaml: {unknown}")
+    if res["exit"] != 0:
+        failures.append(f"herdr pytest exit {res['exit']}")
+    if res.get("regression", {}).get("exit", 0):
+        failures.append("herdr regression suite failed")
+    for rel in pi_files_on_disk:
+        if rel not in manifest["pi"] and not tags:
+            failures.append(f"pi test file not in manifest.yaml: {rel}")
+    for rel, spec in manifest["pi"].items():
+        if tags and spec["scenario"] not in tags:
+            continue
+        r = pi_results.get(rel)
+        if r is None:
+            failures.append(f"pi {rel}: file missing")
+            continue
+        if r["tests"] == 0:
+            failures.append(f"pi {rel}: ran ZERO tests")
+        elif r["tests"] < spec["min_tests"]:
+            failures.append(f"pi {rel}: ran {r['tests']} tests, expected at least {spec['min_tests']}")
+        if r["exit"] or r["failed"] or r["cancelled"] or r["skipped"] or r["todo"]:
+            failures.append(f"pi {rel}: exit {r['exit']}, {r['failed']} failed, {r['cancelled']} cancelled, "
+                            f"{r['skipped']} skipped, {r['todo']} todo\n{r['tail']}")
+    return failures
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", action="store_true", help="cargo build -j 4 the autospec binary first")
@@ -106,55 +149,19 @@ def main() -> int:
         failures.append(f"autospec binary missing at {bin_path}")
 
     report: dict = {"herdr": None, "pi": {}}
-    # ---- Herdr side
     selection = None
     if tags:
         wanted = [f for f, spec in manifest["herdr"].items() if spec["scenario"] in tags]
         selection = " or ".join(Path(f).stem for f in wanted) or "nothing_selected"
     res = run_pytest(selection, args.regression)
     report["herdr"] = res
-    for fname, spec in manifest["herdr"].items():
-        if tags and spec["scenario"] not in tags:
-            continue
-        row = res["files"].get(Path(fname).name)
-        if not row or row["tests"] == 0:
-            failures.append(f"herdr {fname}: ran ZERO tests")
-            continue
-        if row["tests"] < spec["min_tests"]:
-            failures.append(f"herdr {fname}: ran {row['tests']} tests, expected at least {spec['min_tests']}")
-        if row["failed"] or row["skipped"]:
-            failures.append(f"herdr {fname}: {row['failed']} failed, {row['skipped']} skipped (only strict xfail may skip)")
-        if row["xfailed"] > spec.get("max_xfail", 0):
-            failures.append(f"herdr {fname}: {row['xfailed']} xfail, manifest allows {spec.get('max_xfail', 0)}")
-    unknown = sorted(set(res["files"]) - {Path(f).name for f in manifest["herdr"]})
-    if unknown and not tags:
-        failures.append(f"herdr test files not in manifest.yaml: {unknown}")
-    if res["exit"] not in (0,):
-        failures.append(f"herdr pytest exit {res['exit']}")
-    if res.get("regression", {}).get("exit", 0):
-        failures.append("herdr regression suite failed")
-
-    # ---- Pi side
     node = str(cfg.get("node", "node"))
     on_disk = sorted(p.relative_to(pi).as_posix() for p in (pi / "test/e2e").glob("*.e2e.test.ts"))
-    for rel in on_disk:
-        if rel not in manifest["pi"] and not tags:
-            failures.append(f"pi test file not in manifest.yaml: {rel}")
     for rel, spec in manifest["pi"].items():
         if tags and spec["scenario"] not in tags:
             continue
-        if not (pi / rel).exists():
-            failures.append(f"pi {rel}: file missing")
-            continue
-        r = run_node_file(node, pi, rel)
-        report["pi"][rel] = r
-        if r["tests"] == 0:
-            failures.append(f"pi {rel}: ran ZERO tests")
-        elif r["tests"] < spec["min_tests"]:
-            failures.append(f"pi {rel}: ran {r['tests']} tests, expected at least {spec['min_tests']}")
-        if r["exit"] or r["failed"] or r["cancelled"] or r["skipped"] or r["todo"]:
-            failures.append(f"pi {rel}: exit {r['exit']}, {r['failed']} failed, {r['cancelled']} cancelled, "
-                            f"{r['skipped']} skipped, {r['todo']} todo\n{r['tail']}")
+        report["pi"][rel] = run_node_file(node, pi, rel) if (pi / rel).exists() else None
+    failures += judge(manifest, res, report["pi"], tags, on_disk)
 
     # ---- table
     print("\nscenario  runner  file                                              tests  pass  xfail/GAP  seconds")
@@ -163,6 +170,8 @@ def main() -> int:
         if row:
             print(f"{spec['scenario']:<9} pytest  {fname:<48} {row['tests']:>5} {row['passed']:>5} {row['xfailed']:>10} {res['seconds']:>8}")
     for rel, r in report["pi"].items():
+        if r is None:
+            continue
         print(f"{manifest['pi'][rel]['scenario']:<9} node    {rel:<48} {r['tests']:>5} {r['passed']:>5} {len(r['gaps']):>10} {r['seconds']:>8}")
     out = Path(args.results)
     out.parent.mkdir(parents=True, exist_ok=True)
