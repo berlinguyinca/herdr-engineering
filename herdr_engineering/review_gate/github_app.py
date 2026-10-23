@@ -9,6 +9,7 @@ Error messages are fixed strings (plus a status code) passed through
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import re
 import time
@@ -190,7 +191,8 @@ class GitHubAppClient:
             return False, self._http_error(status, headers)
         except (ValueError, TypeError, UnicodeError):
             return False, GitHubAppError("invalid_response")
-        except (OSError, urllib.error.URLError):
+        except (OSError, urllib.error.URLError, http.client.HTTPException):
+            # HTTPException: IncompleteRead, BadStatusLine, LineTooLong, ...
             return False, GitHubAppError("unavailable")
 
     def _http_error(self, status, headers):

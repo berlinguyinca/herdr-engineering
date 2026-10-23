@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 import traceback
@@ -50,6 +51,16 @@ class FakeOpener:
                     raise result
                 return result
         raise AssertionError(f"unrouted {request.get_method()} {path}")
+
+
+class BrokenResp(Resp):
+    """A response whose body read fails mid-stream (truncated chunked body)."""
+
+    def __init__(self):
+        super().__init__(200, b"")
+
+    def read(self, n=-1):
+        raise http.client.IncompleteRead(b"partial")
 
 
 def http_error(code, headers=None):
@@ -460,6 +471,16 @@ RAISE_SITES = [
         lambda cfg: (lambda c: lambda: c.open_prs(REPO))(_mk(cfg, {("GET", _P): OSError("down")})),
     ),
     (
+        "bad_status_line",
+        lambda cfg: (lambda c: lambda: c.open_prs(REPO))(
+            _mk(cfg, {("GET", _P): http.client.BadStatusLine("garbage")})
+        ),
+    ),
+    (
+        "incomplete_read",
+        lambda cfg: (lambda c: lambda: c.open_prs(REPO))(_mk(cfg, {("GET", _P): BrokenResp()})),
+    ),
+    (
         "non_json",
         lambda cfg: (lambda c: lambda: c.open_prs(REPO))(_mk(cfg, {("GET", _P): Resp(200, b"{{")})),
     ),
@@ -550,3 +571,19 @@ def test_every_raise_site_is_unchained(keypair, name, build):
     assert ei.value.__context__ is None
     assert ei.value.__cause__ is None
     assert ei.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [http.client.BadStatusLine("x"), http.client.LineTooLong("header"), "incomplete"],
+    ids=["bad_status_line", "line_too_long", "incomplete_read"],
+)
+def test_http_client_errors_are_unavailable_and_clean(keypair, failure):
+    cfg, _ = keypair
+    route = BrokenResp() if failure == "incomplete" else failure
+    c, opener = client_for(cfg, {("GET", _P): route})
+    with pytest.raises(GitHubAppError) as ei:
+        c.open_prs(REPO)
+    assert ei.value.reason == "unavailable"
+    the_jwt = opener.requests[0].get_header("Authorization").split(" ", 1)[1]
+    _assert_clean(ei.value, [TOKEN, the_jwt])
