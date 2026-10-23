@@ -269,3 +269,18 @@ def test_the_operator_cancel_itself_refuses_anyone_but_the_operator(w):
     assert call(w, "POST", ["helpers", rec["helper_id"], "cancel"], "bob")[0] == 404
     assert call(w, "POST", ["fleet", "helpers", "nope", "cancel"], operator="mallory")[0] == 404
     assert w.s._helpers[rec["helper_id"]]["status"] == "requested"
+
+
+# ------------------------------------------------------------------ re-review M-2, M-4, M-5, M-6
+def test_guests_see_no_grant_or_revoke_of_helper_agents_through_claim_and_finish(w):
+    first = w.s.read_events(w.dave, w.room, 0, 200)["next_cursor"]
+    rec = ask(w)
+    _, c = run(w, rec["helper_id"])
+    w.s.finish_helper(w.op, rec["helper_id"], {"status": "running"})
+    w.s.finish_helper(w.op, rec["helper_id"], {"status": "done", "result": "ok"})
+    page = w.s.read_events(w.dave, w.room, first, 200)
+    assert page["events"] == [] and page["next_cursor"] > first
+    assert any(e.get("agent_id") == c["helper_agent_id"] for e in w.s.read_events(w.carol, w.room, first, 200)["events"])
+    # an ordinary agent's grant is still shown to guests
+    a, info = w.agent("alice", actions=("read",), name="plainone")
+    assert any(e.get("agent_id") == info["agent_id"] for e in w.s.read_events(w.dave, w.room, first, 200)["events"])
