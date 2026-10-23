@@ -728,3 +728,112 @@ def test_the_whole_posted_result_fits_in_20_kb(hr, tmp_path):
     text = hr.mk().helper_result_text(d, st)
     assert len(text.encode()) <= runner.HELPER_RESULT_CAP
     assert "[output truncated at 20 KB]" in text and "[stderr]" in text and text.startswith("[model x")
+
+
+# ------------------------------------------------------------------ delivering the result
+def ended(hr, out: bytes):
+    """A claimed, running helper whose supervisor already wrote its output and result.json: the next cycle
+    reports it."""
+    h = ask(hr)
+    hid = h["helper_id"]
+    r = hr.mk()
+    c = r.ok("POST", f"fleet/helpers/{hid}/claim", {})
+    r.ok("POST", f"fleet/helpers/{hid}/finish", {"status": "running"})
+    d = hr.state / hid
+    d.mkdir(parents=True)
+    (d / "out").write_bytes(out)
+    (d / "result.json").write_text(json.dumps({"exit": 0, "bytes": len(out)}))
+    r.save_state(d, {"helper_id": hid, "phase": "running", "room_id": hr.w.room, "agent_id": c["helper_agent_id"],
+                     "since": time.time()})
+    return hid, d
+
+
+@pytest.fixture
+def sent(monkeypatch):
+    """Every request body the runner really puts on the wire."""
+    bodies = []
+    real = runner.urllib.request.urlopen
+
+    def spy(req, *a, **k):
+        if req.data is not None:
+            bodies.append((req.full_url, req.data))
+        return real(req, *a, **k)
+    monkeypatch.setattr(runner.urllib.request, "urlopen", spy)
+    return bodies
+
+
+def finish_bodies(sent, hid):
+    return [b for u, b in sent if u.endswith(f"fleet/helpers/{hid}/finish")]
+
+
+@pytest.mark.parametrize("out", [
+    ("ok \x01\x02\x1b[31m\x7f\x85 " * 2000 + "end").encode()[:20000],   # control characters: 6x as \\u escapes
+    b"\x01" * 19990 + b"end",                                                   # ~120 KB escaped: over the 64 KiB cap
+    "😀".encode() * 5000,                                                       # 4-byte characters: 12 bytes escaped
+    b'"\\' * 10000,                                                             # quotes and backslashes: 2x
+    b"\n\t" * 10000,
+], ids=["control", "pure-control", "emoji", "quotes", "newlines"])
+def test_a_full_20_kb_result_is_delivered_in_one_body_under_48_kib(hr, sent, out):
+    hid, d = ended(hr, out)
+    cycle(hr)
+    v = view(hr, hid)
+    assert v["status"] == "done", (v, hr.said[-3:])
+    body = finish_bodies(sent, hid)[-1]
+    assert len(body) < 48 * 1024, len(body)
+    res = v["result"] or ""
+    assert not any(ch in res for ch in "\x01\x02\x1b\x7f\x85 ")             # stripped, \n and \t kept
+    if out.startswith(b"\n"):
+        assert res.count("\n") > 9000 and res.count("\t") > 9000
+    if out.startswith("😀".encode()):
+        assert res.count("😀") > 4000
+    assert not d.exists()
+
+
+@pytest.mark.parametrize("code", [413, 500, 502])
+def test_a_refused_finish_keeps_the_helper_and_is_retried_next_cycle(hr, monkeypatch, code):
+    hid, d = ended(hr, b"the answer is 42\n")
+    real = runner.Runner.api
+    fails = [code]
+
+    def flaky(self, method, path, body=None):
+        if path == f"fleet/helpers/{hid}/finish" and fails:
+            return fails.pop(), {"error": "nope"}
+        return real(self, method, path, body)
+    monkeypatch.setattr(runner.Runner, "api", flaky)
+    cycle(hr)
+    assert d.exists() and view(hr, hid)["status"] == "running"             # kept: the result is not lost
+    st = json.loads((d / "state.json").read_text())
+    assert st["ending"]["status"] == "done" and st["finish_attempts"] == 1
+    cycle(hr)                                                              # a new process, the service now takes it
+    v = view(hr, hid)
+    assert v["status"] == "done" and "the answer is 42" in (v["result"] or "")
+    assert not d.exists()
+
+
+def test_after_three_refused_finishes_a_minimal_failure_is_posted(hr, monkeypatch):
+    hid, d = ended(hr, b"x" * 1000)
+    real = runner.Runner.api
+    tries = []
+
+    def refuse_results(self, method, path, body=None):
+        if path == f"fleet/helpers/{hid}/finish" and body and "result" in body:
+            tries.append(body)
+            return 413, {"error": "request too large"}
+        return real(self, method, path, body)
+    monkeypatch.setattr(runner.Runner, "api", refuse_results)
+    for _ in range(2):
+        cycle(hr)
+        assert d.exists() and view(hr, hid)["status"] == "running"
+    cycle(hr)                                                              # the third refusal: give up on the output
+    assert len(tries) == 3
+    v = view(hr, hid)
+    assert v["status"] == "failed" and "could not be delivered" in (v["error_text"] or ""), v
+    assert not d.exists()
+
+
+@pytest.mark.parametrize("text", ['"' * 40000, "😀" * 20000, "\\" * 30000 + "é" * 10000],
+                         ids=["quotes", "emoji", "mixed"])
+def test_the_finish_body_never_exceeds_48_kib(text):
+    body = runner.Runner.finish_body("done", text, "x")
+    size = len(json.dumps(body, ensure_ascii=False).encode())
+    assert size <= runner.FINISH_BODY_MAX and size > runner.FINISH_BODY_MAX - 1024 and body["error"] == "x"

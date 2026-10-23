@@ -118,6 +118,11 @@ HELPERS_PER_HOST = 6                    # live helpers this host runs at once
 HELPER_MARGIN = 30.0                    # stop before the server's expiry, so the result is still accepted
 MAX_EGRESS_ASKS = 20                    # host-access requests one helper may cause
 HELPER_STDIN_MAX = 256_000
+FINISH_BODY_MAX = 48 * 1024             # the service refuses bodies over 64 KiB (413): stay well below
+FINISH_ATTEMPTS = 3                     # refused finishes before only {"status": "failed"} is posted
+# what the service strips from a result anyway (all control characters but \t and \n, C1, U+2028/9): stripped here
+# first, so the 20 KB budget measures what is sent and nothing is inflated into \u escapes
+RESULT_BAD = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")
 CATALOGUE_EVERY = 600.0                 # seconds between model-catalogue posts
 CATALOGUE_MAX = 500
 ROLE_PROMPT = {
@@ -374,7 +379,7 @@ class Runner:
 
     # ------------------------------------------------------------ the collab service (operator listener)
     def api(self, method: str, path: str, body: dict | None = None):
-        data = json.dumps(body).encode() if body is not None else None
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8", "replace") if body is not None else None
         req = urllib.request.Request(f"{self.url}/api/v1/collab/{path}", data=data, method=method,
                                      headers={"Content-Type": "application/json"} if method == "POST" else {})
         try:
@@ -1209,14 +1214,27 @@ class Runner:
         if res.get("exit") not in (0, None) and res.get("stderr"):
             foot.append("[stderr]\n" + str(res["stderr"])[-1500:])
         # the WHOLE posted text fits in HELPER_RESULT_CAP bytes: notes and footers first, the output gets the rest
-        head = head.encode()[:HELPER_RESULT_CAP // 4].decode("utf-8", "ignore")
-        tail = ("\n" + "\n".join(foot) if foot else "").encode()[:HELPER_RESULT_CAP // 4]
+        head = RESULT_BAD.sub("", head).encode()[:HELPER_RESULT_CAP // 4].decode("utf-8", "ignore")
+        tail = RESULT_BAD.sub("", "\n" + "\n".join(foot) if foot else "").encode()[:HELPER_RESULT_CAP // 4]
+        out = RESULT_BAD.sub("", raw.decode("utf-8", "ignore")).encode()
         room = HELPER_RESULT_CAP - len(head.encode()) - len(tail)
         marker = b"\n[output truncated at 20 KB]"
-        if len(raw) > room and b"[output truncated" not in tail:
+        if len(out) > room and b"[output truncated" not in tail:
             tail, room = marker + tail, room - len(marker)
-        text = raw[:max(0, room)].decode("utf-8", "ignore")
+        text = out[:max(0, room)].decode("utf-8", "ignore")
         return head + text + tail.decode("utf-8", "ignore")
+
+    @staticmethod
+    def finish_body(status: str, result: str, error: str | None) -> dict:
+        """The finish request, serialized below FINISH_BODY_MAX bytes (the result is cut further if need be)."""
+        body = {"status": status, "result": result, **({"error": error} if error else {})}
+        while True:
+            size = len(json.dumps(body, ensure_ascii=False).encode("utf-8", "replace"))
+            if size <= FINISH_BODY_MAX or not body["result"]:
+                return body
+            enc = body["result"].encode("utf-8", "replace")
+            keep = min(len(enc) - 1, int(len(enc) * FINISH_BODY_MAX / size) - 64)   # escapes may make it 2x
+            body["result"] = enc[:max(0, keep)].decode("utf-8", "ignore")
 
     def end_helper(self, d: Path, st: dict, status: str, error: str | None) -> None:
         """Stop it, post how it ended (with its output), then remove its pane, work dir, socket dir and state."""
@@ -1225,15 +1243,28 @@ class Runner:
         self.save_state(d, st)
         self.kill(st)
         self.drain_blocked(d, st)
-        body = {"status": status, "result": self.helper_result_text(d, st), **({"error": error} if error else {})}
-        try:
-            code, out = self.api("POST", f"fleet/helpers/{hid}/finish", body)
-        except Failure as exc:
+        attempts = int(st.get("finish_attempts") or 0)
+        while True:
+            # after FINISH_ATTEMPTS refusals the output is given up on: a minimal failure still frees the slots
+            minimal = attempts >= FINISH_ATTEMPTS
+            body = ({"status": "failed", "error": "result could not be delivered"} if minimal
+                    else self.finish_body(status, self.helper_result_text(d, st), error))
+            try:
+                code, out = self.api("POST", f"fleet/helpers/{hid}/finish", body)
+            except Failure as exc:                           # the service is unreachable: not counted, retried
+                self.save_state(d, st)
+                self.say(f"helper {hid}: could not report the result, will retry: {trim(exc)}")
+                return
+            if 200 <= code < 300 or code in (404, 409):      # 404/409: it already ended on the service side
+                break
+            attempts += 1
+            st["finish_attempts"] = attempts
             self.save_state(d, st)
-            self.say(f"helper {hid}: could not report the result, will retry: {trim(exc)}")
-            return
-        if code >= 400 and code not in (404, 409):           # 409: it already ended on the service side
             self.say(f"helper {hid}: finish {code} {trim(out.get('error', ''))}")
+            if minimal and code < 500:                       # even the minimal body is refused: it never will be
+                break
+            if minimal or attempts < FINISH_ATTEMPTS:
+                return                                       # kept: the next cycle tries again
         self.teardown(d, st)
         self.say(f"helper {hid}: {status}" + (f" ({trim(error, 120)})" if error else ""))
 
