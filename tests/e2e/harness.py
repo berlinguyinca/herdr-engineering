@@ -315,10 +315,19 @@ class Plane:
         return r
 
     def verify_features(self, owner: str) -> None:
-        """POSITIVE CONTROL: every optional feature the scenarios rely on must actually answer. Without this a
-        403/404 in a security assertion could simply mean the feature is switched off."""
+        """POSITIVE CONTROL: every optional feature the scenarios rely on must actually be ON, using the signal each
+        feature really gives (an `enabled` flag, a 403 `*_disabled` code, or a validation error that is only
+        reachable once the feature is on). Without this a 403/404 in a security assertion could simply mean the
+        feature is switched off."""
         _, room = self.make_room(owner, "feature-probe", "feature-probe-room")
-        for path in ("/steering", "/xlinks", "/attention", "/delegations", "/proposals", "/consultations", "/progress"):
+        for path in ("/xlinks", "/delegations", "/proposals", "/consultations"):
             r = self.c("GET", f"/rooms/{room}{path}", user=owner)
-            assert r.status == 200, f"feature probe {path} answered {r.status}: {r.body} (feature off or broken)"
+            assert r.status == 200 and r.get("enabled") is True, f"feature probe {path}: {r.status} {r.body} (feature off or broken)"
+        for path in ("/attention", "/progress", "/analytics"):
+            r = self.c("GET", f"/rooms/{room}{path}", user=owner)
+            assert r.status == 200, f"feature probe {path}: {r.status} {r.body} (feature off or broken)"
+        r = self.c("POST", f"/rooms/{room}/steering", {"node_id": "agent:probe", "action": "pause", "instruction": "x"}, user=owner)
+        assert r.status != 403 and r.get("code") != "steering_disabled", f"feature probe steering: {r.status} {r.body} (feature off or broken)"
+        r = self.c("POST", f"/rooms/{room}/comments", {"node_id": "agent:probe", "text": "x"}, user=owner)
+        assert r.status != 403, f"feature probe comments: {r.status} {r.body} (feature off or broken)"
         assert self.c("GET", f"/rooms/{room}/state", user=owner).status == 200
