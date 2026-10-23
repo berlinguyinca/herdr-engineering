@@ -1833,7 +1833,9 @@ class CollabService:
             for r in rows:                             # so the dashboard can warn before approving one
                 r["internal"] = _internal_host(r["host_port"].rsplit(":", 1)[0])
             rows.sort(key=lambda r: (r["created_epoch"], r["id"]))
-            return {"requests": rows}
+            # rooms whose owner listed hosts, so the operator can show (and Remove) them once request rows are pruned
+            listed = sorted(rid for rid in self._rooms if self._profile(rid)["permanent_hosts"])
+            return {"requests": rows, "rooms_with_hosts": listed}
 
     def decide_egress(self, pr: Principal, request_id: str, decision: Any,
                       ttl_seconds: Any = EGRESS_DEFAULT_TTL) -> dict:
