@@ -22,6 +22,8 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   try{browser=await chromium.launch(options);}catch(error){const exe='/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';if(!existsSync(exe))throw error;browser=await chromium.launch({...options,executablePath:exe});}
   const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto(`${base}/#/ci`);
+  assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-selected'),'true');
+  await page.locator('[data-ci-workspace="tests"]').click();
   const insights=page.locator('[data-ci-insights]');
   await page.waitForFunction(()=>document.querySelector('[data-ci-insights]')?.textContent.includes('4 test report attempts'));
   await page.locator('[data-ci-repository]').selectOption('17');
@@ -34,6 +36,7 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   assert.match(await insights.innerText(),/3 retained runs/);
   mkdirSync(path.join(root,'artifacts/ci-insights'),{recursive:true});
   await page.screenshot({path:path.join(root,'artifacts/ci-insights/overview.png'),fullPage:true});
+  await page.locator('[data-ci-workspace="runs"]').click();
   await page.getByRole('tab',{name:/^Failed/}).click();
   await page.getByRole('button',{name:'Run #3',exact:true}).click();
   const inspector=page.locator('.ig-inspector');
@@ -65,10 +68,13 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   assert.match(await inspector.innerText(),/1 matching tests/);
   assert.equal(await testSearch.evaluate(e=>e===document.activeElement),true);
   await inspector.locator('[data-close-inspector]').click();
+  await page.locator('[data-ci-workspace="tests"]').click();
   assert.equal(await insights.isVisible(),true);
+  await page.locator('[data-ci-workspace="runs"]').click();
   const search=page.locator('[data-ig-search]');await search.fill('main');await search.focus();
-  await page.waitForTimeout(5200);assert.equal(await search.evaluate(e=>e===document.activeElement),true);
-  await page.locator('[data-ci-branch]').selectOption('feature');await search.fill('');
+  await page.waitForTimeout(5200);assert.equal(await search.evaluate(e=>e===document.activeElement),true);await search.fill('');
+  await page.locator('[data-ci-workspace="tests"]').click();
+  await page.locator('[data-ci-branch]').selectOption('feature');
   assert.match(await insights.innerText(),/1 retained runs · 1 test report attempts/);
   assert.deepEqual(errors,[]);
  } finally {await browser?.close();server.kill();}
