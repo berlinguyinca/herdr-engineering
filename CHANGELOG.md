@@ -5,6 +5,17 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Event envelope v2 (T01, Herdr side)
+- `POST /api/v1/ingest` accepts `schema_version: 2` bodies per
+  `docs/contracts/event-envelope-v2.md`: server-set `actor`/`received_at`,
+  idempotent `event_id`, `(source, source_sequence)` collision and gap tracking,
+  409 on conflicts, fail-closed `visibility_scope`. v1 bodies are unchanged.
+  `GET /api/v1/ingest/sources` reports per-source sequence, gaps and freshness.
+- Migration `0003_event_envelope_v2.sql` adds nullable envelope columns, a
+  partial unique index and `fabric_event_sources`.
+- `EventStore.append` no longer reports every error as a duplicate: only an
+  existing `event_id` returns False; other failures propagate.
+
 ### Central fleet config: deploy and servers
 - `deploy/control-plane/deploy.sh` renders the compose variables from the central
   fleet file into a transient 0600 env file (removed on exit, even on failure),

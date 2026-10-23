@@ -32,3 +32,13 @@ It extends the existing `Event` / `POST /api/v1/ingest` contract; v1 bodies keep
 - One envelope builder shared by ledger, platform, lifecycle-telemetry and inspector emitters.
 - `source_sequence` allocated from a persisted counter (atomic, crash-safe); never reused.
 - Emitting is best-effort and must not block or fail local execution; a durable local outbox keeps events for replay when Herdr is unreachable. Pi works with no Herdr at all.
+
+## Herdr implementation notes (resolved ambiguities)
+- A v2 body must carry `event_id`, `source` (no `herdr` default: the source is the sequence domain) and `source_sequence`.
+- The first event seen from a source sets its baseline; it never opens a gap. A later arrival inside a gap removes that sequence from the gap (the gap splits or closes).
+- Freshness window defaults to 300 s (`SourceLedger.freshness_seconds`); `GET /api/v1/ingest/sources` lists `status: healthy|stale`.
+- `actor.id` is `key:<12-hex sha256 digest of the API key>`; `kind` is the key's role. An open (keyless loopback) listener reports `open-listener`.
+- No per-principal visibility grant exists yet, so the server only validates the enum (unknown => `private`); it does not narrow further.
+- Idempotency compares emitter-controlled content (not `actor`/`received_at`). After a restart the ledger is rebuilt from stored events without content hashes, so a same-id retry is acknowledged by `(source, source_sequence)` match rather than content comparison. The in-memory event index is bounded (100k); the database unique indexes are the backstop.
+- Typed entities (`host`, `session`, `mission`, `service`) attach the envelope to the first event they record; envelope-only ingests with no recorded event (`inspector`, `mission_activity`) are tracked in the ledger but not stored in `fabric_events`.
+- With a durable sink a v2 event must be acknowledged before the ingest succeeds (failure => 5xx, ledger untouched, retry allowed).
