@@ -39,6 +39,77 @@ def test_summary_uses_single_shared_monitor(server):
     assert data['repos'][0]['repository'] == 'org/app'
 
 
+def test_telemetry_auth_limits_invalid_bundles_and_performance(server):
+    from tests.control_plane.test_ci_performance import cache, timing
+
+    body = {'schema_version': 1, 'records': [cache(), timing()]}
+    assert request(server, 'ci/telemetry', body, key='invalid')[0] == 401
+    assert request(server, 'ci/telemetry', body)[0] == 403
+    status, receipt = request(server, 'ci/telemetry', body, key='write')
+    assert status == 200
+    assert receipt['accepted'] == 2
+    assert receipt['scope']['partial'] is True
+    assert request(server, 'ci/telemetry', body, key='write')[1]['duplicates'] == 2
+    for invalid in [[], {'schema_version': True, 'records': []},
+                    {'schema_version': 1, 'records': [cache()] * 201},
+                    {'schema_version': 1, 'records': [cache(2), {'token': 'secret'}]},
+                    {'schema_version': 1, 'records': [], 'padding': 'x' * 1048576}]:
+        assert request(server, 'ci/telemetry', invalid, key='write')[0] == 400
+    assert request(server, 'ci/performance?days=30')[0] == 400
+    assert request(server, 'ci/performance?days=garbage')[0] == 400
+    assert request(server, 'ci/performance', key='invalid')[0] == 401
+    status, view = request(server, 'ci/performance?days=7&repository=org%2Fapp')
+    assert status == 200
+    assert view['scope']['record_count'] == 2
+    assert view['scope']['memory_only'] is True
+    assert view['cache_groups'][0]['kind'] == 'go'
+
+
+def test_performance_uses_cached_identity_without_provider_calls(server):
+    from tests.control_plane.test_ci_performance import cache
+
+    ingest = {'schema_version': 1, 'records': [cache()]}
+    assert request(server, 'ci/telemetry', ingest, key='write')[0] == 200
+    server.ci_monitor.snapshot = lambda **kwargs: {'repos': [{'id': 17, 'repository': 'org/app',
+        'forge_url': 'https://github.com/org/app'}], 'stale': True}
+    server.github_monitor.repository_languages = lambda **kwargs: {'github.com/org/app': 'Go'}
+    before = server.repo.export_state()
+    status, view = request(server, 'ci/performance')
+    assert status == 200
+    assert view['cache_groups'][0]['project_id'] == 'github.com/org/app'
+    assert view['cache_groups'][0]['language'] == 'Go'
+    assert view['scope']['stale'] is True
+    assert server.repo.export_state() == before
+
+
+def test_performance_does_not_start_provider_polling(server):
+    started = []
+    def forbidden():
+        raise AssertionError('Request handler started provider polling')
+
+    server.ci_monitor.start = forbidden
+    server.github_monitor.start = lambda: started.append('github')
+    status, view = request(server, 'ci/performance')
+    assert status == 200
+    assert view['scope']['partial'] is True
+    assert started == []
+
+
+def test_telemetry_persistence_error_is_sanitized_and_not_acknowledged(server):
+    from tests.control_plane.test_ci_performance import cache
+
+    class UnavailableSink:
+        def record_required(self, event):
+            raise OSError('database-password-private')
+
+    server.repo._sink = UnavailableSink()
+    status, result = request(server, 'ci/telemetry',
+        {'schema_version': 1, 'records': [cache()]}, key='write')
+    assert status == 503
+    assert 'database-password-private' not in json.dumps(result)
+    assert server.repo.ci_performance()['scope']['record_count'] == 0
+
+
 def test_pipeline_and_log_require_valid_query(server):
     assert request(server, 'ci/pipeline')[0] == 400
     assert request(server, 'ci/log?repository=org%2Fapp&number=-1&step=2')[0] == 400
