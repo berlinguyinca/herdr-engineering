@@ -392,7 +392,8 @@ service would stop at start-up with `unknown keys: helpers`. What actually gates
 | `helper_result` | status and final output, marked **untrusted** |
 | `helper_cancel` | ends the helper and everything under it |
 
-Only the agent that asked can read, wait on or cancel a helper over MCP. Its person can list their agents'
+Only the agent that asked (and, for a successor, the agent its predecessor worked under) can read, wait on or
+cancel a helper over MCP. Its person can list their agents'
 helpers, see one's status and cancel it over REST (`GET helpers`, `GET helpers/{id}`, `POST helpers/{id}/cancel`;
 status and ids only, never the task or the result; these routes are for people, an agent gets 404). Everyone else
 gets 404. Host-access requests are listed only for the operator (`GET fleet/egress`). The
@@ -490,6 +491,17 @@ runner kills the boxes on its next cycle (about 10 s). The runner checks the swi
 when the rest of the cycle fails. **Resume helpers** turns it off. Each press is audited with who, when and which
 way (`helpers.pause` / `helpers.resume`): in every project's audit (`GET audit?project_id=...`, with `paused`), and
 in approval mode also in the **People → Decision log** on the dashboard.
+
+**Successors (hand-over).** An agent that runs out of room asks for a `successor` with its handoff note as the
+task. When the runner claims the successor, the service hands over: the successor starts from that note (its
+prompt says "handoff from the agent you replace"), any other successor the predecessor asked for and that has not
+started yet is cancelled ("superseded"), and a predecessor that is itself a helper **ends**: its record becomes
+`done` with the handoff note as its result (`[handed over to successor <id>]` and the note, audited as
+`helper.handover`), its credential is revoked, its own children end, and the runner kills its box on the next
+watch. That stored result is the hand-over its parent reads with `helper_result`; the parent then follows the
+successor, which works under the same parent at the same depth. Output the predecessor prints after asking is not
+kept. A **root** agent (a person's own session, not a helper) is not ended: the service cannot stop a session it
+did not start, and revoking it would also cut its other rooms. It should stop by itself.
 
 **Ending.** Each of these ends the helper and its whole subtree (children, grandchildren, and successors that
 have not taken over yet), each step audited:

@@ -404,34 +404,32 @@ def test_successor_replaces_parent_at_the_same_depth(w):
     h1, _ = run(w, ask(w)["helper_id"])
     s = ask(w, h1, role="successor")
     assert s["depth"] == 1 and s["parent_agent_id"] == w.root.id and s["chain"] == 1
-    hs, _ = run(w, s["helper_id"])
-    assert w.s.agent_rooms(h1)["rooms"]                  # the parent is not revoked here; it ends itself
-    w.s.finish_helper(w.op, s["helper_id"], {"status": "running"})
-    w.s.revoke_agent(w.alice, h1.id)                       # revoking a predecessor that is still active ends it
-    assert not w.s.still_valid(hs)
+    w.s.revoke_agent(w.alice, h1.id)                       # revoking a predecessor before the hand-over ends it
     assert w.s.helper_status(w.alice, s["helper_id"])["status"] == "cancelled"
+    h2, _ = run(w, ask(w)["helper_id"])
+    s = ask(w, h2, role="successor")
+    hs, _ = run(w, s["helper_id"])
+    assert not w.s.still_valid(h2) and w.s.still_valid(hs)  # the claim is the hand-over: the predecessor ends
 
 
 def test_revoking_a_finished_predecessor_leaves_its_successor_alone(w):
     rec = ask(w)
     h1, _ = run(w, rec["helper_id"])
     s = ask(w, h1, role="successor")
+    w.s.finish_helper(w.op, rec["helper_id"], {"status": "done"})      # it finished on its own before the claim
     hs, _ = run(w, s["helper_id"])
     w.s.finish_helper(w.op, s["helper_id"], {"status": "running"})
-    w.s.finish_helper(w.op, rec["helper_id"], {"status": "done"})      # the hand-over
     w.s.revoke_agent(w.alice, h1.id)
     assert w.s.still_valid(hs)
     assert w.s.helper_status(w.alice, s["helper_id"])["status"] == "running"
 
 
-def test_a_successor_not_yet_running_dies_with_a_revoked_parent(w):
+def test_a_successor_not_yet_claimed_dies_with_a_revoked_parent(w):
     h1, _ = run(w, ask(w)["helper_id"])
     queued = ask(w, h1, role="successor")
-    claimed = ask(w, h1, role="successor")
-    hs, _ = run(w, claimed["helper_id"])
     w.s.revoke_agent(w.alice, h1.id)
-    assert not w.s.still_valid(hs)
-    assert {w.s.helper_status(w.alice, x["helper_id"])["status"] for x in (queued, claimed)} == {"cancelled"}
+    assert w.s.helper_status(w.alice, queued["helper_id"])["status"] == "cancelled"
+    assert code(w.s.claim_helper, w.op, queued["helper_id"]) == 409
 
 
 def test_a_successor_starts_after_its_predecessor_finished(w):

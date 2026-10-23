@@ -181,3 +181,43 @@ def test_profile_detail_goes_to_members_names_only_to_agents_and_nothing_to_gues
     assert "api.github.com" not in repr(p) and "git.example.org" not in repr(p)
     assert p["allowed_families"] == ["claude-code"] and p["limits"]["depth"] == 2
 
+
+
+# ------------------------------------------------------------------ successor hand-over (review item 7)
+HANDOFF = "HANDOFF: tests 1-4 pass, continue with step 5 in notes.md"
+
+
+def test_a_helper_predecessor_ends_when_its_successor_is_claimed_and_its_handoff_is_its_result(w):
+    rec = ask(w, role="worker")
+    h1, _ = run(w, rec["helper_id"])
+    w.s.finish_helper(w.op, rec["helper_id"], {"status": "running"})
+    s = ask(w, h1, role="successor", task=HANDOFF)
+    hs, c = run(w, s["helper_id"])
+    assert c["handoff"] == {"from_agent_id": h1.id, "from_helper_id": rec["helper_id"], "text": HANDOFF}
+    assert not w.s.still_valid(h1) and w.s.still_valid(hs)             # the predecessor ended, its successor did not
+    pred = w.s.helper_result(w.root, rec["helper_id"])                 # the artifact: what the tree parent reads
+    assert pred["status"] == "done" and HANDOFF in pred["result"] and s["helper_id"] in pred["result"]
+    assert w.s.helper_result(w.root, s["helper_id"])["status"] == "claimed"   # the tree parent follows the successor
+    w.s.revoke_agent(w.alice, h1.id)                                   # revoking the handed-over predecessor: no effect
+    assert w.s.still_valid(hs)
+    assert code(w.s.finish_helper, w.op, rec["helper_id"], {"status": "done"}) == 409   # its runner's late finish
+
+
+def test_other_waiting_successors_of_the_same_predecessor_are_superseded(w):
+    h1, _ = run(w, ask(w)["helper_id"])
+    first, second = ask(w, h1, role="successor", task=HANDOFF), ask(w, h1, role="successor", task="other")
+    run(w, first["helper_id"])
+    assert w.s.helper_status(w.root, second["helper_id"])["status"] == "cancelled"
+    assert w.s._helpers[second["helper_id"]]["reason"] == "superseded"
+
+
+def test_a_root_predecessor_is_not_ended_by_its_successor(w):
+    s = ask(w, role="successor", task=HANDOFF)
+    hs, c = run(w, s["helper_id"])
+    assert c["handoff"] == {"from_agent_id": w.root.id, "from_helper_id": None, "text": HANDOFF}
+    assert w.s.still_valid(w.root) and w.s.still_valid(hs)
+
+
+def test_an_ordinary_helper_carries_no_handoff(w):
+    _, c = run(w, ask(w)["helper_id"])
+    assert c["handoff"] is None

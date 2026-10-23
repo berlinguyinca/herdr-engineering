@@ -2005,7 +2005,9 @@ class CollabService:
 
     def _helper_for(self, pr: Principal, helper_id: Any) -> dict:
         r = self._helpers.get(helper_id) if isinstance(helper_id, str) else None
-        if r is None or not (r["requester_agent_id"] == pr.id if pr.is_agent else r["owner"] == pr.id):
+        # an agent: the one that asked, or the one the helper works under (for a successor: its predecessor's parent)
+        mine = pr.id in (r["requester_agent_id"], r["parent_agent_id"]) if r and pr.is_agent else bool(r) and r["owner"] == pr.id
+        if not mine:
             raise CollabError(404, "not found")
         return r
 
@@ -2196,14 +2198,41 @@ class CollabService:
                 pr, room_id=r["room_id"], project_id=r["project_id"], helper_id=helper_id, helper_agent_id=aid,
                 actions=actions, claimed_epoch=now, role=r["role"], model=r["model"], status="claimed",
                 action="helper.claim", outcome="allowed", project_ids=[r["project_id"]], resource_id=helper_id))
+            handoff = None
+            if r["role"] == "successor":
+                handoff = {"from_agent_id": r["requester_agent_id"],
+                           "from_helper_id": prev["helper_id"] if prev else None, "text": r["task"]}
+                self._hand_over(pr, r, prev)
             par = self._agents.get(r["parent_agent_id"]) if r["parent_agent_id"] else None
             return {**self._helper_view(r), "task": r["task"], "credential": cred, "device_id": device,
-                    "now": now, "profile": self._runner_profile(r),
+                    "now": now, "profile": self._runner_profile(r), "handoff": handoff,
                     "agent_name": name, "actions": actions, "expires_at": expires,
                     "requester": {"agent_id": r["requester_agent_id"], "name": req["name"],
                                   "instance_id": req.get("instance_id")},
                     "parent": {"agent_id": r["parent_agent_id"], "name": par["name"],
                                "instance_id": par.get("instance_id")} if par else None}
+
+    def _hand_over(self, pr: Principal, r: dict, prev: dict | None) -> None:
+        """A successor was claimed: the other successors its predecessor asked for are superseded, and a helper
+        predecessor ends. Its handoff note (the successor's task) becomes its final result: the stored hand-over
+        its tree parent reads with helper_result. A root predecessor is a person's own session, outside any
+        runner: it is not ended (revoking it would also cut its other rooms and end the successor)."""
+        actor = self._actor(pr)
+        for o in list(self._helpers.values()):
+            if (o is not r and o["role"] == "successor" and o["status"] == "requested"
+                    and o["requester_agent_id"] == r["requester_agent_id"]):
+                self._end_helper(actor, o, "superseded", set())
+        if prev is None or prev["status"] not in ("claimed", "running"):
+            return                                        # it already finished (or ended) on its own
+        note = f"[handed over to successor {r['helper_id']}]\n{r['task']}"
+        self._commit("helper_result", {**actor, "helper_id": prev["helper_id"], "result": note[:MAX_HELPER_RESULT],
+                                       "error_text": None})
+        self._commit("helper_finished", {
+            **actor, "room_id": prev["room_id"], "project_id": prev["project_id"], "helper_id": prev["helper_id"],
+            "role": prev["role"], "model": prev["model"], "status": "done", "finished_epoch": self._now(),
+            "error": None, "successor_id": r["helper_id"], "action": "helper.handover", "outcome": "allowed",
+            "project_ids": [prev["project_id"]], "resource_id": prev["helper_id"]})
+        self._end_agent(actor, prev["helper_agent_id"], "handed over", set())
 
     def finish_helper(self, pr: Principal, helper_id: str, body: dict) -> dict:
         """Operator only: "running" once started, then "done" or "failed" with the output. A finished

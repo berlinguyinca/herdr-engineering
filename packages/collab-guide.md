@@ -221,6 +221,8 @@ the helpers your agents started, and cancel one, with `GET helpers`, `GET helper
 * **Limits:** 3 live helpers per agent and 6 per person (across all rooms), nesting depth 2, 20 helpers per
   person per hour (across all rooms), a successor chain of at most 5. Over a limit the request fails at once and
   says which limit. A request that no host starts within 10 minutes expires.
+* **Successors:** when a successor starts, a predecessor that is itself a helper ends, and its handoff note is
+  kept as its result. Your own (root) agent is not stopped: end it yourself once its successor runs.
 * **Panic switch:** the operator can pause all helpers; that stops every running helper at once.
 * **Know before you grant it:** an SSH key the room gives helpers can be read by them. A helper can print it,
   and the agent that asked then has it, so grant **Start helpers** in such a room only to agents of people you
