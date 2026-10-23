@@ -46,7 +46,7 @@
     # herdr_engineering.config._discover_config_paths()
     herdr_engineering_config_dir: "{{ fleet_home }}/.config/herdr-engineering"
     herdr_engineering_config_file: "{{ herdr_engineering_config_dir }}/config.yaml"
-    herdr_pinned_version: "0.9.1"
+    # herdr_pinned_version + fleet_pins: playbooks/group_vars/all.yml (one source).
     # Agents use the fabric LLM gateway (per-project keys, token accounting); it
     # forwards to https://llm.metabolomics.us with the single lab key.
     llm_endpoint: "http://dev.lan:8088"
@@ -160,3 +160,12 @@
     # ----------------------------------------------------------------------
     - name: "Deploy pi build-gate extension (all fleet hosts)"
       ansible.builtin.include_tasks: ../tasks/pi-build-gate.yml
+
+    # ----------------------------------------------------------------------
+    # Fleet update timer (spec section 4, last in playbook order): the main host (= gateway host) runs
+    # playbooks/fleet-update.yml daily from cron against the fleet. Hosts hold
+    # no repo access or credentials for this.
+    # ----------------------------------------------------------------------
+    - name: "Install the daily fleet update cron entry (gateway host only)"
+      ansible.builtin.include_tasks: ../tasks/fleet-update-cron.yml
+      when: inventory_hostname == herdr_engineering_gateway_host

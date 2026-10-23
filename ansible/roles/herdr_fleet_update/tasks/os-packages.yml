@@ -1,0 +1,69 @@
+---
+# OS package updates for one host (herdr_fleet_update). Debian/Ubuntu: security
+# only by default; a full upgrade only with fleet_update_security_only=false.
+# macOS: brew update && brew upgrade.
+
+- name: "OS packages (Debian): refresh the package cache"
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts['os_family'] == 'Debian'
+
+# `apt-get -s upgrade` prints one "Inst <pkg> [old] (new <origin> [arch])" line
+# per upgradable package; only lines whose origin is a *-security suite are
+# kept (same source the collector counts). Read-only: runs in --check too.
+- name: "OS packages (Debian): list security updates (apt-get -s, *-security origins)"
+  ansible.builtin.shell: |
+    set -o pipefail
+    LC_ALL=C apt-get -s -o Debug::NoLocking=1 upgrade \
+      | awk '/^Inst / && /-security/ {print $2}' | sort -u
+  args:
+    executable: /bin/bash
+  register: fleet_update_security_pkgs
+  changed_when: false
+  check_mode: false
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - fleet_update_security_only | bool
+
+- name: "OS packages (Debian): install the security updates only"
+  ansible.builtin.apt:
+    name: "{{ fleet_update_security_pkgs.stdout_lines }}"
+    state: latest  # noqa: package-latest -- deliberate: only the listed security packages
+    only_upgrade: true
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - fleet_update_security_only | bool
+    - fleet_update_security_pkgs.stdout_lines | default([]) | length > 0
+
+- name: "OS packages (Debian): full upgrade (fleet_update_security_only=false)"
+  ansible.builtin.apt:
+    upgrade: "yes"
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - not (fleet_update_security_only | bool)
+
+- name: "OS packages (macOS): Homebrew update + upgrade"
+  ansible.builtin.shell: |
+    set -e
+    if ! command -v brew >/dev/null 2>&1; then
+      echo "homebrew missing" >&2
+      exit 0
+    fi
+    brew update
+    brew upgrade
+  become: false
+  register: fleet_update_brew
+  changed_when: "'Upgrading' in (fleet_update_brew.stdout | default(''))"
+  when: ansible_facts['system'] == 'Darwin'
+
+- name: "OS packages: unsupported platform, skipped"
+  ansible.builtin.debug:
+    msg: "No OS package update for {{ ansible_facts['system'] }}/{{ ansible_facts['os_family'] }}; skipped."
+  when:
+    - ansible_facts['os_family'] != 'Debian'
+    - ansible_facts['system'] != 'Darwin'

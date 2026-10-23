@@ -1,0 +1,69 @@
+---
+# Daily fleet update from the main host (spec section 4, herdr_fleet_update).
+#
+# Included from site.yml for inventory_hostname == herdr_engineering_gateway_host
+# only. Installs ONE user crontab entry (the fleet user's, never root's) that
+# runs playbooks/fleet-update.yml at 03:30 from this repo's ansible/ directory
+# on the main host:
+#   - `flock -n` on a lock file: a run still going at the next 03:30 makes the
+#     new one exit at once, so runs never overlap;
+#   - the Vault password comes from a 0600 FILE named by
+#     fleet_update_vault_password_file. Ansible never creates or writes it; the
+#     cron line holds only its path, never a secret;
+#   - stdout/stderr append to fleet_update_log_file. Every task that could carry
+#     a secret (control-plane API key) is no_log, so the log holds none.
+# Paths/vars: playbooks/group_vars/all.yml.
+- name: "Fleet update cron (main host)"
+  become: false
+  block:
+    - name: "Check the repo's ansible/ directory exists on the main host"
+      ansible.builtin.stat:
+        path: "{{ fleet_update_ansible_dir }}/playbooks/fleet-update.yml"
+      register: fleet_update_playbook_stat
+
+    - name: "Check the Vault password file (operator-provided, never created here)"
+      ansible.builtin.stat:
+        path: "{{ fleet_update_vault_password_file }}"
+      register: fleet_update_vault_stat
+
+    - name: "Warn: fleet update cron skipped, repo checkout missing on the main host"
+      ansible.builtin.debug:
+        msg: >-
+          {{ fleet_update_ansible_dir }}/playbooks/fleet-update.yml does not exist
+          on {{ inventory_hostname }}; the fleet update cron entry was NOT
+          installed. Run site.yml from the main host's checkout or set
+          fleet_update_ansible_dir to it.
+      when: not fleet_update_playbook_stat.stat.exists
+
+    - name: "Warn: Vault password file missing or not 0600"
+      ansible.builtin.debug:
+        msg: >-
+          {{ fleet_update_vault_password_file }} is missing or not mode 0600.
+          The cron run needs it to decrypt the Vault. Create it yourself
+          (umask 077; editor or `read -s`), never from Ansible.
+      when: >-
+        not fleet_update_vault_stat.stat.exists
+        or fleet_update_vault_stat.stat.mode != '0600'
+
+    - name: "Ensure the fleet update log directory"
+      ansible.builtin.file:
+        path: "{{ fleet_update_log_file | dirname }}"
+        state: directory
+        # 0700 = what stage-helper.yml enforces on the same state directory
+        mode: "0700"
+      when: fleet_update_playbook_stat.stat.exists
+
+    - name: "Install the daily fleet update cron entry"
+      ansible.builtin.cron:
+        name: "herdr fleet update"
+        minute: "30"
+        hour: "3"
+        job: >-
+          cd {{ fleet_update_ansible_dir | quote }} &&
+          PATH={{ fleet_update_cron_path | quote }}
+          flock -n {{ fleet_update_lock_file | quote }}
+          ansible-playbook -i {{ fleet_update_inventory | quote }} playbooks/fleet-update.yml
+          --vault-password-file {{ fleet_update_vault_password_file | quote }}
+          >> {{ fleet_update_log_file | quote }} 2>&1
+      become: false
+      when: fleet_update_playbook_stat.stat.exists

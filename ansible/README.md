@@ -11,11 +11,17 @@ ansible/
 │   ├── hosts.yml            # real inventory (private; NOT committed)
 │   ├── host_vars/           # per-host connection details (private; NOT committed)
 │   └── hosts.example.yml    # committed example (no connection secrets)
+├── files/
+│   └── fleet-update-state.py  # fleet-update decisions + state (main host)
 ├── playbooks/
-│   └── site.yml             # fleet bootstrap entry point
+│   ├── group_vars/all.yml   # herdr_pinned_version, fleet_pins, fleet-update cron paths
+│   ├── site.yml             # fleet bootstrap entry point
+│   └── fleet-update.yml     # daily fleet update, run from the main host
 ├── roles/
 │   ├── herdr_linux/         # Debian/Ubuntu baseline
-│   └── herdr_macos/         # Homebrew baseline
+│   ├── herdr_macos/         # Homebrew baseline
+│   ├── tailscale/           # tailnet install + join
+│   └── herdr_fleet_update/  # OS + herdr/pi/autospec updates, busy deferral
 └── README.md
 ```
 
@@ -89,6 +95,114 @@ and enables `tailscaled`; macOS uses the Homebrew `tailscale` formula.
 - **macOS is best-effort.** Install and join failures (no Homebrew, daemon/app
   not running, no key) are reported but never fail the play. Use
   `-e herdr_engineering_become=false` for the user-scoped brew path.
+
+## Fleet update (`playbooks/fleet-update.yml`, `roles/herdr_fleet_update`)
+
+Updates are **pushed from the main host** (`herdr_engineering_gateway_host`,
+`bender` today). Fleet hosts hold no repo access or credentials for this.
+`site.yml` installs a daily cron entry on the main host only
+(`tasks/fleet-update-cron.yml`); the play then runs against `herdr_fleet`.
+
+Per host, in order:
+
+1. **Busy check (control plane, read-only).** The host is busy if
+   `GET /api/v1/hosts/<id>` reports `latest.agents_running > 0`, or
+   `GET /api/v1/sessions?status=active` lists an active session whose
+   `host_id` is this host. The fabric agent does not report `agents_running`
+   today, so the sessions list is the signal that matters: if it cannot be read
+   (control plane down, 401, bad JSON) the busy state is **unknown** and the
+   host is deferred with result `deferred: busy state unknown`. It never updates
+   blind. `<id>` is `fleet_update_host_id`, default the `nodename` fact (what
+   the agent reports as `socket.gethostname()`), not the inventory alias; set
+   it per host if they differ.
+2. **Busy → defer.** No changes are made. `deferred_since` is recorded on the
+   first deferral and kept across runs. After `fleet_update_max_defer_days` (7)
+   the host still defers; nothing is forced. The control plane then shows
+   the "Updates deferred N d" Problem.
+3. **Not busy → update.** OS packages first. On Debian/Ubuntu,
+   `fleet_update_security_only: true` (the default) upgrades only packages
+   that `apt-get -s upgrade` lists from a `*-security` origin.
+   `fleet_update_security_only: false` runs a full `apt upgrade`. macOS runs
+   `brew update && brew upgrade`. Then the existing tasks run: the platform
+   role (herdr pinned-version check, pi presence, pi-engineering and autospec
+   clones), `tasks/fabric-agent.yml` (herdr-eng at the controller's revision),
+   `tasks/pi-build-gate.yml`, `tasks/pi-runtime.yml` (only with
+   `-e pi_engineering_revision=<sha>`) and `tasks/fabric-systemd.yml`. Only
+   after all of these succeed is the fabric agent restarted (systemd user unit,
+   or launchd `kickstart` on macOS). A failing step yields
+   `failed: <task name>`. Only the task name is recorded, never its output.
+4. **Always post** one host event (`POST /api/v1/ingest`, entity `host`,
+   event `host.fleet_update`). It carries `pins` (from `fleet_pins`, unset pins
+   omitted), the full `fleet_update` object
+   (`{last_updated, deferred_since, result}`; `last_updated` keeps the previous
+   value unless this run updated) and `maintenance`, which is sent every run
+   (`false` included), because the control plane keeps the old value when the
+   key is missing. It never sends `telemetry`, so the agent's samples are not
+   touched. If the control plane is unreachable, the run prints a warning and
+   the update still counts.
+
+State for step 2 lives on the main host in
+`~/.local/share/herdr-engineering/fleet-update-state.json` (keyed by host id,
+0600, written once per run under a lock). `--check` reads the control plane
+but writes neither the state file nor the event.
+
+**Pins** (`playbooks/group_vars/all.yml`): `fleet_pins.herdr` reuses
+`herdr_pinned_version`, the single herdr pin. `pi`, `autospec` and
+`pi_extensions` are empty (unpinned) until set. Write each value exactly as the
+host reports it. Pins are published so drift is judged against them. Enforced
+today: herdr-eng at the controller revision and the build-gate extension;
+pi-engineering only when a revision is passed. The herdr/pi/autospec pins are
+**report-only**: the existing install tasks only check presence and clone
+`main`.
+
+**Maintenance.** Set `maintenance: true` for a host in private inventory
+(`host_vars/<host>.yml`, see `inventory/hosts.example.yml`) to exempt it from
+stale alarms. Remove it, or set it to `false`, to clear the flag on the next
+run.
+
+**Force one host** (operator decision; this overrides both "agents running"
+and "busy state unknown"):
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/fleet-update.yml \
+  --vault-password-file ~/.config/herdr-engineering/ansible-vault-pass \
+  -e fleet_update_force=true -l beast
+```
+
+**Cron + Vault password file (main host).** `site.yml` installs the user
+crontab entry `herdr fleet update` (daily 03:30):
+
+```text
+cd <repo>/ansible && PATH=... flock -n ~/.local/share/herdr-engineering/fleet-update.lock \
+  ansible-playbook -i inventory/hosts.yml playbooks/fleet-update.yml \
+  --vault-password-file ~/.config/herdr-engineering/ansible-vault-pass \
+  >> ~/.local/share/herdr-engineering/fleet-update.log 2>&1
+```
+
+`flock -n` makes a run that would overlap a still-running one exit at once.
+The cron line names the Vault password **file** and never holds a secret.
+Ansible never creates that file. Create it once on the main host:
+
+```bash
+install -d -m 0700 ~/.config/herdr-engineering
+( umask 077; read -rs -p 'vault password: ' p; printf '%s\n' "$p" \
+    > ~/.config/herdr-engineering/ansible-vault-pass; unset p )
+chmod 0600 ~/.config/herdr-engineering/ansible-vault-pass
+```
+
+`site.yml` warns when the file is missing or not mode 0600. When the control
+plane runs with API keys, put an `ingest`/`operator` key in the Vault as
+`fleet_update_api_key`. It is sent as `X-API-Key`, and every HTTP task is
+`no_log`, so the key stays out of the log. Overridable paths are
+`fleet_update_ansible_dir` (the main host's checkout, which must exist; if it
+is missing the entry is skipped with a warning), `fleet_update_inventory`,
+`fleet_update_vault_password_file`, `fleet_update_log_file`,
+`fleet_update_lock_file` and `fleet_update_cron_path`.
+
+**What the host page shows.** The pins, the fleet-update result and
+"last updated", and these Problems: "Updates deferred N d" (deferred over 7
+d), "Last updated N d ago" (over 14 d), "Version differs from pin: ..."
+(versions vs pins), and none of the stale alarms while `maintenance` is true.
 
 ## Usage
 

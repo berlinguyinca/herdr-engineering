@@ -1,0 +1,211 @@
+---
+# Fleet update from the main host (spec section 4, herdr_fleet_update).
+#
+# Per host: decide busy -> defer (record deferred_since) or update (OS packages,
+# herdr/pi/extensions/autospec via the existing tasks, restart the fabric
+# agent) -> post one host event with pins + fleet_update + maintenance.
+#
+# Every control-plane call and the state file run on the main host
+# (delegate_to: localhost, become: false). GETs are reads and run in --check
+# too; the state write and the event POST never do. HTTP tasks are no_log
+# because they may carry the X-API-Key header and the cron log keeps output.
+# Pure decision logic: ansible/files/fleet-update-state.py (tested by
+# tests/test_fleet_update_state.py).
+
+# ---- 1. busy signal ---------------------------------------------------------
+- name: "Fleet update: read active sessions from the control plane (read-only)"
+  ansible.builtin.uri:
+    url: "{{ fleet_update_control_plane_url | regex_replace('/+$', '') }}/api/v1/sessions?status=active"
+    method: GET
+    headers: "{{ fleet_update_request_headers }}"
+    timeout: "{{ fleet_update_http_timeout }}"
+    status_code: [200]
+  register: fleet_update_sessions_probe
+  failed_when: false
+  check_mode: false
+  run_once: true
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: "Fleet update: read this host's control-plane record (read-only)"
+  ansible.builtin.uri:
+    url: "{{ fleet_update_control_plane_url | regex_replace('/+$', '') }}/api/v1/hosts/{{ fleet_update_host_id | urlencode }}"
+    method: GET
+    headers: "{{ fleet_update_request_headers }}"
+    timeout: "{{ fleet_update_http_timeout }}"
+    status_code: [200]
+  register: fleet_update_host_probe
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: "Fleet update: keep only status + body of the host probe"
+  ansible.builtin.set_fact:
+    fleet_update_probe:
+      id: "{{ fleet_update_host_id }}"
+      probe:
+        status: "{{ fleet_update_host_probe.status | default(-1) }}"
+        json: "{{ fleet_update_host_probe.json | default(none) }}"
+
+# ---- 2. decide ---------------------------------------------------------------
+- name: "Fleet update: Decide update vs defer per host"
+  ansible.builtin.command:
+    argv: [python3, "{{ fleet_update_helper }}", decide]
+    stdin: >-
+      {{ {'state_file': fleet_update_state_file,
+          'force': fleet_update_force | bool,
+          'max_defer_days': fleet_update_max_defer_days | int,
+          'sessions': {'status': fleet_update_sessions_probe.status | default(-1),
+                       'json': fleet_update_sessions_probe.json | default(none)},
+          'hosts': ansible_play_hosts | map('extract', hostvars, 'fleet_update_probe')
+                   | list | items2dict(key_name='id', value_name='probe')} | to_json }}
+  register: fleet_update_decide
+  changed_when: false
+  check_mode: false
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: "Fleet update: this host's decision"
+  ansible.builtin.set_fact:
+    fleet_update_decision: "{{ (fleet_update_decide.stdout | from_json)[fleet_update_host_id] }}"
+    fleet_update_outcome: deferred
+    fleet_update_reason: ""
+
+- name: "Fleet update: report the decision"
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} ({{ fleet_update_host_id }}): {{ fleet_update_verdict }}
+      | busy={{ fleet_update_decision.busy }}
+      | deferred_since={{ fleet_update_decision.deferred_since }}
+  vars:
+    fleet_update_verdict: >-
+      {{ ('update (forced)' if fleet_update_decision.forced else 'update')
+         if fleet_update_decision.action == 'update'
+         else 'deferred: ' ~ fleet_update_decision.reason }}
+
+- name: "Fleet update: record the deferral reason"
+  ansible.builtin.set_fact:
+    fleet_update_reason: "{{ fleet_update_decision.reason }}"
+  when: fleet_update_decision.action == 'defer'
+
+# ---- 3. update ---------------------------------------------------------------
+- name: "Update this host (OS packages, herdr, pi, extensions, autospec, agent)"
+  when: fleet_update_decision.action == 'update'
+  block:
+    - name: "Fleet update: OS packages"
+      ansible.builtin.include_tasks: os-packages.yml
+
+    # Existing roles own herdr/pi install: herdr pinned-version check, pi
+    # presence, pi-engineering + autospec clones.
+    - name: "Fleet update: herdr / pi / autospec via the platform role"
+      ansible.builtin.include_role:
+        name: "{{ 'herdr_linux' if ansible_facts['system'] == 'Linux' else 'herdr_macos' }}"
+
+    # herdr-eng (fabric agent) at the controller's exact revision.
+    - name: "Fleet update: herdr-eng + fabric agent release"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/fabric-agent.yml"
+
+    - name: "Fleet update: pi build-gate extension"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/pi-build-gate.yml"
+
+    - name: "Fleet update: pi-engineering runtime (when a revision is selected)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/pi-runtime.yml"
+      when: pi_engineering_revision is defined
+
+    - name: "Fleet update: converge fabric systemd units (Linux)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/fabric-systemd.yml"
+      when: ansible_facts['system'] == 'Linux'
+
+    - name: "Fleet update: Restart the fabric agent (systemd user unit)"
+      ansible.builtin.systemd:
+        name: herdr-eng-fabric-agent.service
+        state: restarted
+        scope: user
+      become: false
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+      when:
+        - fleet_update_restart_agent | bool
+        - ansible_facts['system'] == 'Linux'
+        - (herdr_eng_resolve.stdout | default('not-found') | trim) != 'not-found'
+
+    - name: "Fleet update: Restart the fabric agent (macOS launchd)"
+      ansible.builtin.command:
+        argv: [launchctl, kickstart, -k, "gui/{{ ansible_user_uid }}/com.herdr-engineering.fabric-agent"]
+      become: false
+      changed_when: true
+      when:
+        - fleet_update_restart_agent | bool
+        - ansible_facts['system'] == 'Darwin'
+
+    - name: "Fleet update: mark updated"
+      ansible.builtin.set_fact:
+        fleet_update_outcome: updated
+  rescue:
+    # Only the failed task's NAME: results/messages may contain secrets.
+    - name: "Fleet update: mark failed"
+      ansible.builtin.set_fact:
+        fleet_update_outcome: failed
+        fleet_update_reason: "{{ ansible_failed_task.name | default('unknown step') | truncate(100) }}"
+
+# ---- 4. record + publish -----------------------------------------------------
+- name: "Fleet update: Collect this host's report"
+  ansible.builtin.set_fact:
+    fleet_update_report:
+      id: "{{ fleet_update_host_id }}"
+      report:
+        outcome: "{{ fleet_update_outcome }}"
+        reason: "{{ fleet_update_reason }}"
+        maintenance: "{{ maintenance | default(false) | bool }}"
+        pins: "{{ fleet_pins | default({}) }}"
+        last_updated: "{{ fleet_update_decision.last_updated }}"
+        deferred_since: "{{ fleet_update_decision.deferred_since }}"
+
+- name: "Fleet update: Record results in the main host's state file"
+  ansible.builtin.command:
+    argv: [python3, "{{ fleet_update_helper }}", record]
+    stdin: >-
+      {{ {'state_file': fleet_update_state_file,
+          'dry_run': ansible_check_mode,
+          'hosts': ansible_play_hosts | map('extract', hostvars, 'fleet_update_report')
+                   | list | items2dict(key_name='id', value_name='report')} | to_json }}
+  register: fleet_update_record
+  changed_when: not ansible_check_mode
+  check_mode: false
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: "Fleet update: Post the fleet-update event to the control plane"
+  ansible.builtin.uri:
+    url: "{{ fleet_update_control_plane_url | regex_replace('/+$', '') }}/api/v1/ingest"
+    method: POST
+    headers: "{{ fleet_update_request_headers }}"
+    body_format: json
+    body: "{{ (fleet_update_record.stdout | from_json)[fleet_update_host_id] }}"
+    timeout: "{{ fleet_update_http_timeout }}"
+    status_code: [200, 201, 202]
+  register: fleet_update_post
+  failed_when: false
+  delegate_to: localhost
+  become: false
+  no_log: true
+  when: not ansible_check_mode
+
+- name: "Fleet update: Warn when the control plane refused the event"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: the control plane did not accept the fleet-update event for
+      {{ fleet_update_host_id }} (HTTP {{ fleet_update_post.status | default('n/a') }});
+      the update result is still recorded in {{ fleet_update_state_file }}.
+  when:
+    - not ansible_check_mode
+    - (fleet_update_post.status | default(-1) | int) not in [200, 201, 202]
+
+- name: "Fleet update: result"
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: {{ (fleet_update_record.stdout | from_json)[fleet_update_host_id].payload.fleet_update.result }}"

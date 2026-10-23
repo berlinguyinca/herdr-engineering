@@ -1,0 +1,41 @@
+---
+# Fleet update, run FROM THE MAIN HOST (herdr_engineering_gateway_host) against
+# the fleet (spec section 4, herdr_fleet_update). Daily from cron
+# (tasks/fleet-update-cron.yml, installed by site.yml); hosts hold no repo
+# access or credentials for this.
+#
+# Per host: busy (agents running / active sessions, from the control plane) ->
+# defer, up to fleet_update_max_defer_days (7), never forced without
+# fleet_update_force; otherwise OS packages (security-only by default), herdr,
+# pi, pi extensions, autospec, then restart the fabric agent. Every run posts a
+# host event with pins, fleet_update {last_updated, deferred_since, result} and
+# maintenance.
+#
+#   ansible-playbook -i inventory/hosts.yml playbooks/fleet-update.yml --check
+#   ansible-playbook -i inventory/hosts.yml playbooks/fleet-update.yml \
+#       --vault-password-file ~/.config/herdr-engineering/ansible-vault-pass
+#   # force one busy host (operator only):
+#   ansible-playbook -i inventory/hosts.yml playbooks/fleet-update.yml \
+#       -e fleet_update_force=true -l beast
+- name: "HerdR Engineering fleet update (from the main host)"
+  hosts: herdr_fleet
+  gather_facts: false
+  become: "{{ herdr_engineering_become | default((ansible_user | default(lookup('env', 'USER'), true)) != 'root') }}"
+  environment:
+    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_env.HOME | default('~', true) }}/.local/bin:{{ ansible_env.PATH | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
+  vars:
+    herdr_engineering_repo_root: "{{ playbook_dir }}/../.."
+    fabric_agent_gateway_url: "http://dev.lan:29999"
+  tasks:
+    - name: "Gather facts as the connection user (no become)"
+      ansible.builtin.setup:
+      become: false
+
+    - name: "Record the fleet user's home + uid for paths/ownership"
+      ansible.builtin.set_fact:
+        fleet_home: "{{ ansible_env.HOME }}"
+        fleet_user: "{{ ansible_user_id }}"
+
+    - name: "Update the host or defer it while agents run"
+      ansible.builtin.include_role:
+        name: herdr_fleet_update

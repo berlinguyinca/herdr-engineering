@@ -1,0 +1,35 @@
+---
+# Fleet-wide defaults for every playbook in this directory (site.yml,
+# fleet-update.yml, ...). Playbook-adjacent group_vars load whatever inventory is
+# passed with -i; private inventory group_vars/host_vars override them.
+# No secrets here: secrets come from Ansible Vault (inventory/group_vars/herdr_fleet/vault.yml).
+
+# The ONE herdr pin. Used by roles/herdr_linux + roles/herdr_macos and published
+# to the control plane as pins.herdr by playbooks/fleet-update.yml.
+herdr_pinned_version: "0.9.1"
+
+# Versions the fleet is pinned to. Published to the control plane on every
+# fleet-update run so version drift is judged against these, not the fleet
+# majority. Write each value exactly as the host reports it (`pi --version`,
+# `autospec --version`, an extension's package.json version). An empty value
+# means "not pinned": it is not published and never shows as drift.
+fleet_pins:
+  herdr: "{{ herdr_pinned_version }}"
+  pi: ""
+  autospec: ""
+  # name -> version, e.g. {pi-engineering: "1.4.0"}. Single-file extensions
+  # (build-gate.ts) have no version; do not pin them.
+  pi_extensions: {}
+
+# ---- fleet update cron on the main host (tasks/fleet-update-cron.yml) -------
+# The repo's ansible/ directory ON THE MAIN HOST; cron runs from it. Defaults to
+# the checkout site.yml runs from; override when converging from another machine.
+fleet_update_ansible_dir: "{{ herdr_engineering_repo_root | realpath }}/ansible"
+# Inventory path, relative to fleet_update_ansible_dir (or absolute).
+fleet_update_inventory: "inventory/hosts.yml"
+# 0600 file holding the Ansible Vault password. Created by the operator, never by
+# Ansible; the cron line only names the path.
+fleet_update_vault_password_file: "{{ fleet_home }}/.config/herdr-engineering/ansible-vault-pass"
+fleet_update_log_file: "{{ fleet_home }}/.local/share/herdr-engineering/fleet-update.log"
+fleet_update_lock_file: "{{ fleet_home }}/.local/share/herdr-engineering/fleet-update.lock"
+fleet_update_cron_path: "{{ fleet_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin"

@@ -1,0 +1,43 @@
+---
+# herdr_fleet_update role defaults (host telemetry + fleet provisioning, spec
+# section 4). The play runs from the MAIN host (herdr_engineering_gateway_host)
+# against the fleet; every control-plane call and the state file are on the main
+# host (delegate_to: localhost). Pins live in playbooks/group_vars/all.yml.
+
+# OS packages: security updates only (apt: packages whose candidate comes from a
+# *-security origin). Set false for a full `apt upgrade`. macOS always runs
+# `brew update && brew upgrade` (Homebrew has no security-only channel).
+fleet_update_security_only: true
+
+# A busy host is deferred, never forced; after this many days the control plane
+# shows the "updates deferred" Problem. Nothing is forced without
+# fleet_update_force (operator, per run: -e fleet_update_force=true -l beast).
+fleet_update_max_defer_days: 7
+# true overrides "agents running" AND "busy state unknown" (operator decision).
+fleet_update_force: false
+
+# Inventory flag: exempt the host from stale alarms. Sent explicitly on every
+# run (the control plane keeps the old value when the key is missing).
+maintenance: false
+
+# Control plane (tailnet URL, not a secret). Defaults to the fabric gateway URL
+# the playbook defines.
+fleet_update_control_plane_url: "{{ fabric_agent_gateway_url }}"
+# Control-plane X-API-Key (role ingest or operator) when the control plane runs
+# with API keys. NEVER here or in Git: Ansible Vault
+# (inventory/group_vars/herdr_fleet/vault.yml). Empty = no header (open mode).
+fleet_update_api_key: ""
+fleet_update_request_headers: "{{ {'X-API-Key': fleet_update_api_key} if (fleet_update_api_key | length) > 0 else {} }}"
+fleet_update_http_timeout: 10
+
+# Host id on the control plane. The fabric agent reports
+# entity_id = socket.gethostname(), which is the nodename fact, NOT the
+# inventory alias (e.g. `mac`). Override per host only if they differ.
+fleet_update_host_id: "{{ ansible_facts['nodename'] }}"
+
+# Per-host deferral/last-update state on the main host (controller user).
+fleet_update_state_file: "{{ lookup('env', 'HOME') }}/.local/share/herdr-engineering/fleet-update-state.json"
+fleet_update_helper: "{{ role_path }}/../../files/fleet-update-state.py"
+
+# Restart the fabric agent once every update step succeeded.
+fleet_update_restart_agent: true
