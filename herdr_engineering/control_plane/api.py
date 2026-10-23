@@ -711,14 +711,14 @@ def _make_handler(server, public=False, operator=False):
                 return self._operator()
             if public:
                 return self._public()
-            if self._is_collab_path():
-                return self._collab()
             # Unambiguous framing, as on the public/operator listeners: this server reads
             # only Content-Length, so a chunked or doubly-sized body would be parsed as
-            # the next request on a keep-alive connection.
+            # the next request on a keep-alive connection. Applies to collab paths too.
             if (len(self.headers.get_all("Content-Length") or []) > 1
                     or "Transfer-Encoding" in self.headers):
                 return self._deny(400, "ambiguous request framing")
+            if self._is_collab_path():
+                return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
             # The ingest route is reachable by the ingest role; every other

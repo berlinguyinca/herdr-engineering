@@ -307,3 +307,39 @@ def test_ordinary_resume_still_works_after_framing_rejections(gate_server):
     escalate(gate_server)
     raw_exchange(gate_server, _post_head("Transfer-Encoding: chunked\r\n") + b"0\r\n\r\n")
     assert request(gate_server, RESUME, {}, key="write", method="POST")[0] == 200
+
+
+@pytest.fixture
+def collab_server():
+    import hashlib
+
+    from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
+    digest = hashlib.sha256(b"tok-alice-0123456789").hexdigest()
+    svc = CollabService(StaticTokenAuthenticator({"alice": digest}))
+    server = ControlPlaneServer(ControlPlaneRepo(), collab=svc, api_keys={"read": "viewer"})
+    start(server)
+    yield server
+    server.shutdown()
+
+
+def _collab_head(extra):
+    return ("POST /api/v1/collab/projects HTTP/1.1\r\nHost: x\r\n"
+            "Authorization: Bearer tok-alice-0123456789\r\nContent-Type: application/json\r\n"
+            f"{extra}\r\n").encode()
+
+
+def test_chunked_collab_post_is_rejected_with_one_response(collab_server):
+    chunk = b"%x\r\n" % len(SMUGGLED) + SMUGGLED + b"\r\n0\r\n\r\n"
+    data = raw_exchange(collab_server, _collab_head("Transfer-Encoding: chunked\r\n") + chunk)
+    assert _responses(data) == 1 and b" 400 " in data.split(b"\r\n")[0]
+
+
+def test_duplicate_content_length_collab_post_is_rejected(collab_server):
+    data = raw_exchange(collab_server, _collab_head("Content-Length: 0\r\nContent-Length: 5\r\n") + SMUGGLED)
+    assert _responses(data) == 1 and b" 400 " in data.split(b"\r\n")[0]
+
+
+def test_ordinary_collab_post_still_works(collab_server):
+    body = b'{"name": "proj"}'
+    data = raw_exchange(collab_server, _collab_head(f"Content-Length: {len(body)}\r\n") + body)
+    assert _responses(data) == 1 and b" 201 " in data.split(b"\r\n")[0]
