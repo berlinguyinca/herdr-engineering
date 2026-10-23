@@ -281,6 +281,26 @@ test('focus keys round-trip to a selector for every control kind', () => {
   assert.equal(focusSelector('nonsense:x'), null);
 });
 
+test('a form submit button keeps keyboard focus across a redraw (T16: focus was dropped after Post comment / Propose)', () => {
+  const form = (name, id) => ({ getAttribute: (k) => ({ 'data-wb-form': name, 'data-wb-id': id }[k] ?? null) });
+  const submit = (f) => ({ getAttribute: (k) => (k === 'type' ? 'submit' : null), closest: (sel) => (sel === '[data-wb-form]' ? f : null) });
+  assert.equal(focusKey(submit(form('comment', null))), 'wbs:comment:');
+  assert.equal(focusSelector('wbs:comment:'), '[data-wb-form="comment"] button[type="submit"]');
+  assert.equal(focusKey(submit(form('edit', 'c9'))), 'wbs:edit:c9');
+  assert.equal(focusSelector('wbs:edit:c9'), '[data-wb-form="edit"][data-wb-id="c9"] button[type="submit"]');
+  assert.equal(focusKey({ getAttribute: (k) => (k === 'type' ? 'submit' : null), closest: () => null }), null);
+});
+
+test('a graph the server cut off says so and offers no Load more (T16: it used to look complete)', () => {
+  const base = { graphAll: sample(), filtered: { ...sample(), match: new Set() }, asOf: { step: 5, visible_events: 5, head: true }, filters: { types: new Set(), edgeTypes: new Set() }, total: 3000, mode: 'visual', view: 'graph' };
+  const more = renderLineage({ ...base, graphTruncated: 'scan_budget', graphMore: true });
+  assert.match(more, /data-more/);
+  const last = renderLineage({ ...base, graphTruncated: 'scan_budget', graphMore: false });
+  assert.doesNotMatch(last, /data-more/);
+  assert.match(last, /server stopped reading here/);
+  assert.doesNotMatch(renderLineage({ ...base, graphTruncated: null }), /stopped reading/);
+});
+
 test('an error still renders the replay controls and a Retry button; no false "will be retried" claim', () => {
   const html = renderLineage({ graphAll: { nodes: [], edges: [] }, filtered: { nodes: [], edges: [], match: new Set() }, asOf: { step: 3, visible_events: 5, head: false }, error: 'Could not load the lineage. Press Retry, or choose Live.', filters: { types: new Set(), edgeTypes: new Set() } });
   assert.match(html, /data-replay="live"/);

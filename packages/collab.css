@@ -1,6 +1,13 @@
 /* HerdR Collaboration: page styles on top of the shared design tokens (theme.css/base.css).
  * Same look as the dashboard: white cards on a light grey ground, green accent, Inter. */
 .cx-page { color-scheme: light dark; }
+/* WCAG 1.4.3 (T16 UI gate): the shared light tokens in theme.css give 3.2:1 for muted text and for white-on-accent
+ * (below 4.5:1). Darker values for this page only; the dashboard theme is untouched. Dark mode sets its own below. */
+.cx-page, .cx-embed {
+  --accent: #0a7358; --accent-hover: #085f49;
+  --text-secondary: #55556a; --text-muted: #686880;
+  --status-attention: #b45309; --status-blocked: #c2410c;
+}
 @media (prefers-color-scheme: dark) {
   .cx-page {
     --background: #14161a; --surface: #1c1f26; --surface-2: #272b34; --surface-hover: #232730;
@@ -161,7 +168,7 @@
 .cx-taskcard__head span { color: var(--tc); font-weight: 600; text-transform: uppercase; font-size: .6875rem; letter-spacing: .04em; }
 .cx-taskcard__head time { margin-left: auto; color: var(--text-muted); font-size: .75rem; }
 .cx-event { align-self: center; margin: 6px 0; font-size: .75rem; color: var(--text-muted); background: var(--surface-2); padding: 2px 10px; border-radius: 999px; }
-.cx-jump { position: absolute; right: 18px; bottom: 96px; box-shadow: var(--shadow-lg, 0 4px 12px rgba(0,0,0,.2)); z-index: 2; }
+.cx-jump { position: absolute; right: 18px; bottom: 96px; box-shadow: var(--shadow-lg, 0 4px 12px rgba(0,0,0,.2)); z-index: 10; }
 .cx-jump[hidden] { display: none; }
 .cx-compose { display: flex; gap: 10px; align-items: flex-end; padding: 12px 14px 4px; border-top: 1px solid var(--border-subtle); background: var(--surface); }
 .cx-compose-msg { padding: 2px 16px 10px; background: var(--surface); }
@@ -169,7 +176,7 @@
 .cx-ac-wrap textarea { width: 100%; box-sizing: border-box; resize: none; max-height: 180px; line-height: 1.4; border-radius: 12px; }
 .cx-ac { position: absolute; left: 0; bottom: calc(100% + 6px); min-width: min(320px, 100%); max-width: 100%; margin: 0; padding: 4px; list-style: none;
   background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,.25));
-  max-height: 240px; overflow-y: auto; z-index: 5; }
+  max-height: 240px; overflow-y: auto; z-index: 10; }
 .cx-ac[hidden] { display: none; }
 .cx-ac li { display: flex; justify-content: space-between; gap: 14px; align-items: baseline; padding: 7px 10px; border-radius: 7px; cursor: pointer; }
 .cx-ac li span { color: var(--text-muted); font-size: .75rem; }
@@ -201,6 +208,7 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-flow-edge { cursor: pointer; opacity: 0.85; transition: stroke-width 0.3s; }
 .cx-flow-edge--live { stroke-dasharray: 7 6; animation: cx-flow-move 0.9s linear infinite; }
 .cx-flow-pulse { animation: cx-flow-pulse 1.2s ease-out 1; }
+.cx-still .cx-flow-edge--live, .cx-still .cx-flow-pulse { animation: none; }
 @keyframes cx-flow-move { to { stroke-dashoffset: -26; } }
 @keyframes cx-flow-pulse { 0% { opacity: 1; filter: drop-shadow(0 0 6px currentColor); } 100% { opacity: 0.85; } }
 @media (prefers-reduced-motion: reduce) { .cx-flow-edge--live, .cx-flow-pulse { animation: none; } .cx-log { scroll-behavior: auto; } }
@@ -360,3 +368,7 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .ctx-consult, .ctx-link { border-top: 1px solid var(--hd-border, currentColor); padding-top: 8px; }
 .ctx-inbox { border: 1px solid var(--hd-border, currentColor); border-radius: 8px; padding: 8px; }
 @media (prefers-reduced-motion: reduce) { .ctx-chip { transition: none; } }
+
+/* Long unbroken labels (ids, URLs) must wrap inside inspector link lists instead of widening the page at 320px. */
+.cx-list li .hd-btn { white-space: normal; overflow-wrap: anywhere; text-align: left; max-width: 100%; height: auto; }
+.cx-list li code { overflow-wrap: anywhere; }

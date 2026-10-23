@@ -7,7 +7,7 @@ import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
 import { decisionBody, delegationBody, renderDelegations, renderProposalList, renderReview } from './collab-proposals.js';
 import {
-  filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
+  MAX_RENDER_NODES, filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
 } from './collab-lineage.js';
 import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
 import { ackBody, renderAnalytics, renderInbox as renderAttention, renderProgress, restoreBody, snoozeBody } from './collab-attention.js';
@@ -89,6 +89,25 @@ const GUIDE = `<div class="hd-card">
     <li>The agent can then <b>list rooms, read messages and post</b> as you, in those rooms only. It cannot run commands on your machine through this connection, and everything it reads from others is marked untrusted.</li>
     <li><b>Revoke</b> it here any time; it stops working immediately. Credentials expire after 30 days.</li>
   </ol></div>`;
+
+// Replacing a container's markup drops keyboard focus to <body> when the focused control is rebuilt (WCAG 2.4.3, 3.2.1).
+// stableSelector() names the control by id / data attribute; refocus() finds its replacement, or parks focus on the
+// container itself so a keyboard user keeps their place instead of restarting from the top of the page.
+export function stableSelector(el) {
+  if (!el || !el.tagName) return null;
+  const q = (v) => String(v).replace(/["\\]/g, '\\$&');
+  if (el.id) return `#${CSS.escape(el.id)}`;
+  const data = [...el.attributes].find((a) => a.name.startsWith('data-') && a.name !== 'data-h');
+  if (data) return `${el.tagName.toLowerCase()}[${data.name}="${q(data.value)}"]`;
+  if (el.type === 'submit' && el.closest('form')) { const f = el.closest('form'); const fd = [...f.attributes].find((a) => a.name.startsWith('data-')); if (fd) return `form[${fd.name}="${q(fd.value)}"] button[type="submit"]`; }
+  return null;
+}
+export function refocus(container, selector) {
+  let target = null;
+  try { target = selector ? container.querySelector(selector) : null; } catch { target = null; }
+  if (!target) { if (!container.hasAttribute('tabindex')) container.setAttribute('tabindex', '-1'); target = container; }
+  target.focus({ preventScroll: true });
+}
 
 export function mountCollab(root, { fabricSessions = null } = {}) {
   ensureConversationStyles(root.ownerDocument);
@@ -569,7 +588,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         ${canPost ? '<div id="hcn-ctx-attached" class="ctx-attached" aria-live="polite"></div><div id="hcn-composer"></div>'
         : '<div class="cx-msg" style="padding:12px">Read-only access.</div>'}
       </section>
-      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
+      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span><button type="button" id="hcn-flow-still" class="hd-btn hd-btn--ghost hd-btn--sm" aria-pressed="false">Pause motion</button></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
       <section class="cx-panel cx-cols" id="hcn-p-tasks" hidden>
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Give a task</div><form id="hcn-task" class="cx-stack"><label class="cx-field">To<select name="target" id="hcn-task-target"></select></label><label class="cx-field">What should it do?<textarea class="cx-input" name="text" required maxlength="4000" rows="4"></textarea></label><button class="hd-btn" type="submit">Send task</button><span id="hcn-task-msg" class="cx-msg" role="alert"></span></form></div>' : ''}
         <div class="hd-card cx-stack"><div class="hd-card__title">Tasks</div><div id="hcn-tasks"></div></div></section>
@@ -620,6 +639,15 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
           <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div></section>` : ''}`, strip);
 
+    const stillBtn = $('hcn-flow-still');      // WCAG 2.2.2: moving lines run for longer than 5 s, so they can be paused
+    if (stillBtn) {
+      stillBtn.onclick = () => {
+        const on = stillBtn.getAttribute('aria-pressed') !== 'true';
+        stillBtn.setAttribute('aria-pressed', String(on));
+        stillBtn.textContent = on ? 'Resume motion' : 'Pause motion';
+        $('hcn-p-flow').classList.toggle('cx-still', on);
+      };
+    }
     const log = $('hcn-log');
     let alive = true;
     let composer = null;
@@ -638,7 +666,10 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       const el = $(id);
       if (!el || el.dataset.h === html) return false;
       if (el.contains(document.activeElement) && document.activeElement.matches('input,textarea,select')) { stale.add(id); return false; }
+      const had = el.contains(document.activeElement) && document.activeElement !== el ? document.activeElement : null;
+      const again = had ? stableSelector(had) : null;
       el.dataset.h = html; el.innerHTML = html; stale.delete(id);
+      if (had && !el.contains(document.activeElement)) refocus(el, again);
       return true;
     };
     root.addEventListener('focusout', () => setTimeout(() => { if (stale.size && alive) paint(); }, 0));
@@ -980,7 +1011,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       return { graphAll, filtered, asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, queued: LIN.pending !== null, notice: LIN.notice, busy: LIN.busy, view: LIN.view,
         mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, total: LIN.total,
         workbench: LIN.sel ? renderWorkbench(wbModel()) + renderContextPanel(ctxModel()) : '',
-        graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
+        graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : (LIN.truncated || null), graphMore: LIN.next !== null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
     };
     async function loadWorkbench(keep = false) {
       const node = LIN.sel;
@@ -1104,16 +1135,26 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       else if (!force && !LIN.at && !LIN.busy) { loadLineage(); return; }
       if (!CTX.busy && Date.now() - CTX.at > 15000) { CTX.at = Date.now(); loadContext(); }
       const m = linModel();
-      LIN.layout = layoutGraph(m.filtered);
+      // the layout feeds the SVG's arrow-key navigation only; above the draw cap there is no SVG, and laying out thousands of
+      // nodes on every keystroke of the filter box cost 0.5-2.4 s per key (T16 large-graph gate)
+      LIN.layout = m.filtered.nodes.length <= MAX_RENDER_NODES && LIN.mode !== 'table' ? layoutGraph(m.filtered) : null;
       const html = renderLineage(m);
       drawConsults();
       if (LIN.html === html && box.innerHTML !== '') return;
       const a = document.activeElement;
-      const key = a && box.contains(a) ? focusKey(a) : null;
-      const pos = key && typeof a.selectionStart === 'number' ? a.selectionStart : null;
+      let key = a && box.contains(a) ? focusKey(a) : null;
+      // While a request is in flight the controls are drawn disabled and a disabled control cannot keep focus, so remember
+      // where focus was when the wait began and give it back when the answer is drawn (keyboard users keep their place).
+      const waiting = Boolean(WB.busy || LIN.busy);
+      if (waiting && !LIN.wasWaiting) LIN.waitFocus = key;
+      if (!waiting && LIN.wasWaiting && !key && (!a || a === document.body) && LIN.waitFocus) key = LIN.waitFocus;
+      if (!waiting) LIN.waitFocus = null;
+      LIN.wasWaiting = waiting;
+      const pos = key && a && box.contains(a) && typeof a.selectionStart === 'number' ? a.selectionStart : null;
       LIN.html = html; box.innerHTML = html;
       const sel = key && focusSelector(key);
       const el = sel && box.querySelector(sel);
+      if (key && !el) refocus(box, null);                                  // the control is gone (e.g. "Confirm and send"): park focus on the panel
       if (el) { el.focus({ preventScroll: true }); if (pos !== null && el.setSelectionRange && (el.type === 'search' || el.type === 'textarea' || el.type === 'text')) try { el.setSelectionRange(pos, pos); } catch { /* not selectable */ } }
     }
     function bindLineage(box) {
@@ -1164,7 +1205,13 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           return;
         }
         const f = e.target.dataset.filter;
-        if (f === 'q') { LIN.filters.q = e.target.value; drawLineage(true); }
+        if (f === 'q') {
+          LIN.filters.q = e.target.value;
+          // Above the draw cap one redraw rebuilds thousands of table rows: coalesce a burst of keystrokes into one redraw so
+          // typing itself stays responsive. Small graphs redraw at once, as before.
+          const loaded = LIN.pages.reduce((n, p) => n + ((p && p.nodes) || []).length, 0);
+          if (loaded > MAX_RENDER_NODES) { clearTimeout(LIN.qTimer); LIN.qTimer = setTimeout(() => { if (alive) drawLineage(true); }, 250); } else drawLineage(true);
+        }
         else if (e.target.dataset.replay === 'slider') {
           const out = box.querySelector('.lin-replay__status');
           if (out) out.textContent = `Position ${e.target.value} of ${e.target.max}. Release to load.`;

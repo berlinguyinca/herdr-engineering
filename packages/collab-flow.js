@@ -93,7 +93,7 @@ const sig = (e) => `${e.state}:${e.total}:${e.last}`;
 export function renderFlow(box, flow, { onNode, onEdge, prev = new Map() } = {}) {
   const lay = layoutFlow(flow);
   const next = new Map(lay.edges.map((e) => [e.key, sig(e)]));
-  const edgeSvg = lay.edges.map((e) => `<path class="cx-flow-edge${e.spawn ? ' cx-flow-edge--spawn' : ''}${e.live ? ' cx-flow-edge--live' : ''}${prev.size && prev.get(e.key) !== next.get(e.key) ? ' cx-flow-pulse' : ''}" data-edge="${esc(e.key)}" d="${e.d}" fill="none" stroke="${STATUS_COLOR[e.state]}" stroke-width="${e.width.toFixed(1)}" stroke-linecap="round"><title>${esc(e.spawn ? 'started under this agent (same herdr tab)' : Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}</title></path>`).join('');
+  const edgeSvg = lay.edges.map((e) => `<path class="cx-flow-edge${e.spawn ? ' cx-flow-edge--spawn' : ''}${e.live ? ' cx-flow-edge--live' : ''}${prev.size && prev.get(e.key) !== next.get(e.key) ? ' cx-flow-pulse' : ''}" data-edge="${esc(e.key)}" tabindex="0" role="button" aria-label="${esc(e.spawn ? 'Agent started under another agent' : `Tasks: ${Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', ')}`)}" d="${e.d}" fill="none" stroke="${STATUS_COLOR[e.state]}" stroke-width="${e.width.toFixed(1)}" stroke-linecap="round"><title>${esc(e.spawn ? 'started under this agent (same herdr tab)' : Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}</title></path>`).join('');
   const nodeSvg = lay.nodes.map((n) => {
     const fam = n.kind === 'agent' ? (FAMILY_COLOR[n.family] || 'var(--text-muted, #888)') : 'var(--accent, #1f7ae0)';
     const live = n.fabric && n.fabric.status === 'active';
@@ -107,12 +107,16 @@ export function renderFlow(box, flow, { onNode, onEdge, prev = new Map() } = {})
       <text x="24" y="27" class="cx-flow-sub">${esc(clip(sub, 26))}</text>
       <title>${esc(n.fabric?.display_name || n.name)}</title></g>`;
   }).join('');
-  box.innerHTML = `<div class="cx-flow-scroll"><svg class="cx-flow" viewBox="0 0 ${lay.width} ${lay.height}" width="${lay.width}" height="${lay.height}" role="img" aria-label="Flow of tasks between people and agents">${lay.idleLabel ? `<text x="${lay.idleLabel.x}" y="${lay.idleLabel.y}" class="cx-flow-sub">${esc(lay.idleLabel.text)}</text>` : ''}${edgeSvg}${nodeSvg}</svg></div>`;
+  box.innerHTML = `<div class="cx-flow-scroll"><svg class="cx-flow" viewBox="0 0 ${lay.width} ${lay.height}" width="${lay.width}" height="${lay.height}" role="group" aria-label="Flow of tasks between people and agents">${lay.idleLabel ? `<text x="${lay.idleLabel.x}" y="${lay.idleLabel.y}" class="cx-flow-sub">${esc(lay.idleLabel.text)}</text>` : ''}${edgeSvg}${nodeSvg}</svg></div>`;
   box.querySelectorAll('[data-node]').forEach((el) => {
     const act = () => onNode && onNode(lay.nodes.find((n) => n.id === el.dataset.node));
     el.onclick = act;
     el.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); act(); } };
   });
-  box.querySelectorAll('[data-edge]').forEach((el) => { el.onclick = () => onEdge && onEdge(lay.edges.find((e) => e.key === el.dataset.edge)); });
+  box.querySelectorAll('[data-edge]').forEach((el) => {            // a task line opens its detail: keyboard users get the same (WCAG 2.1.1)
+    const act = () => onEdge && onEdge(lay.edges.find((e) => e.key === el.dataset.edge));
+    el.onclick = act;
+    el.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); act(); } };
+  });
   return next;
 }

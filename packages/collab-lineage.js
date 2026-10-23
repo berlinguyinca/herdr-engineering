@@ -260,7 +260,11 @@ export function renderGraphSvg(graph, layout, { sel = null, focus = null, match 
 
 // The same data as plain tables (the text alternative; also the view for very large graphs).
 export function renderGraphTable(graph, { sel = null } = {}) {
-  const deg = layoutGraph({ nodes: graph.nodes.slice(0, MAX_TABLE_ROWS), edges: graph.edges }).degree;
+  const deg = new Map(graph.nodes.slice(0, MAX_TABLE_ROWS).map((n) => [n.id, { in: 0, out: 0 }]));       // degrees only: no layout needed for a table
+  for (const e of graph.edges) {
+    if (deg.has(e.from_id)) deg.get(e.from_id).out += 1;
+    if (deg.has(e.to_id)) deg.get(e.to_id).in += 1;
+  }
   const nrows = graph.nodes.slice(0, MAX_TABLE_ROWS).map((n) => {
     const look = stateLook(n.state);
     const d = deg.get(n.id) || { in: 0, out: 0 };
@@ -334,6 +338,8 @@ export function focusKey(el) {
   if (wf !== null) return wf === 'action' ? `wbf:action:${attr(el, 'value')}` : `wbf:${wf}:`;
   const wa = attr(el, 'data-wb-act');
   if (wa !== null) return `wba:${wa}:${attr(el, 'data-wb-id') || ''}`;
+  // a form's submit button (Post comment, Propose, Save edit) is rebuilt with the form after the request completes
+  if (attr(el, 'type') === 'submit' && el.closest) { const form = el.closest('[data-wb-form]'); if (form) return `wbs:${attr(form, 'data-wb-form')}:${attr(form, 'data-wb-id') || ''}`; }
   return null;
 }
 export function focusSelector(key) {
@@ -350,6 +356,7 @@ export function focusSelector(key) {
     case 'retry': return '[data-retry]';
     case 'filter': { const [name, ...val] = rest; return val.join(':') ? `[data-filter="${q(name)}"][value="${q(val.join(':'))}"]` : `[data-filter="${q(name)}"]`; }
     case 'wbf': { const [name, ...val] = rest; return val.join(':') ? `[data-wb-field="${q(name)}"][value="${q(val.join(':'))}"]` : `[data-wb-field="${q(name)}"]`; }
+    case 'wbs': { const [form, ...id] = rest; return `[data-wb-form="${q(form)}"]${id.join(':') ? `[data-wb-id="${q(id.join(':'))}"]` : ''} button[type="submit"]`; }
     case 'wba': { const [act, ...id] = rest; return id.join(':') ? `[data-wb-act="${q(act)}"][data-wb-id="${q(id.join(':'))}"]` : `[data-wb-act="${q(act)}"]`; }
     default: return null;
   }
@@ -539,10 +546,17 @@ export function renderLineage(m) {
   }
   if (!a.nodes.length && !m.timeline) return `${renderReplay(m.asOf, { busy: m.busy, queued: m.queued })}${notice(m)}<div class="hd-empty">No lineage is shown for this room yet. Lineage appears only from recorded events you are allowed to see.</div>`;
   const view = m.filtered;
-  const layout = layoutGraph(view);
+  // Above the draw cap there is no SVG (renderGraphSvg answers with a message), so do not lay out thousands of nodes on every redraw.
+  const layout = view.nodes.length <= MAX_RENDER_NODES ? layoutGraph(view) : null;
   const graphPane = m.mode === 'table' ? renderGraphTable(view, { sel: m.sel })
     : `<div class="cx-scroll lin-scroll" role="region" tabindex="0" aria-label="Lineage graph">${renderGraphSvg(view, layout, { sel: m.sel, focus: m.focus, match: view.match })}</div>`;
-  const trunc = m.graphTruncated ? `<p class="cx-msg" role="status">Showing ${a.nodes.length} of ${m.total} nodes (${esc(m.graphTruncated)}). <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-more="1">Load more</button></p>` : '';
+  // `graphMore === false` is the last page the server will give: it stopped reading (e.g. scan_budget) and more nodes may exist.
+  // Say so; staying silent made a cut-off graph look complete (T16 large-graph gate).
+  const trunc = m.graphTruncated
+    ? (m.graphMore === false
+      ? `<p class="cx-msg" role="status">Showing ${a.nodes.length} nodes (${esc(m.graphTruncated)}). The server stopped reading here, so more nodes may exist that this view cannot load.</p>`
+      : `<p class="cx-msg" role="status">Showing ${a.nodes.length} of ${m.total} nodes (${esc(m.graphTruncated)}). <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-more="1">Load more</button></p>`)
+    : '';
   const gantt = m.timeline ? buildGantt(m.timeline, { clock: m.clock, types: m.filters.types }) : null;
   const tab = (k, l) => `<button type="button" role="tab" class="cx-stab" data-view="${k}" aria-selected="${m.view === k}" tabindex="${m.view === k ? 0 : -1}">${l}</button>`;
   const body = m.view === 'gantt'
