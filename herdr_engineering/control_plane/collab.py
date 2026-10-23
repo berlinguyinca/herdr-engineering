@@ -31,6 +31,7 @@ from typing import Any, Protocol
 from . import collab_delegation as dlg
 from . import collab_external as ext
 from . import ids
+from .collab_workbench import WorkbenchMixin
 from .redact import redact_text
 
 SCHEMA_VERSION = 1
@@ -228,7 +229,7 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService:
+class CollabService(WorkbenchMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -264,6 +265,9 @@ class CollabService:
         self.max_rooms_per_project = max_rooms_per_project
         self.max_members_per_room = max_members_per_room
         self.max_log_events = max_log_events
+        # lineage replay for a member starts at their join time ("since_join", default) or covers the whole
+        # room history ("full"). Operator YAML: control_plane.collab.replay_history.
+        self.replay_history = "since_join"
         self.guest_ttl = guest_ttl
         self.default_grant_ttl = default_grant_ttl
         self.max_streams = max_streams_per_principal
@@ -324,6 +328,7 @@ class CollabService:
         self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
         self._msg_room: dict[str, str] = {}                  # message event id -> room id
         self.stats = defaultdict(int)
+        self._init_workbench()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -436,6 +441,8 @@ class CollabService:
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
+        if self._apply_workbench(ev):
+            return
         if t == "external_usage_reserved":
             k = (p["scope"], p["key"])
             self._usage_reserved[k] = max(self._usage_reserved[k], int(p["reserved"]))
@@ -446,7 +453,8 @@ class CollabService:
         elif t == "room_created":
             self._rooms[p["room_id"]] = {
                 "id": p["room_id"], "project_id": p["project_id"], "name": p["name"], "created_by": p["actor_user_id"],
-                "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq}},
+                "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq,
+                                                 "joined_at": p.get("created_at")}},
                 "grants": {}}
         elif t == "user_registered":
             self._users[p["user_id"]] = {"status": p["status"], "since": p["at"], "decided_by": p.get("decided_by"),
@@ -456,7 +464,8 @@ class CollabService:
             u.update(status=p["status"], decided_by=p["decided_by"], decided_at=p["at"], reason=p.get("reason"))
         elif t == "member_added":
             self._rooms[p["room_id"]]["members"][p["subject_user_id"]] = {
-                "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq}
+                "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq,
+                "joined_at": p.get("created_at")}
         elif t == "member_removed":
             room = self._rooms[p["room_id"]]
             room["members"].pop(p["subject_user_id"], None)
@@ -2865,6 +2874,8 @@ class CollabService:
         principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
         contexts = None
         room_id = query.get("room_id")
+        if parts[:1] == ["lineage"]:
+            return self._lineage_read(pr, graph, access, parts[1:], query)
         if parts == ["nodes"]:
             # a listing is always ONE room's view (its own scope plus the missions it linked that this person
             # belongs to), so its cost never depends on other rooms' data
@@ -2880,6 +2891,72 @@ class CollabService:
             raise CollabError(404, "not found") from None
         except ValueError as exc:
             raise CollabError(400, str(exc)) from None
+
+    def _lineage_read(self, pr: Principal, graph, access: dict, parts: list[str], query: dict) -> dict:
+        """T09 read-only lineage views of ONE room: ``lineage`` (graph, optionally as of a replay position),
+        ``lineage/timeline`` (Gantt data) and ``lineage/events`` (the reader's visible ledger). They sit behind
+        the same access snapshot, the same fail-closed 404 and the same per-room context as the node listing;
+        a replay is filtered by the reader's membership AT THIS REQUEST, never the membership of the past."""
+        from .graph import EDGE_TYPES, NODE_TYPES
+        room_id = query.get("room_id")
+        if room_id is None:
+            raise CollabError(400, "room_id is required")
+        if room_id not in access["rooms"]:
+            raise CollabError(404, "not found")
+        contexts = frozenset({("room", room_id, None), *(("mission", m, r) for r, m in access["room_missions"]
+                                                         if r == room_id)})
+        principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
+        since = None
+        if self.replay_history == "since_join":
+            with self._lock:
+                joined = ((self._rooms.get(room_id) or {}).get("members", {}).get(pr.id) or {}).get("joined_at")
+            try:
+                since = datetime.fromisoformat(joined).timestamp()
+            except (TypeError, ValueError):
+                since = self._now()        # no recorded join time: fail closed, history starts now
+
+        def num(name, default):
+            raw = query.get(name)
+            if raw in (None, ""):
+                return default
+            if not re.fullmatch(r"[0-9]{1,9}", str(raw)):          # ASCII digits only, bounded
+                raise CollabError(400, f"{name} must be a non-negative integer")
+            return int(raw)
+
+        def token(name):
+            raw = query.get(name)
+            if raw in (None, ""):
+                return None
+            if not re.fullmatch(r"[0-9a-f]{32}", str(raw)):
+                raise CollabError(400, f"{name} is not a valid page token")
+            return str(raw)
+
+        def kinds(name, allowed):
+            raw = query.get(name)
+            if not raw:
+                return None
+            got = {x for x in str(raw).split(",") if x}
+            if not got or not got <= allowed:
+                raise CollabError(400, f"unknown {name}")
+            return got
+        step = num("step", None)
+        at = query.get("at") or None
+        with self._lock:                # a replay rebuilds the past: bound how often one person can ask
+            self._throttle(f"lineage:{pr.id}", 240, 60.0, "lineage")
+        try:
+            if parts == []:
+                return graph.room_lineage(principal, contexts, step=step, at=at, since=since,
+                                          node_types=kinds("node_types", NODE_TYPES),
+                                          edge_types=kinds("edge_types", EDGE_TYPES),
+                                          limit=num("limit", 200), offset=num("offset", 0))
+            if parts == ["timeline"]:
+                return graph.room_timeline(principal, contexts, step=step, at=at, since=since)
+            if parts == ["events"]:
+                return graph.room_ledger(principal, contexts, cursor=token("cursor"), limit=num("limit", 200),
+                                         since=since)
+        except ValueError as exc:
+            raise CollabError(400, str(exc)) from None
+        raise CollabError(404, "not found")
 
     def list_room_missions(self, pr: Principal, room_id: str) -> dict:
         self._require_user(pr)
@@ -3852,6 +3929,14 @@ class CollabService:
                         return 200, self.list_proposals(pr, rid)
                     if n == 4 and parts[2] == "proposals":
                         return 200, self.get_proposal(pr, rid, parts[3])
+                    if parts[2:] == ["comments"]:
+                        return 200, self.list_comments(pr, rid, query)
+                    if n == 5 and parts[2] == "comments" and parts[4] == "history":
+                        return 200, self.comment_history(pr, rid, parts[3])
+                    if parts[2:] == ["steering"]:
+                        return 200, self.list_steering(pr, rid, query)
+                    if parts[2:] == ["steering", "target"]:
+                        return 200, self.steering_target(pr, rid, str(query.get("node_id", "")))
                     if parts[2:] == ["flow"]:
                         return 200, self.room_flow(pr, rid)
                     if parts[2:] == ["workspaces"]:
@@ -3972,13 +4057,23 @@ class CollabService:
                         return 201, self.create_delegation(pr, rid, body)
                     if n == 5 and parts[2] == "proposals" and parts[4] == "decide":
                         return 200, self.decide_proposal(pr, rid, parts[3], body)
+                    if parts[2:] == ["comments"]:
+                        return self.add_comment(pr, rid, body)
+                    if n == 5 and parts[2] == "comments" and parts[4] in ("edit", "retract"):
+                        return 200, self.revise_comment(pr, rid, parts[3], parts[4], body)
+                    if parts[2:] == ["steering"]:
+                        return self.propose_steering(pr, rid, body)
+                    if n == 5 and parts[2] == "steering" and parts[4] == "confirm":
+                        return 200, self.confirm_steering(pr, rid, parts[3], body)
+                    if n == 5 and parts[2] == "steering" and parts[4] == "reject":
+                        return 200, self.reject_steering(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":
                         return 200, self.cancel_task(pr, rid, parts[3])
                     if parts[2:] == ["messages"]:
                         return self.post_message(pr, rid, body)
             raise CollabError(404, "not found")
         except CollabError as exc:
-            return exc.status, ({"error": exc.message, "code": exc.code} if exc.code else {"error": exc.message})
+            return exc.status, {"error": exc.message, **({"code": exc.code} if exc.code else {}), **getattr(exc, "extra", {})}
 
 
 def _finite_expiry(exp: Any, now: float) -> float | None:

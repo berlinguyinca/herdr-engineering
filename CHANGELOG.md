@@ -15,6 +15,18 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   role is spelled `external` or `collab` is given principal kind `unknown`, never those service-only kinds. See `docs/operations/bounded-delegation.md` and the T11 addendum of the HCN threat model.
 - Rollback: `delegation_enabled: false`, or revert the PR.
 
+### Lineage graph, Gantt timeline and replay (T09, stacked on #167, #165, #164)
+- Room workbench: new read-only "Lineage" panel (`packages/collab-lineage.js`): layered lineage graph, Gantt timeline with
+  head-change and stale markers, replay scrubber, filters and node inspector, each with a table alternative; keyboard
+  operable; nothing encoded by colour alone; all ids and labels escaped.
+- New read routes `GET /api/v1/collab/graph/lineage[/timeline|/events]` (room_id required, same membership 404, budgets, 240/min per person).
+  Replay at a position equals the live projection at that point and never shows what the reader cannot see now.
+  No migration, no new table (derived from the stored lineage events). See `docs/contracts/lineage-events.md` ("T09").
+- Replay is per room (a busy room cannot break another's), visibility is scanned in 128-event chunks so viewers do not stall
+  ingest, member responses no longer carry the global `admission` counter, the ledger window is counted in the reader's own visible events (exact steps, opaque page tokens), and the new
+  operator YAML `control_plane.collab.replay_history` (`since_join` default | `full`) sets how far back a member may replay.
+- Rollback: revert the PR (code only).
+
 ### Tabs/panes and membership-scoped lineage (T08, stacked on #165 and #164)
 - Lineage `room`/`mission` scopes now resolve to HCN membership: an event that names its `room_id` / `mission_id`
   (and optionally `workspace_id`) is readable by that room's non-guest members / that mission's listed members (T07),

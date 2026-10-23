@@ -530,6 +530,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="approval mode: any pool account may sign in and ask to join, and nothing works until "
                          "an approver or the operator approves it; --collab-cognito-group members are approved "
                          "on sight instead of being required")
+    p2.add_argument("--collab-replay-history", default=None, choices=["full", "since_join"],
+                    help="lineage replay window for members (default since_join; normally set by "
+                         "control_plane.collab.replay_history in the fleet config)")
     p2.add_argument("--collab-approver-group", action="append", default=[],
                     help="Cognito group whose members may approve new people (repeatable; approval mode)")
     p2.add_argument("--collab-public-port", type=int, default=None,
@@ -2454,6 +2457,20 @@ def _cmd_cp_web(args) -> int:
                              "existing state; refusing to start empty over an existing log")
         collab = CollabService(StaticTokenAuthenticator(users), sink=sink,
                                delegation_enabled=_delegation_switch(args, cp))
+    if collab is not None:
+        history = getattr(args, "collab_replay_history", None) or "since_join"
+        if history not in ("full", "since_join"):
+            raise SystemExit("control_plane.collab.replay_history must be 'full' or 'since_join'")
+        collab.replay_history = history
+        # T12: comments and steering. Settings are YAML only (no flag or env), and when a fleet file is in use the
+        # service re-reads them per request, so editing `kill_switch: true` takes effect without a restart.
+        from .control_plane.collab_workbench import normalize_steering
+        collab.steering = normalize_steering(getattr(args, "collab_steering", None))
+        if fleet_store is not None:
+            def _steering_from_yaml(_store=fleet_store):
+                section = _store.current().section("control_plane")
+                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("steering")
+            collab.steering_source = _steering_from_yaml
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
@@ -2531,6 +2548,8 @@ COLLAB_CONFIG_KEYS = {
     "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
     # T11 kill switch: bounded task delegation + artifact proposals. Default false = the feature does not exist.
     "delegation_enabled": ("collab_delegation_enabled", bool),
+    "replay_history": ("collab_replay_history", str),     # lineage replay: since_join (default) | full
+    "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
 }
 
 
@@ -2553,6 +2572,13 @@ def _apply_collab_config(args, cp) -> None:
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be a list of strings")
             if not getattr(args, dest):
                 setattr(args, dest, list(value))
+        elif kind is dict:
+            from .control_plane.collab_workbench import normalize_steering
+            try:
+                normalize_steering(value)
+            except ValueError as exc:
+                raise SystemExit(f"fleet config {exc}") from None
+            setattr(args, dest, dict(value))
         elif kind is bool:
             if not isinstance(value, bool):
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be true or false")

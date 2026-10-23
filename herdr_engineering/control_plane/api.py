@@ -38,6 +38,8 @@ from .redact import redact_payload
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
+# T12: the one POST an ingest key may make besides /api/v1/ingest: acknowledging a steering request addressed to it.
+_STEER_ACK = re.compile(r"^/api/v1/steering/[^/]+/ack$")
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
 # back to "dev" in a local checkout / un-stamped image.
 _COMMIT = os.environ.get("HERDR_ENGINEERING_COMMIT", "dev")
@@ -478,6 +480,7 @@ _PUBLIC_STATIC = {
     "/collab-links.js": ("collab-links.js", "text/javascript"),
     "/collab-tabs.js": ("collab-tabs.js", "text/javascript"),
     "/collab-proposals.js": ("collab-proposals.js", "text/javascript"),
+    "/collab-lineage.js": ("collab-lineage.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
     "/conversation-markdown.js": ("conversation-markdown.js", "text/javascript"),
@@ -750,14 +753,14 @@ def _make_handler(server, public=False, operator=False):
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
-            if path.startswith(("/api/v1/ci/", "/api/v1/reviews")):
+            if path.startswith(("/api/v1/ci/", "/api/v1/reviews")) or _STEER_ACK.match(path):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin integration mutation refused")
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
-            min_role = ("ingest" if path == "/api/v1/ingest"
+            min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path)
                        else "operator")
             err = self._require(min_role)
             if err:
@@ -1162,6 +1165,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "not found"}, 404)
             if resource == "graph":
                 return self._graph_get(parts)
+            if resource == "steering":
+                return self._steering(parts)
             if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
                 return self._json({"sources": r.ledger.source_states(), "server_time": r._stamp()})
             if resource == "ingest":
@@ -1282,6 +1287,8 @@ def _make_handler(server, public=False, operator=False):
                     if isinstance(exc, HerdrEngineeringError):
                         return self._json({"error": exc.message}, exc.http_status)
                     raise
+            if resource == "steering":
+                return self._steering(parts, body)
             if resource == "reviews":
                 from .reviews import ReviewService
                 reviews = ReviewService(r)
@@ -1387,6 +1394,32 @@ def _make_handler(server, public=False, operator=False):
                     if changed and r.get_session(sid) is not None:
                         server.agent_summaries.request(sid)
                 return self._json({"ok": True, "entity": entity})
+            return self._json({"error": "not found"}, 404)
+
+        def _steering(self, parts, body=None):
+            """T12 delivery to the emitter that owns a steering target (keyed API; no browser, no HCN credential).
+            ``GET /api/v1/steering/pending`` returns confirmed requests pinned to THIS key's graph principal;
+            ``POST /api/v1/steering/<id>/ack`` reports what it did. Absent in collab-only mode (no graph)."""
+            service = server.collab
+            if service is None or server.collab_only or service.graph_source is None:
+                return self._json({"error": "not found"}, 404)
+            principal = self._principal()
+            if principal.get("authenticated_by") != "api_key":
+                return self._json({"error": "steering delivery needs an authenticated API key; "
+                                            "an open listener has no principal to pin a request to",
+                                   "code": "authentication_required"}, 403)
+            who = principal.get("id")
+            inst = _q(self.path, "instance_id")
+            if inst is not None and not re.fullmatch(r"[A-Za-z0-9._:\-]{1,128}", inst):
+                return self._json({"error": "invalid instance_id"}, 400)
+            from .collab import CollabError
+            try:
+                if body is None and parts[4:] == ["pending"]:
+                    return self._json(service.steering_pending(who, inst))
+                if body is not None and len(parts) == 6 and parts[5] == "ack":
+                    return self._json(service.steering_ack(who, parts[4], body, inst))
+            except CollabError as exc:
+                return self._json({"error": exc.message, **getattr(exc, "extra", {})}, exc.status)
             return self._json({"error": "not found"}, 404)
 
         def _graph_get(self, parts):

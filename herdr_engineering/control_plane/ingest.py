@@ -202,6 +202,7 @@ class IngestService:
             "room_id": env.get("room_id"), "mission_id": env.get("mission_id"),
             "workspace_id": env.get("workspace_id"),
             "actor": env.get("actor"), "ingest_timestamp": env["received_at"],
+            "source_timestamp": env["occurred_at"] or env["received_at"],
             "lineage_seq": env.get("lineage_seq"), "lineage_mode": env.get("lineage_mode")})
         return {"entity_type": "lineage", "entity_id": entity_id, "event_type": event_type}
 
