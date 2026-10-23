@@ -1,5 +1,5 @@
-# Example user unit (not installed by anything). It runs as the operator, whose `gh` login posts the status and
-# whose codex login does the review: install it as a --user unit.
+# Example user unit (not installed by anything). It runs as the operator: the operator's `gh` login posts the
+# status, and the gateway key comes from the operator's ~/.pi/agent/models.json. Install it as a --user unit.
 #   cp deploy/ci-review/herdr-ai-review.{service,timer} ~/.config/systemd/user/
 #   systemctl --user daemon-reload && systemctl --user enable --now herdr-ai-review.timer
 #   loginctl enable-linger "$USER"     # so the timer runs while you are logged out
@@ -13,4 +13,5 @@ Type=oneshot
 ExecStart=/usr/bin/python3 %h/IdeaProjects/herdr-engineering/deploy/ci-review/ai-review.py poll --config %h/.config/herdr-engineering/ai-review.yaml
 TimeoutStartSec=3h
 UMask=0077
-# not PrivateTmp/ProtectHome: the sandbox needs ~/herdr-agents/work, the gh and codex logins, and a user scope
+# not ProtectHome: the script reads the gh login and ~/.pi/agent/models.json
+NoNewPrivileges=yes
