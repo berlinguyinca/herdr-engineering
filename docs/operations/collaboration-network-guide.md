@@ -478,6 +478,10 @@ agent, host and port.
   sees 403.
 * Unanswered requests stop counting after 24 h; a room can have at most 60 open.
 * **External hosts** lists every host a room may reach, with **Remove** (this also ends live approvals).
+* Removing a host, or an approval running out, also cuts tunnels that are **already open**: the runner rewrites
+  each running helper's allow file on its next watch, and the helper's proxy checks its open tunnels against that
+  file every 2 s (`--recheck`) and closes those no longer allowed (a name whose listed private address went is
+  cut too). A tunnel with no traffic either way for 15 minutes is closed as well (`HELPER_TUNNEL_IDLE`).
 * Approvals are **per room**: every helper in the room can use an approved host.
 
 Only the operator decides **host-access requests**: the room owner, the agent and the helper all get 404 on these

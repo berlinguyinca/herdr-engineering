@@ -4,7 +4,9 @@
   serve --sock PATH --allow-file PATH --secrets-file PATH --services-file PATH --log PATH
       Host side. Listens on a unix socket that is bound into the box. Two kinds of request:
         * CONNECT host:port   a TLS tunnel, only to a host:port listed in the allow file (one `host:port` per line,
-                              `[v6]:port` for IPv6, `#` comments). The list is re-read on every connection. An
+                              `[v6]:port` for IPv6, `#` comments). The list is re-read on every connection, and
+                              every --recheck seconds for the tunnels already open: a tunnel whose host:port (or
+                              whose listed internal address) left the list is closed at once. An
                               unlisted target gets 403 and a JSON line {"host","port","ts"} appended to --log, which
                               the runner turns into a host-access request. The proxy resolves the name itself and
                               refuses loopback, link-local, private, CGNAT, multicast and other non-global addresses
@@ -248,6 +250,30 @@ class Server:
         self.open = 0
         self.svc_active = 0
         self.svc_bytes = 0
+        self.tunnels: dict = {}                          # id -> (host, port, dialled ip, box side, upstream side)
+
+    def still_allowed(self, host, port, ip, allow) -> bool:
+        """The CONNECT rule, again: the target is listed, and a non-global address it reached is listed too."""
+        return (host, port) in allow and (not forbidden(ip) or (ip, port) in allow)
+
+    def recheck(self) -> int:
+        """Close every open tunnel the allow file no longer permits (Remove, an expired approval). Returns how many."""
+        allow = read_allow(self.a.allow_file)
+        cut = 0
+        for host, port, ip, w1, w2 in list(self.tunnels.values()):
+            if not self.still_allowed(host, port, ip, allow):
+                for w in (w1, w2):
+                    w.transport.abort()
+                cut += 1
+        return cut
+
+    async def recheck_loop(self):
+        while True:
+            await asyncio.sleep(self.a.recheck)
+            try:
+                self.recheck()
+            except Exception as e:                       # never let a bad allow file stop the checks
+                print(f"collab-egress: recheck failed: {type(e).__name__}", file=sys.stderr)
 
     async def handle(self, reader, writer):
         if self.open >= self.a.max_conns:
@@ -310,7 +336,7 @@ class Server:
             infos = await resolve(host, port)
         except (TimeoutError, OSError):
             return reply(writer, 502, "Bad Gateway", b"cannot resolve host\n")
-        upstream, permitted = None, 0
+        upstream, permitted, dialled = None, 0, None
         for family, _, _, _, sockaddr in infos:
             ip = sockaddr[0]
             if forbidden(ip) and (str(ipaddress.ip_address(ip)), port) not in allow:
@@ -318,6 +344,7 @@ class Server:
             permitted += 1
             try:
                 upstream = await asyncio.wait_for(dial(ip, sockaddr[1], family=family), CONNECT_TIMEOUT)
+                dialled = str(ipaddress.ip_address(ip.split("%", 1)[0]))
                 break
             except (TimeoutError, OSError):
                 continue
@@ -330,9 +357,12 @@ class Server:
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
         activity = [time.monotonic()]
+        key = object()
+        self.tunnels[key] = (host, port, dialled, writer, uw)
         try:
             await asyncio.gather(pipe(reader, uw, self.a.idle_timeout, activity), pipe(ur, writer, self.a.idle_timeout, activity))
         finally:
+            self.tunnels.pop(key, None)
             await close(uw)
 
     async def svc(self, reader, writer, method, target, headers):
@@ -529,8 +559,13 @@ async def serve(args):
     finally:
         os.umask(old)
     os.chmod(args.sock, 0o600)
-    async with server:
-        await server.serve_forever()
+    checker = asyncio.create_task(srv.recheck_loop()) if args.recheck > 0 else None
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        if checker is not None:
+            checker.cancel()
 
 
 # --- the relay inside the box ---
@@ -572,6 +607,8 @@ def main(argv=None):
     s.add_argument("--head-timeout", type=float, default=10, help="seconds to send the request head (default 10)")
     s.add_argument("--idle-timeout", type=float, default=0,
                    help="close a tunnel after this many seconds with no traffic either way; 0 = never (default)")
+    s.add_argument("--recheck", type=float, default=2.0,
+                   help="seconds between checks of the open tunnels against the allow file; 0 = never (default 2)")
     r = sub.add_parser("relay")
     r.add_argument("--sock", required=True)
     r.add_argument("--listen", required=True)
