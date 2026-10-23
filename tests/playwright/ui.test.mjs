@@ -169,7 +169,8 @@ test('activity uses compact expandable rows without hiding event detail', async 
 
 test('activity uses wide space for filters, repetition summary, and keyboard-selected detail', async () => {
   await withApp(async ({page,base}) => {
-    const types=['MissionStarted','HostHeartbeat','MissionStarted','ServiceRegistered','MissionStarted','HostHeartbeat','ExceptionallyLongUnbrokenActivityEventTypeThatMustWrapAtMobileWidth'];
+    const longType='ExceptionallyLongUnbrokenActivityEventTypeThatMustWrapAtMobileWidth';
+    const types=['MissionStarted','HostHeartbeat','MissionStarted','ServiceRegistered','MissionStarted','HostHeartbeat',longType,longType];
     const events=types.map((event_type,index)=>({
       event_id:`wide-event-${index}`,
       event_type,
@@ -189,6 +190,7 @@ test('activity uses wide space for filters, repetition summary, and keyboard-sel
     assert.ok(desktop.width>3200,`activity workspace should use the 4K canvas, got ${desktop.width}`);
     assert.match(await page.locator('[data-event-filter="MissionStarted"]').innerText(),/3/);
     assert.match(await page.locator('[data-repeat-type="MissionStarted"]').innerText(),/3/);
+    assert.match(await page.locator(`[data-repeat-type="${longType}"]`).innerText(),/2/);
     assert.deepEqual(await page.locator('.ac-row').evaluateAll(rows=>rows.map(row=>row.dataset.eventId)),events.map(event=>event.event_id),'filtering must not reorder the chronological source stream');
 
     await page.locator('[data-event-filter="MissionStarted"]').focus();
@@ -209,9 +211,15 @@ test('activity uses wide space for filters, repetition summary, and keyboard-sel
     assert.equal(await page.locator('.ac-row[data-event-id="wide-event-0"]').isVisible(),true,'selected detail should reconcile to an event that remains visible');
     await page.locator('[data-event-filter="all"]').click();
 
-    for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:1200,height:900},{width:1150,height:900},{width:1101,height:900},{width:768,height:1024},{width:390,height:844}]){
+    for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:1301,height:900},{width:1200,height:900},{width:1150,height:900},{width:1101,height:900},{width:901,height:900},{width:768,height:1024},{width:390,height:844}]){
       await page.setViewportSize(viewport);
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`activity overflowed at ${viewport.width}px`);
+      if([1301,901,390].includes(viewport.width)){
+        assert.equal(await page.locator(`[data-repeat-type="${longType}"]`).evaluate(row=>{
+          const label=row.querySelector('span');
+          return row.scrollWidth<=row.clientWidth&&label.scrollWidth<=label.clientWidth;
+        }),true,`repeated long event type should wrap without displacing its count at ${viewport.width}px`);
+      }
       if(viewport.width===390){
         assert.equal(await page.locator('.ac-row summary').evaluateAll(rows=>rows.every(row=>{
           const box=row.getBoundingClientRect();
