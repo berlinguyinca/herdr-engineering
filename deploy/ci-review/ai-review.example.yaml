@@ -1,0 +1,43 @@
+# ai-review.py configuration. Copy to ~/.config/herdr-engineering/ai-review.yaml and pass it with --config.
+# Every key is optional; these are the defaults unless marked "example". Unknown keys are refused.
+# No secrets belong here: gh uses its own login, the reviewer uses its own (~/.codex/auth.json, copied per run).
+
+repos:                                   # example: what `poll` watches when no --repo is given
+  - berlinguyinca/herdr-engineering
+
+state_dir: ~/.local/state/herdr-ai-review   # locks, per-run private files (the login copy, the proxy's files)
+work_area: ~/herdr-agents/work              # collab-sandbox.sh only accepts workdirs under here
+
+# The author's model family when no commit has a Co-Authored-By trailer naming a model.
+author_default_family: claude
+
+reviewer:
+  family: codex                          # must differ from every author family found in the PR's commit trailers
+  label: codex                           # how the status names the reviewer, e.g. "codex gpt-5.5"
+  # A shell string run INSIDE the sandbox, prompt on stdin. Add `-m MODEL` here to pin a model (and say so in
+  # label). The prompt and the diff never go into this string.
+  command: >-
+    codex exec --skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral --color never
+    -s read-only --output-schema verdict.schema.json -o verdict.json -
+  verdict_file: verdict.json             # "" = parse the command's stdout instead
+  timeout_s: 1800                        # per chunk
+  login_dir: ""                          # "" = ~/.codex for codex; only auth.json is copied into the box
+
+sandbox:
+  network: egress                        # egress: only the hosts below, through collab-egress.py; host: open network
+  egress_allow: []                       # [] = the family default: chatgpt.com:443, api.openai.com:443,
+                                         # auth.openai.com:443 for codex (UNVERIFIED; see README)
+  checkout: true                         # a read-only checkout of the head SHA, shown to the reviewer
+  checkout_max_mb: 300
+
+chunk_bytes: 60000                       # diff bytes per reviewer run; files stay together, big files split by hunk
+skip_globs: ["*.lock", "package-lock.json", "pnpm-lock.yaml", "go.sum", "*.min.js", "*.map", "dist/*",
+             "vendor/*", "node_modules/*", "*.png", "*.jpg", "*.pdf", "*.zip", "*.gz", "*.sif"]   # example (shortened)
+post_pending: true                       # "Review running" for the pinned SHA while it works
+keep_workdir: false                      # true keeps the run's files (and the proxy's blocked.jsonl) for debugging
+visual_review: false                     # there is no visual step; true is refused
+
+poll:
+  pending_stale_minutes: 120             # a pending status older than this (a crashed run) is reviewed again
+  max_per_run: 10
+  skip_drafts: false
