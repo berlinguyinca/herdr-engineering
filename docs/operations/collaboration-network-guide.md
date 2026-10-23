@@ -422,7 +422,7 @@ fields are refused.
 | Families | which harnesses helpers may use: `claude-code`, `codex`, `pi`, `agent`. Empty means no helpers. |
 | Allowed models | ids the model picker may choose from (empty = any in the catalogue) |
 | Helpers may use tools | off by default; also needs `--allow-tools` on the runner |
-| Always-allowed hosts | `host:port` lines (at most 50), stored in canonical form (`a.org:0443` becomes `a.org:443`). These skip operator approval; loopback, private, link-local, CGNAT and other non-public IP literals and `localhost` names are refused (400) |
+| Always-allowed hosts | `host:port` or `[IPv6]:port` lines (at most 50), stored in canonical form (`a.org:0443` becomes `a.org:443`). These skip operator approval; loopback, private, link-local, CGNAT and other non-public IP literals and `localhost` names are refused (400) |
 | Services | `name \| https upstream URL \| header \| secret name`: the egress proxy adds the header with the secret's value, so the helper calls `$SVC_<NAME>_URL` and never holds the key. The upstream must be a public host name or address: loopback, private, link-local and other non-public IP literals and `localhost` names are refused (400). The key is attached only when the upstream's host is the host the operator bound the secret to (`--host`, below) |
 | SSH key names | secret names copied into the helper's `~/.ssh` (read-only) |
 | `spend_tokens_per_day` | stored, but **not enforced yet** (see *Residual risks*) |
@@ -456,6 +456,10 @@ proxy tunnels only the room's allowlist:
 * unexpired approvals;
 * each family's model endpoint, which is always on the list: `api.anthropic.com:443`, `api.openai.com:443`
   and `llm.metabolomics.us:443`.
+
+Hosts are `name:port`, `IPv4:port` or a bracketed IPv6 literal `[2001:db8::1]:port`, always in canonical form
+(lowercase, `0443` becomes `443`, IPv6 in its short spelling, no zone id), in requests, approvals, the profile
+and the proxy's allow file alike.
 
 Names are resolved on the host side, and a name that resolves only to private or loopback addresses is refused
 unless that exact address is listed. The same holds for a service's upstream (`/svc/...`): the proxy resolves the

@@ -90,7 +90,7 @@ PROFILE_LIMIT_DEFAULTS = {"live_per_agent": 3, "depth": 2, "per_hour": 20}   # a
 MAX_PROFILE_HOSTS = 50
 MAX_PROFILE_SERVICES = 20
 MAX_PROFILE_NAMES = 50
-_PROFILE_HOST = re.compile(r"[a-z0-9.-]+:\d{1,5}", re.ASCII)
+_PROFILE_HOST = re.compile(r"(?:[a-z0-9.-]+|\[[0-9A-Fa-f:.]{2,45}\]):\d{1,5}", re.ASCII)   # name, IPv4 or [IPv6]
 _EGRESS_HOST = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", re.ASCII)
 _NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*", re.ASCII)   # a last label like this makes a name an IPv4 address
 _PROFILE_SECRET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", re.ASCII)   # a NAME that refers to a host file, never a value
@@ -1741,10 +1741,19 @@ class CollabService:
 
     @staticmethod
     def _egress_host_port(host: Any, port: Any) -> str:
+        """`host:port` in canonical form: a lowercase name or IPv4 address, or a bracketed IPv6 literal
+        (`[2001:db8::1]:443`, canonical spelling, no zone id), the form the egress proxy's allow file reads."""
         if (not isinstance(host, str) or isinstance(port, bool) or not isinstance(port, int)
-                or not 1 <= port <= 65535 or len(host) > 253 or not _EGRESS_HOST.fullmatch(host)):
+                or not 1 <= port <= 65535 or len(host) > 253):
             raise CollabError(400, "invalid host or port")
-        return f"{host}:{port}"
+        if host.startswith("[") and host.endswith("]") and "%" not in host:
+            try:
+                return f"[{ipaddress.IPv6Address(host[1:-1])}]:{port}"
+            except ValueError:
+                pass
+        elif _EGRESS_HOST.fullmatch(host):
+            return f"{host}:{port}"
+        raise CollabError(400, "invalid host or port")
 
     def _egress_live(self, room_id: str, now: float) -> set[str]:
         return {r["host_port"] for r in self._egress.values()
@@ -3190,6 +3199,7 @@ def _profile_strings(v: Any, field: str, rx: re.Pattern | None, limit: int, maxl
 def _internal_host(host: str) -> bool:
     """A name or IP literal that points into the runner host or its network (not globally routable)."""
     h = host.lower().rstrip(".")
+    h = h[1:-1] if h.startswith("[") and h.endswith("]") else h
     if h == "localhost" or h.endswith(".localhost") or h.startswith("localhost."):
         return True
     try:
@@ -3197,8 +3207,15 @@ def _internal_host(host: str) -> bool:
     except ValueError:
         # a name whose last label is a number is an IPv4 address in another spelling (2130706433, 0x7f.1, 127.1)
         return bool(_NUMERIC_LABEL.fullmatch(h.rsplit(".", 1)[-1]))
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        # an IPv4 address carried inside IPv6 (mapped, 6to4, Teredo, NAT64) counts as that address, as in the proxy
+        nat64 = ip in ipaddress.ip_network("64:ff9b::/96")
+        inner = ip.ipv4_mapped or ip.sixtofour or (ip.teredo[1] if ip.teredo else None) \
+            or (ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF) if nat64 else None)
+        if inner is not None and _internal_host(str(inner)):
+            return True
+        if ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
     return not ip.is_global or ip.is_multicast or ip.is_unspecified or ip.is_loopback or ip.is_link_local
 
 
@@ -3256,9 +3273,9 @@ def _normalize_profile(body: Any) -> dict:
         # the proxy sends the bound key from the runner host: the same host rule as host requests, and never a
         # name or address inside the runner host's network (the proxy also checks what the name resolves to)
         try:
-            CollabService._egress_host_port(u.hostname, u.port or 443)
+            CollabService._egress_host_port(f"[{u.hostname}]" if ":" in u.hostname else u.hostname, u.port or 443)
         except CollabError:
-            raise CollabError(400, "upstream_url needs a plain host name or IPv4 address") from None
+            raise CollabError(400, "upstream_url needs a plain host name, IPv4 address or [IPv6] address") from None
         if _internal_host(u.hostname):
             raise CollabError(400, "upstream_url may not name loopback, private or link-local addresses")
         if any(x["name"] == name for x in services):

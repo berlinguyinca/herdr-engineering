@@ -1171,7 +1171,8 @@ class Runner:
                 e = None
             if isinstance(e, dict) and isinstance(e.get("host"), str) and isinstance(e.get("port"), int) \
                     and "suppressed" not in e:
-                key = f"{e['host']}:{e['port']}"
+                host = f"[{e['host']}]" if ":" in e["host"] else e["host"]     # IPv6: the service's [addr] form
+                key = f"{host}:{e['port']}"
                 if e.get("reason") == "forbidden-address":
                     if key not in forbidden and len(forbidden) < MAX_EGRESS_ASKS:
                         forbidden.append(key)
@@ -1179,7 +1180,7 @@ class Runner:
                     try:
                         self.api("POST", "fleet/egress/request", {"room_id": st.get("room_id"),
                                                                   "agent_id": st.get("agent_id"),
-                                                                  "host": e["host"], "port": e["port"]})
+                                                                  "host": host, "port": e["port"]})
                     except Failure:
                         break                             # the service is unreachable: this line again next cycle
                     asked.append(key)

@@ -3,6 +3,8 @@
 the pause in the audit log, what guests and agents see, and the successor hand-over (service side)."""
 from __future__ import annotations
 
+import pytest
+
 from herdr_engineering.control_plane import collab
 from tests.control_plane.test_collab_helpers import ask, run, w  # noqa: F401
 from tests.control_plane.test_collab_tasks import USERS, code, svc  # noqa: F401
@@ -49,3 +51,35 @@ def test_agents_have_no_rest_route_to_helpers(w):
     auth = f"Agent {info['credential']}"
     for method, parts in (("GET", ["helpers"]), ("GET", ["helpers", "x"]), ("POST", ["helpers", "x", "cancel"])):
         assert w.s.dispatch(method, parts, {}, {}, auth, info["device_id"])[0] == 404
+
+
+# ------------------------------------------------------------------ IPv6 hosts (review item 9)
+V6 = "2606:4700:4700::1111"                    # a global address
+
+
+def test_a_bracketed_ipv6_host_can_be_requested_approved_and_reaches_the_allowlist(w):
+    r = w.s.request_egress(w.op, w.room, "a1", f"[{V6.upper()}]", 443)
+    assert r["host_port"] == f"[{V6}]:443"
+    w.s.decide_egress(w.op, r["id"], "approve")
+    assert f"[{V6}]:443" in w.s.egress_allowlist(w.room)
+    assert w.s.request_egress(w.op, w.room, "a1", f"[{V6}]", 443)["state"] == "allowed"
+    out = w.s.promote_egress(w.op, w.room, f"[{V6}]:443")
+    assert f"[{V6}]:443" in out["permanent_hosts"]
+    assert f"[{V6}]:443" not in w.s.remove_egress(w.op, w.room, f"[{V6}]:443")["allowlist"]
+
+
+@pytest.mark.parametrize("host", [V6, f"[{V6}", f"[{V6}]x", "[fe80::1%eth0]", "[::ffff:1.2.3.4%1]", "[]",
+                                  "[1.2.3.4]", "[not-v6]"])
+def test_odd_ipv6_spellings_are_refused(w, host):
+    assert code(w.s.request_egress, w.op, w.room, "a1", host, 443) == 400
+
+
+def test_ipv6_in_the_profile_is_canonical_and_internal_ones_are_refused(w):
+    p = w.s.set_room_profile(w.alice, w.room, {"permanent_hosts": [f"[{V6.upper()}]:0443"], "services": [
+        {"name": "v6", "upstream_url": f"https://[{V6}]:8443/v1", "header": "Authorization", "secret_name": "k"}]})
+    assert p["permanent_hosts"] == [f"[{V6}]:443"] and p["services"][0]["upstream_url"].startswith("https://[")
+    for bad in ("[::1]:443", "[fd00::1]:443", "[fe80::1]:443", "[::ffff:127.0.0.1]:443", "[64:ff9b::a00:1]:443"):
+        assert code(w.s.set_room_profile, w.alice, w.room, {"permanent_hosts": [bad]}) == 400, bad
+    for bad in ("https://[::1]/", "https://[fd00::1]/v1"):
+        assert code(w.s.set_room_profile, w.alice, w.room, {"services": [
+            {"name": "x", "upstream_url": bad, "header": "Authorization", "secret_name": "k"}]}) == 400, bad
