@@ -52,6 +52,10 @@ def _dict_to_event(ev: dict) -> Event:
     )
 
 
+class EventAlreadyStored(RuntimeError):
+    """The durable log already holds this event_id (not a write failure)."""
+
+
 class DurableEventSink:
     """Persists each recorded repo event to the durable event log.
 
@@ -96,9 +100,15 @@ class DurableEventSink:
             # append() returns False only for an existing event_id; any write
             # error propagates from here unchanged.
             if not self._run(self._store.append(_dict_to_event(ev))):
-                raise RuntimeError(
+                raise EventAlreadyStored(
                     "durable event insert was not acknowledged "
                     "(event_id already stored)")
+
+    def stored_identity(self, event_id: str):
+        """(source, source_sequence) of a stored event, or None when absent."""
+        with self._write_lock:
+            self._ensure_store()
+            return self._run(self._store.identity(event_id))
 
     def record_source_state(self, state: dict) -> None:
         """Best-effort upsert of per-source ingest state (fabric_event_sources)."""

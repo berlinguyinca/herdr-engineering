@@ -154,6 +154,9 @@ class V2Conn:
         self.rows, self.fail = [], None
 
     async def fetch(self, sql, *a):
+        if "WHERE event_id" in sql:
+            return [{"source": r.get("source"), "source_sequence": r.get("source_sequence")}
+                    for r in self.rows if r["event_id"] == a[0]]
         if "ORDER BY sequence" in sql:
             return [r for r in self.rows if (r["entity_type"], r["entity_id"]) == (a[0], a[1])]
         return []
@@ -284,3 +287,158 @@ def test_http_actor_comes_from_key_and_conflicts_are_409(http):
     req = urllib.request.Request(base + "/api/v1/ingest/sources", headers={"X-API-Key": "ing-1"})
     with urllib.request.urlopen(req) as r:
         assert json.loads(r.read())["sources"][0]["source"] == "pi"
+
+
+# ------------------------------------------------- review fixes (round 2)
+def durable():
+    conn = V2Conn()
+    repo = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
+    return conn, repo, IngestService(repo)
+
+
+def test_lost_ack_retry_is_a_duplicate_not_a_503():
+    conn, repo, s = durable()
+    s.ingest(body(0), PRINCIPAL)
+    fresh_repo = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))  # ledger empty
+    again = IngestService(fresh_repo).ingest(body(0), PRINCIPAL)
+    assert again["envelope"]["duplicate"] is True
+    assert fresh_repo.ledger.source_state("pi")["last_sequence"] == 0
+    assert len(conn.rows) == 1
+
+
+def test_lost_ack_with_different_sequence_is_a_conflict():
+    conn, repo, s = durable()
+    s.ingest(body(0), PRINCIPAL)
+    fresh = IngestService(ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run)))
+    with pytest.raises(EnvelopeConflict):
+        fresh.ingest(body(5, event_id="ev-0"), PRINCIPAL)
+
+
+def test_db_sequence_collision_becomes_conflict_without_leaking_other_id():
+    conn, repo, s = durable()
+    s.ingest(body(0, event_id="secret-other-event"), PRINCIPAL)
+    fresh = IngestService(ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run)))
+    with pytest.raises(EnvelopeConflict) as err:
+        fresh.ingest(body(0, event_id="mine"), PRINCIPAL)
+    assert "secret-other-event" not in str(err.value)
+
+
+def test_failed_durable_write_leaves_no_entity_state():
+    conn, repo, s = durable()
+    conn.fail = ConnectionError("db down")
+    with pytest.raises(ConnectionError):
+        s.ingest({"schema_version": 2, "event_id": "h", "source": "pi", "source_sequence": 0,
+                  "entity_type": "host", "entity_id": "bender", "event_type": "host.registered",
+                  "payload": {"host_name": "bender"}}, PRINCIPAL)
+    assert repo.list_hosts() == []
+
+
+def test_invalid_handler_input_is_rejected_before_anything_is_stored():
+    conn, repo, s = durable()
+    with pytest.raises(ValueError):
+        s.ingest({"schema_version": 2, "event_id": "m", "source": "pi", "source_sequence": 0,
+                  "entity_type": "mission", "entity_id": "bad:id", "event_type": "mission.started",
+                  "payload": {}}, PRINCIPAL)
+    assert conn.rows == [] and repo.ledger.source_states() == []
+
+
+def test_inspector_envelope_is_persisted_and_survives_restart():
+    conn, repo, s = durable()
+    ib = {"schema_version": 2, "event_id": "i0", "source": "pi", "source_sequence": 0,
+          "entity_type": "inspector", "entity_id": "s1", "event_type": "inspector.message",
+          "payload": {"kind": "message", "role": "user", "text": "private words"}}
+    s.ingest(ib, PRINCIPAL)
+    s.ingest({**ib, "event_id": "i2", "source_sequence": 2}, PRINCIPAL)
+    env_rows = [r for r in conn.rows if r.get("source") == "pi"]
+    assert [r["event_id"] for r in env_rows] == ["i0", "i2"]
+    assert "private words" not in json.dumps([r["payload"] for r in env_rows])
+    fresh = ControlPlaneRepo()
+    fresh.import_state({"events": {"inspector|s1": [
+        {**r, "payload": json.loads(r["payload"]), "entity_type": "inspector", "entity_id": "s1",
+         "ingest_timestamp": f"2026-10-22T10:00:0{i}+00:00", "sequence": i}
+        for i, r in enumerate(env_rows)]}, "event_order": []})
+    assert IngestService(fresh).ingest(ib, PRINCIPAL)["envelope"]["duplicate"] is True
+    with pytest.raises(EnvelopeConflict):
+        IngestService(fresh).ingest({**ib, "event_id": "x"}, PRINCIPAL)
+    assert [(g["from"], g["to"]) for g in fresh.ledger.source_state("pi")["gaps"]] == [(1, 1)]
+
+
+def test_hydrated_ledger_still_detects_changed_content_for_same_event_id():
+    conn, repo, s = durable()
+    s.ingest(body(0), PRINCIPAL)
+    fresh = ControlPlaneRepo()
+    fresh.import_state({"events": {"task|t1": [
+        {**r, "payload": json.loads(r["payload"]), "ingest_timestamp": "2026-10-22T10:00:00+00:00"}
+        for r in conn.rows]}, "event_order": []})
+    with pytest.raises(EnvelopeConflict):
+        IngestService(fresh).ingest({**body(0), "payload": {"n": 42}}, PRINCIPAL)
+
+
+def test_handler_that_records_two_events_still_has_one_envelope_row():
+    repo, s = svc()
+    s.ingest({"schema_version": 2, "event_id": "s-ev", "source": "pi", "source_sequence": 0,
+              "entity_type": "session", "entity_id": "w1:t1", "event_type": "session.started",
+              "payload": {"host_id": "bender", "agent_role": "pi"}}, PRINCIPAL)
+    rows = repo.stream("session", "w1:t1")
+    assert sum(1 for e in rows if e["event_id"] == "s-ev") == 1
+    assert sum(1 for e in rows if e.get("source") == "pi") == 1
+    assert all(e["event_type"] != "session.started" or e["event_id"] == "s-ev" for e in rows)
+    # envelope-only rows stay out of the global feed
+    assert all(e["event_id"] != "s-ev" for e in repo.recent_events(50))
+
+
+def test_concurrent_same_event_id_has_exactly_one_new():
+    repo, s = svc()
+    results = []
+    barrier = threading.Barrier(8)
+
+    def go():
+        barrier.wait()
+        results.append(s.ingest(body(0), PRINCIPAL)["envelope"]["duplicate"])
+
+    threads = [threading.Thread(target=go) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert results.count(False) == 1 and results.count(True) == 7
+    assert len(stored(repo)) == 1
+
+
+def test_source_sequence_is_bounded_to_bigint():
+    _, s = svc()
+    with pytest.raises(ValueError):
+        s.ingest(body(2**63), PRINCIPAL)
+    assert s.ingest(body(2**63 - 1), PRINCIPAL)["envelope"]["duplicate"] is False
+
+
+def test_gaps_and_sources_are_bounded():
+    repo, s = svc()
+    for i in range(0, 400, 2):  # every other sequence => 199 gaps
+        s.ingest(body(i), PRINCIPAL)
+    state = repo.ledger.source_state("pi")
+    assert len(state["gaps"]) <= 64 and state["gaps_truncated"] is True
+    from herdr_engineering.control_plane import envelope
+    ledger = repo.ledger
+    for i in range(envelope.MAX_SOURCES + 5):
+        e = {"event_id": f"x{i}", "source": f"s{i}", "source_sequence": 0,
+             "content_hash": "h", "received_at": f"2026-10-22T10:{i // 60:02d}:{i % 60:02d}+00:00"}
+        ledger.commit(e, persist=False)
+    assert len(ledger.source_states()) <= envelope.MAX_SOURCES
+
+
+def test_http_sequence_collision_is_409_and_storage_errors_are_not_echoed():
+    conn = V2Conn()
+    repo = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
+    IngestService(repo).ingest(body(0, event_id="secret-other-event"), PRINCIPAL)
+    repo2 = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
+    svr = ControlPlaneServer(repo2, api_keys={"ing-1": "ingest"})
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    try:
+        base = f"http://127.0.0.1:{svr.port}"
+        status, out = _post(base, body(0, event_id="mine"))
+        assert status == 409 and "secret-other-event" not in json.dumps(out)
+        conn.fail = ConnectionError("dsn postgres://user@internal-host/db")
+        status, out = _post(base, body(7, event_id="boom"))
+        assert status == 500 and "internal-host" not in json.dumps(out)
+    finally:
+        svr.shutdown()

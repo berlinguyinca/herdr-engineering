@@ -166,6 +166,15 @@ class EventStore:
             raise
         return row is not None
 
+    async def identity(self, event_id: str) -> tuple[str | None, int | None] | None:
+        """(source, source_sequence) stored for ``event_id``, or None if absent."""
+        rows = await self._conn.fetch(
+            f"SELECT source, source_sequence FROM {self._table} WHERE event_id=$1",
+            event_id)
+        if not rows:
+            return None
+        return rows[0]["source"], rows[0]["source_sequence"]
+
     async def read_stream(self, entity_type: str, entity_id: str,
                           after: int = -1) -> list[Event]:
         rows = await self._conn.fetch(

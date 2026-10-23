@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import queue
 import re
@@ -29,6 +30,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
 from .envelope import EnvelopeConflict
+from .events import SequenceCollision
 from .redact import redact_payload
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
@@ -975,6 +977,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._send_json(404, {"error": "not found"})
             except EnvelopeConflict as exc:
                 return self._send_json(409, {"error": str(exc), "reason": "conflict"})
+            except SequenceCollision:
+                return self._send_json(409, {"error": "sequence conflict", "reason": "conflict"})
             except ValueError as exc:
                 message = "Invalid GitHub query." if resource == "github" else str(exc)
                 return self._send_json(400, {"error": message})
@@ -988,6 +992,10 @@ def _make_handler(server, public=False, operator=False):
                     return self._send_json(503, {"error": "Review persistence is unavailable; no launch or decision was acknowledged."})
                 return self._send_json(503, {"error": "Integration service is unavailable."})
             except Exception as exc:  # never drop a connection: surface 500
+                if resource == "ingest":
+                    # Storage/driver errors can name tables, hosts or other events.
+                    logging.getLogger(__name__).exception("ingest failed")
+                    return self._send_json(500, {"error": "ingest failed"})
                 message = "GitHub service is unavailable." if resource == "github" else str(exc)
                 return self._send_json(500, {"error": message})
 

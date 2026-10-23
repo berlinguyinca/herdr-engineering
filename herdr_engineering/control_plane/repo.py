@@ -20,7 +20,7 @@ import time
 from uuid import uuid4
 
 from .agent_identity import AgentIdentityRegistry
-from .envelope import SourceLedger, current_envelope, envelope_event_fields
+from .envelope import SourceLedger, envelope_event_fields
 from .ids import new_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
@@ -1574,7 +1574,11 @@ class ControlPlaneRepo:
 
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
-                     mission_id=None, session_id=None, require_durable=False, publish=True):
+                     mission_id=None, session_id=None, require_durable=False, publish=True,
+                     envelope=None, feed=True):
+        """Record one event. ``envelope`` (a normalised v2 envelope) makes it the
+        canonical envelope row: emitter event_id, server-set actor/received_at,
+        durable before return. ``feed=False`` keeps it out of the global feed."""
         with self._event_lock:
             key = (entity_type, entity_id)
             stream = self._events.setdefault(key, [])
@@ -1591,21 +1595,18 @@ class ControlPlaneRepo:
                 "sequence": seq, "event_type": event_type,
                 "payload": payload or {},
             }
-            env = current_envelope.get()
-            if env is not None and not env.get("consumed") and env.get("entity_type") == entity_type:
-                # An envelope v2 ingest is in progress: this event carries it
-                # (emitter event_id, server-set actor/received_at) and must be
-                # durable before the ingest is acknowledged.
-                env["consumed"] = True
+            env = envelope
+            if env is not None:
                 ev.update(envelope_event_fields(env))
                 ev["event_id"] = env["event_id"]
                 ev["schema_version"] = env["schema_version"]
                 ev["source_timestamp"] = env["occurred_at"] or env["received_at"]
                 ev["ingest_timestamp"] = env["received_at"]
                 ev["mission_id"] = mission_id or env.get("mission_id")
+                meta = {"content_sha256": env["content_hash"]}
                 if env.get("claimed_actor") is not None:
-                    ev["payload"] = {**ev["payload"], "_envelope": {
-                        "claimed_actor": _bounded_claim(env["claimed_actor"])}}
+                    meta["claimed_actor"] = _bounded_claim(env["claimed_actor"])
+                ev["payload"] = {**ev["payload"], "_envelope": meta}
                 require_durable = callable(getattr(self._sink, "record_required", None))
             if require_durable and self._sink is not None:
                 # Command side effects require persistence before submission. A
@@ -1619,7 +1620,8 @@ class ControlPlaneRepo:
             if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
                 self._ci_sequence = seq + 1
             stream.append(ev)
-            self._event_order.append((entity_type, entity_id, seq))
+            if feed:
+                self._event_order.append((entity_type, entity_id, seq))
             if self._sink is not None and not require_durable:
                 try:
                     self._sink.record(ev)

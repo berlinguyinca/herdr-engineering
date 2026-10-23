@@ -9,7 +9,6 @@ the ledger from replayed events and mirrors its state to the durable sink.
 """
 from __future__ import annotations
 
-import contextvars
 import copy
 import hashlib
 import json
@@ -29,12 +28,14 @@ _ID_FIELDS = ("mission_id", "org_id", "project_id", "room_id", "workspace_id",
 _SOURCE_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _MAX_STR = 512
 
-# The envelope of the ingest call in progress. ``ControlPlaneRepo.record_event``
-# attaches it to the first event it records for the matching entity type, so
-# typed handlers (host/session/mission/service) and the generic path share one
-# mechanism without each learning about envelopes.
-current_envelope: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
-    "herdr_current_envelope", default=None)
+# Entity types whose state is derived by dedicated handlers. Their v2 envelope
+# is stored as an envelope-only row: persisted for idempotency, sequence and
+# replay, but kept out of the global feed and out of state reconstruction.
+ENVELOPE_ONLY_TYPES = frozenset({"host", "session", "mission", "service",
+                                 "inspector", "mission_activity"})
+MAX_SEQUENCE = 2**63 - 1          # PostgreSQL bigint
+MAX_GAPS_PER_SOURCE = 64
+MAX_SOURCES = 1024
 
 
 class EnvelopeConflict(Exception):
@@ -108,8 +109,8 @@ def normalize_envelope(body: dict, principal: dict | None, received_at: str) -> 
         raise ValueError("source is required for schema_version 2")
     source = source.lower().strip()
     sequence = body.get("source_sequence")
-    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
-        raise ValueError("source_sequence must be an integer >= 0")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or not 0 <= sequence <= MAX_SEQUENCE:
+        raise ValueError("source_sequence must be an integer between 0 and 2^63-1")
 
     requested = body.get("visibility_scope")
     scope = requested if isinstance(requested, str) and requested in VISIBILITY_SCOPES else "private"
@@ -181,9 +182,8 @@ class SourceLedger:
         """``"new"`` or ``"duplicate"``; raises EnvelopeConflict on contradiction."""
         known = self._events.get(env["event_id"])
         if known is not None:
-            # known[0] is None for an event rebuilt from the durable log: the
-            # stored row cannot reproduce the emitter's hash, so a retry with
-            # the same (source, sequence) is acknowledged, not compared.
+            # known[0] is None only for rows written before content digests
+            # were stored in the envelope metadata: acknowledge by identity.
             if known[0] is None and (known[1], known[2]) == (env["source"], env["source_sequence"]):
                 return "duplicate"
             if known[0] == env["content_hash"]:
@@ -205,6 +205,9 @@ class SourceLedger:
             old_id, (_, old_source, old_seq) = self._events.popitem(last=False)
             if self._sequences.get((old_source, old_seq)) == old_id:
                 del self._sequences[(old_source, old_seq)]
+        if source not in self._sources and len(self._sources) >= MAX_SOURCES:
+            stalest = min(self._sources.values(), key=lambda st: st["last_seen_at"] or "")
+            del self._sources[stalest["source"]]
         state = self._sources.setdefault(
             source, {"source": source, "last_sequence": None, "last_seen_at": None, "gaps": []})
         state["last_seen_at"] = seen_at or env["received_at"]
@@ -213,6 +216,12 @@ class SourceLedger:
             state["last_sequence"] = seq          # first arrival sets the baseline
         elif seq > last + 1:
             state["gaps"].append({"from": last + 1, "to": seq - 1, "seen_at": state["last_seen_at"]})
+            if len(state["gaps"]) > MAX_GAPS_PER_SOURCE:
+                # Collapse the two oldest into one coarse (conservative) range.
+                first, second = state["gaps"][0], state["gaps"][1]
+                state["gaps"][:2] = [{"from": first["from"], "to": second["to"],
+                                      "seen_at": second["seen_at"]}]
+                state["gaps_truncated"] = True
             state["last_sequence"] = seq
         elif seq == last + 1:
             state["last_sequence"] = seq
@@ -245,13 +254,18 @@ class SourceLedger:
                     and e.get("source_sequence") is not None]
             rows.sort(key=lambda e: str(e.get("ingest_timestamp") or ""))
             for e in rows:
+                meta = e.get("payload") or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except ValueError:
+                        meta = {}
+                digest = ((meta.get("_envelope") or {}).get("content_sha256")
+                          if isinstance(meta, dict) else None)
                 env = {"event_id": e["event_id"], "source": e["source"],
                        "source_sequence": int(e["source_sequence"]),
-                       "content_hash": "", "received_at": str(e.get("ingest_timestamp") or "")}
+                       "content_hash": digest, "received_at": str(e.get("ingest_timestamp") or "")}
                 self.commit(env, persist=False)
-                # A replayed event has no hash to compare; mark it unknown so a
-                # same-id retry is acknowledged and a collision is still caught.
-                self._events[e["event_id"]] = (None, env["source"], env["source_sequence"])
 
     # ---------------------------------------------------------------- views
     def _view(self, state: dict) -> dict:
