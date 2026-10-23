@@ -1830,6 +1830,8 @@ class CollabService:
             rows = [dict(r) for r in self._egress.values()
                     if (room_id is None or r["room_id"] == room_id)
                     and not (r["state"] == "open" and now - r["created_epoch"] >= EGRESS_OPEN_TTL)]
+            for r in rows:                             # so the dashboard can warn before approving one
+                r["internal"] = _internal_host(r["host_port"].rsplit(":", 1)[0])
             rows.sort(key=lambda r: (r["created_epoch"], r["id"]))
             return {"requests": rows}
 
