@@ -206,3 +206,59 @@ def test_bad_telemetry_does_not_touch_host_record():
         _beat(ingest, telemetry=_sample(), updates="not a dict")
     h = repo.get_host("bender")
     assert h["last_seen"] == good["last_seen"] and h["latest"] == good["latest"]
+
+
+def _realistic_sample(cpu=20.0):
+    top = [{"pid": 1000 + i, "command": "python3", "user": "wohlgemuth",
+            "cpu_pct": 12.5, "mem_pct": 3.1, "owner": "pi-worker-1"} for i in range(5)]
+    return {
+        **_sample(cpu=cpu), "load5": 0.4, "load15": 0.3, "swap": 2.0,
+        "mem_used_b": 12_000_000_000, "mem_total_b": 64_000_000_000,
+        "uptime_s": 123456, "net_rx_bps": 120000, "net_tx_bps": 80000, "agents_running": 4,
+        "mounts": [{"path": f"/mnt/data{i}", "pct": 40.0, "used_b": 4 * 10**11,
+                    "total_b": 10**12} for i in range(8)],
+        "gpus": [{"name": "NVIDIA GeForce RTX 4090", "util_pct": 55.0,
+                  "vram_used_b": 8 * 10**9, "vram_total_b": 24 * 10**9, "temp_c": 61.0}
+                 for _ in range(2)],
+        "top": {"cpu": top, "mem": top},
+    }
+
+
+def test_rollup_events_carry_aggregates_only_and_stay_small(acknowledged_sink):
+    clock = Clock()
+    repo = ControlPlaneRepo(sink=acknowledged_sink, now=clock)
+    ingest = IngestService(repo)
+    for i in range(40):  # 20 minutes -> several closed buckets
+        _beat(ingest, telemetry=_realistic_sample(cpu=float(i)))
+        clock.advance(30)
+    rollups = [e for e in acknowledged_sink.events if e["event_type"] == "HostMetricsRollup"]
+    assert len(rollups) >= 3
+    for ev in rollups:
+        assert set(ev["payload"]) == {"rollup"}
+        assert len(json.dumps(ev["payload"])) < 1024
+
+
+def test_latest_timestamp_survives_new_repo_over_same_sink(acknowledged_sink):
+    clock = Clock()
+    repo = ControlPlaneRepo(sink=acknowledged_sink, now=clock)
+    ingest = IngestService(repo)
+    for i in range(30):  # 15 minutes: rollups are written after the state event
+        _beat(ingest, telemetry=_realistic_sample(cpu=1.0), updates={"security": 0})
+        clock.advance(30)
+    live = repo.get_host("bender")["latest"]
+    assert live["at"]
+    fresh = ControlPlaneRepo(now=clock)
+    load_into(fresh, FakeSource(events=acknowledged_sink.events))
+    latest = fresh.get_host("bender")["latest"]
+    assert latest["at"] and latest["cpu"] == 1.0
+
+
+def test_legacy_rollup_with_sample_never_overwrites_latest():
+    store = HostMetricsStore(now=Clock())
+    events = [
+        {"entity_id": "bender", "event_type": "HostStateObserved", "sequence": 1,
+         "payload": {"state": {"updates": None}, "latest": {"cpu": 5.0, "at": "t1"}}},
+        {"entity_id": "bender", "event_type": "HostMetricsRollup", "sequence": 2,
+         "payload": {"rollup": {"ts": T0, "cpu": 9.0, "n": 10}, "latest": {"cpu": 9.0}}},
+    ]
+    assert store.hydrate(events)["bender"]["latest"] == {"cpu": 5.0, "at": "t1"}

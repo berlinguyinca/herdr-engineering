@@ -205,7 +205,7 @@ class HostMetricsStore:
             start = ts - ts % BUCKET_S
             bucket = self._open.get(host_id)
             if bucket is not None and bucket["start"] != start:
-                self._close(host_id, bucket, sample)
+                self._close(host_id, bucket)
                 bucket = None
             if bucket is None:
                 bucket = self._open[host_id] = {"start": start, "points": []}
@@ -220,11 +220,12 @@ class HostMetricsStore:
             self._state[host_id] = {"fields": durable}
             self._emit(host_id, STATE_EVENT, {"state": durable, "latest": latest})
 
-    def _close(self, host_id, bucket, latest):
+    def _close(self, host_id, bucket):
         rollup = _average(bucket["points"], bucket["start"])
         rollup["n"] = len(bucket["points"])
         self._rollups.setdefault(host_id, []).append(rollup)
-        self._emit(host_id, ROLLUP_EVENT, {"rollup": rollup, "latest": latest})
+        # Aggregates only: ``latest`` rides the (change-driven) state event.
+        self._emit(host_id, ROLLUP_EVENT, {"rollup": rollup})
 
     def _emit(self, host_id, event_type, payload):
         if self._persist is None:
@@ -302,7 +303,10 @@ class HostMetricsStore:
                 p = _payload(ev)
                 self._seq = max(self._seq, int(ev.get("sequence") or 0))
                 rec = hosts.setdefault(hid, {})
-                if isinstance(p.get("latest"), dict):
+                # Only the state event carries ``latest`` (with its ``at``); a
+                # rollup, including an older one that carried a sample, never
+                # overwrites it.
+                if ev.get("event_type") == STATE_EVENT and isinstance(p.get("latest"), dict):
                     rec["latest"] = p["latest"]
                 if isinstance(p.get("state"), dict):
                     for k in STATE_KEYS:
