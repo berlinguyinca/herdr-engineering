@@ -18,6 +18,12 @@ It fails on any failure, on a suite that ran **zero** tests, on a suite that ran
 Pi side alone, per file and **without** `--test-force-exit`:
 `cd <pi checkout> && node --test --import ./test/support/isolatedState.ts test/e2e/<file>.e2e.test.ts`.
 
+## Prerequisites
+
+System `python3` with `pyyaml`, `PyJWT` and `asyncpg` (scenario 6 restart tests; `pip install --user asyncpg`), Postgres server
+binaries (`initdb`, `pg_ctl`, `postgres`; dirs listed in `acceptance.yaml`), Node 22+ with the Pi checkout's
+`node_modules`, and the autospec binary (`--build`, or `cargo build -j 4 -p autospec-cli` in the AutoSpec checkout).
+
 ## Configuration: YAML only, no environment variables
 
 * `tests/e2e/acceptance.yaml` (paths to the Pi and AutoSpec checkouts, the autospec binary, Postgres bin dirs,
