@@ -541,7 +541,7 @@ def test_ci_green_without_live_job_says_cannot_queue():
     svc.tick()
     assert store.snapshot(KEY).state == State.CI_GREEN
     descs = [s[3:5] for s in app.statuses(A)]
-    wedged = ("failure", "review gate: cannot queue review; push a commit or resume")
+    wedged = ("failure", "review gate: cannot queue review; push a commit")
     assert descs[-1] == wedged
     assert descs.count(wedged) == 1  # deduped
 

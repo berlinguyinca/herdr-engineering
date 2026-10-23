@@ -93,7 +93,7 @@ _CHECK_STATUS = {"green": "pass", "red": "fail", "pending": "pending"}
 MERGE_BACKOFF_FIRST = 60.0
 MERGE_BACKOFF_MAX = 900.0
 STOP_TIMEOUT = 5.0
-_WEDGED = "review gate: cannot queue review; push a commit or resume"
+_WEDGED = "review gate: cannot queue review; push a commit"
 
 
 def _rows_for(snapshot: dict, repo: str) -> list[dict]:
