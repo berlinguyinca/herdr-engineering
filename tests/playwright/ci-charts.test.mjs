@@ -36,12 +36,14 @@ test('native CI charts follow context/search across tabs and preserve focus thro
       window.addRun=()=>window.chartSnapshot.pipelines['org/app'].push(row(window.chartSnapshot.pipelines['org/app'].length+1,'success'));
     });
     await page.waitForFunction(()=>document.querySelector('[data-ci-charts-body]')?.textContent.includes('3 matching runs'));
+    await page.locator('[data-ci-workspace="tests"]').click();
     assert.equal(await page.locator('[data-ci-charts]').getAttribute('open'),null);
     await page.locator('[data-ci-charts]>summary').focus();
     await page.keyboard.press('Enter');
     assert.equal(await page.locator('[data-ci-charts] svg[role="img"]').count(),5);
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Reports are stale/);
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Some repositories have incomplete reports/);
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.locator('#ig-tab-finished').click();
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/3 matching runs/);
     const search=page.locator('[data-ig-search]');
@@ -52,6 +54,7 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     await page.evaluate(()=>{window.addRun();window.chartView.refresh();});
     await page.waitForFunction(()=>document.querySelector('[data-ci-charts-body]')?.textContent.includes('3 matching runs'));
     assert.equal(await page.evaluate(()=>document.activeElement?.hasAttribute('data-ig-search')),true);
+    await page.locator('[data-ci-workspace="tests"]').click();
     const dataSummary=page.locator('[data-ci-chart-data]>summary');
     await dataSummary.focus();await page.keyboard.press('Enter');
     await page.evaluate(()=>{window.addRun();window.chartView.refresh();});
@@ -63,7 +66,9 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     assert.deepEqual(await projects.locator('tbody tr').first().locator('th,td').allTextContents(),['Project Alpha','3','60000','60000','60000']);
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Storage is memory-only/);
     // New records and retained observations obey the same branch and period controls.
+    await page.locator('[data-ci-workspace="runs"]').click();
     await search.fill('');
+    await page.locator('[data-ci-workspace="tests"]').click();
     await page.locator('[data-ci-branch]').selectOption('feature');
     assert.match(await page.locator('.ci-performance').innerText(),/No successful runs with valid positive/);
     await page.locator('[data-ci-branch]').selectOption('main');
@@ -75,7 +80,9 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     await page.locator('[data-ci-period]').selectOption('7');
     assert.match(await page.locator('.ci-performance').innerText(),/3 successful runs/);
     assert.match(await page.locator('[data-ci-charts-body]').innerText(),/Last 7 days/);
+    await page.locator('[data-ci-workspace="runs"]').click();
     await page.locator('#ig-tab-failed').click();
+    await page.locator('[data-ci-workspace="tests"]').click();
     assert.match(await page.locator('.ci-performance').innerText(),/3 successful runs/);
     await projects.focus();
     await page.evaluate(()=>{window.addRun();window.chartView.refresh();});

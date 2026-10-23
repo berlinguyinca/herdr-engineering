@@ -114,18 +114,18 @@ function serviceRow(s) {
 const styles = `<style>
 .sc-intro {color:var(--text-secondary); max-width:80ch; line-height:1.6}
 .sc-history>summary {cursor:pointer;color:var(--text-secondary);font-size:13px}.sc-history .sc-counts {margin:12px 0}
-.sc-counts {display:flex; flex-wrap:wrap; gap:12px; margin:20px 0}
+.sc-counts {display:flex; flex-wrap:wrap; gap:8px; margin:12px 0}
 .sc-counts button {font:inherit;color:inherit;text-align:left;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 14px;font-size:13px}
 .sc-counts strong {font-size:20px;margin-right:5px}
-.sc-controls {display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin:20px 0}
+.sc-controls {display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:12px 0}
 .sc-controls label {display:flex;flex-direction:column;gap:5px;font-size:13px}
 .sc-controls input[type=search],.sc-controls select {border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px;background:var(--surface);color:var(--text);font:inherit;max-width:100%}
 .sc-controls .sc-search {flex:1;min-width:190px}.sc-controls .sc-check {flex-direction:row;align-items:center;min-height:38px}
 .sc-toolbar {display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin:15px 0;font-size:13px}
 .sc-group {border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);margin:12px 0;overflow:hidden}
-.sc-group>summary {cursor:pointer;padding:16px;font-weight:600;overflow-wrap:anywhere}
+.sc-group>summary {cursor:pointer;padding:11px 13px;font-weight:600;overflow-wrap:anywhere}
 .sc-group>summary span {font-weight:400;font-size:12px;color:var(--text-secondary);margin-left:12px}
-.sc-row {display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1.2fr);gap:20px;padding:16px;border-top:1px solid var(--border-subtle);font-size:13px;overflow-wrap:anywhere}
+.sc-row {display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1.2fr);gap:16px;padding:11px 13px;border-top:1px solid var(--border-subtle);font-size:13px;overflow-wrap:anywhere}
 .sc-name {font-size:14px;font-weight:600}.sc-row p {margin:6px 0;line-height:1.5}.sc-meta {color:var(--text-secondary);font-size:12px}
 .sc-location,.sc-health {display:flex;flex-direction:column;gap:7px}.sc-health strong {font-size:12px}
 .sc-health [data-state=current] {color:var(--status-ok)}.sc-health [data-state=unavailable] {color:var(--status-attention)}
