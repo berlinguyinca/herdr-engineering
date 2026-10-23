@@ -638,3 +638,41 @@ def test_stop_times_out_on_a_stuck_tick(caplog):
     assert "still running" in caplog.text
     release.set()
     svc._thread.join(5)
+
+
+def test_tick_counts_a_durable_failure_and_retries_next_tick():
+    class FlakySink:
+        fail = True
+
+        def record_required(self, ev):
+            if self.fail:
+                raise RuntimeError("durable event insert was not acknowledged")
+
+        def record(self, ev):  # best-effort path: must not be what the gate uses
+            pass
+
+    sink = FlakySink()
+    cp = ControlPlaneRepo(sink=sink)
+    app, ci = FakeApp(), CI()
+    store = PipelineStore(cp)
+    svc = GateService(
+        config=ReviewGateConfig(
+            enabled=True,
+            app=AppConfig(1, 2, "/nonexistent/key.pem"),
+            repos=(RepoEnrollment(repo=REPO),),
+            poll_seconds=5,
+        ),
+        app=app,
+        store=store,
+        queue=ReviewQueue(cp),
+        registry=AuthorRegistry(cp),
+        ci_snapshot=ci,
+        now=Clock(),
+    )
+    app.prs[REPO] = [pr()]
+    assert svc.tick()["errors"] == 1
+    assert store.snapshot(KEY).head_sha is None
+    assert cp.stream("pr_gate", str(KEY)) == []
+    sink.fail = False
+    assert svc.tick()["errors"] == 0
+    assert store.snapshot(KEY).head_sha == A

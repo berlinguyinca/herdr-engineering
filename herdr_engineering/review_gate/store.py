@@ -182,7 +182,8 @@ class PipelineStore:
         return [self.snapshot(k) for k in self.known_keys()]
 
     def _record(self, key: PrKey, event_type: str, payload: dict) -> bool:
-        self._repo.record_event(ENTITY, str(key), event_type, payload)
+        # Durable-required: a failed write raises before memory is touched.
+        self._repo.record_event(ENTITY, str(key), event_type, payload, require_durable=True)
         return True
 
     # ----------------------------------------------------------------- write

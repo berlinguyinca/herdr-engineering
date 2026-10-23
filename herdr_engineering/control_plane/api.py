@@ -258,6 +258,12 @@ class ControlPlaneServer:
         config = load_review_gate_config({"control_plane": section})
         if not config.enabled:
             return
+        # Gate events are written require_durable=True. A sink that cannot
+        # acknowledge a write would fail every one of them; refuse up front.
+        # (No sink at all = in-memory repo; the CLI refuses that without a DSN.)
+        sink = getattr(repo, "_sink", None)
+        if sink is not None and not callable(getattr(sink, "record_required", None)):
+            raise ValueError("review_gate: the event sink cannot make durable writes")
         from ..review_gate import github_app
         from ..review_gate.queue import ReviewQueue
         from ..review_gate.registry import AuthorRegistry
@@ -1027,7 +1033,12 @@ def _make_handler(server, public=False, operator=False):
             store = server.gate_store
             if key not in store.known_keys():
                 return self._json({"error": "not found"}, 404)
-            if not store.resume(key):
+            try:
+                resumed = store.resume(key)
+            except Exception:  # noqa: BLE001 - the durable write failed; nothing changed
+                return self._json({"error": "Review gate state could not be persisted; "
+                                            "nothing was resumed."}, 503)
+            if not resumed:
                 return self._json({"error": "pull request is not escalated"}, 409)
             return self._json(_gate_pr(store.snapshot(key)))
 

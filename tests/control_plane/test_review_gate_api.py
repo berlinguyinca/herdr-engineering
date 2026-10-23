@@ -378,3 +378,41 @@ def test_ingest_cannot_forge_gate_events(ingest_gate_server, key, entity_type, e
     after = (request(server, "review-gate/prs"), request(server, "review-gate/queue"))
     assert after == before
     assert server.repo.stream("pr_gate_author", str(pr)) == []
+
+
+def test_resume_durable_write_failure_is_503_and_keeps_escalation(tmp_path, monkeypatch, monitor_starts):
+    class Sink:
+        fail = False
+
+        def record_required(self, ev):
+            if self.fail:
+                raise RuntimeError("durable event insert was not acknowledged")
+
+        def record(self, ev):
+            pass
+
+    sink = Sink()
+    monkeypatch.setattr(github_app, "GitHubAppClient", FakeApp)
+    server = ControlPlaneServer(ControlPlaneRepo(sink=sink), api_keys={"read": "viewer", "write": "operator"},
+                                fleet_config=FakeFleet(gate_section(tmp_path)))
+    start(server)
+    try:
+        key = escalate(server)
+        sink.fail = True
+        status, body = request(server, RESUME, {}, key="write", method="POST")
+        assert status == 503 and "persist" in body["error"]
+        assert server.gate_store.snapshot(key).state.value == "escalated"
+    finally:
+        server.shutdown()
+
+
+def test_sink_without_required_writes_fails_loud(tmp_path, monkeypatch, monitor_starts):
+    class LegacySink:
+        def record(self, ev):
+            pass
+
+    monkeypatch.setattr(github_app, "GitHubAppClient", FakeApp)
+    with pytest.raises(ValueError, match="durable"):
+        ControlPlaneServer(ControlPlaneRepo(sink=LegacySink()), api_keys={"read": "viewer"},
+                           fleet_config=FakeFleet(gate_section(tmp_path)))
+    assert not any(t.name == "review-gate" for t in threading.enumerate())

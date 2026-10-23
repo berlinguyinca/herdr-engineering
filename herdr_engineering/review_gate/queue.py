@@ -96,7 +96,8 @@ class ReviewQueue:
         return job["state"]
 
     def _record(self, kind: str, **payload) -> None:
-        self._repo.record_event(ENTITY, INDEX, kind, payload)
+        # Durable-required: a failed write raises before memory is touched.
+        self._repo.record_event(ENTITY, INDEX, kind, payload, require_durable=True)
 
     @staticmethod
     def _job(j: dict) -> ReviewJob:

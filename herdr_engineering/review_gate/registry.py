@@ -57,7 +57,9 @@ class AuthorRegistry:
             fields = {
                 k: redact_text(v) if isinstance(v, str) else v for k, v in asdict(author).items()
             }
-            self._repo.record_event(ENTITY, str(key), "author_pinned", fields)
+            self._repo.record_event(
+                ENTITY, str(key), "author_pinned", fields, require_durable=True
+            )
 
     def author_of(self, key: PrKey, head_ref: str) -> Author:
         with self._lock:
