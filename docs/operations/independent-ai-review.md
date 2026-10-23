@@ -75,8 +75,11 @@ nothing; its replacement is reviewed on the next poll.
 - **Exfiltration.** The box can reach the model endpoint, and holds a copy of the codex login. Injected text could
   send the diff, which is in the PR anyway, or the login token out through the allowed hosts. See the README's
   "what is NOT isolated".
-- **First real run is unverified.** It is not yet confirmed that codex works through the egress proxy, that the
-  default allow list is complete, or that its nested sandbox works. Run it once with `keep_workdir: true`, and
-  check the run's `blocked.jsonl`.
-- **Big PRs cost several reviewer runs.** PR #160 (550 KB, 33 files) is 12 chunks at 60 KB. Each chunk sees only
+- **Real codex runs are verified.** With codex 0.163, a dry run of PR #160 completed 14 chunks through the egress
+  proxy. Only `chatgpt.com`, `api.openai.com` and `auth.openai.com` (port 443) are allowed. Blocked and not
+  needed: `ab.chatgpt.com`, `*.oaiusercontent.com`. Whether codex's own read-only sandbox confines its shell
+  commands inside bwrap is not verified; the bwrap box is the boundary.
+- **Nothing to review means no approval.** A PR whose files are all binary or skipped fails the run and gets no
+  status; it needs a human review.
+- **Big PRs cost several reviewer runs.** PR #160 (40 files) is 14 chunks at 60 KB, and a real codex run of it took about 8 minutes. Each chunk sees only
   its own files, plus the read-only checkout for context, so a cross-file bug can be missed.

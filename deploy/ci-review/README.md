@@ -47,6 +47,10 @@ Files:
    - Only a blocking finding whose `file` is not in the PR at all is dropped. It is listed in the comment, and the
      status says "N finding(s) dropped (cited code not in the PR)".
    - `success` means every chunk completed and no blocking finding remains. Otherwise the state is `failure`.
+   - A chunk with code must list `code` in `checked`. A chunk of prose only (`.md`, `.rst`, `.txt`, `.adoc`) must
+     list `docs` instead, and counts as covering code and tests, since it has none.
+   - A diff with nothing reviewable (every file binary or skipped) is never approved. The run fails and nothing
+     is posted; such a PR needs a human review.
    - The claims in the status are the aspects that every chunk listed in `checked`, intersected with
      `code, security, tests, docs, performance`. The model can narrow the claims but never widen them. `visual` is
      never claimed: there is no visual step, and `visual_review: true` is refused.
@@ -98,14 +102,21 @@ What is NOT isolated, or not verified yet:
   and the public checkout) to the allowed hosts. Injected text can get it to do that, and it can also use or
   exfiltrate the login token through those same hosts. The token is the operator's codex login. Nothing more
   sensitive than the PR itself is in the box.
-- **Unverified (no real codex run yet):**
-  - That codex honours `HTTPS_PROXY`. It is a Rust client and should.
-  - That the default allow list is complete for a ChatGPT login.
-  - That codex's own `-s read-only` sandbox works nested inside bwrap.
-
-  For the first real run, set `keep_workdir: true`, then read `~/.local/state/herdr-ai-review/run-*/blocked.jsonl`
-  and `proxy.err`. If codex's inner sandbox fails nested, `-s danger-full-access` is acceptable inside this box,
-  because the box is the boundary, but decide that deliberately.
+- **Verified on 2026-10-22** with codex-cli 0.163.0 and a ChatGPT login, on a dry run of PR #160 (14 chunks, all
+  completed with valid verdicts):
+  - codex honours `HTTPS_PROXY` through the relay.
+  - `-s read-only`, `--output-schema` and `-o` work inside the box.
+  - The default allow list (`chatgpt.com`, `api.openai.com`, `auth.openai.com`, all on port 443) is enough.
+  - The proxy refused `ab.chatgpt.com:443` and three `sdmntpr*.oaiusercontent.com:443` hosts, about 6 times each.
+    The review does not need them, so they stay blocked.
+  - A harness installed behind a chain of symlinks (codex's standalone `~/.local/bin/codex` →
+    `~/.codex/packages/standalone/current/bin/codex`, where `current` is itself a link) needed a
+    `collab-sandbox.sh` fix: it now binds every hop of the chain.
+- **Not verified:** whether codex's inner read-only sandbox actually confined any shell commands it ran. The runs
+  completed, but whether codex ran tools at all was not inspected, because `--ephemeral` keeps no session.
+  The bwrap box is the real boundary either way.
+- For debugging, set `keep_workdir: true`. The run's `blocked.jsonl` and `proxy.err` are then kept under
+  `~/.local/state/herdr-ai-review/run-*`.
 - **`sandbox.network: host`** gives the box the host network. Do not use it without a reason.
 - **Prompt injection can still win.** A diff that persuades the model to report no blocking findings gets a
   `success`. The poster's checks limit what an injection can do, but they cannot make the model honest:

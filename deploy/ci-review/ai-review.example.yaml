@@ -27,7 +27,7 @@ reviewer:
 sandbox:
   network: egress                        # egress: only the hosts below, through collab-egress.py; host: open network
   egress_allow: []                       # [] = the family default: chatgpt.com:443, api.openai.com:443,
-                                         # auth.openai.com:443 for codex (UNVERIFIED; see README)
+                                         # auth.openai.com:443 for codex (verified sufficient 2026-10-22)
   checkout: true                         # a read-only checkout of the head SHA, shown to the reviewer
   checkout_max_mb: 300
 

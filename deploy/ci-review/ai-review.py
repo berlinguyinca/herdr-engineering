@@ -94,8 +94,8 @@ DEFAULTS: dict = {
 HARNESS_LOGIN = {"codex": ("codex", "~/.codex", ("auth.json",)),
                  "claude": ("claude", "~/.claude", (".credentials.json",)),
                  "pi": ("pi", "~/.pi/agent", ("auth.json", "models.json"))}
-# Where each family's harness talks to its model. UNVERIFIED for codex with a ChatGPT login: the first real run's
-# blocked.jsonl (kept with keep_workdir) lists what the proxy refused.
+# Where each family's harness talks to its model. codex 0.163 with a ChatGPT login: verified sufficient on
+# 2026-10-22 (ab.chatgpt.com and *.oaiusercontent.com were refused and not needed). claude: unverified.
 EGRESS_DEFAULT = {"codex": ["chatgpt.com:443", "api.openai.com:443", "auth.openai.com:443"],
                   "claude": ["api.anthropic.com:443", "claude.ai:443"]}
 # executable name -> family, to cross-check reviewer.family against the command it runs
