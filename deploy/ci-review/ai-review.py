@@ -107,7 +107,8 @@ FAMILY_WORDS = (("claude", re.compile(r"claude|anthropic", re.I)),
                 ("llama", re.compile(r"llama", re.I)),
                 ("mistral", re.compile(r"mistral|mixtral|devstral|codestral", re.I)),
                 ("glm", re.compile(r"\bglm|zhipu", re.I)),
-                ("kimi", re.compile(r"kimi|moonshot", re.I)))
+                ("kimi", re.compile(r"kimi|moonshot", re.I)),
+                ("flint", re.compile(r"\bflint\b", re.I)))
 TRAILER = re.compile(r"(?im)^\s*co-authored-by:\s*(.+)$")
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
