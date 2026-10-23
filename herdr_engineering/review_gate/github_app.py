@@ -33,6 +33,9 @@ MAX_PR_PAGES = 20
 COMPARE_FILE_CAP = 300
 REFRESH_MARGIN = 60
 STATUS_DESCRIPTION_MAX = 140
+REVIEW_TITLE_MAX = 500
+REVIEW_BODY_MAX = 20000
+PR_FILES_CAP = 300  # GitHub's limit on the PR files listing
 _NAME = re.compile(r"[A-Za-z0-9_.-]+")
 _SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 _BLOB = re.compile(r"[0-9a-fA-F]{40}")
@@ -70,6 +73,23 @@ class PrInfo:
     base_ref: str
     author_login: str
     draft: bool
+
+
+@dataclass(frozen=True)
+class ReviewFile:
+    path: str
+    status: str
+    patch: str | None
+
+
+@dataclass(frozen=True)
+class ReviewMaterial:
+    title: str
+    body: str
+    base_ref: str
+    head_sha: str
+    files: tuple[ReviewFile, ...]
+    truncated: bool
 
 
 def _repo_path(repo):
@@ -250,6 +270,70 @@ class GitHubAppClient:
         raise GitHubAppError(
             "invalid_response"
         )  # cap reached with a full page: never truncate silently
+
+    def _review_pr(self, slug, number, sha):
+        """(title, body, base_ref) while the PR is open at ``sha``; None otherwise."""
+        data = self._send("GET", f"/repos/{slug}/pulls/{number}")
+        try:
+            state, head = data["state"], data["head"]["sha"]
+            base_ref, title, body = data["base"]["ref"], data["title"], data.get("body")
+        except (KeyError, TypeError, AttributeError):
+            raise GitHubAppError("invalid_response") from None
+        title = "" if title is None else title
+        body = "" if body is None else body
+        if not all(isinstance(v, str) for v in (state, head, base_ref, title, body)):
+            raise GitHubAppError("invalid_response")
+        if state != "open" or head.lower() != sha:
+            return None
+        return title[:REVIEW_TITLE_MAX], body[:REVIEW_BODY_MAX], base_ref
+
+    def review_material(
+        self, repo: str, number: int, expected_head_sha: str, *, max_bytes: int
+    ) -> ReviewMaterial | None:
+        """Bounded title/body/patches of an open PR, or None if it moved off ``expected_head_sha``.
+
+        Patches are included until their running UTF-8 size would exceed ``max_bytes``; after
+        that files are only listed. Anything left out sets ``truncated``. The PR is re-read after
+        the files so a push in between yields None.
+        """
+        slug, number, sha = _repo_path(repo), _number(number), _sha(expected_head_sha)
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError("max_bytes must be a non-negative integer")
+        first = self._review_pr(slug, number, sha)
+        if first is None:
+            return None
+        files, truncated, used, full = [], False, 0, False
+        for page in range(1, PR_FILES_CAP // 100 + 1):
+            data = self._send("GET", f"/repos/{slug}/pulls/{number}/files?per_page=100&page={page}")
+            if not isinstance(data, list) or len(data) > 100:
+                raise GitHubAppError("invalid_response")
+            for item in data:
+                try:
+                    path, status, patch = item["filename"], item["status"], item.get("patch")
+                except (KeyError, TypeError, AttributeError):
+                    raise GitHubAppError("invalid_response") from None
+                if not isinstance(path, str) or not isinstance(status, str):
+                    raise GitHubAppError("invalid_response")
+                if patch is not None and not isinstance(patch, str):
+                    raise GitHubAppError("invalid_response")
+                if patch is None or full:
+                    truncated = True
+                    patch = None
+                else:
+                    size = len(patch.encode("utf-8", "replace"))
+                    if used + size > max_bytes:
+                        full, truncated, patch = True, True, None
+                    else:
+                        used += size
+                files.append(ReviewFile(path, status, patch))
+            if len(data) < 100:
+                break
+        else:
+            truncated = True  # reached GitHub's 300-file listing limit
+        if self._review_pr(slug, number, sha) is None:
+            return None
+        title, body, base_ref = first
+        return ReviewMaterial(title, body, base_ref, sha, tuple(files), truncated)
 
     def set_status(
         self,
