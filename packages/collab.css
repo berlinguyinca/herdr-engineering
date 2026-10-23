@@ -243,7 +243,7 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-table th { color: var(--text-secondary); font-weight: 600; }
 
 /* ---- polish: agent names, rows, cards ---- */
-.cx-page, .cx-embed { --cx-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent); }
+.cx-page, .cx-embed { --cx-ring: 0 0 0 3px var(--accent); }      /* a focus ring needs 3:1 against the page (1.4.11); the old 28% tint measured 1.5:1 */
 .cx-embed h1, .cx-page h1 { letter-spacing: -.01em; }
 .cx-head h1 { font-size: 1.6rem; }
 .cx-section > h2 { font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 12px; }
@@ -304,7 +304,8 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .lin-node--waiting .lin-box { fill: color-mix(in srgb, var(--status-attention, #d89b1d) 12%, var(--surface, #fff)); }
 .lin-node--finished .lin-box { fill: color-mix(in srgb, var(--status-ok, #1a9b6c) 10%, var(--surface, #fff)); }
 .lin-node--failed .lin-box { fill: color-mix(in srgb, var(--status-danger, #c0392b) 10%, var(--surface, #fff)); }
-.lin-dim { opacity: .35; }
+/* Unrelated nodes recede by fading their shapes, not their words: 35% text opacity measured 1.7:1 (1.4.3). */
+.lin-dim .lin-box, .lin-dim .lin-edge-line, .lin-dim .lin-arrowhead { opacity: .35; }
 .lin-name { font: 600 11px var(--font-sans, system-ui, sans-serif); fill: var(--text, #1b1f24); }
 .lin-sub, .lin-edge-tag { font: 10px var(--font-sans, system-ui, sans-serif); fill: var(--text-secondary, #555); }
 .lin-edge-line { stroke: var(--text-secondary, #555); stroke-width: 1.6; }
@@ -372,3 +373,11 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 /* Long unbroken labels (ids, URLs) must wrap inside inspector link lists instead of widening the page at 320px. */
 .cx-list li .hd-btn { white-space: normal; overflow-wrap: anywhere; text-align: left; max-width: 100%; height: auto; }
 .cx-list li code { overflow-wrap: anywhere; }
+
+/* The browser's default placeholder grey (#757575) is 3.6:1 on the dark surface; use the muted text token (>= 4.5:1 in both themes). */
+.cx-page ::placeholder, .cx-embed ::placeholder { color: var(--text-muted); opacity: 1; }
+
+/* A 300-character unbroken string (a URL, a hash, a path) in a node label, an instruction or an evidence title must wrap inside its
+   row instead of pushing the page sideways (1.4.10 at 320px). Found by the real-server reflow gate on Attention and Progress. */
+.cx-page .grow, .cx-embed .grow, .cx-attn-item, .cx-attn-item *, .cx-list li, .cx-list li *, .cx-page .cx-msg, .cx-embed .cx-msg { overflow-wrap: anywhere; min-width: 0; }
+.cx-attn-item .hd-btn, .cx-attn-item select { max-width: 100%; }

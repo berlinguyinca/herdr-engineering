@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EDGE_STYLE, MAX_RENDER_NODES, buildGantt, filterGraph, fmtDuration, layoutGraph, mergePages, nextNode,
-  renderGanttSvg, focusKey, focusSelector, renderGanttTable, renderGraphSvg, renderGraphTable, renderInspector, renderLineage, renderReplay,
+  renderGanttSvg, focusKey, focusSelector, focusSuccessor, renderGanttTable, renderGraphSvg, renderGraphTable, renderInspector, renderLineage, renderReplay,
   nodeLabel, replayTarget, replayText, shapeOf, stateLook,
 } from '../collab-lineage.js';
 
@@ -298,6 +298,12 @@ test('a graph the server cut off says so and offers no Load more (T16: it used t
   const last = renderLineage({ ...base, graphTruncated: 'scan_budget', graphMore: false });
   assert.doesNotMatch(last, /data-more/);
   assert.match(last, /server stopped reading here/);
+  // an edges-only cut (every node returned, links left out) must NOT claim that nodes are missing
+  for (const reason of ['edge_budget', 'limit', 'response_bytes']) {
+    const edges = renderLineage({ ...base, graphTruncated: reason, graphMore: false });
+    assert.match(edges, /left out some links/, reason);
+    assert.doesNotMatch(edges, /more nodes may exist|data-more/, reason);
+  }
   assert.doesNotMatch(renderLineage({ ...base, graphTruncated: null }), /stopped reading/);
 });
 
@@ -316,4 +322,13 @@ test('the replay status says a choice is queued while loading', () => {
   assert.match(renderReplay({ step: 1, visible_events: 5, head: false }, { busy: true, queued: true }), /latest choice will load next/);
   assert.match(renderReplay({ step: 1, visible_events: 5, head: false }, { busy: true }), /Loading the position/);
   assert.match(renderLineage({ graphAll: { nodes: [], edges: [] }, filtered: { nodes: [], edges: [], match: new Set() }, asOf: { step: 5, visible_events: 5, head: true }, notice: 'That position could not be loaded, so Live is shown.', filters: { types: new Set(), edgeTypes: new Set() } }), /so Live is shown/);
+});
+
+test('focus goes to the logical successor when the focused control is replaced (T16: it used to land on the panel)', () => {
+  assert.deepEqual(focusSuccessor('wba:confirm:collab_s1'), ['[data-wb-act="confirm-go"][data-wb-id="collab_s1"]', '[data-wb-act="confirm-go"]']);
+  assert.deepEqual(focusSuccessor('wba:confirm-cancel:'), ['[data-wb-act="confirm"]']);
+  assert.deepEqual(focusSuccessor('node:attempt:a1'), []);
+  assert.deepEqual(focusSuccessor(null), []);
+  assert.deepEqual(focusSuccessor('wba:confirm-go:collab_s1'), ['[data-wb-act="reject"][data-wb-id="collab_s1"]', '[data-wb-steer="collab_s1"]']);
+  assert.deepEqual(focusSuccessor('wba:history:c1'), []);
 });

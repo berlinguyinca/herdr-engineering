@@ -362,6 +362,21 @@ export function focusSelector(key) {
   }
 }
 
+// When the focused control is replaced by a different one (a button that opens a step that has its own buttons), focus goes to the
+// logical successor, not to the container: "Review and confirm" opens the confirm step, so focus lands on "Confirm and send";
+// "Cancel" closes it, so focus returns to "Review and confirm". Returns selectors to try in order; none means "park on the panel".
+export function focusSuccessor(key) {
+  const q = (v) => String(v).replace(/["\\]/g, '\\$&');
+  const [kind, act, ...id] = String(key || '').split(':');
+  const ident = id.join(':');
+  if (kind !== 'wba') return [];
+  if (act === 'confirm') return [ident ? `[data-wb-act="confirm-go"][data-wb-id="${q(ident)}"]` : '', '[data-wb-act="confirm-go"]'].filter(Boolean);
+  if (act === 'confirm-cancel') return ['[data-wb-act="confirm"]'];
+  // the request was sent (or declined): stay on that request, on its remaining action if it has one, else on the row itself
+  if ((act === 'confirm-go' || act === 'reject') && ident) return [`[data-wb-act="reject"][data-wb-id="${q(ident)}"]`, `[data-wb-steer="${q(ident)}"]`];
+  return [];
+}
+
 // Where a replay control moves to (pure; the caller fetches). Returns a step number or 'live'.
 export function replayTarget(asOf, action, value) {
   const n = asOf ? asOf.visible_events : 0;
@@ -550,11 +565,15 @@ export function renderLineage(m) {
   const layout = view.nodes.length <= MAX_RENDER_NODES ? layoutGraph(view) : null;
   const graphPane = m.mode === 'table' ? renderGraphTable(view, { sel: m.sel })
     : `<div class="cx-scroll lin-scroll" role="region" tabindex="0" aria-label="Lineage graph">${renderGraphSvg(view, layout, { sel: m.sel, focus: m.focus, match: view.match })}</div>`;
-  // `graphMore === false` is the last page the server will give: it stopped reading (e.g. scan_budget) and more nodes may exist.
-  // Say so; staying silent made a cut-off graph look complete (T16 large-graph gate).
+  // `graphMore === false` is the last page the server will give. What the server says it ran out of decides what is missing:
+  // `scan_budget` means it stopped reading NODES (more may exist); any other reason with no next page (`edge_budget`,
+  // `limit` on edges, `response_bytes`) means every node was returned but some LINKS were left out. Silence made a cut-off
+  // graph look complete (T16 large-graph gate); a wrong claim ("more nodes") for an edges-only cut would mislead as well.
   const trunc = m.graphTruncated
     ? (m.graphMore === false
-      ? `<p class="cx-msg" role="status">Showing ${a.nodes.length} nodes (${esc(m.graphTruncated)}). The server stopped reading here, so more nodes may exist that this view cannot load.</p>`
+      ? (m.graphTruncated === 'scan_budget'
+        ? `<p class="cx-msg" role="status">Showing ${a.nodes.length} nodes (${esc(m.graphTruncated)}). The server stopped reading here, so more nodes may exist that this view cannot load.</p>`
+        : `<p class="cx-msg" role="status">Showing all ${a.nodes.length} nodes, but the server left out some links (${esc(m.graphTruncated)}), so the links drawn may be incomplete.</p>`)
       : `<p class="cx-msg" role="status">Showing ${a.nodes.length} of ${m.total} nodes (${esc(m.graphTruncated)}). <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-more="1">Load more</button></p>`)
     : '';
   const gantt = m.timeline ? buildGantt(m.timeline, { clock: m.clock, types: m.filters.types }) : null;

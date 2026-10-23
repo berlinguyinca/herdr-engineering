@@ -7,7 +7,7 @@ import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
 import { decisionBody, delegationBody, renderDelegations, renderProposalList, renderReview } from './collab-proposals.js';
 import {
-  MAX_RENDER_NODES, filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
+  MAX_RENDER_NODES, filterGraph, focusKey, focusSelector, focusSuccessor, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
 } from './collab-lineage.js';
 import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
 import { ackBody, renderAnalytics, renderInbox as renderAttention, renderProgress, restoreBody, snoozeBody } from './collab-attention.js';
@@ -97,8 +97,10 @@ export function stableSelector(el) {
   if (!el || !el.tagName) return null;
   const q = (v) => String(v).replace(/["\\]/g, '\\$&');
   if (el.id) return `#${CSS.escape(el.id)}`;
-  const data = [...el.attributes].find((a) => a.name.startsWith('data-') && a.name !== 'data-h');
-  if (data) return `${el.tagName.toLowerCase()}[${data.name}="${q(data.value)}"]`;
+  // Every data-* attribute together: a row's control is told apart from its siblings by its own id (data-pid, data-wb-id, ...),
+  // not just by the shared action name, so focus returns to THE control and not to the first one with the same action.
+  const data = [...el.attributes].filter((a) => a.name.startsWith('data-') && a.name !== 'data-h');
+  if (data.length) return `${el.tagName.toLowerCase()}${data.map((a) => `[${a.name}="${q(a.value)}"]`).join('')}`;
   if (el.type === 'submit' && el.closest('form')) { const f = el.closest('form'); const fd = [...f.attributes].find((a) => a.name.startsWith('data-')); if (fd) return `form[${fd.name}="${q(fd.value)}"] button[type="submit"]`; }
   return null;
 }
@@ -641,12 +643,18 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
 
     const stillBtn = $('hcn-flow-still');      // WCAG 2.2.2: moving lines run for longer than 5 s, so they can be paused
     if (stillBtn) {
-      stillBtn.onclick = () => {
-        const on = stillBtn.getAttribute('aria-pressed') !== 'true';
+      // A toggle button keeps ONE label and states its state with aria-pressed; changing the label as well would be read twice
+      // ("Resume motion, pressed"). The choice is remembered per browser; storage may be blocked, so every access is guarded.
+      const KEY = 'hcn.flow.still';
+      const apply = (on, save) => {
         stillBtn.setAttribute('aria-pressed', String(on));
-        stillBtn.textContent = on ? 'Resume motion' : 'Pause motion';
         $('hcn-p-flow').classList.toggle('cx-still', on);
+        if (save) { try { if (on) window.localStorage.setItem(KEY, '1'); else window.localStorage.removeItem(KEY); } catch { /* storage blocked: the choice lasts until reload */ } }
       };
+      let saved = false;
+      try { saved = window.localStorage.getItem(KEY) === '1'; } catch { saved = false; }
+      if (saved) apply(true, false);
+      stillBtn.onclick = () => apply(stillBtn.getAttribute('aria-pressed') !== 'true', true);
     }
     const log = $('hcn-log');
     let alive = true;
@@ -912,14 +920,22 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
               if (!window.confirm(ask)) return;
               await api.decideProposal(roomId, b.dataset.pid, decisionBody(b.dataset.decide, b.dataset.digest, ($('hcn-prop-reason') || {}).value));
               ['hcn-props', 'hcn-review', 'hcn-delegs'].forEach((id) => { $(id).dataset.h = ''; });
+              S.focusProposal = b.dataset.pid;          // the decide buttons go away: focus moves on to this proposal's row, not to <body>
               await loadProposals();
             });
           });
         }
+        landOnDecided();
       };
       show();
       loadTabs().then(() => loadProposals()).then(show);
     }
+    // After a decision the review buttons are gone: land on the decided proposal's own row (its logical successor).
+    const landOnDecided = () => {
+      if (!S.focusProposal) return;
+      const row = $('hcn-props') && $('hcn-props').querySelector(`[data-proposal="${CSS.escape(S.focusProposal)}"]`);
+      if (row) { row.focus({ preventScroll: true }); S.focusProposal = null; }
+    };
 
     // ---- Lineage: graph, Gantt, replay and inspector. Read-only; the server filters every read by your CURRENT
     // membership. Live = the head of your ledger (refreshed while open); a replay position is static.
@@ -1154,7 +1170,10 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       LIN.html = html; box.innerHTML = html;
       const sel = key && focusSelector(key);
       const el = sel && box.querySelector(sel);
-      if (key && !el) refocus(box, null);                                  // the control is gone (e.g. "Confirm and send"): park focus on the panel
+      if (key && !el) {                                                    // the control is gone: its logical successor, else the panel
+        const next = focusSuccessor(key).map((q) => box.querySelector(q)).find(Boolean);
+        if (next) { if (!next.matches('button,a[href],input,select,textarea,[tabindex]')) next.setAttribute('tabindex', '-1'); next.focus({ preventScroll: true }); } else refocus(box, null);
+      }
       if (el) { el.focus({ preventScroll: true }); if (pos !== null && el.setSelectionRange && (el.type === 'search' || el.type === 'textarea' || el.type === 'text')) try { el.setSelectionRange(pos, pos); } catch { /* not selectable */ } }
     }
     function bindLineage(box) {
