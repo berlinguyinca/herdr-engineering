@@ -21,6 +21,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,16 @@ class _RateLimiter:
 
 
 _FLEET_CONFIG_PATH = "/api/v1/fleet/config"
+
+
+def _gate_pr(snap):
+    """A PrSnapshot as plain JSON (no approved_patch_id; findings are already redacted)."""
+    return {
+        "key": str(snap.key), "head_sha": snap.head_sha, "state": snap.state.value,
+        "review_rounds": snap.review_rounds, "ci_fix_rounds": snap.ci_fix_rounds,
+        "reason": snap.reason, "approved_sha": snap.approved_sha,
+        "last_findings": [asdict(f) for f in snap.last_findings],
+    }
 
 
 class ControlPlaneServer:
@@ -235,8 +246,53 @@ class ControlPlaneServer:
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._httpd = None
+        self.gate_service = self.gate_store = self.gate_queue = None
+        self._start_review_gate(repo, fleet_config)
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    def _start_review_gate(self, repo, fleet_config):
+        """Build and start the PR review gate when the central config enables it.
+
+        Last step of construction, so no earlier failure leaks the gate thread. An
+        enabled-but-invalid config raises ValueError (the same fail-loud stance as
+        the bind/collab checks above): a half-configured gate never starts.
+        """
+        if fleet_config is None:
+            return
+        from ..fleet_config import FleetConfigError
+        from ..review_gate.config import load_review_gate_config
+        try:
+            section = fleet_config.current().section("control_plane")
+        except FleetConfigError:
+            return  # no control_plane section: nothing to enable
+        config = load_review_gate_config({"control_plane": section})
+        if not config.enabled:
+            return
+        # Gate events are written require_durable=True. A sink that cannot
+        # acknowledge a write would fail every one of them; refuse up front.
+        # (No sink at all = in-memory repo; the CLI refuses that without a DSN.)
+        sink = getattr(repo, "_sink", None)
+        if sink is not None and not callable(getattr(sink, "record_required", None)):
+            raise ValueError("review_gate: the event sink cannot make durable writes")
+        from ..review_gate import github_app
+        from ..review_gate.queue import ReviewQueue
+        from ..review_gate.registry import AuthorRegistry
+        from ..review_gate.service import GateService
+        from ..review_gate.store import PipelineStore
+        self.gate_store = PipelineStore(
+            repo,
+            review_caps={e.repo: e.review_cap for e in config.repos},
+            ci_fix_caps={e.repo: e.ci_fix_cap for e in config.repos})
+        self.gate_queue = ReviewQueue(repo)
+        self.gate_service = GateService(
+            config=config, app=github_app.GitHubAppClient(config.app),
+            store=self.gate_store, queue=self.gate_queue, registry=AuthorRegistry(repo),
+            ci_snapshot=lambda: self.ci_monitor.snapshot(start=False))
+        # The gate must work with no browser open, and snapshot(start=False) never
+        # starts the poller, so the server starts the shared monitor itself.
+        self.ci_monitor.start()
+        self.gate_service.start()
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError, UnsupportedError
@@ -346,6 +402,8 @@ class ControlPlaneServer:
             self._summary_stop.wait(2)
 
     def shutdown(self):
+        if self.gate_service is not None:
+            self.gate_service.stop()
         self._summary_stop.set()
         if self._summary_scanner:
             self._summary_scanner.join(timeout=2)
@@ -694,6 +752,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._operator()
             if public:
                 return self._public()
+            # Unambiguous framing, as on the public/operator listeners: this server reads
+            # only Content-Length, so a chunked or doubly-sized body would be parsed as
+            # the next request on a keep-alive connection. Applies to collab paths too.
+            if (len(self.headers.get_all("Content-Length") or []) > 1
+                    or "Transfer-Encoding" in self.headers):
+                return self._deny(400, "ambiguous request framing")
             if self._is_collab_path():
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
@@ -701,7 +765,11 @@ def _make_handler(server, public=False, operator=False):
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
-            if path.startswith(("/api/v1/ci/", "/api/v1/reviews")):
+            # Decide on the DECODED resource: routing unquotes each segment, so a raw
+            # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
+            segs = path.split("/")
+            res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
+            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -972,6 +1040,46 @@ def _make_handler(server, public=False, operator=False):
                 message = "GitHub service is unavailable." if resource == "github" else str(exc)
                 return self._send_json(500, {"error": message})
 
+        def _review_gate_get(self, parts):
+            if parts[-1] == "" and len(parts) > 5:
+                parts = parts[:-1]  # one trailing slash is the same route
+            if server.gate_service is None or len(parts) != 5:
+                return self._json({"error": "not found"}, 404)
+            if parts[4] == "prs":
+                return self._json([_gate_pr(snap) for snap in server.gate_store.snapshots()])
+            if parts[4] == "queue":
+                return self._json({"depth": server.gate_queue.depth(),
+                                   "jobs": server.gate_queue.snapshot(),
+                                   "gate": server.gate_service.status()})
+            return self._json({"error": "not found"}, 404)
+
+        def _review_gate_resume(self, parts):
+            # /api/v1/review-gate/prs/<github.com>/<owner>/<name>/<number>/resume
+            # (the canonical repo's slashes stay literal; %2F inside a segment works too)
+            self._read_json()  # always consume the body: keep-alive must not parse it as a request
+            if (server.gate_service is None or len(parts) < 8 or parts[4] != "prs"
+                    or parts[-1] != "resume"):
+                return self._json({"error": "not found"}, 404)
+            from ..review_gate.models import PrKey
+            from .project_links import canonical_repository
+            # Same canonical form as the enrollment config (lowercase owner/name).
+            repo = canonical_repository("/".join(parts[5:-2])) or ""
+            try:
+                key = PrKey.parse(f"{repo}#{parts[-2]}")
+            except ValueError:
+                return self._json({"error": "not found"}, 404)
+            store = server.gate_store
+            if key not in store.known_keys():
+                return self._json({"error": "not found"}, 404)
+            try:
+                resumed = store.resume(key)
+            except Exception:  # noqa: BLE001 - the durable write failed; nothing changed
+                return self._json({"error": "Review gate state could not be persisted; "
+                                            "nothing was resumed."}, 503)
+            if not resumed:
+                return self._json({"error": "pull request is not escalated"}, 409)
+            return self._json(_gate_pr(store.snapshot(key)))
+
         def _api_get(self, parts, resource):
             r = server.repo
             if resource == "health":
@@ -1165,6 +1273,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"available": True, "reviews": summaries,
                                    "total": len(rows), "has_more": offset + limit < len(rows),
                                    "offset": offset, "checked_at": r._stamp()})
+            if resource == "review-gate":
+                return self._review_gate_get(parts)
             if resource == "tests":
                 return self._json(_tests_view())
             return self._json({"error": "not found"}, 404)
@@ -1181,6 +1291,8 @@ def _make_handler(server, public=False, operator=False):
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
+            if resource == "review-gate":
+                return self._review_gate_resume(parts)
             if resource == "ci" and len(parts) == 5 and parts[4] == "telemetry":
                 from .ci_performance import MAX_REQUEST_BYTES, validate_ci_telemetry
                 length = int(self.headers.get('Content-Length') or 0)
@@ -1520,15 +1632,21 @@ def _make_handler(server, public=False, operator=False):
 
         # ---------------------------------------------------------- helpers
         def _read_json(self):
-            length = int(self.headers.get("Content-Length") or 0)
-            if not length:
-                return None
-            if length > _MAX_JSON_BODY:
-                raise ValueError("request body too large")
             try:
-                return json.loads(self.rfile.read(length))
-            except (ValueError, json.JSONDecodeError):
-                raise ValueError("invalid JSON body")
+                length = int(self.headers.get("Content-Length") or 0)
+                if not length:
+                    return None
+                if length > _MAX_JSON_BODY:
+                    raise ValueError("request body too large")
+                try:
+                    return json.loads(self.rfile.read(length))
+                except (ValueError, json.JSONDecodeError):
+                    raise ValueError("invalid JSON body") from None
+            except ValueError:
+                # The body may be unread or only partly read: never reuse the connection,
+                # or the leftover bytes would be parsed as the next request.
+                self.close_connection = True
+                raise
 
         def _json(self, data, status=200):
             payload = json.dumps(data).encode()
@@ -1536,6 +1654,8 @@ def _make_handler(server, public=False, operator=False):
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
             return None
