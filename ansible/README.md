@@ -155,7 +155,12 @@ Per host, in order:
    reaches the update step restarts the agent, even if nothing else changed.
    Until that restart happens, the result is `updated (agent restart pending)`
    and `last updated` keeps its previous value, because the update is not
-   complete while the agent still runs the old code. On macOS the restart is
+   complete while the agent still runs the old code. The marker is written to the
+   state file as soon as OS packages or the herdr-eng release change, before
+   the restart, so it survives a host that drops mid-update or a killed
+   controller run; only a confirmed restart clears it. A host with no agent to
+   restart (no herdr-eng on Linux, no LaunchAgent plist on macOS) never needs a
+   restart, so it records `updated` and any stale marker clears. On macOS the restart is
    best-effort: a LaunchAgent that is not loaded prints a message, leaves the
    restart pending and never records `failed:`. A failing update step
    yields `failed: <task name>`. Only the task name is recorded, never its

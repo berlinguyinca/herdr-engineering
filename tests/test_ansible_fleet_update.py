@@ -452,6 +452,7 @@ def test_restart_is_skipped_when_the_host_became_busy(tmp_path, busy, forced, ex
                       "fleet_update_control_plane_url": f"http://127.0.0.1:{srv.server_port}",
                       "fleet_update_host_id": "beast", "fleet_update_reason": "",
                       "fleet_update_decision": {"forced": forced, "restart_pending": False},
+                      "fleet_update_agent_present": True,
                       "fleet_update_security_install": {"changed": True}},
              "tasks": tasks}]
     pb = tmp_path / "p.yml"
@@ -544,3 +545,78 @@ def test_collect_and_record_carry_restart_pending(tmp_path, done, pending):
         assert saved["last_updated"] == "2026-10-01T00:00:00+00:00"
     else:
         assert saved["result"] == "updated" and saved["last_updated"] != "2026-10-01T00:00:00+00:00"
+
+
+def test_pending_marker_is_written_right_after_a_change():
+    block = _update_block()["block"]
+    names = [t["name"] for t in block]
+    os_i = names.index("Fleet update: OS packages")
+    fa_i = next(i for i, t in enumerate(block) if "fabric-agent.yml" in json.dumps(t))
+    assert "persist the pending-restart marker" in names[os_i + 1]
+    assert "persist the pending-restart marker" in names[fa_i + 1]
+    for i in (os_i + 1, fa_i + 1):
+        t = block[i]
+        assert t["ansible.builtin.command"]["argv"][-1] == "mark-pending"
+        assert "not ansible_check_mode" in t["when"]
+        assert t["delegate_to"] == "localhost" and t["become"] is False
+    assert "fabric_agent_provision" in json.dumps(block[fa_i + 1]["when"])
+
+
+def test_no_agent_means_no_restart_and_no_pending():
+    present = _by_name("is there a fabric agent to restart")[0]["ansible.builtin.set_fact"]
+    assert "herdr_eng_resolve" in present["fleet_update_agent_present"]
+    assert "fleet_update_launchagent.stat.exists" in present["fleet_update_agent_present"]
+    need = _by_name("decide whether the agent needs a restart")[0]["ansible.builtin.set_fact"]
+    assert "fleet_update_agent_present | bool" in need["fleet_update_restart_needed"]
+    report = _by_name("Collect this host's report")[0]["ansible.builtin.set_fact"]["fleet_update_report"]
+    assert "fleet_update_agent_present" in report["restart_pending"]
+
+
+def test_host_without_herdr_eng_clears_pending_and_stays_clean(tmp_path):
+    """Real role tasks from the agent-presence check through Record, on localhost
+    (Linux), herdr-eng 'not-found': every restart task is skipped, no host change."""
+    exe = _ansible("ansible-playbook")
+    if not exe:
+        pytest.skip("ansible-playbook not available")
+    block = _update_block()["block"]
+    start = next(i for i, t in enumerate(block) if "look for the macOS LaunchAgent" in t["name"])
+    tail = [t for t in block[start:] if "mark updated" not in t["name"]]
+    for t in tail:
+        if "include_tasks" in json.dumps(t):
+            t["ansible.builtin.include_tasks"] = str(PROBE)
+    top = [t for t in _load(ROLE / "tasks" / "main.yml")
+           if any(w in t.get("name", "") for w in ("Collect this host's report", "Record results"))]
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"beast": {"last_updated": "2026-10-01T00:00:00+00:00",
+                                           "restart_pending": True}}))
+    helper = str(ROOT / "files" / "fleet-update-state.py")
+
+    def run(changed):
+        decision = json.loads(subprocess.run(
+            ["python3", helper, "decide"], capture_output=True, text=True, check=True,
+            input=json.dumps({"state_file": str(state), "force": False, "max_defer_days": 7,
+                              "active_hosts": [], "hosts": {"beast": {"names": ["beast"]}}}),
+        ).stdout)["beast"]
+        play = [{"hosts": "localhost", "gather_facts": True,
+                 "vars": {**_defaults(), "fleet_update_helper": helper,
+                          "fleet_update_state_file": str(state), "fleet_update_host_id": "beast",
+                          "fleet_home": str(tmp_path), "fleet_pins": {},
+                          "herdr_eng_resolve": {"stdout": "not-found\n"},
+                          "fleet_update_outcome": "updated", "fleet_update_reason": "",
+                          "fleet_update_restart_done": False,
+                          "fleet_update_security_install": {"changed": changed},
+                          "fleet_update_decision": decision},
+                 "tasks": tail + top}]
+        pb = tmp_path / "p.yml"
+        pb.write_text(yaml.safe_dump(play))
+        r = subprocess.run([exe, "-i", "localhost,", "-c", "local", str(pb)],
+                           capture_output=True, text=True, timeout=180)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert re.search(r"Restart the fabric agent \(systemd user unit\)\] \*+\nskipping", r.stdout)
+        return json.loads(state.read_text())["beast"]
+
+    first = run(changed=True)  # OS packages changed, stale pending flag from before
+    assert first["restart_pending"] is False
+    assert first["result"] == "updated" and first["last_updated"] != "2026-10-01T00:00:00+00:00"
+    second = run(changed=False)  # the following night stays clean
+    assert second["restart_pending"] is False and second["result"] == "updated"

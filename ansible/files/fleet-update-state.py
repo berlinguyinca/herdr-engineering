@@ -7,6 +7,7 @@ reading one JSON object on stdin and printing one JSON object on stdout:
   decide  busy signal + deferral state -> per host {action: update|defer, ...}.
           Reads the state file, never writes it.
   busy    one host's busy state right before the agent restart.
+  mark-pending  persist restart_pending=true for one host (crash-safe marker).
   record  per host outcome -> per host control-plane ingest body; writes the
           state file (unless dry_run) under an exclusive lock, merging so
           hosts not in this run keep their entries.
@@ -180,7 +181,8 @@ def _write_state(path: Path, updates: dict) -> None:
     with open(lock, "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         state = load_state(path)
-        state.update(updates)
+        for host, fields in updates.items():  # merge per host: other keys survive
+            state[host] = {**_entry(state, host), **fields}
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".fleet-update-")
         try:
             with os.fdopen(fd, "w") as f:
@@ -247,12 +249,24 @@ def busy(inp: dict) -> dict:
                                **_busy_kwargs(inp))}
 
 
-COMMANDS = {"decide": decide, "record": record, "busy": busy}
+def mark_pending(inp: dict) -> dict:
+    """Persist restart_pending=true for one host right after something the agent
+    depends on changed, so a run that dies before ``record`` (host unreachable
+    mid-update, controller killed) still leaves the retry marker. Same lock and
+    atomic write as ``record``; nothing else in the host's entry changes."""
+    host = inp["host_id"]
+    if not inp.get("dry_run"):
+        _write_state(Path(inp["state_file"]).expanduser(), {host: {"restart_pending": True}})
+    return {"host_id": host, "restart_pending": True}
+
+
+COMMANDS = {"decide": decide, "record": record, "busy": busy, "mark-pending": mark_pending}
 
 
 def main(argv) -> int:
     if len(argv) != 2 or argv[1] not in COMMANDS:
-        print("usage: fleet-update-state.py decide|record|busy < input.json", file=sys.stderr)
+        print("usage: fleet-update-state.py decide|record|busy|mark-pending < input.json",
+              file=sys.stderr)
         return 2
     inp = json.load(sys.stdin)
     out = COMMANDS[argv[1]](inp)

@@ -85,6 +85,24 @@
     - name: "Fleet update: OS packages"
       ansible.builtin.include_tasks: os-packages.yml
 
+    # Crash-safe retry marker: written as soon as something the agent depends
+    # on changed, so a host that drops mid-update (or a killed controller)
+    # still gets its agent restarted by a later run. The final record clears it
+    # only after a confirmed restart.
+    - name: "Fleet update: persist the pending-restart marker (OS packages changed)"
+      ansible.builtin.command:
+        argv: [python3, "{{ fleet_update_helper }}", mark-pending]
+        stdin: "{{ {'state_file': fleet_update_state_file, 'host_id': fleet_update_host_id} | to_json }}"
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      when:
+        - not ansible_check_mode
+        - fleet_update_restart_agent | bool
+        - (fleet_update_security_install | default({}) is changed)
+          or (fleet_update_full_upgrade | default({}) is changed)
+          or (fleet_update_brew | default({}) is changed)
+
     # Existing roles own herdr/pi install: herdr pinned-version check, pi
     # presence, pi-engineering + autospec clones (at main, pre-existing).
     - name: "Fleet update: herdr / pi / autospec via the platform role"
@@ -117,6 +135,18 @@
         fabric_agent_defer_restart: true
       when: herdr_engineering_revision is defined
 
+    - name: "Fleet update: persist the pending-restart marker (herdr-eng staged)"
+      ansible.builtin.command:
+        argv: [python3, "{{ fleet_update_helper }}", mark-pending]
+        stdin: "{{ {'state_file': fleet_update_state_file, 'host_id': fleet_update_host_id} | to_json }}"
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      when:
+        - not ansible_check_mode
+        - fleet_update_restart_agent | bool
+        - fabric_agent_provision | default({}) is changed
+
     - name: "Fleet update: pi build-gate extension"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/pi-build-gate.yml"
       when: herdr_engineering_revision is defined
@@ -129,6 +159,22 @@
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/fabric-systemd.yml"
       when: ansible_facts['system'] == 'Linux'
 
+    # No agent to restart (Linux: no herdr-eng; macOS: no LaunchAgent plist)
+    # means no restart is needed and none can be pending: a stale flag clears.
+    - name: "Fleet update: look for the macOS LaunchAgent"
+      ansible.builtin.stat:
+        path: "{{ fleet_home }}/Library/LaunchAgents/com.herdr-engineering.fabric-agent.plist"
+      become: false
+      register: fleet_update_launchagent
+      when: ansible_facts['system'] == 'Darwin'
+
+    - name: "Fleet update: is there a fabric agent to restart?"
+      ansible.builtin.set_fact:
+        fleet_update_agent_present: >-
+          {{ (herdr_eng_resolve.stdout | default('not-found') | trim) != 'not-found'
+             if ansible_facts['system'] == 'Linux'
+             else (fleet_update_launchagent.stat.exists | default(false)) }}
+
     # Every update step above succeeded. Restart only when something the agent
     # depends on changed, or an earlier run left a restart pending (deferred,
     # failed, or a later step failed after staging), so an idle host that is
@@ -137,6 +183,7 @@
       ansible.builtin.set_fact:
         fleet_update_restart_needed: >-
           {{ (fleet_update_restart_agent | bool)
+             and (fleet_update_agent_present | bool)
              and ((fleet_update_decision.restart_pending | default(false) | bool)
                   or (fabric_agent_provision | default({}) is changed)
                   or (fleet_update_security_install | default({}) is changed)
@@ -258,6 +305,7 @@
       # (For deferred/skipped runs the helper keeps the state file's value.)
       restart_pending: >-
         {{ (fleet_update_restart_agent | bool)
+           and (fleet_update_agent_present | default(true) | bool)
            and not (fleet_update_restart_done | default(false) | bool)
            and ((fleet_update_decision.restart_pending | default(false) | bool)
                 or (fabric_agent_provision | default({}) is changed)

@@ -328,3 +328,28 @@ def test_skipped_keeps_pending(tmp_path):
     state.write_text(json.dumps({"beast": {"restart_pending": True}}))
     _record(state, {"beast": _host("skipped", reason="an earlier host failed")})
     assert json.loads(state.read_text())["beast"]["restart_pending"] is True
+
+
+def test_mark_pending_survives_a_crash_before_record(tmp_path):
+    state = tmp_path / "s.json"
+    prev = _iso(NOW - 2 * DAY)
+    state.write_text(json.dumps({"beast": {"last_updated": prev, "result": "updated"},
+                                 "fry": {"last_updated": "keep"}}))
+    fus.mark_pending({"state_file": str(state), "host_id": "beast"})
+    saved = json.loads(state.read_text())
+    assert saved["beast"] == {"last_updated": prev, "result": "updated", "restart_pending": True}
+    assert saved["fry"] == {"last_updated": "keep"}
+    # the run died here (no record): the next run's decision carries the retry
+    assert _decide_idle(state)["restart_pending"] is True
+    # dry run (--check) writes nothing
+    fus.mark_pending({"state_file": str(state), "host_id": "fry", "dry_run": True})
+    assert "restart_pending" not in json.loads(state.read_text())["fry"]
+
+
+def test_mark_pending_cli(tmp_path):
+    state = tmp_path / "s.json"
+    res = subprocess.run([sys.executable, "-I", str(HELPER), "mark-pending"],
+                         input=json.dumps({"state_file": str(state), "host_id": "beast"}),
+                         capture_output=True, text=True, check=True, timeout=10)
+    assert json.loads(res.stdout)["restart_pending"] is True
+    assert json.loads(state.read_text())["beast"]["restart_pending"] is True
