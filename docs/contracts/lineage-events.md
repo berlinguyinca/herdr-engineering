@@ -291,3 +291,77 @@ panel lists by type instead of walking from a root.
   object's events wins, so an object whose OLD events lack `room_id` stays operator-only until an operator re-creates it
   under a new id or the old events are retired).
 - **Large rooms**: the Tabs panel makes three listing reads (agents, tabs, panes) at most every 8 s while open; not load-tested.
+
+## Lineage views and replay (T09)
+Read-only workbench for ONE room: a lineage graph, a Gantt timeline, a replay scrubber and a node inspector. It extends the
+T08 room page (`packages/collab-lineage.js`, sub-tab "Lineage" in `collab-view.js`) and the T08 collab read routes. No new
+dashboard, service, event store or table: **no migration**. The projection already derives from `fabric_events`; T09 keeps the
+applied events (`GraphProjection._log`, plus `_log_ctx`, an index by the room/mission context a scope names) in memory next to
+the graph, refilled by the same rebuild that refills the graph, so a restart loses nothing. A snapshot table can be added later
+without changing semantics (same argument as T02).
+
+### Routes (collab namespace, HCN-authenticated, `room_id` REQUIRED, same access snapshot and 404 as `graph/nodes`)
+| route | returns |
+|---|---|
+| `GET /api/v1/collab/graph/lineage?room_id=&[step=\|at=]&limit=&offset=&node_types=&edge_types=` | `as_of`, `nodes` (every node type of the room view), `edges` among them, `total_nodes`, `next_offset`, `truncated`/`truncated_reason` |
+| `GET .../graph/lineage/timeline?room_id=&[step=\|at=]` | `as_of`, `lanes` (per node: `spans` = recorded state periods with `open`/`terminal`), `markers` (edge events; `kind` `edge`\|`edge_removed`\|`head_change`; `stale`), `range`, `truncated_reason` |
+| `GET .../graph/lineage/events?room_id=&cursor=&limit=` | the reader's visible ledger page: allow-listed fields only (no raw `attrs`), `step` 1.. , `next_cursor` |
+They exist only in `CollabService.graph_read` (never in the keyed `/api/v1/graph`, so a fleet key gets no unbudgeted replay), only in
+the combined server (`collab_only` => 404), and a non-member, guest, agent or unknown room all answer the same 404. Bad parameters
+are 400 (`step`/`at` together, negative step, non-ISO `at`, unknown type, limit out of range). Reads are rate limited per person (240/min, 429).
+
+### Replay semantics
+- **Position** is a count of the READER's own visible ledger events (`step`, 0..`visible_events`), so no number reveals how many
+  hidden events exist. Past the end clamps to now (silently). `at` resolves, by server receipt time (never the emitter's
+  `occurred_at`), to the number of visible events BEFORE the first one received after that instant: a prefix of admission order.
+- **Replay equals live at that point.** The graph at step k is a projection built from every stored lineage event (ALL rooms:
+  cross-room scope meets and last-writer fields resolve exactly as they did) with admission number <= that of the k-th visible
+  event. `apply` is commutative and idempotent, so this equals a projection that was fed those events live (tested at every
+  step, for several readers, and after a rebuild). The head (step = visible_events) is the live projection itself.
+- **Replay never widens visibility.** (1) An event is shown only if its own scope label is visible to the reader and the object it
+  concerns is visible to the reader NOW. (2) A replayed projection reads through the CURRENT projection: a node or edge in the
+  past is visible only if it is also visible now (tombstones are history and ignored; a later narrowing is not). So re-scoping
+  a node to private, or into another room, hides its past from this room too; `stale`/`bindings` of the past never reveal a
+  binding that is hidden now. (3) Membership is the reader's membership at THIS request: someone added later can replay what
+  happened before they joined (like every other read); someone removed gets 404 at every step.
+- **Budgets** (all report `truncated_reason`, never a count of hidden items): ledger window `LEDGER_SCAN_BUDGET` = newest 20,000
+  events of the room's contexts (`window_trimmed`; step 0 is then the state just before the window); a replay applies at most
+  `REPLAY_MAX_EVENTS` = 25,000 events (the whole prefix; over it is a generic 400, "now" is never capped); graph reads reuse
+  `SCAN_BUDGET`, `EDGE_SCAN_TOTAL`, `MAX_EDGES`, `MAX_RESPONSE_BYTES`; the timeline caps lanes (300) and markers (1000). At most
+  two replayed projections are cached (keyed by position and invalidated when an event arrives); one replay is built at a time.
+- **Pagination.** `limit` (<= 1000) and `offset` page the room's visible nodes (types in fixed order, admission order inside a
+  type); a page also carries the edges between its nodes and the nodes of earlier pages.
+
+### Timeline
+Spans come from recorded `node.upsert`/`node.state` states (a span ends at the next state; a terminal state `done failed cancelled
+superseded merged closed passed completed success error rejected approved aborted` is an instant; the last non-terminal span is `open`
+and drawn to the end of the observed range, never beyond). Markers come from edge events. `head_change` = a `reviewed`/`validated`
+edge bound to a different revision than an earlier visible one for the same subject; `stale` is the projection's own flag for
+that edge as the reader sees it at that position (T02 semantics: related edges only, admission order unless `attrs.supersedes`).
+Times are server receipt times; the emitter's claim (`occurred_at`, which falls back to receipt time) travels alongside and the UI
+offers it as a separate choice. Nothing is inferred from chat, layout or timing, and no progress is invented.
+
+### UI and accessibility
+Graph (layered SVG, no library), table view of the same data (always available; the only view above 300 nodes), Gantt (SVG +
+table), replay (range slider with spoken `aria-valuetext`, step buttons, Live), filters (search, node type, link type, state),
+inspector (read-only: fields, attributes as text, links in/out, state history, provenance). Keyboard: one tab stop in the graph,
+arrows/Home/End between nodes, Enter selects, Escape clears; arrow keys switch Graph/Gantt tabs. Nothing is encoded by colour alone:
+node types differ by shape, link types by dash pattern and a text tag (`stale` is struck through and says so), states by glyph and word,
+Gantt states by fill pattern and label, head changes by a letter. No animation (so nothing to reduce); forced-colors supported.
+Every id, label, attribute and reason is escaped for text and attribute contexts (unit and browser tested with hostile values).
+
+### Not in this task / limitations
+- Click-to-inspect terminal is NOT offered (needs `authorize_workspace`; the inspector says so). No comments, fork, steer or retry.
+- T05 (canonical GitHub issue/PR linking and reconciliation) is not built: issue/PR nodes and `issue_link` edges are drawn when an
+  emitter sends them, but no canonicalisation or reconciliation exists yet. T06's `review_quorum.py` is on a sibling branch and
+  is not on this stack; stale/head-change come only from the T02 projection's own flags.
+- Replay cost is the whole prefix across all rooms (see budgets); beyond 25,000 events a past position answers 400. A busy
+  deployment needs the snapshot table mentioned above. Not load-tested at that size.
+- The inspector shows the node as of the chosen position, from the page's own response; it does not fetch `graph/nodes/{id}`.
+- Pi still does not send `room_id`, so Pi lineage appears here only once the T08 emitter prerequisites hold.
+- Memory: `_log` holds every applied lineage event (references to the dicts the projection already receives); replayed
+  projections are throw-away copies of at most the prefix.
+
+### T09 rollout and rollback
+Code only, no migration: deploy the server, then the web files (`collab-lineage.js` is in the static map in `api.py`). Rollback:
+revert the PR; stored events are untouched and the T08 page is unchanged (a web-only rollback removes the Lineage tab).

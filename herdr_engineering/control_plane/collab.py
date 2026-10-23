@@ -2312,6 +2312,8 @@ class CollabService:
         principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
         contexts = None
         room_id = query.get("room_id")
+        if parts[:1] == ["lineage"]:
+            return self._lineage_read(pr, graph, access, parts[1:], query)
         if parts == ["nodes"]:
             # a listing is always ONE room's view (its own scope plus the missions it linked that this person
             # belongs to), so its cost never depends on other rooms' data
@@ -2327,6 +2329,56 @@ class CollabService:
             raise CollabError(404, "not found") from None
         except ValueError as exc:
             raise CollabError(400, str(exc)) from None
+
+    def _lineage_read(self, pr: Principal, graph, access: dict, parts: list[str], query: dict) -> dict:
+        """T09 read-only lineage views of ONE room: ``lineage`` (graph, optionally as of a replay position),
+        ``lineage/timeline`` (Gantt data) and ``lineage/events`` (the reader's visible ledger). They sit behind
+        the same access snapshot, the same fail-closed 404 and the same per-room context as the node listing;
+        a replay is filtered by the reader's membership AT THIS REQUEST, never the membership of the past."""
+        from .graph import EDGE_TYPES, NODE_TYPES
+        room_id = query.get("room_id")
+        if room_id is None:
+            raise CollabError(400, "room_id is required")
+        if room_id not in access["rooms"]:
+            raise CollabError(404, "not found")
+        contexts = frozenset({("room", room_id, None), *(("mission", m, r) for r, m in access["room_missions"]
+                                                         if r == room_id)})
+        principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
+
+        def num(name, default):
+            raw = query.get(name)
+            if raw in (None, ""):
+                return default
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                raise CollabError(400, f"{name} must be an integer") from None
+
+        def kinds(name, allowed):
+            raw = query.get(name)
+            if not raw:
+                return None
+            got = {x for x in str(raw).split(",") if x}
+            if not got or not got <= allowed:
+                raise CollabError(400, f"unknown {name}")
+            return got
+        step = num("step", None)
+        at = query.get("at") or None
+        with self._lock:                # a replay rebuilds the past: bound how often one person can ask
+            self._throttle(f"lineage:{pr.id}", 240, 60.0, "lineage")
+        try:
+            if parts == []:
+                return graph.room_lineage(principal, contexts, step=step, at=at,
+                                          node_types=kinds("node_types", NODE_TYPES),
+                                          edge_types=kinds("edge_types", EDGE_TYPES),
+                                          limit=num("limit", 200), offset=num("offset", 0))
+            if parts == ["timeline"]:
+                return graph.room_timeline(principal, contexts, step=step, at=at)
+            if parts == ["events"]:
+                return graph.room_ledger(principal, contexts, cursor=num("cursor", 0), limit=num("limit", 200))
+        except ValueError as exc:
+            raise CollabError(400, str(exc)) from None
+        raise CollabError(404, "not found")
 
     def list_room_missions(self, pr: Principal, room_id: str) -> dict:
         self._require_user(pr)

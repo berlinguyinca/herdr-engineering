@@ -464,6 +464,7 @@ _PUBLIC_STATIC = {
     "/collab-flow.js": ("collab-flow.js", "text/javascript"),
     "/collab-links.js": ("collab-links.js", "text/javascript"),
     "/collab-tabs.js": ("collab-tabs.js", "text/javascript"),
+    "/collab-lineage.js": ("collab-lineage.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
     "/conversation-markdown.js": ("conversation-markdown.js", "text/javascript"),
