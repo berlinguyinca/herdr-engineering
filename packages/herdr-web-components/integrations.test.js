@@ -110,3 +110,12 @@ test('CI search narrows colliding repository and run IDs by provider URL',()=>{
   assert.equal(selected.length,1);
   assert.equal(selected[0].record.provider_url,'https://ci-b.example');
 });
+
+test('CI provider selector compares canonical URLs exactly and preserves deployment paths',()=>{
+  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed'};
+  const entries=integrationEntries({pipelines:{history:[{...run,provider_url:'https://CI.example/'},{...run,provider_url:'https://ci.example/secondary/'}]}});
+  const options={tab:'failed',repository:'7',search:'12'};
+  assert.deepEqual(selectIntegrations(entries,{...options,provider:'https://ci.example'}).map(entry=>entry.record.provider_url),['https://CI.example/']);
+  assert.deepEqual(selectIntegrations(entries,{...options,provider:'https://CI.example/secondary'}).map(entry=>entry.record.provider_url),['https://ci.example/secondary/']);
+  assert.equal(selectIntegrations(entries,{...options,provider:'https://ci.example/missing'}).length,0);
+});

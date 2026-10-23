@@ -156,7 +156,7 @@ async function viewIntegrations(parts) {
   const query = route().query;
   dashboardView = mountIntegrations(root, client, {
     kind: parts[0], tab: query.get('tab') || 'current', search: query.get('search') || '',
-    repository: query.get('repository') || '', mission: query.get('mission') || '', session: query.get('session') || '',
+    repository: query.get('repository') || '', provider: query.get('provider') || '', mission: query.get('mission') || '', session: query.get('session') || '',
   });
 }
 

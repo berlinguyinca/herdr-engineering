@@ -34,9 +34,14 @@ export function integrationEntries(data={},kind='ci') {
     search:[record.title,record.provider_url,record.repository,record.repository_id,record.project_id,record.project,record.branch,record.revision,record.run_number,record.review_id,record.status,record.state,record.mission_id,record.session_id].filter(v=>v!=null).join(' ').toLowerCase(),
   })).sort((a,b)=>integrationTimestamp(b.record.updated_at || b.record.created_at)-integrationTimestamp(a.record.updated_at || a.record.created_at));
 }
-export function selectIntegrations(entries,{tab='current',search='',repository='',mission='',session='',branch='',days=0}={}) {
-  const terms=search.toLowerCase().trim().split(/\s+/).filter(Boolean);
-  return entries.filter(e=>(tab==='all' || e.tab===tab) && (!repository || e.record.repository===repository || e.record.repository_id===repository || String(e.record.provider_repo_id)===repository)
+const canonicalProvider = value => {
+  const provider=text(value).trim().replace(/\/+$/,'');
+  try {const url=new URL(provider);return url.origin+url.pathname.replace(/\/+$/,'');}
+  catch {return provider;}
+};
+export function selectIntegrations(entries,{tab='current',search='',repository='',provider='',mission='',session='',branch='',days=0}={}) {
+  const terms=search.toLowerCase().trim().split(/\s+/).filter(Boolean),providerKey=canonicalProvider(provider);
+  return entries.filter(e=>(tab==='all' || e.tab===tab) && (!providerKey || canonicalProvider(e.record.provider_url)===providerKey) && (!repository || e.record.repository===repository || e.record.repository_id===repository || String(e.record.provider_repo_id)===repository)
     && (!branch || e.record.branch===branch) && (!Number(days) || (integrationTimestamp(e.record.created_at || e.record.created)>=Date.now()-Number(days)*86400000 && integrationTimestamp(e.record.created_at || e.record.created)<=Date.now()))
     && (!mission || (e.record.mission_key || e.record.mission_id)===mission || records(e.record.related_missions).some(r=>(r.mission_key || r.mission_id)===mission))
     && (!session || e.record.session_id===session || records(e.record.related_sessions).some(r=>r.session_id===session)) && terms.every(t=>e.search.includes(t)));
@@ -120,10 +125,10 @@ const styles=`<style>
 @media(max-width:900px){.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}}@media(max-width:550px){.ig-row{grid-template-columns:minmax(0,1fr);gap:8px}.ig-state{max-width:none}.ig-tabs button{padding:9px 12px}}
 </style>`;
 
-export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',mission='',session=''}={}) {
+export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',provider='',mission='',session=''}={}) {
   const isCi=kind==='ci';
   const tabs=isCi ? [['current','Current'],['failed','Failed'],['finished','Finished']] : [['current','Current'],['changes','Changes requested'],['failed','Failed'],['finished','Finished']];
-  const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,mission,session,page:0,group:'project',branch:'',days:0};
+  const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,provider,mission,session,page:0,group:'project',branch:'',days:0};
   let disposed=false,data=null,error='',selected=null,pipeline=null,detailError='',log=null,logError='',step='',actionMessage='';
   let timer=null,clock=null,signature='',detailSignature='',chartSignature='';
   let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';

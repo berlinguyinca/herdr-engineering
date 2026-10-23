@@ -176,6 +176,7 @@ test('CI attention destinations retain provider identity when repository IDs and
   const result=overview.overviewAttention({ci:{pipelines:{history:[{...run,provider_url:'https://ci-a.example'},{...run,provider_url:'https://ci-b.example'}]}}},{},now,now);
   assert.equal(result.items.length,2);
   const destinations=result.items.map(item=>new URL(item.href.slice(1),'https://dashboard.example'));
-  assert.deepEqual(destinations.map(url=>url.searchParams.get('search')),['https://ci-a.example 12','https://ci-b.example 12']);
+  assert.deepEqual(destinations.map(url=>url.searchParams.get('provider')),['https://ci-a.example','https://ci-b.example']);
+  assert.deepEqual(destinations.map(url=>url.searchParams.get('search')),['12','12']);
   for(const url of destinations)assert.equal(url.searchParams.get('repository'),'7');
 });
