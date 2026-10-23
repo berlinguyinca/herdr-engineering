@@ -403,6 +403,9 @@ class GateService:
                 counts["merged"] += 1
             return
         self._back_off(key, sha, "merge refused (head moved / not mergeable)")
+        # Known limitation: merge_pr returns only a bool, so a refusal that
+        # update-branch cannot fix (405 not mergeable vs 409 head moved) cannot
+        # be told apart; update-branch is attempted once per head on any refusal.
         if (key, sha) not in self._update_tried:
             self._update_tried.add((key, sha))
             self._app.update_branch(repo, pr.number, sha)
