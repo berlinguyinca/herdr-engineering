@@ -1,16 +1,19 @@
 # Independent AI review
 
 The ruleset on `berlinguyinca/herdr-engineering` requires a commit status named exactly `Independent AI review`.
-`deploy/ci-review/ai-review.py` posts it. The script asks a reviewer from a different model family than the
-author (today: codex reviews Claude's PRs) to review the diff inside the collab sandbox. The script, not the
-model, then decides the state. Design details and the sandbox's gaps are in `deploy/ci-review/README.md`.
+`deploy/ci-review/ai-review.py` posts it. The script sends the PR's diff to a model from a different family than
+the author, chosen from the models `llm.metabolomics.us` advertises. Today that means a deepseek or qwen model
+reviews Claude's PRs. The script, not the model, then decides the state. Details are in
+`deploy/ci-review/README.md`.
 
 ## Running it
 
 ```bash
-cp deploy/ci-review/ai-review.example.yaml ~/.config/herdr-engineering/ai-review.yaml   # edit repos:, label:
+cp deploy/ci-review/ai-review.example.yaml ~/.config/herdr-engineering/ai-review.yaml   # edit repos:, model:
 python3 deploy/ci-review/ai-review.py review --repo berlinguyinca/herdr-engineering --pr 160 \
     --config ~/.config/herdr-engineering/ai-review.yaml --dry-run      # read + review, post nothing
+python3 deploy/ci-review/ai-review.py review --repo berlinguyinca/herdr-engineering --pr 160 \
+    --config ~/.config/herdr-engineering/ai-review.yaml --dry-run --max-chunks 1   # try one chunk
 python3 deploy/ci-review/ai-review.py review --repo berlinguyinca/herdr-engineering --pr 160 \
     --config ~/.config/herdr-engineering/ai-review.yaml                # post the status (and comment)
 python3 deploy/ci-review/ai-review.py poll --config ~/.config/herdr-engineering/ai-review.yaml
@@ -19,9 +22,11 @@ python3 deploy/ci-review/ai-review.py poll --config ~/.config/herdr-engineering/
 Requirements:
 
 - `gh`, signed in as an account that can post statuses and comments on the repo;
-- `codex`, signed in (`~/.codex/auth.json`);
-- bubblewrap;
+- pi's `~/.pi/agent/models.json` with the `metabolomics` provider (its `baseUrl` and `apiKey`);
 - PyYAML.
+
+To see which models can be used, list them with `GET {baseUrl}/models`, and set `reviewer.model` to one of the
+exact ids.
 
 For unattended runs, install the example user units `deploy/ci-review/herdr-ai-review.{service,timer}`
 (`systemctl --user enable --now herdr-ai-review.timer`, and `loginctl enable-linger`). `poll` is idempotent: a
@@ -30,56 +35,57 @@ new status and updates the existing comment.
 
 Statuses:
 
-- `pending`: "Review running (codex)".
-- `success`: "Approved by codex: code+security review, 0 blocking (visual review not run)".
-- `failure`: "Blocked: N findings — see PR comment". The comment, marked `<!-- independent-ai-review -->`, lists
-  each finding with file:line and why.
+- `pending`: "Review running (model id)".
+- `success`: "Approved by \<model id\>: code+security review, 0 blocking (visual review not run)".
+- `failure`: "Blocked: N findings — see PR comment (model id)". The comment, marked
+  `<!-- independent-ai-review -->`, lists each finding with file:line and why.
 
-If the review itself could not run, nothing terminal is posted and the pending status stays. Examples are the
-reviewer missing or failing, a malformed verdict, a sandbox or proxy error, or a timeout. `poll` retries that
-head once the pending status is older than `poll.pending_stale_minutes` (120). A head that moves mid-review gets
-nothing; its replacement is reviewed on the next poll.
+If the review itself could not run, nothing terminal is posted and the pending status stays. Causes include a
+gateway error after retries, a truncated or malformed answer, and a model that is not advertised; in the last
+case no pending status is posted either. `poll` retries that head once the pending status is older than
+`poll.pending_stale_minutes` (120). A head that moves mid-review gets nothing; its replacement is reviewed on the
+next poll.
 
 ## What it checks
 
-- Correctness, security and tests, as the reviewer reports them in `checked`. The status names only the aspects
-  that every chunk reported.
+- Correctness, security and tests, as the model reports them in `checked`. The status names only the aspects that
+  every chunk reported.
 - Every blocking finding must cite a file in the PR. A finding on a PR file whose line is not shown in the diff
   still blocks, marked "line unverified". A finding citing a file not in the PR is dropped, and the status says
   "N finding(s) dropped (cited code not in the PR)".
-- Independence: the reviewer's family must differ from every model family in the commits' `Co-Authored-By`
-  trailers (default author family: claude).
+- Independence: the model's family must differ from every model family in the commits' `Co-Authored-By` trailers
+  (default author family: claude). This holds for the configured model id and for the model id the gateway says
+  answered.
 
 ## What it does NOT check
 
 - **No visual review.** There is no screenshot or UI step. The status always says "(visual review not run)", and
   `visual_review: true` is refused. UI changes still need a human or a separate visual check.
+- **No tool use, no tests run.** The model reads text and answers; it executes nothing. Running tests is CI's
+  job.
 - **Skipped files.** Binary, lock and generated files (`skip_globs`) are not reviewed and are listed under "Not
-  checked".
-- **No tests are run.** That is CI's job. The reviewer can read the checkout, but nothing is executed for it.
+  checked". A PR that has only such files gets no status from this script and needs a human review.
+- **Cross-chunk blind spots.** A large PR is cut into 24 KB chunks. Each chunk sees its own diff, plus the full
+  text of its changed files at the head SHA: up to 12 KB per file and 24 KB per chunk, with new files excluded
+  because the diff already holds them. A bug that spans files in different chunks can be missed.
 - **Not a human review.** It is no substitute for one, and it does not approve the PR in GitHub's review sense.
 
 ## Limits: advisory strength
 
-- **Prompt injection.** The diff, the PR title and body, and the checkout are untrusted. Text in them can try to
-  make the model approve. The mitigations:
-  - the content goes on stdin between random fences, labelled as data;
-  - the reviewer has no GitHub access and no network beyond its model endpoint;
-  - its output must be a strict schema, or the run fails;
-  - the poster decides the state, drops findings on files outside the PR (and says so), and lets the model narrow its claims but never widen
-    them;
+- **Prompt injection.** The diff, the PR title and body, and the file contents are untrusted. The model has no
+  tools, files, network or key, so an injection can only skew its verdict text. The mitigations:
+  - the content sits in the user message between random fences, labelled as data, and never in the
+    instructions;
+  - the answer must match a strict schema, or the run fails;
+  - the poster decides the state, drops findings on files outside the PR (and says so), and lets the model narrow
+    its claims but never widen them;
   - one failed chunk fails the whole run.
 
   None of this stops a successful injection from producing "0 blocking". Treat `success` as "an independent
   model found nothing", not as proof.
-- **Exfiltration.** The box can reach the model endpoint, and holds a copy of the codex login. Injected text could
-  send the diff, which is in the PR anyway, or the login token out through the allowed hosts. See the README's
-  "what is NOT isolated".
-- **Real codex runs are verified.** With codex 0.163, a dry run of PR #160 completed 14 chunks through the egress
-  proxy. Only `chatgpt.com`, `api.openai.com` and `auth.openai.com` (port 443) are allowed. Blocked and not
-  needed: `ab.chatgpt.com`, `*.oaiusercontent.com`. Whether codex's own read-only sandbox confines its shell
-  commands inside bwrap is not verified; the bwrap box is the boundary.
-- **Nothing to review means no approval.** A PR whose files are all binary or skipped fails the run and gets no
-  status; it needs a human review.
-- **Big PRs cost several reviewer runs.** PR #160 (40 files) is 14 chunks at 60 KB, and a real codex run of it took about 8 minutes. Each chunk sees only
-  its own files, plus the read-only checkout for context, so a cross-file bug can be missed.
+- **The key lives on the host that runs the script.** It is read from `~/.pi/agent/models.json` and sent only
+  as the `Authorization` header, to that provider's https `baseUrl` host. Redirects are not followed. The key is
+  redacted from every message.
+- **The gateway is shared and slow for big prompts.** Chunks run one at a time. A 16 KB prompt took 70 to 170 s,
+  mostly reasoning; a 64 KB one took about 9 minutes, and once its route ended mid-answer. Route failures, 429s
+  and 5xx responses are retried with backoff. Measured figures for PR #160 are in the agent-helpers report.

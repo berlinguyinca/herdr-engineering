@@ -236,7 +236,9 @@ class Gateway:
                 used = r.get("model", req["model"])
                 if req.get("stream") and not r.get("json"):
                     half = len(content) // 2
-                    ev = [{"model": used, "choices": [{"index": 0, "delta": {"reasoning_content": "thinking..."}}]},
+                    ev = [{"model": used, "choices": [{"index": 0, "delta": {"reasoning_content": "thinking..."}}]}
+                          for _ in range(r.get("reasoning_events", 1))]
+                    ev += [
                           {"model": used, "choices": [{"index": 0, "delta": {"content": content[:half]}}]},
                           {"model": used, "choices": [{"index": 0, "delta": {"content": content[half:]}}]},
                           {"model": used, "choices": [{"index": 0, "delta": {},
@@ -545,6 +547,19 @@ def test_a_stream_error_is_retried_like_a_5xx(env):
     assert review(env) == 0
     assert [s["state"] for s in env.terminal()] == ["success"]
     assert len(env.rev_calls()) == 2 and len(env.sleeps) == 1
+
+
+def test_long_reasoning_does_not_count_against_the_answer_cap(env, monkeypatch):
+    monkeypatch.setattr(env.mod, "RESPONSE_MAX", 2000)      # the answer cap; reasoning streams far past it
+    env.responses([{"content": EMPTY, "reasoning_events": 300}])
+    assert review(env) == 0
+    assert [s["state"] for s in env.terminal()] == ["success"]
+
+
+def test_an_answer_over_the_cap_fails(env, monkeypatch):
+    monkeypatch.setattr(env.mod, "RESPONSE_MAX", 50)
+    assert review(env) == 1
+    assert env.terminal() == []
 
 
 def test_a_plain_json_answer_to_a_stream_request_is_accepted(env):

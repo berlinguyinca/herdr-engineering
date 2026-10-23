@@ -54,7 +54,8 @@ CLAIMABLE = ("code", "security", "tests", "docs", "performance")
 LIST_MAX = 200                       # findings per list in one verdict; more is malformed
 TEXT_MAX = 4000                      # characters per finding field; more is malformed
 COMMENT_MAX = 60000                  # GitHub refuses comment bodies over 65536 characters
-RESPONSE_MAX = 8_000_000             # bytes of a gateway response that are read
+RESPONSE_MAX = 8_000_000             # bytes of an answer (content) that are accepted
+STREAM_MAX = 1_000_000_000           # bytes of one stream, reasoning included (one SSE event per token)
 RETRY_AFTER_MAX = 60.0
 LAST_RESULT: dict | None = None      # the last review's outcome (tests, --dry-run inspection)
 
@@ -75,9 +76,10 @@ DEFAULTS: dict = {
         "backoff_s": 5.0,                        # first backoff; doubles; Retry-After wins (capped at 60 s)
         "parallel": 1,                           # chunks in flight at once; the gateway is shared
     },
-    "chunk_bytes": 60000,
-    "context_bytes_per_file": 20000,             # full text of each changed (not new) file, cut at this
-    "context_bytes_per_chunk": 60000,            # all context in one chunk, cut at this; 0 = no context
+    # measured on llm.metabolomics.us: a 16 KB prompt took 1-3 min, a 64 KB one reasoned 13+ min and did not finish
+    "chunk_bytes": 24000,
+    "context_bytes_per_file": 12000,             # full text of each changed (not new) file, cut at this
+    "context_bytes_per_chunk": 24000,            # all context in one chunk, cut at this; 0 = no context
     "skip_globs": ["*.lock", "*.lockb", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "go.sum",
                    "*.min.js", "*.min.css", "*.map", "*.pb.go", "*_pb2.py", "*.snap", "dist/*", "vendor/*",
                    "node_modules/*", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.pdf", "*.woff", "*.woff2",
@@ -357,15 +359,17 @@ class Gateway:
     def _sse(self, resp) -> dict:
         """A streamed chat completion, assembled into the non-streamed shape. Reasoning deltas only keep the
         connection alive; only `content` deltas are the answer. An error event fails the chunk."""
-        content, model, finish, usage, size = [], None, "", {}, 0
+        content, model, finish, usage, size, csize = [], None, "", {}, 0, 0
         deadline = time.monotonic() + float(self.r["deadline_s"])
         while True:
             line = resp.readline(1_000_000)
             if not line:
                 break
             size += len(line)
-            if size > RESPONSE_MAX or time.monotonic() > deadline:
-                raise ReviewFailed("the gateway's stream ran past the size or time limit (reviewer.deadline_s)")
+            if time.monotonic() > deadline:
+                raise ReviewFailed(f"the answer took longer than reviewer.deadline_s ({self.r['deadline_s']}s)")
+            if size > STREAM_MAX:
+                raise ReviewFailed("the gateway's stream is larger than any answer can be")
             text = line.decode("utf-8", "replace").strip()
             if not text.startswith("data:"):
                 continue
@@ -391,6 +395,9 @@ class Gateway:
                 d = ch.get("delta") or {} if isinstance(ch, dict) else {}
                 if isinstance(d.get("content"), str):
                     content.append(d["content"])
+                    csize += len(d["content"].encode())
+                    if csize > RESPONSE_MAX:
+                        raise ReviewFailed("the answer is larger than any verdict can be")
                 if isinstance(ch, dict) and ch.get("finish_reason"):
                     finish = str(ch["finish_reason"])
         return {"model": model, "usage": usage,

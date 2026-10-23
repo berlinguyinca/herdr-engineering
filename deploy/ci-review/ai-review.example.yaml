@@ -26,9 +26,11 @@ reviewer:
   backoff_s: 5                           # doubles each retry; a Retry-After header wins (capped at 60 s)
   parallel: 1                            # chunks in flight at once; the gateway is shared
 
-chunk_bytes: 60000                       # diff bytes per request; files stay together, big files split by hunk
-context_bytes_per_file: 20000            # each changed (not new) file's full text at the head SHA, cut at this
-context_bytes_per_chunk: 60000           # all full-file context in one request, cut at this; 0 = none
+# A request is about chunk_bytes + context_bytes_per_chunk + the PR description. Measured on the gateway: 16 KB
+# prompts answered in 1-3 min; a 64 KB one was still reasoning after 13 min. Keep requests small.
+chunk_bytes: 24000                       # diff bytes per request; files stay together, big files split by hunk
+context_bytes_per_file: 12000            # each changed (not new) file's full text at the head SHA, cut at this
+context_bytes_per_chunk: 24000           # all full-file context in one request, cut at this; 0 = none
 skip_globs: ["*.lock", "package-lock.json", "pnpm-lock.yaml", "go.sum", "*.min.js", "*.map", "dist/*",
              "vendor/*", "node_modules/*", "*.png", "*.jpg", "*.pdf", "*.zip", "*.gz", "*.sif"]   # example (shortened)
 post_pending: true                       # "Review running (model)" for the pinned SHA while it works
