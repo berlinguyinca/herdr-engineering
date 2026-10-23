@@ -72,6 +72,7 @@ struct Outcome {
     marks: Marks,
     exit_at_ms: f64,
     err_head: String,
+    lines: Vec<String>,
 }
 
 fn spawn_one(argv: &[String], agent: &Path, cwd: &Path, extra_env: &[(String, String)], timeout_s: u64) -> Outcome {
@@ -91,7 +92,7 @@ fn spawn_one(argv: &[String], agent: &Path, cwd: &Path, extra_env: &[(String, St
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return Outcome { wall_ms: 0.0, cpu_s: 0.0, maxrss_mib: 0.0, exit: -1, marks: Marks::default(), exit_at_ms: 0.0, err_head: format!("spawn failed: {e}") }
+            return Outcome { wall_ms: 0.0, cpu_s: 0.0, maxrss_mib: 0.0, exit: -1, marks: Marks::default(), exit_at_ms: 0.0, err_head: format!("spawn failed: {e}"), lines: vec![] }
         }
     };
     let pid = child.id() as i32;
@@ -113,8 +114,12 @@ fn spawn_one(argv: &[String], agent: &Path, cwd: &Path, extra_env: &[(String, St
         s
     });
     let mut tracker = PhaseTracker::default();
+    let mut lines = vec![];
     for line in BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
         tracker.feed(&line, t0.elapsed().as_secs_f64() * 1000.0);
+        if lines.len() < 200 {
+            lines.push(line);
+        }
     }
     // Reap with wait4 for this child's own rusage (std's wait would discard it).
     let mut status = 0;
@@ -132,6 +137,7 @@ fn spawn_one(argv: &[String], agent: &Path, cwd: &Path, extra_env: &[(String, St
         exit,
         marks: tracker.marks,
         exit_at_ms: exit_at,
+        lines,
         err_head: if exit != 0 { err.lines().next().unwrap_or("").chars().take(160).collect() } else { String::new() },
     }
 }
@@ -270,6 +276,56 @@ fn compat(args: &[String], arms: &BTreeMap<String, Arm>) {
     }
 }
 
+fn newest_session(dir: &Path) -> (usize, String) {
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = vec![];
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "jsonl") {
+                if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                    found.push((m, p));
+                }
+            }
+        }
+    }
+    found.sort();
+    let body = found.last().map(|(_, p)| fs::read_to_string(p).unwrap_or_default()).unwrap_or_default();
+    (found.len(), body)
+}
+
+/// Write a session with one runtime, resume it with others, and check the memory and file survive each hop.
+fn roundtrip(args: &[String], arms: &BTreeMap<String, Arm>) -> bool {
+    let order: Vec<String> = arg(args, "--order").unwrap_or_else(|| "standard-pi,pi-bolt,standard-pi,pi-bolt-jit".into()).split(',').map(String::from).collect();
+    let model = arg(args, "--model").expect("--model");
+    let models = arg(args, "--models-json").expect("--models-json");
+    let agent = AgentDir::new(Some(Path::new(&models))).expect("agent dir");
+    let cwd = agent.0.join("work");
+    fs::create_dir(&cwd).unwrap();
+    let token = format!("PINEAPPLE{}", std::process::id());
+    let mut ok = true;
+    for (i, name) in order.iter().enumerate() {
+        let arm = arms.get(name).unwrap_or_else(|| panic!("unknown arm {name}"));
+        let prompt = if i == 0 { format!("For this test the secret word is {token}. Reply with exactly: OK") } else { "What is the secret word I gave you earlier? Reply with only that word.".to_string() };
+        let mut argv = arm.argv.clone();
+        argv.extend(["-p".into(), prompt, "--thinking".into(), "off".into(), "--model".into(), model.clone(), "--no-tools".into()]);
+        if i > 0 {
+            argv.push("--continue".into());
+        }
+        let o = spawn_one(&argv, &agent.0, &cwd, &[], 300);
+        let text = o.lines.join("\n");
+        let remembered = i == 0 || text.contains(&token);
+        let (files, body) = newest_session(&agent.0.join("sessions"));
+        let valid = !body.is_empty() && body.lines().all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok());
+        println!("hop {i} {name:12} exit={} remembered={remembered} session_files={files} session_lines={} valid_jsonl={valid} {}", o.exit, body.lines().count(), o.err_head);
+        ok &= o.exit == 0 && remembered && valid && files == 1;
+    }
+    println!("roundtrip {}", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(scenario) = args.first().cloned() else {
@@ -283,6 +339,9 @@ fn main() {
     let runtimes = arg(&args, "--runtimes").unwrap_or_else(|| "runtimes.json".into());
     let out = arg(&args, "--out");
     let arms: BTreeMap<String, Arm> = serde_json::from_str(&fs::read_to_string(&runtimes).expect("runtimes file")).expect("runtimes json");
+    if scenario == "roundtrip" {
+        std::process::exit(if roundtrip(&args, &arms) { 0 } else { 1 });
+    }
     if scenario == "compat" {
         compat(&args, &arms);
         return;
