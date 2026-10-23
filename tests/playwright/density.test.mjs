@@ -124,7 +124,10 @@ test('populated tablet heatmap keeps touch targets within their own bucket colum
         await page.locator(`[data-health-mode="${mode}"]`).click();
         for (const density of ['comfortable', 'compact', 'dense']) {
           await page.getByRole('combobox', { name: 'Density' }).selectOption(density);
-          const geometry = await page.locator('.ci-health-grid:visible').first().evaluate(table => {
+          // Query and measure inside one browser task: CI history refreshes
+          // periodically and replaces the heatmap subtree in place.
+          const geometry = await page.evaluate(() => {
+            const table = document.querySelector('[data-health-map] .ci-health-grid');
             const cells = [...table.querySelectorAll('tbody tr:first-child td')];
             const scroll = table.closest('[data-health-grid-scroll]');
             return {
