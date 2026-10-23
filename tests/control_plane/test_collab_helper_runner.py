@@ -169,7 +169,10 @@ def test_secrets_cli_writes_0600_in_a_0700_dir_and_never_echoes(tmp_path):
     assert stat.S_IMODE(d.stat().st_mode) == 0o700 and stat.S_IMODE(f.stat().st_mode) == 0o600
     assert json.loads(f.read_text()) == {"openai": {"value": "Bearer sk-VERYSECRET", "host": "api.openai.com"}}
     secrets_cli(d, "set", "room_abc", "deploy_key", "--base64", stdin="-----KEY-----\n")
-    assert base64.b64decode(json.loads(f.read_text())["deploy_key"]) == b"-----KEY-----\n"
+    assert base64.b64decode(json.loads(f.read_text())["deploy_key"]["ssh_b64"]) == b"-----KEY-----\n"
+    secrets_cli(d, "set", "room_abc", "deploy_two", "--ssh", stdin="KEY2")       # --ssh is the same as --base64
+    assert set(json.loads(f.read_text())["deploy_two"]) == {"ssh_b64"}
+    secrets_cli(d, "rm", "room_abc", "deploy_two")
     r = secrets_cli(d, "list", "room_abc")
     lines = r.stdout.splitlines()
     assert lines[0].startswith("deploy_key ") and "ssh key" in lines[0] and lines[1] == "openai host=api.openai.com"
@@ -205,7 +208,8 @@ def test_secrets_cli_lists_an_old_unbound_value_as_such(tmp_path):
     (d / "room_a.json").write_text(json.dumps({"old": "Bearer x"}))
     (d / "room_a.json").chmod(0o600)
     r = secrets_cli(d, "list", "room_a")
-    assert r.returncode == 0 and r.stdout.startswith("old ") and "no host" in r.stdout and "Bearer" not in r.stdout
+    assert r.returncode == 0 and r.stdout.startswith("old ") and "old format" in r.stdout and "Bearer" not in r.stdout
+    assert "--host" in r.stdout and "--ssh" in r.stdout                   # how to set it again
 
 
 # ------------------------------------------------------------------ the runner runs helpers
@@ -432,8 +436,8 @@ def test_ssh_keys_are_present_only_when_listed_and_secret_values_never_reach_the
         "allowed_families": ["claude-code"], "ssh_secret_names": ["deploy_key"],
         "services": [{"name": "api", "upstream_url": "https://api.example.com/v1", "header": "Authorization",
                       "secret_name": "api_token"}]})
-    write_secrets(hr, w.room, {"deploy_key": base64.b64encode(b"KEY-ONE").decode(),
-                               "other_key": base64.b64encode(b"KEY-TWO").decode(),
+    write_secrets(hr, w.room, {"deploy_key": {"ssh_b64": base64.b64encode(b"KEY-ONE").decode()},
+                               "other_key": {"ssh_b64": base64.b64encode(b"KEY-TWO").decode()},
                                "api_token": {"value": "Bearer sk-SVCSECRET", "host": "api.example.com"}})
     h = ask(hr)
     until(hr, finished(hr, h["helper_id"]))
@@ -449,14 +453,15 @@ def test_ssh_keys_are_present_only_when_listed_and_secret_values_never_reach_the
 
 
 def test_a_secrets_file_with_a_loose_mode_or_a_link_is_ignored(hr):
-    f = write_secrets(hr, hr.w.room, {"k": "v"}, mode=0o644)
+    f = write_secrets(hr, hr.w.room, {"k": {"ssh_b64": "S0VZ"}}, mode=0o644)
     r = hr.mk()
     assert r.room_secrets(hr.w.room) == {} and any("ignored" in m for m in hr.said)
     f.chmod(0o600)
-    assert r.room_secrets(hr.w.room) == {"k": "v"}
-    f.write_text(json.dumps({"k": "v", "b": {"value": "Bearer z", "host": "a.example"}, "odd": {"value": 5},
-                             "n": 7}))
-    assert r.room_secrets(hr.w.room) == {"k": "v", "b": {"value": "Bearer z", "host": "a.example"}}
+    assert r.room_secrets(hr.w.room) == {"k": {"ssh_b64": "S0VZ"}}
+    f.write_text(json.dumps({"k": {"ssh_b64": "S0VZ"}, "b": {"value": "Bearer z", "host": "a.example"},
+                             "odd": {"value": 5}, "n": 7, "old": "S0VZ", "both": {"ssh_b64": "S0VZ", "value": "x"}}))
+    assert r.room_secrets(hr.w.room) == {"k": {"ssh_b64": "S0VZ"}, "b": {"value": "Bearer z", "host": "a.example"}}
+    assert any("old" in m and "set it again" in m for m in hr.said)      # a bare string is neither kind any more
     link = f.with_name("room_link.json")
     link.symlink_to(f)
     assert r.room_secrets("room_link") == {}
@@ -470,7 +475,7 @@ def test_the_proxy_gets_only_secrets_bound_to_their_services_upstream_host(hr):
                 {"name": "old", "upstream_url": "https://api.example.com/", "secret_name": "unbound"}]
     secrets = {"good": {"value": "Bearer A", "host": "api.example.com"},
                "bound_elsewhere": {"value": "Bearer B", "host": "api.example.com"},
-               "unbound": "Bearer C", "deploy_key": "S0VZ"}
+               "unbound": "Bearer C", "deploy_key": {"ssh_b64": "S0VZ"}}
     out = r.proxy_secrets(services, secrets, "h1")
     assert out == {"good": {"value": "Bearer A", "host": "api.example.com"}}
     said = " ".join(hr.said)
@@ -479,14 +484,31 @@ def test_the_proxy_gets_only_secrets_bound_to_their_services_upstream_host(hr):
 
 
 @needs_box
-def test_a_service_secret_listed_as_an_ssh_key_is_not_copied(hr):
+@pytest.mark.parametrize("stored", [
+    {"value": "Bearer sk-SVCSECRET", "host": "api.example.com"},
+    base64.b64encode(b"sk-SVCSECRET").decode(),          # the OLD plain format: strict base64, so it used to decode
+    "0123456789abcdef0123456789abcdef"])                  # a hex key of length %4 == 0 is valid base64 too
+def test_a_service_secret_listed_as_an_ssh_key_is_not_copied(hr, stored):
     w = hr.w
     w.s.set_room_profile(w.alice, w.room, {"allowed_families": ["claude-code"], "ssh_secret_names": ["api_token"]})
-    write_secrets(hr, w.room, {"api_token": {"value": "Bearer sk-SVCSECRET", "host": "api.example.com"}})
+    write_secrets(hr, w.room, {"api_token": stored})
     h = ask(hr)
     until(hr, finished(hr, h["helper_id"]))
     info, res = report(hr, h["helper_id"])
-    assert info["ssh"] is None and "SVCSECRET" not in res
+    assert info["ssh"] is None and "SVCSECRET" not in res and "0123456789abcdef" not in res
+
+
+def test_one_secret_name_never_serves_as_both_a_service_key_and_an_ssh_key(hr, tmp_path):
+    w = hr.w
+    svc = {"name": "api", "upstream_url": "https://api.example.com/v1", "header": "Authorization", "secret_name": "k"}
+    with pytest.raises(collab.CollabError) as e:
+        w.s.set_room_profile(w.alice, w.room, {"allowed_families": ["claude-code"], "services": [svc],
+                                               "ssh_secret_names": ["k"]})
+    assert e.value.status == 400
+    # a profile saved before the rule (or a hand-edited secrets file): the runner still copies no key file
+    r = hr.mk()
+    assert r.ssh_key_names({"services": [svc], "ssh_secret_names": ["k", "deploy"]},
+                           {"k": {"ssh_b64": "S0VZ"}, "deploy": {"ssh_b64": "S0VZ"}}, "h1") == ["deploy"]
 
 
 @needs_box

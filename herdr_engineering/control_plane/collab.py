@@ -3363,6 +3363,8 @@ def _normalize_profile(body: Any) -> dict:
             raise CollabError(400, "service names must be unique")
         services.append({"name": name, "upstream_url": url, "header": header, "secret_name": sec})
     ssh = _profile_strings(body.get("ssh_secret_names", []), "ssh_secret_names", _PROFILE_SECRET_NAME, MAX_PROFILE_NAMES)
+    if set(ssh) & {sv["secret_name"] for sv in services}:
+        raise CollabError(400, "a secret name cannot be both a service's key and an ssh key")
     spend = body.get("spend_tokens_per_day")
     if spend is not None and (not isinstance(spend, int) or isinstance(spend, bool) or not 0 <= spend < 2**53):
         raise CollabError(400, "spend_tokens_per_day must be a non-negative integer or null")

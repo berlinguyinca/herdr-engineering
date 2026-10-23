@@ -449,7 +449,7 @@ next to `collab-spawn.py`:
 
 ```bash
 collab-secrets.py set ROOM_ID api_token --host api.example.com   # a service's header value, for that host only
-collab-secrets.py set ROOM_ID deploy_key --base64                 # a file's bytes (an ssh key): cat key | ... --base64
+collab-secrets.py set ROOM_ID deploy_key --ssh                    # an ssh key file's bytes: cat key | ... --ssh
 collab-secrets.py list ROOM_ID                                    # names and bound hosts, never values
 collab-secrets.py rm ROOM_ID api_token
 ```
@@ -458,10 +458,15 @@ The value is read from stdin (a prompt without echo, or a pipe), never from an a
 For a service, store the whole header value (for example `Bearer <key>`) and bind it with `--host` to the host
 you mean it for (a host name or IP, no scheme or port). The room owner sets the service's `upstream_url`, so the
 binding is what keeps the key on that host: if the owner points the service (or a new one) elsewhere, the runner
-and the proxy refuse to attach the key and the helper gets `502 ... not bound to this upstream host`. A value
-stored before `--host` existed (a plain string) is never sent to a service: `list` marks it, and the runner logs
-"has no bound host"; store it again with `--host`. A `--base64` value is only ever an ssh key file. Each room is
-one file,
+and the proxy refuse to attach the key and the helper gets `502 ... not bound to this upstream host`. Each
+value has an explicit kind: `{"value", "host"}` (`--host`, a service key) or `{"ssh_b64"}` (`--ssh`, `--base64` is
+the same flag, a key file). Only the second kind is ever copied into a helper's `~/.ssh`, and a profile cannot
+name one secret both as a service's key and as an ssh key (400; the runner also skips such a name). A value in the
+**old format** (a bare string, stored before these kinds existed) is used for nothing: `list` marks it "old
+format", the runner logs "is in the old format and is not used". Before this change a bare string listed under
+*SSH key names* was decoded into `~/.ssh` even when it was a service key that happened to be valid base64.
+**Deploy step:** on the runner host run `collab-secrets.py list ROOM_ID` for every room, and set every "old format"
+entry again with `--host HOST` (service) or `--ssh` (key file). Each room is one file,
 `~/.config/herdr-engineering/collab-secrets/<room_id>.json`, written atomically with mode 0600 in a 0700
 directory. The runner ignores the file (with a warning) unless it is a regular file of the runner's own user
 with no group or other bits. Never put secret values in the profile, in task text, or in GitHub.

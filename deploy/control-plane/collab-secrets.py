@@ -7,12 +7,14 @@ host, and are read by collab-spawn.py when it starts a helper in that room:
     proxy adds it as the header of a service in the room profile that names it, and ONLY when that service's
     upstream_url is on the host bound here: the room owner (maybe a coworker) sets upstream_url, so binding the
     host is what stops a repointed service from sending the key elsewhere. The helper never sees the value.
-  * a key file: {name: "<base64>"} (--base64). A name listed in the profile's ssh_secret_names is copied into the
-    helper's ~/.ssh as a file of that name. A plain string is never used as a service header.
+  * a key file: {name: {"ssh_b64": "<base64>"}} (--ssh, or --base64). A name listed in the profile's
+    ssh_secret_names is copied into the helper's ~/.ssh as a file of that name. Only this shape is ever a key file.
+  * an old plain string (stored before these shapes existed) is neither: the runner ignores it and says so; set it
+    again with --host or --ssh.
 
 Usage:
   collab-secrets.py set ROOM NAME --host HOST   a header value, bound to HOST (a host name or IP, no port)
-  collab-secrets.py set ROOM NAME --base64      a key file's bytes (cat key | ... --base64)
+  collab-secrets.py set ROOM NAME --ssh         a key file's bytes (cat key | ... --ssh; --base64 is the same)
   collab-secrets.py list ROOM                   names (and bound hosts), never values
   collab-secrets.py rm ROOM NAME
 The value is read from stdin (a terminal prompt does not echo), never printed and never taken from an argument.
@@ -107,7 +109,8 @@ def main(argv: list[str]) -> int:
     s.add_argument("name")
     kind = s.add_mutually_exclusive_group(required=True)
     kind.add_argument("--host", help="a header value for a service on this host only (no port, no scheme)")
-    kind.add_argument("--base64", action="store_true", help="store stdin's bytes base64-encoded (ssh key files)")
+    kind.add_argument("--ssh", "--base64", dest="ssh", action="store_true",
+                      help="an ssh key file: stdin's bytes, stored base64-encoded")
     sub.add_parser("list").add_argument("room")
     r = sub.add_parser("rm")
     r.add_argument("room")
@@ -134,8 +137,10 @@ def main(argv: list[str]) -> int:
             v = data[k]
             if isinstance(v, dict) and isinstance(v.get("host"), str):
                 print(f"{k} host={v['host']}")
+            elif isinstance(v, dict) and isinstance(v.get("ssh_b64"), str):
+                print(f"{k} ssh key")
             else:
-                print(f"{k} (no host bound: used only as an ssh key file; for a service, set it again with --host)")
+                print(f"{k} (old format, not used: set it again with --host HOST for a service or --ssh for a key)")
         return 0
     if args.cmd == "rm":
         if args.name not in data:
@@ -144,10 +149,10 @@ def main(argv: list[str]) -> int:
         del data[args.name]
         save(d, path, data)
         return 0
-    value = read_value(args.base64)
+    value = read_value(args.ssh)
     if not value:
         raise SystemExit("empty value; nothing stored")
-    data[args.name] = {"value": value, "host": host} if host is not None else value
+    data[args.name] = {"value": value, "host": host} if host is not None else {"ssh_b64": value}
     save(d, path, data)
     print(f"stored {args.name} for {args.room}", file=sys.stderr)
     return 0
