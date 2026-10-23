@@ -1381,6 +1381,39 @@ class GraphProjection:
                     "edges_omitted": omitted, "scan_exhausted": exhausted,
                     "next_offset": offset + limit if more else None}
 
+    # ------------------------------------------------------------ T12: comment anchors and steering targets
+    def anchor_visible(self, principal, anchor: dict) -> bool:
+        """Cheap yes/no: may ``principal`` see this node or edge (hidden and missing are both False)?
+        Used to gate comments, which would otherwise leak the existence and text around a hidden item."""
+        with self._lock:
+            if anchor.get("kind") == "node":
+                return self._node_visible(principal, self._nodes.get(anchor.get("node_id")))
+            keys = self._by_triple.get((anchor.get("edge_type"), anchor.get("from_id"), anchor.get("to_id")), ())
+            return any(self._edge_visible(principal, self._edges[k]) for k in keys)
+
+    def steer_facts(self, principal, node_id: str) -> dict:
+        """What a steering request is fenced on, as ``principal`` sees it. KeyError if absent OR hidden.
+
+        ``owner`` is the graph principal that created the node (OWNED kinds only; a commons node has no single
+        owner); steering is delivered only to that principal. ``superseded`` is true when a live, visible
+        ``supersession`` edge points AT the node (new -> old), i.e. a newer attempt replaced it."""
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if not self._node_visible(principal, node):
+                raise KeyError(node_id)
+            view = self._node_view(node, principal, internal=True)
+            own, others, exhausted = self._expand(principal, node_id, "in", {"supersession"}, False, None,
+                                                  SCAN_BUDGET)
+            superseded = any(not v["removed"] and v["to_id"] == node_id
+                             for v in (self._edge_view(x, principal, {}) for x in own + others))
+            return {"node_id": node_id, "node_type": node.node_type, "commons": bool(node.commons),
+                    "state": view["state"], "label": view["label"], "last_event_id": view["last_event_id"],
+                    "owner": None if node.commons else view.get("owner"), "superseded": superseded,
+                    "scan_exhausted": bool(exhausted),
+                    "attrs": {k: view["attrs"].get(k) for k in
+                              ("plan_digest", "digest", "commit", "head_sha", "attempt_id", "fencing_token")
+                              if isinstance(view["attrs"].get(k), (str, int))}}
+
     def get_edge(self, principal, edge_type: str, from_id: str, to_id: str,
                  commit: str | None = None, plan_digest: str | None = None) -> dict:
         """Provenance of the visible edge(s) of a triple (optionally one binding)."""

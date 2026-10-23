@@ -212,7 +212,7 @@ test('inspector escapes everything, links neighbours as buttons, shows stale and
   assert.ok(html.includes('javascript:alert(1)') && !/href="javascript/.test(html), 'values are text, never links');
   assert.match(html, /data-node="review:r"/);
   assert.match(html, /<strong>stale<\/strong>/);
-  assert.match(html, /Read-only\. This page offers no terminal and no commands\./);
+  assert.match(html, /This page offers no terminal and no commands\./);
   assert.ok(!/<a |terminal</i.test(html.replace('no terminal and no commands', '')));
   assert.match(renderInspector(g, 'nope'), /Select a node to inspect it/);
   assert.match(renderInspector(mergePages([{ nodes: [node('attempt:a1')], edges: [] }]), 'attempt:a1', TL), /State history/);

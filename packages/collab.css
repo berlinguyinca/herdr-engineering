@@ -337,3 +337,14 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .lin-inspector h4 { margin: 12px 0 4px; font-size: .8125rem; text-transform: none; }
 @media (forced-colors: active) { .lin-box, .lin-bar, .lin-edge-line { stroke: CanvasText; } .lin-node--sel .lin-box { stroke: Highlight; } }
 @media (prefers-reduced-motion: reduce) { .lin-svg * { transition: none; animation: none; } }
+
+/* T12: comments and steering beside the lineage inspector. Text from people is data: keep its line breaks, wrap it. */
+.wb { display: grid; gap: 12px; }
+.wb-section { border-top: 1px solid var(--hd-border, currentColor); padding-top: 8px; }
+.wb-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0; }
+.wb-comment, .wb-steer { padding: 6px 0; }
+.wb-comment + .wb-comment, .wb-steer + .wb-steer { border-top: 1px dotted var(--hd-border, currentColor); }
+.wb-fieldset { border: 1px solid var(--hd-border, currentColor); padding: 8px; }
+.wb-radio { display: block; padding: 2px 0; }
+.wb-confirm { border: 2px solid currentColor; padding: 8px; }
+@media (forced-colors: active) { .wb-confirm, .wb-fieldset { border-color: CanvasText; } }

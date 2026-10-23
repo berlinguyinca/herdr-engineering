@@ -84,7 +84,7 @@ test('lineage graph: renders, hostile ids stay text, keyboard selects and the in
   assert.ok(await page.evaluate(() => document.activeElement.getAttribute('data-node')) !== null);
   await page.keyboard.press('Enter');
   await page.locator('aside[aria-label="Inspector"] .lin-inspector').waitFor();
-  assert.match(await page.locator('aside[aria-label="Inspector"]').innerText(), /Read-only\. This page offers no terminal/);
+  assert.match(await page.locator('aside[aria-label="Inspector"]').innerText(), /This page offers no terminal and no commands/);
   assert.equal(await page.locator('g[data-node][aria-pressed="true"]').count(), 1);
   await page.keyboard.press('Escape');
   assert.equal(await page.locator('g[data-node][aria-pressed="true"]').count(), 0);

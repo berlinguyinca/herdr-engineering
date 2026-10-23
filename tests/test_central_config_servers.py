@@ -527,3 +527,23 @@ def test_replay_history_is_validated_in_the_collab_slice(tmp_path):
     central = make_file(tmp_path, collab=dict(COLLAB, replay_history="everything"))
     with pytest.raises(fcc.FleetConfigError, match="replay_history must be"):
         fcc.collab_values(fcc.load_fleet_config(central))
+
+
+def test_steering_settings_are_yaml_only_validated_and_off_by_default(tmp_path):
+    import argparse
+    from herdr_engineering.control_plane.collab_workbench import normalize_steering
+    assert normalize_steering(None)["enabled"] is False and normalize_steering(None)["kill_switch"] is False
+    central = make_file(tmp_path, collab=dict(COLLAB, steering={"enabled": True, "kill_switch": False}))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["steering"]["enabled"] is True
+    central.unlink()
+    for bad in ({"enabled": "yes"}, {"shell": True}, {"actions": ["pause", "exec"]}):
+        central = make_file(tmp_path, collab=dict(COLLAB, steering=bad))
+        with pytest.raises(fcc.FleetConfigError, match="steering"):
+            fcc.collab_values(fcc.load_fleet_config(central))
+        central.unlink()
+    args = argparse.Namespace()
+    cli._apply_collab_config(args, {"collab": {"steering": {"enabled": True, "self_confirm": True}}})
+    assert args.collab_steering == {"enabled": True, "self_confirm": True}
+    with pytest.raises(SystemExit):
+        cli._apply_collab_config(argparse.Namespace(), {"collab": {"steering": {"kill_switch": "no"}}})
+    assert "steering" in fcc.COLLAB_KEYS

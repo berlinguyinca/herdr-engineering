@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from . import ids
+from .collab_workbench import WorkbenchMixin
 from .redact import redact_text
 
 SCHEMA_VERSION = 1
@@ -223,7 +224,7 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService:
+class CollabService(WorkbenchMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -303,6 +304,7 @@ class CollabService:
         self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
         self._msg_room: dict[str, str] = {}                  # message event id -> room id
         self.stats = defaultdict(int)
+        self._init_workbench()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -413,6 +415,8 @@ class CollabService:
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
+        if self._apply_workbench(ev):
+            return
         if t == "project_created":
             self._projects[p["project_id"]] = {"name": p["name"], "members": {p["actor_user_id"]: "manager"}}
         elif t == "project_member_added":
@@ -2920,6 +2924,14 @@ class CollabService:
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
+                    if parts[2:] == ["comments"]:
+                        return 200, self.list_comments(pr, rid, query)
+                    if n == 5 and parts[2] == "comments" and parts[4] == "history":
+                        return 200, self.comment_history(pr, rid, parts[3])
+                    if parts[2:] == ["steering"]:
+                        return 200, self.list_steering(pr, rid, query)
+                    if parts[2:] == ["steering", "target"]:
+                        return 200, self.steering_target(pr, rid, str(query.get("node_id", "")))
                     if parts[2:] == ["flow"]:
                         return 200, self.room_flow(pr, rid)
                     if parts[2:] == ["workspaces"]:
@@ -3018,13 +3030,23 @@ class CollabService:
                         return 200, self.unlink_mission(pr, rid, parts[3])
                     if parts[2:] == ["tasks"]:
                         return 201, self.create_task(pr, rid, body)
+                    if parts[2:] == ["comments"]:
+                        return self.add_comment(pr, rid, body)
+                    if n == 5 and parts[2] == "comments" and parts[4] in ("edit", "retract"):
+                        return 200, self.revise_comment(pr, rid, parts[3], parts[4], body)
+                    if parts[2:] == ["steering"]:
+                        return self.propose_steering(pr, rid, body)
+                    if n == 5 and parts[2] == "steering" and parts[4] == "confirm":
+                        return 200, self.confirm_steering(pr, rid, parts[3], body)
+                    if n == 5 and parts[2] == "steering" and parts[4] == "reject":
+                        return 200, self.reject_steering(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":
                         return 200, self.cancel_task(pr, rid, parts[3])
                     if parts[2:] == ["messages"]:
                         return self.post_message(pr, rid, body)
             raise CollabError(404, "not found")
         except CollabError as exc:
-            return exc.status, {"error": exc.message}
+            return exc.status, {"error": exc.message, **getattr(exc, "extra", {})}
 
 
 def _finite_expiry(exp: Any, now: float) -> float | None:
