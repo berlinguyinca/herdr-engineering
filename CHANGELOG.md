@@ -55,6 +55,20 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   `control_plane.lineage_key_scopes` entry can no longer write `room`/`mission` scope (403 `lineage_forbidden`; `"*"` opts in);
   mission scope needs `room_id`, so stored mission events without it become operator-only after rebuild.
 - Rollback: see `docs/contracts/lineage-events.md` ("T08 rollout and rollback").
+### Head-bound review quorum (T06)
+- Review round 4: head handling is conservative. A lower-sequence write after the applied one is ignored only if it repeats
+  the applied head or a head that writer already reported earlier; any other head makes the PR `head_unverified`
+  (`head_unverified`/`alert` fields, one log line, operator `resync_event_id`). It clears when the writer writes past the
+  applied sequence or an operator acknowledges the write with `attrs.head_resync`; a run of writes is never auto-adopted
+  (`head_rebased` is gone, `head_resynced` replaces it). Evidence is kept per distinct head so re-emits cannot evict it.
+- Review round 3: `rereview_needed` counts only what the caller can see. Matching is ASCII-only (same as autospec;
+  `invalid_target`). Shared vectors grew to 32 cases.
+- `GET /api/v1/graph/nodes/{pr_id}/review-quorum`: derived, head-bound quorum over `reviewed` edges (stale verdicts never
+  counted, distinct configured reviewers, author/replay/forged-head defences, `rereview_required`). Config:
+  `control_plane.review_quorum` in the fleet config. One policy shared with `autospec review-quorum` via
+  `tests/control_plane/fixtures/review-quorum-vectors.json`; statuses `unknown_head`, `head_unverified` (emitter sequence
+  reset), `unknown_author`; digests are 64-hex and bound; `reviewer_groups`. Contract: `docs/contracts/lineage-events.md`. Rollback: remove the
+  block (endpoint answers 404); no schema or event change.
 
 ### Lineage graph projection (T02, Herdr side)
 - Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
