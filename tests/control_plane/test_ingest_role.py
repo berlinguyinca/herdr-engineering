@@ -67,6 +67,17 @@ def test_ingest_key_can_post_ingest(server):
     assert len(repo.list_hosts()) == 1
 
 
+@pytest.mark.parametrize('kind', ['agent_identity', 'agent_summary'])
+def test_ingest_key_cannot_forge_private_agent_projection(server, kind):
+    base, repo = server
+    assert _post(base, '/api/v1/ingest', {
+        'entity_type': kind, 'entity_id': 'one',
+        'event_type': f'{kind}.updated', 'payload': {},
+    }, key='ing-1') == 400
+    assert repo.agent_identities.list() == []
+    assert repo.agent_summary_events() == []
+
+
 def test_ingest_key_cannot_call_operator_only_post(server):
     base, repo = server
     sid = repo.create_session()

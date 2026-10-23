@@ -82,7 +82,7 @@ def _repository_context(provider, repository):
             "forge_host": identity.split("/", 1)[0], "provider_repo_id": provider_id}
 
 
-def debug_ci(monitor, repo, dispatcher, repository, number, session_id, operation_id):
+def debug_ci(monitor, repo, dispatcher, repository, number, session_id, operation_id, *, provider_url=None):
     """Submit one bounded, replay-safe handoff; delivered means transport ACK only.
 
     The API caller must enforce operator authorization. Native identity is
@@ -98,12 +98,14 @@ def debug_ci(monitor, repo, dispatcher, repository, number, session_id, operatio
         raise ValueError("session_id is required")
     if not isinstance(operation_id, str) or not operation_id.strip() or len(operation_id) > 200:
         raise ValueError("operation_id is required")
-    request = {"repository": repository, "number": number}
+    request = {"repository": repository, "number": number,
+               **({"provider_url": provider_url} if provider_url is not None else {})}
     previous = _previous(repo, session_id, operation_id, request)
     if previous is not None:
         return _response(previous, session_id)
     _validate_session(repo.get_session(session_id))
-    provider = monitor._factory()
+    from .ci_monitor import bound_ci_provider
+    provider = bound_ci_provider(monitor._factory, provider_url)
     if not provider.available:
         raise ValueError("Woodpecker is not configured")
     repository_context = _repository_context(provider, repository)

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from .control_plane.project_links import repository_language
 from .errors import InvalidError, PermissionError_Engineering, UnreachableError
 
 
@@ -110,6 +111,9 @@ class WoodpeckerProvider:
     Stored logs are REST JSON entries with base64 data; live logs use SSE.
     `available` indicates configuration only; successful reads establish health.
     """
+
+    # /api/user/repos returns a complete snapshot, including exactly 50 rows.
+    repos_are_snapshot = True
 
     def __init__(self, base_url: str | None = None, token: str | None = None,
                  client=None) -> None:
@@ -211,12 +215,16 @@ class WoodpeckerProvider:
         out = []
         for item in rows:
             full = item.get("full_name") or f"{item.get('owner', '')}/{item.get('name', '')}"
+            language = repository_language(item.get("language"))
+            if language and self.token and self.token in language:
+                language = None
             out.append({
                 "id": item.get("id"), "repository": full,
                 "owner": item.get("owner"), "name": item.get("name"),
                 "private": item.get("private", False), "active": item.get("active", True),
                 "default_branch": item.get("default_branch"), "clone_url": item.get("clone_url"),
                 "forge_url": item.get("forge_url"),
+                "language": language,
             })
         counts = Counter(row["repository"] for row in out)
         self._repo_id_cache = {
@@ -270,12 +278,22 @@ class WoodpeckerProvider:
         if not isinstance(data, dict):
             raise CIProviderError("invalid_response")
         tasks = []
+        workflows = []
         for wf in data.get("workflows", []) or []:
+            # Only retain execution metadata actually supplied by the provider.
+            # Absent depends_on remains absent, rather than implying a root node.
+            workflows.append({
+                **{key: wf[key] for key in ("id", "name", "state", "status", "depends_on",
+                                            "duration", "started", "finished") if key in wf},
+                "started_at": _timestamp(wf.get("started")),
+                "finished_at": _timestamp(wf.get("finished")),
+            })
             for child in wf.get("children", []) or []:
                 tasks.append({
                     "id": child.get("id"), "name": child.get("name"), "state": child.get("state"),
                     "exit_code": child.get("exit_code"), "type": child.get("type"),
                     "workflow": wf.get("name"), "workflow_id": wf.get("id"),
+                    **{key: child[key] for key in ("depends_on", "duration") if key in child},
                     "started": child.get("started"), "finished": child.get("finished"),
                     "started_at": _timestamp(child.get("started")),
                     "finished_at": _timestamp(child.get("finished")),
@@ -284,7 +302,7 @@ class WoodpeckerProvider:
         keys = ("id", "number", "status", "branch", "event", "commit", "author", "message",
                 "title", "created", "started", "finished", "ref", "forge_url")
         return {
-            **{key: data.get(key) for key in keys}, "repository": repository, "tasks": tasks,
+            **{key: data.get(key) for key in keys}, "repository": repository, "tasks": tasks, "workflows": workflows,
             "created_at": _timestamp(data.get("created")),
             "started_at": _timestamp(data.get("started")),
             "finished_at": _timestamp(data.get("finished")),

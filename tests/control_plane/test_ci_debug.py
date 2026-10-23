@@ -113,6 +113,7 @@ def test_short_revision_rejected_without_queued_event():
     native_session(repo)
     provider = Provider()
     provider.revision = "abcdef"
+    repo.get_session("session")  # Materialize the independent durable name projection.
     before = copy.deepcopy(repo.export_state())
     with pytest.raises(ValueError, match="revision"):
         debug_ci(SimpleNamespace(_factory=lambda: provider), repo, None, "17", 12, "session", "operation")

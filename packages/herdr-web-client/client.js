@@ -99,6 +99,20 @@ export class HerdrClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
   }
 
+  getAgentSummary(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { signal });
+  }
+
+  regenerateAgentSummary(id) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { method: 'POST', body: {} });
+  }
+
+  renameAgent(id, name, expectedVersion) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/name`, {
+      method: 'POST', body: { name, expected_version: expectedVersion },
+    });
+  }
+
   // -- services / hosts ---------------------------------------------------
   listServices({ signal } = {}) {
     return this.request('/api/v1/services', { signal });
@@ -194,25 +208,41 @@ export class HerdrClient {
     return this.request('/api/v1/ci', { signal });
   }
 
-  getCiPipeline(repository, number, { signal } = {}) {
-    const query = new URLSearchParams({ repository, number: String(number) });
+  getCiReports({ signal } = {}) {
+    return this.request('/api/v1/ci/reports', { signal });
+  }
+
+  getCiPerformance({ days = 14, repository, branch, signal } = {}) {
+    const query = new URLSearchParams({ days: String(days) });
+    for (const [key, value] of Object.entries({ repository, branch })) {
+      if (value) query.set(key, value);
+    }
+    return this.request(`/api/v1/ci/performance?${query}`, { signal });
+  }
+
+  getCiHistory({ signal } = {}) {
+    return this.request('/api/v1/ci/history', { signal });
+  }
+
+  getCiPipeline(repository, number, { signal, providerUrl } = {}) {
+    const query = new URLSearchParams({ repository, number: String(number), ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) });
     return this.request(`/api/v1/ci/pipeline?${query}`, { signal });
   }
 
-  getCiLog(repository, number, step, { signal } = {}) {
-    const query = new URLSearchParams({ repository, number: String(number), step: String(step) });
+  getCiLog(repository, number, step, { signal, providerUrl } = {}) {
+    const query = new URLSearchParams({ repository, number: String(number), step: String(step), ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) });
     return this.request(`/api/v1/ci/log?${query}`, { signal });
   }
 
-  ciAction(repository, number, action, { signal } = {}) {
+  ciAction(repository, number, action, { signal, providerUrl } = {}) {
     return this.request('/api/v1/ci/actions', {
-      method: 'POST', body: { repository, number, action }, signal,
+      method: 'POST', body: { repository, number, action, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
     });
   }
 
-  debugCi(repository, number, sessionId, operationId, { signal } = {}) {
+  debugCi(repository, number, sessionId, operationId, { signal, providerUrl } = {}) {
     return this.request('/api/v1/ci/debug', {
-      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId }, signal,
+      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
     });
   }
 

@@ -322,3 +322,85 @@ def test_repository_limit_also_bounds_retained_partial_discovery():
     view = monitor.repositories(start=False)
     assert view["status"] == "capacity" and view["partial"]
     assert view["pagination"]["total"] <= 2
+
+
+def test_primary_languages_use_bulk_query_and_cached_reads_without_network():
+    rows = [dict(repository('rust', 0), primaryLanguage={'name': 'Rust'}),
+            dict(repository('go', 0), primaryLanguage={'name': 'Go'}), repository('unknown', 0)]
+    client = Client({'data': {'viewer': {'login': 'fixture', 'repositories': connection(rows)}}})
+    provider = GitHubProvider(token='private-token-value', client=client)
+    monitor = GitHubMonitor(provider_factory=lambda: provider)
+    monitor.refresh()
+    assert monitor.repository_languages(start=False) == {
+        'github.com/owner/rust': 'Rust', 'github.com/owner/go': 'Go', 'github.com/owner/unknown': None}
+    assert len(client.requests) == 1
+    assert 'primaryLanguage {name}' in json.loads(client.requests[0].data)['query']
+    assert 'private-token-value' not in json.dumps(monitor.repository_languages(start=False))
+
+
+@pytest.mark.parametrize('language', [None, [], 'Rust', {}, {'name': 3}, {'name': 'x' * 101}, {'name': 'Rust\nGo'}])
+def test_malformed_primary_language_does_not_break_repository_catalog(language):
+    row = dict(repository('app', 0), primaryLanguage=language)
+    client = Client({'data': {'viewer': {'login': 'fixture', 'repositories': connection([row])}}})
+    monitor = GitHubMonitor(provider_factory=lambda: GitHubProvider(token='private', client=client))
+    monitor.refresh()
+    assert monitor.repository_languages(start=False) == {'github.com/owner/app': None}
+    assert monitor.snapshot(start=False)['status'] == 'ready'
+
+
+def test_language_cache_retains_stale_metadata_but_clears_on_credential_rotation():
+    row = dict(repository('app', 0), primaryLanguage={'name': 'Rust'})
+    client = Client({'data': {'viewer': {'login': 'fixture', 'repositories': connection([row])}}})
+    token = ['first-private-token']
+    monitor = GitHubMonitor(provider_factory=lambda: GitHubProvider(token=token[0], client=client))
+    monitor.refresh()
+    client.payload = OSError('offline')
+    monitor.refresh()
+    assert monitor.snapshot(start=False)['stale']
+    assert monitor.repository_languages(start=False) == {'github.com/owner/app': 'Rust'}
+    token[0] = 'second-private-token'
+    assert monitor.repository_languages(start=False) == {}
+    assert len(client.requests) == 2
+
+
+def test_language_cache_starts_existing_background_refresh_without_blocking():
+    entered, release = threading.Event(), threading.Event()
+    provider = Provider()
+    original = provider.repositories_page
+
+    def blocked(cursor=None):
+        entered.set()
+        assert release.wait(2)
+        return original(cursor)
+
+    provider.repositories_page = blocked
+    monitor = GitHubMonitor(provider_factory=lambda: provider)
+    try:
+        assert monitor.repository_languages() == {}
+        assert entered.wait(1)
+    finally:
+        release.set()
+        monitor.close()
+
+
+def test_partial_repository_discovery_publishes_primary_language_before_issues_finish():
+    provider = Provider()
+
+    def pages(cursor=None):
+        if cursor:
+            raise GitHubError('unavailable')
+        return 'fixture', connection([dict(repository('rust', 0), primaryLanguage={'name': 'Rust'})], 2, 'next')
+
+    provider.repositories_page = pages
+    monitor = GitHubMonitor(provider_factory=lambda: provider)
+    monitor.refresh()
+    assert monitor.snapshot(start=False)['partial']
+    assert monitor.repository_languages(start=False) == {'github.com/owner/rust': 'Rust'}
+
+
+def test_primary_language_cannot_echo_configured_github_token():
+    row = dict(repository('app', 0), primaryLanguage={'name': 'private-token-value'})
+    client = Client({'data': {'viewer': {'login': 'fixture', 'repositories': connection([row])}}})
+    monitor = GitHubMonitor(provider_factory=lambda: GitHubProvider(token='private-token-value', client=client))
+    monitor.refresh()
+    assert monitor.repository_languages(start=False) == {'github.com/owner/app': None}

@@ -33,9 +33,9 @@ export function sessionEntries(sessions, missions=[], now=Date.now()) {
   return records(sessions).filter(s=>text(s.session_id)).map(record=> {
     const project=text(record.cwd).split(/[\\/]/).filter(Boolean).at(-1) || 'Project not reported';
     const mission=associatedMission(record,available);
-    const id=record.session_id, host=text(record.host_id), role=text(record.agent_role)||'Agent session';
+    const id=record.session_id, host=text(record.host_id), role=text(record.display_name)||text(record.agent_role)||'Agent';
     return {record,id,host,role,project,mission,tab:recordVisibility(record,now),
-      search:[id,host,role,project,text(record.cwd),text(record.branch),text(record.model),text(record.summary),
+      search:[id,host,role,text(record.agent_handle),text(record.agent_role),project,text(record.cwd),text(record.branch),text(record.model),text(record.summary),
         text(record.status),text(record.mission_id),mission?.title].filter(Boolean).join(' ').toLocaleLowerCase()};
   }).sort((a,b)=> {
     const stamp=s=>Number.isFinite(Date.parse(s.record.updated_at)) ? Date.parse(s.record.updated_at) : 0;
@@ -62,8 +62,8 @@ export function compactSessionRow(entry,now=Date.now()) {
   return `<article class="ss-row" data-session-id="${esc(entry.id)}">
     <div class="ss-main"><a class="ss-title" data-session-link href="#/herd/session/${esc(encodeURIComponent(entry.id))}">${esc(short(entry.role,70))} · ${esc(short(entry.project,80))}</a>
       <p class="ss-summary">${esc(short(s.summary)||'Activity not reported.')}</p>
-      ${entry.mission ? `<p class="ss-meta">Mission: <a data-mission-link href="#/missions/${esc(encodeURIComponent(entry.mission.key))}">${esc(short(entry.mission.title,130))}</a></p>` : text(s.mission_id) ? '<p class="ss-meta">Mission association not resolved; see session details.</p>' : ''}
-      <p class="ss-meta">${esc(short(entry.id,64))}${text(s.branch) ? ` · Branch ${esc(short(s.branch,70))}` : ''}</p>
+      ${entry.mission ? `<p class="ss-meta">Mission: <a data-mission-link href="#/missions/${esc(encodeURIComponent(entry.mission.key))}">${esc(short(entry.mission.title,130))}</a></p>` : text(s.mission_id) ? '<p class="ss-meta">Mission association not resolved; see agent details.</p>' : ''}
+      <p class="ss-meta ss-id">${esc(short(entry.id,64))}${text(s.branch) ? ` · Branch ${esc(short(s.branch,70))}` : ''}</p>
     </div>
     <div class="ss-state"><strong data-report>${esc(sessionReport(s,now))}</strong><span>${esc(short(entry.host,90)||'Host not reported')}</span>${text(s.model) ? `
       <span class="ss-meta">Model: ${esc(short(s.model,120))}</span>` : ''}</div>
@@ -72,10 +72,11 @@ export function compactSessionRow(entry,now=Date.now()) {
 
 const styles=`<style>
 .ss-intro{max-width:85ch;line-height:1.6;color:var(--text-secondary)}
-.ss-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0}.ss-tabs button{font:inherit;padding:10px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);cursor:pointer}.ss-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.ss-tabs strong{margin-left:6px}
-.ss-controls{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}.ss-controls label{display:flex;flex-direction:column;gap:6px;font-size:13px}.ss-controls .ss-search{flex:1;min-width:180px}.ss-controls input,.ss-controls select{padding:9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}
-.ss-group{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin:12px 0;overflow:hidden}.ss-group h2{font-size:14px;margin:0;padding:12px 16px;overflow-wrap:anywhere}.ss-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,290px);gap:16px;padding:14px 16px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ss-main{min-width:0}.ss-title{font-size:14px;font-weight:600;line-height:1.5}.ss-summary{font-size:13px;line-height:1.5;margin:6px 0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ss-meta{font-size:12px;color:var(--text-secondary);line-height:1.5;margin:6px 0}.ss-state{display:flex;flex-direction:column;gap:5px;font-size:12px;line-height:1.5}.ss-state strong{font-weight:500}.ss-pages{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:18px 0;font-size:13px}.ss-empty{padding:22px;color:var(--text-secondary)}
-@media(max-width:650px){.ss-row{grid-template-columns:minmax(0,1fr);gap:8px}.ss-controls label{min-width:130px;flex:1}.ss-tabs button{padding:9px 12px}}
+.ss-tabs{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.ss-tabs button{font:inherit;padding:8px 13px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);cursor:pointer}.ss-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.ss-tabs strong{margin-left:6px}
+.ss-controls{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ss-controls label{display:flex;flex-direction:column;gap:4px;font-size:12px}.ss-controls .ss-search{flex:1;min-width:180px}.ss-controls input,.ss-controls select{padding:7px 9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}
+.ss-group{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin:8px 0;overflow:hidden}.ss-group h2{font-size:13px;margin:0;padding:9px 12px;overflow-wrap:anywhere}.ss-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,290px);gap:14px;padding:9px 12px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ss-main{min-width:0}.ss-title{font-size:13px;font-weight:600;line-height:1.4}.ss-summary{font-size:12px;line-height:1.4;margin:3px 0;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}.ss-meta{font-size:12px;color:var(--text-secondary);line-height:1.4;margin:3px 0}.ss-id{display:none}.ss-state{display:flex;flex-direction:column;gap:3px;font-size:12px;line-height:1.4}.ss-state strong{font-weight:500}.ss-pages{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:12px 0;font-size:13px}.ss-empty{padding:18px;color:var(--text-secondary)}
+@media(min-width:2200px){section[id^=ss-panel-]:not([hidden]){display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}.ss-group{margin:0}}
+@media(max-width:650px){.ss-row{grid-template-columns:minmax(0,1fr);gap:8px;padding:12px}.ss-id{display:block}.ss-controls label{min-width:130px;flex:1}.ss-tabs button{padding:9px 12px}}
 </style>`;
 
 export function mountSessionsView(container,client,{tab='current'}={}) {
@@ -83,13 +84,13 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   const pageSize=20;
   let disposed=false,sessions=[],missions=[],loaded=false,sessionError='',missionError='',lastSignature='',hostSignature='';
   let sessionRequest=null,missionRequest=null;
-  container.innerHTML=`${styles}<h1>Sessions</h1>
-    <p class="ss-intro">Find an agent by project, host or model. Current shows open sessions reported in the last 15 minutes. Older or missing reports move to Unconfirmed automatically; Failed and Finished retain previous work.</p>
-    <div class="ss-tabs" role="tablist" aria-label="Session outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
-    <div class="ss-controls"><label class="ss-search">Search sessions<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
+  container.innerHTML=`${styles}<h1>Agents</h1>
+    <p class="ss-intro">Find an agent by project, host or model. Current shows open agents reported in the last 15 minutes. Older or missing reports move to Unconfirmed automatically; Failed and Finished retain previous work.</p>
+    <div class="ss-tabs" role="tablist" aria-label="Agent outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
+    <div class="ss-controls"><label class="ss-search">Search agents<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
       <label>Host<select id="ss-host"><option value="">All hosts</option></select></label>
       <label>Group by<select id="ss-group"><option value="project">Project folder</option><option value="none">Recent reports</option></select></label></div>
-    <p class="ss-meta" id="ss-result" role="status">Loading sessions…</p><p class="ss-meta" id="ss-error" role="status"></p>
+    <p class="ss-meta" id="ss-result" role="status">Loading agents…</p><p class="ss-meta" id="ss-error" role="status"></p>
     ${tabs.map(([key])=>`<section id="ss-panel-${key}" role="tabpanel" aria-labelledby="ss-tab-${key}" ${state.tab===key?'':'hidden'}></section>`).join('')}
     <div class="ss-pages"><button type="button" class="hd-btn" id="ss-previous">Previous</button><span id="ss-page"></span><button type="button" class="hd-btn" id="ss-next">Next</button></div>`;
   const el=id=>container.querySelector(`#ss-${id}`);
@@ -119,9 +120,9 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     const visible=selected.slice(state.page*pageSize,(state.page+1)*pageSize),groups=new Map();
     for(const entry of visible){const label=state.group==='project'?entry.project:'Recent reports';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(entry);}
     el(`panel-${state.tab}`).innerHTML=visible.length ? [...groups].map(([name,rows])=>`<div class="ss-group"><h2>${esc(name)}</h2>${rows.map(e=>compactSessionRow(e)).join('')}</div>`).join('')
-      : `<p class="ss-empty">${loaded?'No sessions match this tab and these filters.':'Loading sessions…'}</p>`;
+      : `<p class="ss-empty">${loaded?'No agents match this tab and these filters.':'Loading agents…'}</p>`;
     const noModel=loaded && selected.length>0 && !selected.some(e=>text(e.record.model));
-    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} sessions${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these sessions report which model they use':''}` : 'Loading sessions…';
+    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} agents${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these agents report which model they use':''}` : 'Loading agents…';
     el('page').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`;
     el('previous').disabled=state.page===0;el('next').disabled=(state.page+1)*pageSize>=selected.length;
     if(focusId){
@@ -151,7 +152,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
       if(!Array.isArray(data?.[kind]))throw new Error('Invalid response');
       if(kind==='sessions'){sessions=records(data.sessions);loaded=true;sessionError='';}else{missions=records(data.missions);missionError='';}
     } catch {
-      if(!disposed&&!document.hidden){if(kind==='sessions')sessionError=loaded?'Session updates unavailable. Showing last received records.':'Sessions could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}
+      if(!disposed&&!document.hidden){if(kind==='sessions')sessionError=loaded?'Agent updates unavailable. Showing last received records.':'Agents could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}
     } finally {
       clearTimeout(timeout);
       if(kind==='sessions')sessionRequest=null;else missionRequest=null;

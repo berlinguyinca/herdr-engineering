@@ -22,3 +22,38 @@
 .conversation-markdown code { font-family: var(--font-mono, monospace); font-size: .9em; }
 .conversation-markdown blockquote { margin-left: 0; padding-left: 12px; border-left: 3px solid var(--border, #d8dde5); }
 .conversation-markdown a { color: var(--accent, #2457c5); }
+.conversation-editor-toolbar, .conversation-find, .conversation-json-toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.conversation-editor-toolbar button, .conversation-find button, .conversation-json-toolbar button { border: 1px solid var(--border, #d8dde5); background: var(--surface, #fff); color: var(--text, #222); padding: 4px 8px; border-radius: 5px; cursor: pointer; font: inherit; font-size: 12px; }
+.conversation-editor-toolbar button[aria-pressed=true] { background: var(--surface-hover, #e9eef7); }
+.conversation-editor-body { display: grid; min-height: 0; gap: 12px; }
+.conversation-editor-body[data-mode=split] { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.conversation-editor-preview { min-width: 0; overflow: auto; padding: 12px; border: 1px solid var(--border, #d8dde5); border-radius: 8px; max-height: 320px; }
+.conversation-editor-info { font-size: 11px; color: var(--text-muted, #667085); }
+.conversation-find input { max-width: 160px; background: var(--surface, #fff); color: var(--text, #222); border: 1px solid var(--border, #d8dde5); padding: 4px; }
+.conversation-find[hidden], .conversation-editor-body [hidden] { display: none; }
+.conversation-composer--expanded { position: fixed; inset: 12px; z-index: 10000; box-sizing: border-box; margin: 0; border: 1px solid var(--border, #d8dde5); border-radius: 12px; background: var(--surface, #fff); color: var(--text, #222); box-shadow: 0 0 0 100vmax #0009; overflow: auto; }
+.conversation-composer--expanded .conversation-editor-body { flex: 1; min-height: 180px; }
+.conversation-composer--expanded .conversation-input-wrap { display: flex; min-height: 0; }
+.conversation-composer--expanded .conversation-input-wrap[hidden] { display: none; }
+.conversation-composer--expanded .conversation-input { height: 100%; max-height: none; resize: none; font-family: var(--font-mono, monospace); }
+.conversation-composer--expanded .conversation-editor-preview { max-height: none; }
+.conversation-composer--expanded .conversation-suggestions { bottom: auto; top: 36px; }
+.conversation-table { overflow-x: auto; }
+.conversation-markdown table { border-collapse: collapse; width: 100%; }
+.conversation-markdown th, .conversation-markdown td { padding: 6px 10px; border: 1px solid var(--border, #d8dde5); }
+.conversation-markdown th { background: var(--surface-2, #f4f5f7); }
+.conversation-json { font-family: var(--font-mono, monospace); font-size: 12px; overflow-wrap: anywhere; }
+.conversation-json ul { margin: 4px 0 4px 16px; padding-left: 12px; list-style: none; border-left: 1px solid var(--border, #d8dde5); }
+.conversation-json summary { cursor: pointer; }
+.conversation-json-key { color: var(--accent, #2457c5); }
+.conversation-json-string { color: var(--status-success, #167547); }
+.conversation-json-number, .conversation-json-boolean { color: var(--accent, #2457c5); }
+.conversation-json-null, .conversation-json-limit { color: var(--text-muted, #667085); }
+.conversation-json-error { color: var(--status-failed, #b42318); }
+[data-json-raw] { max-height: 400px; overflow: auto; white-space: pre; }
+@media (max-width: 640px) { .conversation-editor-body[data-mode=split] { grid-template-columns: minmax(0, 1fr); } .conversation-composer--expanded { inset: 4px; } }
+/* Anchor compact completion above the entire composer so the toolbar remains reachable. */
+.conversation-composer { position: relative; }
+.conversation-input-wrap { position: static; }
+.conversation-composer--expanded { position: fixed; }
+.conversation-composer--expanded .conversation-input-wrap { position: relative; }

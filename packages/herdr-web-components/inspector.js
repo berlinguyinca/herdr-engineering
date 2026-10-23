@@ -49,9 +49,9 @@ export function mergeEntry(list, entry, cap = CLIENT_BUFFER) {
 
 export function telemetryHealth(summary, telemetry) {
   if (telemetry === 'none' || !summary) {
-    return { state: 'none', text: 'No inspector telemetry received for this session.' };
+    return { state: 'none', text: 'No inspector telemetry received for this agent.' };
   }
-  if (summary.ended) return { state: 'ended', text: 'Session ended.' };
+  if (summary.ended) return { state: 'ended', text: 'Agent ended.' };
   const age = summary.last_event_age_s;
   if (age != null && age > STALE_AFTER_S) {
     return { state: 'stale', text: `No telemetry for ${formatDuration(age * 1000)} — the agent may be idle, restarting or disconnected.` };
@@ -87,7 +87,7 @@ export function renderAssociations(data) {
   const rows = [];
   if (a.mission_id) rows.push(['Mission', a.mission_id]);
   if (a.handoff_id || a.handoff_from) rows.push(['Handoff', [a.handoff_from && `from ${a.handoff_from}`, a.handoff_id].filter(Boolean).join(' · ')]);
-  if (a.parent_session_id) rows.push(['Parent session', a.parent_session_id]);
+  if (a.parent_session_id) rows.push(['Parent agent', a.parent_session_id]);
   if (a.worktree) rows.push(['Worktree', a.worktree]);
   if (a.branch) rows.push(['Branch', a.branch]);
   if (a.pr) {
@@ -129,7 +129,7 @@ function withheld(d) {
 
 function who(e) {
   const a = e.agent_id && e.agent_id !== 'main'
-    ? `<span class="hd-ins__agent" title="${esc(e.parent_agent_id ? `subagent of ${e.parent_agent_id}` : 'agent')}">${esc(e.agent_id)}</span>` : '';
+    ? `<span class="hd-ins__agent" title="${esc(e.parent_agent_id ? `subagent of ${e.parent_agent_id}` : 'agent')}">${esc(e.display_name || e.agent_id)}</span>` : '';
   return a;
 }
 
@@ -189,7 +189,7 @@ export function renderEvent(e, prefs = {}) {
       body = `<div class="hd-ins__text">${['mission_id', 'handoff_from', 'handoff_id', 'worktree', 'branch'].filter((k) => d[k]).map((k) => `${esc(k)}: ${esc(d[k])}`).join(' · ')}${d.pr ? ` · PR #${esc(d.pr.number ?? '?')}` : ''}</div>`;
       break;
     case 'lifecycle':
-      title = `session ${esc(d.phase)}`;
+      title = `agent ${esc(d.phase)}`;
       break;
     case 'capabilities':
       title = 'capabilities';
@@ -215,7 +215,7 @@ export function renderFiles(data) {
   const rows = [...files].reverse().map((f) => `<tr data-seq="${esc(f.last_seq)}">
       <td><code>${esc(f.path)}</code>${f.sensitive ? ' 🔒' : ''}</td><td>${esc(f.ops.join(', '))}</td>
       <td><span class="hd-diff__add">+${esc(f.additions)}</span> <span class="hd-diff__del">−${esc(f.deletions)}</span></td>
-      <td>${esc(f.agents.join(', '))}</td></tr>`).join('');
+      <td>${esc(f.agents.map(id=>data.summary?.agents?.find(a=>a.agent_id===id)?.display_name || id).join(', '))}</td></tr>`).join('');
   return `<table class="hd-ins__table"><thead><tr><th>File</th><th>Ops</th><th>Changes</th><th>By</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
@@ -228,12 +228,14 @@ export function renderUsage(data) {
   const ctx = u.context_pct != null
     ? `<herdr-metric label="Context" value="${esc(u.context_pct)}% of ${esc(formatTokens(u.latest.context_window))}"></herdr-metric>` : '';
   const agents = s.agents.length > 1
-    ? `<h4>Agents</h4><table class="hd-ins__table"><tbody>${s.agents.map((a) => `<tr><td>${esc(a.agent_id)}</td><td>${a.parent_agent_id ? 'subagent of ' + esc(a.parent_agent_id) : 'primary'}</td><td>${esc(a.tools)} tools</td><td>${esc(a.events)} events</td></tr>`).join('')}</tbody></table>` : '';
+    ? `<h4>Agents</h4><table class="hd-ins__table"><tbody>${s.agents.map((a) => `<tr><td>${esc(a.display_name || a.agent_id)}</td><td>${a.parent_agent_id ? 'helper of ' + esc(s.agents.find(parent=>parent.agent_id===a.parent_agent_id)?.display_name || a.parent_agent_id) : 'primary'}</td><td>${esc(a.tools)} tools</td><td>${esc(a.events)} events</td></tr>`).join('')}</tbody></table>` : '';
   return `<div class="hd-grid">${tiles}${ctx}</div>${agents}`;
 }
 
 /** Render one tab's content. Paging is applied by the caller via `limit`. */
 export function renderView(view, data, prefs, limit = PAGE_SIZE) {
+  const names = new Map((data.summary?.agents || []).map(a=>[a.agent_id,a.display_name]));
+  data = {...data,events:data.events.map(event=>({...event,display_name:names.get(event.agent_id)}))};
   if (view === 'usage') return renderUsage(data) + renderRows(data.events.filter((e) => e.kind === 'model' || e.kind === 'usage'), prefs, limit);
   if (view === 'reasoning') {
     const notice = reasoningNotice(data, prefs);

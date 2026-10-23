@@ -6,6 +6,8 @@ run off the request path. Progress measures repositories checked, not job work.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import threading
 import time
 from collections import Counter
@@ -44,10 +46,35 @@ def _dict(row):
     return row.to_dict() if hasattr(row, 'to_dict') else dict(row)
 
 
+def bound_ci_provider(factory, provider_url=None):
+    """Resolve once and reject a retained identity before any upstream I/O."""
+    provider = factory()
+    if provider_url is not None:
+        def canonical(value):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError('Exact CI provider identity is required')
+            try:
+                url = urlsplit(value.strip())
+                if (url.scheme != 'https' or not url.hostname or url.username or url.password
+                        or url.query or url.fragment):
+                    raise ValueError
+                port = url.port
+                return (url.scheme, url.hostname.lower(), port or 443, url.path.rstrip('/'))
+            except ValueError:
+                raise ValueError('Exact CI provider identity is invalid') from None
+        if canonical(provider_url) != canonical(getattr(provider, 'base_url', None)):
+            raise ValueError('CI provider changed; this retained run cannot be read or acted on')
+    return provider
+
+
 class CIMonitor:
     def __init__(self, *, provider_factory=None, interval=30, repo_limit=500,
-                 budget=120, now=None, on_transition=None, actions_enabled=False):
+                 budget=120, now=None, on_transition=None, actions_enabled=False,
+                 on_observation=None):
         self._factory = provider_factory or _provider
+        from .ci_history import CIHistory
+        self._history = CIHistory(provider_factory=self._factory, interval=interval,
+                                  budget=budget, now=now, repo_limit=repo_limit)
         #: control_plane.ci_actions in the fleet file; retry/cancel are off unless set.
         self.actions_enabled = bool(actions_enabled)
         self._interval = max(5, interval)
@@ -60,6 +87,8 @@ class CIMonitor:
         self._thread = None
         self._last_success = None
         self._on_transition = on_transition
+        self._on_observation = on_observation
+        self._observation_fingerprints = {}
         self._observed = {}
         self._baselined = set()
         self._view = {
@@ -79,6 +108,9 @@ class CIMonitor:
             view['stale'] = True
         return view
 
+    def history(self, *, start=True):
+        return self._history.snapshot(start=start)
+
     def start(self):
         with self._lock:
             if self._thread is None and not self._stop.is_set():
@@ -88,6 +120,7 @@ class CIMonitor:
 
     def close(self):
         self._stop.set()
+        self._history.close()
         if self._thread:
             self._thread.join(timeout=1)
 
@@ -151,7 +184,7 @@ class CIMonitor:
                     rows = provider.pipelines(str(repo['id']), per_page=20)
                     successful_repos.add(str(repo['id']))
                     pipelines[group] = [redact_payload({**_dict(row), 'repository': name,
-                                         'provider_repo_id': repo['id']}) for row in rows]
+                                         'provider_repo_id': repo['id'], 'provider_url': provider.base_url.rstrip('/')}) for row in rows]
                 except Exception as exc:
                     pipelines[group] = previous.get(group, [])
                     errors[group] = _error(exc)[1]
@@ -166,6 +199,9 @@ class CIMonitor:
             limited = len(repos) >= self._repo_limit
             if limited:
                 errors['_inventory'] = f'Inventory limited to {self._repo_limit} repositories.'
+            history_error = self._persist_observations(pipelines)
+            if history_error:
+                errors['_history'] = history_error
             self._transitions(pipelines, successful_repos)
             if not errors:
                 self._last_success = self._now()
@@ -177,6 +213,32 @@ class CIMonitor:
         except Exception as exc:
             status, message = _error(exc)
             self._update(available=False, status=status, stale=bool(self._last_success), error=message)
+
+    def _persist_observations(self, pipelines):
+        """Deduplicate the poll inventory independently of retained history.
+
+        Keep only acknowledged fingerprints in this snapshot, bounded by the
+        repository inventory and provider's per-repository recent-run limit.
+        Failed writes remain retryable even when a run itself is unchanged.
+        """
+        if self._on_observation is None:
+            return None
+        fingerprints, error = {}, None
+        for rows in pipelines.values():
+            for row in rows:
+                key = (str(row.get('provider_repo_id')), str(row.get('run_number')))
+                digest = hashlib.sha256(json.dumps(
+                    row, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                previous = fingerprints.get(key, self._observation_fingerprints.get(key))
+                if previous != digest:
+                    try:
+                        self._on_observation(copy.deepcopy(row))
+                    except Exception:
+                        error = 'CI history could not be persisted. Retrying automatically.'
+                        continue
+                fingerprints[key] = digest
+        self._observation_fingerprints = fingerprints
+        return error
 
     def _transitions(self, pipelines, successful_repos):
         failed = {'failure', 'error', 'failed', 'killed'}
@@ -201,9 +263,9 @@ class CIMonitor:
                    for rows in pipelines.values() for r in rows}
         self._observed = {k: v for k, v in self._observed.items() if k in current}
 
-    def detail(self, repository, number):
+    def detail(self, repository, number, *, provider_url=None):
         repository, number = self._validate(repository, number)
-        provider = self._factory()
+        provider = bound_ci_provider(self._factory, provider_url)
         if not provider.available:
             return {'available': False, 'error': 'Woodpecker is not configured.'}
         try:
@@ -211,17 +273,21 @@ class CIMonitor:
             if row is None:
                 return {'available': False, 'error': 'Pipeline was not found.'}
             row = redact_payload(_dict(row))
+            if provider_url is not None:
+                row.update(provider_url=provider.base_url.rstrip('/'),
+                           provider_repo_id=row.get('provider_repo_id', repository), run_number=number)
             if not self.actions_enabled:
                 row.update(can_retry=False, can_cancel=False)
-            return {'available': True, 'pipeline': row, 'checked_at': _stamp()}
+            return {'available': True, 'pipeline': row, 'checked_at': _stamp(),
+                    **({'provider_url': provider.base_url.rstrip('/')} if provider_url is not None else {})}
         except Exception as exc:
             return {'available': False, 'status': _error(exc)[0], 'error': _error(exc)[1]}
 
-    def log(self, repository, number, step):
+    def log(self, repository, number, step, *, provider_url=None):
         repository, number = self._validate(repository, number)
         if not isinstance(step, str) or not step or len(step) > 200:
             raise ValueError('step is required')
-        provider = self._factory()
+        provider = bound_ci_provider(self._factory, provider_url)
         try:
             value = provider.step_log(repository, number, step)
             if value is None:
@@ -229,18 +295,19 @@ class CIMonitor:
             # Redact exact credential as well as common secret patterns.
             value = value.replace(provider.token, '[REDACTED]') if provider.token else value
             return {'available': True, 'log': redact_text(value[:262144]),
+                    **({'provider_url': provider.base_url.rstrip('/')} if provider_url is not None else {}),
                     'truncated': len(value) > 262144 or value.endswith('[log truncated; open CI for the full log]'),
                     'checked_at': _stamp()}
         except Exception as exc:
             return {'available': False, 'log': '', 'error': _error(exc)[1]}
 
-    def action(self, repository, number, action):
+    def action(self, repository, number, action, *, provider_url=None):
         repository, number = self._validate(repository, number)
         if not self.actions_enabled:
             raise PermissionError('CI actions are disabled by this deployment')
         if action not in {'retry', 'cancel'}:
             raise ValueError('unsupported CI action')
-        provider = self._factory()
+        provider = bound_ci_provider(self._factory, provider_url)
         detail = provider.pipeline(repository, number)
         if not detail or not detail.get('can_retry' if action == 'retry' else 'can_cancel'):
             raise PermissionError('Woodpecker does not permit this action for this pipeline')

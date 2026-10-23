@@ -61,7 +61,8 @@ class IngestService:
 
         # Provider-owned observations and review outcomes have dedicated,
         # authenticated adapters; generic telemetry cannot forge those streams.
-        if entity_type in {"plannotator_review", "ci_pipeline"}:
+        if entity_type in {"plannotator_review", "ci_pipeline", "agent_identity", "agent_summary",
+                           "custom_model", "llm_key", "token_usage"}:
             raise ValueError("provider-owned entity type is not accepted by generic ingestion")
         # The review gate's streams decide merges; a forged verdict/resume/pin
         # would merge unreviewed code, so they are reserved for the gate itself.

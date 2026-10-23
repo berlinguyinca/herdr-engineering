@@ -417,3 +417,36 @@ def test_download_preview_redacts_token_across_preview_boundary():
     log = p.step_log("17", 12, "1")
     assert "a-priv" not in log
     assert "log truncated" in log
+
+
+def test_pipeline_retains_only_reported_dependency_and_duration_metadata():
+    raw = {"id": 1104, "number": 12, "status": "running", "workflows": [
+        {"id": 1, "name": "Build", "state": "running", "depends_on": [],
+         "started": 1720000001, "duration": 30,
+         "token": "workflow-secret", "children": [
+             {"id": 2, "name": "Checkout", "state": "success", "depends_on": [], "duration": 4},
+             {"id": 3, "name": "Tests", "state": "running", "depends_on": ["Checkout"]},
+             {"id": 4, "name": "Unknown", "state": "pending"}]},
+        {"id": 5, "name": "Release", "depends_on": ["Build"], "children": []}]}
+    p = _provider({"/api/repos/17/pipelines/12": raw})
+    detail = p.pipeline("17", 12)
+    assert detail["workflows"][0]["depends_on"] == []
+    assert detail["workflows"][1]["depends_on"] == ["Build"]
+    assert detail["workflows"][0]["duration"] == 30
+    assert detail["workflows"][0]["started_at"] == "2024-07-03T09:46:41Z"
+    assert "token" not in detail["workflows"][0]
+    assert detail["tasks"][0]["depends_on"] == []
+    assert detail["tasks"][0]["duration"] == 4
+    assert detail["tasks"][1]["depends_on"] == ["Checkout"]
+    assert "depends_on" not in detail["tasks"][2]
+
+
+def test_repositories_preserve_explicit_provider_language():
+    p = _provider({'/api/user/repos': [{**REPO, 'language': 'Rust'}]})
+    assert p.repos()[0]['language'] == 'Rust'
+
+
+@pytest.mark.parametrize('language', ['tok', 'Rust tok', 'Rust\nGo', {'name': 'Rust'}, 'x' * 101])
+def test_repository_language_never_exposes_credentials_or_malformed_metadata(language):
+    p = _provider({'/api/user/repos': [{**REPO, 'language': language}]})
+    assert p.repos()[0]['language'] is None

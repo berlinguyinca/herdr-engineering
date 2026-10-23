@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as overview from '../overview-view.js';
 import { overviewModel, renderOverviewSection, meaningfulEvents } from '../overview-view.js';
 
 const now = Date.parse('2026-10-20T12:00:00Z');
@@ -45,7 +46,7 @@ test('actual repository terminal reports are visible without treating ordinary r
     {event_type:'MissionUpdated',payload:{status:'active',stage:'complete'}},{event_type:'MissionStageChanged',payload:{to:'failed'}},{event_type:'SessionUpdated',payload:{status:'stopped'}}];
   assert.equal(meaningfulEvents(events).length,3);
   const html=renderOverviewSection('activity',{events},{activity:{loaded:true}},now,now);
-  assert.match(html,/Mission reported finished/);assert.match(html,/Mission reported failed/);assert.match(html,/Session reported finished/);
+  assert.match(html,/Mission reported finished/);assert.match(html,/Mission reported failed/);assert.match(html,/Agent reported finished/);
 });
 test('overview suppresses telemetry noise and bounds untrusted summaries', () => {
   const events=[{event_type:'HostHeartbeat'},{event_type:'mission_activity.snapshot'},{event_type:'ServiceRegistered'},...Array.from({length:20},()=>({event_type:'MissionEnded',entity_type:'mission',entity_id:'private-id',payload:{title:'<script>'+ 'prompt '.repeat(1000)}}))];
@@ -104,4 +105,102 @@ test('snoozed attention missions leave the count and rows, and can be brought ba
   assert.doesNotMatch(snoozed, /data-snooze="pi:stuck"/);
   const expired = renderOverviewSection('missions', { projections, missions: [], snoozed: new Map([['pi:stuck', now - 1]]) }, states, now, now);
   assert.match(expired, /data-snooze="pi:stuck"/);
+});
+
+
+test('attention orders failures before review actions and unconfirmed evidence, deduplicating exact identities', () => {
+  const run = {provider_url:'https://ci.example',provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed',updated_at:'2026-10-20T11:59:00Z'};
+  const data = {projections:[live('pi:blocked','EXECUTING','blocked')],ci:{pipelines:{recent:[run,run,{...run,provider_repo_id:8}]}},reviews:{reviews:[{review_id:'r/1',title:'Decision',state:'changes_requested',updated_at:'2026-10-20T12:00:00Z'}]},hosts:[{host_id:'host/1',last_seen:'2026-10-19T12:00:00Z'}]};
+  const result=overview.overviewAttention(data,{},now,now);
+  assert.equal(result.items.length,5);
+  assert.equal(result.items[0].severity,'critical');
+  assert.equal(result.items[2].href,'#/missions/pi%3Ablocked');
+  assert.equal(result.items[3].href,'#/reviews?tab=changes&search=r%2F1');
+  assert.equal(result.items[4].href,'#/hosts/host%2F1');
+  assert.notEqual(result.items[0].key,result.items[1].key);
+});
+
+test('attention uses recency within severity and actionability and retains failed sources as partial evidence', () => {
+  const data={ci:{stale:true,pipelines:{recent:[{provider_repo_id:1,run_number:1,state:'failed',updated_at:'2026-10-20T10:00:00Z'},{provider_repo_id:1,run_number:2,state:'failed',updated_at:'2026-10-20T11:00:00Z'}]}}};
+  const result=overview.overviewAttention(data,{ci:{loaded:true,error:true}},now,now);
+  assert.match(result.items[0].detail,/Run #2/);
+  assert.equal(result.complete,false);
+  assert.ok(result.unavailable.includes('ci'));
+  const html=renderOverviewSection('attention',{}, {ci:{error:true}},now,now);
+  assert.match(html,/Attention/);assert.match(html,/Partial coverage/);
+  assert.doesNotMatch(html,/No attention needed|0 items/);
+});
+
+test('overview preferences discard unknown and fixed cards and restore omitted cards safely', () => {
+  assert.deepEqual(overview.sanitizeOverviewPreferences({order:['ci','ci','attention','bogus','health'],hidden:['ci','attention','health','bogus']}),{
+    order:['ci','missions','fleet','sessions','reviews','services','hosts','activity'],hidden:['ci'],
+  });
+  for(const value of [null,42,'bad',[],{order:'ci',hidden:{ci:true}}]) {
+    assert.deepEqual(overview.sanitizeOverviewPreferences(value),{order:['missions','fleet','sessions','ci','reviews','services','hosts','activity'],hidden:[]});
+  }
+});
+
+test('complete attention includes fleet drift and distinguishes an empty complete snapshot from unknown coverage',()=>{
+  const states=Object.fromEntries(['projections','missions','sessions','services','hosts','ci','reviews','health','fleet'].map(key=>[key,{loaded:true}]));
+  const data={fleet:{summary:{drifted:2}},health:{status:'ok'}};
+  const result=overview.overviewAttention(data,states,now,now);
+  assert.equal(result.complete,true);
+  assert.equal(result.items[0].href,'#/hosts?drift=1');
+  assert.match(result.items[0].detail,/2/);
+  assert.match(renderOverviewSection('attention',{},states,now,now),/No attention items in the received reports/);
+  assert.match(renderOverviewSection('attention',{}, {},now,now),/— observed items/);
+});
+
+test('attention drops superseded failures when the same exact CI run has a newer success',()=>{
+  const run={provider_url:'https://ci.example',provider_repo_id:7,repository:'org/repo',run_number:12};
+  const result=overview.overviewAttention({ci:{pipelines:{history:[{...run,state:'failed',updated_at:'2026-10-20T11:00:00Z'},{...run,state:'success',updated_at:'2026-10-20T11:30:00Z'}]}}},{},now,now);
+  assert.equal(result.items.length,0);
+});
+
+test('attention qualifies provider partial coverage even after successful source loading',()=>{
+  const states=Object.fromEntries(['projections','missions','sessions','services','hosts','ci','reviews','health','fleet'].map(key=>[key,{loaded:true}]));
+  assert.equal(overview.overviewAttention({ci:{available:true,status:'partial',pipelines:{}}},states,now,now).complete,false);
+});
+
+test('recorded failed missions rank newest first rather than alphabetical title',()=>{
+  const result=overview.overviewAttention({missions:[
+    {mission_id:'a-older',title:'Alpha older failure',status:'failed',updated_at:'2026-10-20T10:00:00Z'},
+    {mission_id:'z-newer',title:'Zulu newer failure',status:'failed',updated_at:'2026-10-20T11:00:00Z'},
+  ]},{},now,now);
+  assert.deepEqual(result.items.map(item=>item.title),['Zulu newer failure','Alpha older failure']);
+  assert.equal(result.items[0].updated,Date.parse('2026-10-20T11:00:00Z'));
+});
+
+test('CI attention destinations retain provider identity when repository IDs and run numbers collide',()=>{
+  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed'};
+  const result=overview.overviewAttention({ci:{pipelines:{history:[{...run,provider_url:'https://ci-a.example'},{...run,provider_url:'https://ci-b.example'}]}}},{},now,now);
+  assert.equal(result.items.length,2);
+  const destinations=result.items.map(item=>new URL(item.href.slice(1),'https://dashboard.example'));
+  assert.deepEqual(destinations.map(url=>url.searchParams.get('provider')),['https://ci-a.example','https://ci-b.example']);
+  assert.deepEqual(destinations.map(url=>url.searchParams.get('search')),['12','12']);
+  for(const url of destinations)assert.equal(url.searchParams.get('repository'),'7');
+});
+
+test('large attention queues show only the six highest ranked items until expanded',()=>{
+  const missions=Array.from({length:196},(_,index)=>({mission_id:`failure-${index}`,title:`Failure ${index}`,status:'failed',updated_at:new Date(now-index*1000).toISOString()}));
+  const data={missions};
+  const collapsed=renderOverviewSection('attention',data,{},now,now);
+  assert.equal(overview.overviewAttention(data,{},now,now).items.length,196);
+  assert.equal((collapsed.match(/data-attention-key=/g)||[]).length,6);
+  assert.match(collapsed,/Showing 6 of 196 observed items/);
+  assert.match(collapsed,/aria-expanded="false" aria-controls="ov-attention-items"/);
+  assert.match(collapsed,/#\/missions\/failure-0/);
+  assert.doesNotMatch(collapsed,/#\/missions\/failure-6/);
+  assert.match(collapsed,/Partial coverage/);
+  const expanded=renderOverviewSection('attention',{...data,attentionExpanded:true},{},now,now);
+  assert.equal((expanded.match(/data-attention-key=/g)||[]).length,196);
+  assert.match(expanded,/aria-expanded="true" aria-controls="ov-attention-items"/);
+  assert.match(expanded,/Show fewer/);
+  assert.match(expanded,/class="ov-list ov-attention-list is-expanded"/);
+});
+
+test('short attention queues do not offer a redundant expansion control',()=>{
+  const html=renderOverviewSection('attention',{missions:[{mission_id:'one',title:'Failure',status:'failed'}]}, {},now,now);
+  assert.equal((html.match(/data-attention-key=/g)||[]).length,1);
+  assert.doesNotMatch(html,/data-attention-toggle/);
 });

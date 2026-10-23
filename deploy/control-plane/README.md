@@ -177,3 +177,10 @@ token analytics are per project without hand-sourcing a file. When this stack ru
 `HERDR_ENGINEERING_CONTROL_PLANE_KEY` or `~/.config/herdr-engineering/control-plane-key` (0600).
 A key the host failed to revoke is named on stderr (`key_id`); revoke it with the same endpoint.
 See the README section "Sessions get the LLM env automatically".
+
+## Optional agent summary model
+
+Automatic agent summaries can use a separately managed private CPU model. It is
+disabled by default and ordinary deploys never download or start it. See
+[agent summary model operations](../../docs/operations/agent-summary-model.md) for
+explicit provisioning, central configuration, health checks and removal.

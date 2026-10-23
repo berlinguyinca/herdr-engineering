@@ -61,3 +61,10 @@ test('ambiguous send retries retain operation identity across new mounts',()=>{
   assert.equal(pendingOperation(storage,'session:s','different',generate),'operation-2');
   assert.equal(pendingOperation(storage,'session:other','different',generate),'operation-3');
 });
+
+test('human names decorate linked agents and references without changing routing handles',()=>{
+  const sessions=[{session_id:'s',display_name:'Amber Finch',agent_handle:'amber-finch'}];
+  const refs=referenceSuggestions(sessions[0],{summary:{agents:[{agent_id:'main',display_name:'Amber Finch',agent_handle:'amber-finch'}]}},sessions,[{agent_id:'c',instance_id:'s',name:'coder'}]);
+  assert.ok(refs.some(x=>x.label==='Amber Finch' && x.insertText==='@coder'));
+  assert.ok(refs.some(x=>x.label==='Amber Finch' && x.insertText==='@amber-finch'));
+});
