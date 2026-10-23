@@ -114,7 +114,7 @@ next poll.
 - **qwen on the `development` provider.** That provider sets `compat.thinkingFormat: qwen-chat-template`. pi then
   sends `chat_template_kwargs.enable_thinking`, which is the switch this script already sends, so no other switch
   is needed. Measured on 2026-10-23 against qwen3.8-27b: 0 reasoning tokens with the switch, and about 670
-  characters of reasoning without it. A top-level `enable_thinking: false` was ignored. The node answers under
-  its own id, `qwen3.8-27b-vision-c120k-2x`, not the requested
-  `qwen3.8-27b-modality-text-ctx-c128k-quant-q4_k_m`. The family is still qwen, and the status names the id
-  that answered.
+  characters of reasoning without it. A top-level `enable_thinking: false` was ignored. In those probes the
+  answer named `qwen3.8-27b-vision-c120k-2x`, not the requested
+  `qwen3.8-27b-modality-text-ctx-c128k-quant-q4_k_m`; the id depends on which backend serves the request. Any
+  qwen id keeps independence, and the status names the id that answered.
