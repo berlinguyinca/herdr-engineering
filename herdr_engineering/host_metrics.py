@@ -11,6 +11,7 @@ import os
 import platform
 import json
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -418,3 +419,117 @@ class HostSampler:
                                           "/System/Volumes/Update")):
                 mounts.append(u)
         return self._cap_mounts(self._dedupe(mounts))
+
+
+# --- slow report: updates, failed units, versions ---------------------------------
+
+MAX_PACKAGES = 50
+_APT_TIMEOUT = 30.0  # `apt-get -s upgrade` reads the whole dpkg/apt cache; can be slow
+_REBOOT_REQUIRED = "/var/run/reboot-required"
+_PI_EXT_DIR = os.path.expanduser("~/.pi/agent/extensions")
+_INST_RE = re.compile(r"^Inst (\S+)(?: \[([^\]]*)\])? \((\S+) ([^)]*)\)")
+
+
+def _updates(manager, outdated=None, security=None, packages=None) -> dict:
+    return {"manager": manager, "outdated": outdated, "security": security,
+            "packages": (packages or [])[:MAX_PACKAGES]}
+
+
+def parse_apt_simulate(text: str) -> dict:
+    """``apt-get -s upgrade`` output: one ``Inst`` line per pending upgrade; a
+    ``-security`` suite on the line counts it as a security update."""
+    packages, security = [], 0
+    for line in text.splitlines():
+        m = _INST_RE.match(line)
+        if not m:
+            continue
+        name, old, new, suites = m.groups()
+        packages.append({"name": name, "from": old, "to": new})
+        if "-security" in suites:
+            security += 1
+    return _updates("apt", len(packages), security, packages)
+
+
+def parse_brew_outdated(text: str) -> dict:
+    """``brew outdated --json=v2`` (formulae and casks). Brew has no security flag."""
+    data = json.loads(text)
+    packages = []
+    for item in list(data.get("formulae") or []) + list(data.get("casks") or []):
+        inst = item.get("installed_versions")
+        if isinstance(inst, list):
+            inst = inst[-1] if inst else None
+        packages.append({"name": item.get("name"), "from": inst,
+                         "to": item.get("current_version")})
+    return _updates("brew", len(packages), None, packages)
+
+
+def _failed_units() -> list[str]:
+    out = _run(["systemctl", "--failed", "--no-legend"]) if shutil.which("systemctl") else None
+    units = []
+    for line in (out or "").splitlines():
+        f = re.sub(r"^[\s\u25cf*]+", "", line).split()  # drop the status bullet
+        if f:
+            units.append(f[0])
+    return units
+
+
+def read_updates() -> dict:
+    """Pending package updates, reboot flag and failed units. Unknown is ``None``."""
+    linux = platform.system() == "Linux"
+    res = _updates(None)
+    try:
+        if linux and shutil.which("apt-get"):
+            res = _updates("apt")
+            out = _run(["apt-get", "-s", "upgrade"], timeout=_APT_TIMEOUT)
+            if out is not None:
+                res = parse_apt_simulate(out)
+        elif platform.system() == "Darwin" and shutil.which("brew"):
+            res = _updates("brew")
+            out = _run(["brew", "outdated", "--json=v2"], timeout=_APT_TIMEOUT)
+            if out is not None:
+                res = parse_brew_outdated(out)
+    except Exception:  # noqa: BLE001 - unparsable output means unknown
+        res = _updates(res["manager"])
+    res["reboot_required"] = os.path.exists(_REBOOT_REQUIRED) if linux else None
+    res["failed_units"] = _failed_units() if linux else []
+    return res
+
+
+def _first_line(out: str | None) -> str | None:
+    lines = (out or "").strip().splitlines()
+    return lines[0].strip() if lines and lines[0].strip() else None
+
+
+def _tool_version(cmd: list[str]) -> str | None:
+    return _first_line(_run(cmd)) if shutil.which(cmd[0]) else None
+
+
+def _pi_extensions() -> dict:
+    """name -> version. A directory extension reports its package.json version;
+    a single-file extension (e.g. build-gate.ts) has no manifest, so ``None``."""
+    out = {}
+    try:
+        entries = sorted(Path(_PI_EXT_DIR).iterdir())
+    except OSError:
+        return out
+    for e in entries:
+        ver = None
+        if e.is_dir():
+            try:
+                ver = json.loads((e / "package.json").read_text()).get("version")
+            except (OSError, ValueError, AttributeError):
+                ver = None
+        out[e.name] = ver
+    return out
+
+
+def read_versions() -> dict:
+    """Versions of the fleet tooling; ``None`` when a tool is absent."""
+    try:
+        from .version import __version__ as herdr
+    except Exception:  # noqa: BLE001
+        herdr = None
+    return {"herdr": herdr, "pi": _tool_version(["pi", "--version"]),
+            "pi_extensions": _pi_extensions(),
+            "autospec": _tool_version(["autospec", "--version"]),
+            "tailscale": _tool_version(["tailscale", "--version"])}
