@@ -19,7 +19,7 @@ from urllib.parse import quote
 import pytest
 
 from tests.e2e import harness, pg
-from tests.e2e.harness import Plane, sha40
+from tests.e2e.harness import Plane
 
 VOLATILE = {"age_seconds", "last_seen_at", "server_time", "status", "freshness_window_seconds"}
 

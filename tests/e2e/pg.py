@@ -33,7 +33,7 @@ class ThrowawayPostgres:
     def dsn(self) -> str:
         return f"postgresql://postgres@/{self.db}?host={self.sock}"
 
-    def start(self) -> "ThrowawayPostgres":
+    def start(self) -> ThrowawayPostgres:
         self.root.mkdir(parents=True, exist_ok=True)
         subprocess.run([str(self.bins / "initdb"), "-D", str(self.data), "-U", "postgres", "--auth=trust", "-E", "UTF8"],
                        check=True, capture_output=True)
@@ -46,7 +46,7 @@ class ThrowawayPostgres:
         asyncio.run(self._migrate())
         return self
 
-    def start_existing(self) -> "ThrowawayPostgres":
+    def start_existing(self) -> ThrowawayPostgres:
         """Bring the same cluster (same data dir, same socket) back after `stop()`."""
         subprocess.run([str(self.bins / "pg_ctl"), "-D", str(self.data), "-w", "-l", str(self.root / "pg.log"),
                         "-o", f"-c listen_addresses='' -c unix_socket_directories='{self.sock}' -c fsync=off",
