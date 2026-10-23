@@ -435,7 +435,16 @@ export async function tabTrapAudit(page, maxPresses = 300) {
 export async function overflowAudit(page) {
   return page.evaluate(() => {
     const de = document.documentElement;
-    const out = { scrollWidth: de.scrollWidth, clientWidth: de.clientWidth, offenders: [] };
+    const out = { scrollWidth: de.scrollWidth, clientWidth: de.clientWidth, offenders: [], clipped: [] };
+    // 1.4.10 is also lost when content is CUT instead of scrolled: a box with overflow hidden/clip whose content is wider than the box
+    // (an ellipsis is a deliberate, visible cut and is allowed; the page never scrolls, so the document check above cannot see this)
+    for (const el of document.body.querySelectorAll('*')) {
+      const cs = getComputedStyle(el);
+      if (!['hidden', 'clip'].includes(cs.overflowX) || cs.textOverflow === 'ellipsis' || cs.display === 'none' || cs.visibility === 'hidden') continue;
+      if (el.closest('svg') || el.clientWidth === 0) continue;
+      if (el.scrollWidth > el.clientWidth + 1) out.clipped.push(`${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}${el.classList.length ? '.' + [...el.classList].slice(0, 2).join('.') : ''} content ${el.scrollWidth}px in ${el.clientWidth}px`);
+    }
+    out.clipped = out.clipped.slice(0, 8);
     if (de.scrollWidth > de.clientWidth + 1) {
       for (const el of document.body.querySelectorAll('*')) {
         const r = el.getBoundingClientRect();
@@ -453,6 +462,14 @@ export async function overflowAudit(page) {
     }
     return out;
   });
+}
+
+/** The one-line verdict on an overflowAudit result: the page scrolls sideways, or some box cuts its content. '' when fine. */
+export function overflowFailure(o) {
+  const parts = [];
+  if (o.scrollWidth > o.clientWidth + 1) parts.push(`scrollWidth ${o.scrollWidth} > ${o.clientWidth}: ${o.offenders.join(', ')}`);
+  if (o.clipped.length) parts.push(`content is cut off: ${o.clipped.join(', ')}`);
+  return parts.join('; ');
 }
 
 /** Reduced motion: with `prefers-reduced-motion: reduce` nothing animates or transitions for longer than 1ms. */

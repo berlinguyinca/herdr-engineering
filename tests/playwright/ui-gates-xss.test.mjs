@@ -28,7 +28,9 @@ const DISPLAY = new Set(['name', 'label', 'title', 'text', 'instruction', 'conte
   'path', 'paths', 'touched_paths', 'questions', 'task', 'goal', 'what', 'owner_label', 'role_label', 'status_text', 'last_activity', 'headline', 'body', 'error', 'notice']);
 const URLS = new Set(['url', 'href', 'link_url', 'pr_url', 'html_url', 'web_url']);
 const tag = (k) => String(k).replace(/[^a-z0-9]/gi, '').slice(0, 24);
-const payload = (k) => `<img src=x onerror=window.__xss=1><b id=cx-canary-${tag(k)}>"'>`;
+// The payload breaks out of both contexts: a double quote first (out of an attribute value, leaving an event handler and a marker
+// attribute behind), then markup (out of text). Escaped, it is just characters.
+const payload = (k) => `" onfocus=window.__xss=1 data-cx-attr x="'><img src=x onerror=window.__xss=1><b id=cx-canary-${tag(k)}>`;
 
 function taint(v, key, used) {
   if (typeof v === 'string') {
@@ -60,7 +62,7 @@ async function hostile(browser, state) {
 /** What a payload that got through would leave behind. */
 const damage = (page) => page.evaluate(() => ({
   executed: window.__xss,
-  elements: [...document.querySelectorAll('img[src="x"], [id^="cx-canary"], [onerror], [onload], [onmouseover], [onclick], [onfocus], a[href^="javascript:" i], iframe, object, embed')].map((e) => `${e.tagName.toLowerCase()}${e.id ? '#' + e.id : ''}`),
+  elements: [...document.querySelectorAll('img[src="x"], [data-cx-attr], [id^="cx-canary"], [onerror], [onload], [onmouseover], [onclick], [onfocus], a[href^="javascript:" i], iframe, object, embed')].map((e) => `${e.tagName.toLowerCase()}${e.id ? '#' + e.id : ''}`),
   inlineScripts: document.querySelectorAll('script:not([src])').length,
 }));
 const shownKeys = (page) => page.evaluate(() => { const h = document.documentElement.innerHTML; return [...new Set([...h.matchAll(/cx-canary-([a-z0-9]+)/gi)].map((m) => m[1]))]; });

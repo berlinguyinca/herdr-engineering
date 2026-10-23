@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { launch, watch } from './ui-gates-lib.mjs';
-import { staticAudit, focusIndicatorAudit, overflowAudit, summarize } from './a11y-checks.mjs';
+import { staticAudit, focusIndicatorAudit, overflowAudit, overflowFailure, summarize } from './a11y-checks.mjs';
 
 const T = '2026-10-23T10:00:00+00:00';
 const LONG = 'x'.repeat(300);
@@ -112,7 +112,7 @@ test('300-character unbroken labels, comments and instructions never cause horiz
   await page.locator('.wb-comment').first().waitFor();
   await page.locator('.wb-steer').first().waitFor();
   const o = await overflowAudit(page);
-  assert.ok(o.scrollWidth <= o.clientWidth + 1, `overflow: ${o.scrollWidth} > ${o.clientWidth}: ${o.offenders.join(', ')}`);
+  assert.equal(overflowFailure(o), '', 'overflow');
 }));
 
 // What the server ran out of decides what the page may claim: `scan_budget` means nodes may be missing, `edge_budget` means every node

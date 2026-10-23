@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { CFG, REPO, launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
-import { staticAudit, focusIndicatorAudit, tabTrapAudit, overflowAudit, motionAudit, liveAnnouncementAudit, summarize } from './a11y-checks.mjs';
+import { staticAudit, focusIndicatorAudit, tabTrapAudit, overflowAudit, overflowFailure, motionAudit, liveAnnouncementAudit, summarize } from './a11y-checks.mjs';
 import { STATES } from './ui-gates-states.mjs';
 
 const SUBS = ['chat', 'flow', 'tasks', 'agents', 'tabs', 'lineage', 'attention', 'progress', 'links', 'proposals', 'people'];
@@ -121,7 +121,7 @@ test('reflow at 320 CSS px (400% zoom of 1280) and at 200% zoom: no two-dimensio
     for (const sub of SUBS) {
       await render(page, sub);
       const o = await overflowAudit(page);
-      if (o.scrollWidth > o.clientWidth + 1) bad.push(`${name} [${sub}] scrollWidth ${o.scrollWidth} > ${o.clientWidth}: ${o.offenders.join(', ')}`);
+      if (overflowFailure(o)) bad.push(`${name} [${sub}] ${overflowFailure(o)}`);
     }
   }
   assert.deepEqual(bad, []);
@@ -250,7 +250,7 @@ test('device.orientation and device.zoom-not-blocked: rotating a phone loses not
     for (const sub of ['chat', 'lineage', 'attention', 'tabs']) {
       await render(page, sub);
       const o = await overflowAudit(page);
-      assert.ok(o.scrollWidth <= o.clientWidth + 1, `[${sub}] ${size.width}x${size.height}: ${o.offenders.join(', ')}`);
+      assert.equal(overflowFailure(o), '', `[${sub}] ${size.width}x${size.height}`);
       assert.ok(await page.locator(`[data-sub="${sub}"]`).isVisible(), `[${sub}] the sub tab is still reachable after rotation`);
     }
   }
@@ -368,7 +368,7 @@ test('reflow at 320px with 300-character unbroken labels, comments and instructi
       await openSub(page, sub);
       await page.waitForTimeout(250);
       const o = await overflowAudit(page);
-      if (o.scrollWidth > o.clientWidth + 1) bad.push(`[${sub}] scrollWidth ${o.scrollWidth} > ${o.clientWidth}: ${o.offenders.join(', ')}`);
+      if (overflowFailure(o)) bad.push(`[${sub}] ${overflowFailure(o)}`);
     }
     // the inspector of the node whose label, comments and requests are all 300 unbroken characters
     await openSub(page, 'lineage');
@@ -377,7 +377,7 @@ test('reflow at 320px with 300-character unbroken labels, comments and instructi
       await page.locator(`g[data-node="${node}"]`).focus(); await page.keyboard.press('Enter');
       await page.locator('.wb').waitFor(); await page.waitForTimeout(400);
       const o = await overflowAudit(page);
-      if (o.scrollWidth > o.clientWidth + 1) bad.push(`[inspector ${node}] scrollWidth ${o.scrollWidth} > ${o.clientWidth}: ${o.offenders.join(', ')}`);
+      if (overflowFailure(o)) bad.push(`[inspector ${node}] ${overflowFailure(o)}`);
       assert.ok((await page.locator('.wb').innerText()).includes('xxxxxxxxxx'), `the long text of ${node} is on screen (the fixture is doing its job)`);
     }
     assert.deepEqual(bad, []);

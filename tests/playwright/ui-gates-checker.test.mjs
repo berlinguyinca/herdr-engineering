@@ -5,7 +5,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { launch } from './ui-gates-lib.mjs';
-import { staticAudit, focusIndicatorAudit, tabTrapAudit, overflowAudit, motionAudit, liveAnnouncementAudit } from './a11y-checks.mjs';
+import { staticAudit, focusIndicatorAudit, tabTrapAudit, overflowAudit, overflowFailure, motionAudit, liveAnnouncementAudit } from './a11y-checks.mjs';
 
 let browser;
 before(async () => { browser = await launch(); });
@@ -172,11 +172,24 @@ test('overflow audit flags horizontal scrolling at 320px', async () => {
   await p.close(); await ok.close();
 });
 
-test('overflow audit is not fooled by content hidden behind overflow:hidden on a wrapper that is itself wider than the screen', async () => {
+test('overflow audit is not fooled by content cut off behind overflow:hidden: the document does not scroll, but the content is lost', async () => {
   const p = await page('<div style="overflow-x:hidden"><div style="width:900px;height:20px;background:#ccc"></div></div>', { viewport: { width: 320, height: 500 } });
   const o = await overflowAudit(p);
   assert.ok(o.scrollWidth <= o.clientWidth, 'a clipping wrapper means the document itself does not scroll');
+  assert.match(overflowFailure(o), /content is cut off/);
   await p.close();
+});
+
+test('overflow audit allows an ellipsis, a scroll container and overflow:hidden that cuts nothing', async () => {
+  for (const html of [
+    '<p style="width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">a long line that does not fit in its box at all</p>',
+    '<div style="width:100px;overflow-x:auto"><div style="width:400px;height:10px;background:#ccc"></div></div>',
+    '<div style="overflow:hidden;border-radius:8px"><p>fits</p></div>',
+  ]) {
+    const p = await page(html, { viewport: { width: 320, height: 500 } });
+    assert.equal(overflowFailure(await overflowAudit(p)), '', html);
+    await p.close();
+  }
 });
 
 const MOTION_BAD = [
