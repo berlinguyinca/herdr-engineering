@@ -836,7 +836,7 @@ class Runner:
         tools and this runner runs with --allow-tools. The model goes in through the family's --model flag, and
         only when it is a plain id."""
         family = c.get("family")
-        prof = c.get("profile") if isinstance(c.get("profile"), dict) else self.fetch_profile(c.get("room_id"))
+        prof = c.get("profile") if isinstance(c.get("profile"), dict) else {}     # none: no tools, services or keys
         tools = prof.get("tools_allowed") is True and self.allow_tools
         cmd = (FAMILY_CMD_TOOLS if tools else FAMILY_CMD_TEXT_ONLY).get(family) if isinstance(family, str) else None
         if not cmd:
@@ -855,13 +855,6 @@ class Runner:
             else:
                 notes.append(f"model {model} was not passed: no model flag is known for {family}")
         return cmd, notes
-
-    def fetch_profile(self, room) -> dict:
-        if isinstance(room, str) and ROOM_ID.fullmatch(room):
-            status, out = self.api("GET", f"rooms/{room}/profile")
-            if status == 200 and isinstance(out, dict):
-                return out
-        return {}                                 # unknown: no tools, no services, no ssh keys
 
     def room_secrets(self, room) -> dict:
         """The room's secret values (collab-secrets.py). Used only when the file is a regular file of the runner's
@@ -999,7 +992,7 @@ class Runner:
         margin = min(HELPER_MARGIN, max(1.0, lifetime / 10))
         if lifetime - margin <= 1:
             raise Failure("refused: no time left")
-        prof = c.get("profile") if isinstance(c.get("profile"), dict) else self.fetch_profile(room)
+        prof = c.get("profile") if isinstance(c.get("profile"), dict) else {}
         area = Path.home() / AGENT_DIR / "work"
         area.mkdir(parents=True, exist_ok=True, mode=0o700)
         work = area / f"helper-{hid}"

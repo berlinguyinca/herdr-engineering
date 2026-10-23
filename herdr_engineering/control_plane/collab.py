@@ -129,9 +129,9 @@ MAX_SUCCESSOR_CHAIN = 5          # successors of successors, in a row
 MAX_HELPER_TASK = 8000
 MAX_HELPER_RESULT = 32000
 _HELPER_LIVE = frozenset({"requested", "claimed", "running"})
-_HELPER_FIELDS = frozenset({"room_id", "role", "task", "family", "model", "wait"})
+_HELPER_FIELDS = frozenset({"room_id", "role", "task", "family", "model"})   # helper_spawn's wait is MCP-side
 _HELPER_IGNORED = frozenset({"parent", "parent_agent_id"})   # the parent is the caller, never what the body says
-HELPER_ERRORS = frozenset({"failed", "timeout", "cancelled", "sandbox-error", "egress-denied"})   # audited codes
+HELPER_ERRORS = frozenset({"failed", "timeout", "cancelled", "sandbox-error"})   # audited codes
 _HELPER_BAD = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")   # all control chars but \t \n
 
 
@@ -1790,21 +1790,15 @@ class CollabService:
             return dict(self._egress[rid])
 
     def list_egress(self, pr: Principal, room_id: str | None = None) -> dict:
-        self._require_user(pr)
+        """Operator only (GET fleet/egress): every room's host-access requests."""
+        self._require_operator(pr)
         if room_id is not None and not isinstance(room_id, str):
             raise CollabError(400, "invalid room id")
         with self._lock:
             self._housekeeping()
             now = self._now()
-            if not pr.admin:
-                owned = {rid for rid, room in self._rooms.items()
-                         if (self._member(room, pr.id) or {}).get("role") == "owner"}
-                if room_id is not None and room_id not in owned:
-                    raise CollabError(404, "not found")
-            else:
-                owned = set(self._rooms)
             rows = [dict(r) for r in self._egress.values()
-                    if r["room_id"] in owned and (room_id is None or r["room_id"] == room_id)
+                    if (room_id is None or r["room_id"] == room_id)
                     and not (r["state"] == "open" and now - r["created_epoch"] >= EGRESS_OPEN_TTL)]
             rows.sort(key=lambda r: (r["created_epoch"], r["id"]))
             return {"requests": rows}
@@ -1987,6 +1981,15 @@ class CollabService:
         with self._lock:
             self._expire_helpers()
             return self._helper_view(self._helper_for(pr, helper_id))
+
+    def list_my_helpers(self, pr: Principal) -> dict:
+        """A person's view (GET helpers): the helpers their agents asked for, newest first, no task or result."""
+        self._require_user(pr)
+        with self._lock:
+            self._expire_helpers()
+            rows = sorted((r for r in self._helpers.values() if r["owner"] == pr.id),
+                          key=lambda r: (-r["created_epoch"], r["helper_id"]))
+            return {"helpers": [self._helper_view(r) for r in rows[:200]]}
 
     def helper_result(self, pr: Principal, helper_id: str) -> dict:
         """The helper's final output: untrusted text, to be read as data."""
@@ -2984,6 +2987,11 @@ class CollabService:
                     return 200, self.list_my_agents(pr)
                 if parts == ["agents", "join-tokens"]:
                     return 200, self.list_join_tokens(pr)
+                if parts[:1] == ["helpers"] and not pr.is_agent:     # agents use MCP; a person sees their agents'
+                    if n == 1:
+                        return 200, self.list_my_helpers(pr)
+                    if n == 2:
+                        return 200, self.helper_status(pr, parts[1])
                 if parts[:1] == ["fleet"]:
                     if operator is None:                  # dashboard owner only
                         raise CollabError(404, "not found")
@@ -3048,6 +3056,8 @@ class CollabService:
                     return 201, self.create_join_token(pr, body)
                 if n == 4 and parts[:2] == ["agents", "join-tokens"] and parts[3] == "revoke":
                     return 200, self.revoke_join_token(pr, parts[2])
+                if n == 3 and parts[0] == "helpers" and parts[2] == "cancel" and not pr.is_agent:
+                    return 200, self.cancel_helper(pr, parts[1])
                 if parts[:1] == ["fleet"]:
                     if operator is None:                  # dashboard owner only
                         raise CollabError(404, "not found")

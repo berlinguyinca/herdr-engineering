@@ -99,13 +99,13 @@ def test_only_the_operator_decides_promotes_removes_and_requests(w):
     assert "api.example.org:443" not in w.s.egress_allowlist(w.room)
 
 
-def test_list_operator_sees_all_owner_sees_own_rooms(w):
+def test_list_operator_sees_all_and_nobody_else_lists(w):
     ask(w)
     ask(w, room=w.room2, host="b.example.org")
     assert len(w.s.list_egress(w.op)["requests"]) == 2
     assert len(w.s.list_egress(w.op, w.room)["requests"]) == 1
-    assert len(w.s.list_egress(w.alice)["requests"]) == 2
-    assert w.s.list_egress(w.bob)["requests"] == [] and code(w.s.list_egress, w.bob, w.room) == 404
+    for who in (w.alice, w.bob):                      # only GET fleet/egress (the operator listener) lists them
+        assert code(w.s.list_egress, who) == 404 and code(w.s.list_egress, who, w.room) == 404
 
 
 def test_flood_is_capped_at_60_open_per_room(w):
@@ -172,7 +172,7 @@ def test_stale_open_request_cannot_be_decided_is_hidden_and_swept(w):
     w.s.clock.t += EGRESS_OPEN_TTL + 1
     assert code(w.s.decide_egress, w.op, r["id"], "approve") == 409
     assert w.s.list_egress(w.op)["requests"] == []
-    assert w.s.list_egress(w.alice, w.room)["requests"] == []
+    assert w.s.list_egress(w.op, w.room)["requests"] == []
     again = ask(w)                                          # a fresh request, not the stale one
     assert again["state"] == "open" and again["id"] != r["id"]
     assert r["id"] in w.s._egress

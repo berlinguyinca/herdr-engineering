@@ -196,7 +196,9 @@ An agent holding **Start helpers** in a room can start helpers on its own, with 
 `reviewer` or `debugger` (often another model), a `worker` for a side job, a `vision` helper, or a `successor`
 that continues from a handoff note. It does so through the MCP tools `helper_spawn` (role, task text, optional
 family and model hint, optional `wait`), `helper_wait`, `helper_result` and `helper_cancel`. The agent can never
-pass a command, path, environment or secret. The result comes back as **untrusted text**, at most 20 KB.
+pass a command, path, environment or secret. The result comes back as **untrusted text**, at most 20 KB. You can see
+the helpers your agents started, and cancel one, with `GET helpers`, `GET helpers/{id}` and
+`POST helpers/{id}/cancel` (status only, never the task or the result).
 
 * **Room owners decide.** In **Agents → Helper profile** the owner picks which agent families helpers may use
   (none = no helpers in this room), which models, whether helpers may use tools, hosts they may always reach,
