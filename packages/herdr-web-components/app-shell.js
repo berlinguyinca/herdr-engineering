@@ -84,12 +84,13 @@ const SHARED = `
 .hd-shell__link:hover { background: var(--surface-hover); text-decoration: none; }
 .hd-shell__link.active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }
 .hd-shell__main { flex: 1; min-width: 0; }
-.hd-shell__content { max-width: var(--content-max); margin: 0 auto; padding: 24px; }
+.hd-shell__content { max-width: min(1600px, calc(100vw - var(--sidebar-width) - 48px)); margin: 0 auto; padding: 24px; }
 @media (max-width: 720px) {
   .hd-shell { flex-direction: column; }
   .hd-shell__sidebar { width: 100%; border-right: none;
     border-bottom: 1px solid var(--border-subtle); }
   .hd-shell__nav { flex-direction: row; overflow-x: auto; }
+  .hd-shell__content { max-width: none; padding: 16px; }
 }`;
 
 function escapeHtml(s) {
