@@ -112,6 +112,9 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     await page.evaluate(() => document.fonts.ready);
     await page.waitForTimeout(600);
     await page.evaluate(NORMALIZE);
+    // focusing a node scrolls the page by a run-dependent fraction of a pixel; start every capture from the top
+    await page.evaluate(() => { window.scrollTo(0, 0); document.scrollingElement.scrollTop = 0; });
+    await page.waitForTimeout(100);
     await assertBundledFonts(page, ctx);
     const height = Math.min(MAX_HEIGHT, await page.evaluate(() => Math.max(document.documentElement.scrollHeight, innerHeight)));
     const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: CFG.viewports[viewport].width, height }, animations: 'disabled', caret: 'hide' }), regions: {} };
