@@ -67,4 +67,3 @@ def test_registry_pin_failure_raises_and_pins_nothing(sink):
     sink.fail = False
     registry.pin(KEY, Author(kind="pi", model="m2"))
     assert registry.author_of(KEY, "feat/x").model == "m2"
-
