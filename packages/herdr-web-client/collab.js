@@ -114,6 +114,12 @@ export class CollabApi {
       { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}`, ...(context ? { context } : {}) });
   }
   // Consultation (T14): a question and ONE text answer. Cross-workspace links (T14): both ends are checked by the server.
+  attention(room, includeAcked = false) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/attention${includeAcked ? '?include=acked' : ''}`); }
+  attentionAck(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/attention/ack`, body); }
+  attentionSnooze(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/attention/snooze`, body); }
+  attentionRestore(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/attention/restore`, body); }
+  progress(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/progress`); }
+  analytics(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/analytics`); }
   consultations(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/consultations`); }
   askConsultation(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/consultations`, body); }
   answerConsultation(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/consultations/${encodeURIComponent(id)}/answer`, body); }

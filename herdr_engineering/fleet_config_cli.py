@@ -183,7 +183,7 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
 COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
-                         "contextual",
+                         "contextual", "insights",
                          "delegation_enabled"})
 
 

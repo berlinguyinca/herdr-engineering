@@ -31,6 +31,7 @@ from typing import Any, Protocol
 from . import collab_delegation as dlg
 from . import collab_external as ext
 from . import ids
+from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_workbench import WorkbenchMixin
 from .redact import redact_text
@@ -230,7 +231,7 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService(WorkbenchMixin, ContextMixin):
+class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -331,6 +332,7 @@ class CollabService(WorkbenchMixin, ContextMixin):
         self.stats = defaultdict(int)
         self._init_workbench()
         self._init_context()
+        self._init_attention()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -443,7 +445,7 @@ class CollabService(WorkbenchMixin, ContextMixin):
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
-        if self._apply_workbench(ev) or self._apply_context(ev):
+        if self._apply_workbench(ev) or self._apply_context(ev) or self._apply_attention(ev):
             return
         if t == "external_usage_reserved":
             k = (p["scope"], p["key"])
@@ -3962,6 +3964,12 @@ class CollabService(WorkbenchMixin, ContextMixin):
                         return 200, self.list_steering(pr, rid, query)
                     if parts[2:] == ["forks"]:
                         return 200, self.fork_comparison(pr, rid, query)
+                    if parts[2:] == ["attention"]:
+                        return 200, self.attention_inbox(pr, rid, query)
+                    if parts[2:] == ["progress"]:
+                        return 200, self.room_progress(pr, rid, query)
+                    if parts[2:] == ["analytics"]:
+                        return 200, self.room_analytics(pr, rid, query)
                     if parts[2:] == ["steering", "target"]:
                         return 200, self.steering_target(pr, rid, str(query.get("node_id", "")))
                     if parts[2:] == ["flow"]:
@@ -4094,6 +4102,8 @@ class CollabService(WorkbenchMixin, ContextMixin):
                         return self.create_link(pr, rid, body)
                     if n == 5 and parts[2] == "xlinks" and parts[4] == "revoke":
                         return 200, self.revoke_link(pr, rid, parts[3])
+                    if n == 4 and parts[2] == "attention" and parts[3] in ("ack", "snooze", "restore"):
+                        return 200, getattr(self, "attention_" + parts[3])(pr, rid, body)
                     if parts[2:] == ["comments"]:
                         return self.add_comment(pr, rid, body)
                     if n == 5 and parts[2] == "comments" and parts[4] in ("edit", "retract"):

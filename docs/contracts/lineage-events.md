@@ -781,3 +781,66 @@ operator lists `evidence_writers` and something writes `validated` edges for the
 Limitations: T06 review quorum is not on this stack (comparison reports `quorum: unavailable`); independent
 evidence writers must be keys that can see room-scoped nodes, i.e. operator keys; an older Pi ignores the new actions
 and Herdr re-offers up to 5 times.
+
+
+## Attention inbox, evidence-based progress and analytics (T15)
+
+Read models over data the room already holds. There is no new store: the inbox is recomputed on every read from the room graph, the T06
+review quorum, T12/T13 pending confirmations, T11 proposals, T14 consultations and the external-agent roster; the only state is each reader's
+acknowledgements, kept in the collab log (events `attn_ack`, `attn_snooze`, `attn_clear`, per reader and room, at most `max_acks_per_reader`, lapsing
+after `ack_retention_days`).
+
+### Routes (collab namespace)
+| Route | Purpose |
+|---|---|
+| `GET /rooms/{id}/attention[?include=acked]` | the reader's inbox |
+| `GET /rooms/{id}/progress` | evidence-based completion, milestones (linked missions), estimates |
+| `GET /rooms/{id}/analytics` | aggregates |
+| `POST /rooms/{id}/attention/ack` `{key, fp}` / `snooze` `{key, fp, seconds}` / `restore` `{key}` | per-reader marks |
+
+A non-member, a guest or a room without a graph gets the same 404; members get 403 `insights_disabled` while the feature is off. Reads are rate
+limited per person and per room (`reads_per_minute`), marks per person (`acks_per_10min`), and bounded by `max_pages`, `max_prs`, `max_items`.
+Graph reads run outside the CollabService lock (T09 chunked pattern) and results are cached on the log position.
+
+### Operator YAML (`control_plane.collab.insights`; default off, no environment variables)
+`enabled`, `kill_switch`, `inbox`, `progress`, `analytics` (sub-switches), `evidence_writers` (list of principal keys), `verified_credit` (0..1, default 0.5),
+`stuck_after_seconds`, `blocked_escalate_seconds`, `ci_failed_window_seconds`, `max_items`, `max_items_per_category`, `max_prs`, `max_pages`,
+`min_group_size` (default 5), `eta_min_samples` (default 5), `reads_per_minute`, `acks_per_10min`, `max_acks_per_reader`, `ack_retention_days`,
+`snooze_min_seconds`, `snooze_max_seconds`, `cache_entries`. Unknown keys and wrong types are refused at startup.
+
+### Priority rules
+Severity first (error, warning, notice, info), then items addressed to the reader, then oldest first. Error: failing CI, review blocked.
+Warning: head moved (stale head, re-review needed), agent stuck or expired, work blocked past the escalation time. Notice: review requested, blocked,
+steering or promotion confirmation, proposal awaiting a decision, consultation request. Info: review status cannot be established.
+Items are deduplicated by `key` (category plus subject); `fp` fingerprints the condition, so an acknowledgement of an old failure does not hide a new one
+(the item returns marked `resurfaced`). Per-category and total caps report `not_shown_because_of_caps`.
+
+### Evidence rules
+A task is complete only when: a pull request it is attested to be linked to is marked merged by a writer in `evidence_writers`; or an accepted proposal
+written by this room's service exists; or, with no attested PR, a validated edge from a trusted writer is bound to a commit. Reviewed or validated
+at the head without a merge counts as verified (credit `verified_credit`), never complete. A task whose state says done without evidence is listed as
+"reported done without evidence". State, labels, diff statistics and cost written by an agent about itself are never counted. With no evidence writer
+configured, progress says so instead of showing a number. Quorum counts only approvals the reader can see, so hidden approvals never move a number.
+
+### Estimates
+Method `completion_interval_quantiles_v1`: nearest-rank 25th/50th/75th percentile of the gaps between evidence-timed completions (server receipt time),
+projected over the remaining tasks. Always labelled "estimate", with confidence (low/medium/high plus reasons) and assumptions; below `eta_min_samples`
+completions it says "insufficient evidence" and gives no date.
+
+### Privacy
+Only items the reader can see are counted (the room graph is already narrowed to the reader). No per-person or per-agent metric exists. Any aggregate
+over fewer than `min_group_size` items is replaced by "hidden"; distributions merge small cells so a single item cannot be found by subtraction. Cost
+is shown only as self-reported, only when at least `min_group_size` nodes report it.
+
+### Threat model
+Hidden-node leaks through counts, differencing and small groups (visible-only snapshot, suppression, cell merging); forged evidence (trusted writers only,
+reserved names refused, self-reports displayed not counted); inbox spam (derived, deduplicated, capped, one entry per key); stale acknowledgements
+(bound to the fingerprint, retention, per-reader cap); expensive aggregation under locks (budgets, rate limits, graph reads outside the lock, cache); XSS
+(server returns data, the page escapes everything and links only `https://github.com/.../pull/N`); ack events carry no node ids in any field audit or the
+long-poll exposes.
+
+### Limitations
+Estimates assume a steady pace and are weak for small rooms. Erasing evidence by re-adding an unbound edge only understates progress. Evidence writers
+must be keys an agent does not control. Room-scoped pull requests written by a key that cannot see the room, and organization-scope nodes, are outside the
+reader's view and so not counted. T13 `forks.py` still reports the review quorum as absent (left unchanged here; follow-up). No Pi change was needed:
+Pi's ledger and mission adapter already supply the nodes this reads. Playwright was not run (no collab browser harness in the repo); the client is covered by pure renderer tests.
