@@ -23,6 +23,7 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto(`${base}/#/ci`);
   assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-selected'),'true');
+  assert.equal(await page.locator('.ci-report-filters').isVisible(),false,'Health owns its own history filters');
   assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-controls'),'ci-workspace-health');
   await page.locator('[data-ci-workspace="health"]').focus();await page.keyboard.press('ArrowRight');
   assert.equal(await page.locator('[data-ci-workspace="runs"]').getAttribute('aria-selected'),'true');
