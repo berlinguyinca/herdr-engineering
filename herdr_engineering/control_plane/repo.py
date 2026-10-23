@@ -725,16 +725,17 @@ class ControlPlaneRepo:
 
     # ---------------------------------------------------------------- hosts
     def register_host(self, host_name, tailnet_ip):
-        hid = new_id("host")
-        rec = {
-            "host_id": hid, "host_name": host_name, "tailnet_ip": tailnet_ip,
-            "status": "healthy", "last_seen": self._stamp(),
-            "created_at": self._stamp(),
-        }
-        self._hosts[hid] = rec
-        self.record_event("host", hid, "HostRegistered",
-                          {"host_name": host_name, "tailnet_ip": tailnet_ip})
-        return hid
+        with self._event_lock:
+            hid = new_id("host")
+            rec = {
+                "host_id": hid, "host_name": host_name, "tailnet_ip": tailnet_ip,
+                "status": "healthy", "last_seen": self._stamp(),
+                "created_at": self._stamp(),
+            }
+            self._hosts[hid] = rec
+            self.record_event("host", hid, "HostRegistered",
+                              {"host_name": host_name, "tailnet_ip": tailnet_ip})
+            return hid
 
     def get_host(self, host_id):
         host = self._merged_hosts().get(self._canonical_host(host_id))
@@ -756,8 +757,9 @@ class ControlPlaneRepo:
         """Hosts keyed by canonical id; an alias contributes its freshest report."""
         # Snapshot under the lock: ingest threads add hosts while a reader iterates.
         with self._event_lock:
-            hosts = {hid: _copy(rec) for hid, rec in self._hosts.items()}
+            raw = list(self._hosts.items())
             aliases = dict(self._host_aliases)
+            hosts = {hid: _copy(rec) for hid, rec in raw}
         merged = {}
         for hid, rec in hosts.items():
             if hid in aliases:
@@ -837,11 +839,12 @@ class ControlPlaneRepo:
             return True
 
     def mark_host_unavailable(self, host_id):
-        h = self._hosts.get(host_id)
-        if h is None:
-            return False
-        h["status"] = "unavailable"
-        return True
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            if h is None:
+                return False
+            h["status"] = "unavailable"
+            return True
 
     def record_telemetry(self, host_id, sample):
         """Record a telemetry sample (cpu/mem/disk/network/gpu) for a host."""
@@ -903,38 +906,39 @@ class ControlPlaneRepo:
 
     def upsert_host(self, host_id, host_name, tailnet_ip, *,
                     cpu=None, mem=None, status="healthy", inventory=None):
-        stamp = self._stamp()
-        inventory = _clean_inventory(inventory)
-        existing = self._hosts.get(host_id)
-        if existing is None:
-            rec = {"host_id": host_id, "host_name": host_name,
-                   "tailnet_ip": tailnet_ip, "status": status,
-                   "cpu": cpu, "mem": mem,
-                   "last_seen": stamp, "created_at": stamp}
+        with self._event_lock:
+            stamp = self._stamp()
+            inventory = _clean_inventory(inventory)
+            existing = self._hosts.get(host_id)
+            if existing is None:
+                rec = {"host_id": host_id, "host_name": host_name,
+                       "tailnet_ip": tailnet_ip, "status": status,
+                       "cpu": cpu, "mem": mem,
+                       "last_seen": stamp, "created_at": stamp}
+                if inventory:
+                    rec["inventory"] = {**inventory, "collected_at": stamp}
+                self._hosts[host_id] = rec
+                self.record_event("host", host_id, "HostRegistered",
+                                  {"host_name": host_name,
+                                   "tailnet_ip": tailnet_ip,
+                                   **({"inventory": inventory} if inventory else {})})
+                return _copy(rec)
+            existing["host_name"] = host_name or existing["host_name"]
+            existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
+            existing["status"] = status
+            existing["last_seen"] = stamp
+            if cpu is not None:
+                existing["cpu"] = cpu
+            if mem is not None:
+                existing["mem"] = mem
+            payload = {"host_name": existing["host_name"],
+                       "tailnet_ip": existing["tailnet_ip"],
+                       "cpu": cpu, "mem": mem}
             if inventory:
-                rec["inventory"] = {**inventory, "collected_at": stamp}
-            self._hosts[host_id] = rec
-            self.record_event("host", host_id, "HostRegistered",
-                              {"host_name": host_name,
-                               "tailnet_ip": tailnet_ip,
-                               **({"inventory": inventory} if inventory else {})})
-            return _copy(rec)
-        existing["host_name"] = host_name or existing["host_name"]
-        existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
-        existing["status"] = status
-        existing["last_seen"] = stamp
-        if cpu is not None:
-            existing["cpu"] = cpu
-        if mem is not None:
-            existing["mem"] = mem
-        payload = {"host_name": existing["host_name"],
-                   "tailnet_ip": existing["tailnet_ip"],
-                   "cpu": cpu, "mem": mem}
-        if inventory:
-            existing["inventory"] = {**inventory, "collected_at": stamp}
-            payload["inventory"] = inventory
-        self.record_event("host", host_id, "HostHeartbeat", payload)
-        return _copy(existing)
+                existing["inventory"] = {**inventory, "collected_at": stamp}
+                payload["inventory"] = inventory
+            self.record_event("host", host_id, "HostHeartbeat", payload)
+            return _copy(existing)
 
     def upsert_session(self, session_id, *, host_id=None, mission_id=None,
                        agent_role="", model="", status="active",
