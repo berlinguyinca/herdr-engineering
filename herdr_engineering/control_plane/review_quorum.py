@@ -22,7 +22,9 @@ derived ``rereview_required`` flag, consumed by ``autospec review-quorum request
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 
 _FULL_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -38,21 +40,42 @@ class QuorumConfig:
     reviewer_groups: tuple = ()   # tuple of tuples of principal ids
 
 
+# ASCII-only normalisation, identical to autospec's: whitespace is the six ASCII blanks and
+# case folding touches only A-Z. Python's str.lower()/strip() are Unicode-aware (Kelvin sign
+# folds to "k", dotted capital I to "i" plus a mark, NBSP is trimmed), which would let the two
+# implementations disagree on who a reviewer or a target is.
+_ASCII_BLANKS = " \t\n\r\x0b\x0c"
+_ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
+
+
+def ascii_norm(value) -> str:
+    """Trim ASCII blanks and lower-case A-Z only; non-strings become ''."""
+    return value.strip(_ASCII_BLANKS).translate(_ASCII_LOWER) if isinstance(value, str) else ""
+
+
+def _printable_ascii(value: str) -> bool:
+    return all(0x21 <= ord(c) <= 0x7E for c in value)
+
+
+def canonical_target(value):
+    """A review target (``pr:host/owner/repo#n``): non-empty printable ASCII, lower-cased."""
+    norm = ascii_norm(value)
+    return norm if norm and _printable_ascii(norm) else None
+
+
 def canonical_identity(value):
-    if not isinstance(value, str):
-        return None
-    ident = value.strip().lower()
+    ident = ascii_norm(value)
     if ident.endswith("[bot]"):
         ident = ident[:-5]
-    if not ident or len(ident) > 128 or any(c.isspace() or not c.isprintable() for c in ident):
+    if not ident or len(ident) > 128 or not _printable_ascii(ident):
         return None
     return ident
 
 
 def receipt_binding(target: str, commit: str, reviewer: str, receipt_digest: str) -> str:
     """What a producer attaches to a receipt digest and an evaluator recomputes."""
-    tuple_ = "\0".join(("pr-review-receipt-v1", target.strip().lower(), commit.strip().lower(),
-                        canonical_identity(reviewer) or "", receipt_digest.strip().lower()))
+    tuple_ = "\0".join(("pr-review-receipt-v1", canonical_target(target) or "", ascii_norm(commit),
+                        canonical_identity(reviewer) or "", ascii_norm(receipt_digest)))
     return hashlib.sha256(tuple_.encode()).hexdigest()
 
 
@@ -99,9 +122,7 @@ def parse_config(raw) -> QuorumConfig | None:
 
 
 def _sha(value):
-    if not isinstance(value, str):
-        return None
-    value = value.strip().lower()
+    value = ascii_norm(value)
     return value if _FULL_SHA.fullmatch(value) else None
 
 
@@ -110,7 +131,7 @@ def _commit_class(raw, head):
     full = _sha(raw)
     if full is not None:
         return "current" if full == head else "stale"
-    low = raw.strip().lower() if isinstance(raw, str) else ""
+    low = ascii_norm(raw)
     if low and len(low) >= 7 and re.fullmatch(r"[0-9a-f]+", low) and head.startswith(low):
         return "current"
     return "invalid"
@@ -122,16 +143,25 @@ def evaluate(evidence: dict, config: QuorumConfig) -> dict:
     base = {"pr": evidence["pr"], "head": head, "required": config.required, "basis": "all_reviews"}
     empty = {"counted": [], "blocking": [], "stale_reviewers": [], "rejected": [],
              "has_hidden_reviews": False, "blocked_by_hidden": False,
-             "rereview_required": False, "rereview_needed": 0}
+             "rereview_required": False, "rereview_needed": 0, "head_unverified": False, "alert": None,
+             "head_rebased": evidence.get("head_state") == "rebased"}
     if head is None:
         return {**base, **empty, "status": "unknown_head"}
-    if evidence.get("head_regressed"):
-        # A trusted writer's newest head write lost to an older one by sequence: the head we
-        # hold is frozen. Not current, so nothing may pass until a write at a higher sequence.
-        return {**base, **empty, "status": "head_unverified"}
+    if evidence.get("head_state") == "unverified":
+        # A trusted writer's lower-sequence write, far below the applied one, arrived later with
+        # a different head: a late delivery or an emitter restart. Which one is not knowable, so
+        # nothing passes and the response says so (``head_unverified``), until the writer
+        # writes past the applied sequence, a restart run is recognised, or an operator
+        # acknowledges the candidate write (``head_resync``).
+        return {**base, **empty, "status": "head_unverified", "head_unverified": True,
+                "alert": ("the PR head cannot be verified: a trusted emitter wrote a different head "
+                          "at a much lower sequence after a higher one (restart or late delivery); "
+                          "re-sync it before relying on this quorum")}
     author = canonical_identity(evidence.get("author"))
     authors = {canonical_identity(a) for a in evidence.get("authors") or ()}
-    target = evidence["pr"].strip().lower()
+    target = canonical_target(evidence["pr"])
+    if target is None:
+        return {**base, **empty, "status": "invalid_target"}
 
     ident = {rid: canonical_identity(rid) for rid in config.reviewers}
     group_of = {}
@@ -155,7 +185,7 @@ def evaluate(evidence: dict, config: QuorumConfig) -> dict:
         if me is None:
             continue
         for i in items:
-            verdict = i["verdict"].strip().lower() if isinstance(i.get("verdict"), str) else ""
+            verdict = ascii_norm(i.get("verdict"))
             cls = _commit_class(i["commit"], head)
             if i["visible"]:
                 visible_ids.add(group(me))
@@ -184,13 +214,11 @@ def evaluate(evidence: dict, config: QuorumConfig) -> dict:
         if me in authors or (author and (me == author or login == author)):
             rejected.append((me, "author"))
             continue
-        digest = i.get("receipt_digest")
-        digest = digest.strip().lower() if isinstance(digest, str) else ""
+        digest = ascii_norm(i.get("receipt_digest"))
         if not _DIGEST.fullmatch(digest):
             rejected.append((me, "bad_receipt_digest"))
             continue
-        binding = i.get("receipt_binding")
-        binding = binding.strip().lower() if isinstance(binding, str) else ""
+        binding = ascii_norm(i.get("receipt_binding"))
         if binding != receipt_binding(target, head, me, digest):
             rejected.append((me, "bad_receipt_binding"))
             continue
@@ -219,13 +247,20 @@ def evaluate(evidence: dict, config: QuorumConfig) -> dict:
         hide = {group(ident[r]) for r, items in by_reviewer.items() if ident.get(r)
                 and any(not i["visible"] for i in items)}
         return sorted(g for g in groups if g not in hide)
-    return {**base, "status": status, "counted": shown(counted), "blocking": shown(blocking),
+    visible_counted = shown(counted)
+    return {**base, "status": status, "counted": visible_counted, "blocking": shown(blocking),
             "stale_reviewers": shown(stale),
             "rejected": [{"reviewer": r, "reason": why} for r, why in sorted(set(rejected))
                          if r in shown({r})],
             "has_hidden_reviews": hidden_any, "blocked_by_hidden": hidden_block,
+            "head_unverified": False, "alert": None,
+            "head_rebased": evidence.get("head_state") == "rebased",
             "rereview_required": status == "insufficient",
-            "rereview_needed": config.required - len(counted) if status == "insufficient" else 0}
+            # from what THIS viewer can see only: a hidden approval must not shift the number
+            "rereview_needed": max(config.required - len(visible_counted), 0) if status == "insufficient" else 0}
+
+
+_log = logging.getLogger(__name__)
 
 
 def pr_review_quorum(graph, principal, pr_id: str, config: QuorumConfig) -> dict:
@@ -234,8 +269,26 @@ def pr_review_quorum(graph, principal, pr_id: str, config: QuorumConfig) -> dict
         evidence = graph.review_evidence(principal, pr_id, config.reviewers, config.trusted_head_writers)
     except KeyError:
         # PR ids are produced lower-cased by Pi; accept a differently-cased spelling.
-        if pr_id.lower() == pr_id:
+        folded = ascii_norm(pr_id)
+        if folded == pr_id:
             raise
-        evidence = graph.review_evidence(principal, pr_id.lower(), config.reviewers,
+        evidence = graph.review_evidence(principal, folded, config.reviewers,
                                          config.trusted_head_writers)
-    return evaluate(evidence, config)
+    out = evaluate(evidence, config)
+    if out["head_unverified"]:
+        # once per distinct unverified observation, so a polling consumer cannot flood the log
+        warned = getattr(graph, "_quorum_warned", None)
+        if warned is None:
+            warned = graph._quorum_warned = OrderedDict()
+        mark = (evidence["pr"], evidence.get("head_resync_candidate"))
+        if mark not in warned:
+            warned[mark] = None
+            while len(warned) > 256:
+                warned.popitem(last=False)
+            _log.warning("review quorum: head of %s is unverified (candidate write %s); "
+                         "needs a re-sync", evidence["pr"], evidence.get("head_resync_candidate"))
+        if principal and principal.get("kind") == "operator" \
+                and principal.get("authenticated_by") not in (None, "none"):
+            # the exact write an operator acknowledges with a ``head_resync`` attr
+            out["resync_event_id"] = evidence.get("head_resync_candidate")
+    return out

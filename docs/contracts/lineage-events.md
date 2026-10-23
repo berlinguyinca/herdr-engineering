@@ -182,9 +182,17 @@ ONE policy, two implementations: this route (workbench) and `autospec review-quo
 vector file `tests/control_plane/fixtures/review-quorum-vectors.json` (byte-identical to autospec's
 `crates/autospec-core/tests/fixtures/`); both suites load it. Rules:
 1. The head is the newest non-empty `attrs.head_sha` written by a trusted writer and must be a full SHA, else `unknown_head`.
-   `pr` is a commons node, so untrusted writers' values are ignored. If a trusted writer's newest-admitted head write lost to an
-   older one by `source_sequence` (an emitter restart that reset its sequence) the register is frozen on a replaced value:
-   status `head_unverified`, never satisfied, until that writer writes at a higher sequence.
+   `pr` is a commons node, so untrusted writers' values are ignored. A write that arrives AFTER a higher-sequence one from
+   the same writer is either a late delivery or an emitter restart that reset `source_sequence`:
+   - same head value, or within 32 sequence numbers of the applied write: a late/duplicate delivery. Ignored; the applied
+     head stands and nothing is poisoned (benign reordering never locks the PR).
+   - a different head far below (more than 32): suspected restart. Status `head_unverified` (response also carries
+     `head_unverified: true`, a human-readable `alert`, and for operators `resync_event_id`; one WARNING is logged per
+     observation; `autospec review-quorum request` exits 4 on it instead of reporting "not needed"). Never satisfied. It
+     clears when: (a) the writer writes past the applied sequence; (b) a second, increasing-sequence write follows (a restart
+     run is recognised, the newest value is adopted, `head_rebased: true`); or (c) an operator acknowledges the observed write
+     by writing `attrs.head_resync = "<resync_event_id>"` on the PR node (honoured only from an operator principal and only for
+     that exact write). No emitter epoch exists yet; with one (Pi), the 32-number heuristic could be replaced by an exact test.
 2. Only configured reviewers are read; anyone else's edges (approvals or blocks) are ignored, so junk cannot satisfy or block.
 3. A reviewer is the edge OWNER (server-authenticated), never a payload name. `verdict`/`receipt_*` and add/remove are read ONLY
    from the owner's own writes: an operator or `co_writers` member cannot flip a verdict or retract a block.
@@ -196,9 +204,14 @@ vector file `tests/control_plane/fixtures/review-quorum-vectors.json` (byte-iden
 6. An approval needs a 64-hex `receipt_digest` and a `receipt_binding` that recomputes; one digest backing two groups voids both.
 7. Verdicts for other heads are `stale_reviewers`, never counted; a verdict that lands after the head moved is stale; one issued
    for a head not yet observed waits until a trusted writer reports that head.
-8. The decision is computed over ALL matching edges. A caller sees names only of reviewers whose edges it can see; it also gets
+8. Matching is ASCII-only, identical in autospec: whitespace is the six ASCII blanks, case folding touches only A-Z, ids and
+   targets must be printable ASCII (`invalid_target` otherwise); no Unicode folding (Kelvin sign, dotted I, NBSP).
+   `rereview_needed` is computed from the approvals the CALLER can see only, so a hidden approval never shifts it.
+9. A mistaken verdict is retracted by its owner at the same head: `autospec review-quorum publish --retract` sends an
+   `edge.remove` (same key, same edge) which Herdr honours only from the edge's owner.
+10. The decision is computed over ALL matching edges. A caller sees names only of reviewers whose edges it can see; it also gets
    `has_hidden_reviews` and `blocked_by_hidden` (a hidden block still yields `blocked`; existence is disclosed, counts are not).
-Statuses: `satisfied`, `insufficient` (re-review needed), `blocked`, `unknown_head`, `head_unverified`, `unknown_author`. Only
+Statuses: `satisfied`, `insufficient` (re-review needed), `blocked`, `unknown_head`, `head_unverified`, `unknown_author`, `invalid_target`. Only
 `satisfied` passes. PR ids are matched exactly, then lower-cased.
 Residual: the binding is not a signature (a colluding key can recompute it); two unlisted keys of one person count twice;
 a verdict is bound to the head SHA, not the base; private/mission-scoped edges still count; Herdr ignores blocks from

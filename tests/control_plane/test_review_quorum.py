@@ -522,3 +522,98 @@ def test_many_edges_from_one_reviewer_stay_cheap(w):
     t = time.time()
     out = w.q()
     assert time.time() - t < 5 and out["status"] == "insufficient"
+
+
+# ---------------------------------------------------------------- head: reorder vs restart
+def head_at(w, value, seq, who=PI):
+    w.feed.send("node.upsert", {"node_type": "pr", "node_id": PR, "attrs": {"head_sha": value}},
+                principal=who, seq=seq)
+
+
+def test_a_late_nearby_write_with_a_different_head_is_ignored_not_a_lock(w):
+    head_at(w, sha(1), 10)
+    head_at(w, sha(2), 12)
+    head_at(w, sha(3), 11)          # seq 11 delivered after seq 12
+    out = w.q()
+    assert out["head"] == sha(2) and out["status"] != "head_unverified" and out["head_unverified"] is False
+    head_at(w, sha(4), 13)          # the writer carries on; nothing was poisoned
+    assert w.q()["head"] == sha(4)
+
+
+def test_a_far_lower_write_with_the_same_head_is_a_duplicate_not_a_lock(w):
+    head_at(w, sha(2), 100)
+    head_at(w, sha(2), 1)
+    out = w.q()
+    assert out["head"] == sha(2) and out["status"] == "insufficient" and out["head_unverified"] is False
+
+
+def test_a_suspected_restart_is_flagged_loudly_and_logged_once(w, caplog):
+    head_at(w, sha(1), 100)
+    head_at(w, sha(2), 1)
+    with caplog.at_level("WARNING"):
+        out = w.q()
+        again = w.q()
+    assert out["status"] == "head_unverified" and out["head_unverified"] is True
+    assert out["counted"] == [] and "re-sync" in out["alert"] and again["alert"] == out["alert"]
+    assert "resync_event_id" not in out or w.q(principal=VIEWER).get("resync_event_id") is None
+    assert out["resync_event_id"] == "pi-1"                       # the operator sees what to acknowledge
+    assert "resync_event_id" not in w.q(principal=VIEWER)         # nobody else does
+    assert len([r for r in caplog.records if "unverified" in r.getMessage()]) == 1
+
+
+def test_a_run_of_writes_after_a_restart_is_recognised_and_adopted(w):
+    head_at(w, sha(1), 100)
+    head_at(w, sha(2), 1)
+    assert w.q()["status"] == "head_unverified"
+    head_at(w, sha(3), 2)                 # a second, increasing write: this is a restart, not a reorder
+    out = w.q()
+    assert out["head"] == sha(3) and out["head_rebased"] is True and out["status"] == "insufficient"
+    w.repo._rebuild_graph()
+    assert w.q()["head"] == sha(3) and w.q()["head_rebased"] is True
+    head_at(w, sha(4), 101)               # past the old sequence: ordinary again
+    out = w.q()
+    assert out["head"] == sha(4) and out["head_rebased"] is False
+
+
+def test_an_operator_can_acknowledge_the_candidate_write_and_only_that_one(w):
+    head_at(w, sha(1), 100)
+    head_at(w, sha(2), 1)
+    w.feed.node(PR, principal=OPERATOR, attrs={"head_resync": "pi-999"})      # not what was observed
+    assert w.q()["status"] == "head_unverified"
+    w.feed.node(PR, principal=ATTACKER, attrs={"head_resync": "pi-1"})        # not an operator
+    assert w.q()["status"] == "head_unverified"
+    w.feed.node(PR, principal=OPERATOR, attrs={"head_resync": "pi-1"})
+    out = w.q()
+    assert out["head"] == sha(2) and out["head_rebased"] is True and out["status"] == "insufficient"
+    w.repo._rebuild_graph()
+    assert w.q()["head"] == sha(2)
+    # a NEW suspicious observation (lower than the last one) is not covered by the old ack
+    head_at(w, sha(3), 0 + 3)
+    head_at(w, sha(4), 2)
+    out = w.q()
+    assert out["status"] == "head_unverified"
+    assert w.q()["resync_event_id"] == "pi-2"
+
+
+def test_a_viewers_rereview_count_comes_only_from_what_the_viewer_can_see(w):
+    w.head(sha(1))
+    w.review(R1, "review:a", sha(1), scope="private")
+    w.review(R2, "review:b", sha(1))
+    c = cfg(3)
+    seen = w.q(c, principal=R2)
+    assert seen["status"] == "insufficient" and seen["counted"] == ["key:r2"]
+    assert seen["rereview_needed"] == 2 and seen["has_hidden_reviews"] is True   # not 1: no hidden shift
+    own = w.q(c, principal=R1)
+    assert own["counted"] == ["key:r1", "key:r2"] and own["rereview_needed"] == 1
+
+
+def test_matching_is_ascii_only_like_autospec():
+    from herdr_engineering.control_plane.review_quorum import ascii_norm, canonical_identity, canonical_target
+    assert canonical_identity("Key:r1") is None and canonical_identity("key:r1 ") is None
+    assert canonical_identity("  KEY:R1[BOT]\t") == "key:r1"
+    assert ascii_norm("K") == "K" and ascii_norm("İ") == "İ"
+    assert canonical_target("PR:GitHub.com/O/R#7") == "pr:github.com/o/r#7"
+    assert canonical_target("pr:github.com/o/r#7K") is None and canonical_target("pr: x") is None
+    assert canonical_target("") is None and canonical_target(None) is None
+    assert receipt_binding("pr:github.com/o/r#7K", sha(1), "key:r1", "a" * 64) == \
+        receipt_binding("", sha(1), "key:r1", "a" * 64)

@@ -308,6 +308,15 @@ def _narrow(a: str, b: str) -> str:
     return a if SCOPE_RANK.get(a, 0) <= SCOPE_RANK.get(b, 0) else b
 
 
+# Registers whose recent write history is kept (see _Reg.recent): only the PR head, so the
+# bookkeeping costs nothing for every other attribute.
+_TRACKED_ATTRS = frozenset({"head_sha"})
+_RECENT_WRITES = 8
+# A write that arrives after a higher-sequence one is a harmless late delivery when it is
+# within this many sequence numbers of it; further below it looks like an emitter restart.
+HEAD_REORDER_WINDOW = 32
+
+
 class _Reg:
     """Last-writer-wins register per (source, actor), merged across writers by admission order.
 
@@ -316,9 +325,13 @@ class _Reg:
     server's admission order counts: a client-chosen sequence can never beat
     another principal, even on a shared source name.
     """
-    __slots__ = ("by", "firsts", "lasts")
+    __slots__ = ("by", "firsts", "lasts", "recent", "track")
 
-    def __init__(self):
+    def __init__(self, track: bool = False):
+        self.track = track
+        # tracked registers only: writer key -> top-N (rank, seq, event_id, value) by rank, a
+        # commutative summary (top-N of a set) so replay order cannot change it
+        self.recent: dict[tuple, list] = {}
         # writer key -> (seq, event_id, rank, value, key, is_op, scope)
         self.by: dict[tuple, tuple] = {}
         self.firsts: dict[tuple, tuple] = {}   # writer key -> rank of that writer's EARLIEST event here
@@ -333,6 +346,12 @@ class _Reg:
         last = self.lasts.get(key)
         if last is None or rank > last:
             self.lasts[key] = rank             # max over ALL events: order independent
+        if self.track:
+            hist = self.recent.setdefault(key, [])
+            if all(h[2] != eid for h in hist):
+                hist.append((rank, seq, eid, value))
+                hist.sort(key=lambda h: h[0], reverse=True)
+                del hist[_RECENT_WRITES:]
         cur = self.by.get(key)
         if cur is None or (seq, eid) > (cur[0], cur[1]):
             scope = ev.get("visibility_scope")
@@ -461,7 +480,7 @@ class _Claims:
 
     def _put_attrs(self, attrs: dict, ev: dict) -> None:
         for k, v in attrs.items():
-            self.attrs.setdefault(k, _Reg()).set(ev, v)
+            self.attrs.setdefault(k, _Reg(k in _TRACKED_ATTRS)).set(ev, v)
         if "co_writers" in attrs:
             self._w = None
 
@@ -1276,24 +1295,58 @@ class GraphProjection:
                 raise KeyError(pr_id)
 
             def trusted(name):
-                """(value, event_id, regressed): newest non-empty string from a trusted writer.
-
-                ``regressed`` is True when a trusted writer's newest-ADMITTED write of this field
-                lost to an older-admitted one by sequence (an emitter restart that reset its
-                ``source_sequence``): the register is frozen on a value the writer has since
-                replaced, so it cannot be called current.
-                """
+                """(value, event_id): newest non-empty string from a trusted writer."""
                 reg = node.attrs.get(name)
                 ents = [e for e in (reg.by.values() if reg else ())
                         if e[4][1] in head_writers and isinstance(e[3], str) and e[3].strip()]
                 if not ents:
-                    return None, None, False
+                    return None, None
                 best = max(ents, key=lambda t: t[2])
-                regressed = any(reg.lasts.get(e[4], e[2]) > e[2] for e in reg.by.values()
-                                if e[4][1] in head_writers)
-                return best[3], best[1], regressed
-            head, head_event, head_regressed = trusted("head_sha")
-            author, _, _ = trusted("author")
+                return best[3], best[1]
+
+            def trusted_head():
+                """(value, event_id, state, candidate): the PR head from the trusted writers.
+
+                ``state`` is ``ok``, ``rebased`` (an emitter restart was recognised and its
+                new run adopted) or ``unverified`` (a lower-sequence write far below the
+                applied one arrived after it, with a different value: late delivery or a
+                restart, which only the writer or an operator can settle). ``candidate`` is the
+                event id an operator may acknowledge with a ``head_resync`` write.
+                """
+                reg = node.attrs.get("head_sha")
+                if reg is None:
+                    return None, None, "ok", None
+                acks = {e[3] for e in (node.attrs["head_resync"].by.values()
+                                       if "head_resync" in node.attrs else ()) if e[5]}
+                cands, state, candidate = [], "ok", None
+                for e in reg.by.values():
+                    if e[4][1] not in head_writers or not isinstance(e[3], str) or not e[3].strip():
+                        continue
+                    value, eid, rank = e[3], e[1], e[2]
+                    tail = [t for t in sorted(reg.recent.get(e[4], ()), key=lambda h: h[0])
+                            if t[0] > e[2] and isinstance(t[3], str) and t[3].strip()]
+                    far = [t for t in tail if t[3] != e[3] and e[0] - t[1] > HEAD_REORDER_WINDOW]
+                    if far:
+                        last = tail[-1]
+                        run = 1 if e[0] - last[1] > HEAD_REORDER_WINDOW and last[3] != e[3] else 0
+                        for prev, cur in zip(reversed(tail[:-1]), reversed(tail)):
+                            if run and prev[1] < cur[1] and e[0] - prev[1] > HEAD_REORDER_WINDOW:
+                                run += 1
+                            else:
+                                break
+                        if last[2] in acks or run >= 2:
+                            value, eid, rank = last[3], last[2], last[0]
+                            if state == "ok":
+                                state = "rebased"
+                        else:
+                            state, candidate = "unverified", last[2]
+                    cands.append((rank, value, eid))
+                if not cands:
+                    return None, None, "ok", None
+                best = max(cands)
+                return best[1], best[2], state, candidate
+            head, head_event, head_state, candidate = trusted_head()
+            author, _ = trusted("author")
             reviews, authors = [], set()
             for rid in sorted(reviewer_ids):
                 for key in list(self._edges_by_owner.get(rid, ())):
@@ -1311,7 +1364,7 @@ class GraphProjection:
                             "event_id": e.adds.best()[1],
                             "visible": self._edge_visible(principal, e)})
             return {"pr": pr_id, "head": head, "head_event_id": head_event,
-                    "head_regressed": head_regressed, "author": author,
+                    "head_state": head_state, "head_resync_candidate": candidate, "author": author,
                     "reviews": reviews, "authors": sorted(authors)}
 
     def neighborhood(self, principal, root: str, *, depth: int = DEFAULT_DEPTH,
