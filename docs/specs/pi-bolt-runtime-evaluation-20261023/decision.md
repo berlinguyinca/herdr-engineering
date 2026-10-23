@@ -29,8 +29,8 @@ Quality 9/10 vs 10/10 is within model nondeterminism at n=10; no quality regress
 | Metric | standard-pi | pi-bolt | pi-bolt-jit |
 |---|---|---|---|
 | Time to ready (3 reps, s) | 11.0, 19.3, 10.6 | 48.8, 95.8, 80.9 | 57.1, 89.1, 61.9 |
-| CPU seconds to ready | 1.9 | 24.4, 24.2 | 24.9 |
-| Peak RSS | 141 MiB | 369-384 MiB | 370-377 MiB |
+| CPU seconds to ready (n=1 raw for standard; see results/README.md for provenance) | 1.9 | 24.4, 24.2 | 24.9 |
+| Peak RSS (same caveat) | 141 MiB | 369-384 MiB | 370-377 MiB |
 | Commands / tools registered | 44 / 17 | 45 / 17 (+`usage`) | 45 / 17 (+`usage`) |
 In the first pass both Pi-Bolt arms hit the 120 s watchdog (no result); in later runs they completed in 49-96 s, and one more JIT run hit the watchdog. Under Pi-Bolt the extensions are loaded at run time (jiti transpile + interpreter), which Pi-Bolt's own
 docs flag; the documented fix, `pi-bolt compile`, fails on this package (see compatibility-matrix.md). Net effect for the agents we actually run:
