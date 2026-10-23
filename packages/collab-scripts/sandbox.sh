@@ -54,6 +54,16 @@ for n in claude codex pi node; do
   p="$(command -v "$n" 2>/dev/null)" || continue
   r="$(readlink -f "$p")"
   case "$p" in "$HOME"/*) bindro "$(dirname "$p")" ;; esac
+  # every hop of the link chain must exist in the box, not just both ends: codex's standalone install is
+  # ~/.local/bin/codex -> ~/.codex/packages/standalone/current/bin/codex with `current` itself a link to
+  # releases/<version>; binding .../current/bin (bwrap follows the source) makes that hop resolve
+  h="$p"
+  for _ in 1 2 3 4 5 6 7 8; do
+    t="$(readlink "$h" 2>/dev/null)" || break
+    case "$t" in /*) ;; *) t="$(dirname "$h")/$t" ;; esac
+    case "$t" in "$HOME"/*) bindro "$(dirname "$t")" ;; esac
+    h="$t"
+  done
   case "$r" in "$HOME"/*) bindro "$(dirname "$r")" ;; esac
 done
 # Helpers only (set by the runner, never by a task), each fails closed when it does not check out:
