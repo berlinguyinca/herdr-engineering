@@ -203,6 +203,20 @@ export class HerdrClient {
     return this.request(`/api/v1/github/issue?${query}`, { signal });
   }
 
+  // -- architecture explorer (immutable commit-keyed snapshots) ----------------
+  _arch(path, params = {}, signal) {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v != null && v !== '') q.set(k, String(v));
+    return this.request(`/api/v1/architecture/${path}${q.size ? `?${q}` : ''}`, { signal });
+  }
+  listArchitectureSnapshots({ signal, ...params } = {}) { return this._arch('snapshots', params, signal); }
+  listArchitectureAnalyses({ signal, ...params } = {}) { return this._arch('analyses', params, signal); }
+  getArchitectureChildren(sid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/children`, params, signal); }
+  searchArchitectureNodes(sid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes`, params, signal); }
+  getArchitectureNode(sid, nid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}`, {}, signal); }
+  expandArchitectureNode(sid, nid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/edges`, params, signal); }
+  diffArchitecture(base, head, { signal, ...params } = {}) { return this._arch('diff', { base, head, ...params }, signal); }
+
   // -- ci / test runs (leaf types for the topology view) -------------------
   getCi({ signal } = {}) {
     return this.request('/api/v1/ci', { signal });
