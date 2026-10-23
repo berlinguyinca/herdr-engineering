@@ -1716,9 +1716,19 @@ class CollabService:
         return copy.deepcopy(stored) if stored else _normalize_profile({})
 
     def get_room_profile(self, pr: Principal, room_id: str) -> dict:
+        """Members see the whole profile; an agent sees names only (no upstream URLs, no host list); a guest
+        gets the same 404 as a stranger."""
         with self._lock:
-            self._authorize(pr, room_id, "read", "profile.get")
-            return self._profile(room_id)
+            room, _ = self._authorize(pr, room_id, "read", "profile.get")
+            if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
+                self._audit_denied(pr, "profile.get", "guest", room_id=room_id, project_ids=[room["project_id"]])
+                self.stats["policy_denied"] += 1
+                raise CollabError(404, "not found")
+            p = self._profile(room_id)
+            if pr.is_agent:
+                p.pop("permanent_hosts")
+                p["services"] = [{"name": sv["name"]} for sv in p["services"]]
+            return p
 
     def set_room_profile(self, pr: Principal, room_id: str, body: dict) -> dict:
         """Owner only. Replaces the whole profile; unmentioned fields return to their defaults."""
@@ -2889,16 +2899,20 @@ class CollabService:
 
     def read_events(self, pr: Principal, room_id: str, cursor: int, limit: int) -> dict:
         with self._lock:
-            _, first = self._authorize(pr, room_id, "read", "events.read")
-            out, more = [], False
+            room, first = self._authorize(pr, room_id, "read", "events.read")
+            guest = not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest"
+            out, more, nxt = [], False, cursor
             feed = self._by_room.get(room_id, [])
             lo = bisect.bisect_right(feed, max(cursor, first - 1), key=lambda e: e["sequence"])
             for ev in feed[lo:]:
+                if guest and ev["event_type"].startswith("helper_"):
+                    nxt = ev["sequence"]              # a guest never sees helpers, but the cursor moves past them
+                    continue
                 if len(out) >= limit:
                     more = True
                     break
                 out.append({k: v for k, v in self._view(ev).items() if k != "project_id"})
-            nxt = out[-1]["sequence"] if out else cursor
+                nxt = ev["sequence"]
         return {"events": out, "next_cursor": nxt, "has_more": more}
 
     def audit(self, pr: Principal, project_id: str, cursor: int, limit: int) -> dict:

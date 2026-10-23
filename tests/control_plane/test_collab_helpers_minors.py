@@ -146,3 +146,38 @@ def test_pause_and_resume_appear_in_the_operators_user_log(tmp_path):
     assert [(r["action"], r["status"], r["by"], r["user_id"]) for r in rows] == [
         ("helpers.resume", "resumed", "op", "op"), ("helpers.pause", "paused", "op", "op")]     # newest first
     assert all(r["at"] for r in rows)
+
+
+# ------------------------------------------------------------------ what guests and agents see (review item 10)
+SVC = {"name": "gh", "upstream_url": "https://api.github.com/v3", "header": "Authorization", "secret_name": "gh_token"}
+
+
+def test_guests_see_no_helper_events_and_their_cursor_still_moves_past_them(w):
+    w.s.post_message(w.alice, w.room, {"text": "before", "idempotency_key": "k1"})
+    first = w.s.read_events(w.dave, w.room, 0, 200)["next_cursor"]
+    for _ in range(3):
+        ask(w)                                                          # nothing but helper events after this
+    page = w.s.read_events(w.dave, w.room, first, 200)
+    assert page["events"] == [] and page["next_cursor"] > first         # never stuck on hidden events
+    assert w.s.read_events(w.dave, w.room, page["next_cursor"], 200)["events"] == []
+    small = w.s.read_events(w.dave, w.room, first, 1)
+    assert small["events"] == [] and small["next_cursor"] > first
+    everything = w.s.read_events(w.dave, w.room, 0, 200)["events"]
+    assert not any(e["event_type"].startswith("helper") or "helper" in e for e in everything)
+    assert any(e["event_type"].startswith("helper_") for e in w.s.read_events(w.carol, w.room, 0, 200)["events"])
+    st = w.s.room_state(w.dave, w.room, -1, 0, 0)
+    assert not any(e["event_type"].startswith("helper_") for e in st["events"])
+
+
+def test_profile_detail_goes_to_members_names_only_to_agents_and_nothing_to_guests(w):
+    w.s.set_room_profile(w.alice, w.room, {"allowed_families": ["claude-code"], "services": [SVC],
+                                           "permanent_hosts": ["git.example.org:22"]})
+    for who in (w.alice, w.bob, w.carol):
+        p = w.s.get_room_profile(who, w.room)
+        assert p["services"] == [SVC] and p["permanent_hosts"] == ["git.example.org:22"]
+    assert code(w.s.get_room_profile, w.dave, w.room) == 404
+    p = w.s.get_room_profile(w.root, w.room)                           # an agent with a read grant
+    assert p["services"] == [{"name": "gh"}] and "permanent_hosts" not in p
+    assert "api.github.com" not in repr(p) and "git.example.org" not in repr(p)
+    assert p["allowed_families"] == ["claude-code"] and p["limits"]["depth"] == 2
+

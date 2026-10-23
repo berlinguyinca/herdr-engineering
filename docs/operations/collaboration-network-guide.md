@@ -415,7 +415,9 @@ progress, read the room, or start helpers of its own from the box (see *Residual
 
 **Room profile** (**Agents → Helper profile**, owner only; `POST rooms/{id}/profile` replaces the whole profile).
 The profile holds names and policy, never secret values. There is no field a value could ride in on: unknown
-fields are refused.
+fields are refused. Who reads it (`GET rooms/{id}/profile`): the room's owner, contributors and viewers see all of it;
+an agent with a read grant sees names and policy only (each service's name, no upstream URL, no always-allowed
+host list); a guest gets 404.
 
 | Field | Meaning |
 |---|---|
@@ -531,7 +533,8 @@ so those run on their own default model and the result says so.
 
 Over a limit a request fails at once with 429 and says which limit; nothing is queued. Every request, refusal,
 claim, finish, cancel, pause and host decision is in the audit log and the room's event feed (ids, role and
-model only, never the task text or the result).
+model only, never the task text or the result). Guests never see helper events in the feed (their cursor still moves past
+them).
 
 **Residual risks** (known, not fixed; an external security review is **still pending**):
 * **SSH keys are readable by the helper.** A key listed in the profile is a plain file in the box's `~/.ssh`, so
