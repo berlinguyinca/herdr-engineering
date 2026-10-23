@@ -36,6 +36,11 @@ test('CI health keeps exact retained evidence, focus and selection during pendin
  const browser=await chromium.launch({headless:true});
  try {
   const page=await browser.newPage();
+  // Keep the controller's five-second background poll from racing the explicit
+  // refresh whose pending and failure states this test observes.
+  const frozenAt=new Date();
+  await page.clock.install({time:frozenAt});
+  await page.clock.pauseAt(frozenAt);
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   await page.locator('[data-health-bucket]').first().waitFor();
   assert.deepEqual(await page.locator('th[scope=row].ci-health-project').allTextContents(),['org/shared · alpha.example','org/shared · beta.example']);
