@@ -313,3 +313,18 @@ def test_rate_ui_burst_does_not_consume_ingest_budget(rate_limited_server):
     assert _rate_request(server, '/api/v1/services')[0] == 200
     assert _rate_request(server, '/api/v1/health')[0] == 429
     assert _rate_request(server, '/api/v1/ingest', _rate_service(0))[0] == 200
+
+
+def test_redact_payload_keeps_author_logins_but_still_redacts_auth_keys():
+    """"author" contains the hint "auth": the PR author's login is not a secret and the review quorum needs it."""
+    out = redact_payload({"author": "octocat", "authors": ["a"], "auth": "x", "auth_token": "y", "Authorization": "z"})
+    assert out["author"] == "octocat" and out["authors"] == ["a"]
+    assert out["auth"] == out["auth_token"] == out["Authorization"] == "[REDACTED]"
+
+
+def test_redact_does_not_eat_ids_that_merely_end_in_sk_dash_but_still_redacts_real_keys():
+    assert redact_text("task-s6lease") == "task-s6lease"
+    assert redact_text("disk-image-1 and risk-profile-high") == "disk-image-1 and risk-profile-high"
+    assert redact_payload({"task_id": "task-s6lease"})["task_id"] == "task-s6lease"
+    for leaked in ("sk-abcDEF123456", "key=sk-abcDEF123456", "OPENAI_API_KEY_sk-abcDEF123456", '"sk-proj-abcDEF123456"', "(sk-abc123)"):
+        assert "abc" not in redact_text(leaked).replace("[REDACTED]", ""), leaked

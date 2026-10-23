@@ -143,10 +143,9 @@ def test_reviewers_of_one_group_count_once_and_distinct_groups_count_twice(world
     assert world.quorum()["status"] == "satisfied"
 
 
-@pytest.mark.xfail(strict=True, reason="GAP (real bug found by this suite): the PR `author` attr that Pi writes "
-                   "(src/github/lineage.ts) is stored as '[REDACTED]' because redact.py treats any key containing 'auth' "
-                   "as a secret, so the login-based author exclusion in review_quorum.evaluate can never match and "
-                   "a PR author's own approval is counted")
+# Found by this suite and FIXED in the same PR (redact.py exempted `author`): the PR `author` attr Pi writes was stored as
+# '[REDACTED]' because redact.py treats any key containing 'auth' as a secret, so the login-based author exclusion in
+# review_quorum.evaluate could never match and a PR author's own approval was counted.
 def test_the_pr_author_cannot_approve_their_own_pr_by_login(world):
     world.pi_pr(H1, author="Author-Login")        # the key behind `human` is the author (configured login, case-insensitive)
     world.publish("human", H1)
@@ -155,10 +154,10 @@ def test_the_pr_author_cannot_approve_their_own_pr_by_login(world):
     assert q["status"] == "insufficient" and world.plane.pid("human") not in counted(q)
 
 
-def test_author_attr_is_redacted_in_the_stored_pr_node_which_is_the_cause_of_the_gap_above(world):
+def test_author_attr_is_stored_readable_so_the_author_exclusion_can_match_while_secret_keys_stay_redacted(world):
     world.pi_pr(H1, author="Author-Login")
     attrs = world.plane.node(PR).body["node"]["attrs"]
-    assert attrs["author"] == "[REDACTED]" and attrs["head_sha"] == H1     # documents current behaviour (flip with the fix)
+    assert attrs["author"] == "Author-Login" and attrs["head_sha"] == H1
 
 
 def test_a_reviewer_who_produced_the_pr_cannot_approve_it_and_a_distinct_one_can(world):
