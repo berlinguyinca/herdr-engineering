@@ -79,7 +79,7 @@ from urllib.parse import urlsplit
 
 from .config import RepoEnrollment, ReviewGateConfig
 from .decision import decide_merge
-from .github_app import GitHubAppClient, PrInfo
+from .github_app import GitHubAppClient, GitHubAppError, PrInfo
 from .models import CheckRun, PrKey, State, Verdict
 from .queue import ReviewQueue
 from .registry import AuthorRegistry
@@ -153,6 +153,9 @@ class GateService:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._tick_lock = threading.Lock()
+        self._last_tick_at: float | None = None
+        self._last_counts: dict = {}
+        self._last_error: str | None = None
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -193,10 +196,24 @@ class GateService:
         with self._tick_lock:
             try:
                 self._tick(counts)
-            except Exception:  # noqa: BLE001 - tick never raises
+            except Exception as exc:  # noqa: BLE001 - tick never raises
+                self._note_error(exc)
                 log.exception("review gate tick failed")
                 counts["errors"] += 1
+            self._last_tick_at = self._now()
+            self._last_counts = dict(counts)
         return counts
+
+    def _note_error(self, exc: Exception) -> None:
+        """Remember only the GitHubAppError reason (a fixed vocabulary), never message text."""
+        reason = getattr(exc, "reason", None)
+        if isinstance(exc, GitHubAppError) and isinstance(reason, str):
+            self._last_error = reason[:40]
+
+    def status(self) -> dict:
+        """Last tick summary for the API: epoch seconds, counts, last GitHub failure reason."""
+        return {"last_tick_at": self._last_tick_at, "counts": dict(self._last_counts),
+                "last_error": self._last_error}
 
     def _tick(self, counts: dict) -> None:
         if not self._config.enabled:
@@ -213,7 +230,8 @@ class GateService:
             counts["repos"] += 1
             try:
                 prs = self._app.open_prs(enrollment.repo)
-            except Exception:  # noqa: BLE001 - one repo never stops the others
+            except Exception as exc:  # noqa: BLE001 - one repo never stops the others
+                self._note_error(exc)
                 log.warning("review gate: listing PRs failed for %s", enrollment.repo)
                 counts["errors"] += 1
                 continue
@@ -226,7 +244,8 @@ class GateService:
                 counts["prs"] += 1
                 try:
                     self._handle(enrollment, pr, rows, stale, counts)
-                except Exception:  # noqa: BLE001 - one PR never stops the others
+                except Exception as exc:  # noqa: BLE001 - one PR never stops the others
+                    self._note_error(exc)
                     log.warning("review gate: %s#%s failed", enrollment.repo, pr.number)
                     counts["errors"] += 1
 

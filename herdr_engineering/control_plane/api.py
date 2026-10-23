@@ -718,7 +718,11 @@ def _make_handler(server, public=False, operator=False):
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
-            if path.startswith(("/api/v1/ci/", "/api/v1/reviews", "/api/v1/review-gate/")):
+            # Decide on the DECODED resource: routing unquotes each segment, so a raw
+            # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
+            segs = path.split("/")
+            res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
+            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -990,18 +994,22 @@ def _make_handler(server, public=False, operator=False):
                 return self._send_json(500, {"error": message})
 
         def _review_gate_get(self, parts):
+            if parts[-1] == "" and len(parts) > 5:
+                parts = parts[:-1]  # one trailing slash is the same route
             if server.gate_service is None or len(parts) != 5:
                 return self._json({"error": "not found"}, 404)
             if parts[4] == "prs":
                 return self._json([_gate_pr(snap) for snap in server.gate_store.snapshots()])
             if parts[4] == "queue":
                 return self._json({"depth": server.gate_queue.depth(),
-                                   "jobs": server.gate_queue.snapshot()})
+                                   "jobs": server.gate_queue.snapshot(),
+                                   "gate": server.gate_service.status()})
             return self._json({"error": "not found"}, 404)
 
         def _review_gate_resume(self, parts):
             # /api/v1/review-gate/prs/<github.com>/<owner>/<name>/<number>/resume
             # (the canonical repo's slashes stay literal; %2F inside a segment works too)
+            self._read_json()  # always consume the body: keep-alive must not parse it as a request
             if (server.gate_service is None or len(parts) < 8 or parts[4] != "prs"
                     or parts[-1] != "resume"):
                 return self._json({"error": "not found"}, 404)

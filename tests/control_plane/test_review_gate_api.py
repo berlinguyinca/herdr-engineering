@@ -200,3 +200,72 @@ def test_invalid_enabled_config_fails_loud(tmp_path):
 def test_per_repo_caps_reach_the_store(gate_server):
     # the enrollment says ci_fix_cap=1; the default (3) would not have escalated
     escalate(gate_server)
+
+
+def raw_exchange(server, payload: bytes, wait=0.5):
+    import socket
+    sock = socket.create_connection(("127.0.0.1", server.port), timeout=wait)
+    sock.sendall(payload)
+    data = b""
+    try:
+        while chunk := sock.recv(65536):
+            data += chunk
+    except OSError:
+        pass
+    sock.close()
+    return data
+
+
+def test_encoded_resource_cannot_bypass_origin_and_content_type(gate_server):
+    escalate(gate_server)
+    enc = f"review-gate/prs/{REPO}/7/resume".replace("review-gate", "%72eview-gate")
+    status, _ = request(gate_server, enc, {}, key="write", method="POST",
+                        headers={"Origin": "https://evil.example"})
+    assert status == 403
+    assert request(gate_server, enc, {}, key="write", method="POST", ctype="text/plain")[0] == 415
+    assert gate_server.gate_store.snapshot(PrKey(REPO, 7)).state.value == "escalated"
+    # the same flaw existed for ci
+    assert request(gate_server, "%63i/actions", {}, key="write", method="POST",
+                   headers={"Origin": "https://evil.example"})[0] == 403
+    assert request(gate_server, "%63i/actions", {}, key="write", method="POST", ctype="text/plain")[0] == 415
+
+
+@pytest.mark.parametrize("pr,escalated", [(7, True), (7, False), (9, False)])
+def test_resume_body_is_consumed_so_one_response_only(gate_server, pr, escalated):
+    if escalated:
+        escalate(gate_server)
+    elif pr == 7:
+        gate_server.gate_store.on_push(PrKey(REPO, 7), "sha1")
+    smuggled = b"GET /api/v1/review-gate/prs HTTP/1.1\r\nHost: x\r\nX-API-Key: read\r\n\r\n"
+    req = (f"POST /api/v1/review-gate/prs/{REPO}/{pr}/resume HTTP/1.1\r\nHost: x\r\n"
+           f"X-API-Key: write\r\nContent-Type: application/json\r\n"
+           f"Content-Length: {len(smuggled)}\r\n\r\n").encode() + smuggled
+    data = raw_exchange(gate_server, req)
+    assert data.count(b"HTTP/1.") + data.count(b"HTTP/1.0") >= 1
+    assert data.count(b"HTTP/1.0 ") + data.count(b"HTTP/1.1 ") == 1
+
+
+def test_queue_reports_last_tick_and_error(tmp_path, monkeypatch, monitor_starts):
+    class Failing(FakeApp):
+        def open_prs(self, repo):
+            raise github_app.GitHubAppError("authentication")
+
+    monkeypatch.setattr(github_app, "GitHubAppClient", Failing)
+    server = ControlPlaneServer(ControlPlaneRepo(), api_keys={"read": "viewer"},
+                                fleet_config=FakeFleet(gate_section(tmp_path)))
+    start(server)
+    try:
+        server.gate_service.tick()
+        gate = request(server, "review-gate/queue")[1]["gate"]
+        assert gate["counts"]["errors"] > 0
+        assert gate["last_error"] == "authentication"
+        assert gate["last_tick_at"] is not None
+        assert "key" not in json.dumps(gate).lower().replace("last_tick", "")
+    finally:
+        server.shutdown()
+
+
+def test_trailing_slash_routes(gate_server):
+    assert request(gate_server, "review-gate/prs/")[0] == 200
+    assert request(gate_server, "review-gate/queue/")[0] == 200
+    assert request(gate_server, "review-gate/queue/x")[0] == 404
