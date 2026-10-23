@@ -248,10 +248,24 @@ def test_the_operator_cancels_another_owners_helper_on_the_operator_listener(w):
     assert rows and rows[0]["actor_user_id"] == "mallory" and rows[0]["actor_agent_id"] is None
 
 
-def test_nobody_else_reaches_the_operator_cancel(w):
+def test_the_public_listener_never_routes_to_the_operator_cancel(w, monkeypatch):
+    """Even a principal flagged admin on the public listener: only `operator is not None` opens fleet/*."""
     rec = ask(w)
-    for who in ("bob", "mallory"):                                    # the public listener: 404, even for mallory
-        assert call(w, "POST", ["fleet", "helpers", rec["helper_id"], "cancel"], who)[0] == 404
-        assert call(w, "POST", ["helpers", rec["helper_id"], "cancel"], who)[0] == 404
+    real = w.s.authenticate
+
+    def admin_auth(authorization, device):
+        pr = real(authorization, device)
+        pr.admin = True
+        return pr
+    monkeypatch.setattr(w.s, "authenticate", admin_auth)
+    assert call(w, "POST", ["fleet", "helpers", rec["helper_id"], "cancel"], "mallory")[0] == 404
+    assert w.s._helpers[rec["helper_id"]]["status"] == "requested"
+
+
+def test_the_operator_cancel_itself_refuses_anyone_but_the_operator(w):
+    rec = ask(w)
+    for pr in (w.alice, w.bob, w.mallory, w.root):                     # the owner too: she has her own route
+        assert code(w.s.cancel_helper_as_operator, pr, rec["helper_id"]) == 404
+    assert call(w, "POST", ["helpers", rec["helper_id"], "cancel"], "bob")[0] == 404
     assert call(w, "POST", ["fleet", "helpers", "nope", "cancel"], operator="mallory")[0] == 404
     assert w.s._helpers[rec["helper_id"]]["status"] == "requested"
