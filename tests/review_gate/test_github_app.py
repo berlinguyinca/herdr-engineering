@@ -1,5 +1,6 @@
 import io
 import json
+import traceback
 import urllib.error
 
 import jwt
@@ -178,22 +179,50 @@ def test_patch_id_ignores_hunk_offsets(keypair):
     assert len(a) == 64
 
 
-def test_errors_never_contain_token(keypair):
+def _assert_clean(exc, secrets):
+    blobs = [repr(exc), str(exc), repr(exc.args)]
+    for frame, _ in traceback.walk_tb(exc.__traceback__):
+        if frame.f_globals.get("__name__") == "herdr_engineering.review_gate.github_app":
+            blobs.append(repr(frame.f_locals))
+    for blob in blobs:
+        for secret in secrets:
+            assert secret not in blob
+    assert exc.__context__ is None and exc.__cause__ is None and exc.__suppress_context__
+
+
+def test_errors_never_contain_token(keypair, monkeypatch):
     cfg, _ = keypair
-    pem = open(cfg.private_key_file).read()
+    pem_body = open(cfg.private_key_file).read().splitlines()[1]
+    # HTTP 500 path (token + JWT were both in flight)
+    c, opener = client_for(cfg, {("GET", "/repos/acme/widget/pulls"): http_error(500)})
+    with pytest.raises(GitHubAppError) as ei:
+        c.open_prs(REPO)
+    the_jwt = opener.requests[0].get_header("Authorization").split(" ", 1)[1]
+    _assert_clean(ei.value, [TOKEN, the_jwt, pem_body])
+    # non-JSON body echoing the token
     c, _ = client_for(cfg, {("GET", "/repos/acme/widget/pulls"): Resp(200, f"{TOKEN} not json".encode())})
     with pytest.raises(GitHubAppError) as ei:
         c.open_prs(REPO)
     assert ei.value.reason == "invalid_response"
-    assert TOKEN not in str(ei.value)
-    bad = AppConfig(app_id=1, installation_id=99, private_key_file=cfg.private_key_file)
-    open(bad.private_key_file, "w").write("-----BEGIN PRIVATE KEY-----\nSECRETBODY\n-----END PRIVATE KEY-----\n")
-    c2 = GitHubAppClient(bad, client=FakeOpener({}))
+    _assert_clean(ei.value, [TOKEN, pem_body])
+    # failing jwt.encode that echoes the key
+    def boom(payload, key, algorithm=None):
+        raise RuntimeError(key.decode())
+    monkeypatch.setattr(jwt, "encode", boom)
+    c2 = GitHubAppClient(cfg, client=FakeOpener({}))
     with pytest.raises(GitHubAppError) as ei:
         c2.installation_token()
-    assert "SECRETBODY" not in str(ei.value) and "BEGIN" not in str(ei.value)
-    assert pem.splitlines()[1] not in str(ei.value)
-    assert ei.value.__cause__ is None and ei.value.__suppress_context__
+    assert ei.value.reason == "authentication"
+    _assert_clean(ei.value, [pem_body, "BEGIN"])
+
+
+def test_garbage_key_is_authentication_error(keypair):
+    cfg, _ = keypair
+    open(cfg.private_key_file, "w").write("-----BEGIN PRIVATE KEY-----\nSECRETBODY\n-----END PRIVATE KEY-----\n")
+    c = GitHubAppClient(cfg, client=FakeOpener({}))
+    with pytest.raises(GitHubAppError) as ei:
+        c.installation_token()
+    _assert_clean(ei.value, ["SECRETBODY", "BEGIN"])
 
 
 def test_401_maps_to_authentication(keypair):
@@ -221,3 +250,119 @@ def test_repo_path_injection_rejected(keypair):
         with pytest.raises(ValueError):
             c.open_prs(bad)
     assert opener.requests == []
+
+
+def files_resp(files):
+    return Resp(200, {"files": files})
+
+
+def f(name, patch=None, sha=None, status="modified", prev=None):
+    d = {"filename": name, "status": status}
+    if patch is not None:
+        d["patch"] = patch
+    if sha is not None:
+        d["sha"] = sha
+    if prev is not None:
+        d["previous_filename"] = prev
+    return d
+
+
+def test_patch_id_single_unpaged_request(keypair):
+    cfg, _ = keypair
+    c, opener = client_for(cfg, {("GET", "/repos/acme/widget/compare/"): files_resp([f("a", "@@ -1 +1 @@\n-a\n+b")])})
+    c.patch_id(REPO, "1" * 40, "2" * 40)
+    compares = [r for r in opener.requests if "/compare/" in r.full_url]
+    assert len(compares) == 1 and "?" not in compares[0].full_url
+
+
+def test_patch_id_fails_closed_at_300_files(keypair):
+    cfg, _ = keypair
+    many = [f(f"f{i}", "@@ -1 +1 @@\n-a\n+b") for i in range(300)]
+    with pytest.raises(GitHubAppError) as ei:
+        patch_id_for(cfg, files_resp(many))
+    assert ei.value.reason == "invalid_response"
+    patch_id_for(cfg, files_resp(many[:299]))
+
+
+def test_patch_id_patchless_needs_blob_sha(keypair):
+    cfg, _ = keypair
+    for bad in (f("img.png"), f("img.png", sha="short")):
+        with pytest.raises(GitHubAppError) as ei:
+            patch_id_for(cfg, files_resp([bad]))
+        assert ei.value.reason == "invalid_response"
+    one = patch_id_for(cfg, files_resp([f("img.png", sha="a" * 40)]))
+    two = patch_id_for(cfg, files_resp([f("img.png", sha="b" * 40)]))
+    assert one != two
+
+
+def test_patch_id_renames_from_different_sources_differ(keypair):
+    cfg, _ = keypair
+    p = "@@ -1 +1 @@\n-a\n+b"
+    one = patch_id_for(cfg, files_resp([f("new", p, status="renamed", prev="old1")]))
+    two = patch_id_for(cfg, files_resp([f("new", p, status="renamed", prev="old2")]))
+    assert one != two
+
+
+@pytest.mark.parametrize("bad", ["abc1234", "a" * 39, "a" * 41, "g" * 40, ""])
+def test_short_or_malformed_sha_rejected_without_request(keypair, bad):
+    cfg, _ = keypair
+    c, opener = client_for(cfg, {})
+    good = "a" * 40
+    for call in (lambda: c.set_status(REPO, bad, "success", "d"),
+                 lambda: c.merge_pr(REPO, 1, bad),
+                 lambda: c.update_branch(REPO, 1, bad),
+                 lambda: c.patch_id(REPO, bad, good),
+                 lambda: c.patch_id(REPO, good, bad)):
+        with pytest.raises(ValueError):
+            call()
+    assert opener.requests == []
+
+
+def test_sha_is_lowercased_and_64_hex_accepted(keypair):
+    cfg, _ = keypair
+    c, opener = client_for(cfg, {("PUT", "/repos/acme/widget/pulls/1/merge"): Resp(200, {})})
+    assert c.merge_pr(REPO, 1, "AB" * 20) is True
+    assert json.loads(opener.requests[-1].data)["sha"] == "ab" * 20
+    assert c.merge_pr(REPO, 1, "c" * 64) is True
+
+
+def test_401_on_rest_call_clears_cached_token(keypair):
+    cfg, _ = keypair
+    results = [http_error(401), Resp(200, [])]
+    c, opener = client_for(cfg, {("GET", "/repos/acme/widget/pulls"): lambda r: results.pop(0)})
+    with pytest.raises(GitHubAppError):
+        c.open_prs(REPO)
+    c.open_prs(REPO)
+    assert sum("access_tokens" in r.full_url for r in opener.requests) == 2
+
+
+def test_rate_limit_retry_at_uses_injected_clock(keypair):
+    cfg, _ = keypair
+    c, _ = client_for(cfg, {("GET", "/repos/acme/widget/pulls"): http_error(403, {"Retry-After": "30"})})
+    with pytest.raises(GitHubAppError) as ei:
+        c.open_prs(REPO)
+    assert ei.value.reason == "rate_limited" and ei.value.retry_at == 1792670400.0 + 30
+
+
+def test_set_status_redacts_description_and_rejects_secret_url(keypair):
+    cfg, _ = keypair
+    c, opener = client_for(cfg, {("POST", "/repos/acme/widget/statuses/"): Resp(201, {})})
+    c.set_status(REPO, "a" * 40, "failure", "leaked Bearer abcdef123456 here")
+    assert "abcdef123456" not in json.loads(opener.requests[-1].data)["description"]
+    n = len(opener.requests)
+    with pytest.raises(ValueError):
+        c.set_status(REPO, "a" * 40, "failure", "d", target_url="https://x.test/?k=sk-abcdefgh123")
+    assert len(opener.requests) == n
+
+
+def test_open_prs_cap_is_not_silent_and_null_user_tolerated(keypair):
+    cfg, _ = keypair
+    full = [pr(i, "c" * 40) for i in range(100)]
+    c, _ = client_for(cfg, {("GET", "/repos/acme/widget/pulls"): Resp(200, full)})
+    with pytest.raises(GitHubAppError) as ei:
+        c.open_prs(REPO)
+    assert ei.value.reason == "invalid_response"
+    ghost = pr(1, "c" * 40)
+    ghost["user"] = None
+    c, _ = client_for(cfg, {("GET", "/repos/acme/widget/pulls"): Resp(200, [ghost])})
+    assert c.open_prs(REPO)[0].author_login == ""
