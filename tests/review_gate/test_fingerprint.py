@@ -25,3 +25,12 @@ def test_digits_and_whitespace_normalised():
 
 def test_different_path_differs():
     assert finding_fingerprint(_f(path="a.py")) != finding_fingerprint(_f(path="b.py"))
+
+
+def test_path_normalised():
+    assert finding_fingerprint(_f(path="./a.py")) == finding_fingerprint(_f(path=" a.py"))
+    assert finding_fingerprint(_f(path="a\\b.py")) == finding_fingerprint(_f(path="a/b.py"))
+
+
+def test_category_normalised():
+    assert finding_fingerprint(_f(category=" Style ")) == finding_fingerprint(_f(category="style"))

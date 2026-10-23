@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
@@ -20,6 +21,9 @@ class State(StrEnum):
     ESCALATED = "escalated"
 
 
+_REPO_RE = re.compile(r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
 @dataclass(frozen=True)
 class PrKey:
     repo: str
@@ -31,7 +35,12 @@ class PrKey:
     @classmethod
     def parse(cls, text: str) -> PrKey:
         repo, sep, num = text.strip().rpartition("#")
-        if not sep or not repo or not num.isdigit():
+        if (
+            not sep
+            or not _REPO_RE.fullmatch(repo)
+            or not (num.isascii() and num.isdigit())
+            or int(num) <= 0
+        ):
             raise ValueError(f"invalid PR key: {text!r}")
         return cls(repo=repo, number=int(num))
 

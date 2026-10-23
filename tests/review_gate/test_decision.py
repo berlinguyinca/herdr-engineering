@@ -74,3 +74,15 @@ def test_rejects_collected_in_fixed_order_and_before_waits():
         "review FAIL",
         "check ci failed",
     )
+
+
+def test_unknown_verdict_value_rejects():
+    d = _decide([_c()], _v("MAYBE"))
+    assert d.decision == "reject"
+    assert d.reasons == ("review verdict invalid: MAYBE",)
+
+
+def test_unknown_required_check_status_waits():
+    d = _decide([_c("error")], _v())
+    assert d.decision == "wait"
+    assert d.reasons == ("required check ci error",)

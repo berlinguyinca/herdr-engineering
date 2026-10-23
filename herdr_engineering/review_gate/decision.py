@@ -35,6 +35,8 @@ def decide_merge(
             reasons.append(f"check {check.name} sha {check.sha} != head {head_sha}")
     if verdict is not None and verdict.verdict == "FAIL":
         reasons.append("review FAIL")
+    elif verdict is not None and verdict.verdict != "PASS":
+        reasons.append(f"review verdict invalid: {verdict.verdict}")
     for check in checks:
         if check.status == "fail":
             reasons.append(f"check {check.name} failed")
@@ -50,10 +52,8 @@ def decide_merge(
     for check in checks:
         if check.name not in required:
             continue
-        if check.status == "pending":
-            reasons.append(f"required check {check.name} pending")
-        elif check.status == "skipped":
-            reasons.append(f"required check {check.name} skipped")
+        if check.status != "pass":
+            reasons.append(f"required check {check.name} {check.status}")
     if reasons:
         return MergeDecision("wait", tuple(reasons))
 
