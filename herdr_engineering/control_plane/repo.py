@@ -1459,13 +1459,21 @@ class ControlPlaneRepo:
             return dict(accepted=len(pending), duplicates=duplicates,
                         scope=view['scope'], coverage=view['coverage'])
 
-    def ci_performance(self, repository=None, branch=None, days=14):
+    def ci_performance(self, repository=None, branch=None, days=14, *, inventory=None):
         from .ci_performance import performance
         with self._event_lock:
             records = [copy.deepcopy(stream[-1]['payload'])
                        for (kind, _), stream in self._events.items()
                        if kind == 'ci_telemetry' and stream]
-            return performance(records, self.ci_reports()['pipelines'], now=self._now(),
+            pipelines = self.ci_reports()['pipelines']
+            if inventory is not None:
+                from .project_links import annotate_ci_history
+                # Resolve inventory identities before calculating group membership.
+                # Annotate both sources so exact-run enrichment cannot reintroduce
+                # an older/unresolved identity after telemetry has been resolved.
+                records = annotate_ci_history({'repos': inventory, 'pipelines': records}, self)['pipelines']
+                pipelines = annotate_ci_history({'repos': inventory, 'pipelines': pipelines}, self)['pipelines']
+            return performance(records, pipelines, now=self._now(),
                                persistence='durable_sink' if self._sink is not None else 'memory_only',
                                repository=repository, branch=branch, days=days)
 

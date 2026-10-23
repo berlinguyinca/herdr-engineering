@@ -264,3 +264,45 @@ def test_retained_provider_identity_is_not_conflated_across_provider_repos():
     assert group['provider_repo_id'] is None
     assert group['project_id'] is None
     assert group['branch'] is None
+
+
+def test_provider_percentiles_and_alerts_only_use_successful_positive_executions():
+    repo = ControlPlaneRepo(now=lambda: NOW)
+
+    def observe(number, state, finished, duration):
+        repo.observe_ci_pipeline(dict(repository='org/app', provider_repo_id=17,
+            run_number=number, branch='main', state=state,
+            started_at=datetime.fromtimestamp(finished - duration, UTC).isoformat(),
+            finished_at=datetime.fromtimestamp(finished, UTC).isoformat()))
+
+    for number in range(5):
+        observe(number, 'success', NOW - 8 * DAY, 10)
+        observe(number + 10, 'passed', NOW - DAY, 10)
+        observe(number + 20, 'failure', NOW - DAY, 100)
+        observe(number + 30, 'error', NOW - 8 * DAY, 100)
+    for number, state in enumerate(('running', 'pending', 'canceled', 'skipped'), 40):
+        observe(number, state, NOW - DAY, 100)
+    observe(50, 'success', NOW - DAY, 0)
+    observe(51, 'success', 0, 0)
+    view = repo.ci_performance(days=7)
+    trend = view['execution_trends'][0]
+    assert trend['sample_count'] == 5
+    assert trend['p95'] == 10
+    assert trend['baseline']['sample_count'] == 5
+    assert trend['baseline']['p95'] == 10
+    assert view['alerts'] == []
+
+
+def test_failed_provider_executions_cannot_supply_regression_baseline():
+    repo = ControlPlaneRepo(now=lambda: NOW)
+    for number in range(10):
+        finished = NOW - (8 if number < 5 else 1) * DAY
+        duration = 10 if number < 5 else 100
+        repo.observe_ci_pipeline(dict(repository='org/app', provider_repo_id=17,
+            run_number=number, branch='main', state='failure' if number < 5 else 'success',
+            started_at=datetime.fromtimestamp(finished - duration, UTC).isoformat(),
+            finished_at=datetime.fromtimestamp(finished, UTC).isoformat()))
+    trend = repo.ci_performance(days=7)['execution_trends'][0]
+    assert trend['baseline']['sample_count'] == 0
+    assert trend['baseline']['p95'] is None
+    assert repo.ci_performance(days=7)['alerts'] == []

@@ -95,6 +95,35 @@ def test_performance_does_not_start_provider_polling(server):
     assert started == []
 
 
+def test_performance_resolves_inventory_before_grouping_cache_samples(server):
+    from tests.control_plane.test_ci_performance import cache
+
+    server.repo.observe_ci_pipeline({'repository': 'org/app', 'provider_repo_id': 17,
+                                    'run_number': 1, 'state': 'success'})
+    server.ci_monitor.snapshot = lambda **kwargs: {'repos': [
+        {'id': 17, 'repository': 'org/app', 'forge_url': 'https://github.com/org/app'}]}
+    records = [cache(number, pipeline=str(number), wall_seconds=85) for number in range(1, 6)]
+    records.append(cache(10, repo='org/unresolved', wall_seconds=2))
+    assert request(server, 'ci/telemetry', {'schema_version': 1, 'records': records}, key='write')[0] == 200
+    before = server.repo.export_state()
+    status, view = request(server, 'ci/performance')
+    assert status == 200
+    resolved = [group for group in view['cache_groups'] if group['repository'] == 'org/app']
+    assert len(resolved) == 1
+    assert resolved[0]['sample_count'] == 5
+    assert resolved[0]['restore']['p95'] == 85
+    assert resolved[0]['project_id'] == 'github.com/org/app'
+    assert resolved[0]['provider_repo_id'] == '17'
+    assert resolved[0]['branch'] is None
+    assert len(view['alerts']) == 1
+    assert view['alerts'][0]['rule'] == 'cache_budget'
+    assert view['alerts'][0]['current_value'] == 85
+    unresolved = [group for group in view['cache_groups'] if group['repository'] == 'org/unresolved'][0]
+    assert unresolved['project_id'] is None
+    assert unresolved['provider_repo_id'] is None
+    assert server.repo.export_state() == before
+
+
 def test_telemetry_persistence_error_is_sanitized_and_not_acknowledged(server):
     from tests.control_plane.test_ci_performance import cache
 

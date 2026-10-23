@@ -165,7 +165,9 @@ def performance(records, pipelines, *, now, persistence, repository=None, branch
         samples.append(row)
     for original in pipelines:
         began, finished = _timestamp(original.get('started_at')), _timestamp(original.get('finished_at'))
-        if began is None or finished is None or not 0 <= finished - began <= MAX_SECONDS:
+        if (original.get('state') not in ('success', 'passed')
+                or began is None or finished is None or began <= 0 or finished <= 0
+                or not 0 < finished - began <= MAX_SECONDS):
             continue
         samples.append(dict(copy.deepcopy(original), record_type='provider-execution',
                             operation_id=f"provider:{original.get('provider_repo_id')}:{original.get('run_number')}",

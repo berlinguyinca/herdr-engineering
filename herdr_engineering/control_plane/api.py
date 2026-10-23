@@ -1117,9 +1117,10 @@ def _make_handler(server, public=False, operator=False):
                     if raw_days not in ('7', '14'):
                         raise ValueError('CI performance days must be 7 or 14.')
                     days = int(raw_days)
-                    view = r.ci_performance(repository=_q(self.path, "repository") or None,
-                                            branch=_q(self.path, "branch") or None, days=days)
                     snapshot = server.ci_monitor.snapshot(start=False)
+                    view = r.ci_performance(repository=_q(self.path, "repository") or None,
+                                            branch=_q(self.path, "branch") or None, days=days,
+                                            inventory=snapshot.get('repos', []))
                     view['scope']['stale'] = view['scope']['stale'] or bool(snapshot.get('stale'))
                     try:
                         languages = server.github_monitor.repository_languages(start=False)
