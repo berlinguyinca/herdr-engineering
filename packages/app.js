@@ -19,6 +19,7 @@ import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
 import { renderFleetMatrix } from './fleet-view.js';
+import { renderHostDetail, RANGES } from './host-view.js';
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
@@ -364,32 +365,18 @@ async function viewHosts() {
     ${renderFleetMatrix(matrix, { driftedOnly })}`;
 }
 
-async function viewHost(parts) {
-  const h = await client.request(`/api/v1/hosts/${esc(parts[1])}`);
+async function viewHost(parts, revision) {
+  const id = encodeURIComponent(decodeURIComponent(parts[1]));
+  const requested = route().query.get('range');
+  const range = RANGES.includes(requested) ? requested : '1h';
+  // Only the host fetch may fail the page; missing history degrades to empty sparklines.
+  const [h, telemetry] = await Promise.all([
+    client.request(`/api/v1/hosts/${id}`).catch((err) => { if (err?.status === 404) return null; throw err; }),
+    client.request(`/api/v1/hosts/${id}/telemetry?range=${range}`).catch(() => ({ samples: [] })),
+  ]);
+  if (revision !== renderRevision) return;
   if (!h || h.error) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
-  let cpu = '—', mem = '—', disk = '—', seen = '—';
-  try {
-    const { samples } = await client.request(`/api/v1/hosts/${esc(parts[1])}/telemetry?limit=1`);
-    if (samples && samples.length) {
-      const s = samples[samples.length - 1];
-      const pct = (v) => (Number.isFinite(v) ? `${v}%` : '—');
-      cpu = pct(s.cpu ?? s.cpu_pct);
-      mem = pct(s.mem ?? s.mem_pct);
-      disk = pct(s.disk_pct);
-      seen = formatTimestamp(s.at ?? h.last_seen);
-    }
-  } catch { /* telemetry optional */ }
-  root.innerHTML = `
-    <h1>${esc(h.host_name)}</h1>
-    <div style="margin:8px 0"><herdr-status stage="${esc(h.status)}"></herdr-status>
-      <span class="hd-card__sub"> · <herdr-ident kind="host" id="${esc(h.host_id)}"></herdr-ident></span></div>
-    <div class="hd-grid">
-      <herdr-metric label="Tailnet IP" value="${esc(h.tailnet_ip)}"></herdr-metric>
-      <herdr-metric label="CPU" value="${esc(cpu)}"></herdr-metric>
-      <herdr-metric label="Memory" value="${esc(mem)}"></herdr-metric>
-      <herdr-metric label="Disk" value="${esc(disk)}"></herdr-metric>
-    </div>
-    <p class="hd-card__sub">last telemetry ${esc(seen)}</p>`;
+  root.innerHTML = renderHostDetail(h, telemetry, { range, now: Date.now() });
 }
 
 async function viewActivity() {
