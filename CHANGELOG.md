@@ -8,6 +8,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Lineage graph projection (T02, Herdr side)
 - Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
 - Migration `0005_event_id_per_actor.sql`: `event_id` is unique per principal (global primary key dropped).
+- Lineage review round 5: commons field visibility is per writer (a widened node no longer exposes another writer's
+  private fields); an empty ensure never makes the ensurer the commons owner; commons endpoints confer no tombstone
+  authority; tombstoned edge instances free their slot; contribution caps keep operator/owner/own entries; migration 0005
+  rollout order and rollback documented (`docs/operations/event-id-per-actor-rollout.md`).
 - Lineage review round 4: admission mode/sequence are server-only (reserved `_` payload keys rejected); commons nodes keep
   an owner/operator primary value with attributed `fields`/`contributions`, widest-scope visibility, per-writer attr budgets
   and per-writer `from`-commons edge instances; `node.state` on a missing commons node creates it.

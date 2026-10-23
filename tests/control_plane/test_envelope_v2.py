@@ -158,11 +158,12 @@ class V2Conn:
 
     def __init__(self):
         self.rows, self.fail = [], None
+        self.pre0005 = False          # True: event_id is still one global primary key
 
     async def fetch(self, sql, *a):
         if "WHERE event_id" in sql:
             return [{"source": r.get("source"), "source_sequence": r.get("source_sequence")}
-                    for r in self.rows if r["event_id"] == a[0] and _actor_dom(r) == a[1]]
+                    for r in self.rows if r["event_id"] == a[0] and (len(a) < 2 or _actor_dom(r) == a[1])]
         if "ORDER BY sequence" in sql:
             return [r for r in self.rows if (r["entity_type"], r["entity_id"]) == (a[0], a[1])]
         return []
@@ -177,7 +178,7 @@ class V2Conn:
         row = dict(zip(cols, a))
         # migration 0005: event_id unique per actor; 0004: (actor, source, seq) unique.
         # Bare ON CONFLICT DO NOTHING absorbs BOTH violations and returns no row.
-        if any(r["event_id"] == row["event_id"] and _actor_dom(r) == _actor_dom(row)
+        if any(r["event_id"] == row["event_id"] and (self.pre0005 or _actor_dom(r) == _actor_dom(row))
                for r in self.rows):
             return None
         if row.get("source") is not None and any(
@@ -506,3 +507,20 @@ def test_durable_event_id_is_per_principal_and_survives_ledger_loss():
     # the owner's own replay after eviction is recognised as a duplicate by (actor, id)
     again = s.ingest(body(0, event_id="shared-id"), PRINCIPAL)
     assert again["envelope"]["duplicate"] is True
+
+
+def test_cross_principal_event_id_before_migration_0005_says_what_happened():
+    other = {"kind": "agent", "id": "key:other", "authenticated_by": "api_key"}
+    conn = V2Conn()
+    conn.pre0005 = True
+    repo = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
+    s = IngestService(repo)
+    s.ingest(body(0, event_id="shared-id"), other)
+    with pytest.raises(EnvelopeConflict) as ei:
+        s.ingest(body(0, event_id="shared-id"), PRINCIPAL)
+    assert "event_id" in str(ei.value) and "0005" in str(ei.value) and "another principal" in str(ei.value)
+    # a genuine sequence clash keeps its own message
+    s.ingest(body(1, event_id="mine"), PRINCIPAL)
+    with pytest.raises(EnvelopeConflict) as ei:
+        s.ingest(body(1, event_id="other-id"), PRINCIPAL)
+    assert "sequence" in str(ei.value) and "0005" not in str(ei.value)

@@ -59,7 +59,13 @@ def _actor_domain(actor) -> str:
 
 
 class SequenceCollision(Exception):
-    """(source, source_sequence) is already held by a different event."""
+    """(source, source_sequence) is already held by a different event, or (``event_id_clash``,
+    only on a database that has not applied migration 0005) the event_id belongs to another
+    principal."""
+
+    def __init__(self, message: str = "", *, event_id_clash: bool = False):
+        super().__init__(message)
+        self.event_id_clash = event_id_clash
 
 
 def _is_unique_violation(exc: BaseException) -> bool:
@@ -173,6 +179,14 @@ class EventStore:
             # this event_id (a duplicate), or the (actor, source, source_sequence) index
             # (or, before migration 0005, another principal's event_id) refused it.
             if await self.identity(event.event_id, _actor_domain(event.actor)) is None:
+                clash = await self._conn.fetch(
+                    f"SELECT 1 FROM {self._table} WHERE event_id=$1 LIMIT 1", event.event_id)
+                if clash:
+                    # only possible before migration 0005: event_id is still one global namespace
+                    raise SequenceCollision(
+                        f"event_id {event.event_id!r} is already used by another principal "
+                        "(the database still has a global event_id key; apply migration "
+                        "0005_event_id_per_actor.sql)", event_id_clash=True)
                 raise SequenceCollision(
                     f"source {event.source!r} sequence "
                     f"{event.source_sequence} is already used")

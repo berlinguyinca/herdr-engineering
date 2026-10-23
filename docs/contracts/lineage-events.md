@@ -56,17 +56,28 @@ skipped and counted (`events_rejected`), never fatal.
   ingest/agent key may create one, and write its fields (`label`/`state`/`attrs`): fields are per-`(source, actor)` registers
   kept separately and attributed. A non-writer's write is admitted as `foreign`: it never touches the node's owner or
   first/last event ids. Only an operator moderates (operators may write anything, including `co_writers`).
+  - **Ownership**: a commons node's owner is the writer of the first FIELD-bearing admitted write (label, state, attrs or
+    `node.state`). An empty "ensure" never creates ownership (it only creates the shell), so pre-ensuring an id gains nothing.
   - **Primary value** of a commons field: an operator's value if any operator wrote it, else the node owner's, else the
-    earliest writer's. Everyone else's values are `contributions` (<= 5 per field, latest admission first), never the primary,
-    so overwriting a PR's label/state/url cannot replace what the creator said. A node view carries `fields.<name>`
-    provenance `{value, writer, source, event_id, admission, admitted_at}` and, for commons, `contributions.<name>`.
-    `source` is the creator's source. Attr keys follow the same rule; attr budgets for commons are PER WRITER under a hard
-    per-object cap (1024 keys / 256 KiB) so a writer cannot fill a node and lock others out.
-  - **Scope of a commons node is the WIDEST scope any non-operator wrote** (an operator who has written decides, using their
-    narrowest), so pre-creating a commons node as `private` cannot hide it. Owned kinds keep the narrowest scope.
+    earliest writer's - chosen among the values the READER can see. Everyone else's values are `contributions` (<= 5 per
+    field, one per distinct writer; operator first, then the owner, then the caller's own, then newest admission), never the
+    primary, so overwriting a PR's label/state/url cannot replace what the creator said and spam principals cannot push the
+    owner's entry out. A node view carries `fields.<name>` provenance `{value, writer, source, event_id, admission,
+    admitted_at}` and, for commons, `contributions.<name>`. Attr budgets for commons are PER WRITER under a hard per-object
+    cap (1024 keys / 256 KiB) so a writer cannot fill a node and lock others out.
+  - **Visibility is per writer and per field.** Every value carries the scope its writer gave it and is visible only
+    through THAT writer (`private` = that writer alone, `mission`/`room` = operators, `org` = any authenticated caller).
+    A commons node EXISTS for a reader if any of its writers is visible to them (so pre-creating it as `private` cannot
+    hide it from its real emitters); the shell (`id`, `node_type`, `visibility_scope` = the widest scope among the writers
+    visible to the reader) is shown, but ONLY the fields of visible writers: a widened node reveals nothing of another
+    writer's private label/state/attrs/contributions, and `first_event_id`/`last_event_id`/`source` are derived from the visible
+    values alone. Neighborhood, binding, stale and truncation figures are computed over visible items only. Owned kinds are
+    unchanged: the node is as private as the narrowest scope any admitted event carried.
   - Edges whose `from` node is commons and whose type is unbound (`produced`, `issue_link`, ...) are kept PER WRITER (at most 8
-    writers per triple); views carry `writer`. `edge.remove` removes the caller's own instance; `attrs.writer` names another
-    writer's instance, which the owner of either endpoint or an operator may tombstone.
+    LIVE writers per triple, 64 records including tombstoned ones; operators are exempt from the live cap); views carry
+    `writer`. `edge.remove` removes the caller's own instance. `attrs.writer` names another writer's instance, which only an
+    operator or the owner of an OWNED-kind endpoint may tombstone - a commons endpoint (whose "owner" anyone can become)
+    confers no such authority.
   - `node.state` on a missing commons node creates it (like an upsert), so hidden and missing commons nodes answer alike.
   - Payload keys starting with `_` are reserved and rejected (400); the admission number/mode are server-set top-level fields
     of the stored row and are never read from the client payload.

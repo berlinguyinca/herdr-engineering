@@ -110,7 +110,9 @@ class IngestService:
                     entity_type, entity_id, event_type, row_payload,
                     envelope=env, feed=entity_type not in ENVELOPE_ONLY_TYPES,
                     publish=entity_type not in ENVELOPE_ONLY_TYPES)
-            except SequenceCollision:
+            except SequenceCollision as exc:
+                if exc.event_id_clash:
+                    raise EnvelopeConflict(str(exc)) from None
                 raise EnvelopeConflict("source_sequence is already used by another event") from None
             except EventAlreadyStored:
                 # Durable insert landed earlier but the ack was lost (or the

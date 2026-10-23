@@ -936,7 +936,7 @@ def test_realistic_pi_batch_with_two_emitter_keys_is_fully_accepted():
     fb.send("node.upsert", {"node_type": "agent", "node_id": "agent:main"})
     snap = repo.graph.snapshot()
     assert snap["nodes"]["agent:main"]["owner"] == A["id"] and snap["nodes"]["agent:main"]["label"] == "Main"
-    assert snap["nodes"][pr]["owner"] == A["id"]                           # commons: first writer, shared use
+    assert snap["nodes"][pr]["owner"] is None                              # commons: an ensure never claims it
     view = repo.graph.get_node(VIEWER, pr)
     kinds = sorted((e["edge_type"], e["from_id"]) for e in view["edges"])
     assert ("issue_link", pr) in kinds and ("produced", commit) in kinds and ("reviewed", "review:r1") in kinds
@@ -953,7 +953,8 @@ def test_commons_nodes_cannot_be_hidden_or_squatted_but_owned_ones_are_protected
     fb.send("node.upsert", {"node_type": "commit", "node_id": "commit:abc", "label": "real"}, scope="private",
             principal=B)                                      # a foreign field write...
     node = repo.graph.get_node(VIEWER, "commit:abc")["node"]
-    assert node["label"] == "real" and node["visibility_scope"] == "org"   # ...cannot narrow or hide it
+    assert node["label"] is None and node["visibility_scope"] == "org"    # ...cannot narrow or hide the node
+    assert repo.graph.get_node(B, "commit:abc")["node"]["label"] == "real"   # B's private field stays B's
     with pytest.raises(PermissionError):                      # but an OWNED kind refuses a changing write
         fa.node("agent:own", principal=A)
         fb.send("node.upsert", {"node_type": "agent", "node_id": "agent:own", "label": "pwn"}, principal=B)
@@ -1273,17 +1274,32 @@ def test_commons_from_edges_are_per_writer_and_removable_by_endpoint_owner():
     left = repo.graph.get_node(V, "pr:p1")["edges"]
     assert [e["writer"] for e in left] == [A["id"]]
     fv.edge("produced", "commit:abc", "pr:p1", {"ci": "green"}, nodes=False)
-    # naming the writer lets an endpoint owner tombstone the squatter's instance
-    fv.send("edge.remove", {"edge_type": "produced", "from_id": "commit:abc", "to_id": "pr:p1",
-                            "attrs": {"writer": A["id"]}, "reason": "squat"})
-    assert [e["writer"] for e in repo.graph.get_node(V, "pr:p1")["edges"]] == [V["id"]]
-    assert repo.graph.snapshot() == rebuilt(repo).graph.snapshot()
-    # a stranger cannot
+    # a COMMONS endpoint confers no tombstone authority: the victim cannot remove the squatter's instance
+    with pytest.raises(PermissionError):
+        fv.send("edge.remove", {"edge_type": "produced", "from_id": "commit:abc", "to_id": "pr:p1",
+                                "attrs": {"writer": A["id"]}, "reason": "squat"})
     stranger = feed_for(svc, "x", P("stranger"))
     with pytest.raises(PermissionError):
         stranger.send("edge.remove", {"edge_type": "produced", "from_id": "commit:abc",
-                                      "to_id": "pr:p1", "attrs": {"writer": V["id"]},
-                                      "reason": "x"})
+                                      "to_id": "pr:p1", "attrs": {"writer": V["id"]}, "reason": "x"})
+    # an operator moderates
+    feed_for(svc, "ops", OPERATOR).send("edge.remove", {
+        "edge_type": "produced", "from_id": "commit:abc", "to_id": "pr:p1",
+        "attrs": {"writer": A["id"]}, "reason": "squat"})
+    assert [e["writer"] for e in repo.graph.get_node(V, "pr:p1")["edges"]] == [V["id"]]
+    assert repo.graph.snapshot() == rebuilt(repo).graph.snapshot()
+
+
+def test_owner_of_an_owned_endpoint_may_tombstone_a_squatters_instance():
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "gh", V), feed_for(svc, "evil", A)
+    fv.node("task:mine", label="t")
+    fv.node("commit:abc", label="c")
+    fa.edge("produced", "commit:abc", "task:mine", nodes=False)
+    fv.send("edge.remove", {"edge_type": "produced", "from_id": "commit:abc", "to_id": "task:mine",
+                            "attrs": {"writer": A["id"]}, "reason": "squat"})
+    assert repo.graph.get_node(V, "task:mine")["edges"] == []
+    assert repo.graph.snapshot() == rebuilt(repo).graph.snapshot()
 
 
 def test_edge_instances_per_triple_are_bounded():
@@ -1393,3 +1409,127 @@ def test_shuffled_replay_with_commons_contributions_is_deterministic():
         assert g.snapshot() == ref
     n = repo.graph.get_node(OPERATOR, "pr:p0")["node"]
     assert n["label"] == "v0" and n["contributions"]["label"]
+
+
+# ------------------------------------------------------------------ round 5
+def _view_json(g, principal, nid):
+    return json.dumps(g.get_node(principal, nid), sort_keys=True, default=str)
+
+
+@pytest.mark.parametrize("attacker_write", ["attrs", "state"])
+def test_widening_a_private_commons_node_does_not_expose_its_private_fields(attacker_write):
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "v", V), feed_for(svc, "a", A)
+    secret = "SECRET-" + "x" * 5
+    fv.node("pr:secret-1", scope="private", label=secret, attrs={"note": secret}, state="open")
+    with pytest.raises(KeyError):
+        repo.graph.get_node(A, "pr:secret-1")
+    if attacker_write == "attrs":
+        fa.node("pr:secret-1", scope="org", attrs={"x": 1})
+    else:
+        fa.send("node.state", {"node_id": "pr:secret-1", "state": "x"}, scope="org")
+    for g in (repo.graph, rebuilt(repo).graph):
+        for viewer in (A, OTHER, VIEWER):
+            text = _view_json(g, viewer, "pr:secret-1")
+            assert secret not in text and "v-0" not in text and "key:victim" not in text
+            n = g.get_node(viewer, "pr:secret-1")["node"]
+            assert n["label"] is None and "note" not in n["attrs"] and n["visibility_scope"] == "org"
+            nb = json.dumps(g.neighborhood(viewer, "pr:secret-1"), default=str)
+            assert secret not in nb and "key:victim" not in nb
+        mine = g.get_node(V, "pr:secret-1")["node"]
+        assert mine["label"] == secret and mine["attrs"]["note"] == secret   # the owner still sees all
+    # the attacker's own field is what the others see
+    seen = repo.graph.get_node(OTHER, "pr:secret-1")["node"]
+    assert (seen["attrs"].get("x") == 1) if attacker_write == "attrs" else (seen["state"] == "x")
+
+
+def test_commons_field_visibility_is_per_writer_in_both_directions():
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "v", V), feed_for(svc, "a", A)
+    fv.node("pr:p", scope="org", label="public-label", attrs={"k": "pub"})
+    fa.node("pr:p", scope="private", label="hidden-attacker", attrs={"z": "secret-a"})
+    for g in (repo.graph, rebuilt(repo).graph):
+        n = g.get_node(OTHER, "pr:p")["node"]
+        assert n["label"] == "public-label" and n["attrs"] == {"k": "pub"}
+        assert "hidden-attacker" not in _view_json(g, OTHER, "pr:p")
+        assert "secret-a" not in _view_json(g, V, "pr:p")          # nor does the victim see the attacker's
+        assert g.get_node(A, "pr:p")["node"]["attrs"]["z"] == "secret-a"
+    # an operator-only scope is gated by the same rule
+    fv.node("pr:q", scope="org", label="q")
+    fa.node("pr:q", scope="mission", label="ops-only")
+    assert "ops-only" not in _view_json(repo.graph, OTHER, "pr:q")
+    assert "ops-only" in _view_json(repo.graph, OPERATOR, "pr:q")
+
+
+def test_hidden_registers_do_not_leak_through_bindings_ids_or_counts():
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "v", V), feed_for(svc, "a", A)
+    fv.node("pr:p", scope="private", label="L")
+    fv.node("task:t", scope="private")
+    fv.edge("produced", "pr:p", "task:t", scope="private", nodes=False)
+    fa.node("pr:p", scope="org", attrs={"x": 1})
+    n = repo.graph.get_node(OTHER, "pr:p")
+    assert n["edges"] == [] and n["edges_omitted"] == 0 and n["edges_truncated"] is False
+    node = n["node"]
+    assert node["first_event_id"] == node["last_event_id"] == "a-0" or node["first_event_id"] == "a-1"
+    assert node["source"] == "a"
+    assert "task:t" not in json.dumps(repo.graph.neighborhood(OTHER, "pr:p"), default=str)
+
+
+def test_contributions_keep_owner_and_operator_entries_against_spam():
+    repo, svc, _ = make()
+    fv = feed_for(svc, "v", V)
+    fo = feed_for(svc, "ops", OPERATOR)
+    fv.node("pr:p", label="owner-label")
+    fo.node("pr:p", label="op-label")                 # operator is primary; owner's becomes a contribution
+    for i in range(12):
+        feed_for(svc, f"s{i}", P(f"spam{i}")).node("pr:p", label=f"spam{i}")
+    for g in (repo.graph, rebuilt(repo).graph):
+        n = g.get_node(OTHER, "pr:p")["node"]
+        assert n["label"] == "op-label"
+        writers = [c["writer"] for c in n["contributions"]["label"]]
+        assert writers[0] == V["id"] and len(writers) <= 5
+    mine = feed_for(svc, "late", P("late"))
+    mine.node("pr:p", label="late-label")
+    seen = [c["writer"] for c in repo.graph.get_node(P("late"), "pr:p")["node"]["contributions"]["label"]]
+    assert V["id"] in seen                              # owner kept even when spammed out otherwise
+
+
+def test_an_empty_ensure_does_not_make_the_ensurer_the_commons_owner():
+    repo, svc, _ = make()
+    fv, fa = feed_for(svc, "v", V), feed_for(svc, "a", A)
+    fa.send("node.upsert", {"node_type": "issue", "node_id": "issue:7"})           # attacker ensures first
+    fv.node("pr:9", label="pr")
+    fv.send("node.upsert", {"node_type": "issue", "node_id": "issue:7", "label": "the issue",
+                            "attrs": {"url": "https://good.example"}})
+    fa.node("issue:7", attrs={"url": "https://evil.example"})
+    for g in (repo.graph, rebuilt(repo).graph):
+        snap = g.snapshot()["nodes"]["issue:7"]
+        assert snap["owner"] == V["id"]
+        n = g.get_node(OTHER, "issue:7")["node"]
+        assert n["attrs"]["url"] == "https://good.example" and n["label"] == "the issue"
+    fv.edge("issue_link", "pr:9", "issue:7", {"k": 1}, nodes=False)
+    for who, key in ((A, "key:victim"),):
+        with pytest.raises(PermissionError):
+            fa.send("edge.remove", {"edge_type": "issue_link", "from_id": "pr:9", "to_id": "issue:7",
+                                    "reason": "x", "attrs": {"writer": key}})
+    assert [e["writer"] for e in repo.graph.get_node(V, "pr:9")["edges"]] == [V["id"]]
+
+
+def test_tombstoned_instances_do_not_count_toward_the_instance_cap():
+    from herdr_engineering.control_plane.graph import MAX_INSTANCES_PER_TRIPLE as CAP
+    repo, svc, _ = make()
+    fv = feed_for(svc, "v", V)
+    fv.node("commit:c")
+    fv.node("pr:p")
+    feeds = []
+    for i in range(CAP):
+        f = feed_for(svc, f"s{i}", P(f"w{i}"))
+        f.edge("produced", "commit:c", "pr:p", nodes=False)
+        feeds.append(f)
+    extra = feed_for(svc, "extra", P("extra"))
+    with pytest.raises(ValueError):
+        extra.edge("produced", "commit:c", "pr:p", nodes=False)
+    feeds[0].send("edge.remove", {"edge_type": "produced", "from_id": "commit:c", "to_id": "pr:p", "reason": "done"})
+    extra.edge("produced", "commit:c", "pr:p", nodes=False)       # a freed slot is usable
+    assert repo.graph.snapshot() == rebuilt(repo).graph.snapshot()
