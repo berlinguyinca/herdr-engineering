@@ -119,3 +119,14 @@ test('CI provider selector compares canonical URLs exactly and preserves deploym
   assert.deepEqual(selectIntegrations(entries,{...options,provider:'https://CI.example/secondary'}).map(entry=>entry.record.provider_url),['https://ci.example/secondary/']);
   assert.equal(selectIntegrations(entries,{...options,provider:'https://ci.example/missing'}).length,0);
 });
+
+test('active run reports never cross provider collisions and unidentified reports remain ambiguous',async()=>{
+ const {ciSelectedRunReports}=await import('../integrations-view.js');
+ const active={provider_url:'https://ci.example/a',provider_repo_id:17,run_number:12};
+ const other={...active,provider_url:'https://ci.example/b'};
+ const unscoped={provider_repo_id:17,run_number:12};
+ assert.deepEqual(ciSelectedRunReports([active,other,unscoped],[active,other],active),[active]);
+ assert.deepEqual(ciSelectedRunReports([unscoped],[active],active),[unscoped]);
+ assert.deepEqual(ciSelectedRunReports([unscoped],[active],unscoped),[]);
+ assert.deepEqual(ciSelectedRunReports([unscoped],[active,unscoped],active),[]);
+});

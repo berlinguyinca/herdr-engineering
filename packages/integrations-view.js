@@ -98,6 +98,15 @@ export function pipelineDetails(detail, summary={}) {
     revision:detail.revision ?? detail.commit ?? summary.revision,
     state:detail.state ?? detail.status ?? summary.state};
 }
+
+export function ciSelectedRunReports(reports,observations,active) {
+  const identity=JSON.parse(ciRunKey(active)),provider=identity[0];
+  if(!provider)return [];
+  const matches=record=>{const key=JSON.parse(ciRunKey(record));return key[1]===identity[1]&&key[2]===identity[2];};
+  const providers=new Set(records(observations).filter(matches).map(record=>JSON.parse(ciRunKey(record))[0]));
+  return records(reports).filter(report=>matches(report)&&(JSON.parse(ciRunKey(report))[0]===provider || !JSON.parse(ciRunKey(report))[0]&&providers.size===1&&providers.has(provider)));
+}
+
 export function activePiSessions(sessions) {
   return records(sessions).filter(s=>text(s.session_id) && /(^|[\s/_-])pi($|[\s/_-])/i.test(text(s.agent_role))
     && ['active','running','working','idle','waiting','ready','busy'].includes(text(s.status).toLowerCase())
@@ -158,7 +167,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     healthView=mountCiHealth(el('[data-ci-health]'),client,{repository,mission,session,search:search || undefined,
       onSelectRun:record=>openCiRun(record),
       onSelectStep:(record,stepId)=>{
-        if(!selected || selected.number!==record.run_number || String(selected.providerId)!==String(record.provider_repo_id))openCiRun(record);
+        if(selected?.id!==ciRunKey(record))openCiRun(record);
         pending.get('log')?.abort();pending.delete('log');step=String(stepId);log=null;logError='';draw();refreshDetail();
       }});
     const slot=el('[data-health-pipeline-slot]');
@@ -297,7 +306,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       el('[data-ci-insights]').hidden=false;el('[data-ci-charts]').hidden=false;
     }
     if(selected) {
-      const runReports=records(reportData?.reports).filter(r=>String(r.provider_repo_id??r.repository)===String(pipeline?.provider_repo_id??selected.providerId) && r.run_number===Number(selected.number));
+      const runReports=ciSelectedRunReports(reportData?.reports,ciObservations().pipelines,pipeline);
       const candidates=ciObservations().pipelines.filter(record=>sameCiRepository(pipeline,record)&&ciRunKey(record)!==selected.id).slice(0,100);
       const compared=candidates.find(record=>ciRunKey(record)===comparisonKey);
       const comparison=compared?ciComparisonModel(pipeline,{...observedDetails.get(comparisonKey),...compared,tasks:compared.tasks??observedDetails.get(comparisonKey)?.tasks}):null;
@@ -317,13 +326,20 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   }
   function refreshDetail() {
     if(!selected)return;
-    const key=selected.id,selectedStep=step;
-    request('pipeline',signal=>client.getCiPipeline(selected.providerId,selected.number,{signal}),response=>{
+    if(!selected.providerUrl){detailError='Exact CI provider identity is not reported. Live details, logs and actions are unavailable for this retained run.';draw();return;}
+    const target={...selected},key=target.id,selectedStep=step;
+    request('pipeline',signal=>client.getCiPipeline(target.providerId,target.number,{signal,providerUrl:target.providerUrl}),response=>{
       if(selected?.id!==key)return;
       if(!response?.pipeline)throw new Error('Pipeline response is unavailable');
-      pipeline=pipelineDetails(response.pipeline,{...pipeline,repository:selected.repository,run_number:selected.number});detailError='';observedDetails.set(key,pipeline);if(observedDetails.size>30)observedDetails.delete(observedDetails.keys().next().value);
+      if(response.provider_url && canonicalProvider(response.provider_url)!==target.providerUrl)throw new Error('Pipeline provider identity mismatch');
+      const reportedProvider=JSON.parse(ciRunKey(response.pipeline))[0];
+      if(reportedProvider && reportedProvider!==target.providerUrl)throw new Error('Pipeline provider identity mismatch');
+      const next=pipelineDetails(response.pipeline,{...pipeline,repository:target.repository,run_number:target.number});
+      if(ciRunKey(next)!==key)throw new Error('Pipeline identity mismatch');
+      pipeline=next;detailError='';observedDetails.set(key,pipeline);if(observedDetails.size>30)observedDetails.delete(observedDetails.keys().next().value);
     },()=>{if(selected?.id===key)detailError='Pipeline details could not refresh.';});
-    if(selectedStep)request('log',signal=>client.getCiLog(selected.providerId,selected.number,selectedStep,{signal}),response=>{
+    if(selectedStep)request('log',signal=>client.getCiLog(target.providerId,target.number,selectedStep,{signal,providerUrl:target.providerUrl}),response=>{
+      if(response?.provider_url && canonicalProvider(response.provider_url)!==target.providerUrl)throw new Error('Log provider identity mismatch');
       if(selected?.id===key && step===selectedStep){log=response;logError='';}
     },()=>{if(selected?.id===key && step===selectedStep)logError='Step output could not refresh.';});
   }
@@ -354,8 +370,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(!entry)return;
     if(selected?.id===entry.id){el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});return;}
     listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();
-    selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number};
-    pipeline=record;debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';
+    selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number,providerUrl:JSON.parse(entry.id)[0]};
+    pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';
     draw();refreshDetail();el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});
   }
   container.addEventListener('click',async event=>{
@@ -374,18 +390,18 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     }
     if(button.hasAttribute('data-close-inspector')){const lastRunId=selected?.id;cancelDetail();selected=null;pipeline=null;healthView?.selectedRun(null);healthView?.setLayout('split');draw();if(isCi && workspace==='health')[...container.querySelectorAll('[data-health-run]')].find(button=>button.dataset.healthRun===healthOriginKey)?.focus({preventScroll:true});window.scrollTo({top:listScroll});if(isCi && workspace==='runs')[...container.querySelectorAll('[data-run]')].find(button=>button.dataset.run===lastRunId)?.focus({preventScroll:true});}
     if(button.hasAttribute('data-step')){pending.get('log')?.abort();pending.delete('log');step=button.dataset.step;log=null;logError='';draw();refreshDetail();}
-    if(button.hasAttribute('data-debug-send') && selected && debugSessionId && !pending.has('debug')) {
+    if(button.hasAttribute('data-debug-send') && selected?.providerUrl && debugSessionId && !pending.has('debug')) {
       const target={...selected},sessionId=debugSessionId;
       if(!debugOperationId)debugOperationId=newOperationId();
       const operationId=debugOperationId;debugMessage='Sending debugging context to Pi…';draw();
-      request('debug',signal=>client.debugCi(target.providerId,target.number,sessionId,operationId,{signal}),response=>{
+      request('debug',signal=>client.debugCi(target.providerId,target.number,sessionId,operationId,{signal,providerUrl:target.providerUrl}),response=>{
         if(selected?.id!==target.id || debugSessionId!==sessionId)return;
         debugMessage=response.status==='delivered'?'Debugging context delivered to the selected Pi agent.':response.status==='queued'?'Debugging context queued for delivery.':response.error || 'Pi did not receive the debugging context.';
       },err=>{if(selected?.id===target.id && debugSessionId===sessionId)debugMessage=err.status===403?'Sending to Pi requires operator access.':'Delivery unconfirmed; retry checks the same operation.';});
     }
-    if(button.dataset.ciAction && selected && !pending.has('action')) {
+    if(button.dataset.ciAction && selected?.providerUrl && !pending.has('action')) {
       const target={...selected};actionMessage='Sending action to Woodpecker…';draw();
-      request('action',signal=>client.ciAction(target.providerId,target.number,button.dataset.ciAction,{signal}),()=>{if(selected?.id===target.id)actionMessage='Action accepted by Woodpecker.';refresh();},err=>{if(selected?.id===target.id)actionMessage=err.status===403?'This action requires operator access.':'Woodpecker did not accept the action.';});
+      request('action',signal=>client.ciAction(target.providerId,target.number,button.dataset.ciAction,{signal,providerUrl:target.providerUrl}),()=>{if(selected?.id===target.id)actionMessage='Action accepted by Woodpecker.';refresh();},err=>{if(selected?.id===target.id)actionMessage=err.status===403?'This action requires operator access.':'Woodpecker did not accept the action.';});
     }
   },{signal:listenerController.signal});
   container.addEventListener('toggle',event=>{
