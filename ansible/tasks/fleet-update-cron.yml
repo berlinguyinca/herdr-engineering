@@ -58,7 +58,11 @@
         name: "herdr fleet update"
         minute: "30"
         hour: "3"
+        # The log is rotated (one .1 backup) once it passes 5 MB. find/mv, not
+        # stat/date: cron turns every % in the line into a newline.
         job: >-
+          find {{ fleet_update_log_file | quote }} -size +5M
+          -exec mv -f {} {{ (fleet_update_log_file ~ '.1') | quote }} \; 2>/dev/null;
           cd {{ fleet_update_ansible_dir | quote }} &&
           PATH={{ fleet_update_cron_path | quote }}
           flock -n {{ fleet_update_lock_file | quote }}

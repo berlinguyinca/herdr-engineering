@@ -92,9 +92,12 @@
     - tailscale_bin.rc == 0
 
 # tailscaled needs a moment after start before BackendState settles; joining
-# on a transient state would be wrong, so wait for a settled one.
+# on a transient state would be wrong, so wait for a settled one. On Linux the
+# probe is bounded by `timeout 10` (a wedged tailscaled would hang the play);
+# a timeout (rc 124) prints no BackendState, reads as 'Unknown', is retried and
+# then fails clearly below as an unsettled state. Stock macOS has no timeout(1).
 - name: "Wait for a settled Tailscale state (read-only)"
-  ansible.builtin.command: tailscale status --json
+  ansible.builtin.command: "{{ 'timeout 10 ' if ansible_facts['system'] == 'Linux' else '' }}tailscale status --json"
   register: tailscale_probe
   changed_when: false
   failed_when: false

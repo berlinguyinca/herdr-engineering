@@ -180,3 +180,15 @@ def test_diagnostic_redacts_key(tmp_path):
     assert "customkeyformat12345" not in out
     assert "[REDACTED]" in out and "rc=1" in out
     assert "l1" not in out.split("tailscale up failed")[1]
+
+
+def test_status_probe_is_bounded_on_linux_and_a_timeout_is_unsettled():
+    probe = _by_name("Wait for a settled Tailscale state")[0]
+    cmd = probe["ansible.builtin.command"]
+    # Linux wraps the probe in `timeout 10` (stock macOS has no timeout(1)).
+    assert "timeout 10 " in cmd and "ansible_facts['system'] == 'Linux'" in cmd
+    assert cmd.rstrip().endswith("tailscale status --json")
+    # rc 124 (timed out) yields no BackendState, i.e. 'Unknown': retried, then
+    # the unsettled-state task fails clearly. It never crashes the probe task.
+    assert probe["failed_when"] is False
+    assert "Unknown" in probe["until"]

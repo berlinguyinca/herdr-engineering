@@ -620,3 +620,12 @@ def test_host_without_herdr_eng_clears_pending_and_stays_clean(tmp_path):
     assert first["result"] == "updated" and first["last_updated"] != "2026-10-01T00:00:00+00:00"
     second = run(changed=False)  # the following night stays clean
     assert second["restart_pending"] is False and second["result"] == "updated"
+
+
+def test_cron_log_is_rotated_at_5mb_keeping_one_backup():
+    job = _cron_task()["ansible.builtin.cron"]["job"]
+    rotate, _, run = job.partition("; cd ")
+    assert "find {{ fleet_update_log_file | quote }} -size +5M" in rotate
+    assert "-exec mv -f {} {{ (fleet_update_log_file ~ '.1') | quote }}" in rotate
+    assert "ansible-playbook" in run  # rotation runs before the play, every night
+    assert "%" not in job  # cron turns % into a newline
