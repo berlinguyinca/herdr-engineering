@@ -15,6 +15,7 @@ from herdr_engineering.control_plane.repo import ControlPlaneRepo
 WRITER = {"kind": "agent", "id": "key:writer", "authenticated_by": "api_key"}
 OPERATOR = {"kind": "operator", "id": "key:op", "authenticated_by": "api_key"}
 VIEWER = {"kind": "viewer", "id": "key:view", "authenticated_by": "api_key"}
+OTHER = {"kind": "agent", "id": "key:other", "authenticated_by": "api_key"}
 ANON = {"kind": "unknown", "id": None, "authenticated_by": "none"}
 
 
@@ -219,7 +220,7 @@ def test_unknown_types_rejected_and_not_stored():
         with pytest.raises(ValueError):
             f.send(et, pl, entity_id="x")
     assert not [k for k in repo._events if k[0] == "lineage"]
-    assert repo.graph.snapshot() == {"nodes": {}, "edges": {}}
+    assert repo.graph.snapshot() == {"nodes": {}, "edges": {}, "wildcard_removes": {}}
     # the sequence was not consumed by a rejected event
     assert f.send("node.upsert", {"node_type": "agent", "node_id": "agent:a"}, seq=0)["envelope"]["duplicate"] is False
 
@@ -334,7 +335,9 @@ def test_can_see_fails_closed():
     assert not can_see(VIEWER, "galaxy", frozenset())
     assert not can_see(VIEWER, "room", frozenset())
     assert not can_see(VIEWER, "private", None)
-    assert not can_see(VIEWER, "private", frozenset({"key:view", "key:other"}))
+    assert not can_see(VIEWER, "private", frozenset({"key:other"}))
+    assert not can_see(VIEWER, "private", frozenset())
+    assert can_see(VIEWER, "private", frozenset({"key:view", "key:other"}))   # a writer
     assert can_see(VIEWER, "private", frozenset({"key:view"}))
 
 
@@ -454,3 +457,288 @@ def test_rebuild_from_durable_rows_equals_live_state():
     assert fresh.graph.snapshot() == live
     assert fresh.graph.events_rejected == 0
     assert not [t for t in fresh._event_order if t[0] == "lineage"]
+
+
+# ------------------------------------------------- review round 1 regressions
+class Clock:
+    def __init__(self):
+        self.t = 1_800_000_000.0
+
+    def __call__(self):
+        self.t += 1.0
+        return self.t
+
+
+def make_clocked():
+    clock = Clock()
+    repo = ControlPlaneRepo(now=clock)
+    return repo, IngestService(repo), clock
+
+
+def rows(repo):
+    return [e for (k, _), s in repo._events.items() if k == "lineage" for e in s]
+
+
+def test_non_owner_cannot_modify_nodes_edges_or_narrow_scope():
+    repo, svc, f = make()
+    f.node("agent:a1", label="mine")
+    f.edge("spawn", "agent:a1", "agent:a2")
+    before = repo.graph.snapshot()
+    stored = len(rows(repo))
+    hostile = Feed(svc, source="evil")
+    hostile.n = 2**62
+    attempts = [
+        lambda: hostile.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1", "label": "pwn"},
+                             principal=OTHER),
+        lambda: hostile.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1"}, scope="private",
+                             principal=OTHER),
+        lambda: hostile.send("node.state", {"node_id": "agent:a1", "state": "failed"}, principal=OTHER),
+        lambda: hostile.send("edge.add", {"edge_type": "spawn", "from_id": "agent:a1", "to_id": "agent:a2",
+                                          "attrs": {"x": 1}}, principal=OTHER),
+        lambda: hostile.send("edge.remove", {"edge_type": "spawn", "from_id": "agent:a1",
+                                             "to_id": "agent:a2", "reason": "x"}, principal=OTHER),
+        lambda: hostile.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1",
+                                             "attrs": {"co_writers": ["key:other"]}}, principal=OTHER),
+    ]
+    for go in attempts:
+        with pytest.raises(PermissionError):
+            go()
+    assert repo.graph.snapshot() == before
+    assert len(rows(repo)) == stored                       # nothing persisted
+    assert repo.ledger.source_state("evil")["last_sequence"] is None   # sequence not consumed
+    # the owner still sees its node, and the owner can still update it
+    assert repo.graph.get_node(WRITER, "agent:a1")["node"]["label"] == "mine"
+    f.node("agent:a1", label="mine2")
+
+
+def test_operator_overrides_and_co_writers_are_operator_only():
+    repo, svc, f = make()
+    f.node("agent:a1", label="mine", scope="private")
+    ops = Feed(svc, source="ops")
+    ops.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1", "label": "by-op"}, principal=OPERATOR)
+    other = Feed(svc, source="other")
+    with pytest.raises(PermissionError):
+        other.send("node.state", {"node_id": "agent:a1", "state": "running"}, principal=OTHER)
+    ops.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1",
+                             "attrs": {"co_writers": ["key:other"]}}, principal=OPERATOR)
+    other.send("node.state", {"node_id": "agent:a1", "state": "running"}, principal=OTHER)   # now allowed
+    assert repo.graph.snapshot()["nodes"]["agent:a1"]["owner"] == "key:writer"
+    # a private node stays visible to its writers, not to others
+    assert repo.graph.get_node(OTHER, "agent:a1")["node"]["state"] == "running"
+    with pytest.raises(KeyError):
+        repo.graph.get_node(VIEWER, "agent:a1")
+
+
+def test_wildcard_remove_needs_ownership_of_every_binding():
+    repo, svc, f = make()
+    f.edge("reviewed", "review:r", "pr:1", {"commit": "c1"})
+    other = Feed(svc, source="other")
+    with pytest.raises(PermissionError):
+        other.send("edge.remove", {"edge_type": "reviewed", "from_id": "review:r", "to_id": "pr:1",
+                                   "reason": "x"}, principal=OTHER)
+
+
+def test_cross_source_huge_sequence_cannot_win_forever():
+    repo, svc, clock = make_clocked()
+    a = Feed(svc, source="pi")
+    a.node("agent:a1", label="v1")
+    ops = Feed(svc, source="ops")
+    ops.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1", "label": "huge"},
+             principal=OPERATOR, seq=2**62)
+    assert repo.graph.snapshot()["nodes"]["agent:a1"]["label"] == "huge"
+    a.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1", "label": "v2"}, seq=5)
+    assert repo.graph.snapshot()["nodes"]["agent:a1"]["label"] == "v2"       # later receipt wins
+    # within ONE source the emitter's sequence still decides, even if it arrives late
+    a.send("node.upsert", {"node_type": "agent", "node_id": "agent:a1", "label": "old"}, seq=3)
+    assert repo.graph.snapshot()["nodes"]["agent:a1"]["label"] == "v2"
+
+
+def test_stale_flag_does_not_leak_a_hidden_edge():
+    repo, svc, f = make()
+    f.edge("reviewed", "review:r1", "pr:1", {"commit": "c1"})
+    f.edge("reviewed", "review:r1", "pr:1", {"commit": "c2"}, scope="private")
+    pub = repo.graph.get_edge(VIEWER, "reviewed", "review:r1", "pr:1")["edges"]
+    assert [(e["binding"], e["stale"], e["bindings"]) for e in pub] == [({"commit": "c1"}, False, ["c1"])]
+    assert "c2" not in json.dumps(repo.graph.neighborhood(VIEWER, "pr:1"))
+    mine = {e["binding"]["commit"]: e for e in repo.graph.get_edge(WRITER, "reviewed", "review:r1", "pr:1")["edges"]}
+    assert mine["c1"]["stale"] is True and mine["c2"]["stale"] is False
+    assert mine["c1"]["bindings"] == ["c1", "c2"]
+
+
+def test_wildcard_remove_is_commutative_and_does_not_leak_reason():
+    repo, svc, clock = make_clocked()
+    f = Feed(svc)
+    f.node("review:a")
+    f.node("pr:1")
+    E = lambda c: {"edge_type": "reviewed", "from_id": "review:a", "to_id": "pr:1", "attrs": {"commit": c}}
+    f.send("edge.add", E("c1"), entity_id="A")
+    ops = Feed(svc, source="ops")
+    ops.send("edge.remove", {"edge_type": "reviewed", "from_id": "review:a", "to_id": "pr:1",
+                             "reason": "internal-note"}, scope="private", entity_id="B", principal=OPERATOR)
+    f.send("edge.add", E("c2"), entity_id="A")
+    live = repo.graph.snapshot()
+    fresh = ControlPlaneRepo()
+    fresh.import_state(repo.export_state())
+    assert fresh.graph.snapshot() == live                    # the reviewer's reproduction
+    # old binding was added before the wildcard => removed; the newer one survives
+    view = repo.graph.neighborhood(VIEWER, "pr:1", include_removed=True)
+    by = {e["binding"]["commit"]: e for e in view["edges"]}
+    assert by["c1"]["removed"] is True and by["c2"]["removed"] is False
+    assert "removal" not in by["c1"] and "internal-note" not in json.dumps(view)
+    assert by["c1"]["visibility_scope"] == by["c2"]["visibility_scope"] == "org"
+    # the operator who wrote the private remove can read its details
+    opview = repo.graph.get_edge(OPERATOR, "reviewed", "review:a", "pr:1", commit="c1")["edges"][0]
+    assert opview["removal"]["reason"] == "internal-note"
+
+
+def _scenario(f_ops, f_a, f_b):
+    f_a.node("agent:a1", label="A", scope="room")
+    f_a.node("task:t1", state="running")
+    f_b.node("task:t2", state="running")
+    f_b.node("review:r1")
+    f_a.edge("delegation", "agent:a1", "task:t1")
+    f_b.edge("reviewed", "review:r1", "pr:1", {"commit": "c1"})
+    f_b.edge("reviewed", "review:r1", "pr:1", {"commit": "c2", "supersedes": ["c1"]})
+    f_b.edge("validated", "review:r1", "pr:1", {"plan_digest": "d1"})
+    f_ops.send("node.upsert", {"node_type": "task", "node_id": "task:t1", "attrs": {"co_writers": ["key:other"]}},
+               principal=OPERATOR)
+    f_ops.send("edge.remove", {"edge_type": "reviewed", "from_id": "review:r1", "to_id": "pr:1",
+                               "reason": "w"}, scope="private", principal=OPERATOR, entity_id="review:r1")
+    f_a.send("edge.remove", {"edge_type": "delegation", "from_id": "agent:a1", "to_id": "task:t1",
+                             "reason": "r"})
+    f_b.send("node.state", {"node_id": "task:t2", "state": "done"}, principal=OTHER)
+    f_b.send("node.state", {"node_id": "task:t1", "state": "blocked"}, principal=OTHER)
+    f_a.send("edge.remove", {"edge_type": "validated", "from_id": "review:r1", "to_id": "pr:1",
+                             "reason": "gone", "attrs": {"plan_digest": "d1"}}, principal=OTHER)
+
+
+def test_all_merges_commute_under_shuffle_live_and_after_export_import():
+    repo, svc, clock = make_clocked()
+    f_a = Feed(svc, source="pi")
+    f_b = Feed(svc, source="aux")
+    f_ops = Feed(svc, source="ops")
+    f_b_principal = OTHER
+
+    class AsOther(Feed):
+        def send(self, *a, **kw):
+            kw.setdefault("principal", f_b_principal)
+            return super().send(*a, **kw)
+
+    f_b = AsOther(svc, source="aux")
+    _scenario(f_ops, f_a, f_b)
+    live = repo.graph.snapshot()
+    assert live["edges"] and live["wildcard_removes"]
+    events = rows(repo)
+    assert len(events) > 10
+    for seed in range(8):
+        shuffled = list(events)
+        random.Random(seed).shuffle(shuffled)                    # cross-entity interleavings too
+        g = GraphProjection()
+        for e in shuffled:
+            g.apply({**e, "payload": {k: v for k, v in e["payload"].items() if k != "_envelope"}})
+        assert g.snapshot() == live, f"seed {seed}"
+        state = repo.export_state()
+        keys = list(state["events"])
+        random.Random(seed).shuffle(keys)
+        state["events"] = {k: random.Random(seed).sample(state["events"][k], len(state["events"][k]))
+                           for k in keys}
+        fresh = ControlPlaneRepo()
+        fresh.import_state(json.loads(json.dumps(state, default=str)))
+        assert fresh.graph.snapshot() == live, f"import seed {seed}"
+
+
+def test_attrs_caps_are_cumulative_not_per_event():
+    repo, svc, f = make()
+    f.node("task:t", attrs={f"a{i}": 1 for i in range(60)})
+    f.node("task:t", attrs={f"b{i}": 1 for i in range(60)})
+    with pytest.raises(ValueError, match="too many attrs"):
+        f.node("task:t", attrs={f"c{i}": 1 for i in range(60)})
+    g = Feed(svc, source="big")
+    with pytest.raises(ValueError, match="total size"):
+        for i in range(10):
+            g.node("task:big", attrs={"k%d" % i: "x" * 5000})
+    with pytest.raises(ValueError, match="too many attrs|total size"):
+        f.edge("dependency", "task:x", "task:y", {f"e{i}": "x" * 100 for i in range(64)})
+        f.edge("dependency", "task:x", "task:y", {f"f{i}": "x" * 100 for i in range(64)})
+        f.edge("dependency", "task:x", "task:y", {f"g{i}": "x" * 100 for i in range(64)})
+
+
+def test_total_node_edge_and_source_caps(monkeypatch):
+    from herdr_engineering.control_plane import graph as graph_mod
+    repo, svc, f = make()
+    monkeypatch.setattr(graph_mod, "MAX_TOTAL_NODES", 3)
+    f.node("task:1")
+    f.node("task:2")
+    f.node("task:3")
+    with pytest.raises(ValueError, match="capacity"):
+        f.node("task:4")
+    f.node("task:3", label="existing nodes stay writable")
+    monkeypatch.setattr(graph_mod, "MAX_TOTAL_EDGES", 1)
+    f.edge("dependency", "task:1", "task:2")
+    with pytest.raises(ValueError, match="capacity"):
+        f.edge("dependency", "task:2", "task:3")
+    monkeypatch.setattr(graph_mod, "MAX_SOURCES_PER_OBJECT", 2)
+    Feed(svc, source="s1").node("task:1")
+    with pytest.raises(ValueError, match="too many distinct sources"):
+        Feed(svc, source="s2").node("task:1")
+
+
+def test_response_size_is_capped(monkeypatch):
+    from herdr_engineering.control_plane import graph as graph_mod
+    repo, svc, f = make()
+    for i in range(20):
+        f.edge("spawn", "agent:root", f"agent:c{i}")
+        f.node(f"agent:c{i}", attrs={"blob": "x" * 5000})
+    monkeypatch.setattr(graph_mod, "MAX_RESPONSE_BYTES", 30_000)
+    view = repo.graph.neighborhood(VIEWER, "agent:root", depth=1)
+    assert view["truncated"] and 1 < len(view["nodes"]) < 21
+    assert len(json.dumps(view)) < 40_000
+    monkeypatch.setattr(graph_mod, "MAX_RESPONSE_BYTES", 2_000)
+    assert repo.graph.get_node(VIEWER, "agent:root")["edges_truncated"] is True
+
+
+def test_stale_is_by_binding_identity_with_explicit_supersession():
+    repo, svc, clock = make_clocked()
+    f = Feed(svc)
+    f.node("review:r")
+    f.node("pr:1")
+    # same commit with a plan digest added later is the SAME binding, not a different one
+    f.edge("reviewed", "review:r", "pr:1", {"commit": "c1"})
+    f.edge("reviewed", "review:r", "pr:1", {"commit": "c1", "plan_digest": "d"})
+    edges = repo.graph.get_edge(VIEWER, "reviewed", "review:r", "pr:1")["edges"]
+    assert len(edges) == 1 and edges[0]["stale"] is False and edges[0]["attrs"]["plan_digest"] == "d"
+    # newer commit declares it supersedes c1; an older-commit review that arrives late
+    # must not mark the newer one stale
+    f.edge("reviewed", "review:r2", "pr:1", {"commit": "c2", "supersedes": ["c1"]})
+    f.edge("reviewed", "review:r3", "pr:1", {"commit": "c1"})        # late, older commit
+    by = {(e["from_id"], e["binding"]["commit"]): e["stale"]
+          for e in repo.graph.neighborhood(VIEWER, "pr:1", depth=1)["edges"]}
+    assert by[("review:r2", "c2")] is False
+    assert by[("review:r3", "c1")] is True and by[("review:r", "c1")] is True
+    # without any hint, arrival order decides and both bindings are exposed for the UI
+    f.edge("reviewed", "review:q", "pr:9", {"commit": "x1"})
+    f.edge("reviewed", "review:q2", "pr:9", {"commit": "x2"})
+    q = repo.graph.get_edge(VIEWER, "reviewed", "review:q", "pr:9")["edges"][0]
+    assert q["stale"] is True and q["bindings"] == ["x1", "x2"]
+
+
+def test_http_unauthorized_overwrite_is_403(http):
+    server, call, keys = http
+    op, vw, ing = list(keys)
+    ing2 = "in2-" + "k"
+    server._keys[ing2] = "ingest"
+    n = [0]
+
+    def post(key, et, payload, seq=None, source="pi"):
+        n[0] += 1
+        return call("/api/v1/ingest", key, {
+            "schema_version": 2, "event_id": f"w{n[0]}", "source": source,
+            "source_sequence": n[0] if seq is None else seq, "entity_type": "lineage",
+            "entity_id": payload["node_id"], "event_type": et, "payload": payload,
+            "visibility_scope": "org"})
+
+    node = {"node_type": "task", "node_id": "task:a", "label": "A"}
+    assert post(ing, "node.upsert", node)[0] == 200
+    assert post(ing2, "node.upsert", {**node, "label": "pwn"}, seq=2**62, source="evil")[0] == 403
+    assert post(op, "node.upsert", {**node, "label": "op"}, source="ops")[0] == 200
+    assert call("/api/v1/graph/nodes/task%3Aa", vw)[1]["node"]["label"] == "op"

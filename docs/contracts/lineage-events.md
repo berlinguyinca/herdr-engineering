@@ -51,23 +51,55 @@ skipped and counted (`events_rejected`), never fatal.
   `reason`, oversize `attrs` (16 KiB, 64 keys) are all `ValueError` (400) and not stored. `entity_id` is not cross-checked.
 - Nothing is inferred. Raw lineage rows are NOT readable through `GET /api/v1/events?entity_type=lineage` (404); use the graph API.
 
+### Writer model (ownership) and admission
+Two layers: `GraphProjection.admit` runs under the ledger lock BEFORE the envelope row is persisted; `apply` is a pure
+commutative merge that trusts stored events. A refused event is not persisted and its sequence is not consumed (retry allowed).
+- A node/edge's **owner** is the actor of its earliest non-operator event (else the earliest operator event). **Writers** =
+  owner + `co_writers`. `co_writers` is a node/edge attr (list of actor ids, max 8) that only `operator` principals may set.
+- Operators may write anything. A non-operator writing to an object it is not a writer of gets `PermissionError` -> HTTP 403
+  (state, scope, edges, removes, `co_writers` alike). So a non-writer can never overwrite, remove, or narrow the scope of
+  another actor's object. A legitimate second emitter for the same logical agent is authorised by an operator adding its
+  actor id to `co_writers`.
+- Unowned objects are first-come: whoever creates an id first owns it (id squatting is possible; operators can override).
+  Edges are owned by their creator; an edge's endpoints are not ownership-checked (anyone may add an edge between nodes
+  they can see; the edge itself is only visible when both endpoints are).
+- Wildcard `edge.remove` (reviewed/validated without a binding) requires write access to every existing binding of the triple.
+- A 403 for an existing id reveals that the id exists to an authenticated ingest key; read access is unaffected.
+- Capacity (ValueError -> 400): attrs <= 128 keys / 32 KiB TOTAL per node or edge across events (per event 64 keys / 16 KiB),
+  <= 8 distinct sources per object, <= 200k nodes, <= 1M edges. Responses are capped at 2 MiB (`truncated: true`).
+
 ### Merge rules
-- Version of an event = `(source_sequence, source, event_id)`. Within a source that is emitter order; across sources it is only a
-  deterministic tie-break.
-- `label`, `state`, and each `attrs` key are last-writer-wins by version, independently (so out-of-order delivery converges).
-- `visibility_scope` of a node/edge is the NARROWEST scope of any event that defined it; it never widens. Only node events
-  define a node: an `edge.add` to a node with no `node.upsert`/`node.state` yet creates an invisible placeholder (no scope), and
-  edge events never alter a node's scope, authors or first/last event ids. Producers must upsert endpoints.
-- Edge identity is `(edge_type, from_id, to_id)`, extended with the binding `(commit, plan_digest)` for `reviewed`/`validated`
-  so that a re-review at a new commit is a distinct edge (otherwise the old evidence would be overwritten, not flagged stale).
-- `removed` = newest `edge.remove` version > newest `edge.add` version (a later add resurrects; remove-before-add stays removed).
-  For `reviewed`/`validated`, `edge.remove` with `attrs.commit`/`attrs.plan_digest` removes that binding; without them it removes
-  every binding of the triple that was added before it.
-- `stale` (derived at read): a `reviewed`/`validated` edge is stale when another non-removed edge of the same type with the same
-  subject (`to_id`) and a different binding has a higher add version. Stale edges are kept and flagged.
-- Session rollover: there is no containment edge type, so `attempt`/`session` nodes carry `attrs.agent_id` / `attrs.attempt_id`.
-  A rollover is a new `session:` node (and an old session's `node.state`); the `agent:` node id and state are untouched.
-  Closing a pane/tab emits nothing and no Herdr code path derives an agent state change from a session stop or pane close.
+- Every mutable field (label, state, each attr key, an edge's add, an edge's remove) is a per-source last-writer-wins
+  register: inside one source the higher `source_sequence` wins. Across sources the per-source winners are compared by the
+  SERVER receipt time (then source, sequence, event id), so a source claiming a huge sequence cannot win forever.
+- `visibility_scope` of a node/edge is the NARROWEST scope of any event that defined it; never widens. Only node events define
+  a node; an edge to a node with no `node.upsert`/`node.state` yet creates an invisible placeholder, and edge events never
+  alter a node's scope, owner or event ids. Producers must upsert endpoints.
+- Edge identity is `(edge_type, from_id, to_id)`, extended with the binding for `reviewed`/`validated`. Binding = `attrs.commit`
+  if present, else `attrs.plan_digest`. A `plan_digest` accompanying a commit is an ordinary attr, not a different binding.
+- `removed` = the effective remove (own or wildcard, best by the cross-source rule) is newer than the effective add (later add
+  resurrects; remove-before-add stays removed). A wildcard remove lives in its own store and is resolved at read time; it never
+  changes existing edges' scope or owner, so merges commute. Remove details (`removal.reason`, event ids) are shown only to a
+  caller who can see the remove event's own scope; others see only `removed: true`.
+- All merges are commutative and idempotent, tested by shuffling every lineage event (across entities and sources) and
+  comparing the projection live, after replay, and after export/import.
+
+### Stale semantics
+`stale` is computed per caller over the edges THAT caller can see (a hidden edge can never be inferred from another edge's
+flag; `bindings` likewise lists only visible bindings). For a reviewed/validated edge E and another live edge O of the same type
+and subject with a different binding:
+1. O declares `attrs.supersedes` containing E's binding value => E is stale.
+2. E declares it supersedes O's binding => O does not make E stale (explicit order beats arrival, so a late-arriving older-commit
+   review cannot mark a newer one stale if the newer one says `supersedes`).
+3. Neither declares anything => E is stale if O's add was received later. The server cannot know commit order: without hints,
+   "newer" means "received later", and the UI should show `bindings` rather than trust the flag. Emitters that can deliver late
+   should send `attrs.supersedes`.
+Stale edges are kept and flagged.
+
+### Session rollover
+No containment edge type exists, so `attempt`/`session` nodes carry `attrs.agent_id` / `attrs.attempt_id`. A rollover is a new
+`session:` node (and the old one's `node.state`); the `agent:` id and state are untouched. Closing a pane/tab emits nothing and
+no Herdr code derives an agent state change from a session stop or pane close.
 
 ### Read API (viewer level, any valid key; open listener behaves as an operator)
 - `GET /api/v1/graph/nodes/{node_id}` - node + its visible incident edges (capped at 200).
@@ -76,7 +108,7 @@ skipped and counted (`events_rejected`), never fatal.
 - `GET /api/v1/graph/edge?edge_type=&from_id=&to_id=[&commit=|&plan_digest=]` - edge(s) with provenance
   (`event_id`, `source`, `source_sequence` of the winning add, and `removal` when tombstoned).
 - Ids contain `:`, `/`, `#`: percent-encode them.
-- Hidden and missing are both 404. The visibility check runs for every node and edge at every hop, an edge is visible only if
+- Hidden and missing are both 404 (writes: 403 for a non-writer). The visibility check runs for every node and edge at every hop, an edge is visible only if
   its own scope and BOTH endpoints are visible, hidden nodes are never expanded, and `truncated`/limits are computed over visible
   items only, so no counts, ids or event ids of hidden items leak. There is deliberately no total-count endpoint.
 
@@ -85,7 +117,7 @@ skipped and counted (`events_rejected`), never fatal.
 |---|---|
 | `org` | any authenticated caller |
 | `room`, `mission` | `operator` principals only (no room/mission membership exists to check; fail closed for viewer/ingest/agent) |
-| `private` | only the single principal (`actor.id`) that authored every event defining the node/edge; if a second author or more than 8 authors contributed, nobody |
+| `private` | only the object's writers (owner + operator-set `co_writers`); not operators in general |
 | missing/unknown | treated as `private` at ingest; unauthenticated principals see nothing |
 Limitation: `room`/`mission` cannot yet be narrowed to actual members, and an operator key is trusted for all rooms/missions.
 The open (keyless loopback) listener is one shared `open-listener` principal. Principal ids are API-key digests, so a rotated key

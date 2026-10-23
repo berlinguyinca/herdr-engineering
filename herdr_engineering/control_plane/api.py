@@ -980,6 +980,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._send_json(409, {"error": str(exc), "reason": "conflict"})
             except SequenceCollision:
                 return self._send_json(409, {"error": "sequence conflict", "reason": "conflict"})
+            except PermissionError:
+                return self._send_json(403, {"error": "not permitted to modify this lineage object"})
             except ValueError as exc:
                 message = "Invalid GitHub query." if resource == "github" else str(exc)
                 return self._send_json(400, {"error": message})
