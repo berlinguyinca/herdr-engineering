@@ -748,5 +748,32 @@ def test_real_box_end_to_end(tmp_path, monkeypatch):
     assert not any("MARK-DIFF-CONTENT" in a for a in call["argv"])
 
 
+@pytest.mark.skipif(not bwrap_works(), reason="needs bubblewrap")
+def test_real_box_finds_a_harness_behind_a_symlinked_release_dir(tmp_path, monkeypatch):
+    """codex's standalone install: ~/.local/bin/codex -> ~/.codex/packages/standalone/current/bin/codex, where
+    `current` is itself a symlink to releases/<version>. Every hop must exist inside the box."""
+    e = Env(tmp_path, monkeypatch)
+    monkeypatch.setattr(e.mod, "run_box", load().run_box)
+    rel = e.home / ".codex" / "packages" / "standalone" / "releases" / "9.9.9" / "bin"
+    rel.mkdir(parents=True)
+    shutil.copy(e.bin / "codex", rel / "codex")
+    (e.home / ".codex" / "packages" / "standalone" / "current").symlink_to("releases/9.9.9")
+    lb = e.home / ".local" / "bin"
+    lb.mkdir(parents=True)
+    (lb / "codex").symlink_to(e.home / ".codex" / "packages" / "standalone" / "current" / "bin" / "codex")
+    monkeypatch.setenv("PATH", f"{lb}:{e.bin}:{os.environ['PATH']}")
+    e.responses([EMPTY])
+    orig = e.mod.prepare_chunk_dir
+
+    def with_resp(run_dir, i):
+        d = orig(run_dir, i)
+        shutil.copy(e.resp, Path(d) / "resp.json")
+        return d
+
+    monkeypatch.setattr(e.mod, "prepare_chunk_dir", with_resp)
+    assert e.run("review", "--repo", REPO, "--pr", "7") == 0
+    assert [s["state"] for s in e.terminal()] == ["success"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
