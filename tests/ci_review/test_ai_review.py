@@ -680,6 +680,29 @@ def test_checkout_bounded_by_unpacked_size(env):
     assert env.rev_calls() == [] and env.terminal() == []
 
 
+DOC_DIFF = ("diff --git a/docs/guide.md b/docs/guide.md\nindex 1..2 100644\n--- a/docs/guide.md\n"
+            "+++ b/docs/guide.md\n@@ -1 +1 @@\n-old\n+new\n")
+
+
+def test_a_docs_only_chunk_may_report_docs_instead_of_code(env):
+    env.config({"chunk_bytes": 250})
+    env.set_pr(diff=DIFF + DOC_DIFF)
+    # chunks are path-ordered: docs/guide.md first, then src/a.py, src/b.py
+    env.responses([{**EMPTY, "checked": ["docs", "security"]}, {**EMPTY, "checked": ["code", "security"]}])
+    assert review(env) == 0
+    (st,) = env.terminal()
+    assert st["state"] == "success"
+    assert "code+security review" in st["description"]
+    calls = env.rev_calls()
+    assert len(calls) >= 2 and "docs/guide.md" in calls[0]["stdin"] and "src/a.py" not in calls[0]["stdin"]
+
+
+def test_a_code_chunk_reporting_only_docs_fails(env):
+    env.responses([{**EMPTY, "checked": ["docs", "security"]}])
+    assert review(env) == 1
+    assert env.terminal() == []
+
+
 # ---------- dry run and poll ----------
 
 def test_dry_run_posts_nothing(env):

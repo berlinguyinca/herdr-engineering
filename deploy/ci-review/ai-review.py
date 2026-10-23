@@ -390,10 +390,22 @@ def skip_reason(fd: FileDiff, globs: list[str]) -> str | None:
     return None
 
 
+DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
+
+
+def is_doc(path: str) -> bool:
+    return path.lower().endswith(DOC_SUFFIXES)
+
+
 @dataclass
 class Chunk:
     text: str
     files: list[str]
+
+    @property
+    def docs_only(self) -> bool:
+        """Prose only: the reviewer must say it reviewed the docs; there is no code or test in it to review."""
+        return all(is_doc(f) for f in self.files)
 
 
 def split_hunk(hunk: list[str], room: int) -> list[str]:
@@ -485,7 +497,7 @@ VERDICT_SCHEMA = {"type": "object", "additionalProperties": False, "required": l
                                  "not_checked": {"type": "array", "items": {"type": "string"}}}}
 
 
-def parse_verdict(text: str) -> dict:
+def parse_verdict(text: str, need: str = "code") -> dict:
     """The reviewer's whole answer must be one JSON object of exactly this shape (optionally the whole answer in
     one ```json fence). Anything else raises ReviewFailed."""
     t = text.strip()
@@ -512,8 +524,8 @@ def parse_verdict(text: str) -> dict:
         if not isinstance(v[k], list) or len(v[k]) > LIST_MAX or not all(
                 isinstance(x, str) and len(x) <= TEXT_MAX for x in v[k]):
             raise ReviewFailed(f"verdict.{k} must be a list of strings")
-    if "code" not in v["checked"]:
-        raise ReviewFailed("the reviewer did not say it reviewed the code")
+    if need not in v["checked"]:
+        raise ReviewFailed(f"the reviewer did not say it reviewed the {need}")
     return v
 
 
@@ -722,7 +734,7 @@ class Run:
             shutil.rmtree(self.priv, ignore_errors=True)
 
 
-def review_chunk(run: Run, cfg: dict, i: int, prompt: str) -> dict:
+def review_chunk(run: Run, cfg: dict, i: int, prompt: str, need: str = "code") -> dict:
     work = prepare_chunk_dir(run.dir, i)
     r = cfg["reviewer"]
     rc, out, err = run_box(str(work), r["command"], prompt.encode(), run.env(), float(r["timeout_s"]))
@@ -742,7 +754,7 @@ def review_chunk(run: Run, cfg: dict, i: int, prompt: str) -> dict:
     else:
         text = out.decode("utf-8", "replace")
     try:
-        return parse_verdict(text)
+        return parse_verdict(text, need)
     except ReviewFailed as e:
         raise ReviewFailed(f"chunk {i}: {e}") from e
 
@@ -888,7 +900,10 @@ def review(cfg: dict, repo: str, n: int, dry_run: bool) -> int:
                 run.start_proxy()
             for i, ch in enumerate(chunks, 1):
                 prompt = build_prompt(repo, n, sha, pr, ch, i, len(chunks), str(run.src) if run.src else "")
-                verdicts.append(review_chunk(run, cfg, i, prompt))
+                v = review_chunk(run, cfg, i, prompt, "docs" if ch.docs_only else "code")
+                if ch.docs_only:                 # no code or tests in it: those claims hold vacuously
+                    v = {**v, "checked": [*v["checked"], "code", "tests"]}
+                verdicts.append(v)
                 say(f"chunk {i}/{len(chunks)} done")
         finally:
             run.close()
