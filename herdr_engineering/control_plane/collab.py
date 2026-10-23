@@ -92,6 +92,7 @@ MAX_PROFILE_SERVICES = 20
 MAX_PROFILE_NAMES = 50
 _PROFILE_HOST = re.compile(r"[a-z0-9.-]+:\d{1,5}", re.ASCII)
 _EGRESS_HOST = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?", re.ASCII)
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*", re.ASCII)   # a last label like this makes a name an IPv4 address
 _PROFILE_SECRET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", re.ASCII)   # a NAME that refers to a host file, never a value
 _PROFILE_SERVICE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}", re.ASCII)
 _PROFILE_HEADER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}", re.ASCII)
@@ -3184,7 +3185,8 @@ def _internal_host(host: str) -> bool:
     try:
         ip = ipaddress.ip_address(h)
     except ValueError:
-        return False
+        # a name whose last label is a number is an IPv4 address in another spelling (2130706433, 0x7f.1, 127.1)
+        return bool(_NUMERIC_LABEL.fullmatch(h.rsplit(".", 1)[-1]))
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
     return not ip.is_global or ip.is_multicast or ip.is_unspecified or ip.is_loopback or ip.is_link_local
@@ -3241,6 +3243,14 @@ def _normalize_profile(body: Any) -> dict:
             ok = False
         if not ok:
             raise CollabError(400, "upstream_url must be an https URL without credentials")
+        # the proxy sends the bound key from the runner host: the same host rule as host requests, and never a
+        # name or address inside the runner host's network (the proxy also checks what the name resolves to)
+        try:
+            CollabService._egress_host_port(u.hostname, u.port or 443)
+        except CollabError:
+            raise CollabError(400, "upstream_url needs a plain host name or IPv4 address") from None
+        if _internal_host(u.hostname):
+            raise CollabError(400, "upstream_url may not name loopback, private or link-local addresses")
         if any(x["name"] == name for x in services):
             raise CollabError(400, "service names must be unique")
         services.append({"name": name, "upstream_url": url, "header": header, "secret_name": sec})

@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""Room secrets on the host that runs helpers: one 0600 JSON file per room, {name: value}.
+"""Room secrets on the host that runs helpers: one 0600 JSON file per room.
 
 The collab service and the room profile only ever hold secret NAMES; the values live here, on the runner's
 host, and are read by collab-spawn.py when it starts a helper in that room:
-  * a name bound to a service in the room profile is handed to the egress proxy, which adds it as that
-    service's header value (store the whole value, e.g. "Bearer sk-..."); the helper never sees it
-  * a name listed in the profile's ssh_secret_names is copied into the helper's ~/.ssh as a file of that
-    name: store it with --base64 (the file's bytes, base64-encoded)
+  * a header value for a service: {name: {"value": "Bearer sk-...", "host": "api.example.com"}}. The egress
+    proxy adds it as the header of a service in the room profile that names it, and ONLY when that service's
+    upstream_url is on the host bound here: the room owner (maybe a coworker) sets upstream_url, so binding the
+    host is what stops a repointed service from sending the key elsewhere. The helper never sees the value.
+  * a key file: {name: "<base64>"} (--base64). A name listed in the profile's ssh_secret_names is copied into the
+    helper's ~/.ssh as a file of that name. A plain string is never used as a service header.
 
 Usage:
-  collab-secrets.py set ROOM NAME [--base64]   the value is read from stdin (a terminal prompt does not echo)
-  collab-secrets.py list ROOM                  names only, never values
+  collab-secrets.py set ROOM NAME --host HOST   a header value, bound to HOST (a host name or IP, no port)
+  collab-secrets.py set ROOM NAME --base64      a key file's bytes (cat key | ... --base64)
+  collab-secrets.py list ROOM                   names (and bound hosts), never values
   collab-secrets.py rm ROOM NAME
-The value is never printed and never taken from an argument.
+The value is read from stdin (a terminal prompt does not echo), never printed and never taken from an argument.
 """
 from __future__ import annotations
 
 import argparse
 import base64
 import getpass
+import ipaddress
 import json
 import os
 import re
@@ -28,6 +32,22 @@ from pathlib import Path
 ROOM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z", re.ASCII)
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z", re.ASCII)       # the room profile's secret-name rule
 MAX_VALUE = 64 * 1024
+HOSTNAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62})(?:\.[a-z0-9](?:[a-z0-9-]{0,62}))*\Z", re.ASCII)
+NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*", re.ASCII)
+
+
+def canon_host(text: str) -> str | None:
+    """The bound host in the form the egress proxy compares (lowercase, one trailing dot dropped, IP literals
+    canonical), or None when it is not a plain host name or IP address."""
+    h = text.strip().lower()
+    h = h[:-1] if h.endswith(".") else h
+    try:
+        return str(ipaddress.ip_address(h[1:-1] if h.startswith("[") and h.endswith("]") else h))
+    except ValueError:
+        pass
+    if len(h) > 253 or not HOSTNAME.match(h) or NUMERIC_LABEL.fullmatch(h.rsplit(".", 1)[-1]):
+        return None
+    return h
 
 
 def default_dir() -> Path:
@@ -85,7 +105,9 @@ def main(argv: list[str]) -> int:
     s = sub.add_parser("set")
     s.add_argument("room")
     s.add_argument("name")
-    s.add_argument("--base64", action="store_true", help="store stdin's bytes base64-encoded (ssh key files)")
+    kind = s.add_mutually_exclusive_group(required=True)
+    kind.add_argument("--host", help="a header value for a service on this host only (no port, no scheme)")
+    kind.add_argument("--base64", action="store_true", help="store stdin's bytes base64-encoded (ssh key files)")
     sub.add_parser("list").add_argument("room")
     r = sub.add_parser("rm")
     r.add_argument("room")
@@ -95,6 +117,11 @@ def main(argv: list[str]) -> int:
         ap.error("invalid room id")
     if args.cmd in ("set", "rm") and not NAME.match(args.name):
         ap.error("invalid secret name")
+    host = None
+    if args.cmd == "set" and args.host is not None:
+        host = canon_host(args.host)
+        if host is None:
+            ap.error("--host must be a plain host name or IP address (no scheme, port or path)")
     d = Path(args.dir)
     os.makedirs(d, mode=0o700, exist_ok=True)
     if d.is_symlink() or not d.is_dir():
@@ -104,7 +131,11 @@ def main(argv: list[str]) -> int:
     data = load(path)
     if args.cmd == "list":
         for k in sorted(data):
-            print(k)
+            v = data[k]
+            if isinstance(v, dict) and isinstance(v.get("host"), str):
+                print(f"{k} host={v['host']}")
+            else:
+                print(f"{k} (no host bound: used only as an ssh key file; for a service, set it again with --host)")
         return 0
     if args.cmd == "rm":
         if args.name not in data:
@@ -116,7 +147,7 @@ def main(argv: list[str]) -> int:
     value = read_value(args.base64)
     if not value:
         raise SystemExit("empty value; nothing stored")
-    data[args.name] = value
+    data[args.name] = {"value": value, "host": host} if host is not None else value
     save(d, path, data)
     print(f"stored {args.name} for {args.room}", file=sys.stderr)
     return 0

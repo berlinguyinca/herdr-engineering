@@ -419,7 +419,7 @@ fields are refused.
 | Allowed models | ids the model picker may choose from (empty = any in the catalogue) |
 | Helpers may use tools | off by default; also needs `--allow-tools` on the runner |
 | Always-allowed hosts | `host:port` lines (at most 50), stored in canonical form (`a.org:0443` becomes `a.org:443`). These skip operator approval; loopback, private, link-local, CGNAT and other non-public IP literals and `localhost` names are refused (400) |
-| Services | `name \| https upstream URL \| header \| secret name`: the egress proxy adds the header with the secret's value, so the helper calls `$SVC_<NAME>_URL` and never holds the key |
+| Services | `name \| https upstream URL \| header \| secret name`: the egress proxy adds the header with the secret's value, so the helper calls `$SVC_<NAME>_URL` and never holds the key. The upstream must be a public host name or address: loopback, private, link-local and other non-public IP literals and `localhost` names are refused (400). The key is attached only when the upstream's host is the host the operator bound the secret to (`--host`, below) |
 | SSH key names | secret names copied into the helper's `~/.ssh` (read-only) |
 | `spend_tokens_per_day` | stored, but **not enforced yet** (see *Residual risks*) |
 | Limits | `live_per_agent`, `depth`, `per_hour`: an owner may only lower the defaults below |
@@ -428,14 +428,20 @@ fields are refused.
 next to `collab-spawn.py`:
 
 ```bash
-collab-secrets.py set ROOM_ID api_token            # prompts without echo; or pipe the value on stdin
-collab-secrets.py set ROOM_ID deploy_key --base64  # a file's bytes (an ssh key): cat key | ... --base64
-collab-secrets.py list ROOM_ID                     # names only
+collab-secrets.py set ROOM_ID api_token --host api.example.com   # a service's header value, for that host only
+collab-secrets.py set ROOM_ID deploy_key --base64                 # a file's bytes (an ssh key): cat key | ... --base64
+collab-secrets.py list ROOM_ID                                    # names and bound hosts, never values
 collab-secrets.py rm ROOM_ID api_token
 ```
 
-The value is read from stdin, never from an argument, and is never printed. For a service, store the whole
-header value (for example `Bearer <key>`). Each room is one file,
+The value is read from stdin (a prompt without echo, or a pipe), never from an argument, and is never printed.
+For a service, store the whole header value (for example `Bearer <key>`) and bind it with `--host` to the host
+you mean it for (a host name or IP, no scheme or port). The room owner sets the service's `upstream_url`, so the
+binding is what keeps the key on that host: if the owner points the service (or a new one) elsewhere, the runner
+and the proxy refuse to attach the key and the helper gets `502 ... not bound to this upstream host`. A value
+stored before `--host` existed (a plain string) is never sent to a service: `list` marks it, and the runner logs
+"has no bound host"; store it again with `--host`. A `--base64` value is only ever an ssh key file. Each room is
+one file,
 `~/.config/herdr-engineering/collab-secrets/<room_id>.json`, written atomically with mode 0600 in a 0700
 directory. The runner ignores the file (with a warning) unless it is a regular file of the runner's own user
 with no group or other bits. Never put secret values in the profile, in task text, or in GitHub.
@@ -448,7 +454,10 @@ proxy tunnels only the room's allowlist:
   and `llm.metabolomics.us:443`.
 
 Names are resolved on the host side, and a name that resolves only to private or loopback addresses is refused
-unless that exact address is listed. An unlisted host gets `403 access pending`, and the runner files one request
+unless that exact address is listed. The same holds for a service's upstream (`/svc/...`): the proxy resolves the
+name once, drops every non-public address that is not listed as that exact IP:port, connects to an address it
+checked (TLS and the `Host` header still use the name), and answers 403 when none is left. A redirect from the
+upstream is not passed back to the helper (502). An unlisted host gets `403 access pending`, and the runner files one request
 per host:port (at most 20 per helper). It appears under **Agents → Helpers → Host access requests** with room,
 agent, host and port.
 * **Approve 1 day** (the default lifetime, 24 h) or **Approve 1 week**; the service allows up to 30 days.
@@ -520,11 +529,14 @@ model only, never the task text or the result).
   from the box yet: there is no ProxyCommand through the relay.
 * **API keys bound to a service are usable** by every helper in the room. The helper cannot read the key: the
   proxy adds it and redacts it from responses. But it can make any request to that service that the key allows.
+  The key is bound to a host, not to a URL: the room owner can still change the service's path and port on that
+  host (for example to another API of the same provider that the key also unlocks).
 * **Owner-listed hosts bypass operator approval.** A room owner (who may be a coworker, not you) can put any
   public name or address on *Always-allowed hosts*, and every helper in the room can reach it at once. Which
   public hosts are fine is the owner's call. Loopback, private, link-local, CGNAT and other non-public IP
   literals, and `localhost` names, are refused, so an owner cannot open the runner host's own services (or a
-  cloud metadata address). A public name that resolves to a private address is still blocked by the proxy.
+  cloud metadata address). A public name that resolves to a private address is still blocked by the proxy, for
+  tunnels and for service upstreams (`/svc`) alike.
 * **Allowlisted hosts are room-wide.** Approving a host for one helper approves it for every helper in the room,
   for the approval's lifetime, and a helper can send anything it can see there (its work directory, a parent's
   read-only view, the SSH keys). The family model endpoints are always reachable.

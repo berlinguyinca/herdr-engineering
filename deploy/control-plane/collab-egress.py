@@ -11,8 +11,12 @@
                               unless that exact IP:port is itself listed; it connects to the address it checked.
         * GET|POST /svc/<name>/<path>   forwarded over https to the service's upstream_url (--services-file: a JSON
                               list of {name, upstream_url, header, secret_name}) with `header` set from the secrets
-                              file (a JSON object {secret_name: full header value}). The box never holds the value;
-                              it is stripped from anything that comes back.
+                              file (a JSON object {secret_name: {"value": full header value, "host": bound host}}).
+                              The value is attached only when the upstream's host is the host the operator bound it
+                              to; an old plain-string entry (no host) is refused. The upstream name is resolved once
+                              and checked like a CONNECT target (non-global addresses only if that IP:port is
+                              listed), and the connection goes to the checked address. A 3xx answer is not relayed.
+                              The box never holds the value; it is stripped from anything that comes back.
   relay --sock PATH --listen 127.0.0.1:PORT
       Box side. A TCP listener on the box's own loopback that hands every connection to the unix socket.
 Standard library only.
@@ -66,6 +70,17 @@ def forbidden(ip) -> bool:
         if ip.ipv4_mapped:
             ip = ip.ipv4_mapped
     return not ip.is_global or ip.is_multicast or ip.is_unspecified or ip.is_loopback or ip.is_link_local
+
+
+def canon_host(host: str) -> str:
+    """The form a bound host and an upstream's host are compared in: lowercase, one trailing dot dropped, IP literals
+    canonical (collab-secrets.py stores the same form)."""
+    h = host.strip().lower()
+    h = h[:-1] if h.endswith(".") else h
+    try:
+        return str(ipaddress.ip_address(h.strip("[]")))
+    except ValueError:
+        return h
 
 
 def parse_target(text: str):
@@ -169,6 +184,11 @@ async def resolve(host: str, port: int):
 
 
 dial = asyncio.open_connection
+getaddrinfo = socket.getaddrinfo
+
+
+class ForbiddenUpstream(Exception):
+    """A service upstream that resolves only to addresses a tunnel may not reach."""
 
 
 # --- the server ---
@@ -357,12 +377,20 @@ class Server:
                 body = await asyncio.wait_for(reader.readexactly(length), SVC_TIMEOUT)
             except (TimeoutError, asyncio.IncompleteReadError):
                 return
-        secret = self._secret(svc)
+        secret, bound_host = self._secret(svc)
         bound = svc.get("header") if isinstance(svc.get("header"), str) else ""
-        up = urllib.parse.urlsplit(svc.get("upstream_url") or "") if isinstance(svc.get("upstream_url"), str) else None
+        try:
+            up = urllib.parse.urlsplit(svc.get("upstream_url")) if isinstance(svc.get("upstream_url"), str) else None
+            port = (up.port or 443) if up else 443
+        except ValueError:
+            up = None
         if (secret is None or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", bound) or up is None or up.scheme != "https"
                 or not up.hostname or up.username or up.password or any(c in secret for c in "\r\n\0")):
             return reply(writer, 502, "Bad Gateway", b"service is not configured\n")
+        if bound_host is None or canon_host(bound_host) != canon_host(up.hostname):
+            # the room owner sets upstream_url; the operator bound the key to one host (collab-secrets.py --host)
+            return reply(writer, 502, "Bad Gateway",
+                         b"service is not configured: its key is not bound to this upstream host\n")
         drop = STRIP_IN | {bound.lower()}
         out_headers = [(k, v) for k, v in headers if k.lower() not in drop and not k.lower().startswith("proxy-")]
         out_headers += [(bound, secret), ("Accept-Encoding", "identity")]
@@ -371,9 +399,13 @@ class Server:
             upath += "?" + query
         try:
             status, reason, rheaders, rbody = await asyncio.to_thread(
-                fetch, up.hostname, up.port or 443, method, upath, out_headers, body)
+                fetch, up.hostname, port, method, upath, out_headers, body, read_allow(self.a.allow_file))
+        except ForbiddenUpstream:
+            return reply(writer, 403, "Forbidden", b"the service's upstream resolves only to non-public addresses\n")
         except Exception:
             return reply(writer, 502, "Bad Gateway", b"upstream request failed\n")
+        if 300 <= status < 400 and status != 304:         # never hand the box a Location to follow elsewhere
+            return reply(writer, 502, "Bad Gateway", b"the upstream answered with a redirect; not relayed\n")
         redact = redactor(secret)
         rheaders = [(k, redact(v.encode("latin-1", "replace")).decode("latin-1")) for k, v in rheaders
                     if k.lower() not in STRIP_OUT and not k.lower().startswith("proxy-")
@@ -386,18 +418,66 @@ class Server:
         await writer.drain()
 
     def _secret(self, svc):
+        """(value, bound host); host None for an old plain-string entry; (None, None) when there is none."""
         name = svc.get("secret_name")
         try:
             with open(self.a.secrets_file, encoding="utf-8") as f:
                 secrets = json.load(f)
         except (OSError, ValueError):
-            return None
+            return None, None
         v = secrets.get(name) if isinstance(secrets, dict) and isinstance(name, str) else None
-        return v if isinstance(v, str) and v else None
+        if isinstance(v, str) and v:
+            return v, None
+        if isinstance(v, dict) and isinstance(v.get("value"), str) and v["value"]:
+            host = v.get("host")
+            return v["value"], host if isinstance(host, str) and host else None
+        return None, None
 
 
-def fetch(host, port, method, path, headers, body):
-    conn = http.client.HTTPSConnection(host, port, timeout=SVC_TIMEOUT, context=ssl.create_default_context())
+class PinnedHTTPS(http.client.HTTPSConnection):
+    """https to `host` (SNI, certificate check and Host header use the name) over a TCP connection to `ip`, an
+    address that was already checked: the name is not resolved a second time."""
+
+    def __init__(self, host, port, ip, context):
+        super().__init__(host, port, timeout=SVC_TIMEOUT, context=context)
+        self.ip, self.ctx = ip, context
+
+    def connect(self):
+        sock = socket.create_connection((self.ip, self.port), self.timeout)
+        try:
+            self.sock = self.ctx.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
+
+
+def pick_address(host, port, allow):
+    """The addresses `host` may be reached at, in resolver order: global ones, and non-global ones only when that
+    exact IP:port is listed (the CONNECT rule). ForbiddenUpstream when nothing is left."""
+    out = []
+    for _, _, _, _, sockaddr in getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        ip = str(ipaddress.ip_address(sockaddr[0].split("%", 1)[0]))
+        if (forbidden(ip) and (ip, port) not in allow) or ip in out:
+            continue
+        out.append(ip)
+    if not out:
+        raise ForbiddenUpstream(host)
+    return out
+
+
+def fetch(host, port, method, path, headers, body, allow=frozenset()):
+    ctx = ssl.create_default_context()
+    conn, last = None, None
+    for ip in pick_address(host, port, allow):
+        conn = PinnedHTTPS(host, port, ip, ctx)
+        try:
+            conn.connect()
+            break
+        except OSError as e:
+            conn.close()
+            conn, last = None, e
+    if conn is None:
+        raise last or OSError("cannot connect")
     try:
         conn.putrequest(method, path, skip_accept_encoding=True)
         for k, v in headers:

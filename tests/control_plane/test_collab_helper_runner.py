@@ -102,15 +102,17 @@ def secrets_cli(d, *args, stdin=""):
 
 def test_secrets_cli_writes_0600_in_a_0700_dir_and_never_echoes(tmp_path):
     d = tmp_path / "collab-secrets"
-    r = secrets_cli(d, "set", "room_abc", "openai", stdin="Bearer sk-VERYSECRET\n")
+    r = secrets_cli(d, "set", "room_abc", "openai", "--host", "API.OpenAI.com.", stdin="Bearer sk-VERYSECRET\n")
     assert r.returncode == 0 and "VERYSECRET" not in r.stdout + r.stderr
     f = d / "room_abc.json"
     assert stat.S_IMODE(d.stat().st_mode) == 0o700 and stat.S_IMODE(f.stat().st_mode) == 0o600
-    assert json.loads(f.read_text()) == {"openai": "Bearer sk-VERYSECRET"}
+    assert json.loads(f.read_text()) == {"openai": {"value": "Bearer sk-VERYSECRET", "host": "api.openai.com"}}
     secrets_cli(d, "set", "room_abc", "deploy_key", "--base64", stdin="-----KEY-----\n")
     assert base64.b64decode(json.loads(f.read_text())["deploy_key"]) == b"-----KEY-----\n"
     r = secrets_cli(d, "list", "room_abc")
-    assert r.stdout.split() == ["deploy_key", "openai"] and "VERYSECRET" not in r.stdout
+    lines = r.stdout.splitlines()
+    assert lines[0].startswith("deploy_key ") and "ssh key" in lines[0] and lines[1] == "openai host=api.openai.com"
+    assert "VERYSECRET" not in r.stdout
     r = secrets_cli(d, "rm", "room_abc", "openai")
     assert r.returncode == 0 and "openai" not in json.loads(f.read_text())
     assert stat.S_IMODE(f.stat().st_mode) == 0o600
@@ -124,8 +126,25 @@ def test_secrets_cli_refuses_bad_room_or_name(tmp_path, args):
 
 
 def test_secrets_cli_refuses_an_empty_value_and_a_value_in_argv(tmp_path):
-    assert secrets_cli(tmp_path / "s", "set", "room_a", "n", stdin="").returncode != 0
+    assert secrets_cli(tmp_path / "s", "set", "room_a", "n", "--host", "a.example", stdin="").returncode != 0
     assert secrets_cli(tmp_path / "s", "set", "room_a", "n", "the-value", stdin="x").returncode != 0
+
+
+@pytest.mark.parametrize("args", [(), ("--host", "a.example", "--base64"), ("--host", "bad host"),
+                                  ("--host", "a.example:443"), ("--host", "https://a.example"), ("--host", "")])
+def test_secrets_cli_binds_a_header_value_to_exactly_one_host(tmp_path, args):
+    # a header value without a host could be sent wherever the room owner points the service
+    r = secrets_cli(tmp_path / "s", "set", "room_a", "n", *args, stdin="Bearer x")
+    assert r.returncode != 0 and not list(tmp_path.rglob("*.json"))
+
+
+def test_secrets_cli_lists_an_old_unbound_value_as_such(tmp_path):
+    d = tmp_path / "s"
+    d.mkdir(mode=0o700)
+    (d / "room_a.json").write_text(json.dumps({"old": "Bearer x"}))
+    (d / "room_a.json").chmod(0o600)
+    r = secrets_cli(d, "list", "room_a")
+    assert r.returncode == 0 and r.stdout.startswith("old ") and "no host" in r.stdout and "Bearer" not in r.stdout
 
 
 # ------------------------------------------------------------------ the runner runs helpers
@@ -322,7 +341,7 @@ def test_ssh_keys_are_present_only_when_listed_and_secret_values_never_reach_the
                       "secret_name": "api_token"}]})
     write_secrets(hr, w.room, {"deploy_key": base64.b64encode(b"KEY-ONE").decode(),
                                "other_key": base64.b64encode(b"KEY-TWO").decode(),
-                               "api_token": "Bearer sk-SVCSECRET"})
+                               "api_token": {"value": "Bearer sk-SVCSECRET", "host": "api.example.com"}})
     h = ask(hr)
     until(hr, finished(hr, h["helper_id"]))
     info, res = report(hr, h["helper_id"])
@@ -342,10 +361,39 @@ def test_a_secrets_file_with_a_loose_mode_or_a_link_is_ignored(hr):
     assert r.room_secrets(hr.w.room) == {} and any("ignored" in m for m in hr.said)
     f.chmod(0o600)
     assert r.room_secrets(hr.w.room) == {"k": "v"}
+    f.write_text(json.dumps({"k": "v", "b": {"value": "Bearer z", "host": "a.example"}, "odd": {"value": 5},
+                             "n": 7}))
+    assert r.room_secrets(hr.w.room) == {"k": "v", "b": {"value": "Bearer z", "host": "a.example"}}
     link = f.with_name("room_link.json")
     link.symlink_to(f)
     assert r.room_secrets("room_link") == {}
     assert r.room_secrets("../etc") == {}
+
+
+def test_the_proxy_gets_only_secrets_bound_to_their_services_upstream_host(hr):
+    r = hr.mk()
+    services = [{"name": "ok", "upstream_url": "https://API.example.com./v1", "secret_name": "good"},
+                {"name": "moved", "upstream_url": "https://attacker.example/", "secret_name": "bound_elsewhere"},
+                {"name": "old", "upstream_url": "https://api.example.com/", "secret_name": "unbound"}]
+    secrets = {"good": {"value": "Bearer A", "host": "api.example.com"},
+               "bound_elsewhere": {"value": "Bearer B", "host": "api.example.com"},
+               "unbound": "Bearer C", "deploy_key": "S0VZ"}
+    out = r.proxy_secrets(services, secrets, "h1")
+    assert out == {"good": {"value": "Bearer A", "host": "api.example.com"}}
+    said = " ".join(hr.said)
+    assert "bound_elsewhere" in said and "attacker.example" in said and "unbound" in said and "--host" in said
+    assert "Bearer" not in said
+
+
+@needs_box
+def test_a_service_secret_listed_as_an_ssh_key_is_not_copied(hr):
+    w = hr.w
+    w.s.set_room_profile(w.alice, w.room, {"allowed_families": ["claude-code"], "ssh_secret_names": ["api_token"]})
+    write_secrets(hr, w.room, {"api_token": {"value": "Bearer sk-SVCSECRET", "host": "api.example.com"}})
+    h = ask(hr)
+    until(hr, finished(hr, h["helper_id"]))
+    info, res = report(hr, h["helper_id"])
+    assert info["ssh"] is None and "SVCSECRET" not in res
 
 
 @needs_box

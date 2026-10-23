@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import ipaddress
 import json
 import os
 import re
@@ -324,6 +325,17 @@ def link_target(instance_id) -> tuple[str, str] | None:
     else:
         return None
     return (host, pane) if HOST.fullmatch(host) and PANE_ID.fullmatch(pane) else None
+
+
+def canon_host(host: str) -> str:
+    """The egress proxy's (and collab-secrets.py's) comparison form: lowercase, one trailing dot dropped,
+    canonical IP literals."""
+    h = host.strip().lower()
+    h = h[:-1] if h.endswith(".") else h
+    try:
+        return str(ipaddress.ip_address(h.strip("[]")))
+    except ValueError:
+        return h
 
 
 def trim(text: str, n: int = 200) -> str:
@@ -857,7 +869,36 @@ class Runner:
             return {}
         finally:
             os.close(fd)
-        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        # a plain string is a key file (--base64); {value, host} is a header value bound to one host (--host)
+        return {k: v for k, v in data.items() if isinstance(k, str) and (isinstance(v, str) or (
+            isinstance(v, dict) and isinstance(v.get("value"), str) and isinstance(v.get("host"), str)))}
+
+    def proxy_secrets(self, services: list[dict], secrets: dict, hid: str) -> dict:
+        """The header values the helper's egress proxy may attach: only those bound (collab-secrets.py --host) to
+        the host of the service's upstream_url. The room owner sets upstream_url, so a service repointed
+        elsewhere does not get the key. The proxy checks the same again."""
+        out = {}
+        for sv in services:
+            n = sv["secret_name"]
+            v = secrets.get(n)
+            if v is None:
+                continue
+            if not isinstance(v, dict):
+                self.say(f"helper {hid}: room secret {n} has no bound host; service {sv['name']} gets no key "
+                         f"(store it again with collab-secrets.py set ROOM {n} --host HOST)")
+                continue
+            try:
+                host = urllib.parse.urlsplit(sv.get("upstream_url") or "").hostname or ""
+            except ValueError:
+                host = ""
+            if canon_host(host) != canon_host(v["host"]):
+                self.say(f"helper {hid}: room secret {n} is bound to {trim(v['host'], 80)}, not "
+                         f"{trim(host, 80) or '(no host)'}; service {sv['name']} gets no key")
+                continue
+            out[n] = {"value": v["value"], "host": v["host"]}
+        return out
 
     def refresh_allow(self, d: Path, room: str) -> None:
         out = self.ok("GET", f"fleet/egress/{room}")
@@ -918,11 +959,11 @@ class Runner:
                     and isinstance(sv.get("name"), str) and SERVICE_NAME.fullmatch(sv["name"])
                     and isinstance(sv.get("secret_name"), str) and SECRET_NAME.fullmatch(sv["secret_name"])]
         write_private(d / "services.json", json.dumps(services))
-        write_private(d / "secrets.json", json.dumps({sv["secret_name"]: secrets[sv["secret_name"]] for sv in services
-                                                     if sv["secret_name"] in secrets}))
+        write_private(d / "secrets.json", json.dumps(self.proxy_secrets(services, secrets, hid)))
         ssh_dir = None
+        # key files are plain (base64) strings only: a header value listed as an ssh name is never written out
         keys = [n for n in prof.get("ssh_secret_names") or [] if isinstance(n, str) and SECRET_NAME.fullmatch(n)
-                and n in secrets]
+                and isinstance(secrets.get(n), str)]
         if keys:
             ssh_dir = d / "ssh"
             ssh_dir.mkdir(mode=0o700)

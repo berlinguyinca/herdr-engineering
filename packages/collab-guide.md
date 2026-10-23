@@ -210,6 +210,10 @@ pass a command, path, environment or secret. The result comes back as **untruste
   Hosts the owner lists in the profile need no approval: that is the owner's call, but private, loopback and
   link-local addresses and `localhost` are refused. Approvals last a day by
   default, can be made permanent, and apply to the **whole room**.
+* **Services stay on their host.** A service's upstream must be a public https host: private, loopback and
+  link-local addresses and `localhost` are refused when the profile is saved, and a public name that resolves to
+  a private address is blocked by the proxy. The operator binds each service key to one host; a service pointed
+  anywhere else gets no key.
 * **Limits:** 3 live helpers per agent, nesting depth 2, 20 helpers per person per hour (across all rooms),
   a successor chain of at most 5. Over a limit the request fails at once and says which limit.
 * **Panic switch:** the operator can pause all helpers; that stops every running helper at once.

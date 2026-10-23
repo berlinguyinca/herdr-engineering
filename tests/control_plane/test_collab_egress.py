@@ -348,7 +348,7 @@ def tls_upstream(short_dir):
         pytest.skip("needs openssl")
     key, cert = short_dir / "k.pem", short_dir / "c.pem"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
-                    "-days", "1", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+                    "-days", "1", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1,DNS:svc.test,DNS:localhost"],
                    check=True, capture_output=True)
     seen = []
 
@@ -356,6 +356,13 @@ def tls_upstream(short_dir):
         def _reply(self):
             if self.path.endswith("/slow"):
                 time.sleep(3)
+            if self.path.endswith("/redirect"):
+                seen.append({"method": self.command, "path": self.path, "headers": dict(self.headers.items())})
+                self.send_response(302)
+                self.send_header("Location", "https://evil.example/collect")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             n = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(n) if n else b""
             seen.append({"method": self.command, "path": self.path, "headers": dict(self.headers.items()), "body": body})
@@ -386,11 +393,13 @@ def tls_upstream(short_dir):
 def svc_proxy(short_dir, tls_upstream):
     port, cert, seen = tls_upstream
     p = Proxy(short_dir, env={"SSL_CERT_FILE": str(cert)}, args=["--svc-concurrency", "1"])
+    p.allow.write_text(f"127.0.0.1:{port}\n")          # the test upstream is on loopback: listed, like CONNECT
     p.services.write_text(json.dumps([
         {"name": "x", "upstream_url": f"https://127.0.0.1:{port}/base", "header": "Authorization", "secret_name": "x_key"},
         {"name": "nokey", "upstream_url": f"https://127.0.0.1:{port}/", "header": "X-Api-Key", "secret_name": "absent"},
         {"name": "plain", "upstream_url": f"http://127.0.0.1:{port}/", "header": "X-Api-Key", "secret_name": "x_key"}]))
-    p.secrets.write_text(json.dumps({"x_key": f"Bearer {SECRET}"}))
+    p.secrets.write_text(json.dumps({"x_key": {"value": f"Bearer {SECRET}", "host": "127.0.0.1"}}))
+    p.port = port
     yield p, seen
     err = p.stop()
     assert SECRET not in err
@@ -423,6 +432,73 @@ def test_svc_unknown_service_missing_secret_and_non_https_upstreams(svc_proxy):
     assert seen == []                                                       # nothing reached the upstream
     out = p.request(b"GET http://127.0.0.1:3128/svc/x/abs HTTP/1.1\r\nHost: 127.0.0.1:3128\r\n\r\n")
     assert out.startswith(b"HTTP/1.1 200") and seen[-1]["path"] == "/base/abs"   # absolute form to the relay itself
+
+
+def svc_services(p, *extra):
+    base = json.loads(p.services.read_text())
+    p.services.write_text(json.dumps(base + list(extra)))
+
+
+def test_svc_refuses_an_upstream_that_resolves_to_an_unlisted_internal_address(svc_proxy):
+    # the room owner sets upstream_url: a name (or address) inside the runner host's network is not reachable
+    # through /svc unless the operator listed that exact IP:port, the same rule as CONNECT
+    p, seen = svc_proxy
+    svc_services(p, {"name": "lh", "upstream_url": f"https://localhost:{p.port}/", "header": "Authorization",
+                     "secret_name": "lh_key"})
+    p.secrets.write_text(json.dumps({"x_key": {"value": f"Bearer {SECRET}", "host": "127.0.0.1"},
+                                     "lh_key": {"value": f"Bearer {SECRET}", "host": "localhost"}}))
+    p.allow.write_text("")
+    for name in (b"x", b"lh"):
+        out = p.request(b"GET /svc/" + name + b"/a HTTP/1.1\r\nHost: a\r\n\r\n")
+        assert out.startswith(b"HTTP/1.1 403"), out
+    assert seen == []                                                       # nothing reached the upstream
+    p.allow.write_text(f"127.0.0.1:{p.port}\n")
+    out = p.request(b"GET /svc/lh/a HTTP/1.1\r\nHost: a\r\n\r\n")
+    assert out.startswith(b"HTTP/1.1 200"), out
+    assert seen[-1]["headers"]["Host"].startswith("localhost")             # TLS and Host stay the name
+
+
+def test_a_secret_bound_to_one_host_is_never_sent_to_another(svc_proxy):
+    p, seen = svc_proxy
+    # the owner repoints a service (or adds one) that uses the key bound to 127.0.0.1 at another host
+    svc_services(p, {"name": "moved", "upstream_url": f"https://localhost:{p.port}/", "header": "Authorization",
+                     "secret_name": "x_key"},
+                 {"name": "legacy", "upstream_url": f"https://127.0.0.1:{p.port}/", "header": "Authorization",
+                  "secret_name": "old_key"})
+    p.secrets.write_text(json.dumps({"x_key": {"value": f"Bearer {SECRET}", "host": "127.0.0.1"},
+                                     "old_key": f"Bearer {SECRET}"}))     # an old file: no host bound
+    out = p.request(b"GET /svc/moved/a HTTP/1.1\r\nHost: a\r\n\r\n")
+    assert out.startswith(b"HTTP/1.1 502") and b"bound" in out, out
+    out = p.request(b"GET /svc/legacy/a HTTP/1.1\r\nHost: a\r\n\r\n")
+    assert out.startswith(b"HTTP/1.1 502") and b"bound" in out, out
+    assert seen == [] and SECRET.encode() not in out
+    out = p.request(b"GET /svc/x/a HTTP/1.1\r\nHost: a\r\n\r\n")           # the bound host still works
+    assert out.startswith(b"HTTP/1.1 200")
+
+
+def test_svc_does_not_relay_an_upstream_redirect(svc_proxy):
+    p, seen = svc_proxy
+    out = p.request(b"GET /svc/x/redirect HTTP/1.1\r\nHost: a\r\n\r\n")
+    assert out.startswith(b"HTTP/1.1 502") and b"evil.example" not in out, out
+    assert seen[-1]["path"] == "/base/redirect"                            # it did reach the upstream
+
+
+def test_fetch_resolves_once_and_dials_only_the_checked_address(tls_upstream, monkeypatch):
+    port, cert, seen = tls_upstream
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+    eg = load_egress()
+    asked = []
+
+    def fake_getaddrinfo(host, p, *a, **k):
+        asked.append(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.9.8.7", p)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", p))]
+    monkeypatch.setattr(eg, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(eg.ForbiddenUpstream):                              # neither address is listed
+        eg.fetch("svc.test", port, "GET", "/a", [], b"", set())
+    status, _, _, _ = eg.fetch("svc.test", port, "GET", "/a", [], b"", {("127.0.0.1", port)})
+    assert status == 200 and asked == ["svc.test", "svc.test"]             # one lookup per request
+    assert seen[-1]["headers"]["Host"] == f"svc.test:{port}"                # SNI/cert check and Host use the name
 
 
 # --- the sandbox without network, reaching out only through the relay ---

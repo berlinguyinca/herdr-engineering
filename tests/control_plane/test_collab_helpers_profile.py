@@ -106,6 +106,24 @@ def test_invalid_profiles_rejected(w, patch):
     assert w.s._profile(w.room)["allowed_families"] == []                   # nothing was stored
 
 
+@pytest.mark.parametrize("url", [
+    "https://127.0.0.1/v1", "https://10.0.0.5/", "https://192.168.1.1:8443/x", "https://169.254.169.254/latest",
+    "https://100.64.0.1/", "https://0.0.0.0/", "https://localhost/", "https://LOCALHOST.:8443/",
+    "https://svc.localhost/", "https://[::1]/", "https://[fe80::1]/", "https://2130706433/", "https://0x7f.1/",
+    "https://127.1/", "https://bad_host.example/"])
+def test_a_service_upstream_may_not_point_into_the_runner_hosts_network(w, url):
+    # the owner sets this, and the proxy sends the bound key there from the runner host
+    patch = {"services": [{**GOOD["services"][0], "upstream_url": url}]}
+    assert code(w.s.set_room_profile, w.alice, w.room, {**GOOD, **patch}) == 400
+    assert w.s._profile(w.room)["services"] == []
+
+
+def test_a_public_service_upstream_with_a_port_is_accepted(w):
+    patch = {"services": [{**GOOD["services"][0], "upstream_url": "https://API.Example.org:8443/v1"}]}
+    w.s.set_room_profile(w.alice, w.room, {**GOOD, **patch})
+    assert w.s._profile(w.room)["services"][0]["upstream_url"] == "https://API.Example.org:8443/v1"
+
+
 def test_non_dict_body_rejected(w):
     assert code(w.s.set_room_profile, w.alice, w.room, ["x"]) == 400
 
