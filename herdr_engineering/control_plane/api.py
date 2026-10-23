@@ -1111,6 +1111,23 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server.github_monitor.repositories(**query))
             if resource == "ci":
                 what = parts[4] if len(parts) > 4 else ""
+                if what == "performance" and len(parts) == 5:
+                    from .ci_performance import annotate_performance
+                    raw_days = _q(self.path, "days") or "14"
+                    if raw_days not in ('7', '14'):
+                        raise ValueError('CI performance days must be 7 or 14.')
+                    days = int(raw_days)
+                    snapshot = server.ci_monitor.snapshot(start=False)
+                    view = r.ci_performance(repository=_q(self.path, "repository") or None,
+                                            branch=_q(self.path, "branch") or None, days=days,
+                                            inventory=snapshot.get('repos', []))
+                    view['scope']['stale'] = view['scope']['stale'] or bool(snapshot.get('stale'))
+                    try:
+                        languages = server.github_monitor.repository_languages(start=False)
+                    except Exception:
+                        languages = {}
+                    return self._json(annotate_performance(view, r, snapshot.get('repos', []),
+                        languages if isinstance(languages, dict) else {}))
                 if what == "history":
                     from .project_links import annotate_ci_history, cached_github_languages
                     return self._json(annotate_ci_history(server.ci_monitor.history(), r,
@@ -1162,6 +1179,12 @@ def _make_handler(server, public=False, operator=False):
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
+            if resource == "ci" and len(parts) == 5 and parts[4] == "telemetry":
+                from .ci_performance import MAX_REQUEST_BYTES, validate_ci_telemetry
+                length = int(self.headers.get('Content-Length') or 0)
+                if not 0 < length <= MAX_REQUEST_BYTES:
+                    raise ValueError('Invalid CI telemetry bundle size.')
+                return self._json(r.record_ci_telemetry(validate_ci_telemetry(self._read_json())))
             body = self._read_json() or {}
             if resource == "ci" and len(parts) == 5 and parts[4] == "reports":
                 return self._json(r.ingest_ci_report(body))

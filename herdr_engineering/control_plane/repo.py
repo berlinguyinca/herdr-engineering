@@ -1433,6 +1433,50 @@ class ControlPlaneRepo:
         return False
 
     # ---------------------------------------------------------- CI history
+    def record_ci_telemetry(self, records):
+        """Persist validated observations, with retry-safe retained operation IDs."""
+        with self._event_lock:
+            pending, duplicates = {}, 0
+            for record in records:
+                identifier = record['operation_id']
+                stream = self._events.get(('ci_telemetry', identifier), [])
+                previous = stream[-1]['payload'] if stream else pending.get(identifier)
+                if previous is not None:
+                    if {k: v for k, v in previous.items() if k != 'ingested_at'} != record:
+                        raise ValueError('Conflicting CI telemetry operation ID.')
+                    duplicates += 1
+                else:
+                    pending[identifier] = copy.deepcopy(record)
+            for identifier, record in pending.items():
+                record['ingested_at'] = self._stamp()
+                try:
+                    self.record_event('ci_telemetry', identifier, 'CITelemetryReceived', record,
+                                      require_durable=True)
+                except Exception:
+                    raise RuntimeError('CI telemetry persistence is unavailable.') from None
+                self._trim_ci_history('ci_telemetry')
+            view = self.ci_performance()
+            return dict(accepted=len(pending), duplicates=duplicates,
+                        scope=view['scope'], coverage=view['coverage'])
+
+    def ci_performance(self, repository=None, branch=None, days=14, *, inventory=None):
+        from .ci_performance import performance
+        with self._event_lock:
+            records = [copy.deepcopy(stream[-1]['payload'])
+                       for (kind, _), stream in self._events.items()
+                       if kind == 'ci_telemetry' and stream]
+            pipelines = self.ci_reports()['pipelines']
+            if inventory is not None:
+                from .project_links import annotate_ci_history
+                # Resolve inventory identities before calculating group membership.
+                # Annotate both sources so exact-run enrichment cannot reintroduce
+                # an older/unresolved identity after telemetry has been resolved.
+                records = annotate_ci_history({'repos': inventory, 'pipelines': records}, self)['pipelines']
+                pipelines = annotate_ci_history({'repos': inventory, 'pipelines': pipelines}, self)['pipelines']
+            return performance(records, pipelines, now=self._now(),
+                               persistence='durable_sink' if self._sink is not None else 'memory_only',
+                               repository=repository, branch=branch, days=days)
+
     def ingest_ci_report(self, body):
         from .ci_reports import normalize_report, reconcile_report_identities
         with self._event_lock:
@@ -1465,11 +1509,13 @@ class ControlPlaneRepo:
             self._trim_ci_history("ci_observation")
 
     def _trim_ci_history(self, kind=None):
+        from .ci_performance import RECORD_LIMIT
         from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
         keep = set()
-        kinds = {kind} if kind is not None else {"ci_report", "ci_observation"}
+        kinds = {kind} if kind is not None else {"ci_report", "ci_observation", "ci_telemetry"}
         arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
-        for kind, limit in (("ci_report", REPORT_LIMIT), ("ci_observation", PIPELINE_LIMIT)):
+        for kind, limit in (("ci_report", REPORT_LIMIT), ("ci_observation", PIPELINE_LIMIT),
+                            ("ci_telemetry", RECORD_LIMIT)):
             if kind not in kinds:
                 continue
             keys = [key for key in self._events if key[0] == kind]
@@ -1524,7 +1570,7 @@ class ControlPlaneRepo:
             key = (entity_type, entity_id)
             stream = self._events.setdefault(key, [])
             seq = max((e.get("sequence", -1) for e in stream), default=-1) + 1
-            if entity_type in {"ci_report", "ci_observation"}:
+            if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
                 seq = max(seq, self._ci_sequence)
             ev = {
                 "event_id": new_id("event"),
@@ -1542,10 +1588,10 @@ class ControlPlaneRepo:
                 try:
                     self._sink.record_required(ev)
                 except Exception:
-                    if entity_type in {"ci_report", "ci_observation"} and not stream:
+                    if entity_type in {"ci_report", "ci_observation", "ci_telemetry"} and not stream:
                         self._events.pop(key, None)
                     raise
-            if entity_type in {"ci_report", "ci_observation"}:
+            if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
                 self._ci_sequence = seq + 1
             stream.append(ev)
             self._event_order.append((entity_type, entity_id, seq))
@@ -1823,7 +1869,7 @@ class ControlPlaneRepo:
         self._ci_sequence = max(int(state.get("ci_sequence", 0)),
                                 max((event.get("sequence", -1) + 1
                                      for key, stream in self._events.items()
-                                     if key[0] in {"ci_report", "ci_observation"}
+                                     if key[0] in {"ci_report", "ci_observation", "ci_telemetry"}
                                      for event in stream), default=0))
         self._trim_ci_history()
         # Replay durable naming reservations before any session is presented.

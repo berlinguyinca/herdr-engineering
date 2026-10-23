@@ -212,6 +212,14 @@ export class HerdrClient {
     return this.request('/api/v1/ci/reports', { signal });
   }
 
+  getCiPerformance({ days = 14, repository, branch, signal } = {}) {
+    const query = new URLSearchParams({ days: String(days) });
+    for (const [key, value] of Object.entries({ repository, branch })) {
+      if (value) query.set(key, value);
+    }
+    return this.request(`/api/v1/ci/performance?${query}`, { signal });
+  }
+
   getCiHistory({ signal } = {}) {
     return this.request('/api/v1/ci/history', { signal });
   }
