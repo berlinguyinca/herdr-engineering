@@ -231,3 +231,27 @@ def test_runner_rows_carry_the_allowed_families_and_a_profile_change_is_an_audit
     run(w, rec["helper_id"])
     w.s.finish_helper(w.op, rec["helper_id"], {"status": "failed", "error": "profile-changed"})
     assert w.s.helper_status(w.root, rec["helper_id"])["error"] == "profile-changed"
+
+
+# ------------------------------------------------------------------ the operator cancels any helper
+def test_the_operator_cancels_another_owners_helper_on_the_operator_listener(w):
+    rec = ask(w)
+    _, c = run(w, rec["helper_id"])
+    child = ask(w, w.s.authenticate(f"Agent {c['credential']}", c["device_id"]))
+    st, out = call(w, "POST", ["fleet", "helpers", rec["helper_id"], "cancel"], operator="mallory")
+    assert st == 200 and out["status"] == "cancelled"
+    assert w.s._helpers[child["helper_id"]]["status"] == "cancelled"       # the subtree goes too
+    assert code(w.s.authenticate, f"Agent {c['credential']}", c["device_id"]) == 401
+    pid = w.s._rooms[w.room]["project_id"]
+    rows = [e for e in w.s.audit(w.alice, pid, 0, 500)["events"]
+            if e["action"] == "helper.cancel" and e["resource_id"] == rec["helper_id"]]
+    assert rows and rows[0]["actor_user_id"] == "mallory" and rows[0]["actor_agent_id"] is None
+
+
+def test_nobody_else_reaches_the_operator_cancel(w):
+    rec = ask(w)
+    for who in ("bob", "mallory"):                                    # the public listener: 404, even for mallory
+        assert call(w, "POST", ["fleet", "helpers", rec["helper_id"], "cancel"], who)[0] == 404
+        assert call(w, "POST", ["helpers", rec["helper_id"], "cancel"], who)[0] == 404
+    assert call(w, "POST", ["fleet", "helpers", "nope", "cancel"], operator="mallory")[0] == 404
+    assert w.s._helpers[rec["helper_id"]]["status"] == "requested"

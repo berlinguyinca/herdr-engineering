@@ -2038,6 +2038,18 @@ class CollabService:
             self._end_helper(self._actor(pr), r, "cancelled", set())
             return self._helper_view(r)
 
+    def cancel_helper_as_operator(self, pr: Principal, helper_id: str) -> dict:
+        """Operator only (POST fleet/helpers/{id}/cancel): any helper, any owner; same effects as the owner's cancel
+        (its subtree ends, credentials revoked), audited with the operator as actor."""
+        self._require_operator(pr)
+        with self._lock:
+            self._expire_helpers()
+            r = self._helpers.get(helper_id) if isinstance(helper_id, str) else None
+            if r is None:
+                raise CollabError(404, "not found")
+            self._end_helper(self._actor(pr), r, "cancelled by the operator", set())
+            return self._helper_view(r)
+
     def _end_helper(self, actor: dict, r: dict, reason: str, seen: set) -> None:
         if r["status"] in _HELPER_LIVE:
             self._commit("helper_cancelled", {
@@ -3157,6 +3169,8 @@ class CollabService:
                         return 200, self.set_helpers_paused(pr, body.get("paused"))
                     if n == 4 and parts[1] == "helpers" and parts[3] == "claim":
                         return 200, self.claim_helper(pr, parts[2])
+                    if n == 4 and parts[1] == "helpers" and parts[3] == "cancel":
+                        return 200, self.cancel_helper_as_operator(pr, parts[2])
                     if n == 4 and parts[1] == "helpers" and parts[3] == "finish":
                         return 200, self.finish_helper(pr, parts[2], body)
                     if parts == ["fleet", "spawns"]:
