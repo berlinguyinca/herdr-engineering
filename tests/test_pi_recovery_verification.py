@@ -398,3 +398,62 @@ def test_legacy_unknown_input_capability_does_not_crash_verification(tmp_path):
     observer.entries[-1]["message"]["model"] = "fallback"
     observer.current["models"].append({**MODEL, "id": "fallback"})
     assert verify(store, plan, observer)["sessions"][0]["status"] == "verification_unknown"
+
+
+def test_prior_successful_tool_result_remains_progress_while_next_tool_runs(tmp_path):
+    store, plan = setup(tmp_path)
+    entries = messages("toolUse", tool_result=False)
+    entries.append(
+        {
+            "type": "message",
+            "id": "next-tool",
+            "parentId": "tool-result",
+            "message": {
+                "role": "assistant",
+                "provider": "metabolomics",
+                "model": "working",
+                "stopReason": "toolUse",
+                "content": [{"type": "toolCall", "id": "pending-next"}],
+            },
+        }
+    )
+    result = verify(store, plan, Observer(entries))["sessions"][0]
+    assert result["status"] == "progress_verified"
+    assert result["verification"]["evidence"]["assistantId"] == "after"
+    assert result["verification"]["evidence"]["toolResultIds"] == ["tool-result"]
+    assert result["verification"]["evidence"]["latestAssistant"]["id"] == "next-tool"
+
+
+def test_newer_error_overrides_older_progress_even_with_a_pending_retry(tmp_path):
+    store, plan = setup(tmp_path)
+    entries = messages()
+    entries.append(
+        {
+            "type": "message",
+            "id": "new-error",
+            "parentId": "after",
+            "message": {
+                "role": "assistant",
+                "provider": "metabolomics",
+                "model": "working",
+                "stopReason": "error",
+            },
+        }
+    )
+    entries.append(
+        {
+            "type": "message",
+            "id": "retry",
+            "parentId": "new-error",
+            "message": {
+                "role": "assistant",
+                "provider": "metabolomics",
+                "model": "working",
+                "stopReason": "toolUse",
+                "content": [{"type": "toolCall", "id": "pending"}],
+            },
+        }
+    )
+    result = verify(store, plan, Observer(entries))["sessions"][0]
+    assert result["status"] == "inference_failed"
+    assert result["verification"]["evidence"]["assistantId"] == "new-error"

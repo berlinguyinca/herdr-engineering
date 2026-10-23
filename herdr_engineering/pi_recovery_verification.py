@@ -136,6 +136,7 @@ def _interactive_status(entry, target, transport):
         "model": assistant.get("model"),
         "stopReason": assistant.get("stopReason"),
         "toolResultIds": evidence.get("successfulToolResults", []),
+        "latestAssistant": evidence.get("latestAssistant", assistant),
     }
     selected_confirmed = assistant.get("provider") == "metabolomics" and assistant.get(
         "model"

@@ -34,7 +34,8 @@ source installation, `herdr-eng fleet recover` exposes the same interface.
    content-free evidence locally. `progress_verified` requires a new completed
    assistant turn or successful tool result descending from the recorded baseline
    under the exact live session/process identity; it does not mean the task is
-   complete. `inference_failed`, `verification_waiting`, and `verification_unknown`
+   complete. Earlier successful work still counts while the next tool is pending;
+   a newer inference error overrides that success until later progress is proven. `inference_failed`, `verification_waiting`, and `verification_unknown`
    distinguish errors, absent progress, and missing proof. Native auto-fallback is
    reported with the actual compatible gateway model and `modelChanged`, checked
    against the original requirements or a conservative recorded candidate envelope;
@@ -77,8 +78,15 @@ process or changed conversation stops that attempt. Inspect before intervening.
 Interactive recovery only handles a current inference error, not user-aborted or
 already completed turns. An empty editor must be positively visible and no current
 Working/Thinking/Waiting-for-model indicator may be present, even if native status
-says idle. Forked transcript ambiguity, error-turn tool calls and unresolved tool
-results require reconciliation and remain excluded. Missing model capability metadata is not permission to
+says idle. Historical tool calls removed by native compaction/context edits are
+classified through Pi's canonical in-memory session projection only when the
+installed launcher/CLI/SDK ownership and version, process age, active parent chain,
+and unchanged transcript digest are proven. The helper has read-only filesystem
+permissions and never opens a persistent session. Malformed historical records
+must have identities proven outside the active chain; missing older parents need
+a validated compaction checkpoint. Unavailable SDK proof, unresolved projected
+tool calls and current error-turn calls remain excluded. Actual assistant model
+metadata supersedes older restored aliases; a newer explicit model change wins. Missing model capability metadata is not permission to
 fall back from vision or reduce context. Provider credentials stay on each host.
 
 Mission recovery requires the loaded runtime capability

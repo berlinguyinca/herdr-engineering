@@ -45,6 +45,7 @@ class EvidenceError(ValueError):
                 "process_changed",
                 "metadata_unavailable",
                 "metadata_invalid_json",
+                "canonical_projection_unavailable",
             }
             else "metadata_unavailable"
         )
@@ -114,6 +115,14 @@ class RecoveryTransport(PiTransport):
 
     def host(self, target, action, **fields):
         source = Path(__file__).with_name("pi_recovery_host.py").read_text()
+        if action == "inspect":
+            projection = Path(__file__).with_name("pi_recovery_projection.mjs").read_text()
+            source = source.replace(
+                'if __name__ == "__main__":',
+                "CANONICAL_PROJECTION_SCRIPT = "
+                + repr(projection)
+                + '\nif __name__ == "__main__":',
+            )
         result = self._json(target, ["python3", "-c", source, action, json.dumps(fields)])
         if result.get("error"):
             raise EvidenceError(result["error"])

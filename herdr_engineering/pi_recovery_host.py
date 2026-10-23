@@ -6,9 +6,11 @@ content remain local. This helper never edits a transcript or controls a process
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -58,6 +60,145 @@ def process_birth(pid):
     return birth
 
 
+def process_started_at(pid):
+    birth = process_birth(pid)
+    if Path("/proc").exists():
+        boot = next(
+            int(line.split()[1])
+            for line in Path("/proc/stat").read_text().splitlines()
+            if line.startswith("btime ")
+        )
+        return boot + int(birth) / os.sysconf("SC_CLK_TCK")
+    from datetime import datetime
+
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "lstart="],
+        env={**os.environ, "LC_ALL": "C"},
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    return datetime.strptime(result.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+
+
+def private_user_group(gid):
+    import grp
+    import pwd
+
+    user = pwd.getpwuid(os.getuid())
+    group = grp.getgrgid(gid)
+    return (
+        gid == user.pw_gid
+        and set(group.gr_mem) <= {user.pw_name}
+        and all(
+            account.pw_uid == user.pw_uid for account in pwd.getpwall() if account.pw_gid == gid
+        )
+    )
+
+
+def trusted_sdk(home, pid):
+    """Resolve only the existing owned launcher/CLI pair, never cwd or staged peers."""
+    started = process_started_at(pid)
+    wrapper = owned_file(home / ".local/bin/pi")
+    text = wrapper.read_text()
+    commands = [shlex.split(line) for line in text.splitlines() if line.startswith("exec ")]
+    launcher = home / ".local/share/pi-session-auto-resume"
+    if (
+        "# pi-session-auto-resume launcher" not in text
+        or len(commands) != 1
+        or len(commands[0]) != 5
+        or commands[0][-1] != "$@"
+        or Path(commands[0][2]).resolve()
+        != (launcher / "scripts/pi-session-auto-resume.ts").resolve()
+    ):
+        raise ValueError("native SDK launcher proof unavailable")
+    cli = Path(commands[0][3]).resolve()
+    package = (launcher / "node_modules/@earendil-works/pi-coding-agent").resolve()
+    manifest = read_json(package / "package.json")
+    if manifest.get("name") != "@earendil-works/pi-coding-agent" or not re.fullmatch(
+        r"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", manifest.get("version", "")
+    ):
+        raise ValueError("native SDK version proof unavailable")
+    global_package = home / ".npm-global/lib/node_modules/@earendil-works/pi-coding-agent"
+    releases = home / ".pi/agent/install/releases"
+    if package != global_package:
+        if not package.is_relative_to(releases) or package.relative_to(releases).parts != (
+            manifest["version"],
+            "node_modules",
+            "@earendil-works",
+            "pi-coding-agent",
+        ):
+            raise ValueError("native SDK installation path unavailable")
+    if cli not in (package / "dist/cli.js", package / "dist/bundle/cli.js"):
+        raise ValueError("native SDK CLI and launcher disagree")
+    module = package / "dist/core/session-manager.js"
+    paths = [
+        wrapper,
+        launcher / "scripts/pi-session-auto-resume.ts",
+        launcher / "src/gateway/launcherLinks.ts",
+        cli,
+        package / "package.json",
+        module,
+        package / "dist/core/messages.js",
+        package / "dist/config.js",
+        package / "dist/utils/paths.js",
+        package / "dist/utils/child-process.js",
+        package / "dist/utils/text.js",
+    ]
+    files = []
+    for path in dict.fromkeys(paths):
+        path = owned_file(path)
+        info = path.stat()
+        if (
+            info.st_mode & 0o002
+            or (info.st_mode & 0o020 and not private_user_group(info.st_gid))
+            or info.st_ctime > started
+        ):
+            raise ValueError("native SDK predating-process proof unavailable")
+        files.append({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    return {"module": str(module), "version": manifest["version"], "files": files}
+
+
+def canonical_projection(home, pid, path, session_id, raw):
+    try:
+        sdk = trusted_sdk(home, pid)
+        source = globals().get("CANONICAL_PROJECTION_SCRIPT")
+        if source is None:
+            source = Path(__file__).with_name("pi_recovery_projection.mjs").read_text()
+        request = {
+            "path": str(path),
+            "sessionId": session_id,
+            "digest": hashlib.sha256(raw).hexdigest(),
+            "sdk": sdk,
+            "outagePattern": OUTAGE.pattern,
+        }
+        result = subprocess.run(
+            [
+                "node",
+                "--experimental-permission",
+                "--allow-fs-read=*",
+                "--input-type=module",
+                "-e",
+                source,
+                json.dumps(request),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        projected = json.loads(result.stdout)
+        if (
+            trusted_sdk(home, pid) != sdk
+            or hashlib.sha256(path.read_bytes()).hexdigest() != request["digest"]
+        ):
+            return {"verified": False, "errorCode": "projection_custody_changed"}
+        return projected
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return {"verified": False, "errorCode": "native_sdk_proof_unavailable"}
+
+
 def recovery_progress(entries, baseline):
     """Content-free evidence from a new assistant descending from the recorded turn."""
     result = {
@@ -103,7 +244,6 @@ def recovery_progress(entries, baseline):
     result["baselineAncestor"] = descends(latest, baseline)
     if not result["baselineAncestor"]:
         return result
-    message = latest["message"]
 
     def identifier(value):
         return (
@@ -112,35 +252,64 @@ def recovery_progress(entries, baseline):
             else None
         )
 
-    result["assistant"] = {
-        "id": identifier(latest["id"]),
-        "provider": identifier(message.get("provider")),
-        "model": identifier(message.get("model")),
-        "stopReason": message.get("stopReason")
-        if message.get("stopReason") in ("stop", "error", "toolUse", "aborted", "length")
-        else "unknown",
-    }
-    calls = (
-        {
-            p.get("id")
-            for p in message.get("content", [])
-            if isinstance(p, dict) and p.get("type") == "toolCall"
+    def summary(entry):
+        message = entry["message"]
+        return {
+            "id": identifier(entry["id"]),
+            "provider": identifier(message.get("provider")),
+            "model": identifier(message.get("model")),
+            "stopReason": message.get("stopReason")
+            if message.get("stopReason") in ("stop", "error", "toolUse", "aborted", "length")
+            else "unknown",
         }
-        if isinstance(message.get("content"), list)
-        else set()
-    )
-    for entry in entries[positions[latest["id"]] + 1 :]:
+
+    successful = {}
+    for entry in entries:
         tool = entry.get("message", {})
         if (
             entry.get("type") == "message"
             and tool.get("role") == "toolResult"
             and tool.get("isError") is False
-            and tool.get("toolCallId") in calls
             and identifier(entry.get("id"))
-            and descends(entry, latest["id"])
         ):
-            result["successfulToolResults"].append(entry["id"])
-    result["successfulToolResults"] = result["successfulToolResults"][-20:]
+            successful.setdefault(tool.get("toolCallId"), []).append(entry)
+    outcomes = []
+    for assistant in assistants:
+        if not descends(latest, assistant["id"]):
+            continue
+        message = assistant["message"]
+        if message.get("stopReason") in ("stop", "error"):
+            outcomes.append((positions[assistant["id"]], assistant, []))
+        if message.get("stopReason") not in ("stop", "toolUse"):
+            continue
+        calls = (
+            {
+                p.get("id")
+                for p in message.get("content", [])
+                if isinstance(p, dict) and p.get("type") == "toolCall"
+            }
+            if isinstance(message.get("content"), list)
+            else set()
+        )
+        results = [
+            entry
+            for call in calls
+            for entry in successful.get(call, [])
+            if positions[entry["id"]] > positions[assistant["id"]]
+            and descends(entry, assistant["id"])
+            and (assistant is latest or descends(latest, entry["id"]))
+        ]
+        if results:
+            results.sort(key=lambda entry: positions[entry["id"]])
+            outcomes.append(
+                (positions[results[-1]["id"]], assistant, [entry["id"] for entry in results[-20:]])
+            )
+    selected, results = latest, []
+    if outcomes:
+        _, selected, results = max(outcomes, key=lambda outcome: outcome[0])
+    result["assistant"] = summary(selected)
+    result["latestAssistant"] = summary(latest)
+    result["successfulToolResults"] = results
     return result
 
 
@@ -167,6 +336,12 @@ def transcript_metadata(entries, config):
             if message.get("role") in ("user", "assistant"):
                 last_message = entry
                 unsafe_error_turn = False
+            if (
+                message.get("role") == "assistant"
+                and isinstance(message.get("provider"), str)
+                and isinstance(message.get("model"), str)
+            ):
+                provider, model = message["provider"], message["model"]
             if message.get("role") == "toolResult":
                 pending_calls.discard(message.get("toolCallId"))
             for part in (
@@ -243,14 +418,82 @@ def inspect(home, pid, session_id, shell_pid=None, native_path=None, baseline=No
     path = owned_file(matches[0])
     if not path.resolve().is_relative_to(root.resolve()) or path.stat().st_size > 64 * 1024 * 1024:
         raise ValueError("conversation outside bounded same-user store")
-    entries = []
-    with path.open() as stream:
-        for line in stream:
-            entries.append(json.loads(line))
+    raw = path.read_bytes()
+    entries, malformed = [], False
+    for index, line in enumerate(raw.decode("utf-8").splitlines()):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            if not entries:
+                raise ValueError("conversation header mismatch") from None
+            malformed = True
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError("conversation header mismatch")
+        entries.append(entry)
     if not entries or entries[0].get("type") != "session" or entries[0].get("id") != session_id:
         raise ValueError("conversation header mismatch")
-    metadata = transcript_metadata(entries, read_json(home / ".pi/agent/models.json"))
-    if process_birth(pid) != birth:
+    config = read_json(home / ".pi/agent/models.json")
+    metadata = transcript_metadata(entries, config)
+    if malformed or metadata["failureEvidence"] in (
+        "unreconciled_tool_calls",
+        "error_turn_tool_calls",
+        "ambiguous_branch_history",
+    ):
+        projection = canonical_projection(home, pid, path, session_id, raw)
+        metadata["canonicalProjection"] = projection
+        if projection.get("verified") is True:
+            last = projection.get("lastMessage") or {}
+            pending = projection.get("pendingToolCalls")
+            safe_error = (
+                last.get("role") == "assistant"
+                and last.get("stopReason") == "error"
+                and last.get("outage") is True
+                and last.get("toolCalls") == 0
+                and pending == 0
+            )
+            metadata["failure"] = "inference" if safe_error else None
+            metadata["failureEvidence"] = (
+                "canonical_current_inference_error"
+                if safe_error
+                else "canonical_unreconciled_tool_calls"
+                if pending
+                else "canonical_no_current_inference_error"
+            )
+            metadata["lastAssistantId"] = last.get("sourceId")
+            metadata["requiresVision"] = bool(
+                metadata["requiresVision"] or projection.get("hasImages")
+            )
+            selected = projection.get("model") or {}
+            candidate = next(
+                (
+                    model
+                    for model in config.get("providers", {})
+                    .get(selected.get("provider"), {})
+                    .get("models", [])
+                    if model.get("id") == selected.get("modelId")
+                ),
+                None,
+            )
+            if candidate and type(candidate.get("contextWindow")) is int:
+                metadata.update(
+                    provider=selected["provider"],
+                    model=selected["modelId"],
+                    requiredContext=max(
+                        metadata.get("requiredContext") or 0, candidate["contextWindow"]
+                    ),
+                    requiresReasoning=bool(
+                        metadata["requiresReasoning"] or candidate.get("reasoning")
+                    ),
+                )
+        elif malformed:
+            raise ValueError("native canonical projection unavailable")
+    if (
+        process_birth(pid) != birth
+        or hashlib.sha256(path.read_bytes()).digest() != hashlib.sha256(raw).digest()
+    ):
         raise ValueError("process changed during metadata read")
     return {
         **metadata,
@@ -467,6 +710,7 @@ def main():
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         codes = {
             "conversation file missing or ambiguous": "transcript_missing_or_ambiguous",
+            "native canonical projection unavailable": "canonical_projection_unavailable",
             "conversation header mismatch": "transcript_header_mismatch",
             "conversation outside bounded same-user store": "transcript_scope_or_size",
             "process belongs to another user": "process_owner_mismatch",
