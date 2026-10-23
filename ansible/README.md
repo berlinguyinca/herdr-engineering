@@ -50,27 +50,37 @@ wholesale. No secrets live in the inventory or any committed file.
 (Debian/Ubuntu) installs from the official `pkgs.tailscale.com` apt repository
 and enables `tailscaled`; macOS uses the Homebrew `tailscale` formula.
 
-- **Already-joined hosts are left alone.** The role reads
-  `tailscale status --json`; only when `BackendState != "Running"` does it run
+- **Already-joined hosts are left alone.** After starting `tailscaled` the role
+  waits (10 x 3 s) for a settled `BackendState` from `tailscale status --json`.
+  Only `NeedsLogin` triggers
   `tailscale up --hostname=<inventory_hostname> --advertise-tags=tag:fleet`.
-  No re-tag, no re-up, so a second run changes nothing. `--check` never joins.
+  `Running` is left alone; `Stopped` (enrolled but stopped) is reported and left
+  alone, run `tailscale up` manually; any other or never-settling state fails the
+  play with a fixed message. A second run changes nothing and `--check` never
+  joins.
 - **Auth key from Vault, never Git.** Variable `tailscale_auth_key`, required
-  only for hosts not yet on the tailnet. On the main host create (not committed):
+  only for hosts in `NeedsLogin`. Create the vault file on the main host (not
+  committed) with an editor, so the key never lands in shell history:
 
   ```bash
   cd ansible
   mkdir -p inventory/group_vars/herdr_fleet
-  printf 'tailscale_auth_key: tskey-auth-XXXX\n' > inventory/group_vars/herdr_fleet/vault.yml
-  ansible-vault encrypt inventory/group_vars/herdr_fleet/vault.yml
+  ansible-vault create inventory/group_vars/herdr_fleet/vault.yml
+  #   in the editor:  tailscale_auth_key: tskey-auth-XXXX   (placeholder)
   ansible-playbook -i inventory/hosts.yml playbooks/site.yml --ask-vault-pass
   # or: --vault-password-file ~/.herdr-vault-pass  (mode 0600)
   ```
 
-  or pass `-e tailscale_auth_key=...` at run time. The key is written to a
-  short-lived 0600 file consumed via `--auth-key=file:<path>` (needs
-  Tailscale >= 1.62, so it never shows in `ps`), removed afterwards, and every
-  task touching it is `no_log`. A node that must join without a key fails on
-  Linux with a fixed message that never prints the key.
+  Alternatively keep the key in a 0600 vars file passed as
+  `--extra-vars @/path/to/keyfile.yml`. Do not put the key on the command line
+  with `-e tailscale_auth_key=...` (it lands in history and `ps`). The key is
+  written to a 0600 file inside a 0700 temp directory and consumed via
+  `--auth-key=file:<path>`, so it never shows in `ps`; the directory is removed
+  afterwards and every task touching the key is `no_log`. This needs
+  **Tailscale >= 1.62** on the node; the role checks `tailscale version` and
+  fails with an upgrade hint if older. On a failed `tailscale up` the role
+  prints the return code and the last 5 stderr lines with `tskey-...` redacted.
+  A node that must join without a key fails on Linux with a fixed message.
 - **ACL prerequisite.** `tag:fleet` must exist under `tagOwners` in the
   Tailscale access rules. Create the auth key in the admin console as
   reusable, pre-authorized, with tag `tag:fleet`; a 90-day expiry is

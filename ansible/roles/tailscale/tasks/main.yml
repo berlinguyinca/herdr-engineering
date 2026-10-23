@@ -1,10 +1,13 @@
 ---
 # Tailscale: install, run tailscaled, and join the tailnet ONLY when the node is
 # not already logged in. A host that is already "Running" is left alone (no
-# re-tag, no re-up). The auth key never appears in argv, logs or task results:
-# it is written to a short-lived 0600 file consumed via --auth-key=file:<path>
-# (Tailscale >= 1.62) and removed afterwards; every task that touches it is
-# no_log. macOS is best-effort: failures there are reported, never fatal.
+# re-tag, no re-up). Join happens ONLY from BackendState "NeedsLogin"; a
+# "Stopped" node is enrolled and is reported, never re-upped. The auth key never
+# appears in argv, logs or task results: it is written to a 0600 file inside a
+# 0700 private directory, consumed via --auth-key=file:<path> (Tailscale
+# >= 1.62), and the whole directory is removed afterwards; every task that
+# touches it is no_log. macOS is best-effort: failures there are reported,
+# never fatal.
 
 - name: "Install Tailscale (Debian/Ubuntu: official apt repository)"
   when:
@@ -42,15 +45,6 @@
         update_cache: true
         cache_valid_time: 3600
 
-- name: "Run tailscaled at boot (Linux systemd)"
-  ansible.builtin.systemd:
-    name: tailscaled
-    enabled: true
-    state: started
-  when:
-    - ansible_facts['system'] == 'Linux'
-    - tailscale_install | bool
-
 - name: "Install Tailscale on macOS (Homebrew formula, best-effort)"
   community.general.homebrew:
     name: tailscale
@@ -70,40 +64,93 @@
     - ansible_facts['system'] == 'Darwin'
     - tailscale_brew is failed
 
-- name: "Probe Tailscale state (read-only)"
-  ansible.builtin.command: tailscale status --json
-  register: tailscale_probe
+- name: "Locate the tailscale binary"
+  ansible.builtin.command:
+    argv: [sh, -c, "command -v tailscale"]
+  register: tailscale_bin
   changed_when: false
   failed_when: false
   check_mode: false
 
+- name: "Fail clearly when tailscale is not installed (nothing installs it here)"
+  ansible.builtin.fail:
+    msg: >-
+      The tailscale binary is not installed and this role cannot install it on
+      this OS (or tailscale_install is false). Install tailscale first, then re-run.
+  when:
+    - not ansible_check_mode
+    - ansible_facts['system'] == 'Linux'
+    - tailscale_bin.rc != 0
+
+- name: "Run tailscaled at boot (Linux systemd)"
+  ansible.builtin.systemd:
+    name: tailscaled
+    enabled: true
+    state: started
+  when:
+    - ansible_facts['system'] == 'Linux'
+    - tailscale_bin.rc == 0
+
+# tailscaled needs a moment after start before BackendState settles; joining
+# on a transient state would be wrong, so wait for a settled one.
+- name: "Wait for a settled Tailscale state (read-only)"
+  ansible.builtin.command: tailscale status --json
+  register: tailscale_probe
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  when: tailscale_bin.rc == 0
+  retries: 10
+  delay: 3
+  until: >-
+    tailscale_probe.rc is defined
+    and (tailscale_probe.stdout | default('')
+         | regex_findall('"BackendState"\\s*:\\s*"(\\w+)"') | first | default('Unknown'))
+        in ['Running', 'Stopped', 'NeedsLogin']
+
 - name: "Derive Tailscale backend state"
   ansible.builtin.set_fact:
     tailscale_backend_state: >-
-      {{ (tailscale_probe.stdout | from_json).get('BackendState', 'Unknown')
-         if (tailscale_probe.rc | default(127)) == 0
-            and (tailscale_probe.stdout | default('')) is match('\s*\{')
-         else 'NotRunning' }}
+      {{ (tailscale_probe.stdout | default('')
+          | regex_findall('"BackendState"\\s*:\\s*"(\\w+)"') | first | default('Unknown'))
+         if tailscale_bin.rc == 0 else 'NotInstalled' }}
 
 - name: "Report Tailscale state"
   ansible.builtin.debug:
     msg: "tailscale: {{ 'up' if tailscale_backend_state == 'Running' else 'down/not-logged-in (' ~ tailscale_backend_state ~ ')' }}"
 
+- name: "Report an enrolled but stopped node (left alone)"
+  ansible.builtin.debug:
+    msg: "tailscale is enrolled but stopped; left alone (no re-up, no re-tag). Run `tailscale up` manually."
+  when: tailscale_backend_state == 'Stopped'
+
+- name: "Fail on an unexpected or unsettled Tailscale state"
+  ansible.builtin.fail:
+    msg: >-
+      Tailscale backend state is '{{ tailscale_backend_state }}', not one of
+      Running, Stopped or NeedsLogin (the probe did not settle or the state is
+      unsupported). Not joining; investigate tailscaled on this host.
+  when:
+    - not ansible_check_mode
+    - tailscale_backend_state not in ['Running', 'Stopped', 'NeedsLogin']
+    - ansible_facts['system'] == 'Linux'
+
 - name: "Note that the node would join the tailnet (check mode)"
   ansible.builtin.debug:
-    msg: "check mode: tailscale is not Running; a real run would join the tailnet with tags {{ tailscale_tags | join(',') }}."
+    msg: "check mode: a real run would join the tailnet with tags {{ tailscale_tags | join(',') }}."
   when:
-    - tailscale_backend_state != 'Running'
     - ansible_check_mode
+    - tailscale_backend_state in ['NeedsLogin', 'NotInstalled']
 
 - name: "Require an auth key to join the tailnet"
   ansible.builtin.fail:
     msg: >-
       This node is not on the tailnet and no tailscale_auth_key was provided.
       Supply it from Ansible Vault (inventory/group_vars/herdr_fleet/vault.yml)
-      or with -e at run time. The key is never printed.
+      or with --extra-vars @file at run time. The key is never printed.
   when:
-    - tailscale_backend_state != 'Running'
+    - tailscale_backend_state == 'NeedsLogin'
     - not ansible_check_mode
     - ansible_facts['system'] == 'Linux'
     - (tailscale_auth_key | default('') | length) == 0
@@ -114,28 +161,55 @@
       This macOS node is not on the tailnet and no tailscale_auth_key was
       provided; skipping the join (best-effort on macOS). The key is never printed.
   when:
-    - tailscale_backend_state != 'Running'
+    - tailscale_backend_state == 'NeedsLogin'
     - not ansible_check_mode
     - ansible_facts['system'] == 'Darwin'
     - (tailscale_auth_key | default('') | length) == 0
 
-- name: "Join the tailnet (only when not logged in)"
+- name: "Join the tailnet (only from NeedsLogin)"
   when:
-    - tailscale_backend_state != 'Running'
+    - tailscale_backend_state == 'NeedsLogin'
     - not ansible_check_mode
     - (tailscale_auth_key | default('') | length) > 0
   block:
-    - name: "Create a short-lived private file for the auth key"
+    - name: "Read the tailscale client version"
+      ansible.builtin.command: tailscale version
+      register: tailscale_version_out
+      changed_when: false
+      failed_when: false
+
+    - name: "Derive the tailscale client version"
+      ansible.builtin.set_fact:
+        tailscale_client_version: >-
+          {{ (tailscale_version_out.stdout | default('')) | regex_findall('^\\s*([0-9]+[.][0-9]+)') | first | default('0') }}
+
+    - name: "Require a tailscale client that supports --auth-key=file: (>= 1.62)"
+      ansible.builtin.fail:
+        msg: >-
+          Tailscale client '{{ tailscale_client_version }}' is older than 1.62 and
+          cannot read the auth key from a file. Upgrade tailscale on this host.
+      when:
+        - ansible_facts['system'] == 'Linux'
+        - tailscale_client_version is version('1.62', '<')
+
+    - name: "Create a private (0700) temp directory for the auth key"
       ansible.builtin.tempfile:
-        state: file
+        state: directory
         prefix: tsauth.
-      register: tailscale_key_file
+      register: tailscale_key_dir
+      no_log: true
+
+    - name: "Restrict the key directory to 0700"
+      ansible.builtin.file:
+        path: "{{ tailscale_key_dir.path }}"
+        state: directory
+        mode: "0700"
       no_log: true
 
     - name: "Write the auth key (0600)"
       ansible.builtin.copy:
         content: "{{ tailscale_auth_key }}"
-        dest: "{{ tailscale_key_file.path }}"
+        dest: "{{ tailscale_key_dir.path }}/authkey"
         mode: "0600"
       no_log: true
 
@@ -144,13 +218,29 @@
         argv:
           - tailscale
           - up
-          - "--auth-key=file:{{ tailscale_key_file.path }}"
+          - "--auth-key=file:{{ tailscale_key_dir.path }}/authkey"
           - "--hostname={{ tailscale_hostname }}"
           - "--advertise-tags={{ tailscale_tags | join(',') }}"
       no_log: true
-      changed_when: true
+      changed_when: tailscale_up.rc == 0
+      failed_when: false
       register: tailscale_up
-      failed_when: tailscale_up.rc != 0 and ansible_facts['system'] == 'Linux'
+
+    - name: "Show a sanitized tailscale up diagnostic"
+      ansible.builtin.debug:
+        msg: >-
+          tailscale up failed (rc={{ tailscale_up.rc }}):
+          {{ (tailscale_up.stderr_lines | default([]))[-5:] | join(' | ')
+             | regex_replace('tskey-[A-Za-z0-9_-]+', '[REDACTED]')
+             | replace(tailscale_auth_key, '[REDACTED]') }}
+      when: tailscale_up.rc != 0
+
+    - name: "Fail when tailscale up failed (Linux)"
+      ansible.builtin.fail:
+        msg: "tailscale up failed; see the sanitized diagnostic above. The key is never printed."
+      when:
+        - tailscale_up.rc != 0
+        - ansible_facts['system'] == 'Linux'
 
     - name: "Report macOS join failure (non-fatal)"
       ansible.builtin.debug:
@@ -161,9 +251,9 @@
         - ansible_facts['system'] == 'Darwin'
         - tailscale_up.rc != 0
   always:
-    - name: "Remove the auth key file"
+    - name: "Remove the auth key directory"
       ansible.builtin.file:
-        path: "{{ tailscale_key_file.path }}"
+        path: "{{ tailscale_key_dir.path }}"
         state: absent
-      when: tailscale_key_file.path is defined
+      when: tailscale_key_dir.path is defined
       no_log: true
