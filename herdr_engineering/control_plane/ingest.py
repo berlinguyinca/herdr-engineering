@@ -97,6 +97,10 @@ class IngestService:
                 # the row is persisted, so a refused change is never stored and
                 # its sequence is not consumed. Raises PermissionError (403).
                 self.repo.graph.admit(env["actor"], event_type, payload, env["source"])
+                # Server-assigned monotonic admission number, persisted with the
+                # row: ownership and cross-writer ordering never depend on the
+                # wall clock, source names or client sequences.
+                env["lineage_seq"] = self.repo.graph.next_seq()
             # The envelope row is persisted FIRST. If that fails nothing has
             # been applied and the ledger is untouched, so the emitter retries.
             try:
@@ -131,7 +135,8 @@ class IngestService:
             "event_id": env["event_id"], "source": env["source"],
             "source_sequence": env["source_sequence"], "event_type": event_type,
             "payload": payload, "visibility_scope": env["visibility_scope"],
-            "actor": env.get("actor"), "ingest_timestamp": env["received_at"]})
+            "actor": env.get("actor"), "ingest_timestamp": env["received_at"],
+            "lineage_seq": env.get("lineage_seq")})
         return {"entity_type": "lineage", "entity_id": entity_id, "event_type": event_type}
 
     def _stored_identity(self, event_id):

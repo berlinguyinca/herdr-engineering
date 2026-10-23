@@ -66,7 +66,9 @@ MAX_TOTAL_ATTR_KEYS = 128            # per node/edge, across all events
 MAX_TOTAL_ATTRS_BYTES = 32 * 1024    # per node/edge, across all events
 MAX_REASON = 512
 MAX_WRITERS = 8                      # co_writers and supersedes list length
-MAX_SOURCES_PER_OBJECT = 8
+MAX_SOURCES_PER_OBJECT = 16          # distinct (source, actor) writers per object
+MAX_WILDCARD_REMOVES = 10_000
+MAX_OBJECTS_PER_PRINCIPAL = 50_000   # fair-share quota of the global pool (operators exempt)
 MAX_TOTAL_NODES = 200_000
 MAX_TOTAL_EDGES = 1_000_000
 DEFAULT_DEPTH, MAX_DEPTH = 2, 5
@@ -238,9 +240,26 @@ def _ts(ev: dict) -> float:
         return 0.0
 
 
+def _lseq(ev: dict) -> int:
+    """Server-assigned monotonic admission number (persisted in the envelope row)."""
+    val = ev.get("lineage_seq")
+    if val is None:
+        meta = (ev.get("payload") or {}).get("_envelope")
+        val = meta.get("lineage_seq") if isinstance(meta, dict) else None
+    return val if isinstance(val, int) and not isinstance(val, bool) else 0
+
+
 def _rank(ev: dict) -> tuple:
-    """Total order over events: server receipt time, then source/sequence/id."""
-    return (_ts(ev), str(ev["source"]), int(ev["source_sequence"]), str(ev["event_id"]))
+    """Total order over events: admission number, then receipt time, source, sequence, id.
+
+    The admission number is assigned by the server in a monotonic counter, so it
+    cannot be influenced by a client's sequence, source name or the wall clock.
+    """
+    return (_lseq(ev), _ts(ev), str(ev["source"]), int(ev["source_sequence"]), str(ev["event_id"]))
+
+
+def _writer_key(ev: dict) -> tuple:
+    return (str(ev["source"]), (ev.get("actor") or {}).get("id"))
 
 
 def _narrow(a: str, b: str) -> str:
@@ -248,17 +267,23 @@ def _narrow(a: str, b: str) -> str:
 
 
 class _Reg:
-    """Per-source last-writer-wins register, merged across sources by receipt."""
+    """Last-writer-wins register per (source, actor), merged across writers by admission order.
+
+    Inside one (source, actor) the emitter's own ``source_sequence`` decides, so
+    a late-arriving older event loses. Between different writers only the
+    server's admission order counts: a client-chosen sequence can never beat
+    another principal.
+    """
     __slots__ = ("by",)
 
     def __init__(self):
-        self.by: dict[str, tuple] = {}     # source -> (seq, event_id, rank, value)
+        self.by: dict[tuple, tuple] = {}     # writer key -> (seq, event_id, rank, value, key)
 
     def set(self, ev: dict, value: Any = None) -> None:
-        src, seq, eid = str(ev["source"]), int(ev["source_sequence"]), str(ev["event_id"])
-        cur = self.by.get(src)
+        key, seq, eid = _writer_key(ev), int(ev["source_sequence"]), str(ev["event_id"])
+        cur = self.by.get(key)
         if cur is None or (seq, eid) > (cur[0], cur[1]):
-            self.by[src] = (seq, eid, _rank(ev), value)
+            self.by[key] = (seq, eid, _rank(ev), value, key)
 
     def best(self) -> tuple | None:
         return max(self.by.values(), key=lambda t: t[2]) if self.by else None
@@ -269,8 +294,8 @@ class _Reg:
 
 
 def _after(x: tuple, y: tuple) -> bool:
-    """Is register entry ``x`` newer than ``y``? (same source: sequence; else receipt)"""
-    if x[2][1] == y[2][1]:
+    """Is register entry ``x`` newer than ``y``? (same writer: sequence; else admission order)"""
+    if x[4] == y[4]:
         return (x[0], x[1]) > (y[0], y[1])
     return x[2] > y[2]
 
@@ -280,10 +305,9 @@ class _Claims:
 
     def _init_claims(self) -> None:
         self.scope: str | None = None
-        self.nonop: tuple | None = None    # (rank, actor_id) of earliest non-operator event
-        self.op: tuple | None = None       # same for operator events
+        self.claim: tuple | None = None    # (rank, actor_id) of the first admitted event
         self.first = self.last = None      # (rank, event_id)
-        self.sources: set[str] = set()
+        self.sources: set[tuple] = set()
         self.attrs: dict[str, _Reg] = {}
 
     def _touch(self, ev: dict) -> None:
@@ -291,22 +315,18 @@ class _Claims:
         scope = ev.get("visibility_scope")
         scope = scope if scope in SCOPE_RANK else "private"
         self.scope = scope if self.scope is None else _narrow(self.scope, scope)
-        actor = ev.get("actor") or {}
-        claim = (rank, actor.get("id"))
-        if _is_operator(actor):
-            if self.op is None or claim < self.op:
-                self.op = claim
-        elif self.nonop is None or claim < self.nonop:
-            self.nonop = claim
+        claim = (rank, (ev.get("actor") or {}).get("id"))
+        if self.claim is None or claim[0] < self.claim[0]:
+            self.claim = claim
         if self.first is None or rank < self.first[0]:
             self.first = (rank, ev["event_id"])
         if self.last is None or rank > self.last[0]:
             self.last = (rank, ev["event_id"])
-        self.sources.add(str(ev["source"]))
+        self.sources.add(_writer_key(ev))
 
     def owner(self) -> str | None:
-        claim = self.nonop or self.op
-        return claim[1] if claim else None
+        """Actor of the first admitted event (pinned: admission numbers only grow)."""
+        return self.claim[1] if self.claim else None
 
     def co_writers(self) -> tuple:
         reg = self.attrs.get("co_writers")
@@ -363,54 +383,110 @@ class GraphProjection:
         self._wild: dict[tuple, _Wild] = {}
         self._out: dict[str, set] = {}
         self._in: dict[str, set] = {}
+        self._owned: dict[str, int] = {}
+        self._seq = 0
         self.events_applied = 0
         self.events_rejected = 0
 
     # ----------------------------------------------------------- admission
+    def next_seq(self) -> int:
+        """Next monotonic admission number (call under the ingest lock after admit)."""
+        with self._lock:
+            self._seq += 1
+            return self._seq
+
     def admit(self, actor: dict | None, event_type: str, payload: Any, source: str | None = None) -> dict:
         """Pre-persist gate for a live event. Raises ValueError (invalid / over
-        capacity) or PermissionError (actor may not modify this object)."""
+        capacity / nothing to remove for an operator) or PermissionError.
+
+        A non-operator is refused with ONE indistinguishable PermissionError when
+        it is not a writer of the target, cannot see an endpoint, is not a writer
+        of the edge's ``from`` node, or tries to remove something that does not
+        exist: so refusal never reveals whether the object exists.
+        """
         op = validate_lineage(event_type, payload)
         operator = _is_operator(actor)
         aid = (actor or {}).get("id")
+        deny = PermissionError("not permitted to modify this lineage object")
+        attrs = op.get("attrs") or {}
         with self._lock:
+            if not operator and "co_writers" in attrs:
+                raise deny
+            if not operator and (not aid or self._owned.get(aid, 0) >= MAX_OBJECTS_PER_PRINCIPAL) \
+                    and self._would_create(op):
+                if not aid:
+                    raise deny
+                raise ValueError("per-principal object quota reached")
             if op["op"] in ("node.upsert", "node.state"):
                 rec = self._nodes.get(op["node_id"])
-                if rec is None and len(self._nodes) >= MAX_TOTAL_NODES:
-                    raise ValueError("graph node capacity reached")
+                if rec is None:
+                    if len(self._nodes) >= MAX_TOTAL_NODES:
+                        raise ValueError("graph node capacity reached")
+                elif not operator and rec.owner() is not None and aid not in rec.writers():
+                    raise deny
                 recs = [rec]
             else:
+                frm, to = self._nodes.get(op["from_id"]), self._nodes.get(op["to_id"])
+                if not operator:
+                    # the author of an endpoint can always use it, whatever its scope
+                    if any(n is None or n.scope is None or not (
+                            aid in n.writers() or self._node_visible(actor, n)) for n in (frm, to)):
+                        raise deny
+                    if aid not in frm.writers():
+                        raise deny
                 key = (op["edge_type"], op["from_id"], op["to_id"]) + \
                     ((op["binding"],) if op["edge_type"] in BOUND_EDGE_TYPES and op["binding"] else ())
                 wildcard = (op["op"] == "edge.remove" and op["edge_type"] in BOUND_EDGE_TYPES
                             and op["binding"] is None)
-                if wildcard:
-                    tri = key[:3]
-                    recs = [self._wild.get(tri)] + [e for k in self._out.get(tri[1], ())
-                                                    if k[:3] == tri for e in [self._edges[k]]]
-                else:
+                if op["op"] == "edge.add":
                     rec = self._edges.get(key)
                     if rec is None and len(self._edges) >= MAX_TOTAL_EDGES:
                         raise ValueError("graph edge capacity reached")
                     recs = [rec]
-                if len(self._nodes) + 2 > MAX_TOTAL_NODES and not (
-                        op["from_id"] in self._nodes and op["to_id"] in self._nodes):
-                    raise ValueError("graph node capacity reached")
-            attrs = op.get("attrs") or {}
-            if not operator and "co_writers" in attrs:
-                raise PermissionError("only operators may set co_writers")
+                elif wildcard:
+                    tri = key[:3]
+                    existing = [self._edges[k] for k in self._out.get(tri[1], ()) if k[:3] == tri
+                                and self._live(self._edges[k])]
+                    if not existing:
+                        raise (ValueError("edge not found") if operator else deny)
+                    wild = self._wild.get(tri)
+                    if wild is None and len(self._wild) >= MAX_WILDCARD_REMOVES:
+                        raise ValueError("too many wildcard removes")
+                    recs = [wild] + existing
+                else:
+                    rec = self._edges.get(key)
+                    if rec is None or not self._live(rec):
+                        raise (ValueError("edge not found") if operator else deny)
+                    recs = [rec]
+            pair = (source, aid)
             for rec in recs:
                 if rec is None:
                     continue
-                if not operator and rec.owner() is not None and (not aid or aid not in rec.writers()):
-                    raise PermissionError("not permitted to modify this lineage object")
-                if source and source not in rec.sources and len(rec.sources) >= MAX_SOURCES_PER_OBJECT:
-                    raise ValueError("too many distinct sources for this lineage object")
+                if (not operator and op["op"].startswith("edge") and rec.owner() is not None
+                        and aid not in rec.writers()):
+                    raise deny
+                if source and pair not in rec.sources and len(rec.sources) >= MAX_SOURCES_PER_OBJECT:
+                    raise ValueError("too many distinct writers for this lineage object")
             if len(recs) == 1 and recs[0] is not None and attrs:
                 self._check_attr_caps(recs[0], attrs)
             elif attrs:
                 self._check_attr_caps(None, attrs)
         return op
+
+    def _would_create(self, op: dict) -> bool:
+        if op["op"] in ("node.upsert", "node.state"):
+            return op["node_id"] not in self._nodes
+        if op["op"] == "edge.add":
+            return True
+        return False
+
+    def _touch(self, rec: _Claims, ev: dict) -> None:
+        """Record an event on ``rec``; its first event charges the creator's quota."""
+        first = rec.claim is None
+        rec._touch(ev)
+        aid = (ev.get("actor") or {}).get("id")
+        if first and aid and not _is_operator(ev.get("actor")):
+            self._owned[aid] = self._owned.get(aid, 0) + 1
 
     @staticmethod
     def _check_attr_caps(rec: _Claims | None, attrs: dict) -> None:
@@ -445,7 +521,7 @@ class GraphProjection:
 
     def _apply_node(self, op: dict, ev: dict) -> None:
         node = self._node(op["node_id"], op["node_type"])
-        node._touch(ev)
+        self._touch(node, ev)
         if op["op"] == "node.upsert":
             if op["label"] is not None:
                 node.label.set(ev, op["label"])
@@ -465,7 +541,7 @@ class GraphProjection:
         bound = op["binding"]
         if op["op"] == "edge.add":
             edge = self._edge((etype, frm, to) + ((bound,) if etype in BOUND_EDGE_TYPES else ()))
-            edge._touch(ev)
+            self._touch(edge, ev)
             edge.adds.set(ev)
             edge._put_attrs(op["attrs"], ev)
             return
@@ -474,11 +550,11 @@ class GraphProjection:
         if etype in BOUND_EDGE_TYPES and bound is None:
             tri = (etype, frm, to)
             wild = self._wild.setdefault(tri, _Wild())
-            wild._touch(ev)
+            self._touch(wild, ev)
             wild.removes.set(ev, rem)
             return
         edge = self._edge((etype, frm, to) + ((bound,) if etype in BOUND_EDGE_TYPES else ()))
-        edge._touch(ev)
+        self._touch(edge, ev)
         edge.removes.set(ev, rem)
 
     def _edge(self, key: tuple) -> _Edge:
@@ -511,17 +587,25 @@ class GraphProjection:
         val = reg.value() if reg else None
         return set([val] if isinstance(val, str) else (val or []))
 
+    def _related(self, edge: _Edge, other: _Edge) -> bool:
+        """May ``other`` make ``edge`` stale? Only the same reviewer (same ``from``
+        node, which only its writers can add edges from) or an author who is a
+        writer of ``edge`` itself. Unrelated reviewers are never ranked against
+        each other; they only appear side by side in ``bindings``."""
+        return other.from_id == edge.from_id or (other.owner() is not None
+                                                  and other.owner() in edge.writers())
+
     def _is_stale(self, edge: _Edge, principal: Any = None) -> bool:
         """Is ``edge`` (reviewed/validated) outdated, as seen by ``principal``?
 
         Only edges the principal can see take part (``principal=None`` means the
         server-internal view over everything), so a hidden edge can never be
         inferred from another edge's flag. Staleness is by binding identity:
-        for each other live edge O of the same type and subject with a
-        different binding, ``edge`` is stale when
+        for each RELATED (see ``_related``) other live edge O of the same type
+        and subject with a different binding, ``edge`` is stale when
         * O declares ``attrs.supersedes`` containing edge's binding value; or
         * neither side declares a supersession of the other and O's add was
-          received later than edge's (implicit order: server receipt).
+          admitted later than edge's (implicit order: server admission).
         An edge that itself declares it supersedes O is never made stale by O.
         The server cannot know commit order; emitters that can deliver late
         should state it with ``attrs.supersedes``.
@@ -532,7 +616,7 @@ class GraphProjection:
         my_sup = self._supersedes(edge)
         my_add = edge.adds.best()
         for other in self._peers(edge, principal):
-            if other.binding == edge.binding:
+            if other.binding == edge.binding or not self._related(edge, other):
                 continue
             theirs = other.binding[1]
             if mine in self._supersedes(other):
@@ -568,7 +652,7 @@ class GraphProjection:
             "visibility_scope": node.scope or "private",
             "first_event_id": node.first[1] if node.first else None,
             "last_event_id": node.last[1] if node.last else None,
-            "source": node.last[0][1] if node.last else None,
+            "source": node.last[0][2] if node.last else None,
         }
         if internal:
             out["owner"], out["co_writers"] = node.owner(), list(node.co_writers())
@@ -583,7 +667,7 @@ class GraphProjection:
             "attrs": edge.attr_values(),
             "stale": self._is_stale(edge, principal), "removed": removed,
             "visibility_scope": edge.scope or "private",
-            "provenance": {"event_id": add[1], "source": add[2][1], "source_sequence": add[0]},
+            "provenance": {"event_id": add[1], "source": add[2][2], "source_sequence": add[0]},
         }
         if edge.binding is not None:
             out["binding"] = {edge.binding[0]: edge.binding[1]}
@@ -593,7 +677,7 @@ class GraphProjection:
             # The remove event's own scope gates its details; a caller who cannot
             # see it learns only that the edge is removed.
             if principal is None or can_see(principal, scope, frozenset({actor_id} if actor_id else ())):
-                out["removal"] = {"event_id": rem[1], "source": rem[2][1],
+                out["removal"] = {"event_id": rem[1], "source": rem[2][2],
                                   "source_sequence": rem[0], "reason": reason}
         return out
 

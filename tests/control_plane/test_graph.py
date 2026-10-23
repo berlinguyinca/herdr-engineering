@@ -25,8 +25,10 @@ class Feed:
     def __init__(self, svc, source="pi"):
         self.svc, self.source, self.n = svc, source, 0
         self.known = set()
+        self.principal = WRITER
 
-    def send(self, event_type, payload, scope="org", entity_id=None, seq=None, principal=WRITER, **extra):
+    def send(self, event_type, payload, scope="org", entity_id=None, seq=None, principal=None, **extra):
+        principal = principal or self.principal
         seq = self.n if seq is None else seq
         self.n = max(self.n, seq) + 1
         body = {"schema_version": 2, "event_id": f"{self.source}-{seq}", "source": self.source,
@@ -38,13 +40,15 @@ class Feed:
 
     def node(self, node_id, **kw):
         scope = kw.pop("scope", "org")
+        principal = kw.pop("principal", None)
         self.known.add(node_id)
-        return self.send("node.upsert", {"node_type": node_id.split(":")[0], "node_id": node_id, **kw}, scope)
+        return self.send("node.upsert", {"node_type": node_id.split(":")[0], "node_id": node_id, **kw}, scope,
+                         principal=principal)
 
     def edge(self, etype, a, b, attrs=None, scope="org", nodes=True, **kw):
         for nid in (a, b):          # nodes the edge needs must be defined to be visible
             if nodes and nid not in self.known and "seq" not in kw:
-                self.node(nid, scope=scope)
+                self.node(nid, scope=scope, principal=kw.get("principal"))
         p = {"edge_type": etype, "from_id": a, "to_id": b}
         if attrs is not None:
             p["attrs"] = attrs
@@ -131,7 +135,7 @@ def test_rebuild_is_order_independent():
         random.Random(seed).shuffle(events)
         g = GraphProjection()
         for e in events:
-            g.apply({**e, "payload": {k: v for k, v in e["payload"].items() if k != "_envelope"}})
+            g.apply(e)
         assert g.snapshot() == ref
 
 
@@ -159,13 +163,29 @@ def test_edge_remove_tombstone_keeps_history_and_readd_resurrects():
     assert len(repo.graph.neighborhood(OPERATOR, "task:a")["edges"]) == 1
 
 
-def test_remove_before_add_out_of_order_stays_removed():
-    repo, svc, f = make()
-    f.send("edge.remove", {"edge_type": "dependency", "from_id": "task:a", "to_id": "task:b", "reason": "r"}, seq=5)
-    f.node("task:a")
-    f.node("task:b")
-    f.edge("dependency", "task:a", "task:b", seq=2)
-    assert repo.graph.neighborhood(OPERATOR, "task:a")["edges"] == []
+def _raw(eid, seq, lseq, et, payload, actor=WRITER, source="pi", scope="org"):
+    return {"event_id": eid, "source": source, "source_sequence": seq, "lineage_seq": lseq,
+            "event_type": et, "payload": payload, "visibility_scope": scope, "actor": actor,
+            "ingest_timestamp": "2026-10-22T10:00:00+00:00"}
+
+
+def test_replay_remove_before_add_stays_removed_and_placeholders_stay_invisible():
+    """Replay (not live admission) may see a remove before its add; the merge converges."""
+    edge = {"edge_type": "dependency", "from_id": "task:a", "to_id": "task:b"}
+    evs = [_raw("n1", 0, 1, "node.upsert", {"node_type": "task", "node_id": "task:a"}),
+           _raw("n2", 1, 2, "node.upsert", {"node_type": "task", "node_id": "task:b"}),
+           _raw("e1", 2, 3, "edge.add", edge),
+           _raw("e2", 3, 4, "edge.remove", {**edge, "reason": "r"})]
+    for order in ([3, 2, 1, 0], [2, 3, 0, 1], [0, 1, 2, 3]):
+        g = GraphProjection()
+        for i in order:
+            g.apply(evs[i])
+        assert g.neighborhood(OPERATOR, "task:a")["edges"] == []
+    g = GraphProjection()
+    g.apply(evs[2])                                    # edge before either node exists
+    assert g.snapshot()["nodes"]["task:a"]["visibility_scope"] == "private"
+    with pytest.raises(KeyError):
+        g.get_node(VIEWER, "task:a")                   # an undefined endpoint is invisible
 
 
 def test_reviewed_and_validated_require_binding():
@@ -276,7 +296,6 @@ def seed_scopes(f):
     for n in ("org", "room", "priv"):
         f.edge("dependency", "task:hub", f"task:{n}")
     f.edge("dependency", "task:priv", "task:far")      # far only reachable through the hidden node
-    f.edge("dependency", "task:hub", "task:far2", scope="org", nodes=False)  # endpoint never upserted: stays invisible
 
 
 def test_traversal_never_shows_or_leaks_hidden_nodes():
@@ -619,12 +638,8 @@ def test_all_merges_commute_under_shuffle_live_and_after_export_import():
     f_ops = Feed(svc, source="ops")
     f_b_principal = OTHER
 
-    class AsOther(Feed):
-        def send(self, *a, **kw):
-            kw.setdefault("principal", f_b_principal)
-            return super().send(*a, **kw)
-
-    f_b = AsOther(svc, source="aux")
+    f_b = Feed(svc, source="aux")
+    f_b.principal = f_b_principal
     _scenario(f_ops, f_a, f_b)
     live = repo.graph.snapshot()
     assert live["edges"] and live["wildcard_removes"]
@@ -635,7 +650,7 @@ def test_all_merges_commute_under_shuffle_live_and_after_export_import():
         random.Random(seed).shuffle(shuffled)                    # cross-entity interleavings too
         g = GraphProjection()
         for e in shuffled:
-            g.apply({**e, "payload": {k: v for k, v in e["payload"].items() if k != "_envelope"}})
+            g.apply(e)
         assert g.snapshot() == live, f"seed {seed}"
         state = repo.export_state()
         keys = list(state["events"])
@@ -679,7 +694,7 @@ def test_total_node_edge_and_source_caps(monkeypatch):
         f.edge("dependency", "task:2", "task:3")
     monkeypatch.setattr(graph_mod, "MAX_SOURCES_PER_OBJECT", 2)
     Feed(svc, source="s1").node("task:1")
-    with pytest.raises(ValueError, match="too many distinct sources"):
+    with pytest.raises(ValueError, match="too many distinct writers"):
         Feed(svc, source="s2").node("task:1")
 
 
@@ -742,3 +757,141 @@ def test_http_unauthorized_overwrite_is_403(http):
     assert post(ing2, "node.upsert", {**node, "label": "pwn"}, seq=2**62, source="evil")[0] == 403
     assert post(op, "node.upsert", {**node, "label": "op"}, source="ops")[0] == 200
     assert call("/api/v1/graph/nodes/task%3Aa", vw)[1]["node"]["label"] == "op"
+
+
+# ------------------------------------------------- review round 2 regressions
+V = {"kind": "agent", "id": "key:victim", "authenticated_by": "api_key"}
+A = {"kind": "agent", "id": "key:attacker", "authenticated_by": "api_key"}
+B = {"kind": "agent", "id": "key:b", "authenticated_by": "api_key"}
+
+
+def rebuilt(repo):
+    fresh = ControlPlaneRepo()
+    fresh.import_state(json.loads(json.dumps(repo.export_state(), default=str)))
+    return fresh
+
+
+def test_preemptive_wildcard_remove_is_refused_and_cannot_hide_a_later_edge():
+    repo, svc, _ = make()
+    atk, vic = Feed(svc, "pi"), Feed(svc, "pi")
+    rm = {"edge_type": "reviewed", "from_id": "agent:r", "to_id": "commit:c", "reason": "x"}
+    stored = len(rows(repo))
+    for payload in (rm, {**rm, "attrs": {"commit": "c1"}}):
+        with pytest.raises(PermissionError):
+            atk.send("edge.remove", payload, principal=A, seq=2**62)
+    assert len(rows(repo)) == stored
+    vic.send("node.upsert", {"node_type": "agent", "node_id": "agent:r"}, principal=V, seq=1)
+    vic.send("node.upsert", {"node_type": "commit", "node_id": "commit:c"}, principal=V, seq=2)
+    vic.send("edge.add", {"edge_type": "reviewed", "from_id": "agent:r", "to_id": "commit:c",
+                          "attrs": {"commit": "c1"}}, principal=V, seq=3)
+    seen = repo.graph.get_node(VIEWER, "commit:c")["edges"]
+    assert [e["removed"] for e in seen] == [False]
+    # the attacker still cannot remove it once it exists, whatever sequence it claims
+    with pytest.raises(PermissionError):
+        atk.send("edge.remove", rm, principal=A, seq=2**62 + 1)
+    # and the victim's own wildcard remove works
+    vic.send("edge.remove", rm, principal=V, seq=4)
+    assert repo.graph.neighborhood(VIEWER, "commit:c")["edges"] == []
+
+
+def test_same_source_huge_sequence_never_beats_another_principal():
+    repo, svc, _ = make()
+    f = Feed(svc, "pi")
+    f.send("node.upsert", {"node_type": "agent", "node_id": "agent:x", "label": "first"}, principal=V, seq=1)
+    ops = Feed(svc, "op")
+    ops.send("node.upsert", {"node_type": "agent", "node_id": "agent:x",
+                             "attrs": {"co_writers": [B["id"]]}}, principal=OPERATOR)
+    f.send("node.upsert", {"node_type": "agent", "node_id": "agent:x", "label": "b-huge"}, principal=B, seq=2**62)
+    f.send("node.upsert", {"node_type": "agent", "node_id": "agent:x", "label": "victim-later"}, principal=V, seq=2)
+    assert repo.graph.snapshot()["nodes"]["agent:x"]["label"] == "victim-later"
+    assert rebuilt(repo).graph.snapshot() == repo.graph.snapshot()
+
+
+def test_supersedes_from_an_unrelated_reviewer_cannot_mark_a_review_stale():
+    repo, svc, _ = make()
+    fv, fa = Feed(svc, "v"), Feed(svc, "a")
+    fv.edge("reviewed", "agent:good", "commit:subj", {"commit": "c1"}, principal=V)
+    fa.node("agent:evil", principal=A)
+    fa.send("edge.add", {"edge_type": "reviewed", "from_id": "agent:evil", "to_id": "commit:subj",
+                         "attrs": {"commit": "c2", "supersedes": ["c1"]}}, principal=A)
+    view = {e["from_id"]: e for e in repo.graph.get_node(VIEWER, "commit:subj")["edges"]}
+    assert view["agent:good"]["stale"] is False and view["agent:evil"]["stale"] is False
+    assert view["agent:good"]["bindings"] == ["c1", "c2"]          # shown side by side, not ranked
+    # nor can the attacker author an edge FROM the victim's node to impersonate that reviewer
+    with pytest.raises(PermissionError):
+        fa.send("edge.add", {"edge_type": "reviewed", "from_id": "agent:good", "to_id": "commit:subj",
+                             "attrs": {"commit": "c3", "supersedes": ["c1"]}}, principal=A)
+    # the same reviewer superseding its own earlier review still works
+    fv.send("edge.add", {"edge_type": "reviewed", "from_id": "agent:good", "to_id": "commit:subj",
+                         "attrs": {"commit": "c4", "supersedes": ["c1"]}}, principal=V)
+    mine = {e["binding"]["commit"]: e["stale"] for e in repo.graph.get_node(VIEWER, "commit:subj")["edges"]
+            if e["from_id"] == "agent:good"}
+    assert mine == {"c1": True, "c4": False}
+
+
+def test_refusals_are_indistinguishable_and_never_create_ownership():
+    repo, svc, _ = make()
+    fv, fa = Feed(svc, "v"), Feed(svc, "a")
+    fv.node("agent:p", scope="private")
+    fv.node("agent:q", scope="org")
+    fv.node("agent:pub", scope="org")
+    msgs = set()
+    attempts = [
+        ("edge.remove", {"edge_type": "spawn", "from_id": "agent:p", "to_id": "agent:q", "reason": "x"}),  # no such edge
+        ("edge.remove", {"edge_type": "spawn", "from_id": "agent:nope", "to_id": "agent:q", "reason": "x"}),
+        ("edge.add", {"edge_type": "spawn", "from_id": "agent:p", "to_id": "agent:q"}),      # unseen endpoint
+        ("edge.add", {"edge_type": "spawn", "from_id": "agent:nope", "to_id": "agent:q"}),   # unknown endpoint
+        ("edge.add", {"edge_type": "spawn", "from_id": "agent:pub", "to_id": "agent:q"}),    # not writer of from
+        ("node.upsert", {"node_type": "agent", "node_id": "agent:pub"}),                     # not writer of node
+    ]
+    for et, pl in attempts:
+        with pytest.raises(PermissionError) as exc:
+            fa.send(et, pl, principal=A)
+        msgs.add(str(exc.value))
+    assert len(msgs) == 1                                   # one message for every refusal
+    # nothing was claimed: the real owner's edge is accepted afterwards
+    fv.edge("spawn", "agent:p", "agent:q")
+    assert len(repo.graph.get_node(WRITER, "agent:q")["edges"]) == 1
+
+
+def test_ownership_is_pinned_to_admission_order_not_clock_or_source_name():
+    repo = ControlPlaneRepo()
+    t = [1_800_000_000.0]
+    repo._now = lambda: t[0]
+    svc = IngestService(repo)
+    fz, fo, fa = Feed(svc, "zeta"), Feed(svc, "op"), Feed(svc, "alpha")
+    fz.send("node.upsert", {"node_type": "agent", "node_id": "agent:x"}, principal=V)
+    with pytest.raises(PermissionError):                    # same instant, source sorts first
+        fa.send("node.upsert", {"node_type": "agent", "node_id": "agent:x"}, principal=A)
+    fo.send("node.upsert", {"node_type": "agent", "node_id": "agent:x",
+                            "attrs": {"co_writers": [B["id"]]}}, principal=OPERATOR)
+    t[0] -= 5                                               # the clock steps back
+    fa.send("node.upsert", {"node_type": "agent", "node_id": "agent:x", "label": "b"}, principal=B)
+    live = repo.graph.snapshot()["nodes"]["agent:x"]
+    assert live["owner"] == V["id"]
+    assert rebuilt(repo).graph.snapshot()["nodes"]["agent:x"]["owner"] == V["id"]
+    fz.send("node.upsert", {"node_type": "agent", "node_id": "agent:x", "label": "v"}, principal=V)  # still writes
+
+
+def test_per_principal_quota_and_wildcard_cap(monkeypatch):
+    from herdr_engineering.control_plane import graph as graph_mod
+    repo, svc, f = make()
+    fv, fa, fo = Feed(svc, "v"), Feed(svc, "a"), Feed(svc, "o")
+    monkeypatch.setattr(graph_mod, "MAX_OBJECTS_PER_PRINCIPAL", 3)
+    for i in range(3):
+        fv.send("node.upsert", {"node_type": "task", "node_id": f"task:v{i}"}, principal=V)
+    with pytest.raises(ValueError, match="quota"):
+        fv.send("node.upsert", {"node_type": "task", "node_id": "task:v3"}, principal=V)
+    fv.send("node.upsert", {"node_type": "task", "node_id": "task:v0", "label": "update ok"}, principal=V)
+    fa.send("node.upsert", {"node_type": "task", "node_id": "task:a0"}, principal=A)   # others unaffected
+    for i in range(5):                                                                           # operators exempt
+        fo.send("node.upsert", {"node_type": "task", "node_id": f"task:o{i}"}, principal=OPERATOR)
+    assert rebuilt(repo).graph._owned == repo.graph._owned     # quota survives restart
+    monkeypatch.setattr(graph_mod, "MAX_OBJECTS_PER_PRINCIPAL", 10_000)
+    monkeypatch.setattr(graph_mod, "MAX_WILDCARD_REMOVES", 1)
+    w = Feed(svc, "w")
+    for i in range(2):
+        w.edge("reviewed", f"review:{i}", f"pr:{i}", {"commit": "c"})
+    w.send("edge.remove", {"edge_type": "reviewed", "from_id": "review:0", "to_id": "pr:0", "reason": "r"})
+    with pytest.raises(ValueError, match="wildcard"):
+        w.send("edge.remove", {"edge_type": "reviewed", "from_id": "review:1", "to_id": "pr:1", "reason": "r"})
