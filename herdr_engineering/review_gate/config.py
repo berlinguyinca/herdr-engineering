@@ -14,8 +14,13 @@ from herdr_engineering.control_plane.project_links import canonical_repository
 _SECTION_KEYS = {"enabled", "app", "repos", "poll_seconds"}
 _APP_KEYS = {"app_id", "installation_id", "private_key_file"}
 _REPO_KEYS = {
-    "repo", "required_events", "required_checks", "main_pipeline",
-    "disabled_tests_file", "review_cap", "ci_fix_cap",
+    "repo",
+    "required_events",
+    "required_checks",
+    "main_pipeline",
+    "disabled_tests_file",
+    "review_cap",
+    "ci_fix_cap",
 }
 
 

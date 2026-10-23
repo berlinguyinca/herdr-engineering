@@ -74,8 +74,11 @@ class PrInfo:
 def _repo_path(repo):
     canonical = canonical_repository(repo)
     parts = canonical.split("/") if canonical else []
-    if len(parts) != 3 or parts[0] != "github.com" or not all(
-            _NAME.fullmatch(p) and p not in (".", "..") for p in parts[1:]):
+    if (
+        len(parts) != 3
+        or parts[0] != "github.com"
+        or not all(_NAME.fullmatch(p) and p not in (".", "..") for p in parts[1:])
+    ):
         raise ValueError("repo must be a canonical github.com/<owner>/<name>")
     return f"{parts[1]}/{parts[2]}"
 
@@ -107,11 +110,15 @@ class GitHubAppClient:
         failed = False
         try:
             import jwt  # lazy: importing this module must not require PyJWT
+
             with open(self._config.private_key_file, "rb") as handle:
                 pem = handle.read(65536)
             now = int(self._now())
-            encoded = jwt.encode({"iat": now - 60, "exp": now + 540, "iss": str(self._config.app_id)},
-                                 pem, algorithm="RS256")
+            encoded = jwt.encode(
+                {"iat": now - 60, "exp": now + 540, "iss": str(self._config.app_id)},
+                pem,
+                algorithm="RS256",
+            )
         except Exception:  # noqa: BLE001 - never chain: the cause could echo key material
             failed = True
         finally:
@@ -132,8 +139,11 @@ class GitHubAppClient:
     def installation_token(self) -> str:
         if self._token and self._now() < self._token_expiry - REFRESH_MARGIN:
             return self._token
-        data = self._send("POST", f"/app/installations/{int(self._config.installation_id)}/access_tokens",
-                          bearer=self._mint_jwt())
+        data = self._send(
+            "POST",
+            f"/app/installations/{int(self._config.installation_id)}/access_tokens",
+            bearer=self._mint_jwt(),
+        )
         parsed = self._parse_token(data)
         data = None
         if parsed is None:
@@ -157,11 +167,17 @@ class GitHubAppClient:
     def _transport(self, method, path, body, bearer):
         """Return (True, data) or (False, error); never raises, so no traceback holds the credential."""
         request = urllib.request.Request(
-            API + path, method=method,
+            API + path,
+            method=method,
             data=None if body is None else json.dumps(body).encode(),
-            headers={"Authorization": f"Bearer {bearer}", "Accept": "application/vnd.github+json",
-                     "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "herdr-engineering",
-                     "Content-Type": "application/json"})
+            headers={
+                "Authorization": f"Bearer {bearer}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "herdr-engineering",
+                "Content-Type": "application/json",
+            },
+        )
         try:
             with self._client.open(request, timeout=TIMEOUT) as response:
                 raw = response.read(MAX_RESPONSE + 1)
@@ -179,17 +195,27 @@ class GitHubAppClient:
 
     def _http_error(self, status, headers):
         get = headers.get if headers is not None else (lambda *_: None)
-        if status == 429 or (status == 403 and (get("Retry-After") or get("X-RateLimit-Remaining") == "0")):
+        if status == 429 or (
+            status == 403 and (get("Retry-After") or get("X-RateLimit-Remaining") == "0")
+        ):
             now = self._now()
             try:
                 delay = get("Retry-After")
-                retry = now + max(1, min(float(delay), 86400)) if delay is not None \
+                retry = (
+                    now + max(1, min(float(delay), 86400))
+                    if delay is not None
                     else max(now + 60, float(get("X-RateLimit-Reset") or 0))
+                )
             except (TypeError, ValueError):
                 retry = now + 60
             return GitHubAppError("rate_limited", status=status, retry_at=retry)
-        reason = {401: "authentication", 403: "permission", 404: "not_found",
-                  409: "conflict", 422: "conflict"}.get(status, "unavailable")
+        reason = {
+            401: "authentication",
+            403: "permission",
+            404: "not_found",
+            409: "conflict",
+            422: "conflict",
+        }.get(status, "unavailable")
         return GitHubAppError(reason, status=status)
 
     # -- operations --------------------------------------------------------
@@ -203,27 +229,46 @@ class GitHubAppClient:
             bad_item = False
             for item in data:
                 try:
-                    out.append(PrInfo(number=int(item["number"]), head_sha=str(item["head"]["sha"]),
-                                      head_ref=str(item["head"]["ref"]), base_ref=str(item["base"]["ref"]),
-                                      author_login=str((item.get("user") or {}).get("login", "")),
-                                      draft=bool(item.get("draft", False))))
+                    out.append(
+                        PrInfo(
+                            number=int(item["number"]),
+                            head_sha=str(item["head"]["sha"]),
+                            head_ref=str(item["head"]["ref"]),
+                            base_ref=str(item["base"]["ref"]),
+                            author_login=str((item.get("user") or {}).get("login", "")),
+                            draft=bool(item.get("draft", False)),
+                        )
+                    )
                 except (KeyError, TypeError, ValueError, AttributeError):
                     bad_item = True
                 if bad_item:
                     raise GitHubAppError("invalid_response")
             if len(data) < 100:
                 return out
-        raise GitHubAppError("invalid_response")  # cap reached with a full page: never truncate silently
+        raise GitHubAppError(
+            "invalid_response"
+        )  # cap reached with a full page: never truncate silently
 
-    def set_status(self, repo: str, sha: str, state: Literal["pending", "success", "failure", "error"],
-                   description: str, *, context: str = "herdr/review-gate", target_url: str | None = None) -> None:
+    def set_status(
+        self,
+        repo: str,
+        sha: str,
+        state: Literal["pending", "success", "failure", "error"],
+        description: str,
+        *,
+        context: str = "herdr/review-gate",
+        target_url: str | None = None,
+    ) -> None:
         slug, sha = _repo_path(repo), _sha(sha)
         if state not in _STATES:
             raise ValueError("invalid commit status state")
         if target_url and redact_text(target_url) != target_url:
             raise ValueError("target_url must not carry secrets")
-        body = {"state": state, "context": context,
-                "description": redact_text(str(description))[:STATUS_DESCRIPTION_MAX]}
+        body = {
+            "state": state,
+            "context": context,
+            "description": redact_text(str(description))[:STATUS_DESCRIPTION_MAX],
+        }
         if target_url:
             body["target_url"] = target_url
         self._send("POST", f"/repos/{slug}/statuses/{sha}", body=body)
@@ -233,7 +278,11 @@ class GitHubAppClient:
         if method not in ("squash", "merge", "rebase"):
             raise ValueError("invalid merge method")
         try:
-            self._send("PUT", f"/repos/{slug}/pulls/{number}/merge", body={"sha": sha, "merge_method": method})
+            self._send(
+                "PUT",
+                f"/repos/{slug}/pulls/{number}/merge",
+                body={"sha": sha, "merge_method": method},
+            )
         except GitHubAppError as exc:
             if exc.status in (405, 409):
                 return False
@@ -242,7 +291,9 @@ class GitHubAppClient:
 
     def update_branch(self, repo: str, number: int, expected_head_sha: str) -> None:
         slug, number, sha = _repo_path(repo), _number(number), _sha(expected_head_sha)
-        self._send("PUT", f"/repos/{slug}/pulls/{number}/update-branch", body={"expected_head_sha": sha})
+        self._send(
+            "PUT", f"/repos/{slug}/pulls/{number}/update-branch", body={"expected_head_sha": sha}
+        )
 
     def patch_id(self, repo: str, base_sha: str, head_sha: str) -> str:
         """Hash of the per-file patches between base and head, hunk line offsets ignored.
@@ -271,8 +322,12 @@ class GitHubAppClient:
                     if not isinstance(blob, str) or not _BLOB.fullmatch(blob):
                         raise ValueError
                     text = "blob:" + blob.lower()
-                for part in (item["filename"], str(item.get("previous_filename") or ""),
-                             str(item.get("status", "")), text):
+                for part in (
+                    item["filename"],
+                    str(item.get("previous_filename") or ""),
+                    str(item.get("status", "")),
+                    text,
+                ):
                     raw = part.encode()
                     digest.update(len(raw).to_bytes(8, "big"))
                     digest.update(raw)

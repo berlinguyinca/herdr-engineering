@@ -40,7 +40,12 @@ def test_repo_defaults(tmp_path):
     assert got.repos == (RepoEnrollment(repo="github.com/acme/widget"),)
     r = got.repos[0]
     assert r.required_events == ("pull_request",) and r.required_checks == ()
-    assert (r.main_pipeline, r.disabled_tests_file, r.review_cap, r.ci_fix_cap) == (None, None, 4, 3)
+    assert (r.main_pipeline, r.disabled_tests_file, r.review_cap, r.ci_fix_cap) == (
+        None,
+        None,
+        4,
+        3,
+    )
 
 
 def test_present_section_defaults_to_disabled(tmp_path):
@@ -89,12 +94,16 @@ def test_caps_and_poll_bounds(tmp_path):
     with pytest.raises(ValueError, match="poll_seconds"):
         load_review_gate_config(section(tmp_path, poll_seconds=4))
     with pytest.raises(ValueError, match="review_cap"):
-        load_review_gate_config(section(tmp_path, repos=[{"repo": "github.com/a/b", "review_cap": 0}]))
+        load_review_gate_config(
+            section(tmp_path, repos=[{"repo": "github.com/a/b", "review_cap": 0}])
+        )
 
 
 def test_fleet_config_accepts_section(tmp_path):
     d = base()
-    d["sections"]["control_plane"]["values"]["review_gate"] = section(tmp_path)["control_plane"]["review_gate"]
+    d["sections"]["control_plane"]["values"]["review_gate"] = section(tmp_path)["control_plane"][
+        "review_gate"
+    ]
     cfg = load_fleet_config(write(tmp_path, d))
     assert load_review_gate_config({"control_plane": cfg.section("control_plane")}).enabled
 
@@ -145,7 +154,9 @@ def test_missing_key_file_rejected(tmp_path):
 
 def test_empty_required_events_rejected_but_empty_checks_ok(tmp_path):
     with pytest.raises(ValueError, match="required_events"):
-        load_review_gate_config(section(tmp_path, repos=[{"repo": "github.com/a/b", "required_events": []}]))
+        load_review_gate_config(
+            section(tmp_path, repos=[{"repo": "github.com/a/b", "required_events": []}])
+        )
     ok = section(tmp_path, repos=[{"repo": "github.com/a/b", "required_checks": []}])
     assert load_review_gate_config(ok).repos[0].required_checks == ()
 

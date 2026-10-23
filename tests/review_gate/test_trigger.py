@@ -27,8 +27,10 @@ def test_all_success_is_green():
 
 
 def test_one_failure_is_red_with_failures_listed():
-    v = verdict([row(7, "failure", event="push"), row(3, "killed"), row(5, "success", event="deployment")],
-                RepoEnrollment(repo="o/r", required_events=("pull_request", "push", "deployment")))
+    v = verdict(
+        [row(7, "failure", event="push"), row(3, "killed"), row(5, "success", event="deployment")],
+        RepoEnrollment(repo="o/r", required_events=("pull_request", "push", "deployment")),
+    )
     assert v == CiVerdict("red", ("run 3 killed", "run 7 failure"))
 
 
@@ -55,8 +57,13 @@ def test_stale_snapshot_is_never_green():
 def test_cancelled_is_pending():
     for s in ("canceled", "cancelled", "skipped", "declined"):
         assert verdict([row(1, s)]).result == "pending"
-    assert verdict([row(1, "canceled"), row(2, "success", event="push")],
-                   RepoEnrollment(repo="o/r", required_events=("pull_request", "push"))).result == "pending"
+    assert (
+        verdict(
+            [row(1, "canceled"), row(2, "success", event="push")],
+            RepoEnrollment(repo="o/r", required_events=("pull_request", "push")),
+        ).result
+        == "pending"
+    )
 
 
 def test_retry_success_supersedes_earlier_failure():

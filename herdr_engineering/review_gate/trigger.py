@@ -1,4 +1,5 @@
 """CI-green trigger rule: a pure verdict over Woodpecker pipeline rows."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -23,8 +24,9 @@ def _num(row: dict) -> int:
         return -1
 
 
-def ci_verdict_for(sha: str, rows: Sequence[dict], enrollment: RepoEnrollment,
-                   *, snapshot_stale: bool) -> CiVerdict:
+def ci_verdict_for(
+    sha: str, rows: Sequence[dict], enrollment: RepoEnrollment, *, snapshot_stale: bool
+) -> CiVerdict:
     """Decide whether CI for ``sha`` is green, red or still pending.
 
     Precedence (first match wins):

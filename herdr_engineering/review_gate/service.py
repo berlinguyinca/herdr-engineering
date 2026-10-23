@@ -212,8 +212,11 @@ class GateService:
 
     def status(self) -> dict:
         """Last tick summary for the API: epoch seconds, counts, last GitHub failure reason."""
-        return {"last_tick_at": self._last_tick_at, "counts": dict(self._last_counts),
-                "last_error": self._last_error}
+        return {
+            "last_tick_at": self._last_tick_at,
+            "counts": dict(self._last_counts),
+            "last_error": self._last_error,
+        }
 
     def _tick(self, counts: dict) -> None:
         if not self._config.enabled:
