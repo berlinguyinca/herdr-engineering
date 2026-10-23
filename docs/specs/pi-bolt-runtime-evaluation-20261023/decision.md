@@ -63,6 +63,7 @@ used for magnitudes. Magnitudes above come from the lower-load repetitions 1-2.
 
 ## Limits of this evidence (read before deciding)
 - Host was heavily loaded (load 78-120) for the whole run; absolute numbers are not representative of an idle host. Re-run on a quiet host before any approval.
+- Spawner env export verified in a real herdr pane; that check exposed wrong `agent start`/`agent wait` flags in the existing client, fixed with a pinning test (results/herdr-and-accounting-checks.txt).
 - Cancel/crash: one manual extension-free drill PASSED (kill -9, SIGTERM, resume on standard Pi; results/cancel-drill.txt). Not a live mission.
 - Churn soak: 240 launches at 6-way concurrency, 0 failures, no RSS growth (results/soak-churn.txt); a multi-hour single-session soak was not run.
 - 24 concurrent no-op agents: 48/48 ok per arm; Pi-Bolt wall clearly lower, CPU ~10x lower (results/noop-c24.txt).
