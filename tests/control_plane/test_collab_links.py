@@ -400,6 +400,14 @@ def test_allowed_terminal_use_is_audited_at_a_bounded_rate(w):
     assert count() == 4
 
 
+def test_denied_non_terminal_actions_do_not_rearm_the_terminal_audit(w):
+    a = link(w, grants=["terminal"], terminal_principals=["user:alice"])
+    for _ in range(25):
+        w.s.authorize_workspace(w.alice, w.room, a["link_id"], "terminal")
+        code(w.s.authorize_workspace, w.alice, w.room, a["link_id"], "status")   # status is not granted
+    assert audit_actions(w, "allowed").count("workspace.terminal") == 1
+
+
 def test_link_changes_do_not_wake_guests_or_agents_and_agents_see_no_workspace(w):
     a = link(w)
     ag, _ = w.agent("alice", ("read", "post"))

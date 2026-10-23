@@ -2058,7 +2058,8 @@ class CollabService:
             else:
                 ok = action in link["grants"]
             if not ok:
-                self._term_gate.pop(gate, None)
+                if action == "terminal":
+                    self._term_gate.pop(gate, None)         # only a terminal denial re-arms the allow audit
                 self._audit_denied(pr, f"workspace.{action}", "no_workspace_grant", room_id=room_id,
                                    resource_id=link_id, project_ids=[room["project_id"]])
                 self.stats["policy_denied"] += 1
