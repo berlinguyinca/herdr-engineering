@@ -359,7 +359,8 @@ so ship the logs off the host if that matters.
 **What the box does not protect.** The network stays open (the harness has to reach its model), and the
 harness login (`~/.claude`, `~/.codex`, `~/.pi`) is readable, read-only, to the harness. So a task can send
 data it can see (the work directory, the login) to the internet. Agents are text-only by default; only
-start tool-enabled agents (`--allow-tools`) for people you trust. They run in the same box.
+start tool-enabled agents (`--allow-tools`) for people you trust. They run in the same box. (Helpers, 5.1f,
+get a private copy of only the login file instead of these directories.)
 
 ### 5.1f Agent helpers (agents that start their own helpers)
 An agent in a room can start **helpers** with no approval click: a reviewer or debugger for a second opinion,
@@ -540,7 +541,18 @@ model only, never the task text or the result).
 * **Allowlisted hosts are room-wide.** Approving a host for one helper approves it for every helper in the room,
   for the approval's lifetime, and a helper can send anything it can see there (its work directory, a parent's
   read-only view, the SSH keys). The family model endpoints are always reachable.
-* **The harness login is readable** in the box (5.1e), and the model endpoint is always allowed.
+* **The harness login is readable** in the box, and the model endpoint is always allowed. A helper box does
+  **not** get the operator's `~/.claude`, `~/.codex`, `~/.pi` or `~/.claude.json` (no CLAUDE.md, auto-memory,
+  `projects/`, hooks, plugins, skills or settings; workers still get them read-only, 5.1e). The runner makes a
+  private 0700 copy of just the login the helper's harness needs and points `CLAUDE_CONFIG_DIR` / `CODEX_HOME` /
+  `PI_CODING_AGENT_DIR` at it (sandbox option `HERDR_SANDBOX_HARNESS_DIR`): claude gets only the `claudeAiOauth`
+  entry of `.credentials.json` (not the MCP connector tokens stored beside it), codex its `auth.json`, pi its
+  `auth.json` and `models.json` (the gateway providers, which may carry keys). What a helper can still read, and
+  send to an allowed host, is that login: the operator's subscription or API credential. The commands also turn
+  off user and project config (`claude --setting-sources ''`, `codex --ignore-user-config --ignore-rules`,
+  `pi --no-extensions --no-skills --no-prompt-templates --no-context-files`); `claude --bare` is not used because
+  it turns off the OAuth login. The copy is writable (claude writes its state there) and is deleted with the
+  helper.
 * **Helpers run on the runner's own host.** A parent whose pane is on another herdr machine still gets its
   helpers locally.
 * **Nested spawning is server-side only.** Helpers have no MCP in the box, so depth 2 happens only if the runner

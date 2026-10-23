@@ -7,7 +7,8 @@
 #   * WORKDIR is the one place it can create, change or delete files; everything else fails with
 #     "Read-only file system"
 #   * the harness itself (claude/codex/pi, node) and its login (~/.claude, ~/.codex, ~/.pi) are visible
-#     READ-ONLY, so it can sign in but cannot rewrite its own settings or hooks
+#     READ-ONLY, so it can sign in but cannot rewrite its own settings or hooks. Helpers (HERDR_SANDBOX_HARNESS_DIR)
+#     get none of those: only a private copy of the login file the harness needs, made by the runner
 #   * own process namespace (it can't see or signal other processes), no extra privileges, no capabilities,
 #     the environment is cleared, and limits on processes, open files and file size apply
 # The network is left open: the harness has to reach its model. That, plus the harness login being readable
@@ -55,13 +56,37 @@ for n in claude codex pi node; do
   case "$p" in "$HOME"/*) bindro "$(dirname "$p")" ;; esac
   case "$r" in "$HOME"/*) bindro "$(dirname "$r")" ;; esac
 done
-for d in .claude .codex .pi; do bindro "$HOME/$d"; done
-if [ -e "$HOME/.claude.json" ]; then args+=(--ro-bind "$HOME/.claude.json" "$HOME/.claude.json"); fi
 # Helpers only (set by the runner, never by a task), each fails closed when it does not check out:
-#   HERDR_SANDBOX_RO_BINDS  newline-separated directories under ~/herdr-agents/work/ (a reviewer's view of its
-#                           parent's work), shown READ-ONLY at the same path
-#   HERDR_SANDBOX_SSH_DIR   a directory of your own with mode 0700 holding key files, shown READ-ONLY as ~/.ssh
+#   HERDR_SANDBOX_RO_BINDS     newline-separated directories under ~/herdr-agents/work/ (a reviewer's view of its
+#                              parent's work), shown READ-ONLY at the same path
+#   HERDR_SANDBOX_SSH_DIR      a directory of your own with mode 0700 holding key files, shown READ-ONLY as ~/.ssh
+#   HERDR_SANDBOX_HARNESS_DIR  a directory of your own with mode 0700 holding claude/ codex/ pi/ (the login file
+#                              each harness needs, nothing else), shown WRITABLE as ~/.herdr-harness, with
+#                              CLAUDE_CONFIG_DIR, CODEX_HOME and PI_CODING_AGENT_DIR pointing into it. The operator's
+#                              ~/.claude, ~/.codex, ~/.pi and ~/.claude.json (memory, hooks, settings, plugins,
+#                              projects) are then NOT in the box at all.
 deny() { echo "collab-sandbox: $1; refusing to run" >&2; exit 126; }
+harness_env=()
+if [ -n "${HERDR_SANDBOX_HARNESS_DIR+x}" ]; then
+  HD="$HERDR_SANDBOX_HARNESS_DIR"
+  case "$HD" in /*) ;; *) deny "the harness directory must be an absolute path" ;; esac
+  if [ -L "$HD" ] || [ ! -d "$HD" ]; then deny "the harness directory must be a directory, not a link"; fi
+  [ "$(stat -c '%u %a' "$HD")" = "$(id -u) 700" ] || deny "the harness directory must be yours with mode 0700"
+  hreal="$(cd "$HD" && pwd -P)"
+  for d in .claude .codex .pi; do
+    if [ -d "$HOME/$d" ]; then
+      oreal="$(cd "$HOME/$d" && pwd -P)"
+      case "$hreal/" in "$oreal"/*) deny "the harness directory must not be the operator's $d" ;; esac
+    fi
+  done
+  HB="$HOME/.herdr-harness"
+  args+=(--bind "$hreal" "$HB")
+  harness_env=(--setenv CLAUDE_CONFIG_DIR "$HB/claude" --setenv CODEX_HOME "$HB/codex"
+               --setenv PI_CODING_AGENT_DIR "$HB/pi")
+else
+  for d in .claude .codex .pi; do bindro "$HOME/$d"; done
+  if [ -e "$HOME/.claude.json" ]; then args+=(--ro-bind "$HOME/.claude.json" "$HOME/.claude.json"); fi
+fi
 if [ -n "${HERDR_SANDBOX_RO_BINDS+x}" ]; then
   while IFS= read -r ro; do
     [ -n "$ro" ] || continue
@@ -84,7 +109,7 @@ fi
 args+=(--bind "$WORK" "$WORK" --chdir "$WORK"
        --clearenv --setenv PATH "$(dirname "$(command -v claude 2>/dev/null || echo /usr/bin/x)"):$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
        --setenv HOME "$HOME" --setenv USER "${USER:-agent}" --setenv LANG "${LANG:-C.UTF-8}" --setenv TERM dumb
-       --setenv TMPDIR /tmp --setenv HERDR_SANDBOX 1)
+       --setenv TMPDIR /tmp --setenv HERDR_SANDBOX 1 "${harness_env[@]}")
 
 # file-size and fd limits apply to everything in the box. A process cap (ulimit -u) would count every process
 # of this user, so the process and memory caps are a systemd scope instead (a fork bomb stops at the cap).
