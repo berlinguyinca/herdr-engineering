@@ -49,5 +49,5 @@ Incompatibilities / risks logged so far
 4. macOS: Apple silicon only; Intel Macs and musl hosts must stay on standard Pi.
 5. Extension load cost under Pi-Bolt (see above): 5-8x slower to ready, ~13x CPU, ~2.6x RSS with the real extension set.
 6. `pi-bolt compile` cannot bundle the pi-engineering package today (relative imports outside the entry folder; optional `pi-blackhole` import).
-7. Pi-Bolt's compiled binary replaces `.bin/pi` only behind the node launcher; extension code that touches Pi internals via
-   `@earendil-works/pi-coding-agent` imports resolves to the binary's bundled copy, not the release's node_modules copy.
+7. UNVERIFIED hypothesis: extension code importing `@earendil-works/pi-coding-agent` may resolve to the binary's bundled copy rather than the
+   release's `node_modules` copy; not tested (the extension set loaded and registered identically, so no symptom was seen).
