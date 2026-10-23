@@ -169,7 +169,7 @@ test('activity uses compact expandable rows without hiding event detail', async 
 
 test('activity uses wide space for filters, repetition summary, and keyboard-selected detail', async () => {
   await withApp(async ({page,base}) => {
-    const types=['MissionStarted','HostHeartbeat','MissionStarted','ServiceRegistered','MissionStarted','HostHeartbeat'];
+    const types=['MissionStarted','HostHeartbeat','MissionStarted','ServiceRegistered','MissionStarted','HostHeartbeat','ExceptionallyLongUnbrokenActivityEventTypeThatMustWrapAtMobileWidth'];
     const events=types.map((event_type,index)=>({
       event_id:`wide-event-${index}`,
       event_type,
@@ -200,10 +200,24 @@ test('activity uses wide space for filters, repetition summary, and keyboard-sel
     await page.keyboard.press('Enter');
     assert.match(await page.locator('[data-activity-selected]').innerText(),/Host heartbeat/);
     assert.match(await page.locator('[data-activity-selected]').innerText(),/wide-event-1/);
+    assert.doesNotMatch(await page.locator('[data-activity-selection-status]').textContent(),/wide-event-1|Selected payload|\{/,'live announcements should identify the selection without reading its payload');
+    assert.equal(await page.locator('[data-activity-selected]').getAttribute('aria-live'),null,'the full selected payload must not be a live region');
 
-    for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:768,height:1024},{width:390,height:844}]){
+    await page.locator('[data-event-filter="MissionStarted"]').click();
+    assert.match(await page.locator('[data-activity-selected]').innerText(),/Mission started/);
+    assert.match(await page.locator('[data-activity-selected]').innerText(),/wide-event-0/);
+    assert.equal(await page.locator('.ac-row[data-event-id="wide-event-0"]').isVisible(),true,'selected detail should reconcile to an event that remains visible');
+    await page.locator('[data-event-filter="all"]').click();
+
+    for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:1200,height:900},{width:1150,height:900},{width:1101,height:900},{width:768,height:1024},{width:390,height:844}]){
       await page.setViewportSize(viewport);
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`activity overflowed at ${viewport.width}px`);
+      if(viewport.width===390){
+        assert.equal(await page.locator('.ac-row summary').evaluateAll(rows=>rows.every(row=>{
+          const box=row.getBoundingClientRect();
+          return box.left>=0&&box.right<=innerWidth&&row.scrollWidth<=row.clientWidth;
+        })),true,'populated mobile event rows and timestamps should remain inside the viewport');
+      }
     }
   },{BURST:'0'});
 });

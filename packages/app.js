@@ -424,12 +424,13 @@ async function viewActivity() {
     .ac-detail{margin:0;padding:0 32px 8px;font-size:12px;line-height:1.5;color:var(--text-secondary);overflow-wrap:anywhere}.ac-payload{margin:0 32px 12px;max-height:240px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.45;background:var(--surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:10px}
     .ac-row[data-muted=true]{opacity:.65}
     .ac-rail{position:sticky;top:16px;display:grid;gap:var(--density-gap,16px);min-width:0}.ac-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--density-panel-padding,16px)}.ac-panel h2{font-size:16px;margin:0 0 10px}.ac-panel p{color:var(--text-secondary);line-height:1.5}
-    .ac-filter-list{display:flex;flex-wrap:wrap;gap:8px}.ac-filter{min-height:36px;border:1px solid var(--border);border-radius:999px;background:var(--bg);color:var(--text);padding:6px 10px;cursor:pointer}.ac-filter[aria-pressed=true]{border-color:var(--accent);background:var(--accent);color:var(--accent-contrast,#fff)}
+    .ac-filter-list{display:flex;flex-wrap:wrap;gap:8px;min-width:0}.ac-filter{min-height:36px;max-width:100%;border:1px solid var(--border);border-radius:999px;background:var(--bg);color:var(--text);padding:6px 10px;cursor:pointer;overflow-wrap:anywhere;white-space:normal}.ac-filter[aria-pressed=true]{border-color:var(--accent);background:var(--accent);color:var(--accent-contrast,#fff)}
     .ac-repeat-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:14px 0 0;padding:0;list-style:none}.ac-repeat-list li{display:flex;justify-content:space-between;gap:8px;border-top:1px solid var(--border-subtle);padding-top:8px;font-size:12px}.ac-repeat-list strong{font-size:14px}.ac-filter-status{margin:10px 0 0;font-size:12px;color:var(--text-secondary)}
     .ac-selected-head{display:flex;justify-content:space-between;gap:12px;align-items:start}.ac-selected-head h2{margin:3px 0 0}.ac-selected-head time{font-size:12px;color:var(--text-secondary);white-space:nowrap}.ac-selected-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:14px 0}.ac-selected-meta div{min-width:0}.ac-selected-meta dt{font-size:11px;color:var(--text-secondary)}.ac-selected-meta dd{margin:3px 0 0;overflow-wrap:anywhere}.ac-selected .ac-payload{margin:12px 0 0;max-height:360px}
+    .ac-selection-status{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
     @media(min-width:2200px){.ac-workspace{grid-template-columns:minmax(900px,1600px) minmax(760px,1fr)}.ac-rail{grid-template-columns:minmax(260px,.7fr) minmax(360px,1.3fr)}}
-    @media(max-width:1100px){.ac-workspace{grid-template-columns:minmax(0,1fr)}.ac-rail{position:static;grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media(max-width:650px){.ac-rail{grid-template-columns:minmax(0,1fr)}.ac-row summary{grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;padding:12px}.ac-kind{grid-column:1}.ac-time{grid-column:2;grid-row:1/3}.ac-detail{padding:0 12px 8px}.ac-payload{margin:0 12px 12px}.ac-selected-meta{grid-template-columns:minmax(0,1fr)}.ac-selected-head{display:block}.ac-selected-head time{display:block;margin-top:6px}}
+    @media(max-width:1300px){.ac-workspace{grid-template-columns:minmax(0,1fr)}.ac-rail{position:static;grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media(max-width:650px){.ac-rail{grid-template-columns:minmax(0,1fr)}.ac-row summary{grid-template-columns:minmax(0,1fr);gap:4px;padding:12px}.ac-row summary>*{min-width:0}.ac-kind,.ac-time{grid-column:1}.ac-time{white-space:normal;overflow-wrap:anywhere}.ac-detail{padding:0 12px 8px}.ac-payload{margin:0 12px 12px;overflow-wrap:anywhere}.ac-selected-meta{grid-template-columns:minmax(0,1fr)}.ac-selected-head{display:block}.ac-selected-head time{display:block;margin-top:6px}}
   </style><h1>Activity</h1><div class="ac-workspace">
     <section class="ac-stream" aria-labelledby="activity-stream-title"><div class="ac-stream-head"><h2 id="activity-stream-title">Chronological stream</h2><span>${entries.length} events</span></div>
       <div class="ac-list">${entries.map(({ event, description, payload }, index) => `<details class="ac-row" data-event-id="${esc(event.event_id || '')}" data-event-type="${esc(event.event_type || '')}" data-entry-index="${index}" data-muted="${description.muted}"><summary><strong>${esc(description.title)}</strong><span class="ac-kind">${esc(description.kind)}</span><time class="ac-time">${formatTimestamp(event.source_timestamp)}</time></summary><p class="ac-detail">${esc(description.detail)}</p><pre class="ac-payload" aria-label="Original event payload">${esc(payload)}</pre></details>`).join('')}</div>
@@ -439,15 +440,20 @@ async function viewActivity() {
         <p class="ac-filter-status" role="status">Showing all ${entries.length} events</p>
         <h2 style="margin-top:18px">Repeated types</h2><ul class="ac-repeat-list">${types.filter((type) => counts.get(type) > 1).map((type) => `<li data-repeat-type="${esc(type)}"><span>${esc(type)}</span><strong>${counts.get(type)}</strong></li>`).join('') || '<li><span>No repeated event types</span></li>'}</ul>
       </section>
-      <section class="ac-panel ac-selected" data-activity-selected aria-live="polite">${selectedDetail(entries[0])}</section>
+      <p class="ac-selection-status" data-activity-selection-status role="status" aria-live="polite">Selected event: ${esc(entries[0].description.title)}</p>
+      <section class="ac-panel ac-selected" data-activity-selected data-entry-index="0">${selectedDetail(entries[0])}</section>
     </aside>
   </div>`;
 
   const rows = [...root.querySelectorAll('.ac-row')];
   const selected = root.querySelector('[data-activity-selected]');
+  const selectionStatus = root.querySelector('[data-activity-selection-status]');
   const showSelected = (row) => {
     const entry = entries[Number(row.dataset.entryIndex)];
-    if (entry) selected.innerHTML = selectedDetail(entry);
+    if (!entry) return;
+    selected.dataset.entryIndex = row.dataset.entryIndex;
+    selected.innerHTML = selectedDetail(entry);
+    selectionStatus.textContent = `Selected event: ${entry.description.title}`;
   };
   for (const row of rows) {
     row.querySelector('summary').addEventListener('focus', () => showSelected(row));
@@ -464,6 +470,8 @@ async function viewActivity() {
     }
     for (const candidate of filters) candidate.setAttribute('aria-pressed', String(candidate === button));
     filterStatus.textContent = type === 'all' ? `Showing all ${shown} events` : `Showing ${shown} ${type} events`;
+    const selectedRow = rows[Number(selected.dataset.entryIndex)];
+    if (!selectedRow || selectedRow.hidden) showSelected(rows.find((row) => !row.hidden));
   });
 }
 
