@@ -115,6 +115,12 @@ export class HerdrClient {
     });
   }
 
+  // Terminal button: the server builds the attach command from the session record; the
+  // viewer runs it in their own terminal. Nothing is sent but the session id.
+  getTerminalAttach(id) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/terminal`, { method: 'POST', body: {} });
+  }
+
   renameAgent(id, name, expectedVersion) {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/name`, {
       method: 'POST', body: { name, expected_version: expectedVersion },
