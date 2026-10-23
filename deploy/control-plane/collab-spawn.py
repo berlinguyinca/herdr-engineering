@@ -259,6 +259,8 @@ def helper_run(d: Path) -> int:
         sock = spec["sock"]
         with open(d / "proxy.err", "ab") as perr:
             proxy = subprocess.Popen(proxy_argv(spec, d), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=perr)
+        ps = proc_stat(proxy.pid)              # so the runner can stop the proxy even if this supervisor dies
+        write_private(d / "proxy.json", json.dumps({"pid": proxy.pid, "start": ps[1] if ps else None}))
         for _ in range(100):
             if (os.path.exists(sock) and stat.S_ISSOCK(os.stat(sock).st_mode)) or proxy.poll() is not None:
                 break
@@ -1411,6 +1413,7 @@ class Runner:
         st["ending"] = {"status": status, "error": error}
         self.save_state(d, st)
         self.kill(st)
+        self.kill_proxy(d)
         self.drain_blocked(d, st)
         attempts = int(st.get("finish_attempts") or 0)
         while True:
@@ -1437,8 +1440,32 @@ class Runner:
         self.teardown(d, st)
         self.say(f"helper {hid}: {status}" + (f" ({trim(error, 120)})" if error else ""))
 
+    def kill_proxy(self, d: Path) -> None:
+        """Stop the helper's egress proxy (recorded by its supervisor in proxy.json) by itself: if the supervisor
+        died, killing its process group missed nothing else, but an orphaned proxy would keep serving. Only while
+        the pid still has the recorded start time (never a reused pid)."""
+        try:
+            rec = json.loads((d / "proxy.json").read_text())
+            pid, start = int(rec["pid"]), rec["start"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            ps = proc_stat(pid)
+            if pid <= 1 or start is None or not ps or ps[1] != start or ps[0] == "Z":
+                return
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                return
+            for _ in range(30):
+                ps = proc_stat(pid)
+                if not ps or ps[1] != start or ps[0] == "Z":
+                    return
+                time.sleep(0.1)
+
     def teardown(self, d: Path, st: dict) -> None:
         hid = st.get("helper_id", d.name)
+        self.kill_proxy(d)
         pane = st.get("pane")
         if isinstance(pane, str) and PANE_ID.fullmatch(pane):
             try:

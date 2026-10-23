@@ -299,3 +299,57 @@ def test_closing_a_helpers_network_also_drops_its_services_and_keys(hr):
     hr.mk().close_allow(d)
     assert (d / "allow.txt").read_text() == ""
     assert json.loads((d / "services.json").read_text()) == [] and json.loads((d / "secrets.json").read_text()) == {}
+
+
+def sleeper():
+    import subprocess
+    import sys
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    for _ in range(50):
+        if runner.proc_stat(p.pid):
+            break
+        time.sleep(0.05)
+    return p
+
+
+def test_the_egress_proxy_is_stopped_even_when_its_supervisor_is_gone(hr, tmp_path):
+    d = tmp_path / "hd"
+    d.mkdir()
+    p = sleeper()
+    try:
+        (d / "proxy.json").write_text(json.dumps({"pid": p.pid, "start": runner.proc_stat(p.pid)[1]}))
+        hr.mk().kill_proxy(d)
+        assert p.wait(10) is not None
+    finally:
+        p.kill()
+
+
+def test_a_reused_proxy_pid_is_never_signalled(hr, tmp_path):
+    d = tmp_path / "hd"
+    d.mkdir()
+    p = sleeper()
+    try:
+        (d / "proxy.json").write_text(json.dumps({"pid": p.pid, "start": "1"}))   # another process's start time
+        hr.mk().kill_proxy(d)
+        assert p.poll() is None
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_the_supervisor_records_its_proxy(tmp_path, monkeypatch):
+    seen = {}
+
+    class FakeProxy:
+        pid = 4242
+
+        def poll(self):
+            return 0
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *a, **k: FakeProxy())
+    monkeypatch.setattr(runner, "proc_stat", lambda pid: ("S", "777") if pid == 4242 else None)
+    (tmp_path / "spec.json").write_text(json.dumps({"sock": str(tmp_path / "s.sock"), "egress": "/x"}))
+    monkeypatch.setattr(runner.sys, "stdin", type("I", (), {"buffer": type("B", (), {"read": lambda self, n: b""})(),
+                                                            "close": lambda self: None})())
+    runner.helper_run(tmp_path)
+    seen = json.loads((tmp_path / "proxy.json").read_text())
+    assert seen == {"pid": 4242, "start": "777"}
