@@ -4,6 +4,7 @@ independent helper watch, fail-closed allow files, live profile refresh, and tun
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -14,7 +15,14 @@ from tests.control_plane.test_collab_egress import (  # noqa: F401
     load_egress,
     short_dir,
 )
-from tests.control_plane.test_collab_helper_runner import hr  # noqa: F401
+from tests.control_plane.test_collab_helper_runner import (  # noqa: F401
+    ask,
+    hr,
+    needs_box,
+    procs_with,
+    running,
+    until,
+)
 from tests.control_plane.test_collab_spawn import WORKER, calls, rig, runner  # noqa: F401
 from tests.control_plane.test_collab_tasks import svc  # noqa: F401
 
@@ -138,3 +146,80 @@ def test_helper_proxies_get_an_idle_timeout(tmp_path):
     i = argv.index("--idle-timeout")
     assert float(argv[i + 1]) == runner.HELPER_TUNNEL_IDLE and 300 <= runner.HELPER_TUNNEL_IDLE <= 3600
     assert "--allow-file" in argv and str(tmp_path / "allow.txt") in argv
+
+
+# ------------------------------------------------------------------ the helper watch does not wait for fleets (item 2)
+
+
+@needs_box
+def test_pause_stops_a_running_helper_while_the_fleet_path_is_still_busy(hr, monkeypatch):
+    h = ask(hr, task="SLEEP until stopped")
+    until(hr, running(hr, h["helper_id"]))
+    monkeypatch.setattr(runner, "WATCH_EVERY", 0.3)
+    r = hr.mk()
+    monkeypatch.setattr(r, "installed_families", lambda target: ["claude-code"])
+    seen = {}
+
+    def slow_fleet_path(up):                        # stands in for a fleet start that takes minutes (handle())
+        r.ok("POST", "fleet/helpers/pause", {"paused": True})
+        end = time.monotonic() + 20
+        while (hr.state / h["helper_id"]).exists() and time.monotonic() < end:
+            time.sleep(0.1)
+        seen["gone_while_busy"] = not (hr.state / h["helper_id"]).exists()
+    monkeypatch.setattr(r, "sync_names", slow_fleet_path)
+    r.once()
+    assert seen["gone_while_busy"] and procs_with(str(hr.fake / "claude")) == []
+
+
+def fake_running(hr, hid="h_fake", deadline=1e12, **st):
+    d = hr.state / hid
+    d.mkdir(parents=True)
+    (d / "state.json").write_text(json.dumps({"helper_id": hid, "phase": "running", "room_id": hr.w.room,
+                                              "deadline": deadline, "pid": None, **st}))
+    (d / "allow.txt").write_text("api.anthropic.com:443\nold.example.org:443\n")
+    return d
+
+
+def failing(r, path_prefix):
+    real = r.api
+
+    def api(method, path, body=None):
+        if path.startswith(path_prefix):
+            raise runner.Failure(f"{method} {path}: unreachable")
+        return real(method, path, body)
+    r.api = api
+    return r
+
+
+def test_without_the_helper_list_the_allow_file_is_emptied_after_a_short_grace(hr):
+    d = fake_running(hr)
+    r = failing(hr.mk(), "fleet/helpers")
+    runner.write_private(hr.state.parent / "helpers-seen.json", json.dumps({"at": time.time()}))
+    with pytest.raises(runner.Failure):
+        r.helpers_cycle(claim=False)
+    assert "old.example.org" in (d / "allow.txt").read_text()          # within the grace: kept
+    runner.write_private(hr.state.parent / "helpers-seen.json",
+                         json.dumps({"at": time.time() - runner.HELPER_LIST_GRACE - 1}))
+    with pytest.raises(runner.Failure):
+        r.helpers_cycle(claim=False)
+    assert (d / "allow.txt").read_text() == ""                         # fail closed
+    assert (d / "state.json").exists()                                 # not torn down: the service may come back
+
+
+def test_a_failed_egress_fetch_empties_that_helpers_allow_file_after_the_grace(hr, monkeypatch):
+    d = fake_running(hr, allow_ok=time.time() - runner.HELPER_LIST_GRACE - 1)
+    r = failing(hr.mk(), "fleet/egress/")
+    monkeypatch.setattr(r, "alive", lambda st: True)
+    with pytest.raises(runner.Failure):                               # helpers_cycle logs it per helper
+        r.watch_helper(d, {"helper_id": "h_fake", "status": "running"}, False)
+    assert (d / "allow.txt").read_text() == ""
+
+
+def test_the_local_deadline_still_ends_a_helper_when_the_service_is_unreachable(hr, monkeypatch):
+    fake_running(hr, deadline=time.time() - 60)
+    r = failing(hr.mk(), "fleet/helpers")
+    killed = []
+    monkeypatch.setattr(r, "kill", lambda st: killed.append(st["helper_id"]))
+    with pytest.raises(runner.Failure):
+        r.helpers_cycle(claim=False)
+    assert killed == ["h_fake"]
