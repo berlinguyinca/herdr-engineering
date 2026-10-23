@@ -13,9 +13,11 @@ serves until it is killed. Tokens are random and live only in this process and t
 from __future__ import annotations
 
 import base64
-import json
 import itertools
+import json
+import os
 import secrets
+import signal
 import sys
 import tempfile
 import threading
@@ -163,6 +165,7 @@ class Seeder:
         inv = s.create_external_invite(a, self.room, {"label": "Dana's Claude", "proposals": True, "actions": ["read", "post"], "lineage": True})
         out = s.redeem_join_token({"token": inv["code"]})
         agent = s.authenticate(f"Agent {out['credential']}", out["device_id"])
+        self.agent_principal = agent
         self.agent_id = agent.id
         tid = s.create_delegation(a, self.room, {
             "target_agent_id": agent.id, "text": "Review the parser and propose a fix",
@@ -177,7 +180,43 @@ class Seeder:
         s.submit_proposal(agent, tid, {"kind": "doc", "title": "Parser notes <b>x</b>", "content": "notes\n" + HOSTILE,
                                        "expected_version": inbox_version()})
         self.agent_auth = (auth, dev)
+        if self.cfg.get("rich"):
+            self.rich()
+        if self.cfg.get("long_labels"):
+            self.long_labels()
         return self
+
+    def rich(self):
+        """Text in every field the page can render: a redirect with an instruction, a consultation question, a second
+        workspace link. Used by the hostile-text gate, which taints each of them."""
+        s, a, b = self.svc, self.pr["alice"], self.pr["bob"]
+        t = s.steering_target(b, self.room, "attempt:a1")
+        s.propose_steering(b, self.room, {"action": "redirect", "node_id": "attempt:a1", "instruction": "prefer the smaller patch",
+                                          "expected_fence": t["fence"], "idempotency_key": "seed-rich-s"})
+        s.ask_consultation(a, self.room, {"target": {"kind": "user", "id": "bob"}, "subject": {"kind": "node", "node_id": "attempt:a1"},
+                                          "question": "which approach is safer for the parser?", "idempotency_key": "seed-rich-q"})
+        s.external_heartbeat(self.agent_principal, {"status": "working", "activity": "reading parser.py"})
+
+    def long_labels(self):
+        """Unbroken 300-character text in every place a person can type, so the 320px reflow gate meets what real users paste
+        (a URL, a hash, a path). Nothing here can wrap at a space."""
+        word = "x" * 300
+        self.node("task:long", "running", "L" + word)
+        self.edge("dependency", "task:long", "attempt:a1")
+        self.edge("dependency", "attempt:a1", "task:long")
+        self.svc.add_comment(self.pr["bob"], self.room, {"anchor": {"kind": "node", "node_id": "attempt:a1"}, "text": "C" + word,
+                                                         "idempotency_key": "seed-long-c"})
+        t = self.svc.steering_target(self.pr["bob"], self.room, "task:long")
+        self.svc.propose_steering(self.pr["bob"], self.room, {"action": "redirect", "node_id": "task:long", "instruction": "R" + word,
+                                                              "expected_fence": t["fence"], "idempotency_key": "seed-long-s"})
+
+    def close(self) -> None:
+        """Remove everything this process wrote (the event log's temp directory)."""
+        try:
+            self.srv.shutdown()
+        except Exception:      # noqa: BLE001 - best effort on the way out
+            pass
+        self.tmp.cleanup()
 
     def _admin(self):
         p = self.svc.authenticate(f"Bearer {self.tokens['alice']}", None)
@@ -199,8 +238,24 @@ def bulk_graph(seed: Seeder, n: int) -> float:
     return time.time() - t0
 
 
+def _die(*_):
+    """SIGTERM from the test that started us: leave through the normal path so the temp directory is removed."""
+    raise SystemExit(0)
+
+
+def _watch_parent(parent: int) -> None:
+    """If the test runner is killed without a chance to stop us (SIGKILL, a crash, a CI timeout) the process would run on
+    for ever with its temp directory. Poll the parent and leave when it is gone."""
+    while True:
+        time.sleep(1.0)
+        if os.getppid() != parent:
+            os._exit(0)
+
+
 def main():
     cfg = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
+    signal.signal(signal.SIGTERM, _die)
+    threading.Thread(target=_watch_parent, args=(os.getppid(),), daemon=True).start()
     seeder = Seeder(cfg)
     if not cfg.get("empty"):
         seeder.seed()
@@ -209,8 +264,11 @@ def main():
                       "ingest_key": seeder.ingest_key, "agent_id": getattr(seeder, "agent_id", None),
                       "steering_id": (getattr(seeder, "steer", None) or {}).get("steering_id"),
                       "ingest_seconds": round(took, 2), "main_port": seeder.srv.port}), flush=True)
-    while True:
-        time.sleep(3600)
+    try:
+        while True:
+            time.sleep(3600)
+    finally:
+        seeder.close()
 
 
 if __name__ == "__main__":

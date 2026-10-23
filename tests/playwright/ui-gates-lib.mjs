@@ -26,11 +26,10 @@ export function loadConfig(file = path.join(import.meta.dirname, 'ui-gates.yaml'
 }
 export const CFG = loadConfig();
 
-export function chromePath() {
-  const fallback = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
-  return existsSync(fallback) ? fallback : undefined;      // otherwise Playwright's own bundled browser
-}
-export const launch = () => chromium.launch({ headless: true, args: ['--no-sandbox'], executablePath: chromePath() });
+/** The browser Playwright itself resolves for this install (PLAYWRIGHT_BROWSERS_PATH is Playwright's own setting, not ours).
+ *  No path is hard-coded: a machine without the browser gets Playwright's own "run npx playwright install" message. */
+export const chromePath = () => chromium.executablePath();
+export const launch = () => chromium.launch({ headless: true, args: ['--no-sandbox'] });
 
 /** Start tests/playwright/real_server.py (the integrated control plane on loopback). Resolves with its handshake line. */
 export async function startRealServer(cfg = {}) {
@@ -44,7 +43,16 @@ export async function startRealServer(cfg = {}) {
     proc.stdout.on('data', (d) => { buf += d; const i = buf.indexOf('\n'); if (i >= 0) { clearTimeout(timer); try { resolve(JSON.parse(buf.slice(0, i))); } catch (e) { reject(e); } } });
     proc.on('exit', (c) => { clearTimeout(timer); reject(new Error(`real server exited ${c}: ${err.slice(-800)}`)); });
   });
-  return { info, stop: () => { proc.kill('SIGKILL'); } };
+  // SIGTERM first so the server removes its temp directory; SIGKILL only if it has not left after 5 s. The server also leaves by
+  // itself when this process dies (parent-death watchdog in real_server.py).
+  let gone = proc.exitCode !== null || proc.signalCode !== null;
+  proc.on('exit', () => { gone = true; });
+  const stop = () => {
+    if (gone) return;
+    proc.kill('SIGTERM');
+    const t = setTimeout(() => { if (!gone) proc.kill('SIGKILL'); }, 5000); t.unref();
+  };
+  return { info, stop, exited: () => gone };
 }
 
 /** Collects everything that counts as "the page is unhealthy": console errors/warnings, page errors, CSP violations, failed requests. */
@@ -60,12 +68,13 @@ export function watch(page) {
 }
 
 /** Open the real assembled page signed in as `user`. */
-export async function openReal(browser, info, user = 'alice', ctxOpts = {}) {
+export async function openReal(browser, info, user = 'alice', ctxOpts = {}, beforeGoto = null) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, ...ctxOpts });
   const page = await ctx.newPage();
   const w = watch(page);
   const tok = info.tokens[user];
   await page.addInitScript(([t]) => { try { window.sessionStorage.setItem('hcn.tokens', JSON.stringify({ access: t, id: t })); } catch { /* storage blocked */ } }, [tok]);
+  if (beforeGoto) await beforeGoto(ctx, page);
   await page.goto(`${info.base}/#/room/${encodeURIComponent(info.room)}`);
   await page.locator('[data-sub]').first().waitFor({ timeout: 15000 });
   return { ctx, page, w };

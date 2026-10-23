@@ -9,7 +9,8 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { CFG, REPO, launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
-import { staticAudit, focusIndicatorAudit, tabTrapAudit, overflowAudit, motionAudit, summarize } from './a11y-checks.mjs';
+import { staticAudit, focusIndicatorAudit, tabTrapAudit, overflowAudit, motionAudit, liveAnnouncementAudit, summarize } from './a11y-checks.mjs';
+import { STATES } from './ui-gates-states.mjs';
 
 const SUBS = ['chat', 'flow', 'tasks', 'agents', 'tabs', 'lineage', 'attention', 'progress', 'links', 'proposals', 'people'];
 // Text that proves a surface actually rendered something specific (a blank panel passes every a11y check).
@@ -279,3 +280,117 @@ test('review evidence bound to an older commit than the PR head is shown as stal
   assert.match(t, /stale/i);
   await ctx.close();
 });
+
+test('the flow diagram is one Tab stop: arrow keys move between nodes and task lines, Tab leaves it', async () => {
+  const { ctx, page } = await session('alice');
+  await render(page, 'flow');
+  const items = page.locator('svg.cx-flow [data-node], svg.cx-flow [data-edge]');
+  assert.ok(await items.count() >= 3, `the seeded flow has several nodes and lines (${await items.count()})`);
+  assert.equal(await page.locator('svg.cx-flow [data-node][tabindex="0"], svg.cx-flow [data-edge][tabindex="0"]').count(), 1, 'exactly one element of the diagram is in the Tab order');
+  const at = () => page.evaluate(() => { const a = document.activeElement; return a && a.closest('svg.cx-flow') ? (a.dataset.node ? `n:${a.dataset.node}` : `e:${a.dataset.edge}`) : null; });
+  await page.locator('svg.cx-flow [tabindex="0"]').first().focus();
+  const first = await at();
+  await page.keyboard.press('ArrowRight');
+  const second = await at();
+  assert.ok(second && second !== first, 'ArrowRight moves to the next element');
+  assert.equal(await page.locator('svg.cx-flow [data-node][tabindex="0"], svg.cx-flow [data-edge][tabindex="0"]').count(), 1, 'still one Tab stop, now the new one');
+  await page.keyboard.press('End');
+  const last = await at();
+  await page.keyboard.press('Home');
+  assert.equal(await at(), first, 'Home returns to the first element');
+  assert.notEqual(last, first);
+  await page.keyboard.press('Tab');
+  assert.equal(await at(), null, 'one Tab leaves the diagram');
+  await ctx.close();
+});
+
+test('choosing a task line in the flow announces its detail in a live region', async () => {
+  const { ctx, page } = await session('alice');
+  await render(page, 'flow');
+  await page.locator('svg.cx-flow [data-edge]').first().focus();
+  const f = await liveAnnouncementAudit(page, () => page.keyboard.press('Enter'), '#hcn-p-flow');
+  assert.ok(f.stats.changed >= 1, 'the detail text changed');
+  assert.deepEqual([...f], []);
+  await ctx.close();
+});
+
+test('the pause-motion choice is a single toggle button (one label, aria-pressed) and is remembered, also when storage is blocked', async () => {
+  const { ctx, page } = await session('alice', { reducedMotion: 'no-preference' });
+  await render(page, 'flow');
+  const btn = page.locator('#hcn-flow-still');
+  const label = await btn.innerText();
+  await btn.focus(); await page.keyboard.press('Enter');
+  assert.equal(await btn.getAttribute('aria-pressed'), 'true');
+  assert.equal(await btn.innerText(), label, 'the label does not change with the state (aria-pressed says it)');
+  await page.reload();
+  await render(page, 'flow');
+  assert.equal(await page.locator('#hcn-flow-still').getAttribute('aria-pressed'), 'true', 'the choice survives a reload');
+  assert.equal(await page.evaluate(() => document.getAnimations().filter((a) => a.playState === 'running' && a.effect && a.effect.getComputedTiming().iterations === Infinity).length), 0, 'and the motion is still off');
+  await page.locator('#hcn-flow-still').focus(); await page.keyboard.press('Enter');     // back to moving, for the next part
+  await ctx.close();
+  // storage blocked: the toggle must still work and must not throw
+  const blocked = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await blocked.addInitScript(() => { Object.defineProperty(window, 'localStorage', { get() { throw new Error('blocked'); } }); });
+  const p2 = await blocked.newPage();
+  const errors = []; p2.on('pageerror', (e) => errors.push(e.message));
+  await p2.addInitScript(([t]) => window.sessionStorage.setItem('hcn.tokens', JSON.stringify({ access: t, id: t })), [info.tokens.alice]);
+  await p2.goto(`${info.base}/#/room/${encodeURIComponent(info.room)}`);
+  await p2.locator('[data-sub="flow"]').click();
+  await p2.locator('#hcn-flow-still').click();
+  assert.equal(await p2.locator('#hcn-flow-still').getAttribute('aria-pressed'), 'true');
+  assert.deepEqual(errors, [], 'no exception when localStorage is blocked');
+  await blocked.close();
+});
+
+test('no surface or state uses `transition: all` (checked with motion allowed, where it matters)', async () => {
+  const bad = [];
+  const { ctx, page } = await session('alice', { reducedMotion: 'no-preference' });
+  for (const sub of SUBS) { await render(page, sub); const f = (await staticAudit(page, `#hcn-p-${sub}`)).filter((x) => x.rule === 'transition-all'); if (f.length) bad.push(`[${sub}] ${summarize(f)}`); }
+  const f2 = (await staticAudit(page, 'body')).filter((x) => x.rule === 'transition-all');
+  if (f2.length) bad.push(`[page] ${summarize(f2)}`);
+  await ctx.close();
+  for (const st of STATES.slice(0, 3)) {
+    const s = await session('alice', { reducedMotion: 'no-preference' });
+    await st.open(s.page);
+    const f = (await staticAudit(s.page, st.scope)).filter((x) => x.rule === 'transition-all');
+    if (f.length) bad.push(`[${st.id}] ${summarize(f)}`);
+    await s.ctx.close();
+  }
+  assert.deepEqual(bad, []);
+});
+
+test('reflow at 320px with 300-character unbroken labels, comments and instructions on every surface and in the inspector', async () => {
+  const long = await startRealServer({ long_labels: true });
+  try {
+    const { ctx, page } = await openReal(browser, long.info, 'alice', { viewport: CFG.viewports.reflow });
+    const bad = [];
+    for (const sub of SUBS) {
+      await openSub(page, sub);
+      await page.waitForTimeout(250);
+      const o = await overflowAudit(page);
+      if (o.scrollWidth > o.clientWidth + 1) bad.push(`[${sub}] scrollWidth ${o.scrollWidth} > ${o.clientWidth}: ${o.offenders.join(', ')}`);
+    }
+    // the inspector of the node whose label, comments and requests are all 300 unbroken characters
+    await openSub(page, 'lineage');
+    await page.locator('svg.lin-svg g[data-node]').first().waitFor();
+    for (const node of ['task:long', 'attempt:a1']) {
+      await page.locator(`g[data-node="${node}"]`).focus(); await page.keyboard.press('Enter');
+      await page.locator('.wb').waitFor(); await page.waitForTimeout(400);
+      const o = await overflowAudit(page);
+      if (o.scrollWidth > o.clientWidth + 1) bad.push(`[inspector ${node}] scrollWidth ${o.scrollWidth} > ${o.clientWidth}: ${o.offenders.join(', ')}`);
+      assert.ok((await page.locator('.wb').innerText()).includes('xxxxxxxxxx'), `the long text of ${node} is on screen (the fixture is doing its job)`);
+    }
+    assert.deepEqual(bad, []);
+    await ctx.close();
+  } finally { long.stop(); }
+});
+
+for (const [label, opts] of [['desktop light', { colorScheme: 'light' }], ['desktop dark', { colorScheme: 'dark' }]]) {
+  test(`the audit of the default views really covered the page: ${label}`, async () => {
+    const { ctx, page } = await session('alice', { ...opts, reducedMotion: 'reduce' });
+    let controls = 0; let focused = 0; let text = 0;
+    for (const sub of SUBS) { await render(page, sub); const a = await staticAudit(page, `#hcn-p-${sub}`); const b = await focusIndicatorAudit(page, `#hcn-p-${sub}`); controls += a.stats.controls; text += a.stats.textNodes; focused += b.stats.focused; }
+    assert.ok(controls >= 60 && focused >= 40 && text >= 100, `audited ${controls} controls, focused ${focused}, read ${text} text nodes: a silent skip would show here`);
+    await ctx.close();
+  });
+}

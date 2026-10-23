@@ -21,7 +21,11 @@ async function tabTo(page, sel, max = 700) {
 async function guard(page) {
   await page.addInitScript(() => { for (const t of ['pointerdown', 'mousedown', 'mouseup', 'touchstart']) window.addEventListener(t, () => { (window.__pointer ||= []).push(t); }, true); });
 }
-const focusKept = async (page, label) => assert.ok(await page.evaluate(() => document.activeElement && document.activeElement !== document.body), `${label}: focus must not be dropped to <body>`);
+// Focus must come back to THE control that was used (or its logical successor), not merely to something other than <body>:
+// a keyboard user who is thrown to the container, or to the first control on the panel, has lost their place.
+const describe = (page) => page.evaluate(() => { const a = document.activeElement; return a ? `${a.tagName.toLowerCase()}${a.id ? '#' + a.id : ''}${[...a.attributes].filter((x) => x.name.startsWith('data-')).map((x) => `[${x.name}="${x.value}"]`).join('')}` : 'none'; });
+const focusIs = async (page, selector, label) => assert.ok(await page.evaluate((s) => !!document.activeElement && document.activeElement.matches(s), selector), `${label}: focus should be on ${selector}, it is on ${await describe(page)}`);
+const focusIn = async (page, container, label) => assert.ok(await page.evaluate((s) => { const a = document.activeElement; return !!a && a !== document.body && !!a.closest(s); }, container), `${label}: focus should stay inside ${container}, it is on ${await describe(page)}`);
 async function pointerFree(page) { assert.equal(await page.evaluate(() => (window.__pointer || []).length), 0, 'no pointer event reached the page'); }
 
 async function user(name) {
@@ -72,7 +76,7 @@ test('a contributor comments, proposes a redirect and proposes a fork; an owner 
   await tabTo(page, 'form[data-wb-form="comment"] button[type="submit"]');
   await page.keyboard.press('Enter');
   await page.locator('.wb-comment', { hasText: 'keyboard-only comment' }).waitFor();
-  await focusKept(page, 'after posting a comment');
+  await focusIs(page, 'form[data-wb-form="comment"] button[type="submit"]', 'after posting a comment');
 
   // propose a redirect (a radio group is operated with the arrow keys, free text is typed)
   const before = await page.locator('.wb-steer').count();
@@ -82,7 +86,7 @@ test('a contributor comments, proposes a redirect and proposes a fork; an owner 
   await tabTo(page, 'form[data-wb-form="propose"] button[type="submit"]');
   await page.keyboard.press('Enter');
   await page.waitForFunction((n) => document.querySelectorAll('.wb-steer').length > n, before);
-  await focusKept(page, 'after proposing steering');
+  await focusIs(page, 'form[data-wb-form="propose"] button[type="submit"]', 'after proposing steering');
   assert.match(await page.locator('.wb-steers').innerText(), /Redirect with an instruction/);
 
   // propose a fork from a commit the graph shows
@@ -104,22 +108,23 @@ test('a contributor comments, proposes a redirect and proposes a fork; an owner 
   await ap.keyboard.press('Enter');
   await ap.locator('.wb-confirm').waitFor();
   assert.match(await ap.locator('.wb-confirm').innerText(), /exactly this request/i, 'the confirm step restates what will be sent');
-  await focusKept(ap, 'after opening the confirm step');
+  await focusIn(ap, '.wb-confirm', 'after opening the confirm step');
   await tabTo(ap, '[data-wb-act="confirm-go"]');
   await ap.keyboard.press('Enter');
   await ap.locator('.wb-steer', { hasText: /Confirmed, waiting for the agent/ }).first().waitFor();
-  await focusKept(ap, 'after confirming');
+  await focusIn(ap, '.wb', 'after confirming');
 
   // replay: step back with the keyboard, see the position change, return to live
   await tabTo(ap, '[data-replay="prev"]');
   await ap.keyboard.press('Enter');
   await ap.waitForFunction(() => !/^Live/.test(document.querySelector('.lin-replay__status')?.textContent || 'Live'));
   const stepped = await ap.locator('.lin-replay__status').innerText();
+  await focusIs(ap, '[data-replay="prev"]', 'after stepping back');
   await tabTo(ap, '[data-replay="live"]');
   await ap.keyboard.press('Enter');
   await ap.waitForFunction(() => /^Live/.test(document.querySelector('.lin-replay__status')?.textContent || ''));
   assert.ok(stepped.length > 0);
-  await focusKept(ap, 'after replay');
+  await focusIs(ap, '[data-replay="live"]', 'after returning to live');
 
   // attention: acknowledge the first item
   await tabTo(ap, '[data-sub="attention"]');
@@ -129,7 +134,7 @@ test('a contributor comments, proposes a redirect and proposes a fork; an owner 
   await tabTo(ap, '[data-attn-act="ack"]');
   await ap.keyboard.press('Enter');
   await ap.waitForFunction((n) => document.querySelectorAll('.cx-attn-item').length < n, items);
-  await focusKept(ap, 'after acknowledging an attention item');
+  await focusIn(ap, '#hcn-p-attention', 'after acknowledging an attention item');
   await pointerFree(ap);
   await alice.ctx.close();
 });
@@ -142,6 +147,7 @@ test('an owner reads a quarantined proposal and rejects it: keyboard only', asyn
   await tabTo(page, '[data-proposal]');
   await page.keyboard.press('Enter');
   await page.locator('#hcn-review').getByText(/untrusted|quarantine/i).first().waitFor();
+  const pid = await page.locator('[data-proposal]').first().getAttribute('data-proposal');
   await tabTo(page, '#hcn-review button[data-decide="reject"]');
   // the page asks through the browser's own confirm dialog, which is keyboard operable (Enter accepts)
   let asked = '';
@@ -150,9 +156,29 @@ test('an owner reads a quarantined proposal and rejects it: keyboard only', asyn
   await page.waitForFunction(() => !document.querySelector('#hcn-review [data-decide]'), null, { timeout: 8000 });
   assert.match(asked, /Reject this proposal/);
   assert.match(await page.locator('#hcn-p-proposals').innerText(), /rejected/i);
-  await focusKept(page, 'after rejecting a proposal');
+  await focusIs(page, `[data-proposal="${pid}"]`, 'after rejecting a proposal (back on its row)');
   await pointerFree(page);
   await alice.ctx.close();
+});
+
+test('an owner reads a quarantined proposal and accepts it: focus returns to its row', async () => {
+  const own = await startRealServer({});
+  try {
+    const { ctx, page } = await openReal(browser, own.info, 'alice');
+    await guard(page); await page.reload(); await page.locator('[data-sub]').first().waitFor();
+    await tabTo(page, '[data-sub="proposals"]'); await page.keyboard.press('Enter');
+    await tabTo(page, '[data-proposal]');
+    const pid = await page.locator('[data-proposal]').first().getAttribute('data-proposal');
+    await page.keyboard.press('Enter');
+    await tabTo(page, '#hcn-review button[data-decide="accept"]');
+    page.once('dialog', (d) => d.accept());
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !document.querySelector('#hcn-review [data-decide="accept"]'), null, { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    await focusIs(page, `[data-proposal="${pid}"], #hcn-review [data-decide]`, 'after accepting a proposal');
+    await pointerFree(page);
+    await ctx.close();
+  } finally { own.stop(); }
 });
 
 test('remote agent tabs and room tabs are switchable by arrow keys alone', async () => {
