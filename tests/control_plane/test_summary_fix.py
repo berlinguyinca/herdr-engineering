@@ -255,3 +255,226 @@ def test_disabled_or_missing_summary_and_unknown_session(harness):
         urllib.request.urlopen(request, timeout=3)
     assert error.value.code == 404
     assert h.sent == [] and h2.sent == []
+
+
+def test_wake_audit_is_marked_as_wake(harness):
+    h = harness()
+    assert h.post({'list': 'blockers', 'index': 0, 'text': 'CI lint fails on api.py'})[0] == 200
+    assert h.audits()[0]['payload']['delivery'] == 'wake'
+
+
+# ---------------------------------------------------------------- helper fallback (dead session)
+from herdr_engineering.control_plane.collab import (  # noqa: E402
+    CollabService,
+    FileEventLog,
+    StaticTokenAuthenticator,
+)
+from herdr_engineering.control_plane.summary_fix import (  # noqa: E402
+    http_helper_spawner,
+    inprocess_helper_spawner,
+)
+from tests.control_plane.test_collab import Clock, _digest  # noqa: E402
+from tests.control_plane.test_collab_tasks import USERS  # noqa: E402
+
+DEAD = {'status': 'closed', 'terminal_id': None}
+ITEM = {'list': 'blockers', 'index': 0, 'text': 'CI lint fails on api.py'}
+
+
+class FixRoom:
+    """mallory (the operator) owns a standing summary-fix room with a requester agent."""
+
+    def __init__(self, tmp_path, actions=('spawn_helpers',), profile=None, configured=True):
+        self.log = str(tmp_path / 'collab.log')
+        self.s = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}),
+                               sink=FileEventLog(self.log), now=Clock())
+        self.op = self.s.authenticate(f"Bearer {USERS['mallory']}", None)
+        pid = self.s.create_project(self.op, {'name': 'fixes'})['project_id']
+        self.room = self.s.create_room(self.op, pid, {'name': 'summary-fix'})['room_id']
+        info = self.s.connect_agent(self.op, {'harness_type': 'claude-code', 'name': 'summary-fixer'})
+        self.agent_id = info['agent_id']
+        self.s.grant_agent(self.op, self.room, {'agent_id': self.agent_id, 'actions': list(actions)})
+        self.s.set_room_profile(self.op, self.room, profile or {'allowed_families': ['claude-code']})
+        if configured:
+            self.s.summary_fix = {'room_id': self.room, 'requester_agent_id': self.agent_id}
+        self.op.admin = True
+
+    def spawner(self):
+        return inprocess_helper_spawner(self.s, 'mallory')
+
+    def helpers(self):
+        return self.s.list_summary_fix_helpers(self.op)['helpers']
+
+    def task(self, helper_id):
+        return self.s._helpers[helper_id]['task']
+
+
+def dead_harness(harness, room, **kwargs):
+    h = harness(session_changes={**DEAD, **kwargs.pop('session_changes', {})}, **kwargs)
+    h.server.summary_fix_helper = room.spawner()
+    return h
+
+
+def test_dead_session_starts_one_text_only_helper(harness, tmp_path):
+    room = FixRoom(tmp_path)
+    h = dead_harness(harness, room)
+    status, result = h.post(ITEM)
+    assert status == 202 and result['status'] == 'helper_started' and result['delivery'] == 'helper'
+    assert result['tools'] is False and result['replayed'] is False and h.sent == []
+    [helper] = room.helpers()
+    assert helper['helper_id'] == result['helper_id'] and helper['role'] == 'worker'
+    assert helper['requester_agent_id'] == room.agent_id and helper['operation_id'] == result['operation_id']
+    task = room.task(result['helper_id'])
+    assert task.startswith('The agent that owns this session is not running')
+    assert 'untrusted data' in task and 'Nothing you write is applied' in task
+    assert packet(task)['request']['item'] == 'CI lint fails on api.py'
+    [audit] = h.audits()
+    assert audit['payload']['delivery'] == 'helper' and audit['payload']['helper_id'] == result['helper_id']
+    assert audit['payload']['operation_id'] == result['operation_id']
+    assert 'CI lint fails' not in json.dumps(audit['payload'])
+
+
+def test_unconfigured_room_keeps_the_clear_409(harness, tmp_path):
+    room = FixRoom(tmp_path, configured=False)
+    h = dead_harness(harness, room)
+    status, result = h.post(ITEM)
+    assert status == 409 and result['fallback'] == 'helper_unavailable'
+    assert 'No summary-fix helper room is configured' in result['error']
+    assert h.sent == [] and h.audits() == [] and room.helpers() == []
+
+
+def test_replay_returns_the_same_helper_and_never_prompts_the_agent(harness, tmp_path):
+    room = FixRoom(tmp_path)
+    h = dead_harness(harness, room)
+    first = h.post(ITEM)[1]
+    status, second = h.post(ITEM)
+    assert status == 202 and second['replayed'] is True and second['helper_id'] == first['helper_id']
+    native(h.repo)                                  # the agent came back: still no second handoff
+    status, third = h.post(ITEM)
+    assert status == 202 and third['helper_id'] == first['helper_id'] and h.sent == []
+    assert len(room.helpers()) == 1 and len(h.audits()) == 1
+
+
+def test_collab_dedupes_the_operation_across_a_lost_audit_and_a_restart(tmp_path):
+    room = FixRoom(tmp_path)
+    spawn = room.spawner()
+    op = 'summary-fix-' + 'a' * 40 + '-1'
+    s1, first = spawn(op, 'task text')
+    s2, again = spawn(op, 'other text')
+    assert (s1, s2) == (202, 202) and again['helper_id'] == first['helper_id'] and again['replayed'] is True
+    restarted = CollabService(room.s.auth, sink=FileEventLog(room.log), now=room.s._now,
+                              summary_fix=room.s.summary_fix)
+    restarted.hydrate(FileEventLog(room.log).load())
+    status, body = inprocess_helper_spawner(restarted, 'mallory')(op, 'task text')
+    assert status == 202 and body['helper_id'] == first['helper_id'] and body['replayed'] is True
+    assert len(restarted.list_summary_fix_helpers(room.op)['helpers']) == 1
+
+
+def test_helper_packet_is_capped_ascii_and_redacted(harness, tmp_path):
+    room = FixRoom(tmp_path)
+    messages = [('assistant', f'Deploy used OPENAI_KEY {SECRET} and password=hunter22hunter')]
+    messages += [('user' if i % 2 else 'assistant', f'message {i}   \x85 ' + 'x' * 1500) for i in range(12)]
+    h = dead_harness(harness, room, messages=messages)
+    status, result = h.post(ITEM)
+    assert status == 202, result
+    task = room.task(result['helper_id'])
+    assert len(task) <= MAX_PACKET_CHARS and task.isascii()
+    assert SECRET not in task and 'hunter22hunter' not in task
+    assert packet(task)['recent_messages'][-1]['text'].startswith('message 11')
+    assert SECRET not in json.dumps(h.repo.stream('session', SID))
+
+
+def test_secret_in_an_included_message_is_redacted_for_the_helper(harness, tmp_path):
+    room = FixRoom(tmp_path)
+    h = dead_harness(harness, room, messages=[('assistant', f'Deploy used OPENAI_KEY {SECRET} and password=hunter22hunter')])
+    result = h.post(ITEM)[1]
+    context = packet(room.task(result['helper_id']))
+    assert '[REDACTED]' in context['recent_messages'][0]['text']
+    assert SECRET not in room.task(result['helper_id'])
+
+
+@pytest.mark.parametrize('actions,profile,fallback', [
+    (('read',), None, 'helper_refused'),                                  # no spawn_helpers
+    (('read', 'spawn_helpers'), None, 'helper_overgranted'),              # more than spawn_helpers
+    (('spawn_helpers',), {'allowed_families': []}, 'helper_refused'),      # helpers off in the room
+    (('spawn_helpers',), {'allowed_families': ['claude-code'], 'tools_allowed': True}, 'helper_tools_allowed'),
+])
+def test_requester_without_the_right_grant_or_room_is_refused(harness, tmp_path, actions, profile, fallback):
+    room = FixRoom(tmp_path, actions=actions, profile=profile)
+    h = dead_harness(harness, room)
+    status, result = h.post(ITEM)
+    assert status == 409 and result['fallback'] == fallback, result
+    assert h.sent == [] and h.audits() == [] and room.helpers() == []
+
+
+def test_helper_limits_and_the_panic_switch_are_reported(harness, tmp_path):
+    room = FixRoom(tmp_path, profile={'allowed_families': ['claude-code'], 'limits': {'live_per_agent': 1}})
+    h = dead_harness(harness, room)
+    assert h.post(ITEM)[0] == 202
+    status, result = h.post({'list': 'next_steps', 'index': 0, 'text': 'Run the client tests'})
+    assert status == 429 and result['fallback'] == 'helper_limit' and 'limit' in result['error']
+    room.s.set_helpers_paused(room.op, True)
+    status, result = h.post({'list': 'next_steps', 'index': 1, 'text': 'Open the PR'})
+    assert status == 503 and result['fallback'] == 'helpers_paused'
+    assert len(room.helpers()) == 1 and len(h.audits()) == 1
+
+
+def test_unreachable_collab_is_a_502_without_audit(harness, tmp_path):
+    h = harness(session_changes=DEAD)
+
+    def broken(operation_id, task):
+        raise OSError('connection refused')
+    h.server.summary_fix_helper = broken
+    status, result = h.post(ITEM)
+    assert status == 502 and result['fallback'] == 'helper_unreachable' and h.audits() == []
+
+
+def test_summary_fix_routes_are_operator_listener_only(tmp_path):
+    room = FixRoom(tmp_path)
+    body = {'operation_id': 'summary-fix-' + 'b' * 40 + '-1', 'task': 'x'}
+    assert room.s.dispatch('POST', ['fleet', 'summary-fix', 'helper'], {}, body,
+                           f"Bearer {USERS['mallory']}", None)[0] == 404
+    assert room.s.dispatch('GET', ['fleet', 'summary-fix', 'helpers'], {}, {},
+                           f"Bearer {USERS['alice']}", None)[0] == 404
+    for bad in ({**body, 'room_id': room.room}, {**body, 'operation_id': 'anything'}, {'task': 'x'}):
+        assert room.s.dispatch('POST', ['fleet', 'summary-fix', 'helper'], {}, bad, '', None,
+                               operator='mallory')[0] == 400
+    assert room.helpers() == []
+
+
+def test_finished_helper_result_is_listed_as_untrusted_text(tmp_path):
+    room = FixRoom(tmp_path)
+    status, h = room.spawner()('summary-fix-' + 'c' * 40 + '-1', 'look at the lint error')
+    assert status == 202
+    room.s.claim_helper(room.op, h['helper_id'])
+    room.s.finish_helper(room.op, h['helper_id'], {'status': 'done', 'result': 'Add the missing import.\n'})
+    [row] = room.helpers()
+    assert row['status'] == 'done' and row['result'] == 'Add the missing import.\n' and row['untrusted'] is True
+    assert room.s.list_summary_fix_helpers(room.op)['configured'] is True
+
+
+def test_http_spawner_posts_to_the_operator_listener(tmp_path):
+    import http.server
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append((self.path, json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+            code, body = (202, {'helper_id': 'collab_h1'}) if len(seen) == 1 else (409, {'reason': 'helper_unavailable'})
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        spawn = http_helper_spawner(f'http://127.0.0.1:{srv.server_port}/')
+        assert spawn('op', 'task') == (202, {'helper_id': 'collab_h1'})
+        assert spawn('op', 'task') == (409, {'reason': 'helper_unavailable'})
+        assert seen[0] == ('/api/v1/collab/fleet/summary-fix/helper', {'operation_id': 'op', 'task': 'task'})
+    finally:
+        srv.shutdown()
