@@ -335,7 +335,14 @@ never reported says so instead of showing zeros.
 - **Source.** The fabric agent on each host samples every 30 s and posts to the
   control plane; the slow package/unit/version report runs hourly. Both
   intervals are YAML only: `fabric.host_report_interval` (default `30`) and
-  `fabric.host_slow_interval` (default `3600`) seconds.
+  `fabric.host_slow_interval` (default `3600`) seconds. A package scan that
+  returns no count (timeout, 120 s) is retried after 5 min, then 15 min, then
+  hourly.
+- **Agents running.** The number of agent processes on the host, from the same
+  `ps` call as the top consumers: processes whose name is exactly one of
+  `fabric.agent_binaries` (YAML, default `["pi", "claude", "codex"]`), counted
+  once per agent (a matching child of a matching process is not counted
+  again). An idle agent TUI counts. If `ps` fails the count is omitted, never 0.
 - **Retention.** Raw samples are kept in memory for 48 h. Each closed 5-minute
   bucket becomes one averaged rollup point, persisted and kept for 7 days
   (the bucket open at shutdown is lost). A range query returns at most 300 points.

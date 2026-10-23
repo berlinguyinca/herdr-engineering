@@ -108,10 +108,13 @@ Per host, in order:
 1. **Busy check (control plane, read-only).** The host is busy if
    `GET /api/v1/hosts/<id>` reports `latest.agents_running > 0`, or
    `GET /api/v1/sessions?status=active` lists an active session whose
-   `host_id` is this host. The fabric agent does not report `agents_running`
-   today, so the sessions list is the signal that matters: if it cannot be read
-   (control plane down, 401, bad JSON) the busy state is **unknown** and the
-   host is deferred with result `deferred: busy state unknown`. It never updates
+   `host_id` is this host. `agents_running` is the number of agent processes
+   the fabric agent counts on the host (`fabric.agent_binaries`, default `pi`,
+   `claude`, `codex`), so an open but idle agent TUI also defers the host.
+   A count of 0 does not make a host idle on its own: the sessions list must
+   also be readable. If it cannot be read (control plane down, 401, bad JSON)
+   the busy state is **unknown** and the host is deferred with result
+   `deferred: busy state unknown`. It never updates
    blind. `<id>` is `fleet_update_host_id`, default the `nodename` fact (what
    the agent reports as `socket.gethostname()`), not the inventory alias; set
    it per host if they differ. A session matches when its `host_id` is that id,

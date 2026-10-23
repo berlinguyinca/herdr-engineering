@@ -22,9 +22,9 @@ last_updated and clears deferred_since; the others keep the previous values.
 
 Busy rules: a host is busy when its control-plane record reports
 latest.agents_running > 0 OR the control plane lists an active session for it.
-The sessions list must be readable for a host to count as idle (the fabric
-agent does not report agents_running today); otherwise the busy state is
-unknown and the host defers. ``force`` overrides both busy and unknown.
+The sessions list must be readable for a host to count as idle, even when
+agents_running is 0 (that count only sees the configured agent process names);
+otherwise the busy state is unknown and the host defers. ``force`` overrides both busy and unknown.
 """
 from __future__ import annotations
 

@@ -220,3 +220,23 @@ def test_slow_loop_retries_after_five_minutes_when_outdated_unknown(tmp_path):
 
     a._slow_loop(Stop())
     assert waits == [300.0, 3600.0]
+
+
+def test_agent_binaries_config_parsing():
+    import pytest
+
+    from herdr_engineering.fabric_agent import parse_agent_binaries
+    assert parse_agent_binaries(None) == ("pi", "claude", "codex")
+    assert parse_agent_binaries(["pi", " aider "]) == ("pi", "aider")
+    assert parse_agent_binaries("pi") == ("pi",)  # one name, not its characters
+    assert parse_agent_binaries([]) == ()
+    for bad in ([1], [""], ["/usr/bin/pi"], {"pi": 1}, 3):
+        with pytest.raises(ValueError):
+            parse_agent_binaries(bad)
+
+
+def test_agent_passes_configured_binaries_to_the_sampler(tmp_path):
+    cfg = AgentConfig(tailnet_ip="100.1.2.3", store_path=tmp_path / "s.json",
+                      control_plane_url="", agent_binaries=("aider",))
+    a = FabricAgent(_Client(), cfg)
+    assert a._sampler._agent_binaries == ("aider",)

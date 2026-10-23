@@ -4,7 +4,15 @@ from pathlib import Path
 
 from herdr_engineering import host_metrics
 from herdr_engineering.host_metrics import (
-    HostSampler, parse_apple_gpu, parse_nvidia_smi, parse_ps, parse_rocm_smi)
+    DEFAULT_AGENT_BINARIES,
+    HostSampler,
+    count_agents,
+    parse_apple_gpu,
+    parse_nvidia_smi,
+    parse_ps,
+    parse_ps_rows,
+    parse_rocm_smi,
+)
 
 FX = Path(__file__).parent / "fixtures" / "host_metrics"
 
@@ -36,7 +44,7 @@ def test_parse_apple_has_name_and_no_util():
 
 
 def test_parse_ps_top_five_by_cpu_and_mem():
-    rows = "\n".join(f"{i} u{i} {i}.0 {100 - i}.0 cmd{i}" for i in range(1, 11))
+    rows = "\n".join(f"{i} 1 u{i} {i}.0 {100 - i}.0 cmd{i}" for i in range(1, 11))
     t = parse_ps(rows)
     assert [e["pid"] for e in t["cpu"]] == [10, 9, 8, 7, 6]
     assert [e["pid"] for e in t["mem"]] == [1, 2, 3, 4, 5]
@@ -50,16 +58,57 @@ def test_parse_ps_fixture_with_spaces_in_command():
     assert any(e["command"] == "Web Content" for e in t["cpu"])
 
 
+def _ps_only(fixture):
+    return lambda argv: (_fx(fixture) if argv[0] == "ps"
+                         else (_ for _ in ()).throw(FileNotFoundError(argv[0])))
+
+
 def test_owner_comes_from_agent_lookup(monkeypatch):
-    s = HostSampler(agent_lookup=lambda pid: "pi:mission-1" if pid == 42 else None,
-                    agents_running=lambda: 3)
-    monkeypatch.setattr(s, "_run", lambda argv: _fx("ps_output.txt") if argv[0] == "ps"
-                        else (_ for _ in ()).throw(FileNotFoundError(argv[0])))
+    s = HostSampler(agent_lookup=lambda pid: "pi:mission-1" if pid == 42 else None)
+    monkeypatch.setattr(s, "_run", _ps_only("ps_output.txt"))
     out = s.sample()
     top = {e["pid"]: e for e in out["top"]["cpu"]}
     assert top[42]["owner"] == "pi:mission-1"
     assert top[1]["owner"] is None
+    assert out["agents_running"] == 0  # ps worked, no agent binary running
+
+
+def test_ps_rows_carry_ppid():
+    rows = parse_ps_rows(_fx("ps_output.txt"))
+    assert {r["pid"]: r["ppid"] for r in rows} == {1: 0, 42: 1, 77: 1, 100: 42}
+    assert rows[2]["command"] == "python3"  # basename of a path command
+
+
+def test_agents_counted_from_ps_two_pi_one_claude():
+    rows = parse_ps_rows(_fx("ps_agents.txt"))
+    # 2 pi + 1 claude; the claude child of claude, pi-helper, node, python3 and
+    # codex-code-mode-host are not counted
+    assert count_agents(rows, DEFAULT_AGENT_BINARIES) == 3
+    assert count_agents(rows, ("pi",)) == 2
+    assert count_agents(rows, ("codex",)) == 0
+
+
+def test_default_agent_binaries():
+    assert DEFAULT_AGENT_BINARIES == ("pi", "claude", "codex")
+
+
+def test_sampler_reports_agents_running_from_its_one_ps_call(monkeypatch):
+    calls = []
+    s = HostSampler(agent_binaries=("pi", "claude"))
+
+    def run(argv):
+        calls.append(argv[0])
+        return _ps_only("ps_agents.txt")(argv)
+    monkeypatch.setattr(s, "_run", run)
+    out = s.sample()
     assert out["agents_running"] == 3
+    assert calls.count("ps") == 1
+
+
+def test_sampler_counts_zero_when_ps_works_and_no_agent_runs(monkeypatch):
+    s = HostSampler()
+    monkeypatch.setattr(s, "_run", _ps_only("ps_output.txt"))
+    assert s.sample()["agents_running"] == 0
 
 
 def test_gpu_tool_missing_omits_key(monkeypatch):
@@ -70,7 +119,7 @@ def test_gpu_tool_missing_omits_key(monkeypatch):
     monkeypatch.setattr(s, "_run", run)
     out = s.sample()
     assert "gpus" not in out and "top" not in out
-    assert out["agents_running"] == 0
+    assert "agents_running" not in out  # ps failed: unknown, never a guessed 0
 
 
 def test_gpu_command_timeout_omits_key_and_sample_still_returns(monkeypatch):
@@ -85,7 +134,7 @@ def test_gpu_command_timeout_omits_key_and_sample_still_returns(monkeypatch):
 
 
 def test_huge_ps_output_is_capped_at_five():
-    rows = "\n".join(f"{i} u {i % 97}.5 {i % 89}.5 c{i}" for i in range(1, 5001))
+    rows = "\n".join(f"{i} 1 u {i % 97}.5 {i % 89}.5 c{i}" for i in range(1, 5001))
     t = parse_ps(rows)
     assert len(t["cpu"]) == 5 and len(t["mem"]) == 5
 

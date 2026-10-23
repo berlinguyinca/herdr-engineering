@@ -691,6 +691,19 @@ class AgentForwarder:
 # The agent
 # ---------------------------------------------------------------------------
 
+def parse_agent_binaries(value: Any) -> tuple[str, ...]:
+    """``fabric.agent_binaries`` from YAML: a list of process names (a single
+    string is one name). ``None`` keeps the default; anything else is an error."""
+    if value is None:
+        return AgentConfig.agent_binaries
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)) or not all(
+            isinstance(v, str) and v.strip() and "/" not in v for v in value):
+        raise ValueError("fabric.agent_binaries must be a list of process names")
+    return tuple(v.strip() for v in value)
+
+
 _SLOW_RETRY_S = (300.0, 900.0)  # then hourly
 
 
@@ -755,6 +768,8 @@ class AgentConfig:
     # slow package-update / tool-version data rides along on it.
     host_report_interval: float = 30.0
     host_slow_interval: float = 3600.0
+    # Process names counted as running agents (``fabric.agent_binaries``).
+    agent_binaries: tuple[str, ...] = ("pi", "claude", "codex")
 
     def fabric_names(self) -> frozenset[str]:
         """The host names the fabric owns: its control-plane host and this
@@ -788,7 +803,7 @@ class FabricAgent:
         self._lock = threading.Lock()
         from .host_metrics import HostSampler, read_updates, read_versions
         self._sampler = HostSampler(agent_lookup=self._agent_for_pid,
-                                    agents_running=lambda: None)
+                                    agent_binaries=config.agent_binaries)
         self._read_slow = lambda: {"updates": read_updates(), "versions": read_versions()}
         self._slow_data: dict[str, Any] | None = None
         self._slow_sent: float | None = None

@@ -7,15 +7,15 @@ two readings, so the first ``sample()`` call omits them.
 """
 from __future__ import annotations
 
+import json
 import os
 import platform
-import json
 import re
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 _PSEUDO_FS = {
     "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2", "overlay",
@@ -98,21 +98,68 @@ def parse_apple_gpu(system_profiler_json: str) -> list[dict]:
     return out[:MAX_GPUS]
 
 
-def parse_ps(output: str, limit: int = TOP_N) -> dict:
-    """Parse ``ps -A -o pid=,user=,pcpu=,pmem=,comm=`` into top-N by cpu and mem."""
+# Agent CLIs counted as "agents running" (``fabric.agent_binaries`` overrides).
+DEFAULT_AGENT_BINARIES = ("pi", "claude", "codex")
+PS_ARGV = ["ps", "-A", "-o", "pid=,ppid=,user=,pcpu=,pmem=,comm="]
+
+
+def parse_ps_rows(output: str) -> list[dict]:
+    """Parse ``ps -A -o pid=,ppid=,user=,pcpu=,pmem=,comm=`` into rows.
+
+    ``command`` is the basename of ``comm`` (macOS prints the executable path)."""
     rows = []
     for line in output.splitlines():
-        f = line.split(None, 4)
-        if len(f) < 5:
+        f = line.split(None, 5)
+        if len(f) < 6:
             continue
-        pid, cpu, mem = _num(f[0]), _num(f[2]), _num(f[3])
-        if pid is None or cpu is None or mem is None:
+        pid, ppid, cpu, mem = _num(f[0]), _num(f[1]), _num(f[3]), _num(f[4])
+        if pid is None or ppid is None or cpu is None or mem is None:
             continue
-        cmd = f[4].strip().rsplit("/", 1)[-1] or f[4].strip()
-        rows.append({"pid": int(pid), "command": cmd[:64], "user": f[1],
-                     "cpu_pct": cpu, "mem_pct": mem, "owner": None})
+        cmd = f[5].strip().rsplit("/", 1)[-1] or f[5].strip()
+        rows.append({"pid": int(pid), "ppid": int(ppid), "command": cmd[:64], "user": f[2],
+                     "cpu_pct": cpu, "mem_pct": mem})
+    return rows
+
+
+def parse_ps(output: str, limit: int = TOP_N) -> dict:
+    """Top-N processes by cpu and by mem from ``ps`` output (see ``parse_ps_rows``)."""
+    return _top_of(parse_ps_rows(output), limit)
+
+
+def _top_of(ps_rows: list[dict], limit: int = TOP_N) -> dict:
+    rows = [{"pid": r["pid"], "command": r["command"], "user": r["user"],
+             "cpu_pct": r["cpu_pct"], "mem_pct": r["mem_pct"], "owner": None}
+            for r in ps_rows]
     return {"cpu": sorted(rows, key=lambda r: -r["cpu_pct"])[:limit],
             "mem": sorted(rows, key=lambda r: -r["mem_pct"])[:limit]}
+
+
+def count_agents(rows: list[dict], binaries) -> int:
+    """Distinct agent processes: rows whose command name is exactly one of
+    ``binaries`` and that have no matching ancestor.
+
+    The match is on the process name (``comm``), never a substring, so
+    ``pi-helper`` is not ``pi``. Node-based CLIs (pi, claude) set their process
+    name, so they show under their own name on Linux; on macOS ``comm`` is the
+    executable, so an agent run by a plain ``node`` reads as ``node`` and is
+    not counted (an under-count, never a guess). A process whose parent chain
+    holds another match (claude -> claude, codex -> codex helpers) is part of
+    that agent and counted once."""
+    names = set(binaries)
+    by_pid = {r["pid"]: r for r in rows}
+    matches = [r for r in rows if r["command"] in names]
+
+    def has_agent_ancestor(r):
+        seen, pid = set(), r["ppid"]
+        while pid in by_pid and pid not in seen and len(seen) < 64:
+            seen.add(pid)
+            parent = by_pid[pid]
+            if parent["command"] in names:
+                return True
+            pid = parent["ppid"]
+        return False
+
+    return sum(1 for r in matches if not has_agent_ancestor(r))
 
 
 def _herdr_data_dir() -> str:
@@ -153,9 +200,9 @@ def _parse_size(s: str) -> int:
 
 class HostSampler:
     def __init__(self, agent_lookup: Callable[[int], str | None] = lambda pid: None,
-                 agents_running: Callable[[], int] = lambda: 0) -> None:
+                 agent_binaries=DEFAULT_AGENT_BINARIES) -> None:
         self._agent_lookup = agent_lookup
-        self._agents_running = agents_running
+        self._agent_binaries = tuple(agent_binaries)
         self._prev_cpu: tuple[int, int] | None = None
         self._prev_net: tuple[float, int, int] | None = None
 
@@ -178,11 +225,11 @@ class HostSampler:
         out: dict = {}
         darwin = platform.system() == "Darwin"
         steps = ([self._mac_cpu, self._mac_mem, self._mac_uptime, self._mac_net,
-                  self._load, self._disk_pct, self._mounts_df, self._gpus, self._top, self._agents]
+                  self._load, self._disk_pct, self._mounts_df, self._gpus, self._top]
                  if darwin else
                  [self._linux_cpu, self._linux_mem, self._linux_uptime,
-                  self._linux_net, self._load, self._disk_pct, self._mounts_proc, self._gpus, self._top,
-                  self._agents])
+                  self._linux_net, self._load, self._disk_pct, self._mounts_proc, self._gpus,
+                  self._top])
         for step in steps:
             try:
                 out.update(step())
@@ -276,22 +323,22 @@ class HostSampler:
         return {"gpus": gpus[:MAX_GPUS]} if gpus else {}
 
     def _top(self) -> dict:
-        txt = self._try(["ps", "-A", "-o", "pid=,user=,pcpu=,pmem=,comm="])
+        """Top consumers and ``agents_running`` from one ``ps`` call; a failed
+        ``ps`` omits both (the agent count is never a guessed 0)."""
+        txt = self._try(PS_ARGV)
         if not txt:
             return {}
-        top = parse_ps(txt)
+        rows = parse_ps_rows(txt)
+        out: dict = {"agents_running": count_agents(rows, self._agent_binaries)}
+        top = _top_of(rows)
         for e in top["cpu"] + top["mem"]:
             try:
                 e["owner"] = self._agent_lookup(e["pid"])
             except Exception:  # noqa: BLE001
                 e["owner"] = None
-        return {"top": top} if top["cpu"] else {}
-
-    def _agents(self) -> dict:
-        try:
-            return {"agents_running": int(self._agents_running())}
-        except Exception:  # noqa: BLE001
-            return {}
+        if top["cpu"]:
+            out["top"] = top
+        return out
 
     # -- linux -----------------------------------------------------------
     def _linux_cpu(self) -> dict:

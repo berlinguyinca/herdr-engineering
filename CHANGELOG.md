@@ -21,7 +21,8 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   mounts, load, uptime, network, GPU (NVIDIA, ROCm, Apple), top consumers and agent
   count every 30 s, plus an hourly report of package/security updates, reboot-required,
   failed units and tool versions. Intervals: `fabric.host_report_interval` and
-  `fabric.host_slow_interval` (YAML only).
+  `fabric.host_slow_interval` (YAML only). The agent count is the number of agent
+  processes named in `fabric.agent_binaries` (YAML, default `pi`, `claude`, `codex`).
 - Control plane: validated host metrics with 48 h raw history and 7 d of durable
   5-minute rollups (max 300 points); `GET /api/v1/hosts/<id>/telemetry?range=1h|24h|7d`;
   server-side `problems`/`problem_count` on host reads (stale, never_reported, disk,
