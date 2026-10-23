@@ -636,3 +636,73 @@ def test_contextual_settings_reach_the_combined_server_too(tmp_path, monkeypatch
     bad = _run_web(monkeypatch, make_file(d, pg_dsn="", collab={"contextual": {"enabled": "true"}}), collab_users_file=str(users))
     cfg = bad["server_kw"]["collab"].ctx_cfg()
     assert cfg["enabled"] is False and cfg["kill_switch"] is True                  # an invalid section fails CLOSED
+
+
+# ------------------------------------------- unreadable fleet file: security switches fail closed (T14 review)
+
+def _contextual_source(store):
+    return lambda: (store.secure_section("control_plane").get("collab") or {}).get("contextual")
+
+
+def _bump(path):
+    import os
+    import time
+    t = time.time() + 5
+    os.utime(path, (t, t))
+
+
+@pytest.mark.parametrize("breakage", ["delete", "garbage", "invalid_value"])
+def test_a_deleted_or_unparseable_fleet_file_turns_security_switches_off(tmp_path, breakage):
+    from herdr_engineering.control_plane.collab_context import normalize_contextual
+    from herdr_engineering.fleet_config import FleetConfigStore
+    path = make_file(tmp_path, collab=dict(COLLAB, contextual={"enabled": True}))
+    store = FleetConfigStore(path)
+    src = _contextual_source(store)
+    assert normalize_contextual(src())["enabled"] is True
+    if breakage == "delete":
+        path.unlink()
+    elif breakage == "garbage":
+        path.write_text("sections: [unclosed\n  - : :")
+        path.chmod(0o600)
+    else:
+        data = yaml.safe_load(path.read_text())
+        data["sections"]["control_plane"]["values"]["collab"]["contextual"]["kill_switch"] = "yes"
+        path.write_text(yaml.safe_dump(data))
+        path.chmod(0o600)
+    _bump(path) if path.exists() else None
+    with pytest.raises(Exception):
+        normalize_contextual(src())                        # the consumer fails closed (ctx_cfg turns this into OFF)
+    if breakage != "invalid_value":                        # a value error is the section's, not the file's
+        assert store.last_error
+        assert store.current().section("control_plane")    # everything else keeps serving the last good file
+
+
+def test_the_service_treats_an_unreadable_fleet_file_as_the_feature_off(tmp_path, caplog):
+    from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
+    from herdr_engineering.fleet_config import FleetConfigStore
+    path = make_file(tmp_path, collab=dict(COLLAB, contextual={"enabled": True}))
+    store = FleetConfigStore(path)
+    svc = CollabService(StaticTokenAuthenticator({"a": "0" * 64}))
+    svc.contextual_source = _contextual_source(store)
+    assert svc.ctx_cfg()["enabled"] is True
+    with caplog.at_level("ERROR"):
+        path.unlink()
+        assert svc.ctx_cfg()["enabled"] is False and svc.ctx_cfg()["kill_switch"] is True
+    assert any("FAIL CLOSED" in r.message for r in caplog.records)
+    assert svc._ctx_on(svc.ctx_cfg(), "consultation") is False
+    # the file comes back valid: the switch follows it again
+    make_file(tmp_path, collab=dict(COLLAB, contextual={"enabled": True}))
+    assert svc.ctx_cfg()["enabled"] is True
+
+
+def test_config_failure_mode_last_good_is_an_explicit_operator_opt_in(tmp_path):
+    from herdr_engineering.control_plane.collab_context import normalize_contextual
+    from herdr_engineering.fleet_config import FleetConfigStore
+    path = make_file(tmp_path, collab=dict(COLLAB, contextual={"enabled": True}), config_failure_mode="last_good")
+    store = FleetConfigStore(path)
+    path.unlink()
+    assert normalize_contextual(_contextual_source(store)())["enabled"] is True
+    assert store.last_error and store.failure_mode() == "last_good"
+    other = make_file(tmp_path / "x" if (tmp_path / "x").mkdir() is None else tmp_path,
+                      collab=dict(COLLAB, contextual={"enabled": True}), config_failure_mode="whatever")
+    assert FleetConfigStore(other).failure_mode() == "fail_closed"      # anything but the exact opt-in

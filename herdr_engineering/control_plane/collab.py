@@ -2872,14 +2872,23 @@ class CollabService(WorkbenchMixin, ContextMixin):
     def graph_read(self, pr: Principal, parts: list[str], query: dict) -> dict:
         """Lineage graph read for a signed-in person. Hidden, missing and 'no graph for you' all
         answer one 404; nothing here lets a read widen what the graph's own checks allow."""
-        from .graph import read_graph
         graph = self.graph_source() if self.graph_source is not None else None
         access = self.graph_access(pr) if graph is not None else None
         if access is None:
             raise CollabError(404, "not found")
         principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
-        contexts = None
         room_id = query.get("room_id")
+        self.maintain()                         # T14: retry what the graph was not told about links
+        if room_id in access["rooms"]:
+            self._xlink_sweep(room_id)          # a lapsed link is tombstoned now, not at someone's next list
+        try:
+            return self.xlink_filter(self._graph_read(pr, graph, access, principal, parts, query, room_id))
+        except KeyError:
+            raise CollabError(404, "not found") from None
+
+    def _graph_read(self, pr, graph, access, principal, parts, query, room_id):
+        from .graph import read_graph
+        contexts = None
         if parts[:1] == ["lineage"]:
             return self._lineage_read(pr, graph, access, parts[1:], query)
         if parts == ["nodes"]:

@@ -264,8 +264,11 @@ class ControlPlaneServer:
         """Ingest one envelope the HCN service built for an external agent. The principal's allowed room is
         registered from the envelope's own room (which the service took from the enrollment), so the
         existing per-principal scope check applies unchanged."""
+        # a room service (T14 consultation thread) writes under the subject's mission label: the envelope's own
+        # mission id, which the service took from the node's scope, is the one mission it may address
+        mission = envelope.get("mission_id") if str(principal["id"]).startswith("collab:room:") else None
         self.ingest.key_scopes[principal["id"]] = {
-            "rooms": frozenset({envelope["room_id"]}), "missions": frozenset()}
+            "rooms": frozenset({envelope["room_id"]}), "missions": frozenset({mission} if mission else ())}
         return self.ingest.ingest(envelope, principal, valid=valid)
 
     def _dispatch_native_message(self, record, message, artifact_ids):
@@ -348,6 +351,8 @@ class ControlPlaneServer:
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
             self._summary_scanner.start()
         threading.Thread(target=self._sweep_loop, daemon=True).start()
+        if self.collab is not None and self.collab.lineage_sink is not None:
+            threading.Thread(target=self._link_flush_loop, daemon=True).start()
         self._httpd.serve_forever()
 
     def _sweep_loop(self, interval=300):
@@ -358,6 +363,16 @@ class ControlPlaneServer:
                 self.repo.inspector.sweep()
             except Exception:
                 pass
+
+    def _link_flush_loop(self, interval=30):
+        """T14: tell the lineage graph what it missed about cross-workspace links (a retraction the graph was down
+        for), once at start and then on a timer. The pending set is derived from the durable link records."""
+        while self._httpd is not None:
+            try:
+                self.collab.maintain()
+            except Exception:
+                pass
+            time.sleep(interval)
 
     def wait_until_ready(self, timeout=5.0):
         self._ready.wait(timeout=timeout)

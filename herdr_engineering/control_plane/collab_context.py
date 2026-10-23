@@ -24,7 +24,7 @@ from typing import Any
 
 from . import collab_external as ext
 from . import ids
-from .collab_workbench import WorkbenchError, _clean, _key, _sha, anchor_of
+from .collab_workbench import WorkbenchError, _key, _sha, anchor_of
 
 CONTEXTUAL_KEYS = frozenset({
     "enabled", "kill_switch", "context_refs", "consultation", "cross_links", "consult_ttl_seconds",
@@ -97,6 +97,19 @@ def parse_context(raw: Any) -> tuple[dict, str]:
 
 
 HIDDEN = {"hidden": True, "label": "hidden reference"}
+
+
+def _clean(value: Any, what: str, limit: int, required: bool = True, multiline: bool = False) -> str | None:
+    """Display-safe text from an untrusted party: the same sanitizer external agents get (tag characters, bidi
+    controls, soft hyphens, every format/control category, secrets), over-long input refused, not silently cut."""
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise WorkbenchError(400, f"{what} must be a string")
+    text = ext.clean_text(value, limit + 1, multiline=multiline)
+    if (required and not text) or len(text) > limit:
+        raise WorkbenchError(400, f"{what} must be 1-{limit} characters")
+    return text
 
 
 class ContextMixin:
@@ -339,7 +352,7 @@ class ContextMixin:
             anchor, _ = anchor_of(body.get("subject"))
             if anchor["kind"] != "node":
                 raise WorkbenchError(400, "a consultation is about a node")
-            question = _clean(body.get("question"), "question", cfg["max_question_chars"])
+            question = _clean(body.get("question"), "question", cfg["max_question_chars"], multiline=True)
             ikey = _key(body.get("idempotency_key"))
             ttl = body.get("expires_in_seconds", cfg["consult_ttl_seconds"])
             if isinstance(ttl, bool) or not isinstance(ttl, int) or not 60 <= ttl <= cfg["consult_max_ttl_seconds"]:
@@ -348,16 +361,17 @@ class ContextMixin:
             if (not isinstance(tgt, dict) or set(tgt) != {"kind", "id"} or tgt["kind"] not in ("user", "agent")
                     or not isinstance(tgt["id"], str)):
                 raise WorkbenchError(400, "target must be {kind: user|agent, id}")
+            # ONE answer for: subject hidden or missing, target unknown, target is you, target cannot see the subject
             if not graph.anchor_visible(reader, anchor):
                 raise WorkbenchError(404, "not found")
             probe = {"target_kind": tgt["kind"], "target_id": tgt["id"]}
             if (tgt["kind"] == "user" and tgt["id"] == pr.id) or not self._target_ok(probe, room):
-                raise WorkbenchError(404, "no such participant in this room")
+                raise WorkbenchError(404, "not found")
             if tgt["kind"] == "user":
                 # the person asked must be able to see what they are asked about, or the question is a riddle
                 pair = self._uid_reader(tgt["id"], room_id)
                 if pair is None or not pair[0].anchor_visible(pair[1], anchor):
-                    raise WorkbenchError(404, "no such participant in this room")
+                    raise WorkbenchError(404, "not found")
             fp = _sha(room_id, tgt, anchor["node_id"], question, ttl)
             prior = self._idem.get((pr.key, room_id, "consult:" + ikey))
             if prior:
@@ -448,7 +462,7 @@ class ContextMixin:
                 if not text or not str(text).strip():
                     raise WorkbenchError(400, f"answer must be 1-{cfg['max_answer_chars']} characters")
             else:
-                text = _clean(body.get("answer"), "answer", cfg["max_answer_chars"])
+                text = _clean(body.get("answer"), "answer", cfg["max_answer_chars"], multiline=True)
             self._commit("consult_answered", self._actor(
                 pr, project_id=r["project_id"], room_id=r["room_id"], consult_id=r["id"], answer=text,
                 responder=responder[1], epoch=self._now(), visibility_scope="room", action="consult.answer",
@@ -523,14 +537,35 @@ class ContextMixin:
             return self._respond(pr, room, r, body, responder=("agent", pr.id))
 
     # -- graph record: WHO was asked about WHAT, never the text
+    def _consult_scope(self, r: dict) -> dict | None:
+        """Envelope scope fields that give the thread node the SUBJECT's own visibility label (mission and workspace
+        included), so exactly the people who can see the subject can see who asked whom. None when the label cannot be
+        carried by an envelope (several workspaces, another room, a bare label): then nothing is published."""
+        pair = self._uid_reader(r["asker"], r["room_id"])
+        info = pair[0].node_context(pair[1], r["node_id"]) if pair is not None else None
+        label = info["scope"] if info else None
+        if not isinstance(label, tuple) or len(label) != 4 or len(label[3]) > 1:
+            return None
+        scope, cid, rid, wss = label
+        fields = {"visibility_scope": scope, "room_id": cid if scope == "room" else rid}
+        if scope == "mission":
+            fields["mission_id"] = cid
+        if wss:
+            fields["workspace_id"] = wss[0]
+        return fields if fields["room_id"] == r["room_id"] and scope in ("room", "mission") else None
+
     def _consult_publish(self, cid: str) -> bool:
         """Write the consultation thread node, its `consultation` edge and its current state to the lineage graph as
-        the room's service principal. Idempotent (event ids are derived from the consultation id); a failure only
-        counts, the consultation itself stands. Never called under the service lock."""
+        the room's service principal, under the subject's own scope label. Idempotent (event ids are derived from the
+        consultation id); a failure only counts, the consultation itself stands. Never called under the service lock."""
         with self._lock:
             r = self._consults.get(cid)
             sink = self.lineage_sink
             if r is None or sink is None:
+                return False
+            scope = self._consult_scope(r)
+            if scope is None:
+                self.stats["consult_unpublished"] = self.stats.get("consult_unpublished", 0) + 1
                 return False
             node = CONSULT_PREFIX + cid
             attrs = {"source": "hcn-consult", "asked_by": r["asker"], "target_kind": r["target_kind"],
@@ -549,7 +584,7 @@ class ContextMixin:
             for etype, entity, payload, n, tag in steps:
                 sink({"schema_version": 2, "event_id": f"hcn-consult-{cid}-{tag}", "source": source, "source_sequence": n,
                       "entity_type": "lineage", "entity_id": entity, "event_type": etype, "payload": payload,
-                      "visibility_scope": "room", "room_id": room_id}, principal, None)
+                      **scope}, principal, None)
         except Exception:                      # noqa: BLE001 - the consultation stands; a later state change republishes
             self.stats["lineage_failures"] += 1
             return False
@@ -674,7 +709,8 @@ class ContextMixin:
                     out.append(v)
                 if len(out) >= MAX_LIST:
                     break
-            return {"links": out, "enabled": self._ctx_on(self.ctx_cfg(), "cross_links"), "features": self._ctx_features()}
+            on = self._ctx_on(self.ctx_cfg(), "cross_links")
+            return {"links": out if on else [], "enabled": on, "features": self._ctx_features()}
 
     def revoke_link(self, pr, room_id: str, link_id: str) -> dict:
         out = self._wb_call(self._revoke_link, pr, room_id, link_id)
@@ -722,6 +758,61 @@ class ContextMixin:
                        if self._xlinks[i]["state"] == "active" and not self._xlinks[i]["published"]]
         for i in pending:                       # a graph that was down when the link was made catches up here
             self._xlink_publish(i)
+
+    def maintain(self) -> None:
+        """Flush what the lineage graph has not yet been told (publish a missed link, retract a revoked one). The
+        pending set is derived from the durable link records, so it survives a restart; callers: server start, a
+        periodic loop, and every lineage read (rate limited)."""
+        with self._lock:
+            now = self._now()
+            if now - getattr(self, "_xlink_flush_at", 0.0) < 5.0:
+                return
+            self._xlink_flush_at = now
+            rooms = list(self._xlinks_by_room)
+        for room_id in rooms:
+            self._xlink_sweep(room_id)
+
+    def xlink_hidden(self, d: dict) -> bool:
+        """Must this edge (or ledger event) of the cross_link kind be withheld NOW? Decided at READ time from the
+        durable link record, not from what the graph projection happens to hold: a link shows only while it is active,
+        its creator is still authorized and both grants still hold. Switched off = hidden everywhere."""
+        on = self._ctx_on(self.ctx_cfg(), "cross_links")
+        if d.get("edge_type") == "cross_link" and "from_id" in d:
+            if not on:
+                return True
+            if d.get("removed"):
+                return False
+            attrs = d.get("attrs") if isinstance(d.get("attrs"), dict) else {}
+            lid = attrs.get("link_id")
+            lid = lid.get("value") if isinstance(lid, dict) else lid
+            with self._lock:
+                r = self._xlinks.get(lid) if isinstance(lid, str) else None
+                return r is None or self._xlink_state(r) != "active"
+        pl = d.get("payload")
+        if str(d.get("event_type", "")).startswith("edge.") and isinstance(pl, dict) and pl.get("edge_type") == "cross_link":
+            return not on
+        return False
+
+    def xlink_filter(self, body: Any) -> Any:
+        """``body`` with every withheld cross_link edge/event removed (lists are filtered in place, deeply). A body that
+        is itself one withheld edge raises KeyError (the callers answer 404)."""
+        if isinstance(body, dict):
+            if self.xlink_hidden(body):
+                raise KeyError("cross_link")
+            for k, v in list(body.items()):
+                if isinstance(v, (list, dict)):
+                    body[k] = self.xlink_filter(v) if isinstance(v, dict) else self._xlink_list(v)
+        elif isinstance(body, list):
+            return self._xlink_list(body)
+        return body
+
+    def _xlink_list(self, items: list) -> list:
+        out = []
+        for it in items:
+            if isinstance(it, dict) and self.xlink_hidden(it):
+                continue
+            out.append(self.xlink_filter(it) if isinstance(it, (dict, list)) else it)
+        return out
 
     @staticmethod
     def _xlink_system(r: dict, action: str) -> dict:

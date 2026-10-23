@@ -2468,7 +2468,7 @@ def _cmd_cp_web(args) -> int:
         collab.steering = normalize_steering(getattr(args, "collab_steering", None))
         if fleet_store is not None:
             def _steering_from_yaml(_store=fleet_store):
-                section = _store.current().section("control_plane")
+                section = _store.secure_section("control_plane")
                 return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("steering")
             collab.steering_source = _steering_from_yaml
         # T14: contextual chat, consultation and cross-workspace links. Same rule: YAML only, off by default, re-read
@@ -2477,7 +2477,7 @@ def _cmd_cp_web(args) -> int:
         collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
         if fleet_store is not None:
             def _contextual_from_yaml(_store=fleet_store):
-                section = _store.current().section("control_plane")
+                section = _store.secure_section("control_plane")
                 return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("contextual")
             collab.contextual_source = _contextual_from_yaml
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
