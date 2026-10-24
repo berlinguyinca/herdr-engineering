@@ -49,14 +49,14 @@ test("mergeDetail adds non-empty detail fields to a session payload", () => {
   const e = sessionEnvelope();
   const out = mergeDetail(e, {
     agent_role: "claude", cwd: "/work", branch: "main@abc123",
-    pid: "1234", cmdline: "pi --x", summary: "fixing bug", attach: "herdr workspace focus w1H",
+    pid: "1234", cmdline: "pi --x", summary: "fixing bug", attach: `ssh -t beast "bash -lc 'herdr --session default agent attach w1:p1'"`,
   });
   assert.equal(out.payload.cwd, "/work");
   assert.equal(out.payload.branch, "main@abc123");
   assert.equal(out.payload.pid, "1234");
   assert.equal(out.payload.cmdline, "pi --x");
   assert.equal(out.payload.summary, "fixing bug");
-  assert.equal(out.payload.attach, "herdr workspace focus w1H");
+  assert.equal(out.payload.attach, `ssh -t beast "bash -lc 'herdr --session default agent attach w1:p1'"`);
   // agent_role from detail updates when empty, but existing identity wins
   assert.equal(out.payload.agent_role, "pi");
 });
