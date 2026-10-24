@@ -136,7 +136,7 @@ test('agents: unchanged rows keep their nodes and a new agent enters',async()=>{
 test('agent detail: the recorded event list appends and the head status follows live events',async()=>withPage(async(page,base)=>{
  const s={session:agent('x',{status:'working'}),events:[{event_id:'e1',sequence:1,event_type:'SessionStarted',source_timestamp:T0,payload:{}}]};
  await calm(page,'off');
- await boot(page,base,'/herd/session/x',p=>{
+ const reads=await boot(page,base,'/herd/session/x',p=>{
   if(p==='/api/v1/sessions/x')return structuredClone(s.session);
   if(p==='/api/v1/events')return {events:structuredClone(s.events)};
   if(p==='/api/v1/sessions')return {sessions:[]};
@@ -147,6 +147,14 @@ test('agent detail: the recorded event list appends and the head status follows 
  await until(()=>page.locator('#session-stream [data-key]').count().then(n=>n===1),'one recorded event');
  await page.evaluate(()=>{window.__stream=document.getElementById('session-stream');window.__row=window.__stream.firstElementChild;});
  assert.match(await page.locator('.sd-head strong').textContent(),/Last reported working/);
+ await page.evaluate(()=>{window.__headFlashes=0;new MutationObserver(rs=>{for(const r of rs)if(r.target.hasAttribute('data-flash'))window.__headFlashes++;}).observe(document.querySelector('[data-session-head]'),{attributes:true,attributeFilter:['data-flash']});});
+ // A heartbeat (only the report time moves) updates the time without flashing the head.
+ s.session.updated_at='2026-01-01T00:00:12Z';
+ await page.evaluate(()=>window.__emit({event_id:'hb',event_type:'SessionUpdated',entity_id:'x'}));
+ await page.clock.runFor(6000);
+ await until(()=>reads['/api/v1/sessions/x']>=2,'heartbeat refresh read the agent');
+ await sleep(150);
+ assert.equal(await page.evaluate(()=>window.__headFlashes),0,'a heartbeat does not flash the head');
  s.events=[...s.events,{event_id:'e2',sequence:2,event_type:'SessionUpdated',source_timestamp:T0,payload:{status:'waiting'}}];
  s.session.status='waiting';
  await page.evaluate(()=>window.__emit({event_id:'e2',event_type:'SessionUpdated',entity_id:'x'}));
@@ -155,6 +163,7 @@ test('agent detail: the recorded event list appends and the head status follows 
  const r=await page.evaluate(()=>({same:document.getElementById('session-stream')===window.__stream,row:window.__stream.contains(window.__row),children:window.__stream.children.length}));
  assert.deepEqual(r,{same:true,row:true,children:2},'the list grows by one; container and earlier row survive');
  await until(()=>page.locator('.sd-head strong').textContent().then(t=>/Last reported waiting/.test(t)),'head status follows the live event');
+ assert.equal(await page.evaluate(()=>window.__headFlashes),1,'a status change flashes the head once');
 }));
 
 test('agent workspace: a streamed message appends with an enter transition; earlier rows keep their nodes',async()=>{

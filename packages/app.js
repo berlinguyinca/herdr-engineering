@@ -310,11 +310,11 @@ async function viewSessions() {
   return ownPolling(mountSessionsView(root, client, {tab: route().query.get('tab') || 'current'}));
 }
 
-function sessionHeadText(s) {
+function sessionStatusText(s) {
   const outcome = recordOutcome(s);
   const terminal = outcome === 'failed' || outcome === 'finished';
   const reportedStatus = terminal && statusOutcome(s.status) !== outcome ? s.stage : s.status;
-  return `${reportedStatus ? `Last reported ${String(reportedStatus).replaceAll('_',' ').toLowerCase()}` : 'Status unknown'} · ${formatTimestamp(s.updated_at)}`;
+  return reportedStatus ? `Last reported ${String(reportedStatus).replaceAll('_',' ').toLowerCase()}` : 'Status unknown';
 }
 
 async function viewSession(parts, revision) {
@@ -334,7 +334,7 @@ async function viewSession(parts, revision) {
     root.innerHTML = `<style>.sd-head{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:14px 0}.sd-meta{color:var(--text-secondary);line-height:1.6;overflow-wrap:anywhere}.sd-details{margin:14px 0;overflow-wrap:anywhere}.sd-details summary{cursor:pointer;font-weight:600}.sd-details dl{display:grid;grid-template-columns:minmax(100px,auto) minmax(0,1fr);gap:8px 16px}.sd-details dt{color:var(--text-secondary)}.sd-details dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.sd-title{overflow-wrap:anywhere}@media(max-width:600px){.sd-details dl{display:block}.sd-details dd{margin:4px 0 12px}}</style>
       <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Agents</a>
       <h1 class="sd-title">${esc(clip(s.display_name || s.agent_role) || 'Agent')}${project ? ` · ${esc(clip(project))}` : ''}</h1>
-      <div class="sd-head"><strong data-session-head>${esc(sessionHeadText(s))}</strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
+      <div class="sd-head"><strong data-session-head><span data-session-status>${esc(sessionStatusText(s))}</span> · <span data-session-updated>${esc(formatTimestamp(s.updated_at))}</span></strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
       <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.` : 'Agent status reflects the last report; it is not a live process check.'}</p>
       ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
@@ -369,21 +369,28 @@ async function viewSession(parts, revision) {
     }
     const stream = document.getElementById('session-stream');
     const head = root.querySelector('[data-session-head]');
+    let headRequest = null;
     streamItems('session',s.session_id).then(items=>{if(stream.isConnected && revision===renderRevision)paintStream(stream,items,{initial:true});}).catch(()=>{if(stream.isConnected)stream.innerHTML='<span class="muted">Recorded events could not load.</span>';});
     // The page streams its own detail; a live event refreshes the recorded event list (new events
     // are appended) and the head status line, in place.
     return {
       async refresh() {
         if (!stream.isConnected) return;
+        headRequest?.abort();
+        const request = new AbortController(); headRequest = request;
         const [items, latest] = await Promise.all([
           streamItems('session', s.session_id).catch(() => null),
-          client.getSession(id).catch(() => null),
+          client.getSession(id, { signal: request.signal }).catch(() => null),
         ]);
-        if (!stream.isConnected) return;
+        if (headRequest === request) headRequest = null;
+        if (!stream.isConnected || request.signal.aborted) return;
         if (items) paintStream(stream, items);
-        if (latest && head.isConnected && patchText(head, sessionHeadText(latest))) flash(head);
+        if (!latest || !head.isConnected) return;
+        // A heartbeat moves the report time only; the head flashes when the status itself changes.
+        patchText(head.querySelector('[data-session-updated]'), formatTimestamp(latest.updated_at));
+        if (patchText(head.querySelector('[data-session-status]'), sessionStatusText(latest))) flash(head);
       },
-      dispose: disposeSession,
+      dispose() { headRequest?.abort(); disposeSession(); },
     };
   } catch (error) {
     if (revision !== renderRevision) return;
