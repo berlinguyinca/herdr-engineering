@@ -191,6 +191,7 @@ class ControlPlaneRepo:
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+        self.mission_outcomes = None   # set by the server (control_plane.missions); None writes no outcomes
         # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
         # from them on import_state; owns no storage of its own.
         self.graph = GraphProjection()
@@ -302,6 +303,17 @@ class ControlPlaneRepo:
         m["updated_at"] = self._stamp()
         self.record_event("mission", key, "MissionStageChanged",
                           {"from": old, "to": stage}, mission_id=mission_id)
+        self._mission_stage_changed(key, old, stage)
+
+    def _mission_stage_changed(self, key, old, new):
+        # A durable outcome is written when a mission ends; it can never break the stage change itself.
+        outcomes = self.mission_outcomes
+        if outcomes is None:
+            return
+        try:
+            outcomes.on_stage(key, old, new)
+        except Exception:  # noqa: BLE001
+            pass
 
     # -------------------------------------------------------------- sessions
     def create_session(self, mission_id=None, agent_role="", model="",
@@ -1118,6 +1130,7 @@ class ControlPlaneRepo:
         for field, value in (("repository_id", repository_id), ("commit_sha", commit_sha)):
             if value is not None:
                 existing[field] = value
+        previous_stage = existing.get("stage")
         if stage:
             existing["stage"] = existing["status"] = stage
         self.record_event("mission", key, "MissionUpdated",
@@ -1129,6 +1142,8 @@ class ControlPlaneRepo:
                            "repository_id": existing.get("repository_id"),
                            "commit_sha": existing.get("commit_sha")},
                           mission_id=mission_id)
+        if stage:
+            self._mission_stage_changed(key, previous_stage, stage)
         return _copy(existing)
 
     # --------------------------------------------- CI: test runs / builds
@@ -2030,6 +2045,15 @@ class ControlPlaneRepo:
         filters["source"] = "llm-proxy"   # a transcript carries no status, so it has no errors
         records, resolve, meta, _, _ = self._llm_window(window, filters)
         return dict(meta, problems=llm_stats.errors(records, resolve, error_class=error_class))
+
+    def record_attention(self, event_type, payload):
+        """Store an operator acknowledge/snooze/clear. Private stream: never in the feed or the SSE."""
+        self.record_event("attention", "operator", event_type, payload, feed=False, publish=False)
+
+    def attention_events(self):
+        with self._event_lock:
+            return [{"event_type": e["event_type"], "payload": dict(_payload(e))}
+                    for e in self._events.get(("attention", "operator"), [])]
 
     def create_project_key(self, project, label=""):
         """Mint a gateway key for ``project``; the secret is returned once and only

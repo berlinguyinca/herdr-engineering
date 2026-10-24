@@ -44,7 +44,9 @@ _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
-                        r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
+                        r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        # CI fix runner: claim, report state, report result. Never create or cancel.
+                        r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
 # T12: the one POST an ingest key may make besides /api/v1/ingest: acknowledging a steering request addressed to it.
 _STEER_ACK = re.compile(r"^/api/v1/steering/[^/]+/ack$")
 # The only routes the `reviewer` role may POST (review gate workers), and only it:
@@ -110,6 +112,7 @@ _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
 _MAX_SSE_SECONDS = 3600
+_SSE_IDLE_SECONDS = 10  # keep-alive comment cadence while the stream is idle
 
 
 class _DaemonThreadingServer(ThreadingHTTPServer):
@@ -198,7 +201,7 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, github_pg_dsn=None):
+                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -217,11 +220,26 @@ class ControlPlaneServer:
         from .retention import usage_retention_config
         # control_plane.llm_proxy raw/rollup retention (validated; None = defaults).
         self.usage_retention = usage_retention_config(usage_retention)
+        # control_plane.ci_fix (validated; None = defaults, which are disabled: the routes then 404).
+        from .ci_fix import CIFixService, ci_fix_config
+        self.ci_fix_config = ci_fix_config(ci_fix)
+        self.ci_fix = CIFixService(repo, self.ci_fix_config) if self.ci_fix_config["enabled"] else None
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row),
                                     actions_enabled=ci_actions,
                                     on_observation=repo.observe_ci_pipeline)
+        # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
+        from .mission_outcome import MissionOutcomes, missions_config
+        self.missions_config = missions_config(missions)
+        self.mission_outcomes = MissionOutcomes(repo, self.missions_config)
+        repo.mission_outcomes = self.mission_outcomes
+        from .attention_inbox import AttentionInbox, attention_config
+        self.attention_config = attention_config(attention)
+        self.attention = None
+        if self.attention_config["enabled"] and not collab_only:
+            self.attention = AttentionInbox(repo, config=self.attention_config, health=self._health,
+                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix)
         if github_monitor is None:
             # control-plane-web only (the worker never builds a server): the GitHub
             # catalog persists in control_plane.pg_dsn when set, else in memory.
@@ -253,7 +271,7 @@ class ControlPlaneServer:
             digest = hashlib.sha256(str(key).encode()).hexdigest()[:12]
             scopes[f"key:{digest}"] = {"rooms": frozenset(allow.get("rooms") or ()),
                                        "missions": frozenset(allow.get("missions") or ())}
-        self.ingest = IngestService(repo, key_scopes=scopes)
+        self.ingest = IngestService(repo, key_scopes=scopes, system_graph=system_graph)
         self._limiter = _RateLimiter()
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.
@@ -964,7 +982,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path):
+            if res.startswith("reviews") or res == "attention" or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -1394,9 +1412,25 @@ def _make_handler(server, public=False, operator=False):
             if resource == "mission-activity" and len(parts) == 4:
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
+            if resource == "mission-outcomes" and len(parts) == 4:
+                from .mission_outcome import outcome_summaries
+                try:
+                    server.mission_outcomes.sweep()
+                except Exception:  # noqa: BLE001
+                    pass
+                return self._json({"outcomes": outcome_summaries(r)})
             if resource == "missions":
+                try:
+                    server.mission_outcomes.sweep()   # throttled; closes missions that went silent
+                except Exception:  # noqa: BLE001 - a sweep must never fail a read
+                    pass
                 if len(parts) == 6 and parts[5] == "activity":
                     return self._json({"activity": r.mission_activity.get(parts[4])})
+                if len(parts) == 6 and parts[5] == "story":
+                    from .mission_story import build
+                    story = build(r, parts[4], outcomes=server.mission_outcomes, inbox=server.attention,
+                                  config=server.missions_config)
+                    return self._json(story) if story is not None else self._json({"error": "not found"}, 404)
                 if len(parts) > 5 and parts[5] == "timeline":
                     timeline = r.mission_timeline(parts[4])
                     return self._json({"timeline": _with_collab_tasks(server, r, parts[4], timeline)})
@@ -1406,6 +1440,23 @@ def _make_handler(server, public=False, operator=False):
                         {"error": "not found"}, 404)
                 status = _q(self.path, "status")
                 return self._etag_json({"missions": r.list_missions(status)})
+            if resource == "related" and len(parts) == 4:
+                from .relations import related
+                kind, entity_id = _q(self.path, "kind"), _q(self.path, "id")
+                try:
+                    answer = related(r, kind, entity_id)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
+                return self._json(answer) if answer is not None else self._json({"error": "not found"}, 404)
+            if resource == "attention" and len(parts) == 4:
+                if server.attention is None:
+                    return self._json({"error": "not found"}, 404)
+                try:
+                    return self._json(server.attention.snapshot(
+                        state=_q(self.path, "state") or "open",
+                        kind=_q(self.path, "kind") or None, severity=_q(self.path, "severity") or None))
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
             if resource == "inspector":
                 return self._inspector_global_get(parts)
             if resource == "sessions" and len(parts) > 5 and parts[5] == "inspector":
@@ -1572,6 +1623,14 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(server.ci_monitor.log(
                         _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
                         **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
+                if what == "fix" and server.ci_fix is not None and len(parts) in {5, 6}:
+                    if len(parts) == 6 and parts[5] == "config":
+                        return self._json(server.ci_fix.runner_config())
+                    if len(parts) == 6:
+                        return self._json(server.ci_fix.get(parts[5]))
+                    return self._json(server.ci_fix.list(
+                        run=_q(self.path, "run") or None, host=_q(self.path, "host") or None,
+                        active=_q(self.path, "active") == "1"))
                 if what:
                     return self._json({"error": "not found"}, 404)
                 from .project_links import annotate_ci, cached_github_languages
@@ -1638,6 +1697,8 @@ def _make_handler(server, public=False, operator=False):
                 if receipt.get("error") in {"receipt_persistence_unavailable", "receipt_persistence_failed"}:
                     status = 503
                 return self._json(receipt, status)
+            if resource == "ci" and len(parts) >= 5 and parts[4] == "fix":
+                return self._ci_fix_post(parts, body)
             if resource == "ci" and len(parts) == 5 and parts[4] == "actions":
                 try:
                     return self._json(server.ci_monitor.action(
@@ -1650,6 +1711,24 @@ def _make_handler(server, public=False, operator=False):
                     if isinstance(exc, HerdrEngineeringError):
                         return self._json({"error": exc.message}, exc.http_status)
                     raise
+            if resource == "attention" and len(parts) == 5 and parts[4] in ("ack", "snooze", "clear"):
+                if server.attention is None:
+                    return self._json({"error": "not found"}, 404)
+                principal = self._principal()
+                actor = f"{principal['kind']}:{principal['id']}"
+                try:
+                    if parts[4] == "ack":
+                        result = server.attention.acknowledge(body.get("key"), body.get("fingerprint"), actor)
+                    elif parts[4] == "snooze":
+                        result = server.attention.snooze(body.get("key"), body.get("fingerprint"),
+                                                         body.get("seconds"), actor)
+                    else:
+                        result = server.attention.clear(body.get("key"), body.get("fingerprint"), actor)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
+                except PermissionError as exc:
+                    return self._json({"error": str(exc)}, 429)
+                return self._json(result)
             if resource == "steering":
                 return self._steering(parts, body)
             if resource == "reviews":
@@ -1980,6 +2059,7 @@ def _make_handler(server, public=False, operator=False):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             q = queue.Queue(maxsize=256)
             with server._lock:
@@ -1996,14 +2076,26 @@ def _make_handler(server, public=False, operator=False):
                 for ev in reversed(server.repo.recent_events(limit=100)):
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()
-                while True:
-                    ev = q.get(timeout=15)
+                started = time.monotonic()
+                # Bounded lifetime frees threads held by half-open clients;
+                # EventSource reconnects and replays.
+                while time.monotonic() - started < _MAX_SSE_SECONDS:
+                    try:
+                        ev = q.get(timeout=_SSE_IDLE_SECONDS)
+                    except queue.Empty:
+                        if q not in server._subscribers:
+                            break  # dropped as a slow subscriber: close so the client reconnects
+                        # comment frame keeps proxies/EventSource from timing out
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()
-            except (queue.Empty, BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:
                 server._subscribers.discard(q)
+                self.close_connection = True
             return None
 
         # ------------------------------------------------------------ static
@@ -2027,6 +2119,32 @@ def _make_handler(server, public=False, operator=False):
             self.end_headers()
             self.wfile.write(data)
             return None
+
+        def _ci_fix_post(self, parts, body):
+            """Sandboxed CI fix agent. The browser creates and cancels; the runner (``agent`` role)
+            claims, reports state and reports the result. Disabled means every route is a 404."""
+            service = server.ci_fix
+            if service is None:
+                return self._json({"error": "not found"}, 404)
+            if len(parts) == 5:
+                actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
+                view, created = service.request(
+                    server.ci_monitor, body.get("repository"), body.get("number"), body.get("operation_id"),
+                    actor=actor,
+                    **({"provider_url": body["provider_url"]} if "provider_url" in body else {}))
+                return self._json(view, 202 if created else 200)
+            if len(parts) == 6 and parts[5] == "claim":
+                return self._json(service.claim(body.get("host"), body.get("defer")))
+            if len(parts) == 7 and parts[6] == "cancel":
+                return self._json(service.cancel(
+                    parts[5], actor={"role": self._role(), "via": "api_key" if server._keys else "open"}))
+            if len(parts) == 7 and parts[6] == "state":
+                return self._json(service.set_state(
+                    parts[5], body.get("state"),
+                    **{key: body[key] for key in ("reason", "host", "model", "session_id", "branch") if key in body}))
+            if len(parts) == 7 and parts[6] == "result":
+                return self._json(service.record_result(parts[5], body))
+            return self._json({"error": "not found"}, 404)
 
         # ---------------------------------------------------------- helpers
         def _read_json(self):

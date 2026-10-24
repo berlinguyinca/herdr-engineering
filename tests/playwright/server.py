@@ -128,6 +128,41 @@ def _seed_llm(repo, session_id):
     repo.record_token_usage("herdr", "legacy-model", 5, 6)
 
 
+def _seed_attention(repo):
+    """One failed agent: a critical inbox item next to the fleet-drift warning the base seed already causes."""
+    sid = repo.create_session(agent_role="pi", model="gpt-4o")
+    repo._sessions[sid]["status"] = "failed"
+    repo._sessions[sid]["title"] = "Broken parser agent"
+    return sid
+
+
+def _seed_related(repo, session_id, mission_id):
+    """Foreign keys for the Related panel: the dashboard agent gets a repository, branch and host, and
+    the mission gets a review, a pull request and a CI run on the same branch."""
+    repo.upsert_session(session_id, host_id="beast", repository_id="org/app", branch="fix/parser")
+    repo.upsert_review("rev-1", mission_id=mission_id, session_id=session_id, reviewer="codex",
+                       status="done", verdict="approved")
+    repo.upsert_pull_request("pr-rel", mission_id=mission_id, repository="org/app", number=214,
+                             status="open", branch="fix/parser")
+    repo.observe_ci_pipeline({"repository": "org/app", "provider_repo_id": 7, "run_number": 12,
+                              "branch": "fix/parser", "state": "success"})
+
+
+def _seed_missions(repo, m1, s1):
+    """Missions in each state for the story page: Alpha succeeded with an outcome, Gamma failed, Delta ended
+    before outcomes were kept, Beta (the base seed) still running."""
+    from herdr_engineering.control_plane.mission_outcome import MissionOutcomes, missions_config
+    outcomes = MissionOutcomes(repo, missions_config(None))
+    repo.mission_outcomes = outcomes
+    _seed_related(repo, s1, m1)
+    repo.set_mission_stage(m1, "complete")
+    repo.upsert_mission("gamma", title="Gamma", stage="implementation")
+    repo.set_mission_stage("gamma", "failed")
+    repo.upsert_mission("delta", title="Delta", stage="implementation")
+    repo.mission_outcomes = None
+    repo.set_mission_stage("delta", "complete")
+
+
 def main():
     repo = ControlPlaneRepo()
     _m1, _m2, _s1 = _seed(repo)
@@ -135,6 +170,12 @@ def main():
         _seed_inspector(repo, _s1)
     if os.environ.get("LLM_SEED") == "1":
         _seed_llm(repo, _s1)
+    if os.environ.get("ATTENTION_SEED") == "1":
+        _seed_attention(repo)
+    if os.environ.get("RELATED_SEED") == "1":
+        _seed_related(repo, _s1, _m1)
+    if os.environ.get("MISSION_STORY_SEED") == "1":
+        _seed_missions(repo, _m1, _s1)
 
     svr = ControlPlaneServer(repo, host="127.0.0.1", port=0,
                              web_root=_REPO / "packages")
@@ -143,6 +184,16 @@ def main():
     # rate-limit regression test fast and unambiguous (an un-throttled client
     # re-rendering on every event exceeds even 600/min within ~18s, but trips
     # this 200/min budget in a few seconds).
+    if os.environ.get("ATTENTION_TRIGGER"):
+        # A second failure that appears when the test creates this file, so a notification has something new to announce.
+        def _wait_for_trigger():
+            while not os.path.exists(os.environ["ATTENTION_TRIGGER"]):
+                time.sleep(0.1)
+            _seed_attention(repo)
+        threading.Thread(target=_wait_for_trigger, daemon=True).start()
+    if os.environ.get("CI_OFFLINE") == "1":
+        # The host may have a real Woodpecker token; a hermetic page must not list real runs.
+        svr.ci_monitor._factory = lambda: type("Offline", (), {"available": False})()
     budget = int(os.environ.get("RATE_BUDGET", "200"))
     svr._limiter = _RateLimiter(max_requests=budget, window_seconds=60)
     threading.Thread(target=svr.serve, daemon=True).start()

@@ -36,6 +36,13 @@ test('debugCi sends mode only for a fix request', async () => {
   assert.equal('mode' in bodies[2], false);
 });
 
+test('related encodes the kind and id into the query', async () => {
+  const urls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url) => { urls.push(url); return { ok: true, status: 200, text: async () => '{}' }; } });
+  await client.related('session', 'herdr:b:e:p 1&x');
+  assert.equal(urls[0], '/api/v1/related?kind=session&id=herdr%3Ab%3Ae%3Ap+1%26x');
+});
+
 function fakeFetch(routes) {
   return async (url, opts) => {
     const hit = routes.find((r) => url.endsWith(r.path));
@@ -134,6 +141,51 @@ test('connectEvents dispatches parsed events and disconnects cleanly', () => {
   assert.deepEqual(seen, [{ event_type: 'MissionCreated' }]);
   disconnect();
   assert.equal(fakeES.closed, true);
+});
+
+test('connectEvents swallows StreamConnected and replayed event_ids', () => {
+  const seen = [];
+  const fakeES = { onmessage: null, onerror: null, close() {} };
+  connectEvents({
+    url: '/events',
+    onEvent: (e) => seen.push(e),
+    createEventSource: () => fakeES,
+    autoReconnectMs: 0,
+  });
+  const send = (o) => fakeES.onmessage({ data: JSON.stringify(o) });
+  send({ event_type: 'StreamConnected', entity_type: 'stream', entity_id: 'control-plane', sequence: 0 });
+  send({ event_type: 'A', event_id: 'e1' });
+  send({ event_type: 'A', event_id: 'e1' }); // replay after reconnect
+  send({ event_type: 'B', event_id: 'e2' });
+  assert.deepEqual(seen.map((e) => e.event_id), ['e1', 'e2']);
+});
+
+test('connectEvents does not filter on sequence (sequences restart after a server restart)', () => {
+  const seen = [];
+  const fakeES = { onmessage: null, onerror: null, close() {} };
+  connectEvents({
+    url: '/events', onEvent: (e) => seen.push(e),
+    createEventSource: () => fakeES, autoReconnectMs: 0,
+  });
+  const send = (seq, eid) => fakeES.onmessage({
+    data: JSON.stringify({ event_type: 'X', event_id: eid, entity_type: 'mission', entity_id: 'm1', sequence: seq }),
+  });
+  send(5, 'a'); send(1, 'b'); send(1, 'b');
+  assert.deepEqual(seen.map((e) => e.event_id), ['a', 'b']);
+});
+
+test('connectEvents seen-set is bounded to 500 event_ids', () => {
+  const seen = [];
+  const fakeES = { onmessage: null, onerror: null, close() {} };
+  connectEvents({
+    url: '/events', onEvent: (e) => seen.push(e),
+    createEventSource: () => fakeES, autoReconnectMs: 0,
+  });
+  const send = (id) => fakeES.onmessage({ data: JSON.stringify({ event_type: 'A', event_id: id }) });
+  for (let i = 0; i < 600; i++) send(`e${i}`);
+  send('e599'); // recent: still deduped
+  send('e0');   // evicted: forwarded again
+  assert.equal(seen.length, 601);
 });
 
 test('getCi requests /api/v1/ci', async () => {
