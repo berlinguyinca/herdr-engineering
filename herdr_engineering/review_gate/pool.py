@@ -201,14 +201,16 @@ class ReviewPool:
         self._clock = clock
         self._factory = worker_factory or ReviewWorker
         self._slots: list[_Slot] = []
+        self._slots_lock = threading.Lock()
         self._stop = threading.Event()
         self._fatal: Exception | None = None
         self._queue_failures = 0
 
     # ------------------------------------------------------------------ slots
     def _alive(self) -> list[_Slot]:
-        self._slots = [s for s in self._slots if s.thread is not None and s.thread.is_alive()]
-        return self._slots
+        with self._slots_lock:
+            self._slots = [s for s in self._slots if s.thread is not None and s.thread.is_alive()]
+            return list(self._slots)
 
     def _active(self) -> list[_Slot]:
         return [s for s in self._alive() if not s.retiring]
@@ -229,8 +231,9 @@ class ReviewPool:
         slot.thread = threading.Thread(
             target=self._run_slot, args=(slot, worker), name=f"review-gate-{slot.id}", daemon=True
         )
-        self._slots.append(slot)
-        slot.thread.start()
+        with self._slots_lock:  # started inside the lock: _alive() drops unstarted threads
+            slot.thread.start()
+            self._slots.append(slot)
         _log.info("review gate pool slot %s started", slot.id)
         return True
 

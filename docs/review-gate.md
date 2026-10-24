@@ -248,8 +248,10 @@ expire.
 malformed or over-1-MiB body) the pool keeps its size and waits
 `interval_seconds`, doubling per consecutive failure up to 300 s. A 401/403
 from the queue or from any slot, or a key file that goes bad, stops the whole
-pool; the exit codes are those of `worker` (1 refused key, 2 config error). The
-pool never reads or logs key contents; log lines carry counts and class names.
+pool; the exit codes are those of `worker` (1 refused key, 2 config error) plus 3 for an unexpected internal error, which systemd
+restarts. With `min_workers: 0` a pool whose queue reads keep failing (an old control plane,
+a proxy error) has no slots and reviews nothing; it logs a warning per failed read, so watch
+for those. The pool never reads or logs key contents; log lines carry counts and class names.
 
 A systemd unit needs no `Environment=` lines:
 

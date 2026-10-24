@@ -2305,6 +2305,9 @@ def _cmd_review_gate_pool(args) -> int:
     except rgw.WorkerConfigError as exc:
         print(f"review-gate pool: config error: {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:  # noqa: BLE001 - restartable: not a refused key or bad config
+        print(f"review-gate pool: internal error: {type(exc).__name__}", file=sys.stderr)
+        return 3
 
 
 def _cmd_review_request(args) -> int:
