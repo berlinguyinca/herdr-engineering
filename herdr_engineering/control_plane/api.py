@@ -1508,6 +1508,8 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"keys": r.list_project_keys()})
                 if what == "models":
                     return self._json({"models": list(r.list_custom_models().values())})
+                if what in ("stats", "timeseries", "errors") and len(parts) == 5:
+                    return self._llm_stats(what)
                 return self._json({"error": "not found"}, 404)
             if resource == "graph":
                 return self._graph_get(parts)
@@ -1791,6 +1793,23 @@ def _make_handler(server, public=False, operator=False):
             except CollabError as exc:
                 return self._json({"error": exc.message, **getattr(exc, "extra", {})}, exc.status)
             return self._json({"error": "not found"}, 404)
+
+        def _llm_stats(self, what):
+            """LLM page statistics (operator listener only; a bad parameter is a 400)."""
+            window = _q(self.path, "window") or "24h"
+            filters = {k: _q(self.path, k) for k in ("project", "model", "session", "mission")}
+            try:
+                if what == "stats":
+                    return self._json(server.repo.llm_stats(
+                        window, _q(self.path, "group") or "model", **filters))
+                if what == "timeseries":
+                    return self._json(server.repo.llm_timeseries(
+                        window, _q(self.path, "step") or "1h", _q(self.path, "metric") or "requests",
+                        **filters))
+                return self._json(server.repo.llm_errors(
+                    window, _q(self.path, "class"), **filters))
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
 
         def _graph_get(self, parts):
             """Lineage graph reads (viewer level). Every result is filtered by the
