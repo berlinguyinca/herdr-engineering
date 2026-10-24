@@ -165,8 +165,9 @@ function rerenderView(load) {
         if (view && revision === renderRevision) { unmountView(); mountView(view); }
         else if (view && revision !== renderRevision) view.dispose();
       } catch (err) {
-        // Keep the last page; the next event retries. The page's chip says the retry failed.
-        root.querySelector('herdr-freshness')?.touch?.(false, err?.message || 'request failed');
+        // Keep the last page; the next event retries. The page's chip says the retry failed, unless
+        // the user has moved on: a stale retry must not mark the new page's chip.
+        if (revision === renderRevision) root.querySelector('herdr-freshness')?.touch?.(false, err?.message || 'request failed');
       } finally {
         clearTimeout(unwedge);
         if (revision === renderRevision) running = false;
