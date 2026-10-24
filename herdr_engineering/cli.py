@@ -2545,6 +2545,11 @@ def _cmd_cp_web(args) -> int:
         usage_retention = usage_retention_config(cp.get("llm_proxy"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.ci_fix import ci_fix_config
+    try:
+        ci_fix = ci_fix_config(cp.get("ci_fix"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
@@ -2663,6 +2668,7 @@ def _cmd_cp_web(args) -> int:
                              summary_config=cp.get("agent_summaries") or {},
                              review_quorum=_review_quorum_config(cp),
                              usage_retention=usage_retention,
+                             ci_fix=ci_fix,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
