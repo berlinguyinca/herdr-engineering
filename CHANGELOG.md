@@ -8,6 +8,72 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Plannotator bridge: digest echo
 - `herdr-plannotator plan` now prints the `plan_digest` (and `review_id`) the receipt was bound to alongside the upstream decision, computed by the bridge and authoritative over upstream output, so a caller can verify a decision belongs to the exact plan bytes it submitted. Code reviews are unchanged.
 
+### Lineage graph projection (T02, Herdr side)
+- Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
+- Migration `0005_event_id_per_actor.sql`: `event_id` is unique per principal (global primary key dropped).
+- Lineage review round 6: commons fallback primary is the writer who wrote the field first (stable under updates) and
+  readers apply the earliest VISIBLE owner; neighborhood stops rendering neighbours once its budget is spent;
+  commons admission-limit errors are generic; known-limitations list in the lineage contract.
+- Lineage review round 5: commons field visibility is per writer (a widened node no longer exposes another writer's
+  private fields); an empty ensure never makes the ensurer the commons owner; commons endpoints confer no tombstone
+  authority; tombstoned edge instances free their slot; contribution caps keep operator/owner/own entries; migration 0005
+  rollout order and rollback documented (`docs/operations/event-id-per-actor-rollout.md`).
+- Lineage review round 4: admission mode/sequence are server-only (reserved `_` payload keys rejected); commons nodes keep
+  an owner/operator primary value with attributed `fields`/`contributions`, widest-scope visibility, per-writer attr budgets
+  and per-writer `from`-commons edge instances; `node.state` on a missing commons node creates it.
+- Lineage refusals are HTTP 403 `{"reason": "lineage_forbidden"}`; shared COMMONS nodes (commit/pr/issue/ci/artifact) and
+  idempotent "ensure" upserts are accepted from any ingest key.
+- `lineage` envelope events (v2 only) project into a durable graph derived from `fabric_events`
+  (no new table; rebuilt on hydrate). See `docs/contracts/lineage-events.md`.
+- `GET /api/v1/graph/nodes/{id}`, `.../neighborhood`, `/api/v1/graph/edge`: viewer-level reads,
+  visibility-filtered at every hop, depth/node/edge capped, fail closed.
+
+### Event envelope v2 (T01, Herdr side)
+- `POST /api/v1/ingest` accepts `schema_version: 2` bodies per
+  `docs/contracts/event-envelope-v2.md`: server-set `actor`/`received_at`,
+  idempotent `event_id`, `(source, source_sequence)` collision and gap tracking,
+  409 on conflicts, fail-closed `visibility_scope`. v1 bodies are unchanged.
+  `GET /api/v1/ingest/sources` reports per-source sequence, gaps and freshness.
+- Migration `0003_event_envelope_v2.sql` adds nullable envelope columns, a
+  partial unique index and `fabric_event_sources`.
+- `EventStore.append` no longer reports every error as a duplicate: only an
+  existing `event_id` returns False; other failures propagate.
+
+### Terminal button on agent pages
+- An agent page has a **Terminal** button (operator only). It shows the exact command
+  that attaches a terminal on the viewer's own machine to the agent's HerdR pane:
+  `ssh -t <host> "bash -lc 'herdr --session <s> agent attach <pane>'"` from another machine,
+  or `herdr --session <s> agent attach <pane>` on the agent's host, each with a Copy button.
+  The server builds it from the recorded session only (strict charsets, never client input)
+  and never runs it. `POST /api/v1/sessions/<id>/terminal`; see
+  `docs/operations/terminal-attach.md`. The old "Copy attach command" line
+  (`ssh host && herdr workspace focus ...`, which ran the second half locally) is gone
+  from the page.
+
+### Host telemetry and fleet provisioning
+- Collector (`host_metrics.py`, run by the fabric agent): CPU, memory, swap, disk and
+  mounts, load, uptime, network, GPU (NVIDIA, ROCm, Apple), top consumers and agent
+  count every 30 s, plus an hourly report of package/security updates, reboot-required,
+  failed units and tool versions. Intervals: `fabric.host_report_interval` and
+  `fabric.host_slow_interval` (YAML only). The agent count is the number of agent
+  processes named in `fabric.agent_binaries` (YAML, default `pi`, `claude`, `codex`).
+- Control plane: validated host metrics with 48 h raw history and 7 d of durable
+  5-minute rollups (max 300 points); `GET /api/v1/hosts/<id>/telemetry?range=1h|24h|7d`;
+  server-side `problems`/`problem_count` on host reads (stale, never_reported, disk,
+  memory, GPU, failed units, security updates, reboot, version drift, update age).
+- Pages: host detail page and richer list cards with range picker, gauges,
+  sparklines, GPU, mounts, top consumers, updates, versions with pin drift, a
+  problems strip and a never-reported state.
+- Ansible: `tailscale` role (joins only from `NeedsLogin`, auth key from Vault) and
+  `fleet-update.yml` with the `herdr_fleet_update` role, run daily by cron on the main
+  host: security-only OS updates, busy-host deferral, pinned herdr-eng revision, one
+  host at a time, agent restart once, `maintenance` flag and a forced single-host run.
+  See `ansible/README.md`.
+- Behaviour changes: `GET /api/v1/hosts/<id>/telemetry?limit=` is now honoured
+  (1..500); host events from non-agent sources (e.g. the fleet update) no longer
+  refresh a host's liveness or create hosts; `versions.herdr` is now the herdr binary
+  version and `herdr_eng` is the herdr-engineering package version.
+
 ### Central fleet config: deploy and servers
 - `deploy/control-plane/deploy.sh` renders the compose variables from the central
   fleet file into a transient 0600 env file (removed on exit, even on failure),

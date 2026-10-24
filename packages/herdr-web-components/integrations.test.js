@@ -102,3 +102,31 @@ test('CI inspector entry identity distinguishes provider instances',()=>{
  ]}});
  assert.notEqual(entries[0].id,entries[1].id);
 });
+
+test('CI search narrows colliding repository and run IDs by provider URL',()=>{
+  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed'};
+  const entries=integrationEntries({pipelines:{history:[{...run,provider_url:'https://ci-a.example'},{...run,provider_url:'https://ci-b.example'}]}});
+  const selected=selectIntegrations(entries,{tab:'failed',repository:'7',search:'https://ci-b.example 12'});
+  assert.equal(selected.length,1);
+  assert.equal(selected[0].record.provider_url,'https://ci-b.example');
+});
+
+test('CI provider selector compares canonical URLs exactly and preserves deployment paths',()=>{
+  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed'};
+  const entries=integrationEntries({pipelines:{history:[{...run,provider_url:'https://CI.example/'},{...run,provider_url:'https://ci.example/secondary/'}]}});
+  const options={tab:'failed',repository:'7',search:'12'};
+  assert.deepEqual(selectIntegrations(entries,{...options,provider:'https://ci.example'}).map(entry=>entry.record.provider_url),['https://CI.example/']);
+  assert.deepEqual(selectIntegrations(entries,{...options,provider:'https://CI.example/secondary'}).map(entry=>entry.record.provider_url),['https://ci.example/secondary/']);
+  assert.equal(selectIntegrations(entries,{...options,provider:'https://ci.example/missing'}).length,0);
+});
+
+test('active run reports never cross provider collisions and unidentified reports remain ambiguous',async()=>{
+ const {ciSelectedRunReports}=await import('../integrations-view.js');
+ const active={provider_url:'https://ci.example/a',provider_repo_id:17,run_number:12};
+ const other={...active,provider_url:'https://ci.example/b'};
+ const unscoped={provider_repo_id:17,run_number:12};
+ assert.deepEqual(ciSelectedRunReports([active,other,unscoped],[active,other],active),[active]);
+ assert.deepEqual(ciSelectedRunReports([unscoped],[active],active),[unscoped]);
+ assert.deepEqual(ciSelectedRunReports([unscoped],[active],unscoped),[]);
+ assert.deepEqual(ciSelectedRunReports([unscoped],[active,unscoped],active),[]);
+});
