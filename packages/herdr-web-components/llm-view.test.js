@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compact, disclosure, ms, pair, percent, rate, renderLlm, single, when, pickTotal } from '../llm-view.js';
+import { compact, disclosure, ms, pair, percent, rate, renderLlm, renderLlmSession, single, when, pickTotal } from '../llm-view.js';
 
 const dist = (n, p50, p95) => ({ n, p50, p95, insufficient: n < 5 });
 const group = (over = {}) => ({
@@ -78,7 +78,7 @@ test('charts carry a title, a description and a table of the same numbers', () =
 
 test('agent rows link to the agent, unmatched ids are plain text, names come from the dashboard', () => {
   const html = renderLlm(state({ names: { 'herdr:beast:eng:w1:p1': 'Amber Swift' } }), data());
-  assert.match(html, /<a href="#\/herd\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1">Amber Swift<\/a>/);
+  assert.match(html, /<a href="#\/llm\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1">Amber Swift<\/a>/);
   assert.match(html, /zz-9 <em>\(unmatched\)<\/em>/);
   assert.doesNotMatch(html, /href="#\/herd\/session\/unmatched/);
 });
@@ -90,11 +90,38 @@ test('every dynamic string is escaped, including names that collide with object 
   d.problems.problems[0].sessions = ['constructor', '__proto__'];
   const html = renderLlm(state({ names: { evil: '<b>' }, filters: { project: '"><x', model: '' }, projects: ['"><x'] }), d);
   assert.doesNotMatch(html, /<img src=x|<script>x|<b>|"><x/);
-  assert.match(html, /<a href="#\/herd\/session\/constructor">constructor<\/a>/);
+  assert.match(html, /<a href="#\/llm\/session\/constructor">constructor<\/a>/);
 });
 
 test('window links keep the filters and mark the current window', () => {
   const html = renderLlm(state({ window: '7d', filters: { project: 'p', model: 'qwen' } }), data());
   assert.match(html, /class="llm-window" href="#\/llm\?project=p&amp;model=qwen&amp;window=1h"/);
   assert.match(html, /href="#\/llm\?project=p&amp;model=qwen&amp;window=7d" aria-current="page"/);
+});
+
+test('the agent page links back to the agent, names the source, and scopes the window links to itself', () => {
+  const html = renderLlmSession({ window: '7d', sessionId: 'herdr:beast:eng:w1:p1', name: 'Amber Swift', known: true }, data());
+  assert.match(html, /<h1>Amber Swift <span class="llm-badge">llm-proxy<\/span><\/h1>/);
+  assert.match(html, /<a class="llm-back" href="#\/herd\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1">Open agent ↗<\/a>/);
+  assert.match(html, /href="#\/llm\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1\?window=1h"/);
+  assert.match(html, /href="#\/llm\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1\?window=7d" aria-current="page"/);
+  assert.doesNotMatch(html, /data-llm-filter|<h2>Agents<\/h2>/);
+});
+
+test('an agent whose path reports no latency says so, and an unknown session has no agent link', () => {
+  const d = data();
+  d.total.groups = [group({ source: 'transcript', ttft_ms: dist(0, null, null), speed_tps: dist(0, null, null) })];
+  const html = renderLlmSession({ window: '24h', sessionId: 'zz-9', name: '', known: false }, d);
+  assert.match(html, /data-llm-latency-note>Latency and speed are not reported by this agent's path\./);
+  assert.match(html, /Not a known dashboard session\./);
+  assert.doesNotMatch(html, /Open agent/);
+  assert.match(html, /<h1>zz-9 /);
+});
+
+test('an agent page with no records says so instead of showing zeros', () => {
+  const html = renderLlmSession({ window: '24h', sessionId: 's', name: 'A', known: true },
+    { total: { groups: [], retained_since: null }, models: { groups: [] }, problems: { problems: [] },
+      series: { requests: { points: [] }, errors: { points: [] }, ttft: { points: [] }, speed: { points: [] } } });
+  assert.match(html, /No usage has been recorded yet\./);
+  assert.doesNotMatch(html, /undefined|null|NaN/);
 });

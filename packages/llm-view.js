@@ -65,6 +65,7 @@ export function when(iso) {
 export const llmQuery = (obj) => new URLSearchParams(Object.entries(obj).filter(([, v]) => v)).toString();
 
 const sessionHref = (id) => `#/herd/session/${encodeURIComponent(id)}`;
+export const llmSessionHref = (id) => `#/llm/session/${encodeURIComponent(id)}`;
 
 function link(key, names, href = sessionHref) {
   if (typeof key !== 'string') return GAP;
@@ -112,7 +113,7 @@ function modelsTable(models) {
 
 function agentsTable(agents, names) {
   return table(['Agent', 'Source', 'Requests', 'Output tokens', 'Speed p50', 'Errors', 'Last seen'],
-    list(agents?.groups).map((g) => [link(g.key, names), esc(g.source), esc(count(g.requests)),
+    list(agents?.groups).map((g) => [link(g.key, names, llmSessionHref), esc(g.source), esc(count(g.requests)),
       esc(`${g.tokens?.lower_bound ? '≥ ' : ''}${compact(g.tokens?.output)}`), esc(single(g.speed_tps, rate)),
       esc(count(g.errors)), esc(when(g.last_seen))]),
     'No request carried a session id in this window.');
@@ -121,7 +122,7 @@ function agentsTable(agents, names) {
 function problemsTable(problems, names) {
   return table(['Class', 'Count', 'Model', 'Last seen', 'Sessions'],
     list(problems?.problems).map((p) => [esc(p.class), esc(count(p.count)), esc(p.model), esc(when(p.last_seen)),
-      list(p.sessions).slice(0, 5).map((s) => link(s, names)).join(', ')
+      list(p.sessions).slice(0, 5).map((s) => link(s, names, llmSessionHref)).join(', ')
         + (p.session_count > 5 ? ` +${p.session_count - 5} more` : '') || GAP]),
     'No problems in this window.');
 }
@@ -198,12 +199,13 @@ export function disclosure(meta) {
     : `Complete since ${when(m.since)}; records are kept from ${when(m.retained_since)}.`;
 }
 
-function controls(state) {
-  const link2 = (w) => `<a class="llm-window" href="${esc(`#/llm?${llmQuery({ ...state.filters, window: w })}`)}"${w === state.window ? ' aria-current="page"' : ''}>${w}</a>`;
+function controls(state, base = '#/llm') {
+  const link2 = (w) => `<a class="llm-window" href="${esc(`${base}?${llmQuery({ ...state.filters, window: w })}`)}"${w === state.window ? ' aria-current="page"' : ''}>${w}</a>`;
   const select = (name, label, values) => `<label>${label}<select data-llm-filter="${name}"><option value="">All</option>${
     values.map((v) => `<option value="${esc(v)}" ${v === state.filters[name] ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>`;
-  return `<div class="llm-controls"><nav class="llm-windows" aria-label="Time window">${WINDOWS.map(link2).join('')}</nav>${
-    select('project', 'Project', state.projects || [])}${select('model', 'Model', state.modelNames || [])}</div>`;
+  const filters = base === '#/llm'
+    ? `${select('project', 'Project', state.projects || [])}${select('model', 'Model', state.modelNames || [])}` : '';
+  return `<div class="llm-controls"><nav class="llm-windows" aria-label="Time window">${WINDOWS.map(link2).join('')}</nav>${filters}</div>`;
 }
 
 export const llmStyles = `<style>
@@ -213,7 +215,7 @@ export const llmStyles = `<style>
 .llm-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:16px 0}.llm-card{min-width:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:6px 14px 12px}.llm-card h2{font-size:14px;margin:10px 0 4px}.llm-card svg{display:block;width:100%;max-height:210px}.llm-card svg text{font-size:11px;fill:var(--text-secondary);font-family:inherit}.llm-card svg line{stroke:var(--border)}
 .llm-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--text-secondary)}.llm-legend span::before{content:'';display:inline-block;width:9px;height:9px;margin-right:5px;background:var(--c);border-radius:2px}
 .llm-note{font-size:12px;line-height:1.6;color:var(--text-secondary);margin:6px 0}.llm-table{overflow:auto}.llm-table table{border-collapse:collapse;width:100%;font-size:13px}.llm-table th,.llm-table td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--border-subtle);overflow-wrap:anywhere}.llm-table th{color:var(--text-secondary);font-weight:500}
-.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-section h2{font-size:15px;margin:22px 0 6px}
+.llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-section h2{font-size:15px;margin:22px 0 6px}
 @media(max-width:650px){.llm-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.llm-charts{grid-template-columns:minmax(0,1fr)}}
 </style>`;
 
@@ -229,4 +231,26 @@ export function renderLlm(state, data) {
     <section class="llm-section"><h2>Models</h2>${modelsTable(d.models)}</section>
     <section class="llm-section"><h2>Agents</h2>${agentsTable(d.agents, state.names)}</section>
     <section class="llm-section"><h2>Problems</h2>${problemsTable(d.problems, state.names)}</section>`;
+}
+
+/** One agent's usage (#/llm/session/<id>). `state`: {window, sessionId, name, known}.
+ *  `data`: {total, models, problems, series}, all scoped to the session by the API. */
+export function renderLlmSession(state, data) {
+  const d = data || {};
+  const id = state.sessionId;
+  const title = typeof state.name === 'string' && state.name ? state.name : id;
+  const proxy = pickTotal(d.total);
+  const sources = list(d.total?.groups).map((g) => g.source);
+  const badge = sources.map((x) => `<span class="llm-badge">${esc(x)}</span>`).join(' ');
+  const opens = state.known === false
+    ? '<span class="llm-note">Not a known dashboard session.</span>'
+    : `<a class="llm-back" href="${esc(sessionHref(id))}">Open agent ↗</a>`;
+  const notReported = proxy && !num(proxy.ttft_ms?.n) && !num(proxy.speed_tps?.n)
+    ? '<p class="llm-note" data-llm-latency-note>Latency and speed are not reported by this agent\'s path.</p>' : '';
+  return `${llmStyles}<p class="llm-note"><a href="#/llm">← LLM</a></p><h1>${esc(title)} ${badge}</h1>
+    <p>${opens}</p>${controls({ window: state.window, filters: {} }, llmSessionHref(id))}
+    <p class="llm-note" data-llm-disclosure>${esc(disclosure(d.total))}</p>${notReported}
+    ${tiles(proxy)}${charts(d.series)}
+    <section class="llm-section"><h2>Models</h2>${modelsTable(d.models)}</section>
+    <section class="llm-section"><h2>Problems</h2>${problemsTable(d.problems, {})}</section>`;
 }

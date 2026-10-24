@@ -23,7 +23,7 @@ import { renderHostDetail, renderHostCard, HOST_CARD_STYLE, RANGES, safeHostId }
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
-import { renderLlm, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
+import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -101,6 +101,7 @@ const ROUTES = {
   '/analytics/hosts': viewAnalyticsHosts,
   '/analytics/tokens': viewAnalyticsTokens,
   '/llm': viewLlm,
+  '/llm/session/:id': viewLlmSession,
 };
 
 // The agent inspector owns a per-session stream; dispose it whenever the view changes.
@@ -536,6 +537,22 @@ async function viewLlm() {
   root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
     window.location.hash = `#/llm?${llmQuery({ window: window_, ...filters, [el.dataset.llmFilter]: el.value })}`;
   }));
+}
+async function viewLlmSession(parts) {
+  const id = decodeURIComponent(parts[2]);
+  const q = route().query;
+  const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
+  const f = { window: window_, session: id };
+  const step = STEP_FOR[window_];
+  const series = (metric) => client.llm('timeseries', { ...f, step, metric });
+  const [total, models, problems, requests, errors, ttft, speed, session] = await Promise.all([
+    client.llm('stats', { ...f, group: 'all' }), client.llm('stats', { ...f, group: 'model' }),
+    client.llm('errors', f), series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
+    client.getSession(id).catch(() => null),
+  ]);
+  root.innerHTML = renderLlmSession({
+    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '',
+  }, { total, models, problems, series: { requests, errors, ttft, speed } });
 }
 async function viewAnalyticsHosts() {
   const h = await client.analytics('hosts');
