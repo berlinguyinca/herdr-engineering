@@ -133,3 +133,25 @@ Defaults stand until you answer; each can change on request.
 2. **Reference tokens.** Default: an explicit `kind:id` syntax only. Alternative: also recognise bare session ids and run numbers, which links more but risks false positives and probing.
 3. **Where "Related" sits.** Default: a panel at the top of detail pages. Alternative: a sticky side column on wide screens (better for 4K), a larger layout change.
 4. **Projects page.** Default: add links (repository → missions, CI runs, reviews, PRs). Say if Projects should be reworked more than linked.
+
+## Built notes (2026-10-24)
+
+Built as PRs #237 (helper), #238 (`/api/v1/related`), #239 (panel on the pages) and this one (inline references). Decisions used the defaults above.
+
+What was built:
+
+- `packages/entity-links.js`: `entityHref`, `entityLabel`, `forgePrUrl`. Ids are percent-encoded once, and `' ( ) ! *` are encoded too so an id is safe in any attribute quoting. An id over 300 characters gives `null`.
+- `GET /api/v1/related?kind=&id=` (`control_plane/relations.py`), operator listener only; kinds mission, session, host, service, ci, review, pr, project. 400 for a bad kind or missing id, 404 for an unknown entity. Lists are capped at 20 with a `more` count; a source that fails is named in `partial`.
+- `packages/related-panel.js` (`renderRelated`, `mountRelated`): on the mission (including a live-only Pi mission, which shows "Nothing else is linked"), agent, host, service and LLM session pages, on the selected CI run, and on a selected project in the Projects page. The older "Related reviews / Related CI" filter links stay as the panel footer. The CI and reviews filter note now links back to the entity it filters by.
+- Inline references: `renderMarkdown(text, { references })`. `session:<id>`, `mission:<id>`, `host:<id>`, `ci:<owner/repo>#<run>`, `pr:<owner/repo>#<n>`. The resolver (`packages/entity-refs.js`) links only entities in a lazily loaded index of sessions, missions and hosts; the target comes from `entity-links.js`, never from the text, and a throwing or non-`#/` resolver result stays plain text. `conversation-markdown.js` imports nothing from the dashboard and the public collaboration site passes no resolver, so it never links these. Wired into the agent conversation and summaries in the session workspace.
+
+Deviations and not built:
+
+- **CI runs and pull requests have no detail pages**, so their links go to the filtered list (`#/ci?search=<run>&repository=<id>`, `#/reviews?search=<id>`). A pull request in the panel links to the forge (external mark, `noopener noreferrer`) when the repository and number are structured fields.
+- **CI to host** is filled only when the pipeline row reports a `host_id`; none of the current providers do, so the cell is usually empty, as the matrix allows.
+- **CI, review and PR relations to sessions** are matched on `repository_id` and branch, since no direct key exists. A session without a repository id is never linked to a CI run.
+- **Mission LLM link:** the LLM page has no mission filter, so a mission shows the usage summary without a link; an agent links to `#/llm/session/<id>`.
+- **Bare `owner/repo#123`** is not linked (default decision 2: explicit `kind:id` only). The reference index has no CI-run or PR existence check; `ci:` and `pr:` link to the filtered list when the shape is `owner/repo#number`.
+- **Breadcrumbs and back links** (design section 5) are not built; the filter note is the only backlink.
+- **The route table** lives in `entity-links.js`; `app.js` keeps its own `ROUTES` (the router) rather than importing it. No big-bang rewrite.
+- **Relations on the lineage graph** (step 6) not started.
