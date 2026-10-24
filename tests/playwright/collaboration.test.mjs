@@ -22,6 +22,9 @@ async function withCollaboration(surface, fn, role = 'owner') {
     { user_id: 'pending', email: 'pending@example.org', role: 'viewer', room_membership_status: 'pending' },
   ] };
   let agents = [{ agent_id: 'attached', name: 'attached-bot', owner_user_id: 'member', harness_type: 'codex', actions: ['read'] }];
+  const requests = [{ request_id: 'req1', name: 'bot', owner_email: 'member@example.org', actions: ['read'] },
+    { request_id: 'req2', name: 'second-bot', owner_email: 'member@example.org', actions: ['read'] }];
+  const mine = [{ agent_id: 'a1', name: 'bot', status: 'active', rooms: [], pending: [] }];
   let users = [{ user_id: 'member', email: 'member@example.org', status: 'approved' }, { user_id: 'pending', email: 'pending@example.org', status: 'pending' }];
   try {
     const fallback = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
@@ -44,9 +47,9 @@ async function withCollaboration(surface, fn, role = 'owner') {
       else if (path === '/rooms') result = { rooms: [room] };
       else if (path === '/rooms/r1') result = room;
       else if (path === '/rooms/r1/invites') result = { invites: [] };
-      else if (path === '/rooms/r1/state') { await new Promise(r => setTimeout(r, 60)); result = { changed: true, seq: 1, agents, tasks: [], requests: [{ request_id: 'req1', name: 'bot', owner_email: 'member@example.org', actions: ['read'] }] }; }
+      else if (path === '/rooms/r1/state') { await new Promise(r => setTimeout(r, 60)); result = { changed: true, seq: 1, agents, tasks: [], requests }; }
       else if (path === '/rooms/r1/agents/attached/remove') { agents = []; result = {}; }
-      else if (path === '/agents') result = { agents: [{ agent_id: 'a1', name: 'bot', status: 'active', rooms: [], pending: [] }] };
+      else if (path === '/agents') result = { agents: mine };
       else if (path === '/rooms/r1/members/member/upload-permission') { room.members[1].file_upload_permission = body.file_upload_permission; result = room.members[1]; }
       else if (path === '/rooms/r1/members/pending/approve') { room.members[2].room_membership_status = 'approved'; result = room.members[2]; }
       else if (path === '/rooms/r1/members/member/remove') { room.members = room.members.filter(m => m.user_id !== 'member'); result = {}; }
@@ -63,12 +66,90 @@ async function withCollaboration(surface, fn, role = 'owner') {
       await window.view.ready;
     }, surface);
     const openRoom = async () => { await page.locator('[data-room="r1"]').click(); await page.getByRole('tab', { name: 'People', exact: true }).click(); };
-    await fn({ page, calls, holds, openRoom });
+    await fn({ page, calls, holds, openRoom, renameAgents: () => { agents.forEach(a => { a.name += '-renamed'; }); mine.forEach(a => { a.name += '-renamed'; }); requests.forEach(r => { r.name += '-renamed'; }); } });
     assert.deepEqual(errors, []);
   } finally { holds.clear(); await browser?.close(); await new Promise(resolve => server.close(resolve)); }
 }
 
+const flushUI = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
 for (const surface of ['public', 'dashboard']) {
+  for (const action of ['remove', 'upload']) for (const outcome of ['success', 'failure']) {
+    test(`collaboration ${surface}: terminated room ignores pending member ${action} ${outcome}`, async () => withCollaboration(surface, async ({ page, calls, holds, openRoom }) => {
+      await openRoom();
+      const path = `/rooms/r1/members/member/${action === 'remove' ? 'remove' : 'upload-permission'}`;
+      let release; holds.set(path, new Promise(r => { release = r; }));
+      const control = page.locator(action === 'remove' ? '[data-rm="member"]' : '[data-upload="member"]');
+      if (action === 'remove') { page.once('dialog', d => d.accept()); await control.click(); }
+      else await control.check();
+      await page.getByRole('status').filter({ hasText: 'Saving' }).waitFor();
+      page.once('dialog', d => d.accept());
+      await page.getByRole('button', { name: 'Archive and delete room' }).click();
+      await page.getByRole('status').filter({ hasText: 'Archive verified. Room deleted.' }).waitFor();
+      const before = await page.locator('#view').innerHTML(), count = calls.length;
+      const response = page.waitForResponse(r => new URL(r.url()).pathname.endsWith(path));
+      release(outcome === 'success' ? {} : { http: 503, error: 'Member action failed' });
+      await (await response).finished();
+      await flushUI(page);
+      assert.equal(await control.isDisabled(), true, 'completion must not re-enable a terminated room');
+      assert.equal(await page.locator('#view').innerHTML(), before, 'completion and rollback must leave terminated UI untouched');
+      assert.equal(calls.length, count, 'completion must not refresh terminated membership');
+      page.on('dialog', d => d.accept());
+      await page.locator('[data-rm="member"]').dispatchEvent('click');
+      await page.locator('[data-approve-member="pending"]').dispatchEvent('click');
+      await page.locator('[data-upload="member"]').dispatchEvent('change');
+      await page.locator('#hcn-delete-room').dispatchEvent('click');
+      await flushUI(page);
+      assert.equal(calls.length, count, 'terminated handlers must not start mutations');
+      assert.equal(await page.locator('#view').innerHTML(), before);
+    }));
+  }
+
+  for (const action of ['grant', 'detach', 'approve', 'deny', 'approve-all']) {
+    test(`collaboration ${surface}: agent ${action} stays pending across navigation and rerender`, async () => withCollaboration(surface, async ({ page, calls, holds, openRoom, renameAgents }) => {
+      await openRoom(); await page.getByRole('tab', { name: /Agents/ }).click();
+      const path = { grant: '/rooms/r1/agents', detach: '/rooms/r1/agents/attached/remove',
+        approve: '/rooms/r1/agent-requests/req1/decide', deny: '/rooms/r1/agent-requests/req1/decide',
+        'approve-all': '/rooms/r1/agent-requests/approve-all' }[action];
+      const selector = { grant: 'form[data-agent="a1"]', detach: '[data-rmagent="attached"]',
+        approve: 'form[data-req="req1"]', deny: 'form[data-req="req1"] [data-deny]', 'approve-all': '#hcn-approve-all' }[action];
+      const control = page.locator(selector);
+      const button = ['grant', 'approve'].includes(action) ? control.locator('button[type="submit"]') : control;
+      const submit = () => control.dispatchEvent(['grant', 'approve'].includes(action) ? 'submit' : 'click');
+      const posts = () => calls.filter(c => c.method === 'POST' && c.path === path).length;
+      let release; holds.set(path, new Promise(r => { release = r; }));
+      const request = page.waitForRequest(r => new URL(r.url()).pathname.endsWith(path) && r.method() === 'POST');
+      await button.click(); await request;
+      await page.locator('[data-go="/rooms"]').click(); await openRoom();
+      await page.getByRole('tab', { name: /Agents/ }).click(); await button.waitFor();
+      await submit(); await flushUI(page);
+      assert.equal(posts(), 1, 'navigation must not allow a second pending mutation');
+      assert.equal(await button.isDisabled(), true, 'new controls must reflect pending state');
+      // A live state update replaces all agent/request markup while the POST is held.
+      renameAgents();
+      await page.locator('#hcn-requests').getByText('@bot-renamed', { exact: true }).waitFor();
+      await submit(); await flushUI(page);
+      assert.equal(posts(), 1, 'rerender must not allow a second pending mutation');
+      assert.equal(await button.isDisabled(), true);
+      // Batch decisions and individual decisions share the affected request locks.
+      if (['approve', 'deny', 'approve-all'].includes(action)) {
+        const decisionCount = calls.filter(c => c.method === 'POST' && c.path.includes('/agent-requests/')).length;
+        await page.locator('#hcn-approve-all').dispatchEvent('click');
+        await page.locator('form[data-req="req1"] [data-deny]').dispatchEvent('click');
+        await flushUI(page);
+        assert.equal(calls.filter(c => c.method === 'POST' && c.path.includes('/agent-requests/')).length, decisionCount);
+      }
+      const response = page.waitForResponse(r => new URL(r.url()).pathname.endsWith(path));
+      release({ http: 503, error: 'Agent mutation failed' });
+      await (await response).finished();
+      await page.waitForFunction(sel => { const el = document.querySelector(sel); return el && !(el.matches('form') ? el.querySelector('button[type="submit"]') : el).disabled; }, selector);
+      page.once('dialog', d => d.dismiss());
+      const retry = page.waitForRequest(r => new URL(r.url()).pathname.endsWith(path) && r.method() === 'POST');
+      await button.click(); await retry;
+      assert.equal(posts(), 2, 'settled operation must permit retry in the current view');
+    }));
+  }
+
   test(`collaboration ${surface}: pending approval and permanent deletion stay separate`, async () => withCollaboration(surface, async ({ page, calls, holds }) => {
     await page.locator('[data-go="/people"]').click();
     await page.getByRole('button', { name: 'Approve', exact: true }).click();
@@ -104,9 +185,13 @@ for (const surface of ['public', 'dashboard']) {
 
   test(`collaboration ${surface}: upload denial restores the server permission`, async () => withCollaboration(surface, async ({ page, holds, openRoom }) => {
     await openRoom();
-    holds.set('/rooms/r1/members/member/upload-permission', Promise.resolve({ http: 403, error: 'Permission denied' }));
+    let release; holds.set('/rooms/r1/members/member/upload-permission', new Promise(r => { release = r; }));
     const checkbox = page.locator('[data-upload="member"]');
     await checkbox.check();
+    await page.getByRole('status').filter({ hasText: 'Saving' }).waitFor();
+    assert.equal(await checkbox.isChecked(), true);
+    assert.equal(await checkbox.isDisabled(), true);
+    release({ http: 403, error: 'Permission denied' });
     await page.getByRole('alert').filter({ hasText: 'Permission denied' }).waitFor();
     assert.equal(await checkbox.isChecked(), false);
     assert.equal(await checkbox.isEnabled(), true);

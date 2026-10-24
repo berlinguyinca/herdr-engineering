@@ -787,6 +787,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
 
     const log = $('hcn-log');
     let alive = true;
+    const roomCurrent = () => alive && isCurrent(turn);
     let inheritedArchivePending = pendingAdministration.has(`archive:${roomId}`);
     let composer = null;
     let since = -1;
@@ -797,11 +798,11 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
     teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
-    const kick = () => { if (isCurrent(turn) && alive) { since = -1; ctl?.abort(); } }; // an action just happened: refetch now
+    const kick = () => { if (roomCurrent()) { since = -1; ctl?.abort(); } }; // an action just happened: refetch now
 
     // Replace a container's markup only when it changed and you are not typing in it.
     const put = (id, html) => {
-      if (!alive || !isCurrent(turn)) return false;
+      if (!roomCurrent()) return false;
       const el = $(id);
       if (!el || el.dataset.h === html) return false;
       if (el.contains(document.activeElement) && document.activeElement.matches('input,textarea,select')) { stale.add(id); return false; }
@@ -864,21 +865,36 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const taskChip = (st) => pill(st, ({ done: 'var(--status-ok)', failed: 'var(--status-failed)', pending: 'var(--status-attention)', accepted: 'var(--accent)' })[st] || 'var(--text-muted)');
     const ttlSelect = () => '<label class="cx-msg">Lasts <select name="ttl"><option value="">30 days (default)</option><option value="3600">1 hour</option><option value="86400">1 day</option><option value="604800">7 days</option><option value="7776000">90 days</option></select></label>';
     const expiryOf = (f) => { const v = Number(f.querySelector('select[name="ttl"]')?.value || 0); return v ? Date.now() / 1000 + v : undefined; };
-    const warn = (e) => { if (isCurrent(turn) && !cancelled(e)) alert(e.message); };
-    const act = async (fn, control) => {
-      if (!isCurrent(turn) || control?.dataset.busy === '1') return;
-      const buttons = control ? [...control.querySelectorAll('button'), ...(control.matches('button') ? [control] : [])] : [];
-      if (control) control.dataset.busy = '1';
-      buttons.forEach(b => { b.disabled = true; });
+    const warn = (e) => { if (roomCurrent() && !cancelled(e)) alert(e.message); };
+    // Locks belong to the mount, not to replaceable forms or a room navigation.
+    const agentOperation = (id) => JSON.stringify(['agent', roomId, id]);
+    const requestOperation = (id) => JSON.stringify(['request', roomId, id]);
+    const refreshAgentControls = () => {
+      if (!roomCurrent()) return;
+      root.querySelectorAll('[data-rmagent]').forEach(b => { b.disabled = pendingAdministration.has(agentOperation(b.dataset.rmagent)); });
+      root.querySelectorAll('form[data-agent], form[data-req]').forEach(f => {
+        const key = f.dataset.agent ? agentOperation(f.dataset.agent) : requestOperation(f.dataset.req);
+        f.querySelectorAll('button[type="submit"], [data-deny]').forEach(b => { b.disabled = pendingAdministration.has(key); });
+      });
+      const all = $('hcn-approve-all');
+      if (all) all.disabled = (S.requests || []).some(r => pendingAdministration.has(requestOperation(r.request_id)));
+    };
+    const act = async (fn, keys = []) => {
+      if (!roomCurrent() || keys.some(key => pendingAdministration.has(key))) return;
+      keys.forEach(key => pendingAdministration.add(key));
+      refreshAgentControls();
       try { await fn(); } catch (e) { warn(e); }
-      finally { if (isCurrent(turn)) { if (control) delete control.dataset.busy; buttons.forEach(b => { b.disabled = false; }); kick(); } }
+      finally {
+        keys.forEach(key => pendingAdministration.delete(key));
+        if (roomCurrent()) { refreshAgentControls(); kick(); }
+      }
     };
 
     const namedAgent = a => ({...a,display_name:S.flow?.nodes?.find(n=>n.agent_id===a.agent_id)?.fabric?.display_name});
     const drawRoomAgents = () => {
       const mine = new Set(S.mine.map((a) => a.agent_id));
       const html = S.agents.length ? `<ul class="cx-list">${S.agents.map((a) => `<li class="cx-agentrow"><span class="grow">${agentTitle(namedAgent(a), mine.has(a.agent_id) || operator)}<span class="cx-sub1">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></span><span class="cx-pills">${permPills(a.actions)}</span>${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove from room</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
-      if (put('hcn-roomagents', html)) { $('hcn-roomagents').querySelectorAll('[data-rmagent]').forEach((b) => { b.onclick = () => act(() => api.removeAgent(roomId, b.dataset.rmagent), b); }); wireRename($('hcn-roomagents'), redraw('hcn-roomagents'), turn); }
+      if (put('hcn-roomagents', html)) { $('hcn-roomagents').querySelectorAll('[data-rmagent]').forEach((b) => { b.onclick = () => act(() => api.removeAgent(roomId, b.dataset.rmagent), [agentOperation(b.dataset.rmagent)]); }); wireRename($('hcn-roomagents'), redraw('hcn-roomagents'), turn); }
     };
     const drawTaskTargets = () => {
       const can = S.agents.filter((a) => a.actions.includes('execute'));
@@ -909,7 +925,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         f.onsubmit = (ev) => {
           ev.preventDefault();
           const actions = picked(f, 'p');
-          if (actions.length) act(async () => { await api.grantAgent(roomId, f.dataset.agent, actions, expiryOf(f)); if (isCurrent(turn)) $('hcn-agent-msg').textContent = canInvite ? 'Agent permissions saved.' : 'Request sent. Waiting for the room owner.'; }, f);
+          if (actions.length) act(async () => { await api.grantAgent(roomId, f.dataset.agent, actions, expiryOf(f)); if (roomCurrent()) $('hcn-agent-msg').textContent = canInvite ? 'Agent permissions saved.' : 'Request sent. Waiting for the room owner.'; }, [agentOperation(f.dataset.agent)]);
         };
       });
     };
@@ -925,7 +941,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       if (all) {
         $('hcn-approve-all').onclick = () => {
           const v = Number($('hcn-all-ttl').value || 0);
-          act(() => api.approveAll(roomId, { request_ids: requests.map((r) => r.request_id), ...(v ? { expires_at: Date.now() / 1000 + v } : {}) }));
+          act(() => api.approveAll(roomId, { request_ids: requests.map((r) => r.request_id), ...(v ? { expires_at: Date.now() / 1000 + v } : {}) }), requests.map(r => requestOperation(r.request_id)));
         };
       }
       box.querySelectorAll('form[data-req]').forEach((f, i) => {
@@ -934,47 +950,47 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         f.onsubmit = (ev) => {
           ev.preventDefault();
           const actions = picked(f, 'p');
-          if (actions.length) act(() => api.decideRequest(roomId, f.dataset.req, 'approve', actions, expiryOf(f)), f);
+          if (actions.length) act(() => api.decideRequest(roomId, f.dataset.req, 'approve', actions, expiryOf(f)), [requestOperation(f.dataset.req)]);
         };
-        f.querySelector('[data-deny]').onclick = () => act(() => api.decideRequest(roomId, f.dataset.req, 'deny'), f);
+        f.querySelector('[data-deny]').onclick = () => act(() => api.decideRequest(roomId, f.dataset.req, 'deny'), [requestOperation(f.dataset.req)]);
       });
     };
 
     // ---- agent helpers: panic switch, host-access requests and hosts (operator), profile (owner)
     const loadHelpers = async () => {
-      if (!isCurrent(turn)) return;
+      if (!roomCurrent()) return;
       if (operator) {
         try {
           const result = await api.egressRequests();
-          if (!isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           S.egress = (result.requests || []).filter((r) => r.room_id === roomId);
         } catch { /* keep the old list */ }
-        if (!isCurrent(turn)) return;
+        if (!roomCurrent()) return;
         try {
           const h = await api.helpers();
-          if (!isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           S.helpers = h.helpers || []; S.paused = Boolean(h.paused);
         } catch { /* keep */ }
       } else {
         try {
           const result = await api.myHelpers();
-          if (!isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           S.helpers = result.helpers || [];
         } catch { /* guests and old servers: no helper list */ }
       }
-      if (!isCurrent(turn)) return;
+      if (!roomCurrent()) return;
       if (operator) {
         try {
           const x = await api.egressAllowlist(roomId);
-          if (!isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           S.allow = x.allowlist || []; S.entries = Array.isArray(x.entries) ? x.entries : null;
         } catch { /* keep */ }
       }
-      if (!isCurrent(turn)) return;
+      if (!roomCurrent()) return;
       if (canInvite) {
         try {
           const profile = await api.roomProfile(roomId);
-          if (!isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           S.profile = profile;
         } catch { /* not readable: keep */ }
       }
@@ -988,9 +1004,9 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       if (canInvite && S.profile) put('hcn-profile-box', renderProfileEditor(S.profile, { owner: canInvite }));
     };
     const unbindHelpers = wireHelperHandlers(root, {
-      api, roomId, operator, owner: canInvite, act, getProfile: () => S.profile, setProfile: (p) => { if (!isCurrent(turn)) return; S.profile = p; $('hcn-profile-msg').textContent = 'Saved.'; },
-      onError: (m) => { if (isCurrent(turn)) $('hcn-profile-msg').textContent = m; },
-      refresh: async () => { if (!isCurrent(turn)) return; await loadHelpers(); if (isCurrent(turn)) drawHelpers(); },
+      api, roomId, operator, owner: canInvite, act, getProfile: () => S.profile, setProfile: (p) => { if (!roomCurrent()) return; S.profile = p; $('hcn-profile-msg').textContent = 'Saved.'; },
+      onError: (m) => { if (roomCurrent()) $('hcn-profile-msg').textContent = m; },
+      refresh: async () => { if (!roomCurrent()) return; await loadHelpers(); if (roomCurrent()) drawHelpers(); },
       readForm: (f) => { const fd = new FormData(f); return { services: fd.get('services'), ssh_secret_names: fd.get('ssh_secret_names'), allowed_models: fd.get('allowed_models'), allowed_families: fd.getAll('allowed_families'), tools_allowed: fd.get('tools_allowed') !== null, permanent_hosts: fd.get('permanent_hosts') }; },
     });
 
@@ -1022,41 +1038,42 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
 
     const memberAction = async (button, action, success, rollback = () => {}) => {
       const key = `members:${roomId}`;
-      if (!isCurrent(turn) || pendingAdministration.has(key)) { rollback(); return; }
+      if (!roomCurrent()) return;
+      if (pendingAdministration.has(key)) { rollback(); return; }
       pendingAdministration.add(key);
       const msg = $('hcn-members-msg');
       msg.setAttribute('role', 'status'); msg.textContent = 'Saving…';
       button.disabled = true;
       try {
         await action();
-        if (!isCurrent(turn)) return;
+        if (!roomCurrent()) return;
         msg.textContent = success;
         $('hcn-people').dataset.h = '';
       } catch (e) {
-        if (!isCurrent(turn)) return;
+        if (!roomCurrent()) return;
         rollback();
         if (!cancelled(e)) { msg.setAttribute('role', 'alert'); msg.textContent = e.message; }
         else msg.textContent = '';
       } finally {
         pendingAdministration.delete(key);
-        if (isCurrent(turn)) { button.disabled = false; await drawPeople(); }
+        if (roomCurrent()) { button.disabled = false; await drawPeople(); }
       }
     };
     if ($('hcn-delete-room')) $('hcn-delete-room').onclick = async () => {
       const key = `archive:${roomId}`, button = $('hcn-delete-room'), msg = $('hcn-archive-msg');
-      if (!isCurrent(turn) || pendingAdministration.has(key) || button.disabled || !confirmDeleteRoom(info)) return;
+      if (!roomCurrent() || pendingAdministration.has(key) || button.disabled || !confirmDeleteRoom(info)) return;
       pendingAdministration.add(key); button.disabled = true;
       msg.setAttribute('role', 'status'); msg.textContent = 'Archiving and verifying room data… Live deletion is not yet confirmed.';
       try {
         const result = await api.archiveRoom(roomId);
-        if (!isCurrent(turn)) return;
+        if (!roomCurrent()) return;
         if (result.status !== 'verified' || result.live_room_id !== null) throw new Error('Room deletion is not complete. The archive must be verified and live deletion confirmed before completion.');
         dispose();
         // Stop other room mutations once the server confirms live deletion.
         root.querySelectorAll('.cx-panel button, .cx-panel input, .cx-panel select, .cx-panel textarea').forEach(el => { el.disabled = true; });
         msg.textContent = 'Archive verified. Room deleted.';
       } catch (e) {
-        if (!isCurrent(turn)) return;
+        if (!roomCurrent()) return;
         button.disabled = false;
         if (!cancelled(e)) { msg.setAttribute('role', 'alert'); msg.textContent = `${e.message} Deletion is not confirmed; retry or refresh to check the room.`; }
         else msg.textContent = 'Deletion check cancelled. Refresh to check the room before retrying.';
@@ -1064,18 +1081,18 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     };
     let peopleBusy = false;
     const drawPeople = async () => {
-      if (!canInvite || peopleBusy || pendingAdministration.has(`members:${roomId}`)) return;
+      if (!roomCurrent() || !canInvite || peopleBusy || pendingAdministration.has(`members:${roomId}`)) return;
       peopleBusy = true;
       try {
         const [room, inv] = await Promise.all([api.room(roomId), api.invites(roomId)]);
-        if (!alive || !isCurrent(turn) || pendingAdministration.has(`members:${roomId}`)) return;
+        if (!roomCurrent() || pendingAdministration.has(`members:${roomId}`)) return;
         names = new Map((room.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
         const html = renderRoomAdministration({ room, invites: inv.invites, canManage: canInvite });
         if (put('hcn-people', html)) {
           const box = $('hcn-people');
           box.querySelectorAll('[data-rm]').forEach(b => { b.onclick = () => {
             const member = room.members.find(m => m.user_id === b.dataset.rm);
-            if (pendingAdministration.has(`members:${roomId}`)) return;
+            if (!roomCurrent() || pendingAdministration.has(`members:${roomId}`)) return;
             if (confirmAction(`Remove ${member.email || member.user_id} from this room? Their room access and delegated permissions stop. Messages and files remain; their account and other rooms are unchanged.`))
               memberAction(b, () => api.removeMember(roomId, b.dataset.rm), 'Removed from room. Messages and files remain.');
           }; });
@@ -1093,7 +1110,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const loadMine = async () => {
       try {
         const { agents } = await api.agents();
-        if (!isCurrent(turn)) return;
+        if (!roomCurrent()) return;
         S.mine = agents;
       } catch { /* keep the old list */ }
     };
@@ -1102,20 +1119,20 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       setBadge('tasks', S.tasks.filter((t) => ['pending', 'accepted'].includes(t.status)).length);
       if (sub === 'tasks') drawTasks();
       else if (sub === 'flow') drawFlow();
-      else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); }
+      else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); refreshAgentControls(); }
     }
     const paintPanel = async () => {
-      if (!alive || !isCurrent(turn)) return;
+      if (!roomCurrent()) return;
       if (sub === 'agents' && canPost) await loadMine();
-      if (!isCurrent(turn)) return;
+      if (!roomCurrent()) return;
       if (sub === 'agents') await loadHelpers();
-      if (!isCurrent(turn)) return;
+      if (!roomCurrent()) return;
       if (sub === 'people') await drawPeople();
-      if (!alive || !isCurrent(turn)) return;
+      if (!roomCurrent()) return;
       paint();
     };
     const showSub = (k) => {
-      if (!alive || !isCurrent(turn)) return;
+      if (!roomCurrent()) return;
       sub = k; subTab.set(roomId, k);
       root.querySelectorAll('[data-sub]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.sub === k)));
       root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${k}`; });
@@ -1145,22 +1162,23 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     };
     const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
     (async () => {
-      while (alive && isCurrent(turn)) {
+      while (roomCurrent()) {
         if (document.hidden) { await new Promise((r) => { wake = r; }); continue; }
         ctl = new AbortController();
         try {
           const s = await api.state(roomId, since, cursor, 8, ctl.signal);
-          if (!alive || !isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           backoff = 1000;
           refreshArchiveControl();
+          refreshAgentControls();
           if (s.changed) { apply(s); since = s.has_more ? -1 : s.seq; } else since = s.seq;
         } catch (e) {
-          if (!alive || !isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           if (e.name === 'AbortError') continue;
           if (e instanceof AuthError) { dispose(); store.clear(); start(); return; }
           if (e.code === 'not_found') { dispose(); go('/rooms', turn); return; }
           await sleep(backoff);
-          if (!alive || !isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           backoff = Math.min(backoff * 2, 15000);
         }
       }
@@ -1171,13 +1189,13 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     if (taskForm) {
       taskForm.onsubmit = async (ev) => {
         ev.preventDefault();
-        if (!isCurrent(turn)) return;
+        if (!roomCurrent()) return;
         const f = new FormData(taskForm);
         try {
           await api.createTask(roomId, f.get('target'), f.get('text'));
-          if (!isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           taskForm.querySelector('textarea').value = ''; $('hcn-task-msg').textContent = ''; kick();
-        } catch (e) { if (isCurrent(turn) && !cancelled(e)) $('hcn-task-msg').textContent = e.message; }
+        } catch (e) { if (roomCurrent() && !cancelled(e)) $('hcn-task-msg').textContent = e.message; }
       };
     }
     if ($('hcn-composer')) {
@@ -1190,14 +1208,14 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
           detail: `${a.harness_type} · ${names.get(a.owner_user_id) || shortId(a.owner_user_id)}`,
         })),
         onSend: async (text) => {
-          if (!isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           const mention = /^@([a-z0-9-]{1,32})\s+([\s\S]+)$/.exec(text.trim());
           if (mention) { // Preserve the room's authenticated leading-agent task contract.
             const hits = S.agents.filter((a) => a.name === mention[1] && a.actions.includes('execute'));
             if (hits.length !== 1) throw new Error(hits.length ? `More than one agent is called @${mention[1]}; use the Tasks tab` : `No agent named @${mention[1]} in this room accepts tasks`);
             await api.createTask(roomId, hits[0].agent_id, mention[2]);
           } else await api.say(roomId, text);
-          if (alive && isCurrent(turn)) { kick(); log.scrollTop = log.scrollHeight; }
+          if (roomCurrent()) { kick(); log.scrollTop = log.scrollHeight; }
           return { status: 'delivered', message: mention ? 'Task created' : 'Message posted' };
         },
       });
@@ -1206,15 +1224,15 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     if (inviteForm) {
       inviteForm.onsubmit = async (ev) => {
         ev.preventDefault();
-        if (!isCurrent(turn)) return;
+        if (!roomCurrent()) return;
         const f = new FormData(ev.target);
         const msg = $('hcn-invite-msg');
         try {
           await api.invite(roomId, f.get('email'), f.get('role'));
-          if (!isCurrent(turn)) return;
+          if (!roomCurrent()) return;
           msg.textContent = 'Invited. They get access when they sign in here.';
           ev.target.reset(); $('hcn-people').dataset.h = ''; paintPanel();
-        } catch (e) { if (isCurrent(turn) && !cancelled(e)) msg.textContent = e.message; }
+        } catch (e) { if (roomCurrent() && !cancelled(e)) msg.textContent = e.message; }
       };
     }
     log.scrollTop = log.scrollHeight;
