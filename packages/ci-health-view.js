@@ -26,9 +26,9 @@ export function ciHealthUnavailable(history={},missingClient=false) {
 }
 
 // Persist user preferences per route context; repository/mission/session never become global filters.
-export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{},onLayout=()=>{},onContext=()=>{},repository='',mission='',session='',search}={}) {
+export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{},onLayout=()=>{},repository='',mission='',session='',search}={}) {
   const doc=host.ownerDocument;
-  let context={repository,mission,session},commandProject=null,state,expanded,selection=null,selected=null,selectedKey='',layout='tree';
+  let context={repository,mission,session},state,expanded,selection=null,selected=null,selectedKey='',layout='split';
   let history=null,model=null,orderSignature='',error='',disposed=false,timer=null,pending=null,generation=0;
   const listeners=new AbortController();
   const treeLimits=new Map();
@@ -44,14 +44,14 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   load();
   if(typeof search==='string')state.search=bounded(search);
   host.innerHTML=`<style>${ciHealthStyles}</style><style>
-.ci-health-controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:var(--radius);background:linear-gradient(135deg,color-mix(in srgb,var(--surface) 92%,var(--accent)),var(--surface))}.ci-health-controls [data-health-mode]{background:var(--surface);color:var(--text);border:1px solid var(--border);margin-right:3px}.ci-health-controls [data-health-mode][aria-pressed=true]{background:var(--accent);color:#fff;border-color:var(--accent)}.ci-health-controls label{display:flex;flex-direction:column;gap:5px;font-size:12px}.ci-health-controls input,.ci-health-controls select{max-width:100%;padding:8px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm)}.ci-health-controls input[type=checkbox]{margin:0}.ci-health-controls .ci-health-check{flex-direction:row;align-items:center;padding:8px 0}.ci-health-layout{display:flex;flex-wrap:wrap;gap:6px;margin:16px 0}.ci-health-layout button{font-weight:650}.ci-health-layout [aria-selected=true]{outline:2px solid var(--accent);background:var(--accent);color:#fff}.ci-health-selection,.ci-health-status{font-size:12px;line-height:1.6;color:var(--text-secondary);overflow-wrap:anywhere}.ci-health-workflows{padding:12px;font-size:12px}.ci-health-workflows button{display:block;margin:6px 0;text-align:left}.ci-health-tree[hidden]{display:none}.ci-health-lower{display:grid;grid-template-columns:minmax(0,1fr);gap:18px;min-width:0}.ci-health-tree,.ci-health-pipeline-slot{min-width:0}.ci-health-pipeline-slot:empty,.ci-health-pipeline-slot:not(:has(.ig-inspector:not([hidden]))){display:none}[data-health-layout=map]>.ci-health-tree,[data-health-layout=map]>.ci-health-pipeline-slot{display:none}[data-health-layout=tree]>.ci-health-pipeline-slot{display:block}@media(min-width:1100px){.ci-health-lower[data-health-layout=tree]:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(250px,.35fr) minmax(0,1fr)}}
+.ci-health-controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:14px 0}.ci-health-controls [data-health-mode]{background:var(--surface);color:var(--text);border:1px solid var(--border);margin-right:3px}.ci-health-controls [data-health-mode][aria-pressed=true]{background:var(--accent);color:var(--text-on-accent);border-color:var(--accent)}.ci-health-controls label{display:flex;flex-direction:column;gap:5px;font-size:12px}.ci-health-controls input,.ci-health-controls select{max-width:100%;padding:8px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm)}.ci-health-controls input[type=checkbox]{margin:0}.ci-health-controls .ci-health-check{flex-direction:row;align-items:center;padding:8px 0}.ci-health-layout{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.ci-health-layout [aria-pressed=true]{outline:2px solid var(--accent)}.ci-health-selection,.ci-health-status{font-size:12px;line-height:1.6;color:var(--text-secondary);overflow-wrap:anywhere}.ci-health-workflows{padding:12px;font-size:12px}.ci-health-workflows button{display:block;margin:6px 0;text-align:left}.ci-health-tree[hidden]{display:none}.ci-health-lower{display:grid;grid-template-columns:minmax(0,1fr);gap:18px;min-width:0}.ci-health-tree,.ci-health-pipeline-slot{min-width:0}.ci-health-pipeline-slot:empty,.ci-health-pipeline-slot:not(:has(.ig-inspector:not([hidden]))){display:none}[data-health-layout=tree]>.ci-health-pipeline-slot{display:none}[data-health-layout=pipeline]>.ci-health-tree{display:none}@media(min-width:1100px){.ci-health-lower[data-health-layout=split]:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(250px,.35fr) minmax(0,1fr)}}
 </style><section aria-label="CI project health"><h2>Project health</h2><div class="ci-health-controls">
 <div role="group" aria-label="History window"><button type="button" class="hd-btn" data-health-mode="hours">Last 24 hours</button><button type="button" class="hd-btn" data-health-mode="runs">Last 24 runs</button><button type="button" class="hd-btn" data-health-mode="7">7 days</button><button type="button" class="hd-btn" data-health-mode="14">14 days</button><button type="button" class="hd-btn" data-health-mode="30">30 days</button></div>
 <label>Scope<select data-health-scope><option value="default">Default-branch builds</option><option value="pr">Pull requests</option><option value="all">All runs</option></select></label>
 <label>Sort projects<select data-health-sort><option value="name">Project name</option><option value="failures">Failures in selected window</option></select></label>
 <label>Search projects and runs<input type="search" data-health-search maxlength="500"></label><label>Branch<input data-health-branch maxlength="500" placeholder="All branches"></label><label class="ci-health-check"><input type="checkbox" data-health-failures>Projects with failures</label></div>
 <p class="ci-health-status" role="status" data-health-status></p><div data-health-map></div><div class="ci-health-selection" data-health-selection></div>
-<div class="ci-health-layout" role="tablist" aria-label="CI project views"><button type="button" class="hd-btn" role="tab" data-health-layout="map" aria-selected="false">Map</button><button type="button" class="hd-btn" role="tab" data-health-layout="tree" aria-selected="true">Tree</button></div><div class="ci-health-lower" data-health-lower><div class="ci-health-tree" data-health-tree></div><div class="ci-health-pipeline-slot" data-health-pipeline-slot></div></div></section>`;
+<div class="ci-health-layout" role="group" aria-label="Health detail layout"><button type="button" class="hd-btn" data-health-layout="split">Tree + pipeline</button><button type="button" class="hd-btn" data-health-layout="tree">Tree only</button><button type="button" class="hd-btn" data-health-layout="pipeline">Pipeline only</button></div><div class="ci-health-lower" data-health-lower><div class="ci-health-tree" data-health-tree></div><div class="ci-health-pipeline-slot" data-health-pipeline-slot></div></div></section>`;
   const el=selector=>host.querySelector(selector);
   function syncControls() {
     for(const button of host.querySelectorAll('button[data-health-mode]'))button.setAttribute('aria-pressed',String(button.dataset.healthMode===state.mode));
@@ -61,8 +61,8 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   syncControls();
   function applyLayout() {
     host.dataset.healthLayout=layout;el('[data-health-lower]').dataset.healthLayout=layout;
-    for(const button of host.querySelectorAll('button[data-health-layout]'))button.setAttribute('aria-selected',String(button.dataset.healthLayout===layout));
-    el('[data-health-tree]').hidden=layout==='map';
+    for(const button of host.querySelectorAll('button[data-health-layout]'))button.setAttribute('aria-pressed',String(button.dataset.healthLayout===layout));
+    el('[data-health-tree]').hidden=layout==='pipeline';
     onLayout(layout);
   }
   applyLayout();
@@ -88,22 +88,13 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     return rows(history?.pipelines).some(record=>(context.mission && !['mission_key','mission_id','related_missions'].some(key=>Object.hasOwn(record,key))) || (context.session && !['session_id','related_sessions'].some(key=>Object.hasOwn(record,key))));
   }
   function scopedHistory() {
-    const projected=ciHealthProjectHistory(history||{},commandProject);
-    if(!context.mission && !context.session)return projected;
-    return {...projected,...(contextCoverageUnknown()?{coverage:{},status:'partial'}:{}),pipelines:rows(projected.pipelines).filter(record=>(!context.mission || (record.mission_key || record.mission_id)===context.mission || rows(record.related_missions).some(row=>(row.mission_key || row.mission_id)===context.mission)) && (!context.session || record.session_id===context.session || rows(record.related_sessions).some(row=>row.session_id===context.session)))};
+    if(!context.mission && !context.session)return history || {};
+    return {...history,...(contextCoverageUnknown()?{coverage:{},status:'partial'}:{}),pipelines:rows(history?.pipelines).filter(record=>(!context.mission || (record.mission_key || record.mission_id)===context.mission || rows(record.related_missions).some(row=>(row.mission_key || row.mission_id)===context.mission)) && (!context.session || record.session_id===context.session || rows(record.related_sessions).some(row=>row.session_id===context.session)))};
   }
   function selectedSteps() {
     if(!selected || !Array.isArray(selected.tasks))return '';
     const groups=new Map();for(const task of rows(selected.tasks)){const key=String(task.workflow ?? task.workflow_id ?? 'Steps');if(!groups.has(key))groups.set(key,[]);groups.get(key).push(task);}
     return `<section class="ci-health-workflows" aria-label="Selected run workflows"><h3>Run #${esc(String(selected.run_number ?? selected.number ?? ''))} · workflows and steps</h3>${[...groups].map(([name,tasks])=>`<details data-health-disclosure="${esc(JSON.stringify(['workflow',selectedKey,name]))}"><summary>${esc(name)}</summary>${tasks.map(task=>`<button type="button" class="hd-btn" data-health-step="${esc(String(task.id ?? ''))}">${esc(task.name || `Step ${task.id ?? '?'}`)} · ${esc(task.state || task.status || 'Unknown')}</button>`).join('')}</details>`).join('')}</section>`;
-  }
-  function selectedSlot() {
-    if(!selection || !model)return '';
-    const project=model.projects.find(p=>p.key===selection.projectKey),cell=project?.cells.find(c=>c.key===selection.bucketKey);
-    if(!project || !cell)return '';
-    const counts=cell.counts||{},runs=Array.isArray(cell.runs)?cell.runs:[];
-    const runButtons=runs.slice(0,100).map(run=>`<button type="button" data-health-slot-run="${esc(String(run.runKey||run.run_number||''))}"><strong>Run #${esc(String(run.run_number??'unknown'))}</strong><br><small>${esc(run.state||run.status||'Unknown')} · ${esc(run.branch||'Branch unavailable')} · ${esc(run.revision||'Revision unavailable')}</small></button>`).join('');
-    return `<section class="ci-slot-detail" aria-label="Selected CI slot detail"><header><div><h3>${esc(project.identity)}</h3><p class="ci-slot-note">${esc(cell.label||cell.key)} · ${cell.complete?'Complete coverage':'Incomplete coverage'}</p></div><strong>${esc(`${counts.failure||0} failed`)}</strong></header><dl><div><dt>Runs</dt><dd>${esc(counts.total??runs.length)}</dd></div><div><dt>Passed</dt><dd>${esc(counts.success||0)}</dd></div><div><dt>Failed</dt><dd>${esc(counts.failure||0)}</dd></div><div><dt>Active</dt><dd>${esc(counts.active||0)}</dd></div></dl>${runs.length?`<div class="ci-slot-runs">${runButtons}</div><p class="ci-slot-note">Select a run to open its failed steps, tests, logs and provider diagnosis.</p>`:'<p class="ci-slot-note">No run evidence is reported for this slot. Try a wider window or another scope.</p>'}</section>`;
   }
   const CELL='[data-health-project][data-health-bucket]';
   const cellKey=node=>`${node.dataset.healthProject}|${node.dataset.healthBucket}`;
@@ -126,7 +117,7 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     replace(el('[data-health-map]'),!history&&!error?skeleton('CI history',{rows:3}):hideHistory?'':renderCiHeatmap(model));
     animateChanges(el('[data-health-map]'),CELL,cellsBefore,cellKey,{count:false});
     shownCells=nextOrderSignature;
-    replace(el('[data-health-tree]'),hideHistory?'':selectedSlot()+renderCiTree(model,{selectedRunKey:selectedKey,expanded,limits:treeLimits})+selectedSteps());
+    replace(el('[data-health-tree]'),hideHistory?'':renderCiTree(model,{selectedRunKey:selectedKey,expanded,limits:treeLimits})+selectedSteps());
     const selectionHtml=selection?`${!model.projects.some(project=>project.key===selection.projectKey && project.cells.some(cell=>cell.key===selection.bucketKey))?'Selected run or bucket is no longer present in this window.':'Selected project and time bucket · latest labels apply within this selection.'} <button type="button" class="hd-btn" data-health-clear>Clear selection</button>`:'';
     const chip=el('[data-health-selection]');if(chip.innerHTML!==selectionHtml)chip.innerHTML=selectionHtml;
     const cells=[...host.querySelectorAll('[data-health-project][data-health-bucket]')];
@@ -150,17 +141,12 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
       if(history)history={...history,stale:true};error=`CI history unavailable: ${reason?.message || 'Refresh failed'}. ${history?'Showing the last received snapshot.':''}`;draw();
     } finally {clearTimeout(timeout);if(pending===request)pending=null;if(!disposed && version===generation)schedule();}
   }
-  function notifyContext() {
-    const repo=selection?model?.projects.find(p=>p.key===selection.projectKey)?.repo:commandProject;
-    const cell=selection?model?.projects.find(p=>p.key===selection.projectKey)?.cells.find(c=>c.key===selection.bucketKey):null;
-    onContext({...state,run_number:state.mode==='runs'?cell?.runs[0]?.run_number??null:null,start:cell?.start!=null?new Date(cell.start).toISOString():null,end:cell?.end!=null?new Date(cell.end).toISOString():null,project:repo?{...repo,provider_repo_id:repo.provider_repo_id??repo.id}:null});
-  }
   host.addEventListener('change',event=>{
     const target=event.target;
-    for(const name of ['scope','sort'])if(target.matches(`[data-health-${name}]`)){state[name]=target.value;selection=null;state=ciHealthPreferences(state);save();draw();notifyContext();return;}
-    if(target.matches('[data-health-failures]')){state.failuresOnly=target.checked;selection=null;save();draw();notifyContext();}
+    for(const name of ['scope','sort'])if(target.matches(`[data-health-${name}]`)){state[name]=target.value;selection=null;state=ciHealthPreferences(state);save();draw();return;}
+    if(target.matches('[data-health-failures]')){state.failuresOnly=target.checked;selection=null;save();draw();}
   },{signal:listeners.signal});
-  host.addEventListener('input',event=>{for(const name of ['search','branch'])if(event.target.matches(`[data-health-${name}]`)){state[name]=bounded(event.target.value);selection=null;save();draw();notifyContext();}},{signal:listeners.signal});
+  host.addEventListener('input',event=>{for(const name of ['search','branch'])if(event.target.matches(`[data-health-${name}]`)){state[name]=bounded(event.target.value);selection=null;save();draw();}},{signal:listeners.signal});
   host.addEventListener('toggle',event=>{
     const node=event.target;if(disposed || !host.contains(node) || !node.matches('[data-health-disclosure]'))return;
     const key=node.dataset.healthDisclosure;if(expanded.has(key)===node.open)return;
@@ -169,12 +155,11 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   },{capture:true,signal:listeners.signal});
   host.addEventListener('click',event=>{
     const button=event.target.closest('button');if(!button || !host.contains(button))return;
-    if(button.hasAttribute('data-health-mode')){state.mode=button.dataset.healthMode;selection=null;syncControls();save();draw();notifyContext();return;}
+    if(button.hasAttribute('data-health-mode')){state.mode=button.dataset.healthMode;selection=null;syncControls();save();draw();return;}
     if(button.hasAttribute('data-health-layout')){layout=button.dataset.healthLayout;applyLayout();return;}
-    if(button.hasAttribute('data-health-clear')){selection=null;save();draw();notifyContext();return;}
-    if(button.hasAttribute('data-health-bucket')){if(state.mode==='runs'&&!model?.projects.find(p=>p.key===button.dataset.healthProject)?.cells.find(c=>c.key===button.dataset.healthBucket)?.runs.length)return;selection={projectKey:button.dataset.healthProject,bucketKey:button.dataset.healthBucket};save();draw();notifyContext();return;}
+    if(button.hasAttribute('data-health-clear')){selection=null;save();draw();return;}
+    if(button.hasAttribute('data-health-bucket')){selection={projectKey:button.dataset.healthProject,bucketKey:button.dataset.healthBucket};save();draw();return;}
     if(button.hasAttribute('data-health-tree-more')){const key=button.dataset.healthTreeMore;treeLimits.set(key,(treeLimits.get(key) || 100)+100);draw();return;}
-    if(button.hasAttribute('data-health-slot-run')){const record=model?.selectedRows.find(row=>row.runKey===button.dataset.healthSlotRun)||model?.projects.flatMap(p=>p.cells.flatMap(c=>c.runs||[])).find(row=>row.runKey===button.dataset.healthSlotRun);if(record){selected=record;selectedKey=record.runKey;draw();onSelectRun(record);}return;}
     if(button.hasAttribute('data-health-run')){const record=model?.selectedRows.find(row=>row.runKey===button.dataset.healthRun);if(record){selected=record;selectedKey=record.runKey;draw();onSelectRun(record);}return;}
     if(button.hasAttribute('data-health-step') && selected)onSelectStep(selected,button.dataset.healthStep);
   },{signal:listeners.signal});
@@ -190,28 +175,9 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   draw();refresh();
   return {
     refresh,
-    setObservabilityContext(next={}) {
-      if(disposed)return;
-      rememberDisclosures();
-      if(next.start===null&&next.end===null&&next.run_number==null)selection=null;
-      const nextProject=next.project===undefined?commandProject:next.project;
-      if(JSON.stringify(commandProject)!==JSON.stringify(nextProject))selection=null;
-      commandProject=nextProject;
-      const updated={...state,mode:['runs','hours'].includes(next.mode)?next.mode:[7,14,30].includes(Number(next.days))?String(next.days):state.mode};
-      for(const key of ['scope','branch','search','failuresOnly'])if(next[key]!==undefined)updated[key]=next[key];
-      if(['mode','scope','branch','search','failuresOnly'].some(key=>updated[key]!==state[key]))selection=null;
-      state=ciHealthPreferences(updated);syncControls();save();draw();
-    },
-    setLayout(value){if(disposed || !['map','tree'].includes(value))return;layout=value;applyLayout();},
+    setLayout(value){if(disposed || !['split','tree','pipeline'].includes(value))return;layout=value;applyLayout();},
     selectedRun(record){if(disposed)return;selected=record;selectedKey=record?runKey(record):'';draw();},
     setContext(next={}){if(disposed)return;rememberDisclosures();save();context={repository:next.repository || '',mission:next.mission || '',session:next.session || ''};load();for(const name of ['search','branch'])if(typeof next[name]==='string')state[name]=bounded(next[name]);selected=null;selectedKey='';treeLimits.clear();syncControls();draw(false);},
     dispose(){disposed=true;generation++;clearTimeout(timer);pending?.abort();pending=null;listeners.abort();},
   };
-}
-
-
-export function ciHealthProjectHistory(history,project) {
-  if(!project)return history;
-  const same=row=>String(row.provider_url||'').replace(/\/+$/,'')===String(project.provider_url||'').replace(/\/+$/,'') && String(row.provider_repo_id??row.id)===String(project.provider_repo_id) && row.repository===project.repository;
-  return {...history,repos:rows(history.repos).filter(same),pipelines:rows(history.pipelines).filter(same)};
 }
