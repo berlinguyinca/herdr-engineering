@@ -945,7 +945,8 @@ class GitHubMonitor:
             closed = self._read_closed(provider, rid, since)
             if closed is None:
                 return False
-            seen += closed.values()
+            # closed-read timestamps never feed the watermark: a closed issue edited after
+            # the open read would lift it past an open edit that read never saw
             issues = {gid: issue for gid, issue in {**stored, **fresh}.items() if gid not in closed}
             removed, upserts = set(closed) & (set(stored) | set(fresh)), {g: i for g, i in fresh.items() if g not in closed}
             if len(issues) != total:

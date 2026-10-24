@@ -693,3 +693,33 @@ def test_a_failed_removal_never_leaves_the_watermark_past_an_unremoved_close():
         assert stored.watermarks[rid] == before
     else:
         assert stored.watermarks[rid] > before
+
+
+def test_an_edit_on_a_closed_issue_never_lifts_the_watermark_past_an_unread_open_edit():
+    fake = FakeGitHub(page_size=2)
+    gids = [fake.add_issue("acme/a") for _ in range(6)]
+    fake.edit("acme/a", gids[1], state="CLOSED")
+    monitor = monitor_for(fake, {})
+    monitor.refresh()
+    fake.tick(600)
+    fake.edit("acme/a", gids[-1], title="poke")  # the probe changes: an incremental pass
+    original = fake.closed_issues_page
+
+    def during_the_pass(repository_id, since, cursor=None):
+        fake.closed_issues_page = original
+        # after the open read: Y is edited, then a page of other edits, then a comment on closed W
+        fake.edit("acme/a", gids[0], title="Y edited")
+        fake.edit("acme/a", gids[2], title="Z1")
+        fake.edit("acme/a", gids[3], title="Z2")
+        fake.tick(30)
+        fake.edit("acme/a", gids[1], title="comment on closed W")
+        return original(repository_id, since, cursor)
+    fake.closed_issues_page = during_the_pass
+    monitor.refresh()
+    fake.log.clear()
+    monitor.refresh()
+    # one incremental read (no count-mismatch re-read, no reconcile is due) must find Y
+    assert [entry[2] for entry in issue_calls(fake)].count(None) == 1
+    assert monitor._due_reconciles(monitor._repos) == set()
+    titles = {row["github_id"]: row["title"] for row in monitor.issues(per_page=100, start=False)["issues"]}
+    assert titles[gids[0]] == "Y edited"
