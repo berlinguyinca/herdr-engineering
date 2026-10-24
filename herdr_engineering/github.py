@@ -1106,8 +1106,12 @@ class GitHubMonitor:
         with self._lock:
             view = self.snapshot(start=start)
             store = None if self._store_dirty else self._store
+            current_revision = self._revision
         delta = None
-        if store is not None:
+        if store is not None and current_revision is not None and since == current_revision:
+            # the common poll: nothing written since the client's revision, so no store read
+            delta = {"revision": since, "resync": False, "upserted": [], "removed": []}
+        elif store is not None:
             try:
                 delta = store.changes_since(since)
             except Exception:

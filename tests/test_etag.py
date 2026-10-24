@@ -216,3 +216,23 @@ def test_polled_endpoint_answers_200_after_a_change(server):
     status, new_etag, body = get(server, "hosts", etag=etag)
     assert status == 200 and new_etag != etag and len(body["hosts"]) == 2
     assert get(server, "hosts/missing")[1] is None  # a 404 has no ETag
+
+
+def test_since_at_the_current_revision_answers_from_memory_without_a_store_read(server):
+    monitor = server.github_monitor
+    revision = get(server, "github/issues")[2]["revision"]
+    reads = []
+    original = type(monitor._store).changes_since
+
+    def counting(store, since):
+        reads.append(since)
+        return original(store, since)
+    monitor._store.changes_since = counting.__get__(monitor._store)
+    monitor._update(progress={**monitor._view["progress"], "phase": "issues"})  # a pass moved the state
+    for _ in range(3):
+        status, _, delta = get(server, f"github/issues?since={revision}")
+        assert status == 200 and delta["resync"] is False
+        assert delta["upserted"] == [] and delta["removed"] == [] and delta["revision"] == revision
+    assert reads == []  # polling at the current revision never opens a store transaction
+    get(server, f"github/issues?since={revision - 1}")
+    assert reads == [revision - 1]
