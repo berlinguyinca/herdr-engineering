@@ -89,7 +89,11 @@ export class CollabApi {
     });
     if (res.status === 401) throw new AuthError('session expired');
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+    if (!res.ok) {
+      const err = new Error(data.error || `request failed (${res.status})`);
+      err.status = res.status; err.code = data.code; err.fence = data.fence;
+      throw err;
+    }
     return data;
   }
   me() { return this.call('GET', '/me'); }
@@ -145,6 +149,22 @@ export class CollabApi {
   lineageEvents(room, o = {}) {
     return this.call('GET', `/graph/lineage/events?${lineageQuery(room, { step: null }, { limit: String(o.limit || 200), cursor: o.cursor })}`);
   }
+  // Comments anchored to graph nodes and explicit steering (T12). Identity, room scope and rights come from the
+  // credential and the room; the body never names an author, an owner or a target principal.
+  comments(room, o = {}) {
+    const a = o.anchor || (o.nodeId ? { kind: 'node', node_id: o.nodeId } : null);
+    const q = new URLSearchParams({ limit: '100', ...(a ? Object.fromEntries(Object.entries({ anchor_kind: a.kind, node_id: a.node_id, edge_type: a.edge_type, from_id: a.from_id, to_id: a.to_id }).filter(([, v]) => v)) : {}) });
+    return this.call('GET', `/rooms/${encodeURIComponent(room)}/comments?${q}`);
+  }
+  addComment(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/comments`, body); }
+  editComment(room, id, text, revision) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/comments/${encodeURIComponent(id)}/edit`, { text, expected_revision: revision }); }
+  retractComment(room, id, revision) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/comments/${encodeURIComponent(id)}/retract`, { expected_revision: revision }); }
+  commentHistory(room, id) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/comments/${encodeURIComponent(id)}/history`); }
+  steeringTarget(room, nodeId) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/steering/target?${new URLSearchParams({ node_id: nodeId })}`); }
+  steeringList(room, nodeId) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/steering${nodeId ? `?${new URLSearchParams({ node_id: nodeId })}` : ''}`); }
+  proposeSteering(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/steering`, body); }
+  confirmSteering(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/steering/${encodeURIComponent(id)}/confirm`, body); }
+  rejectSteering(room, id, reason) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/steering/${encodeURIComponent(id)}/reject`, reason ? { reason } : {}); }
   linkAgent(agentId, instanceId) { return this.call('POST', `/agents/${encodeURIComponent(agentId)}/link`, { instance_id: instanceId || null }); }
   createJoinToken(body) { return this.call('POST', '/agents/join-tokens', body); }
   joinTokens() { return this.call('GET', '/agents/join-tokens'); }

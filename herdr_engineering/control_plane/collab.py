@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 from . import collab_delegation as dlg
 from . import collab_external as ext
 from . import collab_models, ids
+from .collab_workbench import WorkbenchMixin
 from .redact import redact_text
 
 SCHEMA_VERSION = 1
@@ -297,7 +298,7 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService:
+class CollabService(WorkbenchMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -411,6 +412,7 @@ class CollabService:
         self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
         self._msg_room: dict[str, str] = {}                  # message event id -> room id
         self.stats = defaultdict(int)
+        self._init_workbench()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -526,6 +528,8 @@ class CollabService:
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
+        if self._apply_workbench(ev):
+            return
         if t == "external_usage_reserved":
             k = (p["scope"], p["key"])
             self._usage_reserved[k] = max(self._usage_reserved[k], int(p["reserved"]))
@@ -4909,6 +4913,14 @@ class CollabService:
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
+                    if parts[2:] == ["comments"]:
+                        return 200, self.list_comments(pr, rid, query)
+                    if n == 5 and parts[2] == "comments" and parts[4] == "history":
+                        return 200, self.comment_history(pr, rid, parts[3])
+                    if parts[2:] == ["steering"]:
+                        return 200, self.list_steering(pr, rid, query)
+                    if parts[2:] == ["steering", "target"]:
+                        return 200, self.steering_target(pr, rid, str(query.get("node_id", "")))
                     if parts[2:] == ["delegations"]:
                         return 200, self.list_delegations(pr, rid)
                     if parts[2:] == ["proposals"]:
@@ -5057,6 +5069,16 @@ class CollabService:
                         return 200, self.unlink_mission(pr, rid, parts[3])
                     if parts[2:] == ["tasks"]:
                         return 201, self.create_task(pr, rid, body)
+                    if parts[2:] == ["comments"]:
+                        return self.add_comment(pr, rid, body)
+                    if n == 5 and parts[2] == "comments" and parts[4] in ("edit", "retract"):
+                        return 200, self.revise_comment(pr, rid, parts[3], parts[4], body)
+                    if parts[2:] == ["steering"]:
+                        return self.propose_steering(pr, rid, body)
+                    if n == 5 and parts[2] == "steering" and parts[4] == "confirm":
+                        return 200, self.confirm_steering(pr, rid, parts[3], body)
+                    if n == 5 and parts[2] == "steering" and parts[4] == "reject":
+                        return 200, self.reject_steering(pr, rid, parts[3], body)
                     if parts[2:] == ["delegations"]:
                         return 201, self.create_delegation(pr, rid, body)
                     if n == 5 and parts[2] == "proposals" and parts[4] == "decide":
@@ -5067,13 +5089,12 @@ class CollabService:
                         return self.post_message(pr, rid, body)
             raise CollabError(404, "not found")
         except CollabError as exc:
-            err = {"error": exc.message}
+            err = {"error": exc.message, **getattr(exc, "extra", {})}
             if exc.reason:
                 err["reason"] = exc.reason
             if exc.code:
                 err["code"] = exc.code
             return exc.status, err
-
 
 CATALOGUE_MAX = 500
 

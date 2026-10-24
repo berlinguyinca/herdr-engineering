@@ -7,7 +7,8 @@
 //  * nothing is encoded by colour alone: node types differ by shape, edge types by dash pattern and a text tag,
 //    states by a glyph and a word, Gantt states by a fill pattern and a label; every view also has a table;
 //  * every id, label and value is data: it reaches the page only through esc() (text and attributes alike);
-//  * there is no terminal, no command and no write here. Fork/steer/comment arrive in later tasks.
+//  * there is no terminal and no command here. Comments and steering (collab-workbench.js) are drawn beside the
+//    inspector; they are written only through the server's checked routes.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
 export const MAX_RENDER_NODES = 300;       // beyond this the SVG is skipped and the table is the view
@@ -329,6 +330,10 @@ export function focusKey(el) {
   if (attr(el, 'data-more') !== null) return 'more:';
   if (attr(el, 'data-retry') !== null) return 'retry:';
   if (f !== null) return (f === 'type' || f === 'etype') ? `filter:${f}:${attr(el, 'value')}` : `filter:${f}:`;
+  const wf = attr(el, 'data-wb-field');
+  if (wf !== null) return wf === 'action' ? `wbf:action:${attr(el, 'value')}` : `wbf:${wf}:`;
+  const wa = attr(el, 'data-wb-act');
+  if (wa !== null) return `wba:${wa}:${attr(el, 'data-wb-id') || ''}`;
   return null;
 }
 export function focusSelector(key) {
@@ -344,6 +349,8 @@ export function focusSelector(key) {
     case 'more': return '[data-more]';
     case 'retry': return '[data-retry]';
     case 'filter': { const [name, ...val] = rest; return val.join(':') ? `[data-filter="${q(name)}"][value="${q(val.join(':'))}"]` : `[data-filter="${q(name)}"]`; }
+    case 'wbf': { const [name, ...val] = rest; return val.join(':') ? `[data-wb-field="${q(name)}"][value="${q(val.join(':'))}"]` : `[data-wb-field="${q(name)}"]`; }
+    case 'wba': { const [act, ...id] = rest; return id.join(':') ? `[data-wb-act="${q(act)}"][data-wb-id="${q(id.join(':'))}"]` : `[data-wb-act="${q(act)}"]`; }
     default: return null;
   }
 }
@@ -504,7 +511,8 @@ export function renderInspector(graph, id, tl = null) {
     const other = dir === 'out' ? e.to_id : e.from_id;
     const o = graph.nodes.find((x) => x.id === other);
     return `<li><span class="hd-ident">${esc(EDGE_STYLE[e.edge_type].tag)}</span> <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-node="${esc(other)}">${esc(text(o && o.label, idTail(other)))}</button>`
-      + `${bindingText(e.binding) ? ` <code>${esc(bindingText(e.binding))}</code>` : ''}${e.stale ? ' <strong>stale</strong>' : ''}${e.writer ? ` <span class="cx-msg">by ${esc(e.writer)}</span>` : ''}</li>`;
+      + `${bindingText(e.binding) ? ` <code>${esc(bindingText(e.binding))}</code>` : ''}${e.stale ? ' <strong>stale</strong>' : ''}${e.writer ? ` <span class="cx-msg">by ${esc(e.writer)}</span>` : ''}`
+      + ` <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-wb-act="edge" data-wb-edge-type="${esc(e.edge_type)}" data-wb-from="${esc(e.from_id)}" data-wb-to="${esc(e.to_id)}" aria-label="Discuss the ${esc(EDGE_STYLE[e.edge_type].tag)} link between ${esc(e.from_id)} and ${esc(e.to_id)}">Discuss</button></li>`;
   }).join('');
   const lane = tl && (tl.lanes || []).find((l) => l.node_id === id);
   const history = lane && lane.spans.length ? `<h4>State history</h4><ol class="cx-list">${lane.spans.map((s) => `<li><span>${esc(stateLook(s.state).glyph)} ${esc(s.state)}${s.open ? ' (ongoing)' : ''}</span><time datetime="${esc(s.start)}">${esc(s.start)}</time></li>`).join('')}</ol>` : '';
@@ -518,7 +526,7 @@ export function renderInspector(graph, id, tl = null) {
     + `${attrs.length ? `<h4>Attributes</h4><dl class="lin-dl">${attrs.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(shown(v))}</dd>`).join('')}</dl>` : ''}`
     + `<h4>Links out</h4>${links('out') ? `<ul class="cx-list">${links('out')}</ul>` : '<p class="cx-msg">None.</p>'}`
     + `<h4>Links in</h4>${links('in') ? `<ul class="cx-list">${links('in')}</ul>` : '<p class="cx-msg">None.</p>'}`
-    + `${history}<p class="cx-msg">Read-only. This page offers no terminal and no commands.</p></section>`;
+    + `${history}<p class="cx-msg">This page offers no terminal and no commands. Discussion and steering requests are below.</p></section>`;
 }
 
 // ---- whole panel -------------------------------------------------------------------------------------------------
@@ -547,5 +555,5 @@ export function renderLineage(m) {
     + `<div class="lin-grid2"><div class="cx-stack">${renderFilters(a, m.filters)}`
     + `<div role="tablist" aria-label="Lineage views" class="cx-stabs">${tab('graph', 'Graph')}${tab('gantt', 'Gantt')}</div>`
     + `<div role="tabpanel" aria-label="${m.view === 'gantt' ? 'Gantt' : 'Graph'}" class="cx-stack">${body}</div></div>`
-    + `<aside class="cx-stack" aria-label="Inspector" aria-live="polite">${renderInspector(a, m.sel, m.timeline)}</aside></div>`;
+    + `<aside class="cx-stack" aria-label="Inspector" aria-live="polite">${renderInspector(a, m.sel, m.timeline)}${m.workbench || ''}</aside></div>`;
 }

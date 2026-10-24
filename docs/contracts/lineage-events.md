@@ -507,3 +507,123 @@ Every id, label, attribute and reason is escaped for text and attribute contexts
 ### T09 rollout and rollback
 Code only, no migration: deploy the server, then the web files (`collab-lineage.js` is in the static map in `api.py`). Rollback:
 revert the PR; stored events are untouched and the T08 page is unchanged (a web-only rollback removes the Lineage tab).
+
+## Comments and steering (T12)
+Discussion on graph nodes and edges, and explicit, two-step requests to change what a running attempt does. Both extend the
+HCN service (`herdr_engineering/control_plane/collab_workbench.py`, mixed into `CollabService`) and the T09 inspector
+(`packages/collab-workbench.js`, wired in `collab-view.js`). **No new service, event store or table, no migration:** every
+change is an immutable collab event in the same durable log, applied deterministically (epochs are stored in the event; the
+clock is never read inside `_apply`), so a restart rebuilds the same state. Lineage-owner delivery uses the existing keyed
+API. Neither feature exists in `collab_only` mode (no graph there): the routes answer 404.
+
+### Comments (discussion only)
+- `POST /api/v1/collab/rooms/{room}/comments {anchor, text, idempotency_key}`; anchor is `{"kind":"node","node_id"}` or
+  `{"kind":"edge","edge_type","from_id","to_id"}`. `GET .../comments[?anchor_kind=node&node_id=|edge_type=&from_id=&to_id=&limit=&before=]`,
+  `POST .../comments/{id}/edit {text, expected_revision}`, `POST .../comments/{id}/retract {expected_revision}`,
+  `GET .../comments/{id}/history`.
+- **Scope.** Room-scoped. Writing needs a signed-in, non-guest, approved member with the `post` right; reading needs the `read`
+  right and graph access (`CollabService.graph_access`, T08). Agents, guests, viewers-for-writing and non-members get 403/404.
+  The anchor is checked with the graph principal NARROWED to that one room (`rooms`, `room_ws`, `room_missions` of this room only),
+  so a node visible only through room B (or another mission) cannot be commented on from room A. Hidden and missing anchors are
+  the same 404. **The check is repeated at read time for every comment**: if the anchor later narrows or the member loses access,
+  the comment text disappears with it (it would otherwise be a side channel for the hidden node).
+- **Immutable history.** An edit or retract appends a revision (`comment_revised`); nothing is overwritten. `expected_revision`
+  prevents lost updates (409 `stale_revision`). Only the author edits; the author or a room owner retracts (an owner's
+  removal is `moderated`: its history text is withheld from everyone but the owners and the author). Up to
+  `max_comment_revisions` (10) revisions.
+- **Bounds.** Text 1..`max_comment_chars` (2000), 30 new comments or revisions per person per 10 minutes (150 per room),
+  200 comments per anchor, 5000 per room, 10 revisions per comment; idempotent by `(principal, room, key)`.
+- **Untrusted.** Text is stored redacted, with C0/C1 controls, bidi overrides/isolates, zero-width characters and
+  U+2028/2029 removed (they can paint a fake "system" line or reverse a name). Responses carry `kind: "comment"`, `trust: "untrusted"`
+  and a server-set `author`. The page renders text only through `esc()`. **Comments never enter the room feed**
+  (`_FEED_TYPES`), so `room_read`, MCP, A2A and guests cannot see them, and **no comment is ever delivered to an agent**. The audit
+  trail records `comment.add/edit/retract` but not the text.
+
+### Steering (explicit, typed, two-step)
+Closed set of actions: `pause`, `resume`, `stop_after_step`, `redirect` (the only one with free text, `instruction` <= 1000 chars),
+`approve`, `reject`. There is no command, shell, argv or terminal field anywhere; unknown fields are 400.
+- **Targets.** Control actions: `attempt`, `agent`, `task` or `mission` nodes. `approve`/`reject`: `gate` nodes only, and only with
+  `expected_digest` equal to a digest/commit the gate carries. **`plan` and `review` nodes are refused: plan decisions belong to
+  Plannotator** and steering must not stand in for a Plannotator receipt. Commons nodes (`pr`, `commit`, ...) have no single
+  owner and cannot be steered. A terminal-state target is refused.
+- **Step 1, propose** `POST .../rooms/{room}/steering {action, node_id, expected_fence, [instruction|expected_digest], [reason], idempotency_key}`:
+  a signed-in person with the room's `task` right (owner/contributor). `GET .../steering/target?node_id=` returns the current
+  `fence`, eligible actions, the pinned source and whether you may propose/confirm. The proposal is a `steer_proposed` event.
+- **Step 2, confirm** `POST .../steering/{id}/confirm {digest, expected_fence}`: a member whose role is in `confirm_roles`
+  (default `owner`). The proposer cannot confirm their own request unless the operator sets `self_confirm: true` (a single-owner
+  room therefore needs a contributor to propose, or that explicit opt-in). The digest binds the confirmation to the exact stored
+  proposal. Confirmation is single use and idempotent (a replay returns the same record, no second event). `.../reject` withdraws
+  (proposer) or declines (confirmer) and still works while steering is switched off.
+- **Fence.** `fence = sha256(node id, type, state, last_event_id, superseded, owner, fencing_token/plan_digest/commit/head_sha/attempt_id)`.
+  A target is **superseded** when a live visible `supersession` edge points at it (new -> old). The fence is checked at proposal
+  (the client's `expected_fence`), at confirmation (and against the confirmer's own fresh read) and again at delivery. A mismatch
+  closes the request as `fenced` (409 `stale_fence`); a superseded or finished attempt is 409 `stale_target`. Any change to the
+  target node's state or attributes after the human saw it therefore cancels the request: propose again. Costs: a target that
+  updates attributes often will fence often.
+- **Delivery.** To the graph principal that CREATED the target node (the ingest key/actor that reported it): that is the "target
+  agent" as far as Herdr can know. `GET /api/v1/steering/pending` (any valid API key; returns only requests pinned to the caller's
+  key digest) and `POST /api/v1/steering/{id}/ack {outcome: applied|refused|unsupported|stale, note}` (ingest keys may make only this
+  one extra POST). Not an HCN agent credential: agents never receive or send steering through MCP/A2A. Each item carries
+  `steering_id` (the idempotency key: apply once), `trust: "untrusted"`, `provenance`, `proposed_by`, `confirmed_by`, the room, the
+  target and fence, `valid_until_epoch`, and a fixed notice telling the receiver the free text is untrusted instruction text from a
+  named person, never authority to run commands, and to answer `unsupported` rather than fake an action. At fetch time Herdr re-checks
+  that steering is still on, the proposer still holds `task`, the confirmer still holds a confirming role, the room still exists and
+  the fence still matches; otherwise the request is closed (`rejected`/`fenced`) and not delivered. A request is re-offered until
+  acked at most 5 times and for `delivery_ttl_seconds` (300); an unconfirmed proposal lives `proposal_ttl_seconds` (900).
+- **Replay.** Terminal states (`acked`, `rejected`, `withdrawn`, `fenced`) are never delivered again; a confirmed id is never
+  re-confirmed; an ack with a different outcome after the first is 409; re-adding a removed proposer does not revive anything.
+- **Flood.** 10 proposals per person per 10 minutes (50 per room), at most 3 open per target and 50 per room, 30 confirmations per
+  10 minutes, 2000 requests of history per room, 600 polls and 600 acks per key per minute.
+- **Audit.** `steer.propose/confirm/deliver/ack/rejected/withdrawn/fenced` appear in the project audit with actor and outcome,
+  without free text.
+
+### Operator YAML (no flags, no environment variables)
+```yaml
+control_plane:
+  collab:
+    steering:
+      enabled: false          # default: OFF. Comments follow this switch (and kill_switch) unless comments_enabled is set.
+      kill_switch: false      # true stops proposal, confirmation and delivery at once
+      actions: [pause, resume, stop_after_step, redirect, approve, reject]
+      confirm_roles: [owner]  # owner and/or contributor
+      self_confirm: false     # true lets a proposer confirm their own request
+      proposal_ttl_seconds: 900
+      delivery_ttl_seconds: 300
+```
+Other keys: `max_instruction_chars`, `propose_per_10min`, `confirm_per_10min`, `max_open_per_target`, `max_open_per_room`,
+`comments_enabled` (unset: comments follow `enabled` and `kill_switch`; an explicit true or false decides alone; retract and moderate always work), `comments_per_10min`, `max_comment_chars`, `max_comment_revisions`. Unknown keys or wrong types stop startup
+(and the rendered collab slice). When a fleet config file is in use the service re-reads this section on every request, so editing
+`kill_switch: true` takes effect without a restart; an unreadable or invalid section fails CLOSED (steering and comments off).
+
+### Threat model (what was considered)
+| threat | answer |
+|---|---|
+| cross-room comment injection / reading | anchor checked with a one-room principal at write and at every read; non-members and other rooms get one 404 |
+| guest or agent steering / commenting | user principals only; agents 403, guests/non-members 404; viewers cannot write |
+| unauthenticated steering | HCN routes need a verified token; the delivery routes need an API key and return only requests pinned to that key |
+| one person proposing and confirming | proposer != confirmer unless the operator opts in; confirm needs the owner role |
+| replay of a confirmed request | single-use confirm, terminal states never delivered, `steering_id` is the receiver's idempotency key |
+| steering after revocation | membership/role/approval re-checked at fetch; re-adding a person revives nothing; kill switch re-read per request |
+| stale head / superseded attempt | three fence checks; `supersession` edges and terminal states refuse |
+| comment text spoofing a system message | server-set `author`/`kind`, spoofing characters stripped, never in the feed, never delivered |
+| shell / terminal injection | closed action set, one bounded untrusted text field, no route to a terminal; Pi maps actions to its own typed primitives |
+| flood / log exhaustion | per-person, per-room, per-anchor, per-target caps; the shared 200k log cap is still the hard limit |
+| squatting a target id | known T02 limitation: delivery goes to whoever created the node first; the confirmer sees `pinned_source` |
+
+### Limitations
+- Delivery is **pull**, to the source that reported the node. Pi must poll; Herdr does not push into a host.
+- "The target agent" is the node's creating ingest principal, not an HCN agent identity. Two agents sharing one ingest key
+  share steering. An id squatter who created `attempt:x` first receives steering for it (T02 limitation, shown as `pinned_source`).
+- The fence includes `last_event_id`, so any state/attribute update fences pending requests.
+- Approve/reject are generic gate requests; the receiving system decides what a gate is. They never replace Plannotator.
+- Only the combined server has a graph: the dashboard proxy to an isolated `collab_only` process answers 404 for comments and steering.
+- No visual-regression suite exists; the UI is covered by unit tests and a Playwright run against a mocked API.
+- The UI for links (edges) offers comments only (steering targets are nodes).
+
+### Review follow-ups (T12)
+- Retract and moderate are exempt from `max_comment_revisions` and from the comment rate limit; only edits count.
+- Only OPEN steering requests count toward the per-room cap; closed ones are history. Retracted comments do not count toward the room or item comment caps (an owner can always free room by removing comments).
+- `POST /api/v1/steering/<id>/ack` answers 410 (`expired`) once the delivery window has closed.
+- Every offer, redeliveries included, is a `steer_delivered` audit event with its `delivery` number; the counter is rebuilt from those events on restart.
+- `GET /api/v1/steering/pending?instance_id=<id>`: when the target node carries an `instance_id` attribute, only a caller presenting that id is offered the request, so two Pi instances sharing one key do not consume each other's requests. Nodes without the attribute keep key-only pinning.
+- The steering routes refuse (403, `authentication_required`) on an open listener, which has no principal to pin to.

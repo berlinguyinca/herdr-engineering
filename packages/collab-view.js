@@ -9,6 +9,7 @@ import { decisionBody, delegationBody, renderDelegations, renderProposalList, re
 import {
   filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
 } from './collab-lineage.js';
+import { commentBody, freshDraft, proposalBody, renderWorkbench } from './collab-workbench.js';
 import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
@@ -923,6 +924,12 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
 
     // ---- Lineage: graph, Gantt, replay and inspector. Read-only; the server filters every read by your CURRENT
     // membership. Live = the head of your ledger (refreshed while open); a replay position is static.
+    // Comments and steering for the selected node (collab-workbench.js). The server checks every one of these again.
+    const WB = { at: 0, edge: null, nodeId: null, comments: [], target: null, steers: [], error: null, steerError: null, notice: null, draft: freshDraft(),
+      editing: null, history: null, confirming: null, busy: false, seq: 0 };
+    const wbModel = () => ({ ...WB, me: me.user_id, isOwner: info.role === 'owner',
+      writable: canPost && (LIN.step === null || !!(LIN.asOf && LIN.asOf.head)),
+      readOnlyReason: canPost ? 'A replay shows a past state. Choose Live to comment or propose a change.' : 'Your role in this room is read only.' });
     const LIN = { step: null, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, pages: [], total: 0, next: null,
       truncated: null, asOf: null, timeline: null, error: null, timelineError: null, html: '', pending: null, fails: 0, notice: null, busy: false, at: 0, seq: 0, bound: false, layout: null,
       filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' } };
@@ -931,8 +938,76 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       const filtered = filterGraph(graphAll, LIN.filters);
       return { graphAll, filtered, asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, queued: LIN.pending !== null, notice: LIN.notice, busy: LIN.busy, view: LIN.view,
         mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, total: LIN.total,
+        workbench: LIN.sel ? renderWorkbench(wbModel()) : '',
         graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
     };
+    async function loadWorkbench(keep = false) {
+      const node = LIN.sel;
+      if (!node) { WB.nodeId = null; return; }
+      const my = ++WB.seq;
+      WB.nodeId = node; WB.at = Date.now();
+      const [c, t, st] = await Promise.allSettled([api.comments(roomId, { anchor: WB.edge ? { kind: 'edge', ...WB.edge } : { kind: 'node', node_id: node } }), api.steeringTarget(roomId, node), api.steeringList(roomId, node)]);
+      if (my !== WB.seq || !alive || LIN.sel !== node) return;
+      WB.comments = c.status === 'fulfilled' && Array.isArray(c.value.comments) ? c.value.comments : [];
+      if (c.status === 'rejected') WB.error = 'Comments could not be loaded for this item.'; else if (!keep) WB.error = null;
+      WB.target = t.status === 'fulfilled' && t.value && typeof t.value.fence === 'string' ? t.value : null;
+      WB.steers = st.status === 'fulfilled' && Array.isArray(st.value.steering) ? st.value.steering : [];
+      if (t.status === 'rejected') WB.steerError = 'Steering details could not be loaded for this item.'; else if (!keep) WB.steerError = null;
+      drawLineage(true);
+    }
+    function pickNode(id) {
+      LIN.sel = id; LIN.focus = id;
+      if (!id) { WB.nodeId = null; WB.seq += 1; return; }
+      if (WB.nodeId !== id) {
+        Object.assign(WB, { nodeId: id, edge: null, comments: [], target: null, steers: [], error: null, steerError: null, notice: null, editing: null, history: null, confirming: null, draft: freshDraft() });
+        loadWorkbench();
+      }
+    }
+    const wbWhy = (e, fallback) => (e instanceof AuthError ? 'Your session expired. Sign in again.' : e && e.code === 'stale_fence' ? 'That item changed since you read it. It was reloaded: check it and try again.' : (e && e.message) || fallback);
+    async function wbRun(fn, { steer = false, done = null } = {}) {
+      WB.busy = true; WB.error = null; WB.steerError = null; WB.notice = null; drawLineage(true);
+      try { await fn(); if (done) WB.notice = done; } catch (e) {
+        if (steer) WB.steerError = wbWhy(e, 'The request failed.'); else WB.error = wbWhy(e, 'The request failed.');
+      } finally { WB.busy = false; }
+      await loadWorkbench(true);                                      // refresh the lists but keep the message just shown
+    }
+    const wbKey = () => `web-wb-${Date.now().toString(36)}-${randomString(9)}`;
+    function wbAct(act, id) {
+      const c = WB.comments.find((x) => x.comment_id === id);
+      const s = WB.steers.find((x) => x.steering_id === id);
+      if (act === 'edge-clear') { WB.edge = null; WB.editing = null; WB.history = null; loadWorkbench(); return; }
+      if (act === 'edit' && c) { WB.editing = { id, text: c.text || '' }; drawLineage(true); }
+      else if (act === 'edit-cancel') { WB.editing = null; drawLineage(true); }
+      else if (act === 'retract' && c) wbRun(() => api.retractComment(roomId, id, c.revision), { done: 'Comment retracted. Its history is kept.' });
+      else if (act === 'history' && c) {
+        if (WB.history && WB.history.id === id) { WB.history = null; drawLineage(true); return; }
+        api.commentHistory(roomId, id).then((h) => { WB.history = { id, items: h.comment.history }; drawLineage(true); }).catch((e) => { WB.error = wbWhy(e, 'History could not be loaded.'); drawLineage(true); });
+      } else if (act === 'confirm' && s) { WB.confirming = id; WB.steerError = null; drawLineage(true); }
+      else if (act === 'confirm-cancel') { WB.confirming = null; drawLineage(true); }
+      else if (act === 'confirm-go' && s) {
+        wbRun(async () => {
+          const fresh = await api.steeringTarget(roomId, s.target.node_id);      // confirm only against what you can see NOW
+          if (fresh.fence !== s.target.fence) { const err = new Error('The target changed after this was proposed, so nothing was sent. Ask for a new proposal.'); err.code = 'stale_fence'; throw err; }
+          await api.confirmSteering(roomId, id, { digest: s.digest, expected_fence: fresh.fence });
+          WB.confirming = null;
+        }, { steer: true, done: 'Confirmed. It is delivered once, to the source that reported this item.' });
+      } else if (act === 'reject' && s) wbRun(() => api.rejectSteering(roomId, id), { steer: true, done: 'Request closed.' });
+    }
+    function wbSubmit(kind, id, form) {
+      const node = WB.nodeId;
+      if (!node) return;
+      if (kind === 'comment') {
+        const t = String(form.get('text') || '').trim();
+        if (t) wbRun(async () => { await api.addComment(roomId, commentBody(WB.edge ? { kind: 'edge', ...WB.edge } : { kind: 'node', node_id: node }, t, wbKey())); WB.draft.comment = ''; }, { done: 'Comment posted.' });
+      } else if (kind === 'edit' && WB.editing) {
+        const c = WB.comments.find((x) => x.comment_id === id);
+        const t = String(form.get('text') || '').trim();
+        if (c && t) wbRun(async () => { await api.editComment(roomId, id, t, c.revision); WB.editing = null; }, { done: 'Comment updated. The earlier text stays in its history.' });
+      } else if (kind === 'propose' && WB.target) {
+        wbRun(async () => { await api.proposeSteering(roomId, proposalBody(node, WB.draft, WB.target, wbKey())); WB.draft = freshDraft(); },
+          { steer: true, done: 'Proposed. A room owner must confirm it before anything is sent.' });
+      }
+    }
     const linFail = (e) => (/failed|404|not found/i.test(String(e && e.message)) ? 'No lineage is available for this room.' : 'Could not load the lineage. Press Retry, or choose Live.');
     async function loadLineage(more = false) {
       const my = ++LIN.seq;
@@ -967,6 +1042,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (next) { LIN.step = next.step; LIN.notice = null; loadLineage(); return; }   // the latest choice made while busy
       drawLineage(true);
       if (again) loadLineage();
+      else if (LIN.sel && !WB.busy && !WB.editing && !WB.confirming && Date.now() - WB.at > 7000) loadWorkbench();   // keep the side panel as fresh as the graph
     }
     function drawLineage(force = false) {
       const box = $('hcn-lineage');
@@ -985,7 +1061,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       LIN.html = html; box.innerHTML = html;
       const sel = key && focusSelector(key);
       const el = sel && box.querySelector(sel);
-      if (el) { el.focus({ preventScroll: true }); if (pos !== null && el.setSelectionRange && el.type === 'search') try { el.setSelectionRange(pos, pos); } catch { /* not selectable */ } }
+      if (el) { el.focus({ preventScroll: true }); if (pos !== null && el.setSelectionRange && (el.type === 'search' || el.type === 'textarea' || el.type === 'text')) try { el.setSelectionRange(pos, pos); } catch { /* not selectable */ } }
     }
     function bindLineage(box) {
       LIN.bound = true;
@@ -996,8 +1072,15 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         LIN.step = step; LIN.notice = null; LIN.error = null; if (step === null) LIN.pages = []; loadLineage();
       };
       box.addEventListener('click', (e) => {
+        const wb = e.target.closest('[data-wb-act]');
+        if (wb && wb.dataset.wbAct === 'edge') {
+          WB.edge = { edge_type: wb.dataset.wbEdgeType, from_id: wb.dataset.wbFrom, to_id: wb.dataset.wbTo };
+          WB.editing = null; WB.history = null; loadWorkbench();
+          return;
+        }
+        if (wb) { wbAct(wb.dataset.wbAct, wb.dataset.wbId); return; }
         const n = e.target.closest('[data-node]');
-        if (n) { LIN.sel = n.dataset.node; LIN.focus = n.dataset.node; drawLineage(true); return; }
+        if (n) { pickNode(n.dataset.node); drawLineage(true); return; }
         const r = e.target.closest('[data-replay]');
         if (e.target.closest('[data-retry]')) { loadLineage(); return; }
         if (r && r.dataset.replay !== 'slider') { goStep(replayTarget(LIN.asOf, r.dataset.replay)); return; }
@@ -1007,8 +1090,18 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         if (md) { LIN.mode = md.dataset.mode; drawLineage(true); return; }
         if (e.target.closest('[data-more]') && !LIN.busy) loadLineage(true);
       });
-      box.addEventListener('submit', (e) => { e.preventDefault(); });      // Enter in the search box filters; it never navigates
+      box.addEventListener('submit', (e) => {
+        e.preventDefault();                                              // Enter in the search box filters; it never navigates
+        const f = e.target.closest && e.target.closest('[data-wb-form]');
+        if (f && !WB.busy) wbSubmit(f.dataset.wbForm, f.dataset.wbId, new FormData(f));
+      });
       box.addEventListener('input', (e) => {
+        const wf = e.target.dataset.wbField;
+        if (wf) {                                                       // drafts live in memory so a refresh never eats typing
+          if (wf === 'edit' && WB.editing) WB.editing.text = e.target.value;
+          else if (wf in WB.draft) WB.draft[wf] = e.target.value;
+          return;
+        }
         const f = e.target.dataset.filter;
         if (f === 'q') { LIN.filters.q = e.target.value; drawLineage(true); }
         else if (e.target.dataset.replay === 'slider') {
@@ -1018,6 +1111,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       });
       box.addEventListener('change', (e) => {
         const t = e.target;
+        if (t.dataset.wbField === 'action') { WB.draft.action = t.value; drawLineage(true); return; }
         if (t.dataset.replay === 'slider') { clearTimeout(slide); const v = t.value; slide = setTimeout(() => goStep(replayTarget(LIN.asOf, 'slider', v)), 150); return; }
         if (t.dataset.clock !== undefined) { LIN.clock = t.value; drawLineage(true); return; }
         const f = t.dataset.filter;
@@ -1030,8 +1124,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       box.addEventListener('keydown', (e) => {
         const n = e.target.closest && e.target.closest('g[data-node]');
         if (n) {
-          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); LIN.sel = n.dataset.node; LIN.focus = n.dataset.node; drawLineage(true); return; }
-          if (e.key === 'Escape') { LIN.sel = null; drawLineage(true); return; }
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pickNode(n.dataset.node); drawLineage(true); return; }
+          if (e.key === 'Escape') { pickNode(null); drawLineage(true); return; }
           const to = LIN.layout && nextNode(LIN.layout, n.dataset.node, e.key);
           if (to) { e.preventDefault(); LIN.focus = to; drawLineage(true); box.querySelector(`g[data-node="${CSS.escape(to)}"]`)?.focus(); }
           return;

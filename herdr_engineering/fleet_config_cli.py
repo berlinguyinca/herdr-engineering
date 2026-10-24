@@ -182,7 +182,7 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
 # so an unknown key (which could be a secret) is refused rather than passed along.
 COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
                          "cognito_domain", "public_url", "operator_user", "operator_email",
-                         "open_signup", "approver_groups", "dashboard_hosts", "replay_history",
+                         "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled"})
 
@@ -213,6 +213,11 @@ def collab_values(cfg: FleetConfig) -> dict:
     history = collab.get("replay_history", "since_join")
     if history not in ("full", "since_join"):
         raise FleetConfigError("control_plane.collab.replay_history must be 'full' or 'since_join'")
+    from .control_plane.collab_workbench import normalize_steering
+    try:
+        normalize_steering(collab.get("steering"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
     from .control_plane.collab import summary_fix_config
     try:
         summary_fix_config(collab.get("summary_fix"))

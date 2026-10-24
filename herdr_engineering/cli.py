@@ -2536,6 +2536,15 @@ def _cmd_cp_web(args) -> int:
         if history not in ("full", "since_join"):
             raise SystemExit("control_plane.collab.replay_history must be 'full' or 'since_join'")
         collab.replay_history = history
+        # T12: comments and steering. Settings are YAML only (no flag or env), and when a fleet file is in use the
+        # service re-reads them per request, so editing `kill_switch: true` takes effect without a restart.
+        from .control_plane.collab_workbench import normalize_steering
+        collab.steering = normalize_steering(getattr(args, "collab_steering", None))
+        if fleet_store is not None:
+            def _steering_from_yaml(_store=fleet_store):
+                section = _store.current().section("control_plane")
+                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("steering")
+            collab.steering_source = _steering_from_yaml
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
@@ -2616,6 +2625,7 @@ COLLAB_CONFIG_KEYS = {
     # T11 kill switch: bounded task delegation + artifact proposals. Default false = the feature does not exist.
     "delegation_enabled": ("collab_delegation_enabled", bool),
     "replay_history": ("collab_replay_history", str),     # lineage replay: since_join (default) | full
+    "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
 }
@@ -2633,7 +2643,7 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
-        if kind is dict:
+        if kind is dict and key == "summary_fix":
             from .control_plane.collab import summary_fix_config
             try:
                 setattr(args, dest, summary_fix_config(value))
@@ -2647,6 +2657,13 @@ def _apply_collab_config(args, cp) -> None:
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be a list of strings")
             if not getattr(args, dest):
                 setattr(args, dest, list(value))
+        elif kind is dict:
+            from .control_plane.collab_workbench import normalize_steering
+            try:
+                normalize_steering(value)
+            except ValueError as exc:
+                raise SystemExit(f"fleet config {exc}") from None
+            setattr(args, dest, dict(value))
         elif kind is bool:
             if not isinstance(value, bool):
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be true or false")
