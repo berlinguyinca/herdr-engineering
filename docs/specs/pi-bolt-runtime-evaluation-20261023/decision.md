@@ -1,7 +1,7 @@
 # Decision — Pi-Bolt as an execution runtime for Pi Engineering agents (2026-10-23)
 
 **Recommendation: NO-GO as default or broad rollout. Keep standard Pi as the default everywhere.**
-**Optional, only after explicit human approval: a narrow canary for extension-free helper agents (see "What could be approved").**
+**PB-014 (canary): declined 2026-10-23 ("keep standard Pi"). A narrow canary for extension-free helper agents remains possible later, only after explicit human approval (see "What could be approved").**
 No production default or canary has been changed or enabled. PB-014 is not started and needs your approval.
 
 ## What was measured (actual data, not vendor claims)
