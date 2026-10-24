@@ -14,3 +14,9 @@ Isolated per-runtime request attribution (beast, own key, 2026-10-23): the per-m
 isolates my traffic. 5 Pi-Bolt requests -> model row +5; 5 standard Pi 1.4.0 requests -> +5 more. Every run got the same gateway 404 ("Model qwen3.8-text is not served here",
 non-retryable); neither runtime retried or double-sent. So the gateway counts one request per Pi-Bolt call exactly as for standard Pi, and both handle the error the same way.
 Limit: the model is not served, so prompt/completion tokens read 0; token-level attribution would need an idle SERVED model. The busy served models cannot be isolated.
+
+User-agent check (source read, 2026-10-23): searched the Rust gateway (inferweave repo, crates/, commit 83ff68aa) and the Go gateway checkout for any use of the User-Agent header.
+Every hit is the gateway or relay SETTING its own outbound User-Agent (inferweave-relay, inferweave-weight-fetch, identity http client). Nothing reads an inbound
+User-Agent for limits, priority, affinity or attribution. Inbound identity headers it does read: x-inferweave-admin, x-inferweave-runtime, x-inferweave-node.
+Pi-Bolt sends neither of those. So the bun user-agent does not affect the gateway as built from this source. Caveat: this is the source checkout, not proof of the
+exact deployed binary; an nginx or other front in front of the gateway could still key on it (not visible here).
