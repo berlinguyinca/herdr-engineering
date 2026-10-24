@@ -91,6 +91,9 @@ SECRET_SHAPES = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{
 LOOSE_OBJECT = re.compile(r"[0-9a-f]{2}/[0-9a-f]{38,62}\Z")
 PACK_FILE = re.compile(r"pack/pack-[0-9a-f]{40,64}\.(?:pack|idx)\Z")
 HEX_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+SAFE_ID = re.compile(r"[A-Za-z0-9_-]{4,64}")
+SESSION_FILE = re.compile(r"[0-9A-Za-z:._-]{1,100}\.jsonl")   # Pi's <timestamp>_<uuid>.jsonl
+TRANSCRIPT_MAX_BYTES = 20_000_000
 PI_ISOLATION = "--no-extensions --no-skills --no-prompt-templates --no-context-files"
 INSTRUCTIONS = (
     "You are a throwaway CI fix agent in a sandbox. The failing repository is checked out in ./repo at the exact "
@@ -465,12 +468,17 @@ class HerdrPiLauncher:
     # ------------------------------------------------------------ plumbing
     def _herdr(self, args, timeout=30, check=True):
         try:
-            done = self._run([self.herdr, *args], capture_output=True, text=True, timeout=timeout, check=False)
+            done = self._run([self.herdr, *self.session_args(), *args], capture_output=True, text=True, timeout=timeout, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise Failure(f"herdr {args[0]}: {trim(exc, 120)}") from None
         if check and done.returncode != 0:
             raise Failure(f"herdr {args[0]} failed: {trim(done.stderr or done.stdout, 200)}")
         return done
+
+    def session_args(self):
+        # herdr talks to the default server unless told which session (server) to use; the session id the dashboard
+        # shows names this same server, so every herdr call must address it (verified against a named session)
+        return [] if self.herdr_session == "default" else ["--session", self.herdr_session]
 
     def run_dir(self, fix_id):
         return self.state_dir / "fixes" / fix_id
@@ -590,6 +598,7 @@ class HerdrPiLauncher:
                 f"echo $? > {shlex.quote(str(exit_file))}")
         self._herdr(["pane", "run", pane_id, line])
         registration = self.register(pane_id, fix_id)
+        write_private(run / "registration", registration)
         session = f"herdr:{self.host_id}:{self.herdr_session}:{urllib.parse.quote(pane_id, safe='')}"
         return {"session_id": session, "pane": pane_id, "workspace": workspace, "registration": registration}
 
@@ -609,6 +618,20 @@ class HerdrPiLauncher:
         return "reported" if done.returncode == 0 else "unregistered"
 
     # ------------------------------------------------------------ watch
+    def show_state(self, fix, state):
+        """herdr does not detect Pi inside the box (spike 1: 45 s, never), so the runner's report is the only source
+        of the agent's state, and herdr keeps showing the last one it was told. Tell it when the screen moves or
+        stands still. When herdr did detect the agent itself, it owns the state and this does nothing."""
+        run = self.run_dir(fix["id"])
+        try:
+            if (run / "registration").read_text() != "reported":
+                return
+            pane = json.loads((run / "pane.json").read_text())["pane"]
+        except (OSError, ValueError, KeyError):
+            return
+        self._herdr(["pane", "report-agent", "--source", "ci-fix-runner", "--agent", "pi", "--state", state,
+                     "--agent-session-id", fix["id"], pane], check=False)
+
     def alive(self, fix):
         run = self.run_dir(fix["id"])
         if (run / "exit").exists():
@@ -657,7 +680,40 @@ class HerdrPiLauncher:
                 shutil.rmtree(sock_dir, ignore_errors=True)
         except OSError:
             pass
+        self.keep_transcript(fix)
         shutil.rmtree(run / "harness", ignore_errors=True)
+
+    def keep_transcript(self, fix):
+        """The box's Pi writes its session under the private harness directory, which the dashboard's feed plugin
+        never reads (it only looks under ~/.pi/agent/sessions, spike 2) and which is deleted with the box. Copy the
+        finished session file(s) there so the conversation stays in Agents history. Regular files only, bounded,
+        under a name of our own; a failure here never blocks the cleanup."""
+        if not SAFE_ID.fullmatch(fix["id"]):
+            return
+        source = self.run_dir(fix["id"]) / "harness" / "pi" / "sessions"
+        target = self.pi_config_dir / "sessions" / f"--ci-fix-{fix['id']}--"
+        try:
+            files = [f for d in sorted(source.iterdir()) if d.is_dir() and not d.is_symlink()
+                     for f in sorted(d.iterdir()) if SESSION_FILE.fullmatch(f.name)][:8]
+        except OSError:
+            return
+        for path in files:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except OSError:
+                continue
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > TRANSCRIPT_MAX_BYTES:
+                    self.say(f"{path.name}: not copied (not a regular file, or over {TRANSCRIPT_MAX_BYTES} bytes)")
+                    continue
+                target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                with os.fdopen(fd, "rb", closefd=False) as source_file:
+                    write_private(target / path.name, source_file.read(TRANSCRIPT_MAX_BYTES + 1))
+            except OSError as exc:
+                self.say(f"{path.name}: transcript not kept: {trim(exc, 120)}")
+            finally:
+                os.close(fd)
 
 
 class Refused(Failure):
@@ -1133,10 +1189,17 @@ class Runner:
         now = self.clock()
         if digest is None:                                   # cannot read the screen: unknown is not idle
             return False
+        show = getattr(self.launcher, "show_state", None)
         if digest != fix.get("digest"):
-            fix.update(digest=digest, active_at=now)
+            fix.update(digest=digest, active_at=now, shown="working")
             self.save(fix)
+            if show:
+                show(fix, "working")
             return False
+        if show and fix.get("shown") != "idle":
+            fix["shown"] = "idle"
+            self.save(fix)
+            show(fix, "idle")
         return now - fix.get("active_at", now) > self.config["idle_minutes"] * 60
 
     def finish(self, fix):

@@ -49,6 +49,10 @@ _DEFAULTS = {
     "idle_minutes": 15,
     "queue_timeout_minutes": 30,
     "egress": {"default": ["gateway"], "per_project": {}},
+    # A fix branch is pushed to the repository itself, so its CI runs without approval and with whatever secrets the
+    # CI exposes to pull-request pipelines (some repositories do: checked on ci.metabolomics.us, spike 5).
+    # ``deny`` always wins; a non-empty ``allow`` limits fixes to those repositories.
+    "repositories": {"allow": [], "deny": []},
     "limits": {"max_commits": 10, "max_files": 50, "max_diff_kb": 512, "mirror_gb": 5, "free_disk_gb": 10},
     "paths": {"flag": [".woodpecker/**", ".github/**", "*.lock"], "block": [".git*/hooks/**"]},
     "pull_request": {"draft": True, "label": "herdr-ci-fix"},
@@ -135,6 +139,9 @@ def ci_fix_config(raw):
         if not isinstance(repository, str) or not _REPOSITORY.fullmatch(repository) or len(repository) > 300:
             _fail("egress.per_project", "has a repository name that is not allowed")
         cfg["egress"]["per_project"][repository] = _strings(hosts, "egress.per_project", _HOSTNAME, 32)
+    repositories = _mapping(top.get("repositories"), "repositories", {"allow", "deny"})
+    for key, value in repositories.items():
+        cfg["repositories"][key] = _strings(value, f"repositories.{key}", _REPOSITORY, 200)
     paths = _mapping(top.get("paths"), "paths", {"flag", "block"})
     for key, value in paths.items():
         cfg["paths"][key] = _patterns(value, f"paths.{key}")
@@ -282,6 +289,7 @@ class CIFixService:
             return self.view(previous), False
         context = ci_run_context(monitor, repository, number, request, provider_url)
         run = _run_key(context["repository"], number)
+        self._repository_allowed(context["repository"])
         with self._lock:
             previous = self._by_operation(operation_id, request)
             if previous is not None:
@@ -295,6 +303,13 @@ class CIFixService:
                 "revision": context["revision"], "ci_url": context["ci_url"], "operation_id": operation_id,
                 "request": request, "context": context, "requested_by": actor})
             return self.view(self._fold(fix_id)), True
+
+    def _repository_allowed(self, repository):
+        rules = self.config["repositories"]
+        name = repository.lower()
+        if name in {item.lower() for item in rules["deny"]} or (
+                rules["allow"] and name not in {item.lower() for item in rules["allow"]}):
+            raise ValueError("this repository is not enabled for CI fix agents (control_plane.ci_fix.repositories)")
 
     def _by_operation(self, operation_id, request):
         for row in self._all():
