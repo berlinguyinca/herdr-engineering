@@ -115,6 +115,29 @@ def _label(value, forbidden=None):
     return value if all(c.isprintable() for c in value) else None
 
 
+RUNTIME_KINDS = ("standard-pi", "pi-bolt", "pi-bolt-jit")
+
+
+def _runtime(value):
+    """Runtime facts a Pi agent reports about itself (which Pi binary, engine, CPU, RSS), or None.
+
+    Untrusted emitter: an allowlisted shape with bounded values, never the raw payload. Runtime metrics only;
+    inference metrics (tokens, latency, queue) stay in the inference telemetry."""
+    if not isinstance(value, dict) or value.get("runtime_kind") not in RUNTIME_KINDS:
+        return None
+    def text(key, limit=64):
+        v = value.get(key)
+        return v[:limit] if isinstance(v, str) and all(c.isprintable() for c in v) else None
+    def number(key, hi):
+        v = value.get(key)
+        return round(float(v), 3) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= hi else None
+    out = {"runtime_kind": value["runtime_kind"], "runtime_source": text("runtime_source", 32),
+           "js_engine": value.get("js_engine") if value.get("js_engine") in ("bun", "node") else None,
+           "js_engine_version": text("js_engine_version", 32), "cpu_s": number("cpu_s", 1e7),
+           "rss_mib": number("rss_mib", 1e6), "fallback_reason": text("fallback_reason", 200)}
+    return {k: v for k, v in out.items() if v is not None}
+
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
@@ -867,7 +890,8 @@ class ControlPlaneRepo:
                        agent_session=None, revision=None, interactive_ready=None,
                        launch_pending=None, state_change_seq=None,
                        repository_id=None, commit_sha=None,
-                       transcript=None, parent_session_id=None, name=None):
+                       transcript=None, parent_session_id=None, name=None, runtime=None):
+        runtime = _runtime(runtime)
         if transcript is not None:
             if (not isinstance(transcript, dict) or transcript.get("status") not in (
                     "recording", "unsupported", "identity_unavailable", "unreadable", "unavailable") or
@@ -895,7 +919,8 @@ class ControlPlaneRepo:
                   "interactive_ready": interactive_ready, "launch_pending": launch_pending,
                   "state_change_seq": state_change_seq,
                   "repository_id": repository_id, "commit_sha": commit_sha,
-                  "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name)}
+                  "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name),
+                  "runtime": runtime}
         if existing is None:
             rec = {"session_id": session_id, "mission_id": mission_id,
                    "host_id": host_id, "agent_role": agent_role,
@@ -945,7 +970,7 @@ class ControlPlaneRepo:
                               "summary", "attach", "pane_id", "terminal_id", "herdr_session",
                               "machine", "agent_session", "revision", "interactive_ready",
                               "launch_pending", "state_change_seq", "repository_id", "commit_sha",
-                              "transcript", "parent_session_id", "name") if existing.get(k) is not None}},
+                              "transcript", "parent_session_id", "name", "runtime") if existing.get(k) is not None}},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)
