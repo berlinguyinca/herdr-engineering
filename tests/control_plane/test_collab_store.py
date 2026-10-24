@@ -432,3 +432,30 @@ def test_creation_retry_rejects_rows_without_original_request_evidence(seeded):
     # Raw legacy rows cannot prove their immutable creation input from current data.
     with pytest.raises(ValueError, match='conflict'):
         run(CollabStore(conn).create_room(room_id='room_one', name='One', owner_id='user_owner'))
+
+
+def test_upload_integrity_migration_repairs_old_claims_and_tolerates_other_manifests(database):
+    import json
+
+    from herdr_engineering.control_plane.collab_store import CollabStore
+
+    conn, run = database
+    # Exercise the actual upgrade SQL from the previous table shape, not only
+    # an empty database. The enclosing fixture still owns/cleans this schema.
+    run(conn.execute("""
+        ALTER TABLE collab_room_files DROP CONSTRAINT collab_room_files_check;
+        ALTER TABLE collab_room_files DROP COLUMN verified_parts;
+        ALTER TABLE collab_room_files ADD CONSTRAINT collab_room_files_check CHECK (status!='available' OR sha256 IS NOT NULL);
+        ALTER TABLE collab_audit_events DROP COLUMN actor_kind, DROP COLUMN actor_agent_id, DROP COLUMN outcome;
+        INSERT INTO collab_users(user_id,status) VALUES ('owner','approved');
+        INSERT INTO collab_rooms(room_id,name,owner_id) VALUES ('room_one','Room','owner');
+    """))
+    parts = [{'size_bytes': 1, 'sha256': 'a' * 64}]
+    run(conn.execute("INSERT INTO collab_room_uploads(upload_id,room_id,created_by,status,manifest) VALUES ('upload_old','room_one','owner','available',$1::jsonb),('upload_other','room_one','owner','created',$2::jsonb)",
+                     json.dumps({'schema_version': 1, 'cleanup_done': True, 'files': [{'relative_path': 'a.csv', 'parts': parts}]}),
+                     json.dumps({'files': 'unrelated legacy metadata'})))
+    run(conn.execute("INSERT INTO collab_room_files(file_id,room_id,upload_id,relative_path,storage_key,size_bytes,sha256,status) VALUES ('file_old','room_one','upload_old','a.csv','opaque/blob',1,repeat('b',64),'available')"))
+    run(conn.execute((MIGRATIONS / '0005_collaboration_upload_integrity_audit.sql').read_text()))
+    files = run(CollabStore(conn).list_room_files('room_one'))
+    assert files[0].sha256 is None and files[0].verified_parts == parts
+    assert run(CollabStore(conn).get_upload('upload_old')).manifest['cleanup_done'] is False

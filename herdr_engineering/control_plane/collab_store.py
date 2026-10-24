@@ -84,6 +84,7 @@ class RoomFileRecord:
     sha256: str | None
     status: str
     created_at: datetime
+    verified_parts: list[dict] | None = None
 
 
 @dataclass(frozen=True)
@@ -259,8 +260,9 @@ class CollabStore:
             await self._audit('upload.access_requested', row['request_id'])
             return dict(row)
 
-    async def get_upload(self, upload_id: str) -> UploadRecord | None:
-        row = await self._conn.fetchrow('SELECT * FROM collab_room_uploads WHERE upload_id=$1', upload_id)
+    async def get_upload(self, upload_id: str, *, for_update=False) -> UploadRecord | None:
+        row = await self._conn.fetchrow(
+            'SELECT * FROM collab_room_uploads WHERE upload_id=$1' + (' FOR UPDATE' if for_update else ''), upload_id)
         if row is None:
             return None
         values = dict(row)
@@ -268,10 +270,42 @@ class CollabStore:
             values['manifest'] = json.loads(values['manifest'])
         return UploadRecord(**values)
 
-    async def update_upload(self, upload_id: str, status: str, manifest: dict) -> None:
+    async def update_upload(self, upload_id: str, status: str, manifest: dict, *,
+                            action: str | None = None, actor=None) -> None:
+        """Persist checkpoint and its sanitized audit together, deduplicating retries."""
+        async with self._conn.transaction():
+            old = await self.get_upload(upload_id, for_update=True)
+            if old is None:
+                raise ValueError('upload not found')
+            event = action
+            suffix = ''
+            if action == 'grant':
+                previous = old.manifest.get('grant_expires_at', 0)
+                expiry = manifest['grant_expires_at']
+                event = ('grant_renewed' if previous else 'grant_issued') if expiry > previous else None
+                suffix = ':' + str(expiry)
+            elif action in {'cancelled', 'expired'} and old.status == 'failed':
+                event = None
+            elif action == 'cleanup_completed' and old.manifest.get('cleanup_done'):
+                event = None
+            await self._conn.execute(
+                'UPDATE collab_room_uploads SET status=$2,manifest=$3::jsonb WHERE upload_id=$1',
+                upload_id, status, json.dumps(manifest))
+            if event:
+                await self.audit_upload(upload_id, event, actor=actor, suffix=suffix)
+
+    async def audit_upload(self, upload_id: str, action: str, *, actor=None, suffix='') -> None:
+        if action not in {'grant_issued', 'grant_renewed', 'cancelled', 'expired',
+                          'cleanup_completed', 'cleanup_retry', 'cleanup_started'}:
+            raise ValueError('unsupported upload audit action')
+        # Fixed vocabulary only: never persist exception text, paths or signed grants.
         await self._conn.execute(
-            'UPDATE collab_room_uploads SET status=$2,manifest=$3::jsonb WHERE upload_id=$1',
-            upload_id, status, json.dumps(manifest))
+            'INSERT INTO collab_audit_events(event_id,actor_id,actor_kind,actor_agent_id,action,entity_type,entity_id,outcome) '
+            'VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(event_id) DO NOTHING',
+            'upload.' + action + ':' + upload_id + suffix,
+            actor.owner if actor else None, actor.kind if actor else 'system',
+            actor.id if actor and actor.is_agent else None, 'upload.' + action, 'upload', upload_id,
+            'retry_required' if action == 'cleanup_retry' else 'complete')
 
     async def upload_parts(self, upload_id: str) -> list[dict]:
         return [dict(row) for row in await self._conn.fetch(
@@ -294,16 +328,16 @@ class CollabStore:
                 raise ValueError('upload is not verifying')
             # One set-based insert and one visibility transition, regardless of file count.
             await self._conn.execute(
-                "INSERT INTO collab_room_files(file_id,room_id,upload_id,uploaded_by,relative_path,storage_key,size_bytes,sha256,status) "
-                "SELECT file_id,room_id,upload_id,uploaded_by,relative_path,storage_key,size_bytes,sha256,'available' "
+                "INSERT INTO collab_room_files(file_id,room_id,upload_id,uploaded_by,relative_path,storage_key,size_bytes,sha256,verified_parts,status) "
+                "SELECT file_id,room_id,upload_id,uploaded_by,relative_path,storage_key,size_bytes,sha256,verified_parts,'available' "
                 "FROM jsonb_to_recordset($1::jsonb) AS f(file_id text,room_id text,upload_id text,uploaded_by text,"
-                "relative_path text,storage_key text,size_bytes bigint,sha256 text)", json.dumps(files))
+                "relative_path text,storage_key text,size_bytes bigint,sha256 text,verified_parts jsonb)", json.dumps(files))
             await self._conn.execute("UPDATE collab_room_uploads SET status='available' WHERE upload_id=$1", upload_id)
             await self._audit('upload.finalized', upload_id)
         return await self.upload_files(upload_id)
 
     async def upload_files(self, upload_id: str) -> list[RoomFileRecord]:
-        return [RoomFileRecord(**dict(row)) for row in await self._conn.fetch(
+        return [_room_file(row) for row in await self._conn.fetch(
             "SELECT f.* FROM collab_room_files f JOIN collab_room_uploads u USING(upload_id) "
             "WHERE f.upload_id=$1 AND u.status='available' ORDER BY f.relative_path,f.file_id", upload_id)]
 
@@ -323,7 +357,7 @@ class CollabStore:
             "WHERE f.room_id = $1 AND f.status = 'available' "
             "AND (f.upload_id IS NULL OR u.status = 'available') "
             "ORDER BY f.relative_path, f.file_id", room_id)
-        return [RoomFileRecord(**dict(row)) for row in rows]
+        return [_room_file(row) for row in rows]
 
     async def record_archive(self, *, archive_id: str, room_id: str,
                              requested_by: str, manifest_key: str | None = None) -> ArchiveRecord:
@@ -404,7 +438,7 @@ class CollabStore:
             if await self._conn.fetchval('SELECT EXISTS(SELECT 1 FROM collab_skills WHERE room_id=$1)', room_id):
                 raise ValueError('room skill storage requires an archive exporter')
             if await self._conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM collab_room_uploads WHERE room_id=$1 AND status!='available' AND COALESCE(manifest->>'cleanup_done','false')!='true')", room_id):
+                "SELECT EXISTS(SELECT 1 FROM collab_room_uploads WHERE room_id=$1 AND (status!='available' OR manifest->>'schema_version'='1') AND COALESCE(manifest->>'cleanup_done','false')!='true')", room_id):
                 raise ValueError('room has unfinished uploads')
             snapshot = {'room': dict(room)}
             for name in ROOM_TABLES:
@@ -418,6 +452,9 @@ class CollabStore:
             snapshot['room_upload_parts'] = [dict(r) for r in await self._conn.fetch(
                 'SELECT p.* FROM collab_room_upload_parts p JOIN collab_room_uploads u USING(upload_id) WHERE u.room_id=$1', room_id)]
             # JSONB columns may be returned as text by asyncpg's default codec.
+            for file in snapshot['room_files']:
+                if isinstance(file.get('verified_parts'), str):
+                    file['verified_parts'] = json.loads(file['verified_parts'])
             for upload in snapshot['room_uploads']:
                 if isinstance(upload['manifest'], str):
                     upload['manifest'] = json.loads(upload['manifest'])
@@ -515,3 +552,10 @@ def _json_default(value):
     if isinstance(value, datetime):
         return value.isoformat()
     raise TypeError('unsupported snapshot value')
+
+
+def _room_file(row) -> RoomFileRecord:
+    values = dict(row)
+    if isinstance(values.get('verified_parts'), str):
+        values['verified_parts'] = json.loads(values['verified_parts'])
+    return RoomFileRecord(**values)
