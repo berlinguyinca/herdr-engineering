@@ -18,24 +18,66 @@ export function sandboxMarkup(markup, title) {
   return frame;
 }
 
+// Strict bounded XML source tree. No DTD, resolver, browser DOM, namespaces
+// expansion or active content. Names/attributes are literal display labels.
 function xmlMarkup(text) {
-  // Do not feed DTDs/entities to any parser, even a normally inert DOMParser.
+  const invalid = () => { throw new Error('Invalid XML or unsupported XML syntax.'); };
   if (/<!\s*(?:DOCTYPE|ENTITY)/i.test(text) || /<\?(?!xml\s[^?]*\?>)/i.test(text)) throw new Error('XML entities and processing instructions are not supported.');
-  const doc = new DOMParser().parseFromString(text, 'application/xml');
-  if (doc.querySelector('parsererror')) throw new Error('Invalid XML.');
-  let nodes = 0;
-  const walk = (node, depth) => {
-    if (++nodes > 500 || depth > 12) return '<p>Display limit reached. Use Source or Download.</p>';
-    if (node.nodeType !== 1) return esc(node.textContent || '');
-    const attrs = [...node.attributes].map(a => `${a.name}="${a.value}"`).join(' ');
-    const children = [];
-    for (const child of node.childNodes) {
-      if (nodes >= 500) { children.push('<p>Display limit reached.</p>'); break; }
-      children.push(walk(child, depth + 1));
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/u.test(text)) invalid();
+  const decode = value => value.replace(/&(?:#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);|&/g, entity => {
+    const named = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'" };
+    if (Object.hasOwn(named, entity)) return named[entity];
+    if (entity === '&') return invalid();
+    const code = entity.startsWith('&#x') ? parseInt(entity.slice(3, -1), 16) : Number(entity.slice(2, -1));
+    if (!(code === 9 || code === 10 || code === 13 || (code >= 32 && code <= 0xd7ff) || (code >= 0xe000 && code <= 0xfffd) || (code >= 0x10000 && code <= 0x10ffff))) invalid();
+    return String.fromCodePoint(code);
+  });
+  // A conservative XML name subset; unsupported names fail visibly, not as HTML.
+  const name = '[A-Za-z_][A-Za-z0-9_.:-]*';
+  const stack = [], out = []; let roots = 0, nodes = 0, offset = 0;
+  const addNode = () => { if (++nodes > 500) throw new Error('XML node limit exceeded. Use Download.'); };
+  while (offset < text.length) {
+    const rest = text.slice(offset);
+    if (rest.startsWith('<?xml')) {
+      const declaration = /^<\?xml\s+version\s*=\s*(['"])1\.[01]\1(?:\s+encoding\s*=\s*(['"])[A-Za-z][A-Za-z0-9._-]*\2)?(?:\s+standalone\s*=\s*(['"])(?:yes|no)\3)?\s*\?>/.exec(rest);
+      if (offset !== 0 || !declaration) invalid();
+      offset += declaration[0].length; continue;
     }
-    return `<details${depth < 2 ? ' open' : ''}><summary>${esc(`<${node.nodeName}${attrs ? ' ' + attrs : ''}>`)}</summary><div style="margin-left:16px">${children.join('')}</div></details>`;
-  };
-  return walk(doc.documentElement, 0);
+    if (rest.startsWith('<!--')) {
+      const end = rest.indexOf('-->');
+      if (end < 0 || rest.slice(4, end).includes('--') || rest[end - 1] === '-') invalid();
+      addNode(); offset += end + 3; continue;
+    }
+    if (rest.startsWith('<![CDATA[')) {
+      const end = rest.indexOf(']]>'); if (!stack.length || end < 0) invalid();
+      addNode(); out.push(esc(rest.slice(9, end))); offset += end + 3; continue;
+    }
+    if (!rest.startsWith('<')) {
+      const end = rest.indexOf('<'), raw = end < 0 ? rest : rest.slice(0, end);
+      if (raw.includes(']]>') || (!stack.length && raw.trim())) invalid();
+      addNode(); out.push(esc(decode(raw))); offset += raw.length; continue;
+    }
+    const close = new RegExp(`^</(${name})\\s*>`).exec(rest);
+    if (close) {
+      if (stack.pop() !== close[1]) invalid();
+      out.push('</div></details>'); offset += close[0].length; continue;
+    }
+    const open = new RegExp(`^<(${name})(?=[\\s/>])`).exec(rest); if (!open) invalid();
+    let cursor = open[0].length; const attributes = [], seen = new Set();
+    while (!/^(?:\s*\/?>)/.test(rest.slice(cursor))) {
+      const attr = new RegExp(`^\\s+(${name})\\s*=\\s*(?:"([^"<]*)"|'([^'<]*)')`).exec(rest.slice(cursor));
+      if (!attr || seen.has(attr[1])) invalid();
+      seen.add(attr[1]); attributes.push(`${attr[1]}="${decode(attr[2] ?? attr[3])}"`); cursor += attr[0].length;
+    }
+    const end = /^\s*(\/?)>/.exec(rest.slice(cursor)); if (!end) invalid();
+    if (!stack.length && ++roots > 1) invalid();
+    addNode(); if (stack.length >= 12) throw new Error('XML depth limit exceeded. Use Download.');
+    out.push(`<details open><summary>${esc(`<${open[1]}${attributes.length ? ' ' + attributes.join(' ') : ''}>`)}</summary><div style="margin-left:16px">`);
+    if (end[1]) out.push('</div></details>'); else stack.push(open[1]);
+    offset += cursor + end[0].length;
+  }
+  if (stack.length || roots !== 1) invalid();
+  return out.join('');
 }
 
 // An indentation outline, deliberately not a YAML object deserializer: tags,

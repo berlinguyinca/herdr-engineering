@@ -52,8 +52,8 @@ export function plotMarkup(name, points, { spectrum = false } = {}) {
   return `<h2>${esc(name)}</h2><svg viewBox="0 0 620 290" role="img" aria-label="${spectrum ? 'Mass spectrum' : 'Chromatogram'}"><path d="M40 20V250H600" fill="none" stroke="currentColor"/>${marks}<text x="280" y="280">${spectrum ? 'm/z' : 'Retention time'}</text><text x="45" y="18">Intensity (max ${maxY})</text><text x="540" y="268">${maxX}</text></svg>`;
 }
 
-export function renderMsp(text) {
-  const spectra = parseMsp(text), host = document.createElement('div');
+export function renderMsp(spectra) {
+  const host = document.createElement('div');
   const label = document.createElement('label'), select = document.createElement('select');
   label.textContent = 'Spectrum '; select.setAttribute('aria-label', 'Spectrum'); label.append(select);
   spectra.forEach((s, i) => { const option = document.createElement('option'); option.value = String(i); option.textContent = s.name; select.append(option); });

@@ -568,7 +568,25 @@ _PUBLIC_STATIC = {
     "/collab-preview-msp.js": ("collab-preview-msp.js", "text/javascript"),
     "/collab-preview-text.js": ("collab-preview-text.js", "text/javascript"),
     "/collab-preview-pdf.js": ("collab-preview-pdf.js", "text/javascript"),
+    "/collab-preview-parser.js": ("collab-preview-parser.js", "text/javascript"),
+    "/collab-preview-worker.js": ("collab-preview-worker.js", "text/javascript"),
+    "/vendor/pdfjs/pdf.mjs": ("vendor/pdfjs/pdf.mjs", "text/javascript"),
+    "/vendor/pdfjs/pdf.worker.mjs": ("vendor/pdfjs/pdf.worker.mjs", "text/javascript"),
     "/collab-preview-flasheic.js": ("collab-preview-flasheic.js", "text/javascript"),
+    "/vendor/pdfjs/standard_fonts/FoxitDingbats.pfb": ("vendor/pdfjs/standard_fonts/FoxitDingbats.pfb", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/FoxitFixed.pfb": ("vendor/pdfjs/standard_fonts/FoxitFixed.pfb", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/FoxitFixedBold.pfb": ("vendor/pdfjs/standard_fonts/FoxitFixedBold.pfb", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/FoxitFixedBoldItalic.pfb": ("vendor/pdfjs/standard_fonts/FoxitFixedBoldItalic.pfb", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/FoxitFixedItalic.pfb": ("vendor/pdfjs/standard_fonts/FoxitFixedItalic.pfb", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/FoxitSerif.pfb": ("vendor/pdfjs/standard_fonts/FoxitSerif.pfb", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/FoxitSerifBold.pfb": ("vendor/pdfjs/standard_fonts/FoxitSerifBold.pfb", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/FoxitSerifBoldItalic.pfb": ("vendor/pdfjs/standard_fonts/FoxitSerifBoldItalic.pfb", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/FoxitSerifItalic.pfb": ("vendor/pdfjs/standard_fonts/FoxitSerifItalic.pfb", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/FoxitSymbol.pfb": ("vendor/pdfjs/standard_fonts/FoxitSymbol.pfb", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/LiberationSans-Bold.ttf": ("vendor/pdfjs/standard_fonts/LiberationSans-Bold.ttf", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/LiberationSans-BoldItalic.ttf": ("vendor/pdfjs/standard_fonts/LiberationSans-BoldItalic.ttf", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/LiberationSans-Italic.ttf": ("vendor/pdfjs/standard_fonts/LiberationSans-Italic.ttf", "application/octet-stream"),
+    "/vendor/pdfjs/standard_fonts/LiberationSans-Regular.ttf": ("vendor/pdfjs/standard_fonts/LiberationSans-Regular.ttf", "application/octet-stream"),
     "/collab-scripts.js": ("collab-scripts.js", "text/javascript"),
     "/collab-flow.js": ("collab-flow.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
@@ -1807,7 +1825,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._send_json(404, {"error": "not found"})
             ctype = {
                 ".html": "text/html", ".css": "text/css",
-                ".js": "text/javascript", ".svg": "image/svg+xml",
+                ".js": "text/javascript", ".mjs": "text/javascript", ".svg": "image/svg+xml",
             }.get(target.suffix, "application/octet-stream")
             data = target.read_bytes()
             self.send_response(200)
