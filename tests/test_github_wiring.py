@@ -118,3 +118,71 @@ def test_invalid_sync_settings_stop_the_pass_as_invalid_config(fake_host_config)
     assert view["status"] == "invalid_config"
     assert "github.sync.full_reconcile_interval" in view["error"]
     assert fake.calls == Counter()
+
+
+def test_a_store_retired_by_removing_the_token_is_closed_too():
+    fake, shared = seeded(), {}
+    made = []
+
+    def factory(identity, viewer=None):
+        made.append(ClosingStore(identity=identity, viewer=viewer, shared=shared))
+        return made[-1]
+    ClosingStore.closed = []
+    monitor = GitHubMonitor(provider_factory=lambda: fake, store=factory)
+    monitor.refresh()
+    fake.credential_identity, fake.available = None, False  # the token was removed from the YAML
+    monitor.refresh()
+    assert monitor.snapshot(start=False)["status"] == "not_configured"
+    assert made[1] in ClosingStore.closed and len(made) == 2
+
+
+def test_rotations_leak_neither_loop_threads_nor_connections():
+    import os
+    import threading
+    import time
+    import uuid
+    from pathlib import Path
+
+    import pytest
+    dsn = os.environ.get("HERDR_E2E_PG_DSN")
+    if not dsn:
+        pytest.skip("set HERDR_E2E_PG_DSN to a throwaway Postgres")
+    import asyncpg
+
+    from herdr_engineering.control_plane.bridge import _LoopRunner
+    from herdr_engineering.control_plane.github_store import catalog_store_factory
+    run = _LoopRunner().run
+    name = f"ghleak_{uuid.uuid4().hex[:10]}"
+    admin = run(asyncpg.connect(dsn))
+    run(admin.execute(f"CREATE DATABASE {name}"))
+    database_dsn = dsn.rsplit("/", 1)[0] + f"/{name}"
+    try:
+        conn = run(asyncpg.connect(database_dsn))
+        for migration in ("0006_github_catalog.sql", "0007_github_issue_details.sql"):
+            path = Path(__file__).parents[1] / "deploy" / "control-plane" / "migrations" / migration
+            run(conn.execute(path.read_text(encoding="utf-8")))
+        run(conn.close())
+
+        def connections():
+            return run(admin.fetchval("SELECT count(*) FROM pg_stat_activity WHERE datname=$1", name))
+
+        def loops():
+            return sum(t.name == "herdr-cp-pg-loop" for t in threading.enumerate())
+        before = loops()
+        fake = seeded()
+        monitor = GitHubMonitor(provider_factory=lambda: fake, store=catalog_store_factory(database_dsn))
+        monitor.refresh()
+        for index in range(5):
+            fake.credential_identity = f"fingerprint-{index}"
+            monitor.refresh()
+            assert connections() <= 2  # the current store's data and advisory-lock connections
+        assert monitor.snapshot(start=False)["status"] == "ready"
+        assert loops() - before <= 1  # one shared loop for every store the factory built
+        monitor.close()
+        deadline = time.time() + 5
+        while connections() and time.time() < deadline:
+            time.sleep(0.1)
+        assert connections() == 0
+    finally:
+        run(admin.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+        run(admin.close())

@@ -718,8 +718,18 @@ class GitHubMonitor:
 
     def refresh(self):
         provider = self._sync_credentials()
-        if self._now() < self._retry_at or not self._refresh_lock.acquire(blocking=False):
+        if not self._refresh_lock.acquire(blocking=False):
             return
+        try:
+            if self._now() >= self._retry_at:
+                self._refresh(provider)
+        finally:
+            # every refresh closes what rotations retired, whether or not a pass ran
+            # (paused, token removed); no pass can still hold their advisory lock here
+            self._close_retired()
+            self._refresh_lock.release()
+
+    def _refresh(self, provider):
         with self._lock:
             generation = self._generation
             self._local.generation = generation
@@ -744,7 +754,6 @@ class GitHubMonitor:
                 if generation == self._generation:
                     self._view.update(refreshing=False, checked_at=_stamp())
             del self._local.generation
-            self._refresh_lock.release()
 
     def _revoke_catalog(self, generation):
         """GitHub rejected the token (401): stop serving its catalog and purge the stored one.
@@ -785,12 +794,9 @@ class GitHubMonitor:
             with self._lock:
                 self._view.update(refreshing=True, error=None, status="syncing", partial=True)
             raise GitHubError("not_configured")
-        try:
-            with self._pass_lock(store) as acquired:
-                if acquired:
-                    self._collect_pass(provider)
-        finally:
-            self._close_retired()
+        with self._pass_lock(store) as acquired:
+            if acquired:
+                self._collect_pass(provider)
 
     def _collect_pass(self, provider):
         self._update(refreshing=True, error=None, status="syncing", partial=True, available=True)
