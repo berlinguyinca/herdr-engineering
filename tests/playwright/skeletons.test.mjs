@@ -6,10 +6,11 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {withPage} from './helpers/fixture.mjs';
+import {appRoutes} from './helpers/routes.mjs';
 import {boot,until,sleep,T0} from './helpers/live.mjs';
 
-const ROUTES=['/overview','/topology','/missions','/missions/m-1','/missions/pi%3Amsn-1','/herd','/herd/session/s-1',
- '/services','/services/svc-1','/github','/ci','/reviews','/hosts','/hosts/h-1','/activity','/analytics','/analytics/tokens','/collab'];
+// Every route the router knows (app.js ROUTES), so none is missed.
+const ROUTES=appRoutes();
 
 // The head may move by at most HEAD_PX; the page height may change by at most HEIGHT_PX when the
 // skeleton gives way to the (small, fixed) data.
@@ -22,7 +23,7 @@ const event=n=>({event_id:`e${n}`,sequence:n,event_type:'MissionStageChanged',en
 const PAYLOAD={missions:[{mission_id:'m-1',title:'Mission one',status:'EXECUTING',updated_at:T0}],sessions:[session('s-1'),session('s-2')],
  services:[service('svc-1'),service('svc-2')],hosts:[host('h-1'),host('h-2')],activities:[],events:[event(1),event(2)],timeline:[],
  available:true,reviews:[],repositories:[],issues:[],counts:{},pagination:{},status:'ready',components:[],summary:{},reports:[],pipelines:[],samples:[],
- total:2,completed:1,completion_rate:50,by_stage:{review:1,done:1},models:{},total_sessions:2,healthy:2,unavailable:0,
+ total:2,completed:1,completion_rate:50,by_stage:{review:1,done:1},models:{'qwen-27b':{sessions:2,messages:40},'flint':{sessions:1,messages:12},'codex':{sessions:1,messages:7}},total_sessions:2,healthy:2,unavailable:0,
  mission_id:'m-1',session_id:'s-1',host_id:'h-1',host_name:'h-1',title:'Mission one',display_name:'Agent one',updated_at:T0,created_at:T0,stage:'review',sessions:[]};
 
 const measure=page=>page.evaluate(()=>{

@@ -4,11 +4,11 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {withPage} from './helpers/fixture.mjs';
+import {appRoutes} from './helpers/routes.mjs';
 import {boot,until,sleep} from './helpers/live.mjs';
 
-const ROUTES=['/overview','/topology','/missions','/missions/m-1','/missions/pi%3Amsn-1','/herd','/herd/session/s-1',
- '/services','/local-services','/system-services','/services/svc-1','/github','/ci','/reviews',
- '/hosts','/hosts/h-1','/activity','/analytics','/analytics/models','/analytics/tokens','/analytics/hosts','/collab'];
+// Every route the router knows (app.js ROUTES), so none is missed.
+const ROUTES=appRoutes();
 
 const service={service_id:'svc-1',name:'web',host_id:'h-1',status:'running',kind:'service',observed_at:'2026-01-01T00:00:00Z',updated_at:'2026-01-01T00:00:00Z'};
 // One body that satisfies every view's response validator (lists empty, objects well-formed).

@@ -213,13 +213,14 @@ function statusPage(html, ok, message) {
 
 // First-load placeholder for a route: its head (title bar, and the back link detail pages put
 // above it) at the real page's position, then content rows sized roughly to the page that follows
-// (a Pi mission without a record is short; agent detail and the analytics dashboard fill a screen),
+// (a Pi mission without a record is short, as are model and host analytics; agent detail and the
+// analytics dashboards fill a screen),
 // so the page does not jump on arrival.
 const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></div>';
 function routeSkeleton(match, parts) {
   const back = match === '/missions/:id' || match === '/herd/session/:id' ? BACK_LINK_SKELETON : '';
   const piMission = match === '/missions/:id' && decodeURIComponent(parts[1] || '').startsWith('pi:');
-  const rows = piMission ? 1 : match === '/herd/session/:id' || match === '/analytics' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  const rows = piMission ? 1 : match === '/analytics/models' || match === '/analytics/hosts' ? 2 : match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
   return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
 
