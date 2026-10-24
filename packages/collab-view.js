@@ -3,6 +3,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
+import { mountFilesPanel } from './collab-files.js';
 import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
@@ -754,7 +755,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
     const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents']]), ...(canInvite ? [['people', 'People']] : [])];
+    const tabs = [['chat', 'Chat'], ['files', 'Files'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents']]), ...(canInvite ? [['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
@@ -766,6 +767,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         ${canPost ? '<div id="hcn-composer"></div>'
         : '<div class="cx-msg" style="padding:12px">Read-only access.</div>'}
       </section>
+      <section class="hd-card cx-stack cx-panel" id="hcn-p-files" hidden aria-label="Room files"></section>
       ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
       <section class="cx-panel cx-cols" id="hcn-p-tasks" hidden>
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Give a task</div><form id="hcn-task" class="cx-stack"><label class="cx-field">To<select name="target" id="hcn-task-target"></select></label><label class="cx-field">What should it do?<textarea class="cx-input" name="text" required maxlength="4000" rows="4"></textarea></label><button class="hd-btn" type="submit">Send task</button><span id="hcn-task-msg" class="cx-msg" role="alert"></span></form></div>' : ''}
@@ -790,6 +792,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const roomCurrent = () => alive && isCurrent(turn);
     let inheritedArchivePending = pendingAdministration.has(`archive:${roomId}`);
     let composer = null;
+    let filesPanel = null;
     let since = -1;
     let ctl = null;
     let wake = null;
@@ -797,7 +800,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const stale = new Set();               // panels whose redraw was held back because you were typing in them
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
-    teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
+    teardown = () => { alive = false; composer?.dispose(); filesPanel?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
     const kick = () => { if (roomCurrent()) { since = -1; ctl?.abort(); } }; // an action just happened: refetch now
 
     // Replace a container's markup only when it changed and you are not typing in it.
@@ -1128,6 +1131,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       if (sub === 'agents') await loadHelpers();
       if (!roomCurrent()) return;
       if (sub === 'people') await drawPeople();
+      if (sub === 'files') await filesPanel?.refresh();
       if (!roomCurrent()) return;
       paint();
     };
@@ -1137,10 +1141,16 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       root.querySelectorAll('[data-sub]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.sub === k)));
       root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${k}`; });
       if (k === 'chat') { log.scrollTop = log.scrollHeight; composer?.focus(); }
+      if (k === 'files') ensureFilesPanel().refresh(true);
       paintPanel();
     };
     root.querySelectorAll('[data-sub]').forEach((b) => { b.onclick = () => showSub(b.dataset.sub); });
     root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${sub}`; });
+    function ensureFilesPanel() {
+      return filesPanel ||= mountFilesPanel($('hcn-p-files'), { api, roomId, info, isCurrent: roomCurrent,
+        pending: pendingAdministration, onPermissions: () => showSub('people') });
+    }
+    if (sub === 'files') ensureFilesPanel().refresh(true);
 
     const refreshArchiveControl = () => {
       if (!inheritedArchivePending || pendingAdministration.has(`archive:${roomId}`)) return;
@@ -1171,6 +1181,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
           backoff = 1000;
           refreshArchiveControl();
           refreshAgentControls();
+          if (sub === 'files') filesPanel?.refresh();
           if (s.changed) { apply(s); since = s.has_more ? -1 : s.seq; } else since = s.seq;
         } catch (e) {
           if (!roomCurrent()) return;

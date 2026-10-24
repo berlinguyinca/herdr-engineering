@@ -293,3 +293,12 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-administration { grid-column: 1 / -1; }
 .cx-administration .cx-msg { overflow-wrap: anywhere; }
 .cx-check input:disabled, .cx-administration button:disabled { cursor: not-allowed; opacity: .65; }
+/* Shared room files: aggregate upload updates leave unchanged file rows intact. */
+.cx-file-name { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
+.cx-file-name small { display: block; color: var(--text-muted); margin-top: 4px; }
+.cx-file-list li { flex-wrap: wrap; }
+.cx-upload-batch { display: flex; flex-direction: column; gap: 6px; padding-block: 10px; overflow-wrap: anywhere; }
+.cx-upload-batch progress { width: 100%; accent-color: var(--accent); }
+#hcn-p-files { min-width: 0; }
+#hcn-p-files textarea { width: 100%; box-sizing: border-box; resize: vertical; }
+#hcn-p-files [data-file-preview] { overflow-wrap: anywhere; }
