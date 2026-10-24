@@ -1,0 +1,14 @@
+Checks against the live installation, 2026-10-23 (bender, herdr 0.9.1).
+
+1. Spawner env export, real herdr: split a throwaway pane from the evaluating agent's own pane, ran the exact command
+   RealHerdrCli.exportEnv issues (`herdr pane run <pane> "export PI_ENGINEERING_ROLE=reviewer PI_ENGINEERING_MISSION_ID=m-test1"`),
+   then `echo` in the same pane printed ROLE=reviewer MISSION=m-test1. Pane closed afterwards. PASS.
+2. Found while doing (1): the existing RealHerdrCli passed flags herdr 0.9.1 rejects.
+   `agent start --pane-id ... --name ...` -> "unknown option: --pane-id" (the name is positional, the flag is --pane).
+   `agent wait --until a,b --timeout-ms N` -> herdr takes repeated --until and --timeout. Fixed in pi-engineering 2093f6f with a test that pins the argv.
+   Impact: a real HerdrAgentRuntime start/wait would have failed on this herdr regardless of Pi-Bolt.
+3. Gateway accounting: with the Pi provider key, https://llm.metabolomics.us/v1/usage returns only global aggregates
+   (total_requests, tokens_total, requests_today ...), no per-client or per-session rows, and other users' traffic (~25 requests/min)
+   swamps any before/after delta from a handful of runs. Per-client accounting rows need operator/DB access, which was not part of this
+   authorization. What IS established: the request on the wire is identical apart from the system prompt (results/parity.txt),
+   so anything the gateway derives from the body (model, token counts) is the same, and anything keyed on user-agent/runtime headers differs.

@@ -23,6 +23,7 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto(`${base}/#/ci`);
   assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-selected'),'true');
+  assert.equal(await page.locator('.ci-report-filters').isVisible(),false,'Health owns its own history filters');
   assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-controls'),'ci-workspace-health');
   await page.locator('[data-ci-workspace="health"]').focus();await page.keyboard.press('ArrowRight');
   assert.equal(await page.locator('[data-ci-workspace="runs"]').getAttribute('aria-selected'),'true');
@@ -54,6 +55,35 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   await inspector.locator('[data-step="12"]').focus();await page.keyboard.press('Enter');
   await page.waitForFunction(()=>document.querySelector('.ig-log')?.textContent.includes('expected 200, got 500'));
   assert.equal(await inspector.locator('[data-step="12"]').getAttribute('aria-pressed'),'true');
+  await inspector.locator('[data-collapse-success]').click();
+  assert.equal(await inspector.locator('.ci-pipeline-success').count(),1);
+  assert.equal(await inspector.locator('[data-step="12"]').isVisible(),true);
+  await inspector.locator('.ci-pipeline-success summary').click();
+  assert.equal(await inspector.locator('[data-step="11"]').isVisible(),true);
+  await inspector.locator('[data-pipeline-zoom="in"]').click();
+  await inspector.locator('[data-pipeline-zoom="in"]').click();
+  assert.equal(await inspector.locator('[data-pipeline-zoom="in"]').isDisabled(),true);
+  assert.match(await inspector.locator('[data-pipeline-zoom="reset"]').innerText(),/150%/);
+  await inspector.locator('[data-pipeline-zoom="reset"]').click();
+  const compare=inspector.locator('[data-ci-compare]');
+  const compareKey=await compare.locator('option').filter({hasText:'Run #2'}).getAttribute('value');
+  assert.ok(compareKey);await compare.selectOption(compareKey);
+  assert.match(await inspector.locator('.ci-comparison').innerText(),/Active #3 compared with #2/);
+  assert.match(await inspector.locator('.ci-comparison').innerText(),/Step details not reported/);
+  assert.equal(await inspector.locator('[data-step="12"]').getAttribute('aria-pressed'),'true');
+  assert.match(await inspector.locator('.ig-log').innerText(),/expected 200, got 500/);
+  await page.locator('[data-ci-workspace="runs"]').click();
+  for(const width of [3840,2560,1920,768,390]){
+   await page.setViewportSize({width,height:1000});
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`Overflow at ${width}`);
+   if(width>=1920){
+    assert.equal(await inspector.evaluate(node=>getComputedStyle(node).position),'sticky');
+    const rail=await page.locator('#ig-results').boundingBox(),detail=await inspector.boundingBox();assert.ok(rail.x+rail.width<=detail.x,`Run rail should sit beside inspector at ${width}`);
+   }else if(width===390){assert.equal(await page.locator('#ig-results').isVisible(),false);assert.equal(await inspector.locator('.ig-back-label').isVisible(),true);}
+  }
+  await page.setViewportSize({width:1440,height:1000});
+  await inspector.locator('[data-collapse-success]').click();
+  await page.locator('[data-ci-workspace="health"]').click();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   mkdirSync(path.join(root,'artifacts/ci-insights'),{recursive:true});
   await page.screenshot({path:path.join(root,'artifacts/ci-insights/desktop.png'),fullPage:true});

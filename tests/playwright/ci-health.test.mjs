@@ -46,7 +46,21 @@ test('CI health integrates real paginated history, PR drilldown, old filtered ru
   await page.waitForFunction(()=>document.querySelector('[data-ci-health]')?.textContent.includes('PR #1200'));
   await page.locator('[data-health-mode="30"]').click();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
-  assert.equal(await page.locator('[data-health-map] [data-health-grid-scroll]').first().evaluate(e=>e.scrollWidth<=e.clientWidth+1),true,'30 daily columns should fit desktop overview');
+  // Resolve and measure the refreshing heatmap in one browser task. The
+  // periodic history refresh replaces this subtree and can detach a Locator's
+  // previously resolved node between separate Playwright operations.
+  const gridGeometry=await page.evaluate(()=>{
+   const map=document.querySelector('[data-health-map]');
+   const scroll=map?.querySelector('[data-health-grid-scroll]');
+   const cell=map?.querySelector('.ci-health-grid td');
+   const columnHeader=map?.querySelector('.ci-health-grid thead th');
+   const rowHeader=map?.querySelector('.ci-health-grid tbody th');
+   return {overflowX:getComputedStyle(scroll).overflowX,cellWidth:cell.getBoundingClientRect().width,columnHeaderPosition:getComputedStyle(columnHeader).position,rowHeaderPosition:getComputedStyle(rowHeader).position};
+  });
+  assert.equal(gridGeometry.overflowX,'auto');
+  assert.ok(gridGeometry.cellWidth>=36,'Daily columns retain readable minimum widths');
+  assert.equal(gridGeometry.columnHeaderPosition,'sticky');
+  assert.equal(gridGeometry.rowHeaderPosition,'sticky');
   mkdirSync(path.join(root,'artifacts/ci-health'),{recursive:true});
   await page.screenshot({path:path.join(root,'artifacts/ci-health/desktop.png'),fullPage:true});
   await page.setViewportSize({width:390,height:844});

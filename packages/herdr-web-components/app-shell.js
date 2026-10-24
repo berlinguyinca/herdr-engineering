@@ -1,7 +1,9 @@
+import { DENSITIES, sanitizeDensity } from './density.js';
+
 // herdr-web-components — <herdr-app-shell> sidebar shell (Spec §12-16).
 // routes is a JSON attribute: [{"path":"/missions","label":"Missions"}].
-// The active route is driven by hashchange; the shell emits no DOM writes
-// beyond its own template. Content is projected into the main region.
+// The active route is driven by hashchange. The shell owns its template and
+// the shared document density preference. Content projects into the main region.
 
 export class HerdrAppShell extends HTMLElement {
   static get observedAttributes() {
@@ -12,6 +14,7 @@ export class HerdrAppShell extends HTMLElement {
     super();
     this._nav = [];
     this._menuOpen = false;
+    this._density = 'comfortable';
     this.attachShadow({ mode: 'open' });
   }
 
@@ -21,6 +24,9 @@ export class HerdrAppShell extends HTMLElement {
   }
 
   connectedCallback() {
+    let stored;
+    try { stored = localStorage.getItem('herdr-density'); } catch { /* Storage can be unavailable. */ }
+    this._applyDensity(stored);
     this._parse();
     this._render();
     window.addEventListener('hashchange', this._syncActive);
@@ -29,6 +35,12 @@ export class HerdrAppShell extends HTMLElement {
 
   disconnectedCallback() {
     window.removeEventListener('hashchange', this._syncActive);
+  }
+
+  _applyDensity(value) {
+    this._density = sanitizeDensity(value);
+    document.documentElement.dataset.density = this._density;
+    try { localStorage.setItem('herdr-density', this._density); } catch { /* Apply even without storage. */ }
   }
 
   _parse() {
@@ -67,12 +79,18 @@ export class HerdrAppShell extends HTMLElement {
       <div class="hd-shell">
         <aside class="hd-shell__sidebar">
           <div class="hd-shell__brand"><span>${escapeHtml(brand)}</span><button class="hd-shell__menu" type="button" aria-expanded="false" aria-controls="primary-navigation">Menu</button></div>
+          <label class="hd-shell__density">Density
+            <select aria-label="Density">${DENSITIES.map(value => `<option value="${value}" ${value === this._density ? 'selected' : ''}>${value[0].toUpperCase() + value.slice(1)}</option>`).join('')}</select>
+          </label>
           <nav class="hd-shell__nav" id="primary-navigation" data-open="false" aria-label="Primary">${links}</nav>
         </aside>
         <main class="hd-shell__main"><div class="hd-shell__content">
           <slot></slot>
         </div></main>
       </div>`;
+    this.shadowRoot.querySelector('.hd-shell__density select').addEventListener('change', event => {
+      this._applyDensity(event.target.value);
+    });
     this.shadowRoot.querySelector('.hd-shell__menu')?.addEventListener('click', () => {
       this._menuOpen = !this._menuOpen;
       this.shadowRoot.querySelector('.hd-shell__nav')?.setAttribute('data-open', String(this._menuOpen));
@@ -94,19 +112,24 @@ const SHARED = `
   border-bottom: 1px solid var(--border-subtle); }
 .hd-shell__menu { display: none; font: inherit; padding: 6px 10px; color: var(--text-secondary);
   background: var(--surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); cursor: pointer; }
-.hd-shell__nav { display: flex; flex-direction: column; gap: 2px; padding: 8px; }
-.hd-shell__link { display: flex; padding: 8px 10px; border-radius: var(--radius-sm);
+.hd-shell__nav { display: flex; flex-direction: column; gap: 2px; padding: var(--density-gap, 8px); }
+.hd-shell__link { display: flex; padding: var(--density-row-padding, 8px) 10px; border-radius: var(--radius-sm);
   color: var(--text-secondary); text-decoration: none; font-size: 0.875rem; }
 .hd-shell__link:hover { background: var(--surface-hover); text-decoration: none; }
 .hd-shell__link.active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }
+.hd-shell__density { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 16px; font-size: .8125rem; color: var(--text-secondary); }
+.hd-shell__density select { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .hd-shell__main { flex: 1; min-width: 0; }
 .hd-shell__content { width: auto; max-width: none; margin: 0; padding: clamp(20px,1.25vw,48px); }
-@media (max-width: 720px) {
+@media (max-width: 900px) {
   .hd-shell { flex-direction: column; }
   .hd-shell__sidebar { width: 100%; border-right: none;
     border-bottom: 1px solid var(--border-subtle); }
   .hd-shell__brand { padding: 10px 16px; }
-  .hd-shell__menu { display: inline-flex; }
+  .hd-shell__menu { display: inline-flex; min-height: 44px; align-items: center; }
+  .hd-shell__density { padding: 8px 16px; }
+  .hd-shell__density select, .hd-shell__link { min-height: 44px; align-items: center; }
   .hd-shell__nav { display: none; grid-template-columns: repeat(2,minmax(0,1fr)); max-height: 55vh; overflow-y: auto; }
   .hd-shell__nav[data-open=true] { display: grid; }
   .hd-shell__content { max-width: none; padding: 16px; }
