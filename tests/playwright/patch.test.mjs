@@ -167,3 +167,56 @@ test('morph: identical markup writes nothing; changes patch in place, keyed chil
  assert.deepEqual(r.changedTargets.sort(),['p','summary']);
  assert.deepEqual({keep:r.keep,open:r.open,once:r.once},{keep:true,open:true,once:true});
 }));
+
+test('morph never moves or replaces a focused node or one holding the selection',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ const r=await page.evaluate(()=>{
+  morph(c,'<p data-key="a">A</p><input data-key="b"><div data-key="d"><button>go</button></div>');
+  const input=c.querySelector('input');input.focus();
+  morph(c,'<input data-key="b"><p data-key="a">A</p><div data-key="d"><button>go</button></div>');
+  const out={inputKept:c.querySelector('input')===input,inputFocused:document.activeElement===input};
+  const btn=c.querySelector('button');btn.focus();
+  morph(c,'<input data-key="b"><p data-key="a">A</p><div data-key="d"><a href="#">go</a></div>');
+  out.buttonKept=btn.isConnected&&document.activeElement===btn;
+  btn.blur();
+  morph(c,'<p>hello world</p>');
+  const p=c.querySelector('p');const range=document.createRange();range.selectNodeContents(p);getSelection().removeAllRanges();getSelection().addRange(range);
+  morph(c,'<span>hello world</span>');
+  out.selectionKept=p.isConnected&&!getSelection().isCollapsed&&getSelection().toString()==='hello world';
+  getSelection().removeAllRanges();
+  morph(c,'<span>hello world</span>');
+  out.replacedLater=!p.isConnected&&c.firstElementChild.localName==='span';
+  return out;
+ });
+ assert.deepEqual(r,{inputKept:true,inputFocused:true,buttonKept:true,selectionKept:true,replacedLater:true});
+}));
+
+test('morph syncs form-control properties, except on a focused control',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ const r=await page.evaluate(()=>{
+  morph(c,'<input id="t" value="a"><input id="k" type="checkbox"><select id="s"><option value="1">1</option><option value="2">2</option></select><textarea id="x">one</textarea>');
+  const [t,k,s,x]=['t','k','s','x'].map(id=>document.getElementById(id));
+  t.value='typed';k.checked=true;s.value='2';x.value='edited';
+  morph(c,'<input id="t" value="b"><input id="k" type="checkbox"><select id="s"><option value="1" selected>1</option><option value="2">2</option></select><textarea id="x">two</textarea>');
+  const out={t:t.value,k:k.checked,s:s.value,x:x.value};
+  t.focus();t.value='mine';
+  morph(c,'<input id="t" value="c"><input id="k" type="checkbox" checked><select id="s"><option value="1" selected>1</option><option value="2">2</option></select><textarea id="x">two</textarea>');
+  out.focused=t.value;out.k2=k.checked;
+  return out;
+ });
+ assert.deepEqual(r,{t:'b',k:false,s:'1',x:'two',focused:'mine',k2:true});
+}));
+
+test('morph detects attributes removed from custom elements without dropping self-stamped ones',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ const r=await page.evaluate(()=>{
+  customElements.define('x-obs',class extends HTMLElement{static observedAttributes=['mode'];connectedCallback(){this.setAttribute('role','status');}});
+  customElements.define('x-render',class extends HTMLElement{connectedCallback(){this.textContent=this.getAttribute('hint')||'none';}});
+  morph(c,'<x-obs mode="a"></x-obs><x-render hint="h"></x-render>');
+  const obs=c.querySelector('x-obs'),ren=c.querySelector('x-render');
+  morph(c,'<x-obs></x-obs><x-render></x-render>');
+  const after=c.querySelector('x-render');
+  return {obsKept:c.querySelector('x-obs')===obs,mode:obs.hasAttribute('mode'),role:obs.getAttribute('role'),replaced:after!==ren,text:after.textContent};
+ });
+ assert.deepEqual(r,{obsKept:true,mode:false,role:'status',replaced:true,text:'none'});
+}));
