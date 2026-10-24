@@ -220,6 +220,99 @@ class CollabStorage:
         return self._archive.checksum(key)
 
 
+    def read_archive(self, archive_id: str, name: str, expected_sha256: str) -> bytes:
+        """Read bounded metadata only; file bytes use server-side copies."""
+        key = archive_key(self.config.environment, archive_id, name)
+        body = None
+        try:
+            body = self._archive._s3.get_object(Bucket=self.config.archive_bucket, Key=key)['Body']
+            chunks, size = [], 0
+            while chunk := body.read(1024 * 1024):
+                size += len(chunk)
+                if size > 64 * 1024 * 1024:
+                    raise ValueError('metadata exceeds limit')
+                chunks.append(chunk)
+            data = b''.join(chunks)
+            if hashlib.sha256(data).hexdigest() != expected_sha256:
+                raise ValueError('checksum mismatch')
+            return data
+        except Exception:
+            raise StorageError('archive metadata verification failed') from None
+        finally:
+            if body is not None:
+                body.close()
+
+    def write_archive(self, archive_id: str, name: str, data: bytes) -> ObjectRef:
+        key = archive_key(self.config.environment, archive_id, name)
+        if len(data) > 64 * 1024 * 1024:
+            raise StorageError('archive metadata exceeds limit')
+        try:
+            digest = self._archive.put_at(key, data)
+            return ObjectRef(self.config.archive_bucket, key, len(data), digest)
+        except Exception:
+            raise StorageError('archive object write failed') from None
+
+    def live_inventory(self, room_id: str) -> list[str]:
+        prefix = f'env/{self.config.environment}/rooms/{_opaque_id(room_id, "room")}/'
+        keys, continuation = [], {}
+        try:
+            while True:
+                page = self._archive._s3.list_objects_v2(
+                    Bucket=self.config.live_bucket, Prefix=prefix, **continuation)
+                keys.extend(obj['Key'] for obj in page.get('Contents', []))
+                if not page.get('IsTruncated'):
+                    return sorted(keys)
+                continuation = {'ContinuationToken': page['NextContinuationToken']}
+        except Exception:
+            raise StorageError('live inventory failed') from None
+
+    def _live_client(self) -> RustFSClient:
+        return RustFSClient(endpoint=self.config.endpoint, bucket=self.config.live_bucket,
+                            s3=self._archive._s3)
+
+    def archive_file(self, archive_id: str, room_id: str, file_id: str,
+                     variant: str | None = None) -> ObjectRef:
+        source = live_key(self.config.environment, room_id, file_id, variant)
+        name = f'files/{file_id}/' + ('blob' if variant is None else f'preview/{variant}')
+        key = archive_key(self.config.environment, archive_id, name)
+        try:
+            size, digest = self._live_client().checksum(source)
+            # boto3's managed copy supports multipart server-side copies, including >5GB.
+            self._archive._s3.copy({'Bucket': self.config.live_bucket, 'Key': source},
+                                   self.config.archive_bucket, key)
+            return ObjectRef(self.config.archive_bucket, key, size, digest)
+        except Exception:
+            raise StorageError('archive file copy failed') from None
+
+    def restore_file(self, archive_id: str, old_file_id: str, room_id: str, file_id: str,
+                     size: int, digest: str, variant: str | None = None) -> str:
+        name = f'files/{old_file_id}/' + ('blob' if variant is None else f'preview/{variant}')
+        source = archive_key(self.config.environment, archive_id, name)
+        key = live_key(self.config.environment, room_id, file_id, variant)
+        try:
+            self._archive._s3.copy({'Bucket': self.config.archive_bucket, 'Key': source},
+                                   self.config.live_bucket, key)
+            if self._live_client().checksum(key) != (size, digest):
+                raise ValueError('checksum mismatch')
+            return key
+        except Exception:
+            raise StorageError('restored file verification failed') from None
+
+    def live_checksum(self, room_id: str, file_id: str, variant: str | None = None) -> tuple[int, str]:
+        key = live_key(self.config.environment, room_id, file_id, variant)
+        try:
+            return self._live_client().checksum(key)
+        except Exception:
+            raise StorageError('live file verification failed') from None
+
+    def delete_live_file(self, room_id: str, file_id: str, variant: str | None = None) -> None:
+        key = live_key(self.config.environment, room_id, file_id, variant)
+        try:
+            self._live_client().delete(key)
+        except Exception:
+            raise StorageError('live file deletion failed') from None
+
+
 def verify_manifest(manifest: dict[str, Any], client: CollabStorage) -> VerificationReport:
     archive_id = manifest.get("archive_id") if isinstance(manifest, dict) else None
     objects = _manifest_objects(manifest, client.config.environment, archive_id)
