@@ -96,3 +96,53 @@ test('patchText and patchAttr report whether they wrote',async()=>withPage(async
  });
  assert.deepEqual(r.same,[false,false]);assert.equal(r.idle,0);assert.deepEqual(r.wrote,[true,true]);assert.equal(r.text,'y');assert.equal(r.title,'u');
 }));
+
+test('default update (no update callback): changes write, identical is silent, focused row untouched',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ const r=await page.evaluate(async()=>{
+  const o={key:i=>i.id,render:i=>`<div data-key="${i.id}"><span>${i.text}</span><input></div>`,animate:false};
+  patchList(c,[{id:'a',text:'A'},{id:'b',text:'B'}],o);
+  const a=c.children[0],b=c.children[1];
+  const seen=[];const mo=new MutationObserver(m=>seen.push(...m));mo.observe(c,{subtree:true,childList:true,attributes:true,characterData:true});
+  patchList(c,[{id:'a',text:'A'},{id:'b',text:'B'}],o);
+  await new Promise(r=>setTimeout(r,20));const idle=seen.length+mo.takeRecords().length;mo.disconnect();
+  b.querySelector('input').focus();
+  patchList(c,[{id:'a',text:'A2'},{id:'b',text:'B2'}],o);
+  return {idle,same:c.children[0]===a&&c.children[1]===b,a:a.querySelector('span').textContent,b:b.querySelector('span').textContent};
+ });
+ assert.equal(r.idle,0);assert.equal(r.same,true);assert.equal(r.a,'A2');assert.equal(r.b,'B');
+}));
+
+test('a row holding the text selection is not rewritten',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ const r=await page.evaluate(()=>{
+  const o={key:i=>i.id,render:i=>`<div data-key="${i.id}"><span>${i.text}</span></div>`,animate:false};
+  patchList(c,[{id:'a',text:'A'},{id:'b',text:'B'}],o);
+  const range=document.createRange();range.selectNodeContents(c.children[0].firstChild);
+  const sel=getSelection();sel.removeAllRanges();sel.addRange(range);
+  patchList(c,[{id:'a',text:'A2'},{id:'b',text:'B2'}],o);
+  return [c.children[0].textContent,c.children[1].textContent];
+ });
+ assert.deepEqual(r,['A','B2']);
+}));
+
+test('render without a root element does not throw; leaving key reappearing is revived',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ const r=await page.evaluate(()=>{
+  const out={};
+  try{patchList(c,[{id:'x'},{id:'y'}],{key:i=>i.id,render:i=>i.id==='x'?'':`<div>${i.id}</div>`,animate:false});out.threw=false;}catch(e){out.threw=String(e);}
+  out.count=c.children.length;
+  c.innerHTML='';
+  const o={key:i=>i.id,render:i=>`<div>${i.id}</div>`,animate:true};
+  patchList(c,[{id:'a'}],o);const a=c.children[0];
+  patchList(c,[],o);const leaving=a.hasAttribute('data-leaving');
+  patchList(c,[{id:'a'}],o);
+  a.dispatchEvent(new Event('transitionend'));
+  out.revived=leaving&&c.children.length===1&&c.children[0]===a&&!a.hasAttribute('data-leaving')&&a.parentNode===c;
+  const child=document.createElement('i');a.append(child);
+  patchList(c,[],o);child.dispatchEvent(new Event('transitionend',{bubbles:true}));
+  out.bubbleIgnored=a.parentNode===c;
+  return out;
+ });
+ assert.equal(r.threw,false);assert.equal(r.count,2);assert.equal(r.revived,true);assert.equal(r.bubbleIgnored,true);
+}));
