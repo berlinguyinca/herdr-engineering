@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { completionAt, providers, applyCompletion, ROOM_COMMANDS, unresolvedMentions } from '../collab-mention.js';
+import { completionAt, providers, applyCompletion, ROOM_COMMANDS, unresolvedMentions, mentionChips, filterItems } from '../collab-mention.js';
 
 const ctx = {
   people: [{ user_id: 'u1', handle: 'gert', online: true }, { user_id: 'u2', handle: 'ana' }],
@@ -17,6 +17,7 @@ test('completionAt finds @, # and a leading / with the query typed so far', () =
   assert.deepEqual(typeAll('@ge'), { sigil: '@', query: 'ge', start: 0 });
   assert.deepEqual(typeAll('hi @Gert.p'), { sigil: '@', query: 'gert.p', start: 3 });
   assert.deepEqual(typeAll('see @src/main.js'), { sigil: '@', query: 'src/main.js', start: 4 });
+  assert.deepEqual(typeAll('@org/repo#12'), { sigil: '@', query: 'org/repo#12', start: 0 });
   assert.deepEqual(typeAll('fixes #binv'), { sigil: '#', query: 'binv', start: 6 });
   assert.deepEqual(typeAll('/hand'), { sigil: '/', query: 'hand', start: 0 });
   assert.deepEqual(completionAt('hi @ge there', 6), { sigil: '@', query: 'ge', start: 3 });
@@ -72,4 +73,21 @@ test('applyCompletion inserts the literal text only, equal to typing it out', ()
 test('unresolvedMentions flags names that address nobody, as the server would', () => {
   assert.deepEqual(unresolvedMentions('@gert @gert.pi @lead @old-lead @all @zzz and @Gert. `@code` a@b.com', ctx), ['zzz']);
   assert.deepEqual(unresolvedMentions('@zzz @zzz @yy', ctx), ['zzz', 'yy']);
+});
+
+test('mentionChips wraps only server-resolved names, outside code and links, keeping the literal text', () => {
+  const mentions = [{ kind: 'person', id: 'u1', name: 'gert' }, { kind: 'agent', id: 'a1', name: 'gert.pi' }];
+  const html = mentionChips('<p>hi @gert. ask @lead, <code>@gert</code> <a href="#">@gert</a> @zzz a@gert</p>', mentions, ctx);
+  assert.equal((html.match(/class="cx-mention /g) || []).length, 2);
+  assert.match(html, /data-mention-kind="person"[^>]*><span[^>]*data-icon="person"[^>]*>[^<]*<\/span>@gert<\/span>\./);
+  assert.match(html, /data-mention-id="a1"[^>]*><span[^>]*data-icon="robot"[^>]*>[^<]*<\/span>@lead<\/span>,/);
+  assert.match(html, /<code>@gert<\/code> <a href="#">@gert<\/a> @zzz a@gert/);
+  assert.equal(mentionChips('<p>@gert</p>', [], ctx), '<p>@gert</p>');
+  assert.equal(mentionChips('<p>@x</p>', [{ kind: 'person', id: '"><img>', name: 'x' }], {}).includes('<img>'), false);
+});
+
+test('filterItems ranks generic references by label and insert text', () => {
+  const items = [{ insert: '@src/app.js', label: 'src/app.js', section: 'Files' }, { insert: 'https://github.com/o/r/issues/12', label: 'Issue #12', section: 'Issues' }];
+  assert.deepEqual(filterItems(items, 'app').map((i) => i.label), ['src/app.js']);
+  assert.deepEqual(filterItems(items, '12').map((i) => i.label), ['Issue #12']);
 });

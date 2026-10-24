@@ -185,3 +185,12 @@ def test_join_and_enrollment_carry_skills_too(w):
     start = w.s.start_enrollment(w.alice, {"device_id": "dev1", "harness_type": "pi"})
     done = w.s.complete_enrollment({"code": start["code"], "device_id": "dev1", "skills": ["skill:review"]})
     assert w.s._agents[done["agent_id"]]["skills"] == ["skill:review"]
+
+
+def test_a_task_to_an_agent_keeps_the_literal_text_byte_for_byte(w):
+    pi, pid = agent(w, "alice", "pi")
+    text = "@alice.pi /skill:review @src/app.js !ls $HOME"
+    tid = w.s.create_task(w.bob, w.room, {"target_agent_id": pid, "text": text})["task_id"]
+    assert [t["text"] for t in w.s.list_tasks(pi, w.room)["tasks"] if t["task_id"] == tid] == [text]
+    created = [e for e in w.s.read_events(pi, w.room, 0, 200)["events"] if e["event_type"] == "task_created"]
+    assert created[-1]["task"]["text"] == text

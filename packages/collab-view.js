@@ -16,6 +16,7 @@ import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
+import { providers, ROOM_COMMANDS, unresolvedMentions, mentionChips, resolvesTo } from './collab-mention.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
@@ -565,7 +566,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
+    const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
     const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
@@ -677,7 +678,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         const cont = key === lastKey && at - lastAt < 5 * 60000;
         lastKey = key; lastAt = at.getTime();
         row.className = `cx-m${mine ? ' cx-m--mine' : ''}${agent ? ' cx-m--agent' : ''}${cont ? ' cx-m--cont' : ''}`;
-        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${renderMarkdown(e.text)}</div>${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
+        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${mentionChips(renderMarkdown(e.text), e.mentions, mentionCtx())}</div>${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
         return row;
       }
       lastKey = null;
@@ -1306,9 +1307,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     root.querySelectorAll('[data-sub]').forEach((b) => { b.onclick = () => showSub(b.dataset.sub); });
     root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${sub}`; });
 
+    function mentionCtx() {
+      return { people: S.people, commands: ROOM_COMMANDS,
+        agents: S.agents.map((a) => ({ ...a, label: namedAgent(a).display_name || '' })) };
+    }
     // ---- one long-poll feeds every panel (replaces five timers); it sleeps while the tab is hidden
     const apply = (s) => {
       if (s.agents) { S.agents = s.agents; S.agents.forEach((a) => agentName.set(a.agent_id, a.name)); }
+      if (s.people) S.people = s.people;
       S.links = s.links ?? null; S.missions = s.missions ?? null;
       S.tasks = s.tasks || []; S.flow = s.flow || null; S.requests = s.requests || null;
       S.agents.forEach(a=>agentName.set(a.agent_id,namedAgent(a).display_name || a.name));
@@ -1355,18 +1361,19 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     if ($('hcn-composer')) {
       composer = mountComposer($('hcn-composer'), {
         draftKey: `collab:${me.user_id}:${roomId}`,
-        placeholder: 'Message the room… type @ to hand an agent a task',
-        hint: 'Enter sends · Shift+Enter adds a line · @agent … gives that agent a task',
-        suggestions: () => S.agents.filter((a) => a.actions.includes('execute')).map((a) => ({
-          id: a.agent_id, label: namedAgent(a).display_name || `@${a.name}`, insertText: `@${a.name}`,
-          detail: `${a.harness_type} · ${names.get(a.owner_user_id) || shortId(a.owner_user_id)}`,
-        })),
+        placeholder: 'Message the room… @ people, agents and files · / commands',
+        hint: 'Enter sends · Shift+Enter adds a line · @gert.pi … gives that agent a task',
+        providers, context: mentionCtx,
+        check: (text) => { const missing = unresolvedMentions(text, mentionCtx()); return missing.length ? `${missing.map((n) => `@${n}`).join(', ')} addresses nobody here; it will be sent as plain text.` : ''; },
         onSend: async (text) => {
-          const mention = /^@([a-z0-9-]{1,32})\s+([\s\S]+)$/.exec(text.trim());
-          if (mention) { // Preserve the room's authenticated leading-agent task contract.
-            const hits = S.agents.filter((a) => a.name === mention[1] && a.actions.includes('execute'));
-            if (hits.length !== 1) throw new Error(hits.length ? `More than one agent is called @${mention[1]}; use the Tasks tab` : `No agent named @${mention[1]} in this room accepts tasks`);
-            await api.createTask(roomId, hits[0].agent_id, mention[2]);
+          // The text goes out exactly as typed: the server derives mentions, and a harness reads what was written.
+          const lead = /^@([a-z0-9._-]{1,48})\s+\S/i.exec(text.trim());
+          // the same precedence as the server: a group or a person handle is never an agent's task
+          const hit = lead && resolvesTo(lead[1].toLowerCase(), mentionCtx());
+          const target = hit && hit.kind === 'agent' && S.agents.find((a) => a.agent_id === hit.id);
+          const mention = target && target.actions.includes('execute');
+          if (mention) { // the room's authenticated leading-agent task contract, now with the verbatim text
+            await api.createTask(roomId, target.agent_id, text);
           } else { await api.say(roomId, text, CTX.attach ? contextBody(CTX.attach) : undefined); CTX.attach = null; drawAttach(); }
           if (alive) { kick(); log.scrollTop = log.scrollHeight; }
           return { status: 'delivered', message: mention ? 'Task created' : 'Message posted' };

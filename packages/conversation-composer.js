@@ -122,7 +122,15 @@ export function mountComposer(host, options = {}) {
     const before = input.value.slice(0, input.selectionStart), lines = before.split('\n');
     info.textContent = `Line ${lines.length}, column ${lines.at(-1).length + 1} · ${input.value.length} characters`;
   };
-  const changed = () => { save(); grow(); updateInfo(); updatePreview(); };
+  // options.check(text) -> a note or '' (e.g. "@zzz addresses nobody"). It flags; it never blocks a send.
+  let flagged = false;
+  const flag = () => {
+    if (typeof options.check !== 'function' || sending) return;
+    const note = options.check(input.value) || '';
+    if (note) message(note); else if (flagged) message(expanded ? 'Enter adds a line · Use Send to deliver · Escape closes the editor' : hint);
+    flagged = Boolean(note);
+  };
+  const changed = () => { save(); grow(); updateInfo(); updatePreview(); flag(); };
   const apply = (value, start, end = start) => {
     if (disabled || sending || composing) return false;
     if (value.length > input.maxLength) { message(`Message exceeds ${input.maxLength} characters.`, true); return false; }
@@ -300,7 +308,7 @@ export function mountComposer(host, options = {}) {
       const receipt = await options.onSend(text, attachments.map((a) => a.artifact));
       if (receipt?.status === 'failed' || receipt?.status === 'error') throw new Error(receipt.error || 'Delivery failed');
       if (disposed) return;
-      input.value = ''; undo = []; redo = []; current = snapshot(); changed(); attachments.forEach(revoke); attachments = [];
+      input.value = ''; undo = []; redo = []; current = snapshot(); changed(); flagged = false; attachments.forEach(revoke); attachments = [];
       message(receipt?.message || (receipt?.status === 'delivered' ? 'Delivered' : receipt?.status === 'accepted' ? 'Accepted; waiting for delivery.' : 'Sent'));
     } catch (error) { if (!disposed) message(error.message || 'Send failed. Your draft is saved.', true); }
     finally { sending = false; if (!disposed) { drawAttachments(); input.focus(); } }

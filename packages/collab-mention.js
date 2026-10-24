@@ -60,7 +60,8 @@ const AGENT_BEFORE = /(?:^|[\s([{])@([a-z0-9._-]{1,48})\s+$/i;
 // `!` (a harness shell escape) and `$` are never completed.
 export function completionAt(text, caret) {
   const upto = String(text).slice(0, caret);
-  const m = /([@#/])([^\s@#<>]*)$/.exec(upto);
+  // an @ query may hold '#' and '/' (`@org/repo#12`, `@src/app.js`); # and / queries stop at the next sigil
+  const m = /(@)([^\s@<>]*)$/.exec(upto) || /([#/])([^\s@#<>]*)$/.exec(upto);
   if (!m) return null;
   const start = upto.length - m[0].length, sigil = m[1], query = m[2].toLowerCase(), head = upto.slice(0, start);
   if (!BEFORE.test(head)) return null;                                          // a@b.com, C:\x\@y, and/or
@@ -145,19 +146,64 @@ export function mentionTokens(text) {
   const plain = String(text).replace(/```[\s\S]*?(?:```|$)/g, ' ').replace(/`[^`\n]*`/g, ' ');
   return [...plain.matchAll(MENTION)].map((m) => m[1].toLowerCase());
 }
+// Precedence as on the server: group, agent address, person handle, then an agent's current or old name.
+function resolveName(name, ctx) {
+  if (GROUPS.some((g) => g.name === name)) return { kind: 'group', id: name, name };
+  const agent = (ctx.agents || []).find((a) => a.address === name);
+  if (agent) return { kind: 'agent', id: agent.agent_id, name };
+  const person = (ctx.people || []).find((p) => p.handle === name);
+  if (person) return { kind: 'person', id: person.user_id, name };
+  const alias = findAgent(ctx.agents, name);
+  return alias ? { kind: 'agent', id: alias.agent_id, name: agentKey(alias) } : null;
+}
 export function resolvesTo(token, ctx = {}) {
   for (const name of [token, token.replace(/[._-]+$/, '')]) {
-    if (!name) continue;
-    if (GROUPS.some((g) => g.name === name)) return { kind: 'group', id: name, name };
-    const agent = (ctx.agents || []).find((a) => a.address === name);
-    if (agent) return { kind: 'agent', id: agent.agent_id, name };
-    const person = (ctx.people || []).find((p) => p.handle === name);
-    if (person) return { kind: 'person', id: person.user_id, name };
-    const alias = findAgent(ctx.agents, name);
-    if (alias) return { kind: 'agent', id: alias.agent_id, name: agentKey(alias) };
+    const hit = name && resolveName(name, ctx);
+    if (hit) return hit;
   }
   return null;
 }
 export function unresolvedMentions(text, ctx = {}) {
   return [...new Set(mentionTokens(text).filter((t) => !resolvesTo(t, ctx)))];
+}
+
+// Generic items (`{insert, label, section, icon, detail}`) filtered and ranked by the typed query.
+export function filterItems(items, query) {
+  return rank((items || []).map((item) => ({ score: score(query, item.insert.replace(/^[@#/]/, ''), item.label), item })));
+}
+
+// Mentions in rendered message HTML as chips. Only names the server resolved for this message (its
+// `mentions`) become chips; code, links and unknown names stay text. The chip keeps the literal text.
+const CHIP_ICON = { person: ['person', '👤'], agent: ['robot', '🤖'], group: ['group', '👥'] };
+const escText = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+export function mentionChips(html, mentions, ctx = {}) {
+  const list = mentions || [];
+  if (!list.length) return html;
+  const hit = (token) => {
+    for (const name of [token, token.replace(/[._-]+$/, '')]) {
+      if (!name) continue;
+      const byName = list.find((m) => m.name === name);
+      if (byName) return { m: byName, len: name.length };
+      const r = resolveName(name, ctx);
+      const byId = r && list.find((m) => m.kind === r.kind && m.id === r.id);
+      if (byId) return { m: byId, len: name.length };
+    }
+    return null;
+  };
+  let skip = 0;
+  return String(html).split(/(<[^>]*>)/).map((part) => {
+    if (part.startsWith('<')) {
+      const tag = /^<(\/?)(code|pre|a)\b/i.exec(part);
+      if (tag) skip = Math.max(0, skip + (tag[1] ? -1 : 1));
+      return part;
+    }
+    if (skip) return part;
+    return part.replace(/(^|[\s([{])@([A-Za-z0-9._-]{1,48})(?![A-Za-z0-9._-])/g, (all, pre, token) => {
+      const found = hit(token.toLowerCase());
+      if (!found) return all;
+      const [icon, glyph] = CHIP_ICON[found.m.kind] || CHIP_ICON.person;
+      const label = `${found.m.kind === 'agent' ? 'Agent' : found.m.kind === 'group' ? 'Group' : 'Person'} @${found.m.name}`;
+      return `${pre}<span class="cx-mention cx-mention--${escText(found.m.kind)}" data-mention-kind="${escText(found.m.kind)}" data-mention-id="${escText(found.m.id)}" title="${escText(label)}"><span class="cx-mention__icon" data-icon="${icon}" aria-hidden="true">${glyph}</span>@${token.slice(0, found.len)}</span>${token.slice(found.len)}`;
+    });
+  }).join('');
 }
