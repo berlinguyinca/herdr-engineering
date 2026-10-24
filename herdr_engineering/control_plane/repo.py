@@ -21,6 +21,7 @@ import time
 from uuid import uuid4
 
 from ..llm_session_id import dashboard_form
+from . import llm_stats
 from .agent_identity import AgentIdentityRegistry
 from .envelope import SourceLedger, envelope_event_fields
 from .graph import GraphProjection
@@ -1973,6 +1974,54 @@ class ControlPlaneRepo:
                     b["raw_session_ids"] = sorted([*b["raw_session_ids"], raw])
         return {"total": total, "by_project": by_project, "by_model": by_model,
                 "by_day": dict(sorted(by_day.items())), "by_session": by_session}
+
+    # LLM page (docs/superpowers/specs/2026-10-23-llm-page-design.md, slice 2). Computed from
+    # the retained raw records on each call, like ``token_analytics``; ``retained_since`` says
+    # how far back they go and ``partial`` is true when the window starts before that.
+    def _llm_window(self, window, filters):
+        if window not in llm_stats.WINDOWS:
+            raise ValueError(f"window must be one of {', '.join(llm_stats.WINDOWS)}")
+        now = self._now()
+        since = now - llm_stats.WINDOWS[window]
+        cache = {}
+
+        def resolve(raw):
+            if raw not in cache:
+                cache[raw] = self.resolve_usage_session(raw)
+            return cache[raw]
+
+        project = filters.get("project")
+        with self._event_lock:
+            streams = [s for (etype, eid), s in self._events.items()
+                       if etype == "token_usage" and (not project or eid == project)]
+            events = [ev for s in streams for ev in s]
+        oldest = min((llm_stats._parse(s[0]["source_timestamp"]) for s in streams if s), default=None)
+        records = list(llm_stats.select(events, _payload, since=since, until=now + 1, resolve=resolve,
+                                        **{k: v for k, v in filters.items() if v}))
+        meta = {"window": window, "since": llm_stats._iso(since),
+                "retained_since": llm_stats._iso(oldest),
+                "partial": oldest is None or oldest > since}
+        return records, resolve, meta, since, now
+
+    def llm_stats(self, window="24h", group="model", **filters):
+        if group not in llm_stats.GROUPS:
+            raise ValueError(f"group must be one of {', '.join(llm_stats.GROUPS)}")
+        records, resolve, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, group=group, groups=llm_stats.stats(records, group, resolve))
+
+    def llm_timeseries(self, window="24h", step="1h", metric="requests", **filters):
+        if step not in llm_stats.STEPS:
+            raise ValueError(f"step must be one of {', '.join(llm_stats.STEPS)}")
+        if metric not in llm_stats.METRICS:
+            raise ValueError(f"metric must be one of {', '.join(llm_stats.METRICS)}")
+        records, _, meta, since, now = self._llm_window(window, filters)
+        step_s = llm_stats.STEPS[step]
+        points = llm_stats.timeseries(records, metric, since=since, until=now, step=step_s)
+        return dict(meta, step=step, metric=metric, points=points)
+
+    def llm_errors(self, window="24h", error_class=None, **filters):
+        records, resolve, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, problems=llm_stats.errors(records, resolve, error_class=error_class))
 
     def create_project_key(self, project, label=""):
         """Mint a gateway key for ``project``; the secret is returned once and only

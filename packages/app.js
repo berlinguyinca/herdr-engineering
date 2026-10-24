@@ -23,6 +23,7 @@ import { renderHostDetail, renderHostCard, HOST_CARD_STYLE, RANGES, safeHostId }
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
+import { renderLlm, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -61,6 +62,7 @@ const NAV = [
   { path: '/hosts', label: 'Hosts' },
   { path: '/activity', label: 'Activity' },
   { path: '/analytics', label: 'Analytics' },
+  { path: '/llm', label: 'LLM' },
   { path: '/collab', label: 'Collaboration' },
 ];
 
@@ -98,6 +100,7 @@ const ROUTES = {
   '/analytics/models': viewAnalyticsModels,
   '/analytics/hosts': viewAnalyticsHosts,
   '/analytics/tokens': viewAnalyticsTokens,
+  '/llm': viewLlm,
 };
 
 // The agent inspector owns a per-session stream; dispose it whenever the view changes.
@@ -506,6 +509,33 @@ async function viewAnalyticsTokens() {
       <herdr-metric label="Output tokens" value="${fmt(t.total.output_tokens)}"></herdr-metric>
     </div>` + table('By project', t.by_project) + table('By model', t.by_model) +
     table('By day', t.by_day);
+}
+async function viewLlm() {
+  const q = route().query;
+  const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
+  const filters = { project: q.get('project') || '', model: q.get('model') || '' };
+  const f = { window: window_, ...filters };
+  const step = STEP_FOR[window_];
+  const series = (metric) => client.llm('timeseries', { ...f, step, metric });
+  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions] = await Promise.all([
+    client.llm('stats', { ...f, group: 'all' }),
+    client.llm('stats', { window: window_, project: filters.project, group: 'model' }),
+    client.llm('stats', { ...f, group: 'session' }),
+    client.llm('errors', f),
+    client.llm('stats', { window: window_, group: 'project' }),
+    series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
+    client.listSessions().catch(() => ({ sessions: [] })),
+  ]);
+  const names = {};
+  for (const s of sessions.sessions || []) if (s.display_name) names[s.session_id] = s.display_name;
+  root.innerHTML = renderLlm({
+    window: window_, filters, names,
+    projects: projects.groups.map((g) => g.key),
+    modelNames: [...new Set(models.groups.map((g) => g.key))],
+  }, { total, models, agents, problems, series: { requests, errors, ttft, speed } });
+  root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
+    window.location.hash = `#/llm?${llmQuery({ window: window_, ...filters, [el.dataset.llmFilter]: el.value })}`;
+  }));
 }
 async function viewAnalyticsHosts() {
   const h = await client.analytics('hosts');
