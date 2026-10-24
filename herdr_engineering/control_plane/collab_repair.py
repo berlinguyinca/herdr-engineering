@@ -8,12 +8,13 @@ operator command moves them to a quarantine file/table that keeps every column.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import time
 from datetime import UTC, datetime
 from typing import Any
+
+from . import logfile_lock
 
 REQUIRED_PAYLOAD = ("org_id", "correlation_id", "created_at")
 
@@ -36,6 +37,10 @@ def _payload(row: dict) -> Any:
         except ValueError:
             return None
     return p
+
+
+class SchemaTooOldError(RuntimeError):
+    """``fabric_events`` predates the v2 envelope columns (migration 0003)."""
 
 
 class LogInUseError(RuntimeError):
@@ -182,13 +187,19 @@ def repair_file(path: str, *, apply: bool = False, confirmed: bool = False, cut_
         return report
     if not confirmed:
         raise PermissionError("--apply needs --confirm-quarantine")
-    lock = os.open(path, os.O_RDONLY)
     try:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise LogInUseError(f"refusing to rewrite {path}: a running collaboration server holds it; stop the "
-                                "server first, then repair, then start it again") from None
+        held = logfile_lock.acquire(path, exclusive=True)
+    except logfile_lock.Busy:
+        raise LogInUseError(f"refusing to rewrite {path}: a running collaboration server holds it; stop the "
+                            "server first, then repair, then start it again") from None
+    except OSError as exc:
+        raise LogInUseError(f"refusing to rewrite {path}: cannot lock it ({exc}); stop the server and fix the "
+                            "mount before repairing") from None
+    lock = held
+    try:
+        if held.mode == "none":
+            raise LogInUseError(f"refusing to rewrite {path}: this filesystem supports no lock, so a running server "
+                                "cannot be ruled out; stop the server and repair on a local disk (copy the log)")
         others = _holders(path)
         if others:
             raise LogInUseError(f"refusing to rewrite {path}: process(es) {others} have it open; stop the server "
@@ -224,7 +235,7 @@ def repair_file(path: str, *, apply: bool = False, confirmed: bool = False, cut_
         report.update(quarantine_file=quarantine, backup=backup)
         return report
     finally:
-        os.close(lock)
+        lock.release()
 
 
 _PG_COLUMNS = ("ctid::text AS tid, event_id, entity_id, sequence, event_type, payload, source, source_sequence, "
@@ -238,8 +249,15 @@ def _tid(text: str) -> tuple[int, int]:
 
 
 async def _pg_rows(conn) -> list[dict]:
-    recs = await conn.fetch(f"SELECT {_PG_COLUMNS} FROM fabric_events WHERE entity_type = 'collab' "
-                            "ORDER BY ingest_timestamp, ctid")
+    try:
+        recs = await conn.fetch(f"SELECT {_PG_COLUMNS} FROM fabric_events WHERE entity_type = 'collab' "
+                                "ORDER BY ingest_timestamp, ctid")
+    except Exception as exc:
+        if type(exc).__name__ in ("UndefinedColumnError", "UndefinedTableError"):
+            raise SchemaTooOldError("fabric_events is missing columns or the table: run `herdr-engineering "
+                                    "control-plane migrate` first (migration 0003 adds the envelope columns), then "
+                                    "repeat the repair") from None
+        raise
     return [dict(r) for r in recs]
 
 

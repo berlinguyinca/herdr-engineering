@@ -19,6 +19,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   proxy by their forwarded address (M12); an open listener is no operator in a reserved namespace (L1).
 - Test: the graph neighbourhood budget test counts rendered nodes instead of timing a wall clock.
 - Ingest sequence-conflict 409 now says `reason: "sequence_conflict"` and `last_sequence` (the caller's own source only) so a restarted emitter can resume (Pi H6).
+- Round 4: the revocation reserve counts every unrevoked join token and every member including expired guests (revoking those emits an event); repair/server
+  locking works on filesystems without `flock` (lock-file fallback, never a startup crash), re-checks the inode after locking, and refuses when no lock can be proven;
+  repair on a pre-0003 database says to migrate first; degraded operator reads answer 503.
 - Round 3: safety events are idempotent (a repeated `revoke_agent`/`external_leave`/user decision commits nothing, so they cannot fill the log); the
   revocation reserve is recomputed from state; `collab-repair --apply` works on a real PostgreSQL (tid binding fixed, tested against a throwaway
   server), refuses to rewrite a log a live server holds, reports a gap tail it cannot fix by default, and also quarantines rows whose

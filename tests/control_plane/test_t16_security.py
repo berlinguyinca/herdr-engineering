@@ -707,7 +707,7 @@ def _file_log(tmp_path, extra=()):
     log = FileEventLog(str(path))
     svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), sink=log)
     W(svc)
-    os.close(log._fd)           # the server that wrote it has stopped (a live one is covered by its own tests)
+    log.close()           # the server that wrote it has stopped (a live one is covered by its own tests)
     with open(path, "ab") as fh:
         for row in extra:
             fh.write((json.dumps(row) + "\n").encode())
@@ -790,6 +790,9 @@ def test_collab_repair_postgres_plan_and_apply_use_one_transaction_and_a_quarant
                 async def __aexit__(self, *exc):
                     conn.in_tx = False
             return Tx()
+    locked = Conn()
+    asyncio.run(repair_postgres(locked, apply=True, confirmed=True))
+    assert locked.sql[0].startswith("LOCK TABLE fabric_events") and "SHARE ROW EXCLUSIVE" in locked.sql[0]   # first, in the tx
     dry = Conn()
     out = asyncio.run(repair_postgres(dry))
     assert out["mode"] == "dry-run" and out["quarantine"][0]["reason"] == "ingest_envelope" and len(dry.sql) == 1

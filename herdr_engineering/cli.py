@@ -2310,7 +2310,7 @@ def _cmd_cp_collab_repair(args) -> int:
                 finally:
                     await conn.close()
             report = asyncio.run(_run())
-    except (PermissionError, collab_repair.LogInUseError) as exc:
+    except (PermissionError, collab_repair.LogInUseError, collab_repair.SchemaTooOldError) as exc:
         raise SystemExit(str(exc)) from None
     _print_json({"ok": True, **report})
     return 0

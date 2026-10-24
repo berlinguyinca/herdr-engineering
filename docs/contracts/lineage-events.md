@@ -885,15 +885,19 @@ Fixes for the T16 security audit. Each has a regression test in `tests/control_p
   run reports `contiguous` and lists the rows only that flag would move under `gap_tail` (with the flag to use) instead of reporting nothing.
   **File mode refuses to rewrite a log a server may still be appending to:** `FileEventLog` holds a shared `flock` for its whole life, the repair
   needs it exclusively and also refuses when any other process has the file open (/proc scan, which finds servers older than the lock). Stop
-  the server, repair, start it. **Postgres mode** locks the table against writers for one short transaction, plans inside it, and moves rows by
-  `ctid` bound as (block, offset) tuples; it is covered by a test against a real throwaway PostgreSQL (`test_t16_collab_repair_postgres.py`;
+  the server, repair, start it. **Locking** (`logfile_lock.py`): both sides open the log read-write and re-check after locking that the path still names the locked file.
+  Where `flock` is unsupported (ENOLCK/ENOSYS/EOPNOTSUPP/EBADF on some NFS/FUSE mounts) a cooperative `<log>.lock` pid file takes over with an
+  ERROR log line; if even that cannot be created the server still starts (ERROR: not protected) and the repair refuses ("supports no lock").
+  **Postgres mode** locks the table against writers for one short transaction, plans inside it, and moves rows by
+  `ctid` bound as (block, offset) tuples; on a database without migration 0003 it stops with "run migrate first"; it is covered by a test against a real throwaway PostgreSQL (`test_t16_collab_repair_postgres.py`;
   skipped only if no server binaries are installed). A forger who copied the payload shape AND the log's own sequence beyond its real end
   is caught by the timestamp rule; the allow-list closes new cases.
 * **A full log still revokes (H2).** `max_log_events` is protected by *pre-paid revocation*. Creating something revocable (member, agent, agent
   grant, join token, cross link, workspace link, mission link) is admitted only while `len(log) + outstanding + 2 <= 95 %`, where `outstanding`
-  is the number of revocable things that exist in state right now (members, grants, active agents, usable join tokens, active cross links,
-  workspace and mission links), recomputed from state so it can never drift: a repeated revocation, a re-grant, a lapsed guest or a used-up
-  token cannot over- or under-count it; every other ordinary write needs `len(log) + outstanding + 1 <= 90 %` (chat, comments, audit noise,
+  is the number of things that can still emit a revocation event right now (members INCLUDING expired guests, grants, active agents, every
+  unrevoked join token INCLUDING used-up or expired ones, active cross links, workspace and mission links), recomputed from state so it can
+  never drift: a repeated revocation or a re-grant cannot over- or under-count it, and revoking a used-up token or removing an expired guest
+  was pre-paid; every other ordinary write needs `len(log) + outstanding + 1 <= 90 %` (chat, comments, audit noise,
   presence) or `95 %` (the rest). So every revocation is an event its creation already reserved, and create-then-revoke cycles cannot consume
   the reserve. `SAFETY_EVENTS` (member/agent/grant/join-token/cross-link/workspace/mission revocation, user decision) may use the log up to 100 %.
   Self-triggerable or self-firing events are *not* safety events: credential rotation, cancelling a consultation/request/invite, steering

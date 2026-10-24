@@ -5,6 +5,7 @@ and tests for the mutants the review found alive."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -128,11 +129,13 @@ def test_outstanding_revocations_always_equal_what_exists_in_state(w):
     s.revoke_agent(w.bob, info["agent_id"])
     assert now()["agent"] == base["agent"]
 
-    # a join token: created, then used up, then no longer outstanding
+    # a join token: created, then used up, then revoked
     tok = s.create_join_token(w.alice, {"harness_type": "x", "name_prefix": "f", "count": 1})
     assert now()["join"] == base["join"] + 1
     s.redeem_join_token({"token": tok["token"]})
-    assert now()["join"] == base["join"]                       # used up: nothing left to revoke
+    assert now()["join"] == base["join"] + 1                   # used up but unrevoked: revoking it still emits an event
+    s.revoke_join_token(w.alice, tok["join_id"])
+    assert now()["join"] == base["join"]
     assert now()["agent"] == base["agent"] + 1                 # the agent it made is
     tok2 = s.create_join_token(w.alice, {"harness_type": "x", "name_prefix": "g", "count": 1})
     s.revoke_join_token(w.alice, tok2["join_id"])
@@ -145,15 +148,92 @@ def test_outstanding_revocations_always_equal_what_exists_in_state(w):
     assert s._outstanding() == sum(now().values())
 
 
-def test_a_lapsed_guest_stops_being_outstanding(w):
+def test_an_expired_guest_is_still_outstanding_because_removing_it_still_emits_an_event(w):
     s = w.s
     base = s._recount()["member"]
     s.add_member(w.alice, w.room, {"user_id": "mallory", "role": "guest"})
-    assert s._recount()["member"] == base + 1
-    full = s._outstanding()                                    # fills the cache
     s.clock.t += s.guest_ttl + 100
-    assert s._recount()["member"] == base - 1                  # mallory AND the room's other guest (dave) have lapsed
-    assert s._outstanding() == full - 2                        # the cache follows the clock with no commit in between
+    s._outstanding_key = None
+    assert s._recount()["member"] == base + 1
+    before = len(s._log)
+    s.remove_member(w.alice, w.room, "mallory")
+    assert len(s._log) == before + 1 and s._recount()["member"] == base
+
+
+def test_used_up_token_and_expired_guest_revocations_cannot_drain_the_reserve(w):
+    """review probe n3: create/redeem/revoke-agent loops, then revoke every used-up token."""
+    s = w.s
+    s.max_log_events = 400
+    toks, n = [], 0
+    try:
+        while True:
+            t = s.create_join_token(w.mallory, {"harness_type": "x", "name_prefix": "f", "count": 1})
+            out = s.redeem_join_token({"token": t["token"]})
+            toks.append(t["join_id"])
+            s.revoke_agent(w.mallory, out["agent_id"])
+            n += 1
+            if n % 5 == 0:
+                s.clock.t += 3700
+    except CollabError as exc:
+        assert exc.status in (429, 503)
+    for j in toks:
+        s.revoke_join_token(w.mallory, j)                      # never a 503: every one was pre-paid
+    for u in ("bob", "carol", "dave"):
+        s.remove_member(w.alice, w.room, u)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_fuzz_revoking_everything_is_never_refused(w, seed):
+    """Random create/redeem/expire/revoke traffic against a small log; at the end every outstanding revocable thing
+    can still be revoked (the permanent form of the review's fuzz seeds)."""
+    import random
+    rnd = random.Random(seed)
+    s = w.s
+    s.max_log_events = rnd.choice([250, 300, 400])
+    s.guest_ttl = 600.0
+    pid = s.create_project(w.mallory, {"name": "f"})["project_id"]
+    rooms = [s.create_room(w.mallory, pid, {"name": f"r{i}"})["room_id"] for i in range(4)]
+    tokens, agents, members, missions = [], [], [], []
+    for step in range(400):
+        op = rnd.randrange(8)
+        try:
+            if op == 0:
+                t = s.create_join_token(w.mallory, {"harness_type": "x", "name_prefix": "f", "count": rnd.randint(1, 2)})
+                tokens.append((t["join_id"], t["token"]))
+            elif op == 1 and tokens:
+                out = s.redeem_join_token({"token": rnd.choice(tokens)[1]})
+                agents.append(out["agent_id"])
+            elif op == 2:
+                r = rnd.choice(rooms)
+                u = rnd.choice(["bob", "carol", "dave"])
+                s.add_member(w.mallory, r, {"user_id": u, "role": rnd.choice(["guest", "viewer"])})
+                members.append((r, u))
+            elif op == 3:
+                m = f"m{step}"
+                r = rnd.choice(rooms)
+                s.link_mission(w.mallory, r, {"mission_id": m, "host": "bender"})
+                missions.append((r, m))
+            elif op == 4:
+                s.clock.t += rnd.choice([30, 700, 3700])
+            elif op == 5 and agents:
+                s.revoke_agent(w.mallory, rnd.choice(agents))
+            elif op == 6 and tokens:
+                s.revoke_join_token(w.mallory, rnd.choice(tokens)[0])
+            elif op == 7:
+                s.post_message(w.alice, w.room, {"text": "x", "idempotency_key": f"k{step}"})
+        except CollabError as exc:
+            assert exc.status in (400, 401, 403, 404, 409, 429, 503), exc.status
+    s.clock.t += 7200
+    for r, u in members:
+        if u in s._rooms[r]["members"]:
+            s.remove_member(w.mallory, r, u)
+    for r, m in missions:
+        if (r, m) in s._missions:
+            s.unlink_mission(w.mallory, r, m)
+    for a in agents:
+        s.revoke_agent(w.mallory, a)
+    for j, _ in tokens:
+        s.revoke_join_token(w.mallory, j)
 
 
 # ======================================================================== mutants from the review
@@ -261,7 +341,7 @@ def test_repair_refuses_while_a_live_event_log_holds_the_file(tmp_path):
     assert path.read_bytes() == before and not (tmp_path / "collab.jsonl.quarantine.jsonl").exists()
     live.record_required({"event_id": "late", "sequence": 9999, "x": 1})        # the writer is still intact
     assert b'"late"' in path.read_bytes() and svc is not None
-    os.close(live._fd)                                          # the server stops ...
+    live.close()                                          # the server stops ...
     assert repair_file(str(path), apply=True, confirmed=True)["quarantine_file"]    # ... and the repair may proceed
 
 
@@ -290,7 +370,7 @@ def test_a_server_cannot_start_writing_while_the_repair_holds_the_log(tmp_path):
             FileEventLog(str(path))
     finally:
         os.close(fd)
-    os.close(FileEventLog(str(path))._fd)                       # and it starts normally afterwards
+    FileEventLog(str(path)).close()                       # and it starts normally afterwards
 
 
 def test_events_written_after_a_repair_land_in_the_repaired_file(tmp_path):
@@ -429,5 +509,115 @@ def test_the_fallback_source_listing_still_works_for_a_sources_own_key():
         _http(srv, "POST", "/api/v1/ingest", b, body=v2("host", "h2", "host.registered", {"host_name": "h2"}, 9, source="other"))
         status, body = _http(srv, "GET", "/api/v1/ingest/sources", a)
         assert status == 200 and [(s["source"], s["last_sequence"]) for s in body["sources"]] == [("pi", 4)]
+    finally:
+        srv.shutdown()
+
+
+# ======================================================================== review round 3 items
+def _unsupported(code):
+    import errno
+    import fcntl
+
+    def fake(fd, op):
+        if op & fcntl.LOCK_UN:
+            return None
+        raise OSError(code, os.strerror(code))
+    return fake, errno
+
+
+@pytest.mark.parametrize("name", ["ENOLCK", "ENOSYS", "EOPNOTSUPP", "EBADF"])
+def test_a_filesystem_without_flock_never_crashes_startup_and_falls_back_to_a_lock_file(tmp_path, monkeypatch, name, caplog):
+    import errno
+
+    from herdr_engineering.control_plane import logfile_lock
+    monkeypatch.setattr(logfile_lock, "_flock", _unsupported(getattr(errno, name))[0])
+    path = tmp_path / "collab.jsonl"
+    with caplog.at_level(logging.ERROR):
+        log = FileEventLog(str(path))
+    assert log.lock_mode == "lockfile" and (tmp_path / "collab.jsonl.lock").exists()
+    assert "falling back" in caplog.text
+    log.record_required({"event_id": "e1", "sequence": 1})                  # and it still writes
+    assert b'"e1"' in path.read_bytes()
+    # a repair (also without flock) sees the cooperative lock and refuses
+    with pytest.raises(LogInUseError, match="running collaboration server"):
+        repair_file(str(path), apply=True, confirmed=True)
+    log.close()
+    assert not (tmp_path / "collab.jsonl.lock").exists()
+    assert repair_file(str(path), apply=True, confirmed=True)["mode"] == "apply"     # released: the repair may go
+
+
+def test_without_any_lock_the_server_starts_and_the_repair_refuses_with_a_clear_message(tmp_path, monkeypatch, caplog):
+    import errno
+
+    from herdr_engineering.control_plane import logfile_lock
+    path = tmp_path / "collab.jsonl"
+    path.write_bytes(b"")
+    monkeypatch.setattr(logfile_lock, "_flock", _unsupported(errno.ENOLCK)[0])
+    monkeypatch.setattr(logfile_lock, "_take_lockfile", lambda p: None)          # read-only directory, say
+    with caplog.at_level(logging.ERROR):
+        log = FileEventLog(str(path))
+    assert log.lock_mode == "none" and "NOT protected" in caplog.text
+    log.record_required({"event_id": "e1", "sequence": 1})
+    with pytest.raises(LogInUseError, match="supports no lock"):
+        repair_file(str(path), apply=True, confirmed=True)
+    assert b'"e1"' in path.read_bytes()
+    log.close()
+
+
+def test_a_lock_error_that_is_not_about_support_still_surfaces(tmp_path, monkeypatch):
+    import errno
+
+    from herdr_engineering.control_plane import logfile_lock
+    monkeypatch.setattr(logfile_lock, "_flock", _unsupported(errno.EIO)[0])
+    with pytest.raises(OSError) as exc:
+        FileEventLog(str(tmp_path / "collab.jsonl"))
+    assert exc.value.errno == errno.EIO
+
+
+def test_a_writer_that_opened_the_old_file_before_a_repair_ends_up_on_the_new_one(tmp_path, monkeypatch):
+    """open -> (repair replaces the file) -> lock: the writer must notice and reopen, not append to an orphan inode."""
+    import fcntl
+
+    from herdr_engineering.control_plane import logfile_lock
+    path = tmp_path / "collab.jsonl"
+    path.write_bytes(b'{"old":1}\n')
+    real, calls = fcntl.flock, []
+
+    def swap_then_lock(fd, op):
+        if not calls:
+            calls.append(1)
+            (tmp_path / "new").write_bytes(b'{"new":1}\n')
+            os.replace(tmp_path / "new", path)                    # the repair finished in that window
+        return real(fd, op)
+    monkeypatch.setattr(logfile_lock, "_flock", swap_then_lock)
+    log = FileEventLog(str(path))
+    log.record_required({"event_id": "after"})
+    assert os.fstat(log._fd).st_ino == os.stat(path).st_ino
+    assert b'"after"' in path.read_bytes() and b'"new"' in path.read_bytes()
+    log.close()
+
+
+def test_operator_listener_reads_are_refused_while_collaboration_is_degraded():
+    c = CollabService(StaticTokenAuthenticator({"alice": _digest("tok-alice")}))
+    c.hydrate_or_degrade([{"entity_type": "collab", "entity_id": "log", "sequence": 9, "event_type": "x", "payload": {}}])
+    status, body = c.dispatch("GET", ["rooms"], {}, {}, "", None, operator="alice")
+    assert status == 503 and "disabled" in json.dumps(body)
+
+
+def test_the_ingest_409_for_a_storage_level_sequence_collision_also_names_the_last_sequence():
+    from herdr_engineering.control_plane.events import SequenceCollision
+    from tests.control_plane.test_t16_security import _http, _server, v2
+    a = "ing-a-0123456789abcdef"
+    srv = _server({a: "ingest"})
+    try:
+        for n in range(3):
+            assert _http(srv, "POST", "/api/v1/ingest", a, body=v2("host", "h1", "host.registered", {"host_name": "h1"}, n))[0] == 200
+
+        def boom(*args, **kw):
+            raise SequenceCollision("held by another event")
+        srv.repo.record_event = boom
+        status, body = _http(srv, "POST", "/api/v1/ingest", a,
+                             body=v2("host", "h1", "host.registered", {"host_name": "h1"}, 3, event_id="x-3"))
+        assert status == 409 and body["reason"] == "sequence_conflict" and body["last_sequence"] == 2
     finally:
         srv.shutdown()

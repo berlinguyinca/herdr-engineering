@@ -15,7 +15,6 @@ to a terminal.
 from __future__ import annotations
 
 import bisect
-import fcntl
 import hashlib
 import ipaddress
 import json
@@ -31,7 +30,7 @@ from typing import Any, Protocol
 
 from . import collab_delegation as dlg
 from . import collab_external as ext
-from . import ids
+from . import ids, logfile_lock
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_workbench import WorkbenchMixin
@@ -217,14 +216,17 @@ class FileEventLog:
         self.path = path
         self._lock = threading.Lock()
         self._broken = False
-        self._fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        # A shared advisory lock for the life of the writer (see logfile_lock): `collab-repair --apply` needs it
+        # exclusively, so it can never swap the file out from under an open append descriptor.
         try:
-            # A shared advisory lock for the life of the writer: `collab-repair --apply` needs it exclusively, so it
-            # can never swap the file out from under an open append descriptor (that would lose acknowledged events).
-            fcntl.flock(self._fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(self._fd)
+            self._held = logfile_lock.acquire(path, exclusive=False, create=True)
+        except logfile_lock.Busy:
             raise OSError(f"the collaboration log {path} is being repaired; retry when collab-repair has finished") from None
+        self._fd = self._held.fd
+        self.lock_mode = self._held.mode
+
+    def close(self) -> None:
+        self._held.release()
 
     def load(self) -> list[dict]:
         rows = []
@@ -423,27 +425,26 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         self._replay_history = value
 
     def _recount(self) -> dict:
-        """Revocable things that exist RIGHT NOW, recomputed from state. Counting from state (not by adding on
+        """Things that can still emit a revocation event RIGHT NOW (an expired guest or a used-up token still can),
+        recomputed from state. Counting from state (not by adding on
         create and subtracting on revoke) makes the figure idempotent: a repeated or no-op revocation, a re-grant,
         a lapsed guest or a used-up token can never push it above or below what is really outstanding."""
-        now = self._now()
         out: dict[str, int] = defaultdict(int)
         for room in self._rooms.values():
             for uid, m in room["members"].items():
-                if uid != room["created_by"] and (m.get("expires_at") is None or m["expires_at"] > now):
+                if uid != room["created_by"]:         # an expired guest still needs (and may emit) a member_removed
                     out["member"] += 1
             out["grant"] += len(room["grants"])
         out["agent"] = sum(1 for a in self._agents.values() if a["status"] == "active")
-        out["join"] = sum(1 for j in self._joins.values()
-                          if not j["revoked"] and j["uses"] < j["max_uses"] and j["expires_at"] > now)
+        out["join"] = sum(1 for j in self._joins.values() if not j["revoked"])   # revoking a used-up/expired token is an event
         out["xlink"] = sum(1 for x in self._xlinks.values() if x["state"] == "active")
         out["workspace"] = len(self._links)
         out["mission"] = len(self._missions)
         return out
 
     def _outstanding(self) -> int:
-        key = int(self._now() // 30)       # the count changes with a COUNT_EVENTS commit (which clears the key) or with
-        if self._outstanding_key != key:   # the clock (expiries), so a chat flood does not recount the whole state
+        key = 1                            # the count changes only with a COUNT_EVENTS commit (which clears the key),
+        if self._outstanding_key != key:   # so a chat flood does not recount the whole state
             self._revocable = self._recount()
             self._outstanding_key = key
         return sum(self._revocable.values())
@@ -4082,6 +4083,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 return 200, self.link_joined(body)
             if parts == ["config"] and method == "GET":
                 return 200, self.public_config  # public identifiers only; no auth needed
+            if operator is not None and self.degraded:
+                raise CollabError(503, "collaboration is disabled; ask the operator")   # never serve partial state
             if operator is not None:
                 # Only the operator listener (tailnet-only, Host-checked) ever passes this: the
                 # local owner uses the dashboard without a sign-in, as the same user id they
