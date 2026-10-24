@@ -1090,3 +1090,22 @@ def test_a_pass_over_budget_with_errors_keeps_the_error_summary():
     assert view["deferred_repos"] and view["status"] == "partial"
     assert "could not be refreshed" in view["error"] and "point budget" in view["error"]
     assert view["stale"] is True and view["last_success_at"] == before  # not a clean pass
+
+
+def test_a_write_landing_during_a_purge_cannot_reinstate_the_old_revision():
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared)
+    monitor.refresh()
+    since = monitor.revision()
+    store, seen = monitor._store, []
+    original = store.purge
+
+    def purge():  # a pass's write-through finishes and re-reads the pre-purge revision
+        monitor._remember_revision(store)
+        seen.append(monitor.changes(kind="issues", since=since, start=False))
+        original()
+    store.purge = purge
+    _revoke(fake)
+    monitor.refresh()
+    assert seen[0]["resync"] is True and seen[0]["issues"] == []
+    assert monitor.revision() is not None and monitor.revision() > since  # remembered after the purge

@@ -425,6 +425,7 @@ class GitHubMonitor:
         self._store, self._store_viewer, self._store_dirty = None, None, False
         self._bind_failed = False  # this pass already failed to read the viewer store
         self._revision = None  # the store's catalog revision after its last load or write
+        self._purging = None  # the store a revoked token is purging: no revision adopted from it meanwhile
         self._touch()
 
     def _touch(self):
@@ -604,7 +605,7 @@ class GitHubMonitor:
             except Exception:
                 revision = None
         with self._lock:
-            if store is not self._store:
+            if store is not self._store or store is self._purging:
                 return
             if revision is None or self._revision is None:
                 self._revision = revision
@@ -802,6 +803,7 @@ class GitHubMonitor:
             self._marks, self._watermarks, self._full_at, self._deferred = {}, {}, {}, {}
             self._resume_repos, self._issue_resume = None, {}
             self._revision = None  # until the purge lands, no since can be answered from memory
+            self._purging = store
             self._view.update(available=False, status="auth_error", stale=False, partial=False, account=None,
                               error=str(GitHubError("authentication")))
             self._touch()
@@ -814,6 +816,10 @@ class GitHubMonitor:
                 if store is self._store:
                     self._store_dirty = True  # the next 401 purges again
             return
+        finally:
+            with self._lock:
+                if self._purging is store:
+                    self._purging = None
         self._remember_revision(store)
 
     def _collect(self, provider):
