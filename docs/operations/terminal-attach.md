@@ -32,6 +32,12 @@ Why these forms (herdr 0.9.1):
 - A non-interactive ssh shell does not have `~/.local/bin` (where herdr is installed) on
   PATH, hence `bash -lc`.
 
+The session record's `attach` field (written by the feed plugin,
+`deploy/herdr-cp-feed-plugin/enrich.js`) holds the same ssh form, checked against the same
+charsets; it is null when a value fails them. It used to hold `ssh <host> && herdr workspace
+focus <ws>`, whose second half ran on the viewer's machine. Records written before the fix keep
+that value until the plugin re-enriches the session; the Terminal route above never reads it.
+
 ## Refusals
 
 - `404`: unknown session.

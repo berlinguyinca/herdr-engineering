@@ -37,7 +37,7 @@ The page stores **metadata only** by default: counts, latency, TTFT, tokens in/o
 4. **Proxy backpressure 429s are never recorded.** `_forward` returns before `_forward_slotted` and `_report` run.
 5. **No timing breakdown.** `duration_ms` starts after `acquire()`, so it excludes the proxy queue wait. TTFT and generation time are not measured.
 6. **Retention is not enforced.** `retention.apply_retention` (30-day event TTL) is called only from tests. Usage events therefore accumulate without limit, and `token_analytics` slows down as they do.
-7. **Stale env-var text.** The README still names `FABRIC_LLM_UPSTREAM_KEY` and `HERDR_ENGINEERING_LLM_INJECT`, which contradicts the YAML-only rule. This doc does not change that text; it should be cleaned up separately.
+7. **Stale env-var text.** The README still names `FABRIC_LLM_UPSTREAM_KEY` and `HERDR_ENGINEERING_LLM_INJECT`, which contradicts the YAML-only rule. Resolved by a follow-up: the README now describes `llm.upstream_key` in the central fleet file and `llm: {inject: false}`.
 
 ## Data model
 
@@ -273,7 +273,7 @@ The operator had not answered the questions above when slice 1 was built, so the
 1. **Coverage:** (a). pi sessions that call the gateway directly get transcript-only tokens (slice 5). No pi provider is repointed at the proxy.
 2. **Retention:** raw records 14 days, hourly rollups 400 days, configurable as `control_plane.llm_proxy.raw_retention_days` / `rollup_retention_days`. Samples stay unbuilt (item 6).
 3. **Store:** usage stays in the existing event stream. The dormant `token_usage` SQL table stays unused.
-4. **Session id join:** no association event is recorded (see "Slice 1 notes" below).
+4. **Session id join:** no association event is recorded; the join is resolved at read time (see "Slice 1 notes" below).
 5. **Route:** `#/llm` will **coexist** with `#/analytics/tokens` for now. This overrides the redirect in the UI sketch until the operator decides.
 6. **Failure samples:** not built. `samples.enabled` stays false and the samples route will not exist.
 
@@ -290,5 +290,10 @@ The operator had not answered the questions above when slice 1 was built, so the
 - **`duration_ms`** now runs from the start of the slot wait to the last byte, so it includes `queue_ms`. It used to start after `acquire()`.
 - **`engine` is always null.** No OpenAI-compatible upstream signal for it was found. Nothing is assumed about any engine.
 - **Session id.** The id comes from the `X-InferWeave-Session-ID` or `X-Session-Id` header, then from the key label `session:<id>` (`llm_config` now carries the non-secret `label`), else null. The gateway-bucket fallback `<project>:<key_id>` is not a session and is never recorded as one.
-- **Join check (Decision 4): unverified.** `session_env` labels the key `session:<--session or --mission or pid…>`. Nothing in this repo calls `herdr-eng session run` except tests, so no launcher is known to pass the dashboard session id. The join holds only when the launcher passes it. Decision 4 stays open.
+- **Join check (Decision 4): server-side mapping built, live traffic still missing.** No association event is recorded; the control plane resolves each usage row's raw `session_id` at read time (`ControlPlaneRepo.resolve_usage_session`) and `GET /api/v1/analytics/tokens` returns `by_session`, keyed by dashboard session id or `unmatched:<raw id>`, with `matched_by` naming the rule. The raw id on the record is never rewritten. Rules, in order, never guessing between candidates:
+  - `direct`: the value is a dashboard session id. Only ids inside the metadata charset can arrive this way, because the usage-row whitelist and the proxy drop anything else.
+  - `decoded`: the dashboard id `herdr:<host>:<server>:<pane>` is built with `encodeURIComponent` per part (`emit.js`), so a pane `w1:p1` becomes `w1%3Ap1`, and `%` is outside `[A-Za-z0-9-_.:/]`. The encoded id can never travel in a header or key label. Its decoded *header form* (`herdr:beast:eng:w1:p1`) can, and is unambiguous because host and server contain no `:`. `herdr_engineering/llm_session_id.py` converts both ways; `herdr-eng session run --session <dashboard id>` now labels its key with the header form.
+  - `agent_session`: pi sends its own session id as `X-InferWeave-Session-ID` (pi-engineering `admissionIdentityHeaders`, lane `options.sessionId`). Verified in pi-coding-agent's source: the agent's `sessionId` is `sessionManager.getSessionId()`, which is the session-file header `id` and the `<ts>_<id>.jsonl` file-name suffix. The feed plugin stores that file (or the id) as the session record's `agent_session`, so a native id that names exactly one record maps to it. Suffix matches require a whole UUID; two records with the same id give `unmatched`.
+  - `unmatched`: everything else, including the proxy's gateway-bucket fallback.
+- **What is still missing for live pi traffic.** pi on herdr hosts calls the gateway directly (Decision 1a), so its headers never reach the proxy and no usage row exists to join. Making the join live needs no pi code change: it needs the hosts' pi provider pointed at the proxy (Decision 1, option b, a pi provider *config* change). Without that, pi sessions keep transcript-only tokens. A pi change would only be needed to send the dashboard id itself; the native-id rule makes that unnecessary.
 - **Retention.** `ControlPlaneServer.sweep_once` runs at startup and then every 5 minutes. It drops `token_usage` events older than `raw_retention_days` from memory and deletes them from `fabric_events` (`DurableEventSink.prune_events_before`). No other entity type is touched. `rollup_retention_days` is validated but has no effect until rollups exist (slice 2). A bad value stops `control-plane web` at startup.

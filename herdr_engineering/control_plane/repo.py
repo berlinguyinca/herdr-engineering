@@ -20,6 +20,7 @@ import threading
 import time
 from uuid import uuid4
 
+from ..llm_session_id import dashboard_form
 from .agent_identity import AgentIdentityRegistry
 from .envelope import SourceLedger, envelope_event_fields
 from .graph import GraphProjection
@@ -1906,11 +1907,38 @@ class ControlPlaneRepo:
                                        cache_read_tokens=tokens[3], success=success,
                                        source=source, v2=v2, **common)
 
+    def resolve_usage_session(self, value):
+        """Map a usage row's raw ``session_id`` to a dashboard session (Decision 4).
+
+        ``match`` says how: ``direct`` (it is a dashboard id), ``decoded`` (its header
+        form, see ``llm_session_id``), ``agent_session`` (the native conversation id of
+        exactly one session record: pi sends its session id, which is also the id at
+        the end of its ``<ts>_<id>.jsonl`` file), ``unmatched`` (none, or ambiguous),
+        or ``none`` (the row has no session). Never guesses between candidates."""
+        if not isinstance(value, str) or not value:
+            return {"session_id": None, "match": "none"}
+        if value in self._sessions:
+            return {"session_id": value, "match": "direct"}
+        decoded = dashboard_form(value)
+        if decoded is not None and decoded in self._sessions:
+            return {"session_id": decoded, "match": "decoded"}
+        if _NATIVE_ID.fullmatch(value):
+            hits = [sid for sid, rec in list(self._sessions.items())
+                    if _native_id_matches(rec.get("agent_session"), value)]
+            if len(hits) == 1:
+                return {"session_id": hits[0], "match": "agent_session"}
+        return {"session_id": None, "match": "unmatched"}
+
     def token_analytics(self, project=None, since=None):
-        """Aggregate token usage by project, model and day (UTC)."""
+        """Aggregate token usage by project, model, day (UTC) and dashboard session.
+
+        ``by_session`` is keyed by the dashboard session id, or ``unmatched:<raw id>``
+        when ``resolve_usage_session`` cannot place it; rows without a session id
+        count only in the other groupings."""
         total = {"requests": 0, "input_tokens": 0, "output_tokens": 0,
                  "reasoning_tokens": 0, "cache_read_tokens": 0, "failed": 0}
-        by_project, by_model, by_day = {}, {}, {}
+        by_project, by_model, by_day, by_session = {}, {}, {}, {}
+        resolved = {}
 
         def add(bucket, key, p):
             b = bucket.setdefault(key, {k: 0 for k in total})
@@ -1927,8 +1955,24 @@ class ControlPlaneRepo:
                 add(by_project, p["project"], p)
                 add(by_model, p["model"], p)
                 add(by_day, ev["source_timestamp"][:10], p)
+                raw = p.get("session_id") or ev.get("session_id")  # v1 rows: envelope only
+                if not raw:
+                    continue
+                if raw not in resolved:
+                    resolved[raw] = self.resolve_usage_session(raw)
+                hit = resolved[raw]
+                key = hit["session_id"] or f"unmatched:{raw}"
+                b = by_session.get(key)
+                if b is None:
+                    b = by_session[key] = {**{k: 0 for k in total}, "session_id": hit["session_id"],
+                                           "matched_by": [], "raw_session_ids": []}
+                _accumulate(b, p)
+                if hit["match"] not in b["matched_by"]:
+                    b["matched_by"] = sorted([*b["matched_by"], hit["match"]])
+                if raw not in b["raw_session_ids"]:
+                    b["raw_session_ids"] = sorted([*b["raw_session_ids"], raw])
         return {"total": total, "by_project": by_project, "by_model": by_model,
-                "by_day": dict(sorted(by_day.items()))}
+                "by_day": dict(sorted(by_day.items())), "by_session": by_session}
 
     def create_project_key(self, project, label=""):
         """Mint a gateway key for ``project``; the secret is returned once and only
@@ -2166,6 +2210,32 @@ class ControlPlaneRepo:
 
 
 # ------------------------------------------------------------ helpers
+#: pi/claude/codex conversation ids (same rule as the feed plugin's session-transcript.js ID).
+_NATIVE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{7,79}$")
+_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _native_id_matches(agent_session, value):
+    """True when ``agent_session`` (herdr's native conversation evidence) names ``value``:
+    its ``nativeId``, a ``kind: id`` value, or a ``kind: path`` transcript named
+    ``<id>.jsonl`` / ``*_<id>.jsonl`` / ``*-<id>.jsonl`` (session-transcript.js identityName)."""
+    if not isinstance(agent_session, dict):
+        return False
+    if agent_session.get("nativeId") == value:
+        return True
+    kind, ref = agent_session.get("kind"), agent_session.get("value")
+    if not isinstance(ref, str):
+        return False
+    if kind == "id":
+        return ref == value
+    if kind == "path":
+        name = ref.rsplit("/", 1)[-1]
+        # A suffix match needs a whole UUID: a fragment of one ends the name too.
+        return name == f"{value}.jsonl" or (bool(_UUID.fullmatch(value)) and name.endswith(
+            (f"_{value}.jsonl", f"-{value}.jsonl")))
+    return False
+
+
 def _payload(ev):
     """An event's payload as a dict (a hydrated jsonb column arrives as text)."""
     p = ev.get("payload") or {}

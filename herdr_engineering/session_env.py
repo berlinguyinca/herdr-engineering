@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .host_config import control_plane_url_or
+from .llm_session_id import header_form
 
 DEFAULT_CONTROL_PLANE = "http://dev.lan"
 DEFAULT_GATEWAY = "http://dev.lan:8088/v1"
@@ -225,7 +226,9 @@ def acquire(cfg: dict[str, Any], *, project: str, session: str | None = None,
                                "OPENAI_API_KEY": minted["key"],
                                "HERDR_LLM_KEY_ID": minted["key_id"]})
         return SessionKey({**base, "OPENAI_API_KEY": minted["key"]}, minted["key_id"], False, cp)
-    label = "session:" + (session or mission or f"pid{os.getpid()}")
+    # A dashboard id (herdr:<host>:<server>:<pane%3A..>) cannot pass the proxy's metadata
+    # charset; its decoded header form can, and the control plane maps it back.
+    label = "session:" + (header_form(session) or session or mission or f"pid{os.getpid()}")
     minted = mint_key(cp, project, label)
     return SessionKey({**base, "OPENAI_API_KEY": minted["key"]}, minted["key_id"], True, cp)
 
