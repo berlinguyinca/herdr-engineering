@@ -9,12 +9,9 @@ import {
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import {
-  AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
+  AuthError, CollabApi, TokenStore, authorizeUrl, collabRouteState, exchangeCode, parseRedirect, pkcePair, randomString,
 } from './herdr-web-client/collab.js';
 
-const store = new TokenStore(window.sessionStorage);
-let operator = false;   // the local owner on the dashboard: no sign-in, the server knows who they are
-const api = new CollabApi(() => (operator ? { access: 'operator', id: 'operator' } : store.get()));
 const ROLES = [['contributor', 'Can chat'], ['viewer', 'Read only'], ['guest', 'Guest (read only, expires)']];
 const PERMS = [['read', 'Read messages'], ['post', 'Write messages'], ['execute', 'Receive tasks'], ['instruct', 'Send tasks to agents'], ['spawn_helpers', 'Start helper agents']];
 const PERM_SHORT = { read: 'Read', post: 'Write', execute: 'Receive tasks', instruct: 'Send tasks', spawn_helpers: 'Start helpers' };
@@ -29,6 +26,7 @@ async function loadConfig() {
 
 // Called once at page load. If Cognito just redirected back with a code, finish sign-in.
 export async function completeSignInIfRedirected() {
+  const store = new TokenStore(window.sessionStorage);
   const found = parseRedirect(window.location.search);
   if (!found) return false;
   const done = (hash) => window.history.replaceState(null, '', `${window.location.pathname}#${hash}`);
@@ -84,17 +82,23 @@ const GUIDE = `<div class="hd-card">
     <li><b>Revoke</b> it here any time; it stops working immediately. Credentials expire after 30 days.</li>
   </ol></div>`;
 
-export function mountCollab(root, { fabricSessions = null } = {}) {
+export function mountCollab(root, { fabricSessions = null, surface = root.dataset.standalone === '1' ? 'public' : 'dashboard' } = {}) {
   ensureConversationStyles(root.ownerDocument);
+  const store = new TokenStore(window.sessionStorage);
+  let operator = false; // per mount: credentials never carry over from another shell
+  const api = new CollabApi(() => (operator ? { access: 'operator', id: 'operator' } : store.get()));
   let teardown = null;      // stops the open room's live loop
   let cursor = 0;
   let lastCfg = null;
   let me = null;
-  const standalone = root.dataset.standalone === '1';
+  const standalone = surface === 'public';
   const linkedAgent = !standalone && /^#\/collab\?/.test(window.location.hash)
     ? new URLSearchParams(window.location.hash.split('?')[1]).get('agent') : null;
   let focusLinkedAgent = Boolean(linkedAgent);
   let current = linkedAgent ? '/agents' : '/rooms'; // the dashboard owns the URL hash
+  const routePath = () => standalone ? window.location.hash : current;
+  let routeState = collabRouteState({ surface, route: routePath() });
+  const setStatus = (status, error) => { routeState = collabRouteState({ surface, route: routePath(), status, error }); };
   const nativeSessionLink = (id) => operator && !standalone && typeof id === 'string' && id
     ? `<a href="/#/herd/session/${esc(encodeURIComponent(id))}">Open agent conversation</a>` : '';
   const dispose = () => { if (teardown) teardown(); teardown = null; };
@@ -140,25 +144,29 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   }
 
   async function start() {
-    const cfg = await loadConfig();
+    setStatus('loading');
+    me = null;
+    operator = false;
+    let cfg;
+    try { cfg = await loadConfig(); }
+    catch { setStatus('degraded'); centered('<h1>Collaboration</h1><p role="alert">Unable to load collaboration configuration.</p>'); return; }
     lastCfg = cfg;
     if (!cfg) {
+      setStatus('degraded');
       centered('<h1>Collaboration</h1><p role="status">The collaboration network is not enabled on this server, or this address is not allowed for the dashboard. Try the dashboard by its IP address.</p>');
       return;
     }
-    if (cfg.operator) {   // dashboard: tailnet-only, the owner is already trusted
-      operator = true;
-      me = cfg.operator;
-      return route();
-    }
-    if (window.location.origin !== new URL(cfg.public_url).origin) {
+    operator = Boolean(cfg.operator); // only the trusted operator listener supplies this identity
+    if (!operator && window.location.origin !== new URL(cfg.public_url).origin) {
+      setStatus('degraded');
       centered(`<h1>Collaboration</h1><p role="status">Collaboration is only available over HTTPS.</p>
         <a class="hd-btn" href="${esc(cfg.public_url)}">Open it here</a>`);
       return;
     }
     const err = window.sessionStorage.getItem('hcn.error');
     window.sessionStorage.removeItem('hcn.error');
-    if (!store.get()) {
+    if (!operator && !store.get()) {
+      setStatus('signed-out');
       centered(`<h1>HerdR Collaboration</h1>
         <p>Shared rooms for people and their AI agents. Sign in with your BinView account. New accounts wait for approval before anything is shared.</p>
         ${err ? `<p class="cx-msg" role="alert">${esc(err)}</p>` : ''}
@@ -167,11 +175,13 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       return;
     }
     try {
-      me = await api.link(store.get().id);   // records your verified email so others can invite you
-      if (me.status && me.status !== 'approved') return waiting();
+      if (!operator) await api.link(store.get().id); // record verified email and activate invites
+      me = await api.me();
+      if (me.status !== 'approved') return waiting();
       await route();
     } catch (e) {
-      if (e instanceof AuthError) { store.clear(); return start(); }
+      if (e instanceof AuthError && !operator) { store.clear(); return start(); }
+      setStatus('error', e);
       centered(`<h1>Collaboration</h1><p class="cx-msg" role="alert">${esc(e.message)}</p>
         <p>If you were just added to the group, sign out and sign in again.</p>
         <button id="hcn-out2" class="hd-btn hd-btn--ghost" type="button">Sign out</button>`);
@@ -182,6 +192,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   // Signed in but not approved yet: nothing else works, so say so plainly and keep checking.
   let waitTimer = null;
   function waiting() {
+    setStatus('waiting');
     clearTimeout(waitTimer);
     centered(`<h1>Waiting for approval</h1>
       <p>You're signed in as <strong>${esc(me.email || me.user_id)}</strong>. The person who runs this network, or a lab admin, has to approve your account before you can use rooms or connect agents. Nothing is shared with you until then.</p>
@@ -200,12 +211,26 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   async function route() {
     clearTimeout(waitTimer);
     if (!me) return start();
-    const hash = standalone ? window.location.hash.replace(/^#/, '') : current;
-    const room = /^\/room\/(.+)$/.exec(hash);
-    if (room) return showRoom(decodeURIComponent(room[1]));
-    if (hash === '/agents') return showAgents();
-    if (hash === '/people' && canManagePeople()) return showPeople();
-    return showRooms();
+    if (me.status !== 'approved') return waiting();
+    setStatus('loading');
+    if (routeState.status === 'not-found') {
+      centered('<h1>Collaboration</h1><p role="alert">Room not found.</p>');
+      return;
+    }
+    try {
+      if (routeState.roomId) await showRoom(routeState.roomId);
+      else if (routeState.route === '/agents') await showAgents();
+      else if (routeState.route === '/people' && canManagePeople()) await showPeople();
+      else {
+        if (routeState.route === '/people') { setStatus('forbidden'); centered('<h1>Collaboration</h1><p role="alert">Access denied.</p>'); return; }
+        await showRooms();
+      }
+      setStatus('ready');
+    } catch (e) {
+      if (e instanceof AuthError && !operator) { store.clear(); return start(); }
+      setStatus('error', e);
+      centered(`<h1>Collaboration</h1><p role="alert">${esc(e.message)}</p>`);
+    }
   }
 
   async function showRooms() {
@@ -237,7 +262,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     };
   }
 
-  const canManagePeople = () => operator || Boolean(me && (me.approver || me.admin));
+  const canManagePeople = () => Boolean(me?.capabilities.canManagePeople);
   const USER_PILL = { pending: ['Waiting', 'var(--status-attention, #d89b1d)'], approved: ['Approved', 'var(--status-ok, #1a9b6c)'],
     denied: ['Declined', 'var(--text-muted)'], disabled: ['Disabled', 'var(--status-danger, #c0392b)'], kicked: ['Removed', 'var(--status-danger, #c0392b)'] };
   const when = (iso) => (iso ? String(iso).replace('T', ' ').slice(0, 16) : '');
@@ -548,11 +573,9 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
 
   async function showRoom(roomId) {
     cursor = 0;
-    let info;
-    try { info = await api.room(roomId); } catch (e) { go('/rooms'); return; }
+    const info = await api.room(roomId);
     const strip = await tabsStrip(roomId, null);
-    const canInvite = info.role === 'owner';
-    const canPost = ['owner', 'contributor'].includes(info.role);
+    const { canInvite, canPost } = info.capabilities;
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
@@ -844,7 +867,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           if (!alive) return;
           if (e.name === 'AbortError') continue;
           if (e instanceof AuthError) { dispose(); store.clear(); start(); return; }
-          if (/not found/.test(e.message)) { dispose(); go('/rooms'); return; }
+          if (e.code === 'not_found') { dispose(); go('/rooms'); return; }
           await sleep(backoff); backoff = Math.min(backoff * 2, 15000);
         }
       }
@@ -900,6 +923,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   }
 
   if (standalone) window.addEventListener('hashchange', onHash);
-  start();
-  return { dispose: () => { dispose(); window.removeEventListener('hashchange', onHash); } };
+  const ready = start();
+  return { ready, get state() { return { ...routeState }; },
+    dispose: () => { clearTimeout(waitTimer); dispose(); window.removeEventListener('hashchange', onHash); } };
 }
