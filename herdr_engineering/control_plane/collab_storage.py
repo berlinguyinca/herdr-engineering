@@ -272,12 +272,12 @@ class CollabStorage:
                             s3=self._archive._s3)
 
     def archive_file(self, archive_id: str, room_id: str, file_id: str,
-                     variant: str | None = None) -> ObjectRef:
+                     variant: str | None = None, verified_parts: list[dict] | None = None) -> ObjectRef:
         source = live_key(self.config.environment, room_id, file_id, variant)
         name = f'files/{file_id}/' + ('blob' if variant is None else f'preview/{variant}')
         key = archive_key(self.config.environment, archive_id, name)
         try:
-            size, digest = self._live_client().checksum(source)
+            size, digest = self._live_client().checksum(source, parts=verified_parts)
             # boto3's managed copy supports multipart server-side copies, including >5GB.
             self._archive._s3.copy({'Bucket': self.config.live_bucket, 'Key': source},
                                    self.config.archive_bucket, key)
