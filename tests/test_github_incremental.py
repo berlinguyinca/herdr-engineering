@@ -1037,3 +1037,37 @@ def test_an_unreadable_startup_load_reconciles_ghost_rows_on_the_first_pass():
     stored = seed.load().issues["github.com/acme/app"]
     assert "I_ghost" not in stored and len(stored) == 5
     assert monitor.revision() is not None
+
+
+def test_every_call_is_charged_at_least_one_point():
+    fake = FakeGitHub(page_size=100)
+    for name in ("acme/a", "acme/b", "acme/c"):
+        fake.add_issue(name)
+    fake.rate_limit = {"remaining": 4000, "cost": 0, "resetAt": "2026-10-24T15:00:00Z"}
+    monitor = monitor_for(fake, {}, point_budget=2)
+    monitor.refresh()  # free calls would let a budget of 2 read every repository
+    assert fake.calls["issues"] == 1
+    assert len(monitor.snapshot(start=False)["deferred_repos"]) == 2
+
+
+def test_a_call_without_a_reported_cost_is_charged_one_not_the_previous_cost():
+    import json as _json
+
+    from herdr_engineering.github import GitHubProvider
+    listing = {"viewer": {"login": "me", "repositories": {"totalCount": 0, "nodes": [],
+                                                           "pageInfo": {"hasNextPage": False}}}}
+    replies = [dict(listing, rateLimit={"remaining": 10, "resetAt": "2026-10-24T15:00:00Z", "cost": 7}), listing]
+
+    class Client:
+        def open(self, request, **kwargs):
+            import io
+            return io.BytesIO(_json.dumps({"data": replies.pop(0)}).encode())
+    provider = GitHubProvider(token="placeholder-token-value", client=Client())
+    monitor = GitHubMonitor(provider_factory=lambda: provider)
+    provider.repositories_page()
+    monitor._spent = 0
+    monitor._charge(provider)
+    assert monitor._spent == 7
+    provider.repositories_page()  # GitHub did not report this call's cost
+    monitor._charge(provider)
+    assert monitor._spent == 8

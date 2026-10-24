@@ -130,6 +130,7 @@ class GitHubProvider:
         self._token = value if isinstance(value, str) and value and len(value) <= 16384 and all(32 < ord(c) < 127 for c in value) else None
         self._client = client or urllib.request.build_opener(_NoRedirect())
         self.rate_limit = None
+        self.last_cost = None  # the last call's reported rateLimit.cost (None: not reported)
 
     @property
     def available(self):
@@ -142,6 +143,7 @@ class GitHubProvider:
     def _query(self, query, variables):
         if not self.available:
             raise GitHubError("not_configured")
+        self.last_cost = None
         request = urllib.request.Request("https://api.github.com/graphql",
             data=json.dumps({"query": query, "variables": variables}).encode(), method="POST",
             headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json",
@@ -157,6 +159,7 @@ class GitHubProvider:
             data = payload.get("data")
             if isinstance(data, dict) and isinstance(data.get("rateLimit"), dict):
                 self.rate_limit = {key: data["rateLimit"].get(key) for key in ("remaining", "resetAt", "cost")}
+                self.last_cost = self.rate_limit["cost"]
             if "errors" in payload and payload["errors"] is not None and not isinstance(payload["errors"], list):
                 raise GitHubError("invalid_response")
             if payload.get("errors"):
@@ -997,9 +1000,13 @@ class GitHubMonitor:
         self._pass_reads += 1
 
     def _charge(self, provider):
-        """Add the last call's GraphQL ``rateLimit.cost`` (1 when GitHub did not say) to this pass."""
-        cost = (provider.rate_limit or {}).get("cost") if isinstance(provider.rate_limit, dict) else None
-        self._spent += cost if isinstance(cost, int) and not isinstance(cost, bool) and cost >= 0 else 1
+        """Add the last call's GraphQL ``rateLimit.cost`` to this pass: at least 1 per call, and 1
+        when GitHub did not report it for this call (never an earlier call's cost)."""
+        if hasattr(provider, "last_cost"):
+            cost = provider.last_cost
+        else:  # a provider without per-call costs: its current rate-limit report
+            cost = provider.rate_limit.get("cost") if isinstance(provider.rate_limit, dict) else None
+        self._spent += max(1, cost) if isinstance(cost, int) and not isinstance(cost, bool) else 1
 
     def _due_reconciles(self, discovered):
         """Repositories whose scheduled full read is due, oldest first, at most N this pass."""
