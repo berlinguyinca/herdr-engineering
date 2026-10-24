@@ -2031,6 +2031,15 @@ class ControlPlaneRepo:
         records, resolve, meta, _, _ = self._llm_window(window, filters)
         return dict(meta, problems=llm_stats.errors(records, resolve, error_class=error_class))
 
+    def record_attention(self, event_type, payload):
+        """Store an operator acknowledge/snooze/clear. Private stream: never in the feed or the SSE."""
+        self.record_event("attention", "operator", event_type, payload, feed=False, publish=False)
+
+    def attention_events(self):
+        with self._event_lock:
+            return [{"event_type": e["event_type"], "payload": dict(_payload(e))}
+                    for e in self._events.get(("attention", "operator"), [])]
+
     def create_project_key(self, project, label=""):
         """Mint a gateway key for ``project``; the secret is returned once and only
         its SHA-256 is stored."""
