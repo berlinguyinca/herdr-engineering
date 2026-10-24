@@ -594,6 +594,40 @@ def test_rate_limited_mid_pass_defers_the_rest_the_same_way():
     assert monitor.snapshot(start=False)["deferred_repos"] == []
 
 
+def test_a_rate_limit_defers_only_the_repositories_that_still_had_work():
+    from herdr_engineering.github import GitHubError
+    fake, monitor, clock = ladder()
+    monitor.refresh()  # takes the ladder's edits: every repository is synced
+    for name in ("acme/r1", "acme/r2"):
+        fake.edit(name, next(iter(fake.repos[name])), title=f"again {name}")
+    original = fake.issues_page
+
+    def limited(repository_id, cursor=None):
+        if repository_id == "github.com/acme/r1":
+            raise GitHubError("rate_limited", retry_at=clock[0] + 120)
+        return original(repository_id, cursor)
+    fake.issues_page = limited
+    clock[0] += 300
+    fake.log.clear()
+    monitor.refresh()
+    view = monitor.snapshot(start=False)
+    assert view["status"] == "rate_limited"
+    assert [row["repository_id"] for row in view["deferred_repos"]] == ["github.com/acme/r1", "github.com/acme/r2"]
+    assert touched(fake) == []  # nothing more is read once GitHub said stop
+
+
+def test_deferred_repos_in_the_view_are_capped_but_the_tag_sees_them_all(monkeypatch):
+    from herdr_engineering import github
+    monkeypatch.setattr(github, "DEFERRED_SHOWN", 2)
+    fake, monitor, clock = ladder(budget=1)  # the listing spends it: all four wait
+    view = monitor.snapshot(start=False)
+    assert len(view["deferred_repos"]) == 2 and view["deferred_total"] == 4
+    tag = monitor.list_tag(start=False)
+    with monitor._lock:
+        monitor._deferred["github.com/acme/r4"] += 1  # a change past the cap
+    assert monitor.list_tag(start=False) != tag
+
+
 def test_point_budget_is_read_from_yaml(fake_host_config):
     fake_host_config({"github": {"sync": {"point_budget": 5}}})
     fake, monitor, clock = ladder()

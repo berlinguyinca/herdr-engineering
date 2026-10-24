@@ -42,6 +42,8 @@ WATERMARK_OVERLAP = timedelta(seconds=10)
 # (or one that made no progress) the next pass lists again, so new and removed
 # repositories never wait on a backlog.
 RESUME_PASSES_BEFORE_RELIST = 3
+# At most this many deferred repositories are listed in a view (``deferred_total`` counts them all).
+DEFERRED_SHOWN = 50
 # Repository fields that change while syncing and are never persisted (a
 # re-upsert of unchanged data must not bump the catalog revision).
 VOLATILE_REPOSITORY_FIELDS = ("issues_loaded", "issues_complete", "error", "newest_updated_at")
@@ -431,6 +433,7 @@ class GitHubMonitor:
         return {"available": False, "status": "not_configured", "connection_generation": 0, "refreshing": False, "stale": False,
                 "partial": False, "account": None, "checked_at": None, "last_success_at": None,
                 "scope": {"owners": [], "excluded_repositories": 0, "restricted": False}, "deferred_repos": [],
+                "deferred_total": 0,
                 "error": None, "rate_limit": None, "progress": {"phase": "idle", "repositories_seen": 0,
                     "repositories_total": None, "issue_repositories_complete": 0, "issue_repositories_total": None,
                     "issues_seen": 0, "issues_total_known": None, "current_repository": None}}
@@ -521,7 +524,8 @@ class GitHubMonitor:
                 view["stale"] = view["stale"] or age > self._interval * 2
             deferred = sorted((since, rid) for rid, since in self._deferred.items())
             view["deferred_repos"] = [{"repository_id": rid, "deferred_since": _iso(datetime.fromtimestamp(since, UTC))}
-                                      for since, rid in deferred]
+                                      for since, rid in deferred[:DEFERRED_SHOWN]]
+            view["deferred_total"] = len(deferred)
             # a repository the budget keeps deferring shows as stale, not silently old (ruling 6)
             view["stale"] = view["stale"] or any(self._now() - since > self._interval * 2 for since, _ in deferred)
             return view
@@ -899,7 +903,7 @@ class GitHubMonitor:
         # listing spent the budget, so a repository too big for any pass still advances
         self._floor = next((r["repository_id"] for r in repos if r["repository_id"] in deferred), None)
         self._pass_reads = 0
-        errors, over_budget, completed = {}, [], 0
+        errors, over_budget, completed, limited = {}, [], 0, None
         for record in repos:
             if self._stop.is_set():
                 return
@@ -926,11 +930,17 @@ class GitHubMonitor:
                     record["error"] = str(exc)
                     record["issues_loaded"] = len(self._issues.get(rid, {}))
                 errors[rid] = str(exc)
-                if exc.reason in {"rate_limited", "authentication", "capacity"}:
-                    if exc.reason == "rate_limited":
-                        # the same as a spent budget: the rest waits, the cache stays
-                        self._defer(r["repository_id"] for r in repos if not r["issues_complete"])
+                if exc.reason == "rate_limited":
+                    # the same as a spent budget: no further read (and no floor), so only the
+                    # repositories that still need one wait; unchanged ones complete for free
+                    self._defer([rid])
+                    limited, self._floor = exc, None
+                    self._spent = max(self._spent, self._budget)
+                    continue
+                if exc.reason in {"authentication", "capacity"}:
                     raise
+        if limited is not None:
+            raise limited  # the resume state stays: the next pass continues with the deferred
         if over_budget:
             # keep the resume state: the next pass continues with the deferred
             # repositories before listing again (a partly read repository resumes at its cursor)
@@ -1197,10 +1207,12 @@ class GitHubMonitor:
             view = self.snapshot(start=start)
             revision = None if self._store is None or self._store_dirty else self._revision
             epoch = self._epoch
+            # the view lists DEFERRED_SHOWN of them; a change past that still changes the tag
+            deferred = hashlib.sha256(json.dumps(sorted(self._deferred.items())).encode()).hexdigest()
         if revision is None:
             return None
         return {"revision": revision,
-                "fingerprint": json.dumps([view, epoch, self._generation], sort_keys=True, default=str)}
+                "fingerprint": json.dumps([view, epoch, self._generation, deferred], sort_keys=True, default=str)}
 
     def changes(self, *, kind, since, repository_id=None, tab="all", search="", start=True):
         """``since`` delta of one list: ``{revision, resync: false, upserted, removed}`` plus the sync state.
