@@ -525,3 +525,165 @@ def test_same_store_cannot_reenter_lifecycle_while_an_operation_owns_it(env):
             pass  # ownership is released for the next operation
 
     run(exercise())
+
+
+@pytest.mark.parametrize('provider_fails', [False, True])
+def test_event_loop_shutdown_cancels_outer_and_inner_io_without_hanging(env, provider_fails):
+    import subprocess
+    import sys
+    import textwrap
+
+    # A separate process bounds the old non-yielding cancellation loop. Use the
+    # actual Runner shutdown, which cancels both operation and to_thread tasks.
+    script = textwrap.dedent('''
+        import asyncio
+        import contextvars
+        import os
+        import sys
+        import threading
+        import asyncpg
+        from herdr_engineering.control_plane.collab_archive import CollabArchive
+        from herdr_engineering.control_plane.collab_store import CollabStore
+
+        started, release, finished = (threading.Event() for _ in range(3))
+        cancelled, ownership_held = threading.Event(), threading.Event()
+        context = contextvars.ContextVar('provider_context')
+        timer = None
+
+        async def main():
+            global timer
+            conn = await asyncpg.connect(os.environ['HERDR_E2E_PG_DSN'])
+            store = CollabStore(conn)
+            service = CollabArchive(store, None)
+            context.set('request-context')
+
+            def provider():
+                assert context.get() == 'request-context'
+                started.set()
+                assert release.wait(5)
+                finished.set()
+                if sys.argv[1] == 'True':
+                    raise OSError('provider stopped with an error')
+                return 'complete'
+
+            async def operation():
+                try:
+                    async with store.lifecycle_lock():
+                        try:
+                            await service._io(provider)
+                        except asyncio.CancelledError:
+                            assert finished.is_set(), 'ownership released before provider stopped'
+                            cancelled.set()
+                            raise
+                finally:
+                    await conn.close()
+
+            asyncio.create_task(operation())
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+
+            def stop_provider():
+                if store._lifecycle_active:
+                    ownership_held.set()
+                release.set()
+
+            timer = threading.Timer(0.1, stop_provider)
+            timer.start()
+            # Returning triggers asyncio.run's simultaneous cancellation of
+            # all pending tasks, including the old implementation's inner task.
+
+        asyncio.run(main())
+        timer.join()
+        assert finished.is_set() and cancelled.is_set() and ownership_held.is_set()
+        print('shutdown completed with provider stopped and cancellation propagated')
+    ''')
+    try:
+        result = subprocess.run([sys.executable, '-c', script, str(provider_fails)],
+                                capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        pytest.fail('simultaneous cancellation hung after the provider thread was released')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ''
+    assert 'shutdown completed' in result.stdout
+
+
+@pytest.mark.parametrize('interrupt_last_restore', [False, True])
+def test_scrub_drains_101_restores_and_recovers_without_losing_room_files(env, interrupt_last_restore):
+    from uuid import UUID, uuid5
+
+    conn, run, store, _, s3 = env
+    service = lifecycle(env)
+    archives = [run(service.archive_room(ROOM, 'owner'))]
+    for _ in range(100):
+        room_id, file_id = str(uuid4()), str(uuid4())
+        run(store.create_room(room_id=room_id, name='Pending restore', owner_id='owner'))
+        key = live_key('test', room_id, file_id)
+        run(conn.execute(
+            "INSERT INTO collab_room_files(file_id,room_id,uploaded_by,relative_path,storage_key,size_bytes,sha256,status) "
+            "VALUES ($1,$2,'member','data.csv',$3,$4,$5,'available')", file_id, room_id, key, len(BLOB), DIGEST))
+        s3.objects[LIVE, key] = BLOB
+        s3.objects[LIVE, live_key('test', room_id, file_id, 'thumbnail')] = b'preview'
+        archives.append(run(service.archive_room(room_id, 'owner')))
+    for archive in archives:
+        new_room = str(uuid5(UUID(archive.archive_id), 'restore:member'))
+        run(store.put_job('restore:' + new_room, 'restore',
+                         {'archive_id': archive.archive_id, 'requested_by': 'member'}))
+    assert run(conn.fetchval("SELECT count(*) FROM collab_lifecycle_jobs WHERE kind='restore'")) == 101
+
+    if interrupt_last_restore:
+        copy_object = s3.copy
+        last_room = str(uuid5(UUID(archives[-1].archive_id), 'restore:member'))
+
+        def fail_last_restore(source, bucket, key):
+            if bucket == LIVE and f'/rooms/{last_room}/' in key:
+                raise OSError('interrupted last restore')
+            return copy_object(source, bucket, key)
+
+        s3.copy = fail_last_restore
+        with pytest.raises(Exception, match='verification'):
+            run(service.scrub_deleted_user('member'))
+        assert run(conn.fetchval("SELECT status FROM collab_users WHERE user_id='member'")) == 'disabled'
+        assert run(conn.fetchval('SELECT count(*) FROM collab_room_files')) == 100
+        assert run(conn.fetchval("SELECT count(*) FROM collab_lifecycle_jobs WHERE kind='restore'")) == 1
+        assert run(conn.fetchval("SELECT count(*) FROM collab_lifecycle_jobs WHERE kind='scrub'")) == 1
+        s3.copy = copy_object
+        assert run(lifecycle(env).resume_pending_archives()) == []
+    else:
+        assert run(service.scrub_deleted_user('member')).status == 'complete'
+
+    assert run(conn.fetchval('SELECT count(*) FROM collab_lifecycle_jobs')) == 0
+    assert run(conn.fetchval("SELECT count(*) FROM collab_users WHERE user_id='member'")) == 0
+    assert run(conn.fetchval('SELECT count(*) FROM collab_rooms WHERE owner_id IS NOT NULL')) == 0
+    files = run(conn.fetch('SELECT * FROM collab_room_files'))
+    assert len(files) == 101
+    for file in files:
+        assert file['uploaded_by'] is None
+        assert s3.objects[LIVE, file['storage_key']] == BLOB
+        assert s3.objects[LIVE, file['storage_key'].removesuffix('blob') + 'preview/thumbnail'] == b'preview'
+    for (bucket, key), data in s3.objects.items():
+        if bucket == ARCHIVE:
+            if key.endswith('/blob'):
+                assert data == BLOB
+            elif '/preview/' in key:
+                assert data == b'preview'
+            else:
+                assert b'"member"' not in data and b'private member' not in data
+    # The final archive remains independently recoverable after account deletion.
+    restored = run(lifecycle(env).restore_room(archives[-1].archive_id, 'owner'))
+    restored_files = run(store.list_room_files(restored.room_id))
+    assert len(restored_files) == 1 and restored_files[0].uploaded_by is None
+    assert s3.objects[LIVE, restored_files[0].storage_key] == BLOB
+
+
+def test_scrub_removes_stale_restore_job_for_already_published_room(env):
+    _, run, store, _, s3 = env
+    service = lifecycle(env)
+    archive = run(service.archive_room(ROOM, 'owner'))
+    restored = run(service.restore_room(archive.archive_id, 'member'))
+    run(store.put_job('restore:' + restored.room_id, 'restore',
+                     {'archive_id': archive.archive_id, 'requested_by': 'member'}))
+    assert run(service.scrub_deleted_user('member')).status == 'complete'
+    assert run(store.jobs('restore')) == []
+    files = run(store.list_room_files(restored.room_id))
+    assert len(files) == 1 and files[0].uploaded_by is None
+    assert s3.objects[LIVE, files[0].storage_key] == BLOB
