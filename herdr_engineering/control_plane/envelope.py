@@ -32,7 +32,7 @@ _MAX_STR = 512
 # is stored as an envelope-only row: persisted for idempotency, sequence and
 # replay, but kept out of the global feed and out of state reconstruction.
 ENVELOPE_ONLY_TYPES = frozenset({"host", "session", "mission", "service",
-                                 "inspector", "mission_activity"})
+                                 "inspector", "mission_activity", "lineage"})
 MAX_SEQUENCE = 2**63 - 1          # PostgreSQL bigint
 MAX_GAPS_PER_SOURCE = 64
 MAX_SOURCES = 1024
@@ -156,8 +156,22 @@ def envelope_event_fields(env: dict) -> dict:
         "workspace_id", "task_id", "agent_id")}
 
 
+def _actor_id(actor: Any) -> str:
+    """The principal half of a sequence domain ('' for an unauthenticated actor)."""
+    if isinstance(actor, str):
+        try:
+            actor = json.loads(actor)
+        except ValueError:
+            actor = None
+    value = actor.get("id") if isinstance(actor, dict) else None
+    return value if isinstance(value, str) else ""
+
+
 class SourceLedger:
-    """Idempotency, sequence-collision and gap/freshness state per source.
+    """Idempotency, sequence-collision and gap/freshness state per sequence domain.
+
+    A sequence domain is ``(actor id, source)``: two principals may use the same
+    ``source`` string without burning each other's sequences, gaps or freshness.
 
     ``check`` is read-only; ``commit`` records an envelope once it has been
     applied, so a failed ingest leaves no trace and can be retried. Callers
@@ -173,24 +187,25 @@ class SourceLedger:
         self.freshness_seconds = freshness_seconds
         self._max_events = max_events
         self._persist = persist
-        self._events: OrderedDict[str, tuple[str, str, int]] = OrderedDict()
-        self._sequences: dict[tuple[str, int], str] = {}
-        self._sources: dict[str, dict] = {}
+        self._events: OrderedDict[tuple, tuple] = OrderedDict()   # (actor, id) -> (hash, source, seq, actor)
+        self._sequences: dict[tuple[str, str, int], str] = {}   # (actor, source, seq) -> id
+        self._sources: dict[tuple[str, str], dict] = {}
 
     # ------------------------------------------------------------ admission
     def check(self, env: dict) -> str:
         """``"new"`` or ``"duplicate"``; raises EnvelopeConflict on contradiction."""
-        known = self._events.get(env["event_id"])
+        known = self._events.get((_actor_id(env.get("actor")), env["event_id"]))
         if known is not None:
             # known[0] is None only for rows written before content digests
             # were stored in the envelope metadata: acknowledge by identity.
-            if known[0] is None and (known[1], known[2]) == (env["source"], env["source_sequence"]):
+            if known[0] is None and known[1:] == (
+                    env["source"], env["source_sequence"], _actor_id(env.get("actor"))):
                 return "duplicate"
             if known[0] == env["content_hash"]:
                 return "duplicate"
             raise EnvelopeConflict(
                 f"event_id {env['event_id']!r} already stored with different content")
-        owner = self._sequences.get((env["source"], env["source_sequence"]))
+        owner = self._sequences.get((_actor_id(env.get("actor")), env["source"], env["source_sequence"]))
         if owner is not None and owner != env["event_id"]:
             raise EnvelopeConflict(
                 f"sequence {env['source_sequence']} of source {env['source']!r} "
@@ -199,17 +214,20 @@ class SourceLedger:
 
     def commit(self, env: dict, seen_at: str | None = None, *, persist: bool = True) -> None:
         source, seq, eid = env["source"], env["source_sequence"], env["event_id"]
-        self._events[eid] = (env["content_hash"], source, seq)
-        self._sequences[(source, seq)] = eid
+        actor = _actor_id(env.get("actor"))
+        domain = (actor, source)
+        self._events[(actor, eid)] = (env["content_hash"], source, seq, actor)
+        self._sequences[(actor, source, seq)] = eid
         while len(self._events) > self._max_events:
-            old_id, (_, old_source, old_seq) = self._events.popitem(last=False)
-            if self._sequences.get((old_source, old_seq)) == old_id:
-                del self._sequences[(old_source, old_seq)]
-        if source not in self._sources and len(self._sources) >= MAX_SOURCES:
+            (_, old_id), (_, old_source, old_seq, old_actor) = self._events.popitem(last=False)
+            if self._sequences.get((old_actor, old_source, old_seq)) == old_id:
+                del self._sequences[(old_actor, old_source, old_seq)]
+        if domain not in self._sources and len(self._sources) >= MAX_SOURCES:
             stalest = min(self._sources.values(), key=lambda st: st["last_seen_at"] or "")
-            del self._sources[stalest["source"]]
+            del self._sources[(stalest["actor"], stalest["source"])]
         state = self._sources.setdefault(
-            source, {"source": source, "last_sequence": None, "last_seen_at": None, "gaps": []})
+            domain, {"source": source, "actor": actor, "last_sequence": None,
+                     "last_seen_at": None, "gaps": []})
         state["last_seen_at"] = seen_at or env["received_at"]
         last = state["last_sequence"]
         if last is None:
@@ -262,7 +280,7 @@ class SourceLedger:
                         meta = {}
                 digest = ((meta.get("_envelope") or {}).get("content_sha256")
                           if isinstance(meta, dict) else None)
-                env = {"event_id": e["event_id"], "source": e["source"],
+                env = {"event_id": e["event_id"], "source": e["source"], "actor": e.get("actor"),
                        "source_sequence": int(e["source_sequence"]),
                        "content_hash": digest, "received_at": str(e.get("ingest_timestamp") or "")}
                 self.commit(env, persist=False)
@@ -281,12 +299,24 @@ class SourceLedger:
                 "age_seconds": age, "freshness_window_seconds": self.freshness_seconds,
                 "status": "stale" if stale else "healthy"}
 
-    def source_state(self, source: str) -> dict:
-        with self.lock:
-            state = self._sources.get(source) or {
-                "source": source, "last_sequence": None, "last_seen_at": None, "gaps": []}
+    def source_state(self, source: str, actor: str | None = None) -> dict:
+        """State of one sequence domain. Without ``actor``: the single domain of
+        that source name, or (several principals share the name) the freshest."""
+        with self._lock_ctx():
+            if actor is not None:
+                key = (actor, source)
+            else:
+                cands = [k for k in self._sources if k[1] == source]
+                key = max(cands, key=lambda k: self._sources[k]["last_seen_at"] or "") if cands \
+                    else ("", source)
+            state = self._sources.get(key) or {
+                "source": source, "actor": key[0], "last_sequence": None,
+                "last_seen_at": None, "gaps": []}
             return self._view(state)
 
     def source_states(self) -> list[dict]:
-        with self.lock:
+        with self._lock_ctx():
             return [self._view(s) for _, s in sorted(self._sources.items())]
+
+    def _lock_ctx(self):
+        return self.lock

@@ -7,7 +7,7 @@ It extends the existing `Event` / `POST /api/v1/ingest` contract; v1 bodies keep
 | Field | Set by | Rule |
 |---|---|---|
 | `schema_version` | emitter | `2` for this contract. `1`/absent = legacy. `>2` is rejected (fail closed). |
-| `event_id` | emitter | Globally unique, stable across retries (an emitter retry reuses the id). |
+| `event_id` | emitter | Unique per authenticated principal (migration 0005), stable across retries (an emitter retry reuses the id). |
 | `source` | emitter | Existing `[a-z][a-z0-9_-]{0,31}` rule. Identifies the sequence domain. |
 | `source_sequence` | emitter | Integer >= 0, strictly increasing per `source`, assigned at emit time and persisted by the emitter so it survives restart. |
 | `occurred_at` | emitter | RFC 3339 UTC; stored as `source_timestamp`. |
@@ -22,7 +22,7 @@ It extends the existing `Event` / `POST /api/v1/ingest` contract; v1 bodies keep
 
 ## Server rules
 1. **Idempotency**: same `event_id` + identical content => acknowledged, not re-applied (`duplicate: true`). Same `event_id` + different content => `409 conflict`, original preserved.
-2. **Sequence**: `(source, source_sequence)` already seen with a different `event_id` => `409`. A jump greater than 1 records a **gap** in per-source state (`last_sequence`, `last_seen_at`, `gaps: [{from,to,seen_at}]`) and accepts the event; a later arrival inside a gap closes it (out-of-order replay is allowed).
+2. **Sequence**: the sequence domain is `(actor.id, source)` (the authenticated principal plus the `source` string), so two principals may use the same `source` without burning each other's sequences, gaps or freshness. `(source, source_sequence)` already seen IN THE SAME DOMAIN with a different `event_id` => `409`. A jump greater than 1 records a **gap** in per-source state (`last_sequence`, `last_seen_at`, `gaps: [{from,to,seen_at}]`) and accepts the event; a later arrival inside a gap closes it (out-of-order replay is allowed).
 3. **Freshness/provenance**: per-source state is queryable; a source with no events within its freshness window is reported `stale`, never `healthy` by default.
 4. **Durability**: an append failure is an error, never reported as a duplicate. Replay (`read_stream`) returns events with all v2 fields.
 5. **No fabrication**: the server never synthesizes progress, spawn edges or heartbeats.
@@ -45,3 +45,4 @@ It extends the existing `Event` / `POST /api/v1/ingest` contract; v1 bodies keep
 - Lost acknowledgement: if the durable insert already holds the `event_id` with the same `(source, source_sequence)`, the retry is acknowledged as a duplicate; a different identity is a 409.
 - Bounds: `source_sequence` <= 2^63-1; at most 64 gaps per source (oldest collapse into a coarser range, `gaps_truncated: true`); at most 1024 tracked sources (stalest evicted); 100k in-memory event index (database unique indexes are the backstop).
 - The durable write happens while holding the ledger lock (simple and atomic; serialises v2 ingests).
+- Sequence domain = (principal, source) (migration `0004_sequence_domain_per_principal.sql`: unique index on `(actor->>'id', source, source_sequence)`, `fabric_event_sources` keyed by `(source_actor, source)`). `GET /api/v1/ingest/sources` lists one entry per domain with an `actor` field (the key digest id). Until 0004 is applied the old global index still enforces the stricter rule. `event_id` is unique per principal too (migration `0005_event_id_per_actor.sql`: unique index on `(actor->>'id', event_id)`, the global primary key is dropped), so another key cannot squat a guessable id; idempotency, content-hash conflicts, the durable duplicate check (`EventStore.identity(event_id, actor_id)`) and the in-memory ledger are all keyed `(actor, event_id)`. Until 0005 is applied the old global primary key still enforces the stricter rule (inserts use a bare `ON CONFLICT DO NOTHING`, so the new code works before and after; cross-principal reuse then answers `409` naming the event_id and migration 0005). **Rollout order: deploy the code first, then apply 0005** - the previous release's `ON CONFLICT (event_id)` fails once the primary key is gone. Rolling the code back after 0005 needs the down-step in `docs/operations/event-id-per-actor-rollout.md`.
