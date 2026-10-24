@@ -41,6 +41,9 @@ every Pi-Bolt and Pi-Bolt JIT run hit the 120 s watchdog (6 of 6, ~7 CPU s consu
 censored and heavily load-confounded: they support the direction (Pi-Bolt does not finish loading this extension set where standard Pi does) but must not be
 used for magnitudes. Magnitudes above come from the lower-load repetitions 1-2.
 
+### C. Quiet-host re-run on beast (load ~27 on 24 cores; results/beast/README.md)
+Extension-free: `--version` 363 ms vs 17 ms, no-op CPU 0.83 s vs 0.07 s, 24-concurrent and tools wall not clearly different, all runs ok. **Real extension set, 5/5 runs complete: 26-28 s vs 6.1-6.8 s to ready (~4.3x slower), CPU 23-25 s vs 2.7-3.4 s (~8x), RSS ~440 vs ~145 MiB (~3x).** The earlier ~2.4x RSS saving for extension-free agents did not reproduce (112 vs 121 MiB), so only the CPU and startup advantage is established. This answers the loaded-host caveat: the NO-GO for agents with the extension set holds on a quiet host.
+
 ## Correctness and compatibility
 - Session round-trip PASS: standard Pi -> Pi-Bolt -> standard Pi -> Pi-Bolt JIT on one session file; the remembered fact survived every hop, one session file, valid JSONL after each hop (`results/session-roundtrip.txt`). (A first attempt failed because my harness used the wrong resume flag; it failed on standard Pi too and was fixed.)
 - InferWeave provider URL, auth, model id and token streaming worked unchanged through Pi-Bolt in every scenario (gateway responses streamed; no auth or routing errors).
@@ -65,7 +68,7 @@ Mission workers run in-process through the Pi SDK (`PiWorkerExecutor` -> `create
 | Production rollout requires human approval | Yes; nothing enabled |
 
 ## Limits of this evidence (read before deciding)
-- Host was heavily loaded (load 78-120) for the whole run; absolute numbers are not representative of an idle host. Re-run on a quiet host before any approval.
+- The bender runs were heavily loaded (load 78-270). The key scenarios were re-run on beast at load ~27 (section C); the conclusions held, except the RSS saving.
 - Spawner env export verified in a real herdr pane; that check exposed wrong `agent start`/`agent wait` flags in the existing client, fixed with a pinning test (results/herdr-and-accounting-checks.txt).
 - Worker -> control plane -> dashboard wiring proven end to end against a real local control plane (results/e2e-runtime-dashboard.txt).
 - Cancel/crash: one manual extension-free drill PASSED (kill -9, SIGTERM, resume on standard Pi; results/cancel-drill.txt). Not a live mission.
