@@ -2655,6 +2655,7 @@ def _cmd_cp_web(args) -> int:
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              summary_config=cp.get("agent_summaries") or {},
                              review_quorum=_review_quorum_config(cp),
+                             github_pg_dsn=dsn,
                              usage_retention=usage_retention,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,

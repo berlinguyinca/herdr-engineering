@@ -15,6 +15,10 @@ from typing import Any
 
 from .errors import InvalidError
 
+# github.sync (control-plane-web, read live from the fleet file's github section):
+# seconds between passes, and seconds between scheduled full reads of one repository.
+GITHUB_SYNC_DEFAULTS = {"interval": 300, "full_reconcile_interval": 86400}
+
 DEFAULTS: dict[str, Any] = {
     "version": 1,
     "build_cleanup": {
@@ -83,8 +87,26 @@ DEFAULTS: dict[str, Any] = {
     # logins (organizations and your own account); empty = every owner the
     # token sees. Excluded owners cost no issue calls and are purged from the
     # stored catalog on the next pass.
-    "github": {"organizations": [], "sync": {"full_reconcile_interval": 86400}},
+    # sync: interval between passes and between scheduled full reads (seconds).
+    "github": {"organizations": [], "sync": dict(GITHUB_SYNC_DEFAULTS)},
 }
+
+
+def github_sync(value: Any) -> dict[str, int]:
+    """Validate ``github.sync``; the settings with defaults filled in."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise InvalidError("github.sync must be a mapping")
+    settings = dict(GITHUB_SYNC_DEFAULTS)
+    for key in GITHUB_SYNC_DEFAULTS:
+        item = value.get(key)
+        if item is None:
+            continue
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise InvalidError(f"github.sync.{key} must be a positive whole number")
+        settings[key] = item
+    return settings
 
 
 def github_organizations(value: Any) -> list[str]:
@@ -107,12 +129,7 @@ def validate_github(section: Any) -> None:
     if not isinstance(section, dict):
         raise InvalidError("github must be a mapping")
     github_organizations(section.get("organizations"))
-    sync = section.get("sync") or {}
-    if not isinstance(sync, dict):
-        raise InvalidError("github.sync must be a mapping")
-    interval = sync.get("full_reconcile_interval", 86400)
-    if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
-        raise InvalidError("github.sync.full_reconcile_interval must be a positive number of seconds")
+    github_sync(section.get("sync"))
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

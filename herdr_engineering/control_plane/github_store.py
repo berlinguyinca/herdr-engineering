@@ -595,6 +595,35 @@ class GitHubStore:
             self._sync_guard.release()
 
 
+def catalog_store_factory(pg_dsn: str | None, *, now: Callable[[], float] | None = None):
+    """The monitor's store factory ``(identity, viewer) -> store`` for ``control_plane.pg_dsn``.
+
+    With a DSN every store shares one asyncpg event-loop thread (started on
+    first use); the monitor builds a new store per credential and viewer and
+    closes the superseded one. Without a DSN the stores share one in-memory
+    catalog that lives as long as the process.
+    """
+    if not pg_dsn:
+        shared: dict = {}
+        return lambda identity, viewer=None: MemoryGitHubStore(identity=identity, viewer=viewer,
+                                                                now=now, shared=shared)
+    runner: list = []
+    start = threading.Lock()
+
+    def run(coro):
+        with start:
+            if not runner:
+                from .bridge import _LoopRunner
+                runner.append(_LoopRunner())
+        return runner[0].run(coro)
+
+    def connect():
+        import asyncpg
+        return asyncpg.connect(pg_dsn)
+    return lambda identity, viewer=None: GitHubStore(connect, identity=identity, viewer=viewer,
+                                                     now=now, run=run)
+
+
 def open_github_store(pg_dsn: str | None, *, identity: str, viewer: str | None = None,
                       now: Callable[[], float] | None = None):
     """The store for ``control_plane.pg_dsn``; in memory when no DSN is configured."""

@@ -84,10 +84,10 @@ def _latest(*values):
 
 
 class GitHubError(RuntimeError):
-    def __init__(self, reason, *, retry_at=None):
+    def __init__(self, reason, *, retry_at=None, message=None):
         self.reason = reason
         self.retry_at = retry_at
-        super().__init__({
+        super().__init__(message or {
             "not_configured": "Configure a private server-side GitHub token file.",
             "authentication": "GitHub rejected the configured credential.",
             "permission": "GitHub denied access to this resource.",
@@ -313,6 +313,18 @@ def _configured_organizations():
     return host_value("github.organizations")
 
 
+def _configured_sync():
+    """``github.sync`` from the same fleet-file section (live, like the allowlist)."""
+    from .host_config import host_value
+    return host_value("github.sync")
+
+
+def build_monitor(pg_dsn=None):
+    """The control-plane-web monitor: catalog in Postgres when ``pg_dsn`` is set, else in memory."""
+    from .control_plane.github_store import catalog_store_factory
+    return GitHubMonitor(store=catalog_store_factory(pg_dsn))
+
+
 def _tab(issue, tab):
     state = issue["autospec"]
     return tab == "all" or (tab == "autospec" and state["managed"]) or state["state"] == tab
@@ -352,14 +364,16 @@ class GitHubMonitor:
     in one interval), staggered so a restart does not make them all due.
     """
 
-    def __init__(self, *, provider_factory=None, interval=300, repo_limit=5000, issue_limit=100000, now=None,
-                 store=None, full_reconcile_interval=86400, reconcile_per_pass=None, organizations=None):
+    def __init__(self, *, provider_factory=None, interval=None, repo_limit=5000, issue_limit=100000, now=None,
+                 store=None, full_reconcile_interval=None, reconcile_per_pass=None, organizations=None):
         self._factory = provider_factory or GitHubProvider
-        self._interval = max(30, interval)
         self._repo_limit, self._issue_limit = repo_limit, issue_limit
         self._now = now or time.time
         self._store_factory = store
-        self._full_interval = max(self._interval, full_reconcile_interval)
+        self._retired = []  # superseded stores, closed once no pass can still hold their lock
+        # github.sync.*: an explicit argument wins; None = read the YAML at the start of each pass
+        self._fixed_sync = {"interval": interval, "full_reconcile_interval": full_reconcile_interval}
+        self._apply_sync_settings(strict=False)
         self._reconcile_per_pass = reconcile_per_pass
         # owner allowlist: a list, a callable returning one, or None = read the YAML each pass
         self._organizations = organizations
@@ -403,6 +417,45 @@ class GitHubMonitor:
         self._wake.set()
         if self._thread:
             self._thread.join(timeout=1)
+        with self._lock:
+            self._retire(self._store)
+            self._store = None
+        self._close_retired()
+
+    def _sync_settings(self):
+        """``github.sync`` settings for this pass; ``GitHubError("invalid_config")`` when invalid."""
+        from .config import github_sync
+        fixed = {key: value for key, value in self._fixed_sync.items() if value is not None}
+        try:
+            settings = github_sync(None if len(fixed) == len(self._fixed_sync) else _configured_sync())
+        except InvalidError as exc:
+            raise GitHubError("invalid_config", message=f"{exc}; fix the YAML configuration.") from None
+        settings.update(fixed)
+        return settings
+
+    def _apply_sync_settings(self, *, strict=True):
+        try:
+            settings = self._sync_settings()
+        except GitHubError:
+            if strict:
+                raise
+            from .config import GITHUB_SYNC_DEFAULTS
+            settings = dict(GITHUB_SYNC_DEFAULTS, **{k: v for k, v in self._fixed_sync.items() if v is not None})
+        self._interval = max(30, settings["interval"])
+        self._full_interval = max(self._interval, settings["full_reconcile_interval"])
+
+    def _retire(self, store):
+        """Queue a superseded store for closing (lock held); a running pass may still hold its advisory lock."""
+        if store is not None and store not in self._retired:
+            self._retired.append(store)
+
+    def _close_retired(self):
+        with self._lock:
+            retired, self._retired = [s for s in self._retired if s is not self._store], \
+                [s for s in self._retired if s is self._store]
+        for store in retired:
+            with contextlib.suppress(Exception):
+                store.close()
 
     def _loop(self):
         while not self._stop.is_set():
@@ -448,6 +501,7 @@ class GitHubMonitor:
             if provider.credential_identity != self._credential:
                 self._generation += 1
                 self._credential = provider.credential_identity
+                self._retire(self._store)
                 self._reset_catalog()
                 self._retry_at = 0
                 self._view = self._empty()
@@ -525,6 +579,7 @@ class GitHubMonitor:
             if self._store is None or self._store_viewer == account:
                 return self._store
             store, snapshot = self._open_store(self._credential, account)
+            self._retire(self._store)
             self._store, self._store_viewer = store, account
             if snapshot is None:
                 # the stored catalog belonged to another viewer (now purged) or is unreadable
@@ -633,14 +688,18 @@ class GitHubMonitor:
             with self._lock:
                 self._view.update(refreshing=True, error=None, status="syncing", partial=True)
             raise GitHubError("not_configured")
-        with self._pass_lock(store) as acquired:
-            if acquired:
-                self._collect_pass(provider)
+        try:
+            with self._pass_lock(store) as acquired:
+                if acquired:
+                    self._collect_pass(provider)
+        finally:
+            self._close_retired()
 
     def _collect_pass(self, provider):
         self._update(refreshing=True, error=None, status="syncing", partial=True, available=True)
         self._progress(phase="repositories", repositories_seen=0, repositories_total=None,
                        issues_seen=0, issues_total_known=None, issue_repositories_complete=0, current_repository=None)
+        self._apply_sync_settings()
         allow = self._allowlist()
         with self._lock:
             self._check_generation()

@@ -198,7 +198,7 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None):
+                 review_quorum=None, github_pg_dsn=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -223,8 +223,10 @@ class ControlPlaneServer:
                                     actions_enabled=ci_actions,
                                     on_observation=repo.observe_ci_pipeline)
         if github_monitor is None:
-            from ..github import GitHubMonitor
-            github_monitor = GitHubMonitor()
+            # control-plane-web only (the worker never builds a server): the GitHub
+            # catalog persists in control_plane.pg_dsn when set, else in memory.
+            from ..github import build_monitor
+            github_monitor = build_monitor(github_pg_dsn)
         self.github_monitor = github_monitor
         self.dispatcher = dispatcher or self._dispatch_native_message
         if source is not None:

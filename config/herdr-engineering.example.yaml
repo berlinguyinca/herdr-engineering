@@ -79,3 +79,9 @@ build_cleanup:
 #                                        # case-insensitive; empty/absent = every owner.
 #                                        # Excluded owners cost no issue calls and their
 #                                        # stored rows are purged on the next pass.
+#       sync:
+#         interval: 300                  # seconds between sync passes
+#         full_reconcile_interval: 86400 # each repository is read in full once per this
+#                                        # many seconds (staggered), as a drift safety net
+# The catalog persists in control_plane.pg_dsn when it is set (migration 0006),
+# otherwise it lives in memory and a restart re-reads GitHub.
