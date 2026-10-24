@@ -148,6 +148,78 @@ O's owner is a writer of E. Unrelated reviewers are never ranked against each ot
    should send `attrs.supersedes`.
 Stale edges are kept and flagged.
 
+### Head-bound review quorum (T06)
+Two different meanings of "stale" exist and must not be confused:
+- the graph edge flag `stale` (above) = "a later binding was admitted by a related edge". It is arrival-order based and
+  cannot know which commit is current;
+- the quorum's `stale_reviewers` = "bound to a commit other than the PR's CURRENT head". It is head-relative.
+After a force-push back to an earlier SHA the edge flag may say `stale: true` while the quorum counts that review again,
+because the SHA names the content. Gate on the quorum, show the flag only as a hint.
+
+`GET /api/v1/graph/nodes/{pr_id}/review-quorum` (viewer level; 404 when the PR is absent/hidden or the feature is off)
+DERIVES the quorum; it writes nothing and Herdr does not request reviews itself. `rereview_required` / `rereview_needed`
+are the re-review request: whoever owns review dispatch (Pi on `github.evidence_stale`, AutoSpec) polls or subscribes.
+
+Producer contract. Each independent reviewer publishes with its OWN ingest key (reviewer identity is server-authenticated;
+a shared emitter key is one identity): `node.upsert review:<id>` then `edge.add reviewed review:<id> -> pr:<id>` with
+`attrs.commit` (full head SHA, the binding), `attrs.verdict` (`lgtm`|`blocked`, case-insensitive), `attrs.receipt_digest`
+(64 hex) and `attrs.receipt_binding` = `sha256("pr-review-receipt-v1\0" lower(pr node id) "\0" commit "\0" reviewer principal
+id "\0" receipt_digest)`. `autospec review-quorum publish` does this. Consumer: `autospec review-quorum request` polls this
+route and runs the configured review dispatch once per (PR, head) when `rereview_required` is true.
+
+Configuration (fleet config, `control_plane.review_quorum`, never from events):
+```yaml
+review_quorum:
+  required: 2                      # approvals needed at the current head, 1..16
+  trusted_head_writers: [key:<pi>] # principal ids whose head_sha / author writes define the PR's head
+  reviewers:                       # principal ids that may vote; login optional (recognises the PR author)
+    key:<reviewer-a>: {}
+    key:<author-human>: {login: some-login}
+  reviewer_groups:                 # optional: ids of ONE person/organisation count once
+    - [key:<alice-laptop>, key:<alice-ci>]
+```
+ONE policy, two implementations: this route (workbench) and `autospec review-quorum` (merge gating) are pinned by the shared
+vector file `tests/control_plane/fixtures/review-quorum-vectors.json` (byte-identical to autospec's
+`crates/autospec-core/tests/fixtures/`); both suites load it. Rules:
+1. The head is the newest non-empty `attrs.head_sha` written by a trusted writer and must be a full SHA, else `unknown_head`.
+   `pr` is a commons node, so untrusted writers' values are ignored. A trusted writer's applied head is its highest
+   `source_sequence` write. A write admitted AFTER it (so lower in sequence) is either a late delivery or an emitter restart
+   that reset the sequence:
+   - same value as the applied head, or a head that writer had ALREADY reported before the applied write (an old head
+     redelivered late): ignored, nothing is poisoned. Evidence is kept per DISTINCT head (8 per writer), so re-emits of one
+     head cannot evict the evidence about another.
+   - any other head, however close in sequence, and however many such writes: status `head_unverified` (response also
+     carries `head_unverified: true`, a human-readable `alert`, and for operators `resync_event_id`; one WARNING is logged
+     per observation; `autospec review-quorum request` exits 4 on it instead of reporting "not needed"). Never satisfied.
+     It clears only when (a) the writer writes past the applied sequence (a plain reorder heals on its next write), or
+     (b) an operator acknowledges the observed write by writing `attrs.head_resync = "<resync_event_id>"` on the PR node
+     (operator principal only, that exact write only; the answer then carries `head_resynced: true`). A run of low-sequence
+     writes is NEVER adopted automatically. `autospec review-quorum verify-report` compares the report with the live PR head
+     from GitHub, which is the second defence.
+2. Only configured reviewers are read; anyone else's edges (approvals or blocks) are ignored, so junk cannot satisfy or block.
+3. A reviewer is the edge OWNER (server-authenticated), never a payload name. `verdict`/`receipt_*` and add/remove are read ONLY
+   from the owner's own writes: an operator or `co_writers` member cannot flip a verdict or retract a block.
+4. Blocks first, never dropped: a configured reviewer's `blocked` at the head, at a head prefix or at an unparseable commit
+   blocks (fail closed); at another full head it is stale. Many review nodes of one identity count once.
+5. An approval is excluded if the reviewer owns a `produced` edge into the PR, or their configured `login` equals the `author`
+   attr written by a trusted writer (`x[bot]` equals `x`). A missing/blank author is `unknown_author` (never satisfied; a blank
+   write does not clear a known author, it just carries no value).
+6. An approval needs a 64-hex `receipt_digest` and a `receipt_binding` that recomputes; one digest backing two groups voids both.
+7. Verdicts for other heads are `stale_reviewers`, never counted; a verdict that lands after the head moved is stale; one issued
+   for a head not yet observed waits until a trusted writer reports that head.
+8. Matching is ASCII-only, identical in autospec: whitespace is the six ASCII blanks, case folding touches only A-Z, ids and
+   targets must be printable ASCII (`invalid_target` otherwise); no Unicode folding (Kelvin sign, dotted I, NBSP).
+   `rereview_needed` is computed from the approvals the CALLER can see only, so a hidden approval never shifts it.
+9. A mistaken verdict is retracted by its owner at the same head: `autospec review-quorum publish --retract` sends an
+   `edge.remove` (same key, same edge) which Herdr honours only from the edge's owner.
+10. The decision is computed over ALL matching edges. A caller sees names only of reviewers whose edges it can see; it also gets
+   `has_hidden_reviews` and `blocked_by_hidden` (a hidden block still yields `blocked`; existence is disclosed, counts are not).
+Statuses: `satisfied`, `insufficient` (re-review needed), `blocked`, `unknown_head`, `head_unverified`, `unknown_author`, `invalid_target`. Only
+`satisfied` passes. PR ids are matched exactly, then lower-cased.
+Residual: the binding is not a signature (a colluding key can recompute it); two unlisted keys of one person count twice;
+a verdict is bound to the head SHA, not the base; private/mission-scoped edges still count; Herdr ignores blocks from
+unconfigured principals (anti-DoS) while autospec, with no `eligible_reviewers`, honours a block from anyone.
+
 ### Session rollover
 No containment edge type exists, so `attempt`/`session` nodes carry `attrs.agent_id` / `attrs.attempt_id`. A rollover is a new
 `session:` node (and the old one's `node.state`); the `agent:` id and state are untouched. Closing a pane/tab emits nothing and
@@ -331,3 +403,107 @@ authenticated operator key excepted) on a node id or on either endpoint of an ed
   object's events wins, so an object whose OLD events lack `room_id` stays operator-only until an operator re-creates it
   under a new id or the old events are retired).
 - **Large rooms**: the Tabs panel makes three listing reads (agents, tabs, panes) at most every 8 s while open; not load-tested.
+
+## Lineage views and replay (T09)
+Read-only workbench for ONE room: a lineage graph, a Gantt timeline, a replay scrubber and a node inspector. It extends the
+T08 room page (`packages/collab-lineage.js`, sub-tab "Lineage" in `collab-view.js`) and the T08 collab read routes. No new
+dashboard, service, event store or table: **no migration**. The projection already derives from `fabric_events`; T09 keeps the
+applied events (`GraphProjection._log_ctx`: one list per room/mission context a scope names, bounded, oldest evicted) in memory next to
+the graph, refilled by the same rebuild that refills the graph, so a restart loses nothing. A snapshot table can be added later
+without changing semantics (same argument as T02).
+
+### Routes (collab namespace, HCN-authenticated, `room_id` REQUIRED, same access snapshot and 404 as `graph/nodes`)
+| route | returns |
+|---|---|
+| `GET /api/v1/collab/graph/lineage?room_id=&[step=\|at=]&limit=&offset=&node_types=&edge_types=` | `as_of`, `nodes` (every node type of the room view), `edges` among them, `total_nodes`, `next_offset`, `truncated`/`truncated_reason` |
+| `GET .../graph/lineage/timeline?room_id=&[step=\|at=]` | `as_of`, `lanes` (per node: `spans` = recorded state periods with `open`/`terminal`), `markers` (edge events; `kind` `edge`\|`edge_removed`\|`head_change`; `stale`), `range`, `truncated_reason` |
+| `GET .../graph/lineage/events?room_id=&cursor=<opaque token>&limit=` | the reader's visible ledger page: allow-listed fields only (no raw `attrs`), `step` 1.. , `next_cursor` |
+They exist only in `CollabService.graph_read` (never in the keyed `/api/v1/graph`, so a fleet key gets no unbudgeted replay), only in
+the combined server (`collab_only` => 404), and a non-member, guest, agent or unknown room all answer the same 404. Bad parameters
+are 400 (`step`/`at` together, negative step, non-ISO `at`, unknown type, limit out of range). Reads are rate limited per person (240/min, 429).
+
+### Replay semantics
+- **Position** is a count of the READER's own visible ledger events (`step`, 0..`visible_events`), so no number reveals how many
+  hidden events exist. Past the end clamps to now (silently). `at` (a timestamp without a zone is UTC) resolves, by server receipt time (never the emitter's
+  `occurred_at`), to the number of visible events BEFORE the first one received after that instant: a prefix of admission order.
+- **Replay equals live at that point.** The graph at step k is a projection built from the reader's first k visible events
+  of this room (the room and its linked missions), read through the live projection's gate (which supplies visibility).
+  `apply` is commutative and idempotent, so the visible result equals a projection that was fed those events live (tested at
+  every step, for several readers, after a rebuild, and by a randomized privacy check). Replay is per room: a flood in room A
+  never costs or breaks room B. Steps are exact and self-consistent: every step from 0 to the head is replayable, the head's
+  step is the real count of events in the window, and no rounding is ever exposed. When the window is trimmed (below), a replay
+  shows the window's own events alone, so an object created before the window appears only once an in-window event names it.
+- **Replay never widens visibility.** (1) An event is shown only if its own scope label is visible to the reader and the object it
+  concerns is visible to the reader NOW: for an edge event that is the exact edge instance it touched (its binding, and its writer's
+  instance for a commons `from` node), never a sibling binding of the same triple; for a commons node event it is the writer's
+  CURRENT value of every field the event carried. (2) A replayed projection reads through the CURRENT projection: a node or
+  edge in the past is visible only if it is also visible now (tombstones are history and ignored; a later narrowing is not), and a commons
+  field value of the past is shown only if the same writer's current value of that field is visible, so a writer who later makes a
+  field private (or re-scopes an edge or node narrower) takes its past out of sight too. `stale`/`bindings` of the past never reveal a
+  binding that is hidden now. What stays visible is only what the reader can see now in the same place: a value a writer published to
+  the room and has since REPLACED with another room-visible value is shown at its own past position (that is what a replay is).
+  (3) Membership is the reader's membership at THIS request; someone removed gets 404 at every step. **An overwritten
+  room-visible value stays readable by whoever may read the room, including people who join later, when
+  `replay_history` is `full`.** What a late joiner may see of the past is operator policy, `control_plane.collab.replay_history`
+  in the fleet YAML: `since_join` (the default, strict) starts a member's ledger and replay at their join time: events are
+  filtered one by one by receipt time (no assumption that timestamps are monotonic), step 0 is an empty graph, and the head
+  shows CURRENT values only, with the identity and time of any event from before the join (`first_event_id`, `last_event_id`,
+  `event_id`, `admitted_at`) set to null; an overwritten pre-join value is never shown. `full` lets every member replay the
+  whole retained room history. A member's join time is the `created_at` the server stamped on the `room_created` or
+  `member_added` event, so members from before this feature get the join time of that event; if no join time can be read at
+  all, `since_join` fails closed (history starts at the moment of the request). Re-adding a member (also a role change) starts
+  a new join time. Member responses never carry the global `admission` counter of a field.
+- **Budgets** (all report `truncated_reason`, never a count of hidden items): the ledger window is the newest
+  `LEDGER_SCAN_BUDGET` = 20,000 events THE READER MAY SEE (the room's log is scanned newest first, in chunks, until that many
+  visible events are found or it is exhausted; `window_trimmed` says it was cut), so the window and every count in it
+  (`visible_events`, the head `step`) are in the reader's own units and cannot be used to infer hidden volume. Page tokens
+  (`next_cursor`) are opaque, masked, bound to the reader and room and tamper-checked (HMAC), so paging reveals nothing
+  either. A replay applies at most `REPLAY_MAX_EVENTS` = 25,000 of the READER'S visible events (a hidden event costs
+  nothing; over it is a generic 400, "now" is never capped). Each room/mission context keeps at most
+  `LOG_MAX_PER_CONTEXT` = 100,000 events (the oldest tenth is evicted beyond that: the history floor); after an eviction the
+  window is flagged trimmed and replay covers what is retained. Visibility is evaluated 128 events per hold of the live lock,
+  so a viewer never stalls ingest for a whole scan. A head response (graph, timeline, ledger) is computed against one state:
+  if an event arrived while it was built it is retried, and the third try runs under the lock. Graph reads reuse
+  `SCAN_BUDGET`, `EDGE_SCAN_TOTAL`, `MAX_EDGES`, `MAX_RESPONSE_BYTES`; the timeline caps lanes (300) and markers (1000). At most
+  two replayed projections are cached (keyed by reader, position and the count of applied events); one replay is built at a time.
+- **Pagination.** `limit` (<= 1000) and `offset` page the room's visible nodes (types in fixed order, admission order inside a
+  type); a page also carries the edges between its nodes and the nodes of earlier pages. The `SCAN_BUDGET` of examined ids is shared
+  round-robin between node types, so one busy kind cannot starve the others. The web page does not pass `node_types` (it filters
+  client-side over what was loaded).
+
+### Timeline
+Spans come from recorded `node.upsert`/`node.state` states (a span ends at the next state; a terminal state `done failed cancelled
+superseded merged closed passed completed success error rejected approved aborted` is an instant; the last non-terminal span is `open`
+and drawn to the end of the observed range, never beyond). Markers come from edge events. `head_change` = a `reviewed`/`validated`
+edge bound to a different revision than an earlier visible one for the same subject; `stale` is the projection's own flag for
+that edge as the reader sees it at that position (T02 semantics: related edges only, admission order unless `attrs.supersedes`).
+Times are server receipt times; the emitter's claim (`occurred_at`, which falls back to receipt time) travels alongside and the UI
+offers it as a separate choice. Nothing is inferred from chat, layout or timing, and no progress is invented.
+
+### UI and accessibility
+Graph (layered SVG, no library), table view of the same data (always available; the only view above 300 nodes), Gantt (SVG +
+table), replay (range slider with spoken `aria-valuetext`, step buttons, Live), filters (search, node type, link type, state),
+inspector (read-only: fields, attributes as text, links in/out, state history, provenance). Keyboard: one tab stop in the graph,
+arrows/Home/End between nodes, Enter selects, Escape clears; arrow keys switch Graph/Gantt tabs. Nothing is encoded by colour alone:
+node types differ by shape, link types by dash pattern and a text tag (`stale` is struck through and says so), states by glyph and word,
+Gantt states by fill pattern and label, head changes by a letter. No animation (so nothing to reduce); forced-colors supported.
+Every id, label, attribute and reason is escaped for text and attribute contexts (unit and browser tested with hostile values).
+
+### Not in this task / limitations
+- Click-to-inspect terminal is NOT offered (needs `authorize_workspace`; the inspector says so). No comments, fork, steer or retry.
+- T05 (canonical GitHub issue/PR linking and reconciliation) is not built: issue/PR nodes and `issue_link` edges are drawn when an
+  emitter sends them, but no canonicalisation or reconciliation exists yet. T06's `review_quorum.py` is on a sibling branch and
+  is not on this stack; stale/head-change come only from the T02 projection's own flags.
+- Replay cost is the reader's visible prefix (see budgets); beyond 25,000 visible events a past position answers 400. A busy room needs
+  the snapshot table mentioned above. Not load-tested at that size. No visual-regression suite exists; layout is checked by
+  unit tests and a browser smoke run against a mocked API plus one real-HTTP pytest of the routes, not by screenshots.
+- There is no separate review/CI phase model. PR, review and CI objects appear as lanes of their node types (state spans from
+  `node.state`), `reviewed`/`validated` edges as markers, and revision changes as `head_change` markers; nothing else is inferred.
+- The inspector shows the node as of the chosen position, from the page's own response; it does not fetch `graph/nodes/{id}`.
+- Pi still does not send `room_id`, so Pi lineage appears here only once the T08 emitter prerequisites hold.
+- Memory: each context list holds references to the dicts the projection already receives (bounded, see budgets); at most two
+  replayed projections are cached, each of at most `REPLAY_MAX_EVENTS` events.
+
+### T09 rollout and rollback
+Code only, no migration: deploy the server, then the web files (`collab-lineage.js` is in the static map in `api.py`). Rollback:
+revert the PR; stored events are untouched and the T08 page is unchanged (a web-only rollback removes the Lineage tab).

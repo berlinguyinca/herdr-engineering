@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import re
 
+from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .graph import validate_lineage
+from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
 from .project_links import canonical_repository
 from .sink import EventAlreadyStored
 
@@ -33,6 +35,14 @@ def _git_identity(payload):
             raise ValueError("commit_sha must be a full 40 or 64 character hexadecimal commit")
         commit_sha = commit_sha.lower()
     return {"repository_id": next(iter(identities), None), "commit_sha": commit_sha}
+
+
+# Sources whose host events prove the host is alive: its fabric agent, and the
+# herdr feed plugin on the host (deploy/herdr-cp-feed-plugin posts host.heartbeat
+# / host.inventory with no source, i.e. the default "herdr"). Any other source
+# may only update host state keys (see IngestService._ingest_host_state).
+LIVENESS_SOURCES = frozenset({"fabric-agent", "herdr"})
+_AGENT_ONLY_HOST_KEYS = ("telemetry", "cpu", "mem", "disk", "inventory")
 
 
 class IngestService:
@@ -129,6 +139,10 @@ class IngestService:
         if entity_type in {"plannotator_review", "ci_pipeline", "agent_identity", "agent_summary",
                            "custom_model", "llm_key", "token_usage"}:
             raise ValueError("provider-owned entity type is not accepted by generic ingestion")
+        # The review gate's streams decide merges; a forged verdict/resume/pin
+        # would merge unreviewed code, so they are reserved for the gate itself.
+        if entity_type.strip().lower().startswith(RESERVED_ENTITY_PREFIXES):
+            raise ValueError("reserved review-gate entity type is not accepted by generic ingestion")
         env = normalize_envelope(body, principal, self.repo._stamp())
         if env is None and entity_type == "lineage":
             raise ValueError("lineage events require schema_version 2")
@@ -203,6 +217,7 @@ class IngestService:
             "room_id": env.get("room_id"), "mission_id": env.get("mission_id"),
             "workspace_id": env.get("workspace_id"),
             "actor": env.get("actor"), "ingest_timestamp": env["received_at"],
+            "source_timestamp": env["occurred_at"] or env["received_at"],
             "lineage_seq": env.get("lineage_seq"), "lineage_mode": env.get("lineage_mode")})
         return {"entity_type": "lineage", "entity_id": entity_id, "event_type": event_type}
 
@@ -237,7 +252,7 @@ class IngestService:
             result = self.repo.mission_activity.ingest(entity_id, payload, source=source)
             return {"entity_type": entity_type, "entity_id": entity_id, **result}
         if entity_type == "host":
-            return self._ingest_host(entity_id, event_type, payload)
+            return self._ingest_host(entity_id, event_type, payload, source)
         if entity_type == "session":
             return self._ingest_session(entity_id, event_type, payload,
                                         source)
@@ -263,23 +278,62 @@ class IngestService:
         return {"entity_type": entity_type, "entity_id": entity_id,
                 "event_type": event_type}
 
-    def _ingest_host(self, entity_id, event_type, payload) -> dict:
+    def _ingest_host(self, entity_id, event_type, payload, source="herdr") -> dict:
+        if source not in LIVENESS_SOURCES:
+            return self._ingest_host_state(entity_id, payload)
         status = ("unavailable" if "unavailable" in event_type.lower()
                   else "healthy")
-        host = self.repo.upsert_host(
-            entity_id,
-            payload.get("host_name") or payload.get("name") or entity_id,
-            payload.get("tailnet_ip") or payload.get("ip"),
-            cpu=payload.get("cpu"), mem=payload.get("mem"), status=status,
-            inventory=payload.get("inventory"))
-        sample = {k: payload[k] for k in ("cpu", "mem", "disk")
-                  if isinstance(payload.get(k), (int, float))
-                  and not isinstance(payload.get(k), bool)}
-        if sample:
+        # Validate everything before touching the host: a bad sample is a 400
+        # and must leave the stored record as it was.
+        telemetry = payload.get("telemetry")
+        sample = clean_metrics(telemetry) if telemetry is not None else None
+        state = {k: clean_state(k, payload.get(k)) for k in STATE_KEYS}
+        legacy = {k: clean_metrics({k: payload.get(k)}).get(k) for k in ("cpu", "mem", "disk")}
+        cpu = sample.get("cpu") if sample is not None else legacy["cpu"]
+        mem = sample.get("mem") if sample is not None else legacy["mem"]
+        name = payload.get("host_name") or payload.get("name")
+        ip = payload.get("tailnet_ip") or payload.get("ip")
+        inventory = payload.get("inventory")
+        # A routine heartbeat (known healthy host, same identity, no inventory)
+        # only refreshes liveness in memory: a durable HostHeartbeat per 30 s
+        # sample would grow the event log and the Activity feed without bound.
+        # Registration, identity changes, inventory and status transitions
+        # still go through upsert_host and are recorded as events.
+        existing = self.repo.get_host_record(entity_id)
+        if (existing is not None and status == "healthy"
+                and existing.get("status") == "healthy"
+                and (not name or name == existing.get("host_name"))
+                and (not ip or ip == existing.get("tailnet_ip"))
+                and not inventory):
+            self.repo.record_heartbeat(entity_id, cpu=cpu, mem=mem)
+            host = self.repo.get_host_record(entity_id) or existing
+        else:
+            host = self.repo.upsert_host(
+                entity_id, name or entity_id, ip,
+                cpu=cpu, mem=mem, status=status, inventory=inventory)
+        if sample is not None or any(v is not None for v in state.values()):
+            self.repo.record_host_metrics(entity_id, sample, **state)
+            return host
+        legacy = {k: v for k, v in legacy.items() if v is not None}
+        if legacy:
             self.repo.record_telemetry(entity_id, {
-                "cpu_pct": sample.get("cpu"), "mem_pct": sample.get("mem"),
-                "disk_pct": sample.get("disk")})
+                "cpu_pct": legacy.get("cpu"), "mem_pct": legacy.get("mem"),
+                "disk_pct": legacy.get("disk")})
         return host
+
+    def _ingest_host_state(self, entity_id, payload) -> dict:
+        """A host event from a source that is not the host's own agent (e.g. the
+        Ansible fleet update on the main host): it may only set host STATE keys.
+        It never touches liveness (status, last_seen), identity (host_name, ip)
+        or metrics, and never creates a host the agent has not registered."""
+        bad = sorted(k for k in _AGENT_ONLY_HOST_KEYS if k in payload)
+        if bad:
+            raise ValueError("host metrics/inventory are accepted from the host agent only: "
+                             + ", ".join(bad))
+        state = {k: clean_state(k, payload.get(k)) for k in STATE_KEYS}
+        self.repo.record_host_metrics(entity_id, None, **state)
+        return self.repo.get_host(entity_id) or {"entity_id": entity_id,
+                                                  "ignored": "unknown host"}
 
     def _ingest_session(self, entity_id, event_type, payload,
                         source="herdr") -> dict:
@@ -301,7 +355,7 @@ class IngestService:
             **{k: payload.get(k) for k in (
                 "pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
                 "revision", "interactive_ready", "launch_pending", "state_change_seq",
-                "transcript", "parent_session_id", "name")})
+                "transcript", "parent_session_id", "name", "runtime")})
 
     def _ingest_mission(self, entity_id, event_type, payload,
                         source="herdr") -> dict:

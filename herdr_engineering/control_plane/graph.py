@@ -42,10 +42,13 @@ Nothing here infers edges; only explicit ``edge.add`` events create them.
 """
 from __future__ import annotations
 
+import hmac
 import itertools
 import json
 import re
+import secrets
 import threading
+import time
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any
@@ -98,6 +101,15 @@ DEFAULT_NODES, MAX_NODES = 200, 1000
 DEFAULT_EDGES, MAX_EDGES = 500, 2000
 MAX_NODE_EDGES = 200
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+# T09 (lineage views and replay)
+REPLAY_MAX_EVENTS = 25_000           # lineage events one replay may apply (ONE room's context events up to the position)
+LOG_MAX_PER_CONTEXT = 100_000        # events kept per room/mission context; the oldest are evicted (history floor)
+CHUNK = 128                          # events whose visibility is evaluated per live-lock acquisition
+LEDGER_SCAN_BUDGET = 20_000          # events of ONE room context examined per read (newest window)
+LEDGER_DEFAULT, LEDGER_MAX = 200, 500
+TIMELINE_MAX_LANES, TIMELINE_MAX_MARKERS = 300, 1000
+TERMINAL_STATES = frozenset("done failed cancelled superseded merged closed passed completed success error "
+                            "rejected approved aborted".split())
 
 _STATE_RE = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
 _ID_RE = re.compile(r"([a-z]+):(\S.*)")
@@ -409,6 +421,12 @@ def _narrow(a, b):
     return "mission"                                    # bare room vs contextual mission meets at bare mission
 
 
+# Registers whose recent write history is kept (see _Reg.recent): only the PR head, so the
+# bookkeeping costs nothing for every other attribute.
+_TRACKED_ATTRS = frozenset({"head_sha"})
+_RECENT_VALUES = 8
+
+
 class _Reg:
     """Last-writer-wins register per (source, actor), merged across writers by admission order.
 
@@ -417,12 +435,19 @@ class _Reg:
     server's admission order counts: a client-chosen sequence can never beat
     another principal, even on a shared source name.
     """
-    __slots__ = ("by", "firsts")
+    __slots__ = ("by", "firsts", "lasts", "recent", "track")
 
-    def __init__(self):
+    def __init__(self, track: bool = False):
+        self.track = track
+        # tracked registers only: writer key -> {value: [first_rank, last_rank, last_seq,
+        # last_event_id]}, one entry per DISTINCT value (so re-emits of one head cannot evict
+        # the evidence about another), at most _RECENT_VALUES values, oldest evicted first.
+        # min/max aggregates, so replay order cannot change it.
+        self.recent: dict[tuple, dict] = {}
         # writer key -> (seq, event_id, rank, value, key, is_op, scope)
         self.by: dict[tuple, tuple] = {}
         self.firsts: dict[tuple, tuple] = {}   # writer key -> rank of that writer's EARLIEST event here
+        self.lasts: dict[tuple, tuple] = {}    # writer key -> rank of that writer's LATEST event here (kept or not)
 
     def set(self, ev: dict, value: Any = None) -> None:
         key, seq, eid = _writer_key(ev), int(ev["source_sequence"]), str(ev["event_id"])
@@ -430,6 +455,20 @@ class _Reg:
         first = self.firsts.get(key)
         if first is None or rank < first:
             self.firsts[key] = rank            # min over ALL events, whichever order they arrive in
+        last = self.lasts.get(key)
+        if last is None or rank > last:
+            self.lasts[key] = rank             # max over ALL events: order independent
+        if self.track and isinstance(value, str) and value.strip():
+            hist = self.recent.setdefault(key, {})
+            ent = hist.get(value)
+            if ent is None:
+                hist[value] = [rank, rank, seq, eid]
+                if len(hist) > _RECENT_VALUES:
+                    del hist[min(hist, key=lambda v: hist[v][1])]
+            else:
+                ent[0] = min(ent[0], rank)
+                if rank > ent[1]:
+                    ent[1], ent[2], ent[3] = rank, seq, eid
         cur = self.by.get(key)
         if cur is None or (seq, eid) > (cur[0], cur[1]):
             self.by[key] = (seq, eid, _rank(ev), value, key, _is_operator(ev.get("actor")),
@@ -489,13 +528,15 @@ def _entry_visible(principal: Any, entry: tuple) -> bool:
     return can_see(principal, entry[6], frozenset({writer}) if writer else frozenset())
 
 
-def _prov(entry: tuple | None, extra: dict | None = None) -> dict | None:
-    """Provenance of one register entry: who wrote it, from which source, in which event, when."""
+def _prov(entry: tuple | None, extra: dict | None = None, member: bool = False) -> dict | None:
+    """Provenance of one register entry: who wrote it, from which source, in which event, when. The admission
+    number is a global counter (it would count other rooms' and hidden events), so a room member never gets it."""
     if entry is None:
         return None
     out = {"value": entry[3], "writer": entry[4][1], "source": entry[4][0], "event_id": entry[1],
-           "admission": entry[2][0],
            "admitted_at": datetime.fromtimestamp(entry[2][1], UTC).isoformat() if entry[2][1] else None}
+    if not member:
+        out["admission"] = entry[2][0]
     if extra:
         out.update(extra)
     return out
@@ -556,7 +597,7 @@ class _Claims:
 
     def _put_attrs(self, attrs: dict, ev: dict) -> None:
         for k, v in attrs.items():
-            self.attrs.setdefault(k, _Reg()).set(ev, v)
+            self.attrs.setdefault(k, _Reg(k in _TRACKED_ATTRS)).set(ev, v)
         if "co_writers" in attrs:
             self._w = None
 
@@ -677,8 +718,20 @@ def from_stored(event: dict) -> dict:
 class GraphProjection:
     """Thread-safe lineage graph. Mutated only through :meth:`apply`."""
 
-    def __init__(self):
+    def __init__(self, *, keep_log: bool = True, gate: GraphProjection | None = None):
         self._lock = threading.RLock()
+        # T09: every applied (non-noop) lineage event with its validated op, in apply order, plus an index by
+        # the room/mission context its scope names. The projection keeps only winners; replay and the ledger
+        # need the events. Derived, never persisted: rebuild refills it exactly as it refills the graph.
+        self._keep_log = keep_log
+        self._log_ctx: dict[tuple, list] = {}        # context -> (event, op) in apply order: PER ROOM, so one busy
+        self._log_evicted: dict[tuple, int] = {}     # room never costs another room anything
+        # a replayed projection reads through the CURRENT projection: nothing is visible in the past
+        # that the reader cannot see now (no widening by replay)
+        self._gate = gate
+        self._replay_lock = threading.Lock()
+        self._replay_cache: dict[tuple, GraphProjection] = {}
+        self._cursor_key = secrets.token_bytes(32)
         self._nodes: dict[str, _Node] = {}
         self._edges: dict[tuple, _Edge] = {}
         self._wild: dict[tuple, _Wild] = {}
@@ -894,6 +947,15 @@ class GraphProjection:
             self.events_applied += 1
             if mode == "noop":
                 return
+            if self._keep_log:
+                label = scope_label(ev)
+                if isinstance(label, tuple):
+                    lst = self._log_ctx.setdefault(label[:3], [])
+                    lst.append((ev, op))
+                    if len(lst) > LOG_MAX_PER_CONTEXT:           # bounded: evict the oldest tenth, remember that we did
+                        cut = LOG_MAX_PER_CONTEXT // 10
+                        del lst[:cut]
+                        self._log_evicted[label[:3]] = self._log_evicted.get(label[:3], 0) + cut
             if op["op"] in ("node.upsert", "node.state"):
                 self._apply_node(op, ev, mode)
             else:
@@ -1103,50 +1165,69 @@ class GraphProjection:
         gated by the scope ITS writer gave it: a reader sees the node shell (id, type, widest
         visible scope) plus only the fields of writers it may see, and ids/sources/event ids
         come from those visible values alone."""
-        vis = None
+        mk = None
         if node.commons and principal is not None:
             memo: dict = {}
+            live = self._gate._nodes.get(node.id) if self._gate is not None else None
 
-            def vis(e, _p=principal, _m=memo):
+            def base(e, _p=principal, _m=memo):
                 k = (e[6], e[4][1])             # visibility depends only on (scope, writer)
                 r = _m.get(k)
                 if r is None:
                     r = _m[k] = _entry_visible(_p, e)
                 return r
+
+            def mk(live_reg, _b=base, _p=principal):
+                """Visibility of one register's entries. In a REPLAYED projection a past value is shown only if
+                the same writer's CURRENT value of that field is visible too: a writer who later made a field
+                private takes its past back out of sight."""
+                if self._gate is None:
+                    return _b
+                return lambda e: _b(e) and live_reg is not None and e[4] in live_reg.by \
+                    and _entry_visible(_p, live_reg.by[e[4]])
+
+            def lreg(name, key=None):
+                if live is None:
+                    return None
+                return live.attrs.get(key) if name == "attrs" else getattr(live, name)
         aid = (principal or {}).get("id")
         owner = None
         if node.commons:
             actors = None
-            if vis is not None:             # writers with at least one value this reader may see
-                actors = {e[4][1] for reg in (node.label, node.state, *node.attrs.values())
-                          for e in reg.by.values() if vis(e)}
+            if mk is not None:              # writers with at least one value this reader may see
+                regs = [(node.label, lreg("label")), (node.state, lreg("state")),
+                        *((r, lreg("attrs", k)) for k, r in node.attrs.items())]
+                actors = {e[4][1] for reg, lr in regs for e in reg.by.values() if mk(lr)(e)}
             owner = node.view_owner(actors)
-        state, label = node.pick(node.state, vis, owner), node.pick(node.label, vis, owner)
-        fields: dict = {"label": _prov(label), "state": None, "attrs": {}}
+        vstate, vlabel = (mk(lreg("state")), mk(lreg("label"))) if mk else (None, None)
+        state, label = node.pick(node.state, vstate, owner), node.pick(node.label, vlabel, owner)
+        mem = bool(principal) and principal.get("kind") == "member"
+        fields: dict = {"label": _prov(label, None, mem), "state": None, "attrs": {}}
         if state:
-            fields["state"] = _prov(state, {"value": state[3][0], "reason": state[3][1]})
+            fields["state"] = _prov(state, {"value": state[3][0], "reason": state[3][1]}, mem)
         contrib: dict = {}
         seen_entries = [e for e in (label, state) if e]
-        for name, reg, ent in (("label", node.label, label), ("state", node.state, state)):
-            lst = reg.contributions(ent, owner=owner, caller=aid, vis=vis) if node.commons else []
+        for name, reg, ent, rv in (("label", node.label, label, vlabel), ("state", node.state, state, vstate)):
+            lst = reg.contributions(ent, owner=owner, caller=aid, vis=rv) if node.commons else []
             seen_entries += lst
             if lst:
-                contrib[name] = [_prov(e, {"value": e[3][0], "reason": e[3][1]} if name == "state" else None)
+                contrib[name] = [_prov(e, {"value": e[3][0], "reason": e[3][1]} if name == "state" else None, mem)
                                  for e in lst]
         cattrs: dict = {}
         attrs: dict = {}
         for k, reg in sorted(node.attrs.items()):
-            ent = node.pick(reg, vis, owner)
-            lst = reg.contributions(ent, owner=owner, caller=aid, vis=vis) if node.commons else []
+            av = mk(lreg("attrs", k)) if mk else None
+            ent = node.pick(reg, av, owner)
+            lst = reg.contributions(ent, owner=owner, caller=aid, vis=av) if node.commons else []
             if ent is None and not lst:
                 continue                      # every writer of this key is hidden from the reader
             attrs[k] = ent[3] if ent else None
-            fields["attrs"][k] = _prov(ent)
+            fields["attrs"][k] = _prov(ent, None, mem)
             if ent:
                 seen_entries.append(ent)
             seen_entries += lst
             if lst:
-                cattrs[k] = [_prov(e) for e in lst]
+                cattrs[k] = [_prov(e, None, mem) for e in lst]
         if cattrs:
             contrib["attrs"] = cattrs
         if node.commons:
@@ -1188,7 +1269,8 @@ class GraphProjection:
             "visibility_scope": _base(edge.scope or "private"),
             "provenance": {"event_id": add[1], "source": add[2][2], "source_sequence": add[0],
                            "writer": add[4][1]},
-            "fields": {k: _prov(r.best()) for k, r in sorted(edge.attrs.items())},
+            "fields": {k: _prov(r.best(), None, bool(principal) and principal.get("kind") == "member")
+                       for k, r in sorted(edge.attrs.items())},
         }
         if edge.writer is not None:
             out["writer"] = edge.writer
@@ -1213,6 +1295,8 @@ class GraphProjection:
     def _node_visible(self, principal, node: _Node | None) -> bool:
         if node is None:
             return False
+        if self._gate is not None and not self._gate._node_visible(principal, self._gate._nodes.get(node.id)):
+            return False
         if node.commons:
             # as visible as its most visible writer (see _Node.eff_scope); fields gate separately
             return node.eff_scope(principal, internal=False) is not None
@@ -1221,7 +1305,17 @@ class GraphProjection:
 
     def _edge_visible(self, principal, edge: _Edge) -> bool:
         """An edge is visible only if its own scope AND both endpoints are."""
+        if self._gate is not None and not self._gate._edge_gate(principal, edge.key):
+            return False
         return (self._live(edge) and can_see(principal, edge.scope or "private", edge.writers())
+                and self._node_visible(principal, self._nodes.get(edge.from_id))
+                and self._node_visible(principal, self._nodes.get(edge.to_id)))
+
+    def _edge_gate(self, principal, key: tuple) -> bool:
+        """Is the edge instance visible NOW, ignoring whether it is currently removed? The check a replayed
+        projection must also pass: a tombstone is history, a narrowing is not."""
+        edge = self._edges.get(key)
+        return (edge is not None and can_see(principal, edge.scope or "private", edge.writers())
                 and self._node_visible(principal, self._nodes.get(edge.from_id))
                 and self._node_visible(principal, self._nodes.get(edge.to_id)))
 
@@ -1327,6 +1421,122 @@ class GraphProjection:
             matches.sort(key=lambda e: e.adds.best()[2])
             ctx: dict = {}
             return {"edges": [self._edge_view(e, principal, ctx) for e in matches[:MAX_NODE_EDGES]]}
+
+    @staticmethod
+    def _owner_attr(edge: _Edge, owner: str, name: str) -> Any:
+        """Newest value of attr ``name`` written by ``owner`` itself.
+
+        An operator or a ``co_writer`` may add to the same edge key, and the plain
+        :meth:`_Claims.attr_values` would report THEIR value under the owner's name; a verdict
+        is the reviewer's own statement, so only the reviewer's own entries are read.
+        """
+        reg = edge.attrs.get(name)
+        ents = [e for e in (reg.by.values() if reg else ()) if e[4][1] == owner]
+        return max(ents, key=lambda t: t[2])[3] if ents else None
+
+    def _owner_live(self, edge: _Edge, owner: str) -> bool:
+        """Does ``owner`` currently stand behind ``edge``? Only the owner's own add/remove count.
+
+        A remove by anyone else (operator, co_writer, wildcard) must not erase a reviewer's
+        ``blocked``, nor must another writer's add keep an edge the owner never made alive.
+        """
+        adds = [e for e in edge.adds.by.values() if e[4][1] == owner]
+        if not adds:
+            return False
+        add = max(adds, key=lambda t: t[2])
+        removes = [r for r in edge.removes.by.values() if r[4][1] == owner]
+        wild = self._wild.get(edge.key[:3])
+        if wild is not None:
+            removes += [r for r in wild.removes.by.values() if r[4][1] == owner]
+        return not removes or not _after(max(removes, key=lambda t: t[2]), add)
+
+    def review_evidence(self, principal, pr_id: str, reviewer_ids, head_writers) -> dict:
+        """Raw, UNFILTERED inputs for the head-bound review quorum of one PR (T06).
+
+        The quorum decision must not depend on who asks (a private ``blocked`` edge a
+        viewer cannot see still blocks), so every candidate edge is included and carries a
+        ``visible`` flag the caller uses only to redact identities. KeyError if the PR node
+        is absent or hidden from ``principal``.
+
+        Bounded by construction: reviews are found through the by-owner index of the
+        CONFIGURED reviewer ids, never by scanning the PR's incident edges, so junk edges
+        from other principals cost nothing and cannot cause a denial of service.
+        ``head`` and ``author`` come only from the register entries of ``head_writers``
+        (the PR is a commons node: its primary value may be anyone's).
+        """
+        with self._lock:
+            node = self._nodes.get(pr_id)
+            if node is None or node.node_type != "pr" or not self._node_visible(principal, node):
+                raise KeyError(pr_id)
+
+            def trusted(name):
+                """(value, event_id): newest non-empty string from a trusted writer."""
+                reg = node.attrs.get(name)
+                ents = [e for e in (reg.by.values() if reg else ())
+                        if e[4][1] in head_writers and isinstance(e[3], str) and e[3].strip()]
+                if not ents:
+                    return None, None
+                best = max(ents, key=lambda t: t[2])
+                return best[3], best[1]
+
+            def trusted_head():
+                """(value, event_id, state, candidate): the PR head from the trusted writers.
+
+                A trusted writer's applied head is its highest-``source_sequence`` write. A
+                write admitted AFTER it (so lower in sequence) with a different value is only
+                harmless if that value is an OLD head the writer had already reported before
+                (a late redelivery). Any other lower-sequence different head, however near,
+                could equally be a restart that reset the sequence, so the head is
+                ``unverified`` (alert, never satisfied). It clears when the writer writes
+                past the applied sequence, or when an operator acknowledges the candidate
+                write with ``head_resync`` (``resynced``). Nothing is adopted automatically.
+                """
+                reg = node.attrs.get("head_sha")
+                if reg is None:
+                    return None, None, "ok", None
+                acks = {e[3] for e in (node.attrs["head_resync"].by.values()
+                                       if "head_resync" in node.attrs else ()) if e[5]}
+                cands, state, candidate = [], "ok", None
+                for e in reg.by.values():
+                    if e[4][1] not in head_writers or not isinstance(e[3], str) or not e[3].strip():
+                        continue
+                    value, eid, rank = e[3], e[1], e[2]
+                    unknown = [(h[1], v, h[3]) for v, h in reg.recent.get(e[4], {}).items()
+                               if v != e[3] and h[1] > e[2] and h[0] > e[2]]
+                    if unknown:
+                        last_rank, last_value, last_eid = max(unknown)
+                        if last_eid in acks:
+                            value, eid, rank = last_value, last_eid, last_rank
+                            if state == "ok":
+                                state = "resynced"
+                        else:
+                            state, candidate = "unverified", last_eid
+                    cands.append((rank, value, eid))
+                if not cands:
+                    return None, None, "ok", None
+                best = max(cands)
+                return best[1], best[2], state, candidate
+            head, head_event, head_state, candidate = trusted_head()
+            author, _ = trusted("author")
+            reviews, authors = [], set()
+            for rid in sorted(reviewer_ids):
+                for key in list(self._edges_by_owner.get(rid, ())):
+                    e = self._edges.get(key)
+                    if e is None or e.to_id != pr_id or e.owner() != rid or not self._owner_live(e, rid):
+                        continue
+                    if e.edge_type == "produced":
+                        authors.add(rid)
+                    elif e.edge_type == "reviewed" and e.binding and e.binding[0] == "commit":
+                        reviews.append({
+                            "reviewer": rid, "commit": e.binding[1], "from_id": e.from_id,
+                            "verdict": self._owner_attr(e, rid, "verdict"),
+                            "receipt_digest": self._owner_attr(e, rid, "receipt_digest"),
+                            "receipt_binding": self._owner_attr(e, rid, "receipt_binding"),
+                            "event_id": e.adds.best()[1],
+                            "visible": self._edge_visible(principal, e)})
+            return {"pr": pr_id, "head": head, "head_event_id": head_event,
+                    "head_state": head_state, "head_resync_candidate": candidate, "author": author,
+                    "reviews": reviews, "authors": sorted(authors)}
 
     def list_nodes(self, principal, node_type: str, *, edge_type: str | None = None,
                    limit: int = DEFAULT_NODES, contexts: frozenset | None = None) -> dict:
@@ -1473,6 +1683,412 @@ class GraphProjection:
                     "truncated": truncated,
                     "limits": {"max_depth": MAX_DEPTH, "max_nodes": max_nodes, "max_edges": max_edges,
                                "max_response_bytes": MAX_RESPONSE_BYTES}}
+
+
+    # ------------------------------------------------------ T09: lineage views
+    # Everything below reads the stored lineage events kept in ``_log`` (the projection itself only keeps
+    # winners). A reader gets an event only when (1) the event's own scope label is visible to them and (2) the
+    # object it concerns is visible to them NOW. Replay therefore can never show what the current graph would
+    # hide: a later narrowing hides the past too, a tombstone does not.
+    def _event_visible(self, principal, ev: dict, op: dict) -> bool:
+        actor = (ev.get("actor") or {}).get("id")
+        if not can_see(principal, scope_label(ev), frozenset({actor}) if actor else frozenset()):
+            return False
+        if op["op"] in ("node.upsert", "node.state"):
+            node = self._nodes.get(op["node_id"])
+            if not self._node_visible(principal, node):
+                return False
+            return not node.commons or self._commons_event_visible(principal, ev, op, node)
+        # the exact edge instance this event touched (not any sibling binding or writer instance of the triple)
+        if op["op"] == "edge.add":
+            keys = [_ekey(op, actor)]
+        elif op["edge_type"] in BOUND_EDGE_TYPES and op["binding"] is None:       # a wildcard remove names no instance
+            keys = list(self._by_triple.get((op["edge_type"], op["from_id"], op["to_id"]), ()))
+        else:
+            keys = [_ekey(op, op.get("writer") or actor)]
+        return any(self._edge_gate(principal, k) for k in keys)
+
+    @staticmethod
+    def _commons_event_visible(principal, ev: dict, op: dict, node: _Node) -> bool:
+        """A commons field is visible through its writer's CURRENT value of that field: an event that wrote a
+        value its writer has since made private is not shown (the past must not undo that)."""
+        key = _writer_key(ev)
+        regs = [node.state] if op["op"] == "node.state" else [
+            *([node.label] if op.get("label") is not None else []),
+            *([node.state] if op.get("state") is not None else []),
+            *[node.attrs[k] for k in (op.get("attrs") or {}) if k in node.attrs]]
+        return all(key in reg.by and _entry_visible(principal, reg.by[key]) for reg in regs)
+
+    def _room_entries(self, principal, contexts, since: float | None = None) -> tuple[list, bool]:
+        """The newest ``LEDGER_SCAN_BUDGET`` events the reader may see that are addressed to ``contexts``, in
+        admission order: ``(entries, trimmed)``. The window is counted in the READER'S visible events (the log is
+        scanned newest first until enough visible ones are found or it is exhausted), so its size never
+        correlates with how many hidden events there are. ``since`` (a join time) drops earlier events one by
+        one, never by position. ``trimmed`` also covers a context whose oldest events were evicted. The live
+        lock is held for ``CHUNK`` events at a time, so a viewer never stalls ingest for a whole scan."""
+        with self._lock:
+            parts, trimmed = [], False
+            for c in sorted(contexts, key=repr):
+                parts.extend(self._log_ctx.get(c, ()))
+                trimmed = trimmed or bool(self._log_evicted.get(c))
+        parts.sort(key=lambda t: _rank(t[0]))
+        got: list = []                                   # newest first
+        i = len(parts)
+        while i > 0 and len(got) <= LEDGER_SCAN_BUDGET:
+            lo = max(0, i - CHUNK)
+            with self._lock:
+                got.extend((ev, op) for ev, op in reversed(parts[lo:i])
+                           if (since is None or _ts(ev) >= since) and self._event_visible(principal, ev, op))
+            i = lo
+            time.sleep(0.0002)       # a lock is not fair: really hand it to a waiting ingest before re-taking it
+        if len(got) > LEDGER_SCAN_BUDGET or (i > 0 and len(got) >= LEDGER_SCAN_BUDGET):
+            trimmed = True
+        return got[:LEDGER_SCAN_BUDGET][::-1], trimmed
+
+    @staticmethod
+    def _iso(value: Any) -> str | None:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value) if value else None
+
+    def _event_view(self, step: int, ev: dict, op: dict) -> dict:
+        out = {"step": step, "event_id": str(ev["event_id"]), "event_type": op["op"], "source": str(ev["source"]),
+               "received_at": self._iso(ev.get("ingest_timestamp") or ev.get("received_at")),
+               "occurred_at": self._iso(ev.get("source_timestamp"))}
+        if op["op"] in ("node.upsert", "node.state"):
+            out.update(node_id=op["node_id"], node_type=op["node_type"], state=op.get("state"),
+                       label=op.get("label"), reason=op.get("reason"))
+        else:
+            out.update(edge_type=op["edge_type"], from_id=op["from_id"], to_id=op["to_id"],
+                       binding=dict([op["binding"]]) if op.get("binding") else None, reason=op.get("reason"))
+        return out
+
+    @staticmethod
+    def _parse_at(value: str) -> float:
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).timestamp()      # no zone means UTC, never server-local
+        except (AttributeError, ValueError):
+            raise ValueError("at must be an ISO-8601 timestamp") from None
+
+    @staticmethod
+    def _position(entries: list, step: int | None, at: str | None) -> int:
+        """Resolve a replay position to ``k``, the number of the reader's visible events included (0..n; every
+        value is replayable). ``at`` counts the visible events BEFORE the first one received after that instant
+        (server receipt time, never the emitter's claim), so it is a prefix and never skips an earlier event."""
+        n = len(entries)
+        if step is not None and at is not None:
+            raise ValueError("give step or at, not both")
+        if step is not None:
+            if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+                raise ValueError("step must be a non-negative integer")
+            return min(step, n)
+        if at is not None:
+            t = GraphProjection._parse_at(at)
+            k = 0
+            for ev, _ in entries:
+                if _ts(ev) > t:
+                    break
+                k += 1
+            return k
+        return n
+
+    def _replay(self, principal, contexts, entries: list, k: int) -> GraphProjection:
+        """The graph after the first ``k`` of the reader's visible events, built from those events alone, read
+        through THIS projection's visibility (``apply`` is commutative and idempotent). The cap counts the
+        reader's own visible events, so it says nothing about hidden volume. Cached (two projections)."""
+        if k >= len(entries):
+            return self
+        if k > REPLAY_MAX_EVENTS:
+            raise ValueError("replay is not available for this position")
+        key = (principal.get("id"), frozenset(contexts), k, _lseq(entries[0][0]) if entries else 0,
+               _lseq(entries[k - 1][0]) if k else 0, self.events_applied)
+        with self._replay_lock:
+            hit = self._replay_cache.get(key)
+            if hit:
+                return hit
+            past = GraphProjection(keep_log=False, gate=self)
+            for ev, _op in entries[:k]:
+                try:
+                    past.apply(ev)
+                except ValueError:
+                    past.events_rejected += 1
+            self._replay_cache[key] = past
+            while len(self._replay_cache) > 2:
+                self._replay_cache.pop(next(iter(self._replay_cache)))
+            return past
+
+    def _as_of(self, entries: list, k: int, trimmed: bool) -> dict:
+        last = entries[k - 1][0] if k else None
+        return {"step": k, "visible_events": len(entries), "head": k >= len(entries),
+                "event_id": str(last["event_id"]) if last else None,
+                "received_at": self._iso(last.get("ingest_timestamp") or last.get("received_at")) if last else None,
+                "window_trimmed": trimmed}
+
+    def _cursor_pad(self, principal, contexts) -> bytes:
+        return hmac.new(self._cursor_key, repr((principal.get("id"), sorted(contexts, key=repr))).encode(),
+                        "sha256").digest()
+
+    def _cursor_make(self, principal, contexts, lseq: int) -> str:
+        """An opaque, reader- and room-bound page token: the admission number it stands for is masked, so a
+        token (like a step number) reveals nothing about the events the reader cannot see."""
+        pad = self._cursor_pad(principal, contexts)
+        ct = (lseq ^ int.from_bytes(pad[:8], "big")).to_bytes(8, "big")
+        tag = hmac.new(pad, ct, "sha256").digest()[:8]
+        return (ct + tag).hex()
+
+    def _cursor_read(self, principal, contexts, token) -> int:
+        pad = self._cursor_pad(principal, contexts)
+        try:
+            raw = bytes.fromhex(str(token))
+        except ValueError:
+            raise ValueError("invalid cursor") from None
+        if len(raw) != 16 or not hmac.compare_digest(hmac.new(pad, raw[:8], "sha256").digest()[:8], raw[8:]):
+            raise ValueError("invalid cursor")
+        return int.from_bytes(raw[:8], "big") ^ int.from_bytes(pad[:8], "big")
+
+    def room_ledger(self, principal, contexts, *, cursor: str | None = None, limit: int = LEDGER_DEFAULT,
+                    since: float | None = None) -> dict:
+        """A page of the events this reader may see in one room, in admission order. ``step`` numbers the
+        reader's OWN visible events (1-based) and the page token is opaque, so nothing reveals how many hidden
+        events exist."""
+        if not isinstance(limit, int) or not 1 <= limit <= LEDGER_MAX:
+            raise ValueError(f"limit must be between 1 and {LEDGER_MAX}")
+        after = self._cursor_read(principal, contexts, cursor) if cursor not in (None, "") else None
+
+        def compute():
+            return self._room_entries(principal, contexts, since)
+
+        def finish(state):
+            entries, trimmed = state
+            start = 0 if after is None else sum(1 for ev, _ in entries if _lseq(ev) <= after)
+            page = entries[start:start + limit]
+            more = start + limit < len(entries)
+            return {"events": [self._event_view(start + i + 1, ev, op) for i, (ev, op) in enumerate(page)],
+                    "visible_events": len(entries),
+                    "next_cursor": self._cursor_make(principal, contexts, _lseq(page[-1][0])) if more else None,
+                    "truncated": trimmed, "truncated_reason": "scan_budget" if trimmed else None}
+        return self._coherent(compute, finish)
+
+    def room_graph(self, principal, contexts, *, node_types: set | None = None, edge_types: set | None = None,
+                   limit: int = DEFAULT_NODES, offset: int = 0) -> dict:
+        """Every node type of ONE room's view (its own scope plus the missions it linked that the reader
+        belongs to) with the visible edges among them, paged by ``offset``. Call it on a replayed projection
+        to get the past; the two share every check. Budgets: ``SCAN_BUDGET`` ids examined, ``EDGE_SCAN_TOTAL``
+        incident edges, ``MAX_EDGES`` edges and ``MAX_RESPONSE_BYTES`` bytes; ``truncated_reason`` names the
+        one that ended the read and never counts hidden items."""
+        if node_types is not None and not node_types <= NODE_TYPES:
+            raise ValueError("unknown node_type")
+        if edge_types is not None and not edge_types <= EDGE_TYPES:
+            raise ValueError("unknown edge_type")
+        if not isinstance(limit, int) or not 1 <= limit <= MAX_NODES:
+            raise ValueError(f"limit must be between 1 and {MAX_NODES}")
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be >= 0")
+        with self._lock:
+            reason = None
+            kinds = [t for t in sorted(NODE_TYPES) if node_types is None or t in node_types]
+            iters = {}
+            for t in kinds:
+                seen: dict = {}
+                for c in sorted(contexts, key=repr):
+                    seen.update(self._by_ctx.get(c, {}).get(t, {}))
+                iters[t] = iter(seen)
+            found: dict[str, list] = {t: [] for t in kinds}
+            scanned, active = 0, list(kinds)
+            while active:                       # round-robin: one busy type cannot starve the others of the budget
+                for t in list(active):
+                    nid = next(iters[t], None)
+                    if nid is None:
+                        active.remove(t)
+                        continue
+                    if scanned >= SCAN_BUDGET:
+                        reason = "scan_budget"
+                        active = []
+                        break
+                    scanned += 1
+                    node = self._nodes[nid]
+                    if not self._node_visible(principal, node):
+                        continue
+                    label = node.eff_scope(principal, internal=False) if node.commons else node.eff_scope()
+                    if isinstance(label, tuple) and label[:3] in contexts:
+                        found[t].append(nid)
+            ids = [nid for t in kinds for nid in found[t]]
+            rank = {nid: i for i, nid in enumerate(ids)}
+            budget = MAX_RESPONSE_BYTES
+            nodes, served = [], []
+            for nid in ids[offset:offset + limit]:
+                view = self._node_view(self._nodes[nid], principal)
+                cost = len(json.dumps(view))
+                if budget - cost < 0:
+                    reason = reason or "response_bytes"
+                    break
+                budget -= cost
+                nodes.append(view)
+                served.append(nid)
+            end = offset + len(served)
+            if end < len(ids) and reason is None:
+                reason = "limit"
+            edges, done, left, ctx = [], set(), EDGE_SCAN_TOTAL, {}
+            for nid in served:
+                if left <= 0:
+                    reason = reason or "edge_budget"
+                    break
+                per = min(NEIGHBOR_SCAN_BUDGET, left)
+                left -= min(len(self._out.get(nid, ())) + len(self._in.get(nid, ())), per)
+                own, others, exhausted = self._expand(principal, nid, "both", edge_types, False, None, per)
+                if exhausted:
+                    reason = reason or "edge_budget"
+                for edge in own + others:
+                    if edge.key in done or rank.get(edge.from_id, end) >= end or rank.get(edge.to_id, end) >= end:
+                        continue
+                    done.add(edge.key)
+                    view = self._edge_view(edge, principal, ctx)
+                    cost = len(json.dumps(view))
+                    if len(edges) >= MAX_EDGES or budget - cost < 0:
+                        reason = reason or ("limit" if len(edges) >= MAX_EDGES else "response_bytes")
+                        continue
+                    budget -= cost
+                    edges.append(view)
+            edges.sort(key=lambda e: (e["edge_type"], e["from_id"], e["to_id"], repr(e.get("binding"))))
+            return {"nodes": nodes, "edges": edges, "total_nodes": len(ids), "offset": offset,
+                    "next_offset": end if end < len(ids) else None,
+                    "truncated": reason is not None, "truncated_reason": reason}
+
+    def _coherent(self, compute, finish):
+        """Run ``compute`` (entries, position, replay: all OUTSIDE the live lock) and ``finish`` (the graph read:
+        under it) against one state of the world. If an event arrived in between, retry; the last try does
+        everything under the lock, so the ``as_of`` of a response always matches what it shows."""
+        for attempt in range(3):
+            if attempt == 2:
+                with self._lock:
+                    return finish(compute())
+            seen = self.events_applied
+            state = compute()
+            with self._lock:
+                if self.events_applied == seen:
+                    return finish(state)
+
+    @staticmethod
+    def _strip_pre_join(out: dict, post: set) -> dict:
+        """``replay_history: since_join``: current values are shown, but the identity and time of any event that
+        is not among the reader's post-join events (an older value's history) is dropped."""
+        def fix(d):
+            if isinstance(d, dict) and d.get("event_id") is not None and d["event_id"] not in post:
+                d["event_id"] = None
+                if "admitted_at" in d:
+                    d["admitted_at"] = None
+        for n in out.get("nodes", ()):
+            for k in ("first_event_id", "last_event_id"):
+                if n.get(k) is not None and n[k] not in post:
+                    n[k] = None
+            f = n.get("fields") or {}
+            for v in (f.get("label"), f.get("state"), *(f.get("attrs") or {}).values()):
+                fix(v)
+            for lst in (n.get("contributions") or {}).values():
+                for v in (lst.values() if isinstance(lst, dict) else [lst]):
+                    for e in (v if isinstance(v, list) else [v]):
+                        fix(e)
+        for e in out.get("edges", ()):
+            fix(e.get("provenance"))
+            for v in (e.get("fields") or {}).values():
+                fix(v)
+        return out
+
+    def room_lineage(self, principal, contexts, *, step: int | None = None, at: str | None = None,
+                     since: float | None = None, **kw) -> dict:
+        """The room graph at a position in the reader's event ledger (default: now)."""
+        def compute():
+            entries, trimmed = self._room_entries(principal, contexts, since)
+            k = self._position(entries, step, at)
+            return entries, k, trimmed, self._replay(principal, contexts, entries, k)
+
+        def finish(state):
+            entries, k, trimmed, past = state
+            out = {"as_of": self._as_of(entries, k, trimmed), **past.room_graph(principal, contexts, **kw)}
+            return self._strip_pre_join(out, {ev["event_id"] for ev, _ in entries}) if since is not None else out
+        return self._coherent(compute, finish)
+
+    def room_timeline(self, principal, contexts, *, step: int | None = None, at: str | None = None,
+                      since: float | None = None) -> dict:
+        """Gantt data from the reader's visible events up to a replay position: one lane per node whose
+        ``spans`` are its recorded state periods, plus markers for edge events (spawn, handoff, produced,
+        issue_link, reviewed, validated ...). A ``head_change`` marker is a reviewed/validated edge bound to
+        a different revision than an earlier visible one for the same subject; ``stale`` is the projection's
+        own flag as the reader sees it at that position, never a client guess. Times are server receipt times
+        (``at``) with the emitter's claim alongside (``claimed``); nothing is inferred or invented."""
+        def compute():
+            entries, trimmed = self._room_entries(principal, contexts, since)
+            k = self._position(entries, step, at)
+            return entries, k, trimmed, self._replay(principal, contexts, entries, k)
+
+        def finish(state):
+            entries, k, trimmed, past = state
+            return self._timeline_of(principal, past, entries, k, trimmed)
+        return self._coherent(compute, finish)
+
+    def _timeline_of(self, principal, past, entries: list, k: int, trimmed: bool) -> dict:
+        shown = entries[:k]
+        lanes: dict[str, dict] = {}
+        markers: list[dict] = []
+        bindings: dict[tuple, set] = {}
+        ctx: dict = {}
+        reason = "scan_budget" if trimmed else None
+        for i, (ev, op) in enumerate(shown):
+            view = self._event_view(i + 1, ev, op)
+            at_, claimed = view["received_at"], view["occurred_at"]
+            if "node_id" in view:
+                lane = lanes.setdefault(view["node_id"], {"node_id": view["node_id"], "node_type": view["node_type"],
+                                                          "first_at": at_, "last_at": at_, "last_step": 0, "marks": []})
+                lane["last_at"], lane["last_step"] = at_, i + 1
+                if view["state"]:
+                    lane["marks"].append({"state": view["state"], "at": at_, "claimed": claimed,
+                                          "reason": view["reason"], "step": i + 1})
+                continue
+            kind = "edge_removed" if op["op"] == "edge.remove" else "edge"
+            stale = None
+            if op["edge_type"] in BOUND_EDGE_TYPES and op["op"] == "edge.add":
+                key = (op["edge_type"], op["to_id"])
+                prior = bindings.setdefault(key, set())
+                bound = op["binding"]
+                if prior and bound not in prior:
+                    kind = "head_change"
+                prior.add(bound)
+                found = [e for e in (past._edges[x] for x in past._by_triple.get(
+                    (op["edge_type"], op["from_id"], op["to_id"]), ())) if e.binding == bound]
+                if found and past._edge_visible(principal, found[0]):
+                    stale = bool(past._edge_view(found[0], principal, ctx)["stale"])
+            if len(markers) >= TIMELINE_MAX_MARKERS:
+                reason = reason or "marker_limit"
+                continue
+            markers.append({"kind": kind, "step": i + 1, "at": at_, "claimed": claimed, "edge_type": op["edge_type"],
+                            "from_id": op["from_id"], "to_id": op["to_id"], "binding": view["binding"],
+                            "stale": stale})
+        out_lanes = []
+        for lane in sorted(lanes.values(), key=lambda x: x["last_step"], reverse=True)[:TIMELINE_MAX_LANES]:
+            node = past._nodes.get(lane["node_id"])
+            if node is None or not past._node_visible(principal, node):
+                continue
+            nv = past._node_view(node, principal)
+            marks = lane.pop("marks")
+            lane.pop("last_step")
+            spans = []
+            for j, m in enumerate(marks):
+                nxt = marks[j + 1] if j + 1 < len(marks) else None
+                terminal = m["state"] in TERMINAL_STATES
+                spans.append({"state": m["state"], "start": m["at"], "claimed_start": m["claimed"],
+                              "end": (nxt["at"] if nxt else (m["at"] if terminal else None)),
+                              "claimed_end": (nxt["claimed"] if nxt else (m["claimed"] if terminal else None)),
+                              "open": nxt is None and not terminal, "terminal": terminal,
+                              "reason": m["reason"], "step": m["step"]})
+            out_lanes.append({**lane, "label": nv["label"], "state": nv["state"], "spans": spans})
+        if len(lanes) > TIMELINE_MAX_LANES:
+            reason = reason or "lane_limit"
+        out_lanes.sort(key=lambda x: (x["first_at"] or "", x["node_id"]))
+        return {"as_of": self._as_of(entries, k, trimmed), "lanes": out_lanes, "markers": markers,
+                "range": {"start": self._iso(shown[0][0].get("ingest_timestamp")) if shown else None,
+                          "end": self._iso(shown[-1][0].get("ingest_timestamp")) if shown else None},
+                "truncated": reason is not None, "truncated_reason": reason}
 
     # ------------------------------------------------------------ testing
     def snapshot(self) -> dict:

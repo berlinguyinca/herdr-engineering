@@ -66,6 +66,14 @@ export class TokenStore {
 
 export class AuthError extends Error {}
 
+function lineageQuery(room, o, extra = {}) {
+  const q = new URLSearchParams({ room_id: room });
+  if (o.step !== null && o.step !== undefined) q.set('step', String(o.step));
+  else if (o.at) q.set('at', String(o.at));
+  for (const [k, v] of Object.entries(extra)) if (v !== undefined && v !== null && v !== '' && v !== 0) q.set(k, String(v));
+  return q;
+}
+
 export class CollabApi {
   constructor(getTokens, fetchFn = (...a) => fetch(...a), base = '/api/v1/collab') {
     this.getTokens = getTokens; this.fetch = fetchFn; this.base = base;
@@ -128,6 +136,15 @@ export class CollabApi {
   proposals(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/proposals`); }
   proposal(room, id) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/proposals/${encodeURIComponent(id)}`); }
   decideProposal(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/proposals/${encodeURIComponent(id)}/decide`, body); }
+  // Read-only lineage views of ONE room (T09). `step` replays the reader's own visible ledger up to that event;
+  // omitted = now. The server filters by the caller's CURRENT membership.
+  lineage(room, o = {}) {
+    return this.call('GET', `/graph/lineage?${lineageQuery(room, o, { limit: '200', offset: o.offset, node_types: o.nodeTypes, edge_types: o.edgeTypes })}`);
+  }
+  lineageTimeline(room, o = {}) { return this.call('GET', `/graph/lineage/timeline?${lineageQuery(room, o)}`); }
+  lineageEvents(room, o = {}) {
+    return this.call('GET', `/graph/lineage/events?${lineageQuery(room, { step: null }, { limit: String(o.limit || 200), cursor: o.cursor })}`);
+  }
   linkAgent(agentId, instanceId) { return this.call('POST', `/agents/${encodeURIComponent(agentId)}/link`, { instance_id: instanceId || null }); }
   createJoinToken(body) { return this.call('POST', '/agents/join-tokens', body); }
   joinTokens() { return this.call('GET', '/agents/join-tokens'); }
@@ -168,4 +185,21 @@ export class CollabApi {
   removeMember(id, user) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/members/${encodeURIComponent(user)}/remove`, {});
   }
+  // agent helpers: the room profile (names only, never secret values), host-access requests, the panic switch
+  roomProfile(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/profile`); }
+  setRoomProfile(id, profile) { return this.call('POST', `/rooms/${encodeURIComponent(id)}/profile`, profile); }
+  egressRequests() { return this.call('GET', '/fleet/egress'); }
+  decideEgress(requestId, decision, ttlSeconds) {
+    return this.call('POST', `/fleet/egress/${encodeURIComponent(requestId)}/decide`,
+      { decision, ...(ttlSeconds ? { ttl_seconds: ttlSeconds } : {}) });
+  }
+  promoteEgress(room, hostPort) { return this.call('POST', '/fleet/egress/promote', { room_id: room, host_port: hostPort }); }
+  removeEgress(room, hostPort) { return this.call('POST', '/fleet/egress/remove', { room_id: room, host_port: hostPort }); }
+  egressAllowlist(room) { return this.call('GET', `/fleet/egress/${encodeURIComponent(room)}`); }
+  helpers() { return this.call('GET', '/fleet/helpers'); }
+  myHelpers() { return this.call('GET', '/helpers'); }
+  summaryFixHelpers() { return this.call('GET', '/fleet/summary-fix/helpers'); }   // operator: results of summary-fix helpers (untrusted text)
+  fleetCancelHelper(id) { return this.call('POST', `/fleet/helpers/${encodeURIComponent(id)}/cancel`, {}); }
+  cancelHelper(id) { return this.call('POST', `/helpers/${encodeURIComponent(id)}/cancel`, {}); }
+  pauseHelpers(paused) { return this.call('POST', '/fleet/helpers/pause', { paused: Boolean(paused) }); }
 }

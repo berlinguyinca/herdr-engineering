@@ -167,6 +167,85 @@ test('activity uses compact expandable rows without hiding event detail', async 
   },{BURST:'0'});
 });
 
+test('activity uses wide space for filters, repetition summary, and keyboard-selected detail', async () => {
+  await withApp(async ({page,base}) => {
+    const longType='ExceptionallyLongUnbrokenActivityEventTypeThatMustWrapAtMobileWidth';
+    const types=['MissionStarted','HostHeartbeat','MissionStarted','ServiceRegistered','MissionStarted','HostHeartbeat',longType,longType];
+    const events=types.map((event_type,index)=>({
+      event_id:`wide-event-${index}`,
+      event_type,
+      source_timestamp:new Date(Date.UTC(2026,9,22,12,0,index)).toISOString(),
+      entity_id:`entity-${index}`,
+      payload:{title:`Mission ${index}`,host_name:`host-${index}`,service_name:`service-${index}`,description:`Selected payload ${index}`,...(event_type===longType?{revision:`revision-${'x'.repeat(180)}`}:{})},
+    }));
+    await page.route('**/api/v1/activity?limit=50',route=>route.fulfill({json:{events}}));
+    await page.setViewportSize({width:3840,height:2160});
+    await page.goto(`${base}/#/activity`);await page.locator('.ac-row').first().waitFor();
+    await page.waitForTimeout(300); // let the initial seeded SSE refresh settle before interaction assertions
+
+    const desktop=await page.locator('.ac-workspace').evaluate(node=>({
+      columns:getComputedStyle(node).gridTemplateColumns.split(' ').length,
+      width:node.getBoundingClientRect().width,
+    }));
+    assert.equal(desktop.columns,2,'activity should use a summary/detail rail beside its chronological stream');
+    assert.ok(desktop.width>3200,`activity workspace should use the 4K canvas, got ${desktop.width}`);
+    assert.match(await page.locator('[data-event-filter="MissionStarted"]').innerText(),/3/);
+    assert.match(await page.locator('[data-repeat-type="MissionStarted"]').innerText(),/3/);
+    assert.match(await page.locator(`[data-repeat-type="${longType}"]`).innerText(),/2/);
+    assert.deepEqual(await page.locator('.ac-row').evaluateAll(rows=>rows.map(row=>row.dataset.eventId)),events.map(event=>event.event_id),'filtering must not reorder the chronological source stream');
+
+    await page.locator('[data-event-filter="MissionStarted"]').focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await page.locator('.ac-row:visible').count(),3);
+    await page.locator('[data-event-filter="all"]').click();
+    const selected=page.locator('.ac-row summary').nth(1);
+    await selected.focus();
+    await page.keyboard.press('Enter');
+    assert.match(await page.locator('[data-activity-selected]').innerText(),/Host heartbeat/);
+    assert.match(await page.locator('[data-activity-selected]').innerText(),/wide-event-1/);
+    assert.doesNotMatch(await page.locator('[data-activity-selection-status]').textContent(),/wide-event-1|Selected payload|\{/,'live announcements should identify the selection without reading its payload');
+    assert.equal(await page.locator('[data-activity-selected]').getAttribute('aria-live'),null,'the full selected payload must not be a live region');
+
+    await page.locator('[data-event-filter="MissionStarted"]').click();
+    assert.match(await page.locator('[data-activity-selected]').innerText(),/Mission started/);
+    assert.match(await page.locator('[data-activity-selected]').innerText(),/wide-event-0/);
+    assert.equal(await page.locator('.ac-row[data-event-id="wide-event-0"]').isVisible(),true,'selected detail should reconcile to an event that remains visible');
+    await page.locator('[data-event-filter="all"]').click();
+    const longSelection=page.locator(`[data-event-type="${longType}"] summary`).first();
+    await longSelection.focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await page.locator('[data-activity-selected] h2').innerText(),longType);
+
+    for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:1301,height:900},{width:1300,height:900},{width:1200,height:900},{width:1150,height:900},{width:1101,height:900},{width:901,height:900},{width:768,height:1024},{width:390,height:844}]){
+      await page.setViewportSize(viewport);
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`activity overflowed at ${viewport.width}px`);
+      if([2560,1301,1200,768,390].includes(viewport.width)){
+        assert.equal(await page.locator('[data-activity-selected] h2').evaluate(heading=>heading.scrollWidth<=heading.clientWidth),true,`selected long event heading should wrap at ${viewport.width}px`);
+        assert.equal(await page.locator('[data-activity-selection-status]').evaluate(status=>{
+          const box=status.getBoundingClientRect();const style=getComputedStyle(status);
+          return style.position==='fixed'&&style.overflow==='hidden'&&box.width<=1&&box.left>=0&&box.right<=innerWidth;
+        }),true,`screen-reader selection status must stay clipped outside intrinsic workspace sizing at ${viewport.width}px`);
+      }
+      if(viewport.width===1301){
+        assert.equal(await page.locator('[data-activity-selected] .ac-selected-detail').evaluate(detail=>detail.scrollWidth<=detail.clientWidth),true,'selected revision metadata should wrap inside the 1301px inspector');
+        assert.equal(await page.locator('[data-activity-selected] .ac-payload').evaluate(payload=>payload.scrollWidth<=payload.clientWidth),true,'selected JSON should wrap inside the 1301px inspector');
+      }
+      if([1301,901,390].includes(viewport.width)){
+        assert.equal(await page.locator(`[data-repeat-type="${longType}"]`).evaluate(row=>{
+          const label=row.querySelector('span');
+          return row.scrollWidth<=row.clientWidth&&label.scrollWidth<=label.clientWidth;
+        }),true,`repeated long event type should wrap without displacing its count at ${viewport.width}px`);
+      }
+      if(viewport.width===390){
+        assert.equal(await page.locator('.ac-row summary').evaluateAll(rows=>rows.every(row=>{
+          const box=row.getBoundingClientRect();
+          return box.left>=0&&box.right<=innerWidth&&row.scrollWidth<=row.clientWidth;
+        })),true,'populated mobile event rows and timestamps should remain inside the viewport');
+      }
+    }
+  },{BURST:'0'});
+});
+
 test('analytics composes its existing views into a useful dashboard', async () => {
   await withApp(async ({page,base}) => {
     await page.goto(`${base}/#/analytics`);await page.locator('[data-analytics-links]').waitFor();
@@ -174,6 +253,33 @@ test('analytics composes its existing views into a useful dashboard', async () =
     assert.deepEqual(destinations,['#/analytics/models','#/analytics/hosts','#/analytics/tokens']);
     const boxes=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getBoundingClientRect().width));
     assert.ok(boxes.every(width=>width>200),'analytics destinations should use the available desktop row');
+  },{BURST:'0'});
+});
+
+test('analytics auto-fits operational panels without document overflow', async () => {
+  await withApp(async ({page,base}) => {
+    await page.setViewportSize({width:3840,height:2160});
+    await page.goto(`${base}/#/analytics`);await page.locator('.an-dashboard').waitFor();
+    const wide=await page.locator('.an-dashboard').evaluate(node=>({
+      columns:getComputedStyle(node).gridTemplateColumns.split(' ').length,
+      width:node.getBoundingClientRect().width,
+      panelWidths:[...node.children].map(panel=>panel.getBoundingClientRect().width),
+    }));
+    assert.ok(wide.columns>=4,`analytics should auto-fit at least four operational columns on 4K, got ${wide.columns}`);
+    assert.ok(wide.width>3200,`analytics should use the 4K canvas, got ${wide.width}`);
+    assert.ok(wide.panelWidths.every(width=>width>=280),'analytics panels should remain readable');
+    assert.equal(await page.locator('[data-analytics-panel]').count()>=5,true);
+
+    const analyticsLink=page.locator('[data-analytics-links] a').first();
+    await analyticsLink.focus();
+    assert.equal(await analyticsLink.evaluate(node=>document.activeElement===node),true,'analytics destinations should remain keyboard reachable');
+
+    for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:768,height:1024},{width:390,height:844}]){
+      await page.setViewportSize(viewport);
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`analytics overflowed at ${viewport.width}px`);
+    }
+    await page.setViewportSize({width:390,height:844});
+    assert.equal(await page.locator('.an-dashboard').evaluate(node=>getComputedStyle(node).gridTemplateColumns.split(' ').length),1);
   },{BURST:'0'});
 });
 
@@ -1136,7 +1242,7 @@ test('Reviews groups decisions and preserves plan inspection with safe upstream 
 test('failed CI run sends debugging context only to an explicitly chosen active Pi session',async()=>{
   await withApp(async({page,base})=>{
     const posts=[];
-    const failed={provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure'};
+    const failed={provider_url:'https://ci.example',provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure'};
     await page.route('**/api/v1/ci',r=>r.fulfill({json:{available:true,status:'connected',pipelines:{'lab/spectra':[failed]}}}));
     await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{repository:'7',number:42,status:'failure',commit:'a'.repeat(40),tasks:[{id:1,name:'Tests',state:'failure'}]}}}));
     await page.route('**/api/v1/sessions',r=>r.fulfill({json:{sessions:[{session_id:'chosen',display_name:'Amber Finch',agent_role:'pi',status:'active',title:'Parser agent',host_id:'beast',terminal_id:'term_1',herdr_session:'default',agent_session:{agent:'pi'}},{session_id:'closed',agent_role:'pi',status:'closed'},{session_id:'other',agent_role:'codex',status:'active'}]}}));
@@ -1189,4 +1295,135 @@ test('hosts page lists the fleet version matrix and flags the host that differs'
     await page.waitForSelector('.hd-fleet table');
     assert.ok(!/superpowers/.test(await bodyText(page)), 'in-sync rows hide under the drift filter');
   });
+});
+
+test('overview attention and saved layout stay keyboard usable through refresh at every workspace width',async()=>{
+ await withApp(async({page,base})=>{
+  let blocked=true;
+  await page.route('**/api/v1/mission-activity',r=>r.fulfill({json:{activities:[liveProjection({activity:{health:blocked?'blocked':'active'}})]}}));
+  await page.addInitScript(()=>{if(!localStorage.getItem('herdr.overview.layout.v1'))localStorage.setItem('herdr.overview.layout.v1',JSON.stringify({order:['ci','attention','ci','health','unknown'],hidden:['attention','health','ci']}));});
+  await page.clock.install();await page.goto(`${base}/#/overview`);
+  const attention=page.locator('[data-overview=attention]');
+  await attention.locator('a[href*="missions/"]').waitFor();
+  assert.equal(await attention.isVisible(),true);
+  assert.equal(await page.locator('[data-overview=ci]').isVisible(),false);
+  await page.locator('.ov-customize summary').focus();await page.keyboard.press('Enter');
+  const showCi=page.getByRole('button',{name:'Show CI builds',exact:true});
+  await showCi.focus();await page.keyboard.press('Enter');
+  const hideCi=page.getByRole('button',{name:'Hide CI builds',exact:true});
+  assert.equal(await hideCi.evaluate(el=>el===document.activeElement),true);
+  await page.getByRole('button',{name:'Move CI builds down',exact:true}).focus();await page.keyboard.press('Enter');
+  assert.equal(await page.getByRole('button',{name:'Move CI builds down',exact:true}).evaluate(el=>el===document.activeElement),true);
+  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'missions');
+  // Reload with the saved preferences rather than reconstructing the layout.
+  await page.goto(`${base}/#/activity`);await page.getByRole('heading',{name:'Activity',exact:true}).waitFor();await page.goto(`${base}/#/overview`);await page.getByRole('heading',{name:'Overview',exact:true}).waitFor();
+  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'missions');
+  const target=attention.locator('a[href*="missions/"]');await target.focus();
+  await page.clock.runFor(5500);
+  assert.equal(await target.evaluate(el=>el===document.activeElement),true,await page.evaluate(()=>document.activeElement.outerHTML));
+  blocked=false;await page.clock.runFor(5500);
+  await page.waitForFunction(()=>!document.querySelector('[data-overview=attention] a[href*="missions/"]'));
+  assert.equal(await page.evaluate(()=>document.querySelector('[data-overview=attention] h2')===document.activeElement),true,await page.locator('#view').innerText());
+  await page.locator('.ov-customize summary').click();
+  await page.getByRole('button',{name:'Reset layout',exact:true}).click();
+  assert.deepEqual(await page.locator('.ov-layout > section').evaluateAll(cards=>cards.map(card=>card.dataset.overview)),['missions','fleet','sessions','ci','reviews','services','hosts','activity']);
+  assert.equal(await page.locator('.ov-layout > section[hidden]').count(),0);
+  for(const width of [3840,2560,1920,768,390]) {
+   await page.setViewportSize({width,height:1080});
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`overflow at ${width}`);
+   const layout=await page.evaluate(()=>({attention:document.querySelector('[data-overview=attention]').getBoundingClientRect().top,cards:document.querySelector('.ov-layout').getBoundingClientRect().top,footer:document.querySelector('.ov-health').getBoundingClientRect().top,bottom:document.querySelector('.ov-layout').getBoundingClientRect().bottom}));
+   assert.ok(layout.attention<layout.cards);assert.ok(layout.footer>=layout.bottom);
+  }
+ },{BURST:'0'});
+});
+
+test('overview attention opens only the intended CI provider when repository and run IDs collide',async()=>{
+ await withApp(async({page,base})=>{
+  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed',updated_at:new Date().toISOString()};
+  const runs=[{...run,provider_url:'https://ci.example'},{...run,provider_url:'https://ci.example/secondary'}];
+  await page.route('**/api/v1/ci',route=>route.fulfill({json:{available:true,status:'connected',pipelines:{'org/repo':runs}}}));
+  await page.goto(`${base}/#/overview`);
+  const links=page.locator('[data-overview=attention] a[href*="/ci?"]');
+  await links.nth(1).waitFor();
+  const destination=new URL((await links.nth(0).getAttribute('href')).slice(1),base);
+  assert.equal(destination.searchParams.get('provider'),'https://ci.example');
+  assert.equal(destination.searchParams.get('search'),'12');
+  await links.nth(0).click();
+  await page.locator('#ig-tab-failed[aria-selected=true]').waitFor();
+  await page.locator('#ig-results [data-run]').waitFor();
+  assert.equal(await page.locator('#ig-results [data-run]').count(),1);
+  assert.deepEqual(JSON.parse(await page.locator('#ig-results [data-run]').getAttribute('data-run')),['https://ci.example','7','12']);
+  assert.equal(await page.locator('[data-ig-search]').inputValue(),'12');
+ },{BURST:'0'});
+});
+
+test('large Overview attention queues keep cards close and expand within a keyboard-accessible scroll region',async()=>{
+ await withApp(async({page,base})=>{
+  let refreshed=false,releaseOtherPanels;
+  const otherPanelsReady=new Promise(resolve=>{releaseOtherPanels=resolve;});
+  const missions=Array.from({length:196},(_,index)=>({mission_id:`failure-${index}`,title:`Failure ${index}`,status:'failed',updated_at:new Date(Date.now()-index*1000).toISOString()}));
+  await page.route('**/api/v1/missions',route=>route.fulfill({json:{missions:missions.map(record=>({...record,title:refreshed?`${record.title} refreshed`:record.title}))}}));
+  await page.route('**/api/v1/mission-activity',route=>route.fulfill({json:{activities:[]}}));
+  const hosts=Array.from({length:5},(_,index)=>({host_id:`host-${index}`,host_name:`Host ${index}`,status:'healthy',last_seen:new Date().toISOString()}));
+  const events=Array.from({length:8},(_,index)=>({event_type:'MissionStarted',source_timestamp:new Date().toISOString(),payload:{title:`Activity ${index}: ${'observed lifecycle change '.repeat(6)}`}}));
+  // Independent sources finish after the mobile collapsed measurement.
+  await page.route('**/api/v1/hosts',async route=>{await otherPanelsReady;await route.fulfill({json:{hosts}});});
+  await page.route('**/api/v1/activity**',async route=>{await otherPanelsReady;await route.fulfill({json:{events}});});
+  await page.route('**/api/v1/fleet/inventory',route=>route.fulfill({json:{components:[],hosts:[],summary:{drifted:0}}}));
+  await page.addInitScript(()=>localStorage.setItem('herdr.overview.layout.v1',JSON.stringify({order:['ci'],hidden:['sessions']})));
+  await page.clock.install();await page.goto(`${base}/#/overview`);
+  const attention=page.locator('[data-overview=attention]'),toggle=attention.locator('[data-attention-toggle]');
+  await page.waitForFunction(()=>document.querySelectorAll('[data-attention-key]').length===6);
+  await attention.getByText('Showing 6 of 196 observed items',{exact:true}).waitFor();
+  assert.equal(await attention.locator('[data-attention-key] a').first().getAttribute('href'),'#/missions/failure-0');
+  for(const width of [3840,2560,1920,768,390]) {
+   await page.setViewportSize({width,height:1080});
+   const collapsed=await page.evaluate(()=>({page:document.documentElement.scrollHeight,attention:document.querySelector('[data-overview=attention]').getBoundingClientRect().height,cards:document.querySelector('.ov-layout').getBoundingClientRect().top+scrollY,overflow:document.documentElement.scrollWidth>innerWidth}));
+   assert.equal(collapsed.overflow,false,`collapsed overflow at ${width}`);
+   assert.ok(collapsed.attention<1000,`Attention height ${collapsed.attention} at ${width}`);
+   assert.ok(collapsed.cards<1400,`cards start at ${collapsed.cards} at ${width}`);
+   assert.ok(collapsed.page<4500,`document height ${collapsed.page} at ${width}`);
+   if(width===390) {
+    releaseOtherPanels();
+    await page.waitForFunction(()=>document.querySelectorAll('[data-overview=hosts] .ov-row').length===5 && document.querySelectorAll('[data-overview=activity] .ov-row').length===8);
+   }
+   await toggle.focus();await page.keyboard.press('Enter');
+   assert.equal(await toggle.getAttribute('aria-expanded'),'true');
+   assert.equal(await page.evaluate(()=>document.querySelector('[data-attention-toggle]')===document.activeElement),true);
+   assert.equal(await attention.locator('[data-attention-key]').count(),196);
+   const expanded=await page.evaluate(()=>{
+    const element=document.querySelector('#ov-attention-items');
+    return {height:element.clientHeight,scroll:element.scrollHeight,limit:innerHeight*.6,overflow:document.documentElement.scrollWidth>innerWidth,page:document.documentElement.scrollHeight,attention:document.querySelector('[data-overview=attention]').getBoundingClientRect().height,cards:document.querySelector('.ov-layout').getBoundingClientRect().top+scrollY};
+   });
+   assert.ok(expanded.height<=expanded.limit+1);assert.ok(expanded.scroll>expanded.height);assert.equal(expanded.overflow,false);
+   // Late card responses may grow the document independently of Attention.
+   assert.ok(expanded.attention<collapsed.attention+700,JSON.stringify({width,collapsed,expanded}));
+   assert.ok(expanded.cards<collapsed.cards+700,JSON.stringify({width,collapsed,expanded}));
+   assert.ok(expanded.page<4500,`expanded document height ${expanded.page} at ${width}`);
+   if(width===390) {
+    const initial=await page.evaluate(()=>{
+     const element=document.querySelector('#ov-attention-items');
+     element.scrollTop=200;element.focus({preventScroll:true});
+     return {scroll:element.scrollTop,focused:element===document.activeElement};
+    });
+    assert.equal(initial.focused,true,'expanded list accepts focus before refresh');
+    refreshed=true;await page.clock.runFor(5500);
+    await attention.getByRole('link',{name:'Failure 0 refreshed',exact:true}).waitFor();
+    // Resolve the current DOM node and focus together, rather than an old
+    // element handle that a concurrent source redraw may have detached.
+    const retained=await page.evaluate(()=>{
+     const element=document.querySelector('#ov-attention-items');
+     return {focused:element===document.activeElement,scroll:element.scrollTop};
+    });
+    assert.deepEqual(retained,{focused:true,scroll:initial.scroll});
+   }
+   await toggle.focus();await page.keyboard.press('Enter');
+   assert.equal(await toggle.getAttribute('aria-expanded'),'false');
+   assert.equal(await page.evaluate(()=>document.querySelector('[data-attention-toggle]')===document.activeElement),true);
+   assert.equal(await attention.locator('[data-attention-key]').count(),6);
+  }
+  assert.equal(await page.locator('[data-overview=sessions]').isVisible(),false);
+  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'ci');
+  assert.deepEqual(await page.evaluate(()=>JSON.parse(localStorage.getItem('herdr.overview.layout.v1'))),{order:['ci'],hidden:['sessions']});
+ },{BURST:'0'});
 });
