@@ -38,11 +38,11 @@ sections:
             review_cap: 4                             # FAIL verdicts before escalation (default 4)
             ci_fix_cap: 3                             # red CI rounds before escalation (default 3)
         reviewer:                                     # optional; every key optional, integers >= 1
-          lease_seconds: 900                          # how long a claimed job stays with one worker (default 900)
-          max_diff_bytes: 400000                      # diff bytes sent to the reviewer (default 400000)
+          lease_seconds: 900                          # how long a claimed job stays with one worker (default 900; 30..86400)
+          max_diff_bytes: 400000                      # diff bytes sent to the reviewer (default 400000; 1000..5000000)
           max_findings: 50                            # findings a FAIL may carry (default 50)
           max_attempts: 3                             # claims per job before escalation (default 3)
-          max_output_bytes: 200000                    # reviewer output bytes accepted (default 200000)
+          max_output_bytes: 200000                    # reviewer output bytes accepted (default 200000; 1000..2000000)
         notify:                                       # optional; both commands optional
           fixer_command: [/usr/local/bin/start-fixer, "--repo={repo}", "{number}", "{branch}", "{sha}"]
           notify_command: [/usr/local/bin/page-operator, "{repo}#{number}"]
@@ -87,6 +87,17 @@ Keep personal access tokens out of the loop. Agents should get tokens that can
 push branches and open PRs but cannot set commit statuses or merge. Only the
 App posts `herdr/review-gate` and merges.
 
+**Pin the required check to the App.** Configure the required
+`herdr/review-gate` check so that only the GitHub App may provide it: in
+branch protection or a ruleset, set the required check's expected source to
+the App. Verify that this setting exists in your GitHub plan. Without it, any
+token that can write commit statuses (including a classic personal token with
+`repo` scope) can set `herdr/review-gate` to `success` itself.
+
+**CI is not a trust anchor.** Woodpecker `pull_request` pipelines take their
+configuration from the PR, so the PR author can influence what "CI green"
+means. The gate requires green CI, but the review is the real check.
+
 ## 4. Woodpecker prerequisite
 
 The gate reads CI from the control plane's Woodpecker monitor. The `ci` section
@@ -112,10 +123,21 @@ routes:
 
 No other role can use these routes, operator included. A server running open
 (no API keys) therefore cannot serve reviewers. A `reviewer` key cannot ingest,
-resume a PR or change anything else.
+resume a PR or change anything else. It can read everything a viewer can,
+which includes the dashboard data.
 
-Keep the key on reviewer hosts only. Whoever holds it can submit any verdict,
-PASS included, for a job their worker has claimed. Worker ids are not secrets.
+Keep the key on reviewer hosts only. Whoever holds it can claim jobs and submit
+any verdict, PASS included, for a job they claimed.
+
+**Claim tokens.** Each claim returns a `claim_token`. The heartbeat, result and
+failure calls must send it, and the control plane checks it before anything
+else. Worker ids are not secret, and job ids are visible on `/queue` (who holds
+a claim is shown to operators only), so the token is what protects a claim:
+another `reviewer` key holder who knows the job and worker id still cannot
+heartbeat, submit or fail it. A later claim of the same job invalidates older
+tokens. Tokens live in the control plane's memory, so a control-plane restart
+invalidates every in-flight token: those reviews are answered `stale` and
+wasted, and the jobs are offered again when their leases expire.
 
 ### Worker config
 
@@ -169,8 +191,15 @@ unreachable, a worker killed mid-review). An outage longer than about
 `max_attempts x lease_seconds` (about 45 minutes with the defaults) therefore
 escalates every PR it touched, and an operator must `resume` them (section 8).
 
+A model call has a total wall-clock deadline of `model.timeout_seconds`. A
+model endpoint that answers slowly, byte by byte, is abandoned at the deadline
+and reported as `model_timeout`, so it cannot hold a lease through
+heartbeats.
+
 A stopped worker abandons its job without posting. The job is offered again
-when its lease expires.
+when its lease expires, but the abandoned claim has spent one of its
+`max_attempts`. Restarting workers mid-review again and again can therefore
+escalate a PR.
 
 ### What gets reviewed
 
@@ -180,6 +209,13 @@ when its lease expires.
 - A diff over the bound is truncated and marked as such. A PASS on a truncated
   diff is refused (`diff too large to review fully`), so a huge PR escalates
   instead of merging unread.
+- An approval is for the base branch the reviewer saw. If the PR is retargeted
+  to another base at the same head, the gate does not merge. The status says
+  "base branch changed, re-reviewing" and the head is reviewed again against
+  the new base. Without this, a PR reviewed against branch X, which holds
+  unreviewed commits, could be retargeted to main and merge those commits. An
+  approval with no recorded base, such as one from an older release, is
+  re-reviewed the same way.
 - The PR text is untrusted. Only one strict JSON object counts as a verdict
   (`{"verdict": "PASS" | "FAIL", "findings": [...]}`). Prose, a verdict
   embedded in other text, or anything else is invalid output and spends an
@@ -242,6 +278,12 @@ An **escalation** never goes to the author. It runs `notify.notify_command`, if
 configured, and always records a user notice. A push to an escalated PR is a
 new head, so it pages again. Only `resume` clears the escalation.
 
+**Resume starts a new notification round.** Notifications are deduplicated
+per head SHA, kind and resume generation, which is the number of resumes the
+PR has had. If a resumed PR escalates again, or gets changes requested again,
+on the same head, the operator is paged again and the author gets a new
+message. Within one generation each channel is still tried only once.
+
 ### Command contract (`fixer_command`, `notify_command`)
 
 - An argv list, never a shell string. The first element is an absolute path to
@@ -286,6 +328,16 @@ new head, so it pages again. Only `resume` clears the escalation.
   `output_too_large`, and any other non-200 on a result (429 included) posts
   `result_error`; both spend an attempt. A 429 on a heartbeat does not count
   as a lost lease.
+- **Files without a patch count as truncated.** GitHub returns some files with
+  no `patch` (binary files, pure renames, very large single-file diffs), and so
+  does a PR with 300 or more files. Such a diff counts as truncated, so the PR
+  can never PASS and escalates with `diff too large to review fully`. Split the
+  PR or merge it by hand, then `resume` or close it.
+- **The diff is read from the PR's live file list.** The reviewer's diff is
+  fetched by PR, not by commit, and the head is checked before and after the
+  fetch. An author who force-pushes other content and back within that 1 to
+  3 s window could get a PASS for content the reviewer did not see. Closing
+  this needs a compare-by-SHA fetch, which is a follow-up.
 - **Scale.** Queue and PR state are refolded from the event log every tick,
   which is comfortable for roughly tens of open PRs.
 - **CI history window.** The Woodpecker monitor keeps recent runs only (the
