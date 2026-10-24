@@ -6,10 +6,13 @@ queues an AI review, posts the commit status `herdr/review-gate`, and merges
 through a GitHub App once the review has passed and CI is green. Design:
 `docs/superpowers/specs/2026-10-22-automated-review-merge-gate-design.md`.
 
-> **This release ships the gate core only.** Reviewer workers and author
-> notification are not part of it, so nothing approves PRs yet. An enabled gate
-> will only ever post `pending` or `failure` statuses until the reviewer plan
-> lands.
+The loop, end to end:
+
+1. A push gives the PR a new head SHA. The gate posts `pending` and waits for green CI on that SHA.
+2. CI goes green, and the gate queues one review job for that SHA.
+3. A reviewer worker claims the job, sends the bounded diff to its model and posts the model's text back.
+4. On PASS the gate posts `success` and merges at exactly the reviewed SHA. On FAIL it posts `failure` and sends the findings to the author.
+5. The author pushes a fix, which is a new head, so the cycle starts again. Repeated or capped failures escalate to an operator.
 
 ## 1. Fleet config
 
@@ -34,14 +37,28 @@ sections:
             required_events: [pull_request]           # Woodpecker events that must all be green (default [pull_request])
             review_cap: 4                             # FAIL verdicts before escalation (default 4)
             ci_fix_cap: 3                             # red CI rounds before escalation (default 3)
+        reviewer:                                     # optional; every key optional, integers >= 1
+          lease_seconds: 900                          # how long a claimed job stays with one worker (default 900)
+          max_diff_bytes: 400000                      # diff bytes sent to the reviewer (default 400000)
+          max_findings: 50                            # findings a FAIL may carry (default 50)
+          max_attempts: 3                             # claims per job before escalation (default 3)
+          max_output_bytes: 200000                    # reviewer output bytes accepted (default 200000)
+        notify:                                       # optional; both commands optional
+          fixer_command: [/usr/local/bin/start-fixer, "--repo={repo}", "{number}", "{branch}", "{sha}"]
+          notify_command: [/usr/local/bin/page-operator, "{repo}#{number}"]
 ```
 
 An enabled section with invalid values fails loudly at server start. A missing
-or disabled section turns the gate off, and its API routes return 404.
+or disabled section turns the gate off. Its read and resume routes then return
+404, and the reviewer worker routes return 503 (`review gate disabled`).
 `required_checks` is accepted and validated, but the gate does not use it in
 this release. CI identity comes from the Woodpecker event types in
 `required_events`, and every one of them must have a successful run for the
 head SHA.
+
+The `notify` commands are described in section 7. Neither the config nor its
+commands carry secrets. A command that needs a credential reads it from its
+own file.
 
 ## 2. GitHub App
 
@@ -51,12 +68,13 @@ permissions:
 | Permission      | Access         | Used for                       |
 |-----------------|----------------|--------------------------------|
 | Commit statuses | Read & write   | `herdr/review-gate` status     |
-| Pull requests   | Read & write   | listing PRs, merge             |
+| Pull requests   | Read & write   | listing PRs, review diff, merge |
 | Contents        | Read & write   | merge and update-branch        |
 | Checks          | None           | (not used)                     |
 
 The private key stays on the control-plane host. Installation tokens are
-minted on demand and live only in memory.
+minted on demand and live only in memory. Reviewer workers never see a GitHub
+credential.
 
 ## 3. Branch protection
 
@@ -76,17 +94,122 @@ of the central fleet config (Woodpecker `url` and `token`) must be set, and the
 token's user must be able to see every enrolled repo. A repo the monitor cannot
 see stays `pending` for ever.
 
-## 5. Operating it
+## 5. Reviewer workers
+
+### The `reviewer` API key role
+
+Workers authenticate with a control-plane API key whose role is `reviewer`.
+Add it to `control_plane.api_keys` (key -> role) like any other key. The key
+is sent in the `X-API-Key` header, not `Authorization`.
+
+A `reviewer` key can read like a viewer, and it can POST to exactly four
+routes:
+
+- `POST /api/v1/review-gate/claim`
+- `POST /api/v1/review-gate/jobs/<job_id>/heartbeat`
+- `POST /api/v1/review-gate/jobs/<job_id>/result`
+- `POST /api/v1/review-gate/jobs/<job_id>/failure`
+
+No other role can use these routes, operator included. A server running open
+(no API keys) therefore cannot serve reviewers. A `reviewer` key cannot ingest,
+resume a PR or change anything else.
+
+Keep the key on reviewer hosts only. Whoever holds it can submit any verdict,
+PASS included, for a job their worker has claimed. Worker ids are not secrets.
+
+### Worker config
+
+Each worker reads one YAML file. It takes no environment variables, and it
+holds no secrets inline: keys are read from files, by path.
+
+```yaml
+control_plane_url: https://cp.example.org      # https, or http only for loopback (127.0.0.1, ::1, localhost)
+api_key_file: /etc/herdr/reviewer.key          # the reviewer-role key; absolute path, mode 0600
+worker_id: bender-review-1                     # [A-Za-z0-9._:/-], 1-128 characters
+poll_seconds: 10                               # idle wait between claims (default 10)
+model:
+  base_url: https://llm.example.org            # OpenAI-compatible; same http/https rule
+  model: qwen3-review                          # sent as reviewer_model when claiming
+  api_key_file: /etc/herdr/review-model.key    # optional; absolute path, mode 0600
+  max_tokens: 4096                             # default 4096
+  timeout_seconds: 300                         # default 300
+```
+
+Key files must be absolute paths to regular files with mode 0600. They are
+re-read on every request, so rotating a key needs no restart. A key file that
+goes bad stops the worker. URLs with user info, a query or a fragment are
+refused.
+
+Run it:
+
+```
+herdr-eng review-gate worker --config /etc/herdr/review-worker.yaml          # loop until SIGINT/SIGTERM
+herdr-eng review-gate worker --config /etc/herdr/review-worker.yaml --once   # one claim; prints handled or idle
+```
+
+Exit codes: 0 for a clean stop, 1 when the control plane refuses the key
+(401/403), and 2 for a config error.
+
+**The reviewer model must differ from the author's model.** When the gate
+knows the agent that wrote a PR, it records that agent's model on the job. A
+worker whose `model` equals it (exact string) never gets that PR's job. If
+every worker runs the author's model, the job stays queued.
+
+### Failures and back-off
+
+A model error, a malformed reply or an unusable verdict is reported to the
+control plane, and the job goes straight back to the queue. Each claim spends
+one of the job's `max_attempts`. So that a worker with a dead model does not
+burn every attempt in milliseconds, it waits `poll_seconds` after each job that
+did not end in a recorded or stale result, doubling per consecutive failure up
+to 300 s. A recorded result or an idle claim resets the wait.
+
+Attempts are spent per claim, also when the cause is not the reviewer (GitHub
+unreachable, a worker killed mid-review). An outage longer than about
+`max_attempts x lease_seconds` (about 45 minutes with the defaults) therefore
+escalates every PR it touched, and an operator must `resume` them (section 8).
+
+A stopped worker abandons its job without posting. The job is offered again
+when its lease expires.
+
+### What gets reviewed
+
+- The reviewer sees only the PR title, body and diff, bounded to
+  `max_diff_bytes` (400 KB by default), plus the previous round's findings.
+  It has no repo checkout and no tools.
+- A diff over the bound is truncated and marked as such. A PASS on a truncated
+  diff is refused (`diff too large to review fully`), so a huge PR escalates
+  instead of merging unread.
+- The PR text is untrusted. Only one strict JSON object counts as a verdict
+  (`{"verdict": "PASS" | "FAIL", "findings": [...]}`). Prose, a verdict
+  embedded in other text, or anything else is invalid output and spends an
+  attempt. This stops stray "PASS" text from approving. It does not stop a
+  model that is persuaded to emit a PASS object, so branch protection, CI and
+  the same-model exclusion still matter.
+
+## 6. Operating it
 
 Read endpoints (any API key role):
 
 - `GET /api/v1/review-gate/prs`: state, head SHA, round counts, reason and
   last findings for every PR the gate has seen.
 - `GET /api/v1/review-gate/queue`: queue depth, jobs and the last tick summary.
+- `GET /api/v1/review-gate/notices`: the newest 100 notifications, newest
+  first, each with `key`, `sha`, `kind` (`changes_requested`, `ci_red`,
+  `escalated`), `channel` (`author`, `fixer`, `user`), `ok` and `at` (epoch
+  seconds). Details such as command output are never shown.
 
-**Escalation.** A PR escalates when it hits `ci_fix_cap` red CI rounds or
-`review_cap` failed reviews, or when a review repeats an earlier finding. It
-then holds a `failure` status until an operator resumes it:
+**Escalation.** A PR escalates (the `reason` in `/prs`) when:
+
+- it hits `ci_fix_cap` red CI rounds (`ci fix cap reached`);
+- it hits `review_cap` failed reviews (`review cap reached`);
+- a review repeats an earlier finding (`repeated finding`);
+- the reviewer kept producing unusable output (`invalid review output`);
+- workers kept reporting failure (`reviewer failed repeatedly`);
+- `max_attempts` claims ended with no verdict (`review could not be completed`);
+- the diff was too large to pass (`diff too large to review fully`).
+
+An escalated PR holds a `failure` status until an operator resumes it.
 
 ```
 POST /api/v1/review-gate/prs/github.com/<owner>/<name>/<number>/resume
@@ -96,24 +219,77 @@ Content-Type: application/json
 {}
 ```
 
-Resume resets the round counters and sends the PR back to waiting for CI. A
-non-escalated PR answers 409, an unknown PR 404, and a failed durable write 503
-(nothing changes). The status "cannot queue review; push a commit" means the
-current head cannot be queued again; push a new commit.
+Resume resets the round counters and sends the PR back to waiting for CI. The
+same head is then reviewed again. A non-escalated PR answers 409, an unknown PR
+404, and a failed durable write 503 (nothing changes). The status "cannot
+queue review; push a commit" means the current head cannot be queued again;
+push a new commit.
 
-## 6. Known limits
+## 7. Notifications
+
+When a PR needs work (`changes_requested` or `ci_red`), the gate tries, in
+order, until one delivers:
+
+1. **Author.** The agent that wrote the PR, when it has a live control-plane
+   session, gets a message with the findings or failed CI runs. The findings
+   are marked as untrusted text.
+2. **Fixer.** Otherwise `notify.fixer_command` runs, if configured.
+3. **User notice.** Otherwise a notice is recorded for `/notices`.
+
+Each channel is tried at most once per (head SHA, kind), also across restarts.
+
+An **escalation** never goes to the author. It runs `notify.notify_command`, if
+configured, and always records a user notice. A push to an escalated PR is a
+new head, so it pages again. Only `resume` clears the escalation.
+
+### Command contract (`fixer_command`, `notify_command`)
+
+- An argv list, never a shell string. The first element is an absolute path to
+  the executable and contains no placeholder.
+- Placeholders `{repo}`, `{number}`, `{branch}` and `{sha}` are allowed in the
+  later elements only, with no format spec. Values are validated before
+  substitution; a bad value means the command is not launched.
+- The message (the same text an author would get, at most 8000 characters) is
+  written to stdin.
+- The command runs in `/`, in its own session, with an environment of exactly
+  `PATH=/usr/bin:/bin`.
+- It has 60 s. On timeout its whole process group is killed and the attempt
+  counts as failed. A command that starts long work must detach and close
+  stdout and stderr, or it hits the timeout.
+- Exit 0 means delivered. Anything else means failed, and the next channel
+  runs.
+- At most **one** external command is launched per gate tick. Launches over
+  that budget are deferred to later ticks, so a backlog drains at one command
+  per `poll_seconds`.
+
+## 8. Known limits
 
 - **One gate per fleet.** Run the gate on one control-plane server only;
   nothing prevents two instances from fighting.
-- **Config is read at startup.** Restart the server to change enrollment, caps
-  or the App.
+- **Config is read at startup.** Restart the server to change enrollment, caps,
+  reviewer or notify settings, or the App.
 - **Every new head SHA is re-reviewed.** Approval does not carry over to a new
-  SHA yet, even a rebase or amend with an identical diff.
-- **No reviewers or notifications yet** (see the note at the top).
+  SHA, even a rebase or amend with an identical diff.
+- **Reviewer pool size is whatever you start.** Nothing scales workers with
+  queue depth yet.
+- **Same-model exclusion uses the original author's model.** A fixer started
+  by `fixer_command` may run a different model than the pinned author. The
+  exclusion still compares against the original author.
+- **Author lookup is a heuristic.** It matches a session by branch name. A
+  session in another repo on the same branch name can match when that session
+  recorded no working directory.
+- **Reviewer model after a restart.** A verdict records `reviewer_model`
+  `unknown` when the control plane restarted between the claim and the
+  submit. Nothing decides on that field.
+- **Worker 429/413 handling.** A worker waits out a 429 on claim
+  (`Retry-After`, at most 300 s). A 413 on a result posts the failure
+  `output_too_large`, and any other non-200 on a result (429 included) posts
+  `result_error`; both spend an attempt. A 429 on a heartbeat does not count
+  as a lost lease.
 - **Scale.** Queue and PR state are refolded from the event log every tick,
   which is comfortable for roughly tens of open PRs.
-- **CI history window.** The Woodpecker monitor keeps recent runs only. An
-  approved PR whose CI runs scroll out of that window waits (`pending`) instead
-  of merging.
+- **CI history window.** The Woodpecker monitor keeps recent runs only (the
+  latest 20 per repo). An approved PR whose CI runs scroll out of that window waits
+  (`pending`) instead of merging.
 - In-memory memos (posted statuses, merge back-off) reset on restart, so a
   restart re-posts each status once.
