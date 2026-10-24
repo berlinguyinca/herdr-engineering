@@ -119,6 +119,38 @@ def _encode(package: SkillPackage) -> bytes:
     return data
 
 
+def verify_skill_package(package: SkillPackage, trusted_keys: dict) -> VerificationReport:
+    """Verify a detached package using configured public keys, never its own key."""
+    try:
+        _validate_content(package.manifest, package.files)
+        m = package.manifest
+        if (type(m.get('schema_version')) is not int or m['schema_version'] != 1
+                or m.get('trust') != 'untrusted'
+                or m.get('execution') != 'harness_only'
+                or m.get('scope') not in {'private', 'room', 'shared'}
+                or (m['scope'] == 'room') != (m.get('room_id') is not None)):
+            raise ValueError('invalid manifest')
+        for field in ('skill_id', 'creator_id'):
+            if not isinstance(m.get(field), str) or not m[field].strip():
+                raise ValueError('missing package identity')
+        if datetime.fromisoformat(m['created_at']).tzinfo is None:
+            raise ValueError('created_at requires a timezone')
+        if m['scope'] == 'room' and (not isinstance(m['room_id'], str) or not m['room_id']):
+            raise ValueError('missing room identity')
+        expected = {p: {'sha256': hashlib.sha256(b).hexdigest(), 'size_bytes': len(b)}
+                    for p, b in package.files.items()}
+        if m.get('files') != expected:
+            return VerificationReport(('file checksum mismatch',))
+        body = _canonical(_body(package))
+        _encode(package)
+        if hashlib.sha256(body).hexdigest() != package.sha256:
+            return VerificationReport(('package checksum mismatch',))
+        trusted_keys[package.key_id].verify(bytes.fromhex(package.signature), body)
+    except Exception:
+        return VerificationReport(('invalid package or untrusted signature',))
+    return VerificationReport(())
+
+
 class SkillRegistry:
     def __init__(self, conn, *, s3, bucket: str, environment: str, signing_key,
                  key_id: str, trusted_keys: dict, principal_valid, maintainers=()):
@@ -142,35 +174,7 @@ class SkillRegistry:
         return package
 
     def verify_skill_package(self, package: SkillPackage) -> VerificationReport:
-        """Verify a detached package using configured public keys, never its own key."""
-        try:
-            _validate_content(package.manifest, package.files)
-            m = package.manifest
-            if (type(m.get('schema_version')) is not int or m['schema_version'] != 1
-                    or m.get('trust') != 'untrusted'
-                    or m.get('execution') != 'harness_only'
-                    or m.get('scope') not in {'private', 'room', 'shared'}
-                    or (m['scope'] == 'room') != (m.get('room_id') is not None)):
-                raise ValueError('invalid manifest')
-            for field in ('skill_id', 'creator_id'):
-                if not isinstance(m.get(field), str) or not m[field].strip():
-                    raise ValueError('missing package identity')
-            if datetime.fromisoformat(m['created_at']).tzinfo is None:
-                raise ValueError('created_at requires a timezone')
-            if m['scope'] == 'room' and (not isinstance(m['room_id'], str) or not m['room_id']):
-                raise ValueError('missing room identity')
-            expected = {p: {'sha256': hashlib.sha256(b).hexdigest(), 'size_bytes': len(b)}
-                        for p, b in package.files.items()}
-            if m.get('files') != expected:
-                return VerificationReport(('file checksum mismatch',))
-            body = _canonical(_body(package))
-            _encode(package)
-            if hashlib.sha256(body).hexdigest() != package.sha256:
-                return VerificationReport(('package checksum mismatch',))
-            self.trusted_keys[package.key_id].verify(bytes.fromhex(package.signature), body)
-        except Exception:
-            return VerificationReport(('invalid package or untrusted signature',))
-        return VerificationReport(())
+        return verify_skill_package(package, self.trusted_keys)
 
     def _key(self, digest: str) -> str:
         return f'env/{self.environment}/skills/sha256/{digest}/package.json'

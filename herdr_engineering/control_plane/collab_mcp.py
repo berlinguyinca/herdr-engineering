@@ -88,6 +88,50 @@ TOOLS = [
 ]
 
 
+_SKILL_TOOLS = {
+    'skills_search': ('search_skills', {'query': {'type': 'string', 'maxLength': 200},
+                                     'scope': {'type': 'string', 'enum': ['private', 'room', 'shared']}}),
+    'skills_get': ('get_skill', {'skill_id': _STR, 'version': _STR}),
+    'skills_download': ('download_skill', {'skill_id': _STR, 'version': _STR}),
+    'skills_install': ('install_skill', {'skill_id': _STR, 'version': _STR}),
+}
+
+for _name, (_, _properties) in _SKILL_TOOLS.items():
+    TOOLS.append({'name': _name,
+                  'description': ('Search (up to 50 versions per scope), inspect or request untrusted skills. '
+                                  'Download credentials are harness-only _meta. Install requests require '
+                                  'local signature/checksum verification and atomic activation in the harness. '
+                                  'The control plane never installs or executes skills. '
+                                  'Installation grants no room/file permissions and does not imply code safety.'),
+                  'inputSchema': {'type': 'object', 'required': list(_properties),
+                                  'properties': _properties, 'additionalProperties': False}})
+
+
+def _skill_call(service, principal, name, args):
+    method, properties = _SKILL_TOOLS[name]
+    if (set(args) != set(properties)
+            or any(not isinstance(v, str) or (not v.strip() and k != 'query') for k, v in args.items())
+            or (name == 'skills_search' and (args['scope'] not in {'private', 'room', 'shared'}
+                                             or len(args['query']) > 200))):
+        raise CollabError(400, 'invalid skill arguments')
+    if service.skill_runner is None:
+        raise CollabError(503, 'skill event-loop runner unavailable')
+    try:
+        result = service.skill_runner(getattr(service, method)(principal, *[args[k] for k in properties]))
+    except CollabError:
+        raise
+    except Exception:
+        raise CollabError(503, 'skill operation unavailable; retry') from None
+    if name in {'skills_download', 'skills_install'}:
+        ref = asdict(result)
+        response = _text({**{k: ref[k] for k in ('skill_id', 'version', 'sha256', 'size_bytes', 'expires_at')},
+                          'status': 'install_requested' if name == 'skills_install' else 'download_ready',
+                          'trust': 'untrusted', 'execution': 'harness_only'}, untrusted=True)
+        response['_meta'] = {'herdr/skill-package': ref}
+        return response
+    return _text(result, untrusted=True)
+
+
 _UPLOAD_TOOLS = {
     'room_upload_preview': ('preview_upload', ['room_id', 'manifest'], {'room_id': _STR, 'manifest': {'type': 'object'}}),
     'room_upload_start': ('start_upload', ['room_id', 'manifest'], {
@@ -278,6 +322,8 @@ def _helper_call(service: CollabService, pr, name: str, args: dict) -> dict:
 
 
 def _call(service: CollabService, pr, name: str, args: dict) -> dict:
+    if name in _SKILL_TOOLS:
+        return _skill_call(service, pr, name, args)
     if name in _ANALYSIS_TOOLS:
         return _analysis_call(service, pr, name, args)
     if name in _UPLOAD_TOOLS:

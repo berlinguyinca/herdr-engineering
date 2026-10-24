@@ -54,3 +54,72 @@ def test_upload_mcp_accepts_large_authenticated_manifests_without_relaxing_a2a(s
     assert rpc(stack.pub, 'tools/call', params)[0] == 401
     params['name'] = 'room_post'
     assert rpc(stack.pub, 'tools/call', params, agent=registered)[0] == 413
+
+
+from tests.control_plane.test_skill_registry import agent, env, publish, user  # noqa: E402, F401
+from tests.control_plane.test_skill_transfer import service, transfer  # noqa: E402, F401
+
+
+def test_skill_tools_are_declared():
+    assert {'skills_search', 'skills_get', 'skills_download', 'skills_install'} <= {
+        t['name'] for t in collab_mcp.TOOLS}
+
+
+@pytest.mark.parametrize('name', ['skills_search', 'skills_get', 'skills_download', 'skills_install'])
+def test_skill_mcp_scopes_checksums_and_harness_only_credentials(transfer, env, name):
+    _, v = publish(env)
+    svc = service(transfer)
+    args = {'query': 'csv', 'scope': 'private'} if name == 'skills_search' else {
+        'skill_id': v.skill_id, 'version': v.version}
+    result = collab_mcp._call(svc, agent(), name, args)
+    text = result['content'][0]['text']
+    assert collab_mcp.UNTRUSTED in text
+    assert v.skill_id in text and v.sha256 in text
+    assert all(secret not in text for secret in ['SECRET', 'https://', 'storage_key', 'signature'])
+    if name in ('skills_download', 'skills_install'):
+        grant = result['_meta']['herdr/skill-package']
+        assert grant['url'].startswith('https://') and grant['sha256'] == v.sha256
+        assert 'installed' not in text
+    else:
+        assert '_meta' not in result
+    if name == 'skills_search':
+        assert v.skill_id not in collab_mcp._call(svc, agent('bob'), name, args)['content'][0]['text']
+    else:
+        from herdr_engineering.control_plane.collab import CollabError
+        with pytest.raises(CollabError):
+            collab_mcp._call(svc, agent('bob'), name, args)
+
+
+@pytest.mark.parametrize('name,args', [
+    ('skills_search', {'query': '', 'scope': 'all'}),
+    ('skills_search', {'query': [], 'scope': 'private'}),
+    ('skills_get', {'skill_id': '', 'version': '1'}),
+    ('skills_download', {'skill_id': 'x', 'version': '1', 'url': 'https://evil'}),
+    ('skills_install', {'skill_id': 'x', 'version': '1', 'path': '/tmp/evil'}),
+    ('skills_install', {}),
+])
+def test_skill_mcp_rejects_invalid_arguments(transfer, name, args):
+    from herdr_engineering.control_plane.collab import CollabError
+    with pytest.raises(CollabError) as exc:
+        collab_mcp._call(service(transfer), agent(), name, args)
+    assert exc.value.status == 400
+
+
+def test_skill_provider_errors_never_escape_to_mcp(transfer, env):
+    _, v = publish(env)
+    def fail(*args, **kwargs):
+        raise RuntimeError('https://storage.invalid/?SECRET')
+    transfer[3].generate_presigned_url = fail
+    from herdr_engineering.control_plane.collab import CollabError
+    with pytest.raises(CollabError) as exc:
+        collab_mcp._call(service(transfer), agent(), 'skills_download', {
+            'skill_id': v.skill_id, 'version': v.version})
+    assert exc.value.status == 503 and 'SECRET' not in str(exc.value)
+
+
+def test_skill_mcp_missing_backend_fails_closed(stack):
+    registered = connect(stack.main, 'alice')
+    status, response = rpc(stack.pub, 'tools/call', {
+        'name': 'skills_download', 'arguments': {'skill_id': 'unknown', 'version': '1'}}, agent=registered)
+    assert status == 200
+    assert json.loads(response['result']['content'][0]['text'])['status'] == 503
