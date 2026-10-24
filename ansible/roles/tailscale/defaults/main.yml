@@ -1,0 +1,23 @@
+---
+# Tailscale role defaults (host telemetry + fleet provisioning, spec section 4).
+
+# Tags the node advertises when it joins. The tag must exist in the tailnet
+# access rules (tagOwners) and the auth key must be created with this tag.
+tailscale_tags:
+  - "tag:fleet"
+
+# Name the node registers under.
+tailscale_hostname: "{{ inventory_hostname }}"
+
+# Pre-authorized, reusable, tagged auth key. REQUIRED ONLY when the node is not
+# already logged in to the tailnet. NEVER set it here, in host_vars in clear, or
+# anywhere in Git: supply it from an Ansible Vault file
+# (inventory/group_vars/herdr_fleet/vault.yml) or with -e at run time.
+tailscale_auth_key: ""
+
+# Install the package / repository when tailscale is missing.
+tailscale_install: true
+
+# Linux apt repository (official pkgs.tailscale.com stable channel).
+tailscale_apt_keyring: /usr/share/keyrings/tailscale-archive-keyring.gpg
+tailscale_apt_base_url: https://pkgs.tailscale.com/stable

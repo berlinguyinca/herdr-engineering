@@ -7,6 +7,7 @@ import {parseJson,renderJson} from './conversation-json.js';
 import {selectEvents, linkedAgents, githubLinks, referenceSuggestions, pendingOperation} from './session-workspace-model.js';
 import {randomString} from './herdr-web-client/collab.js';
 import {recordOutcome} from './record-state.js';
+import {fixOutcome, fixError, FIX_LABELS, FIX_LOCKED} from './summary-fix-status.js';
 
 const MAX_EVENTS=2000;
 const PAGE=200;
@@ -20,6 +21,10 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   let renderTimer, refreshTimer, selection=null, split=60;
   let historyGeneration=0,historyReset=false,fullscreen=false,fullscreenFocus=null,agentSummary=null,summaryBusy=false,summaryError='',summarySignature='';
   const expanded=new Map();
+  // "Let the agent fix this" state per exact item text, kept outside paint so polling keeps it.
+  const fixStates=new Map();
+  const fixKey=(list,text)=>`${list}\u0000${text}`;
+  const canFix=()=>Boolean(session.capabilities?.fix_summary_item);
   const pages={all:{before:null,more:false},conversation:{before:null,more:false}};
   const canLoadOlder=view=>pages[view].more && (view==='conversation'?conversationEvents:events).length<MAX_EVENTS;
   const state={agent:'',q:'',type:'',errors:false};
@@ -120,13 +125,45 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   function paintSummary(){
     if(disposed)return;
     const value=agentSummary || {state:summaryError?'failed':'pending'};
-    const signature=JSON.stringify([value,summaryError]);if(signature===summarySignature)return;summarySignature=signature;
+    const signature=JSON.stringify([value,summaryError,[...fixStates]]);if(signature===summarySignature)return;summarySignature=signature;
     const states={disabled:'Automatic summaries are not enabled.',pending:'Summary update pending.',ready:'Up to date with recorded conversation.',stale:'Newer conversation or unavailable history: showing the last saved summary.',failed:'Summary update failed. The last saved summary is retained.',no_data:'No recorded conversation is available to summarize.'};
     const fields=[['discussed','Discussed'],['decisions','Decisions'],['completed','Completed'],['next_steps','Next steps'],['blockers','Blockers']];
     const coverage=value.coverage;
     const provenance=coverage ? `${coverage.status==='partial'?'Partial recording':'Recorded window only'} · ${Number(coverage.message_count ?? value.source_message_count ?? 0)} messages${coverage.reasons?.length?` · ${coverage.reasons.join(', ')}`:''}` : 'Recording coverage is unavailable.';
-    $('[data-agent-summary]').innerHTML=`<p class="sw-summary-state">${esc(summaryError || states[value.state] || 'Summary status unknown.')}</p>${value.overview?`<div class="conversation-markdown">${renderMarkdown(value.overview)}</div>`:''}${value.where_left_off?`<h4>Where we left off</h4><div class="conversation-markdown">${renderMarkdown(value.where_left_off)}</div>`:''}${fields.some(([key])=>value[key]?.length)?`<details><summary>Discussion, decisions and next steps</summary>${fields.filter(([key])=>Array.isArray(value[key]) && value[key].length).map(([key,label])=>`<h4>${label}</h4><ul>${value[key].map(item=>`<li>${esc(item)}</li>`).join('')}</ul>`).join('')}</details>`:''}<p class="sw-summary-provenance">${esc(provenance)}${value.generated_at?` · Generated ${esc(value.generated_at)}`:''}${value.model?` · ${esc(value.model)}`:''}</p>`;
+    const fixable=new Set(canFix()?['next_steps','blockers']:[]);
+    const item=(key,text,index)=>{
+      if(!fixable.has(key))return `<li class="conversation-markdown">${renderMarkdown(String(text))}</li>`;
+      const fix=fixStates.get(fixKey(key,text));
+      const label=FIX_LABELS[fix?.state] || 'Let the agent fix this';
+      const locked=FIX_LOCKED.has(fix?.state);
+      const link=fix?.link?` <a href="${esc(fix.link.href)}">${esc(fix.link.label)}</a>`:'';
+      return `<li class="conversation-markdown">${renderMarkdown(String(text))} <button type="button" class="sw-summary-fix" data-fix-summary data-list="${key}" data-index="${index}"${locked?' disabled':''}>${label}</button>${fix?.message?`<span class="sw-summary-fix-status" ${fix.state==='error'?'role="alert"':'role="status"'}>${esc(fix.message)}${link}</span>`:''}</li>`;
+    };
+    const summaryHost=$('[data-agent-summary]');
+    const detailsOpen=summaryHost.querySelector('details')?.open;
+    summaryHost.innerHTML=`<p class="sw-summary-state">${esc(summaryError || states[value.state] || 'Summary status unknown.')}</p>${value.overview?`<div class="conversation-markdown">${renderMarkdown(value.overview)}</div>`:''}${value.where_left_off?`<h4>Where we left off</h4><div class="conversation-markdown">${renderMarkdown(value.where_left_off)}</div>`:''}${fields.some(([key])=>value[key]?.length)?`<details><summary>Discussion, decisions and next steps</summary>${fields.filter(([key])=>Array.isArray(value[key]) && value[key].length).map(([key,label])=>`<h4>${label}</h4><ul>${value[key].map((text,index)=>item(key,text,index)).join('')}</ul>`).join('')}</details>`:''}<p class="sw-summary-provenance">${esc(provenance)}${value.generated_at?` · Generated ${esc(value.generated_at)}`:''}${value.model?` · ${esc(value.model)}`:''}</p>`;
+    const details=summaryHost.querySelector('details');if(details && detailsOpen)details.open=true;
   }
+  $('[data-agent-summary]').addEventListener('click',async event=>{
+    const button=event.target.closest('[data-fix-summary]');if(!button || button.disabled || !canFix())return;
+    const list=button.dataset.list,index=Number(button.dataset.index);
+    // Send the text the summary holds, never text read back from the page.
+    const text=agentSummary?.[list]?.[index];
+    if(typeof text!=='string' || typeof client.fixSummaryItem!=='function')return;
+    const key=fixKey(list,text);
+    if(FIX_LOCKED.has(fixStates.get(key)?.state))return;
+    fixStates.set(key,{state:'sending',message:''});paintSummary();
+    try{
+      const receipt=await client.fixSummaryItem(session.session_id,list,index,text);
+      if(disposed)return;
+      fixStates.set(key,fixOutcome(receipt));
+    }catch(err){
+      if(disposed)return;
+      const outcome=fixError(err);
+      fixStates.set(key,outcome);
+      if(outcome.reload)loadSummary();
+    }finally{if(!disposed)paintSummary();}
+  });
   async function loadSummary(){
     if(disposed || document.hidden || summaryBusy)return;
     if(typeof client.getAgentSummary!=='function'){agentSummary={state:'disabled'};paintSummary();return;}

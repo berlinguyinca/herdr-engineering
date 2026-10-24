@@ -1,0 +1,11 @@
+Live collaboration check with a Pi-Bolt agent, 2026-10-23 (tests/control_plane/test_pibolt_collab_live.py, opt-in via PIBOLT_LIVE=1; PASS, 83 s).
+Setup: a real local control plane with the collaboration service and its public MCP listener (the same stack the collab tests use, real sockets),
+a room, an agent credential granted read+post, and a real Pi-Bolt (AOT, bolt-v1.0.0) process in RPC mode with that MCP endpoint configured
+(headers: Agent credential + device id), real model calls through the gateway.
+1. `pi-bolt mcp list`: "collab: connected, 8 tools". The agent called mcp__collab__room_post; the message "PIBOLT-A ..." appeared in the room.
+2. A person's client held a long-poll cursor, then "disconnected". A second Pi-Bolt process was killed (SIGKILL) right after its post tool call; a third
+   started fresh and the agent reconnected; its message "PIBOLT-B ..." appeared.
+3. The client reconnected with its OLD cursor: changed=true, and exactly one PIBOLT-A and one PIBOLT-B message, no loss, no duplicate.
+Compat finding: with `--no-extensions` Pi-Bolt did NOT expose the MCP tools in the session (the agent answered "no tool"), although `mcp list` connected.
+MCP is part of the extension surface there; the test therefore runs without that flag. (Not checked on standard Pi.)
+Limits: one pass, one model, agent-side only (the Pi side has no production collaboration caller), local server, not the Cognito-fronted deployment.

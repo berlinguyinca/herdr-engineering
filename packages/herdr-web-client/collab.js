@@ -150,4 +150,21 @@ export class CollabApi {
   removeMember(id, user) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/members/${encodeURIComponent(user)}/remove`, {});
   }
+  // agent helpers: the room profile (names only, never secret values), host-access requests, the panic switch
+  roomProfile(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/profile`); }
+  setRoomProfile(id, profile) { return this.call('POST', `/rooms/${encodeURIComponent(id)}/profile`, profile); }
+  egressRequests() { return this.call('GET', '/fleet/egress'); }
+  decideEgress(requestId, decision, ttlSeconds) {
+    return this.call('POST', `/fleet/egress/${encodeURIComponent(requestId)}/decide`,
+      { decision, ...(ttlSeconds ? { ttl_seconds: ttlSeconds } : {}) });
+  }
+  promoteEgress(room, hostPort) { return this.call('POST', '/fleet/egress/promote', { room_id: room, host_port: hostPort }); }
+  removeEgress(room, hostPort) { return this.call('POST', '/fleet/egress/remove', { room_id: room, host_port: hostPort }); }
+  egressAllowlist(room) { return this.call('GET', `/fleet/egress/${encodeURIComponent(room)}`); }
+  helpers() { return this.call('GET', '/fleet/helpers'); }
+  myHelpers() { return this.call('GET', '/helpers'); }
+  summaryFixHelpers() { return this.call('GET', '/fleet/summary-fix/helpers'); }   // operator: results of summary-fix helpers (untrusted text)
+  fleetCancelHelper(id) { return this.call('POST', `/fleet/helpers/${encodeURIComponent(id)}/cancel`, {}); }
+  cancelHelper(id) { return this.call('POST', `/helpers/${encodeURIComponent(id)}/cancel`, {}); }
+  pauseHelpers(paused) { return this.call('POST', '/fleet/helpers/pause', { paused: Boolean(paused) }); }
 }

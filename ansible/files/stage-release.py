@@ -213,6 +213,15 @@ def describe(home, kind, runner=run):
         return None
 
 
+def stage_or_reuse(home, revision, kind, repository, runner=run):
+    """(result, changed). An already staged, attested and active release is
+    reused untouched (changed=False), so a converge run reports no change."""
+    current = describe(home, kind, runner)
+    if current and current.get('revision') == revision:
+        return current, False
+    return _stage(home, revision, kind, repository, runner), True
+
+
 def describe_pi(home, *, runner=run):
     return describe(home, 'pi', runner)
 
@@ -230,8 +239,9 @@ def main():
         return 0 if result else 1
     if not args.revision:
         parser.error('--revision is required for staging')
-    result = _stage(args.home, args.revision, args.kind, REPOSITORIES[args.kind], run)
-    print(json.dumps(result))
+    result, changed = stage_or_reuse(args.home, args.revision, args.kind,
+                                     REPOSITORIES[args.kind], run)
+    print(json.dumps({**result, 'changed': changed}))
     return 0
 
 
