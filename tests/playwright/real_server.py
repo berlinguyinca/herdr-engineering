@@ -50,7 +50,10 @@ def _b64(obj) -> str:
 
 def make_jwt(now: float | None = None) -> str:
     """JWT-shaped, unsigned, random: the pilot authenticator compares a digest; the page only reads `exp`."""
-    return f"{_b64({'alg': 'none'})}.{_b64({'exp': int((now or time.time())) + 86400, 'n': secrets.token_hex(8)})}.{secrets.token_hex(16)}"
+    # With a fixed clock (the screenshot server) the page still compares `exp` with the REAL time when it loads, so a day past the fixed
+    # instant is a time bomb: the baseline check failed the first time it ran more than 24 hours after FIXED. Fifty years, then.
+    life = 50 * 365 * 86400 if now else 86400
+    return f"{_b64({'alg': 'none'})}.{_b64({'exp': int((now or time.time())) + life, 'n': secrets.token_hex(8)})}.{secrets.token_hex(16)}"
 
 
 class GateAuthenticator(StaticTokenAuthenticator):

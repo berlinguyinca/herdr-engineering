@@ -21,6 +21,14 @@ after(async () => { await browser?.close(); srv?.stop(); });
 
 const surface = (slug) => SURFACES.find((s) => s.slug === slug);
 
+test('the screenshot server\'s sign-in tokens do not expire with the fixed clock (the page compares exp with the REAL time)', () => {
+  // the first version gave the token a day past the fixed instant, so the baseline check failed for anyone who ran it a day later
+  for (const [user, token] of Object.entries(srv.info.tokens)) {
+    const exp = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).exp;
+    assert.ok(exp > Date.now() / 1000 + 10 * 365 * 86400, `${user}'s token expires ${new Date(exp * 1000).toISOString()}`);
+  }
+});
+
 test('the capture is deterministic: three fresh loads of the same surfaces agree within half the page budget', async () => {
   for (const slug of ['collab-lineage', 'collab-chat']) {
     const shots = [];

@@ -258,6 +258,9 @@ Found by the round-3 review's gates (fourth round):
 23. Four room tabs (Tabs, Progress, Lineage, Linked workspaces) went from the page's `h1` straight to `h3` card titles. Each panel now
     starts with a visually hidden `h2` (`.cx-sr`).
 24. The agent rename button was 2.25:1 (muted text at 55% opacity); it is the secondary text colour at full opacity.
+25. The screenshot server's sign-in tokens expired 24 hours after the FIXED clock instant (2026-10-23 10:00 UTC), and the page compares
+    `exp` with the real time, so `baselines:check` and the visual suite began to fail on 2026-10-24 10:00 UTC with nothing changed.
+    The fixture's tokens now outlive the fixed clock by fifty years; a test pins it.
 
 ## What is not covered (honest gaps)
 
