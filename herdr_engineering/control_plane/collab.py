@@ -303,8 +303,10 @@ class CollabService:
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, summary_fix: dict | None = None,
-                 archive_service: Any = None):
+                 archive_service: Any = None, upload_service: Any = None, upload_runner: Any = None):
         self.archive_service = archive_service
+        self.upload_service = upload_service
+        self.upload_runner = upload_runner
         self.auth = authenticator
         try:
             self.summary_fix = summary_fix_config(summary_fix)
@@ -379,6 +381,52 @@ class CollabService:
         self.stats = defaultdict(int)
 
     # ------------------------------------------------------------ plumbing
+    async def _upload_operation(self, name: str, pr: Principal, *args, room_id=None):
+        if self.upload_service is None:
+            raise CollabError(503, "relational upload service unavailable")
+
+        async def authorize(require_upload=True, selected_room=None):
+            rid = selected_room or room_id
+            if not self.still_valid(pr):
+                raise CollabError(403, "credential or platform approval required")
+            if rid in self._rooms:
+                raise CollabError(409, "room requires relational cutover before uploads")
+            allowed = await self.upload_service.store.upload_permission(
+                rid, pr.owner, pr.id if pr.is_agent else None, self._now())
+            if allowed is None:
+                raise CollabError(404, "not found")
+            if require_upload and not allowed:
+                raise CollabError(403, "room upload permission required; request access from the owner")
+            return allowed
+
+        try:
+            return await getattr(self.upload_service, name)(pr, *args, authorize=authorize)
+        except CollabError:
+            raise
+        except ValueError:
+            raise CollabError(409, "upload state conflict; retry") from None
+        except Exception:
+            # Neither provider URLs nor SQL exception data belong in MCP output.
+            raise CollabError(503, "upload operation unavailable; retry") from None
+
+    async def preview_upload(self, principal, room_id, pattern_manifest):
+        return await self._upload_operation('preview_upload', principal, room_id, pattern_manifest, room_id=room_id)
+
+    async def start_upload(self, principal, room_id, manifest, options):
+        return await self._upload_operation('start_upload', principal, room_id, manifest, options, room_id=room_id)
+
+    async def request_upload_access(self, principal, room_id):
+        return await self._upload_operation('request_upload_access', principal, room_id, room_id=room_id)
+
+    async def get_upload_status(self, principal, upload_id):
+        return await self._upload_operation('get_upload_status', principal, upload_id)
+
+    async def finalize_upload(self, principal, upload_id, checksums):
+        return await self._upload_operation('finalize_upload', principal, upload_id, checksums)
+
+    async def cancel_upload(self, principal, upload_id):
+        return await self._upload_operation('cancel_upload', principal, upload_id)
+
     async def _archive_principal(self, pr: Principal):
         self._require_user(pr)
         if self.archive_service is None:
