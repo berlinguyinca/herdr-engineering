@@ -2643,7 +2643,7 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
-        if kind is dict:
+        if kind is dict and key == "summary_fix":
             from .control_plane.collab import summary_fix_config
             try:
                 setattr(args, dest, summary_fix_config(value))
