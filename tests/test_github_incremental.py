@@ -1071,3 +1071,22 @@ def test_a_call_without_a_reported_cost_is_charged_one_not_the_previous_cost():
     provider.repositories_page()  # GitHub did not report this call's cost
     monitor._charge(provider)
     assert monitor._spent == 8
+
+
+def test_a_pass_over_budget_with_errors_keeps_the_error_summary():
+    from herdr_engineering.github import GitHubError
+    fake, monitor, clock = ladder()
+    before = monitor.snapshot(start=False)["last_success_at"]
+    original = fake.issues_page
+
+    def broken(repository_id, cursor=None):
+        if repository_id == "github.com/acme/r1":
+            raise GitHubError("unavailable")
+        return original(repository_id, cursor)
+    fake.issues_page = broken
+    monitor._fixed_sync["point_budget"] = 5
+    monitor.refresh()
+    view = monitor.snapshot(start=False)
+    assert view["deferred_repos"] and view["status"] == "partial"
+    assert "could not be refreshed" in view["error"] and "point budget" in view["error"]
+    assert view["stale"] is True and view["last_success_at"] == before  # not a clean pass

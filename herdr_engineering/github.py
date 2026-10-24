@@ -968,10 +968,12 @@ class GitHubMonitor:
             if not relist and not completed and not self._pass_reads:
                 with self._lock:
                     self._resume_passes = RESUME_PASSES_BEFORE_RELIST  # no progress: list next pass
-            self._update(status="partial", partial=True, stale=False,
-                         error=f"The per-pass point budget ({self._budget}) was spent; "
-                               f"{len(over_budget)} repositories wait for the next pass.",
-                         last_success_at=_stamp())
+            error = (f"The per-pass point budget ({self._budget}) was spent; "
+                     f"{len(over_budget)} repositories wait for the next pass.")
+            if errors:  # an error is not hidden by the budget note, nor counted as a success
+                error = f"Some repository issues could not be refreshed. {error}"
+            self._update(status="partial", partial=True, stale=bool(errors), error=error,
+                         last_success_at=self._view["last_success_at"] if errors else _stamp())
             self._progress(phase="complete", current_repository=None)
             return
         with self._lock:
