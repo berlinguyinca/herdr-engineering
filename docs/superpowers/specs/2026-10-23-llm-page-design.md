@@ -37,7 +37,7 @@ The page stores **metadata only** by default: counts, latency, TTFT, tokens in/o
 4. **Proxy backpressure 429s are never recorded.** `_forward` returns before `_forward_slotted` and `_report` run.
 5. **No timing breakdown.** `duration_ms` starts after `acquire()`, so it excludes the proxy queue wait. TTFT and generation time are not measured.
 6. **Retention is not enforced.** `retention.apply_retention` (30-day event TTL) is called only from tests. Usage events therefore accumulate without limit, and `token_analytics` slows down as they do.
-7. **Stale env-var text.** The README still names `FABRIC_LLM_UPSTREAM_KEY` and `HERDR_ENGINEERING_LLM_INJECT`, which contradicts the YAML-only rule. This doc does not change that text; it should be cleaned up separately.
+7. **Stale env-var text.** The README still names `FABRIC_LLM_UPSTREAM_KEY` and `HERDR_ENGINEERING_LLM_INJECT`, which contradicts the YAML-only rule. Resolved by a follow-up: the README now describes `llm.upstream_key` in the central fleet file and `llm: {inject: false}`.
 
 ## Data model
 
