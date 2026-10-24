@@ -11,6 +11,11 @@ is ``grant ∩ owner's room role ∩ agent ceiling`` evaluated on every request,
 and non-members always get 404 so room ids cannot be enumerated. Peer message
 text is untrusted data: it is stored and returned, never executed, never routed
 to a terminal.
+
+The relational data-platform boundary lives in ``collab_store.CollabStore``.
+New upload/archive services must use it for SQL, after authorization here. This
+foundation does not dual-write or replace the acknowledged lifecycle event log;
+backfill and cutover require an explicit migration of existing event state.
 """
 from __future__ import annotations
 
