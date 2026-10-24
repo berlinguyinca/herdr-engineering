@@ -274,6 +274,10 @@ class FlakyStore(MemoryGitHubStore):
         self._guard()
         return super().remove_issues(repo_id, github_ids)
 
+    def apply_repository(self, row, issues, removed, watermark):
+        self._guard()
+        return super().apply_repository(row, issues, removed, watermark)
+
 
 def test_store_outage_keeps_serving_memory_and_flushes_after_recovery():
     fake, shared, down = seeded(), {}, [True]
@@ -661,3 +665,31 @@ def test_store_unavailable_at_viewer_bind_keeps_the_cache_and_rereads_nothing():
     fake.calls.clear()
     healthy.refresh()
     assert fake.calls == Counter({"repos": 2})
+
+
+def test_a_failed_removal_never_leaves_the_watermark_past_an_unremoved_close():
+    fake, shared = seeded(), {}
+    monitor_for(fake, shared).refresh()
+    rid = "github.com/acme/app"
+    reader = MemoryGitHubStore(identity=fake.credential_identity, shared=shared)
+    before = reader.watermark(rid)
+    closed = next(g for g, i in fake.repos["acme/app"].items() if i["number"] == 2)
+    fake.tick(600)
+    fake.edit("acme/app", closed, state="CLOSED")
+    fake.edit("acme/app", next(g for g, i in fake.repos["acme/app"].items() if i["number"] == 5), title="edit")
+
+    class RemovalFails(MemoryGitHubStore):
+        def remove_issues(self, repo_id, github_ids):
+            raise RuntimeError("injected")
+
+        def _drop_issues(self, *args, **kwargs):
+            raise RuntimeError("injected")
+    broken = GitHubMonitor(provider_factory=lambda: fake, store=lambda identity, viewer=None: RemovalFails(
+        identity=identity, viewer=viewer, shared=shared))
+    broken.refresh()
+    stored = reader.load()
+    # either the whole repository commit landed, or none of it did
+    if closed in stored.issues[rid]:
+        assert stored.watermarks[rid] == before
+    else:
+        assert stored.watermarks[rid] > before

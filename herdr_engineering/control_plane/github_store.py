@@ -210,25 +210,53 @@ class MemoryGitHubStore:
                             watermarks={rid: r["watermark"] for rid, r in state.repos.items()
                                         if r["watermark"] is not None})
 
+    def _lazy_revision(self) -> Callable[[], int]:
+        """One revision for one operation, bumped on its first visible change only."""
+        taken: list[int] = []
+
+        def rev() -> int:
+            if not taken:
+                taken.append(self._bump())
+            return taken[0]
+        return rev
+
+    def _put_repos(self, incoming: dict[str, dict], listed: set[str] | None, rev: Callable[[], int]) -> None:
+        state = self._state
+        changed = [rid for rid, data in incoming.items()
+                   if rid not in state.repos or state.repos[rid]["data"] != data]
+        gone = [rid for rid, r in state.repos.items()
+                if rid not in incoming and (listed is None or r["owner"] in listed)]
+        if not changed and not gone:
+            return
+        for rid in changed:
+            previous = state.repos.get(rid)
+            state.repos[rid] = {"owner": _owner(incoming[rid]), "data": incoming[rid], "rev": rev(),
+                                "watermark": previous["watermark"] if previous else None}
+            state.tombstones.pop(("repository", rid, rid), None)
+        if gone:
+            self._remove_repos(gone, rev())
+
+    def _put_issues(self, repo_id: str, incoming: dict[str, dict], rev: Callable[[], int]) -> None:
+        state = self._state
+        for gid, data in incoming.items():
+            if (repo_id, gid) not in state.issues or state.issues[(repo_id, gid)]["data"] != data:
+                state.issues[(repo_id, gid)] = {"data": data, "rev": rev()}
+                state.tombstones.pop(("issue", repo_id, gid), None)
+
+    def _drop_issues(self, repo_id: str, wanted: list[str], rev: Callable[[], int]) -> None:
+        state = self._state
+        for gid in wanted:
+            state.details.pop((repo_id, gid), None)
+        for gid in [gid for gid in wanted if (repo_id, gid) in state.issues]:
+            del state.issues[(repo_id, gid)]
+            self._tombstone("issue", repo_id, gid, rev())
+
     def upsert_repositories(self, rows: Iterable[dict], scope: set[str] | None) -> None:
         state = self._state
         with state.lock:
             self._claim()
             incoming = {row["repository_id"]: _normal(row) for row in rows}
-            changed = [rid for rid, data in incoming.items()
-                       if rid not in state.repos or state.repos[rid]["data"] != data]
-            listed = None if scope is None else _owners(scope)
-            gone = [rid for rid, r in state.repos.items()
-                    if rid not in incoming and (listed is None or r["owner"] in listed)]
-            if not changed and not gone:
-                return
-            rev = self._bump()
-            for rid in changed:
-                previous = state.repos.get(rid)
-                state.repos[rid] = {"owner": _owner(incoming[rid]), "data": incoming[rid], "rev": rev,
-                                    "watermark": previous["watermark"] if previous else None}
-                state.tombstones.pop(("repository", rid, rid), None)
-            self._remove_repos(gone, rev)
+            self._put_repos(incoming, None if scope is None else _owners(scope), self._lazy_revision())
 
     def upsert_issues(self, repo_id: str, rows: Iterable[dict], watermark: str | None) -> None:
         state = self._state
@@ -236,30 +264,37 @@ class MemoryGitHubStore:
             self._claim()
             if repo_id not in state.repos:
                 raise KeyError(repo_id)
-            incoming = {row["github_id"]: _normal(row) for row in rows}
-            changed = [gid for gid, data in incoming.items()
-                       if (repo_id, gid) not in state.issues or state.issues[(repo_id, gid)]["data"] != data]
-            if changed:
-                rev = self._bump()
-                for gid in changed:
-                    state.issues[(repo_id, gid)] = {"data": incoming[gid], "rev": rev}
-                    state.tombstones.pop(("issue", repo_id, gid), None)
+            self._put_issues(repo_id, {row["github_id"]: _normal(row) for row in rows}, self._lazy_revision())
             state.repos[repo_id]["watermark"] = watermark
 
     def remove_issues(self, repo_id: str, github_ids: Iterable[str]) -> None:
         state = self._state
         with state.lock:
             self._claim()
-            wanted = list(dict.fromkeys(github_ids))
-            for gid in wanted:
-                state.details.pop((repo_id, gid), None)
-            present = [gid for gid in wanted if (repo_id, gid) in state.issues]
-            if not present:
-                return
-            rev = self._bump()
-            for gid in present:
-                del state.issues[(repo_id, gid)]
-                self._tombstone("issue", repo_id, gid, rev)
+            self._drop_issues(repo_id, list(dict.fromkeys(github_ids)), self._lazy_revision())
+
+    def apply_repository(self, row: dict, issues: Iterable[dict], removed: Iterable[str],
+                         watermark: str | None) -> None:
+        """One repository's completed sync, all or nothing: its row (with the ``synced``
+        probe), changed issues, removals and watermark, under one revision."""
+        state = self._state
+        rid = row["repository_id"]
+        incoming = {issue["github_id"]: _normal(issue) for issue in issues}
+        wanted = list(dict.fromkeys(removed))
+        with state.lock:
+            self._claim()
+            saved = (dict(state.meta), {k: dict(v) for k, v in state.repos.items()}, dict(state.issues),
+                     dict(state.tombstones), dict(state.details))
+            try:
+                rev = self._lazy_revision()
+                self._put_repos({rid: _normal(row)}, set(), rev)
+                self._put_issues(rid, incoming, rev)
+                if wanted:
+                    self._drop_issues(rid, wanted, rev)
+                state.repos[rid]["watermark"] = watermark
+            except BaseException:
+                state.meta, state.repos, state.issues, state.tombstones, state.details = saved
+                raise
 
     def purge_owners_not_in(self, owners: set[str]) -> None:
         """Drop repositories (and issues) of owners outside the allowlist.
@@ -340,6 +375,18 @@ async def _drop_details(conn, sql: str, *args) -> None:
             await conn.execute(sql, *args)
     except asyncpg.exceptions.UndefinedTableError:
         pass
+
+
+class _LazyRevision:
+    """One revision for one transaction, bumped on its first visible change only."""
+
+    def __init__(self, conn):
+        self._conn, self._value = conn, None
+
+    async def __call__(self) -> int:
+        if self._value is None:
+            self._value = await GitHubStore._bump(self._conn)
+        return self._value
 
 
 class GitHubStore:
@@ -514,6 +561,62 @@ class GitHubStore:
         except GitHubStoreNotMigrated:
             return None  # truly nothing stored; an unreachable database raises (it is not a purge)
 
+    async def _put_repos(self, conn, incoming: dict[str, dict], listed: list[str] | None, rev) -> None:
+        if listed is not None and not listed:  # nothing can be gone: read only the incoming rows
+            found = await conn.fetch("SELECT repository_id, owner, data FROM github_repositories "
+                                     "WHERE repository_id = ANY($1::text[])", list(incoming))
+        else:
+            found = await conn.fetch("SELECT repository_id, owner, data FROM github_repositories")
+        stored = {r["repository_id"]: (r["owner"], json.loads(r["data"])) for r in found}
+        changed = [rid for rid, data in incoming.items() if rid not in stored or stored[rid][1] != data]
+        gone = [rid for rid, (owner, _) in stored.items()
+                if rid not in incoming and (listed is None or owner in listed)]
+        if not changed and not gone:
+            return
+        if changed:
+            await conn.executemany(
+                "INSERT INTO github_repositories (repository_id, owner, data, rev) "
+                "VALUES ($1,$2,$3::jsonb,$4) ON CONFLICT (repository_id) DO UPDATE SET "
+                "owner=EXCLUDED.owner, data=EXCLUDED.data, rev=EXCLUDED.rev",
+                [(rid, _owner(incoming[rid]), json.dumps(incoming[rid]), await rev()) for rid in changed])
+            await conn.execute(
+                "DELETE FROM github_catalog_tombstones WHERE kind='repository' "
+                "AND repository_id = ANY($1::text[])", changed)
+        if gone:
+            await self._remove_repos(conn, gone, await rev())
+
+    async def _put_issues(self, conn, repo_id: str, incoming: dict[str, dict], rev) -> None:
+        stored = {r["github_id"]: json.loads(r["data"]) for r in await conn.fetch(
+            "SELECT github_id, data FROM github_issues WHERE repository_id=$1 "
+            "AND github_id = ANY($2::text[])", repo_id, list(incoming))}
+        changed = [gid for gid, data in incoming.items() if stored.get(gid) != data]
+        if changed:
+            revision = await rev()
+            await conn.executemany(
+                "INSERT INTO github_issues (repository_id, github_id, data, rev) "
+                "VALUES ($1,$2,$3::jsonb,$4) ON CONFLICT (repository_id, github_id) DO UPDATE SET "
+                "data=EXCLUDED.data, rev=EXCLUDED.rev",
+                [(repo_id, gid, json.dumps(incoming[gid]), revision) for gid in changed])
+            await conn.execute(
+                "DELETE FROM github_catalog_tombstones WHERE kind='issue' AND repository_id=$1 "
+                "AND key = ANY($2::text[])", repo_id, changed)
+
+    async def _drop_issues(self, conn, repo_id: str, wanted: list[str], rev) -> None:
+        await _drop_details(conn, "DELETE FROM github_issue_details WHERE repository_id=$1 "
+                                  "AND github_id = ANY($2::text[])", repo_id, wanted)
+        present = [r["github_id"] for r in await conn.fetch(
+            "SELECT github_id FROM github_issues WHERE repository_id=$1 AND github_id = ANY($2::text[]) "
+            "FOR UPDATE", repo_id, wanted)]
+        if not present:
+            return
+        await conn.execute(
+            "WITH gone AS (DELETE FROM github_issues WHERE repository_id=$1 AND github_id = ANY($2::text[]) "
+            "RETURNING github_id) "
+            "INSERT INTO github_catalog_tombstones (kind, repository_id, key, rev, removed_at) "
+            "SELECT 'issue', $1, github_id, $3, $4 FROM gone "
+            "ON CONFLICT (kind, repository_id, key) DO UPDATE SET rev=EXCLUDED.rev, removed_at=EXCLUDED.removed_at",
+            repo_id, present, await rev(), self._stamp())
+
     def upsert_repositories(self, rows: Iterable[dict], scope: set[str] | None) -> None:
         incoming = {row["repository_id"]: _normal(row) for row in rows}
         listed = None if scope is None else sorted(_owners(scope))
@@ -521,25 +624,7 @@ class GitHubStore:
         async def work(conn):
             async with conn.transaction():
                 await self._claim(conn)
-                stored = {r["repository_id"]: (r["owner"], json.loads(r["data"]))
-                          for r in await conn.fetch("SELECT repository_id, owner, data FROM github_repositories")}
-                changed = [rid for rid, data in incoming.items() if rid not in stored or stored[rid][1] != data]
-                gone = [rid for rid, (owner, _) in stored.items()
-                        if rid not in incoming and (listed is None or owner in listed)]
-                if not changed and not gone:
-                    return
-                rev = await self._bump(conn)
-                if changed:
-                    await conn.executemany(
-                        "INSERT INTO github_repositories (repository_id, owner, data, rev) "
-                        "VALUES ($1,$2,$3::jsonb,$4) ON CONFLICT (repository_id) DO UPDATE SET "
-                        "owner=EXCLUDED.owner, data=EXCLUDED.data, rev=EXCLUDED.rev",
-                        [(rid, _owner(incoming[rid]), json.dumps(incoming[rid]), rev) for rid in changed])
-                    await conn.execute(
-                        "DELETE FROM github_catalog_tombstones WHERE kind='repository' "
-                        "AND repository_id = ANY($1::text[])", changed)
-                if gone:
-                    await self._remove_repos(conn, gone, rev)
+                await self._put_repos(conn, incoming, listed, _LazyRevision(conn))
         self._call(work)
 
     def upsert_issues(self, repo_id: str, rows: Iterable[dict], watermark: str | None) -> None:
@@ -552,20 +637,7 @@ class GitHubStore:
                     "SELECT 1 FROM github_repositories WHERE repository_id=$1 FOR UPDATE", repo_id)
                 if known is None:
                     raise KeyError(repo_id)
-                stored = {r["github_id"]: json.loads(r["data"]) for r in await conn.fetch(
-                    "SELECT github_id, data FROM github_issues WHERE repository_id=$1 "
-                    "AND github_id = ANY($2::text[])", repo_id, list(incoming))}
-                changed = [gid for gid, data in incoming.items() if stored.get(gid) != data]
-                if changed:
-                    rev = await self._bump(conn)
-                    await conn.executemany(
-                        "INSERT INTO github_issues (repository_id, github_id, data, rev) "
-                        "VALUES ($1,$2,$3::jsonb,$4) ON CONFLICT (repository_id, github_id) DO UPDATE SET "
-                        "data=EXCLUDED.data, rev=EXCLUDED.rev",
-                        [(repo_id, gid, json.dumps(incoming[gid]), rev) for gid in changed])
-                    await conn.execute(
-                        "DELETE FROM github_catalog_tombstones WHERE kind='issue' AND repository_id=$1 "
-                        "AND key = ANY($2::text[])", repo_id, changed)
+                await self._put_issues(conn, repo_id, incoming, _LazyRevision(conn))
                 await conn.execute(
                     "UPDATE github_repositories SET watermark=$2 WHERE repository_id=$1", repo_id, watermark)
         self._call(work)
@@ -576,21 +648,28 @@ class GitHubStore:
         async def work(conn):
             async with conn.transaction():
                 await self._claim(conn)
-                await _drop_details(conn, "DELETE FROM github_issue_details WHERE repository_id=$1 "
-                                          "AND github_id = ANY($2::text[])", repo_id, wanted)
-                present = [r["github_id"] for r in await conn.fetch(
-                    "SELECT github_id FROM github_issues WHERE repository_id=$1 AND github_id = ANY($2::text[]) "
-                    "FOR UPDATE", repo_id, wanted)]
-                if not present:
-                    return
-                rev = await self._bump(conn)
+                await self._drop_issues(conn, repo_id, wanted, _LazyRevision(conn))
+        self._call(work)
+
+    def apply_repository(self, row: dict, issues: Iterable[dict], removed: Iterable[str],
+                         watermark: str | None) -> None:
+        """One repository's completed sync in one transaction: its row (with the ``synced``
+        probe), changed issues, removals and watermark, under one revision."""
+        rid = row["repository_id"]
+        data = _normal(row)
+        incoming = {issue["github_id"]: _normal(issue) for issue in issues}
+        wanted = list(dict.fromkeys(removed))
+
+        async def work(conn):
+            async with conn.transaction():
+                await self._claim(conn)
+                rev = _LazyRevision(conn)
+                await self._put_repos(conn, {rid: data}, [], rev)
+                await self._put_issues(conn, rid, incoming, rev)
+                if wanted:
+                    await self._drop_issues(conn, rid, wanted, rev)
                 await conn.execute(
-                    "WITH gone AS (DELETE FROM github_issues WHERE repository_id=$1 AND github_id = ANY($2::text[]) "
-                    "RETURNING github_id) "
-                    "INSERT INTO github_catalog_tombstones (kind, repository_id, key, rev, removed_at) "
-                    "SELECT 'issue', $1, github_id, $3, $4 FROM gone "
-                    "ON CONFLICT (kind, repository_id, key) DO UPDATE SET rev=EXCLUDED.rev, removed_at=EXCLUDED.removed_at",
-                    repo_id, present, rev, self._stamp())
+                    "UPDATE github_repositories SET watermark=$2 WHERE repository_id=$1", rid, watermark)
         self._call(work)
 
     def purge_owners_not_in(self, owners: set[str]) -> None:

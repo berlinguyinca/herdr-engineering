@@ -668,13 +668,13 @@ class GitHubMonitor:
 
         def work(target):
             snapshot = target.load()
-            target.upsert_repositories(repos, None)
+            # the listing first, without the synced probes: a flush cut short leaves
+            # those repositories looking changed, never synced over stale issues
+            target.upsert_repositories([dict(row, synced=None) for row in repos], None)
             for row in repos:
                 rid = row["repository_id"]
-                target.upsert_issues(rid, issues.get(rid, {}).values(), watermarks.get(rid))
                 stale = set(snapshot.issues.get(rid, {}) if snapshot else ()) - set(issues.get(rid, {}))
-                if stale:
-                    target.remove_issues(rid, stale)
+                target.apply_repository(row, issues.get(rid, {}).values(), stale, watermarks.get(rid))
         self._write(store, work)
 
     @staticmethod
@@ -810,7 +810,9 @@ class GitHubMonitor:
                     for key in [key for key in table if key not in discovered]:
                         del table[key]
                 self._resume_repos = discovered
-                rows = [self._stored_repository(record) for record in discovered.values()]
+                # memory is ahead of a store that missed writes: no synced probe until the flush
+                rows = [dict(self._stored_repository(record), **({"synced": None} if self._store_dirty else {}))
+                        for record in discovered.values()]
             self._update(scope={"owners": sorted(allow or owners), "excluded_repositories": excluded,
                                 "restricted": bool(allow)})
 
@@ -1043,12 +1045,9 @@ class GitHubMonitor:
             row = self._stored_repository(record)
             self._touch()
 
-        def work(target):
-            target.upsert_issues(rid, upserts.values(), watermark)
-            if removed:
-                target.remove_issues(rid, removed)
-            target.upsert_repositories([row], set())
-        self._write(store, work)
+        # one transaction: a restart never sees the watermark or the synced probe
+        # ahead of the issues and removals they describe
+        self._write(store, lambda target: target.apply_repository(row, upserts.values(), removed, watermark))
 
     def _repository_rows(self, search):
         """Repositories matching ``search`` in list order (lock held)."""

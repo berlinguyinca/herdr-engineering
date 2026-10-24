@@ -516,3 +516,47 @@ def test_unreachable_database_raises_from_load_instead_of_reading_as_purged():
     store = GitHubStore(refuse, identity="tok-a", viewer="alice", run=_LoopRunner().run)
     with pytest.raises(GitHubStoreUnavailable):
         store.load()
+
+
+def _fail_removal(store):
+    """Make the removal step inside a store operation fail (an injected database error)."""
+    if isinstance(store, GitHubStore):
+        async def boom(*args, **kwargs):
+            raise RuntimeError("injected removal failure")
+    else:
+        def boom(*args, **kwargs):
+            raise RuntimeError("injected removal failure")
+    store._drop_issues = boom
+
+
+def test_apply_repository_commits_row_issues_removals_and_watermark_together(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app", synced={"open": 2})], scope=None)
+    store.upsert_issues(A, [issue("I1", 1), issue("I2", 2)], watermark="w1")
+    before = store.revision()
+    store.apply_repository(repo("acme/app", synced={"open": 1}), [issue("I2", 2, title="edited")], ["I1"], "w2")
+    snap = backend.make().load()
+    assert set(snap.issues[A]) == {"I2"} and snap.issues[A]["I2"]["title"] == "edited"
+    assert snap.watermarks[A] == "w2" and snap.repositories[A]["synced"] == {"open": 1}
+    assert store.revision() == before + 1  # one commit, one revision
+    delta = store.changes_since(before)
+    assert [r["key"] for r in delta["removed"]] == ["I1"]
+    assert {(r["kind"], r["key"]) for r in delta["upserted"]} == {("repository", A), ("issue", "I2")}
+    store.apply_repository(repo("acme/app", synced={"open": 1}), [issue("I2", 2, title="edited")], [], "w3")
+    assert store.revision() == before + 1 and store.watermark(A) == "w3"  # nothing visible changed
+    store.apply_repository(repo("acme/new"), [issue("N1", 1)], [], "w")  # a repository not stored yet
+    assert backend.make().load().issues["github.com/acme/new"]["N1"]["number"] == 1
+
+
+def test_apply_repository_is_all_or_nothing(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app", synced={"open": 2})], scope=None)
+    store.upsert_issues(A, [issue("I1", 1), issue("I2", 2)], watermark="w1")
+    before = store.revision()
+    _fail_removal(store)
+    with pytest.raises(RuntimeError):
+        store.apply_repository(repo("acme/app", synced={"open": 1}), [issue("I2", 2, title="edited")], ["I1"], "w2")
+    snap = backend.make().load()
+    assert set(snap.issues[A]) == {"I1", "I2"} and snap.issues[A]["I2"]["title"] == "issue 2"
+    assert snap.watermarks[A] == "w1" and snap.repositories[A]["synced"] == {"open": 2}
+    assert backend.make().revision() == before
