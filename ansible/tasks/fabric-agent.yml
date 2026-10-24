@@ -8,8 +8,8 @@
 #
 # Runs as the fleet (connection) user (become: false). herdr-eng is
 # provisioned in managed immutable release directories plus a user venv.
-# The gateway control URL is written to the machine-local
-# ~/.config/herdr-engineering/fabric.env (a tailnet URL, not a secret).
+# The gateway control URL comes from the central fleet-config.yaml
+# (fabric.url, served to every host); no per-host env file is written.
 - name: "Deploy dev-fabric auto-registration agent"
   become: false
   block:
@@ -18,13 +18,6 @@
         path: "{{ fleet_home }}/.config/herdr-engineering"
         state: directory
         mode: "0700"
-
-    - name: "Write the fabric gateway control URL for this host"
-      ansible.builtin.copy:
-        dest: "{{ fleet_home }}/.config/herdr-engineering/fabric.env"
-        owner: "{{ fleet_user }}"
-        mode: "0600"
-        content: "HERDR_ENGINEERING_FABRIC_URL={{ fabric_agent_gateway_url }}\n"
 
     - name: "Select the controller release once for direct playbook invocations"
       ansible.builtin.set_fact:

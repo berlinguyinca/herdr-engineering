@@ -7,7 +7,7 @@
 #   - herdr-eng           -> fetched at the selected exact commit and
 #                            pip-installed into ~/.venvs/herdr-engineering
 #                            (fabric-agent.yml)
-#   - fabric.env + auto-registration agent service (fabric-agent.yml)
+#   - auto-registration agent service (fabric-agent.yml; gateway from YAML config)
 #   - pi build-gate extension build-gate.ts (pi-build-gate.yml)
 #   - optional pi-engineering package staging (never session activation)
 #   - version-parity fingerprint report (this playbook)

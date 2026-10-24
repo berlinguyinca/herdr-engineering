@@ -172,8 +172,9 @@ def _build_parser() -> argparse.ArgumentParser:
     pj.add_argument("--user", default=None, help="fleet ssh user for ansible host_vars")
     pj.add_argument("--ansible-host", default=None,
                     help="tailnet MagicDNS/ip for ansible (defaults to ssh_target)")
-    pj.add_argument("--gateway", default="http://dev.lan:29999",
-                    help="fabric gateway URL the agent registers with")
+    pj.add_argument("--gateway", default=None,
+                    help="IGNORED for the fabric agent (warns); set fabric.url in "
+                         "fleet-config.yaml or fabric.gateway_url in config.yaml")
     pj.add_argument("--no-attach", action="store_true",
                     help="skip the herdr machine add step")
     pj.add_argument("--no-provision", action="store_true",
@@ -228,8 +229,9 @@ def _build_parser() -> argparse.ArgumentParser:
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
     pu.add_argument("--host", default=None, help="update only this host (default: all)")
-    pu.add_argument("--gateway", default="http://dev.lan:29999",
-                    help="fabric gateway URL the agent registers with")
+    pu.add_argument("--gateway", default=None,
+                    help="IGNORED for the fabric agent (warns); set fabric.url in "
+                         "fleet-config.yaml or fabric.gateway_url in config.yaml")
     pu.add_argument("--no-pull", action="store_true", help="skip controller git pull")
     pu.add_argument("--no-reinstall", action="store_true",
                     help="skip controller local pip reinstall")
@@ -830,14 +832,15 @@ def _cmd_machines(args) -> int:
 
 def _cmd_fleet_join(args) -> int:
     from pathlib import Path
-    from .fleet import fleet_join
+    from .fleet import DEFAULT_GATEWAY, fleet_join, warn_gateway_ignored
+    warn_gateway_ignored(args.gateway)
     report = fleet_join(
         ssh_target=args.ssh_target,
         label=args.label,
         os_name=args.os,
         user=args.user,
         ansible_host=args.ansible_host or args.ssh_target,
-        gateway=args.gateway,
+        gateway=DEFAULT_GATEWAY,
         attach=not args.no_attach,
         provision=not args.no_provision,
         fleet_config=None if args.no_credentials else Path(args.fleet_config).expanduser(),
@@ -916,10 +919,11 @@ def _cmd_fleet_config(args) -> int:
 
 
 def _cmd_fleet_update(args) -> int:
-    from .fleet import fleet_update
+    from .fleet import DEFAULT_GATEWAY, fleet_update, warn_gateway_ignored
+    warn_gateway_ignored(args.gateway)
     report = fleet_update(
         host=args.host,
-        gateway=args.gateway,
+        gateway=DEFAULT_GATEWAY,
         pull_controller=not args.no_pull,
         reinstall_local=not args.no_reinstall,
     )
@@ -1186,8 +1190,8 @@ def _local_fabric_client():
 
 
 def _gateway_configured_or_reachable() -> bool:
-    """True when a gateway URL is configured (env HERDR_ENGINEERING_FABRIC_URL
-    or fabric.gateway_url in config) OR a gateway is currently reachable.
+    """True when a gateway URL is configured (fabric.url in the central host
+    config or fabric.gateway_url in config.yaml) OR a gateway is currently reachable.
     Used to warn about silent local-registry degradation (issue #77b)."""
     from .config import load_config
     from .errors import InvalidError
@@ -1939,8 +1943,8 @@ def _cmd_dev_agent(args) -> int:
     if not base:
         _print_json({
             "code": "config",
-            "message": "no gateway configured: set fabric.gateway_url or "
-                       "HERDR_ENGINEERING_FABRIC_URL",
+            "message": "no gateway configured: set fabric.url in the central "
+                       "fleet-config.yaml, or fabric.gateway_url in config.yaml",
         })
         return 1
     tailnet_ip = tailnet_ipv4()
