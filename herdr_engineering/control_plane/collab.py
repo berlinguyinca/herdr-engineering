@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 from . import collab_delegation as dlg
 from . import collab_external as ext
 from . import collab_models, ids
+from .collab_context import ContextMixin
 from .collab_workbench import WorkbenchMixin
 from .redact import redact_text
 
@@ -71,7 +72,7 @@ MAX_TEXT = 8000
 MAX_BODY = 64 * 1024
 _PANE_LINK = re.compile(r"pane:[a-z0-9][a-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
-_MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to"})
+_MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to", "context"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")   # C0, DEL and C1 (8-bit CSI)
 _NAME_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
@@ -298,7 +299,7 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService(WorkbenchMixin):
+class CollabService(WorkbenchMixin, ContextMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -413,6 +414,7 @@ class CollabService(WorkbenchMixin):
         self._msg_room: dict[str, str] = {}                  # message event id -> room id
         self.stats = defaultdict(int)
         self._init_workbench()
+        self._init_context()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -528,7 +530,7 @@ class CollabService(WorkbenchMixin):
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
-        if self._apply_workbench(ev):
+        if self._apply_workbench(ev) or self._apply_context(ev):
             return
         if t == "external_usage_reserved":
             k = (p["scope"], p["key"])
@@ -1213,6 +1215,7 @@ class CollabService(WorkbenchMixin):
                 action="member.remove", outcome="allowed", project_ids=[room["project_id"]],
                 resource_id=room_id))
             self._expire_helpers()                   # their helpers in this room end now and free their slots
+        self._xlink_sweep(room_id)          # T14: links this person made no longer stand
         return {"ok": True}
 
     # -- people: approval, disable, kick
@@ -3684,6 +3687,7 @@ class CollabService(WorkbenchMixin):
             self._commit("workspace_unlinked", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, link_id=link_id, action="workspace.unlink",
                 outcome="allowed", project_ids=[room["project_id"]], resource_id=link_id))
+        self._xlink_sweep(room_id)          # T14: a cross-workspace link that leaned on this workspace lapses now
         return {"ok": True}
 
     def set_workspace_primary(self, pr: Principal, room_id: str, link_id: str, body: dict) -> dict:
@@ -3725,7 +3729,9 @@ class CollabService(WorkbenchMixin):
                 pr, project_id=room["project_id"], room_id=room_id, link_id=link_id, grants=grants,
                 terminal_principals=tp, old_grants=list(lk["grants"]), action="workspace.grants",
                 outcome="allowed", project_ids=[room["project_id"]], resource_id=link_id, **extra))
-            return self._link_view(pr, room, self._links[link_id], True)
+            out = self._link_view(pr, room, self._links[link_id], True)
+        self._xlink_sweep(room_id)
+        return out
 
     def graph_access(self, pr: Principal) -> dict | None:
         """Snapshot of what ``pr`` may read in the lineage graph, taken NOW under the service lock
@@ -3761,14 +3767,23 @@ class CollabService(WorkbenchMixin):
     def graph_read(self, pr: Principal, parts: list[str], query: dict) -> dict:
         """Lineage graph read for a signed-in person. Hidden, missing and 'no graph for you' all
         answer one 404; nothing here lets a read widen what the graph's own checks allow."""
-        from .graph import read_graph
         graph = self.graph_source() if self.graph_source is not None else None
         access = self.graph_access(pr) if graph is not None else None
         if access is None:
             raise CollabError(404, "not found")
         principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
-        contexts = None
         room_id = query.get("room_id")
+        self.maintain()                         # T14: retry what the graph was not told about links
+        if room_id in access["rooms"]:
+            self._xlink_sweep(room_id)          # a lapsed link is tombstoned now, not at someone's next list
+        try:
+            return self.xlink_filter(self._graph_read(pr, graph, access, principal, parts, query, room_id))
+        except KeyError:
+            raise CollabError(404, "not found") from None
+
+    def _graph_read(self, pr, graph, access, principal, parts, query, room_id):
+        from .graph import read_graph
+        contexts = None
         if parts[:1] == ["lineage"]:
             return self._lineage_read(pr, graph, access, parts[1:], query)
         if parts == ["nodes"]:
@@ -3834,6 +3849,11 @@ class CollabService(WorkbenchMixin):
             if not got or not got <= allowed:
                 raise CollabError(400, f"unknown {name}")
             return got
+        def wanted_edges():
+            got = kinds("edge_types", EDGE_TYPES)
+            if not self._ctx_on(self.ctx_cfg(), "cross_links"):      # T14: switched off = no link in any lineage view
+                got = (set(EDGE_TYPES) if got is None else got) - {"cross_link"}
+            return got
         step = num("step", None)
         at = query.get("at") or None
         with self._lock:                # a replay rebuilds the past: bound how often one person can ask
@@ -3842,7 +3862,7 @@ class CollabService(WorkbenchMixin):
             if parts == []:
                 return graph.room_lineage(principal, contexts, step=step, at=at, since=since,
                                           node_types=kinds("node_types", NODE_TYPES),
-                                          edge_types=kinds("edge_types", EDGE_TYPES),
+                                          edge_types=wanted_edges(),
                                           limit=num("limit", 200), offset=num("offset", 0))
             if parts == ["timeline"]:
                 return graph.room_timeline(principal, contexts, step=step, at=at, since=since)
@@ -4643,12 +4663,16 @@ class CollabService(WorkbenchMixin):
                     reply = False
             if reply is False:
                 raise CollabError(400, "in_reply_to must reference a message in this room")
-            fp = _digest(json.dumps([room_id, clean, reply]))
+            ctx = None
+            if "context" in body:
+                # T14: a reference to a graph node/edge/proposal/comment. Validated, and visible to THIS poster now.
+                ctx = self._wb_call(self._context_for_post, pr, room, room_id, body["context"])
+            fp = _digest(json.dumps([room_id, clean, reply] + ([ctx] if ctx else [])))
             prior = self._idem.get((pr.key, room_id, key))
             if prior:
                 if prior[0] != fp:
                     raise CollabError(409, "idempotency_key already used for a different message")
-                return 200, {"event": self._view(self._log[prior[1] - 1], replayed=True), "replayed": True}
+                return 200, {"event": self._view(self._log[prior[1] - 1], viewer=pr, replayed=True), "replayed": True}
             now = self._now()
             hits = [t for t in self._hits[pr.key] if now - t < 60]
             # an external agent posts at a third of the rate a person's own agent may; it still draws on
@@ -4673,13 +4697,17 @@ class CollabService(WorkbenchMixin):
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
                 sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
                 text=redact_text(clean), in_reply_to=reply, trust="untrusted",
+                **({"context": ctx} if ctx else {}),
                 visibility_scope="room", action="message.post", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
         self.stats["messages"] += 1
-        return 201, {"event": self._view(ev)}
+        with self._lock:
+            return 201, {"event": self._view(ev, viewer=pr)}
 
     # -- reads
-    def _view(self, ev: dict, **extra) -> dict:
+    def _view(self, ev: dict, viewer=None, _ctx_cache: dict | None = None, **extra) -> dict:
+        """One feed event as ``viewer`` may see it. A message's context reference is resolved per viewer; with no
+        viewer (an internal caller) it is always hidden."""
         p, t = ev["payload"], ev["event_type"]
         out = {"sequence": ev["sequence"], "event_id": ev["event_id"], "event_type": t,
                "schema_version": ev["schema_version"], "room_id": p.get("room_id"),
@@ -4690,6 +4718,8 @@ class CollabService(WorkbenchMixin):
             out.update(sender={"type": "external" if p.get("sender_external") else p["sender_kind"],
                                "id": p["sender_id"], "owner_user_id": p["actor_user_id"]},
                        text=p["text"], trust="untrusted", in_reply_to=p.get("in_reply_to"))
+            if p.get("context"):
+                out["context"] = self._message_context(p, viewer, {} if _ctx_cache is None else _ctx_cache)
         elif t in ("task_created", "task_updated"):
             out.update(actor_user_id=p.get("actor_user_id"), actor_agent_id=p.get("actor_agent_id"),
                        task={"task_id": p["task_id"], "target_agent_id": p.get("target_agent_id"),
@@ -4714,7 +4744,7 @@ class CollabService(WorkbenchMixin):
         with self._lock:
             room, first = self._authorize(pr, room_id, "read", "events.read")
             guest = not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest"
-            out, more, nxt = [], False, cursor
+            out, more, nxt, cache = [], False, cursor, {}
             feed = self._by_room.get(room_id, [])
             lo = bisect.bisect_right(feed, max(cursor, first - 1), key=lambda e: e["sequence"])
             for ev in feed[lo:]:
@@ -4727,7 +4757,7 @@ class CollabService(WorkbenchMixin):
                 if len(out) >= limit:
                     more = True
                     break
-                out.append({k: v for k, v in self._view(ev).items() if k != "project_id"})
+                out.append({k: v for k, v in self._view(ev, viewer=pr, _ctx_cache=cache).items() if k != "project_id"})
                 nxt = ev["sequence"]
         return {"events": out, "next_cursor": nxt, "has_more": more}
 
@@ -4913,6 +4943,10 @@ class CollabService(WorkbenchMixin):
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
+                    if parts[2:] == ["consultations"]:
+                        return 200, self.list_consultations(pr, rid)
+                    if parts[2:] == ["xlinks"]:
+                        return 200, self.list_links(pr, rid)
                     if parts[2:] == ["comments"]:
                         return 200, self.list_comments(pr, rid, query)
                     if n == 5 and parts[2] == "comments" and parts[4] == "history":
@@ -5071,6 +5105,16 @@ class CollabService(WorkbenchMixin):
                         return 200, self.unlink_mission(pr, rid, parts[3])
                     if parts[2:] == ["tasks"]:
                         return 201, self.create_task(pr, rid, body)
+                    if parts[2:] == ["consultations"]:
+                        return self.ask_consultation(pr, rid, body)
+                    if n == 5 and parts[2] == "consultations" and parts[4] == "answer":
+                        return 200, self.answer_consultation(pr, rid, parts[3], body)
+                    if n == 5 and parts[2] == "consultations" and parts[4] == "cancel":
+                        return 200, self.cancel_consultation(pr, rid, parts[3])
+                    if parts[2:] == ["xlinks"]:
+                        return self.create_link(pr, rid, body)
+                    if n == 5 and parts[2] == "xlinks" and parts[4] == "revoke":
+                        return 200, self.revoke_link(pr, rid, parts[3])
                     if parts[2:] == ["comments"]:
                         return self.add_comment(pr, rid, body)
                     if n == 5 and parts[2] == "comments" and parts[4] in ("edit", "retract"):
@@ -5097,7 +5141,6 @@ class CollabService(WorkbenchMixin):
             if exc.code:
                 err["code"] = exc.code
             return exc.status, err
-
 CATALOGUE_MAX = 500
 
 

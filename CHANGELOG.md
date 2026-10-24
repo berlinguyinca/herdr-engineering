@@ -5,6 +5,16 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Contextual chat, consultation and cross-workspace links (T14, stacked on T11 #172 and T12 #171)
+- Chat messages can carry one validated reference to a graph node, edge, comment or proposal. It is checked when posted and again for every
+  reader of every read; a reader who cannot see the target gets one fixed "hidden reference" and nothing else (agents, remote agents and guests always do).
+- Consultation: a member asks another member or a remote agent one bounded, expiring question about a graph node and gets one text answer
+  (never a task, proposal or action). The graph records who asked whom about what, never the text. New MCP tools `consult_inbox`, `consult_answer`.
+- Cross-workspace links: new edge kind `cross_link`, authorized on both ends and written only by the HCN service for one room; revocable and
+  self-expiring when the room loses a workspace grant. See `docs/contracts/lineage-events.md` ("T14").
+- New YAML `control_plane.collab.contextual` (everything off by default, `kill_switch`). No environment variable, no migration.
+- Rollback: `contextual.enabled: false`, or revert the PR.
+
 ### Alternative implementation forks, comparison and promotion (T13, stacked on T12)
 - New steering actions `fork` and `promote` (opt-in via `steering.actions` and `steering.forks.enabled`), a comparison read model
   `GET /api/v1/collab/rooms/{id}/forks`, and a Forks panel in the room workbench. Fork preserves the original; nothing is deleted.
@@ -19,6 +29,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - New YAML kill switch `control_plane.collab.delegation_enabled` (default `false`; works for the combined and `--collab-only` servers). No environment variable.
 - Extends the existing task store, event log and external credentials; new log events are additive; no migration. Defence in depth (untested): an API key whose configured
   role is spelled `external` or `collab` is given principal kind `unknown`, never those service-only kinds. See `docs/operations/bounded-delegation.md` and the T11 addendum of the HCN threat model.
+
 - Hardening after independent review: bounded validator regexes, cheap checks before parsing and parsing outside the lock, strict `---`/`+++` names, `/dev/null` vs hunk
   agreement, wider hard-coded deny-list, CRLF refused, task-list `bounds` limited to owners, open ingest listener refused for the reserved node ids.
 - Rollback: `delegation_enabled: false`, or revert the PR.
@@ -34,6 +45,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   ingest, member responses no longer carry the global `admission` counter, the ledger window is counted in the reader's own visible events (exact steps, opaque page tokens), and the new
   operator YAML `control_plane.collab.replay_history` (`since_join` default | `full`) sets how far back a member may replay.
 - Rollback: revert the PR (code only).
+
 
 ### Head-bound review quorum (T06)
 - Review round 4: head handling is conservative. A lower-sequence write after the applied one is ignored only if it repeats

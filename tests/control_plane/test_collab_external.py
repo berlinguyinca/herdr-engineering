@@ -38,7 +38,11 @@ def fab(w):
     ing.reserved_node = w.s.is_external_node
 
     def sink(envelope, principal, valid=None):
-        ing.key_scopes[principal["id"]] = {"rooms": frozenset({envelope["room_id"]}), "missions": frozenset()}
+        # a room service (T14 consultation thread) writes under the subject's mission label: the envelope's own
+        # mission id, which the service took from the node's scope, is the one mission it may address
+        mission = envelope.get("mission_id") if str(principal["id"]).startswith("collab:room:") else None
+        ing.key_scopes[principal["id"]] = {
+            "rooms": frozenset({envelope["room_id"]}), "missions": frozenset({mission} if mission else ())}
         return ing.ingest(envelope, principal, valid=valid)
     w.s.lineage_sink = sink
     w.s.graph_source = lambda: repo.graph

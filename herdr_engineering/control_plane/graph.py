@@ -59,7 +59,13 @@ NODE_TYPES = frozenset(
     "artifact gate issue".split())
 EDGE_TYPES = frozenset(
     "spawn handoff delegation consultation dependency issue_link fork "
-    "supersession reviewed produced validated".split())
+    "supersession reviewed produced validated cross_link".split())
+# T14: edge kinds only the HCN service may write (as a `collab` principal, after it has checked the asking person
+# and the room). `cross_link` joins two nodes of different workspaces of one room; a `consultation` edge from a
+# service-written `thread:hcn-consult.*` node records a peer consultation. Everybody else is refused with the one
+# indistinguishable lineage_forbidden, operators excepted (trusted, as for every other write).
+CROSS_LINK = "cross_link"
+CONSULT_PREFIX = "thread:hcn-consult."
 BOUND_EDGE_TYPES = frozenset({"reviewed", "validated"})
 LINEAGE_EVENT_TYPES = ("node.upsert", "node.state", "edge.add", "edge.remove")
 # COMMONS kinds are shared identities that several independent emitters legitimately
@@ -316,6 +322,13 @@ def _widen_labels(cur: tuple, label) -> tuple:
     return tuple(sorted(s, key=repr)[:MAX_SCOPE_LABELS])
 
 
+def _is_room_service(actor: dict | None) -> bool:
+    """The HCN service acting for ONE room. The kind cannot be minted by an API key (api.py maps such a role to
+    `unknown`), and the id is the room-bound principal the service builds itself."""
+    return bool(actor) and actor.get("kind") == "collab" and actor.get("authenticated_by") == "collab" \
+        and isinstance(actor.get("id"), str) and actor["id"].startswith("collab:room:")
+
+
 def _is_operator(actor: dict | None) -> bool:
     return bool(actor) and actor.get("kind") == "operator" \
         and actor.get("authenticated_by") not in (None, "none")
@@ -392,8 +405,10 @@ def _ekey(op: dict, writer_id: str | None) -> tuple:
     reviewed/validated; ``writer`` only when the ``from`` node is a shared COMMONS node
     (then every writer has its own instance of the triple and none can squat another's)."""
     bound = op["edge_type"] in BOUND_EDGE_TYPES
+    # a cross-workspace link has one instance PER ROOM (its writer is the room's service principal), so two rooms
+    # that link the same two nodes never share, merge or squat on each other's edge
     return (op["edge_type"], op["from_id"], op["to_id"], op["binding"] if bound else None,
-            writer_id if (op["from_type"] in COMMONS_KINDS and not bound) else None)
+            writer_id if ((op["from_type"] in COMMONS_KINDS and not bound) or op["edge_type"] == CROSS_LINK) else None)
 
 
 def _writer_key(ev: dict) -> tuple:
@@ -815,7 +830,16 @@ class GraphProjection:
             else:
                 frm, to = self._nodes.get(op["from_id"]), self._nodes.get(op["to_id"])
                 bound = op["edge_type"] in BOUND_EDGE_TYPES
-                if not operator:
+                svc = _is_room_service(actor)
+                if op["edge_type"] == CROSS_LINK and not (operator or svc):
+                    raise deny
+                if svc and (op["edge_type"] == CROSS_LINK or (
+                        op["edge_type"] == "consultation" and op["from_id"].startswith(CONSULT_PREFIX))):
+                    # the service already checked the person, the room and both endpoints; the graph only insists
+                    # that the endpoints exist (an edge to a node nobody defined stays invisible anyway)
+                    if any(n is None or n.claim is None for n in (frm, to)):
+                        raise deny
+                elif not operator:
                     # the author of an endpoint can always use it, whatever its scope
                     if any(n is None or n.claim is None or not (
                             aid in n.writers() or self._node_visible(actor, n)) for n in (frm, to)):
@@ -1417,6 +1441,19 @@ class GraphProjection:
                 return self._node_visible(principal, self._nodes.get(anchor.get("node_id")))
             keys = self._by_triple.get((anchor.get("edge_type"), anchor.get("from_id"), anchor.get("to_id")), ())
             return any(self._edge_visible(principal, self._edges[k]) for k in keys)
+
+    def node_context(self, principal, node_id: str) -> dict | None:
+        """What a context reference may show ``principal`` about one node: type, label, state and the workspaces its
+        scope names. None when it is hidden or missing (the two are never told apart)."""
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if not self._node_visible(principal, node):
+                return None
+            view = self._node_view(node, principal)
+            scope = node.eff_scope(principal, internal=False) if node.commons else node.scope
+            wss = tuple(scope[3]) if isinstance(scope, tuple) else ()
+            return {"node_id": node_id, "node_type": node.node_type, "label": view["label"], "state": view["state"],
+                    "workspaces": wss, "scope": scope}
 
     def steer_facts(self, principal, node_id: str) -> dict:
         """What a steering request is fenced on, as ``principal`` sees it. KeyError if absent OR hidden.

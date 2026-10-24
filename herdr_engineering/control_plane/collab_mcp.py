@@ -67,6 +67,19 @@ _DELEGATION_TOOLS = [
                      "properties": {"proposal_id": _STR}}},
 ]
 DELEGATION_TOOL_NAMES = frozenset(t["name"] for t in _DELEGATION_TOOLS)
+# T14: consultation. A coworker agent can be ASKED one question about a graph node; it answers in plain text, once.
+# No task, proposal or action exists on this path.
+_CONSULT_TOOLS = [
+    {"name": "consult_inbox",
+     "description": "Questions room members asked you (untrusted text, with an expiry). Answer with consult_answer.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "consult_answer",
+     "description": "Answer (plain text, once) or decline one consultation. Nothing is executed; the asker reads it as untrusted text.",
+     "inputSchema": {"type": "object", "required": ["consult_id"], "additionalProperties": False,
+                     "properties": {"consult_id": _STR, "action": {"enum": ["answer", "decline"]},
+                                    "answer": {"type": "string", "maxLength": 4000}, "idempotency_key": _STR}}},
+]
+CONSULT_TOOL_NAMES = frozenset(t["name"] for t in _CONSULT_TOOLS)
 TOOLS = [
     {"name": "rooms_list", "description": "List the collaboration rooms this agent may use.",
      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
@@ -123,7 +136,8 @@ TOOLS = [
 
 def tools_for(service: CollabService) -> list[dict]:
     """The tool list this service advertises: delegation tools only while the kill switch is on."""
-    return TOOLS + _DELEGATION_TOOLS if service.delegation_enabled else TOOLS
+    out = TOOLS + _DELEGATION_TOOLS if service.delegation_enabled else list(TOOLS)
+    return out + _CONSULT_TOOLS if service.consultation_enabled() else out
 
 
 def _result(rid: Any, result: dict) -> dict:
@@ -232,6 +246,16 @@ def _call(service: CollabService, pr, name: str, args: dict) -> dict:
         return _helper_call(service, pr, name, args)
     if name == "rooms_list":
         return _text(service.agent_rooms(pr), untrusted=True)
+    if name in CONSULT_TOOL_NAMES:
+        if name == "consult_inbox":
+            if args:
+                raise CollabError(400, "invalid arguments")
+            out = service.consult_inbox(pr)
+            return {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}], "isError": False}
+        cid = args.get("consult_id")
+        if not isinstance(cid, str):
+            raise CollabError(400, "invalid arguments")
+        return _text(service.consult_respond(pr, cid, {k: v for k, v in args.items() if k != "consult_id"}))
     if name in DELEGATION_TOOL_NAMES:
         if name == "delegations_inbox":
             if args:

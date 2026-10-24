@@ -9,6 +9,7 @@ import { decisionBody, delegationBody, renderDelegations, renderProposalList, re
 import {
   filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
 } from './collab-lineage.js';
+import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
 import { commentBody, freshDraft, proposalBody, renderWorkbench } from './collab-workbench.js';
 import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
@@ -573,7 +574,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       <section class="hd-card cx-chat cx-panel" id="hcn-p-chat" aria-label="Conversation">
         <div id="hcn-log" class="cx-log" role="log" aria-live="polite"><div class="hd-empty" id="hcn-empty">No messages yet.</div></div>
         <button type="button" id="hcn-jump" class="hd-btn hd-btn--sm cx-jump" hidden>↓ New messages</button>
-        ${canPost ? '<div id="hcn-composer"></div>'
+        ${canPost ? '<div id="hcn-ctx-attached" class="ctx-attached" aria-live="polite"></div><div id="hcn-composer"></div>'
         : '<div class="cx-msg" style="padding:12px">Read-only access.</div>'}
       </section>
       ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
@@ -621,7 +622,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
             <button class="hd-btn" type="submit">Delegate</button><span id="hcn-deleg-msg" class="cx-msg" role="alert"></span></form>
           <div id="hcn-delegs"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Quarantine</div><div id="hcn-props"></div><div id="hcn-review" aria-live="polite"></div></div></section>` : ''}
-      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><div id="hcn-lineage" class="cx-stack"></div></section>'}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><div id="hcn-consults" class="cx-stack"></div><div id="hcn-lineage" class="cx-stack"></div></section>'}
       ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
@@ -674,7 +675,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         const cont = key === lastKey && at - lastAt < 5 * 60000;
         lastKey = key; lastAt = at.getTime();
         row.className = `cx-m${mine ? ' cx-m--mine' : ''}${agent ? ' cx-m--agent' : ''}${cont ? ' cx-m--cont' : ''}`;
-        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${renderMarkdown(e.text)}</div></div>`;
+        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${renderMarkdown(e.text)}</div>${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
         return row;
       }
       lastKey = null;
@@ -930,6 +931,79 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const wbModel = () => ({ ...WB, me: me.user_id, isOwner: info.role === 'owner',
       writable: canPost && (LIN.step === null || !!(LIN.asOf && LIN.asOf.head)),
       readOnlyReason: canPost ? 'A replay shows a past state. Choose Live to comment or propose a change.' : 'Your role in this room is read only.' });
+    // ---- T14: contextual chat, questions to a person or remote agent, and links across workspaces. Every one of these
+    // is checked again by the server; a hidden reference is shown as one fixed phrase and carries nothing.
+    const CTX = { attach: null, consults: [], links: [], targets: [], features: { context_refs: false, consultation: false, cross_links: false },
+      at: 0, busy: false, error: null, notice: null, askDraft: { target: '', question: '' }, seq: 0 };
+    const ctxModel = () => {
+      const f = CTX.features;
+      return { nodeId: LIN.sel, enabled: f.context_refs || f.consultation || f.cross_links, chat: f.context_refs, consult: f.consultation, crossLinks: f.cross_links,
+        canPost, me: me.user_id, isOwner: info.role === 'owner', consults: CTX.consults, links: CTX.links, busy: CTX.busy, error: CTX.error, notice: CTX.notice,
+        people: CTX.targets.map((t) => ({ kind: t.kind, id: t.id, label: t.kind === 'agent' ? t.label : (names.get(t.id) || shortId(t.id)) })),
+        otherNodes: mergePages(LIN.pages).nodes.map((n) => ({ id: n.id, label: n.label })),
+        askDraft: CTX.askDraft };
+    };
+    function drawAttach() {
+      const h = $('hcn-ctx-attached');
+      if (!h) return;
+      h.innerHTML = CTX.attach ? `<span class="ctx-chip"><span aria-hidden="true">◆</span> The next message refers to ${esc(CTX.attach)} <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-ctx-act="detach">Remove</button></span>` : '';
+      h.onclick = (e) => { if (e.target.closest('[data-ctx-act="detach"]')) { CTX.attach = null; drawAttach(); } };
+    }
+    async function loadContext() {
+      if (CTX.busy) return;
+      const my = ++CTX.seq;
+      const [c, l] = await Promise.allSettled([api.consultations(roomId), api.xlinks(roomId)]);
+      if (my !== CTX.seq || !alive) return;
+      CTX.at = Date.now();
+      if (c.status === 'fulfilled') { CTX.consults = Array.isArray(c.value.consultations) ? c.value.consultations : []; CTX.targets = Array.isArray(c.value.targets) ? c.value.targets : []; if (c.value.features) CTX.features = c.value.features; }
+      if (l.status === 'fulfilled') { CTX.links = Array.isArray(l.value.links) ? l.value.links : []; if (l.value.features) CTX.features = l.value.features; }
+      drawLineage(true);
+    }
+    async function ctxRun(fn, done) {
+      CTX.busy = true; CTX.error = null; CTX.notice = null; drawLineage(true);
+      try { await fn(); CTX.notice = done || null; } catch (e) { CTX.error = e instanceof AuthError ? 'Your session expired. Sign in again.' : (e && e.message) || 'The request failed.'; }
+      CTX.busy = false; CTX.at = 0; await loadContext();
+    }
+    const ctxKey = () => `web-ctx-${Date.now().toString(36)}-${randomString(9)}`;
+    function ctxAct(act, id) {
+      if (act === 'attach' && LIN.sel) { CTX.attach = LIN.sel; CTX.notice = 'The next message you send in the Chat tab refers to this item.'; drawAttach(); drawLineage(true); }
+      else if (act === 'cancel') ctxRun(() => api.cancelConsultation(roomId, id), 'Question cancelled.');
+      else if (act === 'decline') ctxRun(() => api.answerConsultation(roomId, id, declineBody()), 'Declined.');
+      else if (act === 'revoke') ctxRun(() => api.revokeLink(roomId, id), 'Link revoked.');
+    }
+    function ctxSubmit(kind, id, form) {
+      const node = LIN.sel;
+      if (kind === 'ask' && node) {
+        const q = String(form.get('question') || '').trim(); const t = String(form.get('target') || '');
+        if (q && t) ctxRun(async () => { await api.askConsultation(roomId, askBody(node, t, q, ctxKey())); CTX.askDraft = { target: t, question: '' }; }, 'Asked. You will see the answer here.');
+      } else if (kind === 'answer') {
+        const a = String(form.get('answer') || '').trim();
+        if (a) ctxRun(() => api.answerConsultation(roomId, id, answerBody(a)), 'Answered.');
+      } else if (kind === 'link' && node) {
+        const to = String(form.get('to') || '').trim();
+        if (to) ctxRun(() => api.createLink(roomId, linkBody(node, to, form.get('note'), ctxKey())), 'Linked.');
+      }
+    }
+    function drawConsults() {
+      const h = $('hcn-consults');
+      if (!h) return;
+      if (!h.dataset.bound) {                                     // the inbox sits outside the lineage box: bind it once
+        h.dataset.bound = '1';
+        h.addEventListener('click', (e) => {
+          const open = e.target.closest('[data-ctx-open]');
+          if (open) { pickNode(open.dataset.ctxOpen); drawLineage(true); return; }
+          const cx = e.target.closest('[data-ctx-act]');
+          if (cx) ctxAct(cx.dataset.ctxAct, cx.dataset.ctxId);
+        });
+        h.addEventListener('submit', (e) => {
+          e.preventDefault();
+          const cf = e.target.closest && e.target.closest('[data-ctx-form]');
+          if (cf && !CTX.busy) ctxSubmit(cf.dataset.ctxForm, cf.dataset.ctxId, new FormData(cf));
+        });
+      }
+      const html = renderInbox({ ...ctxModel(), enabled: CTX.features.consultation });
+      if (h.dataset.h !== html) { h.dataset.h = html; h.innerHTML = html; }
+    }
     const LIN = { step: null, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, pages: [], total: 0, next: null,
       truncated: null, asOf: null, timeline: null, error: null, timelineError: null, html: '', pending: null, fails: 0, notice: null, busy: false, at: 0, seq: 0, bound: false, layout: null,
       filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' } };
@@ -938,7 +1012,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       const filtered = filterGraph(graphAll, LIN.filters);
       return { graphAll, filtered, asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, queued: LIN.pending !== null, notice: LIN.notice, busy: LIN.busy, view: LIN.view,
         mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, total: LIN.total,
-        workbench: LIN.sel ? renderWorkbench(wbModel()) : '',
+        workbench: LIN.sel ? renderWorkbench(wbModel()) + renderContextPanel(ctxModel()) : '',
         graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
     };
     async function loadWorkbench(keep = false) {
@@ -1061,9 +1135,11 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       // live refresh only at the head of page one: a replay is static and "Load more" pages must survive
       if (!force && LIN.step === null && !LIN.busy && LIN.pages.length <= 1 && Date.now() - LIN.at > 8000) { loadLineage(); }
       else if (!force && !LIN.at && !LIN.busy) { loadLineage(); return; }
+      if (!CTX.busy && Date.now() - CTX.at > 15000) { CTX.at = Date.now(); loadContext(); }
       const m = linModel();
       LIN.layout = layoutGraph(m.filtered);
       const html = renderLineage(m);
+      drawConsults();
       if (LIN.html === html && box.innerHTML !== '') return;
       const a = document.activeElement;
       const key = a && box.contains(a) ? focusKey(a) : null;
@@ -1082,6 +1158,10 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         LIN.step = step; LIN.notice = null; LIN.error = null; if (step === null) LIN.pages = []; loadLineage();
       };
       box.addEventListener('click', (e) => {
+        const open = e.target.closest('[data-ctx-open]');
+        if (open) { pickNode(open.dataset.ctxOpen); drawLineage(true); return; }
+        const cx = e.target.closest('[data-ctx-act]');
+        if (cx) { ctxAct(cx.dataset.ctxAct, cx.dataset.ctxId); return; }
         const wb = e.target.closest('[data-wb-act]');
         if (wb && wb.dataset.wbAct === 'edge') {
           WB.edge = { edge_type: wb.dataset.wbEdgeType, from_id: wb.dataset.wbFrom, to_id: wb.dataset.wbTo };
@@ -1102,10 +1182,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       });
       box.addEventListener('submit', (e) => {
         e.preventDefault();                                              // Enter in the search box filters; it never navigates
+        const cf = e.target.closest && e.target.closest('[data-ctx-form]');
+        if (cf && !CTX.busy) { ctxSubmit(cf.dataset.ctxForm, cf.dataset.ctxId, new FormData(cf)); return; }
         const f = e.target.closest && e.target.closest('[data-wb-form]');
         if (f && !WB.busy) wbSubmit(f.dataset.wbForm, f.dataset.wbId, new FormData(f));
       });
       box.addEventListener('input', (e) => {
+        const cfld = e.target.dataset.ctxField;
+        if (cfld) { CTX.askDraft[cfld] = e.target.value; return; }
         const wf = e.target.dataset.wbField;
         if (wf) {                                                       // drafts live in memory so a refresh never eats typing
           if (wf === 'edit' && WB.editing) WB.editing.text = e.target.value;
@@ -1220,6 +1304,10 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         } catch (e) { $('hcn-task-msg').textContent = e.message; }
       };
     }
+    log.addEventListener('click', (ev) => {                       // a reference chip opens the item in the Lineage tab
+      const open = ev.target.closest && ev.target.closest('[data-ctx-open]');
+      if (open && !guest) { showSub('lineage'); pickNode(open.dataset.ctxOpen); drawLineage(true); }
+    });
     if ($('hcn-composer')) {
       composer = mountComposer($('hcn-composer'), {
         draftKey: `collab:${me.user_id}:${roomId}`,
@@ -1235,7 +1323,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
             const hits = S.agents.filter((a) => a.name === mention[1] && a.actions.includes('execute'));
             if (hits.length !== 1) throw new Error(hits.length ? `More than one agent is called @${mention[1]}; use the Tasks tab` : `No agent named @${mention[1]} in this room accepts tasks`);
             await api.createTask(roomId, hits[0].agent_id, mention[2]);
-          } else await api.say(roomId, text);
+          } else { await api.say(roomId, text, CTX.attach ? contextBody(CTX.attach) : undefined); CTX.attach = null; drawAttach(); }
           if (alive) { kick(); log.scrollTop = log.scrollHeight; }
           return { status: 'delivered', message: mention ? 'Task created' : 'Message posted' };
         },

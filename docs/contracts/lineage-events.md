@@ -628,6 +628,125 @@ Other keys: `max_instruction_chars`, `propose_per_10min`, `confirm_per_10min`, `
 - `GET /api/v1/steering/pending?instance_id=<id>`: when the target node carries an `instance_id` attribute, only a caller presenting that id is offered the request, so two Pi instances sharing one key do not consume each other's requests. Nodes without the attribute keep key-only pinning.
 - The steering routes refuse (403, `authentication_required`) on an open listener, which has no principal to pin to.
 
+## Contextual chat, consultation and cross-workspace links (T14)
+
+Extends the existing HCN service (`CollabService`): the same durable collab log, room membership, audit and lineage sink. No
+second chat, task or graph store. Code: `herdr_engineering/control_plane/collab_context.py`; the graph side is `graph.py`
+(`cross_link`, `node_context`, one admission rule). **Everything is off by default** (`control_plane.collab.contextual`, YAML only,
+no flag or environment variable); a new log event type is additive and there is no migration.
+
+```yaml
+control_plane:
+  collab:
+    contextual:
+      enabled: true          # default false
+      kill_switch: false     # true turns everything off at once (re-read per request by the combined server; a --collab-only process reads it at start)
+      context_refs: true     # chat references         (each of the three defaults to true once `enabled` is set)
+      consultation: true     # questions to a member or a remote agent
+      cross_links: true      # cross-workspace graph links
+      consult_ttl_seconds: 3600
+      consult_max_ttl_seconds: 86400
+```
+Other keys: `max_question_chars`, `max_answer_chars`, `consults_per_10min`, `max_open_per_target`, `max_open_per_asker`,
+`max_open_per_room`, `links_per_10min`, `max_links_per_room`, `max_refs_per_read`. Unknown keys, wrong types and an unreadable
+section are refused (the last fails CLOSED: everything off). The kill switch stops creation, stops answering, removes the MCP
+tools, renders every reference as hidden, empties `GET .../consultations` and `GET .../xlinks` (`enabled: false`), and removes `cross_link`
+edges and their ledger events from EVERY collab graph read (`lineage`, `lineage/timeline`, `lineage/events`, `nodes`, `nodes/{id}`,
+neighborhood, subgraph, `edge`). **Revoking a link and cancelling a question always work.** The keyed (operator/ingest) graph API
+is not behind the collab switch. If the central fleet file is deleted or unparseable AFTER having been valid, `collab.contextual`
+and `collab.steering` (the hot-reloaded switches) fail CLOSED (feature off, error logged once); `control_plane.config_failure_mode: last_good`
+is the explicit opt-in to keep the last good value instead. `delegation_enabled` is read once at start, so it cannot change under a bad file;
+any future hot-reloaded switch (forks) must read through `FleetConfigStore.secure_section`.
+
+### 1. Context references in chat
+`POST /api/v1/collab/rooms/{room}/messages` accepts one optional `context`, exactly one of
+`{"kind":"node","node_id"}`, `{"kind":"edge","edge_type","from_id","to_id"}`, `{"kind":"comment","comment_id"}`,
+`{"kind":"proposal","proposal_id"}` (exact key sets; nothing else rides along). Signed-in, non-guest members with the `post` right only:
+agents, remote agents and guests get 403; MCP `room_post` has no such argument.
+- **At post** the poster must see the target NOW through the room-narrowed reader (the T12 comment reader). A missing, hidden, other-room
+  or forbidden target is one indistinguishable `404 not found`. A proposal reference needs the `invite` right (proposals are the
+  owners' quarantine view); a comment reference needs its anchor to be visible and the comment not retracted.
+- **At every read** (`read_events`, so REST, long-poll `state`, SSE and MCP `room_read` alike) the reference is resolved again for THAT
+  reader. A reader who cannot see it gets `{"hidden": true, "label": "hidden reference"}` and nothing else: no kind, id or label. Agents,
+  remote agents, guests and every internal caller without a viewer always get hidden. A read resolves at most `max_refs_per_read`
+  distinct references (the rest are hidden), caches per request, and writes nothing (no audit event).
+- Never inlined: a comment's text, a proposal's content. The client follows the reference through the T11/T12 routes, which check again.
+- A rescope, an unlinked workspace, a dropped grant, a retracted comment or a removed member therefore hides the reference on the next read.
+
+### 2. Consultation
+`POST …/consultations` `{target:{kind:"user"|"agent",id}, subject:{kind:"node",node_id}, question, expires_in_seconds?, idempotency_key}`
+asks ONE question about ONE node. `GET …/consultations` lists the caller's own (asked or addressed to them) plus `targets` (who could be
+asked). `POST …/consultations/{id}/answer` `{action:"answer"|"decline", answer?}` (the target), `POST …/cancel` (the asker or a room owner).
+Remote agents use MCP `consult_inbox` / `consult_answer` (listed only while the feature is on).
+- Bounded and expiring: TTL (default 1 h, operator maximum), one answer, open caps per target / asker / room, a rate limit per asker and per
+  room. The asker must hold `post`; the target must be able to answer (`post`; not a viewer, guest or yourself) and, for a person, must
+  themselves see the subject. If the asker leaves the room, or the subject leaves the asker's sight, the question is `void`.
+- **Text only, never execution.** The answer is one cleaned text field. It creates no task, proposal, message or graph write by the
+  responder. A remote agent receives the question labelled UNTRUSTED (`CONSULT_NOTICE`), is never shown which node it is about, and
+  the asker reads its answer labelled untrusted.
+- The question and answer travel only to the asker and the target (never in the room feed, a notification or the graph).
+- **Graph record.** The service writes `thread:hcn-consult.<id>` (attrs: asker, target, timestamps; no text) and a `consultation` edge from it
+  to the subject, as the room's service principal. The prefix is reserved: no ingest key can write, edit or point at it. State changes
+  (answered, declined, cancelled) are published as `node.state`; expiry is NOT pushed (the node carries `expires_at`).
+
+### 3. Cross-workspace links: edge kind `cross_link`
+`POST …/xlinks` `{from:{kind:"node",node_id}, to:{kind:"node",node_id}, note?, idempotency_key}`; `GET …/xlinks`; `POST …/xlinks/{id}/revoke`.
+- **Authorization on both ends.** The actor is a signed-in, non-guest member with `post`; BOTH endpoints must be visible to the actor
+  through the room-narrowed reader; the workspaces are read from each endpoint's own scope label (never from the request) and must be
+  non-empty and different; the room must hold a view grant (`status`/`tabs`/`panes`) to EVERY such workspace. Anything not visible or not
+  found is one 404; the other refusals (`no_workspace`, `same_workspace`, `no_grant`) concern nodes the actor can already see.
+- **Distinct kind.** `cross_link` is in `EDGE_TYPES`, drawn and filterable like any edge. Provenance attrs are server-set: `link_id`,
+  `created_by`, `created_at`, `from_workspaces`, `to_workspaces`, `note`, `trust: user-asserted`, `source: hcn-xlink`; `provenance.writer`
+  is `collab:room:<room>`.
+- **Written only by the HCN service.** `graph.admit` accepts `cross_link` only from a principal of kind `collab` whose id is
+  `collab:room:*` (a kind an API key cannot mint) or an operator; everyone else, including the owner of both endpoints, gets the usual
+  `lineage_forbidden`, for `edge.add` and `edge.remove`. The service waives the writer/visibility checks for this one kind (it already
+  checked the person, the room and both ends); the edge still needs both nodes to exist.
+- **Per-room identity.** The edge key includes the room's service principal, so two rooms linking the same pair never share, merge scope
+  with, hide or squat on each other's edge. A reader sees an edge only if its own scope AND both endpoints are visible to them, so an
+  unlinked workspace or a dropped grant hides the link at once, and a replay never shows it before its event.
+- **Revocable and self-expiring.** The creator or a room owner revokes (`edge.remove`). A link also **lapses** and is tombstoned when the
+  room stops holding a view grant to either workspace, or its creator is removed from the room or loses `post` (checked after workspace
+  unlink / grant change / member removal and on every list). Re-granting does not resurrect it.
+- Durable: `xlink_created`, `xlink_revoked`, `xlink_published`, `xlink_unpublished` events rebuild the state on restart; a graph that was
+  down catches up on the next list.
+
+### Threat model (what was considered)
+| threat | control | test (tests/control_plane/test_contextual.py unless noted) |
+|---|---|---|
+| reference reveals a node the reader cannot see | per-reader resolution on every read; hidden = fixed phrase, no id/kind/label; budgeted, cached | `test_a_reference_is_hidden_from_everyone_who_cannot_see_it_and_leaks_nothing`, `test_rescope_workspace_unlink_and_membership_loss_hide_a_stale_reference`, `collab-context.test.js` |
+| existence oracle through posting a reference | hidden / missing / other-room / forbidden are one 404; the refusal posts nothing | `test_a_reference_is_validated_and_visibility_checked_at_post` |
+| agent, remote agent or guest reads or attaches a reference | agents/guests never resolve; attaching is people only; MCP has no argument | `test_who_may_attach_a_reference`, same leak test |
+| forged stored reference naming another room's node | resolved with a one-room reader | `test_a_reference_to_the_other_rooms_node_resolved_in_the_wrong_room_is_hidden` |
+| stale reference after rescope / removal / retraction | resolved at read, never cached server-side | rescope + comment tests |
+| cross-room link creation or leakage | one-room reader at create; per-room edge instance; reads gated by scope AND both endpoints | `test_a_link_is_per_room_and_never_leaks_into_another`, `test_both_ends_must_be_visible_and_in_different_granted_workspaces` |
+| link forging / squatting / tombstoning by an emitter | `cross_link` writable only by the room service principal; removal likewise; per-room key | `test_an_ingest_key_can_neither_forge_squat_nor_tombstone_a_link` |
+| link outlives its authorization | lapse sweep on unlink, grant drop and member removal, and on every lineage read; no resurrection; at READ time a link shows only while active AND its creator is authorized AND both grants hold, so a down graph or a disabled creator never leaves it visible | `test_unlinking_a_workspace_or_dropping_its_grant_lapses_the_link_for_good`, `test_removing_the_creator_ends_their_links`, `test_a_revoked_link_is_hidden_at_once_even_with_the_graph_down_and_the_retraction_is_durable`, `test_a_disabled_creator_lapses_the_link_for_every_reader_and_the_next_read_sweeps_it` |
+| consultation spam / DoS | TTL, open caps per target/asker/room, rate limits, one answer, size caps | `test_limits_expiry_and_a_departed_asker` |
+| prompt injection through question or answer | text only; labelled untrusted; no task/proposal/message/graph write by the responder; spoofing characters stripped; the subject is withheld from remote agents | `test_an_external_agent_is_asked_in_text_only_and_never_sees_the_subject`, `test_a_member_asks_another_member_and_gets_one_text_answer` |
+| spoofed system message | server-set `asked_by` / `created_by`; the reference is a separate field, never part of the text; bodies naming an identity are refused | `test_who_may_ask_and_whom`, `test_who_may_link`, `collab-context.test.js` |
+| stale consultation | void when the asker leaves or the subject leaves the asker's sight; expiry | `test_a_subject_that_leaves_the_askers_sight_voids_the_question`, limits test |
+| notification / feed content leak | there is no notification channel; question and answer are never in the feed, the graph or another person's list | `test_the_graph_records_who_asked_whom_about_what_but_never_the_text`, `test_a_member_asks_…` |
+| kill switch | default off; per-request; fails closed; revoke/cancel still work | `test_the_switch_is_off_by_default_and_off_means_hidden_and_refused`, `test_switch_off_hides_links_from_the_lineage_but_revoking_still_works`, `tests/test_central_config_servers.py` |
+| restart / graph outage | event-sourced; the pending publish/retract set is derived from the durable records and flushed at server start, every 30 s, and on lineage reads | `test_a_sink_that_was_down_catches_up_and_a_restart_keeps_the_state`, `test_a_restart_retries_a_retraction_the_graph_never_got` |
+| consultation thread reveals asker/target to people who cannot see the subject | the thread node and edge carry the SUBJECT's own scope label (room or mission, plus workspace); if that label cannot be carried nothing is published | `test_the_consultation_thread_is_visible_exactly_to_those_who_see_the_subject`, `test_a_subject_whose_scope_cannot_be_carried_publishes_no_thread` |
+| existence probing through consultation errors | unknown target, yourself, a target who cannot see the subject and a hidden subject are one `404 not found` | `test_one_answer_for_every_reason_a_question_cannot_be_asked` |
+| invisible / bidi / tag characters in questions, answers, notes | the external-agent sanitizer (`clean_text`: tag chars, soft hyphen, U+180E, all Cc/Cf/Cs/Co/Cn), over-long refused | `test_untrusted_text_is_cleaned_like_an_external_agents` |
+| unreadable fleet file keeps a switch on | hot switches fail closed unless `config_failure_mode: last_good` | `tests/test_central_config_servers.py::test_a_deleted_or_unparseable_fleet_file_turns_security_switches_off`, `..._the_feature_off`, `..._last_good_is_an_explicit_operator_opt_in` |
+
+### Limitations
+- A remote agent is never told which node a question is about (the asker must put what it needs in the text), and A2A has no
+  consultation method (MCP and REST only).
+- Consultation expiry is computed, not pushed: the graph thread node stays `open` (with `expires_at`) after expiry.
+- Chat chips are resolved when a message is fetched; a chip already on screen is not re-resolved until the room is reloaded.
+- The thread node and `consultation` edge show who asked whom about which node to exactly the people who can see the subject (not the text). A subject whose label names several workspaces gets no thread node.
+- Chat text from people is not run through the invisible-character sanitizer (it would break ZWJ emoji); questions, answers and link notes are.
+- Counts in a graph read (`total`, page sizes) are computed before the link filter and can still reveal that a withheld link exists.
+- A link is a person's assertion, not proof that the two items are related. Only node-to-node links; a consultation is about a node.
+- Endpoint workspaces come from the node's scope label: a node whose events name no workspace (or several) cannot be a link endpoint.
+- The kill switch hides links in every collab graph read; the keyed operator/ingest graph API is not behind it. Only the combined server (graph + lineage sink) offers these routes; a `--collab-only` process answers 409/404.
+- Operators can write `cross_link` (trusted, like every other write). No Pi change is needed or made; Pi emitters cannot write the kind.
+
 ## Forks and promotion (T13)
 
 Alternative implementations reuse the existing vocabulary; there is no second store.

@@ -109,10 +109,18 @@ export class CollabApi {
   createProject(name) { return this.call('POST', '/projects', { name }); }
   createRoom(project, name) { return this.call('POST', `/projects/${encodeURIComponent(project)}/rooms`, { name }); }
   events(id, cursor) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/events?cursor=${cursor}&limit=200`); }
-  say(id, text) {
+  say(id, text, context) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/messages`,
-      { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}` });
+      { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}`, ...(context ? { context } : {}) });
   }
+  // Consultation (T14): a question and ONE text answer. Cross-workspace links (T14): both ends are checked by the server.
+  consultations(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/consultations`); }
+  askConsultation(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/consultations`, body); }
+  answerConsultation(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/consultations/${encodeURIComponent(id)}/answer`, body); }
+  cancelConsultation(room, id) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/consultations/${encodeURIComponent(id)}/cancel`, {}); }
+  xlinks(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/xlinks`); }
+  createLink(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/xlinks`, body); }
+  revokeLink(room, id) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/xlinks/${encodeURIComponent(id)}/revoke`, {}); }
   agents() { return this.call('GET', '/agents'); }
   connectAgent(name) {
     return this.call('POST', '/agents/connect', { harness_type: 'claude-code', ...(name ? { name } : {}) });
