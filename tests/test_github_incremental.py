@@ -360,9 +360,17 @@ def test_restart_spreads_reconcile_instead_of_making_every_repository_due():
     clock = [1_000_000.0]
     monitor_for(fake, shared, now=lambda: clock[0], full_reconcile_interval=3000, reconcile_per_pass=12).refresh()
     clock[0] += 10
-    fake.log.clear()
-    monitor_for(fake, shared, now=lambda: clock[0], full_reconcile_interval=3000, reconcile_per_pass=12).refresh()
-    assert len({entry[1] for entry in issue_calls(fake)}) < 12
+    restarted = monitor_for(fake, shared, now=lambda: clock[0], full_reconcile_interval=3000, reconcile_per_pass=12)
+    reads, passes_with_reads = Counter(), 0
+    for _ in range(10):  # one full interval in 300 s passes
+        fake.log.clear()
+        restarted.refresh()
+        touched = {entry[1] for entry in issue_calls(fake)}
+        reads.update(touched)
+        passes_with_reads += bool(touched)
+        clock[0] += 300
+    assert sorted(reads.values()) == [1] * 12  # every stored repository reconciled exactly once
+    assert passes_with_reads > 1  # spread over the interval, not all at the restart
 
 
 # ---------------------------------------------------------------- G4
