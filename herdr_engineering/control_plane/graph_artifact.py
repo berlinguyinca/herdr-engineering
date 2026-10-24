@@ -10,10 +10,13 @@ The renderer:
   * keeps provenance and source links,
   * is pure (no network, no file I/O) so it is fully unit-testable.
 
-Archify is NOT vendored here: the spec requires verifying upstream license and
-API before pinning it (05-artifacts-archify.md, 09-decisions). This module is
-the deterministic snapshot contract that a pinned Archify adapter could later
-consume; it is the safe fallback renderer.
+Archify is NOT vendored here: upstream (`tt-a1i/archify`, MIT, active) was
+verified (09-decisions) and formally dropped as a dependency — it is a heavy
+Node agent-skill package that would duplicate this P5 deterministic/security
+gate with no gating value. This module is the safe deterministic renderer; it
+closes only the P5 deterministic/security gate, NOT the broader P5 WebUI /
+artifact-surface deliverables (WebUI rendering, source links, sharing,
+annotation, per-family `/artifact` commands), which remain open.
 """
 from __future__ import annotations
 

@@ -117,8 +117,28 @@ restored.
 
 ## 5. Honest open items (not invented)
 
-- **Archify license/API** — unverified upstream; P5 uses the safe renderer
-  until pinned.
+- **Archify — VERIFIED + formally dropped (follow-up PR); P5 narrowed.**
+  Upstream `tt-a1i/archify` (the only real Archify) was verified against its
+  pinned source: MIT license (LICENSE + npm), actively maintained (88k+ stars,
+  stable v3.2.0, pushed 2026-10-24), a deterministic JSON-IR→HTML renderer
+  driven by an AI agent via `node bin/archify.mjs finalize <type>
+  <candidate.json> <output.html> --quality showcase --json`, covering
+  architecture/workflow/sequence/dataflow/lifecycle/erd/class/tree/timeline/
+  waterfall — so the diagram families the spec asks to confirm are genuinely
+  supported. **Decision: not vendored.** Archify is a large Node ≥18
+  agent-skill package (~7.3MB, per-family renderers, sidecar/delivery/
+  browser-check machinery) intended to be driven by an AI agent, not a
+  lightweight library; the spec forbids parallel/duplicate implementations,
+  and the deterministic safe renderer (`graph_artifact.py`) already satisfies
+  the narrower P5 security/determinism gate (deterministic snapshot + CSP +
+  sanitization, 4 tests). Vendoring Archify would duplicate that gate with a
+  heavy dependency and no gating value. **Re-scope, honestly stated:** the
+  P5 deliverables that Archify would have enabled — validated snapshots in the
+  Libre WebUI, click-through source links, sharing/annotation, and the
+  `/artifact <family>` slash commands for every family — are NOT implemented
+  and remain OPEN. Only the deterministic/security gate is closed; re-pin
+  Archify if an interactive canvas or the WebUI artifact surface is later
+  required.
 - **Live ingest wiring — DONE (follow-up PR).** `GraphIngestAdapter`
   (`graph_ingest.py`) translates mission/session/repository/request/span
   lifecycle events into lineage envelopes and routes them through the real
@@ -151,6 +171,7 @@ restored.
 | History/scale/runbook (P6) | ✅ complete | 6 tests |
 | Live ingest wiring | ✅ complete | graph_ingest.py + --system-graph opt-in, 8 tests |
 | Dashboard UI wiring | ✅ complete | collab-lineage.js renders spec-02 node/edge kinds, 23 client tests |
+| Archify (P5) | ⚠️ narrowed | upstream verified (MIT, active, JSON-IR renderer, `finalize` CLI); not vendored — deterministic/security gate closed; WebUI render, source links, sharing, annotation, `/artifact` slash commands remain OPEN |
 
 *Progress is tracked by passing tests and linked evidence, not generated-file
 counts (spec 08).*
