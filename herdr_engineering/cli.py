@@ -12,8 +12,10 @@ import json
 import logging
 import os
 import re
+import signal
 import socket
 import sys
+import threading
 from typing import Any
 
 from .version import __version__
@@ -282,6 +284,13 @@ def _build_parser() -> argparse.ArgumentParser:
     asub.add_parser("list", help="list stored artifacts").set_defaults(func=_cmd_art_list)
     p2 = asub.add_parser("retention", help="enforce retention policy")
     p2.set_defaults(func=_cmd_art_retention)
+    # system-graph artifact (P5): deterministic sanitized snapshot renderer.
+    ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
+    gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
+    p2 = gas.add_parser("render", help="render a graph snapshot JSON to a deterministic sanitized HTML artifact")
+    p2.add_argument("graph_json", help="path to a graph snapshot JSON file")
+    p2.add_argument("--out", default=None, help="output .html path (default: <graph_json>.html)")
+    p2.set_defaults(func=_cmd_graph_artifact_render)
 
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
@@ -455,6 +464,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("review_id"); p2.add_argument("decision")
     p2.add_argument("--comment"); p2.set_defaults(func=_cmd_review_resolve)
 
+    # review-gate ----------------------------------------------------------
+    p = sub.add_parser("review-gate", help="PR review gate tools")
+    gsub = p.add_subparsers(dest="review_gate_command", required=True)
+    p2 = gsub.add_parser("worker", help="run the reviewer worker (claims jobs, calls the model)")
+    p2.add_argument("--config", required=True, help="worker YAML config file")
+    p2.add_argument("--once", action="store_true", help="run one claim cycle and exit")
+    p2.set_defaults(func=_cmd_review_gate_worker)
+    p2 = gsub.add_parser("pool", help="run a pool of reviewer workers sized by the review queue")
+    p2.add_argument("--config", required=True, help="pool YAML config file")
+    p2.set_defaults(func=_cmd_review_gate_pool)
+    p2 = gsub.add_parser("check-skips", help="fail when a test is skipped outside the disabled-tests file")
+    p2.add_argument("--junit", action="append", required=True, help="junit XML file or directory (repeatable)")
+    p2.add_argument("--disabled", required=True, help="disabled-tests YAML file")
+    p2.set_defaults(func=_cmd_review_gate_check_skips)
+
     # candidates -----------------------------------------------------------
     p = sub.add_parser("candidates", help="multi-agent worktree comparison (spec 0140)")
     csub = p.add_subparsers(dest="candidates_command", required=True)
@@ -495,6 +519,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--pg-dsn", default=None,
                     help="optional Postgres DSN to hydrate the repo from "
                          "durable state on startup (Spec §106)")
+    p2.add_argument("--system-graph", action="store_true",
+                    help="opt-in: reflect mission/session/repo/trace lifecycle events "
+                         "into the running lineage graph (system-graph spec P2-P4)")
     p2.add_argument("--seed-demo", action="store_true",
                     help="seed a fresh in-memory repo with demo data so the "
                          "UI is populated (useful when no Postgres is present)")
@@ -1070,6 +1097,25 @@ def _cmd_art_publish(args) -> int:
     _print_json({"ok": res.ok, "status": res.status, "error": res.error,
                  "artifact": res.artifact.to_dict() if res.artifact else None})
     return 0 if res.ok else 1
+
+
+def _cmd_graph_artifact_render(args) -> int:
+    """Render a graph snapshot JSON file (GraphProjection.snapshot() shape) to
+    a deterministic sanitized HTML artifact (system-graph P5).
+    """
+    import json as _json
+    from pathlib import Path
+
+    from .control_plane.graph_artifact import GraphArtifactRenderer
+
+    data = _json.loads(Path(args.graph_json).read_text())
+    result = GraphArtifactRenderer(
+        title=data.get("title", "System graph snapshot")).render(data)
+    out = args.out or f"{args.graph_json}.html"
+    Path(out).write_text(result.html)
+    _print_json({"ok": True, "out": out, "digest": result.digest,
+                 "nodes": result.node_count, "edges": result.edge_count})
+    return 0
 
 
 def _cmd_art_list(args) -> int:
@@ -1875,7 +1921,7 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent
+    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -1914,6 +1960,11 @@ def _cmd_dev_agent(args) -> int:
     # extra excluded ports + the dev-port window the agent will register.
     extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
         "agent_exclude_ports", []))
+    try:
+        agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
+    except ValueError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
     def control_plane_for(host_cfg):
         return fabric_cfg.get("control_plane_url") or host_cfg.control_plane_url
 
@@ -1928,6 +1979,9 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=control_plane_for(live),
+            host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
+            host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
+            agent_binaries=agent_binaries,
         ))
     if args.once:
         summary = agent.scan_once()
@@ -2201,6 +2255,88 @@ def _cmd_browser(args) -> int:
     return 0 if cap.ok else 1
 
 
+def _cmd_review_gate_worker(args) -> int:
+    """Exit 0 on a clean stop, 1 when the reviewer key is refused, 2 on a config error.
+
+    Messages are fixed text (config errors carry no key material); nothing from a
+    response, URL or key file is printed.
+    """
+    from .review_gate import worker as rgw
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        config = rgw.load_worker_config(args.config)
+        reviewer = rgw.ReviewWorker(config)
+        if args.once:
+            print("handled" if reviewer.run_once() else "idle")
+            return 0
+        stop = threading.Event()
+
+        def _request_stop(_signum, _frame):
+            stop.set()
+
+        signal.signal(signal.SIGINT, _request_stop)
+        signal.signal(signal.SIGTERM, _request_stop)
+        reviewer.run(stop)
+        return 0
+    except rgw.WorkerAuthError:
+        print("review-gate worker: the control plane refused the reviewer key", file=sys.stderr)
+        return 1
+    except rgw.WorkerConfigError as exc:
+        print(f"review-gate worker: config error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_review_gate_pool(args) -> int:
+    """Same exit codes and fixed-text messages as ``review-gate worker``."""
+    from .review_gate import pool as rgp
+    from .review_gate import worker as rgw
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        pool = rgp.ReviewPool(rgp.load_pool_config(args.config))
+        stop = threading.Event()
+
+        def _request_stop(_signum, _frame):
+            stop.set()
+
+        signal.signal(signal.SIGINT, _request_stop)
+        signal.signal(signal.SIGTERM, _request_stop)
+        pool.run(stop)
+        return 0
+    except rgw.WorkerAuthError:
+        print("review-gate pool: the control plane refused the reviewer key", file=sys.stderr)
+        return 1
+    except rgw.WorkerConfigError as exc:
+        print(f"review-gate pool: config error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - restartable: not a refused key or bad config
+        print(f"review-gate pool: internal error: {type(exc).__name__}", file=sys.stderr)
+        return 3
+
+
+def _cmd_review_gate_check_skips(args) -> int:
+    """Exit 0 clean, 1 when a skipped test is not in the disabled file, 2 on bad input."""
+    from .review_gate import skips
+
+    try:
+        report = skips.check_junit(args.junit, skips.load_disabled(args.disabled))
+    except skips.SkipsError as exc:
+        print(f"review-gate check-skips: {exc}", file=sys.stderr)
+        return 2
+    for name in report.unused_disabled:
+        print(f"warning: listed as disabled but not skipped: {name}", file=sys.stderr)
+    if report.skipped_unlisted:
+        print(f"{len(report.skipped_unlisted)} test(s) skipped outside the disabled-tests file:")
+        for name in report.skipped_unlisted:
+            print(f"- {name}")
+        return 1
+    print(f"ok: {report.total} testcases, no unlisted skips")
+    return 0
+
+
 def _cmd_review_request(args) -> int:
     from .browser import PlannotatorAdapter
     review = PlannotatorAdapter().request_review(
@@ -2325,6 +2461,22 @@ def _parse_host_aliases(raw: str) -> dict[str, str]:
     return {a.strip(): c.strip() for a, c in pairs if a.strip() and c.strip()}
 
 
+def _require_durable_review_gate(cp: dict, dsn) -> None:
+    """An enabled review gate needs Postgres (``control_plane.pg_dsn``).
+
+    Gate state (PR states, review queue, author pins) is event-sourced and
+    written with ``require_durable=True``. Without a DSN the repo has no sink,
+    those writes would live only in memory and a restart would forget every
+    approval and escalation, so the real server refuses to start. The check
+    lives here, where the DSN is known: a ``ControlPlaneServer`` built directly
+    on an in-memory ``ControlPlaneRepo()`` (tests, embedding) is not refused.
+    """
+    gate = cp.get("review_gate")
+    if not dsn and isinstance(gate, dict) and gate.get("enabled") is True:
+        raise SystemExit("control_plane.review_gate needs durable storage: set "
+                         "control_plane.pg_dsn, or disable the review gate")
+
+
 def _cmd_cp_web(args) -> int:
     """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
 
@@ -2377,6 +2529,9 @@ def _cmd_cp_web(args) -> int:
             raise SystemExit("fleet config control_plane.lineage_key_scopes: an entry names an operator-role key; operator keys "
                              "are not restricted, so the entry would silently do nothing. Remove it or use a non-operator key")
         lineage_key_scopes = {str(k): v for k, v in raw_scopes.items()}
+    # Opt-in: reflect mission/session/repo/trace lifecycle events into the running
+    # lineage graph (system-graph spec P2-P4). Off by default.
+    system_graph = bool(cp.get("system_graph")) or bool(getattr(args, "system_graph", False))
     if args.collab_cognito_group is None:
         args.collab_cognito_group = "local.dev"
     # The Postgres DSN comes from the fleet file's control_plane section (the
@@ -2385,6 +2540,27 @@ def _cmd_cp_web(args) -> int:
     inspector_limits = cp.get("inspector_limits") or {}
     if not isinstance(inspector_limits, dict):
         raise SystemExit("fleet config control_plane.inspector_limits must be a mapping")
+    from .control_plane.retention import usage_retention_config
+    try:
+        usage_retention = usage_retention_config(cp.get("llm_proxy"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.attention_inbox import attention_config
+    try:
+        attention = attention_config(cp.get("attention"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.mission_outcome import missions_config
+    try:
+        missions = missions_config(cp.get("missions"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.ci_fix import ci_fix_config
+    try:
+        ci_fix = ci_fix_config(cp.get("ci_fix"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    _require_durable_review_gate(cp, dsn)
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
@@ -2440,7 +2616,8 @@ def _cmd_cp_web(args) -> int:
             approval = ApprovalPolicy(auto_groups=[args.collab_cognito_group],
                                       approver_groups=args.collab_approver_group)
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
-                               delegation_enabled=_delegation_switch(args, cp))
+                               delegation_enabled=_delegation_switch(args, cp),
+                               summary_fix=getattr(args, "collab_summary_fix", None))
         if args.collab_only:
             collab.hydrate(sink.load())
     elif args.collab_users_file:
@@ -2489,6 +2666,7 @@ def _cmd_cp_web(args) -> int:
                 return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("insights")
             collab.insights_source = _insights_from_yaml
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
+                             system_graph=system_graph,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
                              # collab-only has no operator listener, so nothing is left open
@@ -2499,6 +2677,8 @@ def _cmd_cp_web(args) -> int:
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              summary_config=cp.get("agent_summaries") or {},
                              review_quorum=_review_quorum_config(cp),
+                             usage_retention=usage_retention, attention=attention,
+                             ci_fix=ci_fix, missions=missions,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
@@ -2570,6 +2750,8 @@ COLLAB_CONFIG_KEYS = {
     "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
     "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
     "insights": ("collab_insights", dict),                # T15 attention inbox, progress, analytics; YAML only, off by default
+    # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
+    "summary_fix": ("collab_summary_fix", dict),
 }
 
 
@@ -2585,6 +2767,13 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
+        if kind is dict and key == "summary_fix":
+            from .control_plane.collab import summary_fix_config
+            try:
+                setattr(args, dest, summary_fix_config(value))
+            except ValueError as exc:
+                raise SystemExit(f"fleet config {exc}") from None
+            continue
         if kind is list:
             if isinstance(value, str):
                 value = [value]
@@ -2622,6 +2811,7 @@ def _delegation_switch(args, cp) -> bool:
     if not isinstance(value, bool):
         raise SystemExit("fleet config control_plane.collab.delegation_enabled must be true or false")
     return value
+
 
 def _review_quorum_config(cp):
     """Parse control_plane.review_quorum (None = off); a bad block stops startup."""

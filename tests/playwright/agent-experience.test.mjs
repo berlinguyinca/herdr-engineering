@@ -20,13 +20,14 @@ async function withAgent(run){
     await page.goto(`http://127.0.0.1:${server.address().port}`);await page.clock.install();
     await page.evaluate(async()=>{
       const {mountSessionWorkspace}=await import('/session-workspace.js');
-      window.agent={session_id:'agent:one',display_name:'Amber Finch',agent_handle:'amber-finch',name_version:1,status:'active',updated_at:new Date().toISOString(),capabilities:{rename_agent:true,regenerate_summary:true}};
-      window.summary={state:'ready',overview:'Fixed **recording**.',where_left_off:'Review the final diff.',next_steps:['Run the full tests'],decisions:[],discussed:[],completed:['Captured messages'],blockers:[],generated_at:'2026-10-22T12:00:00Z',model:'small-qwen',coverage:{status:'partial',message_count:3,reasons:['earlier messages expired']}};
-      window.summaryReads=0;window.regenerations=0;window.renames=[];
+      window.agent={session_id:'agent:one',display_name:'Amber Finch',agent_handle:'amber-finch',name_version:1,status:'active',updated_at:new Date().toISOString(),capabilities:{rename_agent:true,regenerate_summary:true,fix_summary_item:true}};
+      window.summary={state:'ready',overview:'Fixed **recording**.',where_left_off:'Review the final diff.',next_steps:['Run the full tests'],decisions:[],discussed:[],completed:['Captured messages'],blockers:['Lint fails <b>here</b>'],generated_at:'2026-10-22T12:00:00Z',model:'small-qwen',coverage:{status:'partial',message_count:3,reasons:['earlier messages expired']}};
+      window.summaryReads=0;window.regenerations=0;window.renames=[];window.fixes=[];
       window.client={
         getInspector:async()=>({epoch:'one',events:[{seq:1,rev:1,kind:'message',agent_id:'main',data:{role:'assistant',text:'Ready'}},{seq:2,rev:2,kind:'tool',agent_id:'helper',data:{tool:'read_json',output:'{"<script>":{"answer":42}}'}}],summary:{agents:[{agent_id:'main',display_name:'Amber Finch'},{agent_id:'helper',display_name:'Slate Owl',agent_handle:'slate-owl',parent_agent_id:'main'}],counts:{message:1}}}),
         inspectorStreamUrl:()=>'/stream',listSessions:async()=>({sessions:[window.agent]}),listMissions:async()=>({missions:[]}),
         getAgentSummary:async()=>{window.summaryReads++;if(window.summaryFailure)throw new Error('Inference offline');return structuredClone(window.summary);},
+        fixSummaryItem:async(id,list,index,text)=>{window.fixes.push({id,list,index,text});if(list==='blockers')throw Object.assign(new Error('The agent that owns this summary is not running.'),{status:409,body:{fallback:'helper_unavailable'}});return {ok:true,status:'delivered'};},
         regenerateAgentSummary:async()=>{window.regenerations++;return {...window.summary,state:'pending'};},
         renameAgent:async(id,name,version)=>{window.renames.push({id,name,version});if(window.renameConflict)throw Object.assign(new Error('Name already reserved'),{status:409});return {display_name:name,handle:'new-name',version:2};},
       };
@@ -99,4 +100,27 @@ test('operator rename conflicts preserve input and viewer controls remain hidden
   await page.evaluate(()=>{window.agent.capabilities={rename_agent:false,regenerate_summary:false};window.remount();});
   assert.equal(await page.getByRole('button',{name:'Rename agent',exact:true}).count(),0);
   assert.equal(await page.getByRole('button',{name:'Regenerate summary',exact:true}).count(),0);
+}));
+
+test('Summary blockers and next steps can be handed back to the owning agent once',()=>withAgent(async page=>{
+  await page.locator('[data-agent-summary] details > summary').click();
+  const fixes=page.getByRole('button',{name:'Let the agent fix this',exact:true});
+  assert.equal(await fixes.count(),2);
+  assert.match(await page.locator('[data-agent-summary]').innerText(),/Lint fails <b>here<\/b>/);
+  await page.locator('[data-fix-summary][data-list="next_steps"]').click();
+  await page.getByRole('button',{name:'Sent to agent',exact:true}).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Sent to agent',exact:true}).isDisabled(),true);
+  assert.equal(await page.locator('[data-agent-summary] details').evaluate(node=>node.open),true);
+  assert.deepEqual(await page.evaluate(()=>window.fixes),[{id:'agent:one',list:'next_steps',index:0,text:'Run the full tests'}]);
+  await page.locator('[data-fix-summary][data-list="blockers"]').click();
+  await page.getByRole('alert').filter({hasText:'not running'}).waitFor();
+  assert.match(await page.getByRole('alert').filter({hasText:'not running'}).innerText(),/Start the agent again/);
+  assert.equal(await page.locator('[data-fix-summary][data-list="blockers"]').isDisabled(),false);
+  await page.clock.fastForward(10000);await page.clock.runFor(100);
+  assert.equal(await page.getByRole('button',{name:'Sent to agent',exact:true}).isDisabled(),true);
+  await page.locator('[data-fix-summary][data-list="next_steps"]').click({force:true});
+  assert.equal(await page.evaluate(()=>window.fixes.filter(f=>f.list==='next_steps').length),1);
+  await page.evaluate(()=>{window.agent.capabilities={fix_summary_item:false};window.remount();});
+  await page.clock.runFor(200);
+  assert.equal(await page.locator('[data-fix-summary]').count(),0);
 }));

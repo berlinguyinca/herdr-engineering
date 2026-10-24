@@ -46,6 +46,27 @@ def _dict(row):
     return row.to_dict() if hasattr(row, 'to_dict') else dict(row)
 
 
+def bound_ci_provider(factory, provider_url=None):
+    """Resolve once and reject a retained identity before any upstream I/O."""
+    provider = factory()
+    if provider_url is not None:
+        def canonical(value):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError('Exact CI provider identity is required')
+            try:
+                url = urlsplit(value.strip())
+                if (url.scheme != 'https' or not url.hostname or url.username or url.password
+                        or url.query or url.fragment):
+                    raise ValueError
+                port = url.port
+                return (url.scheme, url.hostname.lower(), port or 443, url.path.rstrip('/'))
+            except ValueError:
+                raise ValueError('Exact CI provider identity is invalid') from None
+        if canonical(provider_url) != canonical(getattr(provider, 'base_url', None)):
+            raise ValueError('CI provider changed; this retained run cannot be read or acted on')
+    return provider
+
+
 class CIMonitor:
     def __init__(self, *, provider_factory=None, interval=30, repo_limit=500,
                  budget=120, now=None, on_transition=None, actions_enabled=False,
@@ -163,7 +184,7 @@ class CIMonitor:
                     rows = provider.pipelines(str(repo['id']), per_page=20)
                     successful_repos.add(str(repo['id']))
                     pipelines[group] = [redact_payload({**_dict(row), 'repository': name,
-                                         'provider_repo_id': repo['id']}) for row in rows]
+                                         'provider_repo_id': repo['id'], 'provider_url': provider.base_url.rstrip('/')}) for row in rows]
                 except Exception as exc:
                     pipelines[group] = previous.get(group, [])
                     errors[group] = _error(exc)[1]
@@ -242,9 +263,9 @@ class CIMonitor:
                    for rows in pipelines.values() for r in rows}
         self._observed = {k: v for k, v in self._observed.items() if k in current}
 
-    def detail(self, repository, number):
+    def detail(self, repository, number, *, provider_url=None):
         repository, number = self._validate(repository, number)
-        provider = self._factory()
+        provider = bound_ci_provider(self._factory, provider_url)
         if not provider.available:
             return {'available': False, 'error': 'Woodpecker is not configured.'}
         try:
@@ -252,17 +273,21 @@ class CIMonitor:
             if row is None:
                 return {'available': False, 'error': 'Pipeline was not found.'}
             row = redact_payload(_dict(row))
+            if provider_url is not None:
+                row.update(provider_url=provider.base_url.rstrip('/'),
+                           provider_repo_id=row.get('provider_repo_id', repository), run_number=number)
             if not self.actions_enabled:
                 row.update(can_retry=False, can_cancel=False)
-            return {'available': True, 'pipeline': row, 'checked_at': _stamp()}
+            return {'available': True, 'pipeline': row, 'checked_at': _stamp(),
+                    **({'provider_url': provider.base_url.rstrip('/')} if provider_url is not None else {})}
         except Exception as exc:
             return {'available': False, 'status': _error(exc)[0], 'error': _error(exc)[1]}
 
-    def log(self, repository, number, step):
+    def log(self, repository, number, step, *, provider_url=None):
         repository, number = self._validate(repository, number)
         if not isinstance(step, str) or not step or len(step) > 200:
             raise ValueError('step is required')
-        provider = self._factory()
+        provider = bound_ci_provider(self._factory, provider_url)
         try:
             value = provider.step_log(repository, number, step)
             if value is None:
@@ -270,18 +295,19 @@ class CIMonitor:
             # Redact exact credential as well as common secret patterns.
             value = value.replace(provider.token, '[REDACTED]') if provider.token else value
             return {'available': True, 'log': redact_text(value[:262144]),
+                    **({'provider_url': provider.base_url.rstrip('/')} if provider_url is not None else {}),
                     'truncated': len(value) > 262144 or value.endswith('[log truncated; open CI for the full log]'),
                     'checked_at': _stamp()}
         except Exception as exc:
             return {'available': False, 'log': '', 'error': _error(exc)[1]}
 
-    def action(self, repository, number, action):
+    def action(self, repository, number, action, *, provider_url=None):
         repository, number = self._validate(repository, number)
         if not self.actions_enabled:
             raise PermissionError('CI actions are disabled by this deployment')
         if action not in {'retry', 'cancel'}:
             raise ValueError('unsupported CI action')
-        provider = self._factory()
+        provider = bound_ci_provider(self._factory, provider_url)
         detail = provider.pipeline(repository, number)
         if not detail or not detail.get('can_retry' if action == 'retry' else 'can_cancel'):
             raise PermissionError('Woodpecker does not permit this action for this pipeline')

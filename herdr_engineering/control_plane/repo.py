@@ -15,16 +15,23 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import threading
 import time
 from uuid import uuid4
 
+from ..llm_session_id import dashboard_form
+from . import llm_stats
 from .agent_identity import AgentIdentityRegistry
 from .envelope import SourceLedger, envelope_event_fields
 from .graph import GraphProjection
 from .graph import _lseq as _graph_lseq
 from .graph import _rank as _graph_rank
 from .graph import from_stored as _graph_from_stored
+from .host_metrics_store import ENTITY_TYPE as HOST_METRICS_ENTITY
+from .host_metrics_store import STATE_KEYS as HOST_STATE_KEYS
+from .host_metrics_store import HostMetricsStore, clean_metrics, clean_state
+from .host_problems import compute_problems
 from .ids import new_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
@@ -119,6 +126,29 @@ def _label(value, forbidden=None):
     return value if all(c.isprintable() for c in value) else None
 
 
+RUNTIME_KINDS = ("standard-pi", "pi-bolt", "pi-bolt-jit")
+
+
+def _runtime(value):
+    """Runtime facts a Pi agent reports about itself (which Pi binary, engine, CPU, RSS), or None.
+
+    Untrusted emitter: an allowlisted shape with bounded values, never the raw payload. Runtime metrics only;
+    inference metrics (tokens, latency, queue) stay in the inference telemetry."""
+    if not isinstance(value, dict) or value.get("runtime_kind") not in RUNTIME_KINDS:
+        return None
+    def text(key, limit=64):
+        v = value.get(key)
+        return v[:limit] if isinstance(v, str) and all(c.isprintable() for c in v) else None
+    def number(key, hi):
+        v = value.get(key)
+        return round(float(v), 3) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= hi else None
+    out = {"runtime_kind": value["runtime_kind"], "runtime_source": text("runtime_source", 32),
+           "js_engine": value.get("js_engine") if value.get("js_engine") in ("bun", "node") else None,
+           "js_engine_version": text("js_engine_version", 32), "cpu_s": number("cpu_s", 1e7),
+           "rss_mib": number("rss_mib", 1e6), "fallback_reason": text("fallback_reason", 200)}
+    return {k: v for k, v in out.items() if v is not None}
+
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
@@ -161,9 +191,23 @@ class ControlPlaneRepo:
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+        self.mission_outcomes = None   # set by the server (control_plane.missions); None writes no outcomes
         # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
         # from them on import_state; owns no storage of its own.
         self.graph = GraphProjection()
+        self.host_metrics = self._new_host_metrics()
+
+    def _new_host_metrics(self):
+        return HostMetricsStore(now=lambda: self._now(), persist=self._persist_host_metrics)
+
+    def _persist_host_metrics(self, ev):
+        """Rollups and host-state changes go to the sink, not the shared streams/SSE."""
+        if self._sink is None:
+            return
+        stamp = self._stamp()
+        self._sink.record({"event_id": new_id("event"), "schema_version": 1,
+                           "source_timestamp": stamp, "ingest_timestamp": stamp,
+                           "mission_id": None, "session_id": None, **ev})
 
     def _persist_source_state(self, state):
         """Mirror per-source state to the durable sink when it supports it."""
@@ -259,6 +303,17 @@ class ControlPlaneRepo:
         m["updated_at"] = self._stamp()
         self.record_event("mission", key, "MissionStageChanged",
                           {"from": old, "to": stage}, mission_id=mission_id)
+        self._mission_stage_changed(key, old, stage)
+
+    def _mission_stage_changed(self, key, old, new):
+        # A durable outcome is written when a mission ends; it can never break the stage change itself.
+        outcomes = self.mission_outcomes
+        if outcomes is None:
+            return
+        try:
+            outcomes.on_stage(key, old, new)
+        except Exception:  # noqa: BLE001
+            pass
 
     # -------------------------------------------------------------- sessions
     def create_session(self, mission_id=None, agent_role="", model="",
@@ -723,29 +778,48 @@ class ControlPlaneRepo:
 
     # ---------------------------------------------------------------- hosts
     def register_host(self, host_name, tailnet_ip):
-        hid = new_id("host")
-        rec = {
-            "host_id": hid, "host_name": host_name, "tailnet_ip": tailnet_ip,
-            "status": "healthy", "last_seen": self._stamp(),
-            "created_at": self._stamp(),
-        }
-        self._hosts[hid] = rec
-        self.record_event("host", hid, "HostRegistered",
-                          {"host_name": host_name, "tailnet_ip": tailnet_ip})
-        return hid
+        with self._event_lock:
+            hid = new_id("host")
+            rec = {
+                "host_id": hid, "host_name": host_name, "tailnet_ip": tailnet_ip,
+                "status": "healthy", "last_seen": self._stamp(),
+                "created_at": self._stamp(),
+            }
+            self._hosts[hid] = rec
+            self.record_event("host", hid, "HostRegistered",
+                              {"host_name": host_name, "tailnet_ip": tailnet_ip})
+            return hid
 
     def get_host(self, host_id):
-        return self._merged_hosts().get(self._canonical_host(host_id))
+        host = self._merged_hosts().get(self._canonical_host(host_id))
+        return self._with_problems(host) if host is not None else None
+
+    def get_host_record(self, host_id):
+        """A copy of the stored record for exactly ``host_id`` (no alias merge, no problems)."""
+        with self._event_lock:
+            rec = self._hosts.get(host_id)
+            return _copy(rec) if rec is not None else None
+
+    def _with_problems(self, host):
+        """A copy of ``host`` carrying ``problems`` and ``problem_count`` (the store is untouched)."""
+        history = self.host_history(host["host_id"], "1h")
+        problems = compute_problems(host, history, self._now())
+        return {**host, "problems": problems, "problem_count": len(problems)}
 
     def _merged_hosts(self):
         """Hosts keyed by canonical id; an alias contributes its freshest report."""
+        # Snapshot under the lock: ingest threads add hosts while a reader iterates.
+        with self._event_lock:
+            raw = list(self._hosts.items())
+            aliases = dict(self._host_aliases)
+            hosts = {hid: _copy(rec) for hid, rec in raw}
         merged = {}
-        for hid, rec in self._hosts.items():
-            if hid in self._host_aliases:
+        for hid, rec in hosts.items():
+            if hid in aliases:
                 continue
-            merged[hid] = _copy(rec)
-        for alias, canonical in self._host_aliases.items():
-            rec = self._hosts.get(alias)
+            merged[hid] = rec
+        for alias, canonical in aliases.items():
+            rec = hosts.get(alias)
             if rec is None:
                 continue
             base = merged.get(canonical)
@@ -753,16 +827,24 @@ class ControlPlaneRepo:
                 base = merged[canonical] = _copy(rec)
                 base["host_id"] = base["host_name"] = canonical
                 continue
-            if (rec.get("last_seen") or "") > (base.get("last_seen") or ""):
+            fresher = (rec.get("last_seen") or "") > (base.get("last_seen") or "")
+            if fresher:
                 for key in ("last_seen", "status", "cpu", "mem"):
                     if rec.get(key) is not None:
                         base[key] = rec[key]
+            # Report and state keys may live on either record (the agent heartbeats
+            # under one id, the fleet update posts under another): the fresher
+            # record wins a shared key, and a key on only one record survives.
+            for key in ("latest", *HOST_STATE_KEYS):
+                if rec.get(key) is not None and (fresher or base.get(key) is None):
+                    base[key] = rec[key]
             if rec.get("inventory") and not base.get("inventory"):
                 base["inventory"] = _copy(rec["inventory"])
         return merged
 
     def list_hosts(self):
-        return _sort_by(list(self._merged_hosts().values()), "host_name")
+        hosts = [self._with_problems(h) for h in self._merged_hosts().values()]
+        return _sort_by(hosts, "host_name")
 
     def fleet_inventory(self):
         """Host x component version matrix with drift against the fleet reference.
@@ -801,25 +883,28 @@ class ControlPlaneRepo:
                             "missing": sum(c["missing"] for c in components)}}
 
     def record_heartbeat(self, host_id, tailnet_ip=None, cpu=None, mem=None):
-        h = self._hosts.get(host_id)
-        if h is None:
-            return False
-        h["last_seen"] = self._stamp()
-        h["status"] = "healthy"
-        if tailnet_ip is not None:
-            h["tailnet_ip"] = tailnet_ip
-        if cpu is not None:
-            h["cpu"] = cpu
-        if mem is not None:
-            h["mem"] = mem
-        return True
+        """Refresh liveness in memory only (no event): the per-sample hot path."""
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            if h is None:
+                return False
+            h["last_seen"] = self._stamp()
+            h["status"] = "healthy"
+            if tailnet_ip is not None:
+                h["tailnet_ip"] = tailnet_ip
+            if cpu is not None:
+                h["cpu"] = cpu
+            if mem is not None:
+                h["mem"] = mem
+            return True
 
     def mark_host_unavailable(self, host_id):
-        h = self._hosts.get(host_id)
-        if h is None:
-            return False
-        h["status"] = "unavailable"
-        return True
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            if h is None:
+                return False
+            h["status"] = "unavailable"
+            return True
 
     def record_telemetry(self, host_id, sample):
         """Record a telemetry sample (cpu/mem/disk/network/gpu) for a host."""
@@ -833,6 +918,46 @@ class ControlPlaneRepo:
         samples = self._telemetry.get(host_id, [])
         return samples[-limit:]
 
+    def record_host_metrics(self, host_id, sample, *, updates=None, versions=None,
+                            pins=None, fleet_update=None, maintenance=None):
+        """Store one fabric-agent sample: history, ``host["latest"]`` and host state.
+
+        Everything is validated before anything is written, so a ``ValueError``
+        leaves the host record untouched. A state field that is ``None`` was not
+        reported this time and keeps its previous value. ``sample`` may be
+        ``None`` when only state was reported."""
+        cleaned = clean_metrics(sample) if sample is not None else None
+        state = {k: clean_state(k, v) for k, v in
+                 (("updates", updates), ("versions", versions), ("pins", pins),
+                  ("fleet_update", fleet_update), ("maintenance", maintenance))}
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            latest = None
+            if cleaned is not None:
+                latest = {**cleaned, "at": self._stamp()}
+                self.host_metrics.record(host_id, cleaned)
+                self.record_telemetry(host_id, {**cleaned, "cpu_pct": cleaned.get("cpu"),
+                                                "mem_pct": cleaned.get("mem"),
+                                                "disk_pct": cleaned.get("disk")})
+            if h is None:
+                return
+            if latest is not None:
+                h["latest"] = latest
+            for key, value in state.items():
+                if value is not None:
+                    h[key] = value
+            self.host_metrics.observe_state(host_id, {k: h.get(k) for k in HOST_STATE_KEYS},
+                                            h.get("latest"))
+
+    def host_history(self, host_id, range):
+        """At most 300 history points for ``range`` (1h raw, 24h/7d from rollups)."""
+        canonical = self._canonical_host(host_id)
+        ids = [host_id, canonical] + [a for a, c in self._host_aliases.items() if c == canonical]
+        for hid in dict.fromkeys(ids):
+            if self.host_metrics.has(hid):
+                return self.host_metrics.history(hid, range)
+        return self.host_metrics.history(host_id, range)
+
     # ---------------------------------------------------------- ingestion
     # Idempotent upserts that honor an external (runtime-supplied) entity id, so
     # agents/machines can report their lifecycle without minting new ids on every
@@ -841,38 +966,39 @@ class ControlPlaneRepo:
 
     def upsert_host(self, host_id, host_name, tailnet_ip, *,
                     cpu=None, mem=None, status="healthy", inventory=None):
-        stamp = self._stamp()
-        inventory = _clean_inventory(inventory)
-        existing = self._hosts.get(host_id)
-        if existing is None:
-            rec = {"host_id": host_id, "host_name": host_name,
-                   "tailnet_ip": tailnet_ip, "status": status,
-                   "cpu": cpu, "mem": mem,
-                   "last_seen": stamp, "created_at": stamp}
+        with self._event_lock:
+            stamp = self._stamp()
+            inventory = _clean_inventory(inventory)
+            existing = self._hosts.get(host_id)
+            if existing is None:
+                rec = {"host_id": host_id, "host_name": host_name,
+                       "tailnet_ip": tailnet_ip, "status": status,
+                       "cpu": cpu, "mem": mem,
+                       "last_seen": stamp, "created_at": stamp}
+                if inventory:
+                    rec["inventory"] = {**inventory, "collected_at": stamp}
+                self._hosts[host_id] = rec
+                self.record_event("host", host_id, "HostRegistered",
+                                  {"host_name": host_name,
+                                   "tailnet_ip": tailnet_ip,
+                                   **({"inventory": inventory} if inventory else {})})
+                return _copy(rec)
+            existing["host_name"] = host_name or existing["host_name"]
+            existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
+            existing["status"] = status
+            existing["last_seen"] = stamp
+            if cpu is not None:
+                existing["cpu"] = cpu
+            if mem is not None:
+                existing["mem"] = mem
+            payload = {"host_name": existing["host_name"],
+                       "tailnet_ip": existing["tailnet_ip"],
+                       "cpu": cpu, "mem": mem}
             if inventory:
-                rec["inventory"] = {**inventory, "collected_at": stamp}
-            self._hosts[host_id] = rec
-            self.record_event("host", host_id, "HostRegistered",
-                              {"host_name": host_name,
-                               "tailnet_ip": tailnet_ip,
-                               **({"inventory": inventory} if inventory else {})})
-            return _copy(rec)
-        existing["host_name"] = host_name or existing["host_name"]
-        existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
-        existing["status"] = status
-        existing["last_seen"] = stamp
-        if cpu is not None:
-            existing["cpu"] = cpu
-        if mem is not None:
-            existing["mem"] = mem
-        payload = {"host_name": existing["host_name"],
-                   "tailnet_ip": existing["tailnet_ip"],
-                   "cpu": cpu, "mem": mem}
-        if inventory:
-            existing["inventory"] = {**inventory, "collected_at": stamp}
-            payload["inventory"] = inventory
-        self.record_event("host", host_id, "HostHeartbeat", payload)
-        return _copy(existing)
+                existing["inventory"] = {**inventory, "collected_at": stamp}
+                payload["inventory"] = inventory
+            self.record_event("host", host_id, "HostHeartbeat", payload)
+            return _copy(existing)
 
     def upsert_session(self, session_id, *, host_id=None, mission_id=None,
                        agent_role="", model="", status="active",
@@ -882,7 +1008,8 @@ class ControlPlaneRepo:
                        agent_session=None, revision=None, interactive_ready=None,
                        launch_pending=None, state_change_seq=None,
                        repository_id=None, commit_sha=None,
-                       transcript=None, parent_session_id=None, name=None):
+                       transcript=None, parent_session_id=None, name=None, runtime=None):
+        runtime = _runtime(runtime)
         if transcript is not None:
             if (not isinstance(transcript, dict) or transcript.get("status") not in (
                     "recording", "unsupported", "identity_unavailable", "unreadable", "unavailable") or
@@ -910,7 +1037,8 @@ class ControlPlaneRepo:
                   "interactive_ready": interactive_ready, "launch_pending": launch_pending,
                   "state_change_seq": state_change_seq,
                   "repository_id": repository_id, "commit_sha": commit_sha,
-                  "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name)}
+                  "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name),
+                  "runtime": runtime}
         if existing is None:
             rec = {"session_id": session_id, "mission_id": mission_id,
                    "host_id": host_id, "agent_role": agent_role,
@@ -960,7 +1088,7 @@ class ControlPlaneRepo:
                               "summary", "attach", "pane_id", "terminal_id", "herdr_session",
                               "machine", "agent_session", "revision", "interactive_ready",
                               "launch_pending", "state_change_seq", "repository_id", "commit_sha",
-                              "transcript", "parent_session_id", "name") if existing.get(k) is not None}},
+                              "transcript", "parent_session_id", "name", "runtime") if existing.get(k) is not None}},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)
@@ -1002,6 +1130,7 @@ class ControlPlaneRepo:
         for field, value in (("repository_id", repository_id), ("commit_sha", commit_sha)):
             if value is not None:
                 existing[field] = value
+        previous_stage = existing.get("stage")
         if stage:
             existing["stage"] = existing["status"] = stage
         self.record_event("mission", key, "MissionUpdated",
@@ -1013,6 +1142,8 @@ class ControlPlaneRepo:
                            "repository_id": existing.get("repository_id"),
                            "commit_sha": existing.get("commit_sha")},
                           mission_id=mission_id)
+        if stage:
+            self._mission_stage_changed(key, previous_stage, stage)
         return _copy(existing)
 
     # --------------------------------------------- CI: test runs / builds
@@ -1700,6 +1831,12 @@ class ControlPlaneRepo:
     def stream(self, entity_type, entity_id):
         return [_copy(e) for e in self._events.get((entity_type, entity_id), [])]
 
+    def entity_ids(self, entity_type):
+        """Ids of every entity of ``entity_type`` that has at least one event."""
+        with self._event_lock:
+            return [eid for (etype, eid), stream in self._events.items()
+                    if etype == entity_type and stream]
+
     def recent_events(self, limit=50):
         out = []
         by_sequence = {}
@@ -1727,24 +1864,97 @@ class ControlPlaneRepo:
     def record_token_usage(self, project, model, input_tokens=0, output_tokens=0, *,
                            reasoning_tokens=0, cache_read_tokens=0, duration_ms=None,
                            success=True, request_id=None, session_id=None,
-                           mission_id=None, key_id=None, source="llm-proxy"):
+                           mission_id=None, key_id=None, source="llm-proxy", v2=None):
+        """One usage record. ``v2`` (already whitelisted, see ``record_token_usage_row``)
+        makes it a schema-2 record whose unreported token fields stay None (unknown);
+        a v1 record keeps the old shape, with missing token counts stored as 0."""
         if not project:
             raise ValueError("project is required")
+        tokens = (input_tokens, output_tokens, reasoning_tokens, cache_read_tokens)
+        if v2 is None:
+            tokens = tuple(int(t or 0) for t in tokens)
         payload = {"project": project, "model": model or "unknown",
-                   "input_tokens": int(input_tokens or 0),
-                   "output_tokens": int(output_tokens or 0),
-                   "reasoning_tokens": int(reasoning_tokens or 0),
-                   "cache_read_tokens": int(cache_read_tokens or 0),
+                   "input_tokens": tokens[0], "output_tokens": tokens[1],
+                   "reasoning_tokens": tokens[2], "cache_read_tokens": tokens[3],
                    "duration_ms": duration_ms, "success": bool(success),
                    "request_id": request_id, "key_id": key_id, "source": source}
+        if v2 is not None:
+            payload.update(v2, schema=2, session_id=session_id)
         return self.record_event("token_usage", project, "token_usage.recorded",
                                  payload, mission_id=mission_id, session_id=session_id)
 
+    def record_token_usage_row(self, row):
+        """Record one usage row as posted to ``/api/v1/token-usage`` (or reported by the
+        proxy). Only known fields are kept, each type-checked; anything else in the row
+        (a prompt, a response, a key) is dropped, so no body text can be stored."""
+        if not isinstance(row, dict):
+            raise ValueError("usage row must be an object")
+        project = _usage_str(row.get("project"), 128) if isinstance(row.get("project"), str) else None
+        if not project:
+            raise ValueError("project is required")
+        model = _usage_str(row.get("model"), 256) or "unknown"
+        common = {"request_id": _usage_str(row.get("request_id"), 128),
+                  "session_id": _usage_id(row.get("session_id")),
+                  "mission_id": _usage_id(row.get("mission_id")),
+                  "key_id": _usage_str(row.get("key_id"), 128),
+                  "duration_ms": _usage_int(row.get("duration_ms"))}
+        tokens = [_usage_int(row.get(k)) for k in _TOKEN_FIELDS]
+        if row.get("schema") != 2:
+            return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
+                                           cache_read_tokens=tokens[3],
+                                           success=row.get("success", True), **common)
+        status = _usage_int(row.get("status"))
+        error_class = row.get("error_class") if row.get("error_class") in USAGE_ERROR_CLASSES else None
+        success = row.get("success")
+        if not isinstance(success, bool):
+            success = status is not None and 200 <= status < 300 and error_class is None
+        v2 = {"agent_id": _usage_id(row.get("agent_id")),
+              "upstream_model": _usage_str(row.get("upstream_model"), 256),
+              "route": row.get("route") if row.get("route") in ("fabric", "cpu", "upstream") else None,
+              "status": status, "error_class": error_class,
+              "usage_known": row.get("usage_known") is True,
+              "engine": _usage_str(row.get("engine"), 128)}
+        for k in ("fallback", "stream"):
+            v2[k] = row[k] if isinstance(row.get(k), bool) else None
+        for k in ("queue_ms", "ttft_ms", "gen_ms"):
+            v2[k] = _usage_int(row.get(k))
+        source = row.get("source") if row.get("source") in ("llm-proxy", "transcript") else "llm-proxy"
+        return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
+                                       cache_read_tokens=tokens[3], success=success,
+                                       source=source, v2=v2, **common)
+
+    def resolve_usage_session(self, value):
+        """Map a usage row's raw ``session_id`` to a dashboard session (Decision 4).
+
+        ``match`` says how: ``direct`` (it is a dashboard id), ``decoded`` (its header
+        form, see ``llm_session_id``), ``agent_session`` (the native conversation id of
+        exactly one session record: pi sends its session id, which is also the id at
+        the end of its ``<ts>_<id>.jsonl`` file), ``unmatched`` (none, or ambiguous),
+        or ``none`` (the row has no session). Never guesses between candidates."""
+        if not isinstance(value, str) or not value:
+            return {"session_id": None, "match": "none"}
+        if value in self._sessions:
+            return {"session_id": value, "match": "direct"}
+        decoded = dashboard_form(value)
+        if decoded is not None and decoded in self._sessions:
+            return {"session_id": decoded, "match": "decoded"}
+        if _NATIVE_ID.fullmatch(value):
+            hits = [sid for sid, rec in list(self._sessions.items())
+                    if _native_id_matches(rec.get("agent_session"), value)]
+            if len(hits) == 1:
+                return {"session_id": hits[0], "match": "agent_session"}
+        return {"session_id": None, "match": "unmatched"}
+
     def token_analytics(self, project=None, since=None):
-        """Aggregate token usage by project, model and day (UTC)."""
+        """Aggregate token usage by project, model, day (UTC) and dashboard session.
+
+        ``by_session`` is keyed by the dashboard session id, or ``unmatched:<raw id>``
+        when ``resolve_usage_session`` cannot place it; rows without a session id
+        count only in the other groupings."""
         total = {"requests": 0, "input_tokens": 0, "output_tokens": 0,
                  "reasoning_tokens": 0, "cache_read_tokens": 0, "failed": 0}
-        by_project, by_model, by_day = {}, {}, {}
+        by_project, by_model, by_day, by_session = {}, {}, {}, {}
+        resolved = {}
 
         def add(bucket, key, p):
             b = bucket.setdefault(key, {k: 0 for k in total})
@@ -1761,8 +1971,89 @@ class ControlPlaneRepo:
                 add(by_project, p["project"], p)
                 add(by_model, p["model"], p)
                 add(by_day, ev["source_timestamp"][:10], p)
+                raw = p.get("session_id") or ev.get("session_id")  # v1 rows: envelope only
+                if not raw:
+                    continue
+                if raw not in resolved:
+                    resolved[raw] = self.resolve_usage_session(raw)
+                hit = resolved[raw]
+                key = hit["session_id"] or f"unmatched:{raw}"
+                b = by_session.get(key)
+                if b is None:
+                    b = by_session[key] = {**{k: 0 for k in total}, "session_id": hit["session_id"],
+                                           "matched_by": [], "raw_session_ids": []}
+                _accumulate(b, p)
+                if hit["match"] not in b["matched_by"]:
+                    b["matched_by"] = sorted([*b["matched_by"], hit["match"]])
+                if raw not in b["raw_session_ids"]:
+                    b["raw_session_ids"] = sorted([*b["raw_session_ids"], raw])
         return {"total": total, "by_project": by_project, "by_model": by_model,
-                "by_day": dict(sorted(by_day.items()))}
+                "by_day": dict(sorted(by_day.items())), "by_session": by_session}
+
+    # LLM page (docs/superpowers/specs/2026-10-23-llm-page-design.md, slice 2). Computed from
+    # the retained raw records on each call, like ``token_analytics``; ``retained_since`` says
+    # how far back they go and ``partial`` is true when the window starts before that.
+    def _llm_window(self, window, filters):
+        if window not in llm_stats.WINDOWS:
+            raise ValueError(f"window must be one of {', '.join(llm_stats.WINDOWS)}")
+        now = self._now()
+        since = now - llm_stats.WINDOWS[window]
+        cache = {}
+
+        def resolve(raw):
+            if raw not in cache:
+                cache[raw] = self.resolve_usage_session(raw)
+            return cache[raw]
+
+        project = filters.get("project")
+        source = filters.pop("source", None)
+        if source not in (None, "", "llm-proxy", "transcript"):
+            raise ValueError("source must be llm-proxy or transcript")
+        with self._event_lock:
+            streams = [s for (etype, eid), s in self._events.items()
+                       if etype == "token_usage" and (not project or eid == project)]
+            events = [ev for s in streams for ev in s]
+        oldest = min((llm_stats._parse(s[0]["source_timestamp"]) for s in streams if s), default=None)
+        if source in (None, "", "transcript"):   # the agents' own transcripts (tokens only)
+            events += list(llm_stats.transcript_events(self.inspector.usage_events()))
+        records = [(ts, p) for ts, p in llm_stats.select(events, _payload, since=since, until=now + 1,
+                                                          resolve=resolve, **{k: v for k, v in filters.items() if v})
+                   if not source or (p.get("source") or "llm-proxy") == source]
+        meta = {"window": window, "since": llm_stats._iso(since),
+                "retained_since": llm_stats._iso(oldest),
+                "partial": oldest is None or oldest > since}
+        return records, resolve, meta, since, now
+
+    def llm_stats(self, window="24h", group="model", **filters):
+        if group not in llm_stats.GROUPS:
+            raise ValueError(f"group must be one of {', '.join(llm_stats.GROUPS)}")
+        records, resolve, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, group=group, groups=llm_stats.stats(records, group, resolve))
+
+    def llm_timeseries(self, window="24h", step="1h", metric="requests", **filters):
+        if step not in llm_stats.STEPS:
+            raise ValueError(f"step must be one of {', '.join(llm_stats.STEPS)}")
+        if metric not in llm_stats.METRICS:
+            raise ValueError(f"metric must be one of {', '.join(llm_stats.METRICS)}")
+        filters.setdefault("source", "llm-proxy")   # a time series is one source, never a sum
+        records, _, meta, since, now = self._llm_window(window, filters)
+        step_s = llm_stats.STEPS[step]
+        points = llm_stats.timeseries(records, metric, since=since, until=now, step=step_s)
+        return dict(meta, step=step, metric=metric, points=points)
+
+    def llm_errors(self, window="24h", error_class=None, **filters):
+        filters["source"] = "llm-proxy"   # a transcript carries no status, so it has no errors
+        records, resolve, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, problems=llm_stats.errors(records, resolve, error_class=error_class))
+
+    def record_attention(self, event_type, payload):
+        """Store an operator acknowledge/snooze/clear. Private stream: never in the feed or the SSE."""
+        self.record_event("attention", "operator", event_type, payload, feed=False, publish=False)
+
+    def attention_events(self):
+        with self._event_lock:
+            return [{"event_type": e["event_type"], "payload": dict(_payload(e))}
+                    for e in self._events.get(("attention", "operator"), [])]
 
     def create_project_key(self, project, label=""):
         """Mint a gateway key for ``project``; the secret is returned once and only
@@ -1833,8 +2124,9 @@ class ControlPlaneRepo:
 
     def llm_config(self):
         """What the LLM proxy needs: active key hashes and custom models."""
+        # The label is not secret; the proxy reads a session id from "session:<id>".
         return {"keys": [{"key_id": k["key_id"], "project": k["project"],
-                          "key_hash": k["key_hash"]}
+                          "key_hash": k["key_hash"], "label": k.get("label", "")}
                          for k in self._llm_keys() if not k.get("revoked")],
                 "custom_models": list(self.list_custom_models().values())}
 
@@ -1944,6 +2236,17 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != "collab"]
         if durable:
             self.inspector.hydrate(durable)
+        # Host telemetry rollups/state ride a private stream: rebuild history and
+        # put the latest record back on each host.
+        metrics = []
+        for key in [k for k in self._events if k[0] == HOST_METRICS_ENTITY]:
+            metrics.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != HOST_METRICS_ENTITY]
+        self.host_metrics = self._new_host_metrics()
+        for hid, rec in self.host_metrics.hydrate(metrics).items():
+            host = self._hosts.get(hid)
+            if host is not None:
+                host.update({k: v for k, v in rec.items() if v is not None})
 
     def _rebuild_graph(self):
         """Replay stored ``lineage`` envelope rows into a fresh projection.
@@ -1988,6 +2291,32 @@ class ControlPlaneRepo:
 
 
 # ------------------------------------------------------------ helpers
+#: pi/claude/codex conversation ids (same rule as the feed plugin's session-transcript.js ID).
+_NATIVE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{7,79}$")
+_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _native_id_matches(agent_session, value):
+    """True when ``agent_session`` (herdr's native conversation evidence) names ``value``:
+    its ``nativeId``, a ``kind: id`` value, or a ``kind: path`` transcript named
+    ``<id>.jsonl`` / ``*_<id>.jsonl`` / ``*-<id>.jsonl`` (session-transcript.js identityName)."""
+    if not isinstance(agent_session, dict):
+        return False
+    if agent_session.get("nativeId") == value:
+        return True
+    kind, ref = agent_session.get("kind"), agent_session.get("value")
+    if not isinstance(ref, str):
+        return False
+    if kind == "id":
+        return ref == value
+    if kind == "path":
+        name = ref.rsplit("/", 1)[-1]
+        # A suffix match needs a whole UUID: a fragment of one ends the name too.
+        return name == f"{value}.jsonl" or (bool(_UUID.fullmatch(value)) and name.endswith(
+            (f"_{value}.jsonl", f"-{value}.jsonl")))
+    return False
+
+
 def _payload(ev):
     """An event's payload as a dict (a hydrated jsonb column arrives as text)."""
     p = ev.get("payload") or {}
@@ -1997,6 +2326,32 @@ def _payload(ev):
         except ValueError:
             p = {}
     return p if isinstance(p, dict) else {}
+
+
+_TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens")
+# The usage-record error taxonomy (docs/superpowers/specs/2026-10-23-llm-page-design.md).
+USAGE_ERROR_CLASSES = frozenset({
+    "auth_invalid_key", "request_invalid", "request_too_large", "model_project_mismatch",
+    "model_not_registered", "proxy_backpressure", "upstream_admission",
+    "upstream_rejected_metadata", "upstream_client_error", "upstream_server_error",
+    "upstream_unreachable", "stream_truncated", "client_disconnected"})
+_USAGE_ID = re.compile(r"^[A-Za-z0-9\-_.:/]{1,128}$")
+
+
+def _usage_int(value):
+    """A non-negative int, or None (unknown) for anything else (bools included)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    return int(value) if value >= 0 else None
+
+
+def _usage_str(value, limit):
+    return value if isinstance(value, str) and 0 < len(value) <= limit else None
+
+
+def _usage_id(value):
+    """Session/agent/mission ids: the gateway's metadata charset, else None."""
+    return value if isinstance(value, str) and _USAGE_ID.match(value) else None
 
 
 def _accumulate(bucket, p):

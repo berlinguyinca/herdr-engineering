@@ -185,6 +185,30 @@ def test_web_reads_everything_from_the_fleet_file_and_ignores_env(tmp_path, monk
     assert seen["server_kw"]["ci_actions"] is True
 
 
+def test_web_reads_usage_retention_from_llm_proxy_section(tmp_path, monkeypatch, old_env, capsys):
+    seen = _run_web(monkeypatch, make_file(tmp_path, llm_proxy={"max_inflight": 4, "raw_retention_days": 3}))
+    assert seen["server_kw"]["usage_retention"] == {"raw_retention_days": 3, "rollup_retention_days": 400}
+    seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
+    assert seen["server_kw"]["usage_retention"] == {"raw_retention_days": 14, "rollup_retention_days": 400}
+
+
+def test_web_refuses_invalid_usage_retention(tmp_path, monkeypatch, old_env, capsys):
+    with pytest.raises(SystemExit, match="raw_retention_days"):
+        _run_web(monkeypatch, make_file(tmp_path, llm_proxy={"raw_retention_days": 0}))
+
+
+def test_web_reads_ci_fix_from_the_fleet_file_disabled_by_default(tmp_path, monkeypatch, old_env, capsys):
+    seen = _run_web(monkeypatch, make_file(tmp_path, ci_fix={"enabled": True, "hosts": ["bender"]}))
+    assert seen["server_kw"]["ci_fix"]["enabled"] is True and seen["server_kw"]["ci_fix"]["hosts"] == ["bender"]
+    seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
+    assert seen["server_kw"]["ci_fix"]["enabled"] is False
+
+
+def test_web_refuses_invalid_ci_fix(tmp_path, monkeypatch, old_env, capsys):
+    with pytest.raises(SystemExit, match="ci_fix.hosts"):
+        _run_web(monkeypatch, make_file(tmp_path, ci_fix={"enabled": True}))
+
+
 def test_web_without_file_has_no_durable_config_even_with_env(tmp_path, monkeypatch, old_env, capsys):
     seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
     assert "sink_dsn" not in seen and seen["self_report"]["dsn"] is None
@@ -720,3 +744,68 @@ def test_config_failure_mode_last_good_is_an_explicit_operator_opt_in(tmp_path):
     other = make_file(tmp_path / "x" if (tmp_path / "x").mkdir() is None else tmp_path,
                       collab=dict(COLLAB, contextual={"enabled": True}), config_failure_mode="whatever")
     assert FleetConfigStore(other).failure_mode() == "fail_closed"      # anything but the exact opt-in
+
+
+SUMMARY_FIX = {"room_id": "collab_room1", "requester_agent_id": "collab_agent1"}
+
+
+def test_summary_fix_room_is_a_validated_collab_config_key():
+    import argparse
+    args = argparse.Namespace()
+    cli._apply_collab_config(args, {"collab": {"summary_fix": dict(SUMMARY_FIX)}})
+    assert args.collab_summary_fix == SUMMARY_FIX
+    for bad in ({"room_id": "collab_room1"}, dict(SUMMARY_FIX, api_key="hca_x"), "collab_room1",
+                dict(SUMMARY_FIX, room_id=""), dict(SUMMARY_FIX, requester_agent_id="bad id")):
+        with pytest.raises(SystemExit, match="summary_fix"):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"summary_fix": bad}})
+
+
+def test_summary_fix_room_rides_in_the_collab_slice(tmp_path):
+    import json as _json
+    out = tmp_path / "collab.json"
+    fcc.render_collab(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, summary_fix=SUMMARY_FIX))), out)
+    assert _json.loads(out.read_text())["sections"]["control_plane"]["values"]["collab"]["summary_fix"] == SUMMARY_FIX
+    out.unlink()
+    (tmp_path / "fleet-config.yaml").unlink()
+    bad = make_file(tmp_path, collab=dict(COLLAB, summary_fix=dict(SUMMARY_FIX, secret="s3cret")))
+    with pytest.raises(fcc.FleetConfigError, match="summary_fix: unknown keys: secret"):
+        fcc.render_collab(fcc.load_fleet_config(bad), out)
+
+
+def test_collab_service_refuses_a_malformed_summary_fix_config():
+    from herdr_engineering.control_plane.collab import (
+        CollabError,
+        CollabService,
+        StaticTokenAuthenticator,
+    )
+    with pytest.raises(CollabError):
+        CollabService(StaticTokenAuthenticator({}), summary_fix={"room_id": 3})
+    assert CollabService(StaticTokenAuthenticator({}), summary_fix=SUMMARY_FIX).summary_fix == SUMMARY_FIX
+
+
+# ------------------------------------------------------------- review gate durability
+
+def _gate(tmp_path, enabled=True):
+    key = tmp_path / "app.pem"
+    key.write_text("not-a-real-key")
+    key.chmod(0o600)
+    return {"enabled": enabled,
+            "app": {"app_id": 1, "installation_id": 2, "private_key_file": str(key)},
+            "repos": [{"repo": "github.com/acme/widget"}]}
+
+
+def test_web_refuses_enabled_review_gate_without_durable_storage(tmp_path, monkeypatch, old_env):
+    path = make_file(tmp_path, pg_dsn=None, review_gate=_gate(tmp_path))
+    with pytest.raises(SystemExit, match="review_gate needs durable storage"):
+        _run_web(monkeypatch, path)
+
+
+def test_web_starts_enabled_review_gate_with_a_dsn(tmp_path, monkeypatch, old_env):
+    path = make_file(tmp_path, review_gate=_gate(tmp_path))
+    seen = _run_web(monkeypatch, path)
+    assert seen["sink_dsn"]
+
+
+def test_web_without_dsn_is_fine_when_review_gate_disabled(tmp_path, monkeypatch, old_env):
+    path = make_file(tmp_path, pg_dsn=None, review_gate=_gate(tmp_path, enabled=False))
+    assert "sink_dsn" not in _run_web(monkeypatch, path)

@@ -22,6 +22,7 @@
 .conversation-markdown code { font-family: var(--font-mono, monospace); font-size: .9em; }
 .conversation-markdown blockquote { margin-left: 0; padding-left: 12px; border-left: 3px solid var(--border, #d8dde5); }
 .conversation-markdown a { color: var(--accent, #2457c5); }
+.conversation-markdown .md-link-host { font-size: .85em; opacity: .75; }
 .conversation-editor-toolbar, .conversation-find, .conversation-json-toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .conversation-editor-toolbar button, .conversation-find button, .conversation-json-toolbar button { border: 1px solid var(--border, #d8dde5); background: var(--surface, #fff); color: var(--text, #222); padding: 4px 8px; border-radius: 5px; cursor: pointer; font: inherit; font-size: 12px; }
 .conversation-editor-toolbar button[aria-pressed=true] { background: var(--surface-hover, #e9eef7); }

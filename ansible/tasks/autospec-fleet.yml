@@ -1,0 +1,101 @@
+---
+# Keep every Herdr fleet host enrolled in the AutoSpec runtime fleet.
+# The checkout is user-owned and the runtime publisher creates immutable,
+# receipt-bound generations under ~/.autospec. A failed refresh leaves the
+# previous generation active.
+- name: "Create the AutoSpec source directory"
+  become: false
+  ansible.builtin.file:
+    path: "{{ autospec_repo_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: "Checkout the AutoSpec fleet source"
+  become: false
+  ansible.builtin.git:
+    repo: "{{ autospec_repo_url }}"
+    dest: "{{ autospec_repo_dir }}"
+    version: main
+    update: true
+    force: false
+    accept_hostkey: true
+  register: autospec_checkout
+
+- name: "Publish the AutoSpec runtime generation"
+  become: false
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - "{{ autospec_repo_dir }}/scripts/autospec-runtime-install.sh"
+      - --repo-dir
+      - "{{ autospec_repo_dir }}"
+  environment:
+    HOME: "{{ fleet_home }}"
+    USER: "{{ fleet_user }}"
+    PATH: "{{ fleet_home }}/.cargo/bin:{{ fleet_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+  register: autospec_runtime_publish
+  changed_when: autospec_checkout.changed or autospec_runtime_publish.stdout | length > 0
+  when: not ansible_check_mode
+
+- name: "Install the AutoSpec fleet refresh wrapper"
+  become: false
+  ansible.builtin.copy:
+    dest: "{{ fleet_home }}/.local/bin/autospec-fleet-sync"
+    mode: "0750"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      repo="${AUTOSPEC_FLEET_REPO:-{{ autospec_repo_dir }}}"
+      if [[ ! -d "$repo/.git" ]]; then exit 0; fi
+      cd "$repo"
+      [[ -z "$(git status --porcelain --untracked-files=all)" ]] || exit 0
+      git fetch --quiet origin main
+      git merge --ff-only --quiet origin/main
+      exec /bin/bash "$repo/scripts/autospec-runtime-install.sh" --repo-dir "$repo"
+  when: ansible_facts['system'] == 'Linux'
+
+- name: "Install AutoSpec fleet refresh user service"
+  become: false
+  ansible.builtin.copy:
+    dest: "{{ fleet_home }}/.config/systemd/user/autospec-fleet-sync.service"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Refresh the AutoSpec runtime from origin/main
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/flock -n %t/autospec-fleet-sync.lock {{ fleet_home }}/.local/bin/autospec-fleet-sync
+  when: ansible_facts['system'] == 'Linux'
+
+- name: "Install AutoSpec fleet refresh user timer"
+  become: false
+  ansible.builtin.copy:
+    dest: "{{ fleet_home }}/.config/systemd/user/autospec-fleet-sync.timer"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Keep AutoSpec synchronized with the Herdr fleet
+
+      [Timer]
+      OnBootSec=5min
+      OnUnitActiveSec=15min
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+  when: ansible_facts['system'] == 'Linux'
+
+- name: "Enable AutoSpec fleet refresh timer"
+  become: false
+  ansible.builtin.systemd:
+    name: autospec-fleet-sync.timer
+    scope: user
+    daemon_reload: true
+    enabled: true
+    state: started
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+  when:
+    - ansible_facts['system'] == 'Linux'
+    - not ansible_check_mode
