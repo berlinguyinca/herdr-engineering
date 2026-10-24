@@ -223,8 +223,9 @@ herdr-eng devfabric serve lease_xxx            # or --bind <tailscale-ip> for ot
 # ... or run the auto-registration agent so web services that start on this
 #     host appear at a stable dev:<port> (and in the gateway web UI) with zero
 #     manual steps — a per-host service on every fleet host:
-scripts/fabric-agent.sh --gateway http://dev.lan:29999         # Linux (systemd user unit)
-scripts/fabric-agent-macos.sh --gateway http://dev.lan:29999   # macOS (launchd LaunchAgent)
+# (gateway = fabric.url in fleet-config.yaml, else fabric.gateway_url in config.yaml)
+scripts/fabric-agent.sh          # Linux (systemd user unit)
+scripts/fabric-agent-macos.sh    # macOS (launchd LaunchAgent)
 # remove a machine from the fleet (stop agent, close leases, drop from inventory):
 scripts/fabric-offboard.sh
 herdr-eng tests adapters
