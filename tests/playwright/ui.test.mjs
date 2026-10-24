@@ -1409,6 +1409,7 @@ test('hosts page lists the fleet version matrix and flags the host that differs'
 test('overview attention and saved layout stay keyboard usable through refresh at every workspace width',async()=>{
  await withApp(async({page,base})=>{
   let blocked=true;
+  await page.route('**/api/v1/attention*',r=>r.fulfill({status:404,json:{error:'not found'}}));   // these tests drive the browser projection
   await page.route('**/api/v1/mission-activity',r=>r.fulfill({json:{activities:[liveProjection({activity:{health:blocked?'blocked':'active'}})]}}));
   await page.addInitScript(()=>{if(!localStorage.getItem('herdr.overview.layout.v1'))localStorage.setItem('herdr.overview.layout.v1',JSON.stringify({order:['ci','attention','ci','health','unknown'],hidden:['attention','health','ci']}));});
   await page.clock.install();await page.goto(`${base}/#/overview`);
@@ -1443,13 +1444,14 @@ test('overview attention and saved layout stay keyboard usable through refresh a
    const layout=await page.evaluate(()=>({attention:document.querySelector('[data-overview=attention]').getBoundingClientRect().top,cards:document.querySelector('.ov-layout').getBoundingClientRect().top,footer:document.querySelector('.ov-health').getBoundingClientRect().top,bottom:document.querySelector('.ov-layout').getBoundingClientRect().bottom}));
    assert.ok(layout.attention<layout.cards);assert.ok(layout.footer>=layout.bottom);
   }
- },{BURST:'0'});
+ },{BURST:'0',CI_OFFLINE:'1'});
 });
 
 test('overview attention opens only the intended CI provider when repository and run IDs collide',async()=>{
  await withApp(async({page,base})=>{
   const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed',updated_at:new Date().toISOString()};
   const runs=[{...run,provider_url:'https://ci.example'},{...run,provider_url:'https://ci.example/secondary'}];
+  await page.route('**/api/v1/attention*',r=>r.fulfill({status:404,json:{error:'not found'}}));   // these tests drive the browser projection
   await page.route('**/api/v1/ci',route=>route.fulfill({json:{available:true,status:'connected',pipelines:{'org/repo':runs}}}));
   await page.goto(`${base}/#/overview`);
   const links=page.locator('[data-overview=attention] a[href*="/ci?"]');
@@ -1463,12 +1465,13 @@ test('overview attention opens only the intended CI provider when repository and
   assert.equal(await page.locator('#ig-results [data-run]').count(),1);
   assert.deepEqual(JSON.parse(await page.locator('#ig-results [data-run]').getAttribute('data-run')),['https://ci.example','7','12']);
   assert.equal(await page.locator('[data-ig-search]').inputValue(),'12');
- },{BURST:'0'});
+ },{BURST:'0',CI_OFFLINE:'1'});
 });
 
 test('large Overview attention queues keep cards close and expand within a keyboard-accessible scroll region',async()=>{
  await withApp(async({page,base})=>{
   let refreshed=false,releaseOtherPanels;
+  await page.route('**/api/v1/attention*',r=>r.fulfill({status:404,json:{error:'not found'}}));   // these tests drive the browser projection
   const otherPanelsReady=new Promise(resolve=>{releaseOtherPanels=resolve;});
   const missions=Array.from({length:196},(_,index)=>({mission_id:`failure-${index}`,title:`Failure ${index}`,status:'failed',updated_at:new Date(Date.now()-index*1000).toISOString()}));
   await page.route('**/api/v1/missions',route=>route.fulfill({json:{missions:missions.map(record=>({...record,title:refreshed?`${record.title} refreshed`:record.title}))}}));
@@ -1534,5 +1537,5 @@ test('large Overview attention queues keep cards close and expand within a keybo
   assert.equal(await page.locator('[data-overview=sessions]').isVisible(),false);
   assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'ci');
   assert.deepEqual(await page.evaluate(()=>JSON.parse(localStorage.getItem('herdr.overview.layout.v1'))),{order:['ci'],hidden:['sessions']});
- },{BURST:'0'});
+ },{BURST:'0',CI_OFFLINE:'1'});
 });

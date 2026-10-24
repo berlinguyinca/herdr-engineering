@@ -128,6 +128,14 @@ def _seed_llm(repo, session_id):
     repo.record_token_usage("herdr", "legacy-model", 5, 6)
 
 
+def _seed_attention(repo):
+    """One failed agent: a critical inbox item next to the fleet-drift warning the base seed already causes."""
+    sid = repo.create_session(agent_role="pi", model="gpt-4o")
+    repo._sessions[sid]["status"] = "failed"
+    repo._sessions[sid]["title"] = "Broken parser agent"
+    return sid
+
+
 def main():
     repo = ControlPlaneRepo()
     _m1, _m2, _s1 = _seed(repo)
@@ -135,6 +143,8 @@ def main():
         _seed_inspector(repo, _s1)
     if os.environ.get("LLM_SEED") == "1":
         _seed_llm(repo, _s1)
+    if os.environ.get("ATTENTION_SEED") == "1":
+        _seed_attention(repo)
 
     svr = ControlPlaneServer(repo, host="127.0.0.1", port=0,
                              web_root=_REPO / "packages")
@@ -143,6 +153,9 @@ def main():
     # rate-limit regression test fast and unambiguous (an un-throttled client
     # re-rendering on every event exceeds even 600/min within ~18s, but trips
     # this 200/min budget in a few seconds).
+    if os.environ.get("CI_OFFLINE") == "1":
+        # The host may have a real Woodpecker token; a hermetic page must not list real runs.
+        svr.ci_monitor._factory = lambda: type("Offline", (), {"available": False})()
     budget = int(os.environ.get("RATE_BUDGET", "200"))
     svr._limiter = _RateLimiter(max_requests=budget, window_seconds=60)
     threading.Thread(target=svr.serve, daemon=True).start()

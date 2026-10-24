@@ -24,6 +24,7 @@ import { renderHostDetail, renderHostCard, HOST_CARD_STYLE, RANGES, safeHostId }
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
+import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
 import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
@@ -51,6 +52,7 @@ const root = document.getElementById('view');
 
 const NAV = [
   { path: '/overview', label: 'Overview' },
+  { path: '/attention', label: 'Attention' },
   { path: '/topology', label: 'Topology' },
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Agents' },
@@ -72,6 +74,20 @@ const SHELL = document.getElementById('shell');
 SHELL.setAttribute('routes', JSON.stringify(NAV));
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
 
+// The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
+function setAttentionBadge(badge) { SHELL.setBadge?.('/attention', badge); }
+let attentionBadgeTimer = null;
+async function pollAttentionBadge() {
+  clearTimeout(attentionBadgeTimer);
+  if (!document.hidden) {
+    try { setAttentionBadge(attentionBadge(await client.attention({ state: 'open' }))); }
+    catch { /* The page itself explains an unreachable inbox; the badge just stays as it was. */ }
+  }
+  attentionBadgeTimer = setTimeout(pollAttentionBadge, ATTENTION_POLL_MS * 3);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollAttentionBadge(); });
+pollAttentionBadge();
+
 function route() {
   const hash = window.location.hash.replace(/^#/, '') || '/overview';
   const [path, query] = hash.split('?');
@@ -81,6 +97,7 @@ function route() {
 
 const ROUTES = {
   '/overview': viewOverview,
+  '/attention': viewAttention,
   '/github': viewGithub,
   '/collab': viewCollab,
   '/ci': viewIntegrations,
@@ -151,6 +168,10 @@ async function viewTopology() {
 async function viewOverview() {
   root.innerHTML = '<h1>Overview</h1><div id="overview-dashboard"></div>';
   dashboardView = mountOverview(document.getElementById('overview-dashboard'), client);
+}
+
+async function viewAttention() {
+  dashboardView = mountAttention(root, client, { onBadge: setAttentionBadge });
 }
 
 async function viewCollab() {

@@ -147,6 +147,17 @@ export class HerdrClient {
     return this.request(`/api/v1/llm/${encodeURIComponent(what)}${q.size ? `?${q}` : ''}`);
   }
 
+  /** Fleet attention inbox (derived server-side; ack/snooze are shared by every browser). */
+  attention(params = {}, { signal } = {}) {
+    const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v != null && v !== ''));
+    return this.request(`/api/v1/attention${q.size ? `?${q}` : ''}`, { signal });
+  }
+
+  attentionAct(action, body) {
+    if (!['ack', 'snooze', 'clear'].includes(action)) throw new Error(`unknown attention action: ${action}`);
+    return this.request(`/api/v1/attention/${action}`, { method: 'POST', body });
+  }
+
   analytics(kind = 'missions') {
     return this.request(`/api/v1/analytics/${encodeURIComponent(kind)}`);
   }
