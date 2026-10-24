@@ -1,0 +1,14 @@
+# User unit for ci-fix-runner.py (one per host listed in control_plane.ci_fix.hosts). Not installed by anything:
+# copy ci-fix-runner.py, collab-sandbox.sh and collab-egress.py into ~/.local/share/herdr-engineering/, put an `agent`
+# role API key in ~/.config/herdr-engineering/ci-fix-agent.key and the forge token in ci-fix-forge.token (both mode 0600),
+# then `systemctl --user enable --now herdr-ci-fix-runner.timer`. The dashboard URL and gateway come from host.json.
+[Unit]
+Description=Run sandboxed CI fix agents requested on the dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/python3 %h/.local/share/herdr-engineering/ci-fix-runner.py once --api-key-file %h/.config/herdr-engineering/ci-fix-agent.key --forge-token-file %h/.config/herdr-engineering/ci-fix-forge.token
+TimeoutStartSec=20min
