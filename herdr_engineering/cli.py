@@ -284,6 +284,13 @@ def _build_parser() -> argparse.ArgumentParser:
     asub.add_parser("list", help="list stored artifacts").set_defaults(func=_cmd_art_list)
     p2 = asub.add_parser("retention", help="enforce retention policy")
     p2.set_defaults(func=_cmd_art_retention)
+    # system-graph artifact (P5): deterministic sanitized snapshot renderer.
+    ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
+    gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
+    p2 = gas.add_parser("render", help="render a graph snapshot JSON to a deterministic sanitized HTML artifact")
+    p2.add_argument("graph_json", help="path to a graph snapshot JSON file")
+    p2.add_argument("--out", default=None, help="output .html path (default: <graph_json>.html)")
+    p2.set_defaults(func=_cmd_graph_artifact_render)
 
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
@@ -1080,6 +1087,25 @@ def _cmd_art_publish(args) -> int:
     _print_json({"ok": res.ok, "status": res.status, "error": res.error,
                  "artifact": res.artifact.to_dict() if res.artifact else None})
     return 0 if res.ok else 1
+
+
+def _cmd_graph_artifact_render(args) -> int:
+    """Render a graph snapshot JSON file (GraphProjection.snapshot() shape) to
+    a deterministic sanitized HTML artifact (system-graph P5).
+    """
+    import json as _json
+    from pathlib import Path
+
+    from .control_plane.graph_artifact import GraphArtifactRenderer
+
+    data = _json.loads(Path(args.graph_json).read_text())
+    result = GraphArtifactRenderer(
+        title=data.get("title", "System graph snapshot")).render(data)
+    out = args.out or f"{args.graph_json}.html"
+    Path(out).write_text(result.html)
+    _print_json({"ok": True, "out": out, "digest": result.digest,
+                 "nodes": result.node_count, "edges": result.edge_count})
+    return 0
 
 
 def _cmd_art_list(args) -> int:

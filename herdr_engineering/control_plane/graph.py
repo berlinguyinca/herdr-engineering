@@ -56,10 +56,20 @@ from typing import Any
 NODE_TYPES = frozenset(
     "room workspace mission plan task agent attempt session tab pane handoff "
     "thread message decision approach worktree commit pr ci review finding "
-    "artifact gate issue".split())
+    "artifact gate issue "
+    # system-intelligence (spec docs/specs/herdr-system-graph-20261020/02):
+    # repository/host/service/gpu/model/request/span/queue are OWNED kinds; they
+    # default to per-writer ownership exactly like the existing non-commons kinds.
+    "repository branch service endpoint deployment host gpu model worker request "
+    "span queue dataset memory_reference external_dependency module symbol package trace".split())
 EDGE_TYPES = frozenset(
     "spawn handoff delegation consultation dependency issue_link fork "
-    "supersession reviewed produced validated cross_link".split())
+    "supersession reviewed produced validated cross_link "
+    # system-intelligence edge kinds; overlapping spec concepts map onto the
+    # existing kinds above (depends_on->dependency, handoff_to->handoff,
+    # reviews->reviewed, produced->produced, spawned_by->spawn, supersedes->supersession).
+    "calls observed_in belongs_to blocked_by implements references runs_on "
+    "serves deploys_to assigned_to precedes imports routes_to queued_on".split())
 # T14: edge kinds only the HCN service may write (as a `collab` principal, after it has checked the asking person
 # and the room). `cross_link` joins two nodes of different workspaces of one room; a `consultation` edge from a
 # service-written `thread:hcn-consult.*` node records a peer consultation. Everybody else is refused with the one
