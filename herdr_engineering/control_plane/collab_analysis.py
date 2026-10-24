@@ -9,6 +9,7 @@ its connection must be used exclusively on its owning event loop.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
@@ -32,6 +33,7 @@ class AnalysisRequest:
     parent_artifact_id: str | None
     created_at: str
     execution: str = 'harness_only'
+    request_key: str | None = None  # Historical requests have no caller key.
 
 
 @dataclass(frozen=True)
@@ -116,8 +118,10 @@ class CollabAnalysis:
             "VALUES ($1,$2,$3,'analysis',$4)", str(uuid4()), principal.owner, action, entity_id)
 
     async def create_analysis_request(self, principal: Principal, room_id: str, prompt: str,
-                                      file_ids: list[str], *, target_agent_id=None,
+                                      file_ids: list[str], request_key=None, *, target_agent_id=None,
                                       parent_artifact_id=None, authorize=None) -> AnalysisRequest:
+        """Create once per authenticated creator/key; replay only under current authority."""
+        _identifier(request_key)
         _identifier(room_id)
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000:
             raise CollabError(400, 'prompt must contain 1 to 8000 characters')
@@ -127,22 +131,39 @@ class CollabAnalysis:
             raise CollabError(403, 'analysis delegation is not permitted')
         if parent_artifact_id is not None:
             _identifier(parent_artifact_id)
+        fingerprint = hashlib.sha256(_canonical({
+            'room_id': room_id, 'prompt': prompt, 'file_ids': selected,
+            'agent_id': agent_id, 'parent_artifact_id': parent_artifact_id,
+        })).hexdigest()
         async with self.conn.transaction():
             await self._lock()
+            await self.registry._principal(principal)
+            # Serialize absent-row races across processes, not just committed replays.
+            await self.conn.execute('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
+                                    _canonical(['analysis-request', principal.key, request_key]).decode())
             await self._authorize(principal, room_id, authorize)
             await self._executor(principal.owner, agent_id, room_id)
+            previous = await self.conn.fetchrow(
+                'SELECT request_id,request_fingerprint FROM collab_analysis_requests '
+                'WHERE creator_key=$1 AND request_key=$2', principal.key, request_key)
+            if previous and previous['request_fingerprint'] != fingerprint:
+                raise CollabError(409, 'analysis request key conflicts with original input')
             if parent_artifact_id is not None:
                 parent = await self._artifact(principal, parent_artifact_id, authorize)
                 if parent.room_id != room_id:
                     raise CollabError(404, 'not found')
+            if previous:
+                return await self._request(principal, previous['request_id'], authorize)
             files = await self._files(room_id, selected)
             result = AnalysisRequest(str(uuid4()), room_id, principal.owner, principal.key,
-                                     agent_id, prompt, files, parent_artifact_id, datetime.now(UTC).isoformat())
+                                     agent_id, prompt, files, parent_artifact_id, datetime.now(UTC).isoformat(),
+                                     request_key=request_key)
             await self._authorize(principal, room_id, authorize)
             await self.conn.execute(
-                'INSERT INTO collab_analysis_requests(request_id,room_id,owner_id,agent_id,record) '
-                'VALUES ($1,$2,$3,$4,$5::jsonb)', result.request_id, room_id, principal.owner,
-                agent_id, _canonical(asdict(result)).decode())
+                'INSERT INTO collab_analysis_requests '
+                '(request_id,room_id,owner_id,agent_id,record,creator_key,request_key,request_fingerprint) '
+                'VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8)', result.request_id, room_id, principal.owner,
+                agent_id, _canonical(asdict(result)).decode(), principal.key, request_key, fingerprint)
             await self._audit(principal, 'analysis.requested', result.request_id)
             return result
 

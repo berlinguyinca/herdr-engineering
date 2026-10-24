@@ -100,7 +100,8 @@ _UPLOAD_TOOLS = {
 }
 
 _ANALYSIS_TOOLS = {
-    'analysis_request': ('create_analysis_request', ['room_id', 'prompt', 'file_ids'], {
+    'analysis_request': ('create_analysis_request', ['room_id', 'prompt', 'file_ids', 'request_key'], {
+        'request_key': {'type': 'string', 'minLength': 1, 'maxLength': 200},
         'room_id': _STR, 'prompt': {'type': 'string', 'maxLength': 8000},
         'file_ids': {'type': 'array', 'items': _STR, 'minItems': 1, 'maxItems': 100},
         'parent_artifact_id': _STR}),
