@@ -242,3 +242,22 @@ def test_distribution_probe_reads_actual_target_interpreter_metadata(tmp_path):
     metadata.unlink()
     with pytest.raises(RuntimeError, match='distribution does not match'):
         stage.verify_herdr_distribution(home, release, stage.run)
+
+
+def test_already_staged_release_is_reused_without_change(repository, tmp_path):
+    stage = module()
+    repo, sha = repository
+    home = tmp_path / 'home'
+    (home / '.pi/agent').mkdir(parents=True)
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd[0])
+        return install_ok(cmd, **kwargs)
+
+    first, changed = stage.stage_or_reuse(home, sha, 'pi', str(repo), runner)
+    assert changed is True
+    calls.clear()
+    again, changed = stage.stage_or_reuse(home, sha, 'pi', str(repo), runner)
+    assert changed is False and again == first
+    assert 'npm' not in calls  # nothing reinstalled

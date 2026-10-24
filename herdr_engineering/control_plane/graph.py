@@ -1492,69 +1492,6 @@ class GraphProjection:
             ctx: dict = {}
             return {"edges": [self._edge_view(e, principal, ctx) for e in matches[:MAX_NODE_EDGES]]}
 
-    def list_nodes(self, principal, node_type: str, *, edge_type: str | None = None,
-                   limit: int = DEFAULT_NODES, contexts: frozenset | None = None) -> dict:
-        """The nodes of one type the caller may see (first-seen order, at most ``limit``), plus the visible
-        live ``edge_type`` edges between them. This is how a workbench finds its agents when the emitter
-        defines no workspace/mission root node. Visibility is checked per node and per edge; a hidden node
-        is never counted, so ``truncated`` (limit hit, or the ``SCAN_BUDGET`` of examined ids spent) says
-        nothing about hidden items. ``contexts`` (server-built, never from a client) narrows the list to nodes
-        whose visible scope names one of those ``(room|mission, id)`` pairs: one room's view of the graph."""
-        if node_type not in NODE_TYPES:
-            raise ValueError("unknown node_type")
-        if edge_type is not None and edge_type not in EDGE_TYPES:
-            raise ValueError("unknown edge_type")
-        if not isinstance(limit, int) or not 1 <= limit <= MAX_NODES:
-            raise ValueError(f"limit must be between 1 and {MAX_NODES}")
-        with self._lock:
-            views, reason = {}, None
-            if contexts is None:
-                candidates = self._by_type.get(node_type, ())      # keyed API: first-seen order
-            else:                                                  # one room: only what was addressed to it
-                # insertion (admission) order: no sort of the whole set, identical live and after rebuild
-                seen = {}
-                for c in sorted(contexts, key=repr):
-                    seen.update(self._by_ctx.get(c, {}).get(node_type, {}))
-                candidates = seen
-            for scanned, nid in enumerate(candidates):
-                if scanned >= SCAN_BUDGET:
-                    reason = "scan_budget"
-                    break
-                node = self._nodes[nid]
-                if not self._node_visible(principal, node):
-                    continue
-                if contexts is not None:
-                    label = node.eff_scope(principal, internal=False) if node.commons else node.eff_scope()
-                    if not (isinstance(label, tuple) and label[:3] in contexts):
-                        continue
-                if len(views) >= limit:
-                    reason = "limit"
-                    break
-                views[nid] = self._node_view(node, principal)
-            edges, ctx, done = [], {}, set()
-            if edge_type is not None:
-                left = EDGE_SCAN_TOTAL                              # one budget for the whole read
-                for nid in views:
-                    if left <= 0:
-                        reason = reason or "edge_budget"
-                        break
-                    per = min(NEIGHBOR_SCAN_BUDGET, left)
-                    left -= min(len(self._out.get(nid, ())), per)
-                    own, others, exhausted = self._expand(principal, nid, "out", {edge_type}, False, None, per)
-                    if exhausted:
-                        reason = reason or "edge_budget"
-                    for edge in own + others:
-                        if edge.to_id in views and edge.key not in done:
-                            if len(edges) >= MAX_EDGES:
-                                reason = reason or "limit"
-                                continue
-                            done.add(edge.key)
-                            edges.append(self._edge_view(edge, principal, ctx))
-            # `truncated_reason` names the budget that ended the read; it counts only visible items or the size
-            # of the one context asked about, never hidden nodes elsewhere in the graph.
-            return {"node_type": node_type, "nodes": list(views.values()), "edges": edges,
-                    "truncated": reason is not None, "truncated_reason": reason}
-
     @staticmethod
     def _owner_attr(edge: _Edge, owner: str, name: str) -> Any:
         """Newest value of attr ``name`` written by ``owner`` itself.
@@ -1670,6 +1607,69 @@ class GraphProjection:
             return {"pr": pr_id, "head": head, "head_event_id": head_event,
                     "head_state": head_state, "head_resync_candidate": candidate, "author": author,
                     "reviews": reviews, "authors": sorted(authors)}
+
+    def list_nodes(self, principal, node_type: str, *, edge_type: str | None = None,
+                   limit: int = DEFAULT_NODES, contexts: frozenset | None = None) -> dict:
+        """The nodes of one type the caller may see (first-seen order, at most ``limit``), plus the visible
+        live ``edge_type`` edges between them. This is how a workbench finds its agents when the emitter
+        defines no workspace/mission root node. Visibility is checked per node and per edge; a hidden node
+        is never counted, so ``truncated`` (limit hit, or the ``SCAN_BUDGET`` of examined ids spent) says
+        nothing about hidden items. ``contexts`` (server-built, never from a client) narrows the list to nodes
+        whose visible scope names one of those ``(room|mission, id)`` pairs: one room's view of the graph."""
+        if node_type not in NODE_TYPES:
+            raise ValueError("unknown node_type")
+        if edge_type is not None and edge_type not in EDGE_TYPES:
+            raise ValueError("unknown edge_type")
+        if not isinstance(limit, int) or not 1 <= limit <= MAX_NODES:
+            raise ValueError(f"limit must be between 1 and {MAX_NODES}")
+        with self._lock:
+            views, reason = {}, None
+            if contexts is None:
+                candidates = self._by_type.get(node_type, ())      # keyed API: first-seen order
+            else:                                                  # one room: only what was addressed to it
+                # insertion (admission) order: no sort of the whole set, identical live and after rebuild
+                seen = {}
+                for c in sorted(contexts, key=repr):
+                    seen.update(self._by_ctx.get(c, {}).get(node_type, {}))
+                candidates = seen
+            for scanned, nid in enumerate(candidates):
+                if scanned >= SCAN_BUDGET:
+                    reason = "scan_budget"
+                    break
+                node = self._nodes[nid]
+                if not self._node_visible(principal, node):
+                    continue
+                if contexts is not None:
+                    label = node.eff_scope(principal, internal=False) if node.commons else node.eff_scope()
+                    if not (isinstance(label, tuple) and label[:3] in contexts):
+                        continue
+                if len(views) >= limit:
+                    reason = "limit"
+                    break
+                views[nid] = self._node_view(node, principal)
+            edges, ctx, done = [], {}, set()
+            if edge_type is not None:
+                left = EDGE_SCAN_TOTAL                              # one budget for the whole read
+                for nid in views:
+                    if left <= 0:
+                        reason = reason or "edge_budget"
+                        break
+                    per = min(NEIGHBOR_SCAN_BUDGET, left)
+                    left -= min(len(self._out.get(nid, ())), per)
+                    own, others, exhausted = self._expand(principal, nid, "out", {edge_type}, False, None, per)
+                    if exhausted:
+                        reason = reason or "edge_budget"
+                    for edge in own + others:
+                        if edge.to_id in views and edge.key not in done:
+                            if len(edges) >= MAX_EDGES:
+                                reason = reason or "limit"
+                                continue
+                            done.add(edge.key)
+                            edges.append(self._edge_view(edge, principal, ctx))
+            # `truncated_reason` names the budget that ended the read; it counts only visible items or the size
+            # of the one context asked about, never hidden nodes elsewhere in the graph.
+            return {"node_type": node_type, "nodes": list(views.values()), "edges": edges,
+                    "truncated": reason is not None, "truncated_reason": reason}
 
     def neighborhood(self, principal, root: str, *, depth: int = DEFAULT_DEPTH,
                      max_nodes: int = DEFAULT_NODES, max_edges: int = DEFAULT_EDGES,

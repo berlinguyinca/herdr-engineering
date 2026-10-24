@@ -51,9 +51,12 @@ none, so there `POST /rooms/{room}/delegations` answers 409 `graph_unavailable` 
 `kind` is `patch` (a strictly parsed unified diff), `doc` or `analysis` (plain text), or `link` (an https URL kept as a string and
 never fetched by the server). Server-side checks, identical on every protocol:
 * size cap (the task's `max_artifact_bytes`, at most 32 KiB), text only: NUL, control, bidirectional, zero-width and other invisible
-  characters, lone `\r`, and secret-like strings are **refused**, not repaired (a repaired patch is not the patch the reviewer read);
+  characters, any `\r` (so CRLF text is refused with code `crlf`; nothing is converted, send LF), and secret-like strings are **refused**, not repaired (a repaired patch is not the patch the reviewer read);
 * patch: every `diff --git`, `---`, `+++` and hunk header is parsed and counted; refused: paths outside `scope.paths`, `..`/absolute/backslash/
-  drive/`:` paths, `.git*`/`.husky`/`.github/workflows` paths, renames and copies, any mode change, new file modes other than `100644`
+  drive/`:` paths, a hard-coded deny-list of files a checkout executes (`.git*`, `.husky`, `.githooks`, `.github/workflows/`, `.github/actions/`,
+  `.gitlab-ci.yml`, `.circleci/`, `Jenkinsfile`, `.pre-commit-config.yaml`, NTFS 8.3 short names such as `GIT~1`; no room owner or delegate can lift it, and there is no
+  operator override either), `---`/`+++` names with any whitespace or invisible character (refused, never stripped), `/dev/null` headers that disagree with the hunk
+  ranges (creation needs one `-0,0` hunk, deletion one `+0,0` hunk, as `git apply` reads them), renames and copies, any mode change, new file modes other than `100644`
   (so no symlinks `120000`, submodules `160000` or executables `100755`), `GIT binary patch`/`Binary files`, more than 20 files or 2000 lines;
 * link: https only, no credentials in the URL, port 443, DNS name with a dot (no IP literals, `localhost`, `.local`, `.internal`, `.lan`);
 * `refs.paths/nodes/questions` must be inside the scope;
@@ -98,6 +101,10 @@ budget) are audited `denied` with a reason, at most once a minute per reason.
 | delegate, review, decide | REST, a person's token only | not offered | not offered |
 
 ## Rollout and rollback
+Performance and exposure notes: the cheap checks (version, task state, budget, quotas, exact resend) run before the content is parsed, and parsing happens outside the
+service lock; every pattern in the validator is bounded. `GET /rooms/{r}/tasks` shows a delegation's `bounds` and `version` only to room owners (the delegate has its own inbox).
+The open ingest listener (no API keys configured) is not an operator for the reserved `task:hcn-delegation.*` / `artifact:hcn-proposal.*` ids.
+
 Code only; new log events (`proposal_submitted`, `proposal_decided`, `proposal_promoted`, `task_progress`, and `bounds` on `task_created`)
 are additive and ignored by older code, which would show a bounded task as an ordinary pending task addressed to an external agent that cannot
 see it. No migration. Roll back by setting `delegation_enabled: false` (immediate), or by reverting the PR. Graph nodes already written stay.
