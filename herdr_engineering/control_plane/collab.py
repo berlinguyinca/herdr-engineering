@@ -3315,6 +3315,11 @@ class CollabService:
                 depth, root = pt["depth"] + 1, pt["root"]
                 if depth > MAX_TASK_DEPTH:
                     raise CollabError(400, "task chain is too deep")
+                # A relay never widens a person's delegation: the chain's starting user must
+                # still hold (room, target, user) access, as must the user behind the parent.
+                if not (self._creator_valid(pt, room)
+                        and self._root_may_use(root, pt.get("delegation_admin", False), pt["seq"], room, tid_)):
+                    raise CollabError(403, "the requesting user has no delegation for that agent")
             elif parent is not None:
                 raise CollabError(400, "parent_task_id is for agents delegating a task")
             self._prune()
@@ -3330,7 +3335,7 @@ class CollabService:
                 pr, project_id=room["project_id"], room_id=room_id, task_id=task_id,
                 target_agent_id=tid_, text=text, depth=depth, parent_task_id=parent,
                 created_by_kind=pr.kind, created_by_id=pr.id, created_epoch=now, root_user_id=root,
-                delegation_admin=pr.admin,
+                delegation_admin=pt.get("delegation_admin", False) if pr.is_agent else pr.admin,
                 visibility_scope="room", action="task.create", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=task_id))
             if ikey is not None:
@@ -3413,6 +3418,15 @@ class CollabService:
         return bool(permission and permission["status"] == "approved"
                     and (permission.get("expires_at") is None or self._now() < permission["expires_at"]))
 
+    def _root_may_use(self, user_id: str, admin: bool, seq: int, room: dict, agent_id: str) -> bool:
+        """The person who started a task chain must still be entitled to use the target agent."""
+        m = self._member(room, user_id)
+        if not (m and seq >= m["joined_seq"] and "task" in ROLE_ACTIONS[m["role"]] and self._ok(user_id)):
+            return False
+        pr = Principal("user", user_id, user_id)
+        pr.admin = admin
+        return self._delegation_valid(pr, room, agent_id)
+
     def _delegation_request(self, pr: Principal, room: dict, agent_id: str) -> dict:
         permission = self.set_agent_permission(pr, room["id"], agent_id, pr.id, "pending")
         return {"room_id": room["id"], "agent_id": agent_id, "status": "pending",
@@ -3433,7 +3447,9 @@ class CollabService:
         if not creator:
             return False
         eff = self._effective(Principal("agent", t["by_id"], creator["owner"]), room)
-        return bool(eff and "instruct" in eff[0])
+        return bool(eff and "instruct" in eff[0]
+                    and (not delegation or self._root_may_use(
+                        t["root"], t.get("delegation_admin", False), t["seq"], room, t["target"])))
 
     def _task_json(self, tid: str, t: dict) -> dict:
         a = self._agents.get(t["target"], {})
@@ -3504,6 +3520,8 @@ class CollabService:
                     or not self._creator_valid(t, room, delegation=False)):
                 raise CollabError(404, "not found")
             if not self._creator_valid(t, room):
+                if t["by_kind"] != "user":
+                    raise CollabError(404, "not found")     # agents never request access for a person
                 return self._delegation_request(Principal("user", t["by_id"], t["by_id"]), room, t["target"])
             bad = [k for k in body if k not in ("status", "result")]
             status = body.get("status")
