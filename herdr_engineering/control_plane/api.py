@@ -295,6 +295,7 @@ class ControlPlaneServer:
             raise ValueError("review_gate: the event sink cannot make durable writes")
         from ..review_gate import github_app
         from ..review_gate.coordinator import ReviewCoordinator
+        from ..review_gate.notifier import AuthorNotifier
         from ..review_gate.queue import ReviewQueue
         from ..review_gate.registry import AuthorRegistry
         from ..review_gate.service import GateService
@@ -306,13 +307,17 @@ class ControlPlaneServer:
         # The queue's real lease and the lease a Claim reports must be one value.
         self.gate_queue = ReviewQueue(repo, lease_seconds=config.reviewer.lease_seconds)
         app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
+        registry = AuthorRegistry(repo)
+        notifier = AuthorNotifier(repo, config=config.notify, registry=registry,
+                                  dispatcher=self.dispatcher)
         self.gate_service = GateService(
             config=config,
             app=app,
             store=self.gate_store,
             queue=self.gate_queue,
-            registry=AuthorRegistry(repo),
+            registry=registry,
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=False),
+            notifier=notifier,
         )
         self.gate_reviewer_config = config.reviewer
         self.gate_coordinator = ReviewCoordinator(
@@ -1110,6 +1115,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"depth": server.gate_queue.depth(),
                                    "jobs": server.gate_queue.snapshot(),
                                    "gate": server.gate_service.status()})
+            if parts[4] == "notices":
+                from ..review_gate.notifier import recent_notices
+                return self._json(recent_notices(server.repo))
             return self._json({"error": "not found"}, 404)
 
         def _review_gate_resume(self, parts):

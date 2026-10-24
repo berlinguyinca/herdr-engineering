@@ -30,6 +30,9 @@ touched) and every open, non-draft PR in it:
    ``reject`` -> ``failure``; ``wait`` -> ``pending``.
 5. ``CHANGES_REQUESTED``, ``CI_RED`` and ``ESCALATED`` hold ``failure`` (the
    description says why); only ``store.resume`` clears an escalation.
+6. In those three states the optional ``notifier`` is called on every tick
+   (it is idempotent per head SHA and channel); its errors are logged by PR
+   key only and never block the gate.
 
 Decisions and limits:
 - No approval carry-over. A correct carry-over compares each head's diff
@@ -136,8 +139,10 @@ class GateService:
         registry: AuthorRegistry,
         ci_snapshot: Callable[[], dict],
         now: Callable[[], float] = time.time,
+        notifier=None,
     ):
         self._config = config
+        self._notifier = notifier
         self._app = app
         self._store = store
         self._queue = queue
@@ -310,6 +315,7 @@ class GateService:
 
         state = snap.state
         rearmed = False
+        failures: tuple[str, ...] = ()
         if state == State.CI_PENDING:
             verdict = ci_verdict_for(sha, rows, enrollment, snapshot_stale=stale)
             if verdict.result == "green":
@@ -323,8 +329,10 @@ class GateService:
                 self._store.on_ci_red(key, sha, verdict.failures)
                 snap = self._store.snapshot(key)
                 state = snap.state
+                failures = tuple(verdict.failures)
                 if state != State.ESCALATED:
                     self._status(repo, sha, "failure", "CI failed: " + ", ".join(verdict.failures))
+                    self._notify(key, snap, pr.head_ref, failures)
                     return
             else:
                 self._status(repo, sha, "pending", "review gate: waiting for CI")
@@ -354,6 +362,16 @@ class GateService:
             )
         elif state == State.APPROVED:
             self._approved(enrollment, pr, key, snap, rows, stale, counts)
+        if state in (State.CHANGES_REQUESTED, State.CI_RED, State.ESCALATED):
+            self._notify(key, snap, pr.head_ref, failures)
+
+    def _notify(self, key: PrKey, snap: PrSnapshot, head_ref: str, failures) -> None:
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.notify(key, snap, head_ref, failures)
+        except Exception:  # noqa: BLE001 - a notification never blocks the gate
+            log.warning("review gate: notification failed for %s#%s", key.repo, key.number)
 
     def _ensure_queued(self, key: PrKey, sha: str, head_ref: str, counts: dict) -> bool:
         """Plain (deduping) enqueue; False when no live job exists for (key, sha)."""

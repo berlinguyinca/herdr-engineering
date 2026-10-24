@@ -749,3 +749,95 @@ def test_reviewing_pr_with_live_job_is_not_rearmed():
     after = _live_jobs(queue)
     assert [j["job_id"] for j in after] == [j["job_id"] for j in before] == [claim.job_id]
     assert after[0]["state"] == "claimed"
+
+
+class RecordingNotifier:
+    def __init__(self, raises=False):
+        self.calls = []
+        self.raises = raises
+
+    def notify(self, key, snap, head_ref, failures=()):
+        self.calls.append((key, snap.state, snap.head_sha, head_ref, tuple(failures)))
+        if self.raises:
+            raise RuntimeError("notice write failed")
+
+
+def make_notified(notifier):
+    svc, app, store, queue, registry, ci = make()
+    svc._notifier = notifier
+    return svc, app, store, queue, registry, ci
+
+
+def test_service_accepts_notifier_argument():
+    cp = ControlPlaneRepo()
+    notifier = RecordingNotifier()
+    svc = GateService(
+        config=ReviewGateConfig(enabled=True, app=None, repos=(RepoEnrollment(repo=REPO),)),
+        app=FakeApp(),
+        store=PipelineStore(cp),
+        queue=ReviewQueue(cp),
+        registry=AuthorRegistry(cp),
+        ci_snapshot=CI(),
+        notifier=notifier,
+    )
+    assert svc._notifier is notifier
+
+
+def test_service_notifies_ci_red_with_failures_then_on_later_ticks():
+    notifier = RecordingNotifier()
+    svc, app, store, _, _, ci = make_notified(notifier)
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "failure", n=3))
+    svc.tick()
+    assert len(notifier.calls) == 1
+    key, state, sha, ref, failures = notifier.calls[0]
+    assert (key, state, sha, ref) == (KEY, State.CI_RED, A, "feat/x")
+    assert failures  # the run names the status lists
+    svc.tick()
+    assert len(notifier.calls) == 2 and notifier.calls[1][4] == ()
+    assert [s[3] for s in app.statuses(A)] == ["pending", "failure"]
+
+
+def test_service_notifies_changes_requested_and_escalated_only():
+    notifier = RecordingNotifier()
+    svc, app, store, _, _, ci = make_notified(notifier)
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    assert notifier.calls == []  # CI_GREEN: no notification
+    assert store.on_review_started(KEY, A, "reviewer-m")
+    svc.tick()
+    assert notifier.calls == []  # REVIEWING
+    bad = Finding("a.py", "bug", "nope", "high", "fix it", 1)
+    assert store.on_verdict(KEY, Verdict("FAIL", A, (bad,), "reviewer-m"))
+    svc.tick()
+    assert [c[1] for c in notifier.calls] == [State.CHANGES_REQUESTED]
+    assert "changes requested" in app.statuses(A)[-1][4]
+
+
+def test_service_notifies_ci_fix_cap_escalation_with_failures():
+    notifier = RecordingNotifier()
+    svc, app, store, _, _, ci = make_notified(notifier)
+    store._ci_fix_cap = 1
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "failure"))
+    svc.tick()
+    assert [c[1] for c in notifier.calls] == [State.ESCALATED]
+    assert notifier.calls[0][4]
+    assert "escalated" in app.statuses(A)[-1][4]
+
+
+def test_service_calls_notifier_and_survives_its_exception(caplog):
+    notifier = RecordingNotifier(raises=True)
+    svc, app, store, _, _, ci = make_notified(notifier)
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "failure", n=3))
+    summary = svc.tick()
+    assert summary["errors"] == 0
+    assert len(notifier.calls) == 1
+    assert store.snapshot(KEY).state == State.CI_RED
+    assert app.last_status(A) == "failure"
+    assert f"notification failed for {REPO}#7" in caplog.text
+    assert "notice write failed" not in caplog.text
+    svc.tick()  # retried on the next tick
+    assert len(notifier.calls) == 2
