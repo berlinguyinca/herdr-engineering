@@ -27,6 +27,7 @@
 - A token rotation or an org removed from `github.organizations` must purge rows; nothing from an unlisted owner may remain served.
 - SSE reconnect after idle must not trigger a refresh storm; a replayed event must not re-render.
 - A client whose `since` revision predates tombstone retention must get a full resync, not silent drift.
+- A literal `@agent /skill` or `@file` typed to a pi agent must arrive byte-for-byte unchanged; a forged `mentions` field must be ignored; a file edited by two agents must keep both versions.
 - Rate-limit exhaustion mid-pass must leave the previous cache intact and flagged stale/deferred.
 
 ## File Structure
@@ -39,7 +40,7 @@
 
 ## PR grouping
 
-PR-A Tasks 1-5 (plumbing). PR-B Tasks 6-9 (five routes). PR-C Tasks 10-12 (motion, themes, calm). PR-D Tasks 13-18 (per-page polish, may split per area). PR-E Task 19 (migrate remaining views). PR-G1 Tasks G0-G4. PR-G2 Tasks G5-G7. PR-G3 Tasks G8-G9 (Projects, UI).
+PR-A Tasks 1-5 (plumbing). PR-B Tasks 6-9 (five routes). PR-C Tasks 10-12 (motion, themes, calm). PR-D Tasks 13-18 (per-page polish, may split per area). PR-E Task 19 (migrate remaining views). PR-G1 Tasks G0-G4. PR-G2 Tasks G5-G7. PR-G3 Tasks G8-G9 (Projects, UI). PR-C1 Tasks C0-C3 (addressing, completion engine, chips). PR-C2 Tasks C4-C5 (issue refs, room files; C4 needs G2+G4 merged). PR-C3 Tasks C6-C7 (room commands, GitHub write gate).
 
 ---
 
@@ -362,9 +363,80 @@ PR-A Tasks 1-5 (plumbing). PR-B Tasks 6-9 (five routes). PR-C Tasks 10-12 (motio
 
 ---
 
+## Collaboration room track (Tasks C0-C7)
+
+Spec section: "Collaboration room editor and shared work". Literal text reaches harnesses unchanged.
+
+### Task C0: Spike — what exists and what pi accepts
+
+**Files:** Create `docs/superpowers/notes/collab-editor-recon.md`
+
+- [ ] **Step 1:** Record where agent names are stored/validated (`collab-mention.js` `NAME`, `collab.py`), how `conversation-composer.js` uploads attachments, which storage collab already uses for them, and whether agents can report skills at registration. **Step 2:** From pi 1.3.0 help/docs record the in-chat syntax for files and skills; the spec's "pass literally" rule stands regardless. **Step 3: Commit** `docs: collab editor recon`.
+
+### Task C1: Addressing model and server-side resolution
+
+**Files:** Modify `herdr_engineering/control_plane/collab.py` (`post_message`, `_MESSAGE_FIELDS`, agent naming), `packages/herdr-web-client/collab.js`; Test: `tests/test_collab_mentions.py`
+
+**Interfaces:**
+- Produces: `resolve_mentions(room, text) -> list[{kind, id, name}]` (`kind` person|agent|group); stored `mentions` on the message; alias table old name → `<owner>.<harness>`; name regex `[a-z0-9._-]{1,48}`; `@all/@agents/@here` groups.
+
+- [ ] **Step 1: Write failing tests:** `@gert` resolves person; `@gert.pi` resolves agent; old agent name resolves via alias; second same-harness agent is `gert.pi-2`; unknown `@x` yields no mention; a client-sent `mentions` field is ignored (forged); group expands to room members/agents only. **Steps 2-4:** implement and pass. **Step 5: Commit** `feat(collab): owner.harness addressing and server-resolved mentions`.
+
+### Task C2: Completion engine
+
+**Files:** Modify `packages/collab-mention.js` (sigil providers), `packages/conversation-composer.js` (menu from providers); Test: `packages/herdr-web-components/collab-completion.test.js`
+
+**Interfaces:**
+- Produces: `completionAt(text, caret) -> {sigil, query, start} | null`; `providers[sigil](query, ctx) -> Item[]` with `Item {insert, label, section, icon, detail}`; `@` sections People/Agents/Files; `#` issues/PRs; `/` at message start = room commands; after `@agent ` a `/` lists that agent's reported skills. `applyCompletion(text, caret, start, item)` inserts the literal text only.
+
+- [ ] **Step 1: Write failing tests:** `@ge` ranks `gert` before `gert.pi`; `a@b.com` and `C:\path` do not open a menu; `/` mid-sentence does not; `@gert.pi /sk` offers that agent's skills; `applyCompletion` output equals the typed form (no rewriting). **Steps 2-4. Step 5: Commit** `feat(collab): sigil completion engine`.
+
+### Task C3: Chips and composer wiring
+
+**Files:** Modify `packages/collab-view.js` (`mountComposer` call, message render), `packages/session-workspace.js`, `packages/motion.css`; Test: `tests/playwright/collab-editor.test.mjs`
+
+- [ ] **Step 1: Write failing Playwright tests:** menu opens on `@`, arrows/Enter select, Esc closes, focus stays in the textarea; sent message renders person/agent chips with icons; unresolved `@zzz` is flagged before send and sent as plain text; `@gert.pi /skill` text is sent verbatim; the session workspace composer behaves the same. **Steps 2-4. Step 5: Commit** `feat(collab): chips and completion menu in the shared composer`. (Close PR-C1.)
+
+### Task C4: Issue references
+
+**Files:** Modify `herdr_engineering/control_plane/api.py` (`/api/v1/github/resolve?q=`), `collab.py` (`refs` on messages), `packages/collab-mention.js` (`#` provider); Test: `tests/test_collab_refs.py`
+
+**Interfaces:**
+- Consumes: G2/G4 store (`search_issues(query, owners)`), in-scope owners only.
+- Produces: `#binview-44` and `org/repo#44` resolved to `refs`; shortest unambiguous insert form; chip shows title and state from the cache.
+
+- [ ] **Step 1: Write failing tests:** in-scope issue resolves; excluded owner's issue does not appear in the menu or in `refs`; two owners with the same repo name need `org/repo#n`; a closed issue shows closed; cache empty → menu says "GitHub cache not ready", message still sends. **Steps 2-4. Step 5: Commit** `feat(collab): #issue references from the GitHub cache`.
+
+### Task C5: Room files and shelf
+
+**Files:** Create `herdr_engineering/control_plane/collab_files.py`, `packages/collab-files-view.js`; Modify `collab.py`, `api.py`, `packages/conversation-composer.js` (upload hook), `herdr_engineering/cli.py` (`collab file get|put|list`); Test: `tests/test_collab_files.py`, `tests/playwright/collab-files.test.mjs`
+
+**Interfaces:**
+- Produces: `put_file(room, author, name, bytes, parent=None) -> {id, name, version, size, sha256}`; versions immutable; `files` on messages; stable path `.collab/files/<name>`; quotas from `collab.files.max_bytes` (25 MiB) and `collab.files.room_bytes` (500 MiB).
+
+- [ ] **Step 1: Write failing tests:** upload then fetch returns identical bytes and hash; second upload with `parent` creates v2, v1 still readable; oversize and over-quota rejected with a clear error; a non-member cannot read; an agent put creates a version attributed to that agent; shelf lists versions and patches rows without re-render. **Steps 2-4. Step 5: Commit** `feat(collab): room file shelf with immutable versions`. (Close PR-C2.)
+
+### Task C6: Room commands and GitHub write gate
+
+**Files:** Modify `collab.py` (command parser, events), `herdr_engineering/github.py` (`GitHubWriter`, separate token ref), config (`github.write.enabled`, `github.write.token_ref`), `packages/collab-view.js` (cards, confirm dialog); Test: `tests/test_collab_commands.py`
+
+**Interfaces:**
+- Produces: events `handoff {from,to,note}`, `decision`, `summary_request`, `issue_draft`, `assignment`; `GitHubWriter.create_issue(owner, repo, title, body)` and `.assign(owner, repo, number, login)`, refused unless `github.write.enabled`.
+
+- [ ] **Step 1: Write failing tests:** `/handoff @a @b note` yields a handoff event addressed to b; `/` not at message start is plain text; `/issue` never calls GitHub until confirmed; with `github.write.enabled: false` it returns a clear "disabled" result; the write token is never the read token and never appears in events or logs. **Steps 2-4. Step 5: Commit** `feat(collab): room commands and gated GitHub writes`.
+
+### Task C7: Handoff status, presence, unread mentions
+
+**Files:** Modify `collab.py`, `packages/collab-view.js`; Test: `tests/test_collab_handoff.py`
+
+- [ ] **Step 1: Write failing tests:** a handoff starts `pending`, recipient accept/decline updates it and posts a card; presence shows "working" while an agent holds an active task; unread mention count per person clears when the room is read. **Steps 2-4. Step 5: Commit** `feat(collab): handoff status, presence and unread mentions`. (Close PR-C3.)
+
+---
+
 ## Self-review
 
 - **Spec coverage:** patcher (1), calm/motion (2, 5, 10-12, 16), SSE (3), bus (4), freshness/tokens/dark (5, 13, 17), router and five routes (6-9), per-page polish (10-15), docs (18), view migration (19), G1 store, G2/G3 incremental + reconciliation, G4 org scoping, G5 budget, G6 detail, G7/G8 ETag + deltas, G9 Projects. Operator decisions: org allowlist (G4, G9), dark (5, 17), calm (2, 5, 16).
+- **Collab track:** addressing (C1), completion (C2), chips (C3), `#` refs (C4, needs G2+G4), files (C5), commands and write gate (C6), status/presence (C7). The board and `/summarize` content are deferred (spec "later, optional").
 - **Gaps accepted:** no webhooks (non-goal). Generic ETag is body-hash (spec ruling).
 - **Type consistency:** `patchList/patchText/patchAttr` (Task 1) are the only patch names used later; `tween/flash/setCalm/isCalm/loadCalm` (Task 2) likewise; store method names in G1 are the ones G2-G6 call.
 - **Proportion:** tasks give signatures, tests and values; bodies are left to the implementer.

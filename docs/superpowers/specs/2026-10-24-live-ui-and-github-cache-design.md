@@ -228,3 +228,86 @@ A fresh reader asked eight questions; none needs the operator. Rulings, each a c
    first task adds a fixture-page harness. No jsdom is added.
 8. **SSE proxying.** Keepalive every 10 s plus `X-Accel-Buffering: no`; verified live on bender
    (via `dev.lan`) in step 1, since that is the real path.
+
+## Collaboration room editor and shared work (added 2026-10-24)
+
+### Intent
+
+The room is a chat with no harness; people and agents (pi, Claude Code, codex) talk in it, and
+each agent runs its own harness elsewhere. The composer today knows only `@agent` and a thin `/`
+menu, text is the only message payload, and files cannot be shared. The operator wants the room
+to be where several people and several agents collaborate: address the right one without
+ambiguity, hand work between agents, reference GitHub issues, and share files that several agents
+can work on. What works in a pi session (`@file`, `/skill`) must keep working, unchanged, when
+sent to a pi agent.
+
+### Decided by the operator
+
+1. Literal text reaches harnesses unchanged. The editor completes, validates and uploads; it
+   never rewrites what an agent's harness will read.
+2. Files use the link approach: a room-scoped upload, then a link plus a stable path
+   (`.collab/files/<name>`) that an agent-side helper fetches. The room never pushes bytes into a
+   harness.
+3. Addressing (accepted recommendation): `@gert` is a person; `@gert.pi`, `@gert.claude` are
+   gert's agents (`<owner>.<harness>`); `@all`, `@agents`, `@here` are groups. The menu groups
+   People / Agents / Files with a person and a robot icon; sent messages render mentions as chips.
+4. `#binview-44` references a GitHub issue or PR; the menu inserts the shortest unambiguous form
+   and `org/repo#44` when two in-scope owners share a repo name. Candidates come from the GitHub
+   cache and therefore obey `github.organizations`.
+5. Room commands are interpreted by the collab server and only when `/` starts the message:
+   `/handoff @a @b <note>`, `/decide <text>`, `/summarize`, `/issue` (turn the replied-to or
+   selected messages into a GitHub issue), `/assign #repo-n @person`. An agent's own skills are
+   reached as `@gert.pi /skill`: that `/` is passed literally and the menu then lists that agent's
+   skills. `!` is not completed (shell escape belongs to harnesses); `$` is unused.
+6. Room file shelf: every upload is immutable. An edit by an agent becomes a new version
+   (`v2`, `v3`) attributed to it; nothing is overwritten.
+
+### Author's calls (not yet confirmed by the operator)
+
+- Existing agent names keep working as aliases of their new `<owner>.<harness>` names forever;
+  a second agent with the same owner and harness becomes `@gert.pi-2`.
+- Name characters: `[a-z0-9._-]`, 1-48 characters; `.` separates owner from harness.
+- `/issue` and `/assign` write to GitHub only when YAML `github.write.enabled: true` (default
+  false) and after an explicit confirm in the UI. The read-only cache token is not reused for
+  writes; a separate token reference is configured under `github.write.token_ref`.
+- Skills: each agent reports its skill names in its registration; the room only lists them.
+- Upload limits: 25 MiB per file, 500 MiB per room, configurable under `collab.files.*`;
+  executable and archive types are stored but never auto-opened.
+- Later, optional (own PR, after the above): handoff accept/decline status, presence
+  ("working…"), per-person unread mention counts, a per-room board linked to issues.
+
+### Anti-goals
+
+- A message that silently mentions nobody because a name was mistyped: unresolved `@x` is
+  flagged in the composer before send and kept as plain text if sent anyway.
+- A write to GitHub the operator did not confirm; a file overwritten by a second agent.
+- Per-harness translation layers: the editor does not rewrite `/skill` or `@file` for any harness.
+
+### Design
+
+- **Wire format.** `post_message` keeps `text` and adds server-derived `mentions`
+  (`[{kind: person|agent|group, id, name}]`), `refs` (`[{kind: issue|pr, owner, repo, number}]`)
+  and `files` (`[{id, name, version, size, sha256}]`). The server resolves mentions and refs from
+  `text`; clients cannot forge them. Identity stays derived from the credential.
+- **Completion engine.** `packages/collab-mention.js` grows into a sigil-driven engine with one
+  provider per sigil (`@`, `#`, `/`), pure functions tested with `node:test`; `mountComposer`
+  stays the single shared composer for the room and session workspace and receives the providers
+  as options.
+- **Files.** `POST /api/v1/collab/rooms/{room}/files` (multipart, per-room store, content hashed,
+  versioned), `GET .../files`, `GET .../files/{id}[?v=]`, `POST .../files/{id}/versions`. Agents
+  fetch/put through a `herdr-eng collab file` helper using their existing credential. The shelf
+  is a panel patched with `patchList`.
+- **Commands.** Parsed server-side into events (`handoff`, `decision`, `summary_request`,
+  `issue_draft`, `assignment`) shown as structured cards; a handoff names sender, recipient and
+  note and notifies the recipient.
+
+### Testing
+
+`node:test` for sigil parsing, menu ordering, alias resolution; pytest for mention/ref/file
+resolution, forged `mentions`, quota, version immutability, write gate; Playwright for chips,
+menu keyboard flow, shelf upload, and that a literal `@gert.pi /skill` is sent verbatim.
+
+### Left to the builder
+
+Menu ranking, chip visuals, multipart limits mechanics, storage backend for file bytes (follow
+what collab already uses for attachments), helper CLI shape, migration of existing agent names.
