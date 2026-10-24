@@ -15,7 +15,7 @@ ARTIFACT_TTL = 3600.0
 
 async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        service_store=None, host_store=None,
-                       snapshot_store=None, artifact_store=None,
+                       snapshot_store=None, artifact_store=None, collab_archive=None,
                        lease_ttl=LEASE_TTL, host_ttl=HOST_TTL,
                        artifact_ttl=ARTIFACT_TTL) -> dict:
     summary: dict[str, Any] = {}
@@ -57,6 +57,14 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                                       dict(m), sequence=0)
             snapshots += 1
     summary["snapshots"] = snapshots
+
+    if collab_archive is not None:
+        try:
+            summary["collab_archives"] = await collab_archive.resume_pending_archives()
+        except Exception:
+            # Never include object-provider exception text or signed URLs.
+            summary["collab_archives"] = []
+            summary["collab_archive_error"] = "archive retry required"
 
     # Artifact GC: Phase 1 scaffold only; real reachability GC in Phase 5.
     summary["artifact_gc"] = 0

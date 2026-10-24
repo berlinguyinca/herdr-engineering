@@ -302,7 +302,9 @@ class CollabService:
                  max_rooms_per_project: int = 50, max_members_per_room: int = 100,
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
                  default_grant_ttl: float = 30 * 24 * 3600.0,
-                 approval: ApprovalPolicy | None = None, summary_fix: dict | None = None):
+                 approval: ApprovalPolicy | None = None, summary_fix: dict | None = None,
+                 archive_service: Any = None):
+        self.archive_service = archive_service
         self.auth = authenticator
         try:
             self.summary_fix = summary_fix_config(summary_fix)
@@ -377,6 +379,61 @@ class CollabService:
         self.stats = defaultdict(int)
 
     # ------------------------------------------------------------ plumbing
+    async def _archive_principal(self, pr: Principal):
+        self._require_user(pr)
+        if self.archive_service is None:
+            raise CollabError(503, "relational archive service unavailable")
+        if not self.still_valid(pr) or not await self.archive_service.store.approved_user(pr.id):
+            raise CollabError(403, "platform approval required")
+        return self.archive_service
+
+    async def archive_room(self, room_id: str, requested_by: Principal):
+        service = await self._archive_principal(requested_by)
+
+        async def authorize():
+            await self._archive_principal(requested_by)
+            # Legacy rooms must be explicitly migrated before relational deletion.
+            if room_id in self._rooms:
+                raise CollabError(409, "room requires relational cutover before archival")
+            room = await service.store.get_room(room_id)
+            if room is None:
+                from uuid import NAMESPACE_URL, uuid5
+                archive = await service.store.get_archive(str(uuid5(NAMESPACE_URL, 'collab-archive:' + room_id)))
+                if archive is None or not (requested_by.admin or archive.requested_by == requested_by.id):
+                    raise CollabError(404, "not found")
+            elif not requested_by.admin:
+                membership = await service.store.get_membership(room_id, requested_by.id)
+                if (room.owner_id != requested_by.id or membership is None
+                        or membership.status != 'approved' or membership.role != 'owner'
+                        or (membership.expires_at is not None and self._now() >= membership.expires_at)):
+                    raise CollabError(404, "not found")
+        return await service.archive_room(room_id, requested_by.id, authorize=authorize)
+
+    async def restore_room(self, archive_id: str, requested_by: Principal):
+        service = await self._archive_principal(requested_by)
+
+        async def authorize():
+            await self._archive_principal(requested_by)
+            archive = await service.store.get_archive(archive_id)
+            if archive is None or not (requested_by.admin or archive.requested_by == requested_by.id):
+                raise CollabError(404, "not found")
+        return await service.restore_room(archive_id, requested_by.id, authorize=authorize)
+
+    async def scrub_deleted_user(self, user_id: str, requested_by: Principal):
+        service = await self._archive_principal(requested_by)
+
+        async def authorize():
+            await self._archive_principal(requested_by)
+            if not requested_by.admin:
+                raise CollabError(403, "operator required")
+            # This is the relational side of deletion. Do not claim global deletion
+            # while the legacy event log still owns identity or authored content.
+            if (user_id in self._users or user_id in self._user_email
+                    or self._agents_by_owner.get(user_id)
+                    or any(user_id in r['members'] for r in self._rooms.values())):
+                raise CollabError(409, "user requires relational cutover before deletion")
+        return await service.scrub_deleted_user(user_id, authorize=authorize)
+
     @property
     def durable(self) -> bool:
         return callable(getattr(self._sink, "record_required", None))
