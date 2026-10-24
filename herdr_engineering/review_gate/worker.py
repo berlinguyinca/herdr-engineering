@@ -14,6 +14,12 @@ control plane, so it is built to hold nothing worth stealing and to leak nothing
 * Every request has a timeout, every response is read to at most 1 MiB, no
   redirect is followed, and no proxy is taken from the environment.
 * Configuration comes only from the YAML file (no environment variables).
+* Failed attempts are spaced out on purpose. A ``/failure`` releases the job
+  straight back to the queue and the PR escalates after ``max_attempts``, so a
+  worker whose model is down must not re-claim at once and burn every attempt
+  in milliseconds. After each job that does not end in a recorded (or stale)
+  result the worker waits ``poll_seconds``, doubling per consecutive failure up
+  to ``MAX_BACKOFF_SECONDS``; a recorded result or an idle claim resets it.
 
 The control plane authenticates the key with the ``X-API-Key`` header (as every
 other control-plane client does); only the model call uses
@@ -43,6 +49,8 @@ _MAX_KEY_BYTES = 64 * 1024
 # Same pattern the server applies to worker_id / reviewer_model (control_plane/api.py).
 _ID = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
 _JOB_ID = re.compile(r"[0-9a-f]{32}")
+_MAX_LEASE_SECONDS = 86400
+_MESSAGE_ROLES = frozenset({"system", "user", "assistant"})
 _CLAIM_FIELDS = frozenset(
     {"job_id", "repo", "number", "sha", "messages", "lease_seconds", "attempt"}
 )
@@ -75,6 +83,10 @@ class _BadResponse(Exception):
 
 class _TooLarge(Exception):
     """A response over MAX_RESPONSE_BYTES."""
+
+
+class _Truncated(Exception):
+    """The model stopped at max_tokens (finish_reason "length")."""
 
 
 @dataclass(frozen=True)
@@ -173,9 +185,9 @@ def _mapping(raw, where):
 
 
 def _keys(raw, allowed, required, where):
-    unknown = sorted(set(raw) - allowed)
-    if unknown:
-        raise WorkerConfigError(f"{where}: unknown key {unknown[0]!r}")
+    if set(raw) - allowed:
+        # Never echo the key itself: a secret pasted as a key would be printed.
+        raise WorkerConfigError(f"{where}: unknown key")
     for key in sorted(required):
         if key not in raw:
             raise WorkerConfigError(f"{where}: {key} is required")
@@ -275,10 +287,10 @@ def _header(headers, name):
 
 def _retry_after(headers, default):
     value = _header(headers, "Retry-After")
-    if isinstance(value, str) and value.strip().isdigit():
-        seconds = int(value.strip())
-        if seconds >= 1:
-            return min(seconds, MAX_BACKOFF_SECONDS)
+    if isinstance(value, str):
+        value = value.strip()
+        if value.isascii() and value.isdigit() and len(value) <= 6 and int(value) >= 1:
+            return min(int(value), MAX_BACKOFF_SECONDS)
     return default
 
 
@@ -304,10 +316,15 @@ def _valid_job(job) -> bool:
     messages = job["messages"]
     if not isinstance(messages, list) or not messages:
         return False
-    if not all(isinstance(m, dict) for m in messages):
-        return False
+    for m in messages:
+        if not isinstance(m, dict) or set(m) != {"role", "content"}:
+            return False
+        if m["role"] not in _MESSAGE_ROLES or not isinstance(m["content"], str):
+            return False
     lease = job["lease_seconds"]
-    return isinstance(lease, int) and not isinstance(lease, bool) and lease >= 1
+    return (
+        isinstance(lease, int) and not isinstance(lease, bool) and 1 <= lease <= _MAX_LEASE_SECONDS
+    )
 
 
 # --------------------------------------------------------------------- worker
@@ -325,6 +342,8 @@ class ReviewWorker:
         self._http = http or _urllib_http
         self._sleep = sleep
         self._stop = threading.Event()
+        self._failures = 0
+        # Seconds ``run`` waits before the next claim (0: claim again at once).
         self.backoff_seconds = config.poll_seconds
 
     # -------------------------------------------------------------- requests
@@ -371,6 +390,8 @@ class ReviewWorker:
         message = choices[0].get("message")
         if not isinstance(message, dict) or not isinstance(message.get("content"), str):
             raise _BadResponse()
+        if choices[0].get("finish_reason") == "length":
+            raise _Truncated()
         return message["content"]
 
     @staticmethod
@@ -381,6 +402,8 @@ class ReviewWorker:
     def run_once(self) -> bool:
         """One claim cycle. True when a job was claimed and handled (whatever the outcome).
 
+        Never sleeps; it sets ``backoff_seconds``, the wait ``run`` honours before
+        the next claim (see the module docstring on failure spacing).
         Raises ``WorkerAuthError`` on 401/403 and ``WorkerConfigError`` when a key
         file is no longer acceptable; a held job is then abandoned (its lease expires).
         """
@@ -410,6 +433,7 @@ class ReviewWorker:
             return False
         job = reply["job"]
         if job is None:
+            self._failures = 0
             return False
         job_id = job.get("job_id") if isinstance(job, dict) else None
         if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
@@ -419,12 +443,26 @@ class ReviewWorker:
         _log.info("review gate job %s claimed", job_id)
         if not _valid_job(job):
             self._post_failure(job_id, "bad_response")
-            return True
-        self._handle(job_id, job)
+            ok = False
+        else:
+            ok = self._handle(job_id, job)
+        if ok:
+            self._failures = 0
+            self.backoff_seconds = 0
+        else:
+            self._failures = min(self._failures + 1, 32)
+            self.backoff_seconds = self._failure_backoff()
         return True
 
+    def _failure_backoff(self) -> int:
+        delay = self._config.poll_seconds
+        for _ in range(self._failures - 1):
+            delay = min(delay * 2, MAX_BACKOFF_SECONDS)
+        return min(delay, MAX_BACKOFF_SECONDS)
+
     # -------------------------------------------------------------------- job
-    def _handle(self, job_id: str, job: dict) -> None:
+    def _handle(self, job_id: str, job: dict) -> bool:
+        """Run one job; True only when it ended in a recorded (or stale) result."""
         done, wake = threading.Event(), threading.Event()
         lost = {"lost": False, "auth": False, "config": False}
         heartbeat = threading.Thread(
@@ -460,10 +498,10 @@ class ReviewWorker:
             raise WorkerConfigError("key file is no longer acceptable")
         if lost["lost"]:
             _log.info("review gate job %s abandoned", job_id)
-            return
+            return False
         if "text" not in box and "error" not in box:  # stopped mid-call
             _log.info("review gate job %s abandoned", job_id)
-            return
+            return False
         error = box.get("error")
         if isinstance(error, WorkerConfigError):
             _log.warning("review gate job %s abandoned", job_id)
@@ -473,10 +511,11 @@ class ReviewWorker:
                 _ModelError: "model_error",
                 _BadResponse: "bad_response",
                 _TooLarge: "response_too_large",
+                _Truncated: "truncated",
             }.get(type(error), type(error).__name__)
             self._post_failure(job_id, reason)
-            return
-        self._post_result(job_id, box["text"])
+            return False
+        return self._post_result(job_id, box["text"])
 
     def _heartbeat_loop(self, job_id, interval, done, wake, lost):
         path = f"{_JOBS_PATH}{job_id}/heartbeat"
@@ -504,7 +543,7 @@ class ReviewWorker:
         if lost["lost"]:
             wake.set()
 
-    def _post_result(self, job_id: str, text: str) -> None:
+    def _post_result(self, job_id: str, text: str) -> bool:
         body = {"worker_id": self._config.worker_id, "output": text}
         try:
             status, _hdrs, raw = self._post_cp(f"{_JOBS_PATH}{job_id}/result", body)
@@ -512,14 +551,15 @@ class ReviewWorker:
             raise
         except Exception as exc:  # noqa: BLE001 - class name only
             self._post_failure(job_id, type(exc).__name__)
-            return
+            return False
         if status == 413:
             self._post_failure(job_id, "output_too_large")
-            return
+            return False
         if status != 200:
             self._post_failure(job_id, "result_error")
-            return
-        self._log_outcome(job_id, raw, _RESULT_OUTCOMES)
+            return False
+        # "rejected" spends an attempt server-side, so it backs off like a failure.
+        return self._log_outcome(job_id, raw, _RESULT_OUTCOMES) in ("recorded", "stale")
 
     def _post_failure(self, job_id: str, reason: str) -> None:
         body = {"worker_id": self._config.worker_id, "reason": reason}
@@ -544,8 +584,9 @@ class ReviewWorker:
         outcome = reply.get("outcome") if reply is not None and set(reply) == {"outcome"} else None
         if isinstance(outcome, str) and outcome in allowed:
             _log.info("review gate job %s %s", job_id, outcome)
-        else:
-            _log.warning("review gate job %s bad_response", job_id)
+            return outcome
+        _log.warning("review gate job %s bad_response", job_id)
+        return None
 
     # ------------------------------------------------------------------- loop
     def run(self, stop: threading.Event) -> None:
@@ -559,11 +600,11 @@ class ReviewWorker:
         self._stop = stop
         while not stop.is_set():
             try:
-                handled = self.run_once()
+                self.run_once()
             except (WorkerAuthError, WorkerConfigError):
                 raise
             except Exception as exc:  # noqa: BLE001 - keep serving; class name only
                 _log.error("review gate worker error: %s", type(exc).__name__)
-                handled = False
-            if not handled and not stop.is_set():
+                self.backoff_seconds = self._config.poll_seconds
+            if self.backoff_seconds > 0 and not stop.is_set():
                 stop.wait(self.backoff_seconds)

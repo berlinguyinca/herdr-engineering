@@ -156,8 +156,10 @@ def test_config_requires_0600_absolute_key_files_and_rejects_unknown_keys(tmp_pa
         assert CP_KEY not in str(err.value) and MODEL_KEY not in str(err.value)
         return str(err.value)
 
-    bad(lambda d: d.update(extra=1))
-    bad(lambda d: d["model"].update(tools=[]))
+    msg = bad(lambda d: d.update({"sk-PASTED-SECRET-as-a-key": 1}))
+    assert "PASTED" not in msg and "unknown key" in msg
+    msg = bad(lambda d: d["model"].update({"tools-SECRET": []}))
+    assert "SECRET" not in msg and "unknown key" in msg
     bad(lambda d: d.update(api_key_file="relative/cp.key"))
     bad(lambda d: d.pop("worker_id"))
     bad(lambda d: d["model"].pop("model"))
@@ -867,3 +869,144 @@ def test_end_to_end_against_the_real_control_plane(tmp_path, monkeypatch, caplog
         model.shutdown()
         model.server_close()
         srv.shutdown()
+
+
+# ------------------------------------------------------------- fix round 1
+class RecordingStop(threading.Event):
+    """A stop event whose wait() returns at once and records the requested delay."""
+
+    def __init__(self, log, limit):
+        super().__init__()
+        self.log, self.limit = log, limit
+
+    def wait(self, timeout=None):
+        self.log.append(("wait", timeout))
+        if sum(1 for e in self.log if e[0] == "wait") >= self.limit:
+            self.set()
+        return self.is_set()
+
+
+def test_failed_jobs_back_off_exponentially_and_reset_after_success(tmp_path):
+    log = []
+    fake = FakeHttp()
+    happy(fake)
+    model_ok = {"ok": False}
+
+    def model(body):
+        log.append(("model",))
+        if sum(1 for e in log if e == ("model",)) > 20:
+            stop.set()  # guard: never loop forever if run() ignores the backoff
+        if model_ok["ok"]:
+            return 200, {}, json.dumps(chat()).encode()
+        return 500, {}, b"down"
+
+    fake.on("/v1/chat/completions", fn=model)
+    w = ReviewWorker(make_config(tmp_path, poll=10), http=fake)
+    stop = RecordingStop(log, limit=7)
+    w.run(stop)
+    # every model failure is followed by a wait before the next claim
+    assert log[0] == ("model",)
+    for i, entry in enumerate(log):
+        if entry == ("model",) and i + 1 < len(log):
+            assert log[i + 1][0] == "wait" and log[i + 1][1] >= 10
+    waits = [t for kind, *rest in log if kind == "wait" for t in rest]
+    assert waits == [10, 20, 40, 80, 160, 300, 300]
+    assert len(fake.bodies("/failure")) == 7
+
+    # a recorded result resets: no wait, then an idle claim waits poll_seconds
+    model_ok["ok"] = True
+    assert w.run_once() is True and w.backoff_seconds == 0
+    model_ok["ok"] = False
+    assert w.run_once() is True and w.backoff_seconds == 10
+    fake.on("/api/v1/review-gate/claim", payload={"job": None})
+    assert w.run_once() is False and w.backoff_seconds == 10
+    fake.on("/api/v1/review-gate/claim", payload={"job": job()})
+    assert w.run_once() is True and w.backoff_seconds == 10  # reset by the idle claim
+
+
+@pytest.mark.parametrize("ending", ["result_429", "rejected", "failure_not_posted", "lost"])
+def test_other_unsuccessful_endings_also_back_off(tmp_path, ending):
+    fake = FakeHttp()
+    happy(fake)
+    if ending == "result_429":
+        fake.on("/result", status=429, payload={})
+    elif ending == "rejected":
+        fake.on("/result", payload={"outcome": "rejected"})
+    elif ending == "failure_not_posted":
+        fake.on("/v1/chat/completions", status=500, payload={})
+        fake.on("/failure", fn=lambda b: ConnectionRefusedError("x"))
+    else:
+        fake.on("/heartbeat", payload={"ok": False})
+        fake.on(
+            "/v1/chat/completions",
+            fn=lambda b: (time.sleep(0.3), (200, {}, json.dumps(chat()).encode()))[1],
+        )
+    w = ReviewWorker(make_config(tmp_path, poll=10), http=fake)
+    w._heartbeat_interval = lambda lease: 0.01
+    assert w.run_once() is True
+    assert w.backoff_seconds == 10
+
+
+def test_lease_seconds_above_a_day_is_bad_response(tmp_path):
+    fake = FakeHttp()
+    happy(fake, claim_job=job(lease_seconds=86401))
+    assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
+    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "bad_response"}]
+    assert fake.bodies("/v1/chat/completions") == []
+    fake2 = FakeHttp()
+    happy(fake2, claim_job=job(lease_seconds=86400))
+    assert ReviewWorker(make_config(tmp_path), http=fake2).run_once() is True
+    assert fake2.bodies("/result")
+
+
+@pytest.mark.parametrize("value", ["\u00b2", "9" * 5000, "1234567", " 12x"])
+def test_odd_retry_after_values_fall_back_to_poll(tmp_path, value):
+    fake = FakeHttp()
+    fake.on("/api/v1/review-gate/claim", status=429, payload={}, headers={"Retry-After": value})
+    w = ReviewWorker(make_config(tmp_path, poll=7), http=fake)
+    assert w.run_once() is False
+    assert w.backoff_seconds == 7
+
+
+def test_odd_retry_after_does_not_break_cli_once(tmp_path, monkeypatch, capsys):
+    path = write_yaml(tmp_path, good_yaml(tmp_path))
+    fake = FakeHttp()
+    fake.on(
+        "/api/v1/review-gate/claim", status=429, payload={}, headers={"Retry-After": "9" * 5000}
+    )
+    real = worker_mod.ReviewWorker
+    monkeypatch.setattr(worker_mod, "ReviewWorker", lambda cfg: real(cfg, http=fake))
+    assert cli.main(["review-gate", "worker", "--config", path, "--once"]) == 0
+    assert capsys.readouterr().out.strip() == "idle"
+
+
+def test_truncated_model_output_is_a_failure(tmp_path):
+    fake = FakeHttp()
+    payload = {"choices": [{"message": {"content": OUTPUT[:5]}, "finish_reason": "length"}]}
+    happy(fake, model=payload)
+    assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
+    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "truncated"}]
+    assert fake.bodies("/result") == []
+    fake2 = FakeHttp()
+    happy(fake2, model={"choices": [{"message": {"content": OUTPUT}, "finish_reason": "stop"}]})
+    assert ReviewWorker(make_config(tmp_path), http=fake2).run_once() is True
+    assert fake2.bodies("/result") == [{"worker_id": "worker-1", "output": OUTPUT}]
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [],
+        [{"role": "system"}],
+        [{"role": "tool", "content": "x"}],
+        [{"role": "user", "content": ["x"]}],
+        [{"role": "user", "content": "x", "tool_calls": []}],
+        [{"role": "user", "content": "x"}, "x"],
+    ],
+)
+def test_bad_message_shapes_are_bad_response_without_a_model_call(tmp_path, messages):
+    fake = FakeHttp()
+    happy(fake, claim_job=job(messages=messages))
+    assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
+    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "bad_response"}]
+    assert fake.bodies("/v1/chat/completions") == []
