@@ -5,6 +5,33 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Lineage graph, Gantt timeline and replay (T09, stacked on #167, #165, #164)
+- Room workbench: new read-only "Lineage" panel (`packages/collab-lineage.js`): layered lineage graph, Gantt timeline with
+  head-change and stale markers, replay scrubber, filters and node inspector, each with a table alternative; keyboard
+  operable; nothing encoded by colour alone; all ids and labels escaped.
+- New read routes `GET /api/v1/collab/graph/lineage[/timeline|/events]` (room_id required, same membership 404, budgets, 240/min per person).
+  Replay at a position equals the live projection at that point and never shows what the reader cannot see now.
+  No migration, no new table (derived from the stored lineage events). See `docs/contracts/lineage-events.md` ("T09").
+- Replay is per room (a busy room cannot break another's), visibility is scanned in 128-event chunks so viewers do not stall
+  ingest, member responses no longer carry the global `admission` counter, the ledger window is counted in the reader's own visible events (exact steps, opaque page tokens), and the new
+  operator YAML `control_plane.collab.replay_history` (`since_join` default | `full`) sets how far back a member may replay.
+- Rollback: revert the PR (code only).
+
+### Head-bound review quorum (T06)
+- Review round 4: head handling is conservative. A lower-sequence write after the applied one is ignored only if it repeats
+  the applied head or a head that writer already reported earlier; any other head makes the PR `head_unverified`
+  (`head_unverified`/`alert` fields, one log line, operator `resync_event_id`). It clears when the writer writes past the
+  applied sequence or an operator acknowledges the write with `attrs.head_resync`; a run of writes is never auto-adopted
+  (`head_rebased` is gone, `head_resynced` replaces it). Evidence is kept per distinct head so re-emits cannot evict it.
+- Review round 3: `rereview_needed` counts only what the caller can see. Matching is ASCII-only (same as autospec;
+  `invalid_target`). Shared vectors grew to 32 cases.
+- `GET /api/v1/graph/nodes/{pr_id}/review-quorum`: derived, head-bound quorum over `reviewed` edges (stale verdicts never
+  counted, distinct configured reviewers, author/replay/forged-head defences, `rereview_required`). Config:
+  `control_plane.review_quorum` in the fleet config. One policy shared with `autospec review-quorum` via
+  `tests/control_plane/fixtures/review-quorum-vectors.json`; statuses `unknown_head`, `head_unverified` (emitter sequence
+  reset), `unknown_author`; digests are 64-hex and bound; `reviewer_groups`. Contract: `docs/contracts/lineage-events.md`. Rollback: remove the
+  block (endpoint answers 404); no schema or event change.
+
 ### Tabs/panes and membership-scoped lineage (T08, stacked on #165 and #164)
 - Lineage `room`/`mission` scopes now resolve to HCN membership: an event that names its `room_id` / `mission_id`
   (and optionally `workspace_id`) is readable by that room's non-guest members / that mission's listed members (T07),
@@ -17,6 +44,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   `control_plane.lineage_key_scopes` entry can no longer write `room`/`mission` scope (403 `lineage_forbidden`; `"*"` opts in);
   mission scope needs `room_id`, so stored mission events without it become operator-only after rebuild.
 - Rollback: see `docs/contracts/lineage-events.md` ("T08 rollout and rollback").
+
+### Plannotator bridge: digest echo
+- `herdr-plannotator plan` now prints the `plan_digest` (and `review_id`) the receipt was bound to alongside the upstream decision, computed by the bridge and authoritative over upstream output, so a caller can verify a decision belongs to the exact plan bytes it submitted. Code reviews are unchanged.
 
 ### Lineage graph projection (T02, Herdr side)
 - Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
@@ -48,6 +78,41 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   partial unique index and `fabric_event_sources`.
 - `EventStore.append` no longer reports every error as a duplicate: only an
   existing `event_id` returns False; other failures propagate.
+
+### Terminal button on agent pages
+- An agent page has a **Terminal** button (operator only). It shows the exact command
+  that attaches a terminal on the viewer's own machine to the agent's HerdR pane:
+  `ssh -t <host> "bash -lc 'herdr --session <s> agent attach <pane>'"` from another machine,
+  or `herdr --session <s> agent attach <pane>` on the agent's host, each with a Copy button.
+  The server builds it from the recorded session only (strict charsets, never client input)
+  and never runs it. `POST /api/v1/sessions/<id>/terminal`; see
+  `docs/operations/terminal-attach.md`. The old "Copy attach command" line
+  (`ssh host && herdr workspace focus ...`, which ran the second half locally) is gone
+  from the page.
+
+### Host telemetry and fleet provisioning
+- Collector (`host_metrics.py`, run by the fabric agent): CPU, memory, swap, disk and
+  mounts, load, uptime, network, GPU (NVIDIA, ROCm, Apple), top consumers and agent
+  count every 30 s, plus an hourly report of package/security updates, reboot-required,
+  failed units and tool versions. Intervals: `fabric.host_report_interval` and
+  `fabric.host_slow_interval` (YAML only). The agent count is the number of agent
+  processes named in `fabric.agent_binaries` (YAML, default `pi`, `claude`, `codex`).
+- Control plane: validated host metrics with 48 h raw history and 7 d of durable
+  5-minute rollups (max 300 points); `GET /api/v1/hosts/<id>/telemetry?range=1h|24h|7d`;
+  server-side `problems`/`problem_count` on host reads (stale, never_reported, disk,
+  memory, GPU, failed units, security updates, reboot, version drift, update age).
+- Pages: host detail page and richer list cards with range picker, gauges,
+  sparklines, GPU, mounts, top consumers, updates, versions with pin drift, a
+  problems strip and a never-reported state.
+- Ansible: `tailscale` role (joins only from `NeedsLogin`, auth key from Vault) and
+  `fleet-update.yml` with the `herdr_fleet_update` role, run daily by cron on the main
+  host: security-only OS updates, busy-host deferral, pinned herdr-eng revision, one
+  host at a time, agent restart once, `maintenance` flag and a forced single-host run.
+  See `ansible/README.md`.
+- Behaviour changes: `GET /api/v1/hosts/<id>/telemetry?limit=` is now honoured
+  (1..500); host events from non-agent sources (e.g. the fleet update) no longer
+  refresh a host's liveness or create hosts; `versions.herdr` is now the herdr binary
+  version and `herdr_eng` is the herdr-engineering package version.
 
 ### Central fleet config: deploy and servers
 - `deploy/control-plane/deploy.sh` renders the compose variables from the central

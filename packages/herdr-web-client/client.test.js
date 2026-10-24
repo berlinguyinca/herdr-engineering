@@ -14,9 +14,12 @@ test('agent summary and rename requests preserve encoded identity and version', 
   await client.getAgentSummary('a:b');
   await client.regenerateAgentSummary('a:b');
   await client.renameAgent('a:b', 'Ada', 2);
-  assert.deepEqual(calls.map(c => c.url), ['/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/name']);
+  await client.fixSummaryItem('a:b', 'blockers', 1, 'CI is red');
+  assert.deepEqual(calls.map(c => c.url), ['/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/name', '/api/v1/sessions/a%3Ab/summary/fix']);
   assert.equal(calls[1].method, 'POST');
   assert.deepEqual(calls[2].body, { name: 'Ada', expected_version: 2 });
+  assert.equal(calls[3].method, 'POST');
+  assert.deepEqual(calls[3].body, { list: 'blockers', index: 1, text: 'CI is red' });
 });
 
 function fakeFetch(routes) {
@@ -282,4 +285,17 @@ test('CI performance uses bounded-window viewer GET filters and forwards cancell
   assert.equal(calls[0].url,'/api/v1/ci/performance?days=7&repository=org%2Fapp&branch=feature+%26+cache');
   assert.equal(calls[0].options.method,'GET');assert.equal(calls[0].options.signal,controller.signal);
   await client.getCiPerformance();assert.equal(calls[1].url,'/api/v1/ci/performance?days=14');
+});
+
+test('CI reads and mutations bind the expected provider URL without changing legacy requests',async()=>{
+ const calls=[];
+ const client=new HerdrClient('',{fetchImpl:async(url,opts)=>{calls.push({url,opts});return {ok:true,status:200,text:async()=>'{}'};}});
+ const providerUrl='https://ci.example/secondary';
+ await client.getCiPipeline('17',12,{providerUrl});
+ await client.getCiLog('17',12,'4',{providerUrl});
+ await client.ciAction('17',12,'retry',{providerUrl});
+ await client.ciAction('17',12,'cancel',{providerUrl});
+ await client.debugCi('17',12,'session','op',{providerUrl});
+ for(const call of calls.slice(0,2))assert.equal(new URL(call.url,'http://test').searchParams.get('provider_url'),providerUrl);
+ for(const call of calls.slice(2))assert.equal(JSON.parse(call.opts.body).provider_url,providerUrl);
 });

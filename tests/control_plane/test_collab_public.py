@@ -30,7 +30,7 @@ H = {"X-Forwarded-Proto": "https"}
 def stack(acknowledged_sink, tmp_path):
     web = tmp_path / "web"
     web.mkdir()
-    for n in ("collab.html", "collab-app.js", "collab.css", "collab-view.js", "collab-scripts.js", "collab-flow.js", "collab-links.js", "collab-tabs.js", "collab-mention.js", "collab-guide.html", "collab-guide.js", "collab-guide.md", "app.js", "index.html"):
+    for n in ("collab.html", "collab-app.js", "collab.css", "collab-view.js", "collab-scripts.js", "collab-flow.js", "collab-links.js", "collab-tabs.js", "collab-lineage.js", "collab-mention.js", "collab-guide.html", "collab-guide.js", "collab-guide.md", "app.js", "index.html"):
         (web / n).write_text(f"// {n}")
     svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in TOKENS.items()}),
                         sink=acknowledged_sink, public_config={"client_id": "c"})
@@ -131,7 +131,8 @@ def test_mcp_protocol_basics(stack):
     assert UNTRUSTED[:20] in out["result"]["instructions"]
     s, out = rpc(stack.pub, "tools/list", agent=agent)
     assert [t["name"] for t in out["result"]["tools"]] == [
-        "rooms_list", "room_read", "room_post", "tasks_inbox", "tasks_wait", "task_update", "task_create", "agents_list"]
+        "rooms_list", "room_read", "room_post", "tasks_inbox", "tasks_wait", "task_update", "task_create",
+        "helper_spawn", "helper_wait", "helper_result", "helper_cancel", "agents_list"]
     assert stack.pub.call("POST", "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"},
                           headers={**H, "Authorization": f"Agent {agent['credential']}",
                                    "X-Herdr-Device": agent["device_id"]})[0] == 202

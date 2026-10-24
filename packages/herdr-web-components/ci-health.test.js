@@ -27,6 +27,27 @@ test('duplicate repository names keep deterministic provider order',()=>{
  const m=ciHealthModel(history([],{repos,coverage:{'https://z.example|2':{exhausted:true},'https://a.example|1':{exhausted:true}}}),{scope:'all'},now);
  assert.deepEqual(m.projects.map(project=>project.identity),['org/shared · https://a.example #1','org/shared · https://z.example #2']);
 });
+test('only colliding repository labels gain the shortest distinguishing provider host suffix',()=>{
+ const repos=[repo(1,{repository:'org/shared',provider_url:'https://ci.alpha.example'}),repo(2,{repository:'org/shared',provider_url:'https://ci.beta.example'}),repo(3,{repository:'org/unique'})];
+ const m=ciHealthModel(history([],{repos}),{scope:'all'},now);
+ assert.deepEqual(m.projects.map(p=>p.label),['org/shared · alpha.example','org/shared · beta.example','org/unique']);
+ assert.deepEqual(m.projects.map(p=>p.key),['["https://ci.alpha.example","1"]','["https://ci.beta.example","2"]','["https://ci.example","3"]']);
+ assert.equal(m.projects[0].identity,'org/shared · https://ci.alpha.example #1');
+ const html=renderCiHeatmap(m);
+ assert.match(html,/>org\/shared · alpha\.example<\/th>/);
+ assert.match(html,/title="org\/shared · https:\/\/ci\.alpha\.example #1"/);
+ const reversed=ciHealthModel(history([],{repos:[...repos].reverse()}),{scope:'all'},now);
+ assert.deepEqual(reversed.projects.map(p=>[p.key,p.label]),m.projects.map(p=>[p.key,p.label]));
+ const filtered=ciHealthModel(history([],{repos}),{scope:'all',repository:m.projects[0].key},now);
+ assert.equal(filtered.projects[0].label,'org/shared · alpha.example','filtering must not change an established project label');
+});
+test('same-host provider collisions retain ports, paths and repository ids when needed',()=>{
+ const repos=[repo(1,{repository:'org/shared',provider_url:'https://ci.example/team-a/'}),repo(2,{repository:'org/shared',provider_url:'https://ci.example/team-b'}),repo(3,{repository:'org/shared',provider_url:'https://ci.example/team-b'}),repo(4,{repository:'org/shared',provider_url:'https://ci.example:8443'})];
+ const m=ciHealthModel(history([],{repos}),{scope:'all'},now);
+ assert.equal(new Set(m.projects.map(p=>p.label)).size,4);
+ assert.deepEqual(Object.fromEntries(m.projects.map(p=>[p.repo.id,p.label])),{1:'org/shared · ci.example/team-a',2:'org/shared · ci.example/team-b #2',3:'org/shared · ci.example/team-b #3',4:'org/shared · ci.example:8443'});
+ assert.equal(m.projects.find(p=>p.repo.id===1).key,'["https://ci.example/team-a","1"]');
+});
 test('mixed preserves completed failures and canceled/skipped/unknown remain neutral',()=>{
  const m=ciHealthModel(history([run(1,'failure'),run(2,'success'),run(3,'running'),run(4,'cancelled'),run(5,'skipped'),run(6,'unknown')]),{},now);
  const c=m.projects[0].cells.at(-1);assert.equal(c.state,'mixed');assert.equal(c.active,true);assert.equal(c.counts.failure,1);assert.equal(c.counts.canceled,1);

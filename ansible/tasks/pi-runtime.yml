@@ -22,5 +22,6 @@
       - --revision
       - "{{ pi_engineering_revision }}"
   register: pi_runtime_staging
-  changed_when: true
+  # stage-release.py prints "changed": false when the release is already staged
+  changed_when: "'\"changed\": false' not in pi_runtime_staging.stdout"
   when: not ansible_check_mode
