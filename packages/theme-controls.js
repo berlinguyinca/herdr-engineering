@@ -2,7 +2,6 @@
 import { setCalm } from './motion.js';
 
 const THEME_KEY = 'herdr.theme';
-const CALM_KEY = 'herdr.calm';
 
 export function applyTheme(mode) {
   const root = document.documentElement;
@@ -54,5 +53,3 @@ export function mountThemeControls(shell) {
   );
   shell.append(box);
 }
-
-export { CALM_KEY };

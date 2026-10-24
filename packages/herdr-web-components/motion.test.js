@@ -53,6 +53,15 @@ test('tween animates via rAF and writes only changed text',()=>{
   now[0]=100;s.raf.shift()(100);assert.equal(t,'10');
   assert.equal(s.raf.length,0);
 });
+test('a later tween on the same element supersedes the earlier one',()=>{
+  const s=install();const e=el();
+  const now=[0];globalThis.performance={now:()=>now[0]};
+  tween(e,0,10,{duration:100});tween(e,10,50,{duration:100});
+  const [first,second]=s.raf.splice(0);
+  now[0]=100;first(100);assert.equal(e.textContent,'','stale tween writes nothing');
+  second(100);assert.equal(e.textContent,'50');
+  assert.equal(s.raf.length,0);
+});
 test('flash sets data-flash for 600ms and no-ops under calm',()=>{
   const s=install();const e=el();flash(e);
   assert.equal(e.attrs.flash,'');assert.equal(s.timers[0].ms,600);
