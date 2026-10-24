@@ -1175,3 +1175,100 @@ def test_room_discovery_for_agents_includes_lifecycle_fields(lifecycle):
     assert row["room_membership_status"] == "approved"
     assert row["file_upload_permission"] is True
     assert "agent_permission_status" in row
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_dispatch_removal_retry_preserves_readded_membership(lifecycle, restart):
+    service, alice, bob, (room, _) = lifecycle
+    service.add_member(alice, room, {"user_id": bob.id, "role": "contributor"})
+    parts = ["rooms", room, "members", bob.id, "remove"]
+    body = {"idempotency_key": "remove-over-http"}
+    auth = f"Bearer {TOKENS['alice']}"
+    assert service.dispatch("POST", parts, {}, body, auth, None) == (200, {"ok": True})
+    service.add_member(alice, room, {"user_id": bob.id, "role": "contributor"})
+    if restart:
+        again = CollabService(service.auth, sink=service._sink, now=service._now)
+        again.hydrate(service._sink.load())
+        service = again
+    seq = service.seq
+    assert service.dispatch("POST", parts, {}, body, auth, None) == (200, {"ok": True})
+    assert service.room_member(room, bob.id)["room_membership_status"] == "approved"
+    assert service.seq == seq
+    assert service.get_room(bob, room)["room_membership_status"] == "approved"
+
+
+@pytest.mark.parametrize("renewal", ["owner", "contributor", "approval"])
+def test_attachment_renewal_before_housekeeping_revokes_old_delegation(lifecycle, renewal):
+    service, alice, bob, (room, other_room) = lifecycle
+    service.add_member(alice, room, {"user_id": bob.id, "role": "contributor"})
+    owner, delegate = (alice, bob) if renewal == "owner" else (bob, alice)
+    agent = service.connect_agent(owner, {"harness_type": "codex"})["agent_id"]
+    body = {"agent_id": agent, "actions": ["read", "execute"]}
+    attachment = service.grant_agent(owner, room, {**body, "expires_at": service._now() + 5})
+    if renewal != "owner":
+        service.decide_agent_request(alice, room, attachment["request_id"],
+                                     {"decision": "approve", "expires_at": service._now() + 5})
+    service.set_agent_permission(owner, room, agent, delegate.id, "approved")
+    # A live attachment in another room must retain its own delegation.
+    service.add_member(alice, other_room, {"user_id": bob.id, "role": "contributor"})
+    other = service.grant_agent(owner, other_room, body)
+    if renewal != "owner":
+        service.decide_agent_request(alice, other_room, other["request_id"], {"decision": "approve"})
+    service.set_agent_permission(owner, other_room, agent, delegate.id, "approved")
+    if renewal == "approval":
+        request = service.grant_agent(owner, room, {**body, "actions": ["read", "post", "execute"]})
+    service._now.t += 6
+    service._housekept = service._now()  # housekeeping is throttled; renewal must handle expiry itself
+    first_new_event = service.seq
+    if renewal == "approval":
+        service.decide_agent_request(alice, room, request["request_id"], {"decision": "approve"})
+    else:
+        renewed = service.grant_agent(owner, room, body)
+        if renewal == "contributor":
+            assert renewed["status"] == "pending"
+            service.decide_agent_request(alice, room, renewed["request_id"], {"decision": "approve"})
+    assert service.get_room(delegate, room)["agent_permission_status"][agent] == "revoked"
+    events = service._sink.load()
+    changes = [e["event_type"] for e in events if e["sequence"] > first_new_event]
+    assert changes.index("agent_grant_expired") < changes.index("agent_granted")
+    again = CollabService(service.auth, now=service._now)
+    again.hydrate(events)
+    assert again.get_room(delegate, room)["agent_permission_status"][agent] == "revoked"
+    assert again.get_room(delegate, other_room)["agent_permission_status"][agent] == "approved"
+    assert again.list_room_agents(delegate, room)["agents"][0]["agent_id"] == agent
+
+
+@pytest.mark.parametrize("fail_event", ["agent_grant_expired", "agent_granted"])
+def test_attachment_renewal_fails_closed_when_persistence_fails(lifecycle, fail_event):
+    from herdr_engineering.control_plane.collab import CollabError
+
+    service, alice, bob, (room, _) = lifecycle
+    service.add_member(alice, room, {"user_id": bob.id, "role": "contributor"})
+    info = service.connect_agent(alice, {"harness_type": "codex"})
+    body = {"agent_id": info["agent_id"], "actions": ["read", "execute"]}
+    service.grant_agent(alice, room, {**body, "expires_at": service._now() + 5})
+    service.set_agent_permission(alice, room, info["agent_id"], bob.id, "approved")
+    service._now.t += 6
+    log = service._sink
+    seq = service.seq
+
+    class FailingSink:
+        def record_required(self, event):
+            if event["event_type"] == fail_event:
+                raise OSError("unavailable")
+            log.record_required(event)
+
+    service._sink = FailingSink()
+    with pytest.raises(CollabError) as exc:
+        service.grant_agent(alice, room, body)
+    assert exc.value.status == 503
+    again = CollabService(service.auth, now=service._now)
+    again.hydrate(log.load())
+    agent = again.authenticate(f"Agent {info['credential']}", info["device_id"])
+    with pytest.raises(CollabError) as exc:
+        again.get_room(agent, room)
+    assert exc.value.status == 404
+    if fail_event == "agent_grant_expired":
+        assert service.seq == seq
+    else:
+        assert again.get_room(bob, room)["agent_permission_status"][info["agent_id"]] == "revoked"
