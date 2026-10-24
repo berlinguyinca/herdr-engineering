@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from urllib.parse import urlsplit
 
 from . import collab_external as ext
@@ -34,6 +35,7 @@ MAX_SCOPE_NODES = 20
 MAX_SCOPE_QUESTIONS = 10
 MAX_PATCH_FILES = 20
 MAX_PATCH_LINES = 2000
+MAX_HEADER_LINE = 1100                     # two 255-byte paths plus slack; also keeps the header regexes linear
 MAX_TITLE = 120
 MAX_NOTE = 140
 MAX_REASON = 200
@@ -53,12 +55,15 @@ HCN_NODE_PREFIXES = ("task:hcn-delegation.", "artifact:hcn-proposal.", "thread:h
 _ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _NODE = re.compile(r"[a-z]+:[A-Za-z0-9._:/@+=-]{1,190}\Z")
 _DRIVE = re.compile(r"[A-Za-z]:")
-_DENIED_SEGMENTS = frozenset({".git", ".gitmodules", ".gitattributes", ".gitconfig", ".husky"})
-_DENIED_PREFIXES = (".github/workflows/",)
+# Hard-coded and not overridable by a room owner or a delegate: these name files a checkout executes.
+_DENIED_SEGMENTS = frozenset({".git", ".gitmodules", ".gitattributes", ".gitconfig", ".husky", ".githooks", ".circleci",
+                              ".gitlab-ci.yml", "jenkinsfile", ".pre-commit-config.yaml"})
+_DENIED_PREFIXES = (".github/workflows/", ".github/actions/")
+_SHORT_NAME = re.compile(r"[^.~]{1,6}~[0-9]+(\.[^.]{0,3})?\Z")     # NTFS 8.3 alias such as GIT~1 of .git
 _INSTRUCTION_LIKE = re.compile(
     r"(ignore (all |any |the )?(previous|prior|above) (instructions|messages|prompts)|"
     r"disregard (the |your )?(system|previous)|you are now |system prompt|"
-    r"(run|execute) (the following|this) (command|script)|curl [^\n|]*\|\s*(ba)?sh|"
+    r"(run|execute) (the following|this) (command|script)|curl [^\n|]{0,200}\|[ \t]{0,20}(ba)?sh|"
     r"reveal (your|the) (secrets?|credentials?|tokens?)|do not tell the (user|owner))", re.I)
 
 
@@ -88,7 +93,7 @@ def norm_path(value: object, *, allow_dir: bool = False) -> str:
     for seg in segments:
         low = seg.casefold()
         if (not seg or seg in (".", "..") or seg != seg.strip() or seg.endswith(".")
-                or low in _DENIED_SEGMENTS):
+                or low in _DENIED_SEGMENTS or _SHORT_NAME.match(low)):
             raise DelegationError(400, "path escapes the repository or names a protected file")
     clean = "/".join(segments) + ("/" if is_dir else "")
     if any((clean + ("" if is_dir else "/")).casefold().startswith(p) for p in _DENIED_PREFIXES):
@@ -178,10 +183,12 @@ def _text(value: object, limit: int, what: str) -> str:
     characters could make a reviewer read something other than what an applier would act on."""
     if not isinstance(value, str) or not value.strip():
         raise DelegationError(400, f"{what} is required")
-    text = value.replace("\r\n", "\n")
+    text = value
     if len(text.encode("utf-8", "surrogatepass")) > limit:
         raise DelegationError(400, f"{what} is larger than the {limit} byte limit", "too_large")
-    if "\r" in text or "\x00" in text or ext._strip(text) != text:
+    if "\r" in text:
+        raise DelegationError(400, f"{what} has CR or CRLF line endings; send LF-only text (nothing is converted)", "crlf")
+    if "\x00" in text or ext._strip(text) != text:
         raise DelegationError(400, f"{what} contains control, invisible or direction-changing characters", "hidden_characters")
     try:
         text.encode("utf-8")
@@ -198,9 +205,14 @@ _MODE = re.compile(r"(new|deleted) file mode (\d{6})\Z")
 
 
 def _diff_path(raw: str) -> str | None:
-    raw = raw.split("\t", 1)[0].strip()
+    """A ---/+++ name exactly as git would read it: up to the first tab, nothing stripped. A name with leading,
+    trailing or any other whitespace or format character is refused rather than normalised, so the path we check
+    is the path an applier opens."""
+    raw = raw.split("\t", 1)[0]
     if raw == "/dev/null":
         return None
+    if any(c.isspace() or unicodedata.category(c) in ("Cf", "Cc", "Zs", "Zl", "Zp") for c in raw):
+        raise DelegationError(400, "patch paths must not contain whitespace or invisible characters", "bad_patch")
     if not raw.startswith(("a/", "b/")):
         raise DelegationError(400, "patch paths must be a/<path> or b/<path>", "bad_patch")
     return norm_path(raw[2:])
@@ -237,17 +249,23 @@ def parse_patch(text: str, scope_paths: list[str]) -> list[str]:
         if len(touched) > MAX_PATCH_FILES:
             raise DelegationError(400, f"a patch touches at most {MAX_PATCH_FILES} files", "too_large")
     git_pair: tuple[str, str] | None = None
+    git_kind: str | None = None                          # "new" / "deleted" from the extended header
     while i < len(lines):
         line = lines[i]
+        if len(line) > MAX_HEADER_LINE and line.startswith(("diff ", "--- ", "+++ ", "@@")):
+            bad("header line is too long")
         if (m := _GIT.match(line)):
+            for nm in (m.group(1), m.group(2)):
+                _diff_path("a/" + nm)                    # the same whitespace / invisible-character refusal
             a, b = norm_path(m.group(1)), norm_path(m.group(2))
             if a != b:
                 raise DelegationError(400, "renames and copies are not accepted", "bad_patch")
-            git_pair, have_header = (a, b), True
+            git_pair, have_header, git_kind = (a, b), True, None
             i += 1
             while i < len(lines) and not lines[i].startswith(("--- ", "diff --git ", "@@")):
                 h = lines[i]
                 if (mm := _MODE.match(h)):
+                    git_kind = mm.group(1)
                     if mm.group(2) != "100644":
                         raise DelegationError(400, f"file mode {mm.group(2)} is not accepted (regular, non-executable files only)", "bad_mode")
                 elif h.startswith(("old mode", "new mode")):
@@ -266,18 +284,27 @@ def parse_patch(text: str, scope_paths: list[str]) -> list[str]:
             if i + 1 >= len(lines) or not lines[i + 1].startswith("+++ "):
                 bad("--- without +++")
             cur_old, cur_new = _diff_path(line[4:]), _diff_path(lines[i + 1][4:])
+            if (git_kind == "new" and cur_old is not None) or (git_kind == "deleted" and cur_new is not None):
+                bad("the file mode line and the --- / +++ names disagree")
             if git_pair is not None:
                 for p in (cur_old, cur_new):
                     if p is not None and p != git_pair[0]:
                         bad("header paths disagree")
             finish_pair(cur_old, cur_new)
-            git_pair, have_header = None, True
+            git_pair, have_header, git_kind = None, True, None
             i += 2
             nh = 0
             while i < len(lines) and (hm := _HUNK.match(lines[i])):
                 nh += 1
                 old_n = int(hm.group(2)) if hm.group(2) is not None else 1
                 new_n = int(hm.group(4)) if hm.group(4) is not None else 1
+                # git decides creation / deletion from /dev/null AND from a 0,0 side; both must say the same thing
+                creates = hm.group(1) == "0" and old_n == 0
+                deletes = hm.group(3) == "0" and new_n == 0
+                if (cur_old is None) != creates or (cur_new is None) != deletes:
+                    bad("/dev/null and the hunk ranges disagree (creation needs -0,0, deletion needs +0,0)")
+                if (cur_old is None or cur_new is None) and nh > 1:
+                    bad("a created or deleted file has exactly one hunk")
                 i += 1
                 while old_n > 0 or new_n > 0:
                     if i >= len(lines):

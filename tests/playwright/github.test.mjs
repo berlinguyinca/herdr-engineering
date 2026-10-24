@@ -39,6 +39,7 @@ test('GitHub projects show ranked repos, old open issues, measured progress and 
  assert.ok(wide.repo>=280&&wide.repo<=360,`repository rail should stay scannable, got ${wide.repo}`);
  assert.ok(wide.list>900&&wide.inspector>1200,'populated issue list and inspector should share the wide canvas');assert.equal(wide.overflow,false);
  for(const viewport of [{width:2560,height:1440},{width:1920,height:1080},{width:768,height:1024}]){await page.setViewportSize(viewport);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`GitHub should not overflow at ${viewport.width}px`);}
+ await page.getByRole('button',{name:'Back to issues',exact:true}).click();
  const search=page.getByRole('searchbox',{name:'Search open issues'});await search.fill('Old');await search.focus();
  const before=listReads;await page.waitForTimeout(5500);assert.ok(listReads>before);assert.equal(details,1);assert.equal(await search.evaluate(e=>e===document.activeElement),true);
  await page.getByRole('tab',{name:/^Blocked/}).click();await page.getByRole('button',{name:'Blocked work',exact:true}).waitFor();
@@ -106,4 +107,76 @@ test('GitHub filters use server scope, retain independent failures and cancel re
  const before={repoReads,issueReads};await page.waitForTimeout(5500);assert.deepEqual({repoReads,issueReads},before);
  assert.equal(await page.getByText('Late body after navigation',{exact:true}).count(),0);
  assert.equal(await page.getByRole('heading',{name:'Hosts',exact:true}).count(),1);
+}));
+
+// Removing the pane bounds or selection restoration must break these interaction checks.
+test('GitHub wide panes scroll independently and preserve focus, selection and scroll through refresh',async()=>withApp(async(page,base)=>{
+ let reads=0;
+ const rows=Array.from({length:20},(_,i)=>issue(i+1,{title:`Workspace issue ${i+1}`,labels:['auto-implement','ctx:large','reasoning:high','lang:javascript']}));
+ await page.route('**/api/v1/github?*',route=>route.fulfill({json:snapshot({repositories:Array.from({length:20},(_,i)=>repository(`repository-${i}`,100-i))})}));
+ await page.route('**/api/v1/github/issues?*',route=>{reads++;return route.fulfill({json:snapshot({issues:rows})});});
+ await page.route('**/api/v1/github/issue?*',route=>route.fulfill({json:snapshot({checked_at:new Date().toISOString(),issue:{...rows[0],body:'Long description line\n'.repeat(500)}})}));
+ await page.setViewportSize({width:1920,height:1080});await page.goto(`${base}/#/github`);
+ await page.getByRole('button',{name:'Workspace issue 1',exact:true}).click();await page.locator('[data-gh-body]').waitFor();
+ for(const viewport of [{width:3840,height:2160},{width:2560,height:1440},{width:1920,height:1080}]){
+  await page.setViewportSize(viewport);
+  const bounds=await page.evaluate(()=>['.gh-repositories','.gh-issue-list','.gh-inspector'].map(selector=>{const e=document.querySelector(selector),r=e.getBoundingClientRect();return {selector,top:r.top,bottom:r.bottom,height:r.height};}));
+  for(const pane of bounds)assert.ok(pane.top>=0&&pane.bottom<=viewport.height,`${pane.selector} must fit ${viewport.width}px viewport: ${JSON.stringify(pane)}`);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  for(const selector of ['.gh-repositories','.gh-main'])assert.equal(await page.locator(selector).evaluate(e=>getComputedStyle(e).position),'sticky');
+ }
+ await page.evaluate(()=>{document.querySelector('.gh-repo-list').scrollTop=120;document.querySelector('.gh-issue-list').scrollTop=140;document.querySelector('.gh-inspector').scrollTop=160;});
+ const positions=()=>page.evaluate(()=>({repo:document.querySelector('.gh-repo-list').scrollTop,issues:document.querySelector('.gh-issue-list').scrollTop,detail:document.querySelector('.gh-inspector').scrollTop,window:scrollY}));
+ const before=await positions();assert.ok(before.repo>0&&before.issues>0&&before.detail>0,`all three panes must scroll: ${JSON.stringify(before)}`);
+ await page.locator('.gh-issue-list').hover();await page.mouse.wheel(0,240);await page.waitForTimeout(150);
+ const after=await positions();assert.ok(after.issues>before.issues);assert.equal(after.repo,before.repo);assert.equal(after.detail,before.detail);assert.equal(after.window,before.window);
+ await page.locator('[data-gh-body]').focus();const retained=await positions(),beforeReads=reads;
+ await page.waitForTimeout(5500);assert.ok(reads>beforeReads);assert.deepEqual(await positions(),retained);
+ assert.equal(await page.locator('[data-gh-body]').evaluate(e=>e===document.activeElement),true);
+ assert.equal(await page.locator('[data-gh-issue="github.com/lab/busy#1"]').getAttribute('aria-pressed'),'true');
+ await page.getByRole('button',{name:'Refresh issue',exact:true}).evaluate(e=>e.focus({preventScroll:true}));
+ await page.getByRole('button',{name:'Refresh issue',exact:true}).press('Enter');await page.waitForTimeout(150);
+ // Refreshing detail retains the inspector's position even though its contents are replaced.
+ const refreshPosition=await positions();assert.deepEqual(refreshPosition,retained);
+ assert.equal(await page.getByRole('button',{name:'Refresh issue',exact:true}).evaluate(e=>e===document.activeElement),true);
+}));
+
+test('GitHub narrow detail focuses Back and restores document list scroll',async()=>withApp(async(page,base)=>{
+ const rows=Array.from({length:20},(_,i)=>issue(i+1));
+ await page.route('**/api/v1/github?*',route=>route.fulfill({json:snapshot({repositories:[repository('busy',20)]})}));
+ await page.route('**/api/v1/github/issues?*',route=>route.fulfill({json:snapshot({issues:rows})}));
+ await page.route('**/api/v1/github/issue?*',route=>{const number=Number(new URL(route.request().url()).searchParams.get('number'));return route.fulfill({json:snapshot({issue:{...rows[number-1],body:'Mobile description\n'.repeat(150)}})});});
+ for(const viewport of [{width:768,height:1024},{width:390,height:844}]){
+  await page.setViewportSize(viewport);await page.goto(`${base}/#/github`);await page.getByRole('button',{name:'Issue 12',exact:true}).waitFor();
+  const item=page.getByRole('button',{name:'Issue 12',exact:true});await item.scrollIntoViewIfNeeded();const listScroll=await page.evaluate(()=>scrollY);assert.ok(listScroll>0);
+  await item.click();await page.locator('[data-gh-body]').waitFor();
+  const back=page.getByRole('button',{name:'Back to issues',exact:true});assert.equal(await back.count(),1);
+  assert.equal(await back.evaluate(e=>e===document.activeElement),true);
+  assert.equal(await page.locator('.gh-issue-list').isVisible(),false);
+  await page.evaluate(()=>scrollBy(0,450));
+  const backBounds=await back.boundingBox();assert.ok(backBounds.y>=0&&backBounds.y<60,'Back remains available while reading detail');
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  await back.click();assert.equal(await item.evaluate(e=>e===document.activeElement),true);
+  assert.ok(Math.abs(await page.evaluate(()=>scrollY)-listScroll)<2,'closing detail restores the list document position');
+  assert.equal(await page.locator('.gh-issue-list').evaluate(e=>getComputedStyle(e).overflowY),'hidden');
+ }
+}));
+
+test('GitHub desktop selection enters narrow detail with focus and returns to a visible selected row',async()=>withApp(async(page,base)=>{
+ const rows=Array.from({length:20},(_,i)=>issue(i+1));
+ await page.route('**/api/v1/github?*',route=>route.fulfill({json:snapshot({repositories:[repository('busy',20)]})}));
+ await page.route('**/api/v1/github/issues?*',route=>route.fulfill({json:snapshot({issues:rows})}));
+ await page.route('**/api/v1/github/issue?*',route=>{const number=Number(new URL(route.request().url()).searchParams.get('number'));return route.fulfill({json:snapshot({issue:{...rows[number-1],body:'Resized description\n'.repeat(180)}})});});
+ await page.setViewportSize({width:1920,height:1080});await page.goto(`${base}/#/github`);
+ for(const number of [1,12]){
+  await page.setViewportSize({width:1920,height:1080});
+  const item=page.getByRole('button',{name:`Issue ${number}`,exact:true});await item.click();await page.locator('[data-gh-body]').waitFor();
+  await page.setViewportSize({width:390,height:844});
+  await page.waitForFunction(()=>document.activeElement?.hasAttribute('data-gh-close'),null,{timeout:1500});
+  assert.equal(await page.locator('.gh-issue-list').isVisible(),false);
+  await page.evaluate(()=>scrollBy(0,1000));
+  await page.getByRole('button',{name:'Back to issues',exact:true}).click();
+  assert.equal(await item.evaluate(e=>e===document.activeElement),true);
+  const row=await item.boundingBox();assert.ok(row.y>=0&&row.y+row.height<=844,`selected issue ${number} must return within the viewport: ${JSON.stringify(row)}`);
+ }
 }));

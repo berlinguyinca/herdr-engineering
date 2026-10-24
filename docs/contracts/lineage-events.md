@@ -148,6 +148,78 @@ O's owner is a writer of E. Unrelated reviewers are never ranked against each ot
    should send `attrs.supersedes`.
 Stale edges are kept and flagged.
 
+### Head-bound review quorum (T06)
+Two different meanings of "stale" exist and must not be confused:
+- the graph edge flag `stale` (above) = "a later binding was admitted by a related edge". It is arrival-order based and
+  cannot know which commit is current;
+- the quorum's `stale_reviewers` = "bound to a commit other than the PR's CURRENT head". It is head-relative.
+After a force-push back to an earlier SHA the edge flag may say `stale: true` while the quorum counts that review again,
+because the SHA names the content. Gate on the quorum, show the flag only as a hint.
+
+`GET /api/v1/graph/nodes/{pr_id}/review-quorum` (viewer level; 404 when the PR is absent/hidden or the feature is off)
+DERIVES the quorum; it writes nothing and Herdr does not request reviews itself. `rereview_required` / `rereview_needed`
+are the re-review request: whoever owns review dispatch (Pi on `github.evidence_stale`, AutoSpec) polls or subscribes.
+
+Producer contract. Each independent reviewer publishes with its OWN ingest key (reviewer identity is server-authenticated;
+a shared emitter key is one identity): `node.upsert review:<id>` then `edge.add reviewed review:<id> -> pr:<id>` with
+`attrs.commit` (full head SHA, the binding), `attrs.verdict` (`lgtm`|`blocked`, case-insensitive), `attrs.receipt_digest`
+(64 hex) and `attrs.receipt_binding` = `sha256("pr-review-receipt-v1\0" lower(pr node id) "\0" commit "\0" reviewer principal
+id "\0" receipt_digest)`. `autospec review-quorum publish` does this. Consumer: `autospec review-quorum request` polls this
+route and runs the configured review dispatch once per (PR, head) when `rereview_required` is true.
+
+Configuration (fleet config, `control_plane.review_quorum`, never from events):
+```yaml
+review_quorum:
+  required: 2                      # approvals needed at the current head, 1..16
+  trusted_head_writers: [key:<pi>] # principal ids whose head_sha / author writes define the PR's head
+  reviewers:                       # principal ids that may vote; login optional (recognises the PR author)
+    key:<reviewer-a>: {}
+    key:<author-human>: {login: some-login}
+  reviewer_groups:                 # optional: ids of ONE person/organisation count once
+    - [key:<alice-laptop>, key:<alice-ci>]
+```
+ONE policy, two implementations: this route (workbench) and `autospec review-quorum` (merge gating) are pinned by the shared
+vector file `tests/control_plane/fixtures/review-quorum-vectors.json` (byte-identical to autospec's
+`crates/autospec-core/tests/fixtures/`); both suites load it. Rules:
+1. The head is the newest non-empty `attrs.head_sha` written by a trusted writer and must be a full SHA, else `unknown_head`.
+   `pr` is a commons node, so untrusted writers' values are ignored. A trusted writer's applied head is its highest
+   `source_sequence` write. A write admitted AFTER it (so lower in sequence) is either a late delivery or an emitter restart
+   that reset the sequence:
+   - same value as the applied head, or a head that writer had ALREADY reported before the applied write (an old head
+     redelivered late): ignored, nothing is poisoned. Evidence is kept per DISTINCT head (8 per writer), so re-emits of one
+     head cannot evict the evidence about another.
+   - any other head, however close in sequence, and however many such writes: status `head_unverified` (response also
+     carries `head_unverified: true`, a human-readable `alert`, and for operators `resync_event_id`; one WARNING is logged
+     per observation; `autospec review-quorum request` exits 4 on it instead of reporting "not needed"). Never satisfied.
+     It clears only when (a) the writer writes past the applied sequence (a plain reorder heals on its next write), or
+     (b) an operator acknowledges the observed write by writing `attrs.head_resync = "<resync_event_id>"` on the PR node
+     (operator principal only, that exact write only; the answer then carries `head_resynced: true`). A run of low-sequence
+     writes is NEVER adopted automatically. `autospec review-quorum verify-report` compares the report with the live PR head
+     from GitHub, which is the second defence.
+2. Only configured reviewers are read; anyone else's edges (approvals or blocks) are ignored, so junk cannot satisfy or block.
+3. A reviewer is the edge OWNER (server-authenticated), never a payload name. `verdict`/`receipt_*` and add/remove are read ONLY
+   from the owner's own writes: an operator or `co_writers` member cannot flip a verdict or retract a block.
+4. Blocks first, never dropped: a configured reviewer's `blocked` at the head, at a head prefix or at an unparseable commit
+   blocks (fail closed); at another full head it is stale. Many review nodes of one identity count once.
+5. An approval is excluded if the reviewer owns a `produced` edge into the PR, or their configured `login` equals the `author`
+   attr written by a trusted writer (`x[bot]` equals `x`). A missing/blank author is `unknown_author` (never satisfied; a blank
+   write does not clear a known author, it just carries no value).
+6. An approval needs a 64-hex `receipt_digest` and a `receipt_binding` that recomputes; one digest backing two groups voids both.
+7. Verdicts for other heads are `stale_reviewers`, never counted; a verdict that lands after the head moved is stale; one issued
+   for a head not yet observed waits until a trusted writer reports that head.
+8. Matching is ASCII-only, identical in autospec: whitespace is the six ASCII blanks, case folding touches only A-Z, ids and
+   targets must be printable ASCII (`invalid_target` otherwise); no Unicode folding (Kelvin sign, dotted I, NBSP).
+   `rereview_needed` is computed from the approvals the CALLER can see only, so a hidden approval never shifts it.
+9. A mistaken verdict is retracted by its owner at the same head: `autospec review-quorum publish --retract` sends an
+   `edge.remove` (same key, same edge) which Herdr honours only from the edge's owner.
+10. The decision is computed over ALL matching edges. A caller sees names only of reviewers whose edges it can see; it also gets
+   `has_hidden_reviews` and `blocked_by_hidden` (a hidden block still yields `blocked`; existence is disclosed, counts are not).
+Statuses: `satisfied`, `insufficient` (re-review needed), `blocked`, `unknown_head`, `head_unverified`, `unknown_author`, `invalid_target`. Only
+`satisfied` passes. PR ids are matched exactly, then lower-cased.
+Residual: the binding is not a signature (a colluding key can recompute it); two unlisted keys of one person count twice;
+a verdict is bound to the head SHA, not the base; private/mission-scoped edges still count; Herdr ignores blocks from
+unconfigured principals (anti-DoS) while autospec, with no `eligible_reviewers`, honours a block from anyone.
+
 ### Session rollover
 No containment edge type exists, so `attempt`/`session` nodes carry `attrs.agent_id` / `attrs.attempt_id`. A rollover is a new
 `session:` node (and the old one's `node.state`); the `agent:` id and state are untouched. Closing a pane/tab emits nothing and
@@ -674,3 +746,48 @@ Remote agents use MCP `consult_inbox` / `consult_answer` (listed only while the 
 - Endpoint workspaces come from the node's scope label: a node whose events name no workspace (or several) cannot be a link endpoint.
 - The kill switch hides links in every collab graph read; the keyed operator/ingest graph API is not behind it. Only the combined server (graph + lineage sink) offers these routes; a `--collab-only` process answers 409/404.
 - Operators can write `cross_link` (trusted, like every other write). No Pi change is needed or made; Pi emitters cannot write the kind.
+
+## Forks and promotion (T13)
+
+Alternative implementations reuse the existing vocabulary; there is no second store.
+
+- A fork is an OWNED node `approach:<id>` (written by the Pi emitter) plus a `fork` edge from the origin
+  (`attempt`, `agent`, `task` or another `approach`) to it. Siblings are approaches that share an origin.
+- A decision is a `supersession` edge winner -> loser. Nothing is ever deleted; the loser is only marked
+  `superseded`, the winner `selected`.
+- Approach attrs (all self-reported by the fork's own emitter, shown as `source: approach_owner, verified: false`
+  and never used to gate anything): `approach_id, origin_id, mission_id, task_id, base_sha, head_sha, branch, repo,
+  worktree_id, files_changed, insertions, deletions, touched_paths, elapsed_s, cost_usd, tokens, pr, pushed_head`.
+- Fork and promote are steering actions (T12 flow: propose, a different member confirms, keyed delivery to the
+  node owner's key, ack). They are not in the default `actions`; both the `actions` list and
+  `control_plane.collab.steering.forks.enabled: true` must opt in. YAML under `steering.forks`:
+  `enabled`, `max_forks_per_origin` (5), `max_open_forks_per_room` (20), `require_validation` (true),
+  `min_reviews` (0), `evidence_writers` (principals trusted to write validation/review evidence), `max_compared` (10).
+- `fork` needs a `base_sha` that the graph shows for the origin. `promote` needs a live, non-superseded approach
+  with a full `head_sha` and `expected_head`; readiness is re-checked at propose, confirm and delivery.
+- Evidence that counts: `validated` / `reviewed` (verdict `lgtm`) edges bound to the exact head, not stale or removed,
+  written by an `evidence_writers` principal. A `blocked` edge from such a writer blocks promotion.
+- Promotion race: the earliest confirmation wins, an acked-applied promotion closes the group, and Pi holds a
+  cross-process claim per origin. Pi pushes exactly the confirmed sha (never forced), opens a DRAFT PR, links it
+  (T05) and acks `applied` only after all three. It never merges.
+- `GET /api/v1/collab/rooms/{id}/forks?node_id=` returns the comparison read model (403 `forks_disabled` when off).
+
+| Threat | Control | Tests (`tests/control_plane/test_forks.py` unless noted) |
+|---|---|---|
+| Fork flood, disk | per-origin and per-room caps on both sides, free-disk floor on Pi | `test_fork_flood_is_capped_per_origin_and_per_room`, `test_a_fork_is_refused_at_confirmation_when_the_limit_filled_meanwhile`; Pi `flood and disk limits` |
+| Fork of a node the actor cannot see | target resolved through room visibility | `test_who_may_fork_and_what_they_cannot_see`, `test_comparison_hides_what_the_reader_cannot_see_and_is_bounded` |
+| Stale, superseded or unvalidated promotion | `promotion_check` at propose, confirm, delivery; Pi re-checks the head | `test_promotion_is_refused_until_trusted_head_bound_validation_exists`, `test_promote_needs_the_exact_head_the_person_saw`, `test_only_approaches_can_be_promoted_and_a_losing_fork_cannot`, `test_stale_head_after_confirmation_never_reaches_the_pusher`, `test_revoked_evidence_between_confirmation_and_delivery_blocks_delivery`, `test_trusted_evidence_removed_after_proposal_blocks_confirmation` |
+| Comparison forged by the fork's agent | self-reported labels; only operator-listed writers count | `test_comparison_shows_every_sibling_with_provenance_and_never_trusts_the_forks_own_numbers`, `test_the_forks_own_agent_cannot_forge_evidence`, `test_no_trusted_writers_configured_means_nothing_can_ever_validate` |
+| Promotion race | `_promotion_conflict` (earliest confirmation wins) plus Pi registry claim | `test_promotion_race_only_one_sibling_can_be_confirmed_and_delivered`, `test_an_applied_promotion_closes_the_group_even_if_the_state_is_not_reported_yet`, `test_a_refused_or_stale_promotion_does_not_block_the_next_one`; Pi `only one promotion per origin`, `two processes sharing a state dir` (two registry instances in one process, not separate processes) |
+| Branch or path injection | Pi derives every name from the steering id; params are shas and a cleaned label | `test_nothing_in_a_fork_or_promote_delivery_is_a_command`, `test_hostile_text_in_a_fork_is_neutralised`; Pi `derives every name itself`, `fork parameters are typed and strict`, wire-fixture test |
+| Closing siblings destroys work | siblings only marked; branches and worktrees kept; no delete in `CliForkGit` | Pi `pushes exactly the confirmed commit, opens a DRAFT PR...`, `refuses rather than delete` |
+| Confused deputy across rooms | room checked on propose, delivery and on Pi | `test_http_routes`, `test_self_confirmation_and_replay_are_refused_like_any_steering`; Pi `never promotes from another room` |
+
+Unmet or partial against the spec, stated plainly: a fork prepares an isolated worktree and records it but does not
+start an agent in it; "invalidates stale reviews" is done by binding evidence to the exact head (a moved head makes
+evidence stale at read time and blocks promotion) and no gate node is rewritten; promotion is unreachable until the
+operator lists `evidence_writers` and something writes `validated` edges for the fork head.
+
+Limitations: T06 review quorum is not on this stack (comparison reports `quorum: unavailable`); independent
+evidence writers must be keys that can see room-scoped nodes, i.e. operator keys; an older Pi ignores the new actions
+and Herdr re-offers up to 5 times.
