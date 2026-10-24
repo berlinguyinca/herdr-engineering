@@ -82,6 +82,55 @@ const GUIDE = `<div class="hd-card">
     <li><b>Revoke</b> it here any time; it stops working immediately. Credentials expire after 30 days.</li>
   </ol></div>`;
 
+const USER_PILL = { pending: ['Waiting', 'var(--status-attention, #d89b1d)'], approved: ['Approved', 'var(--status-ok, #1a9b6c)'],
+  denied: ['Declined', 'var(--text-muted)'], disabled: ['Disabled', 'var(--status-danger, #c0392b)'], kicked: ['Removed', 'var(--status-danger, #c0392b)'] };
+const when = (iso) => (iso ? String(iso).replace('T', ' ').slice(0, 16) : '');
+
+export function renderPeople({ users = [], manage = false, filter = 'pending', showLog = false, counts = {} }) {
+  const chips = manage ? ['pending', 'approved', 'disabled', 'denied', 'kicked', 'all'] : ['pending'];
+  const rows = users.filter((u) => filter === 'all' || u.status === filter);
+  const buttons = (u) => {
+    const b = (act, label, cls = '') => `<button type="button" class="hd-btn hd-btn--sm${cls}" data-act="${act}" data-user="${esc(u.user_id)}">${label}</button>`;
+    if (u.status === 'pending') return b('approve', 'Approve') + b('deny', 'Decline', ' hd-btn--ghost') + (manage ? b('delete', 'Delete person permanently', ' hd-btn--danger') : '');
+    if (!manage) return '';
+    if (u.status === 'approved') return b('disable', 'Disable', ' hd-btn--ghost') + b('delete', 'Delete person permanently', ' hd-btn--danger');
+    if (u.status === 'disabled') return b('enable', 'Enable') + b('delete', 'Delete person permanently', ' hd-btn--danger');
+    return b('approve', 'Approve again', ' hd-btn--ghost') + b('delete', 'Delete person permanently', ' hd-btn--danger');
+  };
+  return `<div class="cx-head"><div><h1>People</h1>
+    <p class="cx-sub">${manage ? 'Everyone who has signed in. Nobody can use rooms or agents until approved; you can disable access or delete a person permanently.' : 'People waiting to join. Approve the ones you know; they get access straight away.'}</p></div></div>
+    <div class="cx-chips" role="tablist" aria-label="Filter people">${chips.map((c) => `<button type="button" class="cx-chip" role="tab" data-filter="${c}" aria-selected="${c === filter}">${c === 'all' ? 'Everyone' : (USER_PILL[c] || [c])[0]}${c !== 'all' && counts[c] ? ` · ${counts[c]}` : ''}</button>`).join('')}</div>
+    <label class="cx-field">Note for the log (optional)<input id="hcn-user-note" maxlength="200" placeholder="e.g. joins the MS team"></label>
+    ${rows.length ? `<ul class="cx-list" id="hcn-users">${rows.map((u) => `<li>
+      <span class="grow"><b>${esc(u.email || shortId(u.user_id))}</b> ${pill(...(USER_PILL[u.status] || [u.status]))}
+        <span class="hd-card__sub">${u.status === 'pending' ? `asked ${esc(when(u.since))}` : `${esc(u.decided_by || '')} ${esc(when(u.decided_at))}`}${manage && u.status === 'approved' ? ` · ${u.rooms} room${u.rooms === 1 ? '' : 's'}, ${u.agents} agent${u.agents === 1 ? '' : 's'}` : ''}${u.reason ? ` · “${esc(u.reason)}”` : ''}</span></span>
+      <span class="cx-row">${buttons(u)}</span></li>`).join('')}</ul>`
+      : `<div class="hd-empty">${filter === 'pending' ? 'Nobody is waiting.' : 'Nobody here.'}</div>`}
+    ${manage ? `<section class="cx-section"><h2>Decision log</h2><button id="hcn-log-btn" class="hd-btn hd-btn--ghost hd-btn--sm" type="button">${showLog ? 'Hide' : 'Show'} the log</button><div id="hcn-log"></div></section>` : ''}
+    <span id="hcn-people-msg" class="cx-msg" role="status"></span>`;
+}
+
+const confirmAction = (message) => typeof globalThis.confirm === 'function' && globalThis.confirm(message);
+export function confirmDeletePerson(person) {
+  return confirmAction(`Delete ${person.email || person.user_id} permanently? All memberships, sessions, tokens, invitations, owned-agent records and authored messages will be removed. Identity and authored content will be scrubbed from live rooms and retained archives; only minimal audit metadata survives. Room-owned files will remain, with uploader attribution removed or anonymized. This cannot be undone.`);
+}
+export function confirmDeleteRoom(room) {
+  return confirmAction(`Archive and delete ${room.name}? Room data, messages, files and previews are archived and verified before live data is removed. The verified archive is retained; restore creates a new room ID. A failed archive leaves the live room intact.`);
+}
+
+export function renderRoomAdministration({ room, invites = [], canManage = false }) {
+  if (!canManage) return '';
+  const members = (room.members || []).filter(m => m.room_membership_status !== 'removed');
+  return `<ul class="cx-list">${members.map(m => {
+    const pending = m.room_membership_status === 'pending';
+    const approved = !pending && (m.user_status ?? 'approved') === 'approved' && (m.room_membership_status ?? 'approved') === 'approved';
+    return `<li><span class="grow">${esc(m.email || shortId(m.user_id))}</span>${pill(pending ? 'Waiting for room approval' : roleLabel(m.role))}
+      ${pending ? `<button type="button" class="hd-btn hd-btn--sm" data-approve-member="${esc(m.user_id)}">Approve member</button>` : ''}
+      ${approved ? `<label class="cx-check"><input type="checkbox" data-upload="${esc(m.user_id)}"${m.file_upload_permission === true ? ' checked' : ''}${m.role === 'owner' ? ' disabled' : ''}> Upload files</label>` : ''}
+      ${m.role !== 'owner' ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rm="${esc(m.user_id)}">Remove from room</button>` : ''}</li>`;
+  }).join('')}${invites.map(i => `<li><span class="grow">${esc(i.email)}</span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>`;
+}
+
 export function mountCollab(root, { fabricSessions = null, surface = root.dataset.standalone === '1' ? 'public' : 'dashboard' } = {}) {
   ensureConversationStyles(root.ownerDocument);
   const store = new TokenStore(window.sessionStorage);
@@ -89,6 +138,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
   const api = new CollabApi(() => (operator ? { access: 'operator', id: 'operator' } : store.get()));
   let teardown = null;      // stops the open room's live loop
   let cursor = 0;
+  const pendingAdministration = new Set();
   let lastCfg = null;
   let me = null;
   const standalone = surface === 'public';
@@ -333,9 +383,6 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
   }
 
   const canManagePeople = () => Boolean(me?.capabilities.canManagePeople);
-  const USER_PILL = { pending: ['Waiting', 'var(--status-attention, #d89b1d)'], approved: ['Approved', 'var(--status-ok, #1a9b6c)'],
-    denied: ['Declined', 'var(--text-muted)'], disabled: ['Disabled', 'var(--status-danger, #c0392b)'], kicked: ['Removed', 'var(--status-danger, #c0392b)'] };
-  const when = (iso) => (iso ? String(iso).replace('T', ' ').slice(0, 16) : '');
 
   async function showPeople(filter, showLog, turn) {
     if (!isCurrent(turn)) return;
@@ -345,40 +392,34 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const manage = Boolean(data.can_manage);
     const strip = await tabsStrip(null, '/people', turn);
     if (!isCurrent(turn)) return;
-    const counts = data.counts || {};
-    const chips = manage ? ['pending', 'approved', 'disabled', 'denied', 'kicked', 'all'] : ['pending'];
-    const rows = data.users.filter((u) => filter === 'all' || u.status === filter);
-    const buttons = (u) => {
-      const b = (act, label, cls = '') => `<button type="button" class="hd-btn hd-btn--sm${cls}" data-act="${act}" data-user="${esc(u.user_id)}">${label}</button>`;
-      if (u.status === 'pending') return b('approve', 'Approve') + b('deny', 'Decline', ' hd-btn--ghost');
-      if (!manage) return '';
-      if (u.status === 'approved') return b('disable', 'Disable', ' hd-btn--ghost') + b('kick', 'Remove', ' hd-btn--danger');
-      if (u.status === 'disabled') return b('enable', 'Enable') + b('kick', 'Remove', ' hd-btn--danger');
-      return b('approve', 'Approve again', ' hd-btn--ghost');
-    };
-    frame('/people', `<div class="cx-head"><div><h1>People</h1>
-      <p class="cx-sub">${manage ? 'Everyone who has signed in. Nobody can use rooms or agents until approved; you can disable or remove anyone at any time.' : 'People waiting to join. Approve the ones you know; they get access straight away.'}</p></div></div>
-      <div class="cx-chips" role="tablist" aria-label="Filter people">${chips.map((c) => `<button type="button" class="cx-chip" role="tab" data-filter="${c}" aria-selected="${c === filter}">${c === 'all' ? 'Everyone' : (USER_PILL[c] || [c])[0]}${c !== 'all' && counts[c] ? ` · ${counts[c]}` : ''}</button>`).join('')}</div>
-      <label class="cx-field">Note for the log (optional)<input id="hcn-user-note" maxlength="200" placeholder="e.g. joins the MS team"></label>
-      ${rows.length ? `<ul class="cx-list" id="hcn-users">${rows.map((u) => `<li>
-        <span class="grow"><b>${esc(u.email || shortId(u.user_id))}</b> ${pill(...USER_PILL[u.status])}
-          <span class="hd-card__sub">${u.status === 'pending' ? `asked ${esc(when(u.since))}` : `${esc(u.decided_by || '')} ${esc(when(u.decided_at))}`}${manage && u.status === 'approved' ? ` · ${u.rooms} room${u.rooms === 1 ? '' : 's'}, ${u.agents} agent${u.agents === 1 ? '' : 's'}` : ''}${u.reason ? ` · “${esc(u.reason)}”` : ''}</span></span>
-        <span class="cx-row">${buttons(u)}</span></li>`).join('')}</ul>`
-        : `<div class="hd-empty">${filter === 'pending' ? 'Nobody is waiting.' : 'Nobody here.'}</div>`}
-      ${manage ? `<section class="cx-section"><h2>Decision log</h2><button id="hcn-log-btn" class="hd-btn hd-btn--ghost hd-btn--sm" type="button">${showLog ? 'Hide' : 'Show'} the log</button><div id="hcn-log"></div></section>` : ''}
-      <span id="hcn-people-msg" class="cx-msg" role="status"></span>`, strip, turn);
+    frame('/people', renderPeople({ users: data.users, manage, filter, showLog, counts: data.counts }), strip, turn);
     document.querySelectorAll('[data-filter]').forEach((b) => { b.onclick = () => showPeople(b.dataset.filter, showLog, turn); });
     document.querySelectorAll('[data-act]').forEach((b) => {
       b.onclick = async () => {
         if (!isCurrent(turn)) return;
         const act = b.dataset.act;
+        const key = `person:${b.dataset.user}`;
+        if (pendingAdministration.has(key)) return;
         const who = b.closest('li').querySelector('b').textContent;
-        const ask = { kick: `Remove ${who}? They lose every room and all their agents stop working.`, disable: `Disable ${who}? They and their agents are locked out until you enable them.`, deny: `Decline ${who}?` }[act];
+        const ask = { disable: `Disable ${who}? They and their agents are locked out until you enable them.`, deny: `Decline ${who}?` }[act];
+        if (act === 'delete' && !confirmDeletePerson({ email: who })) return;
         if (ask && !window.confirm(ask)) return;
+        pendingAdministration.add(key);
         b.disabled = true;
-        try { await api.decideUser(b.dataset.user, act, ($('hcn-user-note').value || '').trim()); await showPeople(filter, showLog, turn); }
+        const msg = $('hcn-people-msg');
+        msg.setAttribute('role', 'status');
+        if (act === 'delete') msg.textContent = 'Deleting person and scrubbing retained archives…';
+        try {
+          if (act === 'delete') {
+            const result = await api.deletePerson(b.dataset.user);
+            if (!isCurrent(turn)) return;
+            if (result.status !== 'complete') throw new Error('Person deletion is not complete. Refresh People before retrying.');
+          } else await api.decideUser(b.dataset.user, act, ($('hcn-user-note').value || '').trim());
+          await showPeople(filter, showLog, turn);
+          if (isCurrent(turn) && act === 'delete') $('hcn-people-msg').textContent = 'Person deleted permanently. Room-owned files remain.';
+        }
         catch (e) { if (!isCurrent(turn) || cancelled(e)) return; $('hcn-people-msg').textContent = e.message; $('hcn-people-msg').setAttribute('role', 'alert'); }
-        finally { if (isCurrent(turn)) b.disabled = false; }
+        finally { pendingAdministration.delete(key); if (isCurrent(turn)) b.disabled = false; }
       };
     });
     if (manage) {
@@ -732,16 +773,21 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       ${guest ? '' : `<section class="cx-panel cx-cols" id="hcn-p-agents" hidden>
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
-        ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}
+        ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div><span id="hcn-agent-msg" class="cx-msg" role="status"></span></div>' : ''}
         ${operator ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helpers</div><div id="hcn-panic"></div><div class="hd-card__title">Host access requests</div><div id="hcn-egress"></div><div class="hd-card__title">External hosts</div><div id="hcn-hosts-table"></div></div>' : ''}
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helper profile</div><div id="hcn-profile-box"></div></div>' : ''}</section>`}
-      ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
+      ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div><span id="hcn-members-msg" class="cx-msg" role="status"></span></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
-          <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div></section>` : ''}`, strip, turn);
+          <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div>
+        <div class="hd-card cx-stack cx-administration"><div class="hd-card__title">Room administration</div>
+          <p class="cx-sub">Live room data is removed only after its archive is verified.</p>
+          <button id="hcn-delete-room" type="button" class="hd-btn hd-btn--danger"${pendingAdministration.has(`archive:${roomId}`) ? ' disabled' : ''}>Archive and delete room</button>
+          <span id="hcn-archive-msg" class="cx-msg" role="status">${pendingAdministration.has(`archive:${roomId}`) ? 'Archiving and verifying room data…' : ''}</span></div></section>` : ''}`, strip, turn);
 
     const log = $('hcn-log');
     let alive = true;
+    let inheritedArchivePending = pendingAdministration.has(`archive:${roomId}`);
     let composer = null;
     let since = -1;
     let ctl = null;
@@ -819,13 +865,20 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const ttlSelect = () => '<label class="cx-msg">Lasts <select name="ttl"><option value="">30 days (default)</option><option value="3600">1 hour</option><option value="86400">1 day</option><option value="604800">7 days</option><option value="7776000">90 days</option></select></label>';
     const expiryOf = (f) => { const v = Number(f.querySelector('select[name="ttl"]')?.value || 0); return v ? Date.now() / 1000 + v : undefined; };
     const warn = (e) => { if (isCurrent(turn) && !cancelled(e)) alert(e.message); };
-    const act = async (fn) => { if (!isCurrent(turn)) return; try { await fn(); } catch (e) { warn(e); } kick(); };
+    const act = async (fn, control) => {
+      if (!isCurrent(turn) || control?.dataset.busy === '1') return;
+      const buttons = control ? [...control.querySelectorAll('button'), ...(control.matches('button') ? [control] : [])] : [];
+      if (control) control.dataset.busy = '1';
+      buttons.forEach(b => { b.disabled = true; });
+      try { await fn(); } catch (e) { warn(e); }
+      finally { if (isCurrent(turn)) { if (control) delete control.dataset.busy; buttons.forEach(b => { b.disabled = false; }); kick(); } }
+    };
 
     const namedAgent = a => ({...a,display_name:S.flow?.nodes?.find(n=>n.agent_id===a.agent_id)?.fabric?.display_name});
     const drawRoomAgents = () => {
       const mine = new Set(S.mine.map((a) => a.agent_id));
-      const html = S.agents.length ? `<ul class="cx-list">${S.agents.map((a) => `<li class="cx-agentrow"><span class="grow">${agentTitle(namedAgent(a), mine.has(a.agent_id) || operator)}<span class="cx-sub1">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></span><span class="cx-pills">${permPills(a.actions)}</span>${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
-      if (put('hcn-roomagents', html)) { $('hcn-roomagents').querySelectorAll('[data-rmagent]').forEach((b) => { b.onclick = () => act(() => api.removeAgent(roomId, b.dataset.rmagent)); }); wireRename($('hcn-roomagents'), redraw('hcn-roomagents'), turn); }
+      const html = S.agents.length ? `<ul class="cx-list">${S.agents.map((a) => `<li class="cx-agentrow"><span class="grow">${agentTitle(namedAgent(a), mine.has(a.agent_id) || operator)}<span class="cx-sub1">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></span><span class="cx-pills">${permPills(a.actions)}</span>${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove from room</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
+      if (put('hcn-roomagents', html)) { $('hcn-roomagents').querySelectorAll('[data-rmagent]').forEach((b) => { b.onclick = () => act(() => api.removeAgent(roomId, b.dataset.rmagent), b); }); wireRename($('hcn-roomagents'), redraw('hcn-roomagents'), turn); }
     };
     const drawTaskTargets = () => {
       const can = S.agents.filter((a) => a.actions.includes('execute'));
@@ -856,7 +909,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         f.onsubmit = (ev) => {
           ev.preventDefault();
           const actions = picked(f, 'p');
-          if (actions.length) act(() => api.grantAgent(roomId, f.dataset.agent, actions, expiryOf(f)));
+          if (actions.length) act(async () => { await api.grantAgent(roomId, f.dataset.agent, actions, expiryOf(f)); if (isCurrent(turn)) $('hcn-agent-msg').textContent = canInvite ? 'Agent permissions saved.' : 'Request sent. Waiting for the room owner.'; }, f);
         };
       });
     };
@@ -881,9 +934,9 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         f.onsubmit = (ev) => {
           ev.preventDefault();
           const actions = picked(f, 'p');
-          if (actions.length) act(() => api.decideRequest(roomId, f.dataset.req, 'approve', actions, expiryOf(f)));
+          if (actions.length) act(() => api.decideRequest(roomId, f.dataset.req, 'approve', actions, expiryOf(f)), f);
         };
-        f.querySelector('[data-deny]').onclick = () => act(() => api.decideRequest(roomId, f.dataset.req, 'deny'));
+        f.querySelector('[data-deny]').onclick = () => act(() => api.decideRequest(roomId, f.dataset.req, 'deny'), f);
       });
     };
 
@@ -967,19 +1020,71 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       });
     };
 
+    const memberAction = async (button, action, success, rollback = () => {}) => {
+      const key = `members:${roomId}`;
+      if (!isCurrent(turn) || pendingAdministration.has(key)) { rollback(); return; }
+      pendingAdministration.add(key);
+      const msg = $('hcn-members-msg');
+      msg.setAttribute('role', 'status'); msg.textContent = 'Saving…';
+      button.disabled = true;
+      try {
+        await action();
+        if (!isCurrent(turn)) return;
+        msg.textContent = success;
+        $('hcn-people').dataset.h = '';
+      } catch (e) {
+        if (!isCurrent(turn)) return;
+        rollback();
+        if (!cancelled(e)) { msg.setAttribute('role', 'alert'); msg.textContent = e.message; }
+        else msg.textContent = '';
+      } finally {
+        pendingAdministration.delete(key);
+        if (isCurrent(turn)) { button.disabled = false; await drawPeople(); }
+      }
+    };
+    if ($('hcn-delete-room')) $('hcn-delete-room').onclick = async () => {
+      const key = `archive:${roomId}`, button = $('hcn-delete-room'), msg = $('hcn-archive-msg');
+      if (!isCurrent(turn) || pendingAdministration.has(key) || button.disabled || !confirmDeleteRoom(info)) return;
+      pendingAdministration.add(key); button.disabled = true;
+      msg.setAttribute('role', 'status'); msg.textContent = 'Archiving and verifying room data… Live deletion is not yet confirmed.';
+      try {
+        const result = await api.archiveRoom(roomId);
+        if (!isCurrent(turn)) return;
+        if (result.status !== 'verified' || result.live_room_id !== null) throw new Error('Room deletion is not complete. The archive must be verified and live deletion confirmed before completion.');
+        dispose();
+        // Stop other room mutations once the server confirms live deletion.
+        root.querySelectorAll('.cx-panel button, .cx-panel input, .cx-panel select, .cx-panel textarea').forEach(el => { el.disabled = true; });
+        msg.textContent = 'Archive verified. Room deleted.';
+      } catch (e) {
+        if (!isCurrent(turn)) return;
+        button.disabled = false;
+        if (!cancelled(e)) { msg.setAttribute('role', 'alert'); msg.textContent = `${e.message} Deletion is not confirmed; retry or refresh to check the room.`; }
+        else msg.textContent = 'Deletion check cancelled. Refresh to check the room before retrying.';
+      } finally { pendingAdministration.delete(key); }
+    };
     let peopleBusy = false;
     const drawPeople = async () => {
-      if (!canInvite || peopleBusy) return;
+      if (!canInvite || peopleBusy || pendingAdministration.has(`members:${roomId}`)) return;
       peopleBusy = true;
       try {
         const [room, inv] = await Promise.all([api.room(roomId), api.invites(roomId)]);
-        if (!alive || !isCurrent(turn)) return;
+        if (!alive || !isCurrent(turn) || pendingAdministration.has(`members:${roomId}`)) return;
         names = new Map((room.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
-        const html = `<ul class="cx-list">${room.members.map((m) => `<li><span class="grow">${esc(m.email || shortId(m.user_id))}</span>${pill(roleLabel(m.role), m.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}${m.role !== 'owner' ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rm="${esc(m.user_id)}">Remove</button>` : ''}</li>`).join('')}
-          ${inv.invites.map((i) => `<li><span class="grow">${esc(i.email)}</span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>`;
+        const html = renderRoomAdministration({ room, invites: inv.invites, canManage: canInvite });
         if (put('hcn-people', html)) {
-          $('hcn-people').querySelectorAll('[data-rm]').forEach((b) => { b.onclick = () => act(async () => { await api.removeMember(roomId, b.dataset.rm); if (isCurrent(turn)) $('hcn-people').dataset.h = ''; }); });
-          $('hcn-people').querySelectorAll('[data-cancel]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelInvite(roomId, b.dataset.cancel); if (isCurrent(turn)) $('hcn-people').dataset.h = ''; }); });
+          const box = $('hcn-people');
+          box.querySelectorAll('[data-rm]').forEach(b => { b.onclick = () => {
+            const member = room.members.find(m => m.user_id === b.dataset.rm);
+            if (pendingAdministration.has(`members:${roomId}`)) return;
+            if (confirmAction(`Remove ${member.email || member.user_id} from this room? Their room access and delegated permissions stop. Messages and files remain; their account and other rooms are unchanged.`))
+              memberAction(b, () => api.removeMember(roomId, b.dataset.rm), 'Removed from room. Messages and files remain.');
+          }; });
+          box.querySelectorAll('[data-approve-member]').forEach(b => { b.onclick = () => memberAction(b, () => api.approveMember(roomId, b.dataset.approveMember), 'Member approved.'); });
+          box.querySelectorAll('[data-upload]').forEach(b => { b.onchange = () => {
+            const allowed = b.checked;
+            memberAction(b, () => api.setUploadPermission(roomId, b.dataset.upload, allowed), 'Upload permission saved.', () => { b.checked = !allowed; });
+          }; });
+          box.querySelectorAll('[data-cancel]').forEach(b => { b.onclick = () => memberAction(b, () => api.cancelInvite(roomId, b.dataset.cancel), 'Invitation cancelled.'); });
         }
       } catch { /* keep what is shown */ } finally { peopleBusy = false; }
     };
@@ -1000,7 +1105,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); }
     }
     const paintPanel = async () => {
-      if (!isCurrent(turn)) return;
+      if (!alive || !isCurrent(turn)) return;
       if (sub === 'agents' && canPost) await loadMine();
       if (!isCurrent(turn)) return;
       if (sub === 'agents') await loadHelpers();
@@ -1010,6 +1115,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       paint();
     };
     const showSub = (k) => {
+      if (!alive || !isCurrent(turn)) return;
       sub = k; subTab.set(roomId, k);
       root.querySelectorAll('[data-sub]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.sub === k)));
       root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${k}`; });
@@ -1018,6 +1124,15 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     };
     root.querySelectorAll('[data-sub]').forEach((b) => { b.onclick = () => showSub(b.dataset.sub); });
     root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${sub}`; });
+
+    const refreshArchiveControl = () => {
+      if (!inheritedArchivePending || pendingAdministration.has(`archive:${roomId}`)) return;
+      inheritedArchivePending = false;
+      const button = $('hcn-delete-room');
+      if (!button) return;
+      button.disabled = false;
+      $('hcn-archive-msg').textContent = 'Previous deletion request finished. The room is still available; refresh or retry to check deletion status.';
+    };
 
     // ---- one long-poll feeds every panel (replaces five timers); it sleeps while the tab is hidden
     const apply = (s) => {
@@ -1037,6 +1152,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
           const s = await api.state(roomId, since, cursor, 8, ctl.signal);
           if (!alive || !isCurrent(turn)) return;
           backoff = 1000;
+          refreshArchiveControl();
           if (s.changed) { apply(s); since = s.has_more ? -1 : s.seq; } else since = s.seq;
         } catch (e) {
           if (!alive || !isCurrent(turn)) return;

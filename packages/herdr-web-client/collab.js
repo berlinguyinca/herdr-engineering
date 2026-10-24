@@ -168,6 +168,13 @@ export class CollabApi {
   decideUser(user, action, reason) {
     return this.call('POST', `/admin/users/${encodeURIComponent(user)}/${encodeURIComponent(action)}`, reason ? { reason } : {});
   }
+  // Lifecycle HTTP contracts: servers without these routes return visible errors.
+  deletePerson(user) { return this.call('POST', `/admin/users/${encodeURIComponent(user)}/delete`, {}); }
+  approveMember(room, user) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/members/${encodeURIComponent(user)}/approve`, {}); }
+  setUploadPermission(room, user, allowed) {
+    return this.call('POST', `/rooms/${encodeURIComponent(room)}/members/${encodeURIComponent(user)}/upload-permission`, { file_upload_permission: allowed });
+  }
+  archiveRoom(room) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/archive`, {}); }
   userLog() { return this.call('GET', '/admin/users/log'); }
   async room(id) { return normalizeRoom(await this.call('GET', `/rooms/${encodeURIComponent(id)}`)); }
   createProject(name) { return this.call('POST', '/projects', { name }); }
