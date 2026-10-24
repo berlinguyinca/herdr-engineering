@@ -206,6 +206,44 @@ def assemble(repo, key, *, max_agents=12, final_stage=None, ended_at=None, infer
     return out
 
 
+RESULT = {"complete": "succeeded", "failed": "failed", "cancelled": "cancelled", "unknown": "unknown"}
+MAX_SUMMARIES = 500
+
+
+def last_event(payload):
+    """The one-line "last meaningful event" for a catalog row, from a stored outcome."""
+    prs = payload.get("prs") or []
+    if prs:
+        pr = prs[-1]
+        return f"PR #{pr.get('number')} {pr.get('state') or 'opened'}" if pr.get("number") is not None else None
+    ci = payload.get("ci") or []
+    if ci and ci[0].get("state"):
+        return f"CI run #{ci[0].get('run')} {ci[0]['state']}"
+    tests = payload.get("tests")
+    if tests and tests.get("runs"):
+        return f"Tests {'failed' if tests.get('failed') else 'passed'}"
+    return f"Ended: {payload.get('final_stage')}" if payload.get("final_stage") else None
+
+
+def outcome_summaries(repo):
+    """Per mission key, a small summary of its latest stored outcome (for catalog rows). Newest outcome wins;
+    a mission reopened since its outcome has none."""
+    out = {}
+    for mission in repo.list_missions()[:MAX_SUMMARIES]:
+        key = mission_key(mission)
+        event = last_outcome(repo, key)
+        if event is None:
+            continue
+        stage_event = _last_stage_event(repo, key)
+        if mission.get("stage") not in TERMINAL and stage_event is not None and stage_event["sequence"] > event["sequence"]:
+            continue
+        p = event["payload"]
+        out[key] = {"result": RESULT.get(p.get("final_stage"), "unknown"), "final_stage": p.get("final_stage"),
+                    "inferred": bool(p.get("inferred")), "ended_at": p.get("ended_at"), "duration_s": p.get("duration_s"),
+                    "agent_count": p.get("agent_count"), "repository": p.get("repository"), "last_event": last_event(p)}
+    return out
+
+
 class MissionOutcomes:
     """Writes the outcome when a mission ends, and closes missions that went silent."""
 

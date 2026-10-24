@@ -147,6 +147,16 @@ export class HerdrClient {
     return this.request(`/api/v1/llm/${encodeURIComponent(what)}${q.size ? `?${q}` : ''}`);
   }
 
+  /** Stored outcome summaries keyed by mission key, for the mission catalog rows. */
+  missionOutcomes({ signal } = {}) {
+    return this.request('/api/v1/mission-outcomes', { signal });
+  }
+
+  /** One mission's story (header, needs, events, agents, outcome, usage). Rejects with status 404 when unknown. */
+  missionStory(key, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(key)}/story`, { signal });
+  }
+
   /** Neighbours of one entity (cross-linking). Rejects with status 404 for an unknown entity. */
   related(kind, id, { signal } = {}) {
     const q = new URLSearchParams({ kind, id });
