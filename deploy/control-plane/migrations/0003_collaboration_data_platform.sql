@@ -24,6 +24,9 @@ CREATE TABLE collab_room_memberships (
     status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'removed')),
     role text NOT NULL DEFAULT 'viewer' CHECK (role IN ('owner', 'contributor', 'viewer', 'guest')),
     can_upload boolean NOT NULL DEFAULT false,
+    -- Epoch seconds match CollabService, including legacy non-expiring grants.
+    expires_at double precision CHECK (expires_at > '-Infinity'::float8 AND expires_at < 'Infinity'::float8),
+    joined_seq bigint NOT NULL DEFAULT 0 CHECK (joined_seq >= 0),
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (room_id, user_id)
 );
@@ -50,6 +53,12 @@ CREATE TABLE collab_agents (
 CREATE TABLE collab_agent_room_attachments (
     room_id text NOT NULL REFERENCES collab_rooms(room_id) ON DELETE CASCADE,
     agent_id text NOT NULL REFERENCES collab_agents(agent_id) ON DELETE CASCADE,
+    actions text[] NOT NULL DEFAULT '{}' CHECK (
+        actions <@ ARRAY['read', 'post', 'instruct', 'execute', 'spawn_helpers']::text[]
+        AND array_position(actions, NULL) IS NULL),
+    expires_at double precision CHECK (expires_at > '-Infinity'::float8 AND expires_at < 'Infinity'::float8),
+    status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'expired', 'revoked')),
+    granted_seq bigint NOT NULL DEFAULT 0 CHECK (granted_seq >= 0),
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (room_id, agent_id)
 );
@@ -189,6 +198,8 @@ CREATE TABLE collab_audit_events (
     action text NOT NULL,
     entity_type text NOT NULL,
     entity_id text NOT NULL,
+    -- Immutable creation-request digest, not a second copy of scrubbed content.
+    request_fingerprint text CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
     occurred_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX collab_audit_events_entity ON collab_audit_events(entity_type, entity_id, occurred_at);

@@ -277,3 +277,158 @@ def test_concurrent_room_retry_inserts_one_row_and_audit(database):
     assert first == second
     assert run(conn.fetchval('SELECT count(*) FROM collab_rooms')) == 1
     assert run(conn.fetchval('SELECT count(*) FROM collab_audit_events')) == 1
+
+
+@pytest.mark.parametrize('expires_at', [None, 1_800_000_005.125])
+def test_membership_expiry_round_trip_preserves_core_boundary(seeded, expires_at):
+    from dataclasses import asdict
+
+    from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
+    from herdr_engineering.control_plane.collab_store import CollabStore
+
+    conn, run = seeded
+    kwargs = dict(membership_id='membership_roundtrip', room_id='room_two', user_id='user_member',
+                  status='approved', role='guest', can_upload=False, expires_at=expires_at, joined_seq=17)
+    first = run(CollabStore(conn).create_membership(**kwargs))
+    restored = run(CollabStore(conn).get_membership('room_two', 'user_member'))
+    assert restored == first and restored.expires_at == expires_at and restored.joined_seq == 17
+    assert run(CollabStore(conn).create_membership(**kwargs)) == first
+    room = {'members': {'user_member': asdict(restored)}}
+    now = [1_800_000_005.124]
+    service = CollabService(StaticTokenAuthenticator({}), now=lambda: now[0])
+    assert service._member(room, 'user_member') is not None
+    now[0] = 1_800_000_005.125
+    assert (service._member(room, 'user_member') is None) == (expires_at is not None)
+
+
+def test_attachment_round_trip_preserves_effective_actions_expiry_and_visibility(seeded):
+    from dataclasses import asdict
+
+    from herdr_engineering.control_plane.collab import (
+        CollabService,
+        Principal,
+        StaticTokenAuthenticator,
+    )
+    from herdr_engineering.control_plane.collab_store import CollabStore
+
+    conn, run = seeded
+    store = CollabStore(conn)
+    member = run(store.create_membership(membership_id='membership_agent', room_id='room_two',
+                 user_id='user_member', status='approved', role='viewer', joined_seq=20))
+    kwargs = dict(room_id='room_two', agent_id='agent_one', actions=['read', 'execute'],
+                  expires_at=1_800_000_005.0, granted_seq=25)
+    first = run(store.create_attachment(**kwargs))
+    restored = run(CollabStore(conn).get_attachment('room_two', 'agent_one'))
+    assert restored == first and restored.status == 'active'
+    assert restored.actions == ['read', 'execute'] and restored.granted_seq == 25
+    assert run(store.create_attachment(**kwargs)) == first
+    service = CollabService(StaticTokenAuthenticator({'user_member': 'digest'}), now=lambda: 1_800_000_004.0)
+    service._agents['agent_one'] = {'status': 'active', 'owner': 'user_member'}
+    room = {'members': {'user_member': asdict(member)}, 'grants': {'agent_one': asdict(restored)}}
+    # Persisted role and grant restrictions intersect; first visibility is retained.
+    assert service._effective(Principal('agent', 'agent_one', 'user_member'), room) == (frozenset({'read'}), 25)
+    service._now = lambda: 1_800_000_005.0
+    assert service._effective(Principal('agent', 'agent_one', 'user_member'), room) is None
+
+
+def test_attachment_renewal_inputs_survive_before_housekeeping(seeded):
+    from herdr_engineering.control_plane.collab_store import CollabStore
+
+    conn, run = seeded
+    store = CollabStore(conn)
+    original = dict(room_id='room_two', agent_id='agent_one', actions=['read', 'execute'],
+                    expires_at=1_800_000_005.0, granted_seq=25)
+    run(store.create_attachment(**original))
+    run(conn.execute("""
+        INSERT INTO collab_room_memberships(room_id,user_id,status) VALUES ('room_two','user_owner','approved');
+        INSERT INTO collab_agent_permissions(room_id,agent_id,user_id) VALUES ('room_two','agent_one','user_owner');
+    """))
+    # An expired grant may still be marked active before housekeeping. Consumers
+    # must receive its expiry, not mistake it for a perpetual/current grant.
+    expired = run(CollabStore(conn).get_attachment('room_two', 'agent_one'))
+    assert expired.status == 'active' and expired.expires_at <= 1_800_000_006.0
+    assert expired.actions == ['read', 'execute']
+    # Model the core's committed expiry/revocation followed by approved renewal;
+    # the persistence boundary must retain both inputs without reviving delegation.
+    run(conn.execute("""
+        UPDATE collab_agent_room_attachments SET status='expired' WHERE room_id='room_two';
+        UPDATE collab_agent_permissions SET status='revoked' WHERE room_id='room_two';
+    """))
+    assert run(store.get_attachment('room_two', 'agent_one')).status == 'expired'
+    run(conn.execute("""
+        UPDATE collab_agent_room_attachments SET status='active', actions=ARRAY['read'],
+            expires_at=1800000060, granted_seq=30 WHERE room_id='room_two';
+    """))
+    renewed = run(CollabStore(conn).get_attachment('room_two', 'agent_one'))
+    assert renewed.actions == ['read'] and renewed.expires_at == 1_800_000_060.0
+    assert renewed.granted_seq == 30 and renewed.status == 'active'
+    assert run(store.create_attachment(**original)) == renewed
+    assert run(conn.fetchval("SELECT status FROM collab_agent_permissions WHERE room_id='room_two'")) == 'revoked'
+    assert run(conn.fetchval("SELECT status FROM collab_agent_permissions WHERE room_id='room_one'")) == 'approved'
+    run(conn.execute("UPDATE collab_agent_room_attachments SET status='revoked' WHERE room_id='room_two'"))
+    assert run(store.get_attachment('room_two', 'agent_one')).status == 'revoked'
+
+
+@pytest.mark.parametrize('sql', [
+    "UPDATE collab_agent_room_attachments SET actions=ARRAY['invite']",
+    "UPDATE collab_agent_room_attachments SET actions=ARRAY[NULL]::text[]",
+    "UPDATE collab_agent_room_attachments SET status='invalid'",
+    "UPDATE collab_agent_room_attachments SET expires_at='Infinity'",
+    "UPDATE collab_room_memberships SET expires_at='NaN'",
+])
+def test_authorization_input_constraints_fail_closed(seeded, sql):
+    import asyncpg
+
+    conn, run = seeded
+    with pytest.raises(asyncpg.CheckViolationError):
+        run(conn.execute(sql))
+
+
+def test_creation_retry_uses_original_room_request_after_rename(seeded):
+    from herdr_engineering.control_plane.collab_store import CollabStore
+
+    conn, run = seeded
+    original = dict(room_id='room_renamed', name='Original', owner_id='user_owner')
+    run(CollabStore(conn).create_room(**original))
+    run(conn.execute("UPDATE collab_rooms SET name='Renamed' WHERE room_id='room_renamed'"))
+    assert run(CollabStore(conn).create_room(**original)).name == 'Renamed'
+    # Even matching the CURRENT row is a different creation request.
+    with pytest.raises(ValueError, match='conflict'):
+        run(CollabStore(conn).create_room(**(original | {'name': 'Renamed'})))
+    assert run(conn.fetchval("SELECT count(*) FROM collab_audit_events WHERE entity_id='room_renamed'")) == 1
+
+
+def test_creation_retry_uses_original_archive_request_after_manifest_update(seeded):
+    from herdr_engineering.control_plane.collab_store import CollabStore
+
+    conn, run = seeded
+    original = dict(archive_id='archive_updated', room_id='room_one', requested_by='user_owner')
+    run(CollabStore(conn).record_archive(**original))
+    run(conn.execute("""UPDATE collab_room_archives SET manifest_key='archive/manifest.json',
+        manifest_sha256=repeat('c',64), verified_at=now(), status='verified'
+        WHERE archive_id='archive_updated'"""))
+    archive = run(CollabStore(conn).record_archive(**original))
+    assert archive.manifest_key == 'archive/manifest.json' and archive.status == 'verified'
+    with pytest.raises(ValueError, match='conflict'):
+        run(CollabStore(conn).record_archive(**(original | {'manifest_key': 'archive/manifest.json'})))
+    assert run(conn.fetchval("SELECT count(*) FROM collab_audit_events WHERE entity_id='archive_updated'")) == 1
+
+
+def test_creation_retry_does_not_restore_deleted_user_attribution(seeded):
+    from herdr_engineering.control_plane.collab_store import CollabStore
+
+    conn, run = seeded
+    original = dict(room_id='room_scrubbed', name='Room', owner_id='user_owner')
+    run(CollabStore(conn).create_room(**original))
+    run(conn.execute("DELETE FROM collab_users WHERE user_id='user_owner'"))
+    assert run(CollabStore(conn).create_room(**original)).owner_id is None
+    assert run(conn.fetchval("SELECT actor_id FROM collab_audit_events WHERE entity_id='room_scrubbed'")) is None
+
+
+def test_creation_retry_rejects_rows_without_original_request_evidence(seeded):
+    from herdr_engineering.control_plane.collab_store import CollabStore
+
+    conn, run = seeded
+    # Raw legacy rows cannot prove their immutable creation input from current data.
+    with pytest.raises(ValueError, match='conflict'):
+        run(CollabStore(conn).create_room(room_id='room_one', name='One', owner_id='user_owner'))
