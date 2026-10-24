@@ -59,3 +59,32 @@ export function createRefreshBus({
     },
   };
 }
+
+// One mounted view's refresh: fetch with load(), then apply(data) unless the view was disposed
+// meanwhile. Overlapping calls share the in-flight run. A failed refresh keeps the page and marks
+// the view's <herdr-freshness> chip (if any) red; a success marks it fresh.
+export function liveRefresher(load, apply, chip = () => null) {
+  let disposed = false;
+  let inflight = null;
+  const touch = (ok, message) => { const el = chip(); if (el && typeof el.touch === 'function') el.touch(ok, message); };
+  return {
+    applied(data) { apply(data); touch(true); },
+    refresh(hint) {
+      if (disposed) return Promise.resolve();
+      if (inflight) return inflight;
+      inflight = (async () => {
+        try {
+          const data = await load(hint);
+          if (disposed) return;
+          apply(data);
+          touch(true);
+        } catch (error) {
+          if (!disposed) touch(false, error?.message || 'refresh failed');
+        } finally { inflight = null; }
+      })();
+      return inflight;
+    },
+    dispose() { disposed = true; },
+    get disposed() { return disposed; },
+  };
+}

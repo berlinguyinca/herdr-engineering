@@ -19,9 +19,9 @@ import { mountGithub } from './github-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
-import { renderFleetMatrix } from './fleet-view.js';
-import { renderHostDetail, renderHostCard, HOST_CARD_STYLE, RANGES, safeHostId } from './host-view.js';
-import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
+import { RANGES, safeHostId } from './host-view.js';
+import { mountHosts, loadHosts } from './hosts-view.js';
+import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 
@@ -110,7 +110,7 @@ const ROUTES = {
 // View contract: a view* function may return {refresh(hint), dispose()}. One
 // that returns nothing gets NO_REFRESH, except the full-render routes below,
 // which a compat view re-runs in place (no spinner) until Tasks 7-9 mount them.
-const RERENDER_ROUTES = new Set(['/hosts', '/hosts/:id', '/activity', '/analytics', '/analytics/missions',
+const RERENDER_ROUTES = new Set(['/activity', '/analytics', '/analytics/missions',
   '/analytics/models', '/analytics/hosts', '/analytics/tokens', '/missions/:id']);
 const NO_REFRESH = { refresh() {}, dispose() {} };
 // These dashboards own their polling; SSE must preserve their filters and focus.
@@ -402,22 +402,9 @@ async function viewService(parts, revision) {
 }
 
 async function viewHosts(_parts, revision) {
-  const [{ hosts }, matrix, configStatus] = await Promise.all([
-    client.listHosts(),
-    client.request('/api/v1/fleet/inventory').catch(() => ({ hosts: [], components: [] })),
-    client.getFleetConfigStatus().catch(() => null),
-  ]);
+  const data = await loadHosts(client);
   if (revision !== renderRevision) return;
-  const cfg = indexConfigStatus(configStatus);
-  if (!hosts.length) { root.innerHTML = '<herdr-empty message="No hosts reporting"></herdr-empty>'; return; }
-  const driftedOnly = route().query.get('drift') === '1';
-  const now = Date.now();
-  root.innerHTML = `<h1>Hosts</h1>
-    ${HOST_CARD_STYLE}${configNotice(cfg)}
-    <div class="hd-grid">` + hosts.map((h) => renderHostCard(h, { now, cfg })).join('') + `</div>
-    <h2 style="margin-top:24px">Fleet versions</h2>
-    <p class="hd-card__sub"><a href="#/hosts${driftedOnly ? '' : '?drift=1'}">${driftedOnly ? 'Show all components' : 'Show only components that differ'}</a></p>
-    ${renderFleetMatrix(matrix, { driftedOnly })}`;
+  return mountHosts(root, client, { data, driftedOnly: route().query.get('drift') === '1' });
 }
 
 async function viewHost(parts, revision) {
@@ -425,14 +412,9 @@ async function viewHost(parts, revision) {
   if (!id) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
   const requested = route().query.get('range');
   const range = RANGES.includes(requested) ? requested : '1h';
-  // Only the host fetch may fail the page; missing history degrades to empty sparklines.
-  const [h, telemetry] = await Promise.all([
-    client.request(`/api/v1/hosts/${id}`).catch((err) => { if (err?.status === 404) return null; throw err; }),
-    client.request(`/api/v1/hosts/${id}/telemetry?range=${range}`).catch(() => ({ samples: [] })),
-  ]);
+  const data = await loadHostDetail(client, id, range);
   if (revision !== renderRevision) return;
-  if (!h || h.error) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
-  root.innerHTML = renderHostDetail(h, telemetry, { range, now: Date.now() });
+  return mountHostDetail(root, client, id, range, { data });
 }
 
 async function viewActivity(_parts, revision) {

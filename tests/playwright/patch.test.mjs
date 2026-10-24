@@ -146,3 +146,24 @@ test('render without a root element does not throw; leaving key reappearing is r
  });
  assert.equal(r.threw,false);assert.equal(r.count,2);assert.equal(r.revived,true);assert.equal(r.bubbleIgnored,true);
 }));
+
+test('morph: identical markup writes nothing; changes patch in place, keyed children keep nodes, open details stay open',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ const r=await page.evaluate(()=>{
+  customElements.define('x-once',class extends HTMLElement{connectedCallback(){this.textContent='v='+this.getAttribute('value');}});
+  const html=(a,b,v)=>`<p data-section="a">${a}</p><details data-section="d"><summary>S ${b}</summary>body</details><x-once value="${v}"></x-once><p data-section="b">B</p>`;
+  morph(c,html(1,1,1));
+  const [pa,det,once,pb]=c.children;det.open=true;
+  const muts=[];const obs=new MutationObserver(rs=>muts.push(...rs));obs.observe(c,{subtree:true,childList:true,attributes:true,characterData:true});
+  morph(c,html(1,1,1));const identical=obs.takeRecords().length+muts.length;
+  morph(c,html(2,2,1));const changed=obs.takeRecords();
+  morph(c,`<p data-section="b">B</p><p data-section="a">2</p><details data-section="d"><summary>S 2</summary>body</details><x-once value="9"></x-once>`);
+  obs.disconnect();
+  return {identical,changedTargets:changed.map(m=>m.target.nodeType===3?m.target.parentNode.localName:m.target.localName),
+   keep:c.children[0]===pb&&c.children[1]===pa&&c.children[2]===det,open:det.open,
+   once:c.querySelector('x-once')!==once&&c.querySelector('x-once').textContent==='v=9'};
+ });
+ assert.equal(r.identical,0);
+ assert.deepEqual(r.changedTargets.sort(),['p','summary']);
+ assert.deepEqual({keep:r.keep,open:r.open,once:r.once},{keep:true,open:true,once:true});
+}));
