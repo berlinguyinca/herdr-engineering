@@ -162,6 +162,15 @@ export class CollabApi {
     return this.call('GET', `/rooms/${encodeURIComponent(roomId)}/files${cursor == null ? '' : `?cursor=${encodeURIComponent(cursor)}`}`);
   }
   uploadStatus(uploadId) { return this.call('GET', `/uploads/${encodeURIComponent(uploadId)}`); }
+  fileAccess(roomId, fileId, purpose) {
+    return this.call('POST', `/rooms/${encodeURIComponent(roomId)}/files/${encodeURIComponent(fileId)}/access`, { purpose });
+  }
+  previewUpload(roomId, manifest) {
+    return this.call('POST', `/rooms/${encodeURIComponent(roomId)}/uploads/preview`, { manifest });
+  }
+  startUpload(roomId, manifest, options = {}) {
+    return this.call('POST', `/rooms/${encodeURIComponent(roomId)}/uploads`, { manifest, options });
+  }
   skills(scope) { return this.call('GET', `/skills${scope == null ? '' : `?scope=${encodeURIComponent(scope)}`}`); }
   // approval: the people who asked to join (operator: everyone; approvers: those waiting)
   users(status) { return this.call('GET', `/admin/users${status ? `?status=${encodeURIComponent(status)}` : ''}`); }
