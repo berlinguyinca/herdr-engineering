@@ -61,7 +61,9 @@ export const regionFileFor = (slug, region, scheme) => fileFor(`${slug}--${regio
 // Server-generated ids are random per run; rewrite them to stable tokens so the pixels are comparable.
 const NORMALIZE = () => {
   const rules = [[/\b(collab|prp|agent|room|msg|task|dlg|lnk|link|evt)_[0-9a-z]{16,}\b/g, '$1_ID'], [/(@?)\bext-[a-z0-9-]*?-[a-z0-9]{4}\b/g, '$1ext-agent-xxxx'],
-    [/\bkey:[0-9a-f]{12}\b/g, 'key:KEYID'], [/\b[0-9a-f]{16,64}\b/g, (m) => 'HEX'.padEnd(Math.min(m.length, 12), 'x')], [/\bik-[0-9a-f]+\b/g, 'ik-KEY']];
+    [/\bkey:[0-9a-f]{12}\b/g, 'key:KEYID'], [/\b[0-9a-f]{16,64}\b/g, (m) => 'HEX'.padEnd(Math.min(m.length, 12), 'x')], [/\bik-[0-9a-f]+\b/g, 'ik-KEY'],
+    // a text node that BEGINS with 8 to 15 hex characters is a short digest (the steering fence is shown as its first 10): random per run
+    [/^[0-9a-f]{8,15}(?=…|\.{3}|$)/, (m) => 'HEX'.padEnd(m.length, 'x')]];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   let n; while ((n = walker.nextNode())) { let v = n.nodeValue; for (const [re, to] of rules) v = v.replace(re, to); if (v !== n.nodeValue) n.nodeValue = v; }
 };
