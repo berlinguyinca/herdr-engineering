@@ -304,20 +304,28 @@ class GitHubAppClient:
         return info
 
     def _review_pr(self, slug, number, sha):
-        """(title, body, base_ref) while the PR is open at ``sha``; None otherwise."""
+        """(title, body, base_ref, base_sha) while the PR is open at ``sha``; None otherwise."""
         data = self._send("GET", f"/repos/{slug}/pulls/{number}")
         try:
             state, head = data["state"], data["head"]["sha"]
             base_ref, title, body = data["base"]["ref"], data["title"], data.get("body")
+            raw_base_sha = data["base"]["sha"]
         except (KeyError, TypeError, AttributeError):
             raise GitHubAppError("invalid_response") from None
+        base_sha = None
+        try:
+            base_sha = _sha(raw_base_sha)
+        except ValueError:
+            pass
+        if base_sha is None:  # raised outside the except block: no chained context
+            raise GitHubAppError("invalid_response")
         title = "" if title is None else title
         body = "" if body is None else body
         if not all(isinstance(v, str) for v in (state, head, base_ref, title, body)):
             raise GitHubAppError("invalid_response")
         if state != "open" or head.lower() != sha:
             return None
-        return title[:REVIEW_TITLE_MAX], body[:REVIEW_BODY_MAX], base_ref
+        return title[:REVIEW_TITLE_MAX], body[:REVIEW_BODY_MAX], base_ref, base_sha
 
     def review_material(
         self, repo: str, number: int, expected_head_sha: str, *, max_bytes: int
@@ -363,9 +371,13 @@ class GitHubAppClient:
         else:
             truncated = True  # read PR_FILES_CAP files: there may be more
         second = self._review_pr(slug, number, sha)
-        if second is None or second[2] != first[2]:
-            return None  # head moved, closed, or retargeted during the fetch
-        title, body, base_ref = first
+        # Both the base name AND the base commit must match the first read: a
+        # name-only check misses a retarget main -> X -> main during the file
+        # pages. A normal forward move of the base branch during the fetch also
+        # voids it; the job is then skipped and retried after its lease expires.
+        if second is None or second[2:] != first[2:]:
+            return None  # head moved, closed, retargeted, or base moved during the fetch
+        title, body, base_ref, _base_sha = first
         return ReviewMaterial(title, body, base_ref, sha, tuple(files), truncated)
 
     def set_status(

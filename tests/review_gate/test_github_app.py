@@ -594,7 +594,10 @@ def test_http_client_errors_are_unavailable_and_clean(keypair, failure):
 HEAD = "a" * 40
 
 
-def _pr(state="open", sha=HEAD, title="T", body="B", base="main", draft=False):
+BASE_SHA = "c" * 40
+
+
+def _pr(state="open", sha=HEAD, title="T", body="B", base="main", draft=False, base_sha=BASE_SHA):
     return Resp(
         200,
         {
@@ -605,7 +608,7 @@ def _pr(state="open", sha=HEAD, title="T", body="B", base="main", draft=False):
             "draft": draft,
             "user": {"login": "bot"},
             "head": {"sha": sha, "ref": "feat/x"},
-            "base": {"ref": base},
+            "base": {"ref": base, "sha": base_sha},
         },
     )
 
@@ -799,3 +802,43 @@ def test_pr_state_malformed_raises_invalid_response(keypair):
     with pytest.raises(GitHubAppError) as ei:
         c.pr_state(REPO, 5)
     assert ei.value.reason == "invalid_response"
+
+
+def _two_reads(cfg, first, second):
+    seen = []
+
+    def pr_route(request):
+        seen.append(1)
+        return first if len(seen) == 1 else second
+
+    c, _ = client_for(
+        cfg,
+        {
+            ("GET", "/repos/acme/widget/pulls/5/files"): Resp(200, [_file("a")]),
+            ("GET", "/repos/acme/widget/pulls/5"): pr_route,
+        },
+    )
+    return c.review_material(REPO, 5, HEAD, max_bytes=100), seen
+
+
+def test_review_material_none_when_base_sha_changes_during_the_fetch(keypair):
+    """Same base name on both reads but another base commit: main -> X -> main
+    while the files were read, or main simply moved; either voids the fetch."""
+    cfg, _ = keypair
+    m, seen = _two_reads(cfg, _pr(), _pr(base_sha="d" * 40))
+    assert m is None and len(seen) == 2
+
+
+def test_review_material_kept_when_base_ref_and_sha_are_unchanged(keypair):
+    cfg, _ = keypair
+    m, seen = _two_reads(cfg, _pr(), _pr())
+    assert m is not None and m.base_ref == "main" and len(seen) == 2
+
+
+@pytest.mark.parametrize("bad", [None, "nothex", "c" * 39, 5])
+def test_review_material_malformed_base_sha_is_invalid_response(keypair, bad):
+    cfg, _ = keypair
+    with pytest.raises(GitHubAppError) as ei:
+        _two_reads(cfg, _pr(base_sha=bad), _pr())
+    assert ei.value.reason == "invalid_response"
+    assert ei.value.__context__ is None

@@ -72,7 +72,8 @@ Decisions and limits:
   (``app.pr_state``): a retarget since the listing takes the same re-review
   path, a moved head skips the merge (the next tick handles it), and a closed
   or draft PR or a failed read skips it with the merge back-off. The remaining
-  window is the GitHub round trip between that read and ``merge_pr``.
+  window is two GitHub round trips: the ``success`` status post and then
+  ``merge_pr``, both after that read.
 - A PR that leaves the open list (closed, merged elsewhere) has its queued
   review cancelled. Detection uses an in-memory memo of PR numbers per repo,
   so a PR closed while the service was down is not noticed.

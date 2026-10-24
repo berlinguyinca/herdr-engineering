@@ -216,14 +216,16 @@ escalate a PR.
   unreviewed commits, could be retargeted to main and merge those commits. An
   approval with no recorded base is re-reviewed the same way. That covers one
   from an older release, or one recorded across a control-plane restart.
-  A base change while the diff is fetched voids that fetch, so no verdict is
-  recorded for it. Right before merging, the gate re-reads the PR:
+  A change of the base branch name or base commit while the diff is fetched
+  voids that fetch, so no verdict is recorded for it. That includes a plain
+  forward move of the base branch; the job is then retried after its lease
+  expires. Right before merging, the gate re-reads the PR:
   - a retarget since the last poll leads to a re-review;
   - a moved head skips the merge;
   - a closed or draft PR, or a failed read, skips it and backs off.
 
-  What remains open is the brief GitHub round trip between that read and the
-  merge call.
+  What remains open is a short window of two GitHub round trips after that
+  read: the `success` status post, then the merge call.
 - The PR text is untrusted. Only one strict JSON object counts as a verdict
   (`{"verdict": "PASS" | "FAIL", "findings": [...]}`). Prose, a verdict
   embedded in other text, or anything else is invalid output and spends an
@@ -344,8 +346,9 @@ message. Within one generation each channel is still tried only once.
 - **The diff is read from the PR's live file list.** The reviewer's diff is
   fetched by PR, not by commit, and the head is checked before and after the
   fetch. An author who force-pushes other content and back within that 1 to
-  3 s window could get a PASS for content the reviewer did not see. Closing
-  this needs a compare-by-SHA fetch, which is a follow-up.
+  3 s window could get a PASS for content the reviewer did not see. A
+  compare-by-SHA fetch, with the diff bound to the base and head commits, is
+  the follow-up that would close this window completely.
 - **Scale.** Queue and PR state are refolded from the event log every tick,
   which is comfortable for roughly tens of open PRs.
 - **CI history window.** The Woodpecker monitor keeps recent runs only (the
