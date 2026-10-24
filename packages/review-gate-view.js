@@ -79,3 +79,94 @@ export function renderNotices(notices) {
  if(!rows.length)return empty('No notices yet.');
  return `<ul class="rg-notices">${rows.slice(0,100).map(n=>`<li><strong>${esc(short(n.kind,40))}</strong> via ${esc(short(n.channel,20))} · ${n.ok===true?'delivered':'failed'} · ${esc(short(n.key,120))} <code>${esc(shortSha(n.sha))}</code>${when(n.at)?` · ${esc(when(n.at))}`:''}</li>`).join('')}</ul>`;
 }
+
+const styles=`<style>
+.rg-note{color:var(--text-secondary);font-size:12px;line-height:1.6;margin:7px 0;overflow-wrap:anywhere}.rg-warning{color:var(--status-attention);font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+.rg-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px;margin:16px 0;min-width:0;overflow-x:auto}.rg-panel h2{font-size:15px;margin:0 0 8px}
+.rg-tiles{display:flex;flex-wrap:wrap;gap:10px;list-style:none;padding:0;margin:0}.rg-tile{border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:8px 12px;display:flex;flex-direction:column;min-width:90px}.rg-tile strong{font-size:20px}.rg-tile span{font-size:12px;color:var(--text-secondary)}
+.rg-table{width:100%;border-collapse:collapse;font-size:13px}.rg-table th{text-align:left;font-size:12px;color:var(--text-secondary);font-weight:600}.rg-table th,.rg-table td{padding:8px;border-top:1px solid var(--border-subtle);vertical-align:top;overflow-wrap:anywhere}.rg-table small{color:var(--text-secondary)}
+.rg-select{font:inherit;background:none;border:0;padding:0;color:var(--accent);cursor:pointer;text-align:left}.rg-select[aria-pressed=true]{text-decoration:underline;font-weight:600}
+.rg-badge{display:inline-block;padding:2px 7px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px}.rg-escalated,.rg-ci_red,.rg-main-red{color:var(--status-attention)}
+.rg-findings{padding-left:18px;font-size:13px}.rg-finding p{margin:4px 0;overflow-wrap:anywhere}.rg-notices{padding-left:18px;font-size:13px;line-height:1.7;overflow-wrap:anywhere}
+.rg-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);gap:16px;align-items:start}
+@media(max-width:700px){.rg-layout{grid-template-columns:minmax(0,1fr)}.rg-table thead{position:absolute;left:-9999px}.rg-table,.rg-table tbody,.rg-table tr,.rg-table td{display:block}.rg-table tr{border:1px solid var(--border-subtle);border-radius:var(--radius-sm);margin:8px 0;padding:6px}.rg-table td{border:0;padding:4px 8px}.rg-table td::before{content:attr(data-label) ": ";color:var(--text-secondary);font-size:12px}}
+</style>`;
+
+const errorText=e=>short(e&&e.body&&typeof e.body.error==='string'?e.body.error:e&&e.message,300)||'request failed';
+const SOURCES=[['prs','/api/v1/review-gate/prs'],['queue','/api/v1/review-gate/queue'],['notices','/api/v1/review-gate/notices'],['main','/api/v1/review-gate/main']];
+
+export function mountReviewGate(container,client,{intervalMs=5000,timers={setInterval,clearInterval}}={}) {
+ const panels={};for(const [name] of SOURCES)panels[name]={data:null,at:0,error:''};
+ let disposed=false,disabled=false,inFlight=false,again=false,controller=null,timer=null,selected='';
+ const resuming=new Map(),resumeErrors=new Map();
+
+ // A panel keeps its last good data; a failed read only adds a visible warning.
+ const warn=p=>!p.error?'':p.data!==null?`<p class="rg-warning" role="status">Showing data from ${esc(when(p.at))||'an earlier read'}: ${esc(p.error)}</p>`:`<p class="rg-warning" role="status">Could not load: ${esc(p.error)}</p>`;
+ const panel=(title,p,body)=>`<section class="rg-panel"><h2>${esc(title)}</h2>${warn(p)}${p.data!==null?body:''}</section>`;
+ function draw() {
+  if(disposed)return;
+  const focus=typeof document!=='undefined'&&document.activeElement&&container.contains?.(document.activeElement)?document.activeElement.dataset:null;
+  if(disabled){container.innerHTML=`${styles}<h1>Review gate</h1><p class="rg-note" role="status">Review gate is not enabled on this control plane.</p>`;return;}
+  const {prs,queue,notices,main}=panels;
+  const rows=list(prs.data),jobs={};
+  for(const j of list(queue.data&&queue.data.jobs))if(typeof j.key==='string')jobs[j.key]=j;
+  const pr=rows.find(p=>p.key===selected);
+  container.innerHTML=`${styles}<h1>Review gate</h1>
+   ${panel('Overview',queue,renderGateSummary(queue.data))}
+   ${panel('Main branch',main,renderMainStatus(main.data))}
+   <div class="rg-layout">${panel('Pull requests',prs,renderPrTable(rows,jobs,selected))}<section class="rg-panel" aria-label="Pull request detail">${pr?renderPrDetail(pr,{busy:resuming.has(selected),error:resumeErrors.get(selected)||''}):renderPrDetail(null)}</section></div>
+   ${panel('Review queue',queue,renderQueue(queue.data))}
+   ${panel('Recent notices',notices,renderNotices(notices.data))}`;
+  if(focus&&container.querySelectorAll){const attr=focus.rgSelect!==undefined?'data-rg-select':focus.rgResume!==undefined?'data-rg-resume':'';const v=focus.rgSelect??focus.rgResume;if(attr)[...container.querySelectorAll(`[${attr}]`)].find(n=>n.getAttribute(attr)===v)?.focus?.({preventScroll:true});}
+ }
+ function stop(){if(timer!==null){timers.clearInterval(timer);timer=null;}}
+
+ async function poll() {
+  if(disposed||disabled)return;
+  if(inFlight){again=true;return;}
+  inFlight=true;again=false;
+  const ctl=controller=new AbortController();
+  const results=await Promise.allSettled(SOURCES.map(([,path])=>client.request(path,{signal:ctl.signal})));
+  inFlight=false;
+  if(disposed||ctl.signal.aborted)return;
+  results.forEach((r,i)=>{
+   const p=panels[SOURCES[i][0]];
+   if(r.status==='fulfilled'){p.data=r.value??(i===0||i===2?[]:{});p.at=Date.now();p.error='';}
+   else if(r.reason&&r.reason.status===404)disabled=true;
+   else p.error=errorText(r.reason);
+  });
+  if(disabled)stop();
+  draw();
+  if(again&&!disabled)poll();
+ }
+
+ async function resume(key) {
+  const pr=list(panels.prs.data).find(p=>p.key===key),path=resumePath(key);
+  if(!pr||pr.state!=='escalated'||!path||resuming.has(key))return;
+  const ask=typeof window!=='undefined'&&window.confirm?window.confirm:()=>false;
+  if(!ask(`Resume review for ${short(key,120)}? Its round counters reset and the current head is reviewed again.`))return;
+  resuming.set(key,true);resumeErrors.delete(key);draw();
+  try{await client.request(path,{method:'POST',body:{}});}
+  catch(e){
+   resumeErrors.set(key,e&&(e.status===401||e.status===403)?'Only an operator key can resume a pull request.':e&&e.status===404?'Pull request not found, or the review gate is disabled.':`Resume refused: ${errorText(e)}`);
+  }
+  resuming.delete(key);
+  if(disposed)return;
+  draw();poll();
+ }
+
+ const onClick=event=>{
+  const t=event.target&&event.target.closest;if(!t)return;
+  const pick=event.target.closest('[data-rg-select]');
+  if(pick){selected=text(pick.dataset.rgSelect);draw();return;}
+  const res=event.target.closest('[data-rg-resume]');
+  if(res)resume(text(res.dataset.rgResume));
+ };
+ container.addEventListener('click',onClick);
+ draw();
+ timer=timers.setInterval(poll,intervalMs);
+ poll();
+ return {dispose(){
+  if(disposed)return;disposed=true;stop();controller?.abort();container.removeEventListener('click',onClick);
+ }};
+}
