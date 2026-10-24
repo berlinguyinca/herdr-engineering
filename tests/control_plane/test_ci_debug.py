@@ -216,3 +216,52 @@ def test_numeric_repo_id_selects_correct_forge_when_names_collide():
     with pytest.raises(ValueError, match="ambiguous"):
         debug_ci(SimpleNamespace(_factory=lambda: provider), repo, None,
                  "org/frontend", 12, "session", "other-operation")
+
+
+def test_fix_mode_sends_the_fix_instructions_with_the_same_untrusted_context(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native_session(repo)
+    provider = Provider()
+    seen = []
+    def dispatch(session, message, artifacts):
+        seen.append(message)
+        return {"status": "delivered"}
+    result = debug_ci(SimpleNamespace(_factory=lambda: provider), repo, dispatch, "17", 12, "session", "op-fix",
+                      mode="fix")
+    assert result["ok"] is True and result["handoff_type"] == "fix-with-pi"
+    message = seen[0]
+    assert message.startswith("Fix this failing CI run.")
+    assert "NEW git worktree" in message and "Do not merge" in message and "never in a shared checkout" in message
+    context = json.loads(message.split("CI_CONTEXT_JSON:\n", 1)[1])
+    assert context["revision"] == SHA and context["request"]["mode"] == "fix"
+    assert "untrusted CI data" in message and "FAILED build" in message
+    assert "private-ci-token" not in message
+
+
+def test_debug_requests_keep_their_shape_and_the_modes_do_not_share_an_operation_id(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native_session(repo)
+    provider = Provider()
+    calls = []
+    def dispatch(*args):
+        calls.append(args)
+        return {"status": "delivered"}
+    monitor = SimpleNamespace(_factory=lambda: provider)
+    first = debug_ci(monitor, repo, dispatch, "17", 12, "session", "operation")
+    assert first["handoff_type"] == "debug-with-pi"
+    assert "mode" not in json.loads(calls[0][1].split("CI_CONTEXT_JSON:\n", 1)[1])["request"]
+    with pytest.raises(ValueError, match="operation_id"):
+        debug_ci(monitor, repo, dispatch, "17", 12, "session", "operation", mode="fix")
+    again = debug_ci(monitor, repo, dispatch, "17", 12, "session", "op-2", mode="fix")
+    replay = debug_ci(monitor, repo, dispatch, "17", 12, "session", "op-2", mode="fix")
+    assert again == replay and replay["handoff_type"] == "fix-with-pi" and len(calls) == 2
+
+
+def test_unknown_mode_is_rejected_before_any_read():
+    repo = ControlPlaneRepo()
+    native_session(repo)
+    provider = Provider()
+    for mode in ("deploy", "", None, "FIX"):
+        with pytest.raises(ValueError, match="mode"):
+            debug_ci(SimpleNamespace(_factory=lambda: provider), repo, None, "17", 12, "session", "o", mode=mode)
+    assert provider.reads == 0

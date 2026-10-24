@@ -15,6 +15,7 @@ from herdr_engineering.review_gate.github_app import (
     GitHubAppClient,
     GitHubAppError,
     PrInfo,
+    pr_number_from_subject,
 )
 
 REPO = "github.com/acme/widget"
@@ -842,3 +843,133 @@ def test_review_material_malformed_base_sha_is_invalid_response(keypair, bad):
         _two_reads(cfg, _pr(base_sha=bad), _pr())
     assert ei.value.reason == "invalid_response"
     assert ei.value.__context__ is None
+
+
+BRANCH_PATH = "/repos/acme/widget/branches/"
+
+
+def test_default_branch_head_reads_both_calls(keypair):
+    cfg, _ = keypair
+    c, opener = client_for(
+        cfg,
+        {
+            ("GET", BRANCH_PATH): Resp(200, {"commit": {"sha": "A" * 40}}),
+            ("GET", "/repos/acme/widget"): Resp(200, {"default_branch": "release/1"}),
+        },
+    )
+    assert c.default_branch_head(REPO) == ("release/1", "a" * 40)
+    urls = [r.full_url for r in opener.requests if "/repos/" in r.full_url]
+    assert urls[0].endswith("/repos/acme/widget")
+    assert urls[1].endswith("/branches/release%2F1")
+
+
+def test_default_branch_head_rejects_malformed(keypair):
+    cfg, _ = keypair
+    for repo_body, branch_body in (
+        ({}, None),
+        ({"default_branch": 5}, None),
+        ({"default_branch": "bad\nname"}, None),
+        ({"default_branch": "main"}, {"commit": {}}),
+        ({"default_branch": "main"}, {"commit": {"sha": "short"}}),
+        ({"default_branch": "main"}, []),
+    ):
+        routes = {("GET", "/repos/acme/widget"): Resp(200, repo_body)}
+        if branch_body is not None:
+            routes = {("GET", BRANCH_PATH): Resp(200, branch_body), **routes}
+        c, _ = client_for(cfg, routes)
+        with pytest.raises(GitHubAppError) as ei:
+            c.default_branch_head(REPO)
+        assert ei.value.reason == "invalid_response"
+
+
+def commit(sha, message):
+    return {"sha": sha * 40, "commit": {"message": message}}
+
+
+def range_for(cfg, body):
+    c, opener = client_for(cfg, {("GET", "/repos/acme/widget/compare/"): Resp(200, body)})
+    return c.commits_between(REPO, "1" * 40, "2" * 40), opener
+
+
+def test_commits_between_oldest_first_with_pr_numbers(keypair):
+    cfg, _ = keypair
+    body = {
+        "total_commits": 3,
+        "commits": [
+            commit("a", "fix x (#12)\n\nlong body"),
+            commit("b", "direct push"),
+            commit("c", "Merge pull request #7 from a/b\n\nfeat"),
+        ],
+    }
+    got, opener = range_for(cfg, body)
+    assert [(c.sha[0], c.subject, c.pr_number) for c in got.commits] == [
+        ("a", "fix x (#12)", 12),
+        ("b", "direct push", None),
+        ("c", "Merge pull request #7 from a/b", 7),
+    ]
+    assert got.total == 3 and got.truncated is False
+    assert opener.requests[-1].full_url.endswith(f"/compare/{'1' * 40}...{'2' * 40}")
+
+
+def test_commits_between_truncated_flag(keypair):
+    cfg, _ = keypair
+    got, _ = range_for(cfg, {"total_commits": 400, "commits": [commit("a", "x" * 500)]})
+    assert got.truncated is True and got.total == 400
+    assert len(got.commits[0].subject) == 200
+    for bad in (
+        {"commits": []},
+        {"total_commits": 0, "commits": "x"},
+        {"total_commits": 1, "commits": [{"sha": "a" * 40}]},
+    ):
+        with pytest.raises(GitHubAppError):
+            range_for(cfg, bad)
+
+
+def test_commits_between_invalid_sha_is_refused_before_any_request(keypair):
+    cfg, _ = keypair
+    c, opener = client_for(cfg, {})
+    for base, head in (("../x", "2" * 40), ("1" * 40, "main")):
+        with pytest.raises(ValueError):
+            c.commits_between(REPO, base, head)
+    assert opener.requests == []
+
+
+def test_pr_number_from_subject():
+    assert pr_number_from_subject("fix x (#12)") == 12
+    assert pr_number_from_subject("Merge pull request #7 from a/b") == 7
+    assert pr_number_from_subject("no number") is None
+    assert pr_number_from_subject("(#12) at the start only") is None
+    assert pr_number_from_subject("#12 (#13)") == 13
+    assert pr_number_from_subject("big (#" + "9" * 30 + ")") is None
+    assert pr_number_from_subject("Merge pull request #" + "9" * 30 + " from a/b") is None
+
+
+def test_head_commit_reads_subject_and_pr(keypair):
+    cfg, _ = keypair
+    c, opener = client_for(
+        cfg,
+        {
+            ("GET", "/repos/acme/widget/commits/"): Resp(
+                200, {"commit": {"message": "fix (#3)\n\nbody"}}
+            )
+        },
+    )
+    got = c.head_commit(REPO, "a" * 40)
+    assert (got.subject, got.pr_number) == ("fix (#3)", 3)
+    for bad in ({}, {"commit": {"message": 4}}):
+        c, _ = client_for(cfg, {("GET", "/repos/acme/widget/commits/"): Resp(200, bad)})
+        with pytest.raises(GitHubAppError):
+            c.head_commit(REPO, "a" * 40)
+
+
+def test_merge_pattern_wins_and_only_ascii_digits_parse():
+    assert pr_number_from_subject("Merge pull request #7 from evil/x(#9)") == 7
+    assert pr_number_from_subject("fix (#\u0661\u0662)") is None
+    assert pr_number_from_subject("Merge pull request #\u0667 from a/b") is None
+
+
+def test_commits_between_rejects_negative_total(keypair):
+    cfg, _ = keypair
+    with pytest.raises(GitHubAppError) as ei:
+        range_for(cfg, {"total_commits": -1, "commits": []})
+    assert ei.value.reason == "invalid_response"

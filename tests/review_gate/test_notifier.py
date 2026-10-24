@@ -628,3 +628,35 @@ def test_old_notice_without_gen_counts_as_generation_zero():
     assert dispatcher.calls == []
     notifier.notify(KEY, snap(gen=1), BRANCH)
     assert len(dispatcher.calls) == 1
+
+
+def test_notify_main_red_author_then_user_and_dedupes():
+    notifier, cp, dispatcher, run = make(notify=NOTIFY)
+    cp.upsert_session("s2", host_id="h1", branch="feat/y", cwd="/w/widgets", pane_id="p2")
+    registry = AuthorRegistry(cp)
+    registry.pin(PrKey(REPO, 3), registry.author_of(PrKey(REPO, 3), "feat/y"))
+    culprits = [PrKey(REPO, 3), PrKey(REPO, 9)]  # 9 has no pinned author
+    assert notifier.notify_main_red(REPO, A, "main", "main is red", culprits) is True
+    assert dispatcher.calls == ["main is red"]
+    queued = [e for e in cp.stream("session", "s2") if e["event_type"] == "SessionCommandQueued"]
+    assert queued[0]["payload"]["operation_id"] == f"gate-main:{REPO}:{A}:3"
+    assert len(run.calls) == 1
+    assert run.calls[0][0] == ["/usr/local/bin/page", f"{REPO}#9"]
+    got = {
+        (e["entity_id"], e["payload"]["channel"], e["payload"]["ok"], e["payload"]["detail"])
+        for ent in (f"{REPO}#3", f"{REPO}#9", f"{REPO}#0")
+        for e in cp.stream(ENTITY, ent)
+    }
+    assert got == {
+        (f"{REPO}#3", "author", True, "delivered"),
+        (f"{REPO}#9", "author", False, "no_session"),
+        (f"{REPO}#0", "user", True, "sent"),
+    }
+    # second call, also after a restart: nothing is sent again
+    notifier.begin_tick()
+    assert notifier.notify_main_red(REPO, A, "main", "main is red", culprits) is True
+    assert len(dispatcher.calls) == 1 and len(run.calls) == 1
+    # a new sha notifies again, and with no culprits the user is still told
+    notifier.begin_tick()
+    assert notifier.notify_main_red(REPO, B, "main", "again", []) is True
+    assert len(run.calls) == 2 and run.calls[1][0][1] == f"{REPO}#0"
