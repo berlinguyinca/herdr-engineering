@@ -20,7 +20,12 @@ import pytest
 from herdr_engineering.control_plane import collab_mcp
 from herdr_engineering.control_plane import review_quorum as rq
 from herdr_engineering.control_plane.api import ControlPlaneServer
-from herdr_engineering.control_plane.collab import CollabError, CollabService, StaticTokenAuthenticator, _digest
+from herdr_engineering.control_plane.collab import (
+    CollabError,
+    CollabService,
+    StaticTokenAuthenticator,
+    _digest,
+)
 from herdr_engineering.control_plane.collab_workbench import normalize_steering
 from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
@@ -33,17 +38,27 @@ from herdr_engineering.control_plane.review_quorum import (
 from tests.control_plane.test_collab_bounded import body as deleg_body
 from tests.control_plane.test_collab_bounded import make
 from tests.control_plane.test_collab_external import enroll
-from tests.control_plane.test_collab_external import fab as ext_fab
+from tests.control_plane.test_collab_external import fab as ext_fab  # noqa: F401
 from tests.control_plane.test_collab_links import link, w  # noqa: F401
 from tests.control_plane.test_collab_tasks import USERS, code, svc, user  # noqa: F401
-from tests.control_plane.test_forks import H0, H1, B0, ALL, confirm, fk, pending, propose, tgt  # noqa: F401
+from tests.control_plane.test_forks import (  # noqa: F401
+    ALL,
+    B0,
+    H0,
+    H1,
+    confirm,
+    fk,
+    pending,
+    propose,
+    tgt,
+)
 from tests.control_plane.test_graph import OTHER, WRITER, Feed
 from tests.control_plane.test_graph_membership import fab, put  # noqa: F401
 from tests.control_plane.test_lineage_views import node
-from tests.control_plane.test_workbench import wb  # noqa: F401
 from tests.control_plane.test_workbench import confirm as wb_confirm
 from tests.control_plane.test_workbench import propose as wb_propose
 from tests.control_plane.test_workbench import target as wb_target
+from tests.control_plane.test_workbench import wb  # noqa: F401
 
 PR = "pr:github.com/o/r#7"
 
@@ -463,3 +478,25 @@ def test_an_external_agent_still_cannot_delegate_onward(world):
     d.accept(tid)
     assert d._mcp("task_create", {"room_id": w.room, "target_agent_id": pr.id, "text": "x", "parent_task_id": tid})[0] == 403
     assert d._rest("POST", ["rooms", w.room, "delegations"], deleg_body(target_agent_id=pr.id))[0] == 403
+
+
+def test_a_commons_node_read_never_hands_back_a_field_value_its_reader_cannot_see():
+    """The node view of a shared (commons) node hides a writer's private field from other readers (T16 M9). The steering
+    facts are an INTERNAL view, so the fence and digest must not be derived from them for such a node: a PR is never a
+    steering target anyway."""
+    ing_a, ing_b = "ing-a-0123456789abcdef", "ing-b-0123456789abcdef"
+    srv = _plane({ing_a: "ingest", ing_b: "ingest"}, collab=CollabService(
+        StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()})))
+    try:
+        srv.collab.steering = normalize_steering({"enabled": True})
+        feed = Feed(IngestService(srv.repo))
+        a = {"kind": "ingest", "id": pid_of(ing_a), "authenticated_by": "api_key"}
+        b = {"kind": "ingest", "id": pid_of(ing_b), "authenticated_by": "api_key"}
+        node(feed, PR, scope="org", label="PR 7", principal=b)                            # a visible shell
+        node(feed, PR, scope="private", attrs={"head_sha": "d" * 40, "author": "somebody"}, principal=a)
+        s, mine = _call(srv, "GET", "/api/v1/graph/nodes/" + "pr%3Agithub.com%2Fo%2Fr%237", ing_a)
+        s2, seen = _call(srv, "GET", "/api/v1/graph/nodes/" + "pr%3Agithub.com%2Fo%2Fr%237", ing_b)
+        assert s == s2 == 200 and seen["node"]["attrs"] == {}                            # control: b cannot see the field
+        assert "d" * 40 not in json.dumps(seen) and "fence" not in seen and "digest" not in seen
+    finally:
+        srv.shutdown()
