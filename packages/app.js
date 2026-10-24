@@ -22,6 +22,7 @@ import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
 import { mountHosts, loadHosts } from './hosts-view.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
+import { mountActivity, loadActivity } from './activity-view.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 
@@ -110,7 +111,7 @@ const ROUTES = {
 // View contract: a view* function may return {refresh(hint), dispose()}. One
 // that returns nothing gets NO_REFRESH, except the full-render routes below,
 // which a compat view re-runs in place (no spinner) until Tasks 7-9 mount them.
-const RERENDER_ROUTES = new Set(['/activity', '/analytics', '/analytics/missions',
+const RERENDER_ROUTES = new Set(['/analytics', '/analytics/missions',
   '/analytics/models', '/analytics/hosts', '/analytics/tokens', '/missions/:id']);
 const NO_REFRESH = { refresh() {}, dispose() {} };
 // These dashboards own their polling; SSE must preserve their filters and focus.
@@ -418,88 +419,9 @@ async function viewHost(parts, revision) {
 }
 
 async function viewActivity(_parts, revision) {
-  const { events } = await client.activity(50);
+  const data = await loadActivity(client, missionTitles);
   if (revision !== renderRevision) return;
-  if (!events.length) {
-    root.innerHTML = '<h1>Activity</h1><herdr-empty message="No activity yet"></herdr-empty>';
-    return;
-  }
-  const missionTitleLookup = titles(await missionTitles());
-  if (revision !== renderRevision) return;
-  const entries = events.map((event) => {
-    const description = describeEvent(event, { missionTitles: missionTitleLookup });
-    const rawPayload = JSON.stringify(event.payload || {}, null, 2);
-    return {
-      event,
-      description,
-      payload: rawPayload.length > 8000 ? `${rawPayload.slice(0, 7999)}…` : rawPayload,
-    };
-  });
-  const counts = new Map();
-  for (const { event } of entries) counts.set(event.event_type, (counts.get(event.event_type) || 0) + 1);
-  const types = [...counts.keys()];
-  const selectedDetail = ({ event, description, payload }) => `<div class="ac-selected-head"><div><span class="ac-eyebrow">Selected event</span><h2>${esc(description.title)}</h2></div><time>${formatTimestamp(event.source_timestamp)}</time></div>
-    <dl class="ac-selected-meta"><div><dt>Type</dt><dd>${esc(event.event_type || 'Event')}</dd></div><div><dt>Event ID</dt><dd><code>${esc(event.event_id || 'unavailable')}</code></dd></div></dl>
-    <p class="ac-selected-detail">${esc(description.detail)}</p><pre class="ac-payload" aria-label="Selected event payload">${esc(payload)}</pre>`;
-  root.innerHTML = `<style>
-    .ac-workspace{display:grid;grid-template-columns:minmax(620px,1600px) minmax(320px,1fr);gap:var(--density-gap,16px);align-items:start;width:100%}
-    .ac-stream{min-width:0}.ac-stream-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:8px}.ac-stream-head h2{margin:0}.ac-stream-head span,.ac-eyebrow{font-size:12px;color:var(--text-secondary)}
-    .ac-list{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
-    .ac-row{border-bottom:1px solid var(--border-subtle)}.ac-row:last-child{border-bottom:0}.ac-row[open]{background:var(--bg)}
-    .ac-row summary{display:grid;grid-template-columns:minmax(140px,220px) minmax(0,1fr) auto;gap:14px;align-items:center;padding:10px 12px;cursor:pointer;list-style-position:inside;font-size:13px}
-    .ac-row summary strong{overflow-wrap:anywhere}.ac-kind,.ac-time{font-size:12px;color:var(--text-secondary)}.ac-time{white-space:nowrap}
-    .ac-detail{margin:0;padding:0 32px 8px;font-size:12px;line-height:1.5;color:var(--text-secondary);overflow-wrap:anywhere}.ac-payload{margin:0 32px 12px;max-height:240px;overflow:auto;white-space:pre-wrap;font-size:11px;line-height:1.45;background:var(--surface);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:10px}
-    .ac-row[data-muted=true]{opacity:.65}
-    .ac-rail{position:sticky;top:16px;display:grid;gap:var(--density-gap,16px);min-width:0}.ac-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--density-panel-padding,16px)}.ac-panel h2{font-size:16px;margin:0 0 10px}.ac-panel p{color:var(--text-secondary);line-height:1.5}
-    .ac-filter-list{display:flex;flex-wrap:wrap;gap:8px;min-width:0}.ac-filter{min-height:36px;max-width:100%;border:1px solid var(--border);border-radius:999px;background:var(--bg);color:var(--text);padding:6px 10px;cursor:pointer;overflow-wrap:anywhere;white-space:normal}.ac-filter[aria-pressed=true]{border-color:var(--accent);background:var(--accent);color:var(--accent-contrast,#fff)}
-    .ac-repeat-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:14px 0 0;padding:0;list-style:none}.ac-repeat-list li{display:flex;justify-content:space-between;gap:8px;min-width:0;border-top:1px solid var(--border-subtle);padding-top:8px;font-size:12px}.ac-repeat-list li span{min-width:0;overflow-wrap:anywhere}.ac-repeat-list strong{flex:0 0 auto;font-size:14px}.ac-filter-status{margin:10px 0 0;font-size:12px;color:var(--text-secondary)}
-    .ac-selected{min-width:0}.ac-selected>*{min-width:0;max-width:100%;box-sizing:border-box}.ac-selected-head{display:flex;justify-content:space-between;gap:12px;align-items:start}.ac-selected-head>div{min-width:0;max-width:100%}.ac-selected-head h2{min-width:0;margin:3px 0 0;overflow-wrap:anywhere;word-break:break-word}.ac-selected-head time{flex:0 0 auto;font-size:12px;color:var(--text-secondary);white-space:nowrap}.ac-selected-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:14px 0}.ac-selected-meta div{min-width:0}.ac-selected-meta dt{font-size:11px;color:var(--text-secondary)}.ac-selected-meta dd{margin:3px 0 0;overflow-wrap:anywhere}.ac-selected-detail{overflow-wrap:anywhere;word-break:break-word}.ac-selected .ac-payload{margin:12px 0 0;max-width:100%;max-height:360px;box-sizing:border-box;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
-    .ac-selection-status{position:fixed;inset:0 auto auto 0;width:1px;max-width:1px;height:1px;padding:0;margin:0;overflow:hidden;overflow-wrap:anywhere;word-break:break-all;clip-path:inset(50%);white-space:normal;border:0;contain:strict}
-    @media(min-width:2200px){.ac-workspace{grid-template-columns:minmax(900px,1600px) minmax(760px,1fr)}.ac-rail{grid-template-columns:minmax(260px,.7fr) minmax(360px,1.3fr)}}
-    @media(max-width:1300px){.ac-workspace{grid-template-columns:minmax(0,1fr)}.ac-rail{position:static;grid-template-columns:repeat(2,minmax(0,1fr))}}
-    @media(max-width:650px){.ac-rail{grid-template-columns:minmax(0,1fr)}.ac-row summary{grid-template-columns:minmax(0,1fr);gap:4px;padding:12px}.ac-row summary>*{min-width:0}.ac-kind,.ac-time{grid-column:1}.ac-time{white-space:normal;overflow-wrap:anywhere}.ac-detail{padding:0 12px 8px}.ac-payload{margin:0 12px 12px;overflow-wrap:anywhere}.ac-selected-meta{grid-template-columns:minmax(0,1fr)}.ac-selected-head{display:block}.ac-selected-head time{display:block;margin-top:6px}}
-  </style><h1>Activity</h1><div class="ac-workspace">
-    <section class="ac-stream" aria-labelledby="activity-stream-title"><div class="ac-stream-head"><h2 id="activity-stream-title">Chronological stream</h2><span>${entries.length} events</span></div>
-      <div class="ac-list">${entries.map(({ event, description, payload }, index) => `<details class="ac-row" data-event-id="${esc(event.event_id || '')}" data-event-type="${esc(event.event_type || '')}" data-entry-index="${index}" data-muted="${description.muted}"><summary><strong>${esc(description.title)}</strong><span class="ac-kind">${esc(description.kind)}</span><time class="ac-time">${formatTimestamp(event.source_timestamp)}</time></summary><p class="ac-detail">${esc(description.detail)}</p><pre class="ac-payload" aria-label="Original event payload">${esc(payload)}</pre></details>`).join('')}</div>
-    </section>
-    <aside class="ac-rail" aria-label="Activity summary and selected event">
-      <section class="ac-panel"><h2>Event types</h2><div class="ac-filter-list" role="group" aria-label="Filter activity by event type"><button class="ac-filter" type="button" data-event-filter="all" aria-pressed="true">All <strong>${entries.length}</strong></button>${types.map((type) => `<button class="ac-filter" type="button" data-event-filter="${esc(type)}" aria-pressed="false">${esc(type)} <strong>${counts.get(type)}</strong></button>`).join('')}</div>
-        <p class="ac-filter-status" role="status">Showing all ${entries.length} events</p>
-        <h2 style="margin-top:18px">Repeated types</h2><ul class="ac-repeat-list">${types.filter((type) => counts.get(type) > 1).map((type) => `<li data-repeat-type="${esc(type)}"><span>${esc(type)}</span><strong>${counts.get(type)}</strong></li>`).join('') || '<li><span>No repeated event types</span></li>'}</ul>
-      </section>
-      <p class="ac-selection-status" data-activity-selection-status role="status" aria-live="polite">Selected event: ${esc(entries[0].description.title)}</p>
-      <section class="ac-panel ac-selected" data-activity-selected data-entry-index="0">${selectedDetail(entries[0])}</section>
-    </aside>
-  </div>`;
-
-  const rows = [...root.querySelectorAll('.ac-row')];
-  const selected = root.querySelector('[data-activity-selected]');
-  const selectionStatus = root.querySelector('[data-activity-selection-status]');
-  const showSelected = (row) => {
-    const entry = entries[Number(row.dataset.entryIndex)];
-    if (!entry) return;
-    selected.dataset.entryIndex = row.dataset.entryIndex;
-    selected.innerHTML = selectedDetail(entry);
-    selectionStatus.textContent = `Selected event: ${entry.description.title}`;
-  };
-  for (const row of rows) {
-    row.querySelector('summary').addEventListener('focus', () => showSelected(row));
-    row.addEventListener('toggle', () => { if (row.open) showSelected(row); });
-  }
-  const filters = [...root.querySelectorAll('[data-event-filter]')];
-  const filterStatus = root.querySelector('.ac-filter-status');
-  for (const button of filters) button.addEventListener('click', () => {
-    const type = button.dataset.eventFilter;
-    let shown = 0;
-    for (const row of rows) {
-      row.hidden = type !== 'all' && row.dataset.eventType !== type;
-      if (!row.hidden) shown += 1;
-    }
-    for (const candidate of filters) candidate.setAttribute('aria-pressed', String(candidate === button));
-    filterStatus.textContent = type === 'all' ? `Showing all ${shown} events` : `Showing ${shown} ${type} events`;
-    const selectedRow = rows[Number(selected.dataset.entryIndex)];
-    if (!selectedRow || selectedRow.hidden) showSelected(rows.find((row) => !row.hidden));
-  });
+  return mountActivity(root, client, { data, missionTitles });
 }
 
 async function viewAnalytics(_parts, revision) {
