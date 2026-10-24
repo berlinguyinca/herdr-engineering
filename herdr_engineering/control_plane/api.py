@@ -1595,10 +1595,13 @@ def _make_handler(server, public=False, operator=False):
                         _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
                         **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
                 if what == "fix" and server.ci_fix is not None and len(parts) in {5, 6}:
+                    if len(parts) == 6 and parts[5] == "config":
+                        return self._json(server.ci_fix.runner_config())
                     if len(parts) == 6:
                         return self._json(server.ci_fix.get(parts[5]))
-                    run = _q(self.path, "run")
-                    return self._json(server.ci_fix.list(run=run or None))
+                    return self._json(server.ci_fix.list(
+                        run=_q(self.path, "run") or None, host=_q(self.path, "host") or None,
+                        active=_q(self.path, "active") == "1"))
                 if what:
                     return self._json({"error": "not found"}, 404)
                 from .project_links import annotate_ci, cached_github_languages
@@ -2089,7 +2092,7 @@ def _make_handler(server, public=False, operator=False):
                     **({"provider_url": body["provider_url"]} if "provider_url" in body else {}))
                 return self._json(view, 202 if created else 200)
             if len(parts) == 6 and parts[5] == "claim":
-                return self._json(service.claim(body.get("host")))
+                return self._json(service.claim(body.get("host"), body.get("defer")))
             if len(parts) == 7 and parts[6] == "cancel":
                 return self._json(service.cancel(
                     parts[5], actor={"role": self._role(), "via": "api_key" if server._keys else "open"}))
