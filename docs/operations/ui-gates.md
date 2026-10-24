@@ -253,6 +253,12 @@ Found by the strengthened gates (second round):
     are wired to their panels now and the name is "Tasks, 3 waiting".
 22. The room-tab "+ New room" used U+FF0B, a glyph only a CJK font has (so its look depended on the host); it is an ASCII plus.
 
+Found by the round-3 review's gates (fourth round):
+
+23. Four room tabs (Tabs, Progress, Lineage, Linked workspaces) went from the page's `h1` straight to `h3` card titles. Each panel now
+    starts with a visually hidden `h2` (`.cx-sr`).
+24. The agent rename button was 2.25:1 (muted text at 55% opacity); it is the secondary text colour at full opacity.
+
 ## What is not covered (honest gaps)
 
 - **Sign-in is not exercised.** The real server runs with a test authenticator and placeholder client id and hosted-UI domain; the
@@ -283,11 +289,27 @@ Found by the strengthened gates (second round):
   a removed debounce. A control mutant that changes nothing (FP1) survives, as it must. Survivors of all rounds: N1b, N9a, R13b (above).
   The first run flagged the Tab-trap mutant only through the mention test; the dialog test could not see it because it started from the
   textarea, whose own Tab handler indents. It now starts at the edges and catches it itself.
+- **Fourth-round mutants.** The reviewer's Q1-Q20 were re-run against the gates at this commit: all 20 are caught (Q13, the chip padding
+  shrinking from 5px to 1px, first survived: an 18px chip passes WCAG 2.5.8 through its spacing exception, so the People test now also
+  requires 28px). Q1-Q4 (unescaped `reported_by` note, `state_reason`, analytics `basis`, request `owner_email`) are caught by the
+  hostile-text gates; Q5-Q8, Q10-Q12 and Q15 by the states audit (the role, `aria-pressed` and `aria-current` selectors those states
+  now require, `lang`, the title, the comment label and the heading rule); Q9, Q13 and Q14 only by the People page test (a focus ring
+  on the chips, their height, the Rooms tab list's name); Q16-Q18 by the pixels. New mutants for the fixes: the old `nameOf` label
+  handling, no tab-list name rule, the old rename opacity, a panel without its `h2`, an unescaped fork overlap path, proposal ref path,
+  inbox detail, estimate method and progress error, and an `update` that ignores what it writes: all caught. One new mutant survives
+  because it is equivalent: heading order restricted to headings whose predecessor is in the same panel changes nothing now that
+  every panel starts with its own `h2`. One of mine was not a defect of the gate (the owner e-mail of a request is printed inline in
+  `collab-view.js`, not by an exported renderer; the page-level gate catches it as Q4).
 - The debounce gate counts `renderLineage` calls (one for six keystrokes) but no longer asserts `layoutGraph` is never called: a filter
   that narrows the result below the draw cap legitimately lays out.
 - The X3 milestone is injected by the proxy, not seeded; a seeded one needs a linked mission.
-- One run of the states file failed once on the phone viewport and could not be reproduced in eight further runs (the cause was not
-  isolated); treat it as a possible load-sensitive flake.
+- **The phone states flake was found in round 4.** Two runs in ten failed on the phone viewport under a host load average of 30 to
+  60: a viewer chat audited while the log still said "No messages yet." (2 text nodes, not 11), and the agents state counted 7
+  controls, not 10, because "Your agents" arrives after the room's agents. Both states now wait for what arrives late (the log's
+  placeholder to go, the grant forms and the room's agents to be listed); the chat floors are observed minus three. The phone run
+  then passed 10 times of 10 (twice, after each fix). One more thing was not stable: my own `Live` is-not-pressed selector in the
+  stepped-back replay state (a poll can put the view back to live between two lines of the test); it is gone, and the
+  `aria-pressed` on Live is required in the live table state instead.
 - **N5b** (the Pause motion label gone, an empty box) was invisible to every gate until the flow surface joined the visual suite.
 - **Not covered by the pixel gate:** a change of one colour step (+1 per channel); a host whose fontconfig rendering settings differ.
 - **Search is client-side** and covers only loaded nodes; the server caps lineage paging at 3,000 nodes.

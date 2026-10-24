@@ -19,6 +19,8 @@ export async function openMention(page) {
   throw new Error('the @-mention list never opened: the room has no agent that accepts tasks');
 }
 /** Wait for the room's agents (they arrive after the chat), then leave the composer empty and closed. */
+/** The log starts as "No messages yet." and fills when the first poll answers: a state audited before that has two text nodes, not thirty. */
+export const logLoaded = (page) => page.locator('#hcn-empty').waitFor({ state: 'detached' });
 export async function chatReady(page) {
   await openMention(page);
   await page.keyboard.press('Escape');
@@ -75,7 +77,7 @@ export const STATES = [
     open: async (page) => { await nodeSelected(page); await page.locator('[data-wb-act="confirm"]').first().click(); await page.locator('.wb-confirm').waitFor(); } },
   { id: 'lineage: Gantt view', scope: '#hcn-p-lineage', must: ['svg.lin-svg[role="img"]', '[data-view="gantt"][aria-selected="true"]'], min: 25, minText: 171,
     open: async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role="img"]').waitFor(); await page.waitForTimeout(250); } },
-  { id: 'lineage: replay controls after stepping back', scope: '#hcn-p-lineage', must: ['[data-replay="slider"]', '[data-replay="live"]:not([aria-pressed="true"])'], min: 30, minText: 68,
+  { id: 'lineage: replay controls after stepping back', scope: '#hcn-p-lineage', must: ['[data-replay="slider"]', '[data-replay="live"]'], min: 30, minText: 68,
     open: async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('[data-replay="prev"]').click(); await page.waitForFunction(() => !/^Live/.test(document.querySelector('.lin-replay__status')?.textContent || 'Live')); } },
   { id: 'lineage: table alternative (a node selected, the live view)', scope: '#hcn-p-lineage',
     // the table marks the selected node's row (aria-current), and the Live button says it is the one in force (aria-pressed)
@@ -104,7 +106,7 @@ export const STATES = [
     open: async (page) => { await openSub(page, 'chat'); await chatReady(page); await page.locator('[data-expand]').click(); await page.locator('form.conversation-composer--expanded').waitFor(); await page.waitForTimeout(200); } },
   { id: 'chat: the @-mention list open (a listbox of agents)', scope: '#hcn-p-chat', must: ['ul[role="listbox"]:not([hidden]) [role="option"]', 'textarea[role="combobox"][aria-expanded="true"]'], min: 15, minText: 25,
     open: async (page) => { await openSub(page, 'chat'); await openMention(page); } },
-  { id: 'chat: composer with a menu of agents', scope: '#hcn-p-chat', must: ['#hcn-log[role="log"]'], min: 14, minText: 24, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); await chatReady(page); } },
+  { id: 'chat: composer with a menu of agents', scope: '#hcn-p-chat', must: ['#hcn-log[role="log"]'], min: 14, minText: 24, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); await logLoaded(page); await chatReady(page); } },
   // the other tabs' own views (round 3): a tab nobody audited is where a lost focus ring, a 1px-padded chip or a skipped heading hides
   { id: 'people: the members of the room', scope: '#hcn-p-people', must: ['#hcn-people li'], min: 4, minText: 12,
     open: async (page) => { await openSub(page, 'people'); await page.locator('#hcn-people li').first().waitFor(); } },
@@ -131,7 +133,7 @@ export const STATES = [
 
 /** Run as the VIEWER (carol): the same panels with fewer controls. A viewer has no composer and cannot steer, and that must be audited too. */
 export const VIEWER_STATES = [
-  { id: 'viewer: chat', scope: '#hcn-p-chat', must: ['#hcn-log[role="log"]'], min: 0, minText: 10, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); } },
+  { id: 'viewer: chat', scope: '#hcn-p-chat', must: ['#hcn-log[role="log"]'], min: 0, minText: 10, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); await logLoaded(page); } },
   { id: 'viewer: lineage with a node selected', scope: '#hcn-p-lineage', must: ['.wb', 'svg.lin-svg g[data-node]'], min: 37, minText: 147,
     open: async (page) => {
       await openSub(page, 'lineage');
