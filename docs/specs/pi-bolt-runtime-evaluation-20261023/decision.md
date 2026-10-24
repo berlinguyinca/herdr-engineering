@@ -55,7 +55,7 @@ Extension-free: `--version` 363 ms vs 17 ms, no-op CPU 0.83 s vs 0.07 s, 24-conc
   a started runtime's exit code is propagated and never replayed on standard Pi, malformed config never blocks Pi.
 
 ## Where Pi-Bolt can apply (important scope finding)
-Mission workers run in-process through the Pi SDK (`PiWorkerExecutor` -> `createAgentSession`), not through a spawned `pi` binary, and the pane-based `HerdrAgentRuntime` has no production caller. The launcher selector therefore covers only agents started with the `pi` command. Plan gates, Autospec/Planotator execution and lineage run on paths Pi-Bolt does not touch. Pi-Bolt's RPC mode works (live check) and is the route if mission workers ever need it, but that is a new RPC-backed executor, not an adapter flag. Details: results/mission-worker-scope.txt.
+Mission workers run in-process through the Pi SDK (`PiWorkerExecutor` -> `createAgentSession`), not through a spawned `pi` binary, and the pane-based `HerdrAgentRuntime` has no production caller. The launcher selector therefore covers only agents started with the `pi` command. Plan gates, Autospec/Planotator execution and lineage run on paths Pi-Bolt does not touch. Pi-Bolt's RPC mode works (live check) and is the route if mission workers ever need it. A spike (`PiBoltRpcWorkerExecutor`, pi-engineering, 6 tests, not wired) ran a real scout task through Pi-Bolt and standard Pi with identical results, so RPC workers are feasible for simple read-only tasks. It does not carry over the terminating tools, resilience wrapper or context budgets that gates and lineage rely on, so those stay on the SDK executor. Details: results/mission-worker-scope.txt.
 
 ## Acceptance criteria status
 | Criterion | Status |
