@@ -1416,6 +1416,11 @@ def _make_handler(server, public=False, operator=False):
                     pass
                 if len(parts) == 6 and parts[5] == "activity":
                     return self._json({"activity": r.mission_activity.get(parts[4])})
+                if len(parts) == 6 and parts[5] == "story":
+                    from .mission_story import build
+                    story = build(r, parts[4], outcomes=server.mission_outcomes, inbox=server.attention,
+                                  config=server.missions_config)
+                    return self._json(story) if story is not None else self._json({"error": "not found"}, 404)
                 if len(parts) > 5 and parts[5] == "timeline":
                     timeline = r.mission_timeline(parts[4])
                     return self._json({"timeline": _with_collab_tasks(server, r, parts[4], timeline)})
