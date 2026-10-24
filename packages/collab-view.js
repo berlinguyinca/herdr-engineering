@@ -110,29 +110,42 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     clearTimeout(waitTimer); dispose();
     return generation;
   };
-  const go = (path) => {
-    if (disposed) return;
+  const go = (path, turn) => {
+    if (!isCurrent(turn)) return;
     if (standalone && window.location.hash !== `#${path}`) { window.location.hash = path; beginNavigation(); }
     else { current = path; route(); }
   };
   const onHash = () => { if (!disposed) route(); };
   const $ = (id) => document.getElementById(id);
 
-  async function signIn(cfg) {
+  async function signIn(cfg, turn) {
+    if (!isCurrent(turn)) return;
     const { verifier, challenge } = await pkcePair();
+    if (!isCurrent(turn)) return;
     const state = randomString(16);
     window.sessionStorage.setItem('hcn.pkce', JSON.stringify({ verifier, state }));
     window.location.assign(authorizeUrl(cfg, cfg.public_url, state, challenge));
   }
 
-  const copy = async (text, btn) => {
-    try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; } catch { btn.textContent = 'Select and copy'; }
-    setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
+  const copy = async (text, btn, turn) => {
+    if (!isCurrent(turn)) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      if (!isCurrent(turn)) return;
+      btn.textContent = 'Copied';
+    } catch (e) {
+      if (!isCurrent(turn) || cancelled(e)) return;
+      btn.textContent = 'Select and copy';
+    }
+    setTimeout(() => { if (isCurrent(turn)) btn.textContent = 'Copy'; }, 1800);
   };
 
-  function frame(active, content, strip = '') {
+  function frame(active, content, strip, turn) {
+    if (!isCurrent(turn)) return;
     dispose();
-    const wire = () => root.querySelectorAll('[data-go]').forEach((b) => { b.onclick = () => go(b.dataset.go); });
+    // Explicit navigation stays usable while another route is loading. Async
+    // action completions instead pass their captured turn to go().
+    const wire = () => root.querySelectorAll('[data-go]').forEach((b) => { b.onclick = () => go(b.dataset.go, generation); });
     if (!standalone) {
       root.innerHTML = `<div class="cx-embed">${strip}${content}</div>`;
       wire();
@@ -147,7 +160,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       </aside>
       <main class="hd-shell__main"><div class="hd-shell__content">${strip}${content}</div></main></div>`;
     wire();
-    if ($('hcn-out')) $('hcn-out').onclick = () => { store.clear(); window.location.hash = ''; start(); };
+    if ($('hcn-out')) $('hcn-out').onclick = () => { if (!isCurrent(turn)) return; store.clear(); window.location.hash = ''; start(); };
   }
 
   function centered(inner) {
@@ -189,7 +202,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         <p>Shared rooms for people and their AI agents. Sign in with your BinView account. New accounts wait for approval before anything is shared.</p>
         ${err ? `<p class="cx-msg" role="alert">${esc(err)}</p>` : ''}
         <button id="hcn-signin" class="hd-btn" type="button">Sign in</button>`);
-      $('hcn-signin').onclick = () => signIn(cfg);
+      $('hcn-signin').onclick = () => signIn(cfg, turn);
       return;
     }
     try {
@@ -207,7 +220,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       centered(`<h1>Collaboration</h1><p class="cx-msg" role="alert">${esc(e.message)}</p>
         <p>If you were just added to the group, sign out and sign in again.</p>
         <button id="hcn-out2" class="hd-btn hd-btn--ghost" type="button">Sign out</button>`);
-      $('hcn-out2').onclick = () => { store.clear(); start(); };
+      $('hcn-out2').onclick = () => { if (!isCurrent(turn)) return; store.clear(); start(); };
     }
   }
 
@@ -221,7 +234,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       setStatus(revoked ? 'revoked' : 'forbidden');
       centered(`<h1>${revoked ? 'Access revoked' : 'Access denied'}</h1><p role="alert">Your collaboration account is ${esc(me.status)}.</p>
         <button id="hcn-out3" class="hd-btn hd-btn--ghost" type="button">Sign out</button>`);
-      $('hcn-out3').onclick = () => { store.clear(); start(); };
+      $('hcn-out3').onclick = () => { if (!isCurrent(turn)) return; store.clear(); start(); };
       return;
     }
     setStatus(error ? 'degraded' : 'waiting');
@@ -232,7 +245,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       <p>You're signed in as <strong>${esc(me.email || me.user_id)}</strong>. The person who runs this network, or a lab admin, has to approve your account before you can use rooms or connect agents. Nothing is shared with you until then.</p>
       <p class="cx-sub">This page checks every few seconds and opens as soon as you're approved.</p>
       <button id="hcn-out3" class="hd-btn hd-btn--ghost" type="button">Sign out</button>`);
-    $('hcn-out3').onclick = () => { clearTimeout(waitTimer); store.clear(); start(); };
+    $('hcn-out3').onclick = () => { if (!isCurrent(turn)) return; clearTimeout(waitTimer); store.clear(); start(); };
     pollApproval(turn);
   }
 
@@ -299,21 +312,23 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       ${operator ? '<div id="hcn-helpers-panel"></div>' : ''}
       <section class="cx-section"><h2>New room</h2>
         <form id="hcn-new" class="hd-card cx-form"><label class="cx-field">Room name<input name="name" required maxlength="120" placeholder="e.g. Metabolomics review"></label>
-          <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></section>`, strip);
-    document.querySelectorAll('#hcn-rooms [data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
+          <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></section>`, strip, turn);
+    document.querySelectorAll('#hcn-rooms [data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`, generation); }; });
     if (operator && $('hcn-helpers-panel')) {   // all rooms' host requests, helpers and the panic switch; the operator is rarely a member of the rooms asking
-      const panel = createHelpersPanel({ container: $('hcn-helpers-panel'), api, operator, getRooms: async () => (await api.rooms()).rooms || [], go, hidden: () => document.hidden });
+      const panel = createHelpersPanel({ container: $('hcn-helpers-panel'), api, operator, getRooms: async () => (await api.rooms()).rooms || [], go: (path) => go(path, turn), hidden: () => document.hidden });
       teardown = () => panel.destroy();
       panel.start();
     }
     $('hcn-new').onsubmit = async (ev) => {
       ev.preventDefault();
+      if (!isCurrent(turn)) return;
       const name = new FormData(ev.target).get('name');
       try {
         const p = await api.createProject(name);
+        if (!isCurrent(turn)) return;
         const r = await api.createRoom(p.project_id, name);
-        go(`/room/${encodeURIComponent(r.room_id)}`);
-      } catch (e) { $('hcn-new-msg').textContent = e.message; $('hcn-new-msg').setAttribute('role', 'alert'); }
+        go(`/room/${encodeURIComponent(r.room_id)}`, turn);
+      } catch (e) { if (!isCurrent(turn) || cancelled(e)) return; $('hcn-new-msg').textContent = e.message; $('hcn-new-msg').setAttribute('role', 'alert'); }
     };
   }
 
@@ -322,9 +337,10 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     denied: ['Declined', 'var(--text-muted)'], disabled: ['Disabled', 'var(--status-danger, #c0392b)'], kicked: ['Removed', 'var(--status-danger, #c0392b)'] };
   const when = (iso) => (iso ? String(iso).replace('T', ' ').slice(0, 16) : '');
 
-  async function showPeople(filter = 'pending', showLog = false, turn = generation) {
+  async function showPeople(filter, showLog, turn) {
+    if (!isCurrent(turn)) return;
     let data;
-    try { data = await api.users(); } catch (e) { if (isCurrent(turn) && !cancelled(e)) go('/rooms'); return; }
+    try { data = await api.users(); } catch (e) { if (!cancelled(e)) go('/rooms', turn); return; }
     if (!isCurrent(turn)) return;
     const manage = Boolean(data.can_manage);
     const strip = await tabsStrip(null, '/people', turn);
@@ -350,17 +366,18 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         <span class="cx-row">${buttons(u)}</span></li>`).join('')}</ul>`
         : `<div class="hd-empty">${filter === 'pending' ? 'Nobody is waiting.' : 'Nobody here.'}</div>`}
       ${manage ? `<section class="cx-section"><h2>Decision log</h2><button id="hcn-log-btn" class="hd-btn hd-btn--ghost hd-btn--sm" type="button">${showLog ? 'Hide' : 'Show'} the log</button><div id="hcn-log"></div></section>` : ''}
-      <span id="hcn-people-msg" class="cx-msg" role="status"></span>`, strip);
-    document.querySelectorAll('[data-filter]').forEach((b) => { b.onclick = () => showPeople(b.dataset.filter, showLog); });
+      <span id="hcn-people-msg" class="cx-msg" role="status"></span>`, strip, turn);
+    document.querySelectorAll('[data-filter]').forEach((b) => { b.onclick = () => showPeople(b.dataset.filter, showLog, turn); });
     document.querySelectorAll('[data-act]').forEach((b) => {
       b.onclick = async () => {
+        if (!isCurrent(turn)) return;
         const act = b.dataset.act;
         const who = b.closest('li').querySelector('b').textContent;
         const ask = { kick: `Remove ${who}? They lose every room and all their agents stop working.`, disable: `Disable ${who}? They and their agents are locked out until you enable them.`, deny: `Decline ${who}?` }[act];
         if (ask && !window.confirm(ask)) return;
         b.disabled = true;
-        try { await api.decideUser(b.dataset.user, act, ($('hcn-user-note').value || '').trim()); showPeople(filter, showLog); }
-        catch (e) { $('hcn-people-msg').textContent = e.message; $('hcn-people-msg').setAttribute('role', 'alert'); b.disabled = false; }
+        try { await api.decideUser(b.dataset.user, act, ($('hcn-user-note').value || '').trim()); await showPeople(filter, showLog, turn); }
+        catch (e) { if (!isCurrent(turn) || cancelled(e)) return; $('hcn-people-msg').textContent = e.message; $('hcn-people-msg').setAttribute('role', 'alert'); b.disabled = false; }
       };
     });
     if (manage) {
@@ -369,18 +386,20 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         if (!showLog) { box.innerHTML = ''; return; }
         try {
           const { log } = await api.userLog();
+          if (!isCurrent(turn)) return;
           box.innerHTML = log.length ? `<table class="cx-table"><thead><tr><th>When</th><th>Who</th><th>What</th><th>By</th><th>Note</th></tr></thead><tbody>${log.map((r) => `<tr><td>${esc(when(r.at))}</td><td>${esc(r.email || shortId(r.user_id))}</td><td>${esc(String(r.action || '').replace('user.', ''))}</td><td>${esc(r.by || 'sign-in')}</td><td>${esc(r.reason || '')}</td></tr>`).join('')}</tbody></table>` : '<div class="hd-empty">Nothing yet.</div>';
-        } catch (e) { box.textContent = e.message; }
+        } catch (e) { if (isCurrent(turn) && !cancelled(e)) box.textContent = e.message; }
       };
-      $('hcn-log-btn').onclick = () => showPeople(filter, !showLog);
+      $('hcn-log-btn').onclick = () => showPeople(filter, !showLog, turn);
       paint();
     }
   }
 
   // Collaboration handles route mentions; canonical dashboard names are edited in Agents.
-  function wireRename(box, after) {
+  function wireRename(box, after, turn) {
     box.querySelectorAll('[data-rename]').forEach((btn) => {
       btn.onclick = () => {
+        if (!isCurrent(turn)) return;
         const holder = btn.closest('.cx-ntitle');
         const id = btn.dataset.rename;
         const old = btn.dataset.name;
@@ -389,14 +408,15 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         const input = f.elements.n;
         input.focus();
         input.select();
-        f.querySelector('[data-x]').onclick = () => after();
+        f.querySelector('[data-x]').onclick = () => { if (isCurrent(turn)) after(); };
         f.onsubmit = async (ev) => {
           ev.preventDefault();
+          if (!isCurrent(turn)) return;
           const next = input.value.trim().toLowerCase();
           if (next === old) { after(); return; }
-          try { await api.renameAgent(id, next); after(); } catch (e) { f.querySelector('.cx-msg').textContent = e.message; }
+          try { await api.renameAgent(id, next); if (isCurrent(turn)) after(); } catch (e) { if (isCurrent(turn) && !cancelled(e)) f.querySelector('.cx-msg').textContent = e.message; }
         };
-        f.onkeydown = (ev) => { if (ev.key === 'Escape') after(); };
+        f.onkeydown = (ev) => { if (ev.key === 'Escape' && isCurrent(turn)) after(); };
       };
     });
   }
@@ -410,7 +430,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       <section class="cx-section"><h2>Add a fleet of agents</h2><div id="hcn-fleet"></div><div id="hcn-fleet-out"></div><div id="hcn-spawns"></div></section>
       ${operator ? '<section class="cx-section"><h2>Hosts</h2><p class="cx-sub">Fleets started from here are spread over these hosts in turn. Untick a host to keep automatic agents off it.</p><div id="hcn-hosts"></div></section>' : ''}
       <section class="cx-section"><h2>Your agents</h2><div id="hcn-agents"></div></section>
-      <section class="cx-section">${GUIDE}</section>`, strip);
+      <section class="cx-section">${GUIDE}</section>`, strip, turn);
     await renderAgents(turn);
     if (!isCurrent(turn)) return;
     await renderFleet(turn);
@@ -424,6 +444,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         const busy = await renderSpawns(turn);
         if (!isCurrent(turn)) return;
         if (busy) await renderAgents(turn);
+        if (!isCurrent(turn)) return;
         if (alive && !document.hidden) tick = setTimeout(cycle, busy ? 2000 : 6000);
         else if (alive) tick = setTimeout(cycle, 6000);
       };
@@ -431,17 +452,25 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       cycle();
     }
     $('hcn-connect').onclick = async () => {
+      if (!isCurrent(turn)) return;
       const btn = $('hcn-connect');
       btn.disabled = true;
-      try { showCredential(await api.connectAgent($('hcn-agent-name').value.trim().toLowerCase())); await renderAgents(); } catch (e) {
+      try {
+        const credential = await api.connectAgent($('hcn-agent-name').value.trim().toLowerCase());
+        if (!isCurrent(turn)) return;
+        showCredential(credential, turn);
+        await renderAgents(turn);
+      } catch (e) {
+        if (!isCurrent(turn) || cancelled(e)) return;
         $('hcn-connect-out').innerHTML = `<div class="hd-error" role="alert">${esc(e.message)}</div>`;
-      } finally { btn.disabled = false; }
+      } finally { if (isCurrent(turn)) btn.disabled = false; }
     };
   }
 
   // ---- fleets: many agents of one family, registered by copy-paste scripts
   const FAMILIES = ['claude-code', 'codex', 'pi', 'agent'];
-  async function renderFleet(turn = generation) {
+  async function renderFleet(turn) {
+    if (!isCurrent(turn)) return;
     const box = $('hcn-fleet');
     if (!box) return;
     const { rooms } = await api.rooms();
@@ -471,6 +500,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       </form>`;
     $('hcn-fleet-form').onsubmit = async (ev) => {
       ev.preventDefault();
+      if (!isCurrent(turn)) return;
       const f = ev.target;
       const fd = new FormData(f);
       const room = fd.get('room');
@@ -483,22 +513,24 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       try {
         if (fd.get('how') === 'spawn') {
           await api.requestSpawn({ harness_type: body.harness_type, name_prefix: body.name_prefix, count: body.count, ...(room ? { room_id: room, actions: body.actions } : {}), ...(parent ? { parent_agent_id: parent } : {}) });
+          if (!isCurrent(turn)) return;
           $('hcn-fleet-out').innerHTML = '';
           msg.textContent = 'Requested. They start within a few seconds; progress is listed below.';
-          await renderSpawns();
+          await renderSpawns(turn);
           return;
         }
-        if (fd.get('how') === 'direct') showFleetFiles(await api.bulkConnect(body), body);
-        else showFleetScript(await api.createJoinToken(body), body, flags);
-        await renderAgents();
-        await renderJoinTokens();
-      } catch (e) { msg.textContent = e.message; msg.setAttribute('role', 'alert'); }
+        if (fd.get('how') === 'direct') showFleetFiles(await api.bulkConnect(body), body, turn);
+        else showFleetScript(await api.createJoinToken(body), body, flags, turn);
+        await renderAgents(turn);
+        await renderJoinTokens(turn);
+      } catch (e) { if (!isCurrent(turn) || cancelled(e)) return; msg.textContent = e.message; msg.setAttribute('role', 'alert'); }
     };
-    await renderJoinTokens();
+    await renderJoinTokens(turn);
   }
 
   // ---- hosts that may receive automatic agents, and the progress of fleets started on them
-  async function renderHosts(turn = generation) {
+  async function renderHosts(turn) {
+    if (!isCurrent(turn)) return;
     const box = $('hcn-hosts');
     if (!box || !operator) return;
     let hosts;
@@ -507,9 +539,14 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const html = hosts.length ? `<ul class="cx-list">${hosts.map((h) => `<li><span class="grow"><b>${esc(h.host)}</b> ${pill(h.online ? 'online' : 'offline', h.online ? 'var(--status-ok)' : 'var(--text-muted)')}${h.kind === 'local' ? ' <span class="hd-ident">this machine</span>' : ''}${h.online ? ` <span class="hd-ident">${h.families && h.families.length ? esc(h.families.join(', ')) : 'no agent CLIs found'}</span>` : ''}</span><label class="cx-check"><input type="checkbox" data-auto="${esc(h.host)}"${h.auto_agents ? ' checked' : ''}> Automatic agents</label></li>`).join('')}</ul>` : '<div class="hd-empty">No hosts reported yet. The host runner reports every few seconds.</div>';
     if (box.dataset.h === html) return;
     box.dataset.h = html; box.innerHTML = html;
-    box.querySelectorAll('[data-auto]').forEach((c) => { c.onchange = async () => { try { await api.setFleetHost(c.dataset.auto, c.checked); } catch (e) { alert(e.message); } renderHosts(); }; });
+    box.querySelectorAll('[data-auto]').forEach((c) => { c.onchange = async () => {
+      if (!isCurrent(turn)) return;
+      try { await api.setFleetHost(c.dataset.auto, c.checked); await renderHosts(turn); }
+      catch (e) { if (isCurrent(turn) && !cancelled(e)) alert(e.message); }
+    }; });
   }
-  async function renderSpawns(turn = generation) {
+  async function renderSpawns(turn) {
+    if (!isCurrent(turn)) return false;
     const box = $('hcn-spawns');
     if (!box || !operator) return false;
     let list;
@@ -525,16 +562,18 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
   const scriptCard = (title, text, note) => `<div class="hd-card cx-stack"><div class="hd-card__title">${esc(title)}</div>
       <div class="cx-code"><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-copy>Copy</button><pre data-text></pre></div>
       <p class="cx-msg">${esc(note)}</p></div>`;
-  function fillScripts(out, items) {
+  function fillScripts(out, items, turn) {
+    if (!isCurrent(turn)) return;
     out.innerHTML = items.map((i) => scriptCard(i.title, i.text, i.note)).join('');
     out.querySelectorAll('.hd-card').forEach((card, n) => {
       card.querySelector('[data-text]').textContent = items[n].text;     // textContent: never parsed as HTML
       const btn = card.querySelector('[data-copy]');
-      btn.onclick = () => copy(items[n].text, btn);
+      btn.onclick = () => copy(items[n].text, btn, turn);
     });
   }
 
-  function showFleetScript(tok, body, flags = []) {
+  function showFleetScript(tok, body, flags, turn) {
+    if (!isCurrent(turn)) return;
     const base = lastCfg.public_url;
     const opts = { base, token: tok.token, count: tok.max_uses, prefix: tok.name_prefix };
     const oneLiner = `curl -fsSL ${base.replace(/\/$/, '')}/api/v1/collab/scripts/join.sh | HERDR_JOIN_TOKEN=${shq(tok.token)} bash -s -- --count ${tok.max_uses}${flags.length ? ` ${flags.join(' ')}` : ''}`;
@@ -547,10 +586,11 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         note: 'Waits for tasks, hands each task text to your command on stdin and reports its output. Without HERDR_AGENT_CMD it just acknowledges.' },
       { title: '3. Let an agent delegate', text: `~/herdr-agents/agents.sh ~/herdr-agents/${tok.name_prefix}-1.json ROOM_ID\n~/herdr-agents/delegate.sh ~/herdr-agents/${tok.name_prefix}-1.json ROOM_ID TARGET_AGENT_ID PARENT_TASK_ID "what to do"`,
         note: 'An agent can only pass on part of a task it accepted, so work always traces back to a person.' },
-    ]);
+    ], turn);
   }
 
-  function showFleetFiles(res, body) {
+  function showFleetFiles(res, body, turn) {
+    if (!isCurrent(turn)) return;
     const files = filesFromBulk(lastCfg.public_url, res.agents);
     const out = $('hcn-fleet-out');
     fillScripts(out, [
@@ -558,10 +598,11 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         text: `mkdir -p ~/herdr-agents && cd ~/herdr-agents\n${files.map((f) => `cat > ${f.name} <<'EOF'\n${f.text}EOF`).join('\n')}\nchmod 600 *.json`,
         note: 'These credentials are shown once. Paste on the machine that runs the agents, then use worker.sh below.' },
       { title: 'worker.sh', text: workerScript({ base: lastCfg.public_url }), note: 'Save as ~/herdr-agents/worker.sh and chmod +x. Run: worker.sh AGENT.json' },
-    ]);
+    ], turn);
   }
 
-  async function renderJoinTokens(turn = generation) {
+  async function renderJoinTokens(turn) {
+    if (!isCurrent(turn)) return;
     const box = $('hcn-fleet-out');
     if (!box) return;
     let list;
@@ -570,10 +611,15 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     let holder = $('hcn-tokens');
     if (!holder) { holder = document.createElement('div'); holder.id = 'hcn-tokens'; box.after(holder); }
     holder.innerHTML = list.length ? `<h3>Active join tokens</h3><ul class="cx-list">${list.map((t) => `<li><span class="grow"><b>${esc(t.name_prefix)}-N</b> ${esc(t.harness_type)} · ${t.uses}/${t.max_uses} used · until ${esc(new Date(t.expires_at * 1000).toLocaleString())}</span><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke-token="${esc(t.join_id)}">Revoke</button></li>`).join('')}</ul>` : '';
-    holder.querySelectorAll('[data-revoke-token]').forEach((b) => { b.onclick = async () => { await api.revokeJoinToken(b.dataset.revokeToken); renderJoinTokens(); }; });
+    holder.querySelectorAll('[data-revoke-token]').forEach((b) => { b.onclick = async () => {
+      if (!isCurrent(turn)) return;
+      try { await api.revokeJoinToken(b.dataset.revokeToken); await renderJoinTokens(turn); }
+      catch (e) { if (isCurrent(turn) && !cancelled(e)) alert(e.message); }
+    }; });
   }
 
-  function showCredential(a) {
+  function showCredential(a, turn) {
+    if (!isCurrent(turn)) return;
     const snippets = connectSnippets(lastCfg, a);
     const out = $('hcn-connect-out');
     out.innerHTML = `<div class="hd-card cx-stack">
@@ -583,16 +629,18 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       <p id="hcn-note" class="cx-msg"></p>
       <p class="cx-msg">Next: open a room and add this agent under <em>Your agents in this room</em>.</p></div>`;
     const pick = (i) => {
+      if (!isCurrent(turn)) return;
       $('hcn-snippet').textContent = snippets[i].text;   // textContent: never parsed as HTML
       $('hcn-note').textContent = snippets[i].note;
       out.querySelectorAll('[data-tab]').forEach((t) => t.setAttribute('aria-selected', String(Number(t.dataset.tab) === i)));
-      $('hcn-copy').onclick = () => copy(snippets[i].text, $('hcn-copy'));
+      $('hcn-copy').onclick = () => copy(snippets[i].text, $('hcn-copy'), turn);
     };
     out.querySelectorAll('[data-tab]').forEach((t) => { t.onclick = () => pick(Number(t.dataset.tab)); });
     pick(0);
   }
 
-  async function renderAgents(turn = generation) {
+  async function renderAgents(turn) {
+    if (!isCurrent(turn)) return;
     const box = $('hcn-agents');
     if (!box) return;
     const { agents } = await api.agents();
@@ -621,9 +669,16 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       const selected = [...box.querySelectorAll('[data-agent-card]')].find((card) => card.dataset.agentCard === linkedAgent);
       if (selected) { selected.focus({ preventScroll: true }); selected.scrollIntoView({ block: 'center' }); focusLinkedAgent = false; }
     }
-    wireRename(box, renderAgents);
-    box.querySelectorAll('[data-link]').forEach((sel) => { sel.onchange = async () => { try { await api.linkAgent(sel.dataset.link, sel.value); } catch (e) { alert(e.message); } }; });
-    box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { await api.revokeAgent(b.dataset.revoke); renderAgents(); }; });
+    wireRename(box, () => renderAgents(turn), turn);
+    box.querySelectorAll('[data-link]').forEach((sel) => { sel.onchange = async () => {
+      if (!isCurrent(turn)) return;
+      try { await api.linkAgent(sel.dataset.link, sel.value); } catch (e) { if (isCurrent(turn) && !cancelled(e)) alert(e.message); }
+    }; });
+    box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => {
+      if (!isCurrent(turn)) return;
+      try { await api.revokeAgent(b.dataset.revoke); await renderAgents(turn); }
+      catch (e) { if (isCurrent(turn) && !cancelled(e)) alert(e.message); }
+    }; });
   }
 
   // ---- one tab per room, then the AI agents page
@@ -682,7 +737,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
-          <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div></section>` : ''}`, strip);
+          <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div></section>` : ''}`, strip, turn);
 
     const log = $('hcn-log');
     let alive = true;
@@ -695,7 +750,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
     teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
-    const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
+    const kick = () => { if (isCurrent(turn) && alive) { since = -1; ctl?.abort(); } }; // an action just happened: refetch now
 
     // Replace a container's markup only when it changed and you are not typing in it.
     const put = (id, html) => {
@@ -762,14 +817,14 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const taskChip = (st) => pill(st, ({ done: 'var(--status-ok)', failed: 'var(--status-failed)', pending: 'var(--status-attention)', accepted: 'var(--accent)' })[st] || 'var(--text-muted)');
     const ttlSelect = () => '<label class="cx-msg">Lasts <select name="ttl"><option value="">30 days (default)</option><option value="3600">1 hour</option><option value="86400">1 day</option><option value="604800">7 days</option><option value="7776000">90 days</option></select></label>';
     const expiryOf = (f) => { const v = Number(f.querySelector('select[name="ttl"]')?.value || 0); return v ? Date.now() / 1000 + v : undefined; };
-    const warn = (e) => { alert(e.message); };
-    const act = async (fn) => { try { await fn(); } catch (e) { warn(e); } kick(); };
+    const warn = (e) => { if (isCurrent(turn) && !cancelled(e)) alert(e.message); };
+    const act = async (fn) => { if (!isCurrent(turn)) return; try { await fn(); } catch (e) { warn(e); } kick(); };
 
     const namedAgent = a => ({...a,display_name:S.flow?.nodes?.find(n=>n.agent_id===a.agent_id)?.fabric?.display_name});
     const drawRoomAgents = () => {
       const mine = new Set(S.mine.map((a) => a.agent_id));
       const html = S.agents.length ? `<ul class="cx-list">${S.agents.map((a) => `<li class="cx-agentrow"><span class="grow">${agentTitle(namedAgent(a), mine.has(a.agent_id) || operator)}<span class="cx-sub1">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></span><span class="cx-pills">${permPills(a.actions)}</span>${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
-      if (put('hcn-roomagents', html)) { $('hcn-roomagents').querySelectorAll('[data-rmagent]').forEach((b) => { b.onclick = () => act(() => api.removeAgent(roomId, b.dataset.rmagent)); }); wireRename($('hcn-roomagents'), redraw('hcn-roomagents')); }
+      if (put('hcn-roomagents', html)) { $('hcn-roomagents').querySelectorAll('[data-rmagent]').forEach((b) => { b.onclick = () => act(() => api.removeAgent(roomId, b.dataset.rmagent)); }); wireRename($('hcn-roomagents'), redraw('hcn-roomagents'), turn); }
     };
     const drawTaskTargets = () => {
       const can = S.agents.filter((a) => a.actions.includes('execute'));
@@ -794,8 +849,8 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       }).join('')}</ul>${canInvite ? '' : '<p class="cx-msg">The room owner approves what each agent may do here.</p>'}` : '<div class="hd-empty">No agents yet. <a href="#/agents" data-go="/agents">Connect one</a>.</div>';
       if (!put('hcn-grant', html)) return;
       const box = $('hcn-grant');
-      box.querySelectorAll('[data-go]').forEach((el) => { el.onclick = (e) => { if (!standalone) { e.preventDefault(); go(el.dataset.go); } }; });
-      wireRename(box, redraw('hcn-grant'));
+      box.querySelectorAll('[data-go]').forEach((el) => { el.onclick = (e) => { if (!standalone) { e.preventDefault(); go(el.dataset.go, turn); } }; });
+      wireRename(box, redraw('hcn-grant'), turn);
       box.querySelectorAll('form[data-agent]').forEach((f) => {
         f.onsubmit = (ev) => {
           ev.preventDefault();
@@ -833,6 +888,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
 
     // ---- agent helpers: panic switch, host-access requests and hosts (operator), profile (owner)
     const loadHelpers = async () => {
+      if (!isCurrent(turn)) return;
       if (operator) {
         try { S.egress = ((await api.egressRequests()).requests || []).filter((r) => r.room_id === roomId); } catch { /* keep the old list */ }
         try { const h = await api.helpers(); S.helpers = h.helpers || []; S.paused = Boolean(h.paused); } catch { /* keep */ }
@@ -849,9 +905,9 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       if (canInvite && S.profile) put('hcn-profile-box', renderProfileEditor(S.profile, { owner: canInvite }));
     };
     const unbindHelpers = wireHelperHandlers(root, {
-      api, roomId, operator, owner: canInvite, act, getProfile: () => S.profile, setProfile: (p) => { S.profile = p; $('hcn-profile-msg').textContent = 'Saved.'; },
-      onError: (m) => { $('hcn-profile-msg').textContent = m; },
-      refresh: async () => { await loadHelpers(); drawHelpers(); },
+      api, roomId, operator, owner: canInvite, act, getProfile: () => S.profile, setProfile: (p) => { if (!isCurrent(turn)) return; S.profile = p; $('hcn-profile-msg').textContent = 'Saved.'; },
+      onError: (m) => { if (isCurrent(turn)) $('hcn-profile-msg').textContent = m; },
+      refresh: async () => { if (!isCurrent(turn)) return; await loadHelpers(); if (isCurrent(turn)) drawHelpers(); },
       readForm: (f) => { const fd = new FormData(f); return { services: fd.get('services'), ssh_secret_names: fd.get('ssh_secret_names'), allowed_models: fd.get('allowed_models'), allowed_families: fd.getAll('allowed_families'), tools_allowed: fd.get('tools_allowed') !== null, permanent_hosts: fd.get('permanent_hosts') }; },
     });
 
@@ -892,8 +948,8 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         const html = `<ul class="cx-list">${room.members.map((m) => `<li><span class="grow">${esc(m.email || shortId(m.user_id))}</span>${pill(roleLabel(m.role), m.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}${m.role !== 'owner' ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rm="${esc(m.user_id)}">Remove</button>` : ''}</li>`).join('')}
           ${inv.invites.map((i) => `<li><span class="grow">${esc(i.email)}</span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>`;
         if (put('hcn-people', html)) {
-          $('hcn-people').querySelectorAll('[data-rm]').forEach((b) => { b.onclick = () => act(async () => { await api.removeMember(roomId, b.dataset.rm); $('hcn-people').dataset.h = ''; }); });
-          $('hcn-people').querySelectorAll('[data-cancel]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelInvite(roomId, b.dataset.cancel); $('hcn-people').dataset.h = ''; }); });
+          $('hcn-people').querySelectorAll('[data-rm]').forEach((b) => { b.onclick = () => act(async () => { await api.removeMember(roomId, b.dataset.rm); if (isCurrent(turn)) $('hcn-people').dataset.h = ''; }); });
+          $('hcn-people').querySelectorAll('[data-cancel]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelInvite(roomId, b.dataset.cancel); if (isCurrent(turn)) $('hcn-people').dataset.h = ''; }); });
         }
       } catch { /* keep what is shown */ } finally { peopleBusy = false; }
     };
@@ -908,6 +964,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); }
     }
     const paintPanel = async () => {
+      if (!isCurrent(turn)) return;
       if (sub === 'agents' && canPost) await loadMine();
       if (sub === 'agents') await loadHelpers();
       if (sub === 'people') await drawPeople();
@@ -947,7 +1004,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
           if (!alive) return;
           if (e.name === 'AbortError') continue;
           if (e instanceof AuthError) { dispose(); store.clear(); start(); return; }
-          if (e.code === 'not_found') { dispose(); go('/rooms'); return; }
+          if (e.code === 'not_found') { dispose(); go('/rooms', turn); return; }
           await sleep(backoff); backoff = Math.min(backoff * 2, 15000);
         }
       }
@@ -958,11 +1015,13 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     if (taskForm) {
       taskForm.onsubmit = async (ev) => {
         ev.preventDefault();
+        if (!isCurrent(turn)) return;
         const f = new FormData(taskForm);
         try {
           await api.createTask(roomId, f.get('target'), f.get('text'));
+          if (!isCurrent(turn)) return;
           taskForm.querySelector('textarea').value = ''; $('hcn-task-msg').textContent = ''; kick();
-        } catch (e) { $('hcn-task-msg').textContent = e.message; }
+        } catch (e) { if (isCurrent(turn) && !cancelled(e)) $('hcn-task-msg').textContent = e.message; }
       };
     }
     if ($('hcn-composer')) {
@@ -975,13 +1034,14 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
           detail: `${a.harness_type} · ${names.get(a.owner_user_id) || shortId(a.owner_user_id)}`,
         })),
         onSend: async (text) => {
+          if (!isCurrent(turn)) return;
           const mention = /^@([a-z0-9-]{1,32})\s+([\s\S]+)$/.exec(text.trim());
           if (mention) { // Preserve the room's authenticated leading-agent task contract.
             const hits = S.agents.filter((a) => a.name === mention[1] && a.actions.includes('execute'));
             if (hits.length !== 1) throw new Error(hits.length ? `More than one agent is called @${mention[1]}; use the Tasks tab` : `No agent named @${mention[1]} in this room accepts tasks`);
             await api.createTask(roomId, hits[0].agent_id, mention[2]);
           } else await api.say(roomId, text);
-          if (alive) { kick(); log.scrollTop = log.scrollHeight; }
+          if (alive && isCurrent(turn)) { kick(); log.scrollTop = log.scrollHeight; }
           return { status: 'delivered', message: mention ? 'Task created' : 'Message posted' };
         },
       });
@@ -990,13 +1050,15 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     if (inviteForm) {
       inviteForm.onsubmit = async (ev) => {
         ev.preventDefault();
+        if (!isCurrent(turn)) return;
         const f = new FormData(ev.target);
         const msg = $('hcn-invite-msg');
         try {
           await api.invite(roomId, f.get('email'), f.get('role'));
+          if (!isCurrent(turn)) return;
           msg.textContent = 'Invited. They get access when they sign in here.';
           ev.target.reset(); $('hcn-people').dataset.h = ''; paintPanel();
-        } catch (e) { msg.textContent = e.message; }
+        } catch (e) { if (isCurrent(turn) && !cancelled(e)) msg.textContent = e.message; }
       };
     }
     log.scrollTop = log.scrollHeight;

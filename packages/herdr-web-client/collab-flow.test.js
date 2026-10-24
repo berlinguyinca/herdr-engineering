@@ -100,9 +100,10 @@ async function collabHarness(t, surface, userStatus = 'approved', intercept = ()
   t.mock.method(globalThis, 'setTimeout', (fn, ms) => { const id = {}; timers.set(id, { fn, ms }); return id; });
   t.mock.method(globalThis, 'clearTimeout', (id) => timers.delete(id));
   const element = () => ({ dataset: {}, innerHTML: '', textContent: '', scrollHeight: 0,
+    value: '', disabled: false, setAttribute() {}, reset() {},
     addEventListener() {}, removeEventListener() {}, querySelectorAll: () => [], contains: () => false });
   const elements = new Map(['hcn-new', 'hcn-out', 'hcn-out2', 'hcn-out3', 'hcn-signin', 'hcn-log', 'hcn-jump', 'hcn-connect', 'hcn-agents'].map((id) => [id, element()]));
-  const links = ['/rooms', '/room/old', '/room/new', '/agents'].map((go) => ({ dataset: { go } }));
+  const links = ['/rooms', '/room/old', '/room/new', '/agents', '/people'].map((go) => ({ dataset: { go } }));
   const document = { hidden: true, querySelector: () => ({}), querySelectorAll: () => [],
     getElementById: (id) => elements.get(id) || null, addEventListener() {}, removeEventListener() {} };
   const window = { sessionStorage, location: { hash: '#/rooms', origin: 'https://collab.example' },
@@ -132,7 +133,7 @@ async function collabHarness(t, surface, userStatus = 'approved', intercept = ()
   const root = { ...element(), ownerDocument: document, dataset: { standalone: surface === 'public' ? '1' : '0' },
     querySelectorAll: (selector) => selector === '[data-go]' ? links : [] };
   view = mountCollab(root);
-  return { view, root, model, calls, storage, timers, elements,
+  return { view, root, model, calls, storage, timers, elements, element, document, window,
     navigate: async (path) => {
       if (surface === 'public') { window.location.hash = `#${path}`; listeners.get('hashchange')?.(); }
       else links.find((link) => link.dataset.go === path).onclick();
@@ -280,6 +281,124 @@ for (const surface of ['public', 'dashboard']) {
     assert.equal(h.root.innerHTML, 'replacement view');
     assert.deepEqual(h.view.state, state);
     assert.equal(h.timers.size, 0);
+  });
+}
+
+const actionCases = [
+  { name: 'project creation', route: '/rooms', path: '/projects', result: { project_id: 'p1' }, form: 'hcn-new' },
+  { name: 'room creation', route: '/rooms', path: '/projects/p1/rooms', result: { room_id: 'created' }, form: 'hcn-new' },
+  { name: 'People decision', route: '/people', path: '/admin/users/u2/approve', result: {}, button: 'decision' },
+  { name: 'agent credential', route: '/agents', path: '/agents/connect', result: { credential: 'private-credential', device_id: 'd1', agent_id: 'a1' }, button: 'hcn-connect' },
+  { name: 'fleet token', route: '/agents', path: '/agents/join-tokens', result: { token: 'private-token', max_uses: 1, name_prefix: 'worker', harness_type: 'codex' }, form: 'hcn-fleet-form', how: 'token' },
+  { name: 'fleet credentials', route: '/agents', path: '/agents/bulk', result: { agents: [] }, form: 'hcn-fleet-form', how: 'direct' },
+  { name: 'fleet spawn', route: '/agents', path: '/fleet/spawns', result: {}, form: 'hcn-fleet-form', how: 'spawn' },
+];
+
+async function actionHarness(t, surface, action) {
+  const responses = (path, init = {}) => {
+    if (path === '/me') return jsonResponse({ user_id: 'u1', user_status: 'approved', approver: true });
+    if (path.startsWith('/admin/users') && init.method === 'GET') return jsonResponse({ users: [{ user_id: 'u2', email: 'two@example.org', status: 'pending' }], can_manage: false });
+    if (init.method === 'POST') return jsonResponse(path === '/projects' ? { project_id: 'p1' }
+      : path === '/projects/p1/rooms' ? { room_id: 'created' } : action.result);
+    if (path === '/agents/join-tokens') return jsonResponse({ tokens: [] });
+    return null;
+  };
+  const h = await collabHarness(t, surface, 'approved', responses);
+  await h.view.ready;
+  const realFormData = globalThis.FormData;
+  t.mock.method(globalThis, 'FormData', class { constructor(form) { return form.formData; } });
+  for (const id of ['hcn-new-msg', 'hcn-user-note', 'hcn-people-msg', 'hcn-agent-name', 'hcn-connect-out',
+    'hcn-fleet', 'hcn-fleet-out', 'hcn-fleet-form', 'hcn-fleet-msg', 'hcn-tokens', 'hcn-copy', 'hcn-snippet', 'hcn-note']) {
+    h.elements.set(id, h.element());
+  }
+  for (const id of ['hcn-new', 'hcn-fleet-form']) {
+    const formData = new realFormData();
+    for (const [key, value] of Object.entries({ name: 'New room', family: 'codex', prefix: 'worker', count: '1', how: action.how || 'token' })) formData.set(key, value);
+    h.elements.get(id).formData = formData;
+  }
+  const decision = { ...h.element(), dataset: { act: 'approve', user: 'u2' },
+    closest: () => ({ querySelector: () => ({ textContent: 'two@example.org' }) }) };
+  h.elements.set('decision', decision);
+  h.document.querySelectorAll = (selector) => selector === '[data-act]' ? [decision] : [];
+  await h.navigate(action.route);
+  assert.equal(h.view.state.status, 'ready', 'action route must finish mounting');
+  return { ...h, responses, invoke: () => action.form
+    ? h.elements.get(action.form).onsubmit({ preventDefault() {}, target: h.elements.get(action.form) })
+    : h.elements.get(action.button).onclick() };
+}
+
+const actionSnapshot = (h) => ({ html: h.root.innerHTML, state: h.view.state,
+  hash: h.window.location.hash, credentials: [...h.storage], timers: [...h.timers.keys()], calls: [...h.calls],
+  elements: [...h.elements].map(([id, el]) => [id, el.innerHTML, el.textContent, el.disabled, el.value]),
+});
+
+for (const surface of ['public', 'dashboard']) for (const action of actionCases) {
+  for (const leave of ['navigation', 'disposal']) for (const outcome of ['success', 'error', 'auth', 'abort']) {
+    test(`collab ${surface} action ${action.name} ignores ${outcome} after ${leave}`, async (t) => {
+      const h = await actionHarness(t, surface, action);
+      const pending = deferred();
+      let held = false;
+      h.model.intercept = (path, init) => {
+        if (path === action.path && init.method === 'POST') { held = true; return pending.promise; }
+        return h.responses(path, init);
+      };
+      const completion = h.invoke();
+      await flush();
+      assert.ok(held, 'the intended mutation is in flight');
+      if (leave === 'navigation') await h.navigate('/room/new');
+      else { h.view.dispose(); h.root.innerHTML = 'replacement view'; }
+      const snapshot = actionSnapshot(h);
+      if (outcome === 'abort') pending.reject(new DOMException('cancelled', 'AbortError'));
+      else pending.resolve(jsonResponse(outcome === 'success' ? action.result : { error: 'late action failure' },
+        outcome === 'auth' ? 401 : outcome === 'error' ? 503 : 200));
+      await completion;
+      await flush();
+      assert.deepEqual(actionSnapshot(h), snapshot, 'stale action cannot navigate, render, refresh, mutate credentials, or schedule work');
+    });
+  }
+
+  test(`collab ${surface} action ${action.name} still completes on its current route`, async (t) => {
+    const h = await actionHarness(t, surface, action);
+    const before = h.calls.length;
+    await h.invoke();
+    await flush();
+    assert.ok(h.calls.slice(before).includes(action.path));
+    if (action.route === '/rooms') {
+      if (surface === 'public') assert.equal(h.window.location.hash, '/room/created');
+      else assert.equal(h.view.state.roomId, 'created');
+    } else if (action.name === 'People decision') assert.match(h.root.innerHTML, /<h1>People/);
+    else if (action.name === 'agent credential') assert.match(h.elements.get('hcn-snippet').textContent, /private-credential/);
+    else if (action.name === 'fleet spawn') assert.match(h.elements.get('hcn-fleet-msg').textContent, /Requested/);
+    else assert.match(h.elements.get('hcn-fleet-out').innerHTML, /hd-card/);
+  });
+
+  test(`collab ${surface} action ${action.name} still reports current errors`, async (t) => {
+    const h = await actionHarness(t, surface, action);
+    h.model.intercept = (path, init) => path === action.path && init?.method === 'POST'
+      ? jsonResponse({ error: 'current action failure' }, 503) : h.responses(path, init);
+    await h.invoke();
+    const id = action.route === '/rooms' ? 'hcn-new-msg' : action.name === 'People decision' ? 'hcn-people-msg'
+      : action.name === 'agent credential' ? 'hcn-connect-out' : 'hcn-fleet-msg';
+    const el = h.elements.get(id);
+    assert.match(el.innerHTML + el.textContent, /current action failure/);
+  });
+}
+
+for (const surface of ['public', 'dashboard']) for (const leave of ['navigation', 'disposal']) {
+  test(`collab ${surface} credential copy completion cannot change labels or timers after ${leave}`, async (t) => {
+    const h = await actionHarness(t, surface, actionCases.find((action) => action.name === 'agent credential'));
+    await h.invoke();
+    const pending = deferred();
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { clipboard: { writeText: () => pending.promise } } });
+    t.after(() => { if (descriptor) Object.defineProperty(globalThis, 'navigator', descriptor); else delete globalThis.navigator; });
+    const completion = h.elements.get('hcn-copy').onclick();
+    if (leave === 'navigation') await h.navigate('/room/new');
+    else h.view.dispose();
+    const snapshot = actionSnapshot(h);
+    pending.resolve();
+    await completion;
+    assert.deepEqual(actionSnapshot(h), snapshot);
   });
 }
 
