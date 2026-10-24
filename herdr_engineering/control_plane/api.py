@@ -198,7 +198,7 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None):
+                 review_quorum=None, system_graph: bool = False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -251,7 +251,7 @@ class ControlPlaneServer:
             digest = hashlib.sha256(str(key).encode()).hexdigest()[:12]
             scopes[f"key:{digest}"] = {"rooms": frozenset(allow.get("rooms") or ()),
                                        "missions": frozenset(allow.get("missions") or ())}
-        self.ingest = IngestService(repo, key_scopes=scopes)
+        self.ingest = IngestService(repo, key_scopes=scopes, system_graph=system_graph)
         self._limiter = _RateLimiter()
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.

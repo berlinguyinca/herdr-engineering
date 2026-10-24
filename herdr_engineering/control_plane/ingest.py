@@ -10,9 +10,12 @@ to one control-plane entity.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
+
+log = logging.getLogger(__name__)
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .graph import validate_lineage
@@ -48,7 +51,7 @@ _AGENT_ONLY_HOST_KEYS = ("telemetry", "cpu", "mem", "disk", "inventory")
 class IngestService:
     """Translates lifecycle event envelopes into idempotent repo mutations."""
 
-    def __init__(self, repo, key_scopes=None):
+    def __init__(self, repo, key_scopes=None, system_graph: bool = False):
         self.repo = repo
         # Per-key room/mission allow-lists for lineage addressed to a room or mission (operator YAML
         # `control_plane.lineage_key_scopes`, resolved by the server to principal ids):
@@ -62,6 +65,13 @@ class IngestService:
         # the HCN service's `is_hcn_node`; checked on EVERY endpoint of an edge, so an ingest key cannot attach
         # a fake `produced` edge to an accepted artifact either.
         self.service_node = None
+        # System-graph live-ingest adapter (system-graph spec P2-P4). When enabled,
+        # mission/session/repository/request/span lifecycle events are ALSO emitted
+        # as lineage envelopes into the running graph. Opt-in; disabled by default.
+        self.system_graph = None
+        if system_graph:
+            from .graph_ingest import GraphIngestAdapter
+            self.system_graph = GraphIngestAdapter(repo, scope="org")
 
     def _check_lineage_scope(self, env: dict) -> None:
         """Fail closed: a non-operator key may address a room or mission only if the operator listed it.
@@ -250,6 +260,24 @@ class IngestService:
 
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
                   record_generic=True) -> dict:
+        # System-graph live-ingest adapter (opt-in): reflect lifecycle events
+        # into the running lineage graph as lineage envelopes. Best-effort: a
+        # failure here is logged inside the adapter and never breaks the source
+        # event's own ingestion.
+        if self.system_graph is not None and entity_type in (
+                "mission", "session", "repository", "request", "span"):
+            # Reflect the lifecycle event into the running graph as lineage
+            # envelopes, re-entering the SAME ingest path (admit + persist +
+            # apply). Best-effort: failures are logged and swallowed so they
+            # never break the source event's own ingestion.
+            for env in self.system_graph.emit(entity_type, entity_id, event_type, payload or {}):
+                try:
+                    self.ingest(env, {"id": self.system_graph.actor,
+                                      "kind": "agent",
+                                      "authenticated_by": "api_key"})
+                except (ValueError, PermissionError) as exc:
+                    log.warning("system-graph ingest skipped %s %s (%s): %s",
+                                entity_type, entity_id, env["event_type"], exc)
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":
                 raise ValueError("invalid mission activity event_type")
