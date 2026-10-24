@@ -942,3 +942,21 @@ def test_pr_number_from_subject():
     assert pr_number_from_subject("#12 (#13)") == 13
     assert pr_number_from_subject("big (#" + "9" * 30 + ")") is None
     assert pr_number_from_subject("Merge pull request #" + "9" * 30 + " from a/b") is None
+
+
+def test_head_commit_reads_subject_and_pr(keypair):
+    cfg, _ = keypair
+    c, opener = client_for(
+        cfg,
+        {
+            ("GET", "/repos/acme/widget/commits/"): Resp(
+                200, {"commit": {"message": "fix (#3)\n\nbody"}}
+            )
+        },
+    )
+    got = c.head_commit(REPO, "a" * 40)
+    assert (got.subject, got.pr_number) == ("fix (#3)", 3)
+    for bad in ({}, {"commit": {"message": 4}}):
+        c, _ = client_for(cfg, {("GET", "/repos/acme/widget/commits/"): Resp(200, bad)})
+        with pytest.raises(GitHubAppError):
+            c.head_commit(REPO, "a" * 40)

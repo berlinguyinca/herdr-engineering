@@ -472,6 +472,16 @@ class GitHubAppClient:
             raise GitHubAppError("invalid_response")
         return branch, head
 
+    def head_commit(self, repo: str, sha: str) -> CommitInfo:
+        """One commit's subject and PR number (the range when no green sha is known)."""
+        slug, sha = _repo_path(repo), _sha(sha)
+        data = self._send("GET", f"/repos/{slug}/commits/{sha}")
+        message = (data.get("commit") or {}).get("message") if isinstance(data, dict) else None
+        if not isinstance(message, str):
+            raise GitHubAppError("invalid_response")
+        first = message.split("\n", 1)[0].strip()
+        return CommitInfo(sha, first[:SUBJECT_MAX], pr_number_from_subject(first))
+
     def commits_between(self, repo: str, base_sha: str, head_sha: str) -> CommitRange:
         """Commits after ``base_sha`` up to ``head_sha``, oldest first, one compare read.
 
