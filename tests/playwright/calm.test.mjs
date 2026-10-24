@@ -1,9 +1,10 @@
 // Task 16: calm mode and OS reduced motion. On every route (read from app.js's router), through a
-// first load and live updates that change the data, nothing moves: no element is ever marked
-// data-entering / data-leaving / data-flash, document.getAnimations() stays empty (no CSS animation
-// or transition runs, the skeleton shimmer included), and a changed value is written at once (no
-// count-up still running after the refresh). A control run with calm off proves the guard can see
-// the motion it forbids.
+// first load and live updates that change the data, nothing moves:
+//  - no element is ever marked data-entering / data-leaving / data-flash (observed from first paint);
+//  - document.getAnimations() is empty when sampled after each load and each refresh;
+//  - a changed value is written at once (no count-up still running after the refresh).
+// A separate test samples while every route's first-load skeleton is on screen: its shimmer must
+// not run. Control runs with calm off prove each check can see the motion it forbids.
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {withPage} from './helpers/fixture.mjs';
@@ -106,3 +107,39 @@ test('control: with calm off the same tour sees motion',async()=>withPage(async(
  assert.ok(seen.animations.length>0,'calm off runs animations');
  assert.ok(seen.settling.length>0,'calm off counts values up after a refresh lands');
 }));
+
+// While a skeleton is on screen (the API held back), its shimmer must not run under calm or OS
+// reduced motion. Calm off is the control: there the shimmer runs.
+async function skeletonMotion(init){
+ const seen={running:[],names:new Set(),sampled:0};
+ await withPage(async(page,base)=>{
+  await init(page);
+  await boot(page,base,ROUTES[0],()=>({__hang:true}));
+  for(const hash of ROUTES){
+   await page.evaluate(h=>{location.hash=h;},hash);
+   await until(()=>page.evaluate(()=>!!document.querySelector('#view [data-skeleton]')),`${hash} skeleton`,8000);
+   await sleep(60);
+   const r=await page.evaluate(()=>({anims:document.getAnimations().map(a=>a.animationName||a.transitionProperty||'?'),
+    names:[...document.querySelectorAll('#view .hd-skeleton')].map(e=>getComputedStyle(e).animationName)}));
+   seen.sampled++;
+   for(const a of r.anims)seen.running.push(`${hash} ${a}`);
+   for(const n of r.names)seen.names.add(n);
+  }
+ });
+ return seen;
+}
+
+test('calm on and OS reduced motion: a visible skeleton does not shimmer',async()=>{
+ for(const init of [calmOn,reducedMotion]){
+  const seen=await skeletonMotion(init);
+  assert.equal(seen.sampled,ROUTES.length);
+  assert.deepEqual(seen.running,[],'no animation while the skeleton shows');
+  assert.deepEqual([...seen.names],['none'],'the skeleton rows have no animation');
+ }
+});
+
+test('control: with calm off a visible skeleton shimmers',async()=>{
+ const seen=await skeletonMotion(p=>p.addInitScript(()=>{try{localStorage.setItem('herdr.calm','off');}catch{}}));
+ assert.ok(seen.running.some(r=>/hd-skeleton/.test(r)),'the shimmer runs');
+ assert.ok(seen.names.has('hd-skeleton'));
+});
