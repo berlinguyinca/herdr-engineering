@@ -42,6 +42,9 @@ _NAME = re.compile(r"[A-Za-z0-9_.-]+")
 _SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 _BLOB = re.compile(r"[0-9a-fA-F]{40}")
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*$", re.MULTILINE)
+SUBJECT_MAX = 200
+_SQUASH_PR = re.compile(r"\(#([0-9]{1,9})\)\s*$")
+_MERGE_PR = re.compile(r"Merge pull request #([0-9]{1,9})(?![0-9])")
 _STATES = ("pending", "success", "failure", "error")
 _MESSAGES = {
     "authentication": "GitHub rejected the App credential.",
@@ -92,6 +95,26 @@ class ReviewMaterial:
     head_sha: str
     files: tuple[ReviewFile, ...]
     truncated: bool
+
+
+@dataclass(frozen=True)
+class CommitInfo:
+    sha: str
+    subject: str
+    pr_number: int | None
+
+
+@dataclass(frozen=True)
+class CommitRange:
+    commits: tuple[CommitInfo, ...]
+    total: int
+    truncated: bool
+
+
+def pr_number_from_subject(subject: str) -> int | None:
+    """The PR a commit subject names: a trailing ``(#N)`` (squash) or ``Merge pull request #N``."""
+    match = _MERGE_PR.match(subject) or _SQUASH_PR.search(subject)
+    return int(match.group(1)) if match else None
 
 
 def _repo_path(repo):
@@ -425,6 +448,66 @@ class GitHubAppClient:
         self._send(
             "PUT", f"/repos/{slug}/pulls/{number}/update-branch", body={"expected_head_sha": sha}
         )
+
+    def default_branch_head(self, repo: str) -> tuple[str, str]:
+        """(default branch name, its head sha): two reads, malformed data is invalid_response."""
+        slug = _repo_path(repo)
+        info = self._send("GET", f"/repos/{slug}")
+        branch = info.get("default_branch") if isinstance(info, dict) else None
+        if (
+            not isinstance(branch, str)
+            or not branch
+            or len(branch) > 255
+            or any(ord(c) < 33 or ord(c) == 127 for c in branch)
+        ):
+            raise GitHubAppError("invalid_response")
+        data = self._send("GET", f"/repos/{slug}/branches/{urllib.parse.quote(branch, safe='')}")
+        raw = (data.get("commit") or {}).get("sha") if isinstance(data, dict) else None
+        head = None
+        try:
+            head = _sha(raw)
+        except ValueError:
+            pass
+        if head is None:  # raised outside the except block: no chained context
+            raise GitHubAppError("invalid_response")
+        return branch, head
+
+    def head_commit(self, repo: str, sha: str) -> CommitInfo:
+        """One commit's subject and PR number (the range when no green sha is known)."""
+        slug, sha = _repo_path(repo), _sha(sha)
+        data = self._send("GET", f"/repos/{slug}/commits/{sha}")
+        message = (data.get("commit") or {}).get("message") if isinstance(data, dict) else None
+        if not isinstance(message, str):
+            raise GitHubAppError("invalid_response")
+        first = message.split("\n", 1)[0].strip()
+        return CommitInfo(sha, first[:SUBJECT_MAX], pr_number_from_subject(first))
+
+    def commits_between(self, repo: str, base_sha: str, head_sha: str) -> CommitRange:
+        """Commits after ``base_sha`` up to ``head_sha``, oldest first, one compare read.
+
+        GitHub returns at most 250 commits there; ``truncated`` is set when it reports more.
+        """
+        slug, base, head = _repo_path(repo), _sha(base_sha), _sha(head_sha)
+        data = self._send("GET", f"/repos/{slug}/compare/{base}...{head}")
+        raw = data.get("commits") if isinstance(data, dict) else None
+        total = data.get("total_commits") if isinstance(data, dict) else None
+        if not isinstance(raw, list) or type(total) is not int or total < 0 or total < len(raw):
+            raise GitHubAppError("invalid_response")
+        out = []
+        failed = False
+        try:
+            for item in raw:
+                sha = _sha(item["sha"])
+                message = item["commit"]["message"]
+                if not isinstance(message, str):
+                    raise ValueError
+                first = message.split("\n", 1)[0].strip()
+                out.append(CommitInfo(sha, first[:SUBJECT_MAX], pr_number_from_subject(first)))
+        except (KeyError, TypeError, AttributeError, ValueError):
+            failed = True
+        if failed:
+            raise GitHubAppError("invalid_response")
+        return CommitRange(tuple(out), total, total > len(out))
 
     def patch_id(self, repo: str, base_sha: str, head_sha: str) -> str:
         """Hash of the per-file patches between base and head, hunk line offsets ignored.

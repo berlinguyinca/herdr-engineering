@@ -333,7 +333,7 @@ class ControlPlaneServer:
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._httpd = None
-        self.gate_service = self.gate_store = self.gate_queue = None
+        self.gate_service = self.gate_store = self.gate_queue = self.gate_main = None
         self.gate_coordinator = self.gate_reviewer_config = None
         self._start_review_gate(repo, fleet_config)
         # live stream (Spec §52)
@@ -376,6 +376,7 @@ class ControlPlaneServer:
             raise ValueError("review_gate: the event sink cannot make durable writes")
         from ..review_gate import github_app
         from ..review_gate.coordinator import ReviewCoordinator
+        from ..review_gate.main_verify import MainVerifier
         from ..review_gate.notifier import AuthorNotifier
         from ..review_gate.queue import ReviewQueue
         from ..review_gate.registry import AuthorRegistry
@@ -391,6 +392,7 @@ class ControlPlaneServer:
         registry = AuthorRegistry(repo)
         notifier = AuthorNotifier(repo, config=config.notify, registry=registry,
                                   dispatcher=self.dispatcher)
+        self.gate_main = MainVerifier(repo, app, notifier)
         self.gate_service = GateService(
             config=config,
             app=app,
@@ -399,6 +401,7 @@ class ControlPlaneServer:
             registry=registry,
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=False),
             notifier=notifier,
+            main_verifier=self.gate_main,
         )
         self.gate_reviewer_config = config.reviewer
         self.gate_coordinator = ReviewCoordinator(
@@ -1264,6 +1267,8 @@ def _make_handler(server, public=False, operator=False):
             if parts[4] == "notices":
                 from ..review_gate.notifier import recent_notices
                 return self._json(recent_notices(server.repo))
+            if parts[4] == "main":
+                return self._json({"repos": server.gate_main.status()})
             return self._json({"error": "not found"}, 404)
 
         def _review_gate_resume(self, parts):

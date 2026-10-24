@@ -24,6 +24,7 @@ from herdr_engineering.review_gate import github_app
 from herdr_engineering.review_gate.github_app import PrInfo, ReviewFile, ReviewMaterial
 from herdr_engineering.review_gate.models import PrKey, State
 from herdr_engineering.review_gate.pool import PoolConfig, ReviewPool
+from herdr_engineering.review_gate.registry import AuthorRegistry
 from herdr_engineering.review_gate.worker import ModelConfig, ReviewWorker, WorkerConfig
 
 REPO = "github.com/acme/widget"
@@ -81,10 +82,28 @@ class FakeGitHub:
         self.prs: list[PrInfo] = []
         self.calls: list[tuple] = []
         self.diff = "@@ -1,2 +1,2 @@\n-a = 1\n+a = 2"
+        self.history: list[tuple[str, str]] = []  # default branch, oldest first
         FakeGitHub.instances.append(self)
 
     def open_prs(self, repo):
         return list(self.prs) if repo == REPO else []
+
+    # -- default branch (main verification) ---------------------------------
+    def default_branch_head(self, repo):
+        return "main", self.history[-1][0]
+
+    def commits_between(self, repo, base_sha, head_sha):
+        shas = [sha for sha, _ in self.history]
+        picked = self.history[shas.index(base_sha) + 1 : shas.index(head_sha) + 1]
+        commits = tuple(
+            github_app.CommitInfo(sha, subject, github_app.pr_number_from_subject(subject))
+            for sha, subject in picked
+        )
+        return github_app.CommitRange(commits, len(commits), False)
+
+    def head_commit(self, repo, sha):
+        subject = dict(self.history)[sha]
+        return github_app.CommitInfo(sha, subject, github_app.pr_number_from_subject(subject))
 
     def set_status(self, repo, sha, state, description, *, context="herdr/review-gate"):
         self.calls.append(("status", sha, state, description))
@@ -134,6 +153,19 @@ class CI:
 
     def __call__(self, start=False):
         return {"pipelines": {"acme/widget": list(self.rows)}, "stale": False, "available": True}
+
+    def main_run(self, sha, state):
+        self.rows.append(
+            {
+                "revision": sha,
+                "state": state,
+                "event": "push",
+                "branch": "main",
+                "run_number": len(self.rows) + 1,
+                "repository": "acme/widget",
+                "forge_url": "https://github.com/acme/widget/commit/" + sha,
+            }
+        )
 
     def green(self, sha, number=7):
         self.rows.append(
@@ -674,3 +706,58 @@ def test_e2e_pool_drains_a_burst(loop):
         runner.join(10)
     assert not runner.is_alive()
     assert len(loop.model.seen) == 6
+
+
+def test_main_goes_red_then_green(make_loop):
+    loop = make_loop(repos=[{"repo": REPO, "main_pipeline": "push"}])
+    srv = loop.srv
+    shas = [c * 40 for c in "123456"]
+    base, m1, m2, m3, m4, _ = shas
+    registry = AuthorRegistry(srv.repo)
+    for number, branch, session in ((7, "feat/a", "s7"), (8, "feat/b", "s8")):
+        srv.repo.upsert_session(
+            session, host_id="h1", branch=branch, cwd="/w/widget", pane_id=f"p{number}"
+        )
+        key = PrKey(REPO, number)
+        registry.pin(key, registry.author_of(key, branch))
+
+    def merge(sha, subject):
+        loop.app.history.append((sha, subject))
+
+    merge(base, "initial")
+    loop.ci.main_run(base, "success")
+    loop.tick()
+    status, body = loop.request("GET", "review-gate/main", "read")
+    assert status == 200
+    assert body["repos"][0]["state"] == "green" and body["repos"][0]["last_green_sha"] == base
+
+    # two PRs merge, the full suite on the new head fails
+    merge(m1, "fix widget (#7)")
+    merge(m2, "add gadget (#8)")
+    loop.ci.main_run(m2, "failure")
+    loop.tick()
+    loop.tick()  # idempotent per failing sha
+    assert len(loop.dispatcher.calls) == 2  # one message per culprit author
+    assert all("#7, #8" in c and m2 in c and base in c for c in loop.dispatcher.calls)
+    status, notices = loop.request("GET", "review-gate/notices", "read")
+    main_notices = sorted((n["key"], n["channel"]) for n in notices if n["kind"] == "main_red")
+    assert main_notices == [(f"{REPO}#0", "user"), (f"{REPO}#7", "author"), (f"{REPO}#8", "author")]
+    status, body = loop.request("GET", "review-gate/main", "read")
+    assert body["repos"][0]["state"] == "red" and body["repos"][0]["culprits"] == [7, 8]
+
+    # a later head is green: last green advances
+    merge(m3, "repair (#9)")
+    loop.ci.main_run(m3, "success")
+    loop.tick()
+    status, body = loop.request("GET", "review-gate/main", "read")
+    assert body["repos"][0]["state"] == "green" and body["repos"][0]["last_green_sha"] == m3
+
+    # the next red lists only the commits after it
+    merge(m4, "oops (#10)")
+    loop.ci.main_run(m4, "failure")
+    loop.tick()
+    status, body = loop.request("GET", "review-gate/main", "read")
+    assert body["repos"][0]["culprits"] == [10] and body["repos"][0]["range_total"] == 1
+    status, notices = loop.request("GET", "review-gate/notices", "read")
+    users = [n for n in notices if n["kind"] == "main_red" and n["channel"] == "user"]
+    assert sorted(n["sha"] for n in users) == sorted([m2, m4])

@@ -474,6 +474,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = gsub.add_parser("pool", help="run a pool of reviewer workers sized by the review queue")
     p2.add_argument("--config", required=True, help="pool YAML config file")
     p2.set_defaults(func=_cmd_review_gate_pool)
+    p2 = gsub.add_parser("check-skips", help="fail when a test is skipped outside the disabled-tests file")
+    p2.add_argument("--junit", action="append", required=True, help="junit XML file or directory (repeatable)")
+    p2.add_argument("--disabled", required=True, help="disabled-tests YAML file")
+    p2.set_defaults(func=_cmd_review_gate_check_skips)
 
     # candidates -----------------------------------------------------------
     p = sub.add_parser("candidates", help="multi-agent worktree comparison (spec 0140)")
@@ -2308,6 +2312,26 @@ def _cmd_review_gate_pool(args) -> int:
     except Exception as exc:  # noqa: BLE001 - restartable: not a refused key or bad config
         print(f"review-gate pool: internal error: {type(exc).__name__}", file=sys.stderr)
         return 3
+
+
+def _cmd_review_gate_check_skips(args) -> int:
+    """Exit 0 clean, 1 when a skipped test is not in the disabled file, 2 on bad input."""
+    from .review_gate import skips
+
+    try:
+        report = skips.check_junit(args.junit, skips.load_disabled(args.disabled))
+    except skips.SkipsError as exc:
+        print(f"review-gate check-skips: {exc}", file=sys.stderr)
+        return 2
+    for name in report.unused_disabled:
+        print(f"warning: listed as disabled but not skipped: {name}", file=sys.stderr)
+    if report.skipped_unlisted:
+        print(f"{len(report.skipped_unlisted)} test(s) skipped outside the disabled-tests file:")
+        for name in report.skipped_unlisted:
+            print(f"- {name}")
+        return 1
+    print(f"ok: {report.total} testcases, no unlisted skips")
+    return 0
 
 
 def _cmd_review_request(args) -> int:

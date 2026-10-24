@@ -13,6 +13,11 @@ Channels, per (key, head sha, kind) where kind is the state value:
   delivered. ``ESCALATED`` never goes to the author: it always gets a ``user``
   notice, after running ``notify_command`` if one is configured (the notice's
   ``ok``/``detail`` then say how that command went).
+- ``notify_main_red`` (the default branch went red): each culprit PR's pinned
+  author gets the message (kind ``main_red``, operation id
+  ``gate-main:<repo>:<sha>:<n>``), and the ``user`` channel (entity key
+  ``<repo>#0``) ALWAYS gets a notice, after ``notify_command`` with ``{number}``
+  set to the newest culprit PR or 0 and ``{branch}`` the default branch.
 
 Idempotency: every attempt is recorded as a durable ``notified`` event on
 stream ``pr_gate_notice``/``str(key)`` AFTER the attempt; a channel already
@@ -75,6 +80,7 @@ _KINDS = {
     State.ESCALATED: "escalated",
 }
 _PLACEHOLDERS = {"repo", "number", "branch", "sha"}
+_MAIN_KIND = "main_red"
 _SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,255}")
 _UNTRUSTED = (
@@ -175,15 +181,20 @@ def _clip(text: str) -> str:
     return text[: MAX_TEXT - len(_MARKER)] + _MARKER
 
 
-def _argv(command: Sequence[str], key: PrKey, sha: str, branch: str) -> list[str]:
-    """Substitute the placeholders per element; raise _BadArgument on any doubt."""
+def _argv(
+    command: Sequence[str], key: PrKey, sha: str, branch: str, *, main: bool = False
+) -> list[str]:
+    """Substitute the placeholders per element; raise _BadArgument on any doubt.
+
+    ``main`` (a default-branch notice): ``key.number`` may be 0, meaning no PR.
+    """
     repo, number = key.repo, key.number
     try:
-        if PrKey.parse(f"{repo}#{number}") != key:
+        if PrKey.parse(f"{repo}#{number or 1}") != PrKey(repo, number or 1):
             raise _BadArgument("repo")
     except ValueError:
         raise _BadArgument("repo") from None
-    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+    if isinstance(number, bool) or not isinstance(number, int) or number < int(not main):
         raise _BadArgument("number")
     if not isinstance(sha, str) or not _SHA_RE.fullmatch(sha):
         raise _BadArgument("sha")
@@ -279,6 +290,48 @@ class AuthorNotifier:
         if "user" not in done:
             self._record(key, sha, kind, "user", True, "recorded", gen)
 
+    def notify_main_red(
+        self, repo: str, sha: str, branch: str, text: str, culprits: Sequence[PrKey]
+    ) -> bool:
+        """Tell the culprit PRs' authors and ALWAYS the user; True once the user notice is durable.
+
+        False means the launch budget deferred ``notify_command``: nothing is recorded for the
+        user channel, so a later tick tries again. An author channel is attempted once per
+        (sha, culprit) whether or not it delivered.
+        """
+        text = _clip(text)
+        with self._lock:
+            for key in culprits:
+                if self._attempted(key, sha, _MAIN_KIND, 0):
+                    continue
+                ok, detail = self._to_author(
+                    key,
+                    sha,
+                    _MAIN_KIND,
+                    None,
+                    text,
+                    0,
+                    operation_id=f"gate-main:{repo}:{sha}:{key.number}",
+                )
+                try:
+                    self._record(key, sha, _MAIN_KIND, "author", ok, detail, 0)
+                except Exception:  # noqa: BLE001 - a replayed operation id never double-sends
+                    log.warning("review gate: main notice record failed for %s", key)
+            user = PrKey(repo, 0)
+            if "user" in self._attempted(user, sha, _MAIN_KIND, 0):
+                return True
+            ok, detail = True, "recorded"
+            if self._config.notify_command:
+                newest = PrKey(repo, max((k.number for k in culprits), default=0))
+                try:
+                    ok, detail = self._launch(
+                        self._config.notify_command, newest, sha, branch, text, main=True
+                    )
+                except _Deferred:
+                    return False
+            self._record(user, sha, _MAIN_KIND, "user", ok, detail, 0)
+            return True
+
     def message(
         self, key: PrKey, snap: PrSnapshot, head_ref: str, failures: Sequence[str] = ()
     ) -> str:
@@ -366,10 +419,24 @@ class AuthorNotifier:
         self._repo.record_event(ENTITY, str(key), EVENT, payload, require_durable=True)
 
     def _to_author(
-        self, key: PrKey, sha: str, kind: str, head_ref: str, text: str, gen: int
+        self,
+        key: PrKey,
+        sha: str,
+        kind: str,
+        head_ref: str | None,
+        text: str,
+        gen: int,
+        *,
+        operation_id: str | None = None,
     ) -> tuple[bool, str]:
+        """``head_ref`` None: only a pinned author counts (no branch to look sessions up by)."""
         try:
-            author = self._registry.author_of(key, head_ref)
+            if head_ref is None:
+                author = self._registry.pinned_author(key)
+                if author is None:
+                    return False, "no_session"
+            else:
+                author = self._registry.author_of(key, head_ref)
             session_id = author.session_id
             if (
                 author.kind not in ("collab", "pi")
@@ -380,7 +447,7 @@ class AuthorNotifier:
             receipt = self._repo.send_message(
                 session_id,
                 text,
-                operation_id=f"gate:{key}:{sha}:{kind}:g{gen}",
+                operation_id=operation_id or f"gate:{key}:{sha}:{kind}:g{gen}",
                 dispatcher=self._dispatcher,
             )
         except Exception:  # noqa: BLE001 - any failure is a failed attempt
@@ -392,10 +459,17 @@ class AuthorNotifier:
         return False, "queued" if status == "queued" else "failed"
 
     def _launch(
-        self, command: Sequence[str], key: PrKey, sha: str, branch: str, text: str
+        self,
+        command: Sequence[str],
+        key: PrKey,
+        sha: str,
+        branch: str,
+        text: str,
+        *,
+        main: bool = False,
     ) -> tuple[bool, str]:
         try:
-            argv = _argv(command, key, sha, branch)
+            argv = _argv(command, key, sha, branch, main=main)
         except _BadArgument:
             log.warning("review gate: command not launched for %s (bad argument)", key)
             return False, "bad_argument"

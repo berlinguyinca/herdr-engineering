@@ -37,6 +37,7 @@ sections:
             required_events: [pull_request]           # Woodpecker events that must all be green (default [pull_request])
             review_cap: 4                             # FAIL verdicts before escalation (default 4)
             ci_fix_cap: 3                             # red CI rounds before escalation (default 3)
+            main_pipeline: push                       # Woodpecker event of the full-suite run on the default branch (default: off, section 8)
         reviewer:                                     # optional; every key optional, integers >= 1
           lease_seconds: 900                          # how long a claimed job stays with one worker (default 900; 30..86400)
           max_diff_bytes: 400000                      # diff bytes sent to the reviewer (default 400000; 1000..5000000)
@@ -189,7 +190,7 @@ to 300 s. A recorded result or an idle claim resets the wait.
 Attempts are spent per claim, also when the cause is not the reviewer (GitHub
 unreachable, a worker killed mid-review). An outage longer than about
 `max_attempts x lease_seconds` (about 45 minutes with the defaults) therefore
-escalates every PR it touched, and an operator must `resume` them (section 8).
+escalates every PR it touched, and an operator must `resume` them (section 9).
 
 A model call has a total wall-clock deadline of `model.timeout_seconds`. A
 model endpoint that answers slowly, byte by byte, is abandoned at the deadline
@@ -311,8 +312,12 @@ Read endpoints (any API key role):
 - `GET /api/v1/review-gate/queue`: queue depth, jobs and the last tick summary.
 - `GET /api/v1/review-gate/notices`: the newest 100 notifications, newest
   first, each with `key`, `sha`, `kind` (`changes_requested`, `ci_red`,
-  `escalated`), `channel` (`author`, `fixer`, `user`), `ok` and `at` (epoch
-  seconds). Details such as command output are never shown.
+  `escalated`, `main_red`), `channel` (`author`, `fixer`, `user`), `ok` and
+  `at` (epoch seconds). Details such as command output are never shown.
+- `GET /api/v1/review-gate/main`: `{"repos": [...]}`, one entry per repo with
+  main verification on: `repo`, `branch`, `head_sha`, `state` (`green`, `red`,
+  `pending`, `unknown`), `last_green_sha`, `failures`, `range_total`,
+  `culprits` (PR numbers). It reflects the latest tick only.
 
 **Escalation.** A PR escalates (the `reason` in `/prs`) when:
 
@@ -383,7 +388,79 @@ message. Within one generation each channel is still tried only once.
   that budget are deferred to later ticks, so a backlog drains at one command
   per `poll_seconds`.
 
-## 8. Known limits
+## 8. Main verification
+
+The full suite is an ordinary Woodpecker **push** pipeline in the repo. It never
+blocks a merge; the gate only watches it and, on a red run, tells the likely
+culprits. Turn it on per repo with `main_pipeline: push` (the Woodpecker event
+whose runs on the default branch count; leave it out for off).
+
+Example `.woodpecker/main.yaml` (the last step enforces the disabled-tests
+file):
+
+```yaml
+when:
+  event: push
+  branch: main
+steps:
+  - name: full-suite
+    image: <your ci image>
+    commands:
+      - pytest --junitxml=reports/junit.xml
+      - herdr-eng review-gate check-skips --junit reports --disabled .herdr/disabled-tests.yaml
+```
+
+**One run at a time.** Set this in Woodpecker (project setting: cancel previous
+pipelines on push, or one concurrent build); the gate does not enforce it. The
+gate judges the newest default-branch head only and ignores runs for older
+heads, so a merge that lands during a run is covered by the next run.
+
+**What the gate does.** Each tick it reads the default branch head and the
+Woodpecker runs for that head on that branch. Green: it records the head as the
+last green sha, once. Red: once per failing sha it sends one notice, then
+records the red durably. Pending, a stale CI snapshot and any GitHub failure
+record nothing and are never treated as green. There is no auto-revert and no
+gate status on main.
+
+**The notice** names the failing head, the last green sha, the CI failures
+(run number and state only, never CI log text), the culprit PR numbers and the
+commits since the last green run, oldest first, at most 50 listed with the true
+count stated. Culprit PRs come from `(#N)` at the end of a squash subject and
+`Merge pull request #N` in a merge subject. With no known green sha only the
+failing head is listed, and the notice says so. A range with no PR (direct
+pushes) says "no pull request identified". Commit subjects are untrusted: they
+are flattened to one line, bounded, redacted and marked untrusted. The pinned
+author of each culprit PR gets the message (a PR whose author was never pinned
+is skipped), and the user ALWAYS gets a `user` notice (`kind` `main_red`, key
+`<repo>#0`), after `notify_command` when one is configured. For main notices
+`{number}` is the newest culprit PR (0 when none) and `{branch}` the default
+branch. A later red head notifies again. The `notify_command` launch shares the
+one-launch-per-tick budget, so a deferred notice is retried on a later tick. `notify_command` is
+at-least-once: if the notice cannot be recorded after the command ran, the next
+tick runs it again. If the commit range cannot be read after 3 attempts, the
+notice names the head only and says so (no author messages). A rerun of an
+already-green commit is called out as such, and a cut-short range says the
+culprit list may be partial.
+
+**Disabled-tests file** (YAML in the repo, passed with `--disabled`):
+
+```yaml
+disabled:
+  - test: "tests.test_x.TestY::test_z"      # <classname>::<name> as in the junit XML
+    reason: "flaky on arm, tracked in #123"  # required, non-empty
+```
+
+`herdr-eng review-gate check-skips --junit PATH [--junit PATH ...] --disabled FILE`
+reads junit files (or directories of `*.xml`, non-recursive). A testcase with a
+`<skipped>` child (pytest xfail included) that is not listed fails the step
+(exit 1). A listed test that is not skipped is only reported on stderr. Exit 2
+means the check could not be made, which is never a pass: no testcases at all,
+a missing path, malformed XML, XML with a `<!DOCTYPE`/`<!ENTITY`, or a
+disabled-tests file that is missing, malformed, has a duplicate test or an
+entry without a reason. `disabled_tests_file` in the repo config is validated
+but not read by the gate; the pipeline passes the path itself.
+
+## 9. Known limits
 
 - **One gate per fleet.** Run the gate on one control-plane server only;
   nothing prevents two instances from fighting.
@@ -425,3 +502,9 @@ message. Within one generation each channel is still tried only once.
   (`pending`) instead of merging.
 - In-memory memos (posted statuses, merge back-off) reset on restart, so a
   restart re-posts each status once.
+- **Main verification limits.** Only the newest default-branch head is judged;
+  a red head is never re-notified, and a sha that was red and later reruns
+  green is recorded green. Culprits are the PRs named in commit subjects in the
+  range, not a bisect. The compare read returns at most 250 commits, and a
+  longer range says so. Status shown by `/main` is in memory (a restart shows
+  nothing until the next tick); last-green and the red markers are durable.
