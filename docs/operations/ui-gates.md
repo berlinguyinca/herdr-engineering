@@ -59,8 +59,10 @@ fraction of them: a selected lineage node with its comment, steering, consult an
 step; the Gantt; the replay bar; the table alternative; a proposal under review; expanded attention items; a remote agent tab;
 links; chat; an edited comment (History) and a retracted one; the expanded message editor; the @-mention list open. Each state names
 selectors that must exist once open (a state that fails to open is a failure, not a skip) and a least number of audited controls and
-text nodes, set at 90% of what the audit counted (the owner total is 512 controls, floor 460; the first version's floors were about a
-third of the count). Two viewer states (chat, and lineage with a node selected) run as the read-only account. Everything runs at
+text nodes. The floor of a state that settles late (the chat states: the room's agents arrive after the chat) is the observed count
+minus three; the floors of the others are 90% of it. The owner total is 571 controls (floor 540) over 21 states: the round-3 review
+added the tabs nobody audited (progress with a milestone, the attention inbox, agents, flow, tasks, the room's people) and made the
+table state select a node first. Two viewer states (chat, and lineage with a node selected) run as the read-only account. Everything runs at
 desktop light, desktop dark and phone 375, each on its own server (acknowledging an attention item is server state).
 
 Every real-page test also fails on any console error, CSP violation, failed request or HTTP status of 400 or more.
@@ -105,11 +107,19 @@ element or handler is created, and that canaries reached the screen for the requ
 tainted unless it is an identifier or a value the page branches on (a key pattern list, plus hex ids and timestamps); a
 hand-written list of display fields once left a bounded task's `target_name` untested. The sign-in config response is left alone
 (the page finds its server through it). The test lists which tainted fields never reached the screen and requires that list to equal
-`UNRENDERED`, so a new unrendered field cannot hide: 21 are listed (analytics and review-evidence tables that the small fixture room
-suppresses, PR and diff statistics, and identifiers the page reads but does not paint). **Those 21 are not proven inert.** Three
-placements are asserted directly: the lineage an external agent reported, named by its label (the fixture now reports one), a
-milestone label (the proxy adds a milestone to an empty progress response, because a real one needs a linked mission), and the
-target of a bounded task. The payload also breaks out of attributes (a quote, an event handler and a marker attribute first).
+`UNRENDERED`, so a new unrendered field cannot hide. Round 3 put text where four renderers print it (an external agent's `reported_by` in
+the virtual tab, a node's `state_reason` in the inspector, an agent's `owner_email` in a pending request and in the flow detail, the
+analytics `basis`: the fixture room now has `min_group_size` 2 and two finished tasks, one reopened) and asserts each canary is visible
+and inert, so `UNRENDERED` fell from 21 to 17. Each of the 17 is covered somewhere else, in `ui-gates-render-xss.test.mjs`, which
+gives the renderers a complete model in which every string is hostile (once with the fields the renderer branches on intact, once
+with those hostile too) and parses the result in Chromium: `error`, `method`, `milestone` and `paths` are printed by a renderer
+there and their canary is asserted on screen; `progress` is drawn only as the number of a `<progress>` and is asserted to be 0 when it
+is not a number; the other 12 (`bindings`, `categories`, `category`, `changed_files`, `diff_summary`, `head`, `means`, `order`,
+`review_quorum`, `self_reports`, `touched_paths`, `value`) are server objects that no page source reads, which a source scan asserts
+(it fails the day a renderer reads one, and it has its own known-bad lines). The same file renders the pane that reports itself as
+remote and every proposal kind. Three placements from before are still asserted directly: the lineage an external agent reported,
+a milestone label (the proxy adds a milestone to an empty progress response, because a real one needs a linked mission; the states
+test does the same), and the target of a bounded task. The payload also breaks out of attributes (a quote, an event handler and a marker attribute first).
 
 Keyboard: after any action, focus returns to the same control (or its successor: confirm lands on "Confirm and send", cancel on
 "Review and confirm", a decided proposal on its row), asserted exactly rather than "not the body". The flow diagram is one Tab stop
@@ -176,9 +186,13 @@ Mono (Regular, Bold) for text, `Herdr Symbols` (a renamed subset of DejaVu Sans:
 data URLs for capture only (`bypassCSP`, because the page CSP is `default-src 'none'`). The room tab's plus sign is now an ASCII `+`
 (it was U+FF0B, which only a CJK font has). `assertBundledFonts` walks EVERY element and ::before/::after of the page through the
 DevTools protocol (`CSS.getPlatformFontsForNode`) and fails the capture if any glyph was painted by a host font; its own test puts a
-host-font span (and an emoji) on the page and requires the failure. **Portability is proved, not assumed:** the visual suite runs
+host-font span (and an emoji) on the page and requires the failure. **What that proves, and what it does not:** the visual suite runs
 `baselines:check` in a child process under a `FONTCONFIG_FILE` that lists only `tests/playwright/fonts` (plus `/etc/fonts/conf.d`
-for rendering settings) and requires the whole suite to pass; `fc-list` under that file shows only the four bundled families.
+for rendering settings) and requires the whole suite to pass; `fc-list` under that file shows only the four bundled families. So the
+screenshots do not depend on which FONTS the host has installed. They do still depend on the host's fontconfig RENDERING settings
+(hinting, antialiasing, subpixel order, in `/etc/fonts/conf.d`): with no `conf.d` at all the check fails. A host with other
+settings, another Chromium build or another operating system has not been tried; the first run on the CI agent is that test (see
+"CI" below).
 
 The suite has teeth (18 injected defects, each of which must fail on the page or the component): hidden edges, transparent
 inspector text, hidden logo and glyphs, missing badges, an invisible Send button, a +7 colour shift, a 1px shift, a 1px wider button,
@@ -189,7 +203,10 @@ Baseline policy:
 
 - `update` needs `--i-understand-this-rewrites-baselines` and a clean git tree, so a baseline cannot be regenerated by accident or
   to hide an unreviewed change. Say why in the PR (browser build, font, intended CSS).
-- Total size and per-file size are capped (yaml) and enforced by a test and by `check` and `update`.
+- Per-file size and total size are capped (yaml). `check` fails over either cap. `update` refuses a file over the per-file cap, and
+  computes the total the directory WOULD have (replaced files counted once, at their new size) before it writes: over the cap it
+  writes nothing and exits 1. It also writes nothing if any surface failed to capture, so a failed update never leaves a half
+  rewritten set. A test pins the projection.
 - Baselines are tied to the Chromium build Playwright resolves (its FreeType and Skia) and to the bundled fonts. No glyph may fall
   back to a host font (asserted per element). What a baseline can STILL depend on, honestly: the host's fontconfig RENDERING
   settings (hinting level, anti-aliasing, sub-pixel layout: they come from `/etc/fonts/conf.d`, are not fonts, and were left
@@ -283,3 +300,21 @@ Found by the strengthened gates (second round):
 - **Other test files in `tests/playwright/` (not part of these gates) still hardcode a Chromium path** from an earlier machine.
 - **Pre-existing failures outside this change:** on the base branch (`feat/t16-release-gates`) three CI-dashboard tests fail too (and one more, "activity uses compact expandable rows...", failed once there under load but passes on this branch)
   ("CI reports publish over HTTP...", "CI catalog keeps filters...", "failed CI run sends debugging context...").
+
+## CI
+
+`.woodpecker/ui-gates.yaml` runs `npm run test:ui-gates` and `npm run ui-gates:baselines:check` on Woodpecker, for pull requests that
+touch the page, its tests, the control plane or the baselines, and by hand. GitHub Actions is disabled organisation-wide and is not
+used. **It has not been run on a Woodpecker agent yet**; the first run is the real test of the screenshots there.
+
+Image requirements, because the screenshots are compared pixel for pixel:
+
+- Node 22 and the Playwright 1.64 browsers (the baselines come from the Chromium that Playwright resolves; the official
+  `mcr.microsoft.com/playwright:v1.64.0-noble` image has them and Chromium's system libraries);
+- Python 3.12 with this repository installed (`pip install -e '.[dev]'`) first on `PATH`: the fixture server is the real control plane;
+- `git` (the baseline `update` guard reads the tree) and a writable checkout;
+- fontconfig with `/etc/fonts/conf.d` as shipped by Debian/Ubuntu (`10-hinting-slight`, `10-sub-pixel-rgb`, `10-yes-antialias`,
+  `11-lcdfilter-default`): fonts do not matter, these rendering settings do. An agent whose settings differ fails `baselines:check`
+  while every other gate passes; fix the image (or, after reviewing the diff images, run `update` from a commit and say why).
+
+The suite takes about ten minutes on a workstation and runs one test at a time; give the step that much and one CPU core per Chromium.

@@ -1,0 +1,33 @@
+# UI gates for the collaboration page (docs/operations/ui-gates.md): accessibility, hostile text, keyboard, states, performance and the
+# pixel-compared screenshots. Written for Woodpecker, the CI this organisation runs; GitHub Actions is disabled organisation-wide and is
+# not used here.
+#
+# STATUS: this definition has NOT been run on Woodpecker yet. The suite was verified on a workstation (Ubuntu 24.04, Node 22, Chromium from
+# Playwright 1.64) and the screenshots are compared pixel for pixel, so the first run on a new agent is the proof that the agent
+# renders like the workstation. If `baselines:check` fails there and everything else passes, the agent's rendering settings differ
+# (see "Image requirements" in the document): fix the image, do not regenerate the baselines.
+#
+# It does not start on every push: it runs for pull requests that touch the page, its tests or the baselines, and by hand.
+when:
+  - event: manual
+  - event: pull_request
+    path:
+      include: ['packages/**', 'tests/playwright/**', 'tests/visual/**', 'docs/assets/screenshots/**', 'package.json', 'package-lock.json', 'herdr_engineering/control_plane/**']
+
+steps:
+  - name: ui-gates
+    # Needs: Node 22, Python 3.12 with this repository installed (the fixture server is the real control plane), git, Chromium's system
+    # libraries and fontconfig with /etc/fonts/conf.d (hinting, antialiasing and subpixel settings). The official Playwright image for the
+    # version in package-lock.json carries all of that apart from the Python environment.
+    image: mcr.microsoft.com/playwright:v1.64.0-noble
+    commands:
+      - apt-get update -qq && apt-get install -y -qq python3-venv python3-pip git >/dev/null
+      - python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q -e '.[dev]'
+      - npm ci --no-audit --no-fund
+      # the suite starts the fixture server with `python3`: put the environment first on PATH
+      - export PATH=/tmp/venv/bin:$PATH
+      # every gate (a11y, hostile text, keyboard, states, performance, tokens...) and the visual suite, one test at a time
+      - npm run test:ui-gates
+      # the screenshots again, as the command a reviewer runs; it must pass without writing anything
+      - npm run ui-gates:baselines:check
+      - git diff --exit-code -- docs/assets/screenshots

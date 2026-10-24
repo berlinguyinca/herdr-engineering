@@ -31,6 +31,8 @@ const STATIC = [
     ['a select named only by its option text', '<select><option>Fork from this commit</option><option>another</option></select>'],
     ['a select with text NEXT to it that is not a label', '<span>Snooze for</span><select><option>1 hour</option></select>'],
     ['a textarea named only by its content', '<textarea>my draft comment</textarea>'],
+    ['a select wrapped in a label whose only text is the select\'s own options', '<label class="cx-field"><select><option>Fork from this commit</option><option>another</option></select></label>'],
+    ['a textarea wrapped in a label with no words of its own', '<label class="cx-field"><textarea>typed content</textarea></label>'],
     ['a select with an empty aria-label and options', '<select aria-label=""><option>1 hour</option></select>']],
   [['aria-label', '<button aria-label="Close" style="width:30px;height:30px"></button>'], ['text', '<button>Save</button>'],
     ['aria-labelledby with text', '<span id="n">Search</span><button aria-labelledby="n" style="width:30px;height:30px"></button>'],
@@ -88,6 +90,7 @@ const STATIC = [
   ['transition-all', [['transition: all', '<button>a</button>', 'button{transition:all .3s}']], [['named properties', '<button>a</button>', 'button{transition:opacity .3s,background-color .3s}']]],
   ['target-size', [['two tiny targets close together', '<button aria-label="x" style="width:12px;height:12px;padding:0">x</button><button aria-label="y" style="width:12px;height:12px;padding:0">y</button>']],
     [['a 44px button', '<button style="min-width:44px;min-height:44px">Save</button>']]],
+  ['tablist-name', [['a tab list with no name', '<div role="tablist"><button role="tab" aria-selected="true">One</button></div>']], [['a named tab list', '<div role="tablist" aria-label="Rooms"><button role="tab" aria-selected="true">One</button></div>']]],
   ['tab-needs-tablist', [['a tab outside a tablist', '<button role="tab" aria-selected="false">One</button>']], [['a tab in a tablist', '<div role="tablist"><button role="tab" aria-selected="true">One</button></div>']]],
   ['label', [['an input without a label', '<input type="text">'], ['a textarea with only a placeholder', '<textarea placeholder="p"></textarea>']], [['a labelled input', '<label>Name <input type="text"></label>']]],
   ['keyboard-operable', [['a clickable div that cannot be focused', '<div style="cursor:pointer">click me</div>'],
@@ -200,11 +203,18 @@ test('overflow audit is not fooled by content cut off behind overflow:hidden: th
   await p.close();
 });
 
+test('overflow audit still flags a 1px box that is clipped but not marked visually hidden', async () => {
+  const p = await page('<h2 style="width:1px;height:1px;overflow:hidden;white-space:nowrap">Content that is simply cut off</h2>', { viewport: { width: 320, height: 500 } });
+  assert.match(overflowFailure(await overflowAudit(p)), /content is cut off/);
+  await p.close();
+});
+
 test('overflow audit allows an ellipsis, a scroll container and overflow:hidden that cuts nothing', async () => {
   for (const html of [
     '<p style="width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">a long line that does not fit in its box at all</p>',
     '<div style="width:100px;overflow-x:auto"><div style="width:400px;height:10px;background:#ccc"></div></div>',
     '<div style="overflow:hidden;border-radius:8px"><p>fits</p></div>',
+    '<h2 style="position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap">A heading for the outline only</h2>',
   ]) {
     const p = await page(html, { viewport: { width: 320, height: 500 } });
     assert.equal(overflowFailure(await overflowAudit(p)), '', html);

@@ -78,7 +78,10 @@ function staticInPage(arg, L) {
       if (lb) { const t = lb.split(/\s+/).map((i) => document.getElementById(i)).filter(Boolean).map(text).join(' ').trim(); if (t) return t; }
       const al = (el.getAttribute('aria-label') || '').trim();
       if (al) return al;
-      if (el.labels && el.labels.length) { const t = [...el.labels].map(text).join(' ').trim(); if (t) return t; }
+      // a label's text is what it SAYS, not what the controls inside it hold: a <select>'s option text and a <textarea>'s content are values,
+      // so a label that wraps a select and has no words of its own names nothing (cloned, with every control removed, before reading)
+      const labelText = (lb) => { const c = lb.cloneNode(true); c.querySelectorAll('select, option, textarea, input, button, output, progress, meter').forEach((n) => n.remove()); return text(c); };
+      if (el.labels && el.labels.length) { const t = [...el.labels].map(labelText).join(' ').trim(); if (t) return t; }
       // a select's name is NOT its option text and a textarea's name is NOT its content: both are the value a person chose or typed
       if (el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') return (el.getAttribute('title') || '').trim();
       if (el.tagName === 'INPUT' && ['submit', 'button', 'reset'].includes(el.type) && el.value) return el.value;
@@ -163,11 +166,17 @@ function staticInPage(arg, L) {
       if (role === 'tablist' && visible(el)) {
         const tabs = [...el.querySelectorAll('[role=tab]')];
         if (!tabs.length) add('tablist-empty', '1.3.1', el, 'role=tablist with no tabs');
+        if (!(el.getAttribute('aria-label') || '').trim() && !el.getAttribute('aria-labelledby')) add('tablist-name', '4.1.2', el, 'role=tablist without an accessible name: a person who meets two tab lists cannot tell them apart');
       }
     }
-    // ---- headings: no skipped levels
-    const hs = [...scope.querySelectorAll('h1,h2,h3,h4,h5,h6')].filter(visible).map((h) => Number(h.tagName[1]));
-    for (let i = 1; i < hs.length; i += 1) if (hs[i] - hs[i - 1] > 1) { add('heading-order', '1.3.1', scope.querySelectorAll('h1,h2,h3,h4,h5,h6')[i], `h${hs[i - 1]} followed by h${hs[i]}`); break; }
+    // ---- headings: no skipped levels. The heading a panel's first heading follows is the last visible heading BEFORE the panel in the
+    // document, not nothing: an h5 straight under an h2 is a skipped level even when it is the first heading the audit sees.
+    const docHeads = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')].filter(visible);
+    for (let i = 1; i < docHeads.length; i += 1) {
+      if (!scope.contains(docHeads[i])) continue;
+      const lvl = Number(docHeads[i].tagName[1]); const prev = Number(docHeads[i - 1].tagName[1]);
+      if (lvl - prev > 1) { add('heading-order', '1.3.1', docHeads[i], `h${prev} followed by h${lvl}`); break; }
+    }
     // ---- language / title / zoom
     if (scope === document.body && !document.querySelector('main, [role=main]')) add('landmark-main', '2.4.1', document.body, 'the page has no <main> landmark to skip to');
     if (!document.documentElement.getAttribute('lang')) add('html-lang', '3.1.1', document.documentElement, 'no lang on <html>');
@@ -456,6 +465,8 @@ export async function overflowAudit(page) {
       const cs = getComputedStyle(el);
       if (!['hidden', 'clip'].includes(cs.overflowX) || cs.textOverflow === 'ellipsis' || cs.display === 'none' || cs.visibility === 'hidden') continue;
       if (el.closest('svg') || el.clientWidth === 0) continue;
+      // a visually-hidden heading or label (1px, clipped away on purpose) is not content that someone is missing
+      if (el.clientWidth <= 1 && el.clientHeight <= 1 && (/^rect\(0(px)?,? 0(px)?,? 0(px)?,? 0(px)?\)$/.test(cs.clip) || /inset\(50%\)/.test(cs.clipPath))) continue;
       if (el.scrollWidth > el.clientWidth + 1) out.clipped.push(`${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}${el.classList.length ? '.' + [...el.classList].slice(0, 2).join('.') : ''} content ${el.scrollWidth}px in ${el.clientWidth}px`);
     }
     out.clipped = out.clipped.slice(0, 8);

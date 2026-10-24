@@ -37,7 +37,7 @@ async function withPage(behaviour, fn) {
       let body = {};
       if (path === '/config') body = { client_id: 'test', hosted_ui_domain: 'test', public_url: 'https://example.test', operator: { user_id: 'owner', email: 'owner@example.test' } };
       else if (path === '/rooms') body = { rooms: [{ room_id: 'room-one', name: 'Review', role: 'owner' }] };
-      else if (path === '/admin/users') body = { users: [] };
+      else if (path === '/admin/users') body = state.users ? { users: state.users, counts: { pending: 2, approved: 3, disabled: 1 }, can_manage: true } : { users: [] };
       else if (path === '/rooms/room-one') body = { room_id: 'room-one', name: 'Review', role: 'owner', members: [] };
       else if (path === '/rooms/room-one/state') body = { changed: true, seq: 1, next_cursor: 1, agents: [], tasks: [], events: [], flow: { nodes: [], edges: [], tasks: [] } };
       else if (path === '/graph/lineage') {
@@ -55,9 +55,12 @@ async function withPage(behaviour, fn) {
     });
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
     await page.evaluate(async () => { const { mountCollab } = await import('/collab-view.js'); window.collab = mountCollab(document.querySelector('#host')); });
-    await page.locator('[data-room="room-one"]').click();
-    await page.locator('[data-sub="lineage"]').click();
-    await fn(page, state, w);
+    if (state.top) await fn(page, state, w);      // a top-level page (Rooms, People, AI agents), not a room
+    else {
+      await page.locator('[data-room="room-one"]').click();
+      await page.locator('[data-sub="lineage"]').click();
+      await fn(page, state, w);
+    }
     await page.evaluate(() => window.collab.dispose());
   } finally { await browser.close(); await new Promise((r) => server.close(r)); }
 }
@@ -136,3 +139,26 @@ test('a graph with more pages to load offers Load more, whatever the reason', as
     assert.doesNotMatch(await page.locator('#hcn-lineage').innerText(), /more nodes may exist|left out some links/);
   });
 });
+
+// The People page (approvals): reached only by an operator or an approver, so the real-server gates never see it. Its filter chips are
+// the one place that has its own focus ring, its own padding and its own role (a tab list that needs a name).
+const USERS = [['pending', 'new@example.test'], ['pending', 'second@example.test'], ['approved', 'one@example.test'], ['approved', 'two@example.test'], ['approved', 'three@example.test'], ['disabled', 'off@example.test']]
+  .map(([status, email], i) => ({ user_id: `u${i}`, email, status, since: T, decided_by: 'owner', decided_at: T, rooms: 1, agents: 1 }));
+for (const [label, size] of [['desktop', { width: 1100, height: 900 }], ['phone', { width: 375, height: 700 }]]) {
+  test(`the People page is accessible (${label}): chips are 24px targets with a focus ring, the tab lists are named, headings do not skip`, async () => withPage({ top: true, users: USERS }, async (page) => {
+    await page.setViewportSize(size);
+    await page.locator('.cx-rtabs [role="tab"]', { hasText: 'People' }).click();
+    await page.locator('.cx-chip[data-filter]').first().waitFor();
+    assert.equal(await page.locator('.cx-chip[data-filter]').count(), 6, 'every filter chip is on the page');
+    assert.equal(await page.locator('[role="tablist"][aria-label="Filter people"]').count(), 1);
+    assert.equal(await page.locator('[role="tablist"][aria-label="Rooms"]').count(), 1);
+    const stat = await staticAudit(page, '#host');
+    const foc = await focusIndicatorAudit(page, '#host');
+    assert.ok(stat.stats.controls >= 12, `only ${stat.stats.controls} controls audited`);
+    assert.ok(foc.stats.focused >= 12, `only ${foc.stats.focused} focus indicators audited`);
+    const f = [...stat, ...foc];
+    assert.deepEqual(f, [], summarize(f));
+    const o = await overflowAudit(page);
+    assert.equal(overflowFailure(o), '', 'overflow');
+  }));
+}

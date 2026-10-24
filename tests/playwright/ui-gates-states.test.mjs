@@ -22,7 +22,7 @@ const RUNS = [
 ];
 
 // What the audit counted when the floors were set (sum over STATES / over VIEWER_STATES). The totals may not fall below 90% of it.
-const FLOOR = { owner: { controls: 460, focused: 407 }, viewer: { controls: 37, focused: 30 } };
+const FLOOR = { owner: { controls: 540, focused: 480 }, viewer: { controls: 37, focused: 30 } };
 
 for (const [label, opts] of RUNS) {
   test(`every control in every state is accessible: ${label}`, async () => {

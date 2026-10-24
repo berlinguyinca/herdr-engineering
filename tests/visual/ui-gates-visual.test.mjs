@@ -13,7 +13,7 @@ import { mkdtempSync, writeFileSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { CFG, launch, openReal, openSub } from '../playwright/ui-gates-lib.mjs';
-import { FONT_DIR, SURFACES, VIEWPORTS, assertBundledFonts, baselineSizes, bundledFontCss, capture, expectedBaselineFiles, orphanBaselines, checkAgainstBaseline, checkRegion, diffPng, newDeterministicServer } from '../playwright/visual-baselines.mjs';
+import { FONT_DIR, SURFACES, VIEWPORTS, assertBundledFonts, baselineSizes, bundledFontCss, capture, expectedBaselineFiles, orphanBaselines, projectedTotalKb, checkAgainstBaseline, checkRegion, diffPng, newDeterministicServer } from '../playwright/visual-baselines.mjs';
 
 let srv; let browser;
 before(async () => { srv = await newDeterministicServer(); browser = await launch(); });
@@ -42,6 +42,16 @@ test('the baselines respect the size policy (total and per file)', () => {
   assert.ok(sz.count >= expectedBaselineFiles().size, `${sz.count} baselines`);
   assert.ok(sz.totalKb <= CFG.screenshots.max_total_kb, `${sz.totalKb.toFixed(0)} KB of baselines exceed the ${CFG.screenshots.max_total_kb} KB cap`);
   assert.ok(sz.biggest.kb <= CFG.screenshots.max_file_kb, `${sz.biggest.f} is ${sz.biggest.kb.toFixed(0)} KB, above ${CFG.screenshots.max_file_kb} KB`);
+});
+
+test('update checks the TOTAL size before it writes anything: the projection counts replaced files once and new files in full', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'projected-'));
+  writeFileSync(path.join(dir, 'a.png'), Buffer.alloc(100 * 1024));
+  writeFileSync(path.join(dir, 'b.png'), Buffer.alloc(50 * 1024));
+  assert.equal(projectedTotalKb([], dir), 150);
+  assert.equal(projectedTotalKb([[path.join(dir, 'a.png'), Buffer.alloc(10 * 1024)]], dir), 60, 'a replaced file counts at its new size');
+  assert.equal(projectedTotalKb([[path.join(dir, 'c.png'), Buffer.alloc(30 * 1024)]], dir), 180, 'a new file is added');
+  assert.equal(projectedTotalKb([[path.join(dir, 'c.png'), Buffer.alloc(30 * 1024)]], path.join(dir, 'missing')), 30);
 });
 
 test('no baseline is an orphan, and the tool notices one', () => {

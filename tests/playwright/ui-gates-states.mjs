@@ -38,7 +38,9 @@ const nodeSelected = async (page, node = 'attempt:a1') => {
 /** @type {{id:string, scope:string, must:string[], min:number, open:(page:any)=>Promise<void>}[]} */
 export const STATES = [
   { id: 'lineage: node selected (comment, steering, consult and link forms)', scope: '#hcn-p-lineage',
-    must: ['form[data-wb-form="comment"]', 'form[data-wb-form="propose"]', 'form[data-ctx-form="ask"]', 'form[data-ctx-form="link"]'], min: 56, minText: 170, open: nodeSelected },
+    // the selected node says so to assistive technology (aria-pressed true on it alone), not only in pixels
+    must: ['form[data-wb-form="comment"]', 'form[data-wb-form="propose"]', 'form[data-ctx-form="ask"]', 'form[data-ctx-form="link"]',
+      'g[data-node="attempt:a1"][aria-pressed="true"]', 'g[data-node][aria-pressed="false"]'], min: 56, minText: 170, open: nodeSelected },
   { id: 'lineage: an edited comment with its revision history', scope: '#hcn-p-lineage', must: ['[data-wb-act="history"]', '.wb-comment'], min: 59, minText: 184,
     open: async (page) => {
       await nodeSelected(page);
@@ -73,10 +75,12 @@ export const STATES = [
     open: async (page) => { await nodeSelected(page); await page.locator('[data-wb-act="confirm"]').first().click(); await page.locator('.wb-confirm').waitFor(); } },
   { id: 'lineage: Gantt view', scope: '#hcn-p-lineage', must: ['svg.lin-svg[role="img"]', '[data-view="gantt"][aria-selected="true"]'], min: 25, minText: 171,
     open: async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role="img"]').waitFor(); await page.waitForTimeout(250); } },
-  { id: 'lineage: replay controls after stepping back', scope: '#hcn-p-lineage', must: ['[data-replay="slider"]', '[data-replay="live"]'], min: 30, minText: 68,
+  { id: 'lineage: replay controls after stepping back', scope: '#hcn-p-lineage', must: ['[data-replay="slider"]', '[data-replay="live"]:not([aria-pressed="true"])'], min: 30, minText: 68,
     open: async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('[data-replay="prev"]').click(); await page.waitForFunction(() => !/^Live/.test(document.querySelector('.lin-replay__status')?.textContent || 'Live')); } },
-  { id: 'lineage: table alternative', scope: '#hcn-p-lineage', must: ['table.lin-table'], min: 31, minText: 137,
-    open: async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('#hcn-lineage [data-mode="table"]').first().click(); await page.locator('table.lin-table').first().waitFor(); } },
+  { id: 'lineage: table alternative (a node selected, the live view)', scope: '#hcn-p-lineage',
+    // the table marks the selected node's row (aria-current), and the Live button says it is the one in force (aria-pressed)
+    must: ['table.lin-table', 'table.lin-table tr[aria-current="true"]', '[data-replay="live"][aria-pressed="true"]'], min: 60, minText: 240,
+    open: async (page) => { await nodeSelected(page); await page.locator('#hcn-lineage [data-mode="table"]').first().click(); await page.locator('table.lin-table').first().waitFor(); } },
   { id: 'proposals: a quarantined proposal under review', scope: '#hcn-p-proposals', must: ['#hcn-review [data-decide="accept"]', '#hcn-review [data-decide="reject"]'], min: 18, minText: 36,
     open: async (page) => { await openSub(page, 'proposals'); await page.locator('[data-proposal]').first().click(); await page.locator('#hcn-review [data-decide]').first().waitFor(); } },
   { id: 'attention: acknowledged items expanded', scope: '#hcn-p-attention', must: ['[data-attn-act="toggle-quiet"][aria-expanded="true"]'], min: 4, minText: 17,
@@ -96,16 +100,38 @@ export const STATES = [
       await page.locator('#hcn-tabs [role="tab"][aria-selected="true"]', { hasText: /Dana/ }).waitFor();
     } },
   { id: 'links: linked workspaces', scope: '#hcn-p-links', must: ['#hcn-links li'], min: 1, minText: 7, open: async (page) => { await openSub(page, 'links'); await page.locator('#hcn-links li').first().waitFor(); } },
-  { id: 'chat: expanded message editor (a modal dialog)', scope: '#hcn-p-chat', must: ['form.conversation-composer--expanded[role="dialog"][aria-modal="true"]'], min: 16, minText: 27,
+  { id: 'chat: expanded message editor (a modal dialog)', scope: '#hcn-p-chat', must: ['form.conversation-composer--expanded[role="dialog"][aria-modal="true"]'], min: 14, minText: 24,
     open: async (page) => { await openSub(page, 'chat'); await chatReady(page); await page.locator('[data-expand]').click(); await page.locator('form.conversation-composer--expanded').waitFor(); await page.waitForTimeout(200); } },
-  { id: 'chat: the @-mention list open (a listbox of agents)', scope: '#hcn-p-chat', must: ['ul[role="listbox"]:not([hidden]) [role="option"]', 'textarea[role="combobox"][aria-expanded="true"]'], min: 17, minText: 28,
+  { id: 'chat: the @-mention list open (a listbox of agents)', scope: '#hcn-p-chat', must: ['ul[role="listbox"]:not([hidden]) [role="option"]', 'textarea[role="combobox"][aria-expanded="true"]'], min: 15, minText: 25,
     open: async (page) => { await openSub(page, 'chat'); await openMention(page); } },
-  { id: 'chat: composer with a menu of agents', scope: '#hcn-p-chat', must: ['#hcn-log'], min: 16, minText: 27, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); await chatReady(page); } },
+  { id: 'chat: composer with a menu of agents', scope: '#hcn-p-chat', must: ['#hcn-log[role="log"]'], min: 14, minText: 24, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); await chatReady(page); } },
+  // the other tabs' own views (round 3): a tab nobody audited is where a lost focus ring, a 1px-padded chip or a skipped heading hides
+  { id: 'people: the members of the room', scope: '#hcn-p-people', must: ['#hcn-people li'], min: 4, minText: 12,
+    open: async (page) => { await openSub(page, 'people'); await page.locator('#hcn-people li').first().waitFor(); } },
+  { id: 'progress: evidence, a milestone and the analytics', scope: '#hcn-p-progress', must: ['[aria-label="Milestones"]', '#hcn-analytics table'], min: 0, minText: 28,
+    // the fixture room links no mission, so the server sends no milestone; give the page one the way a linked mission would
+    open: async (page) => {
+      await page.route('**/api/v1/collab/**/progress*', async (route) => {
+        const res = await route.fetch(); const body = await res.json();
+        if (Array.isArray(body.milestones) && !body.milestones.length) body.milestones.push({ ...(body.room || {}), milestone: 'mission:m1', label: 'Milestone one', tasks: 1, complete: 0 });
+        await route.fulfill({ response: res, json: body });
+      });
+      await openSub(page, 'progress'); await page.locator('[aria-label="Milestones"]').first().waitFor(); await page.locator('#hcn-analytics table').first().waitFor();
+    } },
+  { id: 'attention: the inbox', scope: '#hcn-p-attention', must: ['[aria-label="Items that need attention"]'], min: 2, minText: 8,
+    open: async (page) => { await openSub(page, 'attention'); await page.locator('[aria-label="Items that need attention"]').first().waitFor(); } },
+  { id: 'agents: the room agents', scope: '#hcn-p-agents', must: ['#hcn-p-agents [data-rename]', '#hcn-grant form[data-agent]', '#hcn-roomagents li'], min: 8, minText: 24,
+    // "Your agents" is fetched after the room's agents: wait for it, or the number of controls depends on which answer came first
+    open: async (page) => { await openSub(page, 'agents'); await page.locator('#hcn-p-agents [data-rename]').first().waitFor(); await page.locator('#hcn-grant form[data-agent]').first().waitFor(); await page.locator('#hcn-roomagents li').first().waitFor(); await page.waitForTimeout(250); } },
+  { id: 'flow: the diagram and its table', scope: '#hcn-p-flow', must: ['svg.cx-flow [data-node]'], min: 3, minText: 8,
+    open: async (page) => { await openSub(page, 'flow'); await page.locator('svg.cx-flow [data-node]').first().waitFor(); } },
+  { id: 'tasks: the task list', scope: '#hcn-p-tasks', must: ['#hcn-p-tasks li button'], min: 3, minText: 7,
+    open: async (page) => { await openSub(page, 'tasks'); await page.locator('#hcn-p-tasks li button').first().waitFor(); await page.waitForTimeout(250); } },
 ];
 
 /** Run as the VIEWER (carol): the same panels with fewer controls. A viewer has no composer and cannot steer, and that must be audited too. */
 export const VIEWER_STATES = [
-  { id: 'viewer: chat', scope: '#hcn-p-chat', must: ['#hcn-log'], min: 0, minText: 10, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); } },
+  { id: 'viewer: chat', scope: '#hcn-p-chat', must: ['#hcn-log[role="log"]'], min: 0, minText: 10, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); } },
   { id: 'viewer: lineage with a node selected', scope: '#hcn-p-lineage', must: ['.wb', 'svg.lin-svg g[data-node]'], min: 37, minText: 147,
     open: async (page) => {
       await openSub(page, 'lineage');

@@ -231,6 +231,13 @@ export function baselineSizes() {
   return { count: files.length, totalKb: files.reduce((a, b) => a + b.kb, 0), biggest: files.sort((a, b) => b.kb - a.kb)[0] || null };
 }
 
+/** The total the baseline directory would have after writing `pending` ([[file, png], ...]) over what is there now. */
+export function projectedTotalKb(pending, dir = BASELINE_DIR) {
+  const sizes = new Map(existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.png')).map((f) => [path.join(dir, f), statSync(path.join(dir, f)).size / 1024]) : []);
+  for (const [file, png] of pending) sizes.set(file, png.length / 1024);
+  return [...sizes.values()].reduce((a, b) => a + b, 0);
+}
+
 const git = (...args) => execFileSync('git', args, { cwd: REPO, encoding: 'utf8' });
 function refuseUnlessAllowed(argv) {
   if (!argv.includes(UPDATE_FLAG)) {
@@ -254,6 +261,7 @@ async function main() {
   const srv = await newDeterministicServer();
   const browser = await launch();
   let failed = 0;
+  const pending = [];
   try {
     mkdirSync(BASELINE_DIR, { recursive: true });
     for (const { surface, viewport, scheme } of combos(filter)) {
@@ -264,12 +272,20 @@ async function main() {
         if (cmd === 'update') {
           const kb = png.length / 1024;
           if (kb > CFG.screenshots.max_file_kb) { console.error(`${path.basename(file)} is ${kb.toFixed(0)} KB, above the ${CFG.screenshots.max_file_kb} KB cap: shrink the surface or raise the cap in ui-gates.yaml on purpose`); failed += 1; continue; }
-          writeFileSync(file, png); console.log(`wrote ${path.relative(REPO, file)} (${png.length} bytes)`); continue;
+          pending.push([file, png]); continue;      // nothing is written until the whole set is known to fit the total cap
         }
         const r = await compare(png);
         console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}: ${r.why}`);
         if (!r.ok) failed += 1;
       }
+    }
+    if (cmd === 'update') {
+      const total = projectedTotalKb(pending);
+      if (total > CFG.screenshots.max_total_kb) {
+        console.error(`refusing to write: the baselines would total ${total.toFixed(0)} KB, above the ${CFG.screenshots.max_total_kb} KB cap (screenshots.max_total_kb in ui-gates.yaml). Nothing was written.`);
+        failed += 1;
+      } else if (!failed) for (const [file, png] of pending) { writeFileSync(file, png); console.log(`wrote ${path.relative(REPO, file)} (${png.length} bytes)`); }
+      else console.error('refusing to write any baseline because one surface failed: nothing was written.');
     }
     const orphans = orphanBaselines();
     if (orphans.length) {

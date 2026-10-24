@@ -598,7 +598,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}</section>`}
-      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-tabs" hidden aria-label="Primary agents and their subagents">
+      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-tabs" hidden aria-label="Primary agents and their subagents"><h2 class="cx-sr">Agents by tab</h2>
         ${canInvite ? `<details class="cx-stack" id="hcn-ext"><summary>Invite a remote agent</summary>
           <form id="hcn-ext-form" class="cx-stack">
             <label class="cx-field">Name shown on its tab<input name="label" required maxlength="40" placeholder="Dana's Claude"></label>
@@ -633,9 +633,9 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
             <button class="hd-btn" type="submit">Delegate</button><span id="hcn-deleg-msg" class="cx-msg" role="alert"></span></form>
           <div id="hcn-delegs"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Quarantine</div><div id="hcn-props"></div><div id="hcn-review" aria-live="polite"></div></div></section>` : ''}
-      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-attention" hidden aria-label="Attention inbox"><div id="hcn-attention" class="cx-stack"></div></section><section class="hd-card cx-stack cx-panel" id="hcn-p-progress" hidden aria-label="Progress and analytics"><div id="hcn-progress" class="cx-stack"></div><div id="hcn-analytics" class="cx-stack"></div></section>'}
-      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><div id="hcn-consults" class="cx-stack"></div><div id="hcn-lineage" class="cx-stack"></div></section>'}
-      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-attention" hidden aria-label="Attention inbox"><div id="hcn-attention" class="cx-stack"></div></section><section class="hd-card cx-stack cx-panel" id="hcn-p-progress" hidden aria-label="Progress and analytics"><h2 class="cx-sr">Progress and analytics</h2><div id="hcn-progress" class="cx-stack"></div><div id="hcn-analytics" class="cx-stack"></div></section>'}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><h2 class="cx-sr">Lineage</h2><div id="hcn-consults" class="cx-stack"></div><div id="hcn-lineage" class="cx-stack"></div></section>'}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><h2 class="cx-sr">Linked workspaces and missions</h2><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
