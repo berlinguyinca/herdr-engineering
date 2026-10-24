@@ -163,3 +163,25 @@ def test_addresses_survive_a_restart(w, tmp_path):
     alice = again.authenticate(f"Bearer {USERS['alice']}", None)
     assert {a["agent_id"]: a["address"] for a in again.list_room_agents(alice, w.room)["agents"]} == {second: "alice.pi-2"}
     assert again.resolve_mentions(w.room, "@alice.pi-2")[0]["id"] == second
+
+
+def test_agents_report_skill_names_at_registration_and_the_room_only_lists_them(w):
+    info = w.s.connect_agent(w.alice, {"harness_type": "pi", "skills": ["skill:review", "skill:pdf-tools", "skill:review"]})
+    w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["read", "post"]})
+    row = w.s.list_room_agents(w.bob, w.room)["agents"][0]
+    assert row["skills"] == ["skill:pdf-tools", "skill:review"]
+    plain = w.s.connect_agent(w.alice, {"harness_type": "pi"})
+    w.s.grant_agent(w.alice, w.room, {"agent_id": plain["agent_id"], "actions": ["read"]})
+    assert {a["agent_id"]: a["skills"] for a in w.s.list_room_agents(w.bob, w.room)["agents"]}[plain["agent_id"]] == []
+    for bad in ("skill:x", [1], ["has space"], ["x" * 65], ["a\nb"], ["ok"] * 101, [""]):
+        assert code(w.s.connect_agent, w.alice, {"harness_type": "pi", "skills": bad}) == 400, bad
+
+
+def test_join_and_enrollment_carry_skills_too(w):
+    tok = w.s.create_join_token(w.alice, {"harness_type": "pi", "name_prefix": "fleet", "count": 2})["token"]
+    joined = w.s.redeem_join_token({"token": tok, "skills": ["deploy"]})
+    assert w.s._agents[joined["agent_id"]]["skills"] == ["deploy"]
+    assert code(w.s.redeem_join_token, {"token": tok, "skills": "deploy"}) == 400
+    start = w.s.start_enrollment(w.alice, {"device_id": "dev1", "harness_type": "pi"})
+    done = w.s.complete_enrollment({"code": start["code"], "device_id": "dev1", "skills": ["skill:review"]})
+    assert w.s._agents[done["agent_id"]]["skills"] == ["skill:review"]

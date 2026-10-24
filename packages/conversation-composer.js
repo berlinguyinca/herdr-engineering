@@ -1,6 +1,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import { parseJson, mountJsonViewer } from './conversation-json.js';
+import { completionAt as sigilAt, applyCompletion } from './collab-mention.js';
 
 let nextId = 0;
 
@@ -16,6 +17,8 @@ export function completionAt(text, caret) {
   const match = /(?:^|\s)([@/][^\s@<>]*)$/.exec(String(text).slice(0, caret));
   return match ? { start: caret - match[1].length, query: match[1].slice(1).toLowerCase(), trigger: match[1][0] } : null;
 }
+
+const ICONS = { person: '👤', group: '👥', robot: '🤖', file: '📄', issue: '#', command: '/', skill: '✦' };
 
 // The caller owns authentication and delivery. Only its upload adapter can turn
 // a local File into an artifact that onSend is allowed to hand to the runtime.
@@ -69,12 +72,30 @@ export function mountComposer(host, options = {}) {
   };
   const close = () => { items = []; popup.hidden = true; input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); };
   const drawSuggestions = () => {
-    popup.innerHTML = items.map((item, i) => `<li role="option" id="${id}-option-${i}" data-index="${i}" aria-selected="${i === selection}"><b>${esc(item.label)}</b>${item.detail ? `<span>${esc(item.detail)}</span>` : ''}</li>`).join('');
+    popup.innerHTML = items.map((item, i) => {
+      const heading = item.section && item.section !== items[i - 1]?.section ? `<li role="presentation" class="conversation-suggestions-section">${esc(item.section)}</li>` : '';
+      const icon = item.icon ? `<span class="conversation-suggestion-icon" data-icon="${esc(item.icon)}" aria-hidden="true">${ICONS[item.icon] || ''}</span>` : '';
+      return `${heading}<li role="option" id="${id}-option-${i}" data-index="${i}" aria-selected="${i === selection}"${item.section ? ` data-section="${esc(item.section)}"` : ''}>${icon}<b>${esc(item.label)}</b>${item.detail ? `<span>${esc(item.detail)}</span>` : ''}</li>`;
+    }).join('');
     popup.hidden = false; input.setAttribute('aria-expanded', 'true'); input.setAttribute('aria-activedescendant', `${id}-option-${selection}`);
-    popup.children[selection]?.scrollIntoView({ block: 'nearest' });
+    popup.querySelector(`#${id}-option-${selection}`)?.scrollIntoView({ block: 'nearest' });
+  };
+  // Sigil providers (`@`, `#`, `/`): one function per sigil, given the typed query and the caller's context.
+  const providerItems = () => {
+    const token = sigilAt(input.value, input.selectionStart);
+    const provide = token && options.providers[token.sigil];
+    if (!provide) return [];
+    const ctx = typeof options.context === 'function' ? options.context() : options.context || {};
+    return provide(token.query, { ...ctx, agent: token.agent }).slice(0, 12).map((item) => ({ id: `${item.section}:${item.insert}`, ...item }));
   };
   const suggest = () => {
     if (disabled || sending || composing) return close();
+    if (options.providers) {
+      const found = providerItems();
+      if (!found.length) return close();
+      if (found.length !== items.length || found.some((item, i) => item.id !== items[i]?.id)) selection = 0;
+      items = found; drawSuggestions(); return;
+    }
     const token = completionAt(input.value, input.selectionStart);
     if (!token) return close();
     const candidates = typeof options.suggestions === 'function' ? options.suggestions(token.query, token.trigger) : options.suggestions || [];
@@ -155,6 +176,12 @@ export function mountComposer(host, options = {}) {
     apply(text.slice(0, start) + before + body + after + text.slice(end), start + before.length, start + before.length + body.length);
   };
   const choose = (index) => {
+    if (options.providers) {             // the item's literal text, nothing else: what a harness reads is what was typed
+      const token = sigilAt(input.value, input.selectionStart), item = items[index];
+      if (!token || !item) return close();
+      const next = applyCompletion(input.value, input.selectionStart, token.start, item);
+      apply(next.text, next.caret); return;
+    }
     const token = completionAt(input.value, input.selectionStart), item = items[index];
     if (!token || !item) return close();
     const head = input.value.slice(0, token.start) + item.insertText + ' ';
