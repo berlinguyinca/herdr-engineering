@@ -304,7 +304,10 @@ class CollabService:
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, summary_fix: dict | None = None,
                  archive_service: Any = None, upload_service: Any = None, upload_runner: Any = None,
-                 analysis_service: Any = None, analysis_runner: Any = None):
+                 analysis_service: Any = None, analysis_runner: Any = None,
+                 skill_service: Any = None, skill_runner: Any = None):
+        self.skill_service = skill_service
+        self.skill_runner = skill_runner
         self.analysis_service = analysis_service
         self.analysis_runner = analysis_runner
         self.archive_service = archive_service
@@ -384,6 +387,31 @@ class CollabService:
         self.stats = defaultdict(int)
 
     # ------------------------------------------------------------ plumbing
+    async def _skill_operation(self, name, principal, *args):
+        if self.skill_service is None:
+            raise CollabError(503, "relational skill service unavailable")
+        try:
+            return await getattr(self.skill_service, name)(principal, *args)
+        except CollabError:
+            raise
+        except Exception:
+            raise CollabError(503, "skill operation unavailable; retry") from None
+
+    async def search_skills(self, principal, query, scope):
+        return await self._skill_operation('search_skills', principal, query, scope)
+
+    async def get_skill(self, principal, skill_id, version):
+        return await self._skill_operation('get_skill', principal, skill_id, version)
+
+    async def download_skill(self, principal, skill_id, version):
+        return await self._skill_operation('download_skill', principal, skill_id, version)
+
+    async def install_skill(self, principal, skill_id, version):
+        return await self._skill_operation('install_skill', principal, skill_id, version)
+
+    async def record_skill_installation(self, principal, skill_id, version, sha256):
+        return await self._skill_operation('record_installation', principal, skill_id, version, sha256)
+
     async def _analysis_operation(self, name, principal, *args, **kwargs):
         if self.analysis_service is None:
             raise CollabError(503, "relational analysis service unavailable")
