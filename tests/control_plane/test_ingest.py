@@ -28,9 +28,10 @@ def test_host_upsert_is_idempotent_across_heartbeats():
     assert h["host_name"] == "bender"
     assert h["tailnet_ip"] == "100.104.39.6"
     assert h["cpu"] == 15
-    # two heartbeats + one registered event recorded
+    # Routine heartbeats (same identity) refresh liveness in memory only: one
+    # registered event, no per-heartbeat HostHeartbeat (I-1, unbounded growth).
     types = [e["event_type"] for e in repo.stream("host", "bender")]
-    assert types == ["HostRegistered", "HostHeartbeat", "HostHeartbeat"]
+    assert types == ["HostRegistered"]
 
 
 def test_session_upsert_start_then_stop():
@@ -269,3 +270,22 @@ def test_session_retains_validated_identity_repair_status():
         svc.ingest({"entity_type": "session", "entity_id": "bad", "event_type": "session.updated",
                     "payload": {"transcript": {"status": "recording", "identity_repair": "invented"}}})
     assert svc.repo.get_session("bad") is None
+
+
+@pytest.mark.parametrize("entity_type", [
+    "pr_gate", "pr_gate_author", "review_job", "pr_gate_future", "review_jobs", "PR_GATE", " pr_gate"])
+def test_generic_ingest_rejects_review_gate_streams(entity_type):
+    repo = ControlPlaneRepo()
+    with pytest.raises(ValueError, match="reserved"):
+        make_svc(repo).ingest({
+            "entity_type": entity_type, "entity_id": "github.com/acme/widgets#7",
+            "event_type": "verdict", "payload": {"verdict": "PASS", "sha": "a" * 40}})
+    assert repo.stream(entity_type, "github.com/acme/widgets#7") == []
+
+
+def test_reserved_prefixes_cover_every_gate_stream():
+    from herdr_engineering.review_gate import queue, registry, store
+    from herdr_engineering.review_gate.entities import RESERVED_ENTITY_PREFIXES
+
+    for entity in (store.ENTITY, queue.ENTITY, registry.ENTITY):
+        assert entity.startswith(RESERVED_ENTITY_PREFIXES)

@@ -5,10 +5,14 @@ import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts
 import { renderFlow } from './collab-flow.js';
 import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
+import { decisionBody, delegationBody, renderDelegations, renderProposalList, renderReview } from './collab-proposals.js';
 import {
   filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
 } from './collab-lineage.js';
 import { commentBody, freshDraft, proposalBody, renderWorkbench } from './collab-workbench.js';
+import {
+  createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
+} from './collab-helpers.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import {
@@ -19,8 +23,8 @@ const store = new TokenStore(window.sessionStorage);
 let operator = false;   // the local owner on the dashboard: no sign-in, the server knows who they are
 const api = new CollabApi(() => (operator ? { access: 'operator', id: 'operator' } : store.get()));
 const ROLES = [['contributor', 'Can chat'], ['viewer', 'Read only'], ['guest', 'Guest (read only, expires)']];
-const PERMS = [['read', 'Read messages'], ['post', 'Write messages'], ['execute', 'Receive tasks'], ['instruct', 'Send tasks to agents']];
-const PERM_SHORT = { read: 'Read', post: 'Write', execute: 'Receive tasks', instruct: 'Send tasks' };
+const PERMS = [['read', 'Read messages'], ['post', 'Write messages'], ['execute', 'Receive tasks'], ['instruct', 'Send tasks to agents'], ['spawn_helpers', 'Start helper agents']];
+const PERM_SHORT = { read: 'Read', post: 'Write', execute: 'Receive tasks', instruct: 'Send tasks', spawn_helpers: 'Start helpers' };
 const ROLE_LABEL = { owner: 'Owner', contributor: 'Can chat', viewer: 'Read only', guest: 'Guest' };
 
 async function loadConfig() {
@@ -219,10 +223,16 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           <span class="hd-card__title">${esc(r.name)}</span>
           <span class="cx-row cx-row--between">${pill(roleLabel(r.role), r.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}<span class="hd-card__sub">Open →</span></span></button>`).join('')}</div>`
         : '<div class="hd-empty">No rooms yet. Create your first one below.</div>'}
+      ${operator ? '<div id="hcn-helpers-panel"></div>' : ''}
       <section class="cx-section"><h2>New room</h2>
         <form id="hcn-new" class="hd-card cx-form"><label class="cx-field">Room name<input name="name" required maxlength="120" placeholder="e.g. Metabolomics review"></label>
           <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></section>`, strip);
-    document.querySelectorAll('[data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
+    document.querySelectorAll('#hcn-rooms [data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
+    if (operator && $('hcn-helpers-panel')) {   // all rooms' host requests, helpers and the panic switch; the operator is rarely a member of the rooms asking
+      const panel = createHelpersPanel({ container: $('hcn-helpers-panel'), api, operator, getRooms: async () => (await api.rooms()).rooms || [], go, hidden: () => document.hidden });
+      teardown = () => panel.destroy();
+      panel.start();
+    }
     $('hcn-new').onsubmit = async (ev) => {
       ev.preventDefault();
       const name = new FormData(ev.target).get('name');
@@ -553,8 +563,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['links', 'Workspaces']]), ...(canInvite ? [['people', 'People']] : [])];
+    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
+    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
@@ -573,8 +583,44 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       ${guest ? '' : `<section class="cx-panel cx-cols" id="hcn-p-agents" hidden>
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
-        ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}</section>`}
-      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-tabs" hidden aria-label="Primary agents and their subagents"><div id="hcn-tabs" aria-live="polite"></div></section>'}
+        ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}
+        ${operator ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helpers</div><div id="hcn-panic"></div><div class="hd-card__title">Host access requests</div><div id="hcn-egress"></div><div class="hd-card__title">External hosts</div><div id="hcn-hosts-table"></div></div>' : ''}
+        ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helper profile</div><div id="hcn-profile-box"></div></div>' : ''}</section>`}
+      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-tabs" hidden aria-label="Primary agents and their subagents">
+        ${canInvite ? `<details class="cx-stack" id="hcn-ext"><summary>Invite a remote agent</summary>
+          <form id="hcn-ext-form" class="cx-stack">
+            <label class="cx-field">Name shown on its tab<input name="label" required maxlength="40" placeholder="Dana's Claude"></label>
+            <fieldset class="cx-stack"><legend class="cx-msg">It may</legend>
+              <label><input type="checkbox" checked disabled> read this room's chat</label>
+              <label><input type="checkbox" name="post"> post messages</label>
+              <label><input type="checkbox" name="lineage"> report its own lineage to the graph</label>
+              <label><input type="checkbox" name="proposals"> be given bounded tasks and send artifact proposals (held in quarantine; nothing is applied)</label></fieldset>
+            <label class="cx-field">Invite valid for<select name="ttl"><option value="900">15 minutes</option><option value="3600" selected>1 hour</option><option value="86400">1 day</option></select></label>
+            <label class="cx-field">Credential lasts<select name="cred"><option value="3600">1 hour</option><option value="86400" selected>1 day</option><option value="604800">7 days</option></select></label>
+            <div class="cx-msg">A remote agent never gets a terminal, a shell or any right to give or take tasks. You can revoke it at any time.</div>
+            <button class="hd-btn" type="submit">Create invite</button><span id="hcn-ext-msg" class="cx-msg" role="status"></span></form>
+          <div id="hcn-ext-code" class="cx-stack" role="status"></div></details>` : ''}
+        <div id="hcn-ext-invites"></div>
+        <div id="hcn-tabs" aria-live="polite"></div></section>`}
+      ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-proposals" hidden aria-label="Bounded tasks and proposals">
+        <div class="hd-card cx-stack"><div class="hd-card__title">Delegate a bounded task</div>
+          <form id="hcn-deleg" class="cx-stack">
+            <label class="cx-field">To<select name="target" id="hcn-deleg-target" required></select></label>
+            <label class="cx-field">What should it look at?<textarea class="cx-input" name="text" required maxlength="4000" rows="3"></textarea></label>
+            <label class="cx-field">Repository paths it may write (one per line, <code>dir/</code> for a folder)<textarea class="cx-input" name="paths" rows="2"></textarea></label>
+            <label class="cx-field">Graph nodes it may refer to (one per line, like <code>commit:abc123</code>)<textarea class="cx-input" name="nodes" rows="2"></textarea></label>
+            <label class="cx-field">Questions (one per line, <code>id: text</code>)<textarea class="cx-input" name="questions" rows="2"></textarea></label>
+            <fieldset class="cx-stack"><legend class="cx-msg">It may answer with</legend>
+              <label><input type="checkbox" name="kind" value="doc" checked> a document</label><label><input type="checkbox" name="kind" value="analysis"> an analysis</label>
+              <label><input type="checkbox" name="kind" value="patch"> a patch</label><label><input type="checkbox" name="kind" value="link"> a link</label></fieldset>
+            <div class="cx-row"><label class="cx-field">Proposals<input name="maxProposals" type="number" min="1" max="5" value="1"></label>
+              <label class="cx-field">Steps<input name="maxSteps" type="number" min="1" max="200" value="20"></label>
+              <label class="cx-field">Max bytes<input name="maxBytes" type="number" min="256" max="32768" value="16384"></label>
+              <label class="cx-field">Expires<select name="expires"><option value="1800">30 minutes</option><option value="3600" selected>1 hour</option><option value="21600">6 hours</option><option value="86400">1 day</option></select></label></div>
+            <div class="cx-msg">The agent can only answer with a proposal. It goes to quarantine below; nothing is applied and no command runs. Token limits are advisory: the server cannot measure them.</div>
+            <button class="hd-btn" type="submit">Delegate</button><span id="hcn-deleg-msg" class="cx-msg" role="alert"></span></form>
+          <div id="hcn-delegs"></div></div>
+        <div class="hd-card cx-stack"><div class="hd-card__title">Quarantine</div><div id="hcn-props"></div><div id="hcn-review" aria-live="polite"></div></div></section>` : ''}
       ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><div id="hcn-lineage" class="cx-stack"></div></section>'}
       ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
@@ -592,7 +638,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const stale = new Set();               // panels whose redraw was held back because you were typing in them
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
-    teardown = () => { alive = false; composer?.dispose(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
+    teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
     const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
 
     // Replace a container's markup only when it changed and you are not typing in it.
@@ -618,9 +664,11 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       const at = new Date(e.created_at);
       const time = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       if (e.event_type === 'message') {
-        const agent = e.sender.type === 'agent';
+        const remote = e.sender.type === 'external';
+        const agent = e.sender.type === 'agent' || remote;
         const mine = !agent && e.sender.id === me.user_id;
-        const who = agent ? (agentName.has(e.sender.id) ? `@${agentName.get(e.sender.id)}` : `Agent of ${names.get(e.sender.owner_user_id) || shortId(e.sender.owner_user_id)}`)
+        const remoteRow = remote ? ((S.externals && S.externals.externals) || []).find((r) => r.agent_id === e.sender.id) : null;
+        const who = remote ? `Remote: ${remoteRow ? remoteRow.label : 'agent invited by ' + (names.get(e.sender.owner_user_id) || shortId(e.sender.owner_user_id))}` : agent ? (agentName.has(e.sender.id) ? `@${agentName.get(e.sender.id)}` : `Agent of ${names.get(e.sender.owner_user_id) || shortId(e.sender.owner_user_id)}`)
           : (mine ? 'You' : (names.get(e.sender.id) || shortId(e.sender.id)));
         const key = `${e.sender.type}:${e.sender.id}`;
         const cont = key === lastKey && at - lastAt < 5 * 60000;
@@ -728,6 +776,30 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       });
     };
 
+    // ---- agent helpers: panic switch, host-access requests and hosts (operator), profile (owner)
+    const loadHelpers = async () => {
+      if (operator) {
+        try { S.egress = ((await api.egressRequests()).requests || []).filter((r) => r.room_id === roomId); } catch { /* keep the old list */ }
+        try { const h = await api.helpers(); S.helpers = h.helpers || []; S.paused = Boolean(h.paused); } catch { /* keep */ }
+      } else { try { S.helpers = (await api.myHelpers()).helpers || []; } catch { /* guests and old servers: no helper list */ } }
+      if (operator) { try { const x = await api.egressAllowlist(roomId); S.allow = x.allowlist || []; S.entries = Array.isArray(x.entries) ? x.entries : null; } catch { /* keep */ } }
+      if (canInvite) { try { S.profile = await api.roomProfile(roomId); } catch { /* not readable: keep */ } }
+    };
+    const drawHelpers = () => {
+      if (operator) {
+        put('hcn-panic', renderPanic(S.paused, { operator }));
+        put('hcn-egress', renderEgressRequests(S.egress, { operator }));
+        put('hcn-hosts-table', renderHostsTable(S.allow || [], S.egress, { operator, room: roomId, permanent: S.profile && Array.isArray(S.profile.permanent_hosts) ? S.profile.permanent_hosts : null, entries: S.entries }));
+      }
+      if (canInvite && S.profile) put('hcn-profile-box', renderProfileEditor(S.profile, { owner: canInvite }));
+    };
+    const unbindHelpers = wireHelperHandlers(root, {
+      api, roomId, operator, owner: canInvite, act, getProfile: () => S.profile, setProfile: (p) => { S.profile = p; $('hcn-profile-msg').textContent = 'Saved.'; },
+      onError: (m) => { $('hcn-profile-msg').textContent = m; },
+      refresh: async () => { await loadHelpers(); drawHelpers(); },
+      readForm: (f) => { const fd = new FormData(f); return { services: fd.get('services'), ssh_secret_names: fd.get('ssh_secret_names'), allowed_models: fd.get('allowed_models'), allowed_families: fd.getAll('allowed_families'), tools_allowed: fd.get('tools_allowed') !== null, permanent_hosts: fd.get('permanent_hosts') }; },
+    });
+
     // ---- live flow: nodes are people/agents, edges are tasks; the dashboard adds fabric session state
     let flowSig = new Map();
     const showDetail = (html) => { const d = $('hcn-flow-detail'); if (d) d.innerHTML = html; };
@@ -745,7 +817,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         onNode: (n) => {
           const mine = flow.edges.filter((e) => e.from === n.id || e.to === n.id).map((e) => `${esc(flow.nodes.find((x) => x.id === e.from)?.name)} → ${esc(flow.nodes.find((x) => x.id === e.to)?.name)}: ${esc(Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}`);
           const f = n.fabric ? `<br>Fabric agent ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}${n.fabric.parent_session_id ? ` · started by agent ${esc(n.fabric.parent_session_id)}` : ''}${nativeSessionLink(n.fabric.session_id) ? `<br>${nativeSessionLink(n.fabric.session_id)}` : ''}` : '';
-          showDetail(`<b>${esc(n.fabric?.display_name || (n.kind === 'agent' ? `@${n.name}` : n.name))}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}`);
+          showDetail(`<b>${esc(n.fabric?.display_name || (n.kind === 'agent' ? `@${n.name}` : n.name))}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}${n.kind === 'agent' ? renderHelperTree(n.agent_id, flow, S.helpers, { operator, viewerId: me && me.user_id }) : ''}`);
         },
         onEdge: (e) => {
           const ts = flow.tasks.filter((t) => t.from === e.from && t.to === e.to).slice(0, 5);
@@ -780,15 +852,27 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         const none = { nodes: [], edges: [] };
         const [agents, tabNodes, paneNodes] = await Promise.all([
           api.graphList(roomId, 'agent', 'spawn'), api.graphList(roomId, 'tab'), api.graphList(roomId, 'pane')].map((p) => p.catch(() => none)));
-        S.tabs = buildTabsPanes([agents, tabNodes, paneNodes], S.links || []);
+        // The remote-agent roster comes from the collaboration service itself (so it works where the graph is
+        // not served); a failed read keeps the last roster rather than inventing one.
+        try { S.externals = await api.externals(roomId); } catch { /* keep the last roster */ }
+        S.tabs = buildTabsPanes([agents, tabNodes, paneNodes], S.links || [], S.externals ? S.externals.externals : null);
       } finally { S.tabsAt = Date.now(); tabsBusy = false; }
     };
     function drawTabs() {
       const show = () => {
         const box = $('hcn-tabs');
         if (!box) return;
-        if (put('hcn-tabs', renderTabsPanes(S.tabs || { tabs: [], hidden_by_grant: 0 }, S.tabSel))) {
+        const pend = (S.externals && S.externals.invites) || [];
+        put('hcn-ext-invites', pend.length ? `<ul class="cx-list" aria-label="Open remote-agent invites">${pend.map((i) => `<li><span class="grow"><b>${esc(i.label)}</b> <span class="cx-msg">invited, not yet used · may ${esc((i.actions || []).join(', '))}${i.lineage ? ', report lineage' : ''}</span></span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel-ext="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>` : '');
+        $('hcn-ext-invites')?.querySelectorAll('[data-cancel-ext]').forEach((b) => { b.onclick = () => act(async () => { await api.revokeExternalInvite(roomId, b.dataset.cancelExt); S.tabsAt = 0; $('hcn-ext-invites').dataset.h = ''; }); });
+        if (put('hcn-tabs', renderTabsPanes(S.tabs || { tabs: [], hidden_by_grant: 0 }, S.tabSel, { canManage: canInvite }))) {
           const ids = (S.tabs?.tabs || []).map((t) => t.agent_id);
+          box.querySelectorAll('[data-revoke]').forEach((b) => {
+            b.onclick = () => {
+              if (!window.confirm('Revoke this remote agent? It is cut off at once; what it already did stays visible.')) return;
+              act(async () => { await api.revokeExternal(roomId, b.dataset.revoke); S.tabsAt = 0; box.dataset.h = ''; });
+            };
+          });
           box.querySelectorAll('[data-tab]').forEach((b) => {
             b.onclick = () => { S.tabSel = b.dataset.tab; box.dataset.h = ''; drawTabs(); };
             b.onkeydown = (e) => {
@@ -800,6 +884,42 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       };
       show();
       loadTabs().then(show);
+    }
+    // Bounded tasks and proposals (T11): the owner's quarantine view. Content is untrusted text; see collab-proposals.js.
+    let propBusy = false;
+    const loadProposals = async () => {
+      if (propBusy) return;
+      propBusy = true;
+      try {
+        const [d, p] = await Promise.all([api.delegations(roomId), api.proposals(roomId)]);
+        S.deleg = d; S.props = p;
+        if (S.propSel) { try { S.propOne = await api.proposal(roomId, S.propSel); } catch { S.propOne = null; } }
+      } catch { /* keep what is shown; a service with delegation off answers 403 */ } finally { propBusy = false; }
+    };
+    function drawProposals() {
+      const show = () => {
+        const targets = ((S.externals && S.externals.externals) || []).filter((x) => x.proposals && x.state === 'active');
+        put('hcn-deleg-target', targets.length ? targets.map((x) => `<option value="${esc(x.agent_id)}">${esc(x.label)}</option>`).join('') : '<option value="">No remote agent was invited for bounded tasks</option>');
+        if (put('hcn-delegs', renderDelegations(S.deleg))) {
+          $('hcn-delegs').querySelectorAll('[data-cancel-deleg]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelDelegation(roomId, b.dataset.cancelDeleg); $('hcn-delegs').dataset.h = ''; }); });
+        }
+        if (put('hcn-props', renderProposalList(S.props, S.propSel))) {
+          $('hcn-props').querySelectorAll('[data-proposal]').forEach((b) => { b.onclick = () => { S.propSel = b.dataset.proposal; $('hcn-props').dataset.h = ''; $('hcn-review').dataset.h = ''; loadProposals().then(show); }; });
+        }
+        if (put('hcn-review', renderReview(S.propOne))) {
+          $('hcn-review').querySelectorAll('[data-decide]').forEach((b) => {
+            b.onclick = () => act(async () => {
+              const ask = b.dataset.decide === 'accept' ? 'Record this proposal in the graph as accepted? Nothing is applied or run.' : 'Reject this proposal?';
+              if (!window.confirm(ask)) return;
+              await api.decideProposal(roomId, b.dataset.pid, decisionBody(b.dataset.decide, b.dataset.digest, ($('hcn-prop-reason') || {}).value));
+              ['hcn-props', 'hcn-review', 'hcn-delegs'].forEach((id) => { $(id).dataset.h = ''; });
+              await loadProposals();
+            });
+          });
+        }
+      };
+      show();
+      loadTabs().then(() => loadProposals()).then(show);
     }
 
     // ---- Lineage: graph, Gantt, replay and inspector. Read-only; the server filters every read by your CURRENT
@@ -1029,7 +1149,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       });
     }
     const setBadge = (k, n) => { const b = $(`hcn-b-${k}`); if (!b) return; b.hidden = !n; b.textContent = n > 99 ? '99+' : String(n); };
-    const loadMine = async () => { try { S.mine = (await api.agents()).agents; } catch { /* keep the old list */ } };
+    const loadMine = async () => { try { S.mine = (await api.agents()).agents.filter((x) => !x.external); }   // a remote agent is bound to its invite: nothing to grant
+       catch { /* keep the old list */ } };
     function paint() {
       setBadge('agents', (S.requests || []).length);
       setBadge('tasks', S.tasks.filter((t) => ['pending', 'accepted'].includes(t.status)).length);
@@ -1037,11 +1158,13 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       else if (sub === 'flow') drawFlow();
       else if (sub === 'links') put('hcn-links', renderLinks(S.links, S.missions));
       else if (sub === 'tabs') drawTabs();
+      else if (sub === 'proposals') drawProposals();
       else if (sub === 'lineage') drawLineage();
-      else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); }
+      else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); }
     }
     const paintPanel = async () => {
       if (sub === 'agents' && canPost) await loadMine();
+      if (sub === 'agents') await loadHelpers();
       if (sub === 'people') await drawPeople();
       paint();
     };
@@ -1128,6 +1251,41 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           await api.invite(roomId, f.get('email'), f.get('role'));
           msg.textContent = 'Invited. They get access when they sign in here.';
           ev.target.reset(); $('hcn-people').dataset.h = ''; paintPanel();
+        } catch (e) { msg.textContent = e.message; }
+      };
+    }
+    const extForm = $('hcn-ext-form');
+    if (extForm) {
+      extForm.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const f = new FormData(ev.target);
+        const msg = $('hcn-ext-msg');
+        const box = $('hcn-ext-code');
+        try {
+          const out = await api.inviteExternal(roomId, {
+            label: String(f.get('label') || ''), actions: f.get('post') ? ['read', 'post'] : ['read'],
+            lineage: !!f.get('lineage'), proposals: !!f.get('proposals'), ttl_seconds: Number(f.get('ttl')), credential_ttl_seconds: Number(f.get('cred')) });
+          msg.textContent = '';
+          // shown once: the server keeps only a digest of the code
+          box.innerHTML = `<div class="cx-msg">Give this one-time code to your coworker. It is shown only now, works once and expires ${esc(new Date(out.expires_at * 1000).toISOString())}.</div>`
+            + `<code class="cx-code" id="hcn-ext-codeval" tabindex="0">${esc(out.code)}</code>`
+            + `<div class="cx-msg">Their bridge redeems it with <code>POST /api/v1/collab/agents/join</code> (<code>{"token": "…"}</code>) and then reports with the credential it receives. See docs/operations/external-agents.md.</div>`;
+          ev.target.reset(); S.tabsAt = 0; $('hcn-ext-invites').dataset.h = ''; drawTabs();
+        } catch (e) { msg.textContent = e.message; box.textContent = ''; }
+      };
+    }
+    const delegForm = $('hcn-deleg');
+    if (delegForm) {
+      delegForm.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const f = new FormData(ev.target);
+        const msg = $('hcn-deleg-msg');
+        try {
+          await api.delegate(roomId, delegationBody({
+            target: f.get('target'), text: f.get('text'), paths: f.get('paths'), nodes: f.get('nodes'), questions: f.get('questions'),
+            kinds: f.getAll('kind'), maxProposals: f.get('maxProposals'), maxSteps: f.get('maxSteps'), maxBytes: f.get('maxBytes'), expires: f.get('expires') }));
+          msg.textContent = 'Delegated.';
+          ev.target.reset(); $('hcn-delegs').dataset.h = ''; drawProposals();
         } catch (e) { msg.textContent = e.message; }
       };
     }
