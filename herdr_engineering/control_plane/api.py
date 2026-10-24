@@ -34,6 +34,7 @@ from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .graph import read_graph
 from .redact import redact_ingest_body, redact_payload
+from .review_quorum import pr_review_quorum
 
 log = logging.getLogger(__name__)
 
@@ -149,7 +150,8 @@ class ControlPlaneServer:
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None):
+                 summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
+                 review_quorum=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -234,6 +236,7 @@ class ControlPlaneServer:
                 f"{host!r} without collab_tls_terminated (bearer credentials "
                 "require TLS)")
         self.fleet_config = fleet_config
+        self.review_quorum = review_quorum      # QuorumConfig | None (feature off)
         self.collab = collab
         self.collab_require_https = collab_require_https
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
@@ -1533,6 +1536,15 @@ def _make_handler(server, public=False, operator=False):
         def _graph_get(self, parts):
             """Lineage graph reads (viewer level). Every result is filtered by the
             caller's principal; hidden and missing both answer 404."""
+            parts = list(parts)
+            if len(parts) == 7 and parts[4] == "nodes" and parts[6] == "review-quorum":
+                if server.review_quorum is None:
+                    return self._json({"error": "review quorum is not configured"}, 404)
+                try:
+                    return self._json(pr_review_quorum(server.repo.graph, self._principal(), parts[5],
+                                                       server.review_quorum))
+                except KeyError:
+                    return self._json({"error": "not found"}, 404)
             return self._json(read_graph(server.repo.graph, self._principal(), parts[4:],
                                          lambda name: _q(self.path, name)))
 
