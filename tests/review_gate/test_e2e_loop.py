@@ -87,6 +87,10 @@ class FakeGitHub:
     def set_status(self, repo, sha, state, description, *, context="herdr/review-gate"):
         self.calls.append(("status", sha, state, description))
 
+    def pr_state(self, repo, number):
+        self.calls.append(("pr_state", number))
+        return next((p for p in self.prs if p.number == number), None)
+
     def merge_pr(self, repo, number, sha):
         self.calls.append(("merge", repo, number, sha))
         return True

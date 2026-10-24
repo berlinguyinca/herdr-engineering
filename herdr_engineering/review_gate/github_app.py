@@ -273,6 +273,36 @@ class GitHubAppClient:
             "invalid_response"
         )  # cap reached with a full page: never truncate silently
 
+    def pr_state(self, repo: str, number: int) -> PrInfo | None:
+        """One fresh read of a PR: its PrInfo while open, None otherwise.
+
+        Used right before a merge so a head move or retarget after the tick's
+        listing is seen. Malformed data raises GitHubAppError("invalid_response").
+        """
+        slug, number = _repo_path(repo), _number(number)
+        data = self._send("GET", f"/repos/{slug}/pulls/{number}")
+        try:
+            state = data["state"]
+            info = PrInfo(
+                number=number,
+                head_sha=data["head"]["sha"],
+                head_ref=data["head"]["ref"],
+                base_ref=data["base"]["ref"],
+                author_login=str((data.get("user") or {}).get("login", "")),
+                draft=data.get("draft", False),
+            )
+        except (KeyError, TypeError, AttributeError):
+            raise GitHubAppError("invalid_response") from None
+        if not all(
+            isinstance(v, str) for v in (state, info.head_sha, info.head_ref, info.base_ref)
+        ):
+            raise GitHubAppError("invalid_response")
+        if not isinstance(info.draft, bool):
+            raise GitHubAppError("invalid_response")
+        if state != "open":
+            return None
+        return info
+
     def _review_pr(self, slug, number, sha):
         """(title, body, base_ref) while the PR is open at ``sha``; None otherwise."""
         data = self._send("GET", f"/repos/{slug}/pulls/{number}")
@@ -296,7 +326,7 @@ class GitHubAppClient:
 
         Patches are included until their running UTF-8 size would exceed ``max_bytes``; after
         that files are only listed. Anything left out sets ``truncated``. The PR is re-read after
-        the files so a push in between yields None.
+        the files so a push, close or retarget (base change) in between yields None.
         """
         slug, number, sha = _repo_path(repo), _number(number), _sha(expected_head_sha)
         if type(max_bytes) is not int or max_bytes < 0:
@@ -332,8 +362,9 @@ class GitHubAppClient:
                 break
         else:
             truncated = True  # read PR_FILES_CAP files: there may be more
-        if self._review_pr(slug, number, sha) is None:
-            return None
+        second = self._review_pr(slug, number, sha)
+        if second is None or second[2] != first[2]:
+            return None  # head moved, closed, or retargeted during the fetch
         title, body, base_ref = first
         return ReviewMaterial(title, body, base_ref, sha, tuple(files), truncated)
 

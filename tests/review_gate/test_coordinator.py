@@ -567,10 +567,21 @@ def test_verdict_records_the_base_the_reviewer_saw(env):
     assert env.snap().approved_base_ref == "feature-x"
 
 
-def test_verdict_after_restart_uses_the_refetched_base(env):
+def test_verdict_after_restart_records_no_base_and_so_fails_closed(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
     env.app.base = "release"
     fresh = restarted(env)
     assert fresh.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "recorded"
-    assert env.snap().approved_base_ref == "release"
+    assert env.snap().approved_base_ref is None  # unknown: GateService re-reviews
+
+
+def test_material_refused_for_a_base_change_during_the_fetch_is_skipped(env):
+    """review_material returns None when the base changed between its two PR reads."""
+    env.ready()
+    env.app.result = "none"
+    assert env.coord.claim("w1", "reviewer-model") is None
+    snap = env.snap()
+    assert snap.state == State.REVIEWING and snap.approved_sha is None
+    events = [e["event_type"] for e in env.store._repo.stream("pr_gate", str(KEY))]
+    assert "verdict" not in events

@@ -65,8 +65,9 @@ nothing. A coordinator restart draws a new secret: in-flight reviews become
 stale (wasted, never wrongly recorded).
 
 Base ref: the verdict records the PR base the reviewer saw (``base_ref`` of the
-material fetched at claim, or re-fetched after a restart). A PASS approves for
-that base only; GateService re-reviews when the PR is retargeted.
+material fetched at claim). After a restart that base is unknown, so the
+verdict records None and GateService re-reviews instead of merging. A PASS
+approves for the recorded base only; GateService re-reviews a retargeted PR.
 """
 
 from __future__ import annotations
@@ -243,7 +244,9 @@ class ReviewCoordinator:
                 return "rejected"
             if material is None:
                 return "rejected"
-            held = _Held(bool(material.truncated), UNKNOWN_REVIEWER, _base(material))
+            # base_ref None: the base the reviewer saw is unknown after a restart,
+            # so an approval fails closed into a re-review (GateService._approved).
+            held = _Held(bool(material.truncated), UNKNOWN_REVIEWER, None)
         with self._lock:
             if not self._token_ok(job_id, worker_id, claim_token):
                 return "stale"  # re-claimed while the lock was dropped

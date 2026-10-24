@@ -214,8 +214,16 @@ escalate a PR.
   "base branch changed, re-reviewing" and the head is reviewed again against
   the new base. Without this, a PR reviewed against branch X, which holds
   unreviewed commits, could be retargeted to main and merge those commits. An
-  approval with no recorded base, such as one from an older release, is
-  re-reviewed the same way.
+  approval with no recorded base is re-reviewed the same way. That covers one
+  from an older release, or one recorded across a control-plane restart.
+  A base change while the diff is fetched voids that fetch, so no verdict is
+  recorded for it. Right before merging, the gate re-reads the PR:
+  - a retarget since the last poll leads to a re-review;
+  - a moved head skips the merge;
+  - a closed or draft PR, or a failed read, skips it and backs off.
+
+  What remains open is the brief GitHub round trip between that read and the
+  merge call.
 - The PR text is untrusted. Only one strict JSON object counts as a verdict
   (`{"verdict": "PASS" | "FAIL", "findings": [...]}`). Prose, a verdict
   embedded in other text, or anything else is invalid output and spends an

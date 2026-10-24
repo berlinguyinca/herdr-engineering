@@ -14,6 +14,7 @@ from herdr_engineering.review_gate.config import AppConfig
 from herdr_engineering.review_gate.github_app import (
     GitHubAppClient,
     GitHubAppError,
+    PrInfo,
 )
 
 REPO = "github.com/acme/widget"
@@ -593,15 +594,18 @@ def test_http_client_errors_are_unavailable_and_clean(keypair, failure):
 HEAD = "a" * 40
 
 
-def _pr(state="open", sha=HEAD, title="T", body="B"):
+def _pr(state="open", sha=HEAD, title="T", body="B", base="main", draft=False):
     return Resp(
         200,
         {
+            "number": 5,
             "state": state,
             "title": title,
             "body": body,
-            "head": {"sha": sha},
-            "base": {"ref": "main"},
+            "draft": draft,
+            "user": {"login": "bot"},
+            "head": {"sha": sha, "ref": "feat/x"},
+            "base": {"ref": base},
         },
     )
 
@@ -749,3 +753,49 @@ def test_review_material_errors_carry_no_token(keypair):
         c.review_material(REPO, 5, HEAD, max_bytes=100)
     assert ei.value.reason == "invalid_response"
     _assert_clean(ei.value, [TOKEN])
+
+
+def test_review_material_none_when_base_changes_during_the_fetch(keypair):
+    cfg, _ = keypair
+    seen = []
+
+    def pr_route(request):
+        seen.append(1)
+        return _pr(base="feature-x" if len(seen) == 1 else "main")
+
+    c, _ = client_for(
+        cfg,
+        {
+            ("GET", "/repos/acme/widget/pulls/5/files"): Resp(200, [_file("a")]),
+            ("GET", "/repos/acme/widget/pulls/5"): pr_route,
+        },
+    )
+    assert c.review_material(REPO, 5, HEAD, max_bytes=100) is None
+    assert len(seen) == 2
+
+
+# -- pr_state ----------------------------------------------------------------
+def test_pr_state_reads_one_open_pr(keypair):
+    cfg, _ = keypair
+    c, opener = client_for(cfg, {("GET", "/repos/acme/widget/pulls/5"): _pr(base="dev")})
+    got = c.pr_state(REPO, 5)
+    assert got == PrInfo(
+        number=5, head_sha=HEAD, head_ref="feat/x", base_ref="dev", author_login="bot", draft=False
+    )
+    assert [r.full_url.endswith("/pulls/5") for r in opener.requests].count(True) == 1
+
+
+def test_pr_state_none_when_not_open_and_draft_flag_kept(keypair):
+    cfg, _ = keypair
+    c, _ = client_for(cfg, {("GET", "/repos/acme/widget/pulls/5"): _pr(state="closed")})
+    assert c.pr_state(REPO, 5) is None
+    c, _ = client_for(cfg, {("GET", "/repos/acme/widget/pulls/5"): _pr(draft=True)})
+    assert c.pr_state(REPO, 5).draft is True
+
+
+def test_pr_state_malformed_raises_invalid_response(keypair):
+    cfg, _ = keypair
+    c, _ = client_for(cfg, {("GET", "/repos/acme/widget/pulls/5"): Resp(200, {"state": "open"})})
+    with pytest.raises(GitHubAppError) as ei:
+        c.pr_state(REPO, 5)
+    assert ei.value.reason == "invalid_response"

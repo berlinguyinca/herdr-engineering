@@ -23,6 +23,8 @@ class FakeApp:
         self.calls: list[tuple] = []
         self.merge_result = True
         self.fail_open_prs: set[str] = set()
+        self.fresh = None
+        self.pr_state_error = False
 
     def open_prs(self, repo):
         self.calls.append(("open_prs", repo))
@@ -32,6 +34,17 @@ class FakeApp:
 
     def set_status(self, repo, sha, state, description, *, context="herdr/review-gate"):
         self.calls.append(("set_status", repo, sha, state, description, context))
+
+    def pr_state(self, repo, number):
+        """The fresh single-PR read before a merge: ``fresh`` overrides the listing."""
+        self.calls.append(("pr_state", repo, number))
+        if self.pr_state_error:
+            raise GitHubAppError("unavailable", status=503)
+        if self.fresh == "closed":
+            return None
+        if self.fresh is not None:
+            return self.fresh
+        return next((p for p in self.prs.get(repo, []) if p.number == number), None)
 
     def merge_pr(self, repo, number, sha):
         self.calls.append(("merge_pr", repo, number, sha))
@@ -936,3 +949,70 @@ def test_approval_without_a_recorded_base_fails_closed():
     assert app.named("merge_pr") == []
     assert store.snapshot(KEY).state == State.CI_GREEN
     assert [j["state"] for j in queue.snapshot() if j["sha"] == A] == ["queued"]
+
+
+# ------------------------------------------------- fresh read before the merge
+def _ready_to_merge():
+    return _approved_on("main", "main")
+
+
+def test_happy_path_reads_the_pr_once_then_posts_success_then_merges():
+    svc, app, _, _ = _ready_to_merge()
+    start = len(app.calls)
+    svc.tick()
+    tail = [c[0] if c[0] != "set_status" else ("set_status", c[3]) for c in app.calls[start:]]
+    assert tail == ["open_prs", "pr_state", ("set_status", "success"), "merge_pr"]
+
+
+def test_retarget_after_listing_before_merge_is_not_merged_and_is_rereviewed():
+    svc, app, store, queue = _ready_to_merge()
+    app.fresh = pr(base="feature-x")  # retargeted after the tick listed it as main
+    svc.tick()
+    assert app.named("merge_pr") == []
+    assert "success" not in [c[3] for c in app.statuses(A)]
+    assert app.statuses(A)[-1][3:5] == ("pending", "review gate: base branch changed, re-reviewing")
+    assert store.snapshot(KEY).state == State.CI_GREEN
+    assert [j["state"] for j in queue.snapshot() if j["sha"] == A] == ["queued"]
+
+
+def test_head_moved_after_listing_before_merge_is_not_merged():
+    svc, app, store, _ = _ready_to_merge()
+    app.fresh = pr(sha=B)
+    n = len(app.statuses(A))
+    svc.tick()
+    assert app.named("merge_pr") == []
+    assert len(app.statuses(A)) == n  # no status change; the next tick sees head B
+    assert store.snapshot(KEY).state == State.APPROVED
+    app.prs[REPO] = [pr(sha=B)]
+    app.fresh = None
+    svc.tick()
+    assert store.snapshot(KEY).head_sha == B and app.named("merge_pr") == []
+
+
+def test_draft_or_closed_after_listing_is_not_merged():
+    for fresh in (pr(draft=True), "closed"):
+        svc, app, store, _ = _ready_to_merge()
+        app.fresh = fresh
+        svc.tick()
+        assert app.named("merge_pr") == []
+        assert "success" not in [c[3] for c in app.statuses(A)]
+        assert "retrying at" in app.statuses(A)[-1][4]  # the merge back-off applies
+        assert store.snapshot(KEY).state == State.APPROVED
+
+
+def test_failing_fresh_read_means_no_merge_and_back_off():
+    svc, app, store, _ = _ready_to_merge()
+    clock = svc._now
+    app.pr_state_error = True
+    summary = svc.tick()
+    assert summary["errors"] == 1
+    assert app.named("merge_pr") == []
+    assert "success" not in [c[3] for c in app.statuses(A)]
+    assert "retrying at" in app.statuses(A)[-1][4]
+    app.pr_state_error = False
+    clock.t += 10
+    svc.tick()  # inside the back-off window: no read, no merge
+    assert app.named("merge_pr") == [] and len(app.named("pr_state")) == 1
+    clock.t += 51
+    svc.tick()
+    assert app.named("merge_pr") == [("merge_pr", REPO, 7, A)]

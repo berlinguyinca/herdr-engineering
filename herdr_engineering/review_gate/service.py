@@ -68,6 +68,11 @@ Decisions and limits:
   re-queued (``queue.rearm``) and the status says "base branch changed,
   re-reviewing". Otherwise a PR reviewed against branch X (holding unreviewed
   commits) and then retargeted to main would merge those commits unreviewed.
+  Right before posting ``success`` and merging, the PR is re-read
+  (``app.pr_state``): a retarget since the listing takes the same re-review
+  path, a moved head skips the merge (the next tick handles it), and a closed
+  or draft PR or a failed read skips it with the merge back-off. The remaining
+  window is the GitHub round trip between that read and ``merge_pr``.
 - A PR that leaves the open list (closed, merged elsewhere) has its queued
   review cancelled. Detection uses an in-memory memo of PR numbers per repo,
   so a PR closed while the service was down is not noticed.
@@ -408,10 +413,7 @@ class GateService:
         if snap.approved_base_ref is None or pr.base_ref != snap.approved_base_ref:
             # Approved for another base (retargeted) or for an unknown one: fail
             # closed and review this head again against the current base.
-            if self._store.on_base_changed(key, sha, pr.base_ref):
-                self._queue.rearm(key, sha, self._author_model(key, sha, pr.head_ref))
-                counts["enqueued"] += 1
-            self._status(repo, sha, "pending", "review gate: base branch changed, re-reviewing")
+            self._rereview_base(key, pr, counts)
             return
         checks = []
         for event in enrollment.required_events:
@@ -436,6 +438,21 @@ class GateService:
         backoff = self._merge_backoff.get((key, sha))
         if backoff is not None and self._now() < backoff[0]:
             return  # the "retrying at" pending status is already posted
+        # Fresh single-PR read right before the merge: the listing may be up to
+        # a tick old. Before ``success`` so a refused merge never shows success.
+        try:
+            fresh = self._app.pr_state(repo, pr.number)
+        except Exception:
+            self._back_off(key, sha, "PR re-read failed")
+            raise
+        if fresh is None or fresh.draft:
+            self._back_off(key, sha, "PR not open or draft")
+            return
+        if fresh.head_sha != sha:
+            return  # head moved: the next tick handles the new head
+        if fresh.base_ref != snap.approved_base_ref:
+            self._rereview_base(key, fresh, counts)
+            return
         self._status(repo, sha, "success", "review gate: approved, CI green")
         try:
             merged = self._app.merge_pr(repo, pr.number, sha)
@@ -454,6 +471,13 @@ class GateService:
         if (key, sha) not in self._update_tried:
             self._update_tried.add((key, sha))
             self._app.update_branch(repo, pr.number, sha)
+
+    def _rereview_base(self, key: PrKey, pr: PrInfo, counts: dict) -> None:
+        sha = pr.head_sha
+        if self._store.on_base_changed(key, sha, pr.base_ref):
+            self._queue.rearm(key, sha, self._author_model(key, sha, pr.head_ref))
+            counts["enqueued"] += 1
+        self._status(key.repo, sha, "pending", "review gate: base branch changed, re-reviewing")
 
     def _back_off(self, key: PrKey, sha: str, why: str) -> None:
         previous = self._merge_backoff.get((key, sha))
