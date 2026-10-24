@@ -184,8 +184,8 @@ def test_decisions_survive_a_restart_and_people_already_using_it_keep_working(s,
     again.hydrate(log)
     assert who(again, "bob").status == "approved" and who(again, "carol").status == "pending"
     kinds = [e["event_type"] for e in log]
-    assert "user_registered" in kinds and "user_decided" in kinds
-    ev = next(e for e in log if e["event_type"] == "user_decided" and e["payload"]["user_id"] == "bob")
+    assert "user_registered" in kinds and "user_approved" in kinds
+    ev = next(e for e in log if e["event_type"] == "user_approved" and e["payload"]["user_id"] == "bob")
     assert ev["payload"]["decided_by"] == "adm" and ev["payload"]["action"] == "user.approve"
 
     # a service that ran before approval mode: its existing members are grandfathered in
@@ -222,3 +222,29 @@ def test_nobody_is_approved_before_their_verified_email_is_known(s):
     assert st == 409 and "verified email" in out["error"]
     who(s, "bob")
     assert call(s, "POST", ["admin", "users", "bob", "approve"], "adm")[0] == 200
+
+
+def test_explicit_user_approval_event_and_room_lifecycle_fields(s):
+    who(s, "bob")
+    adm = who(s, "adm")
+    approved = s.decide_user(adm, "bob", "approve", {"idempotency_key": "approve-bob"})
+    assert approved["user_status"] == "approved"
+    seq = s.seq
+    assert s.decide_user(adm, "bob", "approve", {"idempotency_key": "approve-bob"}) == approved
+    assert s.seq == seq
+    project = s.create_project(adm, {"name": "p"})["project_id"]
+    room = s.create_room(adm, project, {"name": "r"})["room_id"]
+    s.invite_member(adm, room, {"user_id": "bob"})
+    assert s.me(who(s, "bob"))["user_status"] == "approved"
+    assert s.room_member(room, "bob")["room_membership_status"] == "pending"
+    s.decide_room_member(adm, room, "bob", "approve")
+    s.remove_room_member(adm, room, "bob")
+    assert s.user_status("bob") == "approved"
+    event = next(e for e in s._sink.load() if e["event_type"] == "user_approved" and e["payload"]["user_id"] == "bob")
+    assert event["payload"]["decided_by"] == "adm"
+    again = CollabService(s.auth, now=Clock(), approval=s.approval)
+    again.hydrate(s._sink.load())
+    bob_row = next(row for row in call(again, "GET", ["admin", "users"], None, operator="op")[1]["users"]
+                   if row["user_id"] == "bob")
+    assert bob_row["user_status"] == "approved"
+    assert bob_row["memberships"][0]["room_membership_status"] == "removed"
