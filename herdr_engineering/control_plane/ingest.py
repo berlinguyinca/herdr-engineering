@@ -13,8 +13,11 @@ from __future__ import annotations
 import re
 
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
+from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
+from .events import SequenceCollision
 from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
 from .project_links import canonical_repository
+from .sink import EventAlreadyStored
 
 
 def _git_identity(payload):
@@ -47,7 +50,15 @@ class IngestService:
     def __init__(self, repo):
         self.repo = repo
 
-    def ingest(self, body: dict) -> dict:
+    def ingest(self, body: dict, principal: dict | None = None) -> dict:
+        """Apply one ingest body.
+
+        ``principal`` is the authenticated caller (``{kind, id, authenticated_by}``)
+        and becomes the ``actor`` of a schema_version 2 envelope. v1 bodies
+        (no/1 ``schema_version``) take the legacy path and ignore it.
+        Raises ``EnvelopeConflict`` (HTTP 409) when a v2 envelope contradicts
+        stored state.
+        """
         if not isinstance(body, dict):
             raise ValueError("body must be a JSON object")
         entity_type = body.get("entity_type")
@@ -77,6 +88,69 @@ class IngestService:
         # would merge unreviewed code, so they are reserved for the gate itself.
         if entity_type.strip().lower().startswith(RESERVED_ENTITY_PREFIXES):
             raise ValueError("reserved review-gate entity type is not accepted by generic ingestion")
+        env = normalize_envelope(body, principal, self.repo._stamp())
+        if env is None:
+            return self._dispatch(entity_type, entity_id, event_type, payload, source)
+        env["entity_type"] = entity_type
+        self._prevalidate(entity_type, entity_id, payload)
+        ledger = self.repo.ledger
+        ack = {"event_id": env["event_id"], "source": env["source"],
+               "source_sequence": env["source_sequence"]}
+        head = {"entity_type": entity_type, "entity_id": entity_id, "event_type": event_type}
+        # Inspector/mission_activity payloads are redacted per field by their
+        # own stores, so the envelope row never carries them.
+        row_payload = {} if entity_type in ("inspector", "mission_activity") else payload
+        with ledger.lock:
+            if ledger.check(env) == "duplicate":
+                return {**head, "envelope": {**ack, "duplicate": True}}
+            # The envelope row is persisted FIRST. If that fails nothing has
+            # been applied and the ledger is untouched, so the emitter retries.
+            try:
+                self.repo.record_event(
+                    entity_type, entity_id, event_type, row_payload,
+                    envelope=env, feed=entity_type not in ENVELOPE_ONLY_TYPES,
+                    publish=entity_type not in ENVELOPE_ONLY_TYPES)
+            except SequenceCollision:
+                raise EnvelopeConflict("source_sequence is already used by another event") from None
+            except EventAlreadyStored:
+                # Durable insert landed earlier but the ack was lost (or the
+                # in-memory index evicted it): same identity => already stored.
+                if self._stored_identity(env["event_id"]) != (env["source"], env["source_sequence"]):
+                    raise EnvelopeConflict("event_id already stored for a different source sequence") from None
+                ledger.commit(env)
+                return {**head, "envelope": {**ack, "duplicate": True}}
+            try:
+                result = self._dispatch(entity_type, entity_id, event_type, payload, source,
+                                        record_generic=False)
+            finally:
+                # The row is durable, so its (source, sequence) is consumed even
+                # if the handler then fails; the failure is reported once.
+                ledger.commit(env)
+        return {**result, "envelope": {**ack, "duplicate": False}}
+
+    def _stored_identity(self, event_id):
+        lookup = getattr(getattr(self.repo, "_sink", None), "stored_identity", None)
+        if not callable(lookup):
+            raise RuntimeError("durable event identity is unavailable")
+        found = lookup(event_id)
+        if found is None:
+            raise RuntimeError("durable event identity is unavailable")
+        return tuple(found)
+
+    @staticmethod
+    def _prevalidate(entity_type, entity_id, payload) -> None:
+        """Reject what a handler would reject BEFORE the envelope is persisted."""
+        if entity_type == "mission" and ":" in entity_id:
+            raise ValueError("invalid mission id")
+        if entity_type in ("session", "mission"):
+            _git_identity(payload)
+        if entity_type == "service" and any(
+                k in payload for k in ("repository_id", "forge_url", "repository_url",
+                                       "repo_url", "clone_url", "commit_sha")):
+            _git_identity(payload)
+
+    def _dispatch(self, entity_type, entity_id, event_type, payload, source,
+                  record_generic=True) -> dict:
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":
                 raise ValueError("invalid mission activity event_type")
@@ -104,7 +178,8 @@ class IngestService:
                     "event_type": event_type, **res}
         # Unknown/other entity types: record the event generically so nothing is
         # silently dropped, and the UI still sees it on the activity stream.
-        self.repo.record_event(entity_type, entity_id, event_type, payload)
+        if record_generic:
+            self.repo.record_event(entity_type, entity_id, event_type, payload)
         return {"entity_type": entity_type, "entity_id": entity_id,
                 "event_type": event_type}
 
