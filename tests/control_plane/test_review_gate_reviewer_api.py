@@ -338,12 +338,13 @@ def test_bad_worker_id_job_id_and_oversize_body_rejected(server):
     assert post(server, f"{base}/heartbeat", b"")[0] == 400
     assert post(server, f"{base}/heartbeat", b"[" * 4000 + b"]" * 4000)[0] == 400
     assert post(server, f"{base}/heartbeat", b'{"worker_id": "\xff"}')[0] == 400
-    # oversize bodies: 8 KiB for claim/heartbeat/failure, max_output_bytes + 4 KiB for result
+    # oversize bodies: 8 KiB for claim/heartbeat/failure, 6 x max_output_bytes + 4 KiB for
+    # result (JSON escaping expands a byte up to 6x; the coordinator's byte check is the limit)
     pad = "x" * (8 * 1024)
     assert post(server, "review-gate/claim", {"worker_id": "w1", "reviewer_model": pad})[0] == 413
     assert post(server, f"{base}/heartbeat", {"worker_id": pad})[0] == 413
     assert post(server, f"{base}/failure", {"worker_id": "w1", "reason": pad})[0] == 413
-    big = "x" * (MAX_OUTPUT + 4 * 1024)
+    big = "x" * (6 * MAX_OUTPUT + 4 * 1024)
     assert post(server, f"{base}/result", {"worker_id": "w1", "output": big})[0] == 413
     # a result body under the HTTP cap but over max_output_bytes is the coordinator's "rejected"
     assert post(
@@ -497,3 +498,55 @@ def test_framing_rejections_give_one_response(server):
     )
     assert _responses(data) == 1
     assert server.gate_store.snapshot(KEY).state == State.CI_GREEN
+
+
+def test_result_cap_allows_json_escaping_of_a_legal_output(server):
+    """An output within max_output_bytes whose JSON escaping expands it ~6x reaches the
+    coordinator (its byte-exact check decides) instead of an HTTP 413."""
+    job = ready(server)
+    claim(server)
+    base = f"review-gate/jobs/{job.job_id}"
+    escaped = "\x01" * MAX_OUTPUT  # MAX_OUTPUT bytes, ~6 x MAX_OUTPUT once JSON-encoded
+    assert len(json.dumps({"worker_id": "w1", "output": escaped})) > MAX_OUTPUT + 4 * 1024
+    status, body = post(server, f"{base}/result", {"worker_id": "w1", "output": escaped})
+    assert (status, body) == (200, {"outcome": "rejected"})  # not a verdict, but not 413
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "review-gate/jobs/a%2Fheartbeat",
+        "review-gate/jobs/JOB%2Fresult",
+        "review-gate/jobs/%2Ffailure",
+        "review-gate/jobs/JOB/heartbeat%2F",
+        "review-gate/jobs/JOB/heartbeat%2Fx",
+        "review-gate/jobs/JOB%2Fheartbeat%2Fx",
+    ],
+)
+def test_encoded_slashes_in_reviewer_routes_are_404(server, path):
+    job = ready(server)
+    status, body = post(server, path.replace("JOB", job.job_id), {"worker_id": "w1"})
+    assert (status, body) == (404, {"error": "not found"})
+    assert server.gate_store.snapshot(KEY).state == State.CI_GREEN
+
+
+def test_reviewer_route_shapes_match_on_decoded_segments():
+    from herdr_engineering.control_plane.api import _reviewer_route
+
+    root = ["", "api", "v1", "review-gate"]
+    jid = "c" * 32
+    assert _reviewer_route([*root, "claim"]) == ("claim", None)
+    for action in ("heartbeat", "result", "failure"):
+        assert _reviewer_route([*root, "jobs", jid, action]) == (action, jid)
+    for bad in (
+        [*root, "jobs", f"a/{action}"],
+        [*root, "jobs", jid, "approve"],
+        [*root, "jobs", jid],
+        [*root, "jobs", jid, "result", ""],
+        [*root, "claim", ""],
+        [*root, "claim/x"],
+        [*root, "jobs", "a", "b", "heartbeat"],
+        ["", "api", "v2", "review-gate", "claim"],
+        [*root[:3], "reviews", "claim"],
+    ):
+        assert _reviewer_route(bad) is None, bad

@@ -82,6 +82,9 @@ _UNTRUSTED_CI = (
 )
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
 _KILL_WAIT = 5
+_CI_CAP = "ci fix cap reached"
+# None: a snapshot without a reason (not written by the store) keeps its findings.
+_FINDING_ESCALATIONS = frozenset({"review cap reached", "repeated finding", None})
 
 
 class _BadArgument(ValueError):
@@ -273,8 +276,13 @@ class AuthorNotifier:
             reason = _flat(snap.reason or "cap reached")
             lines.append(f"Escalated: {reason}; operator resume needed.")
             lines.append("")
-        ci_escalation = snap.state == State.ESCALATED and (
-            snap.reason == "ci fix cap reached" or not snap.last_findings
+        escalated = snap.state == State.ESCALATED
+        # Only these escalations are about findings or CI; any other reason (the
+        # reviewer could not produce a verdict) lists neither: findings left over
+        # from an older head would read as current, and it is not a CI failure.
+        ci_escalation = escalated and snap.reason == _CI_CAP
+        show_findings = snap.state == State.CHANGES_REQUESTED or (
+            escalated and snap.reason in _FINDING_ESCALATIONS
         )
         if snap.state == State.CI_RED or ci_escalation:
             names = list(failures) or self._ci_failures(key, snap.head_sha)
@@ -284,7 +292,7 @@ class AuthorNotifier:
                 lines.extend(f"- {_flat(name)}" for name in names)
             else:
                 lines.append("CI failed.")
-        elif snap.last_findings:
+        elif snap.last_findings and show_findings:
             lines.append(_UNTRUSTED)
             for n, f in enumerate(snap.last_findings, 1):
                 path = _flat(f.path)

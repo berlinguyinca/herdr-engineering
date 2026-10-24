@@ -538,3 +538,41 @@ def test_real_child_timeout_kills_process_group(tmp_path, monkeypatch):
 
     time.sleep(3)
     assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "invalid review output",
+        "reviewer failed repeatedly",
+        "review could not be completed",
+        "diff too large to review fully",
+    ],
+)
+def test_reviewer_escalation_is_not_called_a_ci_failure(reason):
+    notifier, _, _, _ = make()
+    for findings in ((), (FINDING,)):  # findings may be left over from an older head
+        text = notifier.message(
+            KEY, snap(state=State.ESCALATED, findings=findings, reason=reason), BRANCH
+        )
+        assert reason in text and "operator resume needed" in text
+        assert "CI failed" not in text
+        assert "off by one" not in text  # stale findings are not presented as current
+
+
+def test_ci_cap_escalation_still_lists_ci_failures():
+    notifier, _, _, _ = make()
+    text = notifier.message(
+        KEY,
+        snap(state=State.ESCALATED, findings=(FINDING,), reason="ci fix cap reached"),
+        BRANCH,
+        ("run 3 failure",),
+    )
+    assert "CI failed:" in text and "run 3 failure" in text and "off by one" not in text
+
+
+@pytest.mark.parametrize("reason", ["review cap reached", "repeated finding"])
+def test_review_cap_escalation_lists_findings(reason):
+    notifier, _, _, _ = make()
+    text = notifier.message(KEY, snap(state=State.ESCALATED, reason=reason), BRANCH)
+    assert "off by one" in text and "CI failed" not in text

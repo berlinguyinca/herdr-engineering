@@ -36,11 +36,32 @@ from .redact import redact_payload
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
 # The only routes the `reviewer` role may POST (review gate workers), and only it:
-# an operator key is refused there too. Matched on the DECODED path with
-# fullmatch; the job id segment is validated (32 hex) by the handler (400).
-_REVIEWER_POST = re.compile(
-    r"/api/v1/review-gate/(?:claim|jobs/[^/]+/(?:heartbeat|result|failure))"
-)
+# an operator key is refused there too. See `_reviewer_route`.
+_REVIEWER_ROOT = ["", "api", "v1", "review-gate"]
+_REVIEWER_JOB_ACTIONS = frozenset({"heartbeat", "result", "failure"})
+
+
+def _reviewer_route(parts):
+    """``(action, job_id)`` for a reviewer worker route, else None.
+
+    ``parts`` is the DECODED segment list (``/api/v1/review-gate/...`` split on
+    "/" and unquoted per segment), so an encoded slash stays inside one segment
+    and never matches: exactly ``review-gate/claim`` or
+    ``review-gate/jobs/<job_id>/{heartbeat,result,failure}``. The job id shape
+    (32 hex) is the handler's check (400).
+    """
+    if len(parts) == 5 and parts[:4] == _REVIEWER_ROOT and parts[4] == "claim":
+        return "claim", None
+    if (
+        len(parts) == 7
+        and parts[:4] == _REVIEWER_ROOT
+        and parts[4] == "jobs"
+        and parts[6] in _REVIEWER_JOB_ACTIONS
+    ):
+        return parts[6], parts[5]
+    return None
+
+
 _CLAIM_FIELDS = ("job_id", "repo", "number", "sha", "messages", "lease_seconds", "attempt")
 _RESULT_OUTCOMES = frozenset({"recorded", "stale", "rejected"})
 _FAILURE_OUTCOMES = frozenset({"released", "escalated", "stale"})
@@ -629,7 +650,7 @@ def _make_handler(server, public=False, operator=False):
                 # operator shortcut below: only `reviewer` gets past here.
                 if role != "reviewer":
                     return self._deny(403, "reviewer role required")
-                if not _REVIEWER_POST.fullmatch("/".join(self._decoded_parts())):
+                if _reviewer_route(self._decoded_parts()) is None:
                     return self._deny(404, "not found")
                 return None
             if role == "reviewer" and min_role != "viewer":
@@ -1181,13 +1202,15 @@ def _make_handler(server, public=False, operator=False):
             in depth). Every refusal goes through ``_deny`` (Connection: close), so an
             unread body can never be parsed as a next request.
             """
-            if self._role() != "reviewer" or not _REVIEWER_POST.fullmatch("/".join(parts)):
+            if self._role() != "reviewer":
                 return self._deny(403, "reviewer role required")
+            route = _reviewer_route(parts)
+            if route is None:
+                return self._deny(404, "not found")
             coord, cfg = server.gate_coordinator, server.gate_reviewer_config
             if coord is None or cfg is None:
                 return self._deny(503, "review gate disabled")
-            action = "claim" if parts[4] == "claim" else parts[6]
-            job_id = None if action == "claim" else parts[5]
+            action, job_id = route
             if job_id is not None and not _REVIEWER_JOB_ID.fullmatch(job_id):
                 return self._deny(400, "invalid job id")
             fields = {
@@ -1196,7 +1219,11 @@ def _make_handler(server, public=False, operator=False):
                 "result": {"worker_id", "output"},
                 "failure": {"worker_id", "reason"},
             }[action]
-            cap = cfg.max_output_bytes + 4 * 1024 if action == "result" else _REVIEWER_SMALL_BODY
+            # JSON escaping can expand each output byte up to 6x ("\u0001"); the
+            # coordinator's byte-exact max_output_bytes check is the real limit.
+            cap = (
+                6 * cfg.max_output_bytes + 4 * 1024 if action == "result" else _REVIEWER_SMALL_BODY
+            )
             body, error = self._reviewer_body(cap, fields)
             if error is not None:
                 return self._deny(*error)
