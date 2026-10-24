@@ -84,6 +84,13 @@ PROXY_IDLE_SECONDS = 900                            # the egress proxy closes a 
 CONTEXT_KEYS = ("repository", "repository_id", "ci_url", "pipeline_id", "failing_step", "log_summary", "branch")
 # Pi's isolation flags, as the helper runner uses them: nothing from the operator's or the repository's own
 # configuration (a hostile repository's AGENTS.md, extensions, skills and prompt templates are not loaded).
+BINARY_MAX = 256 * 1024                             # a binary file the agent adds may not be bigger than this
+SUMMARY_MAX = 64 * 1024                             # bytes of SUMMARY.md read at all
+PR_BODY_SUMMARY = 4000
+SECRET_SHAPES = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{12,}")
+LOOSE_OBJECT = re.compile(r"[0-9a-f]{2}/[0-9a-f]{38,62}\Z")
+PACK_FILE = re.compile(r"pack/pack-[0-9a-f]{40,64}\.(?:pack|idx)\Z")
+HEX_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 PI_ISOLATION = "--no-extensions --no-skills --no-prompt-templates --no-context-files"
 INSTRUCTIONS = (
     "You are a throwaway CI fix agent in a sandbox. The failing repository is checked out in ./repo at the exact "
@@ -225,6 +232,53 @@ class HttpsForge:
     def credential_file(self):
         return self.token_file
 
+    def token(self):
+        try:
+            if self.token_file is None:
+                raise OSError
+            if self.token_file.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                raise Failure(f"{self.token_file} must not be readable by group or others")
+            return self.token_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            raise Failure("no forge token file is configured on this runner") from None
+
+    def request(self, method, url, body=None):
+        """One forge API call: (status, parsed JSON). The token goes in a header and nowhere else."""
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": f"Bearer {self.token()}", "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json", "User-Agent": "herdr-ci-fix-runner"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:                     # noqa: S310
+                return response.status, json.loads(response.read(2_000_000) or b"{}")
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, json.loads(exc.read(100_000) or b"{}")
+            except ValueError:
+                return exc.code, {}
+        except (OSError, ValueError) as exc:
+            raise Failure(f"forge unreachable: {trim(exc, 120)}") from None
+
+    def open_pr(self, context, head, base, title, body, draft, label):
+        """A pull request (GitHub only) in the same repository, then its label. Returns {url, number, labelled}."""
+        identity = context.get("repository_id") or ""
+        host, _, path = identity.partition("/")
+        if host != "github.com" or path.count("/") != 1 or not REPO_PATH.fullmatch(path):
+            raise Failure(f"pull requests are only supported on github.com, not {trim(host, 60)}")
+        status, made = self.request("POST", f"https://api.github.com/repos/{path}/pulls",
+                                    {"title": title, "head": head, "base": base, "body": body, "draft": bool(draft)})
+        if status not in (200, 201) or not isinstance(made, dict) or not isinstance(made.get("number"), int):
+            raise Failure(f"the forge refused the pull request ({status}): {trim(made.get('message', '') if isinstance(made, dict) else '', 160)}")
+        url = made.get("html_url")
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise Failure("the forge returned no pull request URL")
+        labelled = False
+        if label:
+            code, _ = self.request("POST", f"https://api.github.com/repos/{path}/issues/{made['number']}/labels",
+                                   {"labels": [label]})
+            labelled = code in (200, 201)
+        return {"url": url, "number": made["number"], "labelled": labelled}
+
 
 # ---------------------------------------------------------------------------- git
 class Git:
@@ -248,8 +302,15 @@ class Git:
                       + shlex.quote(str(credential_file)) + ")\"; }; f")
             argv += ["-c", "credential.helper=", "-c", f"credential.helper={helper}"]
         argv += list(args)
-        rest = list(args)
-        name = (rest[2] if rest[:1] == ["-C"] and len(rest) > 2 else rest[0]) if rest else "git"
+        rest, name = list(args), "git"
+        while rest:                                           # the subcommand: the first word that is not an option
+            if rest[0] in {"-C", "-c"} and len(rest) > 1:
+                rest = rest[2:]
+            elif rest[0].startswith("-"):
+                rest = rest[1:]
+            else:
+                name = rest[0]
+                break
         try:
             done = subprocess.run(argv, cwd=cwd, env=self._env(), capture_output=True, text=True,
                                   timeout=timeout, check=False)
@@ -307,6 +368,25 @@ class Git:
 
     def head(self, dest):
         return self.run(["-C", str(dest), "rev-parse", "HEAD"]).stdout.strip()
+
+    def remote_branch(self, url, branch, credential_file=None):
+        """The sha a remote branch points at, or None when it does not exist."""
+        out = self.run(["ls-remote", "--heads", url, f"refs/heads/{branch}"], credential_file=credential_file,
+                       timeout=FETCH_TIMEOUT).stdout.split()
+        return out[0] if out else None
+
+    def default_branch(self, url, credential_file=None):
+        for line in self.run(["ls-remote", "--symref", url, "HEAD"], credential_file=credential_file,
+                             timeout=FETCH_TIMEOUT).stdout.splitlines():
+            if line.startswith("ref: refs/heads/"):
+                return line[len("ref: refs/heads/"):].split("\t")[0]
+        return None
+
+    def push_new_branch(self, repo, url, branch, credential_file=None):
+        """Push exactly one branch that must not exist yet (`--force-with-lease` with an empty expectation)."""
+        self.run(["-C", str(repo), "-c", "push.default=nothing", "push", "--no-verify", "-q",
+                  f"--force-with-lease=refs/heads/{branch}:", url, f"refs/heads/{branch}:refs/heads/{branch}"],
+                 credential_file=credential_file, timeout=FETCH_TIMEOUT)
 
     def commits_since(self, dest, sha):
         out = self.run(["-C", str(dest), "rev-list", "--count", f"{sha}..HEAD"], check=False).stdout.strip()
@@ -580,18 +660,290 @@ class HerdrPiLauncher:
         shutil.rmtree(run / "harness", ignore_errors=True)
 
 
-class CommitGate:
-    """The result gate. Until the push and pull-request step exists it never pushes: no commit is `no_change`,
-    anything else is refused with that reason."""
+class Refused(Failure):
+    """The result gate refused to publish; the message is the reason shown on the dashboard."""
 
-    def __init__(self, git):
-        self.git = git
 
-    def run(self, fix, config):
-        commits = self.git.commits_since(Path(fix["repo"]), fix["revision"])
-        if commits == 0:
+def glob_regex(pattern):
+    """Gitignore-like: a pattern with a slash is anchored at the root, one without matches at any depth;
+    `**` crosses directories, `*` and `?` do not."""
+    anchored = "/" in pattern.rstrip("/")
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile(("" if anchored else "(?:.*/)?") + "".join(out) + r"\Z")
+
+
+def matching(patterns, path):
+    return next((pattern for pattern in patterns if glob_regex(pattern).match(path)), None)
+
+
+def git_like_component(name):
+    """True for a path component git would treat as its own directory (`.git`, `GIT~1`, `.git.`, ignorable
+    characters inside): a tree entry like that can plant hooks or configuration."""
+    squeezed = re.sub(r"[\u200c\u200d\u200e\u200f\u202a-\u202e\u2060-\u2064\ufeff]", "", name).lower().rstrip(" .")
+    return squeezed in {".git", "git~1", ".gitmodules"} or name in {".", ".."}
+
+
+def scrub(text, secrets=()):
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return SECRET_SHAPES.sub("[REDACTED]", text)
+
+
+def read_regular(path, limit):
+    """The first ``limit`` bytes of a regular file, never through a link; None when it is not one."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return handle.read(limit)
+    finally:
+        os.close(fd)
+
+
+class ResultGate:
+    """The only place anything leaves the host, and it never runs git inside the agent's work copy.
+
+    The agent can rewrite everything under its own `.git` (config, hooks, aliases, remotes, `insteadOf`, a
+    `core.fsmonitor` command), so none of that is ever read or executed. The gate reads the one branch tip
+    out of the agent's refs as plain text, copies only the NEW object files (regular files, by name pattern)
+    into a fresh bare repository of its own that borrows the trusted mirror's objects, and does every check and
+    the push from there. It then: counts commits, refuses merges and history that does not descend from the
+    failing commit, bounds files/bytes/binaries, refuses submodules, symlinks leaving the tree, `.git`-like paths
+    and the configured blocking paths, flags (does not block) CI configuration and lockfiles, pushes only
+    `herdr-ci-fix/<run>-<sha7>` (which must not exist on the remote) and opens a draft pull request with a label.
+    It never merges and never touches any other branch."""
+
+    def __init__(self, git, forge, state_dir, say=None):
+        self.git, self.forge, self.state_dir = git, forge, Path(state_dir)
+        self.say = say or (lambda message: None)
+
+    def run(self, fix, config, save=None):
+        gate_dir = self.state_dir / "fixes" / fix["id"] / "gate.git"
+        try:
+            return self._run(fix, config, save, gate_dir)
+        except Refused as exc:
+            return "failed", str(exc), None
+        finally:
+            shutil.rmtree(gate_dir, ignore_errors=True)
+
+    # ------------------------------------------------------------ reading what the agent left
+    def agent_tip(self, repo, branch):
+        """The sha of refs/heads/<branch> read as text from the agent's refs; no git is run there."""
+        dotgit = repo / ".git"
+        if dotgit.is_symlink() or not dotgit.is_dir():
+            raise Refused("the work copy's .git is not a plain directory")
+        heads = os.path.realpath(dotgit / "refs" / "heads")
+        loose = os.path.realpath(dotgit / "refs" / "heads" / branch)
+        if loose.startswith(heads + os.sep):
+            data = read_regular(loose, 200)
+            if data is not None:
+                text = data.decode("ascii", "replace").strip()
+                if HEX_ID.fullmatch(text):
+                    return text
+                raise Refused("the fix branch is not a plain commit reference")
+        packed = read_regular(dotgit / "packed-refs", 4_000_000)
+        for line in (packed or b"").decode("ascii", "replace").splitlines():
+            parts = line.split(" ", 1)
+            if len(parts) == 2 and parts[1] == f"refs/heads/{branch}" and HEX_ID.fullmatch(parts[0]):
+                return parts[0]
+        return None
+
+    def import_objects(self, repo, gate, since, mirror, cap):
+        """Copy the object files the agent created (mtime after the work copy was made) into the gate's repository;
+        everything older comes from the mirror through alternates. Regular files with git's own names only."""
+        source = repo / ".git" / "objects"
+        total = count = 0
+        for base, dirs, files in os.walk(source, followlinks=False):
+            relative = Path(base).relative_to(source)
+            dirs[:] = [d for d in dirs if d == "pack" or re.fullmatch(r"[0-9a-f]{2}", d)] if not relative.parts else []
+            for name in files:
+                rel = (relative / name).as_posix()
+                if not (LOOSE_OBJECT.fullmatch(rel) or PACK_FILE.fullmatch(rel)):
+                    continue
+                path = Path(base) / name
+                info = os.lstat(path)
+                if not stat.S_ISREG(info.st_mode) or info.st_mtime < since:
+                    continue
+                total += info.st_size
+                count += 1
+                if count > 100_000 or total > cap:
+                    raise Refused("the agent's new objects are larger than the repository size limit")
+                target = gate / "objects" / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, target, follow_symlinks=False)
+        (gate / "objects" / "info").mkdir(parents=True, exist_ok=True)
+        (gate / "objects" / "info" / "alternates").write_text(str(Path(mirror) / "objects") + "\n")
+
+    # ------------------------------------------------------------ the checks
+    def inspect(self, gate, base, tip, config):
+        limits, paths = config["limits"], config["paths"]
+
+        def run(*args):
+            return self.git.run(["-C", str(gate), *args]).stdout
+
+        if self.git.run(["-C", str(gate), "merge-base", "--is-ancestor", base, tip], check=False).returncode != 0:
+            raise Refused("the branch does not descend from the failing commit")
+        if run("rev-list", "--merges", "--count", f"{base}..{tip}").strip() != "0":
+            raise Refused("the branch contains a merge commit")
+        commits = int(run("rev-list", "--count", f"{base}..{tip}").strip() or 0)
+        if commits > limits["max_commits"]:
+            raise Refused(f"the agent made {commits} commits; the limit is {limits['max_commits']}")
+        if self.git.run(["-C", str(gate), "rev-list", "--objects", "--quiet", "--missing=error", f"{base}..{tip}"],
+                        check=False).returncode != 0:
+            raise Refused("the branch refers to objects that are missing or damaged")
+        diff = ["diff", "-z", "--no-renames", "--no-ext-diff", "--no-textconv"]
+        tokens = run(*diff, "--raw", "--no-abbrev", base, tip).split("\0")
+        changes = []
+        for index in range(0, len(tokens) - 1, 2):
+            meta = tokens[index].lstrip(":").split()
+            if len(meta) != 5:
+                raise Refused("could not read the changes the agent made")
+            changes.append({"old_mode": meta[0], "mode": meta[1], "sha": meta[3], "status": meta[4][:1],
+                            "path": tokens[index + 1]})
+        if len(changes) > limits["max_files"]:
+            raise Refused(f"the agent changed {len(changes)} files; the limit is {limits['max_files']}")
+        numbers = [part.split("\t", 2) for part in run(*diff, "--numstat", base, tip).split("\0") if part]
+        binary = {path for added, _removed, path in numbers if added == "-"}
+        insertions = sum(int(a) for a, _r, _p in numbers if a.isdigit())
+        deletions = sum(int(r) for _a, r, _p in numbers if r.isdigit())
+        flags, total = [], 0
+        for change in changes:
+            path = change["path"]
+            if "160000" in (change["old_mode"], change["mode"]):
+                raise Refused(f"submodule change refused: {trim(path, 120)}")
+            if not path or path.startswith("/") or any(git_like_component(part) or part == "" for part in path.split("/")):
+                raise Refused(f"path refused: {trim(path, 120)}")
+            blocked = matching(paths["block"], path)
+            if blocked:
+                raise Refused(f"{trim(path, 120)} is a blocked path ({blocked})")
+            if change["mode"] == "120000":
+                target = run("cat-file", "blob", change["sha"]).strip()
+                resolved = os.path.normpath(os.path.join(os.path.dirname(path), target))
+                if target.startswith("/") or resolved.startswith("..") or "\0" in target:
+                    raise Refused(f"symbolic link leaving the tree refused: {trim(path, 120)}")
+            if change["status"] != "D":
+                size = int(run("cat-file", "-s", change["sha"]).strip())
+                total += size
+                if path in binary and size > BINARY_MAX:
+                    raise Refused(f"binary file {trim(path, 120)} is {size // 1024} KB; the limit is {BINARY_MAX // 1024} KB")
+            flagged = matching(paths["flag"], path)
+            if flagged:
+                flags.append(f"{trim(path, 140)} changed (matches {flagged})")
+        if total > limits["max_diff_kb"] * 1024:
+            raise Refused(f"the change is {total // 1024} KB; the limit is {limits['max_diff_kb']} KB")
+        return {"commits": commits, "files": len(changes), "insertions": insertions, "deletions": deletions,
+                "diff_kb": -(-total // 1024), "flags": flags}
+
+    # ------------------------------------------------------------ publish
+    def summary(self, fix):
+        data = read_regular(Path(fix["work"]) / "SUMMARY.md", SUMMARY_MAX)
+        if data is None:
+            return ""
+        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", data.decode("utf-8", "replace")).strip()
+        return scrub(text, [self._token()])[:PR_BODY_SUMMARY]
+
+    def _token(self):
+        try:
+            return self.forge.token()
+        except (Failure, AttributeError):
+            return ""
+
+    def body(self, fix, stats, summary, branch):
+        fence = "`````"
+        flags = "\n".join(f"- {flag}" for flag in stats["flags"]) or "- none"
+        text = summary.replace(fence, "````") or "(the agent wrote no summary)"
+        agent = (fix.get("agent") or {}).get("session_id")
+        return (
+            "**This pull request was written by an AI agent in a sandbox and has not been reviewed.** "
+            "It was opened as a draft by the herdr CI fix runner; it never merges itself.\n\n"
+            f"- CI run: {fix['context'].get('ci_url', '(unknown)')}\n- Failing commit: `{fix['revision']}`\n"
+            f"- Branch: `{branch}`\n" + (f"- Agent session: `{agent}`\n" if agent else "")
+            + f"- Diff: {stats['files']} file(s), +{stats['insertions']} -{stats['deletions']}, {stats['commits']} commit(s)\n\n"
+            f"**Flags (review these first)**\n{flags}\n\n**What the agent said** (untrusted text)\n"
+            f"{fence}\n{text}\n{fence}\n")
+
+    def _run(self, fix, config, save, gate):
+        repo, base, branch = Path(fix["repo"]), fix["revision"], fix["branch"]
+        if branch != f"{BRANCH_PREFIX}{fix['number']}-{base[:7]}" or not re.fullmatch(r"herdr-ci-fix/[0-9]+-[0-9a-f]{7}", branch):
+            raise Refused("the fix branch name is not the one this run was given")
+        tip = self.agent_tip(repo, branch)
+        if tip is None:
+            raise Refused("the agent removed the fix branch")
+        if tip == base:
             return "no_change", "the agent ended without a commit", None
-        return "failed", "the result gate (push and pull request) is not available in this runner version; nothing was pushed", None
+        cap = config["limits"]["mirror_gb"] * 1024 ** 3
+        self.git.run(["init", "--bare", "-q", str(gate)])
+        self.import_objects(repo, gate, fix.get("copied_at", 0) - 5, fix["mirror"], cap)
+        self.git.run(["-C", str(gate), "update-ref", f"refs/heads/{branch}", tip])
+        stats = self.inspect(gate, base, tip, config)
+        summary = self.summary(fix)
+        state = fix.setdefault("gate", {})
+        url = self.forge.url(fix["context"])
+        credential = self.forge.credential_file() if url.startswith("https://") else None
+        if state.get("tip") == tip and state.get("pushed"):
+            pass                                                  # a repeat after a crash: already pushed, go on
+        else:
+            if self.git.remote_branch(url, branch, credential) is not None:
+                raise Refused(f"the remote already has a branch named {branch}; nothing was pushed")
+            try:
+                self.git.push_new_branch(gate, url, branch, credential)
+            except Failure as exc:
+                raise Refused(f"push failed; nothing was published: {trim(exc, 200)}") from None
+            state.update(tip=tip, pushed=True)
+            fix["pushed"] = True
+            if save:
+                save(fix)
+        result = {**stats, "branch": branch, "summary": summary or None}
+        result["flags"] = (stats["flags"][:19] + [f"+{len(stats['flags']) - 19} more flagged files"]) if len(stats["flags"]) > 20 else stats["flags"]
+        if not summary:
+            result.pop("summary")
+        pr = state.get("pr")
+        if pr is None:
+            try:
+                pr = self.open_pull_request(fix, config, branch, url, credential, stats, summary)
+            except Failure as exc:
+                return ("failed", f"the branch {branch} was pushed but the pull request could not be opened: "
+                        f"{trim(exc, 200)}", result)
+            state["pr"] = pr
+            if save:
+                save(fix)
+        if not pr.get("labelled") and config["pull_request"]["label"]:
+            result["flags"] = result["flags"][:19] + [f"the label {config['pull_request']['label']} could not be applied"]
+        return "succeeded", None, {**result, "pr_url": pr["url"], "pr_number": pr["number"]}
+
+    def open_pull_request(self, fix, config, branch, url, credential, stats, summary):
+        wanted = (fix["context"].get("branch") or "")
+        base = None
+        if wanted and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", wanted) and not wanted.startswith(BRANCH_PREFIX):
+            base = wanted if self.git.remote_branch(url, wanted, credential) else None
+        base = base or self.git.default_branch(url, credential)
+        if not base:
+            raise Failure("could not tell which branch the pull request should target")
+        title = f"Draft: fix for CI run #{fix['number']} on {fix.get('repository') or 'this repository'} (AI agent)"
+        pull = config["pull_request"]
+        return self.forge.open_pr(fix["context"], branch, base, title[:200], self.body(fix, stats, summary, branch),
+                                  pull["draft"], pull["label"])
 
 
 # ---------------------------------------------------------------------------- the runner
@@ -605,9 +957,9 @@ class Runner:
         self.work_root = Path(work_root)
         self.mirror_root = Path(mirror_root)
         self.cp, self.git, self.forge, self.gateway, self.launcher = control_plane, git, forge, gateway, launcher
-        self.gate = gate or CommitGate(git)
         self.clock = clock
         self.say = say or (lambda message: print(f"ci-fix-runner: {message}", file=sys.stderr))
+        self.gate = gate or ResultGate(git, forge, self.state_dir, say=self.say)
         self.config = {}
 
     # ------------------------------------------------------------ local records
@@ -669,7 +1021,7 @@ class Runner:
         except Failure as exc:
             self.say(f"{fix['id']}: stopping the agent: {exc}")
         self._remove_tree(self.work_root / "ci-fix", fix["id"])
-        if fix.get("mirror") and fix.get("pin") and not fix.get("pushed"):
+        if fix.get("mirror") and fix.get("pin"):
             self.git.unpin(Path(fix["mirror"]), fix["pin"])
 
     def forget(self, fix_id):
@@ -794,7 +1146,7 @@ class Runner:
         except Rejected as exc:
             self.say(f"{fix['id']}: {exc}")
         try:
-            state, reason, result = self.gate.run(fix, self.config)
+            state, reason, result = self.gate.run(fix, self.config, self.save)
         except Failure as exc:
             state, reason, result = "failed", f"the result gate failed: {trim(exc, 200)}", None
         self.end(fix, state, reason, result)
@@ -919,7 +1271,8 @@ class Runner:
         if work.exists():
             self._remove_tree(self.work_root / "ci-fix", fix["id"])
         self.git.make_work_clone(mirror, pin, work / "repo", branch, sha)
-        return {"branch": branch, "work": str(work), "repo": str(work / "repo"), "mirror": str(mirror), "pin": pin}
+        return {"branch": branch, "work": str(work), "repo": str(work / "repo"), "mirror": str(mirror), "pin": pin,
+                "copied_at": time.time()}                  # real time: compared with file mtimes by the result gate
 
 
 # ---------------------------------------------------------------------------- command line

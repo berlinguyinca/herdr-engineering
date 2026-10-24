@@ -51,14 +51,23 @@ def forge(tmp_path):
 
 
 class LocalForge:
+    """A bare repository on disk standing in for the forge; pull requests are recorded, not opened."""
+
     def __init__(self, path):
-        self.path = path
+        self.path, self.prs, self.pr_error, self.labelled = path, [], None, True
 
     def url(self, context):
         return str(self.path)
 
     def credential_file(self):
         return None
+
+    def open_pr(self, context, head, base, title, body, draft, label):
+        if self.pr_error:
+            raise runner.Failure(self.pr_error)
+        self.prs.append({"head": head, "base": base, "title": title, "body": body, "draft": draft, "label": label})
+        number = len(self.prs) + 8
+        return {"url": f"https://github.com/org/frontend/pull/{number}", "number": number, "labelled": self.labelled}
 
 
 class Gateway:
@@ -218,21 +227,6 @@ def test_prepare_makes_a_standalone_copy_at_the_exact_commit_and_cleans_up_when_
     assert final["state"] == "no_change" and final["ended_at"] and "without a commit" in final["reason"]
     assert env.launcher.stopped == [fix]
     assert env.leftovers() == []                                              # no record, work copy or pin remains
-
-
-def test_an_agent_commit_is_never_pushed_by_this_version(env):
-    fix = env.ask()
-    env.runner().once()
-    repo = env.tmp / "work" / "ci-fix" / fix / "repo"
-    (repo / "app.txt").write_text("fixed\n")
-    git("add", "-A", cwd=repo)
-    git("commit", "-q", "-m", "fix", cwd=repo)
-    env.launcher.running[fix] = False
-    env.runner().once()
-    final = env.service.get(fix)
-    assert final["state"] == "failed" and "nothing was pushed" in final["reason"]
-    assert git("rev-list", "--count", "main", cwd=env.forge.path) == "3"      # the forge is untouched
-    assert env.leftovers() == []
 
 
 def test_a_running_fix_is_left_alone_while_its_agent_lives(env):
