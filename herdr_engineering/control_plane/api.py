@@ -44,7 +44,9 @@ _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
-                        r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
+                        r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        # CI fix runner: claim, report state, report result. Never create or cancel.
+                        r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
 # T12: the one POST an ingest key may make besides /api/v1/ingest: acknowledging a steering request addressed to it.
 _STEER_ACK = re.compile(r"^/api/v1/steering/[^/]+/ack$")
 # The only routes the `reviewer` role may POST (review gate workers), and only it:
@@ -198,7 +200,7 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False):
+                 review_quorum=None, system_graph: bool = False, ci_fix=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -217,6 +219,10 @@ class ControlPlaneServer:
         from .retention import usage_retention_config
         # control_plane.llm_proxy raw/rollup retention (validated; None = defaults).
         self.usage_retention = usage_retention_config(usage_retention)
+        # control_plane.ci_fix (validated; None = defaults, which are disabled: the routes then 404).
+        from .ci_fix import CIFixService, ci_fix_config
+        self.ci_fix_config = ci_fix_config(ci_fix)
+        self.ci_fix = CIFixService(repo, self.ci_fix_config) if self.ci_fix_config["enabled"] else None
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row),
@@ -1573,6 +1579,11 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(server.ci_monitor.log(
                         _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
                         **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
+                if what == "fix" and server.ci_fix is not None and len(parts) in {5, 6}:
+                    if len(parts) == 6:
+                        return self._json(server.ci_fix.get(parts[5]))
+                    run = _q(self.path, "run")
+                    return self._json(server.ci_fix.list(run=run or None))
                 if what:
                     return self._json({"error": "not found"}, 404)
                 from .project_links import annotate_ci, cached_github_languages
@@ -1639,6 +1650,8 @@ def _make_handler(server, public=False, operator=False):
                 if receipt.get("error") in {"receipt_persistence_unavailable", "receipt_persistence_failed"}:
                     status = 503
                 return self._json(receipt, status)
+            if resource == "ci" and len(parts) >= 5 and parts[4] == "fix":
+                return self._ci_fix_post(parts, body)
             if resource == "ci" and len(parts) == 5 and parts[4] == "actions":
                 try:
                     return self._json(server.ci_monitor.action(
@@ -2028,6 +2041,32 @@ def _make_handler(server, public=False, operator=False):
             self.end_headers()
             self.wfile.write(data)
             return None
+
+        def _ci_fix_post(self, parts, body):
+            """Sandboxed CI fix agent. The browser creates and cancels; the runner (``agent`` role)
+            claims, reports state and reports the result. Disabled means every route is a 404."""
+            service = server.ci_fix
+            if service is None:
+                return self._json({"error": "not found"}, 404)
+            if len(parts) == 5:
+                actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
+                view, created = service.request(
+                    server.ci_monitor, body.get("repository"), body.get("number"), body.get("operation_id"),
+                    actor=actor,
+                    **({"provider_url": body["provider_url"]} if "provider_url" in body else {}))
+                return self._json(view, 202 if created else 200)
+            if len(parts) == 6 and parts[5] == "claim":
+                return self._json(service.claim(body.get("host")))
+            if len(parts) == 7 and parts[6] == "cancel":
+                return self._json(service.cancel(
+                    parts[5], actor={"role": self._role(), "via": "api_key" if server._keys else "open"}))
+            if len(parts) == 7 and parts[6] == "state":
+                return self._json(service.set_state(
+                    parts[5], body.get("state"),
+                    **{key: body[key] for key in ("reason", "host", "model", "session_id", "branch") if key in body}))
+            if len(parts) == 7 and parts[6] == "result":
+                return self._json(service.record_result(parts[5], body))
+            return self._json({"error": "not found"}, 404)
 
         # ---------------------------------------------------------- helpers
         def _read_json(self):

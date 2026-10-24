@@ -197,6 +197,18 @@ def test_web_refuses_invalid_usage_retention(tmp_path, monkeypatch, old_env, cap
         _run_web(monkeypatch, make_file(tmp_path, llm_proxy={"raw_retention_days": 0}))
 
 
+def test_web_reads_ci_fix_from_the_fleet_file_disabled_by_default(tmp_path, monkeypatch, old_env, capsys):
+    seen = _run_web(monkeypatch, make_file(tmp_path, ci_fix={"enabled": True, "hosts": ["bender"]}))
+    assert seen["server_kw"]["ci_fix"]["enabled"] is True and seen["server_kw"]["ci_fix"]["hosts"] == ["bender"]
+    seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
+    assert seen["server_kw"]["ci_fix"]["enabled"] is False
+
+
+def test_web_refuses_invalid_ci_fix(tmp_path, monkeypatch, old_env, capsys):
+    with pytest.raises(SystemExit, match="ci_fix.hosts"):
+        _run_web(monkeypatch, make_file(tmp_path, ci_fix={"enabled": True}))
+
+
 def test_web_without_file_has_no_durable_config_even_with_env(tmp_path, monkeypatch, old_env, capsys):
     seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
     assert "sink_dsn" not in seen and seen["self_report"]["dsn"] is None
