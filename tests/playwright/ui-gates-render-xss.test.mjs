@@ -136,7 +136,7 @@ test('no page source reads the server fields that no renderer prints', () => {
 
 test('the scan has teeth: a line that reads each field is found', () => {
   const sample = { bindings: 'e.bindings.map(x)', categories: 'm.categories', category: 'it.category', changed_files: 'd.changed_files', diff_summary: 'x.diff_summary', means: 'l.means', order: 'p.order',
-    review_quorum: 'f.review_quorum', self_reports: 's.self_reports', touched_paths: 'a.touched_paths', head: 'task.head', value: 'prov.value' };
+    review_quorum: 'f.review_quorum', self_reports: 's.self_reports', touched_paths: 'a.touched_paths', head: '${esc(t.head)}', value: '${esc(v.value)}' };
   assert.deepEqual(Object.keys(sample).sort(), Object.keys(UNREAD).sort());
   for (const [k, line] of Object.entries(sample)) assert.ok(new RegExp(UNREAD[k]).test(line), `${k} is not found in "${line}"`);
 });

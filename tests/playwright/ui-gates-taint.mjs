@@ -29,6 +29,7 @@ export const UNREAD = {
   bindings: '\\.bindings\\b|\\bbindings\\s*:', categories: '\\.categories\\b|\\bcategories\\s*:', category: '\\.category\\b|\\bcategory\\s*:',
   changed_files: 'changed_files', diff_summary: 'diff_summary', means: '\\.means\\b|\\bmeans\\s*:', order: '\\.order\\b|\\border\\s*:',
   review_quorum: 'review_quorum', self_reports: 'self_reports', touched_paths: 'touched_paths',
-  // `head` is read only as a truthy flag (asOf.head: "this is the live view"); `.value` as a provenance field is never read (writer, source are)
-  head: '(?<!asOf|as_of)\\.head\\b(?!\\s*[)&|?;,])', value: '\\b(prov|provenance|lp)\\.value\\b',
+  // `head` is read only as a truthy flag (asOf.head, as_of.head: "this is the live view"); a provenance object's `.value` is never read
+  // (writer and source are): both are found inside an esc() call, which is how every renderer prints a field (a bare `${x.value}` is the DOM's own input value and the unescaped bug the other gates catch)
+  head: '(?<!asOf|as_of)\\.head\\b', value: 'esc\\([^)]*\\.value\\b',
 };

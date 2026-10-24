@@ -23,6 +23,7 @@ node --test --test-concurrency=1 tests/playwright/ui-gates-perf.test.mjs      # 
 node --test --test-concurrency=1 tests/playwright/ui-gates-tokens.test.mjs    # raw colour, spacing, z-index, font tokens
 node --test --test-concurrency=1 tests/playwright/ui-gates-states.test.mjs    # every control in every state (inspector forms, Gantt, replay, review...)
 node --test --test-concurrency=1 tests/playwright/ui-gates-xss.test.mjs       # hostile text injected into every API field, every surface and state
+node --test --test-concurrency=1 tests/playwright/ui-gates-render-xss.test.mjs # complete all-hostile models through the renderers, parsed in Chromium
 node --test --test-concurrency=1 tests/playwright/ui-gates-interaction.test.mjs  # one-Tab-stop graph, Enter/Space on nodes, aria-expanded, tabpanels, modal editor, @-mention listbox
 node --test --test-concurrency=1 tests/visual/ui-gates-visual.test.mjs        # screenshots vs docs/assets/screenshots (not in plain `npm test`)
 
@@ -60,7 +61,7 @@ step; the Gantt; the replay bar; the table alternative; a proposal under review;
 links; chat; an edited comment (History) and a retracted one; the expanded message editor; the @-mention list open. Each state names
 selectors that must exist once open (a state that fails to open is a failure, not a skip) and a least number of audited controls and
 text nodes. The floor of a state that settles late (the chat states: the room's agents arrive after the chat) is the observed count
-minus three; the floors of the others are 90% of it. The owner total is 571 controls (floor 540) over 21 states: the round-3 review
+minus three controls and minus six text nodes; the floors of the others are 90% of it. The owner total is 571 controls (floor 540) over 21 states: the round-3 review
 added the tabs nobody audited (progress with a milestone, the attention inbox, agents, flow, tasks, the room's people) and made the
 table state select a node first. Two viewer states (chat, and lineage with a node selected) run as the read-only account. Everything runs at
 desktop light, desktop dark and phone 375, each on its own server (acknowledging an attention item is server state).
@@ -116,7 +117,7 @@ with those hostile too) and parses the result in Chromium: `error`, `method`, `m
 there and their canary is asserted on screen; `progress` is drawn only as the number of a `<progress>` and is asserted to be 0 when it
 is not a number; the other 12 (`bindings`, `categories`, `category`, `changed_files`, `diff_summary`, `head`, `means`, `order`,
 `review_quorum`, `self_reports`, `touched_paths`, `value`) are server objects that no page source reads, which a source scan asserts
-(it fails the day a renderer reads one, and it has its own known-bad lines). The same file renders the pane that reports itself as
+(it fails the day a renderer reads one, and it has its own known-bad lines; `head` and `value` are matched by pattern: a `.head` other than the live-view flag, and `.value` inside an `esc()` call, so it is a heuristic, not a proof). The same file renders the pane that reports itself as
 remote and every proposal kind. Three placements from before are still asserted directly: the lineage an external agent reported,
 a milestone label (the proxy adds a milestone to an empty progress response, because a real one needs a linked mission; the states
 test does the same), and the target of a bounded task. The payload also breaks out of attributes (a quote, an event handler and a marker attribute first).
@@ -309,7 +310,7 @@ Found by the round-3 review's gates (fourth round):
 - **The phone states flake was found in round 4.** Two runs in ten failed on the phone viewport under a host load average of 30 to
   60: a viewer chat audited while the log still said "No messages yet." (2 text nodes, not 11), and the agents state counted 7
   controls, not 10, because "Your agents" arrives after the room's agents. Both states now wait for what arrives late (the log's
-  placeholder to go, the grant forms and the room's agents to be listed); the chat floors are observed minus three. The phone run
+  placeholder to go, the grant forms and the room's agents to be listed); the chat floors are observed minus three controls and six text nodes. The phone run
   then passed 10 times of 10 (twice, after each fix). One more thing was not stable: my own `Live` is-not-pressed selector in the
   stepped-back replay state (a poll can put the view back to live between two lines of the test); it is gone, and the
   `aria-pressed` on Live is required in the live table state instead.
@@ -328,18 +329,20 @@ Found by the round-3 review's gates (fourth round):
 
 ## CI
 
-`.woodpecker/ui-gates.yaml` runs `npm run test:ui-gates` and `npm run ui-gates:baselines:check` on Woodpecker, for pull requests that
-touch the page, its tests, the control plane or the baselines, and by hand. GitHub Actions is disabled organisation-wide and is not
-used. **It has not been run on a Woodpecker agent yet**; the first run is the real test of the screenshots there.
+`.woodpecker/ui-gates.yml` runs `bash scripts/ci/ui-gates.sh` (which runs `npm run test:ui-gates`, then `npm run ui-gates:baselines:check`,
+then fails on any change under `docs/assets/screenshots`) on Woodpecker, for pull requests that touch the page, its tests, the control
+plane or the baselines, and by hand. GitHub Actions is disabled organisation-wide and is not used. The definition follows the shape of
+the organisation's other pipelines that were read (`image: bash`, `skip_clone` plus a plain git checkout, step logic in a script in
+the repository, no docker, apt or sudo on the exec hosts). **It has not been run on a Woodpecker agent.** Whether an exec host has
+Chromium's shared libraries and a Debian-style fontconfig is unknown, and the first run is the real test of the screenshots there.
 
-Image requirements, because the screenshots are compared pixel for pixel:
+What the host must already have, because the screenshots are compared pixel for pixel and the script installs nothing system-wide:
 
-- Node 22 and the Playwright 1.64 browsers (the baselines come from the Chromium that Playwright resolves; the official
-  `mcr.microsoft.com/playwright:v1.64.0-noble` image has them and Chromium's system libraries);
-- Python 3.12 with this repository installed (`pip install -e '.[dev]'`) first on `PATH`: the fixture server is the real control plane;
-- `git` (the baseline `update` guard reads the tree) and a writable checkout;
+- Node 22 and Python 3.12 with `venv`; `git`; a writable checkout. The script installs the Python package into a venv, runs `npm ci`
+  and `npx playwright install chromium` (the Chromium of Playwright 1.64 is the build the baselines came from);
+- Chromium's shared libraries (what Playwright's own `install-deps` would add);
 - fontconfig with `/etc/fonts/conf.d` as shipped by Debian/Ubuntu (`10-hinting-slight`, `10-sub-pixel-rgb`, `10-yes-antialias`,
-  `11-lcdfilter-default`): fonts do not matter, these rendering settings do. An agent whose settings differ fails `baselines:check`
-  while every other gate passes; fix the image (or, after reviewing the diff images, run `update` from a commit and say why).
+  `11-lcdfilter-default`): fonts do not matter, these rendering settings do. A host whose settings differ fails `baselines:check`
+  while every other gate passes; fix the host (or, after reviewing the diff images, run `update` from a commit and say why).
 
 The suite takes about ten minutes on a workstation and runs one test at a time; give the step that much and one CPU core per Chromium.
