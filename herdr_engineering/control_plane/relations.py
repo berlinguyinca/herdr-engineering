@@ -145,7 +145,7 @@ def related(repo, kind, entity_id, *, now_llm=True):
         for row in pipelines():
             if any(_repo_match(s, row) for s in mine):
                 c.add("ci", _ci_item(row))
-        mission_extras(m["mission_id"])
+        mission_extras(key)
         extra["llm"] = llm(mission=key)
     elif kind == "session":
         s = by_session.get(entity_id)
@@ -154,7 +154,7 @@ def related(repo, kind, entity_id, *, now_llm=True):
         mkey = s.get("mission_key")
         if mkey and mkey in by_mission:
             c.add("mission", _mission_item(by_mission[mkey]))
-            mission_extras(by_mission[mkey]["mission_id"])
+            mission_extras(mkey)
         if s.get("host_id"):
             c.add("host", _item(s["host_id"], s["host_id"]))
         for other in sessions:
@@ -209,7 +209,7 @@ def related(repo, kind, entity_id, *, now_llm=True):
                 mkey = s.get("mission_key")
                 if mkey in by_mission:
                     c.add("mission", _mission_item(by_mission[mkey]))
-                    mission_extras(by_mission[mkey]["mission_id"])
+                    mission_extras(mkey)
                 if s.get("host_id") and row.get("host_id") == s["host_id"]:
                     c.add("host", _item(s["host_id"], s["host_id"]))
         for p in repo.list_pull_requests():
