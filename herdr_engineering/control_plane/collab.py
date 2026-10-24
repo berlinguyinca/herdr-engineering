@@ -74,7 +74,10 @@ _NAME_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
 INVITE_TTL = 7 * 24 * 3600.0
 MAX_OPEN_INVITES = 50
-_FEED_TYPES = frozenset({"message", "member_added", "member_removed",
+_LIFECYCLE_EVENTS = frozenset({"user_approved", "room_member_invited", "room_member_approved",
+                               "room_member_removed", "agent_access_requested", "agent_access_approved",
+                               "agent_access_revoked", "file_upload_permission_changed"})
+_FEED_TYPES = (_LIFECYCLE_EVENTS - {"user_approved", "agent_access_requested"}) | frozenset({"message", "member_added", "member_removed",
                          "agent_granted", "agent_revoked", "agent_grant_revoked", "agent_renamed",
                          "task_created", "task_updated",
                          "helper_requested", "helper_claimed", "helper_started", "helper_finished",
@@ -323,6 +326,10 @@ class CollabService:
         self._seq = 0
         self._projects: dict[str, dict] = {}
         self._rooms: dict[str, dict] = {}
+        self._room_memberships: dict[tuple[str, str], dict] = {}
+        self._agent_permissions: dict[tuple[str, str, str], dict] = {}
+        self._file_permissions: dict[tuple[str, str], bool] = {}
+        self._lifecycle_idem: dict[tuple, str] = {}
         self._agents: dict[str, dict] = {}
         self._by_cred: dict[str, str] = {}      # credential digest -> agent id
         self._agent_projects: dict[str, set] = defaultdict(set)  # projects an agent was ever granted into
@@ -378,6 +385,12 @@ class CollabService:
             if len(self._log) >= self.max_log_events:
                 self.stats["log_full"] += 1
                 raise CollabError(503, "collaboration log is full; ask the operator")
+            if event_type in _LIFECYCLE_EVENTS:
+                payload.setdefault("idempotency_key", ids.new_id("transition"))
+            if event_type in ("room_created", "room_member_invited", "room_member_approved"):
+                uid = payload["actor_user_id"] if event_type == "room_created" else payload["subject_user_id"]
+                member = self._room_memberships.get((payload["room_id"], uid), {})
+                payload.setdefault("membership_id", member.get("membership_id") or ids.new_id("membership"))
             now = self._iso()
             payload = {"org_id": ORG_ID, "correlation_id": payload.pop("correlation_id", None)
                        or ids.new_id("collab"), "created_at": now, **payload}
@@ -482,13 +495,13 @@ class CollabService:
         elif t == "user_registered":
             self._users[p["user_id"]] = {"status": p["status"], "since": p["at"], "decided_by": p.get("decided_by"),
                                          "decided_at": p["at"] if p["status"] != "pending" else None, "reason": None}
-        elif t == "user_decided":
+        elif t in ("user_decided", "user_approved"):
             u = self._users.setdefault(p["user_id"], {"since": p["at"]})
             u.update(status=p["status"], decided_by=p["decided_by"], decided_at=p["at"], reason=p.get("reason"))
-        elif t == "member_added":
+        elif t in ("member_added", "room_member_approved"):
             self._rooms[p["room_id"]]["members"][p["subject_user_id"]] = {
                 "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq}
-        elif t == "member_removed":
+        elif t in ("member_removed", "room_member_removed"):
             room = self._rooms[p["room_id"]]
             room["members"].pop(p["subject_user_id"], None)
             # Agents of a removed member lose their grants for good: re-adding the person
@@ -547,7 +560,7 @@ class CollabService:
         elif t in ("agent_grant_revoked", "agent_grant_expired"):
             self._rooms[p["room_id"]]["grants"].pop(p["agent_id"], None)
             self._rooms_by_agent[p["agent_id"]].discard(p["room_id"])
-        elif t == "agent_access_requested":
+        elif t == "agent_access_requested" and "permission_id" not in p:
             for rid in self._requests_by_room.get(p["room_id"], ()):       # one open request per agent per room
                 rq = self._requests[rid]
                 if rq["open"] and rq["agent_id"] == p["agent_id"]:
@@ -676,9 +689,239 @@ class CollabService:
         elif t == "message":
             self._idem[(p["sender_key"], p["room_id"], p["idempotency_key"])] = (p["fingerprint"], seq)
             self._msg_room[ev["event_id"]] = (p["room_id"], seq)
-        if t in _FEED_TYPES:
+        self._apply_lifecycle(ev)
+        if t in _FEED_TYPES or (t == "agent_access_requested" and "permission_id" in p):
             for rid in {p.get("room_id"), *p.get("room_ids", ())} - {None}:
                 self._by_room[rid].append(ev)
+
+    def _apply_lifecycle(self, ev: dict) -> None:
+        """Project explicit records alongside the legacy active-members/attachment indexes."""
+        t, p = ev["event_type"], ev["payload"]
+        rid, uid = p.get("room_id"), p.get("subject_user_id")
+        if "transition_fingerprint" in p:
+            key = (p["transition_actor"], p["transition_operation"], p["transition_resource"],
+                   p["idempotency_key"])
+            self._lifecycle_idem[key] = p["transition_fingerprint"]
+        if t == "room_created":
+            uid = p["actor_user_id"]
+        if t in ("room_created", "member_added", "room_member_approved", "room_member_invited"):
+            key = (rid, uid)
+            previous = self._room_memberships.get(key, {})
+            status = "pending" if t == "room_member_invited" else "approved"
+            self._room_memberships[key] = {
+                "membership_id": p.get("membership_id") or previous.get("membership_id") or ev["event_id"],
+                "room_id": rid, "user_id": uid, "status": status,
+                "role": "owner" if t == "room_created" else p["role"],
+                "expires_at": p.get("expires_at")}
+            if not previous or previous.get("status") == "removed":
+                self._file_permissions[key] = t == "room_created"
+        elif t in ("member_removed", "room_member_removed"):
+            if (rid, uid) in self._room_memberships:
+                self._room_memberships[(rid, uid)]["status"] = "removed"
+            self._file_permissions[(rid, uid)] = False
+            for (room, aid, user), permission in self._agent_permissions.items():
+                if room == rid and (user == uid or self._agents.get(aid, {}).get("owner") == uid):
+                    permission["status"] = "revoked"
+        elif t == "file_upload_permission_changed":
+            self._file_permissions[(rid, uid)] = p["file_upload_permission"]
+        elif t in ("agent_access_requested", "agent_access_approved", "agent_access_revoked") and "permission_id" in p:
+            self._agent_permissions[(rid, p["agent_id"], uid)] = {
+                "permission_id": p["permission_id"], "room_id": rid, "agent_id": p["agent_id"],
+                "user_id": uid, "status": p["agent_permission_status"]}
+        elif t in ("agent_revoked", "agent_grant_revoked", "agent_grant_expired"):
+            for (room, aid, _), permission in self._agent_permissions.items():
+                if aid == p["agent_id"] and (t == "agent_revoked" or room == rid):
+                    permission["status"] = "revoked"
+
+    def _lifecycle_retry(self, pr: Principal, operation: str, resource: str,
+                         key: str | None, values: dict) -> tuple[dict, bool]:
+        """Scope retry keys to an actor and operation; rebuild them from committed events."""
+        if key is not None and (not isinstance(key, str) or not _KEY_RE.fullmatch(key)):
+            raise CollabError(400, "invalid idempotency_key")
+        key = key or ids.new_id("transition")
+        fingerprint = _digest(json.dumps(values, sort_keys=True))
+        prior = self._lifecycle_idem.get((pr.key, operation, resource, key))
+        if prior is not None and prior != fingerprint:
+            raise CollabError(409, "idempotency_key already used for a different transition")
+        return {"transition_actor": pr.key, "transition_operation": operation,
+                "transition_resource": resource, "idempotency_key": key,
+                "transition_fingerprint": fingerprint}, prior is not None
+
+    def _confirm_lifecycle(self, pr: Principal, room: dict, transition: dict) -> None:
+        """Remember a new retry key even when the requested state already holds."""
+        self._commit("lifecycle_transition_confirmed", self._actor(pr, room_id=room["id"],
+            project_id=room["project_id"], project_ids=[room["project_id"]], outcome="allowed",
+            action=transition["transition_operation"], resource_id=transition["transition_resource"], **transition))
+
+    def user_status(self, uid: str) -> str:
+        with self._lock:
+            return self._users.get(uid, {}).get("status", "approved" if self.approval is None and self.auth.exists(uid) else "pending")
+
+    def _member_fields(self, room_id: str, uid: str) -> dict:
+        with self._lock:
+            member = self._room_memberships.get((room_id, uid), {})
+            return {"user_status": self.user_status(uid), "room_membership_status": member.get("status", "none"),
+                    "agent_permission_status": {aid: permission["status"]
+                        for (rid, aid, user), permission in self._agent_permissions.items() if rid == room_id and user == uid},
+                    "file_upload_permission": bool(self._member(self._rooms[room_id], uid)
+                        and self._ok(uid) and self._file_permissions.get((room_id, uid), False))}
+
+    def room_member(self, room_id: str, uid: str) -> dict:
+        """Internal lifecycle lookup, including pending and removed membership records."""
+        with self._lock:
+            member = self._room_memberships.get((room_id, uid))
+            if member is None:
+                raise CollabError(404, "not found")
+            return {**member, **self._member_fields(room_id, uid)}
+
+    def _lifecycle_room(self, pr: Principal, room_id: str, *, owner: bool = False) -> dict:
+        self._require_user(pr)
+        if pr.admin:
+            room = self._rooms.get(room_id)
+            if room is None:
+                raise CollabError(404, "not found")
+            return room
+        if not self.still_valid(pr):
+            raise CollabError(403, "platform approval required")
+        return self._authorize(pr, room_id, "invite" if owner else "read", "room.permission")[0]
+
+    def invite_member(self, pr: Principal, room_id: str, body: dict) -> dict:
+        with self._lock:
+            room = self._lifecycle_room(pr, room_id, owner=True)
+            uid, role = body.get("user_id"), body.get("role", "contributor")
+            if not isinstance(uid, str) or not self._ok(uid):
+                raise CollabError(404, "unknown user")
+            if not isinstance(role, str) or role not in INVITABLE_ROLES:
+                raise CollabError(400, "invalid role")
+            transition, replayed = self._lifecycle_retry(pr, "room.member.invite", room_id,
+                body.get("idempotency_key"), {"user_id": uid, "role": role, "expires_at": body.get("expires_at")})
+            if replayed:
+                return self.room_member(room_id, uid)
+            exp = _finite_expiry(body.get("expires_at"), self._now())
+            previous = self._room_memberships.get((room_id, uid))
+            if previous and previous["status"] != "removed":
+                if previous["role"] != role:
+                    raise CollabError(409, "already invited with a different role")
+                if body.get("idempotency_key") is not None:
+                    self._confirm_lifecycle(pr, room, transition)
+                return self.room_member(room_id, uid)
+            pending = sum(1 for (rid, _), member in self._room_memberships.items()
+                          if rid == room_id and member["status"] == "pending")
+            if len(room["members"]) + pending >= self.max_members_per_room:
+                raise CollabError(429, "room member limit reached")
+            if role == "guest" and exp is None:
+                exp = self._now() + self.guest_ttl
+            self._commit("room_member_invited", self._actor(pr, room_id=room_id,
+                project_id=room["project_id"], subject_user_id=uid, role=role, expires_at=exp,
+                membership_id=previous["membership_id"] if previous else ids.new_id("membership"),
+                action="room.member.invite", outcome="allowed", project_ids=[room["project_id"]],
+                resource_id=uid, **transition))
+            return self.room_member(room_id, uid)
+
+    def decide_room_member(self, pr: Principal, room_id: str, uid: str, decision: str,
+                           *, idempotency_key: str | None = None) -> dict:
+        if decision != "approve":
+            raise CollabError(400, "decision must be approve; use room removal to revoke membership")
+        with self._lock:
+            room = self._lifecycle_room(pr, room_id, owner=True)
+            transition, replayed = self._lifecycle_retry(pr, "room.member.approve", room_id,
+                idempotency_key, {"user_id": uid})
+            member = self.room_member(room_id, uid)
+            if replayed or member["status"] == "approved":
+                if not replayed and idempotency_key is not None:
+                    self._confirm_lifecycle(pr, room, transition)
+                return member
+            if member["status"] != "pending" or not self._ok(uid):
+                raise CollabError(409, "member is not awaiting approval")
+            _finite_expiry(member["expires_at"], self._now())
+            self._room_has_space(room)
+            self._commit("room_member_approved", self._actor(pr, room_id=room_id,
+                project_id=room["project_id"], subject_user_id=uid, role=member["role"],
+                expires_at=member["expires_at"], membership_id=member["membership_id"],
+                action="room.member.approve", outcome="allowed", project_ids=[room["project_id"]],
+                resource_id=uid, **transition))
+            return self.room_member(room_id, uid)
+
+    def remove_room_member(self, pr: Principal, room_id: str, uid: str,
+                           *, idempotency_key: str | None = None) -> dict:
+        with self._lock:
+            room = self._lifecycle_room(pr, room_id, owner=True)
+            transition, replayed = self._lifecycle_retry(pr, "room.member.remove", room_id,
+                idempotency_key, {"user_id": uid})
+            member = self.room_member(room_id, uid)
+            if replayed or member["status"] == "removed":
+                if not replayed and idempotency_key is not None:
+                    self._confirm_lifecycle(pr, room, transition)
+                return member
+            if member["role"] == "owner":
+                raise CollabError(400, "cannot remove an owner")
+            self._commit("room_member_removed", self._actor(pr, room_id=room_id,
+                project_id=room["project_id"], subject_user_id=uid, action="member.remove",
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=uid, **transition))
+            self._expire_helpers()
+            return self.room_member(room_id, uid)
+
+    def set_file_upload_permission(self, pr: Principal, room_id: str, uid: str, allowed: bool,
+                                   *, idempotency_key: str | None = None) -> dict:
+        if not isinstance(allowed, bool):
+            raise CollabError(400, "file_upload_permission must be true or false")
+        with self._lock:
+            room = self._lifecycle_room(pr, room_id, owner=True)
+            transition, replayed = self._lifecycle_retry(pr, "file.upload.permission", room_id,
+                idempotency_key, {"user_id": uid, "allowed": allowed})
+            member = self.room_member(room_id, uid)
+            if replayed:
+                return member
+            if not self._member(room, uid) or not self._ok(uid):
+                raise CollabError(409, "an approved room member is required")
+            if member["role"] == "owner" and not allowed:
+                raise CollabError(400, "room owners retain upload permission")
+            if member["file_upload_permission"] == allowed and idempotency_key is None:
+                return member
+            self._commit("file_upload_permission_changed", self._actor(pr, room_id=room_id,
+                project_id=room["project_id"], subject_user_id=uid, file_upload_permission=allowed,
+                action="file.upload.permission", outcome="allowed", project_ids=[room["project_id"]],
+                resource_id=uid, **transition))
+            return self.room_member(room_id, uid)
+
+    def set_agent_permission(self, pr: Principal, room_id: str, agent_id: str, uid: str, status: str,
+                             *, idempotency_key: str | None = None) -> dict:
+        """Record per-member delegation, independently of the agent's room attachment.
+
+        Task submission/request envelopes are wired to these records by the subsequent task.
+        """
+        kinds = {"pending": "agent_access_requested", "approved": "agent_access_approved",
+                 "revoked": "agent_access_revoked"}
+        if not isinstance(status, str) or status not in kinds:
+            raise CollabError(400, "invalid agent permission status")
+        with self._lock:
+            room = self._lifecycle_room(pr, room_id)
+            agent = self._agents.get(agent_id)
+            if not agent or not self._effective(Principal("agent", agent_id, agent["owner"]), room):
+                raise CollabError(404, "no such agent in this room")
+            if status == "pending":
+                if uid != pr.id:
+                    raise CollabError(403, "request access for yourself")
+            elif not pr.admin and agent["owner"] != pr.id:
+                raise CollabError(403, "only the agent owner can decide access")
+            transition, replayed = self._lifecycle_retry(pr, "agent.permission", room_id,
+                idempotency_key, {"agent_id": agent_id, "user_id": uid, "status": status})
+            existing = self._agent_permissions.get((room_id, agent_id, uid))
+            if replayed or (existing and status == "pending" and existing["status"] == "approved"):
+                if not replayed and idempotency_key is not None:
+                    self._confirm_lifecycle(pr, room, transition)
+                return {**existing, "agent_permission_status": existing["status"]}
+            if not self._member(room, uid) or not self._ok(uid):
+                raise CollabError(409, "an approved room member is required")
+            if existing and existing["status"] == status and idempotency_key is None:
+                return {**existing, "agent_permission_status": existing["status"]}
+            self._commit(kinds[status], self._actor(pr, room_id=room_id,
+                project_id=room["project_id"], agent_id=agent_id, subject_user_id=uid,
+                permission_id=existing["permission_id"] if existing else ids.new_id("permission"),
+                agent_permission_status=status, action="agent.access." + status,
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=agent_id, **transition))
+            permission = self._agent_permissions[(room_id, agent_id, uid)]
+            return {**permission, "agent_permission_status": permission["status"]}
 
     # ------------------------------------------------------ authentication
     def authenticate(self, authorization: str, device: str | None) -> Principal:
@@ -742,12 +985,12 @@ class CollabService:
                         not auto and sum(1 for x in self._users.values() if x["status"] == "pending") >= MAX_PENDING_USERS):
                     self.stats["policy_denied"] += 1
                     raise CollabError(429, "too many people are waiting for approval; ask the operator")
-                self._commit("user_registered", {
+                self._commit("user_approved" if auto else "user_registered", {
                     "actor_user_id": uid, "actor_agent_id": None, "user_id": uid, "at": self._iso(),
                     "status": "approved" if auto else "pending", "decided_by": "auto:group" if auto else None,
                     "action": "user.register", "outcome": "allowed", "project_ids": [], "resource_id": uid})
             elif u["status"] == "pending" and auto:
-                self._commit("user_decided", {
+                self._commit("user_approved", {
                     "actor_user_id": uid, "actor_agent_id": None, "user_id": uid, "at": self._iso(),
                     "status": "approved", "decided_by": "auto:group", "reason": None,
                     "action": "user.approve", "outcome": "allowed", "project_ids": [], "resource_id": uid})
@@ -762,7 +1005,7 @@ class CollabService:
         """The tailnet-only dashboard owner is always approved: nobody else can lock them out."""
         with self._lock:
             if self._users.get(uid, {}).get("status") != "approved":
-                self._commit("user_decided", {
+                self._commit("user_approved", {
                     "actor_user_id": uid, "actor_agent_id": None, "user_id": uid, "at": self._iso(),
                     "status": "approved", "decided_by": "operator", "reason": None,
                     "action": "user.approve", "outcome": "allowed", "project_ids": [], "resource_id": uid})
@@ -939,7 +1182,8 @@ class CollabService:
             self._commit("room_created", self._actor(
                 pr, project_id=project_id, room_id=rid, name=name, action="room.create",
                 outcome="allowed", project_ids=[project_id], resource_id=rid))
-        return {"room_id": rid, "project_id": project_id, "name": name}
+        return {"room_id": rid, "project_id": project_id, "name": name,
+                **self._member_fields(rid, pr.id)}
 
     def list_rooms(self, pr: Principal) -> dict:
         self._require_user(pr)
@@ -949,19 +1193,21 @@ class CollabService:
                 m = self._member(room, pr.id)
                 if m:
                     out.append({"room_id": rid, "name": room["name"], "role": m["role"],
-                                "project_id": room["project_id"] if m["role"] != "guest" else None})
+                                "project_id": room["project_id"] if m["role"] != "guest" else None,
+                                **self._member_fields(rid, pr.id)})
         return {"rooms": out}
 
     def get_room(self, pr: Principal, room_id: str) -> dict:
         with self._lock:
             room, _ = self._authorize(pr, room_id, "read", "room.read")
-            out = {"room_id": room_id, "name": room["name"]}
+            out = {"room_id": room_id, "name": room["name"], **self._member_fields(room_id, pr.owner)}
             if not pr.is_agent:
                 m = self._member(room, pr.id)
                 out["role"] = m["role"]
                 if m["role"] == "owner":
-                    out["members"] = [{"user_id": u, "role": v["role"], "email": self._user_email.get(u)}
-                                      for u, v in room["members"].items() if self._member(room, u)]
+                    out["members"] = [{"user_id": u, "role": v["role"], "email": self._user_email.get(u),
+                                       **self._member_fields(room_id, u)}
+                                      for (rid, u), v in self._room_memberships.items() if rid == room_id]
             return out
 
     def add_member(self, pr: Principal, room_id: str, body: dict) -> dict:
@@ -974,31 +1220,23 @@ class CollabService:
             exp = _finite_expiry(body.get("expires_at"), self._now())
             if not isinstance(uid, str) or not self._ok(uid):
                 raise CollabError(404, "unknown user")
+            transition, replayed = self._lifecycle_retry(pr, "member.add", room_id,
+                body.get("idempotency_key"), {"user_id": uid, "role": role, "expires_at": body.get("expires_at")})
+            if replayed:
+                return {"room_id": room_id, "user_id": uid, "role": role, **self._member_fields(room_id, uid)}
             if self._member(room, uid):
                 raise CollabError(409, "already a member")
             self._room_has_space(room)
             if role == "guest" and exp is None:
                 exp = self._now() + self.guest_ttl
-            self._commit("member_added", self._actor(
+            self._commit("room_member_approved", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, subject_user_id=uid, role=role,
                 expires_at=exp, action="member.add", outcome="allowed",
-                project_ids=[room["project_id"]], resource_id=room_id))
-        return {"room_id": room_id, "user_id": uid, "role": role}
+                project_ids=[room["project_id"]], resource_id=room_id, **transition))
+        return {"room_id": room_id, "user_id": uid, "role": role, **self._member_fields(room_id, uid)}
 
     def remove_member(self, pr: Principal, room_id: str, uid: str) -> dict:
-        self._require_user(pr)
-        with self._lock:
-            room, _ = self._authorize(pr, room_id, "invite", "member.remove")
-            m = room["members"].get(uid)
-            if m is None:
-                raise CollabError(404, "not found")
-            if m["role"] == "owner":
-                raise CollabError(400, "cannot remove an owner")
-            self._commit("member_removed", self._actor(
-                pr, project_id=room["project_id"], room_id=room_id, subject_user_id=uid,
-                action="member.remove", outcome="allowed", project_ids=[room["project_id"]],
-                resource_id=room_id))
-            self._expire_helpers()                   # their helpers in this room end now and free their slots
+        self.remove_room_member(pr, room_id, uid)
         return {"ok": True}
 
     # -- people: approval, disable, kick
@@ -1007,7 +1245,8 @@ class CollabService:
         agents = sum(1 for aid in self._agents_by_owner.get(uid, ()) if self._agents[aid]["status"] == "active")
         return {"user_id": uid, "email": self._user_email.get(uid), "status": u["status"], "since": u.get("since"),
                 "decided_by": u.get("decided_by"), "decided_at": u.get("decided_at"), "reason": u.get("reason"),
-                "rooms": rooms, "agents": agents}
+                "rooms": rooms, "agents": agents, "user_status": u["status"],
+                "memberships": [self.room_member(rid, uid) for rid, user in self._room_memberships if user == uid]}
 
     def list_users(self, pr: Principal, status: str | None = None) -> dict:
         """The operator sees everyone; an approver sees only the people waiting."""
@@ -1035,7 +1274,7 @@ class CollabService:
             rows = []
             for e in reversed(self._log):
                 p = e["payload"]
-                if e["event_type"] in ("user_registered", "user_decided"):
+                if e["event_type"] in ("user_registered", "user_decided", "user_approved"):
                     rows.append({"at": p.get("at"), "user_id": p["user_id"], "email": self._user_email.get(p["user_id"]),
                                  "action": p.get("action"), "status": p["status"], "by": p.get("decided_by"),
                                  "reason": p.get("reason")})
@@ -1068,6 +1307,14 @@ class CollabService:
             if action == "approve" and not self._user_email.get(uid):
                 # Nobody is approved blind: the pool lets anyone sign up, and the email is what says who it is.
                 raise CollabError(409, "they have not finished signing in yet (no verified email); ask again in a moment")
+            transition, replayed = ({}, False)
+            if action == "approve":
+                transition, replayed = self._lifecycle_retry(
+                    pr, "user.approve", uid, body.get("idempotency_key"), {"reason": reason})
+            if replayed:
+                if u["status"] == "approved" and self._user_email.get(uid):
+                    self._deliver_pending(uid, self._user_email[uid])
+                return self._user_row(uid, u)
             if action in ("approve", "deny"):
                 if not pr.admin and u["status"] != "pending":
                     raise CollabError(403, "approvers only decide people who are waiting")
@@ -1079,15 +1326,15 @@ class CollabService:
                 raise CollabError(409, "only an approved person can be disabled")
             self._throttle("userdecide:" + pr.id, 300, 600.0, "user decision")
             new = USER_ACTIONS[action]
-            self._commit("user_decided", self._actor(
+            self._commit("user_approved" if new == "approved" else "user_decided", self._actor(
                 pr, user_id=uid, at=self._iso(), status=new, decided_by=pr.id, reason=reason,
-                action=f"user.{action}", outcome="allowed", project_ids=[], resource_id=uid))
+                action=f"user.{action}", outcome="allowed", project_ids=[], resource_id=uid, **transition))
             if action == "kick":
                 # Out of every room, and every agent they own stops working for good.
                 for rid, room in list(self._rooms.items()):
                     m = room["members"].get(uid)
                     if m is not None and m["role"] != "owner":      # an owner's room stays; they simply can't get in
-                        self._commit("member_removed", self._actor(
+                        self._commit("room_member_removed", self._actor(
                             pr, project_id=room["project_id"], room_id=rid, subject_user_id=uid,
                             action="member.remove", outcome="allowed", project_ids=[room["project_id"]],
                             resource_id=rid))
@@ -1109,7 +1356,7 @@ class CollabService:
     # -- people: link email at sign-in, invite by email
     def me(self, pr: Principal) -> dict:
         self._require_user(pr)
-        out = {"user_id": pr.id, "email": self._user_email.get(pr.id)}
+        out = {"user_id": pr.id, "email": self._user_email.get(pr.id), "user_status": self.user_status(pr.id)}
         if self.approval is not None:
             out.update(status=pr.status, approver=pr.approver, admin=pr.admin)
         return out
@@ -1128,7 +1375,7 @@ class CollabService:
                                                  "user_id": pr.id, "email": email})
             if self._approved(pr.id):                  # invitations wait for approval, then arrive
                 self._deliver_pending(pr.id, email)
-        out = {"user_id": pr.id, "email": email}
+        out = {"user_id": pr.id, "email": email, "user_status": self.user_status(pr.id)}
         if self.approval is not None:
             out.update(status=pr.status, approver=pr.approver, admin=pr.admin)
         return out
@@ -1149,7 +1396,7 @@ class CollabService:
                                                "invite_id": iid, "reason": "inviter_unavailable"})
                 continue
             if not self._member(room, user) and len(room["members"]) < self.max_members_per_room:
-                self._commit("member_added", {
+                self._commit("room_member_approved", {
                     "actor_user_id": inv["inviter"], "actor_agent_id": None,
                     "project_id": room["project_id"], "room_id": inv["room_id"],
                     "subject_user_id": user, "role": inv["role"],
@@ -1177,7 +1424,7 @@ class CollabService:
             if user and self._ok(user):
                 if self._member(room, user):
                     return reply   # same answer as a pending invite: no signed-in-or-not oracle
-                self._commit("member_added", self._actor(
+                self._commit("room_member_approved", self._actor(
                     pr, project_id=room["project_id"], room_id=room_id, subject_user_id=user,
                     role=role, expires_at=self._now() + self.guest_ttl if role == "guest" else None, action="member.add", outcome="allowed",
                     project_ids=[room["project_id"]], resource_id=room_id))
@@ -1710,7 +1957,8 @@ class CollabService:
                 room = self._rooms[rid]
                 eff = self._effective(pr, room)
                 if eff and eff[0]:
-                    out.append({"room_id": rid, "name": room["name"], "actions": sorted(eff[0])})
+                    out.append({"room_id": rid, "name": room["name"], "actions": sorted(eff[0]),
+                                **self._member_fields(rid, pr.owner)})
         return {"rooms": out}
 
     def rotate_credential(self, pr: Principal) -> dict:
@@ -2594,7 +2842,8 @@ class CollabService:
                     return {"seq": cur, "changed": False}
             m = self._member(self._rooms[room_id], pr.id) if not pr.is_agent else None
             guest = bool(m and m["role"] == "guest")
-            out: dict[str, Any] = {"seq": cur, "changed": True, **self.read_events(pr, room_id, cursor, 200)}
+            out: dict[str, Any] = {"seq": cur, "changed": True, **self._member_fields(room_id, pr.owner),
+                                   **self.read_events(pr, room_id, cursor, 200)}
             out["agents"] = [] if guest else self.list_room_agents(pr, room_id)["agents"]
             out["tasks"] = self.list_tasks(pr, room_id)["tasks"]
             out["flow"] = None if guest else self.room_flow(pr, room_id)
@@ -2760,7 +3009,10 @@ class CollabService:
                 a = self._agents.get(aid)
                 if a and a["status"] == "active":
                     out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
-                                "owner_user_id": a["owner"], "actions": g["actions"]})
+                                "owner_user_id": a["owner"], "actions": g["actions"],
+                                "agent_permission_status": self._agent_permissions.get(
+                                    (room_id, aid, pr.owner), {}).get("status",
+                                        "approved" if a["owner"] == pr.owner else "none")})
         return {"agents": out}
 
     # -- tasks (work for agents)
@@ -3093,6 +3345,13 @@ class CollabService:
             elif t.startswith("helper_"):             # ids, role and model: never the task text or result
                 out.update(helper={"helper_id": p.get("helper_id"), "role": p.get("role"), "model": p.get("model"),
                                    "status": p.get("status")})
+        membership_status = {"room_member_invited": "pending", "room_member_approved": "approved",
+                             "room_member_removed": "removed", "member_added": "approved", "member_removed": "removed"}
+        if t in membership_status:
+            out["room_membership_status"] = membership_status[t]
+        for field in ("membership_id", "permission_id", "agent_permission_status", "file_upload_permission"):
+            if field in p:
+                out[field] = p[field]
         out.update(extra)
         return out
 
