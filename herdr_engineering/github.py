@@ -38,6 +38,10 @@ rateLimit {remaining resetAt cost} }"""
 # GitHub's updatedAt can trail an event by a few seconds (G0 spike), so an
 # incremental read re-reads this much below the stored watermark.
 WATERMARK_OVERLAP = timedelta(seconds=10)
+# A pass that resumes deferred work skips the listing; after this many in a row
+# (or one that made no progress) the next pass lists again, so new and removed
+# repositories never wait on a backlog.
+RESUME_PASSES_BEFORE_RELIST = 3
 # Repository fields that change while syncing and are never persisted (a
 # re-upsert of unchanged data must not bump the catalog revision).
 VOLATILE_REPOSITORY_FIELDS = ("issues_loaded", "issues_complete", "error", "newest_updated_at")
@@ -410,7 +414,9 @@ class GitHubMonitor:
         self._marks, self._watermarks = {}, {}
         self._full_at = {}  # repository -> time of its last full read (scheduled reconcile)
         self._deferred = {}  # repository -> when it was first deferred (budget or rate limit)
-        self._resume_repos, self._issue_resume = None, {}
+        # _issue_resume: repository -> its unfinished sync (see _sync_repository)
+        self._resume_repos, self._issue_resume, self._resume_passes = None, {}, 0
+        self._floor, self._pass_reads = None, 0
         self._store, self._store_viewer, self._store_dirty = None, None, False
         self._bind_failed = False  # this pass already failed to read the viewer store
         self._revision = None  # the store's catalog revision after its last load or write
@@ -820,7 +826,9 @@ class GitHubMonitor:
                         table.pop(rid, None)
                 if self._resume_repos is not None:
                     self._resume_repos = {rid: r for rid, r in self._resume_repos.items() if _owner(r) in allow}
-        if self._resume_repos is None:
+            relist = self._resume_repos is None or self._resume_passes >= RESUME_PASSES_BEFORE_RELIST
+            self._resume_passes = 0 if relist else self._resume_passes + 1
+        if relist:
             discovered, cursor, cursors, excluded, owners = {}, None, set(), 0, set()
             while not self._stop.is_set():
                 account, connection = provider.repositories_page(cursor)
@@ -887,7 +895,11 @@ class GitHubMonitor:
         due = self._due_reconciles(discovered)
         self._progress(phase="issues", issue_repositories_total=len(repos),
                        issues_total_known=sum(r["open_issue_count"] for r in repos))
-        errors, over_budget = {}, []
+        # progress floor: the longest-deferred repository gets one read even when the
+        # listing spent the budget, so a repository too big for any pass still advances
+        self._floor = next((r["repository_id"] for r in repos if r["repository_id"] in deferred), None)
+        self._pass_reads = 0
+        errors, over_budget, completed = {}, [], 0
         for record in repos:
             if self._stop.is_set():
                 return
@@ -898,6 +910,7 @@ class GitHubMonitor:
             try:
                 if not self._sync_repository(provider, store, record, reconcile=rid in due):
                     return
+                completed += 1
                 with self._lock:
                     self._deferred.pop(rid, None)
                 done = [r for r in repos if r["issues_complete"]]
@@ -921,6 +934,9 @@ class GitHubMonitor:
         if over_budget:
             # keep the resume state: the next pass continues with the deferred
             # repositories before listing again (a partly read repository resumes at its cursor)
+            if not relist and not completed and not self._pass_reads:
+                with self._lock:
+                    self._resume_passes = RESUME_PASSES_BEFORE_RELIST  # no progress: list next pass
             self._update(status="partial", partial=True, stale=False,
                          error=f"The per-pass point budget ({self._budget}) was spent; "
                                f"{len(over_budget)} repositories wait for the next pass.",
@@ -929,7 +945,7 @@ class GitHubMonitor:
             return
         with self._lock:
             self._check_generation()
-            self._resume_repos, self._issue_resume = None, {}
+            self._resume_repos, self._issue_resume, self._resume_passes = None, {}, 0
         self._update(status="partial" if errors else "ready", partial=bool(errors), stale=bool(errors),
                      error="Some repository issues could not be refreshed." if errors else None,
                      last_success_at=self._view["last_success_at"] if errors else _stamp())
@@ -942,10 +958,15 @@ class GitHubMonitor:
             for rid in rids:
                 self._deferred.setdefault(rid, now)
 
-    def _afford(self):
-        """Before an issue read: stop when this pass's point budget is spent."""
-        if self._spent >= self._budget:
+    def _afford(self, rid):
+        """Before an issue read: stop when this pass's point budget is spent.
+
+        The pass's progress floor (the longest-deferred repository) may still
+        make the first issue read of the pass.
+        """
+        if self._spent >= self._budget and not (rid == self._floor and not self._pass_reads):
             raise _OverBudget()
+        self._pass_reads += 1
 
     def _charge(self, provider):
         """Add the last call's GraphQL ``rateLimit.cost`` (1 when GitHub did not say) to this pass."""
@@ -981,55 +1002,71 @@ class GitHubMonitor:
             self._apply(store, record, probe, issues={}, upserts={}, removed=set(stored),
                         watermark=_latest(watermark, probe["newest"]), full=True)
             return True
-        mode = "incremental" if watermark and _when(watermark) and not reconcile else "full"
-        if resume is not None:
-            mode = resume[3]
-        read = self._read_open(provider, record, stored, mode, watermark, resume)
-        if read is None:
-            return False
-        fresh, total = read
-        seen = [issue["updated_at"] for issue in fresh.values()]
-        if mode == "full":
+        if resume is None:
+            # An unfinished sync survives deferral and relisting. It keeps the probe of
+            # the listing it started from: a later listing's newer probe would lift the
+            # watermark (and the synced mark) past edits this sync never read.
+            mode = "incremental" if watermark and _when(watermark) and not reconcile else "full"
+            resume = self._resume(rid, phase="open", mode=mode, probe=probe, seen=[])
+        probe = resume["probe"]
+        if resume["phase"] == "open":
+            if self._read_open(provider, record, stored, watermark, resume) is None:
+                return False
+            resume["seen"] += [issue["updated_at"] for issue in resume["fresh"].values()]
+            if resume["mode"] == "incremental":
+                with self._lock:
+                    self._check_generation()
+                    resume.update(phase="closed", closed={}, cursor=None, cursors=set(),
+                                  since=_iso(_when(watermark) - WATERMARK_OVERLAP))
+        fresh = resume["fresh"]
+        if resume["mode"] == "full":
             issues, removed, upserts = dict(fresh), set(stored) - set(fresh), fresh
         else:
-            since = _iso(_when(watermark) - WATERMARK_OVERLAP)
-            closed = self._read_closed(provider, rid, since)
+            closed = self._read_closed(provider, rid, resume)
             if closed is None:
                 return False
             # closed-read timestamps never feed the watermark: a closed issue edited after
             # the open read would lift it past an open edit that read never saw
             issues = {gid: issue for gid, issue in {**stored, **fresh}.items() if gid not in closed}
             removed, upserts = set(closed) & (set(stored) | set(fresh)), {g: i for g, i in fresh.items() if g not in closed}
-            if len(issues) != total:
+            if len(issues) != resume["total"]:
                 # deletes and transfers never pass through CLOSED: re-read this repository only
-                mode = "full"
-                read = self._read_open(provider, record, issues, mode, watermark, None)
-                if read is None:
+                # (recorded first, so a deferral resumes the full read, not the closed one)
+                resume = self._resume(rid, phase="open", mode="full", probe=probe, seen=resume["seen"])
+                if self._read_open(provider, record, issues, watermark, resume) is None:
                     return False
-                full, _ = read
-                seen += [issue["updated_at"] for issue in full.values()]
+                full = resume["fresh"]
+                resume["seen"] += [issue["updated_at"] for issue in full.values()]
                 removed = (set(stored) | set(fresh)) - set(full)
                 issues, upserts = dict(full), full
         self._apply(store, record, probe, issues=issues, upserts=upserts, removed=removed,
-                    watermark=_latest(watermark, probe["newest"], *seen), full=mode == "full")
+                    watermark=_latest(watermark, probe["newest"], *resume["seen"]),
+                    full=resume["mode"] == "full")
         return True
 
-    def _read_open(self, provider, record, stored, mode, watermark, resume):
+    def _resume(self, rid, **state):
+        """Start (and record) one repository's sync: its open read comes first."""
+        resume = dict(state, fresh={}, cursor=None, cursors=set(), total=None)
+        with self._lock:
+            self._check_generation()
+            self._issue_resume[rid] = resume
+        return resume
+
+    def _read_open(self, provider, record, stored, watermark, resume):
         """Page open issues newest first: all of them (``full``) or down to the watermark overlap.
 
-        Returns ``(issues read, open totalCount)``, or ``None`` when stopped.
+        Continues ``resume`` at its cursor and records each page in it (``fresh``,
+        ``cursor``, the open ``total``); ``None`` when stopped.
         """
         rid = record["repository_id"]
-        fresh, cursor, cursors, _ = resume or ({}, None, set(), mode)
-        cutoff = _when(watermark) - WATERMARK_OVERLAP if mode == "incremental" else None
-        total = None
+        fresh = resume["fresh"]
+        cutoff = _when(watermark) - WATERMARK_OVERLAP if resume["mode"] == "incremental" else None
         while True:
             if self._stop.is_set():
                 return None
-            self._afford()
-            connection = provider.issues_page(rid, cursor)
+            self._afford(rid)
+            connection = provider.issues_page(rid, resume["cursor"])
             self._charge(provider)
-            total = connection["totalCount"] if total is None else total
             below = False
             for row in connection["nodes"]:
                 issue = _issue(row, rid)
@@ -1044,37 +1081,46 @@ class GitHubMonitor:
                     raise GitHubError("capacity")
                 self._issues[rid] = copy.deepcopy(candidate)
                 record["issues_loaded"] = len(candidate)
+                if resume["total"] is None:
+                    resume["total"] = connection["totalCount"]
             self._update(rate_limit=provider.rate_limit)
             if below or not connection["pageInfo"]["hasNextPage"]:
-                return fresh, total
-            cursor = connection["pageInfo"]["endCursor"]
-            if cursor in cursors:
-                raise GitHubError("invalid_response")
-            cursors.add(cursor)
-            with self._lock:
-                self._check_generation()
-                self._issue_resume[rid] = (fresh, cursor, cursors, mode)
+                return fresh
+            self._advance(resume, connection)
 
-    def _read_closed(self, provider, rid, since):
-        """``{github_id: updatedAt}`` of issues closed (or edited while closed) since ``since``."""
-        closed, cursor, cursors = {}, None, set()
+    def _advance(self, resume, connection):
+        """Record the next page's cursor in ``resume`` (a repeated cursor is an invalid response)."""
+        cursor = connection["pageInfo"]["endCursor"]
+        if cursor in resume["cursors"]:
+            raise GitHubError("invalid_response")
+        with self._lock:
+            self._check_generation()
+            resume["cursors"].add(cursor)
+            resume["cursor"] = cursor
+
+    def _read_closed(self, provider, rid, resume):
+        """``{github_id: updatedAt}`` of issues closed (or edited while closed) since ``resume["since"]``.
+
+        Pages from ``resume``'s cursor, so a window larger than one pass's budget
+        is read once across passes, never again from page 1; ``None`` when stopped.
+        """
+        closed = resume["closed"]
         while True:
             if self._stop.is_set():
                 return None
-            self._afford()
-            connection = provider.closed_issues_page(rid, since, cursor)
+            self._afford(rid)
+            connection = provider.closed_issues_page(rid, resume["since"], resume["cursor"])
             self._charge(provider)
             for row in connection["nodes"]:
                 if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                     raise GitHubError("invalid_response")
-                closed[row["id"]] = row.get("updatedAt")
+            with self._lock:
+                self._check_generation()
+                closed.update((row["id"], row.get("updatedAt")) for row in connection["nodes"])
             self._update(rate_limit=provider.rate_limit)
             if not connection["pageInfo"]["hasNextPage"]:
                 return closed
-            cursor = connection["pageInfo"]["endCursor"]
-            if cursor in cursors:
-                raise GitHubError("invalid_response")
-            cursors.add(cursor)
+            self._advance(resume, connection)
 
     def _apply(self, store, record, probe, *, issues, upserts, removed, watermark, full=False):
         """Commit one repository's completed sync to memory, then to the store.

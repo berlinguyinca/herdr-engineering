@@ -602,6 +602,87 @@ def test_point_budget_is_read_from_yaml(fake_host_config):
     assert len(monitor.snapshot(start=False)["deferred_repos"]) == 2
 
 
+def closed_backlog(budget):
+    """acme/big with 10 issues closed since its last sync (5 closed pages of 2) plus one edit."""
+    fake = FakeGitHub(page_size=2)
+    keep = fake.add_issue("acme/big")
+    gids = [fake.add_issue("acme/big") for _ in range(10)]
+    fake.add_issue("acme/small")
+    clock = [1_000_000.0]
+    monitor = monitor_for(fake, {}, now=lambda: clock[0], point_budget=1000)
+    monitor.refresh()
+    for gid in gids:
+        fake.edit("acme/big", gid, state="CLOSED")
+    fake.edit("acme/big", keep, title="edited")
+    monitor._fixed_sync["point_budget"] = budget
+    return fake, monitor, clock, fake.repos["acme/big"][keep]["number"]
+
+
+def drive(fake, monitor, clock, passes):
+    """Run passes until nothing is deferred; return each pass's calls."""
+    history = []
+    for _ in range(passes):
+        clock[0] += 300
+        fake.log.clear()
+        fake.calls.clear()
+        monitor.refresh()
+        history.append(list(fake.log))
+        if not monitor.snapshot(start=False)["deferred_repos"]:
+            break
+    return history
+
+
+def big_reads(log):
+    return [entry for entry in log if entry[0] in {"issues", "closed"} and entry[1] == "github.com/acme/big"]
+
+
+def test_a_closed_window_larger_than_the_budget_resumes_at_its_cursor_and_converges():
+    fake, monitor, clock, keep = closed_backlog(3)
+    first = drive(fake, monitor, clock, 1)
+    assert monitor.snapshot(start=False)["deferred_repos"]  # the closed window does not fit one pass
+    fake.add_repo("acme/new")       # only a fresh listing can show these two
+    del fake.repos["acme/small"]
+    history = first + drive(fake, monitor, clock, 12)
+    view = monitor.snapshot(start=False)
+    assert view["deferred_repos"] == [] and view["status"] == "ready"
+    # every pass advanced acme/big; its closed window was never re-read from page 1
+    assert all(big_reads(log) for log in history[:-1])
+    closed_starts = [e for log in history for e in big_reads(log) if e[0] == "closed" and e[2] is None]
+    assert len(closed_starts) == 1
+    assert numbers(monitor, "github.com/acme/big") == [keep]
+    clock[0] += 300
+    monitor.refresh()  # the catalog is not frozen: the next pass lists again
+    repos = {r["repository_id"] for r in monitor.repositories(start=False, per_page=100)["repositories"]}
+    assert repos == {"github.com/acme/big", "github.com/acme/new"}
+
+
+def test_a_repository_that_never_fits_the_budget_still_advances_and_the_listing_is_forced():
+    fake, monitor, clock, keep = closed_backlog(1)  # the listing alone spends the budget
+    drive(fake, monitor, clock, 1)
+    fake.add_repo("acme/new")
+    history = drive(fake, monitor, clock, 20)
+    assert monitor.snapshot(start=False)["deferred_repos"] == []
+    assert all(big_reads(log) for log in history[:-1])  # the longest-deferred repository always moves
+    listed = [index for index, log in enumerate(history) if any(e[0] == "repos" for e in log)]
+    assert listed and listed[0] <= 3  # resuming never freezes the listing for more than a few passes
+    assert "github.com/acme/new" in {r["repository_id"] for r in
+                                     monitor.repositories(start=False, per_page=100)["repositories"]}
+    assert numbers(monitor, "github.com/acme/big") == [keep]
+
+
+def test_a_relist_during_a_resumed_sync_never_lifts_the_watermark_past_an_unread_edit():
+    fake, monitor, clock, keep = closed_backlog(1)
+    drive(fake, monitor, clock, 1)
+    drive(fake, monitor, clock, 1)  # acme/big's open read is done; its closed read is under way
+    fake.edit("acme/big", next(g for g, i in fake.repos["acme/big"].items() if i["state"] == "OPEN"),
+              title="edited after the open read")
+    drive(fake, monitor, clock, 20)
+    monitor._fixed_sync["point_budget"] = 1000
+    clock[0] += 300
+    monitor.refresh()
+    assert titles(monitor, "github.com/acme/big") == {"edited after the open read"}
+
+
 # ---------------------------------------------------------------- G6
 
 
