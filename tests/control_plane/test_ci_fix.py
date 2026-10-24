@@ -526,3 +526,31 @@ def test_api_serves_the_runner_filters_and_defer(api):
     assert call(api, "ci/fix/claim", {"host": "bender"}, key="runner")[1]["request"]["id"] == fix
     assert call(api, "ci/fix?host=bender&active=1", key="runner")[1]["fixes"][0]["id"] == fix
     assert call(api, "ci/fix?host=beast&active=1", key="runner")[1]["fixes"] == []
+
+
+# ------------------------------------------------------------------ association with the agent's session
+def association(repo, session_id):
+    page = repo.inspector.query(session_id, role="viewer", view="conversation", limit=1)
+    return {key: value for key, value in page["summary"]["association"].items() if key != "_flags"}
+
+
+def test_the_agents_session_is_tied_to_the_run_branch_and_pull_request():
+    repo, service, monitor = make()
+    fix = claimed(service, monitor)
+    session = "herdr:bender:default:w7%3Ap1"
+    service.set_state(fix, "running", session_id=session, branch="herdr-ci-fix/12-bbbbbbb", model="m")
+    assert association(repo, session) == {"worktree": "ci-fix org/frontend:12", "branch": "herdr-ci-fix/12-bbbbbbb"}
+    service.set_state(fix, "finishing")
+    service.record_result(fix, {"pr_url": "https://github.com/org/frontend/pull/9", "pr_number": 9, "summary": "ok"})
+    assert association(repo, session)["pr"] == {"number": 9, "url": "https://github.com/org/frontend/pull/9",
+                                                "repo": "org/frontend"}
+    before = len(repo.stream("ci_fix", fix))
+    service.set_state(fix, "finishing", reason="same again")                      # replays add no second association
+    assert len(repo.stream("ci_fix", fix)) == before + 1
+
+
+def test_a_session_id_the_inspector_refuses_does_not_fail_the_transition():
+    _, service, monitor = make()
+    fix = claimed(service, monitor)
+    out = service.set_state(fix, "running", session_id="has spaces and !!", branch="herdr-ci-fix/12-bbbbbbb")
+    assert out["state"] == "running" and out["session_id"] == "has spaces and !!"

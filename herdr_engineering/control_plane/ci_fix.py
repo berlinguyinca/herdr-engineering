@@ -8,6 +8,8 @@ commit, a branch name under ``herdr-ci-fix/`` and a short summary, never a crede
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 import threading
 from urllib.parse import urlsplit
@@ -15,6 +17,7 @@ from urllib.parse import urlsplit
 from .ids import is_valid_id, new_id
 from .redact import redact_text
 
+log = logging.getLogger(__name__)
 ENTITY = "ci_fix"
 ACTIVE = frozenset({"claimed", "preparing", "running", "finishing"})
 TERMINAL = frozenset({"succeeded", "no_change", "failed", "cancelled", "expired"})
@@ -387,7 +390,10 @@ class CIFixService:
             if state == current and not fresh:
                 return self.view(record)
             self._event(fix_id, "CIFixStateChanged", {"state": state, **fresh})
-            return self.view(self._fold(fix_id))
+            record = self._fold(fix_id)
+            if "session_id" in fresh or "branch" in fresh:
+                self._associate(record)
+            return self.view(record)
 
     _RESULT_INT = {"commits": 1000, "files": 100000, "insertions": 10**9, "deletions": 10**9, "diff_kb": 10**7}
 
@@ -432,7 +438,31 @@ class CIFixService:
             if record["result"] is not None:
                 raise ValueError("result already recorded")
             self._event(fix_id, "CIFixResult", result)
-            return self.view(self._fold(fix_id))
+            record = self._fold(fix_id)
+            if result.get("pr_url"):
+                self._associate(record)
+            return self.view(record)
+
+    def _associate(self, record):
+        """Tie the agent's session to the run it works on. The control plane writes this itself from the
+        validated state the runner reported (the agent in the box has no way to call it), as an inspector
+        association: the branch, a worktree label naming the run and, once it exists, the draft pull request.
+        Best effort: a session id the inspector does not accept must not fail the transition."""
+        session_id = record.get("session_id")
+        if not session_id:
+            return
+        event = {"kind": "association", "agent_id": "main", "worktree": f"ci-fix {record['run']}"[:512]}
+        if record.get("branch"):
+            event["branch"] = record["branch"]
+        result = record.get("result") or {}
+        if result.get("pr_url"):
+            event["pr"] = {"number": result.get("pr_number"), "url": result["pr_url"], "repo": record["repository"]}
+        digest = hashlib.sha256(repr(sorted(event.items(), key=str)).encode()).hexdigest()[:24]
+        event["event_id"] = f"cifix:{record['id']}:{digest}"[:128]
+        try:
+            self.repo.inspector.ingest(session_id, event)
+        except (ValueError, RuntimeError) as exc:
+            log.warning("ci fix %s: association not recorded: %s", record["id"], type(exc).__name__)
 
     def cancel(self, fix_id, *, actor=None):
         """Operator cancel. A queued fix ends at once; a running one is flagged and the runner stops it,

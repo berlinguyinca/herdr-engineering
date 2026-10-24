@@ -77,17 +77,21 @@ class Launcher:
 
     def __init__(self, unavailable=None):
         self.unavailable, self.started, self.stopped, self.running = unavailable, [], [], {}
+        self.screen = {}                                  # fix id -> what the "screen" shows (None: unreadable)
 
     def available(self):
         return self.unavailable
 
-    def start(self, fix):
+    def start(self, fix, config=None):
         self.started.append(fix["id"])
         self.running[fix["id"]] = True
         return {"session_id": f"herdr:bender:eng:{len(self.started)}"}
 
     def alive(self, fix):
         return self.running.get(fix["id"], False)
+
+    def fingerprint(self, fix):
+        return self.screen.get(fix["id"])
 
     def stop(self, fix):
         self.stopped.append(fix["id"])
@@ -250,7 +254,7 @@ def test_a_commit_the_forge_does_not_have_fails_with_that_reason_and_leaves_noth
 
 def test_the_launcher_failing_ends_the_fix_and_cleans_up(env):
     class Broken(Launcher):
-        def start(self, fix):
+        def start(self, fix, config=None):
             raise runner.Failure("pi is not installed")
     env.launcher = Broken()
     fix = env.ask()
