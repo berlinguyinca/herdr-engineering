@@ -122,6 +122,51 @@ test('connectEvents dispatches parsed events and disconnects cleanly', () => {
   assert.equal(fakeES.closed, true);
 });
 
+test('connectEvents swallows StreamConnected and replayed event_ids', () => {
+  const seen = [];
+  const fakeES = { onmessage: null, onerror: null, close() {} };
+  connectEvents({
+    url: '/events',
+    onEvent: (e) => seen.push(e),
+    createEventSource: () => fakeES,
+    autoReconnectMs: 0,
+  });
+  const send = (o) => fakeES.onmessage({ data: JSON.stringify(o) });
+  send({ event_type: 'StreamConnected', entity_type: 'stream', entity_id: 'control-plane', sequence: 0 });
+  send({ event_type: 'A', event_id: 'e1' });
+  send({ event_type: 'A', event_id: 'e1' }); // replay after reconnect
+  send({ event_type: 'B', event_id: 'e2' });
+  assert.deepEqual(seen.map((e) => e.event_id), ['e1', 'e2']);
+});
+
+test('connectEvents drops replayed per-entity sequences but forwards newer ones', () => {
+  const seen = [];
+  const fakeES = { onmessage: null, onerror: null, close() {} };
+  connectEvents({
+    url: '/events', onEvent: (e) => seen.push(e),
+    createEventSource: () => fakeES, autoReconnectMs: 0,
+  });
+  const send = (seq, id = 'm1') => fakeES.onmessage({
+    data: JSON.stringify({ event_type: 'X', entity_type: 'mission', entity_id: id, sequence: seq }),
+  });
+  send(1); send(2); send(2); send(1); send(3); send(1, 'm2');
+  assert.deepEqual(seen.map((e) => `${e.entity_id}:${e.sequence}`), ['m1:1', 'm1:2', 'm1:3', 'm2:1']);
+});
+
+test('connectEvents seen-set is bounded to 500 event_ids', () => {
+  const seen = [];
+  const fakeES = { onmessage: null, onerror: null, close() {} };
+  connectEvents({
+    url: '/events', onEvent: (e) => seen.push(e),
+    createEventSource: () => fakeES, autoReconnectMs: 0,
+  });
+  const send = (id) => fakeES.onmessage({ data: JSON.stringify({ event_type: 'A', event_id: id }) });
+  for (let i = 0; i < 600; i++) send(`e${i}`);
+  send('e599'); // recent: still deduped
+  send('e0');   // evicted: forwarded again
+  assert.equal(seen.length, 601);
+});
+
 test('getCi requests /api/v1/ci', async () => {
   const calls = [];
   const client = new HerdrClient('', {
