@@ -61,28 +61,36 @@ export function createRefreshBus({
 }
 
 // One mounted view's refresh: fetch with load(), then apply(data) unless the view was disposed
-// meanwhile. Overlapping calls share the in-flight run. A failed refresh keeps the page and marks
-// the view's <herdr-freshness> chip (if any) red; a success marks it fresh.
+// meanwhile. A refresh requested while one is in flight is not swallowed: it runs once more after
+// the current one finishes (any number of mid-flight requests coalesce into that one rerun).
+// A failed refresh keeps the page and marks the view's <herdr-freshness> chip (if any) red.
 export function liveRefresher(load, apply, chip = () => null) {
   let disposed = false;
   let inflight = null;
+  let again = null;
+  let nextHint;
   const touch = (ok, message) => { const el = chip(); if (el && typeof el.touch === 'function') el.touch(ok, message); };
+  const run = (hint) => {
+    inflight = (async () => {
+      try {
+        const data = await load(hint);
+        if (disposed) return;
+        apply(data);
+        touch(true);
+      } catch (error) {
+        if (!disposed) touch(false, error?.message || 'refresh failed');
+      } finally { inflight = null; }
+    })();
+    return inflight;
+  };
   return {
     applied(data) { apply(data); touch(true); },
     refresh(hint) {
       if (disposed) return Promise.resolve();
-      if (inflight) return inflight;
-      inflight = (async () => {
-        try {
-          const data = await load(hint);
-          if (disposed) return;
-          apply(data);
-          touch(true);
-        } catch (error) {
-          if (!disposed) touch(false, error?.message || 'refresh failed');
-        } finally { inflight = null; }
-      })();
-      return inflight;
+      if (!inflight) return run(hint);
+      nextHint = hint;
+      if (!again) again = inflight.then(() => { again = null; return disposed ? undefined : run(nextHint); });
+      return again;
     },
     dispose() { disposed = true; },
     get disposed() { return disposed; },

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createRefreshBus} from '../refresh-bus.js';
+import {createRefreshBus, liveRefresher} from '../refresh-bus.js';
 
 function harness(){
   let t=0;const timers=[];
@@ -85,4 +85,27 @@ test('register({fresh:true}) treats registration as a refresh: first event waits
   assert.equal(a.calls.length,0);assert.equal(b.calls.length,1);
   advance(4999);assert.equal(a.calls.length,0);
   advance(1);assert.equal(a.calls.length,1);
+});
+
+test('liveRefresher: a refresh requested mid-flight runs once more after it finishes, with the latest data',async()=>{
+  const gates=[];let calls=0;const applied=[];
+  const live=liveRefresher(()=>{calls++;return new Promise(r=>gates.push(r));},d=>applied.push(d));
+  const first=live.refresh();
+  const second=live.refresh();live.refresh();// both coalesce into one trailing run
+  assert.equal(calls,1);
+  gates[0]('old');await first;
+  await new Promise(r=>setImmediate(r));
+  assert.equal(calls,2,'the swallowed request runs once more');
+  gates[1]('new');await second;
+  assert.deepEqual(applied,['old','new']);
+  await new Promise(r=>setImmediate(r));
+  assert.equal(calls,2,'no extra runs');
+});
+
+test('liveRefresher: a disposed view applies nothing and does not rerun',async()=>{
+  const gates=[];let calls=0;const applied=[];
+  const live=liveRefresher(()=>{calls++;return new Promise(r=>gates.push(r));},d=>applied.push(d));
+  const p=live.refresh();live.refresh();live.dispose();
+  gates[0]('x');await p;await new Promise(r=>setImmediate(r));
+  assert.deepEqual([calls,applied],[1,[]]);
 });
