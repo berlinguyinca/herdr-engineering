@@ -113,9 +113,12 @@ filtered or searched, never animate.
 - `easeValue(progress, from, to)` eases a `<progress>`.
 - `snapshotText(root, selector, keyOf)` before a redraw and `animateChanges(root, selector, before,
   keyOf)` after it flash the values that changed. A single number counts up from its old value.
-- `skeleton(label, { rows, height, bare })` is the first-load placeholder (`[data-skeleton]`,
-  announced as "Loading <label>"). Views replace it when their data lands. A live refresh never
-  shows a skeleton again.
+- `skeleton(label, { rows, height, bare, inStatus })` is the first-load placeholder
+  (`[data-skeleton]`, `aria-busy="true"`). On its own it is a `role="status"` region labelled
+  "Loading <label>". Inside an existing `role="status"` region, pass `inStatus`: the placeholder
+  then adds no second region and carries a visually hidden "Loading <label>" for the outer one.
+  Views replace it when their data lands. A failed first load replaces it with the error text, and
+  a live refresh never shows a skeleton again.
 - Durations come from `--motion-fast` and `--motion-normal`.
 
 ### Calm and dark controls
@@ -136,7 +139,9 @@ Calm (auto, on, off).
     blocks (the media query, and `data-theme="dark"`).
   - Never hard-code a colour in a view: add a token with its light and dark values.
   - `tests/playwright/dark-theme.test.mjs` checks every route for 4.5:1 text contrast and no
-    light fills in dark.
+    light fills in dark. Known limit: it measures text against the fills of its DOM ancestors,
+    so an absolutely positioned element drawn over a sibling's fill is not measured against what
+    it visually covers.
 
 ### Freshness chip (`freshness.js`)
 

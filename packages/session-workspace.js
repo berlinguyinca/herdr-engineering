@@ -56,8 +56,8 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   host.innerHTML=`<section class="sw" data-session-workspace>
     <header class="sw-workspace-heading"><strong data-agent-name>${esc(session.display_name || session.agent_role || 'Agent')}</strong><button type="button" data-rename-agent${session.capabilities?.rename_agent?'':' hidden'}>Rename agent</button><a class="sw-llm-link" data-llm-link href="#/llm/session/${esc(encodeURIComponent(session.session_id))}">LLM usage</a><button type="button" data-fullscreen aria-expanded="false">Fullscreen workspace</button></header>
     <form data-rename-form hidden><label>Agent name <input aria-label="Agent name" name="agent_name" maxlength="64" required></label><button type="submit">Save name</button><button type="button" data-cancel-rename>Cancel</button><p data-rename-status role="status"></p></form>
-    <section class="sw-summary-card" aria-label="Agent summary"><div class="sw-summary-heading"><h3>AI-generated summary</h3><button type="button" data-regenerate-summary${session.capabilities?.regenerate_summary?'':' hidden'}>Regenerate summary</button></div><div data-agent-summary role="status">${skeleton('summary',{rows:2,height:18})}</div></section>
-    <div class="sw-status" data-recording-status role="status">${skeleton('recorded conversation',{rows:1,height:16})}</div>
+    <section class="sw-summary-card" aria-label="Agent summary"><div class="sw-summary-heading"><h3>AI-generated summary</h3><button type="button" data-regenerate-summary${session.capabilities?.regenerate_summary?'':' hidden'}>Regenerate summary</button></div><div data-agent-summary role="status">${skeleton('summary',{rows:2,height:18,inStatus:true})}</div></section>
+    <div class="sw-status" data-recording-status role="status">${skeleton('recorded conversation',{rows:1,height:16,inStatus:true})}</div>
     <div class="sw-relations" data-session-relations></div>
     <div class="sw-filters"><label>Agent <select data-agent-filter><option value="">All agents</option></select></label>
       <label>Search <input type="search" data-search placeholder="Search conversation and activity"></label>

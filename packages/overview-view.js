@@ -113,7 +113,7 @@ function availability(keys, states) {
     const state = states[key];
     const label = SOURCE_LABELS[key];
     if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: Could not refresh.${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
-    if (!state?.loaded) return `<div class="hd-skeleton ov-skeleton" data-skeleton role="status" aria-label="Loading ${esc(label.toLowerCase())}"></div>`;
+    if (!state?.loaded) return `<div class="hd-skeleton ov-skeleton" data-skeleton aria-busy="true" role="status" aria-label="Loading ${esc(label.toLowerCase())}"></div>`;
     return '';
   }).join('');
 }

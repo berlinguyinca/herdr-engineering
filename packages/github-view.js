@@ -30,7 +30,7 @@ export function githubIssueLabel(issue={}) {
 }
 // failed: the first read failed (its message shows beside the list), so no skeleton is left behind.
 export function renderGithubHealth(snapshot,{failed=false}={}) {
- if(!snapshot)return failed?'':skeleton('GitHub connection',{rows:1,height:20});
+ if(!snapshot)return failed?'':skeleton('GitHub connection',{rows:1,height:20,inStatus:true});
  const messages={not_configured:'GitHub connection needs server configuration.',auth_error:'GitHub authentication failed. The server credential needs attention.',rate_limited:'GitHub is rate limited. Synchronization will resume when requests are available.',unavailable:'GitHub could not be reached.'};
  const progress=snapshot.progress||{},issues=progress.phase==='issues'||Number(progress.issue_repositories_complete)>0;
  const complete=issues?progress.issue_repositories_complete:progress.repositories_seen;

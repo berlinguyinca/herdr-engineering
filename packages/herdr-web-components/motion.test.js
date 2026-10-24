@@ -69,3 +69,14 @@ test('flash sets data-flash for 600ms and no-ops under calm',()=>{
   const c=install();setCalm('on');const f=el();flash(f);
   assert.equal(f.attrs.flash,undefined);assert.equal(c.timers.length,0);
 });
+
+test('skeleton: a busy, announced placeholder; inside a status region it adds no second one', async () => {
+  const {skeleton} = await import('../motion.js');
+  const own = skeleton('runs');
+  assert.match(own, /data-skeleton/);assert.match(own, /aria-busy="true"/);
+  assert.match(own, /role="status"/);assert.match(own, /aria-label="Loading runs"/);
+  const nested = skeleton('runs', {inStatus: true});
+  assert.match(nested, /data-skeleton/);assert.match(nested, /aria-busy="true"/);
+  assert.doesNotMatch(nested, /role=/);
+  assert.match(nested, /<span class="visually-hidden">Loading runs<\/span>/, 'the outer region announces it');
+});
