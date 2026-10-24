@@ -859,7 +859,7 @@ def test_v1_records_and_analytics_shape_are_unchanged():
     v1 = _records(repo)[1]
     assert v1["input_tokens"] == 0 and "schema" not in v1  # v1 payloads keep the old shape
     out = repo.token_analytics()
-    assert set(out) == {"total", "by_project", "by_model", "by_day"}
+    assert set(out) == {"total", "by_project", "by_model", "by_day", "by_session"}
     assert out["total"] == {"requests": 4, "input_tokens": 4, "output_tokens": 6,
                             "reasoning_tokens": 0, "cache_read_tokens": 0, "failed": 1}
     assert set(out["by_model"]) == {"m", "m2"}

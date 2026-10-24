@@ -562,7 +562,9 @@ renders only the `llm` section and `control_plane.llm_proxy` into the proxy's 06
 configuration from the environment and the key is never given to agents (see
 `deploy/control-plane/README.md`). The token
 usage (including streaming) is recorded against the project: `GET /api/v1/analytics/tokens`
-(`?project=`, `?since=`) and the **Token usage** page at `#/analytics/tokens`. Custom models
+(`?project=`, `?since=`; `by_session` maps each row's session id to a dashboard session or
+labels it `unmatched:<id>`, see the LLM page spec, Decision 4) and the **Token usage** page at
+`#/analytics/tokens`. Custom models
 (`POST /api/v1/llm/models {"name","base_url","upstream_model"}`) are routed to their own endpoint
 and never receive the lab key. The gateway is not exposed beyond the fabric. It uses the public
 HTTPS API only; the `upstream` link role (specs repo, spec 63) will replace this path.
