@@ -165,12 +165,15 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     const bar=row.querySelector('progress'), from=bar?Number(bar.getAttribute('value')):NaN;
     morph(row,element(item.html));
     const next=row.querySelector('progress');
-    if(next&&next===bar)easeValue(next,from,Number(next.getAttribute('value')));
+    if(next&&next===bar&&rowMotion)easeValue(next,from,Number(next.getAttribute('value')));
   }
   // Groups and rows keep their nodes across refreshes: a group <details> is created once (its open
   // state is the user's), rows are keyed by mission key and enter/leave through patchList. A group
   // created by this draw (first paint, a filter or tab change) shows its rows without animation.
-  function patchGroups(wanted,selected){
+  let motionSettled=false,motionView='';
+  let rowMotion=false;
+  function patchGroups(wanted,selected,live){
+    rowMotion=live;
     const root=el('groups'), keys=new Set(wanted.map(([key])=>key));
     for(const child of [...root.children])if(!child.matches('details[data-group]')||!keys.has(child.dataset.group))child.remove();
     let cursor=root.firstElementChild;
@@ -187,8 +190,8 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
       if(group!==cursor)root.insertBefore(group,cursor);else cursor=group.nextElementSibling;
       patchText(group.querySelector('summary span'),rows.length);
       const list=group.querySelector('[data-rows]');
-      patchList(list,rows.slice(0,limit).map(e=>({key:e.key,html:compactMissionRow(e)})),{key:item=>item.key,render:item=>item.html,update:updateRow,inPlace:true,animate:!created});
-      if(created)for(const row of list.querySelectorAll('[data-entering]'))row.removeAttribute('data-entering');
+      patchList(list,rows.slice(0,limit).map(e=>({key:e.key,html:compactMissionRow(e)})),{key:item=>item.key,render:item=>item.html,update:updateRow,inPlace:true,animate:live&&!created});
+      if(created||!live)for(const row of list.querySelectorAll('[data-entering]'))row.removeAttribute('data-entering');
       morph(group.querySelector('[data-group-foot]'),`${rows.length?'':`<p class="mc-note">${liveLoaded&&recordedLoaded?'No missions in this group match your filters.':'Loading reports…'}</p>`}
         ${rows.length>limit?`<div class="mc-more"><button class="hd-btn" data-more="${key}">Show ${Math.min(10,rows.length-limit)} more (${rows.length-limit} remaining)</button></div>`:''}`);
     }
@@ -206,7 +209,12 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     const focusKey=container.contains(focused) ? {mission:focused.closest('[data-mission-key]')?.dataset.missionKey,group:focused.closest('details[data-group]')?.dataset.group,more:focused.dataset.more,tab:focused.closest('[data-tab]')?.dataset.tab,filter:focused.closest('[data-filter]')?.dataset.filter,isSummary:focused.tagName==='SUMMARY'} : null;
     const scroll={x:window.scrollX,y:window.scrollY};
     const countLabel=n=>liveLoaded&&recordedLoaded?String(n):liveLoaded||recordedLoaded?`${n}+`:'…';
-    const tabCounts=snapshotText(el('tabs'),'[data-tab] span',tabKey), filterCounts=snapshotText(el('counts'),'[data-filter] strong',filterKey);
+    // Motion only for data-driven changes: not while the first load is partial (counts read "3+"
+    // until both sources land) and not when the user changed the tab, a filter or the search.
+    const settled=liveLoaded&&recordedLoaded, view=JSON.stringify([state,[...limits]]);
+    const live=settled&&motionSettled&&view===motionView;
+    motionSettled=settled;motionView=view;
+    const tabCounts=live?snapshotText(el('tabs'),'[data-tab] span',tabKey):null, filterCounts=live?snapshotText(el('counts'),'[data-filter] strong',filterKey):null;
     el('tabs').innerHTML=TABS.map(([key,label])=>`<button type="button" role="tab" id="mc-tab-${key}" aria-controls="mc-groups" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}" data-tab="${key}">${label} <span>${countLabel(all.filter(e=>e.tab===key).length)}</span></button>`).join('');
     el('groups').setAttribute('aria-labelledby',`mc-tab-${state.tab}`);
     el('counts').hidden=state.tab!=='current';
@@ -218,7 +226,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     el('host').innerHTML='<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');el('host').value=state.host;
     el('result').textContent=liveLoaded||recordedLoaded?`${selected.length} matching ${state.tab} missions${liveLoaded&&recordedLoaded?'':' · partial results (+): waiting for remaining source'} · live activity refreshes every 5 seconds`:'Loading missions…';
     const wanted=GROUPS.filter(([key])=>(state.tab==='current'?currentGroup(key):state.tab==='unconfirmed'?['lastknown','recorded'].includes(key):state.tab===key)&&(state.status==='all'||state.status===key));
-    patchGroups(wanted,selected);
+    patchGroups(wanted,selected,live);
     if(focusKey){
       let target;
       if(focusKey.mission) {

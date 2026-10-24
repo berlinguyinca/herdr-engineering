@@ -118,6 +118,7 @@ export function mountTopology(container,client,{status='current'}={}) {
       return `<details class="tx-subgroup" data-tx-disclosure="${esc(key)}" ${subOpen?'open':''}><summary>${esc(sub.label)}<span>${sub.entries.length}</span></summary>${subOpen?sub.entries.slice(0,limit).map(row=>topologyRow(row,now)).join('')+(sub.entries.length>limit?`<div class="tx-more"><button type="button" class="hd-btn" data-tx-more="${esc(key)}">Show ${Math.min(6,sub.entries.length-limit)} more · ${sub.entries.length-limit} remaining</button></div>`:''):''}</details>`;
     }).join('')||'<p class="tx-note">No records match the selected view for this host.</p>'}</div>`:''}</details>`;
   }
+  let motionSettled=false,motionView='';
   const metricKey=node=>node.nextElementSibling?.textContent||null;
   const entryKey=node=>node.closest('[data-topology-entry]')?.dataset.topologyEntry;
   function tick(){for(const stamp of container.querySelectorAll('[data-topology-time]'))stamp.textContent=formatDuration(Math.max(0,Date.now()-Number(stamp.dataset.topologyTime)));}
@@ -130,8 +131,13 @@ export function mountTopology(container,client,{status='current'}={}) {
     const sourceReady=kind=>kind==='ci'?sourceStates.ci?.loaded && data.ci?.available!==false:kind==='mission'?sourceStates.projections?.loaded&&sourceStates.missions?.loaded:sourceStates[{service:'services',session:'sessions',ci:'ci'}[kind]]?.loaded;
     // Panels are rebuilt with innerHTML (Task 19 moves them onto the patcher); motion pairs old and
     // new nodes by key: metric tiles by label, rows by data-topology-entry (status change = flash).
-    const metricsBefore=snapshotText(el('[data-tx-metrics]'),'strong',metricKey),tabsBefore=snapshotText(container,'[data-tab-count]');
-    const rowsBefore=snapshotText(el('#tx-results'),'[data-topology-entry] .tx-state strong',entryKey);
+    // Motion only for data-driven changes: not while sources are still landing on first load and
+    // not when the user changed the tab, search, grouping, type, host or opened/expanded something.
+    const settled=Object.keys(sources).every(key=>sourceStates[key]?.loaded);
+    const view=JSON.stringify([state,[...opened],[...limits]]),live=settled&&motionSettled&&view===motionView;
+    motionSettled=settled;motionView=view;
+    const metricsBefore=live?snapshotText(el('[data-tx-metrics]'),'strong',metricKey):null,tabsBefore=live?snapshotText(container,'[data-tab-count]'):null;
+    const rowsBefore=live?snapshotText(el('#tx-results'),'[data-topology-entry] .tx-state strong',entryKey):null;
     el('[data-tx-metrics]').innerHTML=Object.entries(TYPES).map(([kind,label])=>`<div><strong>${sourceReady(kind)?all.filter(e=>e.type===kind&&e.visibility==='current').length:'—'}</strong><span>${label==='Services'?'recently healthy HerdR services':label==='CI runs'?'current CI runs':`current ${label.toLowerCase()}`}</span></div>`).join('');
     animateChanges(el('[data-tx-metrics]'),'strong',metricsBefore,metricKey);
     for(const [key] of TABS){const button=el(`[data-tx-tab="${key}"]`);button.setAttribute('aria-selected',String(state.status===key));button.tabIndex=state.status===key?0:-1;el(`[data-tab-count="${key}"]`).textContent=Object.values(sourceStates).some(s=>s.loaded)?selectTopology(all,{...state,status:key}).length:'…';}

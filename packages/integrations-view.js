@@ -198,7 +198,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     return cached && cached.version===reviewVersion(summary) ? {...cached.record,...summary,_detailsError:cached.error,_detailsLoaded:!!cached.record} : summary;
   })} : data||{},kind);
   const entryKey=node=>node.closest('[data-entry]')?.dataset.entry;
-  let chartsDrawn=false;
+  let chartsDrawn=false,motionSettled=false,motionView='';
   function replace(element,html) {
     const focused=document.activeElement;
     const focusKey=element.contains(focused) ? ['data-run','data-step','data-close-inspector','data-ci-action','data-ci-test-search','data-ci-test-page','data-collapse-success','data-pipeline-zoom','data-ci-compare'].find(k=>focused.hasAttribute(k)) : null;
@@ -263,8 +263,13 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       signature=nextSignature;
       // Rows and charts are rebuilt with innerHTML (Task 19 moves them onto the patcher); motion pairs
       // old and new nodes by key: tab counts by node, rows by data-entry (state change = flash).
-      const tabCounts=snapshotText(container,'[data-tab] strong');
-      const rowStates=snapshotText(el('#ig-results'),'[data-entry] .ig-state strong',entryKey);
+      // Motion only for data-driven changes: not before the reports have landed (CI counts include
+      // retained observations) and not when the user changed the tab, a filter, the search or page.
+      const settled=!!data&&(!isCi||reportData!==null||!!reportsError), view=JSON.stringify(state);
+      const live=settled&&motionSettled&&view===motionView;
+      motionSettled=settled;motionView=view;
+      const tabCounts=live?snapshotText(container,'[data-tab] strong'):null;
+      const rowStates=live?snapshotText(el('#ig-results'),'[data-entry] .ig-state strong',entryKey):null;
       for(const [key] of tabs) {
         const button=el(`[data-tab="${key}"]`),active=state.tab===key;
         button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;

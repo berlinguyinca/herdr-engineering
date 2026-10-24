@@ -289,8 +289,14 @@ export function mountOverview(container, client) {
       else if(alert.hasAttribute('data-pulse'))alert.removeAttribute('data-pulse');
     });
   }
+  // Tiles count up only for data-driven changes: not while sources are still landing on first load,
+  // and not right after the user snoozed or restored missions.
+  let motionSettled=false, userChange=false;
   function draw() {
     if(disposed || document.hidden)return;
+    const settled=Object.keys(sources).every(key=>states[key]?.loaded);
+    const live=settled&&motionSettled&&!userChange;
+    motionSettled=settled;userChange=false;
     for(const panel of panels) {
       const element=container.querySelector(`[data-overview="${panel}"]`);
       const html=renderOverviewSection(panel,data,states,received);
@@ -305,7 +311,7 @@ export function mountOverview(container, client) {
       const attentionToggle=hadFocus && focused.hasAttribute('data-attention-toggle');
       const attentionList=hadFocus && focused.id==='ov-attention-items';
       const attentionScroll=element.querySelector('.ov-attention-list.is-expanded')?.scrollTop || 0;
-      const metrics=snapshotText(element,'.ov-metric strong',metricKey);
+      const metrics=live?snapshotText(element,'.ov-metric strong',metricKey):null;
       element.innerHTML=html;
       animateChanges(element,'.ov-metric strong',metrics,metricKey);
       if(panel==='attention')markNewCritical(element);
@@ -371,7 +377,7 @@ export function mountOverview(container, client) {
     if(!button)return;
     if(button.hasAttribute('data-snooze'))data.snoozed.set(button.dataset.snooze,Date.now()+SNOOZE_MS);
     else data.snoozed.clear();
-    saveSnoozed(data.snoozed);signatures.delete('missions');draw();
+    saveSnoozed(data.snoozed);signatures.delete('missions');userChange=true;draw();
   });
   document.addEventListener('visibilitychange',visibility);visibility();
   return {refresh,dispose(){disposed=true;clearInterval(clock);for(const timer of timers.values())clearTimeout(timer);for(const controller of controllers.values())controller.abort();document.removeEventListener('visibilitychange',visibility);}};

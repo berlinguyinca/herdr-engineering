@@ -138,6 +138,7 @@ export function mountGithub(container,client) {
   el(`[data-gh-${kind}-page-label]`).textContent=`Page ${current}${total!==null?` · ${total} total`:''}`;
  }
  function tick(){for(const node of container.querySelectorAll('[data-gh-time]'))node.textContent=formatDuration(Math.max(0,Date.now()-Number(node.dataset.ghTime)));}
+ let motionView='';
  function draw() {
   if(disposed)return;
   replace(el('[data-gh-health]'),renderGithubHealth(repositories),'health',JSON.stringify(repositories&&[repositories.status,repositories.refreshing,repositories.progress,repositories.partial,repositories.stale,repositories.account,repositories.last_success_at,repositories.error,repositories.rate_limit]));
@@ -146,7 +147,9 @@ export function mountGithub(container,client) {
   // Lists are rebuilt with innerHTML (Task 19 moves them onto the patcher); motion pairs old and new
   // nodes by key: a repository or issue whose text changed flashes, tab counts count up.
   const repoKey=node=>node.dataset.ghRepository,issueRowKey=node=>node.dataset.ghIssueRow;
-  const reposBefore=snapshotText(el('[data-gh-repositories]'),'[data-gh-repository]',repoKey),issuesBefore=snapshotText(el('#gh-issue-panel'),'[data-gh-issue-row]',issueRowKey),countsBefore=snapshotText(container,'[data-gh-tab-count]');
+  // Only data-driven changes animate: not the first load, not a change of repository, tab, search or page.
+  const view=JSON.stringify(state),live=!!repositories&&!!issues&&motionView===view;motionView=repositories&&issues?view:'';
+  const reposBefore=live?snapshotText(el('[data-gh-repositories]'),'[data-gh-repository]',repoKey):null,issuesBefore=live?snapshotText(el('#gh-issue-panel'),'[data-gh-issue-row]',issueRowKey):null,countsBefore=live?snapshotText(container,'[data-gh-tab-count]'):null;
   const repos=rankGithubRepositories(repositories?.repositories);
   replace(el('[data-gh-repositories]'),repos.map(repo=>renderGithubRepository(repo,repo.repository_id===state.repository)).join('')||`<li class="gh-empty">${!repositories?'Loading repositories…':repositories.available===false?'Repository data is unavailable. Connection details appear above.':'No repositories match this search.'}</li>`,'repos',JSON.stringify([repositories,state.repository]));
   animateChanges(el('[data-gh-repositories]'),'[data-gh-repository]',reposBefore,repoKey,{count:false});
