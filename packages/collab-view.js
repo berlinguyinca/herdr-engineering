@@ -10,6 +10,7 @@ import {
   filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
 } from './collab-lineage.js';
 import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
+import { ackBody, renderAnalytics, renderInbox as renderAttention, renderProgress, restoreBody, snoozeBody } from './collab-attention.js';
 import { commentBody, freshDraft, proposalBody, renderWorkbench } from './collab-workbench.js';
 import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
@@ -565,7 +566,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
     const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
+    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
@@ -622,6 +623,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
             <button class="hd-btn" type="submit">Delegate</button><span id="hcn-deleg-msg" class="cx-msg" role="alert"></span></form>
           <div id="hcn-delegs"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Quarantine</div><div id="hcn-props"></div><div id="hcn-review" aria-live="polite"></div></div></section>` : ''}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-attention" hidden aria-label="Attention inbox"><div id="hcn-attention" class="cx-stack"></div></section><section class="hd-card cx-stack cx-panel" id="hcn-p-progress" hidden aria-label="Progress and analytics"><div id="hcn-progress" class="cx-stack"></div><div id="hcn-analytics" class="cx-stack"></div></section>'}
       ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><div id="hcn-consults" class="cx-stack"></div><div id="hcn-lineage" class="cx-stack"></div></section>'}
       ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
@@ -1232,6 +1234,46 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         }
       });
     }
+    // ---- T15: attention inbox, evidence-based progress, analytics (server-derived; the page only shows them)
+    const ATT = { data: null, error: null, notice: null, showQuiet: false, at: 0, prog: null, progError: null, stats: null, statsError: null, pat: 0 };
+    const attErr = (e) => (e && e.status === 403 ? 'The attention inbox, progress and analytics are not enabled for this room.' : 'Could not load this view. It will retry.');
+    async function loadAttention(force) {
+      if (!force && Date.now() - ATT.at < 15000) { drawAttention(); return; }
+      ATT.at = Date.now();
+      try { ATT.data = await api.attention(roomId, ATT.showQuiet); ATT.error = null; setBadge('attention', (ATT.data.items || []).length); }
+      catch (e) { ATT.error = attErr(e); }
+      drawAttention();
+    }
+    function drawAttention() {
+      const h = $('hcn-attention');
+      if (!h) return;
+      if (!h.dataset.bound) {
+        h.dataset.bound = '1';
+        const act = async (fn) => { try { await fn(); ATT.notice = null; } catch (e) { ATT.notice = e && e.status === 429 ? 'Too many changes; try again in a minute.' : 'That did not work.'; } await loadAttention(true); };
+        h.addEventListener('click', (e) => {
+          const b = e.target.closest('[data-attn-act]');
+          if (!b) return;
+          const a = b.dataset.attnAct;
+          if (a === 'toggle-quiet') { ATT.showQuiet = !ATT.showQuiet; loadAttention(true); return; }
+          if (a === 'ack') act(() => api.attentionAck(roomId, ackBody(b.dataset.attnKey, b.dataset.attnFp)));
+          else if (a === 'restore') act(() => api.attentionRestore(roomId, restoreBody(b.dataset.attnKey)));
+        });
+        h.addEventListener('change', (e) => {
+          const sel = e.target.closest('[data-attn-snooze]');
+          if (sel && sel.value) act(() => api.attentionSnooze(roomId, snoozeBody(sel.dataset.attnKey, sel.dataset.attnFp, sel.value)));
+        });
+      }
+      put('hcn-attention', renderAttention({ data: ATT.data, error: ATT.error, notice: ATT.notice, showQuiet: ATT.showQuiet }));
+    }
+    async function loadProgress(force) {
+      if (!force && Date.now() - ATT.pat < 30000) return;
+      ATT.pat = Date.now();
+      const [p, a] = await Promise.allSettled([api.progress(roomId), api.analytics(roomId)]);
+      ATT.prog = p.status === 'fulfilled' ? p.value : ATT.prog; ATT.progError = p.status === 'rejected' ? attErr(p.reason) : null;
+      ATT.stats = a.status === 'fulfilled' ? a.value : ATT.stats; ATT.statsError = a.status === 'rejected' ? attErr(a.reason) : null;
+      put('hcn-progress', renderProgress({ data: ATT.prog, error: ATT.progError }));
+      put('hcn-analytics', renderAnalytics({ data: ATT.stats, error: ATT.statsError }));
+    }
     const setBadge = (k, n) => { const b = $(`hcn-b-${k}`); if (!b) return; b.hidden = !n; b.textContent = n > 99 ? '99+' : String(n); };
     const loadMine = async () => { try { S.mine = (await api.agents()).agents.filter((x) => !x.external); }   // a remote agent is bound to its invite: nothing to grant
        catch { /* keep the old list */ } };
@@ -1244,6 +1286,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       else if (sub === 'tabs') drawTabs();
       else if (sub === 'proposals') drawProposals();
       else if (sub === 'lineage') drawLineage();
+      else if (sub === 'attention') loadAttention(false);
+      else if (sub === 'progress') loadProgress(false);
       else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); }
     }
     const paintPanel = async () => {

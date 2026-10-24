@@ -325,6 +325,7 @@ class ControlPlaneServer:
                 self.ingest.reserved_node = collab.is_external_node
                 self.ingest.service_node = collab.is_hcn_node
                 collab.lineage_sink = self._external_lineage
+                collab.quorum_config = review_quorum        # T15: review items and the "reviewed at head" evidence use the T06 policy
         self.host = host
         self.port = port
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
@@ -649,6 +650,7 @@ _PUBLIC_STATIC = {
     "/collab-tabs.js": ("collab-tabs.js", "text/javascript"),
     "/collab-proposals.js": ("collab-proposals.js", "text/javascript"),
     "/collab-lineage.js": ("collab-lineage.js", "text/javascript"),
+    "/collab-attention.js": ("collab-attention.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
     "/conversation-markdown.js": ("conversation-markdown.js", "text/javascript"),

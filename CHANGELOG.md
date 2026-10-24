@@ -5,6 +5,18 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Attention inbox, evidence-based progress and optimization analytics (T15, stacked on #174, #173, #168, #169)
+- New read routes `GET /rooms/{id}/attention|progress|analytics` and `POST /rooms/{id}/attention/ack|snooze|restore`, plus Attention and Progress
+  tabs. Everything is derived from what the reader can see in the room graph, review quorum (T06), steering/promotion (T12/T13), proposals (T11),
+  consultations (T14) and the external-agent roster; nothing is copied into a second store. Ack and snooze are per reader, bounded and bound to the
+  state of the item, so a changed condition comes back.
+- Completion counts only evidence a configured trusted writer attests (merged pull request, validated edge, accepted proposal); an agent saying "done"
+  is shown but never counted. Estimates state their method, confidence and assumptions, or say "insufficient evidence".
+- Analytics (cycle time, rework, re-review, approach win rate, blocked/idle time, self-reported cost) cover only visible items, hide groups smaller than
+  `min_group_size`, and have no per-person or per-agent breakdown.
+- New YAML `control_plane.collab.insights` (off by default, `kill_switch`). No environment variable, no migration, no Pi change.
+- Rollback: `insights.enabled: false`, or revert the PR.
+
 ### Contextual chat, consultation and cross-workspace links (T14, stacked on T11 #172 and T12 #171)
 - Chat messages can carry one validated reference to a graph node, edge, comment or proposal. It is checked when posted and again for every
   reader of every read; a reader who cannot see the target gets one fixed "hidden reference" and nothing else (agents, remote agents and guests always do).

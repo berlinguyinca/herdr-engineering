@@ -2554,6 +2554,14 @@ def _cmd_cp_web(args) -> int:
                 section = _store.secure_section("control_plane")
                 return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("contextual")
             collab.contextual_source = _contextual_from_yaml
+        # T15: attention inbox, evidence-based progress and analytics. Same rule: YAML only, off by default, hot kill switch.
+        from .control_plane.collab_attention import normalize_insights
+        collab.insights = normalize_insights(getattr(args, "collab_insights", None))
+        if fleet_store is not None:
+            def _insights_from_yaml(_store=fleet_store):
+                section = _store.current().section("control_plane")
+                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("insights")
+            collab.insights_source = _insights_from_yaml
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
@@ -2636,6 +2644,7 @@ COLLAB_CONFIG_KEYS = {
     "replay_history": ("collab_replay_history", str),     # lineage replay: since_join (default) | full
     "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
     "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
+    "insights": ("collab_insights", dict),                # T15 attention inbox, progress, analytics; YAML only, off by default
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
 }
@@ -2668,10 +2677,11 @@ def _apply_collab_config(args, cp) -> None:
             if not getattr(args, dest):
                 setattr(args, dest, list(value))
         elif kind is dict:
+            from .control_plane.collab_attention import normalize_insights
             from .control_plane.collab_context import normalize_contextual
             from .control_plane.collab_workbench import normalize_steering
             try:
-                (normalize_contextual if key == "contextual" else normalize_steering)(value)
+                {"contextual": normalize_contextual, "insights": normalize_insights}.get(key, normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
