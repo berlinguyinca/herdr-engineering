@@ -66,7 +66,7 @@ const external = (url,label) => {
 };
 // failed: the first load failed (its message shows in [data-ig-error]), so no skeleton is left behind.
 export function integrationHealth(data,kind='ci',{failed=false}={}) {
-  if (!data) return failed ? '' : skeleton(kind==='ci'?'CI runs':'reviews',{rows:1,height:20});
+  if (!data) return failed ? '' : skeleton(kind==='ci'?'CI runs':'reviews',{rows:1,height:20,inStatus:true});
   const labels={not_configured:'Woodpecker is not configured. Add a CI token to the server configuration.',auth_error:'Woodpecker authentication failed. The server credential needs attention.',unavailable:'Woodpecker could not be reached.',partial:'Some CI repositories could not refresh.',syncing:'Discovering CI repositories and runs…'};
   const error=kind==='ci' ? labels[data.status] || (data.available===false ? 'CI data is unavailable.' : '') : data.error;
   const progress=data.progress;

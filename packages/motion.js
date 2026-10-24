@@ -115,10 +115,14 @@ export function flash(el){
  setTimeout(()=>el.removeAttribute('data-flash'),600);
 }
 
-// Skeleton placeholder for a first load: grey rows with a shimmer (still under calm), announced
-// as "Loading <label>" to assistive tech. Views replace it wholesale when their data arrives.
+// Skeleton placeholder for a first load: grey rows with a shimmer (static under calm). It is
+// aria-busy and announced as "Loading <label>". Views replace it wholesale when their data arrives.
 // bare: rows only, for a placeholder nested inside an outer [data-skeleton] that announces itself.
-export function skeleton(label,{rows=3,height=44,bare=false}={}){
+// inStatus: the placeholder sits inside an existing role="status" region, so it adds no second
+// one; a visually hidden "Loading <label>" lets the outer region announce it.
+export function skeleton(label,{rows=3,height=44,bare=false,inStatus=false}={}){
  const safe=String(label).replace(/[&<>"']/g,c=>`&#${c.charCodeAt(0)};`);
- return `<div class="hd-skeleton-group"${bare?'':` data-skeleton role="status" aria-label="Loading ${safe}"`}>${`<div class="hd-skeleton" style="height:${Number(height)}px"></div>`.repeat(Math.max(1,rows))}</div>`;
+ const own=bare?'':inStatus?' data-skeleton aria-busy="true"':` data-skeleton aria-busy="true" role="status" aria-label="Loading ${safe}"`;
+ const hidden=!bare&&inStatus?`<span class="visually-hidden">Loading ${safe}</span>`:'';
+ return `<div class="hd-skeleton-group"${own}>${hidden}${`<div class="hd-skeleton" style="height:${Number(height)}px"></div>`.repeat(Math.max(1,rows))}</div>`;
 }

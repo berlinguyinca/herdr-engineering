@@ -30,7 +30,10 @@ const measure=page=>page.evaluate(()=>{
  const head=view.querySelector('.hd-live-head');
  const rect=view.getBoundingClientRect();
  return {head:head?Math.round(head.getBoundingClientRect().top):null,height:Math.round(Math.min(rect.height,innerHeight-rect.top)),
-  skeletons:view.querySelectorAll('[data-skeleton]').length,loadingText:/Loading[^\n]*…/.test(view.innerText)};
+  skeletons:view.querySelectorAll('[data-skeleton]').length,loadingText:/Loading[^\n]*…/.test(view.innerText),
+  // a11y: a loading region is aria-busy, and a skeleton never puts a status region inside another one
+  notBusy:[...view.querySelectorAll('[data-skeleton]')].filter(e=>!e.closest('[aria-busy="true"]')).map(e=>e.getAttribute('aria-label')||e.parentElement.outerHTML.slice(0,60)),
+  nested:[...view.querySelectorAll('[role="status"] [data-skeleton][role="status"]')].map(e=>e.getAttribute('aria-label'))};
 });
 
 test('each route shows a skeleton on first load and does not jump when data arrives',async()=>{
@@ -42,10 +45,13 @@ test('each route shows a skeleton on first load and does not jump when data arri
   await sleep(100);
   const before=await measure(page);
   assert.equal(before.loadingText,false,`${hash}: no "Loading…" text beside the skeleton`);
+  assert.deepEqual(before.notBusy,[],`${hash}: every skeleton sits in an aria-busy region`);
+  assert.deepEqual(before.nested,[],`${hash}: no status region nested in another`);
   open();
   await until(async()=>(await measure(page)).skeletons===0,`${hash}: skeleton replaced`,8000);
   await sleep(150);
   const after=await measure(page);
+  assert.equal(await page.evaluate(()=>document.querySelector('#view [aria-busy="true"]')||document.getElementById('view').getAttribute('aria-busy')==='true'?'busy':''),'',`${hash}: nothing stays aria-busy once loaded`);
   report.push(`${hash} head ${before.head}->${after.head} height ${before.height}->${after.height}`);
   assert.ok(before.head!=null&&after.head!=null,`${hash}: page head present before and after`);
   assert.ok(Math.abs(after.head-before.head)<=HEAD_PX,`${hash}: head moved ${before.head}->${after.head}`);

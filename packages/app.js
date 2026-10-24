@@ -220,7 +220,7 @@ function routeSkeleton(match, parts) {
   const back = match === '/missions/:id' || match === '/herd/session/:id' ? BACK_LINK_SKELETON : '';
   const piMission = match === '/missions/:id' && decodeURIComponent(parts[1] || '').startsWith('pi:');
   const rows = piMission ? 1 : match === '/herd/session/:id' || match === '/analytics' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
-  return `<div data-skeleton role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
+  return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
 
 // ------------------------------------------------------------- views
