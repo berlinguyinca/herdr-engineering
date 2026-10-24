@@ -314,6 +314,80 @@ def test_ack_events_replay_after_a_restart():
     assert ("attention", "operator") not in {(t, i) for t, i, _ in twin._event_order}   # never in the feed
 
 
+def _summary(blockers, generated=NOW - 60):
+    return {"session_id": None, "blockers": blockers, "generated_at": _iso(generated), "discussed": [], "decisions": [],
+            "completed": [], "next_steps": [], "citations": []}
+
+
+def test_an_active_agent_with_a_summary_blocker_is_blocked_and_a_new_blocker_reopens_it():
+    repo, inbox, clock, _ = _world()
+    sid = repo.create_session(agent_role="coder")
+    repo.persist_agent_summary({"session_id": sid, "summary": _summary(["CI is red on main", "No API key"])})
+    (item,) = _by_kind(inbox)["agent_blocked"]
+    assert item["key"] == f"blocked:{sid}" and item["severity"] == "warning" and item["source"] == "summaries"
+    assert item["href"] == f"#/herd/session/{sid}" and item["detail"] == "CI is red on main (+1 more)"
+    inbox.acknowledge(item["key"], item["fingerprint"])
+    assert [i["state"] for i in inbox.snapshot(state="all")["items"]] == ["acknowledged"]
+    repo.persist_agent_summary({"session_id": sid, "summary": _summary(["Waiting for review"])})
+    (again,) = _by_kind(inbox)["agent_blocked"]
+    assert again["fingerprint"] != item["fingerprint"] and again["state"] == "open"
+    assert clock[0] == NOW
+
+
+def test_a_summary_blocker_is_ignored_for_finished_agents_stale_summaries_and_empty_lists():
+    repo, inbox, clock, _ = _world()
+    done = repo.create_session()
+    repo._sessions[done]["status"] = "finished"
+    repo.persist_agent_summary({"session_id": done, "summary": _summary(["old problem"])})
+    quiet = repo.create_session()
+    repo.persist_agent_summary({"session_id": quiet, "summary": _summary([])})
+    old = repo.create_session()
+    repo.persist_agent_summary({"session_id": old, "summary": _summary(["stale"], generated=NOW - 30 * HOUR)})
+    assert "agent_blocked" not in _by_kind(inbox)
+    clock[0] += 0
+    failed = repo.create_session()
+    repo._sessions[failed]["status"] = "failed"
+    repo.persist_agent_summary({"session_id": failed, "summary": _summary(["x"])})
+    assert "agent_blocked" not in _by_kind(inbox)      # a failed agent is already agent_failed, not blocked too
+
+
+def _proxy_rows(repo, clock, cls, count, status=429, ago=0):
+    clock[0] = NOW - ago
+    for _ in range(count):
+        repo.record_token_usage_row({"schema": 2, "project": "p", "model": "m", "status": status, "stream": True,
+                                     "usage_known": True, "input_tokens": 1, "output_tokens": 0, "error_class": cls,
+                                     "route": "fabric", "session_id": "s-1", "duration_ms": 5})
+    clock[0] = NOW
+
+
+def test_llm_problems_need_the_threshold_and_fold_models_per_error_class():
+    repo, inbox, clock, _ = _world(config={"thresholds": {"llm_error_count": 5}})
+    _proxy_rows(repo, clock, "upstream_admission", 4)
+    assert "llm_problems" not in _by_kind(inbox)
+    _proxy_rows(repo, clock, "upstream_admission", 2)
+    _proxy_rows(repo, clock, "upstream_unreachable", 3, status=502)
+    (item,) = _by_kind(inbox)["llm_problems"]
+    assert item["key"] == "llm:upstream_admission" and item["severity"] == "warning" and item["count"] == 6
+    assert item["href"] == "#/llm?window=24h" and "6 failed requests in 24h" in item["detail"]
+    inbox.acknowledge(item["key"], item["fingerprint"])
+    _proxy_rows(repo, clock, "upstream_admission", 10)       # more of the same: the acknowledge holds
+    (again,) = _by_kind(inbox)["llm_problems"]
+    assert again["state"] == "acknowledged" and again["count"] == 16 and again["fingerprint"] == item["fingerprint"]
+
+
+def test_llm_errors_outside_the_window_do_not_count_and_a_broken_stats_source_is_partial():
+    repo, inbox, clock, _ = _world(config={"thresholds": {"llm_error_count": 2, "llm_window": "1h"}})
+    _proxy_rows(repo, clock, "upstream_admission", 5, ago=3 * HOUR)
+    assert "llm_problems" not in _by_kind(inbox)
+
+    def boom(*a, **k):
+        raise RuntimeError("stats gone")
+
+    repo.llm_errors = boom
+    body = inbox.snapshot()
+    assert body["unavailable"] == ["llm"] and body["items"][0]["key"] == "source:llm"
+
+
 def test_the_answer_carries_the_notification_policy_from_yaml():
     _, inbox, _, _ = _world(config={"notify": {"browser": True, "min_severity": "warning", "quiet_hours": {"start": 1, "end": 2}}})
     assert inbox.snapshot()["notify"] == {"browser": True, "min_severity": "warning", "quiet_hours": {"start": 1, "end": 2}}
@@ -346,10 +420,12 @@ def test_config_defaults_and_validation():
     cfg = attention_config(None)
     assert cfg["enabled"] and cfg["snooze"] == {"min_seconds": 3600, "max_seconds": 604800}
     assert cfg["notify"]["quiet_hours"] == {"start": 22, "end": 7} and cfg["resolved"]["max_items"] == 100
+    assert cfg["thresholds"] == {"host_stale_seconds": 600, "llm_error_count": 20, "llm_window": "24h",
+                                 "failed_window_hours": 168, "blocked_window_hours": 24}
     assert attention_config({"enabled": False})["enabled"] is False
     for bad in ({"enabled": "yes"}, {"bogus": 1}, {"snooze": {"min_seconds": 0}},
                 {"snooze": {"min_seconds": 100, "max_seconds": 50}}, {"snooze": {"nope": 1}},
-                {"thresholds": {"llm_window": "30d"}}, {"notify": {"min_severity": "loud"}},
+                {"thresholds": {"llm_window": "30d"}}, {"thresholds": {"blocked_window_hours": 0}}, {"notify": {"min_severity": "loud"}},
                 {"notify": {"quiet_hours": {"start": 24, "end": 7}}}, {"resolved": {"max_items": 0}}, []):
         with pytest.raises(ValueError):
             attention_config(bad)
