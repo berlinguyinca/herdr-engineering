@@ -19,8 +19,8 @@ from urllib.parse import quote
 ENTITY = "attention"
 STREAM = "operator"
 SEVERITIES = ("critical", "warning", "info")
-KINDS = ("mission_attention", "mission_failed", "agent_failed", "ci_failed", "review_changes",
-         "service_down", "host_stale", "control_plane", "fleet_drift", "source_unavailable")
+KINDS = ("mission_attention", "mission_failed", "agent_failed", "agent_blocked", "ci_failed", "review_changes",
+         "service_down", "host_stale", "control_plane", "fleet_drift", "llm_problems", "source_unavailable")
 STATES = ("open", "acknowledged", "snoozed")
 MAX_ITEMS = 200
 MAX_PER_KIND = 50
@@ -39,9 +39,9 @@ _CI_DONE = frozenset(("success", "passed", "finished", "complete", "completed", 
                       "skipped", "declined", "approved", "closed", "resolved"))
 _REVIEW_CHANGES = frozenset(("changes_requested", "request_changes", "rejected", "annotated", "denied"))
 _CI_OUTAGE = frozenset(("unavailable", "auth_error", "partial"))
-_SOURCE_PAGES = {"missions": "#/missions", "sessions": "#/herd", "ci": "#/ci", "reviews": "#/reviews",
+_SOURCE_PAGES = {"missions": "#/missions", "sessions": "#/herd", "summaries": "#/herd", "llm": "#/llm", "ci": "#/ci", "reviews": "#/reviews",
                  "services": "#/services", "hosts": "#/hosts", "health": "#/topology", "fleet": "#/hosts"}
-_SOURCE_LABELS = {"missions": "Missions", "sessions": "Agents", "ci": "CI", "reviews": "Reviews",
+_SOURCE_LABELS = {"missions": "Missions", "sessions": "Agents", "summaries": "Agent summaries", "llm": "LLM usage", "ci": "CI", "reviews": "Reviews",
                   "services": "Services", "hosts": "Hosts", "health": "Control plane", "fleet": "Fleet versions"}
 _RANK = {name: index for index, name in enumerate(SEVERITIES)}
 
@@ -80,10 +80,11 @@ def attention_config(raw):
     number("snooze.min_seconds", snooze["min_seconds"], 1)
     number("snooze.max_seconds", snooze["max_seconds"], snooze["min_seconds"])
     thresholds = section("thresholds", {"host_stale_seconds": 600, "llm_error_count": 20, "llm_window": "24h",
-                                        "failed_window_hours": 168})
+                                        "failed_window_hours": 168, "blocked_window_hours": 24})
     number("thresholds.host_stale_seconds", thresholds["host_stale_seconds"], 1)
     number("thresholds.llm_error_count", thresholds["llm_error_count"], 1)
     number("thresholds.failed_window_hours", thresholds["failed_window_hours"], 1)
+    number("thresholds.blocked_window_hours", thresholds["blocked_window_hours"], 1)
     if thresholds["llm_window"] not in ("1h", "24h", "7d"):
         raise ValueError("control_plane.attention.thresholds.llm_window must be 1h, 24h or 7d")
     notify = section("notify", {"browser": True, "min_severity": "critical",
@@ -205,9 +206,9 @@ class AttentionInbox:
         self._first_seen = {}
         self._resolved = collections.deque()
         self._writes = collections.deque()
-        self.sources = {"missions": self._missions, "sessions": self._sessions, "ci": self._ci,
+        self.sources = {"missions": self._missions, "sessions": self._sessions, "summaries": self._blocked, "ci": self._ci,
                         "reviews": self._reviews, "services": self._services, "hosts": self._hosts,
-                        "health": self._control_plane, "fleet": self._fleet}
+                        "health": self._control_plane, "fleet": self._fleet, "llm": self._llm}
 
     # ------------------------------------------------------------- sources
     def _missions(self, now):
@@ -262,6 +263,27 @@ class AttentionInbox:
             name = session.get("display_name") or session.get("title") or session.get("agent_role") or "Failed agent"
             items.append(_item(f"session:{sid}", "agent_failed", "critical", name, "Agent reported failed",
                                f"#/herd/session/{_enc(sid)}", "sessions", "failed", seen=seen, action="Open agent"))
+        return items
+
+    def _blocked(self, now):
+        """An active agent whose latest stored AI summary names a blocker. Never read from the terminal screen."""
+        after = now - float(self.config["thresholds"]["blocked_window_hours"]) * 3600
+        sessions = {s.get("session_id"): s for s in self.repo.list_sessions()}
+        items = []
+        for event in self.repo.agent_summary_events():
+            summary = event.get("summary") or {}
+            session = sessions.get(event.get("session_id"))
+            blockers = [" ".join(b.split()) for b in (summary.get("blockers") or ()) if isinstance(b, str) and b.strip()]
+            generated = _epoch(summary.get("generated_at"))
+            if (session is None or not blockers or status_outcome(session.get("status"), session.get("stage")) != "current"
+                    or generated is None or generated < after):
+                continue
+            sid = session["session_id"]
+            name = session.get("display_name") or session.get("title") or session.get("agent_role") or "Agent"
+            extra = f" (+{len(blockers) - 1} more)" if len(blockers) > 1 else ""
+            items.append(_item(f"blocked:{sid}", "agent_blocked", "warning", f"Agent blocked · {name}",
+                               blockers[0] + extra, f"#/herd/session/{_enc(sid)}", "summaries",
+                               "\n".join(blockers), seen=generated, action="Open agent"))
         return items
 
     def _ci(self, now):
@@ -336,6 +358,29 @@ class AttentionInbox:
                 items.append(_item(f"host:{hid}", "host_stale", "warning", host.get("host_name") or hid,
                                    "No recent healthy host report", f"#/hosts/{_enc(hid)}", "hosts",
                                    "down" if down else "stale", seen=seen, action="Open host"))
+        return items
+
+    def _llm(self, now):
+        """One item per error class whose count in the window reaches the threshold (proxy records only)."""
+        thresholds = self.config["thresholds"]
+        window = thresholds["llm_window"]
+        classes = {}
+        for problem in self.repo.llm_errors(window).get("problems") or ():
+            entry = classes.setdefault(problem["class"], {"count": 0, "models": set(), "last_seen": None})
+            entry["count"] += int(problem.get("count") or 0)
+            entry["models"].add(problem.get("model") or "unknown")
+            seen = _epoch(problem.get("last_seen"))
+            if seen is not None and (entry["last_seen"] is None or seen > entry["last_seen"]):
+                entry["last_seen"] = seen
+        items = []
+        for cls, entry in sorted(classes.items()):
+            if entry["count"] < thresholds["llm_error_count"]:
+                continue
+            models = len(entry["models"])
+            items.append(_item(f"llm:{cls}", "llm_problems", "warning", f"LLM problems · {cls}",
+                               f"{entry['count']} failed requests in {window} across {models} model{'s' if models != 1 else ''}",
+                               f"#/llm?window={window}", "llm", cls, seen=entry["last_seen"],
+                               count=entry["count"], action="Open LLM"))
         return items
 
     def _control_plane(self, now):
