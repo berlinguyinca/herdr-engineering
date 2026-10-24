@@ -126,6 +126,8 @@ def test_group_by_session_resolves_dashboard_ids_and_skips_rows_without_one():
     keys = [g["key"] for g in repo.llm_stats("24h", group="session")["groups"]]
     assert sorted(keys) == ["unmatched:s-1", "unmatched:zz-9"]   # no such dashboard session; the row without an id is left out
     assert [g["key"] for g in repo.llm_stats("24h", group="route")["groups"]] == ["fabric"]
+    (total,) = repo.llm_stats("24h", group="all")["groups"]     # one overall group: its percentiles are real, not merged
+    assert (total["key"], total["requests"]) == ("all", 3)
 
 
 def test_errors_group_by_class_and_model_with_sessions():
@@ -200,7 +202,8 @@ def test_routes_on_the_operator_listener():
 
 
 @pytest.mark.parametrize("path", ["/api/v1/llm/stats", "/api/v1/llm/stats?window=24h", "/api/v1/llm/timeseries",
-                                  "/api/v1/llm/errors", "/api/v1/llm/sessions/s-1", "/api/v1/llm/samples"])
+                                  "/api/v1/llm/errors", "/api/v1/llm/sessions/s-1", "/api/v1/llm/samples",
+                                  "/llm-view.js", "/llm"])
 def test_llm_routes_do_not_exist_on_the_public_listener(stack, path):
     status, _ = stack.pub.call("GET", path)
     assert status == 404

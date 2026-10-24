@@ -112,11 +112,29 @@ def _seed_inspector(repo, sid):
     ]})
 
 
+def _seed_llm(repo, session_id):
+    """Usage records for the LLM page: 30 good streams for one dashboard session, a few
+    failures, one request from a session the dashboard does not know, and a v1 record."""
+    base = {"schema": 2, "project": "herdr", "model": "qwen", "route": "fabric", "stream": True,
+            "usage_known": True, "status": 200}
+    for i in range(30):
+        repo.record_token_usage_row({**base, "session_id": session_id, "input_tokens": 50, "output_tokens": 200,
+                                     "ttft_ms": 300 + 10 * i, "gen_ms": 4000, "queue_ms": 0, "duration_ms": 4400})
+    for status, cls in ((429, "upstream_admission"), (429, "upstream_admission"), (502, "upstream_unreachable")):
+        repo.record_token_usage_row({**base, "session_id": session_id, "status": status, "error_class": cls,
+                                     "duration_ms": 50})
+    repo.record_token_usage_row({**base, "session_id": "zz-unknown-1", "output_tokens": 10, "input_tokens": 1,
+                                 "ttft_ms": 100, "gen_ms": 100, "duration_ms": 150})
+    repo.record_token_usage("herdr", "legacy-model", 5, 6)
+
+
 def main():
     repo = ControlPlaneRepo()
     _m1, _m2, _s1 = _seed(repo)
     if os.environ.get("INSPECTOR_SEED", "1") != "0":
         _seed_inspector(repo, _s1)
+    if os.environ.get("LLM_SEED") == "1":
+        _seed_llm(repo, _s1)
 
     svr = ControlPlaneServer(repo, host="127.0.0.1", port=0,
                              web_root=_REPO / "packages")

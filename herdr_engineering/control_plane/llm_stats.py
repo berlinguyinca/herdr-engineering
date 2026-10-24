@@ -17,7 +17,7 @@ STEPS = {"5m": 300, "1h": 3600, "1d": 86400}
 MAX_POINTS = 500
 MIN_SAMPLES = 5
 MIN_GEN_MS = 50          # a shorter generation phase makes tokens/s meaningless
-GROUPS = ("model", "project", "session", "route")
+GROUPS = ("all", "model", "project", "session", "route")
 METRICS = ("requests", "tokens_out", "errors", "ttft_p95", "speed_p50")
 # Log-spaced bucket upper bounds, 10 ms .. 600 s for latencies (about 12% apart), and
 # 0.1 .. 10 000 for tokens/s. A percentile is the upper bound of the bucket holding
@@ -145,6 +145,8 @@ def _iso(ts):
 def group_key(by, p, resolve):
     """The group a record belongs to, or None when it has none (a record without a
     session id is left out of the per-session grouping)."""
+    if by == "all":
+        return "all"
     if by == "model":
         return p.get("model") or "unknown"
     if by == "project":

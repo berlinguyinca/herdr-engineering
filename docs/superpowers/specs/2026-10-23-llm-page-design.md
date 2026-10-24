@@ -135,7 +135,7 @@ The errors view groups records by class, then model, then session. For each grou
 All routes are served on the **operator listener only**. Nothing is added to `_PUBLIC_STATIC` or to the collab allowlist.
 
 ```
-GET /api/v1/llm/stats?window=24h&group=model|project|session|route&project=&model=&mission=
+GET /api/v1/llm/stats?window=24h&group=all|model|project|session|route&project=&model=&mission=
     → {window, groups:[{key, source, requests, errors, tokens{...}, ttft{p50,p95,n},
        speed{p50,p95,n}, e2e{...}, queue{...}}], partial, retained_since}
 GET /api/v1/llm/timeseries?window=7d&step=1h&metric=requests|tokens_out|ttft_p95|speed_p50|errors
@@ -300,7 +300,7 @@ The operator had not answered the questions above when slice 1 was built, so the
 
 ### Slice 2 notes (stats API, as built)
 
-- **Routes** (operator listener only; a bad parameter is a 400): `GET /api/v1/llm/stats?window=1h|24h|7d|30d&group=model|project|session|route&project=&model=&session=&mission=`, `GET /api/v1/llm/timeseries?window=&step=5m|1h|1d&metric=requests|tokens_out|errors|ttft_p95|speed_p50`, `GET /api/v1/llm/errors?window=&class=`. A timeseries is capped at 500 points, so `30d` with `5m` is a 400. Each answer carries `window`, `since`, `retained_since` and `partial`. `partial` is true when the oldest retained record is newer than the window start, so a young install shows "partial" for `30d` until it has that much history. `/api/v1/analytics/tokens` is unchanged.
+- **Routes** (operator listener only; a bad parameter is a 400): `GET /api/v1/llm/stats?window=1h|24h|7d|30d&group=all|model|project|session|route&project=&model=&session=&mission=`, `GET /api/v1/llm/timeseries?window=&step=5m|1h|1d&metric=requests|tokens_out|errors|ttft_p95|speed_p50`, `GET /api/v1/llm/errors?window=&class=`. A timeseries is capped at 500 points, so `30d` with `5m` is a 400. Each answer carries `window`, `since`, `retained_since` and `partial`. `partial` is true when the oldest retained record is newer than the window start, so a young install shows "partial" for `30d` until it has that much history. `/api/v1/analytics/tokens` is unchanged.
 - **Ruling: no persisted rollups.** The design asked for hourly rollups kept 400 days. Statistics are instead computed from the retained raw records on each call (a full scan, like `token_analytics`), with the fixed-bucket histograms built in memory per group. At 14 days of raw records that is cheap, and a persisted rollup would be a second store to keep consistent. Cost if wrong: history older than `raw_retention_days` is gone, and `rollup_retention_days` stays a validated setting with no effect. Revisit if the scan gets slow or the operator wants more than 14 days.
 - **Percentiles** come from 64 log-spaced buckets (10 ms to 600 s for times, 0.1 to 10 000 for tokens/s). A percentile is the upper bound of the bucket holding that rank, clamped to the observed min and max, so it is exact to within one bucket (about 12%). A group with fewer than 5 samples reports `insufficient: true` and no percentile.
 - **Definitions as built.** Speed needs a stream, `usage_known`, and `gen_ms >= 50`. End-to-end throughput applies to non-stream requests only and is never called speed. TTFT and queue wait are reported only where recorded. An error is a v2 record with an error class or a status of 400 or more, or a v1 record with `success: false` (class `unclassified`). Token totals carry `lower_bound: true` when any successful v2 record had no usage object.

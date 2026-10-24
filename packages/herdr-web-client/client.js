@@ -141,6 +141,12 @@ export class HerdrClient {
     return this.request(`/api/v1/activity?limit=${limit}`, { signal });
   }
 
+  /** LLM page statistics. `params` are the query filters (window, group, project, model, ...). */
+  llm(what, params = {}) {
+    const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v != null && v !== ''));
+    return this.request(`/api/v1/llm/${encodeURIComponent(what)}${q.size ? `?${q}` : ''}`);
+  }
+
   analytics(kind = 'missions') {
     return this.request(`/api/v1/analytics/${encodeURIComponent(kind)}`);
   }
