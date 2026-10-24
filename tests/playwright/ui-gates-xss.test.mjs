@@ -15,6 +15,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
 import { STATES } from './ui-gates-states.mjs';
+import { URLS, UNREAD, tag, taint } from './ui-gates-taint.mjs';
 
 const allUsed = new Set();      // every field the proxy tainted, over all tests
 let srv; let browser;
@@ -22,29 +23,6 @@ before(async () => { srv = await startRealServer({ rich: true, mention_agent: tr
 after(async () => { await browser?.close(); srv?.stop(); });
 
 const SUBS = ['chat', 'flow', 'tasks', 'agents', 'tabs', 'lineage', 'attention', 'progress', 'links', 'proposals', 'people'];
-// EVERY string the server sends is tainted unless it is an identifier or a value the page branches on (an id, a fence, a digest, a
-// state, a kind, a timestamp, a handle used to look something up): changing those breaks the page rather than testing it. The
-// earlier version listed the display fields by hand, and a field nobody listed (a bounded task's target_name) was never tested.
-const KEEP = /(^|_)(id|ids|key|fence|digest|sha|token|state|status|kind|type|role|action|actions|mode|family|visibility|source|scope|version|revision|cursor|offset|code|stage|tone|level|severity|schema|handle|instance|device|credential|ref|fp|cmd|channel|transport|direction|format|mime|encoding|lang|tz|unit|tier|phase|outcome|result|verdict|decision|trust|origin|namespace|prefix|suffix|field|fields|path_kind|edge|edge_type|node_type|anchor|target|subject|expected|binding|principal|session|surface|pane|tab|workspace|from|to|by|domain|issuer|audience|public_url)$|_at$|^(next|prev|since|until|ts|time|ttl|seq|sequence|ok|id|n|kind|type|state|status|role)$/;
-// Identifier-looking keys that ARE shown to people and that the server restricts, so only a proxy can test them.
-const FORCE = new Set(['workspace_id', 'host', 'instance_id', 'display_name', 'email', 'reported_by', 'agent_name', 'delegate_label', 'owner_label', 'role_label', 'last_activity', 'target_name', 'attestor']);
-const URLS = new Set(['url', 'href', 'link_url', 'pr_url', 'html_url', 'web_url']);
-const tag = (k) => String(k).replace(/[^a-z0-9]/gi, '').slice(0, 24);
-// The payload breaks out of both contexts: a double quote first (out of an attribute value, leaving an event handler and a marker
-// attribute behind), then markup (out of text). Escaped, it is just characters.
-const payload = (k) => `" onfocus=window.__xss=1 data-cx-attr x="'><img src=x onerror=window.__xss=1><b id=cx-canary-${tag(k)}>`;
-
-function taint(v, key, used) {
-  if (typeof v === 'string') {
-    if (URLS.has(key)) { used.add(key); return 'javascript:window.__xss=9'; }
-    if (v.length && key && (FORCE.has(key) || !KEEP.test(key)) && !/^[0-9a-f-]{8,}$/i.test(v) && !/^\d{4}-\d\d-\d\dT/.test(v)) { used.add(key); return `${payload(key)} ${v}`; }
-    return v;
-  }
-  if (Array.isArray(v)) return v.map((x) => taint(x, key, used));
-  if (v && typeof v === 'object') { const o = {}; for (const [k, x] of Object.entries(v)) o[k] = taint(x, k, used); return o; }
-  return v;
-}
-
 async function hostile(browser, state) {
   const used = allUsed;
   const { ctx, page } = await openReal(browser, srv.info, 'alice', { viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' }, async (c) => {
@@ -112,6 +90,24 @@ for (const st of STATES) {
 const PLACEMENTS = [
   ['tabs', 'a remote agent tab: the lineage it reported, named by the agent label', '[aria-label^="Lineage reported by"]', 'cx-canary-label',
     async (page) => { await openSub(page, 'tabs'); await page.locator('#hcn-tabs [role="tab"]', { hasText: /Dana/ }).first().click(); await page.locator('[aria-label^="Lineage reported by"]').first().waitFor(); }],
+  // round 3: four renderers whose escaping could be removed with every gate green, because no fixture put text where they print it
+  ['tabs', 'a virtual tab: who reported the agent (reported_by)', '#hcn-tabpanel', 'cx-canary-reportedby',
+    async (page) => { await openSub(page, 'tabs'); await page.locator('#hcn-tabs [role="tab"]', { hasText: /Virtual agent/ }).first().click(); await page.locator('#hcn-tabpanel', { hasText: 'Virtual tab' }).waitFor(); }],
+  ['lineage', 'the reason a node is in its state (state_reason)', '.lin-inspector', 'cx-canary-statereason',
+    async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('g[data-node="attempt:a2"]').focus(); await page.keyboard.press('Enter'); await page.locator('.lin-inspector').waitFor(); }],
+  ['agents', 'a pending agent request: its owner (owner_email)', '#hcn-requests', 'cx-canary-owneremail',
+    async (page) => { await openSub(page, 'agents'); await page.locator('#hcn-requests li').first().waitFor(); }],
+  ['flow', 'the detail of an agent node in the flow: its owner (owner_email)', '#hcn-flow-detail', 'cx-canary-owneremail',
+    async (page) => {
+      await openSub(page, 'flow');
+      const nodes = page.locator('svg.cx-flow [data-node]'); await nodes.first().waitFor();
+      for (let i = 0, n = await nodes.count(); i < n; i += 1) {
+        await nodes.nth(i).focus(); await page.keyboard.press('Enter');
+        if ((await page.locator('#hcn-flow-detail').innerText()).includes('cx-canary-owneremail')) return;
+      }
+    }],
+  ['progress', 'the analytics table: the basis of a figure (basis)', '#hcn-analytics', 'cx-canary-basis',
+    async (page) => { await openSub(page, 'progress'); await page.locator('#hcn-analytics table td').first().waitFor(); }],
   ['progress', 'a milestone label', '[aria-label="Milestones"]', 'cx-canary-label', async (page) => { await openSub(page, 'progress'); await page.locator('[aria-label="Milestones"]').first().waitFor(); }],
   ['proposals', 'the target of a bounded task', '[aria-label="Bounded tasks"]', 'cx-canary-targetname', async (page) => { await openSub(page, 'proposals'); await page.locator('[aria-label="Bounded tasks"]').first().waitFor(); }],
 ];
@@ -122,6 +118,7 @@ for (const [, what, sel, canary, open] of PLACEMENTS) {
     await page.waitForTimeout(500);
     const shown = await page.locator(sel).first().innerText();
     assert.ok(shown.includes(canary), `${canary} is not on screen inside ${sel}: ${shown.slice(0, 120)}`);
+    note(`placement: ${what}`, await shownKeys(page));
     const d = await damage(page);
     assert.equal(d.executed, undefined); assert.deepEqual(d.elements, []);
     await ctx.unrouteAll({ behavior: 'ignoreErrors' });
@@ -129,15 +126,11 @@ for (const [, what, sel, canary, open] of PLACEMENTS) {
   });
 }
 
-// Fields the server sends and the proxy taints that no surface or state paints (found by the run itself, then checked by hand): they
-// are consumed as data by the page, or shown only in states this gate does not open. Keep the list honest: a new unrendered field
-// must be added here on purpose, and one that starts to render must be removed.
-// Honest gap: these 21 are NOT proven inert by this gate. Most are analytics and review-evidence tables (basis, value, category, order,
-// method, means, selfreports, reviewquorum, progress) that the small fixture room suppresses (the page shows "too few items"), PR and
-// diff statistics (head, changedfiles, diffsummary, touchedpaths, paths) shown only in states with a real PR, and identifiers the page
-// reads but does not paint (milestone, owneremail, reportedby, statereason, bindings, error). See docs/operations/ui-gates.md.
-const UNRENDERED = ['basis', 'bindings', 'categories', 'category', 'changedfiles', 'diffsummary', 'error', 'head', 'means', 'method', 'milestone', 'order', 'owneremail',
-  'paths', 'progress', 'reportedby', 'reviewquorum', 'selfreports', 'statereason', 'touchedpaths', 'value'];
+// Fields the server sends and the proxy taints that no surface or state of THIS fixture paints. Every one is covered somewhere else
+// (ui-gates-render-xss.test.mjs): a renderer prints it (error, method, milestone, paths: the canary is asserted visible when a complete
+// model is rendered), it is drawn only as a number (progress), or no page source reads it at all (UNREAD, scanned there). The list
+// must match what the run finds: a field that starts to render here must be removed, a new one added on purpose.
+const UNRENDERED = ['error', 'method', 'milestone', 'paths', 'progress', ...Object.keys(UNREAD).map(tag)].sort();
 
 test('the canaries really reached the screen for a wide set of fields (otherwise "inert" proves nothing)', () => {
   const table = [...seen].map(([k, w]) => `${k}: ${[...w].map((x) => x.slice(0, 24)).join(' | ')}`).sort();

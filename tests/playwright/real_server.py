@@ -79,7 +79,7 @@ class Seeder:
                                                                             "reject", "fork", "promote"],
                                                 "forks": {"enabled": True, "require_validation": False}})
         self.svc.contextual = normalize_contextual({"enabled": True})
-        self.svc.insights = normalize_insights({"enabled": True})
+        self.svc.insights = normalize_insights({"enabled": True, **({"min_group_size": 2} if cfg.get("rich") else {})})
         pr = {n: self.svc.authenticate(f"Bearer {t}", None) for n, t in self.tokens.items()}
         self.pr = pr
         proj = self.svc.create_project(pr["alice"], {"name": "T16 gates"})["project_id"]
@@ -204,6 +204,20 @@ class Seeder:
         s.external_lineage(self.agent_principal, {"event_id": "seed-rich-l1", "source_sequence": 1, "event_type": "node.upsert",
                                                   "payload": {"node_type": "agent", "node_id": f"agent:{self.agent_id}.worker",
                                                               "label": "Reported worker", "state": "running"}})
+
+        # round 3: put text in the fields the small room never showed. Each is one renderer the hostile-text gate must now reach.
+        # a task that finished and was reopened, and one that finished: two lanes are enough for the analytics table (min_group_size 2),
+        # and a table row is where the server's "basis" sentence is printed
+        for tid in ("task:rw1", "task:rw2"):
+            self.node(tid, "running", f"Rework {tid[-1]}")
+            self.send("node.state", {"node_id": tid, "state": "done"})
+        self.send("node.state", {"node_id": "task:rw1", "state": "running", "reason": "needs rework"})
+        # an agent that reports itself as external but is not on the room's roster: a "virtual tab" naming `reported_by`
+        self.node("agent:virt", "running", "Virtual agent", {"external": True, "reported_by": "remote-harness"})
+        # an agent asking to join: its request names the owner's e-mail address
+        out = s.connect_agent(a, {"harness_type": "claude-code", "name": "asker-bot"})
+        with s._lock:
+            s._file_request(a.id, self.room, out["agent_id"], ["read", "post"])
 
     def long_labels(self):
         """Unbroken 300-character text in every place a person can type, so the 320px reflow gate meets what real users paste
