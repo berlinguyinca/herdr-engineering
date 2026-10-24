@@ -9,6 +9,7 @@ import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} fro
 import {renderCiPipeline,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
 import {mountCiHealth} from './ci-health-view.js';
 import {snapshotText,animateChanges} from './motion.js';
+import {freshnessSources} from './freshness.js';
 
 const text = value => typeof value === 'string' ? value : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -154,7 +155,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const listenerController=new AbortController();
   const reviewCache=new Map();
   const title=isCi?'CI':'Reviews';
-  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles:''}<h1>${title}</h1><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
+  // The chip follows the run list and, on CI, the run history (both poll every 5 s).
+  const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
+  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles:''}<div class="hd-live-head"><h1>${title}</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
     <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
     ${isCi?'<div data-ci-health></div>':''}
     <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
@@ -373,12 +376,12 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     refreshPerformance();
     if(isCi && typeof client.getCiReports==='function')request('reports',signal=>client.getCiReports({signal}),response=>{
       if(!Array.isArray(response?.reports)||!Array.isArray(response?.pipelines))throw new Error('Invalid CI history response');
-      reportData=response;reportsError='';
-    },()=>{reportsError=`CI history could not refresh.${reportData?' Showing last received reports.':''}`;});
+      reportData=response;reportsError='';chip.ok('reports');
+    },failure=>{chip.fail('reports',`CI history: ${failure?.message||'request failed'}`);reportsError=`CI history could not refresh.${reportData?' Showing last received reports.':''}`;});
     request('list',signal=>isCi ? client.getCi({signal}) : client.listReviews({signal}),response=>{
       if(!response || (isCi ? typeof response.available!=='boolean' : !Array.isArray(response.reviews)))throw new Error('Invalid integration response');
-      data=response;error='';
-    },()=>{error=`${title} could not refresh.${data?' Showing last received records.':' Retrying automatically.'}`;});
+      data=response;error='';chip.ok('list');
+    },failure=>{chip.fail('list',`${title}: ${failure?.message||'request failed'}`);error=`${title} could not refresh.${data?' Showing last received records.':' Retrying automatically.'}`;});
     refreshDetail();
   }
   function cancelDetail() {for(const key of ['pipeline','log','debug-sessions']){pending.get(key)?.abort();pending.delete(key);}}

@@ -139,7 +139,8 @@ const styles = `<style>
 .ml-log{border-bottom:1px solid var(--border-subtle);padding:6px 0}.ml-content h3{margin-top:0}.ml-content{min-width:0}.ml-content .hd-grid{align-items:start}
 </style>`;
 
-export function mountMissionActivity(container, client, missionKey) {
+// onStatus(ok, message) reports each poll to the page's freshness chip (the page owns the chip).
+export function mountMissionActivity(container, client, missionKey, { onStatus = () => {} } = {}) {
   let disposed = false, controller = null, pollTimer = null, clockTimer = null, failures = 0;
   let projections = [], received = Date.now(), lastJson = '', fetchError = false;
   const disclosureStates = new Map();
@@ -218,11 +219,13 @@ export function mountMissionActivity(container, client, missionKey) {
       if (disposed || activeController.signal.aborted) return;
       projections = missionKey ? (response.activity ? [response.activity] : []) : records(response.activities);
       received = Date.now(); failures = 0; fetchError = false;
+      onStatus(true);
       const json = JSON.stringify(projections);
       if (json !== lastJson) { lastJson = json; redraw(); } else tick();
     } catch (error) {
       if (disposed || (activeController.signal.aborted && !timedOut)) return;
       failures++; fetchError = true;
+      onStatus(false, timedOut ? 'timed out' : error?.message || 'request failed');
       if (!projections.length) content.innerHTML = '<p class="muted">Mission activity unavailable. Retrying automatically.</p>';
       tick();
     } finally {

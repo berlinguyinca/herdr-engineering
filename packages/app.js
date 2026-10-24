@@ -28,6 +28,7 @@ import { morph, patchList, patchText } from './patch.js';
 import { flash } from './motion.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
+import { freshnessSources } from './freshness.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -163,7 +164,10 @@ function rerenderView(load) {
         const view = await load(revision);
         if (view && revision === renderRevision) { unmountView(); mountView(view); }
         else if (view && revision !== renderRevision) view.dispose();
-      } catch { /* keep the last page; the next event retries */ } finally {
+      } catch (err) {
+        // Keep the last page; the next event retries. The page's chip says the retry failed.
+        root.querySelector('herdr-freshness')?.touch?.(false, err?.message || 'request failed');
+      } finally {
         clearTimeout(unwedge);
         if (revision === renderRevision) running = false;
       }
@@ -187,12 +191,23 @@ async function render() {
     view = await load(revision);
   } catch (err) {
     if (revision !== renderRevision) return;
-    root.innerHTML = `<herdr-error message="${esc(err.message || 'request failed')}"></herdr-error>`;
+    statusPage(`<herdr-error message="${esc(err.message || 'request failed')}"></herdr-error>`, false, err.message || 'request failed');
     if (!streamsOwnDetail) mountView(rerenderView(load));
     return;
   }
   if (revision !== renderRevision) { view?.dispose(); return; }
   mountView(view || (streamsOwnDetail ? NO_REFRESH : rerenderView(load)));
+}
+
+// Every routed page carries one freshness chip (<herdr-freshness>) in its head.
+const CHIP = (interval = LIVE_REFRESH_MS) => `<herdr-freshness interval="${interval}"></herdr-freshness>`;
+const liveHead = (title, interval) => `<div class="hd-live-head">${title}${CHIP(interval)}</div>`;
+const chipIn = (el) => () => el.querySelector('herdr-freshness');
+// Error and not-found pages have a chip too: red with the error, or fresh for a page that loaded
+// and found nothing. A failed retry (rerenderView) marks it red again.
+function statusPage(html, ok, message) {
+  root.innerHTML = liveHead('') + html;
+  root.querySelector('herdr-freshness').touch(ok, message);
 }
 
 // ------------------------------------------------------------- views
@@ -202,12 +217,18 @@ async function viewTopology() {
 }
 
 async function viewOverview() {
-  root.innerHTML = '<h1>Overview</h1><div id="overview-dashboard"></div>';
-  return ownPolling(mountOverview(document.getElementById('overview-dashboard'), client));
+  root.innerHTML = `${liveHead('<h1>Overview</h1>')}<div id="overview-dashboard"></div>`;
+  return ownPolling(mountOverview(document.getElementById('overview-dashboard'), client, { freshness: chipIn(root) }));
 }
 
 async function viewCollab() {
-  return ownPolling(mountCollab(root, { fabricSessions: () => client.listSessions('active') }));
+  // The chip sits outside the collab root: collab redraws its whole frame on every page change.
+  root.innerHTML = `${liveHead('', 30000)}<div id="collab-root"></div>`;
+  const chip = chipIn(root);
+  return ownPolling(mountCollab(document.getElementById('collab-root'), {
+    fabricSessions: () => client.listSessions('active'),
+    onFreshness: (ok, message) => chip()?.touch(ok, message),
+  }));
 }
 
 async function viewGithub() {
@@ -223,8 +244,8 @@ async function viewIntegrations(parts) {
 }
 
 async function viewMissions() {
-  root.innerHTML = '<h1>Missions</h1><div id="live-missions"></div>';
-  const catalog = mountMissionCatalog(document.getElementById('live-missions'), client, {tab: route().query.get('tab') || 'current', status: route().query.get('status') || 'all'});
+  root.innerHTML = `${liveHead('<h1>Missions</h1>')}<div id="live-missions"></div>`;
+  const catalog = mountMissionCatalog(document.getElementById('live-missions'), client, {tab: route().query.get('tab') || 'current', status: route().query.get('status') || 'all', freshness: chipIn(root)});
   // Recorded lifecycle data refreshes separately so live telemetry and filters stay put.
   return { refresh: () => catalog.refreshRecorded(), dispose: () => catalog.dispose() };
 }
@@ -245,13 +266,16 @@ async function viewMission(parts, revision) {
   try { m = await client.getMission(key); }
   catch (error) { if (error.status !== 404 || !key.startsWith('pi:')) throw error; }
   if (revision !== renderRevision) return;
+  // One chip for the page: the live telemetry and the recorded history are its two sources.
+  const sources = freshnessSources(chipIn(root));
+  const onStatus = (ok, message) => ok ? sources.ok('live') : sources.fail('live', `Live activity: ${message}`);
   if (key.startsWith('pi:') && !m) {
-    root.innerHTML = `<a href="#/missions">← Missions</a><h1>Pi mission</h1>${relatedIntegrationLinks({},'mission',key)}<div id="live-mission-detail"></div>`;
-    return { refresh() {}, dispose: mountMissionActivity(document.getElementById('live-mission-detail'), client, key) };
+    root.innerHTML = `<a href="#/missions">← Missions</a>${liveHead('<h1>Pi mission</h1>')}${relatedIntegrationLinks({},'mission',key)}<div id="live-mission-detail"></div>`;
+    return { refresh() {}, dispose: mountMissionActivity(document.getElementById('live-mission-detail'), client, key, { onStatus }) };
   }
-  if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}${relatedIntegrationLinks(m,'mission',key)}<div id="mission-history"></div>`;
-  const disposeLive = key.startsWith('pi:') ? mountMissionActivity(document.getElementById('live-mission-detail'), client, key) : null;
+  if (!m) { statusPage('<herdr-error message="Mission not found"></herdr-error>', true); return; }
+  root.innerHTML = `<a href="#/missions">← Missions</a>${liveHead(`<h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>`)}${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}${relatedIntegrationLinks(m,'mission',key)}<div id="mission-history"></div>`;
+  const disposeLive = key.startsWith('pi:') ? mountMissionActivity(document.getElementById('live-mission-detail'), client, key, { onStatus }) : null;
   const history = document.getElementById('mission-history');
   let pending = false;
   let shownTimeline = [null, ''];
@@ -284,7 +308,9 @@ async function viewMission(parts, revision) {
       try { items = (await client.missionTimeline(missionKey(m))).timeline || []; } catch { /* empty timeline */ }
       const itemsKey = JSON.stringify(items);
       if (timelineElement !== shownTimeline[0] || itemsKey !== shownTimeline[1]) { timelineElement.items = items; shownTimeline = [timelineElement, itemsKey]; }
+      sources.ok('history');
     } catch (error) {
+      if (history.isConnected) sources.fail('history', `Recorded history: ${error.message || 'request failed'}`);
       // A failed first load shows the error; a failed refresh keeps the last history.
       if (history.isConnected && !history.querySelector('details[data-history-panel]')) history.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
     } finally { pending = false; }
@@ -325,7 +351,7 @@ async function viewSession(parts, revision) {
   try {
     const s = await client.getSession(id, {signal: controller.signal});
     if (revision !== renderRevision || controller.signal.aborted) return;
-    if (!s) { root.innerHTML = '<herdr-error message="Agent not found"></herdr-error>'; return; }
+    if (!s) { statusPage('<herdr-error message="Agent not found"></herdr-error>', true); return; }
     const outcome = recordOutcome(s);
     const terminal = outcome === 'failed' || outcome === 'finished';
     const clip = value => typeof value === 'string' ? value.slice(0, 180) : '';
@@ -333,7 +359,7 @@ async function viewSession(parts, revision) {
     const fields = [['Agent ID',s.session_id],['Last reported status',s.status],['Stage',s.stage],['Directory',s.cwd],['Git branch',s.branch],['PID',s.pid],['Command line',s.cmdline],['Model',s.model],['Last reported',formatTimestamp(s.updated_at)]].filter(([,v])=>v != null && v !== '');
     root.innerHTML = `<style>.sd-head{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:14px 0}.sd-meta{color:var(--text-secondary);line-height:1.6;overflow-wrap:anywhere}.sd-details{margin:14px 0;overflow-wrap:anywhere}.sd-details summary{cursor:pointer;font-weight:600}.sd-details dl{display:grid;grid-template-columns:minmax(100px,auto) minmax(0,1fr);gap:8px 16px}.sd-details dt{color:var(--text-secondary)}.sd-details dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.sd-title{overflow-wrap:anywhere}@media(max-width:600px){.sd-details dl{display:block}.sd-details dd{margin:4px 0 12px}}</style>
       <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Agents</a>
-      <h1 class="sd-title">${esc(clip(s.display_name || s.agent_role) || 'Agent')}${project ? ` · ${esc(clip(project))}` : ''}</h1>
+      ${liveHead(`<h1 class="sd-title">${esc(clip(s.display_name || s.agent_role) || 'Agent')}${project ? ` · ${esc(clip(project))}` : ''}</h1>`)}
       <div class="sd-head"><strong data-session-head><span data-session-status>${esc(sessionStatusText(s))}</span> · <span data-session-updated>${esc(formatTimestamp(s.updated_at))}</span></strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
       <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.` : 'Agent status reflects the last report; it is not a live process check.'}</p>
       ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
@@ -370,7 +396,10 @@ async function viewSession(parts, revision) {
     const stream = document.getElementById('session-stream');
     const head = root.querySelector('[data-session-head]');
     let headRequest = null;
-    streamItems('session',s.session_id).then(items=>{if(stream.isConnected && revision===renderRevision)paintStream(stream,items,{initial:true});}).catch(()=>{if(stream.isConnected)stream.innerHTML='<span class="muted">Recorded events could not load.</span>';});
+    // The chip follows the two reads this page refreshes: the agent record and its recorded events.
+    const sources = freshnessSources(chipIn(root));
+    sources.ok('agent');
+    streamItems('session',s.session_id).then(items=>{if(stream.isConnected && revision===renderRevision){paintStream(stream,items,{initial:true});sources.ok('events');}}).catch((error)=>{if(stream.isConnected){stream.innerHTML='<span class="muted">Recorded events could not load.</span>';sources.fail('events',`Recorded events: ${error.message || 'request failed'}`);}});
     // The page streams its own detail; a live event refreshes the recorded event list (new events
     // are appended) and the head status line, in place.
     return {
@@ -378,13 +407,15 @@ async function viewSession(parts, revision) {
         if (!stream.isConnected) return;
         headRequest?.abort();
         const request = new AbortController(); headRequest = request;
+        const failed = (source, label) => (error) => { if (!request.signal.aborted) sources.fail(source, `${label}: ${error?.message || 'request failed'}`); return null; };
         const [items, latest] = await Promise.all([
-          streamItems('session', s.session_id).catch(() => null),
-          client.getSession(id, { signal: request.signal }).catch(() => null),
+          streamItems('session', s.session_id).catch(failed('events', 'Recorded events')),
+          client.getSession(id, { signal: request.signal }).catch(failed('agent', 'Agent')),
         ]);
         if (headRequest === request) headRequest = null;
         if (!stream.isConnected || request.signal.aborted) return;
-        if (items) paintStream(stream, items);
+        if (items) { paintStream(stream, items); sources.ok('events'); }
+        if (latest) sources.ok('agent');
         if (!latest || !head.isConnected) return;
         // A heartbeat moves the report time only; the head flashes when the status itself changes.
         patchText(head.querySelector('[data-session-updated]'), formatTimestamp(latest.updated_at));
@@ -426,7 +457,7 @@ async function viewServices(_parts, revision) {
 async function viewService(parts, revision) {
   const svc = await client.request(`/api/v1/services/${encodeURIComponent(decodeURIComponent(parts[1]))}`);
   if (revision !== renderRevision) return;
-  if (!svc || svc.error) { root.innerHTML = '<herdr-error message="Service not found"></herdr-error>'; return; }
+  if (!svc || svc.error) { statusPage('<herdr-error message="Service not found"></herdr-error>', true); return; }
   return ownPolling(mountServiceDetails(root, client, svc));
 }
 
@@ -438,7 +469,7 @@ async function viewHosts(_parts, revision) {
 
 async function viewHost(parts, revision) {
   const id = safeHostId(parts[1]);
-  if (!id) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
+  if (!id) { statusPage('<herdr-error message="Host not found"></herdr-error>', true); return; }
   const requested = route().query.get('range');
   const range = RANGES.includes(requested) ? requested : '1h';
   const data = await loadHostDetail(client, id, range);

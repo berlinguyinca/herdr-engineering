@@ -30,8 +30,12 @@ const PERMS = [['read', 'Read messages'], ['post', 'Write messages'], ['execute'
 const PERM_SHORT = { read: 'Read', post: 'Write', execute: 'Receive tasks', instruct: 'Send tasks', spawn_helpers: 'Start helpers' };
 const ROLE_LABEL = { owner: 'Owner', contributor: 'Can chat', viewer: 'Read only', guest: 'Guest' };
 
-async function loadConfig() {
-  const res = await fetch('/api/v1/collab/config');
+// onStatus(ok, message): a server error (5xx or no answer) is a failed refresh; a 404 or an
+// incomplete config means collaboration is simply not enabled, which is not an error.
+async function loadConfig(onStatus = () => {}) {
+  let res;
+  try { res = await fetch('/api/v1/collab/config'); } catch (e) { onStatus(false, e.message || 'request failed'); throw e; }
+  onStatus(res.status < 500, `HTTP ${res.status}`);
   if (!res.ok) return null;
   const cfg = await res.json();
   return cfg && cfg.client_id && cfg.hosted_ui_domain && cfg.public_url ? cfg : null;
@@ -94,7 +98,8 @@ const GUIDE = `<div class="hd-card">
     <li><b>Revoke</b> it here any time; it stops working immediately. Credentials expire after 30 days.</li>
   </ol></div>`;
 
-export function mountCollab(root, { fabricSessions = null } = {}) {
+// onFreshness(ok, message) feeds the dashboard route's freshness chip (the standalone page has none).
+export function mountCollab(root, { fabricSessions = null, onFreshness = () => {} } = {}) {
   ensureConversationStyles(root.ownerDocument);
   let teardown = null;      // stops the open room's live loop
   let cursor = 0;
@@ -150,7 +155,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   }
 
   async function start() {
-    const cfg = await loadConfig();
+    const cfg = await loadConfig(onFreshness);
     lastCfg = cfg;
     if (!cfg) {
       centered('<h1>Collaboration</h1><p role="status">The collaboration network is not enabled on this server, or this address is not allowed for the dashboard. Try the dashboard by its IP address.</p>');
@@ -545,7 +550,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   // ---- one tab per room, then the AI agents page
   let roomsCache = [];
   async function tabsStrip(activeRoom, activePage) {
-    try { roomsCache = (await api.rooms()).rooms; } catch { /* keep the last list */ }
+    try { roomsCache = (await api.rooms()).rooms; onFreshness(true); } catch (e) { onFreshness(false, `Rooms: ${e.message || 'request failed'}`); /* keep the last list */ }
     let waitingCount = 0;
     if (canManagePeople()) { try { waitingCount = (await api.users('pending')).users.length; } catch { /* not an approver */ } }
     const t = (to, label, on, extra = '') => `<button type="button" class="cx-rtab${extra}" role="tab" data-go="${to}" aria-selected="${on}">${label}</button>`;
@@ -1335,12 +1340,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           const s = await api.state(roomId, since, cursor, 8, ctl.signal);
           if (!alive) return;
           backoff = 1000;
+          onFreshness(true);
           if (s.changed) { apply(s); since = s.has_more ? -1 : s.seq; } else since = s.seq;
         } catch (e) {
           if (!alive) return;
           if (e.name === 'AbortError') continue;
           if (e instanceof AuthError) { dispose(); store.clear(); start(); return; }
           if (/not found/.test(e.message)) { dispose(); go('/rooms'); return; }
+          onFreshness(false, `Room: ${e.message || 'request failed'}`);
           await sleep(backoff); backoff = Math.min(backoff * 2, 15000);
         }
       }

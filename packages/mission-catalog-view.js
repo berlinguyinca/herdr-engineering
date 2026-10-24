@@ -5,6 +5,7 @@ import { freshnessAt, missionHealth } from './mission-live-view.js';
 import { recordOutcome, statusOutcome, recordVisibility, reportFreshness, reportTimestamp } from './record-state.js';
 import { patchList, patchText, morph } from './patch.js';
 import { snapshotText, animateChanges, easeValue } from './motion.js';
+import { freshnessSources } from './freshness.js';
 
 const text = value => typeof value === 'string' ? value : '';
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
@@ -138,7 +139,8 @@ const styles = `<style>
 @media(max-width:650px){.mc-row{grid-template-columns:minmax(0,1fr);gap:8px}.mc-controls label{min-width:130px;flex:1}.mc-status{gap:3px}.mc-counts button{padding:8px}.mc-group>summary span{margin-left:4px}}
 </style>`;
 
-export function mountMissionCatalog(container, client, {tab = 'current', status = 'all'} = {}) {
+export function mountMissionCatalog(container, client, {tab = 'current', status = 'all', freshness = () => null} = {}) {
+  const chip = freshnessSources(freshness);
   let disposed = false, projections = [], recorded = [], received = Date.now();
   let liveController = null, pollTimer = null, clockTimer = null, recordedTimer = null, recordedController = null;
   let failures = 0, liveError = '', recordedError = '', lastSignature = '', lastClassification = '', liveLoaded = false, recordedLoaded = false;
@@ -289,9 +291,9 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     try {
       const response=await client.listMissions(undefined,{signal:controller.signal});
       if(disposed||controller.signal.aborted)return;
-      recorded=records(response.missions);recordedLoaded=true;recordedError='';draw();tick();
-    } catch {
-      if(!disposed&&(!controller.signal.aborted||timedOut)){recordedError='Recorded history could not refresh; keeping the last received records.';tick();}
+      recorded=records(response.missions);recordedLoaded=true;recordedError='';chip.ok('recorded');draw();tick();
+    } catch (error) {
+      if(!disposed&&(!controller.signal.aborted||timedOut)){chip.fail('recorded',`Recorded missions: ${timedOut?'timed out':error?.message||'request failed'}`);recordedError='Recorded history could not refresh; keeping the last received records.';tick();}
     } finally {clearTimeout(deadline);if(recordedController===controller)recordedController=null;}
   }
   async function poll() {
@@ -301,9 +303,10 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     try {
       const response=await client.listMissionActivity({signal:controller.signal});
       if(disposed||controller.signal.aborted)return;
-      projections=records(response.activities);received=Date.now();liveLoaded=true;failures=0;liveError='';draw();tick();
-    } catch {
+      projections=records(response.activities);received=Date.now();liveLoaded=true;failures=0;liveError='';chip.ok('live');draw();tick();
+    } catch (error) {
       if(disposed||(controller.signal.aborted&&!timedOut))return;
+      chip.fail('live',`Live activity: ${timedOut?'timed out':error?.message||'request failed'}`);
       failures++;liveError='Activity connection interrupted · showing last known data; retrying automatically.';tick();
     } finally {
       clearTimeout(deadline);liveController=null;
