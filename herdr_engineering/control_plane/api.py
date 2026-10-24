@@ -198,7 +198,7 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False):
+                 review_quorum=None, system_graph: bool = False, attention=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -222,6 +222,12 @@ class ControlPlaneServer:
                                     repo.record_event("ci_pipeline", key, event, row),
                                     actions_enabled=ci_actions,
                                     on_observation=repo.observe_ci_pipeline)
+        from .attention_inbox import AttentionInbox, attention_config
+        self.attention_config = attention_config(attention)
+        self.attention = None
+        if self.attention_config["enabled"] and not collab_only:
+            self.attention = AttentionInbox(repo, config=self.attention_config, health=self._health,
+                                            ci_snapshot=self.ci_monitor.snapshot)
         if github_monitor is None:
             from ..github import GitHubMonitor
             github_monitor = GitHubMonitor()
@@ -962,7 +968,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path):
+            if res.startswith("reviews") or res == "attention" or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -1404,6 +1410,15 @@ def _make_handler(server, public=False, operator=False):
                         {"error": "not found"}, 404)
                 status = _q(self.path, "status")
                 return self._json({"missions": r.list_missions(status)})
+            if resource == "attention" and len(parts) == 4:
+                if server.attention is None:
+                    return self._json({"error": "not found"}, 404)
+                try:
+                    return self._json(server.attention.snapshot(
+                        state=_q(self.path, "state") or "open",
+                        kind=_q(self.path, "kind") or None, severity=_q(self.path, "severity") or None))
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
             if resource == "inspector":
                 return self._inspector_global_get(parts)
             if resource == "sessions" and len(parts) > 5 and parts[5] == "inspector":
@@ -1651,6 +1666,24 @@ def _make_handler(server, public=False, operator=False):
                     if isinstance(exc, HerdrEngineeringError):
                         return self._json({"error": exc.message}, exc.http_status)
                     raise
+            if resource == "attention" and len(parts) == 5 and parts[4] in ("ack", "snooze", "clear"):
+                if server.attention is None:
+                    return self._json({"error": "not found"}, 404)
+                principal = self._principal()
+                actor = f"{principal['kind']}:{principal['id']}"
+                try:
+                    if parts[4] == "ack":
+                        result = server.attention.acknowledge(body.get("key"), body.get("fingerprint"), actor)
+                    elif parts[4] == "snooze":
+                        result = server.attention.snooze(body.get("key"), body.get("fingerprint"),
+                                                         body.get("seconds"), actor)
+                    else:
+                        result = server.attention.clear(body.get("key"), body.get("fingerprint"), actor)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
+                except PermissionError as exc:
+                    return self._json({"error": str(exc)}, 429)
+                return self._json(result)
             if resource == "steering":
                 return self._steering(parts, body)
             if resource == "reviews":

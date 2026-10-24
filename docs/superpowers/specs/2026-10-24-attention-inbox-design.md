@@ -184,3 +184,20 @@ Defaults below stand until you answer; each can change on request.
 4. **Blocked agents.** Default: only from the AI summary's `blockers`. Alternative: classify from the pane screen, which catches "waiting for input" sooner but is noisy and was shown unreliable for status.
 5. **Scope of acknowledge.** Default: one operator view for everyone who can open the dashboard (it has no per-person identity). Alternative: per-browser, which brings back the cross-machine problem.
 6. **Collaboration inbox.** Default: stays separate (room-scoped, reader-scoped, public site). The dashboard inbox may later show a single "N collaboration items" link, but never their contents.
+
+## Decisions applied (defaults, 2026-10-24)
+
+All six decisions above were built at their stated defaults: the Overview reads the same endpoint; resolved history is in memory only; notifications are browser-only and critical-only; blocked agents come only from AI-summary `blockers`; acknowledge and snooze are one shared operator view; the collaboration inbox stays separate.
+
+### Slice 1 notes (derivation, state and API, as built)
+
+- `control_plane/attention_inbox.py` holds the derivation, the config validator and `AttentionInbox`. The browser's `statusOutcome` and `missionHealth` are ported to Python (`status_outcome`, `mission_health`) so server and browser classify alike.
+- Stored state is one private `attention`/`operator` event stream (`attention_ack`, `attention_snooze`, `attention_clear`), recorded with `feed=False, publish=False`, so it replays through `export_state`/`import_state` and the durable sink but never reaches `/activity` or the SSE feed. Each event carries the actor the control plane records (`operator:<key digest>`).
+- A write is stored only when `(key, fingerprint)` matches a currently derived item; otherwise the answer is `{stored: false, reason}`. A repeated identical ack is not stored again. Writes are capped at 30 a minute (429). Snooze seconds outside `snooze.min_seconds..max_seconds` are a 400, not clamped.
+- Fingerprints are a hash of the kind plus the condition (`failed`, `stalled`, `down` vs `stale` ...), not of timestamps, so a new failing run on the same branch does not reopen a snooze but a different kind of problem on the same key does.
+- **Deviation: CI.** A failed run is coalesced per repository and branch as the count of consecutive failures from the newest run backwards; a newer green run clears the item (the browser projection kept every failed run). Runs still running are skipped over.
+- **Deviation: failed windows.** Failed missions and agents older than `thresholds.failed_window_hours` (new key, default 168) are not items, so old failures do not live in the inbox for ever. The browser projection had no such bound.
+- **Deviation: missions.** `mission_attention` needs a live report (freshness `live`) and a current lifecycle, exactly as the catalog groups them; a stale or disconnected report is never an incident.
+- A source that raises, or CI that is stale, `partial`, `unavailable`, `auth_error` or still syncing with no data, becomes a `source_unavailable` item and `partial: true`. `not_configured` CI is not an outage. Items of an unavailable source are never moved to Resolved.
+- `ControlPlaneServer(attention=...)` takes the validated config; `cli.py` validates `control_plane.attention` and exits on a bad key. `enabled: false` answers 404 on all four routes. The POST routes pass the same-origin and JSON guard used for reviews and CI.
+- Not built in this slice: the page, nav badge and Overview switch (slice 2), notifications (slice 3), `agent_blocked` and `llm_problems` (slice 4).
