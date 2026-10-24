@@ -145,13 +145,17 @@ test('a graph with more pages to load offers Load more, whatever the reason', as
 const USERS = [['pending', 'new@example.test'], ['pending', 'second@example.test'], ['approved', 'one@example.test'], ['approved', 'two@example.test'], ['approved', 'three@example.test'], ['disabled', 'off@example.test']]
   .map(([status, email], i) => ({ user_id: `u${i}`, email, status, since: T, decided_by: 'owner', decided_at: T, rooms: 1, agents: 1 }));
 for (const [label, size] of [['desktop', { width: 1100, height: 900 }], ['phone', { width: 375, height: 700 }]]) {
-  test(`the People page is accessible (${label}): chips are 24px targets with a focus ring, the tab lists are named, headings do not skip`, async () => withPage({ top: true, users: USERS }, async (page) => {
+  test(`the People page is accessible (${label}): chips are 28px tall with a focus ring, the tab lists are named, headings do not skip`, async () => withPage({ top: true, users: USERS }, async (page) => {
     await page.setViewportSize(size);
     await page.locator('.cx-rtabs [role="tab"]', { hasText: 'People' }).click();
     await page.locator('.cx-chip[data-filter]').first().waitFor();
     assert.equal(await page.locator('.cx-chip[data-filter]').count(), 6, 'every filter chip is on the page');
     assert.equal(await page.locator('[role="tablist"][aria-label="Filter people"]').count(), 1);
     assert.equal(await page.locator('[role="tablist"][aria-label="Rooms"]').count(), 1);
+    // WCAG 2.5.8 lets a target under 24px pass when no other target is within 24px of it, and a row of spaced chips does: a chip that
+    // shrinks to 18px is still "accessible" by the letter. The page's own standard is stricter (a finger, not a pointer): 28px tall.
+    const heights = await page.locator('.cx-chip[data-filter]').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().height)));
+    assert.ok(heights.every((h) => h >= 28), `filter chips are at least 28px tall: ${heights.join(', ')}`);
     const stat = await staticAudit(page, '#host');
     const foc = await focusIndicatorAudit(page, '#host');
     assert.ok(stat.stats.controls >= 12, `only ${stat.stats.controls} controls audited`);
