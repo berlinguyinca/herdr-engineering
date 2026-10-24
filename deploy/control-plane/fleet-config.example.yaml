@@ -26,6 +26,15 @@ sections:
       minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
       ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: head-bound post-PR review quorum (GET /api/v1/graph/nodes/{pr}/review-quorum).
+      # Principal ids are the server-side `key:<digest>` actors; omit the block to turn it off.
+      # review_quorum:
+      #   required: 2
+      #   trusted_head_writers: ["key:REDACTED"]   # who may define a PR's current head / author
+      #   reviewers:
+      #     "key:REDACTED": {}
+      #     "key:REDACTED2": {login: "reviewer-login"}
+      #   reviewer_groups: []                       # e.g. [["key:REDACTED", "key:REDACTED2"]] = one person
       # OPTIONAL: the public collaboration container (only when the host has the marker
       # ~/.config/herdr-engineering/collab-enabled). Public identifiers only - deploy.sh
       # hands exactly this mapping (nothing else from this file) to collab-public, and
@@ -40,6 +49,13 @@ sections:
         operator_user: "REDACTED"                    # Cognito username the dashboard's no-sign-in
                                                      # collaboration acts as (required)
         # operator_email: "owner@example.test"       # optional, shown for the operator
+        # T15 attention inbox, evidence-based progress, analytics (everything off unless enabled):
+        # insights:
+        #   enabled: false                 # kill_switch: true turns every route off at once
+        #   kill_switch: false
+        #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
+        #   min_group_size: 5              # aggregates over fewer items are hidden
+        #   reads_per_minute: 60
       # Variables docker compose itself substitutes; deploy.sh renders exactly this
       # mapping into a transient 0600 env file. The first eight keys are required.
       compose:

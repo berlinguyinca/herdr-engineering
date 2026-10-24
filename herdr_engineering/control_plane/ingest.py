@@ -10,9 +10,12 @@ to one control-plane entity.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
+
+log = logging.getLogger(__name__)
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .graph import validate_lineage
@@ -48,11 +51,76 @@ _AGENT_ONLY_HOST_KEYS = ("telemetry", "cpu", "mem", "disk", "inventory")
 class IngestService:
     """Translates lifecycle event envelopes into idempotent repo mutations."""
 
-    def __init__(self, repo):
+    def __init__(self, repo, key_scopes=None, system_graph: bool = False):
         self.repo = repo
+        # Per-key room/mission allow-lists for lineage addressed to a room or mission (operator YAML
+        # `control_plane.lineage_key_scopes`, resolved by the server to principal ids):
+        # {principal_id: {"rooms": set, "missions": set}}. A key with no entry may write only
+        # org/private scopes. "*" in a set is an explicit operator opt-in for every id (and for bare, id-less scopes).
+        self.key_scopes = key_scopes if key_scopes is not None else {}
+        # T10: node ids inside an external agent's namespace belong to that agent alone. Set by the server
+        # to the HCN service's `is_external_node`; None = no external agents on this process.
+        self.reserved_node = None
+        # T11: ids only the HCN service writes (delegation task and accepted-proposal nodes). Set by the server to
+        # the HCN service's `is_hcn_node`; checked on EVERY endpoint of an edge, so an ingest key cannot attach
+        # a fake `produced` edge to an accepted artifact either.
+        self.service_node = None
+        # System-graph live-ingest adapter (system-graph spec P2-P4). When enabled,
+        # mission/session/repository/request/span lifecycle events are ALSO emitted
+        # as lineage envelopes into the running graph. Opt-in; disabled by default.
+        self.system_graph = None
+        if system_graph:
+            from .graph_ingest import GraphIngestAdapter
+            self.system_graph = GraphIngestAdapter(repo, scope="org")
 
-    def ingest(self, body: dict, principal: dict | None = None) -> dict:
+    def _check_lineage_scope(self, env: dict) -> None:
+        """Fail closed: a non-operator key may address a room or mission only if the operator listed it.
+        Refused with the same PermissionError (HTTP 403, reason lineage_forbidden) as any lineage refusal,
+        before anything is persisted or sequenced."""
+        scope = env.get("visibility_scope")
+        actor = env.get("actor") or {}
+        if scope not in ("room", "mission") or (
+                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
+            return
+        allowed = self.key_scopes.get(actor.get("id")) or {}
+        rooms, missions = allowed.get("rooms") or (), allowed.get("missions") or ()
+
+        def ok(value, allow):
+            return "*" in allow or (isinstance(value, str) and bool(value) and value in allow)
+        if scope == "room":
+            good = ok(env.get("room_id"), rooms)
+        else:       # a mission is bound to the room that linked it: both must be addressed and allowed
+            good = ok(env.get("room_id"), rooms) and ok(env.get("mission_id"), missions)
+        if not good:
+            raise PermissionError("not permitted to modify this lineage object")
+
+    def _check_reserved_nodes(self, env: dict, event_type: str, payload: dict) -> None:
+        """Only an external agent itself (or an authenticated operator key) may write a node or edge
+        source inside that agent's namespace; anyone else is refused exactly like any lineage refusal."""
+        actor = env.get("actor") or {}
+        if self.service_node is not None and actor.get("kind") != "collab" and not (
+                actor.get("kind") == "operator"
+                and actor.get("authenticated_by") not in (None, "none", "open_listener")):   # an open listener is no operator here
+            ends = (payload.get("from_id"), payload.get("to_id")) if event_type.startswith("edge.") else (payload.get("node_id"),)
+            if any(isinstance(e, str) and self.service_node(e) for e in ends):
+                raise PermissionError("not permitted to modify this lineage object")
+        if self.reserved_node is None or actor.get("kind") == "external" or (
+                # T14: the HCN service joins two nodes for a person; the edge is its own instance (writer =
+                # the room's service principal) and adds nothing to the endpoint's own namespace
+                actor.get("kind") == "collab" and event_type.startswith("edge.")
+                and payload.get("edge_type") == "cross_link") or (
+                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
+            return
+        written = payload.get("from_id") if event_type.startswith("edge.") else payload.get("node_id")
+        if isinstance(written, str) and self.reserved_node(written):
+            raise PermissionError("not permitted to modify this lineage object")
+
+    def ingest(self, body: dict, principal: dict | None = None, valid=None) -> dict:
         """Apply one ingest body.
+
+        ``valid`` (T10) is an optional zero-argument callable evaluated inside the ledger lock,
+        immediately before a lineage envelope is admitted: a falsy result refuses the event exactly
+        like any lineage refusal, so a credential revoked while its request was in flight cannot land.
 
         ``principal`` is the authenticated caller (``{kind, id, authenticated_by}``)
         and becomes the ``actor`` of a schema_version 2 envelope. v1 bodies
@@ -92,6 +160,9 @@ class IngestService:
         env = normalize_envelope(body, principal, self.repo._stamp())
         if env is None and entity_type == "lineage":
             raise ValueError("lineage events require schema_version 2")
+        if env is not None and entity_type == "lineage":
+            self._check_lineage_scope(env)
+            self._check_reserved_nodes(env, event_type, payload)
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type
@@ -107,6 +178,8 @@ class IngestService:
             if ledger.check(env) == "duplicate":
                 return {**head, "envelope": {**ack, "duplicate": True}}
             if entity_type == "lineage":
+                if valid is not None and not valid():
+                    raise PermissionError("not permitted to modify this lineage object")
                 # Ownership/capacity gate: runs under the ledger lock and BEFORE
                 # the row is persisted, so a refused change is never stored and
                 # its sequence is not consumed. Raises PermissionError (403).
@@ -153,7 +226,12 @@ class IngestService:
             "event_id": env["event_id"], "source": env["source"],
             "source_sequence": env["source_sequence"], "event_type": event_type,
             "payload": payload, "visibility_scope": env["visibility_scope"],
+            # the room/mission/workspace context a `room`/`mission` scope is resolved against
+            # (the same fields a rebuild reads back from the stored row)
+            "room_id": env.get("room_id"), "mission_id": env.get("mission_id"),
+            "workspace_id": env.get("workspace_id"),
             "actor": env.get("actor"), "ingest_timestamp": env["received_at"],
+            "source_timestamp": env["occurred_at"] or env["received_at"],
             "lineage_seq": env.get("lineage_seq"), "lineage_mode": env.get("lineage_mode")})
         return {"entity_type": "lineage", "entity_id": entity_id, "event_type": event_type}
 
@@ -182,6 +260,24 @@ class IngestService:
 
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
                   record_generic=True) -> dict:
+        # System-graph live-ingest adapter (opt-in): reflect lifecycle events
+        # into the running lineage graph as lineage envelopes. Best-effort: a
+        # failure here is logged inside the adapter and never breaks the source
+        # event's own ingestion.
+        if self.system_graph is not None and entity_type in (
+                "mission", "session", "repository", "request", "span"):
+            # Reflect the lifecycle event into the running graph as lineage
+            # envelopes, re-entering the SAME ingest path (admit + persist +
+            # apply). Best-effort: failures are logged and swallowed so they
+            # never break the source event's own ingestion.
+            for env in self.system_graph.emit(entity_type, entity_id, event_type, payload or {}):
+                try:
+                    self.ingest(env, {"id": self.system_graph.actor,
+                                      "kind": "agent",
+                                      "authenticated_by": "api_key"})
+                except (ValueError, PermissionError) as exc:
+                    log.warning("system-graph ingest skipped %s %s (%s): %s",
+                                entity_type, entity_id, env["event_type"], exc)
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":
                 raise ValueError("invalid mission activity event_type")

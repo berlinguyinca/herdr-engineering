@@ -32,8 +32,9 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from ..version import __version__
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
-from .graph import DEFAULT_DEPTH, DEFAULT_EDGES, DEFAULT_NODES
+from .graph import read_graph
 from .redact import redact_ingest_body, redact_payload
+from .review_quorum import pr_review_quorum
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +44,56 @@ _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
-                        r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
+                        r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        # CI fix runner: claim, report state, report result. Never create or cancel.
+                        r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
+# T12: the one POST an ingest key may make besides /api/v1/ingest: acknowledging a steering request addressed to it.
+_STEER_ACK = re.compile(r"^/api/v1/steering/[^/]+/ack$")
+# The only routes the `reviewer` role may POST (review gate workers), and only it:
+# an operator key is refused there too. See `_reviewer_route`.
+_REVIEWER_ROOT = ["", "api", "v1", "review-gate"]
+_REVIEWER_JOB_ACTIONS = frozenset({"heartbeat", "result", "failure"})
+
+
+def _reviewer_route(parts):
+    """``(action, job_id)`` for a reviewer worker route, else None.
+
+    ``parts`` is the DECODED segment list (``/api/v1/review-gate/...`` split on
+    "/" and unquoted per segment), so an encoded slash stays inside one segment
+    and never matches: exactly ``review-gate/claim`` or
+    ``review-gate/jobs/<job_id>/{heartbeat,result,failure}``. The job id shape
+    (32 hex) is the handler's check (400).
+    """
+    if len(parts) == 5 and parts[:4] == _REVIEWER_ROOT and parts[4] == "claim":
+        return "claim", None
+    if (
+        len(parts) == 7
+        and parts[:4] == _REVIEWER_ROOT
+        and parts[4] == "jobs"
+        and parts[6] in _REVIEWER_JOB_ACTIONS
+    ):
+        return parts[6], parts[5]
+    return None
+
+
+_CLAIM_FIELDS = (
+    "job_id",
+    "repo",
+    "number",
+    "sha",
+    "messages",
+    "lease_seconds",
+    "attempt",
+    "claim_token",
+)
+_RESULT_OUTCOMES = frozenset({"recorded", "stale", "rejected"})
+_FAILURE_OUTCOMES = frozenset({"released", "escalated", "stale"})
+_REVIEWER_ID = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
+_REVIEWER_JOB_ID = re.compile(r"[0-9a-f]{32}")
+_REVIEWER_CLAIM_TOKEN = re.compile(r"[0-9a-f]{64}")
+_REVIEWER_SMALL_BODY = 8 * 1024
+_REVIEWER_REASON_MAX = 500
+_log = logging.getLogger(__name__)
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
 # back to "dev" in a local checkout / un-stamped image.
 _COMMIT = os.environ.get("HERDR_ENGINEERING_COMMIT", "dev")
@@ -149,11 +199,14 @@ class ControlPlaneServer:
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 summary_config=None, summary_client=None, usage_retention=None):
+                 summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
+                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
-        (read + mutate) / "ingest" (read + POST /api/v1/ingest only).
+        (read + mutate) / "ingest" (read + POST /api/v1/ingest only) /
+        "agent" (ingest + host-side tool routes) / "reviewer" (read + POST the
+        four review-gate worker routes only; no other role may POST those).
         No key configured = open (private-by-default bind).
 
         `allow_open` is an explicit opt-in that permits an unauthenticated
@@ -166,11 +219,26 @@ class ControlPlaneServer:
         from .retention import usage_retention_config
         # control_plane.llm_proxy raw/rollup retention (validated; None = defaults).
         self.usage_retention = usage_retention_config(usage_retention)
+        # control_plane.ci_fix (validated; None = defaults, which are disabled: the routes then 404).
+        from .ci_fix import CIFixService, ci_fix_config
+        self.ci_fix_config = ci_fix_config(ci_fix)
+        self.ci_fix = CIFixService(repo, self.ci_fix_config) if self.ci_fix_config["enabled"] else None
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row),
                                     actions_enabled=ci_actions,
                                     on_observation=repo.observe_ci_pipeline)
+        # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
+        from .mission_outcome import MissionOutcomes, missions_config
+        self.missions_config = missions_config(missions)
+        self.mission_outcomes = MissionOutcomes(repo, self.missions_config)
+        repo.mission_outcomes = self.mission_outcomes
+        from .attention_inbox import AttentionInbox, attention_config
+        self.attention_config = attention_config(attention)
+        self.attention = None
+        if self.attention_config["enabled"] and not collab_only:
+            self.attention = AttentionInbox(repo, config=self.attention_config, health=self._health,
+                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix)
         if github_monitor is None:
             from ..github import GitHubMonitor
             github_monitor = GitHubMonitor()
@@ -194,7 +262,13 @@ class ControlPlaneServer:
         # in-memory blob stand-in, so they survive a web restart.
         self.rustfs = rustfs
         from .ingest import IngestService
-        self.ingest = IngestService(repo)
+        # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
+        scopes = {}
+        for key, allow in (lineage_key_scopes or {}).items():
+            digest = hashlib.sha256(str(key).encode()).hexdigest()[:12]
+            scopes[f"key:{digest}"] = {"rooms": frozenset(allow.get("rooms") or ()),
+                                       "missions": frozenset(allow.get("missions") or ())}
+        self.ingest = IngestService(repo, key_scopes=scopes, system_graph=system_graph)
         self._limiter = _RateLimiter()
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.
@@ -228,6 +302,7 @@ class ControlPlaneServer:
                 f"{host!r} without collab_tls_terminated (bearer credentials "
                 "require TLS)")
         self.fleet_config = fleet_config
+        self.review_quorum = review_quorum      # QuorumConfig | None (feature off)
         self.collab = collab
         self.collab_require_https = collab_require_https
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
@@ -258,6 +333,16 @@ class ControlPlaneServer:
         self._public_httpd = None
         if collab is not None:
             collab.hydrate(repo.take_collab_replay())
+            if not collab_only:
+                # membership-scoped lineage reads (lineage-events.md, "Scope semantics"): the
+                # isolated collab-only process never sees fabric data, so it serves none
+                collab.graph_source = lambda: repo.graph
+                # External agents (T10) report lineage about themselves through the HCN route; the service
+                # builds the envelope, this only registers the room that enrollment bound it to.
+                self.ingest.reserved_node = collab.is_external_node
+                self.ingest.service_node = collab.is_hcn_node
+                collab.lineage_sink = self._external_lineage
+                collab.quorum_config = review_quorum        # T15: review items and the "reviewed at head" evidence use the T06 policy
         self.host = host
         self.port = port
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
@@ -265,10 +350,22 @@ class ControlPlaneServer:
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._httpd = None
-        self.gate_service = self.gate_store = self.gate_queue = None
+        self.gate_service = self.gate_store = self.gate_queue = self.gate_main = None
+        self.gate_coordinator = self.gate_reviewer_config = None
         self._start_review_gate(repo, fleet_config)
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    def _external_lineage(self, envelope, principal, valid=None):
+        """Ingest one envelope the HCN service built for an external agent. The principal's allowed room is
+        registered from the envelope's own room (which the service took from the enrollment), so the
+        existing per-principal scope check applies unchanged."""
+        # a room service (T14 consultation thread) writes under the subject's mission label: the envelope's own
+        # mission id, which the service took from the node's scope, is the one mission it may address
+        mission = envelope.get("mission_id") if str(principal["id"]).startswith("collab:room:") else None
+        self.ingest.key_scopes[principal["id"]] = {
+            "rooms": frozenset({envelope["room_id"]}), "missions": frozenset({mission} if mission else ())}
+        return self.ingest.ingest(envelope, principal, valid=valid)
 
     def _start_review_gate(self, repo, fleet_config):
         """Build and start the PR review gate when the central config enables it.
@@ -295,6 +392,9 @@ class ControlPlaneServer:
         if sink is not None and not callable(getattr(sink, "record_required", None)):
             raise ValueError("review_gate: the event sink cannot make durable writes")
         from ..review_gate import github_app
+        from ..review_gate.coordinator import ReviewCoordinator
+        from ..review_gate.main_verify import MainVerifier
+        from ..review_gate.notifier import AuthorNotifier
         from ..review_gate.queue import ReviewQueue
         from ..review_gate.registry import AuthorRegistry
         from ..review_gate.service import GateService
@@ -303,11 +403,31 @@ class ControlPlaneServer:
             repo,
             review_caps={e.repo: e.review_cap for e in config.repos},
             ci_fix_caps={e.repo: e.ci_fix_cap for e in config.repos})
-        self.gate_queue = ReviewQueue(repo)
+        # The queue's real lease and the lease a Claim reports must be one value.
+        self.gate_queue = ReviewQueue(repo, lease_seconds=config.reviewer.lease_seconds)
+        app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
+        registry = AuthorRegistry(repo)
+        notifier = AuthorNotifier(repo, config=config.notify, registry=registry,
+                                  dispatcher=self.dispatcher)
+        self.gate_main = MainVerifier(repo, app, notifier)
         self.gate_service = GateService(
-            config=config, app=github_app.GitHubAppClient(config.app),
-            store=self.gate_store, queue=self.gate_queue, registry=AuthorRegistry(repo),
-            ci_snapshot=lambda: self.ci_monitor.snapshot(start=False))
+            config=config,
+            app=app,
+            store=self.gate_store,
+            queue=self.gate_queue,
+            registry=registry,
+            ci_snapshot=lambda: self.ci_monitor.snapshot(start=False),
+            notifier=notifier,
+            main_verifier=self.gate_main,
+        )
+        self.gate_reviewer_config = config.reviewer
+        self.gate_coordinator = ReviewCoordinator(
+            store=self.gate_store,
+            queue=self.gate_queue,
+            app=app,
+            config=config.reviewer,
+            enrolled={e.repo for e in config.repos},
+        )
         # The gate must work with no browser open, and snapshot(start=False) never
         # starts the poller, so the server starts the shared monitor itself.
         self.ci_monitor.start()
@@ -393,6 +513,8 @@ class ControlPlaneServer:
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
             self._summary_scanner.start()
         threading.Thread(target=self._sweep_loop, daemon=True).start()
+        if self.collab is not None and self.collab.lineage_sink is not None:
+            threading.Thread(target=self._link_flush_loop, daemon=True).start()
         self._httpd.serve_forever()
 
     def _sweep_loop(self, interval=300):
@@ -413,6 +535,16 @@ class ControlPlaneServer:
             sweep_token_usage(self.repo, raw_retention_days=self.usage_retention["raw_retention_days"])
         except Exception as exc:
             log.warning("token_usage retention sweep failed: %s", type(exc).__name__)
+
+    def _link_flush_loop(self, interval=30):
+        """T14: tell the lineage graph what it missed about cross-workspace links (a retraction the graph was down
+        for), once at start and then on a timer. The pending set is derived from the durable link records."""
+        while self._httpd is not None:
+            try:
+                self.collab.maintain()
+            except Exception:
+                pass
+            time.sleep(interval)
 
     def wait_until_ready(self, timeout=5.0):
         self._ready.wait(timeout=timeout)
@@ -534,6 +666,11 @@ _PUBLIC_STATIC = {
     "/collab-view.js": ("collab-view.js", "text/javascript"),
     "/collab-scripts.js": ("collab-scripts.js", "text/javascript"),
     "/collab-flow.js": ("collab-flow.js", "text/javascript"),
+    "/collab-links.js": ("collab-links.js", "text/javascript"),
+    "/collab-tabs.js": ("collab-tabs.js", "text/javascript"),
+    "/collab-proposals.js": ("collab-proposals.js", "text/javascript"),
+    "/collab-lineage.js": ("collab-lineage.js", "text/javascript"),
+    "/collab-attention.js": ("collab-attention.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
     "/conversation-markdown.js": ("conversation-markdown.js", "text/javascript"),
@@ -589,7 +726,10 @@ def _make_handler(server, public=False, operator=False):
             for candidate, role in server._keys.items():
                 if secrets.compare_digest(supplied, candidate):
                     digest = hashlib.sha256(candidate.encode()).hexdigest()[:12]
-                    return {"kind": role, "id": f"key:{digest}", "authenticated_by": "api_key"}
+                    # "external" and "collab" are principal kinds only the HCN service can mint; a key whose
+                    # configured role spells one of them is an ordinary unprivileged key, never that principal.
+                    kind = "unknown" if role in ("external", "collab") else role
+                    return {"kind": kind, "id": f"key:{digest}", "authenticated_by": "api_key"}
             return {"kind": "unknown", "id": None, "authenticated_by": "none"}
 
         def _deny(self, status, message):
@@ -616,8 +756,11 @@ def _make_handler(server, public=False, operator=False):
             Role model (Spec §104): viewer = read-only; operator = read +
             mutate; ingest = read + POST /api/v1/ingest only (read-only
             everywhere else); agent = ingest plus exactly the host-side tool routes
-            (LLM key mint/revoke, review create/result). Unknown roles are treated as viewer (fail-closed
-            for mutations).
+            (LLM key mint/revoke, review create/result); reviewer = read-only plus
+            POST to exactly the four review-gate worker routes (claim, job
+            heartbeat/result/failure), which NO other role may POST, operator
+            included (so open/keyless mode cannot use them). Unknown roles are
+            treated as viewer (fail-closed for mutations).
 
             The return value MUST be truthy on refusal: callers do
             ``if self._require(...): return``. (It used to return the result of
@@ -627,6 +770,16 @@ def _make_handler(server, public=False, operator=False):
             role = self._role()
             if role is None:
                 return self._deny(401, "unauthorized")
+            if self.command == "POST" and self._is_reviewer_namespace():
+                # Decided on the DECODED path (routing unquotes), before the
+                # operator shortcut below: only `reviewer` gets past here.
+                if role != "reviewer":
+                    return self._deny(403, "reviewer role required")
+                if _reviewer_route(self._decoded_parts()) is None:
+                    return self._deny(404, "not found")
+                return None
+            if role == "reviewer" and min_role != "viewer":
+                return self._deny(403, "read-only")
             if min_role == "operator":
                 if role == "operator":
                     return None
@@ -643,6 +796,19 @@ def _make_handler(server, public=False, operator=False):
                     return None
                 return self._deny(403, "read-only")
             return None
+
+        def _decoded_parts(self):
+            """Path segments unquoted exactly as ``_route_api`` routes them."""
+            return [unquote(seg) for seg in self.path.split("?")[0].split("/")]
+
+        def _is_reviewer_namespace(self):
+            """True for any POST target under review-gate/claim or review-gate/jobs."""
+            parts = self._decoded_parts()
+            return (
+                len(parts) > 4
+                and parts[:4] == ["", "api", "v1", "review-gate"]
+                and parts[4] in ("claim", "jobs")
+            )
 
         # ------------------------------------------------------------ routes
         # -------------------------------------------- public (collab-only) listener
@@ -717,7 +883,7 @@ def _make_handler(server, public=False, operator=False):
             if not base:
                 return self._deny(404, "not found")
             self.send_response(200)
-            data = json.dumps(collab_a2a.agent_card(base)).encode()
+            data = json.dumps(collab_a2a.agent_card(base, delegation=server.collab.delegation_enabled)).encode()
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "public, max-age=300")
             self.send_header("Content-Length", str(len(data)))
@@ -813,14 +979,14 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path):
+            if res.startswith("reviews") or res == "attention" or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin integration mutation refused")
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
-            min_role = ("ingest" if path == "/api/v1/ingest"
+            min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path)
                        else "operator")
             err = self._require(min_role)
             if err:
@@ -976,7 +1142,8 @@ def _make_handler(server, public=False, operator=False):
                 result = service.dispatch(self.command, parts, query, body,
                                           self.headers.get("Authorization", ""),
                                           self.headers.get("X-Herdr-Device"),
-                                          operator=server.operator_user if operator else None)
+                                          operator=server.operator_user if operator else None,
+                                          client=self._proxied_client())
             except Exception:
                 return self._json({"error": "internal error"}, 500)  # never echo internals
             if isinstance(result, tuple):
@@ -1106,9 +1273,19 @@ def _make_handler(server, public=False, operator=False):
             if parts[4] == "prs":
                 return self._json([_gate_pr(snap) for snap in server.gate_store.snapshots()])
             if parts[4] == "queue":
+                jobs = server.gate_queue.snapshot()
+                if self._role() != "operator":
+                    # Who holds a claim is operator information (the claim token
+                    # is what protects a claim; this only narrows the view).
+                    jobs = [{k: v for k, v in j.items() if k != "claimed_by"} for j in jobs]
                 return self._json({"depth": server.gate_queue.depth(),
-                                   "jobs": server.gate_queue.snapshot(),
+                                   "jobs": jobs,
                                    "gate": server.gate_service.status()})
+            if parts[4] == "notices":
+                from ..review_gate.notifier import recent_notices
+                return self._json(recent_notices(server.repo))
+            if parts[4] == "main":
+                return self._json({"repos": server.gate_main.status()})
             return self._json({"error": "not found"}, 404)
 
         def _review_gate_resume(self, parts):
@@ -1138,6 +1315,93 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "pull request is not escalated"}, 409)
             return self._json(_gate_pr(store.snapshot(key)))
 
+        def _reviewer_body(self, cap, fields):
+            """Read a reviewer route's JSON object body: ``(body, None)`` or ``(None, (status, error))``.
+
+            Fixed error strings only: nothing from the request is ever echoed back.
+            """
+            length = _content_length(self.headers.get("Content-Length"))
+            if not length:
+                return None, (400, "invalid request body")
+            if length > cap:
+                return None, (413, "request body too large")
+            try:
+                body = json.loads(self.rfile.read(length))
+            except (ValueError, RecursionError):
+                return None, (400, "invalid request body")
+            if not isinstance(body, dict) or set(body) != fields:
+                return None, (400, "invalid request body")
+            for name in sorted(fields & {"worker_id", "reviewer_model"}):
+                value = body[name]
+                if not isinstance(value, str) or not _REVIEWER_ID.fullmatch(value):
+                    return None, (400, f"invalid {name}")
+            if "output" in fields and not isinstance(body["output"], str):
+                return None, (400, "invalid output")
+            if "claim_token" in fields and not (
+                isinstance(body["claim_token"], str)
+                and _REVIEWER_CLAIM_TOKEN.fullmatch(body["claim_token"])
+            ):
+                return None, (400, "invalid claim_token")
+            reason = body.get("reason", "")
+            if not isinstance(reason, str) or len(reason) > _REVIEWER_REASON_MAX:
+                return None, (400, "invalid reason")
+            return body, None
+
+        def _review_gate_worker(self, parts):
+            """POST review-gate/claim and review-gate/jobs/<job_id>/{heartbeat,result,failure}.
+
+            Reviewer role only (``_require`` enforced it; re-checked here as defence
+            in depth). Every refusal goes through ``_deny`` (Connection: close), so an
+            unread body can never be parsed as a next request.
+            """
+            if self._role() != "reviewer":
+                return self._deny(403, "reviewer role required")
+            route = _reviewer_route(parts)
+            if route is None:
+                return self._deny(404, "not found")
+            coord, cfg = server.gate_coordinator, server.gate_reviewer_config
+            if coord is None or cfg is None:
+                return self._deny(503, "review gate disabled")
+            action, job_id = route
+            if job_id is not None and not _REVIEWER_JOB_ID.fullmatch(job_id):
+                return self._deny(400, "invalid job id")
+            fields = {
+                "claim": {"worker_id", "reviewer_model"},
+                "heartbeat": {"worker_id", "claim_token"},
+                "result": {"worker_id", "output", "claim_token"},
+                "failure": {"worker_id", "reason", "claim_token"},
+            }[action]
+            # JSON escaping can expand each output byte up to 6x ("\u0001"); the
+            # coordinator's byte-exact max_output_bytes check is the real limit.
+            cap = (
+                6 * cfg.max_output_bytes + 4 * 1024 if action == "result" else _REVIEWER_SMALL_BODY
+            )
+            body, error = self._reviewer_body(cap, fields)
+            if error is not None:
+                return self._deny(*error)
+            worker = body["worker_id"]
+            try:
+                if action == "claim":
+                    got = coord.claim(worker, body["reviewer_model"])
+                    job = None if got is None else {f: getattr(got, f) for f in _CLAIM_FIELDS}
+                    return self._json({"job": job})
+                token = body["claim_token"]
+                if action == "heartbeat":
+                    ok = coord.heartbeat(job_id, worker, claim_token=token) is True
+                    return self._json({"ok": ok})
+                if action == "result":
+                    outcome = coord.submit(job_id, worker, body["output"], claim_token=token)
+                    allowed = _RESULT_OUTCOMES
+                else:
+                    outcome = coord.fail(job_id, worker, body["reason"], claim_token=token)
+                    allowed = _FAILURE_OUTCOMES
+                if not isinstance(outcome, str) or outcome not in allowed:
+                    raise TypeError("unexpected coordinator outcome")
+                return self._json({"outcome": outcome})
+            except Exception as exc:  # noqa: BLE001 - fixed 500, class name only in the log
+                _log.error("review gate %s failed: %s", action, type(exc).__name__)
+                return self._json({"error": "internal error"}, 500)
+
         def _api_get(self, parts, resource):
             r = server.repo
             if resource == "health":
@@ -1145,9 +1409,25 @@ def _make_handler(server, public=False, operator=False):
             if resource == "mission-activity" and len(parts) == 4:
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
+            if resource == "mission-outcomes" and len(parts) == 4:
+                from .mission_outcome import outcome_summaries
+                try:
+                    server.mission_outcomes.sweep()
+                except Exception:  # noqa: BLE001
+                    pass
+                return self._json({"outcomes": outcome_summaries(r)})
             if resource == "missions":
+                try:
+                    server.mission_outcomes.sweep()   # throttled; closes missions that went silent
+                except Exception:  # noqa: BLE001 - a sweep must never fail a read
+                    pass
                 if len(parts) == 6 and parts[5] == "activity":
                     return self._json({"activity": r.mission_activity.get(parts[4])})
+                if len(parts) == 6 and parts[5] == "story":
+                    from .mission_story import build
+                    story = build(r, parts[4], outcomes=server.mission_outcomes, inbox=server.attention,
+                                  config=server.missions_config)
+                    return self._json(story) if story is not None else self._json({"error": "not found"}, 404)
                 if len(parts) > 5 and parts[5] == "timeline":
                     timeline = r.mission_timeline(parts[4])
                     return self._json({"timeline": _with_collab_tasks(server, r, parts[4], timeline)})
@@ -1157,6 +1437,23 @@ def _make_handler(server, public=False, operator=False):
                         {"error": "not found"}, 404)
                 status = _q(self.path, "status")
                 return self._json({"missions": r.list_missions(status)})
+            if resource == "related" and len(parts) == 4:
+                from .relations import related
+                kind, entity_id = _q(self.path, "kind"), _q(self.path, "id")
+                try:
+                    answer = related(r, kind, entity_id)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
+                return self._json(answer) if answer is not None else self._json({"error": "not found"}, 404)
+            if resource == "attention" and len(parts) == 4:
+                if server.attention is None:
+                    return self._json({"error": "not found"}, 404)
+                try:
+                    return self._json(server.attention.snapshot(
+                        state=_q(self.path, "state") or "open",
+                        kind=_q(self.path, "kind") or None, severity=_q(self.path, "severity") or None))
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
             if resource == "inspector":
                 return self._inspector_global_get(parts)
             if resource == "sessions" and len(parts) > 5 and parts[5] == "inspector":
@@ -1266,9 +1563,13 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"keys": r.list_project_keys()})
                 if what == "models":
                     return self._json({"models": list(r.list_custom_models().values())})
+                if what in ("stats", "timeseries", "errors") and len(parts) == 5:
+                    return self._llm_stats(what)
                 return self._json({"error": "not found"}, 404)
             if resource == "graph":
                 return self._graph_get(parts)
+            if resource == "steering":
+                return self._steering(parts)
             if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
                 return self._json({"sources": r.ledger.source_states(), "server_time": r._stamp()})
             if resource == "ingest":
@@ -1322,6 +1623,14 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(server.ci_monitor.log(
                         _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
                         **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
+                if what == "fix" and server.ci_fix is not None and len(parts) in {5, 6}:
+                    if len(parts) == 6 and parts[5] == "config":
+                        return self._json(server.ci_fix.runner_config())
+                    if len(parts) == 6:
+                        return self._json(server.ci_fix.get(parts[5]))
+                    return self._json(server.ci_fix.list(
+                        run=_q(self.path, "run") or None, host=_q(self.path, "host") or None,
+                        active=_q(self.path, "active") == "1"))
                 if what:
                     return self._json({"error": "not found"}, 404)
                 from .project_links import annotate_ci, cached_github_languages
@@ -1360,6 +1669,8 @@ def _make_handler(server, public=False, operator=False):
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
+            if resource == "review-gate" and len(parts) > 4 and parts[4] in ("claim", "jobs"):
+                return self._review_gate_worker(parts)
             if resource == "review-gate":
                 return self._review_gate_resume(parts)
             if resource == "ci" and len(parts) == 5 and parts[4] == "telemetry":
@@ -1378,13 +1689,16 @@ def _make_handler(server, public=False, operator=False):
                     receipt = debug_ci(server.ci_monitor, r, server.dispatcher,
                                        body.get("repository"), body.get("number"),
                                        body.get("session_id"), body.get("operation_id"),
-                                       **({"provider_url": body["provider_url"]} if "provider_url" in body else {}))
+                                       **({"provider_url": body["provider_url"]} if "provider_url" in body else {}),
+                                       **({"mode": body["mode"]} if "mode" in body else {}))
                 except HerdrEngineeringError as exc:
                     return self._json({"error": exc.message}, exc.http_status)
                 status = {"delivered": 200, "queued": 202}.get(receipt.get("status"), 502)
                 if receipt.get("error") in {"receipt_persistence_unavailable", "receipt_persistence_failed"}:
                     status = 503
                 return self._json(receipt, status)
+            if resource == "ci" and len(parts) >= 5 and parts[4] == "fix":
+                return self._ci_fix_post(parts, body)
             if resource == "ci" and len(parts) == 5 and parts[4] == "actions":
                 try:
                     return self._json(server.ci_monitor.action(
@@ -1397,6 +1711,26 @@ def _make_handler(server, public=False, operator=False):
                     if isinstance(exc, HerdrEngineeringError):
                         return self._json({"error": exc.message}, exc.http_status)
                     raise
+            if resource == "attention" and len(parts) == 5 and parts[4] in ("ack", "snooze", "clear"):
+                if server.attention is None:
+                    return self._json({"error": "not found"}, 404)
+                principal = self._principal()
+                actor = f"{principal['kind']}:{principal['id']}"
+                try:
+                    if parts[4] == "ack":
+                        result = server.attention.acknowledge(body.get("key"), body.get("fingerprint"), actor)
+                    elif parts[4] == "snooze":
+                        result = server.attention.snooze(body.get("key"), body.get("fingerprint"),
+                                                         body.get("seconds"), actor)
+                    else:
+                        result = server.attention.clear(body.get("key"), body.get("fingerprint"), actor)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
+                except PermissionError as exc:
+                    return self._json({"error": str(exc)}, 429)
+                return self._json(result)
+            if resource == "steering":
+                return self._steering(parts, body)
             if resource == "reviews":
                 from .reviews import ReviewService
                 reviews = ReviewService(r)
@@ -1518,49 +1852,63 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"ok": True, "entity": entity})
             return self._json({"error": "not found"}, 404)
 
+        def _steering(self, parts, body=None):
+            """T12 delivery to the emitter that owns a steering target (keyed API; no browser, no HCN credential).
+            ``GET /api/v1/steering/pending`` returns confirmed requests pinned to THIS key's graph principal;
+            ``POST /api/v1/steering/<id>/ack`` reports what it did. Absent in collab-only mode (no graph)."""
+            service = server.collab
+            if service is None or server.collab_only or service.graph_source is None:
+                return self._json({"error": "not found"}, 404)
+            principal = self._principal()
+            if principal.get("authenticated_by") != "api_key":
+                return self._json({"error": "steering delivery needs an authenticated API key; "
+                                            "an open listener has no principal to pin a request to",
+                                   "code": "authentication_required"}, 403)
+            who = principal.get("id")
+            inst = _q(self.path, "instance_id")
+            if inst is not None and not re.fullmatch(r"[A-Za-z0-9._:\-]{1,128}", inst):
+                return self._json({"error": "invalid instance_id"}, 400)
+            from .collab import CollabError
+            try:
+                if body is None and parts[4:] == ["pending"]:
+                    return self._json(service.steering_pending(who, inst))
+                if body is not None and len(parts) == 6 and parts[5] == "ack":
+                    return self._json(service.steering_ack(who, parts[4], body, inst))
+            except CollabError as exc:
+                return self._json({"error": exc.message, **getattr(exc, "extra", {})}, exc.status)
+            return self._json({"error": "not found"}, 404)
+
+        def _llm_stats(self, what):
+            """LLM page statistics (operator listener only; a bad parameter is a 400)."""
+            window = _q(self.path, "window") or "24h"
+            filters = {k: _q(self.path, k) for k in ("project", "model", "session", "mission", "source")}
+            try:
+                if what == "stats":
+                    return self._json(server.repo.llm_stats(
+                        window, _q(self.path, "group") or "model", **filters))
+                if what == "timeseries":
+                    return self._json(server.repo.llm_timeseries(
+                        window, _q(self.path, "step") or "1h", _q(self.path, "metric") or "requests",
+                        **filters))
+                return self._json(server.repo.llm_errors(
+                    window, _q(self.path, "class"), **filters))
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+
         def _graph_get(self, parts):
             """Lineage graph reads (viewer level). Every result is filtered by the
             caller's principal; hidden and missing both answer 404."""
-            g = server.repo.graph
-            principal = self._principal()
-            if len(parts) >= 6 and parts[4] == "nodes" and len(parts) == 6:
-                def qi(name, default):
-                    raw = _q(self.path, name)
-                    if raw in (None, ""):
-                        return default
-                    try:
-                        return int(raw)
-                    except ValueError:
-                        raise ValueError(f"{name} must be an integer") from None
-                return self._json(g.get_node(
-                    principal, parts[5], edge_type=_q(self.path, "edge_type") or None,
-                    from_id=_q(self.path, "from_id") or None,
-                    limit=qi("limit", 200), offset=qi("offset", 0)))
-            if len(parts) == 7 and parts[4] == "nodes" and parts[6] in ("neighborhood", "subgraph"):
-                def num(name, default):
-                    raw = _q(self.path, name)
-                    if raw is None or raw == "":
-                        return default
-                    try:
-                        return int(raw)
-                    except ValueError:
-                        raise ValueError(f"{name} must be an integer") from None
-                kinds = _q(self.path, "edge_types")
-                return self._json(g.neighborhood(
-                    principal, parts[5], depth=num("depth", DEFAULT_DEPTH),
-                    max_nodes=num("max_nodes", DEFAULT_NODES),
-                    max_edges=num("max_edges", DEFAULT_EDGES),
-                    direction=_q(self.path, "direction") or "both",
-                    edge_types=set(kinds.split(",")) if kinds else None,
-                    include_removed=_q(self.path, "include_removed") == "true"))
-            if len(parts) == 5 and parts[4] == "edge":
-                edge_type, frm, to = (_q(self.path, n) for n in ("edge_type", "from_id", "to_id"))
-                if not (edge_type and frm and to):
-                    raise ValueError("edge_type, from_id and to_id are required")
-                return self._json(g.get_edge(principal, edge_type, frm, to,
-                                             commit=_q(self.path, "commit"),
-                                             plan_digest=_q(self.path, "plan_digest")))
-            return self._json({"error": "not found"}, 404)
+            parts = list(parts)
+            if len(parts) == 7 and parts[4] == "nodes" and parts[6] == "review-quorum":
+                if server.review_quorum is None:
+                    return self._json({"error": "review quorum is not configured"}, 404)
+                try:
+                    return self._json(pr_review_quorum(server.repo.graph, self._principal(), parts[5],
+                                                       server.review_quorum))
+                except KeyError:
+                    return self._json({"error": "not found"}, 404)
+            return self._json(read_graph(server.repo.graph, self._principal(), parts[4:],
+                                         lambda name: _q(self.path, name)))
 
         def _agent_capabilities(self, session):
             operator = self._role() == "operator"
@@ -1758,6 +2106,32 @@ def _make_handler(server, public=False, operator=False):
             self.end_headers()
             self.wfile.write(data)
             return None
+
+        def _ci_fix_post(self, parts, body):
+            """Sandboxed CI fix agent. The browser creates and cancels; the runner (``agent`` role)
+            claims, reports state and reports the result. Disabled means every route is a 404."""
+            service = server.ci_fix
+            if service is None:
+                return self._json({"error": "not found"}, 404)
+            if len(parts) == 5:
+                actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
+                view, created = service.request(
+                    server.ci_monitor, body.get("repository"), body.get("number"), body.get("operation_id"),
+                    actor=actor,
+                    **({"provider_url": body["provider_url"]} if "provider_url" in body else {}))
+                return self._json(view, 202 if created else 200)
+            if len(parts) == 6 and parts[5] == "claim":
+                return self._json(service.claim(body.get("host"), body.get("defer")))
+            if len(parts) == 7 and parts[6] == "cancel":
+                return self._json(service.cancel(
+                    parts[5], actor={"role": self._role(), "via": "api_key" if server._keys else "open"}))
+            if len(parts) == 7 and parts[6] == "state":
+                return self._json(service.set_state(
+                    parts[5], body.get("state"),
+                    **{key: body[key] for key in ("reason", "host", "model", "session_id", "branch") if key in body}))
+            if len(parts) == 7 and parts[6] == "result":
+                return self._json(service.record_result(parts[5], body))
+            return self._json({"error": "not found"}, 404)
 
         # ---------------------------------------------------------- helpers
         def _read_json(self):

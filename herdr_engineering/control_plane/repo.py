@@ -20,6 +20,8 @@ import threading
 import time
 from uuid import uuid4
 
+from ..llm_session_id import dashboard_form
+from . import llm_stats
 from .agent_identity import AgentIdentityRegistry
 from .envelope import SourceLedger, envelope_event_fields
 from .graph import GraphProjection
@@ -189,6 +191,7 @@ class ControlPlaneRepo:
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+        self.mission_outcomes = None   # set by the server (control_plane.missions); None writes no outcomes
         # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
         # from them on import_state; owns no storage of its own.
         self.graph = GraphProjection()
@@ -300,6 +303,17 @@ class ControlPlaneRepo:
         m["updated_at"] = self._stamp()
         self.record_event("mission", key, "MissionStageChanged",
                           {"from": old, "to": stage}, mission_id=mission_id)
+        self._mission_stage_changed(key, old, stage)
+
+    def _mission_stage_changed(self, key, old, new):
+        # A durable outcome is written when a mission ends; it can never break the stage change itself.
+        outcomes = self.mission_outcomes
+        if outcomes is None:
+            return
+        try:
+            outcomes.on_stage(key, old, new)
+        except Exception:  # noqa: BLE001
+            pass
 
     # -------------------------------------------------------------- sessions
     def create_session(self, mission_id=None, agent_role="", model="",
@@ -1116,6 +1130,7 @@ class ControlPlaneRepo:
         for field, value in (("repository_id", repository_id), ("commit_sha", commit_sha)):
             if value is not None:
                 existing[field] = value
+        previous_stage = existing.get("stage")
         if stage:
             existing["stage"] = existing["status"] = stage
         self.record_event("mission", key, "MissionUpdated",
@@ -1127,6 +1142,8 @@ class ControlPlaneRepo:
                            "repository_id": existing.get("repository_id"),
                            "commit_sha": existing.get("commit_sha")},
                           mission_id=mission_id)
+        if stage:
+            self._mission_stage_changed(key, previous_stage, stage)
         return _copy(existing)
 
     # --------------------------------------------- CI: test runs / builds
@@ -1906,11 +1923,38 @@ class ControlPlaneRepo:
                                        cache_read_tokens=tokens[3], success=success,
                                        source=source, v2=v2, **common)
 
+    def resolve_usage_session(self, value):
+        """Map a usage row's raw ``session_id`` to a dashboard session (Decision 4).
+
+        ``match`` says how: ``direct`` (it is a dashboard id), ``decoded`` (its header
+        form, see ``llm_session_id``), ``agent_session`` (the native conversation id of
+        exactly one session record: pi sends its session id, which is also the id at
+        the end of its ``<ts>_<id>.jsonl`` file), ``unmatched`` (none, or ambiguous),
+        or ``none`` (the row has no session). Never guesses between candidates."""
+        if not isinstance(value, str) or not value:
+            return {"session_id": None, "match": "none"}
+        if value in self._sessions:
+            return {"session_id": value, "match": "direct"}
+        decoded = dashboard_form(value)
+        if decoded is not None and decoded in self._sessions:
+            return {"session_id": decoded, "match": "decoded"}
+        if _NATIVE_ID.fullmatch(value):
+            hits = [sid for sid, rec in list(self._sessions.items())
+                    if _native_id_matches(rec.get("agent_session"), value)]
+            if len(hits) == 1:
+                return {"session_id": hits[0], "match": "agent_session"}
+        return {"session_id": None, "match": "unmatched"}
+
     def token_analytics(self, project=None, since=None):
-        """Aggregate token usage by project, model and day (UTC)."""
+        """Aggregate token usage by project, model, day (UTC) and dashboard session.
+
+        ``by_session`` is keyed by the dashboard session id, or ``unmatched:<raw id>``
+        when ``resolve_usage_session`` cannot place it; rows without a session id
+        count only in the other groupings."""
         total = {"requests": 0, "input_tokens": 0, "output_tokens": 0,
                  "reasoning_tokens": 0, "cache_read_tokens": 0, "failed": 0}
-        by_project, by_model, by_day = {}, {}, {}
+        by_project, by_model, by_day, by_session = {}, {}, {}, {}
+        resolved = {}
 
         def add(bucket, key, p):
             b = bucket.setdefault(key, {k: 0 for k in total})
@@ -1927,8 +1971,89 @@ class ControlPlaneRepo:
                 add(by_project, p["project"], p)
                 add(by_model, p["model"], p)
                 add(by_day, ev["source_timestamp"][:10], p)
+                raw = p.get("session_id") or ev.get("session_id")  # v1 rows: envelope only
+                if not raw:
+                    continue
+                if raw not in resolved:
+                    resolved[raw] = self.resolve_usage_session(raw)
+                hit = resolved[raw]
+                key = hit["session_id"] or f"unmatched:{raw}"
+                b = by_session.get(key)
+                if b is None:
+                    b = by_session[key] = {**{k: 0 for k in total}, "session_id": hit["session_id"],
+                                           "matched_by": [], "raw_session_ids": []}
+                _accumulate(b, p)
+                if hit["match"] not in b["matched_by"]:
+                    b["matched_by"] = sorted([*b["matched_by"], hit["match"]])
+                if raw not in b["raw_session_ids"]:
+                    b["raw_session_ids"] = sorted([*b["raw_session_ids"], raw])
         return {"total": total, "by_project": by_project, "by_model": by_model,
-                "by_day": dict(sorted(by_day.items()))}
+                "by_day": dict(sorted(by_day.items())), "by_session": by_session}
+
+    # LLM page (docs/superpowers/specs/2026-10-23-llm-page-design.md, slice 2). Computed from
+    # the retained raw records on each call, like ``token_analytics``; ``retained_since`` says
+    # how far back they go and ``partial`` is true when the window starts before that.
+    def _llm_window(self, window, filters):
+        if window not in llm_stats.WINDOWS:
+            raise ValueError(f"window must be one of {', '.join(llm_stats.WINDOWS)}")
+        now = self._now()
+        since = now - llm_stats.WINDOWS[window]
+        cache = {}
+
+        def resolve(raw):
+            if raw not in cache:
+                cache[raw] = self.resolve_usage_session(raw)
+            return cache[raw]
+
+        project = filters.get("project")
+        source = filters.pop("source", None)
+        if source not in (None, "", "llm-proxy", "transcript"):
+            raise ValueError("source must be llm-proxy or transcript")
+        with self._event_lock:
+            streams = [s for (etype, eid), s in self._events.items()
+                       if etype == "token_usage" and (not project or eid == project)]
+            events = [ev for s in streams for ev in s]
+        oldest = min((llm_stats._parse(s[0]["source_timestamp"]) for s in streams if s), default=None)
+        if source in (None, "", "transcript"):   # the agents' own transcripts (tokens only)
+            events += list(llm_stats.transcript_events(self.inspector.usage_events()))
+        records = [(ts, p) for ts, p in llm_stats.select(events, _payload, since=since, until=now + 1,
+                                                          resolve=resolve, **{k: v for k, v in filters.items() if v})
+                   if not source or (p.get("source") or "llm-proxy") == source]
+        meta = {"window": window, "since": llm_stats._iso(since),
+                "retained_since": llm_stats._iso(oldest),
+                "partial": oldest is None or oldest > since}
+        return records, resolve, meta, since, now
+
+    def llm_stats(self, window="24h", group="model", **filters):
+        if group not in llm_stats.GROUPS:
+            raise ValueError(f"group must be one of {', '.join(llm_stats.GROUPS)}")
+        records, resolve, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, group=group, groups=llm_stats.stats(records, group, resolve))
+
+    def llm_timeseries(self, window="24h", step="1h", metric="requests", **filters):
+        if step not in llm_stats.STEPS:
+            raise ValueError(f"step must be one of {', '.join(llm_stats.STEPS)}")
+        if metric not in llm_stats.METRICS:
+            raise ValueError(f"metric must be one of {', '.join(llm_stats.METRICS)}")
+        filters.setdefault("source", "llm-proxy")   # a time series is one source, never a sum
+        records, _, meta, since, now = self._llm_window(window, filters)
+        step_s = llm_stats.STEPS[step]
+        points = llm_stats.timeseries(records, metric, since=since, until=now, step=step_s)
+        return dict(meta, step=step, metric=metric, points=points)
+
+    def llm_errors(self, window="24h", error_class=None, **filters):
+        filters["source"] = "llm-proxy"   # a transcript carries no status, so it has no errors
+        records, resolve, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, problems=llm_stats.errors(records, resolve, error_class=error_class))
+
+    def record_attention(self, event_type, payload):
+        """Store an operator acknowledge/snooze/clear. Private stream: never in the feed or the SSE."""
+        self.record_event("attention", "operator", event_type, payload, feed=False, publish=False)
+
+    def attention_events(self):
+        with self._event_lock:
+            return [{"event_type": e["event_type"], "payload": dict(_payload(e))}
+                    for e in self._events.get(("attention", "operator"), [])]
 
     def create_project_key(self, project, label=""):
         """Mint a gateway key for ``project``; the secret is returned once and only
@@ -2166,6 +2291,32 @@ class ControlPlaneRepo:
 
 
 # ------------------------------------------------------------ helpers
+#: pi/claude/codex conversation ids (same rule as the feed plugin's session-transcript.js ID).
+_NATIVE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{7,79}$")
+_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _native_id_matches(agent_session, value):
+    """True when ``agent_session`` (herdr's native conversation evidence) names ``value``:
+    its ``nativeId``, a ``kind: id`` value, or a ``kind: path`` transcript named
+    ``<id>.jsonl`` / ``*_<id>.jsonl`` / ``*-<id>.jsonl`` (session-transcript.js identityName)."""
+    if not isinstance(agent_session, dict):
+        return False
+    if agent_session.get("nativeId") == value:
+        return True
+    kind, ref = agent_session.get("kind"), agent_session.get("value")
+    if not isinstance(ref, str):
+        return False
+    if kind == "id":
+        return ref == value
+    if kind == "path":
+        name = ref.rsplit("/", 1)[-1]
+        # A suffix match needs a whole UUID: a fragment of one ends the name too.
+        return name == f"{value}.jsonl" or (bool(_UUID.fullmatch(value)) and name.endswith(
+            (f"_{value}.jsonl", f"-{value}.jsonl")))
+    return False
+
+
 def _payload(ev):
     """An event's payload as a dict (a hydrated jsonb column arrives as text)."""
     p = ev.get("payload") or {}

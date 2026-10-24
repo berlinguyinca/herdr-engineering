@@ -37,6 +37,8 @@ def test_host_bridge_registers_dynamic_url_and_binds_decision(tmp_path, monkeypa
     result = run_review(kind="plan", cwd=tmp_path, control_plane="http://herdr", plan_file=plan,
                         binary=binary, revision="abc", post=lambda base, path, body: calls.append((path, body)))
     assert result["decision"] == "approved"
+    assert result["plan_digest"] == calls[0][1]["plan_digest"]   # echoed for the caller to verify
+    assert result["review_id"] == calls[0][1]["review_id"]
     assert calls[0][0] == "/api/v1/reviews"
     assert calls[0][1]["plan"] == "# A plan"
     ready = [body for path, body in calls if path.endswith("/heartbeat") and body.get("review_url")]
@@ -164,3 +166,18 @@ def test_git_executable_unavailable_is_optional_metadata(tmp_path, monkeypatch):
     from herdr_engineering.plannotator import _review_identity
     monkeypatch.setenv("PATH", str(tmp_path))
     assert _review_identity(tmp_path, None, None, None) == (None, None, None)
+
+
+def test_digest_echo_is_authoritative_and_only_for_plan_reviews(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    plan = tmp_path / "p.md"
+    plan.write_text("# Plan")
+    forged = {"decision": "approved", "plan_digest": "0" * 64}   # upstream output must not choose the digest
+    calls = []
+    result = run_review(kind="plan", cwd=tmp_path, control_plane="http://herdr", plan_file=plan,
+                        binary=fake_cli(tmp_path, forged), revision="abc",
+                        post=lambda base, path, body: calls.append((path, body)))
+    assert result["plan_digest"] == calls[0][1]["plan_digest"] != "0" * 64
+    code = run_review(kind="code", cwd=tmp_path, control_plane="http://herdr", binary=fake_cli(tmp_path),
+                      revision="abc", post=lambda base, path, body: None)
+    assert "plan_digest" not in code

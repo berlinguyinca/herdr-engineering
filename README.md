@@ -610,10 +610,16 @@ curl -X POST http://dev.lan/api/v1/llm/keys/<key_id>/revoke
 export OPENAI_BASE_URL=http://dev.lan:8088/v1 OPENAI_API_KEY=hk-...
 ```
 
-Requests are forwarded to `https://llm.metabolomics.us` with the one dedicated lab key
-(`FABRIC_LLM_UPSTREAM_KEY` in `deploy/control-plane/.env`, never given to agents) and the token
+Requests are forwarded to `llm.upstream_url` (e.g. `https://llm.metabolomics.us`) with the one
+dedicated lab key, `llm.upstream_key` in the central fleet file. `deploy/control-plane/deploy.sh`
+renders only the `llm` section and `control_plane.llm_proxy` into the proxy's 0600 slice
+(`herdr-eng fleet config render-llm`, mounted at `/etc/herdr/llm/`); the proxy reads no
+configuration from the environment and the key is never given to agents (see
+`deploy/control-plane/README.md`). The token
 usage (including streaming) is recorded against the project: `GET /api/v1/analytics/tokens`
-(`?project=`, `?since=`) and the **Token usage** page at `#/analytics/tokens`. Custom models
+(`?project=`, `?since=`; `by_session` maps each row's session id to a dashboard session or
+labels it `unmatched:<id>`, see the LLM page spec, Decision 4) and the **Token usage** page at
+`#/analytics/tokens`. Custom models
 (`POST /api/v1/llm/models {"name","base_url","upstream_model"}`) are routed to their own endpoint
 and never receive the lab key. The gateway is not exposed beyond the fabric. It uses the public
 HTTPS API only; the `upstream` link role (specs repo, spec 63) will replace this path.
@@ -651,9 +657,10 @@ when the command exits, however it exits; `project` mode reuses a cached project
 (`~/.config/herdr-engineering/llm-<project>.env`, 0600, ignored if more permissive) and re-mints it
 if it was revoked. The key never appears in argv, logs, stdout or error text. If the control plane is
 unreachable the command still starts, with a warning (`--require-llm-env` makes that an error).
-Opt out with `--no-llm-env`, `llm: {inject: false}` in config or `HERDR_ENGINEERING_LLM_INJECT=0`.
-When the control plane runs with API keys, give the operator key via
-`HERDR_ENGINEERING_CONTROL_PLANE_KEY` or `~/.config/herdr-engineering/control-plane-key` (0600).
+Opt out with `--no-llm-env` or `llm: {inject: false}` in the config (YAML only; no environment
+variable switches it). When the control plane runs with API keys, the operator key comes from the
+host's fleet config (`agent.api_key`) or `~/.config/herdr-engineering/control-plane-key` (0600;
+ignored if group/world readable).
 The session's own processes (and root) can read the key from its environment; that is the
 trade-off for tracking, and the reason a session key is short-lived. A wrapper killed with
 SIGKILL cannot revoke; its key stays labelled `session:<id>` in `GET /api/v1/llm/keys` for cleanup.

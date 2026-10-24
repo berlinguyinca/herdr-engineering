@@ -5,6 +5,91 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Attention inbox, evidence-based progress and optimization analytics (T15, stacked on #174, #173, #168, #169)
+- New read routes `GET /rooms/{id}/attention|progress|analytics` and `POST /rooms/{id}/attention/ack|snooze|restore`, plus Attention and Progress
+  tabs. Everything is derived from what the reader can see in the room graph, review quorum (T06), steering/promotion (T12/T13), proposals (T11),
+  consultations (T14) and the external-agent roster; nothing is copied into a second store. Ack and snooze are per reader, bounded and bound to the
+  state of the item, so a changed condition comes back.
+- Completion counts only evidence a configured trusted writer attests (merged pull request, validated edge, accepted proposal); an agent saying "done"
+  is shown but never counted. Estimates state their method, confidence and assumptions, or say "insufficient evidence".
+- Analytics (cycle time, rework, re-review, approach win rate, blocked/idle time, self-reported cost) cover only visible items, hide groups smaller than
+  `min_group_size`, and have no per-person or per-agent breakdown.
+- New YAML `control_plane.collab.insights` (off by default, `kill_switch`). No environment variable, no migration, no Pi change.
+- Rollback: `insights.enabled: false`, or revert the PR.
+
+### Contextual chat, consultation and cross-workspace links (T14, stacked on T11 #172 and T12 #171)
+- Chat messages can carry one validated reference to a graph node, edge, comment or proposal. It is checked when posted and again for every
+  reader of every read; a reader who cannot see the target gets one fixed "hidden reference" and nothing else (agents, remote agents and guests always do).
+- Consultation: a member asks another member or a remote agent one bounded, expiring question about a graph node and gets one text answer
+  (never a task, proposal or action). The graph records who asked whom about what, never the text. New MCP tools `consult_inbox`, `consult_answer`.
+- Cross-workspace links: new edge kind `cross_link`, authorized on both ends and written only by the HCN service for one room; revocable and
+  self-expiring when the room loses a workspace grant. See `docs/contracts/lineage-events.md` ("T14").
+- New YAML `control_plane.collab.contextual` (everything off by default, `kill_switch`). No environment variable, no migration.
+- Rollback: `contextual.enabled: false`, or revert the PR.
+
+### Alternative implementation forks, comparison and promotion (T13, stacked on T12)
+- New steering actions `fork` and `promote` (opt-in via `steering.actions` and `steering.forks.enabled`), a comparison read model
+  `GET /api/v1/collab/rooms/{id}/forks`, and a Forks panel in the room workbench. Fork preserves the original; nothing is deleted.
+- Promotion is two-step and human-confirmed, promotes exactly one fork at an exact head, and never merges. See `docs/contracts/lineage-events.md` ("T13").
+- Rollback: revert the PR (code only; no migration).
+
+### Bounded task delegation and artifact proposals (T11, stacked on #170, #167, #165, #164)
+- A room owner can delegate one bounded task (scope, budget, expiry, allowed output kinds) to a coworker's external agent invited with
+  `proposals: true`. The agent answers only with an artifact proposal (patch, doc, analysis or link) that waits in quarantine; a room owner
+  accepts or rejects it with the digest of what was reviewed. Accepting records `task:hcn-delegation.*` and `artifact:hcn-proposal.*` nodes and a
+  `produced` edge in the lineage graph; nothing is ever applied. Same checks over REST, MCP (4 tools) and A2A (`tasks/get|list|cancel`, `message/send` with a `taskId`).
+- New YAML kill switch `control_plane.collab.delegation_enabled` (default `false`; works for the combined and `--collab-only` servers). No environment variable.
+- Extends the existing task store, event log and external credentials; new log events are additive; no migration. Defence in depth (untested): an API key whose configured
+  role is spelled `external` or `collab` is given principal kind `unknown`, never those service-only kinds. See `docs/operations/bounded-delegation.md` and the T11 addendum of the HCN threat model.
+
+- Hardening after independent review: bounded validator regexes, cheap checks before parsing and parsing outside the lock, strict `---`/`+++` names, `/dev/null` vs hunk
+  agreement, wider hard-coded deny-list, CRLF refused, task-list `bounds` limited to owners, open ingest listener refused for the reserved node ids.
+- Rollback: `delegation_enabled: false`, or revert the PR.
+
+### Lineage graph, Gantt timeline and replay (T09, stacked on #167, #165, #164)
+- Room workbench: new read-only "Lineage" panel (`packages/collab-lineage.js`): layered lineage graph, Gantt timeline with
+  head-change and stale markers, replay scrubber, filters and node inspector, each with a table alternative; keyboard
+  operable; nothing encoded by colour alone; all ids and labels escaped.
+- New read routes `GET /api/v1/collab/graph/lineage[/timeline|/events]` (room_id required, same membership 404, budgets, 240/min per person).
+  Replay at a position equals the live projection at that point and never shows what the reader cannot see now.
+  No migration, no new table (derived from the stored lineage events). See `docs/contracts/lineage-events.md` ("T09").
+- Replay is per room (a busy room cannot break another's), visibility is scanned in 128-event chunks so viewers do not stall
+  ingest, member responses no longer carry the global `admission` counter, the ledger window is counted in the reader's own visible events (exact steps, opaque page tokens), and the new
+  operator YAML `control_plane.collab.replay_history` (`since_join` default | `full`) sets how far back a member may replay.
+- Rollback: revert the PR (code only).
+
+
+### Head-bound review quorum (T06)
+- Review round 4: head handling is conservative. A lower-sequence write after the applied one is ignored only if it repeats
+  the applied head or a head that writer already reported earlier; any other head makes the PR `head_unverified`
+  (`head_unverified`/`alert` fields, one log line, operator `resync_event_id`). It clears when the writer writes past the
+  applied sequence or an operator acknowledges the write with `attrs.head_resync`; a run of writes is never auto-adopted
+  (`head_rebased` is gone, `head_resynced` replaces it). Evidence is kept per distinct head so re-emits cannot evict it.
+- Review round 3: `rereview_needed` counts only what the caller can see. Matching is ASCII-only (same as autospec;
+  `invalid_target`). Shared vectors grew to 32 cases.
+- `GET /api/v1/graph/nodes/{pr_id}/review-quorum`: derived, head-bound quorum over `reviewed` edges (stale verdicts never
+  counted, distinct configured reviewers, author/replay/forged-head defences, `rereview_required`). Config:
+  `control_plane.review_quorum` in the fleet config. One policy shared with `autospec review-quorum` via
+  `tests/control_plane/fixtures/review-quorum-vectors.json`; statuses `unknown_head`, `head_unverified` (emitter sequence
+  reset), `unknown_author`; digests are 64-hex and bound; `reviewer_groups`. Contract: `docs/contracts/lineage-events.md`. Rollback: remove the
+  block (endpoint answers 404); no schema or event change.
+
+### Tabs/panes and membership-scoped lineage (T08, stacked on #165 and #164)
+- Lineage `room`/`mission` scopes now resolve to HCN membership: an event that names its `room_id` / `mission_id`
+  (and optionally `workspace_id`) is readable by that room's non-guest members / that mission's listed members (T07),
+  through the new `GET /api/v1/collab/graph/...` routes (node, neighborhood, edge and a per-room type listing);
+  everyone else still gets 404, and a signed-in person never reads `org` lineage. Bare `room`/`mission` stay
+  operator-only and the keyed `/api/v1/graph` API is unchanged. No migration; reads only.
+- Room workbench: new read-only "Tabs" panel (`packages/collab-tabs.js`): primary agents as tabs, spawned subagents as
+  panes, from recorded `spawn` lineage only. Closing a pane never changes the agent.
+- Breaking: `GET /api/v1/collab/graph/nodes` (listing) requires `room_id` (400 otherwise); a key with no
+  `control_plane.lineage_key_scopes` entry can no longer write `room`/`mission` scope (403 `lineage_forbidden`; `"*"` opts in);
+  mission scope needs `room_id`, so stored mission events without it become operator-only after rebuild.
+- Rollback: see `docs/contracts/lineage-events.md` ("T08 rollout and rollback").
+
+### Plannotator bridge: digest echo
+- `herdr-plannotator plan` now prints the `plan_digest` (and `review_id`) the receipt was bound to alongside the upstream decision, computed by the bridge and authoritative over upstream output, so a caller can verify a decision belongs to the exact plan bytes it submitted. Code reviews are unchanged.
+
 ### YAML-only fabric agent configuration
 - The fabric agent, its install scripts, the enroll-sync/service-metadata units and the Ansible fabric tasks no longer
   write or read `fabric.env` (`HERDR_ENGINEERING_FABRIC_URL`). The gateway URL is `fabric.url` in the central

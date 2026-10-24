@@ -226,3 +226,71 @@ def test_rearm_replaces_live_job_for_same_sha():
     new = q.rearm(K1, "a" * 40, None)
     assert [j["job_id"] for j in q.snapshot()] == [new.job_id]
     assert new.job_id != old.job_id
+
+
+def test_live_claim_requires_holder_and_unexpired_lease():
+    q, clock = make(lease_seconds=100)
+    q.enqueue(K1, "a" * 40, None)
+    job = q.claim("w1", "m")
+    assert q.live_claim(job.job_id, "w1").job_id == job.job_id
+    assert q.live_claim(job.job_id, "w2") is None
+    assert q.live_claim("nope", "w1") is None
+    clock.t += 101
+    assert q.live_claim(job.job_id, "w1") is None
+
+
+def test_renew_extends_only_for_holder():
+    q, clock = make(lease_seconds=100)
+    q.enqueue(K1, "a" * 40, None)
+    job = q.claim("w1", "m")
+    before = q.snapshot()[0]["lease_expires_at"]
+    clock.t += 50
+    assert q.renew(job.job_id, "w2") is False
+    assert q.snapshot()[0]["lease_expires_at"] == before
+    assert q.renew(job.job_id, "w1") is True
+    assert q.snapshot()[0]["lease_expires_at"] == before + 50
+    clock.t += 101
+    assert q.renew(job.job_id, "w1") is False
+
+
+def test_release_requeues_in_place():
+    q, _ = make()
+    j1 = q.enqueue(K1, "a" * 40, None)
+    j2 = q.enqueue(K2, "b" * 40, None)
+    assert q.claim("w1", "m").job_id == j1.job_id
+    assert q.depth() == 1
+    assert q.release(j1.job_id, "w2") is False
+    assert q.release(j1.job_id, "w1") is True
+    assert q.depth() == 2
+    assert q.release(j1.job_id, "w1") is False  # no longer held
+    assert q.claim("w3", "m").job_id == j1.job_id  # FIFO position kept
+    assert q.claim("w4", "m").job_id == j2.job_id
+
+
+def test_attempts_counts_claims():
+    q, _ = make()
+    job = q.enqueue(K1, "a" * 40, None)
+    assert q.attempts(job.job_id) == 0
+    q.claim("w1", "m")
+    q.release(job.job_id, "w1")
+    q.claim("w2", "m")
+    assert q.attempts(job.job_id) == 2
+
+
+def test_duplicate_enqueued_event_is_ignored():
+    repo = ControlPlaneRepo()
+    q = ReviewQueue(repo, now=Clock())
+    base = {"key": str(K1), "sha": "a" * 40, "author_model": None, "enqueued_at": "t"}
+    for jid in ("j1", "j2"):
+        repo.record_event("review_job", "index", "enqueued", {**base, "job_id": jid})
+    assert q.depth() == 1
+    assert [j["job_id"] for j in q.snapshot()] == ["j1"]
+
+
+def test_enqueued_after_done_or_cancelled_is_not_deduped():
+    q, _ = make()
+    job = q.enqueue(K1, "a" * 40, None)
+    q.claim("w", "m")
+    q.complete(job.job_id, "w")
+    again = q.rearm(K1, "a" * 40, None)
+    assert [j["job_id"] for j in q.snapshot()] == [again.job_id]
