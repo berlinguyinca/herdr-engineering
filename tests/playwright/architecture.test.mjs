@@ -125,7 +125,7 @@ for (const [name, ctx] of [['dark-wide', {colorScheme: 'dark', viewport: {width:
     // headings must actually be readable on the view's own surface (WCAG AA 4.5:1)
     const lum = c => { const [r, g, b] = c.match(/\d+/g).slice(0, 3).map(Number).map(v => { v /= 255; return v <= .03928 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4; }); return .2126 * r + .7152 * g + .0722 * b; };
     const ratio = (x, y) => { const [hi, lo] = [lum(x), lum(y)].sort((m, n) => n - m); return (hi + .05) / (lo + .05); };
-    for (const sel of ['.arch h1', '.arch .arch-meta', '.arch-table td']) {
+    for (const sel of ['.arch h1', '.arch .arch-meta', '.arch-table td', '.arch-activity h2', '.arch-activity h3', '.arch-activity li', '.arch-timeline h3', '.arch-timeline small', '.arch-request label', '.arch-note']) {
       const fg = await page.locator(sel).first().evaluate(e => getComputedStyle(e).color);
       assert.ok(ratio(fg, bg) >= 4.5, `${sel} contrast ${ratio(fg, bg).toFixed(2)} on ${name}: ${fg} vs ${bg}`);
     }
