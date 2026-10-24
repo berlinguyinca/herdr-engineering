@@ -200,7 +200,7 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None):
+                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -228,6 +228,11 @@ class ControlPlaneServer:
                                     repo.record_event("ci_pipeline", key, event, row),
                                     actions_enabled=ci_actions,
                                     on_observation=repo.observe_ci_pipeline)
+        # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
+        from .mission_outcome import MissionOutcomes, missions_config
+        self.missions_config = missions_config(missions)
+        self.mission_outcomes = MissionOutcomes(repo, self.missions_config)
+        repo.mission_outcomes = self.mission_outcomes
         from .attention_inbox import AttentionInbox, attention_config
         self.attention_config = attention_config(attention)
         self.attention = None
@@ -1405,6 +1410,10 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
             if resource == "missions":
+                try:
+                    server.mission_outcomes.sweep()   # throttled; closes missions that went silent
+                except Exception:  # noqa: BLE001 - a sweep must never fail a read
+                    pass
                 if len(parts) == 6 and parts[5] == "activity":
                     return self._json({"activity": r.mission_activity.get(parts[4])})
                 if len(parts) > 5 and parts[5] == "timeline":

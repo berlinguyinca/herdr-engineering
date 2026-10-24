@@ -2550,6 +2550,11 @@ def _cmd_cp_web(args) -> int:
         attention = attention_config(cp.get("attention"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.mission_outcome import missions_config
+    try:
+        missions = missions_config(cp.get("missions"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     from .control_plane.ci_fix import ci_fix_config
     try:
         ci_fix = ci_fix_config(cp.get("ci_fix"))
@@ -2673,7 +2678,7 @@ def _cmd_cp_web(args) -> int:
                              summary_config=cp.get("agent_summaries") or {},
                              review_quorum=_review_quorum_config(cp),
                              usage_retention=usage_retention, attention=attention,
-                             ci_fix=ci_fix,
+                             ci_fix=ci_fix, missions=missions,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
