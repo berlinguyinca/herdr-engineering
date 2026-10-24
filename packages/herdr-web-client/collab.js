@@ -168,9 +168,6 @@ export class CollabApi {
   previewUpload(roomId, manifest) {
     return this.call('POST', `/rooms/${encodeURIComponent(roomId)}/uploads/preview`, { manifest });
   }
-  startUpload(roomId, manifest, options = {}) {
-    return this.call('POST', `/rooms/${encodeURIComponent(roomId)}/uploads`, { manifest, options });
-  }
   skills(scope) { return this.call('GET', `/skills${scope == null ? '' : `?scope=${encodeURIComponent(scope)}`}`); }
   // approval: the people who asked to join (operator: everyone; approvers: those waiting)
   users(status) { return this.call('GET', `/admin/users${status ? `?status=${encodeURIComponent(status)}` : ''}`); }

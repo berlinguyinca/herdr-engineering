@@ -85,6 +85,28 @@ def test_public_listener_serves_shared_conversation_components(stack):
         assert stack.pub.call("GET", f"/{name}", headers=H)[0] == 200
 
 
+def test_public_listener_serves_file_browser_import_from_real_packages(stack):
+    import http.client
+
+    stack.srv.web_root = ROOT_DIR / "packages"
+    connection = http.client.HTTPConnection("127.0.0.1", stack.srv.public_port, timeout=5)
+    try:
+        for path in ("/collab-view.js", "/collab-files.js", "/herdr-web-components/util.js"):
+            connection.request("GET", path, headers=H)
+            response = connection.getresponse()
+            body = response.read()
+            assert response.status == 200, path
+            assert response.getheader("Content-Type").startswith("text/javascript"), path
+            assert response.getheader("X-Content-Type-Options") == "nosniff"
+            assert body == (ROOT_DIR / "packages" / path.lstrip("/")).read_bytes()
+        connection.request("GET", "/app.js", headers=H)
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 404  # the deployment fix does not open dashboard assets
+    finally:
+        connection.close()
+
+
 def test_public_static_carries_security_headers(stack):
     import http.client
     c = http.client.HTTPConnection("127.0.0.1", stack.srv.public_port, timeout=5)

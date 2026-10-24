@@ -83,7 +83,7 @@ test('authorized file entry rejects denied, expired and executable sources', asy
   await assert.rejects(openAuthorizedFile(files[0], { api }), /Room access revoked/);
 });
 
-test('direct upload preview/start preserve the existing manifest and do not transmit file bytes', async () => {
+test('browser upload preview preserves the manifest without creating a user-owned session', async () => {
   const { startBulkUploadPreview } = await module();
   const manifest = { files: [{ relative_path: 'a.csv', size_bytes: 3, sha256: 'a'.repeat(64), parts: [{ size_bytes: 3, sha256: 'a'.repeat(64) }] }] };
   const calls = [];
@@ -92,11 +92,10 @@ test('direct upload preview/start preserve the existing manifest and do not tran
     return { ok: true, status: 200, json: async () => ({ room_id: 'r/1', file_count: 1, total_bytes: 3, can_upload: true, access_request_required: false }) };
   });
   assert.equal((await startBulkUploadPreview('r/1', manifest, { api })).file_count, 1);
-  await api.startUpload('r/1', manifest);
+  assert.equal(api.startUpload, undefined, 'session creation belongs to the registered agent, not the browser client');
   assert.deepEqual(calls, [
     { url: '/api/v1/collab/rooms/r%2F1/uploads/preview', body: { manifest } },
-    { url: '/api/v1/collab/rooms/r%2F1/uploads', body: { manifest, options: {} } },
   ]);
   await assert.rejects(startBulkUploadPreview('r/1', '/data/**/*.csv', { api }), /manifest/i);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 1);
 });

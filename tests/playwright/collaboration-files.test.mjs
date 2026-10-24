@@ -8,7 +8,7 @@ import { chromium } from 'playwright';
 const manifest = { files: [{ relative_path: 'new.csv', size_bytes: 3, sha256: 'a'.repeat(64), parts: [{ size_bytes: 3, sha256: 'a'.repeat(64) }] }] };
 // The real shared view/client runs in Chromium. HTTP fixtures document the
 // not-yet-wired file/access/upload contracts; they are not live-backend proof.
-async function withFiles(surface, fn, { role = 'owner', canUpload = true } = {}) {
+async function withFiles(surface, fn, { role = 'owner', canUpload = true, statusResponse } = {}) {
   const server = createServer(async (req, res) => {
     if (req.url === '/') { res.setHeader('Content-Type', 'text/html'); res.end('<link rel="stylesheet" href="/collab.css"><div id="view"></div>'); return; }
     try { res.setHeader('Content-Type', req.url.endsWith('.css') ? 'text/css' : 'application/javascript'); res.end(await readFile(new URL(`../../packages/${req.url.slice(1)}`, import.meta.url))); }
@@ -17,6 +17,7 @@ async function withFiles(surface, fn, { role = 'owner', canUpload = true } = {})
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser;
   const calls = [], holds = new Map();
+  if (statusResponse) holds.set('/uploads/agent-u1', statusResponse);
   const room = { room_id: 'r1', name: 'Lab', role, file_upload_permission: canUpload, members: [
     { user_id: 'owner', email: 'owner@example.org', role: 'owner', file_upload_permission: true },
     { user_id: 'member', email: 'member@example.org', role: 'viewer', file_upload_permission: false },
@@ -26,7 +27,7 @@ async function withFiles(surface, fn, { role = 'owner', canUpload = true } = {})
     { file_id: 'b', room_id: 'r1', relative_path: 'data/deep/b.json', status: 'available', size_bytes: 9, preview_status: 'failed' },
     { file_id: 'unfinished', room_id: 'r1', relative_path: 'unfinished.csv', status: 'verifying' },
   ];
-  const batch = { upload_id: 'u1', room_id: 'r1', status: 'uploading', file_count: 10000, total_bytes: 100, uploaded_bytes: 50, completed_parts: 1, total_parts: 2 };
+  const batch = { upload_id: 'agent-u1', room_id: 'r1', status: 'uploading', file_count: 10000, total_bytes: 100, uploaded_bytes: 50, completed_parts: 1, total_parts: 2 };
   try {
     const fallback = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
     browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], executablePath: process.env.PLAYWRIGHT_CHROMIUM || (existsSync(fallback) ? fallback : undefined) });
@@ -46,8 +47,8 @@ async function withFiles(surface, fn, { role = 'owner', canUpload = true } = {})
       else if (path === '/rooms/r1/files') result = { files: url.search ? [{ file_id: 'c', room_id: 'r1', relative_path: 'last.txt', status: 'available' }] : files, next_cursor: url.search ? null : 'page/2', has_more: !url.search, uploads: [batch] };
       else if (path.endsWith('/access')) result = { url: 'https://objects.example/authorized', expires_at: Date.now() / 1000 + 60 };
       else if (path === '/rooms/r1/uploads/preview') result = { room_id: 'r1', file_count: 1, total_bytes: 3, can_upload: canUpload, access_request_required: !canUpload };
-      else if (path === '/rooms/r1/uploads') result = { upload_id: 'u1', room_id: 'r1', file_count: 1, total_bytes: 3, files: [{ url: 'SECRET-GRANT' }], expires_at: Date.now() / 1000 + 60 };
-      else if (path === '/uploads/u1') result = batch;
+      else if (path === '/rooms/r1/uploads') result = { http: 403, error: 'A registered agent must create its own upload' };
+      else if (path === '/uploads/agent-u1') result = batch;
       else if (path === '/rooms/r1/members/member/upload-permission') { room.members[1].file_upload_permission = body.file_upload_permission; result = {}; }
       else result = {};
       await route.fulfill({ status: result.http || 200, contentType: 'application/json', body: JSON.stringify(result) }).catch(() => {});
@@ -108,27 +109,48 @@ for (const surface of ['public', 'dashboard']) {
     await page.getByRole('alert').filter({ hasText: 'Room access revoked' }).waitFor();
   }));
 
-  test(`files ${surface}: aggregate upload status, dry run, start lock and finalization visibility`, async () => withFiles(surface, async ({ page, calls, holds, files, batch }) => {
+  test(`files ${surface}: browser previews and hands off the manifest without creating a user session`, async () => withFiles(surface, async ({ page, calls, files, batch }) => {
     await page.getByText(/10000 files/).waitFor();
     assert.equal(await page.locator('#hcn-p-files progress').count(), 1);
     await page.getByLabel('Upload manifest').fill(JSON.stringify(manifest));
     await page.getByRole('button', { name: 'Preview upload', exact: true }).click();
     await page.getByText('1 files · 3 bytes', { exact: true }).waitFor();
-    let release; holds.set('/rooms/r1/uploads', new Promise(r => { release = r; }));
-    const start = page.getByRole('button', { name: 'Start upload', exact: true });
-    await start.click(); await start.dispatchEvent('click');
-    assert.equal(calls.filter(c => c.path === '/rooms/r1/uploads').length, 1);
-    assert.equal(await start.isDisabled(), true);
-    release({ upload_id: 'u1', room_id: 'r1', file_count: 1, total_bytes: 3, files: [{ url: 'SECRET-GRANT' }] });
-    await page.getByText(/Upload started/).waitFor();
-    assert.doesNotMatch(await page.locator('#hcn-p-files').innerHTML(), /SECRET-GRANT/);
+    assert.equal(await page.getByRole('button', { name: 'Start upload', exact: true }).count(), 0);
+    const handoff = page.getByLabel('Agent upload instructions');
+    await handoff.waitFor();
+    assert.deepEqual(JSON.parse(await handoff.inputValue()), {
+      name: 'room_upload_start', arguments: { room_id: 'r1', manifest, options: {} },
+    });
+    await page.getByText(/same registered agent/).waitFor();
+    await page.getByLabel('Agent-created upload ID').fill('agent-u1');
+    await page.getByRole('button', { name: 'Track upload', exact: true }).click();
+    await page.getByText('Tracking upload.', { exact: true }).waitFor();
+    assert.equal(calls.filter(c => c.path === '/rooms/r1/uploads').length, 0);
+    assert.ok(calls.some(c => c.path === '/uploads/agent-u1'));
     assert.equal(await page.getByText('unfinished.csv').count(), 0);
     files[2].status = 'available'; batch.status = 'available'; batch.uploaded_bytes = 100;
     await page.getByRole('button', { name: 'Refresh files', exact: true }).click();
     await page.getByText('unfinished.csv', { exact: true }).waitFor();
     assert.deepEqual(calls.find(c => c.path.endsWith('/uploads/preview')).body, { manifest });
-    assert.deepEqual(calls.find(c => c.path === '/rooms/r1/uploads').body, { manifest, options: {} });
   }));
+
+  test(`files ${surface}: pending status cannot block initial files, pagination or refresh`, async () => {
+    let release;
+    const statusResponse = new Promise(resolve => { release = resolve; });
+    try {
+      await withFiles(surface, async ({ page, calls, batch }) => {
+        await page.locator('[data-file-path="data"]').waitFor();
+        assert.equal(await page.getByRole('button', { name: 'Refresh files', exact: true }).isEnabled(), true);
+        await page.getByRole('button', { name: 'Load more files' }).click();
+        await page.getByText('last.txt', { exact: true }).waitFor();
+        await page.getByRole('button', { name: 'Refresh files', exact: true }).click();
+        await page.waitForFunction(() => !document.querySelector('[data-refresh-files]').disabled);
+        assert.equal(calls.filter(c => c.path === '/uploads/agent-u1').length, 1, 'no overlapping status polls');
+        release({ ...batch, uploaded_bytes: 75 });
+        await page.waitForFunction(() => document.querySelector('progress').value === 75);
+      }, { statusResponse });
+    } finally { release({ http: 503, error: 'test ended' }); }
+  });
 
   test(`files ${surface}: owners manage existing member permission controls`, async () => withFiles(surface, async ({ page, calls }) => {
     await page.getByRole('button', { name: 'Manage file permissions' }).click();
@@ -161,23 +183,24 @@ for (const surface of ['public', 'dashboard']) {
   }));
 
   test(`files ${surface}: upload status failure leaves finalized files usable`, async () => withFiles(surface, async ({ page, holds }) => {
-    holds.set('/uploads/u1', Promise.resolve({ http: 503, error: 'Upload status unavailable' }));
+    holds.set('/uploads/agent-u1', Promise.resolve({ http: 503, error: 'Upload status unavailable' }));
     await page.getByRole('button', { name: 'Refresh files', exact: true }).click();
     await page.getByRole('alert').filter({ hasText: 'Upload status unavailable' }).waitFor();
     await page.locator('[data-file-path="data"]').click();
     await page.locator('[data-file-id="a"]').waitFor();
-    holds.delete('/uploads/u1');
+    holds.delete('/uploads/agent-u1');
     await page.getByRole('button', { name: 'Refresh files', exact: true }).click();
-    await page.waitForFunction(() => !document.querySelector('[data-refresh-files]').disabled);
+    await page.waitForFunction(() => document.querySelector('[data-upload-status-error]').textContent === '');
     assert.equal(await page.getByRole('alert').filter({ hasText: 'Upload status unavailable' }).count(), 0);
   }));
 
   test(`files ${surface}: changing the manifest invalidates a successful dry run`, async () => withFiles(surface, async ({ page, calls }) => {
     await page.getByLabel('Upload manifest').fill(JSON.stringify(manifest));
     await page.getByRole('button', { name: 'Preview upload', exact: true }).click();
-    await page.getByRole('button', { name: 'Start upload', exact: true }).waitFor();
+    await page.getByLabel('Agent upload instructions').waitFor();
     await page.getByLabel('Upload manifest').fill('invalid');
     assert.equal(await page.locator('[data-upload-summary]').textContent(), '');
+    assert.equal(await page.getByLabel('Agent upload instructions').count(), 0);
     assert.equal(await page.getByRole('button', { name: 'Start upload', exact: true }).count(), 0);
     await page.getByRole('button', { name: 'Preview upload', exact: true }).click();
     await page.locator('[data-upload-message][role="alert"]').waitFor();
@@ -185,21 +208,31 @@ for (const surface of ['public', 'dashboard']) {
     assert.equal(calls.filter(c => c.path === '/rooms/r1/uploads').length, 0);
   }));
 
-  for (const operation of ['preview', 'start']) for (const outcome of ['success', 'failure']) {
+  for (const operation of ['preview', 'status']) for (const outcome of ['success', 'failure']) {
     test(`files ${surface}: ${operation} ${outcome} after disposal has no UI effects or followups`, async () => withFiles(surface, async ({ page, holds, calls }) => {
-      await page.getByLabel('Upload manifest').fill(JSON.stringify(manifest));
-      if (operation === 'start') {
-        await page.getByRole('button', { name: 'Preview upload', exact: true }).click();
-        await page.getByRole('button', { name: 'Start upload', exact: true }).waitFor();
-      }
-      const path = operation === 'preview' ? '/rooms/r1/uploads/preview' : '/rooms/r1/uploads';
+      await page.locator('[data-file-path="data"]').waitFor();
+      await page.waitForFunction(() => document.querySelector('[data-upload-status-loading]').textContent === '');
+      const path = operation === 'preview' ? '/rooms/r1/uploads/preview' : '/uploads/agent-u1';
       let release; holds.set(path, new Promise(resolve => { release = resolve; }));
-      await page.getByRole('button', { name: operation === 'preview' ? 'Preview upload' : 'Start upload', exact: true }).click();
+      const requestStarted = page.waitForRequest(request => new URL(request.url()).pathname === `/api/v1/collab${path}`);
+      if (operation === 'preview') {
+        await page.getByLabel('Upload manifest').fill(JSON.stringify(manifest));
+        await page.getByRole('button', { name: 'Preview upload', exact: true }).click();
+      } else {
+        await page.getByLabel('Agent-created upload ID').fill('agent-u1');
+        await page.getByRole('button', { name: 'Track upload', exact: true }).click();
+      }
+      await requestStarted;
+      if (operation === 'preview') {
+        await page.locator('[data-upload-preview]').dispatchEvent('submit');
+        assert.equal(calls.filter(call => call.path === path).length, 1);
+        assert.equal(await page.getByRole('button', { name: 'Preview upload', exact: true }).isDisabled(), true);
+      }
       await page.evaluate(() => window.view.dispose());
       const before = await page.locator('#hcn-p-files').innerHTML(), count = calls.length;
       release(outcome === 'failure' ? { http: 403, error: 'Permission revoked' } : operation === 'preview'
         ? { room_id: 'r1', can_upload: true, file_count: 1, total_bytes: 3 }
-        : { room_id: 'r1', upload_id: 'u2', file_count: 1, total_bytes: 3 });
+        : { room_id: 'r1', upload_id: 'agent-u1', status: 'available', file_count: 1, total_bytes: 3 });
       await page.waitForTimeout(150);
       assert.equal(await page.locator('#hcn-p-files').innerHTML(), before);
       assert.equal(calls.length, count);
