@@ -774,10 +774,17 @@ class ControlPlaneRepo:
                 base = merged[canonical] = _copy(rec)
                 base["host_id"] = base["host_name"] = canonical
                 continue
-            if (rec.get("last_seen") or "") > (base.get("last_seen") or ""):
-                for key in ("last_seen", "status", "cpu", "mem", "latest", *HOST_STATE_KEYS):
+            fresher = (rec.get("last_seen") or "") > (base.get("last_seen") or "")
+            if fresher:
+                for key in ("last_seen", "status", "cpu", "mem"):
                     if rec.get(key) is not None:
                         base[key] = rec[key]
+            # Report and state keys may live on either record (the agent heartbeats
+            # under one id, the fleet update posts under another): the fresher
+            # record wins a shared key, and a key on only one record survives.
+            for key in ("latest", *HOST_STATE_KEYS):
+                if rec.get(key) is not None and (fresher or base.get(key) is None):
+                    base[key] = rec[key]
             if rec.get("inventory") and not base.get("inventory"):
                 base["inventory"] = _copy(rec["inventory"])
         return merged
