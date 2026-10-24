@@ -313,3 +313,11 @@ The operator had not answered the questions above when slice 1 was built, so the
 - **Page.** `#/llm/session/<id>` shows the agent name with a source badge, an "Open agent ↗" link to `#/herd/session/<id>` (replaced by a note when the id is not a known dashboard session), the same tiles and charts scoped to that agent, its models and its problems. When the agent's records carry no latency it says so.
 - **Links.** The agent and problem rows on `#/llm` link to the usage view. The session workspace header and each herd row get an "LLM usage" link. They carry no numbers (that would be one more request per row); the figures are on the usage page.
 - **Mission link not built.** `#/llm?mission=<id>` works in the API (`mission` filter) but no mission page links to it yet.
+
+### Slice 5 notes (transcript source, as built)
+
+- **Source.** The usage events the inspector already keeps per session (pi, claude and codex transcripts) now appear as source `transcript` in `/api/v1/llm/stats`, next to `llm-proxy`. They are read from each session's retained event ring (`InspectorStore.usage_events`), not stored a second time.
+- **What a transcript row carries.** Tokens (input, output, reasoning, cache read) and an `events` count. `requests`, `errors` and `error_rate` are `null` (unknown, not 0), and there are no TTFT, speed or queue figures. The row has `partial_source: true`: the ring is bounded, so a long session may have older usage already evicted and its window total is a lower bound. Transcript rows have no project, so a `project` filter leaves them out; a `mission` filter does too.
+- **Precedence.** Sources are never added. For `group=session`, a transcript row whose agent also has proxy records in the window gets `cross_check: true` and the page labels it "(cross-check)". The tiles use the proxy figures when any exist, otherwise the transcript's tokens with "tokens only".
+- **Time series and problems.** `timeseries` takes `source` and defaults to `llm-proxy`, so a request count is never a transcript event count; `source=transcript` gives a token series. `errors` is proxy-only because a transcript has no status.
+- **Coverage.** pi sessions that call the gateway directly, claude and codex now appear on `#/llm` with tokens. Their latency, speed and errors stay "not reported".

@@ -101,5 +101,5 @@ test('an empty install shows placeholders, not zeros', async () => {
     await page.goto(`${base}/#/llm`);
     await page.getByText('No usage has been recorded yet.').waitFor({ timeout: 8000 });
     assert.ok(await page.getByText('No requests recorded in this window.').count() >= 1);
-  }, { LLM_SEED: '0' });
+  }, { LLM_SEED: '0', INSPECTOR_SEED: '0' });
 });

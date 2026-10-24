@@ -1797,7 +1797,7 @@ def _make_handler(server, public=False, operator=False):
         def _llm_stats(self, what):
             """LLM page statistics (operator listener only; a bad parameter is a 400)."""
             window = _q(self.path, "window") or "24h"
-            filters = {k: _q(self.path, k) for k in ("project", "model", "session", "mission")}
+            filters = {k: _q(self.path, k) for k in ("project", "model", "session", "mission", "source")}
             try:
                 if what == "stats":
                     return self._json(server.repo.llm_stats(

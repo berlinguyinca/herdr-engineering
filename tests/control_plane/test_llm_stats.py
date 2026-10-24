@@ -81,7 +81,7 @@ def test_sources_are_never_summed():
     repo, clock = _repo()
     _seed(repo, clock, [_row(), _row(source="transcript", stream=None, usage_known=True)])
     groups = repo.llm_stats("24h")["groups"]
-    assert sorted((g["source"], g["requests"]) for g in groups) == [("llm-proxy", 1), ("transcript", 1)]
+    assert sorted((g["source"], g["requests"] or g["events"]) for g in groups) == [("llm-proxy", 1), ("transcript", 1)]
 
 
 def test_windows_filters_and_partial_disclosure():
@@ -207,3 +207,55 @@ def test_routes_on_the_operator_listener():
 def test_llm_routes_do_not_exist_on_the_public_listener(stack, path):
     status, _ = stack.pub.call("GET", path)
     assert status == 404
+
+
+def _transcript(repo, sid, *usages):
+    repo.inspector.ingest(sid, {"events": [
+        {"kind": "usage", "ts": "2026-10-24T11:00:00Z", "model": "pi-model", **u} for u in usages]})
+
+
+def test_transcript_tokens_are_their_own_source_with_unknown_requests_and_timings():
+    repo, clock = _repo()
+    _transcript(repo, "herdr:a:b:w1%3Ap1", {"input_tokens": 10, "output_tokens": 500},
+                {"input_tokens": 5, "output_tokens": 250})
+    _seed(repo, clock, [_row(session_id="s-1")])
+    by_source = {g["source"]: g for g in repo.llm_stats("24h", group="all")["groups"]}
+    t = by_source["transcript"]
+    assert t["tokens"]["output"] == 750 and t["events"] == 2 and t["partial_source"] is True
+    assert (t["requests"], t["errors"], t["error_rate"]) == (None, None, None)
+    assert t["ttft_ms"]["n"] == 0 and t["speed_tps"]["n"] == 0        # not reported, not 0
+    assert by_source["llm-proxy"]["requests"] == 1 and by_source["llm-proxy"]["tokens"]["output"] == 100
+    assert by_source["llm-proxy"]["partial_source"] is False
+
+
+def test_a_session_with_proxy_records_marks_its_transcript_row_as_a_cross_check():
+    repo, clock = _repo()
+    sid = repo.create_session(agent_role="pi")
+    other = repo.create_session(agent_role="pi")
+    _transcript(repo, sid, {"output_tokens": 10})
+    _transcript(repo, other, {"output_tokens": 20})
+    _seed(repo, clock, [_row(session_id=sid)])
+    rows = {(g["key"], g["source"]): g for g in repo.llm_stats("24h", group="session")["groups"]}
+    assert rows[(sid, "transcript")]["cross_check"] is True
+    assert rows[(other, "transcript")]["cross_check"] is False
+    assert rows[(sid, "llm-proxy")]["cross_check"] is False
+
+
+def test_timeseries_and_errors_use_the_proxy_source_only_and_source_can_be_chosen():
+    repo, clock = _repo()
+    _transcript(repo, "t-1", {"output_tokens": 999})
+    _seed(repo, clock, [_row(), _row(status=500, error_class="upstream_server_error")])
+    assert sum(p["v"] for p in repo.llm_timeseries("24h", "1h", "requests")["points"]) == 2
+    assert sum(p["v"] for p in repo.llm_timeseries("24h", "1h", "tokens_out")["points"]) == 200
+    assert sum(p["v"] for p in repo.llm_timeseries("24h", "1h", "tokens_out", source="transcript")["points"]) == 999
+    assert [p["class"] for p in repo.llm_errors("24h")["problems"]] == ["upstream_server_error"]
+    assert [g["source"] for g in repo.llm_stats("24h", group="all", source="transcript")["groups"]] == ["transcript"]
+    with pytest.raises(ValueError):
+        repo.llm_stats("24h", source="bogus")
+
+
+def test_transcript_usage_outside_the_window_is_left_out():
+    repo, _ = _repo()
+    repo.inspector.ingest("t-1", {"events": [{"kind": "usage", "ts": "2026-10-10T00:00:00Z", "output_tokens": 5}]})
+    assert repo.llm_stats("24h", group="all")["groups"] == []
+    assert repo.llm_stats("30d", group="all")["groups"][0]["tokens"]["output"] == 5

@@ -125,3 +125,24 @@ test('an agent page with no records says so instead of showing zeros', () => {
   assert.match(html, /No usage has been recorded yet\./);
   assert.doesNotMatch(html, /undefined|null|NaN/);
 });
+
+test('transcript rows show events, not requests, are marked as cross-checks, and never feed the tiles', () => {
+  const d = data();
+  const transcript = group({ key: 'herdr:beast:eng:w1:p1', source: 'transcript', requests: null, errors: null, error_rate: null,
+    events: 7, partial_source: true, cross_check: true, ttft_ms: dist(0, null, null), speed_tps: dist(0, null, null) });
+  d.agents.groups.push(transcript);
+  d.total.groups.push({ ...transcript, key: 'all', cross_check: undefined });
+  const html = renderLlm(state(), d);
+  assert.match(html, /transcript \(cross-check\)<\/td><td>7 events<\/td>/);
+  assert.match(html, /Transcript rows cover only the events still retained/);
+  assert.match(html, /<div class="llm-tile__value">120<\/div>/);       // still the proxy figures
+});
+
+test('with only a transcript the tiles show tokens and say requests are not reported', () => {
+  const d = data();
+  d.total.groups = [group({ source: 'transcript', requests: null, errors: null, error_rate: null, events: 3,
+    partial_source: true, ttft_ms: dist(0, null, null), speed_tps: dist(0, null, null) })];
+  const html = renderLlm(state(), d);
+  assert.match(html, /<div class="llm-tile__value">3 events<\/div><div class="llm-tile__note">tokens only, from the agent&#39;s transcript/);
+  assert.match(html, /<div class="llm-tile__value">not reported<\/div><div class="llm-tile__note">streams only/);
+});

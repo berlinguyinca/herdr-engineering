@@ -1991,13 +1991,19 @@ class ControlPlaneRepo:
             return cache[raw]
 
         project = filters.get("project")
+        source = filters.pop("source", None)
+        if source not in (None, "", "llm-proxy", "transcript"):
+            raise ValueError("source must be llm-proxy or transcript")
         with self._event_lock:
             streams = [s for (etype, eid), s in self._events.items()
                        if etype == "token_usage" and (not project or eid == project)]
             events = [ev for s in streams for ev in s]
         oldest = min((llm_stats._parse(s[0]["source_timestamp"]) for s in streams if s), default=None)
-        records = list(llm_stats.select(events, _payload, since=since, until=now + 1, resolve=resolve,
-                                        **{k: v for k, v in filters.items() if v}))
+        if source in (None, "", "transcript"):   # the agents' own transcripts (tokens only)
+            events += list(llm_stats.transcript_events(self.inspector.usage_events()))
+        records = [(ts, p) for ts, p in llm_stats.select(events, _payload, since=since, until=now + 1,
+                                                          resolve=resolve, **{k: v for k, v in filters.items() if v})
+                   if not source or (p.get("source") or "llm-proxy") == source]
         meta = {"window": window, "since": llm_stats._iso(since),
                 "retained_since": llm_stats._iso(oldest),
                 "partial": oldest is None or oldest > since}
@@ -2014,12 +2020,14 @@ class ControlPlaneRepo:
             raise ValueError(f"step must be one of {', '.join(llm_stats.STEPS)}")
         if metric not in llm_stats.METRICS:
             raise ValueError(f"metric must be one of {', '.join(llm_stats.METRICS)}")
+        filters.setdefault("source", "llm-proxy")   # a time series is one source, never a sum
         records, _, meta, since, now = self._llm_window(window, filters)
         step_s = llm_stats.STEPS[step]
         points = llm_stats.timeseries(records, metric, since=since, until=now, step=step_s)
         return dict(meta, step=step, metric=metric, points=points)
 
     def llm_errors(self, window="24h", error_class=None, **filters):
+        filters["source"] = "llm-proxy"   # a transcript carries no status, so it has no errors
         records, resolve, meta, _, _ = self._llm_window(window, filters)
         return dict(meta, problems=llm_stats.errors(records, resolve, error_class=error_class))
 
