@@ -272,9 +272,13 @@ class SkillRegistry:
             "VALUES ($1,$2,$3,'skill',$4)", str(uuid4()), p.id, action, entity_id)
 
     async def create_skill_draft(self, principal: Principal, metadata: dict) -> SkillDraft:
+        """Create once per creator/request_key; reject reuse with different canonical input."""
         try:
-            if not isinstance(metadata, dict) or set(metadata) - _FIELDS - {'files', 'skill_id', 'room_id'}:
+            if not isinstance(metadata, dict) or set(metadata) - _FIELDS - {'files', 'skill_id', 'room_id', 'request_key'}:
                 raise ValueError('unknown metadata fields')
+            request_key = metadata.get('request_key')
+            if not isinstance(request_key, str) or not request_key.strip() or len(request_key) > 200:
+                raise ValueError('a caller-supplied request_key is required')
             _validate_content(metadata, metadata.get('files'))
         except (ValueError, TypeError, KeyError):
             raise CollabError(400, 'invalid skill metadata') from None
@@ -283,11 +287,31 @@ class SkillRegistry:
         content = json.loads(_canonical({k: metadata[k] for k in _FIELDS}))
         skill_id, draft_id = metadata.get('skill_id') or str(uuid4()), str(uuid4())
         room_id = metadata.get('room_id')
+        fingerprint = hashlib.sha256(_canonical({
+            **content, 'skill_id': metadata.get('skill_id'), 'room_id': room_id,
+            'files': {p: {'sha256': hashlib.sha256(b).hexdigest(), 'size_bytes': len(b)}
+                      for p, b in files.items()},
+        })).hexdigest()
         if not isinstance(skill_id, str) or (room_id is not None and not isinstance(room_id, str)):
             raise CollabError(400, 'invalid skill or room ID')
         async with self.conn.transaction():
             await self.conn.execute('SELECT pg_advisory_xact_lock_shared($1)', LIFECYCLE_LOCK)
             await self._principal(principal, human=True)
+            # Serialize absent-row races as well as committed retries across processes.
+            await self.conn.execute('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+                                    _canonical([principal.key, request_key]).decode())
+            previous = await self.conn.fetchrow(
+                'SELECT * FROM collab_skill_drafts WHERE created_by=$1 AND request_key=$2',
+                principal.id, request_key)
+            if previous:
+                if previous['request_fingerprint'] != fingerprint:
+                    raise CollabError(409, 'draft request key conflicts with original input')
+                status = await self.conn.fetchval(
+                    'SELECT status FROM collab_skills WHERE skill_id=$1', previous['skill_id'])
+                if status == 'revoked':
+                    raise CollabError(404, 'not found')
+                await self._principal(principal, human=True)
+                return SkillDraft(previous['draft_id'], previous['skill_id'], previous['version'])
             skill = await self.conn.fetchrow('SELECT * FROM collab_skills WHERE skill_id=$1 FOR UPDATE', skill_id)
             if skill is None:
                 if 'skill_id' in metadata:
@@ -308,10 +332,10 @@ class SkillRegistry:
             await self._principal(principal, human=True)
             await self.conn.execute(
                 'INSERT INTO collab_skill_drafts '
-                '(draft_id,skill_id,created_by,target_room_id,version,storage_key,sha256,manifest,signature,key_id) '
-                'VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)', draft_id, skill_id, principal.id,
+                '(draft_id,skill_id,created_by,target_room_id,version,storage_key,sha256,manifest,signature,key_id,request_key,request_fingerprint,storage_bucket) '
+                'VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13)', draft_id, skill_id, principal.id,
                 room_id, content['version'], key, package.sha256, _canonical(manifest).decode(),
-                package.signature, package.key_id)
+                package.signature, package.key_id, request_key, fingerprint, self.bucket)
             await self._audit(principal, 'skill.drafted', draft_id)
         return SkillDraft(draft_id, skill_id, content['version'])
 
@@ -350,10 +374,10 @@ class SkillRegistry:
                 draft['skill_id'], scope, room_id)
             row = await self.conn.fetchrow(
                 'INSERT INTO collab_skill_versions '
-                '(skill_id,version,storage_key,sha256,status,manifest,signature,key_id,source_draft_id) '
-                "VALUES ($1,$2,$3,$4,'published',$5::jsonb,$6,$7,$8) RETURNING *",
+                '(skill_id,version,storage_key,sha256,status,manifest,signature,key_id,source_draft_id,storage_bucket) '
+                "VALUES ($1,$2,$3,$4,'published',$5::jsonb,$6,$7,$8,$9) RETURNING *",
                 draft['skill_id'], draft['version'], key, package.sha256,
-                _canonical(package.manifest).decode(), package.signature, package.key_id, draft_id)
+                _canonical(package.manifest).decode(), package.signature, package.key_id, draft_id, self.bucket)
             await self._audit(principal, 'skill.published', f'{draft["skill_id"]}:{draft["version"]}')
             return self._version(row)
 

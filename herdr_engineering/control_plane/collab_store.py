@@ -508,15 +508,31 @@ class CollabStore:
             await self.remove_job(job_id)
             return await self.get_room(snapshot['room']['room_id'])
 
+    async def skill_package_refs(self, user_id: str) -> list[dict]:
+        """Trusted object locations only; no manifest or code bytes in cleanup journals."""
+        return [dict(r) for r in await self._conn.fetch(
+            'SELECT d.storage_bucket AS bucket,d.storage_key FROM collab_skill_drafts d '
+            'JOIN collab_skills s USING(skill_id) WHERE s.owner_id=$1 OR d.created_by=$1 '
+            'UNION SELECT v.storage_bucket AS bucket,v.storage_key FROM collab_skill_versions v '
+            'JOIN collab_skills s USING(skill_id) WHERE s.owner_id=$1 '
+            'ORDER BY bucket,storage_key', user_id)]
+
     async def start_scrub(self, user_id: str, job_id: str) -> dict:
         if not isinstance(user_id, str) or not user_id:
             raise ValueError('user ID must be nonempty')
         async with self._conn.transaction():
             job = await self.get_job(job_id)
-            if job:
-                return job['payload']
-            payload = {'user_id': user_id, 'agent_ids': [r['agent_id'] for r in await self._conn.fetch(
-                'SELECT agent_id FROM collab_agents WHERE owner_id=$1', user_id)]}
+            if job and (job['kind'] != 'scrub' or job['payload']['user_id'] != user_id):
+                raise ValueError('scrub job identity mismatch')
+            payload = job['payload'] if job else {
+                'user_id': user_id, 'agent_ids': [r['agent_id'] for r in await self._conn.fetch(
+                    'SELECT agent_id FROM collab_agents WHERE owner_id=$1', user_id)]}
+            # Refresh old/incomplete jobs before any cascade can discard locations.
+            packages = payload.setdefault('skill_packages', [])
+            for ref in await self.skill_package_refs(user_id):
+                if ref not in packages:
+                    packages.append(ref)
+                    payload.pop('skill_packages_verified', None)
             await self.put_job(job_id, 'scrub', payload)
             await self._conn.execute("UPDATE collab_users SET status='disabled' WHERE user_id=$1", user_id)
             return payload
@@ -527,6 +543,13 @@ class CollabStore:
                 "SELECT EXISTS(SELECT 1 FROM collab_room_uploads WHERE created_by=$1 "
                 "AND manifest->>'schema_version'='1' AND COALESCE(manifest->>'cleanup_done','false')!='true')", user_id):
                 raise ValueError('upload cleanup required before user deletion')
+            packages = await self.skill_package_refs(user_id)
+            job = await self.get_job(job_id)
+            payload = job['payload'] if job else {}
+            if packages or payload.get('skill_packages'):
+                if (payload.get('user_id') != user_id or not payload.get('skill_packages_verified')
+                        or any(ref not in payload.get('skill_packages', []) for ref in packages)):
+                    raise ValueError('skill package cleanup required before user deletion')
             # The approved FKs remove authored content and access, not room bytes.
             # Upload manifests are user-authored metadata; do not retain their content.
             await self._conn.execute("UPDATE collab_room_uploads SET manifest='{}'::jsonb WHERE created_by=$1", user_id)

@@ -19,6 +19,8 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from botocore.exceptions import ClientError
+
 from . import ids
 from .rustfs import RustFSClient
 
@@ -312,6 +314,34 @@ class CollabStorage:
             self._live_client().delete(key)
         except Exception:
             raise StorageError('live file deletion failed') from None
+
+
+    def delete_skill_package(self, bucket: str | None, key: str) -> None:
+        """Delete a journaled package and prove absence; never guess a legacy bucket.
+
+        Versioned or suspended buckets require version-aware erasure, so fail
+        closed rather than treating an S3 delete marker as proof of a scrub.
+        The location comes from trusted relational metadata, not package input.
+        """
+        prefix = f'env/{self.config.environment}/skills/sha256/'
+        try:
+            if (not isinstance(bucket, str) or not bucket
+                    or not isinstance(key, str) or not key.startswith(prefix)
+                    or not re.fullmatch(r'[0-9a-f]{64}/package\.json', key[len(prefix):])):
+                raise ValueError('unknown or unsupported skill package location')
+            s3 = self._archive._s3
+            if s3.get_bucket_versioning(Bucket=bucket).get('Status') is not None:
+                raise ValueError('version-aware erasure required')
+            s3.delete_object(Bucket=bucket, Key=key)
+            try:
+                s3.head_object(Bucket=bucket, Key=key)
+            except ClientError as exc:
+                if exc.response.get('Error', {}).get('Code') in {'404', 'NoSuchKey', 'NotFound'}:
+                    return
+                raise
+            raise ValueError('skill package still exists')
+        except Exception:
+            raise StorageError('skill package cleanup could not be verified') from None
 
 
 def verify_manifest(manifest: dict[str, Any], client: CollabStorage) -> VerificationReport:
