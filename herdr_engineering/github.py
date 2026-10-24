@@ -409,6 +409,12 @@ class GitHubMonitor:
         self._deferred = {}  # repository -> when it was first deferred (budget or rate limit)
         self._resume_repos, self._issue_resume = None, {}
         self._store, self._store_viewer, self._store_dirty = None, None, False
+        self._revision = None  # the store's catalog revision after its last load or write
+        self._touch()
+
+    def _touch(self):
+        """Count an in-memory change (lock held) so an ETag never outlives what it describes."""
+        self._epoch = getattr(self, "_epoch", 0) + 1
 
     @staticmethod
     def _empty():
@@ -544,14 +550,24 @@ class GitHubMonitor:
         """
         if self._store_factory is None:
             return None, None
+        self._revision = None
         try:
             store = self._store_factory(identity, viewer)
         except Exception:
             return None, None
         try:
-            return store, store.load()
+            snapshot = store.load()
         except Exception:
             return store, None
+        self._remember_revision(store, snapshot.revision if snapshot is not None else None)
+        return store, snapshot
+
+    def _remember_revision(self, store, revision=None):
+        """Cache the store's revision so serving a list never opens a store transaction."""
+        try:
+            self._revision = revision if revision is not None else store.revision()
+        except Exception:
+            self._revision = None
 
     def _allowlist(self):
         """The validated owner allowlist (empty = every owner); ``GitHubError`` when invalid."""
@@ -588,6 +604,7 @@ class GitHubMonitor:
             # not persisted: spread the next full reads over one interval after a restart
             offset = int(hashlib.sha256(rid.encode()).hexdigest()[:8], 16) % int(self._full_interval)
             self._full_at[rid] = self._now() - offset
+        self._touch()
         if self._repos:
             self._view.update(available=True, status="stale", stale=True,
                               account=snapshot.viewer)
@@ -606,6 +623,7 @@ class GitHubMonitor:
                 self._issues, self._marks, self._watermarks, self._issue_resume = {}, {}, {}, {}
                 self._full_at = {}
                 self._store_dirty = False
+                self._touch()
             return store
 
     def _write(self, store, work):
@@ -616,6 +634,9 @@ class GitHubMonitor:
             work(store)
         except Exception:
             self._store_dirty = True
+            return
+        if store is self._store:
+            self._remember_revision(store)
 
     def _stored_repository(self, record):
         row = {key: value for key, value in record.items() if key not in VOLATILE_REPOSITORY_FIELDS}
@@ -664,11 +685,13 @@ class GitHubMonitor:
         with self._lock:
             self._check_generation()
             self._view.update(fields)
+            self._touch()
 
     def _progress(self, **fields):
         with self._lock:
             self._check_generation()
             self._view["progress"].update(fields)
+            self._touch()
 
     def refresh(self):
         provider = self._sync_credentials()
@@ -1004,6 +1027,7 @@ class GitHubMonitor:
             self._issue_resume.pop(rid, None)
             record.update(issues_complete=True, issues_loaded=len(issues), error=None)
             row = self._stored_repository(record)
+            self._touch()
 
         def work(target):
             target.upsert_issues(rid, upserts.values(), watermark)
@@ -1012,11 +1036,24 @@ class GitHubMonitor:
             target.upsert_repositories([row], set())
         self._write(store, work)
 
+    def _repository_rows(self, search):
+        """Repositories matching ``search`` in list order (lock held)."""
+        return sorted((copy.deepcopy(row) for row in self._repos.values() if search.lower() in row["name_with_owner"].lower()),
+                      key=lambda r: (-r["open_issue_count"], r["name_with_owner"].lower()))
+
+    def _issue_rows(self, repository_id, search):
+        """Issues matching the repository and ``search`` filters, unsorted (lock held)."""
+        return [copy.deepcopy(issue) for rid, issues in self._issues.items() if repository_id is None or rid == repository_id
+                for issue in issues.values() if search.lower() in issue["title"].lower() or search in str(issue["number"])]
+
+    @staticmethod
+    def _issue_order(rows):
+        return sorted(rows, key=lambda row: (row["updated_at"] or "", row["number"]), reverse=True)
+
     def repositories(self, *, page=1, per_page=50, search="", start=True):
         with self._lock:
             view = self.snapshot(start=start)
-            rows = sorted((copy.deepcopy(row) for row in self._repos.values() if search.lower() in row["name_with_owner"].lower()),
-                          key=lambda r: (-r["open_issue_count"], r["name_with_owner"].lower()))
+            rows = self._repository_rows(search)
         view["repositories"], view["pagination"] = _page(rows, page, per_page)
         return view
 
@@ -1025,11 +1062,75 @@ class GitHubMonitor:
             raise ValueError("unknown issue tab")
         with self._lock:
             view = self.snapshot(start=start)
-            rows = [copy.deepcopy(issue) for rid, issues in self._issues.items() if repository_id is None or rid == repository_id
-                    for issue in issues.values() if search.lower() in issue["title"].lower() or search in str(issue["number"])]
+            rows = self._issue_rows(repository_id, search)
         view["counts"] = {name: sum(_tab(issue, name) for issue in rows) for name in sorted(TABS)}
-        rows = sorted((issue for issue in rows if _tab(issue, tab)), key=lambda row: (row["updated_at"] or "", row["number"]), reverse=True)
+        rows = self._issue_order(issue for issue in rows if _tab(issue, tab))
         view["issues"], view["pagination"] = _page(rows, page, per_page)
+        return view
+
+    def revision(self):
+        """The catalog revision the lists are at, or ``None`` when it cannot be trusted
+        (no store, or writes failing so memory is ahead of the store)."""
+        with self._lock:
+            return None if self._store is None or self._store_dirty else self._revision
+
+    def list_tag(self, *, start=True):
+        """What a list ETag is made of, taken *before* the body is built.
+
+        ``{"revision", "fingerprint"}``: the revision plus the whole sync state
+        (status, stale, progress, scope, deferral...) and the in-memory change
+        counter, so a 304 never hides a state change. ``None`` when there is no
+        trustworthy revision; the caller then hashes the body instead.
+        """
+        with self._lock:
+            view = self.snapshot(start=start)
+            revision = None if self._store is None or self._store_dirty else self._revision
+            epoch = self._epoch
+        if revision is None:
+            return None
+        return {"revision": revision,
+                "fingerprint": json.dumps([view, epoch, self._generation], sort_keys=True, default=str)}
+
+    def changes(self, *, kind, since, repository_id=None, tab="all", search="", start=True):
+        """``since`` delta of one list: ``{revision, resync: false, upserted, removed}`` plus the sync state.
+
+        Keys come from the store's revisioned rows and tombstones; the rows are
+        the in-memory ones the full list serves. A changed row that no longer
+        matches the filters (repository, search, tab) is reported as removed.
+        A ``since`` the store can no longer answer (older than its pruned
+        tombstones, newer than its revision) or an untrusted revision answers
+        ``resync: true`` with the full, unpaginated list.
+        """
+        if kind not in {"repositories", "issues"} or tab not in TABS:
+            raise ValueError("unknown GitHub list")
+        with self._lock:
+            view = self.snapshot(start=start)
+            store = None if self._store_dirty else self._store
+        delta = None
+        if store is not None:
+            try:
+                delta = store.changes_since(since)
+            except Exception:
+                delta = None
+        with self._lock:
+            if kind == "repositories":
+                rows = self._repository_rows(search)
+                current = {(row["repository_id"], row["repository_id"]): row for row in rows}
+            else:
+                every = self._issue_rows(repository_id, search)
+                view["counts"] = {name: sum(_tab(issue, name) for issue in every) for name in sorted(TABS)}
+                rows = self._issue_order(issue for issue in every if _tab(issue, tab))
+                current = {(row["repository_id"], row["github_id"]): row for row in rows}
+        if delta is None or delta["resync"]:
+            view.update({"revision": delta["revision"] if delta else None, "resync": True, kind: rows})
+            return view
+        wanted = "repository" if kind == "repositories" else "issue"
+        touched = dict.fromkeys((item["repository_id"], item["key"]) for item in delta["upserted"] + delta["removed"]
+                                if item["kind"] == wanted and (repository_id is None or item["repository_id"] == repository_id))
+        position = {key: index for index, key in enumerate(current)}
+        upserted = sorted((key for key in touched if key in current), key=position.get)
+        view.update(revision=delta["revision"], resync=False, upserted=[current[key] for key in upserted],
+                    removed=[{"repository_id": rid, "key": key} for rid, key in touched if (rid, key) not in current])
         return view
 
     def issue_detail(self, repository_id, number):

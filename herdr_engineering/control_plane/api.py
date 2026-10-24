@@ -1402,10 +1402,10 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"timeline": _with_collab_tasks(server, r, parts[4], timeline)})
                 if len(parts) > 4:
                     m = r.get_mission(parts[4])
-                    return self._json(m) if m else self._json(
+                    return self._etag_json(m) if m else self._json(
                         {"error": "not found"}, 404)
                 status = _q(self.path, "status")
-                return self._json({"missions": r.list_missions(status)})
+                return self._etag_json({"missions": r.list_missions(status)})
             if resource == "inspector":
                 return self._inspector_global_get(parts)
             if resource == "sessions" and len(parts) > 5 and parts[5] == "inspector":
@@ -1419,14 +1419,14 @@ def _make_handler(server, public=False, operator=False):
                     s = r.get_session(parts[4])
                     if s:
                         s = self._agent_capabilities(s)
-                    return self._json(s) if s else self._json(
+                    return self._etag_json(s) if s else self._json(
                         {"error": "not found"}, 404)
                 status = _q(self.path, "status")
-                return self._json({"sessions": [self._agent_capabilities(s) for s in r.list_sessions(status)]})
+                return self._etag_json({"sessions": [self._agent_capabilities(s) for s in r.list_sessions(status)]})
             if resource == "services":
                 if len(parts) > 4:
                     s = r.get_service(parts[4])
-                    return self._json(s) if s else self._json(
+                    return self._etag_json(s) if s else self._json(
                         {"error": "not found"}, 404)
                 services = r.list_services()
                 host_filter = _q(self.path, "host_id")
@@ -1441,7 +1441,7 @@ def _make_handler(server, public=False, operator=False):
                     # The ownership feed needs identity and proof only; the full
                     # catalog projection is most of the bytes of a large inventory.
                     services = [{k: s.get(k) for k in _FEED_SERVICE_FIELDS} for s in services]
-                return self._json({"services": services, "summary": summary})
+                return self._etag_json({"services": services, "summary": summary})
             if resource == "fleet" and parts[4:] == ["config", "status"]:
                 if server.fleet_config is None:
                     return self._json({"error": "not found"}, 404)
@@ -1458,9 +1458,9 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"samples": r.list_telemetry(parts[4], limit)})
                 if len(parts) == 5:
                     h = r.get_host(parts[4])
-                    return self._json(h) if h else self._json(
+                    return self._etag_json(h) if h else self._json(
                         {"error": "not found"}, 404)
-                return self._json({"hosts": r.list_hosts()})
+                return self._etag_json({"hosts": r.list_hosts()})
             if resource == "activity":
                 evs = [_redact_event(e) for e in r.recent_events(
                     limit=_qint(self.path, "limit", 50))]
@@ -1532,13 +1532,10 @@ def _make_handler(server, public=False, operator=False):
                 if len(parts) > 5 or (len(parts) == 5 and what not in {"issues", "issue"}):
                     return self._json({"error": "not found"}, 404)
                 query = _github_query(self.path, what)
-                if what == "issues":
-                    repository = query.pop("repository", None)
-                    return self._json(server.github_monitor.issues(repository_id=repository, **query))
                 if what == "issue":
                     return self._json(server.github_monitor.issue_detail(
                         query["repository"], query["number"]))
-                return self._json(server.github_monitor.repositories(**query))
+                return self._github_list(what or "repositories", query)
             if resource == "ci":
                 what = parts[4] if len(parts) > 4 else ""
                 if what == "performance" and len(parts) == 5:
@@ -2049,17 +2046,80 @@ def _make_handler(server, public=False, operator=False):
                 self.close_connection = True
                 raise
 
-        def _json(self, data, status=200):
-            payload = json.dumps(data).encode()
+        def _json(self, data, status=200, *, etag=None, payload=None):
+            payload = json.dumps(data).encode() if payload is None else payload
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
+            if etag and status == 200:
+                self.send_header("ETag", etag)
             if self.close_connection:
                 self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
             return None
+
+        def _not_modified(self, etag):
+            """304: no body (keep-alive safe without Content-Length), same validator."""
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-store")
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            return None
+
+        def _fresh(self, etag):
+            return _if_none_match(self.headers.get("If-None-Match"), etag)
+
+        def _etag_json(self, data, status=200):
+            """A read-only body with a content-hash ETag; ``304`` when the client already has it.
+
+            Polled views (hosts, sessions, services, missions) save the transfer
+            and the re-render, not the server work: the body is still built.
+            """
+            if status != 200:
+                return self._json(data, status)
+            payload, etag = etag_json(data)
+            if self._fresh(etag):
+                return self._not_modified(etag)
+            return self._json(data, etag=etag, payload=payload)
+
+        def _github_list(self, kind, query):
+            """``/github`` and ``/github/issues`` with ``revision``, ``ETag`` and ``since`` deltas.
+
+            The ETag is ``W/"<revision>-<hash>"`` where the hash covers the query and
+            the monitor's sync state, taken before the body is built (so it can only
+            be older than the body, never claim a newer one). A monitor without a
+            trustworthy revision falls back to a content hash.
+            """
+            monitor = server.github_monitor
+            since = query.pop("since", None)
+            repository = query.pop("repository", None) if kind == "issues" else None
+            tag_of = getattr(monitor, "list_tag", None)
+            tag = tag_of() if tag_of else None
+            etag = None
+            if tag is not None:
+                material = json.dumps([kind, repository, since, sorted(query.items()), tag["fingerprint"]],
+                                      default=str).encode()
+                etag = f'W/"{tag["revision"]}-{hashlib.sha256(material).hexdigest()[:20]}"'
+                if self._fresh(etag):
+                    return self._not_modified(etag)
+            changes = getattr(monitor, "changes", None)
+            if since is not None and changes is not None:
+                filters = {"repository_id": repository, "tab": query.get("tab", "all")} if kind == "issues" else {}
+                body = changes(kind=kind, since=since, search=query.get("search", ""), **filters)
+            else:
+                extra = {"repository_id": repository} if kind == "issues" else {}
+                body = (monitor.issues(**extra, **query) if kind == "issues" else monitor.repositories(**query))
+                if since is not None:  # a monitor without deltas: always a full resync
+                    body = dict(body, resync=True)
+                if tag is not None:
+                    body = dict(body, revision=tag["revision"])
+            if etag is None:
+                return self._etag_json(body)
+            return self._json(body, etag=etag)
 
         def _bytes(self, data, mime):
             self.send_response(200)
@@ -2140,10 +2200,34 @@ def _qint(path, key, default):
         return default
 
 
+def etag_json(body) -> tuple[bytes, str]:
+    """The JSON payload of ``body`` and its strong content-hash ETag.
+
+    The hash covers the serialized bytes, so it saves bandwidth and client
+    re-render on an unchanged body, not the work of building it (ruling 1).
+    """
+    payload = json.dumps(body).encode()
+    return payload, '"' + hashlib.sha256(payload).hexdigest()[:32] + '"'
+
+
+def _if_none_match(header, etag) -> bool:
+    """RFC 9110 weak comparison of ``If-None-Match`` (a list, ``*``, ``W/`` prefixes) with ``etag``."""
+    if not header or not etag:
+        return False
+    def opaque(tag):
+        tag = tag.strip()
+        return tag[2:] if tag.startswith("W/") else tag
+    wanted = opaque(etag)
+    return any(item.strip() == "*" or opaque(item) == wanted for item in header.split(","))
+
+
+_MAX_REVISION = 2**63 - 1
+
+
 def _github_query(path, kind):
     """Bound local dashboard filters; never forward arbitrary upstream paths."""
     values = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=20)
-    allowed = {"repository", "number"} if kind == "issue" else {"page", "per_page", "search"}
+    allowed = {"repository", "number"} if kind == "issue" else {"page", "per_page", "search", "since"}
     if kind == "issues":
         allowed |= {"repository", "tab"}
     if values.keys() - allowed or any(len(items) != 1 for items in values.values()):
@@ -2170,6 +2254,10 @@ def _github_query(path, kind):
         if not repository:
             raise ValueError("GitHub repository required")
         return query
+    if "since" in query:
+        if not re.fullmatch(r"[0-9]{1,19}", query["since"]) or int(query["since"]) > _MAX_REVISION:
+            raise ValueError("invalid GitHub revision")
+        query["since"] = int(query["since"])
     query.setdefault("search", "")
     if len(query["search"]) > 300 or any(ord(char) < 32 or ord(char) == 127 for char in query["search"]):
         raise ValueError("invalid GitHub search")
