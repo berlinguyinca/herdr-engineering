@@ -26,6 +26,15 @@ sections:
       minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
       ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: head-bound post-PR review quorum (GET /api/v1/graph/nodes/{pr}/review-quorum).
+      # Principal ids are the server-side `key:<digest>` actors; omit the block to turn it off.
+      # review_quorum:
+      #   required: 2
+      #   trusted_head_writers: ["key:REDACTED"]   # who may define a PR's current head / author
+      #   reviewers:
+      #     "key:REDACTED": {}
+      #     "key:REDACTED2": {login: "reviewer-login"}
+      #   reviewer_groups: []                       # e.g. [["key:REDACTED", "key:REDACTED2"]] = one person
       # OPTIONAL: the public collaboration container (only when the host has the marker
       # ~/.config/herdr-engineering/collab-enabled). Public identifiers only - deploy.sh
       # hands exactly this mapping (nothing else from this file) to collab-public, and

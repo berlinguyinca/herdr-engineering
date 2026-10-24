@@ -52,7 +52,8 @@
           - --revision
           - "{{ herdr_engineering_revision }}"
       register: fabric_agent_provision
-      changed_when: true
+      # stage-release.py prints "changed": false when the release is already staged
+      changed_when: "'\"changed\": false' not in fabric_agent_provision.stdout"
       when: not ansible_check_mode
 
     - name: "Use the immutable checkout for companion installation"
@@ -67,6 +68,9 @@
              + (['--repo', herdr_engineering_checkout] if ansible_facts['system'] == 'Darwin' else []) }}
       environment:
         HERDR_ENGINEERING_CHECKOUT: "{{ herdr_engineering_checkout | default(fleet_home ~ '/herdr-engineering-repo') }}"
+        # fleet-update.yml sets fabric_agent_defer_restart: the script then leaves
+        # a running agent alone and the role restarts it once at the end.
+        HERDR_FABRIC_AGENT_NO_RESTART: "{{ '1' if (fabric_agent_defer_restart | default(false) | bool) else '' }}"
         HOME: "{{ fleet_home }}"
         USER: "{{ fleet_user }}"
         XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
