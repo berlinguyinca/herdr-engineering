@@ -565,6 +565,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--collab-operator-url", default=None,
                     help="dashboard: forward /api/v1/collab/* to the operator listener of the "
                          "isolated collab service (e.g. http://100.64.0.1:8082)")
+    # No flag on purpose: the T11 delegation kill switch is YAML only (control_plane.collab.delegation_enabled).
+    p2.set_defaults(collab_delegation_enabled=False)
     p2.add_argument("--collab-dashboard-host", action="append", default=[],
                     help="extra DNS name the dashboard may be reached by for collaboration "
                          "(IP literals and localhost always work; repeatable; DNS-rebinding guard)")
@@ -2511,6 +2513,7 @@ def _cmd_cp_web(args) -> int:
             approval = ApprovalPolicy(auto_groups=[args.collab_cognito_group],
                                       approver_groups=args.collab_approver_group)
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
+                               delegation_enabled=_delegation_switch(args, cp),
                                summary_fix=getattr(args, "collab_summary_fix", None))
         if args.collab_only:
             collab.hydrate(sink.load())
@@ -2526,7 +2529,8 @@ def _cmd_cp_web(args) -> int:
         if sink is not None and source is None:
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
-        collab = CollabService(StaticTokenAuthenticator(users), sink=sink)
+        collab = CollabService(StaticTokenAuthenticator(users), sink=sink,
+                               delegation_enabled=_delegation_switch(args, cp))
     if collab is not None:
         history = getattr(args, "collab_replay_history", None) or "since_join"
         if history not in ("full", "since_join"):
@@ -2609,6 +2613,8 @@ COLLAB_CONFIG_KEYS = {
     "open_signup": ("collab_open_signup", bool),
     "approver_groups": ("collab_approver_group", list),
     "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
+    # T11 kill switch: bounded task delegation + artifact proposals. Default false = the feature does not exist.
+    "delegation_enabled": ("collab_delegation_enabled", bool),
     "replay_history": ("collab_replay_history", str),     # lineage replay: since_join (default) | full
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
@@ -2650,6 +2656,18 @@ def _apply_collab_config(args, cp) -> None:
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be a non-empty string")
             if getattr(args, dest) is None:
                 setattr(args, dest, value)
+
+
+def _delegation_switch(args, cp) -> bool:
+    """The T11 kill switch from control_plane.collab.delegation_enabled (YAML only, default off). The
+    collab-only path has already folded it into ``args`` via _apply_collab_config; the combined path reads it here."""
+    if getattr(args, "collab_delegation_enabled", False):
+        return True
+    collab = cp.get("collab") if isinstance(cp, dict) else None
+    value = collab.get("delegation_enabled", False) if isinstance(collab, dict) else False
+    if not isinstance(value, bool):
+        raise SystemExit("fleet config control_plane.collab.delegation_enabled must be true or false")
+    return value
 
 
 def _review_quorum_config(cp):

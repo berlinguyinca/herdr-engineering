@@ -8,12 +8,12 @@ credential system. Federation between servers is a separate, later feature and i
 An ordinary HCN agent record with an `external` block: bound to one room, sponsored by the room owner who invited it, limited to
 `read` and optionally `post`, with a credential that has a hard expiry. It is its own principal kind in every view
 (`kind: "external"`, message sender type `external`, lineage actor kind `external`).
-It never gets: a terminal, a shell, a pane or session link, `instruct`/`execute` (tasks arrive in T11), the member roster,
+It never gets: a terminal, a shell, a pane or session link, `instruct`/`execute` (bounded tasks and artifact proposals are a separate, opt-in capability: `bounded-delegation.md`), the member roster,
 the flow, the task list, membership or grant events, workspace links, missions, or anything from before it was enrolled.
 
 ## Flow
 1. The room owner opens Tabs > "Invite a remote agent" (or `POST /api/v1/collab/rooms/{room}/externals/invites`):
-   `{label, actions: ["read"] | ["read","post"], lineage: bool, ttl_seconds (60-86400, default 3600),
+   `{label, actions: ["read"] | ["read","post"], lineage: bool, proposals: bool (T11, default false), ttl_seconds (60-86400, default 3600),
    credential_ttl_seconds (300-604800, default 86400)}`. The reply holds the one-time `code` (`hcj_...`); only its digest is stored.
 2. The coworker's bridge redeems it (public route, the code is the authentication; **outbound only**):
    `POST /api/v1/collab/agents/join {"token": "<code>", "harness_type": "claude-code"}` ->
@@ -30,7 +30,8 @@ the flow, the task list, membership or grant events, workspace links, missions, 
    Open invites can be cancelled the same way (`.../externals/invites/{invite}/revoke`).
 
 ## Configuration
-No environment variables and no new YAML keys: the limits are constants in
+No environment variables. The only YAML key is the T11 kill switch `control_plane.collab.delegation_enabled` (default false; see
+`bounded-delegation.md`); the limits are constants in
 `herdr_engineering/control_plane/collab_external.py` (room cap 25, 10 invites per owner per hour, stale after 90 s, ...).
 The feature is available wherever HCN is enabled; room owners are the only ones who can create invites. In the isolated
 `--collab-only` process, enrollment, presence, chat and the roster work, but lineage answers 404 (that process has no graph).

@@ -5,6 +5,18 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Bounded task delegation and artifact proposals (T11, stacked on #170, #167, #165, #164)
+- A room owner can delegate one bounded task (scope, budget, expiry, allowed output kinds) to a coworker's external agent invited with
+  `proposals: true`. The agent answers only with an artifact proposal (patch, doc, analysis or link) that waits in quarantine; a room owner
+  accepts or rejects it with the digest of what was reviewed. Accepting records `task:hcn-delegation.*` and `artifact:hcn-proposal.*` nodes and a
+  `produced` edge in the lineage graph; nothing is ever applied. Same checks over REST, MCP (4 tools) and A2A (`tasks/get|list|cancel`, `message/send` with a `taskId`).
+- New YAML kill switch `control_plane.collab.delegation_enabled` (default `false`; works for the combined and `--collab-only` servers). No environment variable.
+- Extends the existing task store, event log and external credentials; new log events are additive; no migration. Defence in depth (untested): an API key whose configured
+  role is spelled `external` or `collab` is given principal kind `unknown`, never those service-only kinds. See `docs/operations/bounded-delegation.md` and the T11 addendum of the HCN threat model.
+- Hardening after independent review: bounded validator regexes, cheap checks before parsing and parsing outside the lock, strict `---`/`+++` names, `/dev/null` vs hunk
+  agreement, wider hard-coded deny-list, CRLF refused, task-list `bounds` limited to owners, open ingest listener refused for the reserved node ids.
+- Rollback: `delegation_enabled: false`, or revert the PR.
+
 ### Lineage graph, Gantt timeline and replay (T09, stacked on #167, #165, #164)
 - Room workbench: new read-only "Lineage" panel (`packages/collab-lineage.js`): layered lineage graph, Gantt timeline with
   head-change and stale markers, replay scrubber, filters and node inspector, each with a table alternative; keyboard

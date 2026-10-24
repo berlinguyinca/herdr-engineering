@@ -321,6 +321,7 @@ class ControlPlaneServer:
                 # External agents (T10) report lineage about themselves through the HCN route; the service
                 # builds the envelope, this only registers the room that enrollment bound it to.
                 self.ingest.reserved_node = collab.is_external_node
+                self.ingest.service_node = collab.is_hcn_node
                 collab.lineage_sink = self._external_lineage
         self.host = host
         self.port = port
@@ -629,6 +630,7 @@ _PUBLIC_STATIC = {
     "/collab-flow.js": ("collab-flow.js", "text/javascript"),
     "/collab-links.js": ("collab-links.js", "text/javascript"),
     "/collab-tabs.js": ("collab-tabs.js", "text/javascript"),
+    "/collab-proposals.js": ("collab-proposals.js", "text/javascript"),
     "/collab-lineage.js": ("collab-lineage.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
@@ -685,7 +687,10 @@ def _make_handler(server, public=False, operator=False):
             for candidate, role in server._keys.items():
                 if secrets.compare_digest(supplied, candidate):
                     digest = hashlib.sha256(candidate.encode()).hexdigest()[:12]
-                    return {"kind": role, "id": f"key:{digest}", "authenticated_by": "api_key"}
+                    # "external" and "collab" are principal kinds only the HCN service can mint; a key whose
+                    # configured role spells one of them is an ordinary unprivileged key, never that principal.
+                    kind = "unknown" if role in ("external", "collab") else role
+                    return {"kind": kind, "id": f"key:{digest}", "authenticated_by": "api_key"}
             return {"kind": "unknown", "id": None, "authenticated_by": "none"}
 
         def _deny(self, status, message):
@@ -839,7 +844,7 @@ def _make_handler(server, public=False, operator=False):
             if not base:
                 return self._deny(404, "not found")
             self.send_response(200)
-            data = json.dumps(collab_a2a.agent_card(base)).encode()
+            data = json.dumps(collab_a2a.agent_card(base, delegation=server.collab.delegation_enabled)).encode()
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "public, max-age=300")
             self.send_header("Content-Length", str(len(data)))

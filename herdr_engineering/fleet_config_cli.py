@@ -183,7 +183,8 @@ def render_compose(cfg: FleetConfig, out: Path) -> None:
 COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "cognito_web_client",
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history",
-                         "summary_fix"})   # summary_fix: ids of the operator's summary-fix room and agent, no secret
+                         "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
+                         "delegation_enabled"})
 
 
 def collab_values(cfg: FleetConfig) -> dict:

@@ -5,6 +5,7 @@ import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts
 import { renderFlow } from './collab-flow.js';
 import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
+import { decisionBody, delegationBody, renderDelegations, renderProposalList, renderReview } from './collab-proposals.js';
 import {
   filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
 } from './collab-lineage.js';
@@ -561,8 +562,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['links', 'Workspaces']]), ...(canInvite ? [['people', 'People']] : [])];
+    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
+    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
@@ -591,7 +592,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
             <fieldset class="cx-stack"><legend class="cx-msg">It may</legend>
               <label><input type="checkbox" checked disabled> read this room's chat</label>
               <label><input type="checkbox" name="post"> post messages</label>
-              <label><input type="checkbox" name="lineage"> report its own lineage to the graph</label></fieldset>
+              <label><input type="checkbox" name="lineage"> report its own lineage to the graph</label>
+              <label><input type="checkbox" name="proposals"> be given bounded tasks and send artifact proposals (held in quarantine; nothing is applied)</label></fieldset>
             <label class="cx-field">Invite valid for<select name="ttl"><option value="900">15 minutes</option><option value="3600" selected>1 hour</option><option value="86400">1 day</option></select></label>
             <label class="cx-field">Credential lasts<select name="cred"><option value="3600">1 hour</option><option value="86400" selected>1 day</option><option value="604800">7 days</option></select></label>
             <div class="cx-msg">A remote agent never gets a terminal, a shell or any right to give or take tasks. You can revoke it at any time.</div>
@@ -599,6 +601,25 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           <div id="hcn-ext-code" class="cx-stack" role="status"></div></details>` : ''}
         <div id="hcn-ext-invites"></div>
         <div id="hcn-tabs" aria-live="polite"></div></section>`}
+      ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-proposals" hidden aria-label="Bounded tasks and proposals">
+        <div class="hd-card cx-stack"><div class="hd-card__title">Delegate a bounded task</div>
+          <form id="hcn-deleg" class="cx-stack">
+            <label class="cx-field">To<select name="target" id="hcn-deleg-target" required></select></label>
+            <label class="cx-field">What should it look at?<textarea class="cx-input" name="text" required maxlength="4000" rows="3"></textarea></label>
+            <label class="cx-field">Repository paths it may write (one per line, <code>dir/</code> for a folder)<textarea class="cx-input" name="paths" rows="2"></textarea></label>
+            <label class="cx-field">Graph nodes it may refer to (one per line, like <code>commit:abc123</code>)<textarea class="cx-input" name="nodes" rows="2"></textarea></label>
+            <label class="cx-field">Questions (one per line, <code>id: text</code>)<textarea class="cx-input" name="questions" rows="2"></textarea></label>
+            <fieldset class="cx-stack"><legend class="cx-msg">It may answer with</legend>
+              <label><input type="checkbox" name="kind" value="doc" checked> a document</label><label><input type="checkbox" name="kind" value="analysis"> an analysis</label>
+              <label><input type="checkbox" name="kind" value="patch"> a patch</label><label><input type="checkbox" name="kind" value="link"> a link</label></fieldset>
+            <div class="cx-row"><label class="cx-field">Proposals<input name="maxProposals" type="number" min="1" max="5" value="1"></label>
+              <label class="cx-field">Steps<input name="maxSteps" type="number" min="1" max="200" value="20"></label>
+              <label class="cx-field">Max bytes<input name="maxBytes" type="number" min="256" max="32768" value="16384"></label>
+              <label class="cx-field">Expires<select name="expires"><option value="1800">30 minutes</option><option value="3600" selected>1 hour</option><option value="21600">6 hours</option><option value="86400">1 day</option></select></label></div>
+            <div class="cx-msg">The agent can only answer with a proposal. It goes to quarantine below; nothing is applied and no command runs. Token limits are advisory: the server cannot measure them.</div>
+            <button class="hd-btn" type="submit">Delegate</button><span id="hcn-deleg-msg" class="cx-msg" role="alert"></span></form>
+          <div id="hcn-delegs"></div></div>
+        <div class="hd-card cx-stack"><div class="hd-card__title">Quarantine</div><div id="hcn-props"></div><div id="hcn-review" aria-live="polite"></div></div></section>` : ''}
       ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><div id="hcn-lineage" class="cx-stack"></div></section>'}
       ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
@@ -863,6 +884,42 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       show();
       loadTabs().then(show);
     }
+    // Bounded tasks and proposals (T11): the owner's quarantine view. Content is untrusted text; see collab-proposals.js.
+    let propBusy = false;
+    const loadProposals = async () => {
+      if (propBusy) return;
+      propBusy = true;
+      try {
+        const [d, p] = await Promise.all([api.delegations(roomId), api.proposals(roomId)]);
+        S.deleg = d; S.props = p;
+        if (S.propSel) { try { S.propOne = await api.proposal(roomId, S.propSel); } catch { S.propOne = null; } }
+      } catch { /* keep what is shown; a service with delegation off answers 403 */ } finally { propBusy = false; }
+    };
+    function drawProposals() {
+      const show = () => {
+        const targets = ((S.externals && S.externals.externals) || []).filter((x) => x.proposals && x.state === 'active');
+        put('hcn-deleg-target', targets.length ? targets.map((x) => `<option value="${esc(x.agent_id)}">${esc(x.label)}</option>`).join('') : '<option value="">No remote agent was invited for bounded tasks</option>');
+        if (put('hcn-delegs', renderDelegations(S.deleg))) {
+          $('hcn-delegs').querySelectorAll('[data-cancel-deleg]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelDelegation(roomId, b.dataset.cancelDeleg); $('hcn-delegs').dataset.h = ''; }); });
+        }
+        if (put('hcn-props', renderProposalList(S.props, S.propSel))) {
+          $('hcn-props').querySelectorAll('[data-proposal]').forEach((b) => { b.onclick = () => { S.propSel = b.dataset.proposal; $('hcn-props').dataset.h = ''; $('hcn-review').dataset.h = ''; loadProposals().then(show); }; });
+        }
+        if (put('hcn-review', renderReview(S.propOne))) {
+          $('hcn-review').querySelectorAll('[data-decide]').forEach((b) => {
+            b.onclick = () => act(async () => {
+              const ask = b.dataset.decide === 'accept' ? 'Record this proposal in the graph as accepted? Nothing is applied or run.' : 'Reject this proposal?';
+              if (!window.confirm(ask)) return;
+              await api.decideProposal(roomId, b.dataset.pid, decisionBody(b.dataset.decide, b.dataset.digest, ($('hcn-prop-reason') || {}).value));
+              ['hcn-props', 'hcn-review', 'hcn-delegs'].forEach((id) => { $(id).dataset.h = ''; });
+              await loadProposals();
+            });
+          });
+        }
+      };
+      show();
+      loadTabs().then(() => loadProposals()).then(show);
+    }
 
     // ---- Lineage: graph, Gantt, replay and inspector. Read-only; the server filters every read by your CURRENT
     // membership. Live = the head of your ledger (refreshed while open); a replay position is static.
@@ -997,6 +1054,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       else if (sub === 'flow') drawFlow();
       else if (sub === 'links') put('hcn-links', renderLinks(S.links, S.missions));
       else if (sub === 'tabs') drawTabs();
+      else if (sub === 'proposals') drawProposals();
       else if (sub === 'lineage') drawLineage();
       else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); }
     }
@@ -1102,7 +1160,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         try {
           const out = await api.inviteExternal(roomId, {
             label: String(f.get('label') || ''), actions: f.get('post') ? ['read', 'post'] : ['read'],
-            lineage: !!f.get('lineage'), ttl_seconds: Number(f.get('ttl')), credential_ttl_seconds: Number(f.get('cred')) });
+            lineage: !!f.get('lineage'), proposals: !!f.get('proposals'), ttl_seconds: Number(f.get('ttl')), credential_ttl_seconds: Number(f.get('cred')) });
           msg.textContent = '';
           // shown once: the server keeps only a digest of the code
           box.innerHTML = `<div class="cx-msg">Give this one-time code to your coworker. It is shown only now, works once and expires ${esc(new Date(out.expires_at * 1000).toISOString())}.</div>`
@@ -1110,6 +1168,21 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
             + `<div class="cx-msg">Their bridge redeems it with <code>POST /api/v1/collab/agents/join</code> (<code>{"token": "…"}</code>) and then reports with the credential it receives. See docs/operations/external-agents.md.</div>`;
           ev.target.reset(); S.tabsAt = 0; $('hcn-ext-invites').dataset.h = ''; drawTabs();
         } catch (e) { msg.textContent = e.message; box.textContent = ''; }
+      };
+    }
+    const delegForm = $('hcn-deleg');
+    if (delegForm) {
+      delegForm.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const f = new FormData(ev.target);
+        const msg = $('hcn-deleg-msg');
+        try {
+          await api.delegate(roomId, delegationBody({
+            target: f.get('target'), text: f.get('text'), paths: f.get('paths'), nodes: f.get('nodes'), questions: f.get('questions'),
+            kinds: f.getAll('kind'), maxProposals: f.get('maxProposals'), maxSteps: f.get('maxSteps'), maxBytes: f.get('maxBytes'), expires: f.get('expires') }));
+          msg.textContent = 'Delegated.';
+          ev.target.reset(); $('hcn-delegs').dataset.h = ''; drawProposals();
+        } catch (e) { msg.textContent = e.message; }
       };
     }
     log.scrollTop = log.scrollHeight;

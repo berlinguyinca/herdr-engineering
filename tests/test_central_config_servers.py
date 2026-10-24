@@ -163,7 +163,7 @@ def _run_web(monkeypatch, path, **overrides):
                               collab_operator_user=None, collab_operator_email=None,
                               collab_operator_host=[], collab_operator_url=None,
                               collab_dashboard_host=[], collab_open_signup=False,
-                              collab_approver_group=[])
+                              collab_approver_group=[], collab_delegation_enabled=False)
     for k, v in overrides.items():
         setattr(args, k, v)
     assert cli._cmd_cp_web(args) == 0
@@ -530,6 +530,43 @@ def test_lineage_key_scopes_reach_the_server_and_bad_entries_stop_startup(tmp_pa
     with pytest.raises(SystemExit) as e:
         _run_web(monkeypatch, make_file(d, api_keys=keys, lineage_key_scopes={op: {"rooms": ["r1"]}}))
     assert "operator" in str(e.value)
+
+
+# ------------------------------------------------- T11 delegation kill switch (YAML only, default off)
+def test_delegation_kill_switch_is_off_by_default_and_a_collab_yaml_key(tmp_path, monkeypatch, old_env):
+    import herdr_engineering.control_plane.collab_cognito as cc
+    monkeypatch.setattr(cc, "boto_group_lookup", lambda *a: (lambda *b: None))
+    assert "delegation_enabled" in fcc.COLLAB_KEYS and "delegation_enabled" in cli.COLLAB_CONFIG_KEYS
+    _, off = _collab_slice(tmp_path)
+    assert _run_web(monkeypatch, off, **_collab_only_args(tmp_path))["server_kw"]["collab"].delegation_enabled is False
+    d = tmp_path / "on"
+    d.mkdir()
+    _, on = _collab_slice(d, dict(COLLAB, delegation_enabled=True))
+    assert _run_web(monkeypatch, on, **_collab_only_args(d))["server_kw"]["collab"].delegation_enabled is True
+    d = tmp_path / "bad"
+    d.mkdir()
+    _, bad = _collab_slice(d, dict(COLLAB, delegation_enabled="yes"))
+    with pytest.raises(SystemExit) as e:
+        _run_web(monkeypatch, bad, **_collab_only_args(d))
+    assert "delegation_enabled" in str(e.value)
+
+
+def test_delegation_kill_switch_reaches_the_combined_server_too(tmp_path, monkeypatch, old_env):
+    import json as _json
+    users = tmp_path / "users.json"
+    users.write_text(_json.dumps({"alice": "0" * 64}))
+    for name, collab, want in (("unset", None, False), ("off", {"delegation_enabled": False}, False),
+                               ("on", {"delegation_enabled": True}, True)):
+        d = tmp_path / name
+        d.mkdir()
+        path = make_file(d, pg_dsn="", **({"collab": collab} if collab else {}))
+        seen = _run_web(monkeypatch, path, collab_users_file=str(users))
+        assert seen["server_kw"]["collab"].delegation_enabled is want, name
+    d = tmp_path / "typo"
+    d.mkdir()
+    with pytest.raises(SystemExit) as e:
+        _run_web(monkeypatch, make_file(d, pg_dsn="", collab={"delegation_enabled": "true"}), collab_users_file=str(users))
+    assert "delegation_enabled" in str(e.value)
 
 
 def test_replay_history_is_validated_in_the_collab_slice(tmp_path):
