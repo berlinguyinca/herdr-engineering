@@ -3,6 +3,7 @@
 // nothing and a changed counter writes only its own node (every counter sits in a data-field).
 import { morph } from './patch.js';
 import { liveRefresher } from './refresh-bus.js';
+import { snapshotText, animateChanges } from './motion.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
 const TITLES = { '': 'Analytics', missions: 'Analytics', models: 'Model analytics', tokens: 'Token usage', hosts: 'Host analytics', stages: 'Stage analytics', usage: 'Usage' };
@@ -139,11 +140,24 @@ function usagePage({ usage }) {
 
 const PAGES = { '': dashboard, missions: dashboard, models: modelsPage, tokens: tokensPage, hosts: hostsPage, stages: stagesPage, usage: usagePage };
 
+const CHANGING = '[data-field], .hd-table td, herdr-metric .hd-metric__value';
+const changeKey = (el) => el.closest('herdr-metric')?.getAttribute('label') ?? el;
+
 export function mountAnalytics(container, client, sub = '', { data = null } = {}) {
   const page = PAGES[sub] ? sub : '';
   container.innerHTML = `<div class="hd-live-head" style="display:flex;flex-wrap:wrap;align-items:baseline;gap:12px"><h1>${TITLES[page]}</h1><herdr-freshness interval="5000"></herdr-freshness></div><div data-analytics-body></div>`;
   const body = container.querySelector('[data-analytics-body]');
-  const live = liveRefresher(() => loadAnalytics(client, page), (next) => morph(body, PAGES[page](next)), () => container.querySelector('herdr-freshness'));
+  // A refresh that changed a value flashes that cell (a single number counts up); the first paint
+  // and identical refreshes do not. morph keeps counter and table-cell nodes, so they pair by node;
+  // a <herdr-metric> whose value changed is a new element, so its value pairs by the tile's label.
+  let painted = false;
+  const apply = (next) => {
+    const before = painted ? snapshotText(body, CHANGING, changeKey) : null;
+    morph(body, PAGES[page](next));
+    if (before) animateChanges(body, CHANGING, before, changeKey);
+    painted = true;
+  };
+  const live = liveRefresher(() => loadAnalytics(client, page), apply, () => container.querySelector('herdr-freshness'));
   if (data) live.applied(data); else live.refresh();
   return { refresh: (hint) => live.refresh(hint), dispose: () => live.dispose() };
 }
