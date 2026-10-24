@@ -97,13 +97,25 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
   let focusLinkedAgent = Boolean(linkedAgent);
   let current = linkedAgent ? '/agents' : '/rooms'; // the dashboard owns the URL hash
   const routePath = () => standalone ? window.location.hash : current;
+  let generation = 0, disposed = false, navigationPath = routePath();
+  const isCurrent = (turn) => !disposed && turn === generation && navigationPath === routePath();
+  const cancelled = (error) => error?.name === 'AbortError';
   let routeState = collabRouteState({ surface, route: routePath() });
   const setStatus = (status, error) => { routeState = collabRouteState({ surface, route: routePath(), status, error }); };
   const nativeSessionLink = (id) => operator && !standalone && typeof id === 'string' && id
     ? `<a href="/#/herd/session/${esc(encodeURIComponent(id))}">Open agent conversation</a>` : '';
   const dispose = () => { if (teardown) teardown(); teardown = null; };
-  const go = (path) => { if (standalone) { window.location.hash = path; } else { current = path; route(); } };
-  const onHash = () => { if (store.get() && me) route(); };
+  const beginNavigation = () => {
+    generation += 1; navigationPath = routePath();
+    clearTimeout(waitTimer); dispose();
+    return generation;
+  };
+  const go = (path) => {
+    if (disposed) return;
+    if (standalone && window.location.hash !== `#${path}`) { window.location.hash = path; beginNavigation(); }
+    else { current = path; route(); }
+  };
+  const onHash = () => { if (!disposed) route(); };
   const $ = (id) => document.getElementById(id);
 
   async function signIn(cfg) {
@@ -144,12 +156,18 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
   }
 
   async function start() {
+    if (disposed) return;
+    const turn = beginNavigation();
     setStatus('loading');
     me = null;
     operator = false;
     let cfg;
     try { cfg = await loadConfig(); }
-    catch { setStatus('degraded'); centered('<h1>Collaboration</h1><p role="alert">Unable to load collaboration configuration.</p>'); return; }
+    catch (e) {
+      if (!isCurrent(turn) || cancelled(e)) return;
+      setStatus('degraded'); centered('<h1>Collaboration</h1><p role="alert">Unable to load collaboration configuration.</p>'); return;
+    }
+    if (!isCurrent(turn)) return;
     lastCfg = cfg;
     if (!cfg) {
       setStatus('degraded');
@@ -176,10 +194,14 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     }
     try {
       if (!operator) await api.link(store.get().id); // record verified email and activate invites
-      me = await api.me();
-      if (me.status !== 'approved') return waiting();
+      if (!isCurrent(turn)) return;
+      const identity = await api.me();
+      if (!isCurrent(turn)) return;
+      me = identity;
+      if (me.status !== 'approved') return approval(turn);
       await route();
     } catch (e) {
+      if (!isCurrent(turn) || cancelled(e)) return;
       if (e instanceof AuthError && !operator) { store.clear(); return start(); }
       setStatus('error', e);
       centered(`<h1>Collaboration</h1><p class="cx-msg" role="alert">${esc(e.message)}</p>
@@ -189,53 +211,86 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     }
   }
 
-  // Signed in but not approved yet: nothing else works, so say so plainly and keep checking.
+  // Only pending approval is polled. Terminal decisions remain visible until sign-in/reload.
   let waitTimer = null;
-  function waiting() {
-    setStatus('waiting');
+  function approval(turn, error = null) {
+    if (!isCurrent(turn)) return;
     clearTimeout(waitTimer);
+    if (me.status !== 'pending') {
+      const revoked = ['disabled', 'revoked', 'kicked'].includes(me.status);
+      setStatus(revoked ? 'revoked' : 'forbidden');
+      centered(`<h1>${revoked ? 'Access revoked' : 'Access denied'}</h1><p role="alert">Your collaboration account is ${esc(me.status)}.</p>
+        <button id="hcn-out3" class="hd-btn hd-btn--ghost" type="button">Sign out</button>`);
+      $('hcn-out3').onclick = () => { store.clear(); start(); };
+      return;
+    }
+    setStatus(error ? 'degraded' : 'waiting');
+    if (error) centered(`<h1>Approval check unavailable</h1><p role="alert">${esc(error.message)}</p><p>Retrying shortly.</p>
+      <button id="hcn-out3" class="hd-btn hd-btn--ghost" type="button">Sign out</button>`);
+    else
     centered(`<h1>Waiting for approval</h1>
       <p>You're signed in as <strong>${esc(me.email || me.user_id)}</strong>. The person who runs this network, or a lab admin, has to approve your account before you can use rooms or connect agents. Nothing is shared with you until then.</p>
       <p class="cx-sub">This page checks every few seconds and opens as soon as you're approved.</p>
       <button id="hcn-out3" class="hd-btn hd-btn--ghost" type="button">Sign out</button>`);
     $('hcn-out3').onclick = () => { clearTimeout(waitTimer); store.clear(); start(); };
+    pollApproval(turn);
+  }
+
+  function pollApproval(turn) {
+    if (!isCurrent(turn)) return;
     waitTimer = setTimeout(async () => {
+      if (!isCurrent(turn)) return;
       try {
         const now = await api.me();
-        if (now.status === 'approved') { me = now; return route(); }
-      } catch (e) { if (e instanceof AuthError) { store.clear(); return start(); } }
-      return waiting();
+        if (!isCurrent(turn)) return;
+        me = now;
+        if (me.status === 'approved') return route();
+        return approval(turn);
+      } catch (e) {
+        if (!isCurrent(turn)) return;
+        if (cancelled(e)) { pollApproval(turn); return; }
+        if (e instanceof AuthError) {
+          if (!operator) { store.clear(); return start(); }
+          setStatus('signed-out'); centered('<h1>Collaboration</h1><p role="alert">Session expired.</p>'); return;
+        }
+        return approval(turn, e);
+      }
     }, 5000);
   }
 
   async function route() {
-    clearTimeout(waitTimer);
+    if (disposed) return;
+    const turn = beginNavigation();
     if (!me) return start();
-    if (me.status !== 'approved') return waiting();
+    if (me.status !== 'approved') return approval(turn);
     setStatus('loading');
     if (routeState.status === 'not-found') {
       centered('<h1>Collaboration</h1><p role="alert">Room not found.</p>');
       return;
     }
     try {
-      if (routeState.roomId) await showRoom(routeState.roomId);
-      else if (routeState.route === '/agents') await showAgents();
-      else if (routeState.route === '/people' && canManagePeople()) await showPeople();
+      if (routeState.roomId) await showRoom(routeState.roomId, turn);
+      else if (routeState.route === '/agents') await showAgents(turn);
+      else if (routeState.route === '/people' && canManagePeople()) await showPeople('pending', false, turn);
       else {
         if (routeState.route === '/people') { setStatus('forbidden'); centered('<h1>Collaboration</h1><p role="alert">Access denied.</p>'); return; }
-        await showRooms();
+        await showRooms(turn);
       }
+      if (!isCurrent(turn)) return;
       setStatus('ready');
     } catch (e) {
+      if (!isCurrent(turn) || cancelled(e)) return;
       if (e instanceof AuthError && !operator) { store.clear(); return start(); }
       setStatus('error', e);
       centered(`<h1>Collaboration</h1><p role="alert">${esc(e.message)}</p>`);
     }
   }
 
-  async function showRooms() {
+  async function showRooms(turn) {
     const { rooms } = await api.rooms();
-    const strip = await tabsStrip(null, '/rooms');
+    if (!isCurrent(turn)) return;
+    const strip = await tabsStrip(null, '/rooms', turn);
+    if (!isCurrent(turn)) return;
     frame('/rooms', `<div class="cx-head"><div><h1>Rooms</h1><p class="cx-sub">Conversations you and your agents can take part in.</p></div></div>
       ${rooms.length ? `<div class="hd-grid" id="hcn-rooms">${rooms.map((r) => `<button type="button" class="hd-card cx-room" data-room="${esc(r.room_id)}">
           <span class="hd-card__title">${esc(r.name)}</span>
@@ -267,11 +322,13 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     denied: ['Declined', 'var(--text-muted)'], disabled: ['Disabled', 'var(--status-danger, #c0392b)'], kicked: ['Removed', 'var(--status-danger, #c0392b)'] };
   const when = (iso) => (iso ? String(iso).replace('T', ' ').slice(0, 16) : '');
 
-  async function showPeople(filter = 'pending', showLog = false) {
+  async function showPeople(filter = 'pending', showLog = false, turn = generation) {
     let data;
-    try { data = await api.users(); } catch (e) { go('/rooms'); return; }
+    try { data = await api.users(); } catch (e) { if (isCurrent(turn) && !cancelled(e)) go('/rooms'); return; }
+    if (!isCurrent(turn)) return;
     const manage = Boolean(data.can_manage);
-    const strip = await tabsStrip(null, '/people');
+    const strip = await tabsStrip(null, '/people', turn);
+    if (!isCurrent(turn)) return;
     const counts = data.counts || {};
     const chips = manage ? ['pending', 'approved', 'disabled', 'denied', 'kicked', 'all'] : ['pending'];
     const rows = data.users.filter((u) => filter === 'all' || u.status === filter);
@@ -344,8 +401,9 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     });
   }
 
-  async function showAgents() {
-    const strip = await tabsStrip(null, '/agents');
+  async function showAgents(turn) {
+    const strip = await tabsStrip(null, '/agents', turn);
+    if (!isCurrent(turn)) return;
     frame('/agents', `<div class="cx-head"><div><h1>AI agents</h1><p class="cx-sub">Connect Claude Code, Codex, Pi or any MCP client so it can work in your rooms.</p></div>
         <div class="cx-row"><input id="hcn-agent-name" class="cx-input" maxlength="32" pattern="[a-z0-9]+(-[a-z0-9]+)*" placeholder="name (optional)" aria-label="Agent name" autocomplete="off"><button id="hcn-connect" class="hd-btn" type="button">Connect an AI agent</button></div></div>
       <div id="hcn-connect-out"></div>
@@ -353,15 +411,19 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       ${operator ? '<section class="cx-section"><h2>Hosts</h2><p class="cx-sub">Fleets started from here are spread over these hosts in turn. Untick a host to keep automatic agents off it.</p><div id="hcn-hosts"></div></section>' : ''}
       <section class="cx-section"><h2>Your agents</h2><div id="hcn-agents"></div></section>
       <section class="cx-section">${GUIDE}</section>`, strip);
-    await renderAgents();
-    await renderFleet();
+    await renderAgents(turn);
+    if (!isCurrent(turn)) return;
+    await renderFleet(turn);
+    if (!isCurrent(turn)) return;
     if (operator) {            // keep the host list and fleet progress fresh while this page is open
       let alive = true;
       let tick = null;
       const cycle = async () => {
-        await renderHosts();
-        const busy = await renderSpawns();
-        if (busy) await renderAgents();
+        await renderHosts(turn);
+        if (!isCurrent(turn)) return;
+        const busy = await renderSpawns(turn);
+        if (!isCurrent(turn)) return;
+        if (busy) await renderAgents(turn);
         if (alive && !document.hidden) tick = setTimeout(cycle, busy ? 2000 : 6000);
         else if (alive) tick = setTimeout(cycle, 6000);
       };
@@ -379,13 +441,15 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
 
   // ---- fleets: many agents of one family, registered by copy-paste scripts
   const FAMILIES = ['claude-code', 'codex', 'pi', 'agent'];
-  async function renderFleet() {
+  async function renderFleet(turn = generation) {
     const box = $('hcn-fleet');
     if (!box) return;
     const { rooms } = await api.rooms();
+    if (!isCurrent(turn)) return;
     const usable = rooms.filter((r) => ['owner', 'contributor'].includes(r.role));
     let parents = [];
     try { parents = (await api.agents()).agents.filter((a) => a.status === 'active' && /^pane:/.test(a.instance_id || '')); } catch { /* the form works without */ }
+    if (!isCurrent(turn)) return;
     box.innerHTML = `<form id="hcn-fleet-form" class="cx-stack">
         <div class="cx-row">
           <label class="cx-msg">Family <select name="family">${FAMILIES.map((f) => `<option>${esc(f)}</option>`).join('')}</select></label>
@@ -434,21 +498,23 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
   }
 
   // ---- hosts that may receive automatic agents, and the progress of fleets started on them
-  async function renderHosts() {
+  async function renderHosts(turn = generation) {
     const box = $('hcn-hosts');
     if (!box || !operator) return;
     let hosts;
     try { hosts = (await api.fleetHosts()).hosts; } catch { return; }
+    if (!isCurrent(turn)) return;
     const html = hosts.length ? `<ul class="cx-list">${hosts.map((h) => `<li><span class="grow"><b>${esc(h.host)}</b> ${pill(h.online ? 'online' : 'offline', h.online ? 'var(--status-ok)' : 'var(--text-muted)')}${h.kind === 'local' ? ' <span class="hd-ident">this machine</span>' : ''}${h.online ? ` <span class="hd-ident">${h.families && h.families.length ? esc(h.families.join(', ')) : 'no agent CLIs found'}</span>` : ''}</span><label class="cx-check"><input type="checkbox" data-auto="${esc(h.host)}"${h.auto_agents ? ' checked' : ''}> Automatic agents</label></li>`).join('')}</ul>` : '<div class="hd-empty">No hosts reported yet. The host runner reports every few seconds.</div>';
     if (box.dataset.h === html) return;
     box.dataset.h = html; box.innerHTML = html;
     box.querySelectorAll('[data-auto]').forEach((c) => { c.onchange = async () => { try { await api.setFleetHost(c.dataset.auto, c.checked); } catch (e) { alert(e.message); } renderHosts(); }; });
   }
-  async function renderSpawns() {
+  async function renderSpawns(turn = generation) {
     const box = $('hcn-spawns');
     if (!box || !operator) return false;
     let list;
     try { list = (await api.spawns()).spawns.slice(0, 8); } catch { return false; }
+    if (!isCurrent(turn)) return false;
     const busy = list.some((s) => ['requested', 'claimed'].includes(s.status));
     const colour = { requested: 'var(--status-attention)', claimed: 'var(--accent)', done: 'var(--status-ok)', stalled: 'var(--status-failed)', expired: 'var(--text-muted)' };
     const html = list.length ? `<h3>Recent fleet starts</h3><ul class="cx-list">${list.map((s) => `<li><span class="grow"><b>${esc(s.name_prefix)}-N</b> ${esc(s.harness_type)} × ${s.count}${s.error ? `<br><span class="cx-msg" role="alert">${esc(s.error)}</span>` : ''}${s.placements.length ? `<br>${s.placements.map((p) => `<span class="hd-ident" title="${esc(p.error || '')}">${esc(p.name)} → ${esc(p.host)}${p.status === 'failed' ? ' ✗' : ''}</span>`).join(' ')}` : ''}</span>${pill(s.status === 'done' && s.placements.some((p) => p.status === 'failed') ? 'partly started' : s.status, colour[s.status] || 'var(--text-muted)')}</li>`).join('')}</ul>` : '';
@@ -495,11 +561,12 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     ]);
   }
 
-  async function renderJoinTokens() {
+  async function renderJoinTokens(turn = generation) {
     const box = $('hcn-fleet-out');
     if (!box) return;
     let list;
     try { list = (await api.joinTokens()).tokens.filter((t) => t.status === 'active'); } catch { return; }
+    if (!isCurrent(turn)) return;
     let holder = $('hcn-tokens');
     if (!holder) { holder = document.createElement('div'); holder.id = 'hcn-tokens'; box.after(holder); }
     holder.innerHTML = list.length ? `<h3>Active join tokens</h3><ul class="cx-list">${list.map((t) => `<li><span class="grow"><b>${esc(t.name_prefix)}-N</b> ${esc(t.harness_type)} · ${t.uses}/${t.max_uses} used · until ${esc(new Date(t.expires_at * 1000).toLocaleString())}</span><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke-token="${esc(t.join_id)}">Revoke</button></li>`).join('')}</ul>` : '';
@@ -525,14 +592,16 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     pick(0);
   }
 
-  async function renderAgents() {
+  async function renderAgents(turn = generation) {
     const box = $('hcn-agents');
     if (!box) return;
     const { agents } = await api.agents();
+    if (!isCurrent(turn)) return;
     const live = agents.filter((a) => a.status === 'active');
     // On the dashboard the owner can tie an agent to a running fabric session (the join key is the session id).
     let sessions = null;
     if (operator && fabricSessions) { try { const r = await fabricSessions(); sessions = Array.isArray(r) ? r : (r.sessions || []); } catch { sessions = null; } }
+    if (!isCurrent(turn)) return;
     const sessionOptions = (cur) => {
       const list = [...(sessions || [])];
       if (cur && !list.some((x) => x.session_id === cur)) list.unshift({ session_id: cur, agent_role: 'linked', host_id: '' });
@@ -559,10 +628,16 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
 
   // ---- one tab per room, then the AI agents page
   let roomsCache = [];
-  async function tabsStrip(activeRoom, activePage) {
-    try { roomsCache = (await api.rooms()).rooms; } catch { /* keep the last list */ }
+  async function tabsStrip(activeRoom, activePage, turn) {
+    try {
+      const { rooms } = await api.rooms();
+      if (!isCurrent(turn)) return '';
+      roomsCache = rooms;
+    } catch (e) { if (cancelled(e)) throw e; /* keep the last list */ }
+    if (!isCurrent(turn)) return '';
     let waitingCount = 0;
     if (canManagePeople()) { try { waitingCount = (await api.users('pending')).users.length; } catch { /* not an approver */ } }
+    if (!isCurrent(turn)) return '';
     const t = (to, label, on, extra = '') => `<button type="button" class="cx-rtab${extra}" role="tab" data-go="${to}" aria-selected="${on}">${label}</button>`;
     return `<div class="cx-rtabs" role="tablist" aria-label="Rooms">${roomsCache.map((r) => t(`/room/${encodeURIComponent(r.room_id)}`, esc(r.name), r.room_id === activeRoom)).join('')}${t('/rooms', '＋ New room', activePage === '/rooms', ' cx-rtab--new')}<span class="grow"></span>${canManagePeople() ? t('/people', `People${waitingCount ? ` <span class="cx-badge" title="waiting for approval">${waitingCount}</span>` : ''}`, activePage === '/people') : ''}${t('/agents', 'AI agents', activePage === '/agents')}</div>`;
   }
@@ -571,10 +646,12 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
   const initials = (s) => (String(s).replace(/^@/, '').match(/[a-z0-9]/gi) || ['?']).slice(0, 2).join('').toUpperCase();
   const subTab = new Map();                // room id -> the sub-tab last open there
 
-  async function showRoom(roomId) {
+  async function showRoom(roomId, turn) {
     cursor = 0;
     const info = await api.room(roomId);
-    const strip = await tabsStrip(roomId, null);
+    if (!isCurrent(turn)) return;
+    const strip = await tabsStrip(roomId, null, turn);
+    if (!isCurrent(turn)) return;
     const { canInvite, canPost } = info.capabilities;
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
@@ -622,6 +699,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
 
     // Replace a container's markup only when it changed and you are not typing in it.
     const put = (id, html) => {
+      if (!alive || !isCurrent(turn)) return false;
       const el = $(id);
       if (!el || el.dataset.h === html) return false;
       if (el.contains(document.activeElement) && document.activeElement.matches('input,textarea,select')) { stale.add(id); return false; }
@@ -809,6 +887,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       peopleBusy = true;
       try {
         const [room, inv] = await Promise.all([api.room(roomId), api.invites(roomId)]);
+        if (!alive || !isCurrent(turn)) return;
         names = new Map((room.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
         const html = `<ul class="cx-list">${room.members.map((m) => `<li><span class="grow">${esc(m.email || shortId(m.user_id))}</span>${pill(roleLabel(m.role), m.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}${m.role !== 'owner' ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rm="${esc(m.user_id)}">Remove</button>` : ''}</li>`).join('')}
           ${inv.invites.map((i) => `<li><span class="grow">${esc(i.email)}</span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>`;
@@ -832,6 +911,7 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
       if (sub === 'agents' && canPost) await loadMine();
       if (sub === 'agents') await loadHelpers();
       if (sub === 'people') await drawPeople();
+      if (!alive || !isCurrent(turn)) return;
       paint();
     };
     const showSub = (k) => {
@@ -925,5 +1005,5 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
   if (standalone) window.addEventListener('hashchange', onHash);
   const ready = start();
   return { ready, get state() { return { ...routeState }; },
-    dispose: () => { clearTimeout(waitTimer); dispose(); window.removeEventListener('hashchange', onHash); } };
+    dispose: () => { disposed = true; generation += 1; clearTimeout(waitTimer); dispose(); window.removeEventListener('hashchange', onHash); } };
 }
