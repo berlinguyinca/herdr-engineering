@@ -512,6 +512,26 @@ def test_dashboard_host_names_are_a_collab_config_key():
     assert "dashboard_hosts" in fcc.COLLAB_KEYS
 
 
+def test_lineage_key_scopes_reach_the_server_and_bad_entries_stop_startup(tmp_path, monkeypatch, old_env):
+    ing, op = "in-" + "k1", "op-" + "k1"
+    keys = {ing: "ingest", op: "operator"}
+    ok = make_file(tmp_path, api_keys=keys, lineage_key_scopes={ing: {"rooms": ["r1"], "missions": ["m1"]}})
+    seen = _run_web(monkeypatch, ok)
+    assert seen["server_kw"]["lineage_key_scopes"] == {ing: {"rooms": ["r1"], "missions": ["m1"]}}
+    for name, bad in (("operator", {op: {"rooms": ["r1"]}}), ("unknown", {"no-" + "such": {"rooms": ["r1"]}}),
+                      ("shape", {ing: {"rooms": "r1"}}), ("extra", {ing: {"admin": True}})):
+        d = tmp_path / name
+        d.mkdir()
+        with pytest.raises(SystemExit) as e:
+            _run_web(monkeypatch, make_file(d, api_keys=keys, lineage_key_scopes=bad))
+        assert ing not in str(e.value) and op not in str(e.value), "the key is never echoed"
+    d = tmp_path / "opmsg"
+    d.mkdir()
+    with pytest.raises(SystemExit) as e:
+        _run_web(monkeypatch, make_file(d, api_keys=keys, lineage_key_scopes={op: {"rooms": ["r1"]}}))
+    assert "operator" in str(e.value)
+
+
 SUMMARY_FIX = {"room_id": "collab_room1", "requester_agent_id": "collab_agent1"}
 
 

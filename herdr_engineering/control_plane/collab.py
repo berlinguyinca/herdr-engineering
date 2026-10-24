@@ -310,6 +310,9 @@ class CollabService:
         except ValueError as exc:
             raise CollabError(400, str(exc)) from None
         self.approval = approval
+        # The fabric lineage graph, attached by the combined (non collab-only) server. The graph never
+        # calls back into this service: membership is handed to it as a per-request snapshot.
+        self.graph_source = None      # callable returning the CURRENT projection (a rebuild replaces it)
         self._users: dict[str, dict] = {}       # approval mode: user id -> {status, since, decided_by, decided_at, reason}
         self._sink = sink
         self._now = now or time.time
@@ -3160,6 +3163,64 @@ class CollabService:
                 outcome="allowed", project_ids=[room["project_id"]], resource_id=link_id, **extra))
             return self._link_view(pr, room, self._links[link_id], True)
 
+    def graph_access(self, pr: Principal) -> dict | None:
+        """Snapshot of what ``pr`` may read in the lineage graph, taken NOW under the service lock
+        (so a removal, mission unlink or link-grant change is effective on the next request).
+        A person who is a non-guest member of a room sees `room`-scoped lineage that names it; a
+        mission member sees `mission`-scoped lineage that names the mission; an event that also
+        names a workspace additionally needs a link granting status/tabs/panes from that room.
+        Guests, agents and people with no non-guest membership get ``None`` (no graph at all):
+        room access never implies more than the metadata the room's links grant."""
+        if pr.kind != "user":
+            return None
+        with self._lock:
+            if not self._ok(pr.id):
+                return None
+            rooms, room_ws = set(), set()
+            for rid, room in self._rooms.items():
+                m = self._member(room, pr.id)
+                if not m or m["role"] == "guest":
+                    continue
+                rooms.add(rid)
+                for lid in self._links_by_room.get(rid, ()):
+                    lk = self._links[lid]
+                    if set(lk["grants"]) & LINK_VIEW_GRANTS:
+                        room_ws.add((rid, lk["workspace_id"]))
+            if not rooms:
+                return None
+            # a mission is readable only through the room that linked it, by the people that link lists
+            room_missions = {(rid, mid) for (rid, mid), ms in self._missions.items()
+                             if rid in rooms and pr.id in ms["members"]}
+            return {"rooms": frozenset(rooms), "room_ws": frozenset(room_ws),
+                    "room_missions": frozenset(room_missions)}
+
+    def graph_read(self, pr: Principal, parts: list[str], query: dict) -> dict:
+        """Lineage graph read for a signed-in person. Hidden, missing and 'no graph for you' all
+        answer one 404; nothing here lets a read widen what the graph's own checks allow."""
+        from .graph import read_graph
+        graph = self.graph_source() if self.graph_source is not None else None
+        access = self.graph_access(pr) if graph is not None else None
+        if access is None:
+            raise CollabError(404, "not found")
+        principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
+        contexts = None
+        room_id = query.get("room_id")
+        if parts == ["nodes"]:
+            # a listing is always ONE room's view (its own scope plus the missions it linked that this person
+            # belongs to), so its cost never depends on other rooms' data
+            if room_id is None:
+                raise CollabError(400, "room_id is required")
+            if room_id not in access["rooms"]:
+                raise CollabError(404, "not found")
+            contexts = frozenset({("room", room_id, None), *(("mission", m, r) for r, m in access["room_missions"]
+                                                             if r == room_id)})
+        try:
+            return read_graph(graph, principal, parts, lambda name: query.get(name), contexts=contexts)
+        except KeyError:
+            raise CollabError(404, "not found") from None
+        except ValueError as exc:
+            raise CollabError(400, str(exc)) from None
+
     def list_room_missions(self, pr: Principal, room_id: str) -> dict:
         self._require_user(pr)
         with self._lock:
@@ -3706,6 +3767,8 @@ class CollabService:
                         st = str(query["status"]) if "status" in query else None
                         return 200, self.list_spawns(pr, st)
                     raise CollabError(404, "not found")
+                if parts[:1] == ["graph"]:
+                    return 200, self.graph_read(pr, parts[1:], query)
                 if parts == ["tasks", "inbox"]:
                     return 200, self.task_inbox(pr)
                 if parts == ["rooms"]:

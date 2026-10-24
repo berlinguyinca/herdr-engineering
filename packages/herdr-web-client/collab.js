@@ -110,6 +110,12 @@ export class CollabApi {
     return this.call('GET', `/rooms/${encodeURIComponent(room)}/state?since=${since}&cursor=${cursor}&wait=${wait}`, undefined, signal);
   }
   flow(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/flow`); }
+  // Nodes of one type this person may see in ONE room (server-filtered by membership), with the visible
+  // edges of `edgeType` between them. The room's own scope and its linked missions only.
+  graphList(room, nodeType, edgeType) {
+    const q = new URLSearchParams({ node_type: nodeType, room_id: room, limit: '500', ...(edgeType ? { edge_type: edgeType } : {}) });
+    return this.call('GET', `/graph/nodes?${q}`);
+  }
   linkAgent(agentId, instanceId) { return this.call('POST', `/agents/${encodeURIComponent(agentId)}/link`, { instance_id: instanceId || null }); }
   createJoinToken(body) { return this.call('POST', '/agents/join-tokens', body); }
   joinTokens() { return this.call('GET', '/agents/join-tokens'); }
