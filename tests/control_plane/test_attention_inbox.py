@@ -314,6 +314,13 @@ def test_ack_events_replay_after_a_restart():
     assert ("attention", "operator") not in {(t, i) for t, i, _ in twin._event_order}   # never in the feed
 
 
+def test_the_answer_carries_the_notification_policy_from_yaml():
+    _, inbox, _, _ = _world(config={"notify": {"browser": True, "min_severity": "warning", "quiet_hours": {"start": 1, "end": 2}}})
+    assert inbox.snapshot()["notify"] == {"browser": True, "min_severity": "warning", "quiet_hours": {"start": 1, "end": 2}}
+    _, quiet, _, _ = _world(config={"notify": {"quiet_hours": None, "browser": False}})
+    assert quiet.snapshot()["notify"] == {"browser": False, "min_severity": "critical", "quiet_hours": None}
+
+
 def test_filters_and_bad_parameters():
     repo, inbox, _, _ = _world(ci={"status": "ok", "pipelines": {"o/r": [_run(1, "failure", repository="o/r")]}})
     sid = repo.create_session()

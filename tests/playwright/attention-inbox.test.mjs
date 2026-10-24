@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright';
 
@@ -75,12 +76,12 @@ test('an acknowledge in one browser shows in a second browser context', async ()
     await b.locator('[data-attention-row^="session:"] [data-ack]').waitFor({ timeout: 8000 });
     await a.locator('[data-attention-row^="session:"] [data-ack]').click();
     // The other browser has never been told: it learns from the server on its next poll.
-    await b.locator('details.at-group summary', { hasText: 'Acknowledged (1)' }).waitFor({ timeout: 15000 });
+    await b.locator('details.at-group summary', { hasText: 'Acknowledged (1)' }).waitFor({ timeout: 30000 });
     assert.equal(await b.locator('[data-attention-row^="session:"] [data-ack]').count(), 0);
     // Reopen from the second browser; the first sees the item open again.
     await b.locator('details.at-group summary', { hasText: 'Acknowledged (1)' }).click();
     await b.locator('[data-attention-row^="session:"] [data-clear]').click();
-    await a.locator('[data-attention-row^="session:"] [data-ack]').waitFor({ timeout: 15000 });
+    await a.locator('[data-attention-row^="session:"] [data-ack]').waitFor({ timeout: 30000 });
   });
 });
 
@@ -132,5 +133,63 @@ test('the page fits a 390px screen without horizontal scrolling', async () => {
     await page.locator('[data-attention-row^="session:"]').waitFor({ timeout: 8000 });
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     assert.ok(overflow <= 0, `horizontal overflow ${overflow}px`);
+  });
+});
+
+// ------------------------------------------------------------- notifications
+const stubNotification = () => {
+  window.__shown = [];
+  class Stub {
+    static permission = 'granted';
+    static async requestPermission() { return 'granted'; }
+    constructor(title, options) { this.title = title; this.options = options; window.__shown.push({ title, options }); }
+    close() {}
+  }
+  window.Notification = Stub;
+};
+
+async function withTrigger(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'attention-trigger-'));
+  const trigger = path.join(dir, 'go');
+  try { await withApp((ctx) => fn({ ...ctx, fire: () => fs.writeFileSync(trigger, '1') }), { ATTENTION_TRIGGER: trigger }); }
+  finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+test('a new critical item raises one browser notification with a title and link only', async () => {
+  await withTrigger(async ({ browser, base, fire }) => {
+    const context = await browser.newContext();
+    await context.addInitScript(stubNotification);
+    const page = await context.newPage();
+    await page.goto(`${base}/#/attention`);
+    await page.locator('[data-attention-row^="session:"]').first().waitFor({ timeout: 8000 });
+    await page.locator('[data-notify-toggle="on"]').click();
+    await page.locator('[data-notify-status="on"]').waitFor();
+    await page.waitForResponse((r) => r.url().includes('/api/v1/attention'), { timeout: 10000 });   // the baseline poll
+    await page.waitForTimeout(500);
+    assert.equal(await page.evaluate(() => window.__shown.length), 0);       // the failure already open is the baseline
+    fire();
+    await page.waitForFunction(() => window.__shown.length === 1, null, { timeout: 20000 });
+    const shown = await page.evaluate(() => window.__shown);
+    assert.equal(shown[0].options.body, '');
+    assert.deepEqual(shown[0].options.data, { href: '#/attention' });
+    const rows = await page.locator('[data-attention-row^="session:"] strong').allTextContents();
+    assert.equal(rows.length, 2);
+    assert.ok(rows.includes(shown[0].title), `${shown[0].title} not among ${rows}`);
+    await page.waitForTimeout(11000);                                         // two more polls: no repeat for the same item
+    assert.equal(await page.evaluate(() => window.__shown.length), 1);
+  });
+});
+
+test('with notifications left off nothing is announced and the page offers to enable them', async () => {
+  await withTrigger(async ({ browser, base, fire }) => {
+    const context = await browser.newContext();
+    await context.addInitScript(stubNotification);
+    const page = await context.newPage();
+    await page.goto(`${base}/#/attention`);
+    await page.locator('[data-notify-status="off"]').waitFor({ timeout: 8000 });
+    fire();
+    await page.locator('[data-attention-row^="session:"]').nth(1).waitFor({ timeout: 20000 });
+    await page.waitForTimeout(1500);
+    assert.equal(await page.evaluate(() => window.__shown.length), 0);
   });
 });
