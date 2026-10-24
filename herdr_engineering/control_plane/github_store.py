@@ -48,6 +48,10 @@ FAMILY = "github"
 TOMBSTONE_RETENTION = timedelta(days=7)
 # Session advisory-lock key wrapping one sync pass (b"herdrgh" as an integer).
 ADVISORY_LOCK_KEY = int.from_bytes(b"herdrgh", "big")
+# Bounds on one store call (seconds): a hung database surfaces as GitHubStoreUnavailable
+# (asyncio.TimeoutError is an OSError) instead of blocking the monitor, which may hold its lock.
+STORE_CONNECT_TIMEOUT = 10.0
+STORE_COMMAND_TIMEOUT = 30.0
 
 
 class GitHubStoreUnavailable(RuntimeError):
@@ -830,13 +834,22 @@ class GitHubStore:
             self._sync_guard.release()
 
 
-def catalog_store_factory(pg_dsn: str | None, *, now: Callable[[], float] | None = None):
+def _connector(pg_dsn: str, command_timeout: float):
+    def connect():
+        import asyncpg
+        return asyncpg.connect(pg_dsn, timeout=STORE_CONNECT_TIMEOUT, command_timeout=command_timeout)
+    return connect
+
+
+def catalog_store_factory(pg_dsn: str | None, *, now: Callable[[], float] | None = None,
+                          command_timeout: float = STORE_COMMAND_TIMEOUT):
     """The monitor's store factory ``(identity, viewer) -> store`` for ``control_plane.pg_dsn``.
 
     With a DSN every store shares one asyncpg event-loop thread (started on
     first use); the monitor builds a new store per credential and viewer and
     closes the superseded one. Without a DSN the stores share one in-memory
-    catalog that lives as long as the process.
+    catalog that lives as long as the process. Every query is bounded by
+    ``command_timeout`` and every connect by ``STORE_CONNECT_TIMEOUT``.
     """
     if not pg_dsn:
         shared: dict = {}
@@ -852,9 +865,7 @@ def catalog_store_factory(pg_dsn: str | None, *, now: Callable[[], float] | None
                 runner.append(_LoopRunner())
         return runner[0].run(coro)
 
-    def connect():
-        import asyncpg
-        return asyncpg.connect(pg_dsn)
+    connect = _connector(pg_dsn, command_timeout)
     return lambda identity, viewer=None: GitHubStore(connect, identity=identity, viewer=viewer,
                                                      now=now, run=run)
 
@@ -864,8 +875,4 @@ def open_github_store(pg_dsn: str | None, *, identity: str, viewer: str | None =
     """The store for ``control_plane.pg_dsn``; in memory when no DSN is configured."""
     if not pg_dsn:
         return MemoryGitHubStore(identity=identity, viewer=viewer, now=now)
-
-    def connect():
-        import asyncpg
-        return asyncpg.connect(pg_dsn)
-    return GitHubStore(connect, identity=identity, viewer=viewer, now=now)
+    return GitHubStore(_connector(pg_dsn, STORE_COMMAND_TIMEOUT), identity=identity, viewer=viewer, now=now)

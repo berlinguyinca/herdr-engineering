@@ -597,3 +597,33 @@ def test_purge_drops_the_catalog_but_keeps_the_identity(backend):
     other = backend.make(identity="tok-b")
     other.purge()  # never another credential's catalog
     assert backend.make().load() is not None
+
+
+def test_store_connections_carry_connect_and_command_timeouts(monkeypatch):
+    import asyncpg
+
+    from herdr_engineering.control_plane import github_store
+    seen = []
+
+    async def fake_connect(dsn, **kwargs):
+        seen.append(kwargs)
+        raise ConnectionRefusedError("not a database")
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
+    for store in (github_store.catalog_store_factory("postgresql://x@127.0.0.1:1/db")("fp", None),
+                  github_store.open_github_store("postgresql://x@127.0.0.1:1/db", identity="fp")):
+        with pytest.raises(GitHubStoreUnavailable):
+            store.revision()
+    assert seen and all(kw.get("command_timeout") == github_store.STORE_COMMAND_TIMEOUT
+                        and kw.get("timeout") == github_store.STORE_CONNECT_TIMEOUT for kw in seen)
+
+
+@_needs_pg
+def test_a_hung_query_times_out_as_unavailable_and_the_store_recovers():
+    from herdr_engineering.control_plane.github_store import catalog_store_factory
+    store = catalog_store_factory(_PG_DSN, command_timeout=0.3)("tok-a", "alice")
+    try:
+        with pytest.raises(GitHubStoreUnavailable):
+            store._call(lambda conn: conn.execute("SELECT pg_sleep(3)"))
+        assert store._call(lambda conn: conn.fetchval("SELECT 1")) == 1
+    finally:
+        store.close()
