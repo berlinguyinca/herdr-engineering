@@ -9,3 +9,8 @@ What the data does support: rows are keyed by authenticated client identity (a U
 requests land on the same identity's counters. So the bun user-agent does not by itself create a new client in these rows. Whether any gateway rule
 (rate limits, owner priority, affinity) reads the user-agent is not visible here.
 Not done: an isolated attribution test needs a dedicated, otherwise idle identity/key (not available), or operator-side request logs.
+
+Isolated per-runtime request attribution (beast, own key, 2026-10-23): the per-model row for `qwen3.8-text` (12 requests lifetime, idle: two snapshots 20 s apart identical)
+isolates my traffic. 5 Pi-Bolt requests -> model row +5; 5 standard Pi 1.4.0 requests -> +5 more. Every run got the same gateway 404 ("Model qwen3.8-text is not served here",
+non-retryable); neither runtime retried or double-sent. So the gateway counts one request per Pi-Bolt call exactly as for standard Pi, and both handle the error the same way.
+Limit: the model is not served, so prompt/completion tokens read 0; token-level attribution would need an idle SERVED model. The busy served models cannot be isolated.
