@@ -20,3 +20,8 @@ Every hit is the gateway or relay SETTING its own outbound User-Agent (inferweav
 User-Agent for limits, priority, affinity or attribution. Inbound identity headers it does read: x-inferweave-admin, x-inferweave-runtime, x-inferweave-node.
 Pi-Bolt sends neither of those. So the bun user-agent does not affect the gateway as built from this source. Caveat: this is the source checkout, not proof of the
 exact deployed binary; an nginx or other front in front of the gateway could still key on it (not visible here).
+
+Live user-agent probe (deployed stack incl. any front proxy, 2026-10-23): GET https://llm.metabolomics.us/v1/models with the Pi key, 3 requests each with the node
+Pi user-agent, the bun Pi-Bolt user-agent, and curl/8: all 200, identical body size (1181 bytes), no rate-limit or retry-after headers in any. Body hashes differ
+across all three (including repeats of the same agent is not tested), consistent with per-response fields rather than UA treatment; no differential handling is visible.
+Limit: one read-only endpoint, 9 requests; does not exercise chat-completions limits or priority under load.
