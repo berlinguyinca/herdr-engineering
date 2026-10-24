@@ -81,6 +81,208 @@ test('collab shells load the same identity and do not leak operator auth between
   }
 });
 
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+const jsonResponse = (data, status = 200) => ({ ok: status < 400, status, json: async () => data });
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+};
+
+async function collabHarness(t, surface, userStatus = 'approved', intercept = () => null) {
+  const { mountCollab } = await import('../collab-view.js');
+  const storage = new Map();
+  const sessionStorage = { getItem: (key) => storage.get(key) ?? null,
+    setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) };
+  const token = `h.${btoa(JSON.stringify({ exp: Date.now() / 1000 + 600 }))}.s`;
+  sessionStorage.setItem('hcn.tokens', JSON.stringify({ access: token, id: 'id-token' }));
+  const timers = new Map(), listeners = new Map(), calls = [];
+  t.mock.method(globalThis, 'setTimeout', (fn, ms) => { const id = {}; timers.set(id, { fn, ms }); return id; });
+  t.mock.method(globalThis, 'clearTimeout', (id) => timers.delete(id));
+  const element = () => ({ dataset: {}, innerHTML: '', textContent: '', scrollHeight: 0,
+    addEventListener() {}, removeEventListener() {}, querySelectorAll: () => [], contains: () => false });
+  const elements = new Map(['hcn-new', 'hcn-out', 'hcn-out2', 'hcn-out3', 'hcn-signin', 'hcn-log', 'hcn-jump', 'hcn-connect', 'hcn-agents'].map((id) => [id, element()]));
+  const links = ['/rooms', '/room/old', '/room/new', '/agents'].map((go) => ({ dataset: { go } }));
+  const document = { hidden: true, querySelector: () => ({}), querySelectorAll: () => [],
+    getElementById: (id) => elements.get(id) || null, addEventListener() {}, removeEventListener() {} };
+  const window = { sessionStorage, location: { hash: '#/rooms', origin: 'https://collab.example' },
+    addEventListener: (name, fn) => listeners.set(name, fn), removeEventListener: (name) => listeners.delete(name) };
+  const oldWindow = globalThis.window, oldDocument = globalThis.document;
+  globalThis.window = window; globalThis.document = document;
+  let view;
+  t.after(() => {
+    view?.dispose();
+    if (oldWindow === undefined) delete globalThis.window; else globalThis.window = oldWindow;
+    if (oldDocument === undefined) delete globalThis.document; else globalThis.document = oldDocument;
+  });
+  const model = { userStatus, intercept };
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const path = url.replace('/api/v1/collab', '');
+    calls.push(path);
+    const result = model.intercept(path, init);
+    if (result) return result;
+    const data = path === '/config' ? { client_id: 'web', hosted_ui_domain: 'https://auth.example',
+      public_url: 'https://collab.example', ...(surface === 'dashboard' ? { operator: { user_id: 'u1' } } : {}) }
+      : path === '/me' ? { user_id: 'u1', user_status: model.userStatus }
+      : path === '/rooms' ? { rooms: [] }
+      : path.startsWith('/rooms/') ? { room_id: path.slice(7), name: path.slice(7), role: 'guest' }
+      : { agents: [] };
+    return jsonResponse(data);
+  });
+  const root = { ...element(), ownerDocument: document, dataset: { standalone: surface === 'public' ? '1' : '0' },
+    querySelectorAll: (selector) => selector === '[data-go]' ? links : [] };
+  view = mountCollab(root);
+  return { view, root, model, calls, storage, timers, elements,
+    navigate: async (path) => {
+      if (surface === 'public') { window.location.hash = `#${path}`; listeners.get('hashchange')?.(); }
+      else links.find((link) => link.dataset.go === path).onclick();
+      await flush();
+    },
+    poll: async () => {
+      const entry = [...timers].find(([, timer]) => timer.ms === 5000);
+      assert.ok(entry, 'approval polling is scheduled');
+      timers.delete(entry[0]);
+      await entry[1].fn();
+      await flush();
+    },
+  };
+}
+
+for (const surface of ['public', 'dashboard']) {
+  for (const stage of ['room', 'tabs', 'rooms', 'agents']) for (const outcome of ['success', 'error', 'auth', 'abort']) {
+    for (const action of ['navigation', 'disposal']) test(`collab ${surface} ignores stale ${stage} ${outcome} after ${action}`, async (t) => {
+      const h = await collabHarness(t, surface);
+      await h.view.ready;
+      const pending = deferred();
+      let held = false;
+      h.model.intercept = (path) => {
+        if (!held && path === (stage === 'room' ? '/rooms/old' : stage === 'agents' ? '/agents' : '/rooms')) { held = true; return pending.promise; }
+      };
+      await h.navigate(stage === 'rooms' ? '/rooms' : stage === 'agents' ? '/agents' : '/room/old');
+      assert.ok(held);
+      if (action === 'navigation') await h.navigate('/room/new');
+      else { h.view.dispose(); h.root.innerHTML = 'replacement view'; }
+      const html = h.root.innerHTML, state = h.view.state, tokens = h.storage.get('hcn.tokens');
+      const agentsHtml = h.elements.get('hcn-agents').innerHTML;
+      if (outcome === 'abort') pending.reject(new DOMException('cancelled', 'AbortError'));
+      else pending.resolve(outcome === 'success' ? jsonResponse(stage === 'room'
+        ? { room_id: 'old', name: 'stale room', role: 'guest' } : stage === 'agents' ? { agents: [] } : { rooms: [] })
+        : jsonResponse({ error: 'stale failure' }, outcome === 'auth' ? 401 : 503));
+      await flush();
+      assert.equal(h.root.innerHTML, html, 'late response must not render');
+      assert.equal(h.elements.get('hcn-agents').innerHTML, agentsHtml, 'late nested render must not change content');
+      assert.deepEqual(h.view.state, state, 'late response must not change current route status');
+      assert.equal(h.storage.get('hcn.tokens'), tokens, 'late auth failure must not sign out current navigation');
+      assert.equal(h.timers.size, 0, 'late responses must not start background work');
+    });
+  }
+
+  for (const stage of ['/config', '/me']) for (const outcome of ['success', 'error']) {
+    test(`collab ${surface} ignores startup ${stage} ${outcome} after disposal`, async (t) => {
+      const pending = deferred();
+      const h = await collabHarness(t, surface, 'pending', (path) => path === stage ? pending.promise : null);
+      await flush();
+      h.view.dispose();
+      h.root.innerHTML = 'replacement view';
+      const state = h.view.state;
+      pending.resolve(outcome === 'error' ? jsonResponse({ error: 'late failure' }, 503)
+        : jsonResponse(stage === '/me' ? { user_id: 'u1', user_status: 'pending' }
+          : { client_id: 'web', hosted_ui_domain: 'https://auth.example', public_url: 'https://collab.example' }));
+      await h.view.ready;
+      assert.equal(h.root.innerHTML, 'replacement view');
+      assert.deepEqual(h.view.state, state);
+      assert.equal(h.timers.size, 0);
+    });
+  }
+
+  test(`collab ${surface} ignores cancellation on the current route`, async (t) => {
+    const h = await collabHarness(t, surface);
+    await h.view.ready;
+    const html = h.root.innerHTML;
+    h.model.intercept = (path) => path === '/rooms/old' ? Promise.reject(new DOMException('cancelled', 'AbortError')) : null;
+    await h.navigate('/room/old');
+    assert.equal(h.root.innerHTML, html);
+    assert.notEqual(h.view.state.status, 'error');
+  });
+
+  for (const [userStatus, status] of [['denied', 'forbidden'], ['disabled', 'revoked'], ['revoked', 'revoked'], ['kicked', 'revoked']]) {
+    test(`collab ${surface} ${userStatus} is terminal instead of waiting`, async (t) => {
+      const h = await collabHarness(t, surface, userStatus);
+      await h.view.ready;
+      assert.equal(h.view.state.status, status);
+      assert.doesNotMatch(h.root.innerHTML, /Waiting for approval/);
+      assert.equal(h.timers.size, 0);
+      assert.ok(!h.calls.includes('/rooms'));
+    });
+  }
+
+  test(`collab ${surface} pending approval becomes denied and stops polling`, async (t) => {
+    const h = await collabHarness(t, surface, 'pending');
+    await h.view.ready;
+    h.model.userStatus = 'denied';
+    await h.poll();
+    assert.equal(h.view.state.status, 'forbidden');
+    assert.doesNotMatch(h.root.innerHTML, /Waiting for approval/);
+    assert.equal(h.timers.size, 0);
+    assert.ok(!h.calls.includes('/rooms'));
+  });
+
+  test(`collab ${surface} approval polling exposes failure and recovers through pending to approved`, async (t) => {
+    const h = await collabHarness(t, surface, 'pending');
+    await h.view.ready;
+    h.model.intercept = (path) => path === '/me' ? jsonResponse({ error: 'approval service offline' }, 503) : null;
+    await h.poll();
+    assert.equal(h.view.state.status, 'degraded');
+    assert.match(h.root.innerHTML, /approval service offline/);
+    assert.ok(!h.calls.includes('/rooms'));
+    h.model.intercept = () => null;
+    await h.poll();
+    assert.equal(h.view.state.status, 'waiting');
+    h.model.userStatus = 'approved';
+    await h.poll();
+    assert.equal(h.view.state.status, 'ready');
+    assert.match(h.root.innerHTML, /No rooms yet/);
+    assert.equal(h.timers.size, 0);
+  });
+
+  for (const kind of ['network', 'abort', 'auth']) test(`collab ${surface} approval poll handles ${kind} without losing lifecycle state`, async (t) => {
+    const h = await collabHarness(t, surface, 'pending');
+    await h.view.ready;
+    const html = h.root.innerHTML;
+    h.model.intercept = (path) => path !== '/me' ? null : kind === 'auth' ? jsonResponse({}, 401)
+      : Promise.reject(kind === 'abort' ? new DOMException('cancelled', 'AbortError') : new TypeError('offline'));
+    await h.poll();
+    assert.equal(h.view.state.status, kind === 'auth' ? 'signed-out' : kind === 'abort' ? 'waiting' : 'degraded');
+    if (kind === 'auth') assert.equal(h.timers.size, 0);
+    else {
+      if (kind === 'abort') assert.equal(h.root.innerHTML, html);
+      h.model.intercept = () => null;
+      h.model.userStatus = 'approved';
+      await h.poll();
+      assert.equal(h.view.state.status, 'ready');
+      assert.equal(h.timers.size, 0);
+    }
+  });
+
+  for (const outcome of ['success', 'error']) test(`collab ${surface} ignores approval polling ${outcome} after disposal`, async (t) => {
+    const h = await collabHarness(t, surface, 'pending');
+    await h.view.ready;
+    const pending = deferred();
+    h.model.intercept = (path) => path === '/me' ? pending.promise : null;
+    const polling = h.poll();
+    await flush();
+    h.view.dispose();
+    h.root.innerHTML = 'replacement view';
+    const state = h.view.state;
+    pending.resolve(outcome === 'success' ? jsonResponse({ user_id: 'u1', user_status: 'approved' })
+      : jsonResponse({ error: 'stale polling failure' }, 503));
+    await polling;
+    assert.equal(h.root.innerHTML, 'replacement view');
+    assert.deepEqual(h.view.state, state);
+    assert.equal(h.timers.size, 0);
+  });
+}
+
 const flow = {
   nodes: [
     { id: 'u:alice', kind: 'person', name: 'alice' },
