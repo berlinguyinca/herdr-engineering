@@ -66,6 +66,14 @@ export class TokenStore {
 
 export class AuthError extends Error {}
 
+function lineageQuery(room, o, extra = {}) {
+  const q = new URLSearchParams({ room_id: room });
+  if (o.step !== null && o.step !== undefined) q.set('step', String(o.step));
+  else if (o.at) q.set('at', String(o.at));
+  for (const [k, v] of Object.entries(extra)) if (v !== undefined && v !== null && v !== '' && v !== 0) q.set(k, String(v));
+  return q;
+}
+
 export class CollabApi {
   constructor(getTokens, fetchFn = (...a) => fetch(...a), base = '/api/v1/collab') {
     this.getTokens = getTokens; this.fetch = fetchFn; this.base = base;
@@ -81,7 +89,11 @@ export class CollabApi {
     });
     if (res.status === 401) throw new AuthError('session expired');
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+    if (!res.ok) {
+      const err = new Error(data.error || `request failed (${res.status})`);
+      err.status = res.status; err.code = data.code; err.fence = data.fence;
+      throw err;
+    }
     return data;
   }
   me() { return this.call('GET', '/me'); }
@@ -97,10 +109,24 @@ export class CollabApi {
   createProject(name) { return this.call('POST', '/projects', { name }); }
   createRoom(project, name) { return this.call('POST', `/projects/${encodeURIComponent(project)}/rooms`, { name }); }
   events(id, cursor) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/events?cursor=${cursor}&limit=200`); }
-  say(id, text) {
+  say(id, text, context) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/messages`,
-      { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}` });
+      { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}`, ...(context ? { context } : {}) });
   }
+  // Consultation (T14): a question and ONE text answer. Cross-workspace links (T14): both ends are checked by the server.
+  attention(room, includeAcked = false) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/attention${includeAcked ? '?include=acked' : ''}`); }
+  attentionAck(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/attention/ack`, body); }
+  attentionSnooze(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/attention/snooze`, body); }
+  attentionRestore(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/attention/restore`, body); }
+  progress(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/progress`); }
+  analytics(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/analytics`); }
+  consultations(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/consultations`); }
+  askConsultation(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/consultations`, body); }
+  answerConsultation(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/consultations/${encodeURIComponent(id)}/answer`, body); }
+  cancelConsultation(room, id) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/consultations/${encodeURIComponent(id)}/cancel`, {}); }
+  xlinks(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/xlinks`); }
+  createLink(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/xlinks`, body); }
+  revokeLink(room, id) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/xlinks/${encodeURIComponent(id)}/revoke`, {}); }
   agents() { return this.call('GET', '/agents'); }
   connectAgent(name) {
     return this.call('POST', '/agents/connect', { harness_type: 'claude-code', ...(name ? { name } : {}) });
@@ -110,6 +136,50 @@ export class CollabApi {
     return this.call('GET', `/rooms/${encodeURIComponent(room)}/state?since=${since}&cursor=${cursor}&wait=${wait}`, undefined, signal);
   }
   flow(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/flow`); }
+  // Nodes of one type this person may see in ONE room (server-filtered by membership), with the visible
+  // edges of `edgeType` between them. The room's own scope and its linked missions only.
+  graphList(room, nodeType, edgeType) {
+    const q = new URLSearchParams({ node_type: nodeType, room_id: room, limit: '500', ...(edgeType ? { edge_type: edgeType } : {}) });
+    return this.call('GET', `/graph/nodes?${q}`);
+  }
+  // External coworker / remote agents (T10). The invite code is returned once by inviteExternal.
+  externals(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/externals`); }
+  inviteExternal(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/invites`, body); }
+  revokeExternal(room, agentId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/${encodeURIComponent(agentId)}/revoke`, {}); }
+  revokeExternalInvite(room, inviteId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/invites/${encodeURIComponent(inviteId)}/revoke`, {}); }
+  // Bounded delegation and artifact proposals (T11). Owner side only; a proposal's content is untrusted text.
+  delegations(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/delegations`); }
+  delegate(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/delegations`, body); }
+  cancelDelegation(room, taskId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/tasks/${encodeURIComponent(taskId)}/cancel`, {}); }
+  proposals(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/proposals`); }
+  proposal(room, id) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/proposals/${encodeURIComponent(id)}`); }
+  decideProposal(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/proposals/${encodeURIComponent(id)}/decide`, body); }
+  // Read-only lineage views of ONE room (T09). `step` replays the reader's own visible ledger up to that event;
+  // omitted = now. The server filters by the caller's CURRENT membership.
+  lineage(room, o = {}) {
+    return this.call('GET', `/graph/lineage?${lineageQuery(room, o, { limit: '200', offset: o.offset, node_types: o.nodeTypes, edge_types: o.edgeTypes })}`);
+  }
+  lineageTimeline(room, o = {}) { return this.call('GET', `/graph/lineage/timeline?${lineageQuery(room, o)}`); }
+  lineageEvents(room, o = {}) {
+    return this.call('GET', `/graph/lineage/events?${lineageQuery(room, { step: null }, { limit: String(o.limit || 200), cursor: o.cursor })}`);
+  }
+  // Comments anchored to graph nodes and explicit steering (T12). Identity, room scope and rights come from the
+  // credential and the room; the body never names an author, an owner or a target principal.
+  comments(room, o = {}) {
+    const a = o.anchor || (o.nodeId ? { kind: 'node', node_id: o.nodeId } : null);
+    const q = new URLSearchParams({ limit: '100', ...(a ? Object.fromEntries(Object.entries({ anchor_kind: a.kind, node_id: a.node_id, edge_type: a.edge_type, from_id: a.from_id, to_id: a.to_id }).filter(([, v]) => v)) : {}) });
+    return this.call('GET', `/rooms/${encodeURIComponent(room)}/comments?${q}`);
+  }
+  addComment(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/comments`, body); }
+  editComment(room, id, text, revision) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/comments/${encodeURIComponent(id)}/edit`, { text, expected_revision: revision }); }
+  retractComment(room, id, revision) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/comments/${encodeURIComponent(id)}/retract`, { expected_revision: revision }); }
+  commentHistory(room, id) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/comments/${encodeURIComponent(id)}/history`); }
+  steeringTarget(room, nodeId) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/steering/target?${new URLSearchParams({ node_id: nodeId })}`); }
+  forks(room, nodeId) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/forks?${new URLSearchParams({ node_id: nodeId })}`); }
+  steeringList(room, nodeId) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/steering${nodeId ? `?${new URLSearchParams({ node_id: nodeId })}` : ''}`); }
+  proposeSteering(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/steering`, body); }
+  confirmSteering(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/steering/${encodeURIComponent(id)}/confirm`, body); }
+  rejectSteering(room, id, reason) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/steering/${encodeURIComponent(id)}/reject`, reason ? { reason } : {}); }
   linkAgent(agentId, instanceId) { return this.call('POST', `/agents/${encodeURIComponent(agentId)}/link`, { instance_id: instanceId || null }); }
   createJoinToken(body) { return this.call('POST', '/agents/join-tokens', body); }
   joinTokens() { return this.call('GET', '/agents/join-tokens'); }

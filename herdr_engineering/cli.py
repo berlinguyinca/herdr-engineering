@@ -12,8 +12,10 @@ import json
 import logging
 import os
 import re
+import signal
 import socket
 import sys
+import threading
 from typing import Any
 
 from .version import __version__
@@ -282,6 +284,13 @@ def _build_parser() -> argparse.ArgumentParser:
     asub.add_parser("list", help="list stored artifacts").set_defaults(func=_cmd_art_list)
     p2 = asub.add_parser("retention", help="enforce retention policy")
     p2.set_defaults(func=_cmd_art_retention)
+    # system-graph artifact (P5): deterministic sanitized snapshot renderer.
+    ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
+    gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
+    p2 = gas.add_parser("render", help="render a graph snapshot JSON to a deterministic sanitized HTML artifact")
+    p2.add_argument("graph_json", help="path to a graph snapshot JSON file")
+    p2.add_argument("--out", default=None, help="output .html path (default: <graph_json>.html)")
+    p2.set_defaults(func=_cmd_graph_artifact_render)
 
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
@@ -455,6 +464,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("review_id"); p2.add_argument("decision")
     p2.add_argument("--comment"); p2.set_defaults(func=_cmd_review_resolve)
 
+    # review-gate ----------------------------------------------------------
+    p = sub.add_parser("review-gate", help="PR review gate tools")
+    gsub = p.add_subparsers(dest="review_gate_command", required=True)
+    p2 = gsub.add_parser("worker", help="run the reviewer worker (claims jobs, calls the model)")
+    p2.add_argument("--config", required=True, help="worker YAML config file")
+    p2.add_argument("--once", action="store_true", help="run one claim cycle and exit")
+    p2.set_defaults(func=_cmd_review_gate_worker)
+
     # candidates -----------------------------------------------------------
     p = sub.add_parser("candidates", help="multi-agent worktree comparison (spec 0140)")
     csub = p.add_subparsers(dest="candidates_command", required=True)
@@ -530,6 +547,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="approval mode: any pool account may sign in and ask to join, and nothing works until "
                          "an approver or the operator approves it; --collab-cognito-group members are approved "
                          "on sight instead of being required")
+    p2.add_argument("--collab-replay-history", default=None, choices=["full", "since_join"],
+                    help="lineage replay window for members (default since_join; normally set by "
+                         "control_plane.collab.replay_history in the fleet config)")
     p2.add_argument("--collab-approver-group", action="append", default=[],
                     help="Cognito group whose members may approve new people (repeatable; approval mode)")
     p2.add_argument("--collab-public-port", type=int, default=None,
@@ -552,6 +572,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--collab-operator-url", default=None,
                     help="dashboard: forward /api/v1/collab/* to the operator listener of the "
                          "isolated collab service (e.g. http://100.64.0.1:8082)")
+    # No flag on purpose: the T11 delegation kill switch is YAML only (control_plane.collab.delegation_enabled).
+    p2.set_defaults(collab_delegation_enabled=False)
     p2.add_argument("--collab-dashboard-host", action="append", default=[],
                     help="extra DNS name the dashboard may be reached by for collaboration "
                          "(IP literals and localhost always work; repeatable; DNS-rebinding guard)")
@@ -1065,6 +1087,25 @@ def _cmd_art_publish(args) -> int:
     _print_json({"ok": res.ok, "status": res.status, "error": res.error,
                  "artifact": res.artifact.to_dict() if res.artifact else None})
     return 0 if res.ok else 1
+
+
+def _cmd_graph_artifact_render(args) -> int:
+    """Render a graph snapshot JSON file (GraphProjection.snapshot() shape) to
+    a deterministic sanitized HTML artifact (system-graph P5).
+    """
+    import json as _json
+    from pathlib import Path
+
+    from .control_plane.graph_artifact import GraphArtifactRenderer
+
+    data = _json.loads(Path(args.graph_json).read_text())
+    result = GraphArtifactRenderer(
+        title=data.get("title", "System graph snapshot")).render(data)
+    out = args.out or f"{args.graph_json}.html"
+    Path(out).write_text(result.html)
+    _print_json({"ok": True, "out": out, "digest": result.digest,
+                 "nodes": result.node_count, "edges": result.edge_count})
+    return 0
 
 
 def _cmd_art_list(args) -> int:
@@ -1870,7 +1911,7 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent
+    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -1909,6 +1950,11 @@ def _cmd_dev_agent(args) -> int:
     # extra excluded ports + the dev-port window the agent will register.
     extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
         "agent_exclude_ports", []))
+    try:
+        agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
+    except ValueError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
     def control_plane_for(host_cfg):
         return fabric_cfg.get("control_plane_url") or host_cfg.control_plane_url
 
@@ -1923,6 +1969,9 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=control_plane_for(live),
+            host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
+            host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
+            agent_binaries=agent_binaries,
         ))
     if args.once:
         summary = agent.scan_once()
@@ -2196,6 +2245,39 @@ def _cmd_browser(args) -> int:
     return 0 if cap.ok else 1
 
 
+def _cmd_review_gate_worker(args) -> int:
+    """Exit 0 on a clean stop, 1 when the reviewer key is refused, 2 on a config error.
+
+    Messages are fixed text (config errors carry no key material); nothing from a
+    response, URL or key file is printed.
+    """
+    from .review_gate import worker as rgw
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        config = rgw.load_worker_config(args.config)
+        reviewer = rgw.ReviewWorker(config)
+        if args.once:
+            print("handled" if reviewer.run_once() else "idle")
+            return 0
+        stop = threading.Event()
+
+        def _request_stop(_signum, _frame):
+            stop.set()
+
+        signal.signal(signal.SIGINT, _request_stop)
+        signal.signal(signal.SIGTERM, _request_stop)
+        reviewer.run(stop)
+        return 0
+    except rgw.WorkerAuthError:
+        print("review-gate worker: the control plane refused the reviewer key", file=sys.stderr)
+        return 1
+    except rgw.WorkerConfigError as exc:
+        print(f"review-gate worker: config error: {exc}", file=sys.stderr)
+        return 2
+
+
 def _cmd_review_request(args) -> int:
     from .browser import PlannotatorAdapter
     review = PlannotatorAdapter().request_review(
@@ -2349,6 +2431,7 @@ def _cmd_cp_web(args) -> int:
 
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
+    lineage_key_scopes = {}
     if args.collab_only:
         # The public collab container is given only the collab slice of the central
         # file (`fleet config render-collab`): no fleet endpoint, no API keys, no DSN.
@@ -2374,6 +2457,19 @@ def _cmd_cp_web(args) -> int:
         merged = {str(k): str(v) for k, v in file_keys.items()}
         merged.update(api_keys or {})
         api_keys = merged or None
+        raw_scopes = cp.get("lineage_key_scopes") or {}
+        if not isinstance(raw_scopes, dict):
+            raise SystemExit("fleet config control_plane.lineage_key_scopes must map an api key to {rooms: [...], missions: [...]}")
+        for key, allow in raw_scopes.items():
+            if (str(key) not in (api_keys or {}) or not isinstance(allow, dict) or set(allow) - {"rooms", "missions"}
+                    or not all(isinstance(allow.get(n, []), list) and all(isinstance(v, str) and v for v in allow.get(n, []))
+                               for n in ("rooms", "missions"))):
+                raise SystemExit("fleet config control_plane.lineage_key_scopes: each entry must name a configured api key "
+                                 "and hold only rooms/missions lists of non-empty strings")
+        if any((api_keys or {}).get(str(k)) == "operator" for k in raw_scopes):
+            raise SystemExit("fleet config control_plane.lineage_key_scopes: an entry names an operator-role key; operator keys "
+                             "are not restricted, so the entry would silently do nothing. Remove it or use a non-operator key")
+        lineage_key_scopes = {str(k): v for k, v in raw_scopes.items()}
     if args.collab_cognito_group is None:
         args.collab_cognito_group = "local.dev"
     # The Postgres DSN comes from the fleet file's control_plane section (the
@@ -2443,6 +2539,7 @@ def _cmd_cp_web(args) -> int:
             approval = ApprovalPolicy(auto_groups=[args.collab_cognito_group],
                                       approver_groups=args.collab_approver_group)
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
+                               delegation_enabled=_delegation_switch(args, cp),
                                summary_fix=getattr(args, "collab_summary_fix", None))
         if args.collab_only:
             collab.hydrate(sink.load())
@@ -2458,8 +2555,40 @@ def _cmd_cp_web(args) -> int:
         if sink is not None and source is None:
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
-        collab = CollabService(StaticTokenAuthenticator(users), sink=sink)
-    svr = ControlPlaneServer(repo, api_keys=api_keys,
+        collab = CollabService(StaticTokenAuthenticator(users), sink=sink,
+                               delegation_enabled=_delegation_switch(args, cp))
+    if collab is not None:
+        history = getattr(args, "collab_replay_history", None) or "since_join"
+        if history not in ("full", "since_join"):
+            raise SystemExit("control_plane.collab.replay_history must be 'full' or 'since_join'")
+        collab.replay_history = history
+        # T12: comments and steering. Settings are YAML only (no flag or env), and when a fleet file is in use the
+        # service re-reads them per request, so editing `kill_switch: true` takes effect without a restart.
+        from .control_plane.collab_workbench import normalize_steering
+        collab.steering = normalize_steering(getattr(args, "collab_steering", None))
+        if fleet_store is not None:
+            def _steering_from_yaml(_store=fleet_store):
+                section = _store.secure_section("control_plane")
+                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("steering")
+            collab.steering_source = _steering_from_yaml
+        # T14: contextual chat, consultation and cross-workspace links. Same rule: YAML only, off by default, re-read
+        # per request when a fleet file is in use so `kill_switch: true` needs no restart.
+        from .control_plane.collab_context import normalize_contextual
+        collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
+        if fleet_store is not None:
+            def _contextual_from_yaml(_store=fleet_store):
+                section = _store.secure_section("control_plane")
+                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("contextual")
+            collab.contextual_source = _contextual_from_yaml
+        # T15: attention inbox, evidence-based progress and analytics. Same rule: YAML only, off by default, hot kill switch.
+        from .control_plane.collab_attention import normalize_insights
+        collab.insights = normalize_insights(getattr(args, "collab_insights", None))
+        if fleet_store is not None:
+            def _insights_from_yaml(_store=fleet_store):
+                section = _store.current().section("control_plane")
+                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("insights")
+            collab.insights_source = _insights_from_yaml
+    svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
                              # collab-only has no operator listener, so nothing is left open
@@ -2469,6 +2598,7 @@ def _cmd_cp_web(args) -> int:
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              summary_config=cp.get("agent_summaries") or {},
+                             review_quorum=_review_quorum_config(cp),
                              usage_retention=usage_retention,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
@@ -2535,6 +2665,12 @@ COLLAB_CONFIG_KEYS = {
     "open_signup": ("collab_open_signup", bool),
     "approver_groups": ("collab_approver_group", list),
     "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
+    # T11 kill switch: bounded task delegation + artifact proposals. Default false = the feature does not exist.
+    "delegation_enabled": ("collab_delegation_enabled", bool),
+    "replay_history": ("collab_replay_history", str),     # lineage replay: since_join (default) | full
+    "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
+    "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
+    "insights": ("collab_insights", dict),                # T15 attention inbox, progress, analytics; YAML only, off by default
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
 }
@@ -2552,7 +2688,7 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
-        if kind is dict:
+        if kind is dict and key == "summary_fix":
             from .control_plane.collab import summary_fix_config
             try:
                 setattr(args, dest, summary_fix_config(value))
@@ -2566,6 +2702,15 @@ def _apply_collab_config(args, cp) -> None:
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be a list of strings")
             if not getattr(args, dest):
                 setattr(args, dest, list(value))
+        elif kind is dict:
+            from .control_plane.collab_attention import normalize_insights
+            from .control_plane.collab_context import normalize_contextual
+            from .control_plane.collab_workbench import normalize_steering
+            try:
+                {"contextual": normalize_contextual, "insights": normalize_insights}.get(key, normalize_steering)(value)
+            except ValueError as exc:
+                raise SystemExit(f"fleet config {exc}") from None
+            setattr(args, dest, dict(value))
         elif kind is bool:
             if not isinstance(value, bool):
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be true or false")
@@ -2575,6 +2720,27 @@ def _apply_collab_config(args, cp) -> None:
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be a non-empty string")
             if getattr(args, dest) is None:
                 setattr(args, dest, value)
+
+
+def _delegation_switch(args, cp) -> bool:
+    """The T11 kill switch from control_plane.collab.delegation_enabled (YAML only, default off). The
+    collab-only path has already folded it into ``args`` via _apply_collab_config; the combined path reads it here."""
+    if getattr(args, "collab_delegation_enabled", False):
+        return True
+    collab = cp.get("collab") if isinstance(cp, dict) else None
+    value = collab.get("delegation_enabled", False) if isinstance(collab, dict) else False
+    if not isinstance(value, bool):
+        raise SystemExit("fleet config control_plane.collab.delegation_enabled must be true or false")
+    return value
+
+
+def _review_quorum_config(cp):
+    """Parse control_plane.review_quorum (None = off); a bad block stops startup."""
+    from .control_plane.review_quorum import parse_config
+    try:
+        return parse_config(cp.get("review_quorum"))
+    except ValueError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
 
 
 def _load_cp_fleet_config(path_arg):

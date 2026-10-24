@@ -1,0 +1,226 @@
+{
+ "history": {
+  "range": "1h",
+  "samples": [
+   {
+    "agents_running": 3,
+    "at": "2027-01-15T08:00:00+00:00",
+    "disk": 40.0,
+    "gpu_temp_c": 61.0,
+    "gpu_util_pct": 37.0,
+    "load1": 1.5,
+    "load15": 1.0,
+    "load5": 1.25,
+    "mem": 75.0,
+    "mem_total_b": 17179869184,
+    "mem_used_b": 12884901888,
+    "swap": 50.0,
+    "ts": 1800000000.0,
+    "uptime_s": 273600
+   },
+   {
+    "agents_running": 3,
+    "at": "2027-01-15T08:00:30+00:00",
+    "cpu": 50.0,
+    "disk": 40.0,
+    "gpu_temp_c": 61.0,
+    "gpu_util_pct": 37.0,
+    "load1": 1.5,
+    "load15": 1.0,
+    "load5": 1.25,
+    "mem": 75.0,
+    "mem_total_b": 17179869184,
+    "mem_used_b": 12884901888,
+    "net_rx_bps": 2000,
+    "net_tx_bps": 1000,
+    "swap": 50.0,
+    "ts": 1800000030.0,
+    "uptime_s": 273600
+   }
+  ]
+ },
+ "host": {
+  "cpu": 50.0,
+  "created_at": "2027-01-15T08:00:00+00:00",
+  "fleet_update": {
+   "deferred_since": null,
+   "last_updated": "2027-01-12T08:00:00+00:00",
+   "result": "updated"
+  },
+  "host_id": "beast",
+  "host_name": "beast",
+  "last_seen": "2027-01-15T08:00:30+00:00",
+  "latest": {
+   "agents_running": 3,
+   "at": "2027-01-15T08:00:30+00:00",
+   "cpu": 50.0,
+   "disk": 40.0,
+   "gpus": [
+    {
+     "name": "NVIDIA GeForce RTX 4090",
+     "temp_c": 61.0,
+     "util_pct": 37.0,
+     "vram_total_b": 25757220864,
+     "vram_used_b": 10737418240
+    },
+    {
+     "name": "NVIDIA GeForce RTX 4090",
+     "temp_c": 48.0,
+     "vram_total_b": 25757220864,
+     "vram_used_b": 536870912
+    }
+   ],
+   "load1": 1.5,
+   "load15": 1.0,
+   "load5": 1.25,
+   "mem": 75.0,
+   "mem_total_b": 17179869184,
+   "mem_used_b": 12884901888,
+   "mounts": [
+    {
+     "path": "/",
+     "pct": 40.0,
+     "total_b": 1073741824000,
+     "used_b": 429496729600
+    },
+    {
+     "path": "/boot/efi",
+     "pct": 50.0,
+     "total_b": 1073741824,
+     "used_b": 536870912
+    },
+    {
+     "path": "/data",
+     "pct": 25.0,
+     "total_b": 4294967296000,
+     "used_b": 1073741824000
+    }
+   ],
+   "net_rx_bps": 2000,
+   "net_tx_bps": 1000,
+   "swap": 50.0,
+   "top": {
+    "cpu": [
+     {
+      "command": "python3",
+      "cpu_pct": 40.0,
+      "mem_pct": 9.0,
+      "owner": null,
+      "pid": 700,
+      "user": "carol"
+     },
+     {
+      "command": "claude",
+      "cpu_pct": 25.0,
+      "mem_pct": 4.0,
+      "owner": null,
+      "pid": 601,
+      "user": "bob"
+     },
+     {
+      "command": "pi",
+      "cpu_pct": 12.0,
+      "mem_pct": 2.0,
+      "owner": "dev:5173",
+      "pid": 501,
+      "user": "alice"
+     },
+     {
+      "command": "pi",
+      "cpu_pct": 3.0,
+      "mem_pct": 1.5,
+      "owner": null,
+      "pid": 502,
+      "user": "alice"
+     },
+     {
+      "command": "claude",
+      "cpu_pct": 1.0,
+      "mem_pct": 0.5,
+      "owner": null,
+      "pid": 602,
+      "user": "bob"
+     }
+    ],
+    "mem": [
+     {
+      "command": "python3",
+      "cpu_pct": 40.0,
+      "mem_pct": 9.0,
+      "owner": null,
+      "pid": 700,
+      "user": "carol"
+     },
+     {
+      "command": "claude",
+      "cpu_pct": 25.0,
+      "mem_pct": 4.0,
+      "owner": null,
+      "pid": 601,
+      "user": "bob"
+     },
+     {
+      "command": "pi",
+      "cpu_pct": 12.0,
+      "mem_pct": 2.0,
+      "owner": "dev:5173",
+      "pid": 501,
+      "user": "alice"
+     },
+     {
+      "command": "pi",
+      "cpu_pct": 3.0,
+      "mem_pct": 1.5,
+      "owner": null,
+      "pid": 502,
+      "user": "alice"
+     },
+     {
+      "command": "claude",
+      "cpu_pct": 1.0,
+      "mem_pct": 0.5,
+      "owner": null,
+      "pid": 602,
+      "user": "bob"
+     }
+    ]
+   },
+   "uptime_s": 273600
+  },
+  "maintenance": false,
+  "mem": 75.0,
+  "pins": {
+   "autospec": "2.1.0",
+   "herdr": "0.9.1",
+   "pi": "0.70.2",
+   "pi_extensions": {
+    "auth-helper": "1.2.0",
+    "token-tools": "0.3.0"
+   }
+  },
+  "problem_count": 0,
+  "problems": [],
+  "status": "healthy",
+  "tailnet_ip": "100.64.0.7",
+  "updates": {
+   "failed_units": [],
+   "manager": "apt",
+   "outdated": 0,
+   "packages": [],
+   "reboot_required": false,
+   "security": 0
+  },
+  "versions": {
+   "autospec": "2.1.0",
+   "herdr": "0.9.1",
+   "herdr_eng": "0.0.0+e2e",
+   "pi": "0.70.2",
+   "pi_extensions": {
+    "auth-helper": "1.2.0",
+    "build-gate.ts": null,
+    "token-tools": "0.3.0"
+   },
+   "tailscale": "1.80.2"
+  }
+ }
+}
