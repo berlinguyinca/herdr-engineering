@@ -91,7 +91,9 @@ def test_public_listener_serves_file_browser_import_from_real_packages(stack):
     stack.srv.web_root = ROOT_DIR / "packages"
     connection = http.client.HTTPConnection("127.0.0.1", stack.srv.public_port, timeout=5)
     try:
-        for path in ("/collab-view.js", "/collab-files.js", "/herdr-web-components/util.js"):
+        for path in ("/collab-view.js", "/collab-files.js", "/herdr-web-components/util.js",
+                     "/collab-previews.js", "/collab-preview-msp.js", "/collab-preview-text.js",
+                     "/collab-preview-pdf.js", "/collab-preview-flasheic.js"):
             connection.request("GET", path, headers=H)
             response = connection.getresponse()
             body = response.read()
@@ -113,6 +115,8 @@ def test_public_static_carries_security_headers(stack):
     c.request("GET", "/", headers=H)
     r = c.getresponse()
     assert "default-src 'none'" in r.getheader("Content-Security-Policy")
+    assert "frame-src 'self' blob:" in r.getheader("Content-Security-Policy")
+    assert "connect-src 'self' https:" in r.getheader("Content-Security-Policy")
     assert r.getheader("X-Content-Type-Options") == "nosniff" and r.getheader("X-Frame-Options") == "DENY"
     c.close()
 
@@ -280,6 +284,8 @@ def test_public_guide_is_served_and_names_no_private_infrastructure(stack):
         r.read()
         assert r.status == 200 and r.getheader("Content-Type").startswith(ctype), path
         assert "default-src 'none'" in r.getheader("Content-Security-Policy")
+    assert "frame-src 'self' blob:" in r.getheader("Content-Security-Policy")
+    assert "connect-src 'self' https:" in r.getheader("Content-Security-Policy")
     assert stack.main.call("GET", "/guide", headers=H)[0] in (401, 404)          # not on the dashboard listener
     c.close()
     text = (ROOT_DIR / "packages" / "collab-guide.md").read_text()

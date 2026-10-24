@@ -4,6 +4,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
 import { mountFilesPanel } from './collab-files.js';
+import { renderPreview } from './collab-previews.js';
 import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
@@ -132,7 +133,7 @@ export function renderRoomAdministration({ room, invites = [], canManage = false
   }).join('')}${invites.map(i => `<li><span class="grow">${esc(i.email)}</span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>`;
 }
 
-export function mountCollab(root, { fabricSessions = null, surface = root.dataset.standalone === '1' ? 'public' : 'dashboard' } = {}) {
+export function mountCollab(root, { fabricSessions = null, previewServices = {}, surface = root.dataset.standalone === '1' ? 'public' : 'dashboard' } = {}) {
   ensureConversationStyles(root.ownerDocument);
   const store = new TokenStore(window.sessionStorage);
   let operator = false; // per mount: credentials never carry over from another shell
@@ -1148,7 +1149,8 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${sub}`; });
     function ensureFilesPanel() {
       return filesPanel ||= mountFilesPanel($('hcn-p-files'), { api, roomId, info, isCurrent: roomCurrent,
-        pending: pendingAdministration, onPermissions: () => showSub('people') });
+        pending: pendingAdministration, onPermissions: () => showSub('people'),
+        onPreview: (file, source) => renderPreview(file, source, { ...previewServices, api }) });
     }
     if (sub === 'files') ensureFilesPanel().refresh(true);
 
