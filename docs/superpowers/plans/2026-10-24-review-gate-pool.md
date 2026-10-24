@@ -84,5 +84,5 @@ Behaviour: each slot thread runs `worker.run(slot_stop, before_cycle=..., after_
 - [ ] **Step 1: Tests**: `test_pool_command_parses_and_runs_with_stop` (mirrors the worker command test); `test_e2e_pool_drains_a_burst` in the e2e file: enqueue 6 PRs against the existing live-loop fixture, run a pool with min 1 / max 3 and a fake model, assert all six reach a verdict, the pool grew above 1 and retired back to `min_workers` once the queue emptied (bound the wait with a deadline, not a sleep).
 - [ ] **Step 2: Run, expect failures.**
 - [ ] **Step 3: Implement** the command; document in `docs/review-gate.md`: the pool YAML with an example, the scaling rule, one pool per host/model, a systemd unit example (no environment), the failure behaviour (queue unreachable, auth error exit), and that pool size is per process.
-- [ ] **Step 4: Run the gate tests and `ruff check` / `ruff format --check` on touched files.** `PYTHONPATH=. pytest tests/review_gate tests/control_plane/test_review_gate_api.py tests/control_plane/test_review_gate_reviewer_api.py -q -n0`
+- [ ] **Step 4: Run the gate tests and `ruff check` / `ruff format --check` on touched files.** `PYTHONPATH=. pytest tests/review_gate tests/control_plane/test_review_gate_api.py tests/control_plane/test_review_gate_reviewer_api.py -q`
 - [ ] **Step 5: Commit** `feat(review-gate): pool command and docs`.
