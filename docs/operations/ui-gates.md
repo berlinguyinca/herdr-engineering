@@ -257,6 +257,20 @@ Found by the strengthened gates (second round):
   with the newer one; removing both, R13c, is caught).
 - **R7c** (the layout skip above the draw cap) is caught by counting `layoutGraph` calls through CDP precise coverage, not by timing:
   the layout costs tens of milliseconds, which no budget separates from noise.
+- **Third-round mutants (27, all caught by a gate that names them):** unlabelled fork and snooze selects, favicon link removed, three
+  unescaped renderers (reported-lineage label, milestone label, bounded-task target), every lineage node a Tab stop, flow node ignoring
+  Enter and ignoring Space, an attention disclosure that always says expanded, the editor losing `role=dialog`, losing `aria-modal`
+  and losing its Tab trap, the mention list without an active descendant and without `aria-expanded`, reversed and reordered focusables,
+  four hidden workbench controls (comment text, fork button, steering buttons, submit), a host font on the replay buttons, transparent
+  text through `-webkit-text-fill-color`, a tab without `aria-controls`, a panel without `tabpanel`, a count glued into a tab name, and
+  a removed debounce. A control mutant that changes nothing (FP1) survives, as it must. Survivors of all rounds: N1b, N9a, R13b (above).
+  The first run flagged the Tab-trap mutant only through the mention test; the dialog test could not see it because it started from the
+  textarea, whose own Tab handler indents. It now starts at the edges and catches it itself.
+- The debounce gate counts `renderLineage` calls (one for six keystrokes) but no longer asserts `layoutGraph` is never called: a filter
+  that narrows the result below the draw cap legitimately lays out.
+- The X3 milestone is injected by the proxy, not seeded; a seeded one needs a linked mission.
+- One run of the states file failed once on the phone viewport and could not be reproduced in eight further runs (the cause was not
+  isolated); treat it as a possible load-sensitive flake.
 - **N5b** (the Pause motion label gone, an empty box) was invisible to every gate until the flow surface joined the visual suite.
 - **Not covered by the pixel gate:** a change of one colour step (+1 per channel); a host whose fontconfig rendering settings differ.
 - **Search is client-side** and covers only loaded nodes; the server caps lineage paging at 3,000 nodes.
