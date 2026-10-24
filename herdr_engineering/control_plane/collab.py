@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 
 from . import collab_delegation as dlg
 from . import collab_external as ext
+from . import collab_mentions as mentions
 from . import collab_models, ids
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
@@ -74,6 +75,7 @@ MAX_BODY = 64 * 1024
 _PANE_LINK = re.compile(r"pane:[a-z0-9][a-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
 _MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to", "context"})
+_MESSAGE_DERIVED = frozenset({"mentions"})   # the server derives these from the text; a client's copy is dropped
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")   # C0, DEL and C1 (8-bit CSI)
 _NAME_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
@@ -366,6 +368,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         self.public_config = dict(public_config or {})
         self._email_user: dict[str, str] = {}   # email -> user id (linked at sign-in)
         self._user_email: dict[str, str] = {}
+        self._user_handle: dict[str, str] = {}  # user id -> @handle, assigned once from the first linked email
+        self._handle_user: dict[str, str] = {}
+        self._seen: dict[str, dict[tuple, float]] = defaultdict(dict)   # room -> (kind, id) -> last room view; memory only
         self._invites: dict[str, dict] = {}
         self._tasks: dict[str, dict] = {}
         self._tasks_by_target: dict[str, list[str]] = defaultdict(list)
@@ -582,7 +587,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         elif t == "agent_enrolled":
             if p["code_digest"] in self._pending:
                 self._pending[p["code_digest"]]["used"] = True
+            # The address slot (`pi`, `pi-2`) is the lowest one free among the owner's live agents of that
+            # harness when this agent is made, and never changes afterwards, so `@gert.pi-2` keeps meaning it.
+            hk = mentions.harness_key(p["harness_type"])
+            used = {self._agents[a].get("slot") for a in self._agents_by_owner.get(p["owner_user_id"], ())
+                    if self._agents[a]["status"] == "active"}
             self._agents[p["agent_id"]] = {
+                "slot": mentions.first_free(hk, used), "aliases": [],
                 "owner": p["owner_user_id"], "device_id": p["device_id"], "harness_type": p["harness_type"],
                 "instance_id": p.get("instance_id"), "status": "active",
                 "name": p.get("name") or _default_handle(p["harness_type"], p["agent_id"]),
@@ -613,7 +624,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         elif t == "agent_linked":
             self._agents[p["agent_id"]]["instance_id"] = p.get("instance_id")
         elif t == "agent_renamed":
-            self._agents[p["agent_id"]]["name"] = p["name"]
+            a = self._agents[p["agent_id"]]
+            if a["name"] not in a["aliases"]:                  # an old name keeps working as an alias
+                a["aliases"].append(a["name"])
+            a["name"] = p["name"]
         elif t == "credential_rotated":
             a = self._agents[p["agent_id"]]
             self._by_cred.pop(a["cred_digest"], None)
@@ -849,6 +863,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 self._email_user.pop(old, None)
             self._user_email[p["user_id"]] = p["email"]
             self._email_user[p["email"]] = p["user_id"]
+            if p["user_id"] not in self._user_handle:          # frozen: a later email never moves a handle
+                h = mentions.first_free(mentions.handle_base(p["email"]), {*self._handle_user, *mentions.GROUPS})
+                self._user_handle[p["user_id"]] = h
+                self._handle_user[h] = p["user_id"]
         elif t == "invite_created":
             self._invites[p["invite_id"]] = {
                 "room_id": p["room_id"], "email": p["email"], "role": p["role"],
@@ -3243,6 +3261,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             if self._state_waiters[pr.key] >= self.MAX_STATE_WAITERS:
                 raise CollabError(429, "too many open room views")
             self._state_waiters[pr.key] += 1
+            self._mark_seen(room_id, pr)
         try:
             with self._cv:
                 while True:
@@ -3263,6 +3282,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             guest = bool(m and m["role"] == "guest")
             out: dict[str, Any] = {"seq": cur, "changed": True, **self.read_events(pr, room_id, cursor, 200)}
             out["agents"] = [] if guest else self.list_room_agents(pr, room_id)["agents"]
+            with self._lock:                      # handles only, never emails; a guest gets no roster
+                out["people"] = [] if guest else self._room_people(room_id)
             out["tasks"] = self.list_tasks(pr, room_id)["tasks"]
             out["flow"] = None if guest else self.room_flow(pr, room_id)
             with self._lock:                      # quiet reads: people only, never guests or agents
@@ -3278,6 +3299,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         finally:
             with self._cv:
                 self._state_waiters[pr.key] -= 1
+                self._mark_seen(room_id, pr)
 
     FLOW_TASKS = 60
 
@@ -3413,7 +3435,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 if a and a["status"] == "active":
                     out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
                                 "owner_user_id": a["owner"], "actions": g["actions"],
-                                "external": bool(a.get("external"))})
+                                "external": bool(a.get("external")), "address": self._address(aid),
+                                "aliases": list(a.get("aliases", ())),
+                                "online": self._online(room_id, "agent", aid)})
         return {"agents": out}
 
     # -- room <-> workspace and mission links
@@ -4631,10 +4655,90 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                     "outcome": "allowed", "resource_id": proposal_id})
         return True
 
+    # -- addressing: @person, @owner.harness, old names as aliases, @all/@agents/@here
+    ONLINE_WINDOW = 45.0        # a room view (state long-poll) this recent counts as "here"
+
+    def _address(self, aid: str) -> str | None:
+        a = self._agents.get(aid) or {}
+        h = self._user_handle.get(a.get("owner"))
+        return f"{h}.{a['slot']}" if h and a.get("slot") else None
+
+    def _room_agents_live(self, room: dict) -> list[str]:
+        return [aid for aid in room["grants"] if (self._agents.get(aid) or {}).get("status") == "active"]
+
+    def _online(self, room_id: str, kind: str, pid: str) -> bool:
+        if kind == "agent" and (self._agents.get(pid) or {}).get("external"):
+            hb = self._presence.get(pid)
+            if hb and self._now() - hb["at"] < ext.PRESENCE_STALE:
+                return True
+        seen = self._seen.get(room_id, {}).get((kind, pid))
+        return seen is not None and self._now() - seen < self.ONLINE_WINDOW
+
+    def _address_book(self, room_id: str) -> dict[str, dict]:
+        """name -> mention for one room, by precedence: group, agent address, person handle, an agent's
+        current name, then its old names. A lower level never overrides a higher one; a name two agents
+        share at the same level addresses nobody."""
+        room = self._rooms[room_id]
+        people = [u for u in room["members"] if self._member(room, u)]
+        agents = self._room_agents_live(room)
+        everyone = [{"kind": "person", "id": u} for u in people] + [{"kind": "agent", "id": a} for a in agents]
+        groups = {"all": everyone, "agents": [t for t in everyone if t["kind"] == "agent"],
+                  "here": [t for t in everyone if self._online(room_id, t["kind"], t["id"])]}
+        book: dict[str, dict] = {g: {"kind": "group", "id": g, "name": g, "targets": groups[g]} for g in mentions.GROUPS}
+        levels: list[dict[str, list[dict]]] = [defaultdict(list) for _ in range(4)]
+        for aid in agents:
+            m = {"kind": "agent", "id": aid, "name": self._address(aid) or self._agents[aid]["name"]}
+            if self._address(aid):
+                levels[0][self._address(aid)].append(m)
+            levels[2][self._agents[aid]["name"]].append(m)
+            for old in self._agents[aid].get("aliases", ()):
+                levels[3][old].append(m)
+        for u in people:
+            if self._user_handle.get(u):
+                levels[1][self._user_handle[u]].append({"kind": "person", "id": u, "name": self._user_handle[u]})
+        for level in levels:
+            for name, hits in level.items():
+                if name not in book and len({h["id"] for h in hits}) == 1:
+                    book[name] = hits[0]
+                elif name not in book:
+                    book[name] = None                      # ambiguous: blocks lower levels too
+        return {k: v for k, v in book.items() if v is not None}
+
+    def _resolve_mentions(self, room_id: str, text: str) -> list[dict]:
+        book, out, seen = self._address_book(room_id), [], set()
+        for token in mentions.tokens(text):
+            hit = next((book[c] for c in mentions.candidates(token) if c in book), None)
+            if hit is None or (hit["kind"], hit["id"]) in seen:
+                continue
+            seen.add((hit["kind"], hit["id"]))
+            out.append(copy.deepcopy(hit))
+            if len(out) >= mentions.MAX_MENTIONS:
+                break
+        return out
+
+    def resolve_mentions(self, room_id: str, text: str) -> list[dict]:
+        """`[{kind: person|agent|group, id, name}]` for the names in `text` that address someone in this
+        room (groups also carry their `targets`). Unknown names are not mentions; the text is unchanged."""
+        with self._lock:
+            if room_id not in self._rooms:
+                raise CollabError(404, "not found")
+            return self._resolve_mentions(room_id, text)
+
+    def _mark_seen(self, room_id: str, pr: Principal) -> None:
+        self._seen[room_id][("agent" if pr.is_agent else "person", pr.id)] = self._now()
+
+    def _room_people(self, room_id: str) -> list[dict]:
+        room = self._rooms[room_id]
+        return [{"user_id": u, "handle": self._user_handle[u], "online": self._online(room_id, "person", u)}
+                for u in room["members"] if self._member(room, u) and self._user_handle.get(u)]
+
     # -- messages
     def post_message(self, pr: Principal, room_id: str, body: dict) -> tuple[int, dict]:
         with self._lock:
             room, first = self._authorize(pr, room_id, "post", "message.post")
+            if any(k in body for k in _MESSAGE_DERIVED):     # never trusted: the server resolves the text itself
+                self.stats["derived_fields_dropped"] += 1
+                body = {k: v for k, v in body.items() if k not in _MESSAGE_DERIVED}
             bad = [k for k in body if k not in _MESSAGE_FIELDS]
             if bad:
                 forged = any(k.startswith(("actor_", "sender_", "owner_")) or k in
@@ -4695,10 +4799,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             ohits.append(now)
             self._hits[pr.key] = hits
             self._hits[okey] = ohits
+            stored = redact_text(clean)
             ev = self._commit("message", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
                 sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
-                text=redact_text(clean), in_reply_to=reply, trust="untrusted",
+                text=stored, mentions=self._resolve_mentions(room_id, stored), in_reply_to=reply, trust="untrusted",
                 **({"context": ctx} if ctx else {}),
                 visibility_scope="room", action="message.post", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
@@ -4719,7 +4824,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         if t == "message":
             out.update(sender={"type": "external" if p.get("sender_external") else p["sender_kind"],
                                "id": p["sender_id"], "owner_user_id": p["actor_user_id"]},
-                       text=p["text"], trust="untrusted", in_reply_to=p.get("in_reply_to"))
+                       text=p["text"], trust="untrusted", in_reply_to=p.get("in_reply_to"),
+                       mentions=copy.deepcopy(p.get("mentions") or []))
+            if viewer is not None and getattr(viewer, "is_agent", False):     # wake on the long-poll, act if addressed
+                me = ("agent", viewer.id)
+                out["mentions_me"] = any((m["kind"], m["id"]) == me or any(
+                    (t["kind"], t["id"]) == me for t in m.get("targets", ())) for m in out["mentions"])
             if p.get("context"):
                 out["context"] = self._message_context(p, viewer, {} if _ctx_cache is None else _ctx_cache)
         elif t in ("task_created", "task_updated"):
