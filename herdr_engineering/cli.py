@@ -1870,7 +1870,7 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent
+    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -1909,6 +1909,11 @@ def _cmd_dev_agent(args) -> int:
     # extra excluded ports + the dev-port window the agent will register.
     extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
         "agent_exclude_ports", []))
+    try:
+        agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
+    except ValueError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
     def control_plane_for(host_cfg):
         return fabric_cfg.get("control_plane_url") or host_cfg.control_plane_url
 
@@ -1923,6 +1928,9 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=control_plane_for(live),
+            host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
+            host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
+            agent_binaries=agent_binaries,
         ))
     if args.once:
         summary = agent.scan_once()

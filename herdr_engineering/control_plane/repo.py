@@ -21,6 +21,10 @@ import time
 from uuid import uuid4
 
 from .agent_identity import AgentIdentityRegistry
+from .host_metrics_store import ENTITY_TYPE as HOST_METRICS_ENTITY
+from .host_metrics_store import STATE_KEYS as HOST_STATE_KEYS
+from .host_metrics_store import HostMetricsStore, clean_metrics, clean_state
+from .host_problems import compute_problems
 from .ids import new_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
@@ -178,6 +182,19 @@ class ControlPlaneRepo:
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+        self.host_metrics = self._new_host_metrics()
+
+    def _new_host_metrics(self):
+        return HostMetricsStore(now=lambda: self._now(), persist=self._persist_host_metrics)
+
+    def _persist_host_metrics(self, ev):
+        """Rollups and host-state changes go to the sink, not the shared streams/SSE."""
+        if self._sink is None:
+            return
+        stamp = self._stamp()
+        self._sink.record({"event_id": new_id("event"), "schema_version": 1,
+                           "source_timestamp": stamp, "ingest_timestamp": stamp,
+                           "mission_id": None, "session_id": None, **ev})
 
     def _persist_inspector(self, ev):
         """Persist inspector detail outside global streams; require capture ACKs."""
@@ -731,29 +748,48 @@ class ControlPlaneRepo:
 
     # ---------------------------------------------------------------- hosts
     def register_host(self, host_name, tailnet_ip):
-        hid = new_id("host")
-        rec = {
-            "host_id": hid, "host_name": host_name, "tailnet_ip": tailnet_ip,
-            "status": "healthy", "last_seen": self._stamp(),
-            "created_at": self._stamp(),
-        }
-        self._hosts[hid] = rec
-        self.record_event("host", hid, "HostRegistered",
-                          {"host_name": host_name, "tailnet_ip": tailnet_ip})
-        return hid
+        with self._event_lock:
+            hid = new_id("host")
+            rec = {
+                "host_id": hid, "host_name": host_name, "tailnet_ip": tailnet_ip,
+                "status": "healthy", "last_seen": self._stamp(),
+                "created_at": self._stamp(),
+            }
+            self._hosts[hid] = rec
+            self.record_event("host", hid, "HostRegistered",
+                              {"host_name": host_name, "tailnet_ip": tailnet_ip})
+            return hid
 
     def get_host(self, host_id):
-        return self._merged_hosts().get(self._canonical_host(host_id))
+        host = self._merged_hosts().get(self._canonical_host(host_id))
+        return self._with_problems(host) if host is not None else None
+
+    def get_host_record(self, host_id):
+        """A copy of the stored record for exactly ``host_id`` (no alias merge, no problems)."""
+        with self._event_lock:
+            rec = self._hosts.get(host_id)
+            return _copy(rec) if rec is not None else None
+
+    def _with_problems(self, host):
+        """A copy of ``host`` carrying ``problems`` and ``problem_count`` (the store is untouched)."""
+        history = self.host_history(host["host_id"], "1h")
+        problems = compute_problems(host, history, self._now())
+        return {**host, "problems": problems, "problem_count": len(problems)}
 
     def _merged_hosts(self):
         """Hosts keyed by canonical id; an alias contributes its freshest report."""
+        # Snapshot under the lock: ingest threads add hosts while a reader iterates.
+        with self._event_lock:
+            raw = list(self._hosts.items())
+            aliases = dict(self._host_aliases)
+            hosts = {hid: _copy(rec) for hid, rec in raw}
         merged = {}
-        for hid, rec in self._hosts.items():
-            if hid in self._host_aliases:
+        for hid, rec in hosts.items():
+            if hid in aliases:
                 continue
-            merged[hid] = _copy(rec)
-        for alias, canonical in self._host_aliases.items():
-            rec = self._hosts.get(alias)
+            merged[hid] = rec
+        for alias, canonical in aliases.items():
+            rec = hosts.get(alias)
             if rec is None:
                 continue
             base = merged.get(canonical)
@@ -761,16 +797,24 @@ class ControlPlaneRepo:
                 base = merged[canonical] = _copy(rec)
                 base["host_id"] = base["host_name"] = canonical
                 continue
-            if (rec.get("last_seen") or "") > (base.get("last_seen") or ""):
+            fresher = (rec.get("last_seen") or "") > (base.get("last_seen") or "")
+            if fresher:
                 for key in ("last_seen", "status", "cpu", "mem"):
                     if rec.get(key) is not None:
                         base[key] = rec[key]
+            # Report and state keys may live on either record (the agent heartbeats
+            # under one id, the fleet update posts under another): the fresher
+            # record wins a shared key, and a key on only one record survives.
+            for key in ("latest", *HOST_STATE_KEYS):
+                if rec.get(key) is not None and (fresher or base.get(key) is None):
+                    base[key] = rec[key]
             if rec.get("inventory") and not base.get("inventory"):
                 base["inventory"] = _copy(rec["inventory"])
         return merged
 
     def list_hosts(self):
-        return _sort_by(list(self._merged_hosts().values()), "host_name")
+        hosts = [self._with_problems(h) for h in self._merged_hosts().values()]
+        return _sort_by(hosts, "host_name")
 
     def fleet_inventory(self):
         """Host x component version matrix with drift against the fleet reference.
@@ -809,25 +853,28 @@ class ControlPlaneRepo:
                             "missing": sum(c["missing"] for c in components)}}
 
     def record_heartbeat(self, host_id, tailnet_ip=None, cpu=None, mem=None):
-        h = self._hosts.get(host_id)
-        if h is None:
-            return False
-        h["last_seen"] = self._stamp()
-        h["status"] = "healthy"
-        if tailnet_ip is not None:
-            h["tailnet_ip"] = tailnet_ip
-        if cpu is not None:
-            h["cpu"] = cpu
-        if mem is not None:
-            h["mem"] = mem
-        return True
+        """Refresh liveness in memory only (no event): the per-sample hot path."""
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            if h is None:
+                return False
+            h["last_seen"] = self._stamp()
+            h["status"] = "healthy"
+            if tailnet_ip is not None:
+                h["tailnet_ip"] = tailnet_ip
+            if cpu is not None:
+                h["cpu"] = cpu
+            if mem is not None:
+                h["mem"] = mem
+            return True
 
     def mark_host_unavailable(self, host_id):
-        h = self._hosts.get(host_id)
-        if h is None:
-            return False
-        h["status"] = "unavailable"
-        return True
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            if h is None:
+                return False
+            h["status"] = "unavailable"
+            return True
 
     def record_telemetry(self, host_id, sample):
         """Record a telemetry sample (cpu/mem/disk/network/gpu) for a host."""
@@ -841,6 +888,46 @@ class ControlPlaneRepo:
         samples = self._telemetry.get(host_id, [])
         return samples[-limit:]
 
+    def record_host_metrics(self, host_id, sample, *, updates=None, versions=None,
+                            pins=None, fleet_update=None, maintenance=None):
+        """Store one fabric-agent sample: history, ``host["latest"]`` and host state.
+
+        Everything is validated before anything is written, so a ``ValueError``
+        leaves the host record untouched. A state field that is ``None`` was not
+        reported this time and keeps its previous value. ``sample`` may be
+        ``None`` when only state was reported."""
+        cleaned = clean_metrics(sample) if sample is not None else None
+        state = {k: clean_state(k, v) for k, v in
+                 (("updates", updates), ("versions", versions), ("pins", pins),
+                  ("fleet_update", fleet_update), ("maintenance", maintenance))}
+        with self._event_lock:
+            h = self._hosts.get(host_id)
+            latest = None
+            if cleaned is not None:
+                latest = {**cleaned, "at": self._stamp()}
+                self.host_metrics.record(host_id, cleaned)
+                self.record_telemetry(host_id, {**cleaned, "cpu_pct": cleaned.get("cpu"),
+                                                "mem_pct": cleaned.get("mem"),
+                                                "disk_pct": cleaned.get("disk")})
+            if h is None:
+                return
+            if latest is not None:
+                h["latest"] = latest
+            for key, value in state.items():
+                if value is not None:
+                    h[key] = value
+            self.host_metrics.observe_state(host_id, {k: h.get(k) for k in HOST_STATE_KEYS},
+                                            h.get("latest"))
+
+    def host_history(self, host_id, range):
+        """At most 300 history points for ``range`` (1h raw, 24h/7d from rollups)."""
+        canonical = self._canonical_host(host_id)
+        ids = [host_id, canonical] + [a for a, c in self._host_aliases.items() if c == canonical]
+        for hid in dict.fromkeys(ids):
+            if self.host_metrics.has(hid):
+                return self.host_metrics.history(hid, range)
+        return self.host_metrics.history(host_id, range)
+
     # ---------------------------------------------------------- ingestion
     # Idempotent upserts that honor an external (runtime-supplied) entity id, so
     # agents/machines can report their lifecycle without minting new ids on every
@@ -849,38 +936,39 @@ class ControlPlaneRepo:
 
     def upsert_host(self, host_id, host_name, tailnet_ip, *,
                     cpu=None, mem=None, status="healthy", inventory=None):
-        stamp = self._stamp()
-        inventory = _clean_inventory(inventory)
-        existing = self._hosts.get(host_id)
-        if existing is None:
-            rec = {"host_id": host_id, "host_name": host_name,
-                   "tailnet_ip": tailnet_ip, "status": status,
-                   "cpu": cpu, "mem": mem,
-                   "last_seen": stamp, "created_at": stamp}
+        with self._event_lock:
+            stamp = self._stamp()
+            inventory = _clean_inventory(inventory)
+            existing = self._hosts.get(host_id)
+            if existing is None:
+                rec = {"host_id": host_id, "host_name": host_name,
+                       "tailnet_ip": tailnet_ip, "status": status,
+                       "cpu": cpu, "mem": mem,
+                       "last_seen": stamp, "created_at": stamp}
+                if inventory:
+                    rec["inventory"] = {**inventory, "collected_at": stamp}
+                self._hosts[host_id] = rec
+                self.record_event("host", host_id, "HostRegistered",
+                                  {"host_name": host_name,
+                                   "tailnet_ip": tailnet_ip,
+                                   **({"inventory": inventory} if inventory else {})})
+                return _copy(rec)
+            existing["host_name"] = host_name or existing["host_name"]
+            existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
+            existing["status"] = status
+            existing["last_seen"] = stamp
+            if cpu is not None:
+                existing["cpu"] = cpu
+            if mem is not None:
+                existing["mem"] = mem
+            payload = {"host_name": existing["host_name"],
+                       "tailnet_ip": existing["tailnet_ip"],
+                       "cpu": cpu, "mem": mem}
             if inventory:
-                rec["inventory"] = {**inventory, "collected_at": stamp}
-            self._hosts[host_id] = rec
-            self.record_event("host", host_id, "HostRegistered",
-                              {"host_name": host_name,
-                               "tailnet_ip": tailnet_ip,
-                               **({"inventory": inventory} if inventory else {})})
-            return _copy(rec)
-        existing["host_name"] = host_name or existing["host_name"]
-        existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
-        existing["status"] = status
-        existing["last_seen"] = stamp
-        if cpu is not None:
-            existing["cpu"] = cpu
-        if mem is not None:
-            existing["mem"] = mem
-        payload = {"host_name": existing["host_name"],
-                   "tailnet_ip": existing["tailnet_ip"],
-                   "cpu": cpu, "mem": mem}
-        if inventory:
-            existing["inventory"] = {**inventory, "collected_at": stamp}
-            payload["inventory"] = inventory
-        self.record_event("host", host_id, "HostHeartbeat", payload)
-        return _copy(existing)
+                existing["inventory"] = {**inventory, "collected_at": stamp}
+                payload["inventory"] = inventory
+            self.record_event("host", host_id, "HostHeartbeat", payload)
+            return _copy(existing)
 
     def upsert_session(self, session_id, *, host_id=None, mission_id=None,
                        agent_role="", model="", status="active",
@@ -1983,6 +2071,17 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != "collab"]
         if durable:
             self.inspector.hydrate(durable)
+        # Host telemetry rollups/state ride a private stream: rebuild history and
+        # put the latest record back on each host.
+        metrics = []
+        for key in [k for k in self._events if k[0] == HOST_METRICS_ENTITY]:
+            metrics.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != HOST_METRICS_ENTITY]
+        self.host_metrics = self._new_host_metrics()
+        for hid, rec in self.host_metrics.hydrate(metrics).items():
+            host = self._hosts.get(hid)
+            if host is not None:
+                host.update({k: v for k, v in rec.items() if v is not None})
 
     def take_collab_replay(self):
         """Hand the diverted durable HCN events to the collaboration service (once)."""

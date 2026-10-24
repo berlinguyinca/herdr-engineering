@@ -16,6 +16,30 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   (`ssh host && herdr workspace focus ...`, which ran the second half locally) is gone
   from the page.
 
+### Host telemetry and fleet provisioning
+- Collector (`host_metrics.py`, run by the fabric agent): CPU, memory, swap, disk and
+  mounts, load, uptime, network, GPU (NVIDIA, ROCm, Apple), top consumers and agent
+  count every 30 s, plus an hourly report of package/security updates, reboot-required,
+  failed units and tool versions. Intervals: `fabric.host_report_interval` and
+  `fabric.host_slow_interval` (YAML only). The agent count is the number of agent
+  processes named in `fabric.agent_binaries` (YAML, default `pi`, `claude`, `codex`).
+- Control plane: validated host metrics with 48 h raw history and 7 d of durable
+  5-minute rollups (max 300 points); `GET /api/v1/hosts/<id>/telemetry?range=1h|24h|7d`;
+  server-side `problems`/`problem_count` on host reads (stale, never_reported, disk,
+  memory, GPU, failed units, security updates, reboot, version drift, update age).
+- Pages: host detail page and richer list cards with range picker, gauges,
+  sparklines, GPU, mounts, top consumers, updates, versions with pin drift, a
+  problems strip and a never-reported state.
+- Ansible: `tailscale` role (joins only from `NeedsLogin`, auth key from Vault) and
+  `fleet-update.yml` with the `herdr_fleet_update` role, run daily by cron on the main
+  host: security-only OS updates, busy-host deferral, pinned herdr-eng revision, one
+  host at a time, agent restart once, `maintenance` flag and a forced single-host run.
+  See `ansible/README.md`.
+- Behaviour changes: `GET /api/v1/hosts/<id>/telemetry?limit=` is now honoured
+  (1..500); host events from non-agent sources (e.g. the fleet update) no longer
+  refresh a host's liveness or create hosts; `versions.herdr` is now the herdr binary
+  version and `herdr_eng` is the herdr-engineering package version.
+
 ### Central fleet config: deploy and servers
 - `deploy/control-plane/deploy.sh` renders the compose variables from the central
   fleet file into a transient 0600 env file (removed on exit, even on failure),
