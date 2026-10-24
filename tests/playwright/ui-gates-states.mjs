@@ -18,6 +18,13 @@ export async function openMention(page) {
   }
   throw new Error('the @-mention list never opened: the room has no agent that accepts tasks');
 }
+/** Wait for the room's agents (they arrive after the chat), then leave the composer empty and closed. */
+export async function chatReady(page) {
+  await openMention(page);
+  await page.keyboard.press('Escape');
+  await page.locator('textarea.conversation-input').fill('');
+  await page.locator('ul[role="listbox"][hidden]').waitFor({ state: 'attached' });
+}
 const nodeSelected = async (page, node = 'attempt:a1') => {
   await openSub(page, 'lineage');
   await page.locator('svg.lin-svg g[data-node]').first().waitFor();
@@ -89,11 +96,11 @@ export const STATES = [
       await page.locator('#hcn-tabs [role="tab"][aria-selected="true"]', { hasText: /Dana/ }).waitFor();
     } },
   { id: 'links: linked workspaces', scope: '#hcn-p-links', must: ['#hcn-links li'], min: 1, minText: 7, open: async (page) => { await openSub(page, 'links'); await page.locator('#hcn-links li').first().waitFor(); } },
-  { id: 'chat: expanded message editor (a modal dialog)', scope: '#hcn-p-chat', must: ['form.conversation-composer--expanded[role="dialog"][aria-modal="true"]'], min: 16, minText: 15,
-    open: async (page) => { await openSub(page, 'chat'); await page.locator('[data-expand]').click(); await page.locator('form.conversation-composer--expanded').waitFor(); await page.waitForTimeout(200); } },
-  { id: 'chat: the @-mention list open (a listbox of agents)', scope: '#hcn-p-chat', must: ['ul[role="listbox"]:not([hidden]) [role="option"]', 'textarea[role="combobox"][aria-expanded="true"]'], min: 17, minText: 15,
+  { id: 'chat: expanded message editor (a modal dialog)', scope: '#hcn-p-chat', must: ['form.conversation-composer--expanded[role="dialog"][aria-modal="true"]'], min: 16, minText: 27,
+    open: async (page) => { await openSub(page, 'chat'); await chatReady(page); await page.locator('[data-expand]').click(); await page.locator('form.conversation-composer--expanded').waitFor(); await page.waitForTimeout(200); } },
+  { id: 'chat: the @-mention list open (a listbox of agents)', scope: '#hcn-p-chat', must: ['ul[role="listbox"]:not([hidden]) [role="option"]', 'textarea[role="combobox"][aria-expanded="true"]'], min: 17, minText: 28,
     open: async (page) => { await openSub(page, 'chat'); await openMention(page); } },
-  { id: 'chat: composer with a menu of agents', scope: '#hcn-p-chat', must: ['#hcn-log'], min: 16, minText: 15, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); } },
+  { id: 'chat: composer with a menu of agents', scope: '#hcn-p-chat', must: ['#hcn-log'], min: 16, minText: 27, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); await chatReady(page); } },
 ];
 
 /** Run as the VIEWER (carol): the same panels with fewer controls. A viewer has no composer and cannot steer, and that must be audited too. */

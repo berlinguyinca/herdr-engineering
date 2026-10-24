@@ -105,8 +105,21 @@ test('the expanded message editor is a modal dialog: role, name, Tab stays insid
   assert.equal(await expand.getAttribute('aria-expanded'), 'true');
   const inside = () => page.evaluate(() => { const a = document.activeElement; return !!a && !!a.closest('form.conversation-composer--expanded'); });
   assert.ok(await inside(), 'focus moved into the dialog when it opened');
-  for (let i = 0; i < 14; i += 1) { await page.keyboard.press('Tab'); if (!(await inside())) assert.fail(`Tab number ${i + 1} left the dialog`); }
-  for (let i = 0; i < 14; i += 1) { await page.keyboard.press('Shift+Tab'); if (!(await inside())) assert.fail(`Shift+Tab number ${i + 1} left the dialog`); }
+  // The trap is at the ends. Start from the last control that is not the textarea (whose own Tab handler indents) and require Tab to
+  // wrap to the first, then from the first and require Shift+Tab to wrap to the last. A form whose edge lets focus escape fails here.
+  const ring = await form.evaluate((f) => [...f.querySelectorAll('button, input, textarea, select, [tabindex="0"]')].filter((e) => !e.disabled && e.getClientRects().length && e.tabIndex >= 0).map((e, i) => { e.dataset.ring = String(i); return { i, tag: e.tagName }; }));
+  assert.ok(ring.length >= 4, `the dialog has several controls (${ring.length})`);
+  const first = ring[0].i; const last = ring.at(-1).i;
+  const at = () => page.evaluate(() => document.activeElement?.dataset.ring ?? null);
+  if (ring.at(-1).tag !== 'TEXTAREA') {
+    await page.locator(`[data-ring="${last}"]`).focus(); await page.keyboard.press('Tab');
+    assert.equal(await at(), String(first), 'Tab from the last control wraps to the first, inside the dialog');
+  }
+  if (ring[0].tag !== 'TEXTAREA') {
+    await page.locator(`[data-ring="${first}"]`).focus(); await page.keyboard.press('Shift+Tab');
+    assert.equal(await at(), String(last), 'Shift+Tab from the first control wraps to the last, inside the dialog');
+  }
+  assert.ok(await inside(), 'focus never left the dialog');
   await page.locator('textarea.conversation-input').focus();
   await page.keyboard.press('Escape');
   await page.waitForFunction(() => !document.querySelector('form.conversation-composer--expanded'));
