@@ -190,3 +190,25 @@ test('agent workspace: a streamed message appends with an enter transition; earl
   assert.deepEqual(r,{m1:true,a2:true,entered:mode==='off'?['3','4']:[]});
  });
 });
+
+test('agent workspace: changing a filter shows its rows without the enter transition',async()=>withPage(async(page,base)=>{
+ await page.goto(`${base}/__blank`);
+ await page.evaluate(async()=>{
+  document.documentElement.dataset.calm='off';
+  document.body.innerHTML='<div id="host"></div>';
+  const {mountSessionWorkspace}=await import('/session-workspace.js');
+  const events=[{seq:1,rev:1,kind:'message',agent_id:'main',data:{role:'user',text:'Hello'}},{seq:2,rev:2,kind:'message',agent_id:'helper',data:{role:'assistant',text:'Helper here'}},
+   {seq:3,rev:3,kind:'message',agent_id:'main',data:{role:'assistant',text:'Main again'}},{seq:4,rev:4,kind:'tool',agent_id:'main',data:{tool:'bash',status:'ok'}}];
+  const data={events,rev:4,epoch:'e',has_more:false,summary:{agents:[{agent_id:'main'},{agent_id:'helper'}],association:{}}};
+  const client={getInspector:async()=>structuredClone(data),inspectorStreamUrl:()=>'/stream',listSessions:async()=>({sessions:[]}),sendMessage:async()=>({status:'delivered'})};
+  mountSessionWorkspace(document.querySelector('#host'),client,{session_id:'s',status:'working',host_id:'h'},{connect:o=>{window.stream=o;return ()=>{};}});
+ });
+ await page.waitForSelector('[data-message-seq="3"]');
+ await watch(page);
+ await page.locator('[data-agent-filter]').selectOption('helper');
+ await page.waitForFunction(()=>document.querySelectorAll('[data-message-seq]').length===1);
+ await page.locator('[data-agent-filter]').selectOption('');
+ await page.waitForFunction(()=>document.querySelectorAll('[data-message-seq]').length===3);
+ await sleep(200);
+ assert.deepEqual((await watched(page)).entered,[],'rows a filter brings back do not slide in');
+}));
