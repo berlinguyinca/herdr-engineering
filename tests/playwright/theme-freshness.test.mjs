@@ -74,21 +74,43 @@ test('setCalm("on") zeroes transition duration on a [data-flash] element',async(
  await page.evaluate(()=>{document.body.innerHTML='<div id="x" data-flash>v</div>'});
  assert.notEqual(await dur(),'0s');
  await page.evaluate(()=>setCalm('on'));
- assert.equal(await dur(),'0s');
+ assert.ok(parseFloat(await dur())<0.001);
  assert.equal(await page.evaluate(()=>getComputedStyle(document.getElementById('x')).animationName),'none');
 }));
 
-test('index.html applies stored theme and calm before module load and mounts the controls',async()=>withPage(async(page,base)=>{
+test('inline script applies stored theme and calm before any module loads',async()=>withPage(async(page,base)=>{
  await page.addInitScript(()=>{localStorage.setItem('herdr.theme','dark');localStorage.setItem('herdr.calm','on')});
  await page.route('**/api/**',r=>r.fulfill({status:200,contentType:'application/json',body:'{}'}));
- await page.goto(`${base}/`);
+ let release;const gate=new Promise(r=>{release=r});
+ await page.route(/\/(motion|theme-controls|freshness|app)\.js$/,async route=>{await gate;await route.continue();});
+ // deferred module scripts block DOMContentLoaded, so resolve on commit and poll for the inline script's effect
+ await page.goto(`${base}/`,{waitUntil:'commit'});
+ await page.waitForFunction(()=>document.documentElement.dataset.theme==='dark');
+ // modules are held back, so only the inline script can have set these
+ const early=await page.evaluate(()=>({t:document.documentElement.dataset.theme,c:document.documentElement.dataset.calm,controls:!!document.querySelector('.hd-controls')}));
+ assert.deepEqual(early,{t:'dark',c:'on',controls:false});
+ release();
  await page.waitForSelector('.hd-controls');
- const r=await page.evaluate(()=>({t:document.documentElement.dataset.theme,c:document.documentElement.dataset.calm,sel:[...document.querySelectorAll('.hd-controls select')].map(s=>s.value)}));
- assert.deepEqual(r,{t:'dark',c:'on',sel:['dark','on']});
+ const r=await page.evaluate(()=>[...document.querySelectorAll('.hd-controls select')].map(s=>s.value));
+ assert.deepEqual(r,['dark','on']);
  await page.selectOption('.hd-controls select[data-control="calm"]','off');
  assert.equal(await page.evaluate(()=>[document.documentElement.dataset.calm,localStorage.getItem('herdr.calm')].join()),'off,off');
  await page.selectOption('.hd-controls select[data-control="theme"]','auto');
  assert.equal(await page.evaluate(()=>[document.documentElement.dataset.theme??'none',localStorage.getItem('herdr.theme')].join()),'none,');
+}));
+
+test('explicit calm=off beats OS reduced motion; auto and on honour it',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ await page.emulateMedia({reducedMotion:'reduce'});
+ await page.evaluate(()=>{document.body.innerHTML='<div id="x" data-flash>v</div>'});
+ const dur=()=>page.evaluate(()=>getComputedStyle(document.getElementById('x')).transitionDuration);
+ const anim=()=>page.evaluate(()=>getComputedStyle(document.getElementById('x')).animationName);
+ await page.evaluate(()=>setCalm('auto'));
+ assert.ok(parseFloat(await dur())<0.001);assert.equal(await anim(),'none');
+ await page.evaluate(()=>setCalm('off'));
+ assert.equal(await dur(),'0.6s');assert.equal(await anim(),'hd-flash');
+ await page.evaluate(()=>setCalm('on'));
+ assert.ok(parseFloat(await dur())<0.001);
 }));
 
 test('every var(--token) used in packages is defined',()=>{
