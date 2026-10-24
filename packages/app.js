@@ -23,6 +23,8 @@ import { RANGES, safeHostId } from './host-view.js';
 import { mountHosts, loadHosts } from './hosts-view.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
+import { mountAnalytics, loadAnalytics } from './analytics-view.js';
+import { morph } from './patch.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 
@@ -96,10 +98,10 @@ const ROUTES = {
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
   '/analytics': viewAnalytics,
-  '/analytics/missions': viewAnalyticsMissions,
-  '/analytics/models': viewAnalyticsModels,
-  '/analytics/hosts': viewAnalyticsHosts,
-  '/analytics/tokens': viewAnalyticsTokens,
+  '/analytics/missions': viewAnalytics,
+  '/analytics/models': viewAnalytics,
+  '/analytics/hosts': viewAnalytics,
+  '/analytics/tokens': viewAnalytics,
 };
 
 // Router rule: render() runs only on a route change (any hash change, query
@@ -108,11 +110,8 @@ const ROUTES = {
 // currentView.refresh(hint) and never replaces the page; the spinner shows only
 // on a route's first load.
 //
-// View contract: a view* function may return {refresh(hint), dispose()}. One
-// that returns nothing gets NO_REFRESH, except the full-render routes below,
-// which a compat view re-runs in place (no spinner) until Tasks 7-9 mount them.
-const RERENDER_ROUTES = new Set(['/analytics', '/analytics/missions',
-  '/analytics/models', '/analytics/hosts', '/analytics/tokens', '/missions/:id']);
+// View contract: a view* function may return {refresh(hint), dispose()}; one that
+// returns nothing (an error or not-found page) gets NO_REFRESH.
 const NO_REFRESH = { refresh() {}, dispose() {} };
 // These dashboards own their polling; SSE must preserve their filters and focus.
 const ownPolling = (view) => ({ refresh() {}, dispose: () => view.dispose() });
@@ -145,9 +144,9 @@ function unmountView() {
   if (currentView) { currentView.dispose(); currentView = null; }
 }
 
-// Compat for routes not yet mounted: re-run the route's view function in place.
-// A failed refresh keeps the last page; a refresh that yields a real view
-// (e.g. retrying a page whose first load failed) adopts it.
+// Retry for a page whose first load failed: re-run the route's view function in
+// place on the next event. A failed retry keeps the error page; a retry that
+// yields a real view adopts it.
 function rerenderView(load) {
   let running = false;
   return {
@@ -185,7 +184,7 @@ async function render() {
     return;
   }
   if (revision !== renderRevision) { view?.dispose(); return; }
-  mountView(view || (RERENDER_ROUTES.has(match) ? rerenderView(load) : NO_REFRESH));
+  mountView(view || NO_REFRESH);
 }
 
 // ------------------------------------------------------------- views
@@ -247,6 +246,7 @@ async function viewMission(parts, revision) {
   const disposeLive = key.startsWith('pi:') ? mountMissionActivity(document.getElementById('live-mission-detail'), client, key) : null;
   const history = document.getElementById('mission-history');
   let pending = false;
+  let shownTimeline = [null, ''];
   const refreshHistory = async (initial) => {
     if (pending || !history.isConnected || document.hidden) return;
     pending = true;
@@ -256,8 +256,8 @@ async function viewMission(parts, revision) {
       const scope = m.purpose || m.cwd || m.title;
       const [sessionsHtml, streamHtml] = await Promise.all([missionSessions(m), streamList('mission', missionKey(m))]);
       if (revision !== renderRevision || !history.isConnected) return;
-      const open = new Map([...history.querySelectorAll('details[data-history-panel]')].map(el => [el.dataset.historyPanel, el.open]));
-      history.innerHTML = `<h2>Recorded history</h2>
+      // Morphed in place: identical data writes nothing and open disclosures stay open.
+      morph(history, `<h2>Recorded history</h2>
     <div style="margin:8px 0"><herdr-status stage="${esc(m.status)}"></herdr-status>
       <span class="hd-card__sub"> · ${sessions} agents · ${esc(m.stage || 'Stage not recorded')} · created ${esc(formatTimestamp(m.created_at))}</span></div>
     <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
@@ -269,22 +269,21 @@ async function viewMission(parts, revision) {
     </details>
     <details class="hd-card" data-history-panel="sessions"><summary>Recorded agents · ${sessions}</summary>${sessionsHtml}</details>
     <details class="hd-card" data-history-panel="timeline"><summary>Timeline</summary><herdr-timeline id="mission-timeline"></herdr-timeline></details>
-    <details class="hd-card" data-history-panel="events"><summary>Event stream</summary><div id="mission-stream">${streamHtml}</div></details>`;
-      history.querySelectorAll('details[data-history-panel]').forEach(el => { if (open.has(el.dataset.historyPanel)) el.open = open.get(el.dataset.historyPanel); });
+    <details class="hd-card" data-history-panel="events"><summary>Event stream</summary><div id="mission-stream">${streamHtml}</div></details>`);
 
       const timelineElement = history.querySelector('#mission-timeline');
-      try {
-        const { timeline } = await client.missionTimeline(missionKey(m));
-        timelineElement.items = timeline || [];
-      } catch { timelineElement.items = []; }
+      let items = [];
+      try { items = (await client.missionTimeline(missionKey(m))).timeline || []; } catch { /* empty timeline */ }
+      const itemsKey = JSON.stringify(items);
+      if (timelineElement !== shownTimeline[0] || itemsKey !== shownTimeline[1]) { timelineElement.items = items; shownTimeline = [timelineElement, itemsKey]; }
     } catch (error) {
-      if (history.isConnected) history.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
+      // A failed first load shows the error; a failed refresh keeps the last history.
+      if (history.isConnected && !history.querySelector('details[data-history-panel]')) history.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
     } finally { pending = false; }
   };
   await refreshHistory(m);
-  // Mission telemetry owns its polling; refreshing only the recorded history keeps disclosures open.
-  // Non-Pi missions still re-render through the compat view until Task 9.
-  if (disposeLive) return { refresh: () => refreshHistory(), dispose: disposeLive };
+  // Mission telemetry owns its polling; a live event refreshes only the recorded history, in place.
+  return { refresh: () => refreshHistory(), dispose: disposeLive || (() => {}) };
 }
 
 async function missionSessions(m) {
@@ -424,83 +423,12 @@ async function viewActivity(_parts, revision) {
   return mountActivity(root, client, { data, missionTitles });
 }
 
-async function viewAnalytics(_parts, revision) {
-  const [missions, models, hosts] = await Promise.all([
-    client.analytics('missions'), client.analytics('models'), client.analytics('hosts'),
-  ]);
+// /analytics and /analytics/{missions,models,tokens,hosts}: one mounted view per sub-page.
+async function viewAnalytics(parts, revision) {
+  const sub = parts[1] || '';
+  const data = await loadAnalytics(client, sub);
   if (revision !== renderRevision) return;
-  root.innerHTML = `
-    <style>
-      .an-dashboard{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:var(--density-gap,16px);align-items:start;width:100%}.an-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--density-panel-padding,16px)}.an-panel h2{font-size:16px;margin:0 0 12px}.an-panel p{font-size:12px;color:var(--text-secondary)}
-      .an-value{font-size:28px;font-weight:700;line-height:1.1}.an-value span{font-size:12px;font-weight:400;color:var(--text-secondary)}.an-pairs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.an-pairs div{min-width:0}.an-pairs strong{display:block;font-size:20px}.an-pairs span{font-size:12px;color:var(--text-secondary)}
-      .an-links{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(160px,100%),1fr));gap:8px}.an-links a{display:flex;flex-direction:column;gap:4px;min-width:0;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);text-decoration:none}.an-links a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.an-links strong{color:var(--text)}.an-links span{font-size:12px;color:var(--text-secondary)}
-      .an-stage{grid-column:span 2}.an-model-list{margin:0;padding:0;list-style:none}.an-model-list li{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid var(--border-subtle);font-size:12px}.an-model-list li:first-child{border-top:0}.an-model-list span{overflow-wrap:anywhere}.an-stage .hd-card{padding:10px;margin-top:8px}
-      @media(max-width:700px){.an-stage{grid-column:auto}.an-pairs{grid-template-columns:minmax(0,1fr)}}
-    </style>
-    <h1>Analytics</h1>
-    <div class="an-dashboard">
-      <section class="an-panel" data-analytics-panel="missions"><h2>Missions</h2><div class="an-value">${missions.total} <span>observed</span></div><p>${missions.completed} completed</p></section>
-      <section class="an-panel" data-analytics-panel="completion"><h2>Completion</h2><div class="an-value">${missions.completion_rate}%</div><p>Across recorded missions</p></section>
-      <section class="an-panel" data-analytics-panel="fleet"><h2>Fleet health</h2><div class="an-pairs"><div><strong>${hosts.healthy}</strong><span>healthy</span></div><div><strong>${hosts.unavailable}</strong><span>unavailable</span></div></div><p>${hosts.total} hosts reporting</p></section>
-      <section class="an-panel" data-analytics-panel="models"><h2>Model coverage</h2><div class="an-value">${Object.keys(models.models).length} <span>models</span></div><p>${models.total_sessions} agent sessions</p><ul class="an-model-list">${Object.entries(models.models).slice(0, 4).map(([model, usage]) => `<li><span>${esc(model)}</span><strong>${usage.sessions}</strong></li>`).join('') || '<li><span>No model usage recorded</span></li>'}</ul></section>
-      <section class="an-panel" data-analytics-panel="views"><h2>Explore analytics</h2><nav class="an-links" data-analytics-links aria-label="Analytics views"><a href="#/analytics/models"><strong>Models</strong><span>Agent distribution by model</span></a><a href="#/analytics/hosts"><strong>Hosts</strong><span>Reported fleet health</span></a><a href="#/analytics/tokens"><strong>Token usage</strong><span>Requests and tokens by project</span></a></nav></section>
-      <section class="an-panel an-stage" data-analytics-panel="stages"><h2>Missions by stage</h2>${stageBars(missions.by_stage)}</section>
-    </div>`;
-}
-
-async function viewAnalyticsMissions(parts, revision) { await viewAnalytics(parts, revision); }
-async function viewAnalyticsModels(_parts, revision) {
-  const { models, total_sessions } = await client.analytics('models');
-  if (revision !== renderRevision) return;
-  root.innerHTML = `<h1>Model analytics</h1><p>${total_sessions} total agents</p><div class="hd-grid">` +
-    Object.entries(models).map(([model, u]) => `
-      <div class="hd-card">
-        <div class="hd-card__title">${esc(model)}</div>
-        <div class="hd-card__sub">${u.sessions} agent(s) · ${u.messages} messages</div>
-      </div>`).join('') + '</div>';
-}
-async function viewAnalyticsTokens(_parts, revision) {
-  const t = await client.analytics('tokens');
-  if (revision !== renderRevision) return;
-  const fmt = (n) => Number(n || 0).toLocaleString();
-  const rows = (bucket) => Object.entries(bucket).map(([k, u]) => `
-      <tr><td>${esc(k)}</td><td>${fmt(u.requests)}</td><td>${fmt(u.input_tokens)}</td>
-      <td>${fmt(u.output_tokens)}</td><td>${fmt(u.reasoning_tokens)}</td><td>${fmt(u.failed)}</td></tr>`).join('');
-  const table = (title, bucket) => `<h3 style="margin-top:20px">${title}</h3>
-    <table class="hd-table"><thead><tr><th></th><th>Requests</th><th>Input</th><th>Output</th>
-    <th>Reasoning</th><th>Failed</th></tr></thead><tbody>${rows(bucket) ||
-      '<tr><td colspan="6">No usage recorded yet.</td></tr>'}</tbody></table>`;
-  root.innerHTML = `<h1>Token usage</h1>
-    <div class="hd-grid">
-      <herdr-metric label="Requests" value="${fmt(t.total.requests)}"></herdr-metric>
-      <herdr-metric label="Input tokens" value="${fmt(t.total.input_tokens)}"></herdr-metric>
-      <herdr-metric label="Output tokens" value="${fmt(t.total.output_tokens)}"></herdr-metric>
-    </div>` + table('By project', t.by_project) + table('By model', t.by_model) +
-    table('By day', t.by_day);
-}
-async function viewAnalyticsHosts(_parts, revision) {
-  const h = await client.analytics('hosts');
-  if (revision !== renderRevision) return;
-  root.innerHTML = `
-    <h1>Host analytics</h1>
-    <div class="hd-grid">
-      <herdr-metric label="Total" value="${h.total}"></herdr-metric>
-      <herdr-metric label="Healthy" value="${h.healthy}"></herdr-metric>
-      <herdr-metric label="Unavailable" value="${h.unavailable}"></herdr-metric>
-    </div>`;
-}
-
-function stageBars(byStage) {
-  const entries = Object.entries(byStage || {});
-  if (!entries.length) return '<herdr-empty message="No mission data"></herdr-empty>';
-  return entries.map(([stage, n]) => `
-    <div class="hd-card" style="display:flex;align-items:center;gap:12px">
-      <herdr-status stage="${esc(stage)}"></herdr-status>
-      <div style="flex:1;background:var(--surface-2);border-radius:4px;height:10px;overflow:hidden">
-        <div style="width:${Math.min(100, n * 14)}%;height:100%;background:var(--accent)"></div>
-      </div>
-      <span class="hd-card__sub">${n}</span>
-    </div>`).join('');
+  return mountAnalytics(root, client, sub, { data });
 }
 
 async function streamList(entityType, entityId) {
