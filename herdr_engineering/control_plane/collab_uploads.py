@@ -3,8 +3,8 @@
 The harness expands paths and hashes bytes locally. Only UploadPart is signed;
 completion, server-side promotion and atomic publication remain server-owned.
 SHA256 multipart checksums are composite, never ETags or user metadata. For a
-multipart destination we verify the ordered part digests; the manifest's whole
-file SHA256 remains a harness assertion until an independent full-object check.
+multipart destination we persist verified part digests and leave whole-file
+SHA256 unset. Archival derives that hash while independently verifying the parts.
 No object body is downloaded or proxied by this workflow.
 """
 from __future__ import annotations
@@ -120,6 +120,8 @@ class CollabUploads:
     def __init__(self, store, storage, *, now=time.time):
         self.store, self.storage, self.now = store, storage, now
         self.s3 = storage._archive._s3
+        if getattr(self.s3, 'meta', None) is not None and self.s3.meta.config.signature_version != 's3v4':
+            raise ValueError('SHA256 upload grants require Signature V4')
         self.bucket = storage.config.live_bucket
         self.environment = storage.config.environment
 
@@ -192,6 +194,7 @@ class CollabUploads:
         expected = _composite(file) if head.get('ChecksumType') == 'COMPOSITE' else _b64(file['sha256'])
         if checksum != expected:
             raise CollabError(409, 'uploaded checksum missing or mismatch')
+        return head.get('ChecksumType') != 'COMPOSITE'
 
     async def _parts(self, key, multipart_id, file):
         found, marker = [], 0
@@ -245,7 +248,7 @@ class CollabUploads:
                                                        created_by=principal.owner, manifest=state)
             expires = min(self.now() + ttl, row.manifest['session_expires_at'])
             state = {**row.manifest, 'grant_expires_at': max(expires, row.manifest.get('grant_expires_at', 0))}
-            await self.store.update_upload(upload_id, 'uploading', state)
+            await self.store.update_upload(upload_id, 'uploading', state, action='grant', actor=principal)
             records = await self.store.upload_parts(upload_id)
             multipart = {p['relative_path']: p['multipart_id'] for p in records}
             granted, index, emitted, next_cursor = [], 0, 0, None
@@ -283,7 +286,8 @@ class CollabUploads:
                         'ChecksumSHA256': _b64(part['sha256']), 'ContentLength': part['size_bytes']},
                         ExpiresIn=remaining)
                     urls.append({'part_number': n, 'size_bytes': part['size_bytes'], 'url': url,
-                                 'headers': {'x-amz-checksum-sha256': _b64(part['sha256'])}})
+                                 'headers': {'x-amz-checksum-sha256': _b64(part['sha256']),
+                                             'content-length': str(part['size_bytes'])}})
                     emitted += 1
                 if urls:
                     granted.append({'relative_path': file['relative_path'], 'parts': urls})
@@ -352,11 +356,13 @@ class CollabUploads:
                                ExtraArgs={'ChecksumAlgorithm': 'SHA256'},
                                Config=TransferConfig(multipart_threshold=MAX_PART,
                                                      multipart_chunksize=row.manifest['part_size']))
-                self._verify_head(await self._head(destination), file)
+                full_hash_verified = self._verify_head(await self._head(destination), file)
                 records.append({'file_id': self._file_id(row, file), 'room_id': row.room_id,
                                 'upload_id': upload_id, 'uploaded_by': principal.owner,
                                 'relative_path': file['relative_path'], 'storage_key': destination,
-                                'size_bytes': file['size_bytes'], 'sha256': file['sha256']})
+                                'size_bytes': file['size_bytes'],
+                                'sha256': file['sha256'] if full_hash_verified else None,
+                                'verified_parts': None if full_hash_verified else file['parts']})
             await authorize(True, row.room_id)
             result = await self.store.publish_upload(upload_id, records, lambda: authorize(True, row.room_id))
             # A published batch is durable even if staging cleanup needs a retry.
@@ -371,40 +377,81 @@ class CollabUploads:
             row = await self._owned(principal, upload_id, authorize)
             if row.status == 'available':
                 raise CollabError(409, 'available uploads cannot be cancelled')
-            await self.store.update_upload(upload_id, 'failed', row.manifest)
+            await self.store.update_upload(upload_id, 'failed', row.manifest, action='cancelled', actor=principal)
             await self._cleanup(await self.store.get_upload(upload_id))
 
-    async def _cleanup(self, row):
-        # Prefix inventory also catches CreateMultipartUpload succeeding just
-        # before a crash prevented its returned ID from reaching Postgres.
+    async def _multipart_inventory(self, row):
+        """Include orphaned managed copies, but never a neighboring live key."""
         files = row.manifest['files']
-        prefix = self._key(row, files[0]).rsplit('/', 1)[0] + '/'
-        pagination = {}
-        while True:
-            page = await self._io(self.s3.list_multipart_uploads, Bucket=self.bucket, Prefix=prefix, **pagination)
-            for upload in page.get('Uploads', []):
-                if not upload['Key'].startswith(prefix):
-                    raise CollabError(503, 'invalid cleanup inventory')
-                try:
-                    await self._io(self.s3.abort_multipart_upload, Bucket=self.bucket,
-                                   Key=upload['Key'], UploadId=upload['UploadId'])
-                except ClientError as exc:
-                    if exc.response.get('Error', {}).get('Code') != 'NoSuchUpload':
-                        raise
-            if not page.get('IsTruncated'):
-                break
-            next_page = {'KeyMarker': page['NextKeyMarker'], 'UploadIdMarker': page['NextUploadIdMarker']}
-            if next_page == pagination:
-                raise CollabError(503, 'invalid cleanup pagination')
-            pagination = next_page
+        staging = self._key(row, files[0]).rsplit('/', 1)[0] + '/'
+        found = set()
+        for prefix, exact in [(staging, False), *[(self._live(row, f), True) for f in files]]:
+            pagination = {}
+            while True:
+                page = await self._io(self.s3.list_multipart_uploads, Bucket=self.bucket, Prefix=prefix, **pagination)
+                for upload in page.get('Uploads', []):
+                    if not upload['Key'].startswith(prefix):
+                        raise CollabError(503, 'invalid cleanup inventory')
+                    if not exact or upload['Key'] == prefix:
+                        found.add((upload['Key'], upload['UploadId']))
+                if not page.get('IsTruncated'):
+                    break
+                next_page = {'KeyMarker': page['NextKeyMarker'], 'UploadIdMarker': page['NextUploadIdMarker']}
+                if next_page == pagination:
+                    raise CollabError(503, 'invalid cleanup pagination')
+                pagination = next_page
+        return found
+
+    async def _cleanup(self, row):
+        try:
+            return await self._cleanup_objects(row)
+        except Exception:
+            await self.store.audit_upload(row.upload_id, 'cleanup_retry')
+            raise
+
+    async def _cleanup_objects(self, row):
+        if row.manifest.get('cleanup_done'):
+            return True
+        files = row.manifest['files']
+        known = {tuple(item) for item in row.manifest.get('cleanup_multiparts', [])}
+        by_path = {f['relative_path']: f for f in files}
+        for part in await self.store.upload_parts(row.upload_id):
+            if part['multipart_id']:
+                known.add((self._key(row, by_path[part['relative_path']]), part['multipart_id']))
+        known |= await self._multipart_inventory(row)
+        state = {**row.manifest, 'cleanup_multiparts': [list(item) for item in sorted(known)]}
+        # Persist IDs before abort: an aborted upload may disappear from inventory
+        # while its in-flight parts are still consuming storage.
+        await self.store.update_upload(row.upload_id, row.status, state, action='cleanup_started')
+        empty = True
+        for key, multipart_id in sorted(known):
+            try:
+                await self._io(self.s3.abort_multipart_upload, Bucket=self.bucket, Key=key, UploadId=multipart_id)
+            except ClientError as exc:
+                if exc.response.get('Error', {}).get('Code') != 'NoSuchUpload':
+                    raise
+            try:
+                page = await self._io(self.s3.list_parts, Bucket=self.bucket, Key=key, UploadId=multipart_id)
+                if page.get('Parts') or page.get('IsTruncated'):
+                    empty = False
+            except ClientError as exc:
+                if exc.response.get('Error', {}).get('Code') != 'NoSuchUpload':
+                    raise
+        # Check inventory again; grant expiry is necessary but not storage proof.
+        remaining = await self._multipart_inventory(row)
+        state['cleanup_multiparts'] = [list(item) for item in sorted(known | remaining)]
         for file in files:
             await self._io(self.s3.delete_object, Bucket=self.bucket, Key=self._key(row, file))
             if row.status != 'available':
                 await self._io(self.s3.delete_object, Bucket=self.bucket, Key=self._live(row, file))
-        # Wait out signed grants before marking aborted sessions fully cleaned.
-        # In-flight UploadPart calls may finish after the first abort.
-        done = row.status == 'available' or self.now() >= row.manifest.get('grant_expires_at', 0)
-        await self.store.update_upload(row.upload_id, row.status, {**row.manifest, 'cleanup_done': done})
+        done = (empty and not remaining
+                and (row.status == 'available' or self.now() >= row.manifest.get('grant_expires_at', 0)))
+        state['cleanup_done'] = done
+        if done:
+            state.pop('cleanup_multiparts', None)
+        await self.store.update_upload(row.upload_id, row.status, state,
+                                       action='cleanup_completed' if done else 'cleanup_retry')
+        return done
 
     async def cleanup_expired_uploads(self, limit=100):
         """Worker entrypoint; bounded, retryable, no user authority needed to expire grants."""
@@ -415,10 +462,10 @@ class CollabUploads:
             for row in await self.store.uploads_for_cleanup(self.now(), limit):
                 try:
                     if row.status != 'available':
-                        await self.store.update_upload(row.upload_id, 'failed', row.manifest)
+                        await self.store.update_upload(row.upload_id, 'failed', row.manifest, action='expired')
                         row = await self.store.get_upload(row.upload_id)
-                    await self._cleanup(row)
-                    reports.append({'upload_id': row.upload_id, 'status': 'cleaned'})
+                    done = await self._cleanup(row)
+                    reports.append({'upload_id': row.upload_id, 'status': 'cleaned' if done else 'retry'})
                 except Exception:
                     reports.append({'upload_id': row.upload_id, 'status': 'retry'})
         return reports

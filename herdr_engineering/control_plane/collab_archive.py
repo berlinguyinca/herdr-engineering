@@ -153,15 +153,20 @@ class CollabArchive:
                 inventory = set(await self._io(self.storage.live_inventory, archive.original_room_id))
                 for file in snapshot['room_files']:
                     base = live_key(self.storage.config.environment, archive.original_room_id, file['file_id'])
-                    if file['storage_key'] != base or not file['sha256']:
+                    if file['storage_key'] != base or not (file['sha256'] or file.get('verified_parts')):
                         raise ValueError('file metadata does not identify verified room bytes')
                     variants = [None] + [k[len(base.removesuffix('blob') + 'preview/'):]
                                          for k in sorted(inventory) if k.startswith(base.removesuffix('blob') + 'preview/')]
                     for variant in variants:
                         ref = await self._io(self.storage.archive_file, archive.archive_id,
-                                             archive.original_room_id, file['file_id'], variant)
-                        if variant is None and (ref.size_bytes, ref.sha256) != (file['size_bytes'], file['sha256']):
-                            raise StorageError('live file verification failed')
+                                             archive.original_room_id, file['file_id'], variant,
+                                             file.get('verified_parts') if variant is None else None)
+                        if variant is None:
+                            if ref.size_bytes != file['size_bytes'] or (file['sha256'] and ref.sha256 != file['sha256']):
+                                raise StorageError('live file verification failed')
+                            # Composite evidence was checked against bytes while hashing.
+                            # Export the independently computed whole-file hash for restore.
+                            file['sha256'] = ref.sha256
                         objects.append({'key': ref.key, 'size_bytes': ref.size_bytes, 'sha256': ref.sha256})
                         sources.append({'file_id': file['file_id'], 'variant': variant})
                         inventory.discard(live_key(self.storage.config.environment, archive.original_room_id, file['file_id'], variant))

@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib
+import io
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import pytest
@@ -65,6 +67,8 @@ class S3:
             self.uploads[args['UploadId']]['parts'][args['PartNumber']] = chunk
 
     def list_parts(self, *, Bucket, Key, UploadId, PartNumberMarker=0):
+        if UploadId not in self.uploads:
+            raise ClientError({'Error': {'Code': 'NoSuchUpload'}}, 'ListParts')
         upload = self.uploads[UploadId]
         assert (upload['Bucket'], upload['Key']) == (Bucket, Key)
         nums = [n for n in sorted(upload['parts']) if n > PartNumberMarker]
@@ -104,6 +108,15 @@ class S3:
     def list_multipart_uploads(self, *, Bucket, Prefix, **kwargs):
         return {'Uploads': [{'Key': u['Key'], 'UploadId': uid} for uid, u in self.uploads.items()
                             if u['Bucket'] == Bucket and u['Key'].startswith(Prefix)]}
+
+    def get_object(self, *, Bucket, Key):
+        return {'Body': io.BytesIO(self.objects[Bucket, Key][0])}
+
+    def put_object(self, *, Bucket, Key, Body):
+        self.objects[Bucket, Key] = (Body, b64(sha(Body)), 'FULL_OBJECT')
+
+    def list_objects_v2(self, *, Bucket, Prefix, **kwargs):
+        return {'Contents': [{'Key': key} for bucket, key in self.objects if bucket == Bucket and key.startswith(Prefix)]}
 
     def delete_object(self, *, Bucket, Key):
         self.objects.pop((Bucket, Key), None)
@@ -429,11 +442,10 @@ def test_upload_grant_pages_are_bounded_and_resume_independently(upload_env):
 
 
 def test_upload_sdk_contract_validates_real_boto3_parameters(upload_env):
-    import boto3
     from botocore.validate import validate_parameters
 
     _, run, _, _, s3, service, pr, _ = upload_env
-    client = boto3.client('s3', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+    client = CollabStorage(S3Config(environment='test', access_key='test', secret_key='test'))._archive._s3
     operations = {'create_multipart_upload': 'CreateMultipartUpload', 'head_object': 'HeadObject',
                   'list_parts': 'ListParts', 'complete_multipart_upload': 'CompleteMultipartUpload',
                   'list_multipart_uploads': 'ListMultipartUploads', 'delete_object': 'DeleteObject'}
@@ -449,7 +461,10 @@ def test_upload_sdk_contract_validates_real_boto3_parameters(upload_env):
 
     def sign(operation, *, Params, ExpiresIn):
         signed = client.generate_presigned_url(operation, Params=Params, ExpiresIn=ExpiresIn)
-        assert 'Signature=' in signed or 'X-Amz-Signature=' in signed
+        query = parse_qs(urlsplit(signed).query)
+        assert query.get('X-Amz-Algorithm') == ['AWS4-HMAC-SHA256']
+        assert not {'Signature', 'AWSAccessKeyId', 'Expires'} & set(query)
+        assert {'content-length', 'x-amz-checksum-sha256'} <= set(query['X-Amz-SignedHeaders'][0].split(';'))
         return signer(operation, Params=Params, ExpiresIn=ExpiresIn)
 
     s3.generate_presigned_url = sign
@@ -467,3 +482,168 @@ def test_upload_preview_accepts_large_file_part_geometry(upload_env):
                            {'size_bytes': 1, 'sha256': 'c' * 64}]}]}
     preview = run(service.preview_upload(pr, ROOM, large))
     assert preview.can_upload and preview.total_bytes == 2 * PART_SIZE + 1
+
+
+def test_upload_rejects_injected_v2_signer(upload_env):
+    import boto3
+    from botocore.config import Config
+
+    from herdr_engineering.control_plane.collab_uploads import CollabUploads
+    client = boto3.client('s3', region_name='us-east-1', aws_access_key_id='test',
+                          aws_secret_access_key='test', config=Config(signature_version='s3'))
+    with pytest.raises(ValueError, match='Signature V4'):
+        CollabUploads(upload_env[2], CollabStorage(S3Config(environment='test'), s3=client))
+
+
+@pytest.mark.parametrize('corrupt_bytes', [False, True])
+def test_upload_composite_only_destination_has_no_verified_whole_hash_and_archives(upload_env, corrupt_bytes):
+    from herdr_engineering.control_plane.collab_archive import CollabArchive
+    conn, run, store, storage, s3, _, pr, _ = upload_env
+    service = setup(upload_env)
+    data = b'a' * PART_SIZE + b'b'
+    declared = manifest(data)
+    declared['files'][0]['sha256'] = 'f' * 64  # cannot be proved from composite SHA256
+    def composite_copy(source, bucket, key, **kwargs):
+        s3.objects[bucket, key] = s3.objects[source['Bucket'], source['Key']]
+    s3.copy = composite_copy
+    grant = run(service.start_upload(pr, ROOM, declared, {}))
+    s3.send(grant, data)
+    files = run(service.finalize_upload(pr, grant.upload_id, {'data/a.csv': 'f' * 64}))
+    assert files[0].sha256 is None, 'an asserted whole-file hash must not become verified metadata'
+    assert files[0].verified_parts == declared['files'][0]['parts']
+    assert run(store.list_room_files(ROOM)) == files
+    if corrupt_bytes:
+        s3_bucket = storage.config.live_bucket
+        s3.objects[s3_bucket, files[0].storage_key] = (b'x' + data[1:], s3.objects[s3_bucket, files[0].storage_key][1], 'COMPOSITE')
+        with pytest.raises(Exception, match='verification|copy failed'):
+            run(CollabArchive(store, storage).archive_room(ROOM, 'owner'))
+        assert run(store.get_room(ROOM)) is not None
+    else:
+        archive = run(CollabArchive(store, storage).archive_room(ROOM, 'owner'))
+        assert archive.status == 'verified'
+        restored = run(CollabArchive(store, storage).restore_room(archive.archive_id, 'owner'))
+        restored_file = run(store.list_room_files(restored.room_id))[0]
+        assert restored_file.sha256 == sha(data)
+        assert s3.objects[storage.config.live_bucket, restored_file.storage_key][0] == data
+
+
+def test_upload_cleanup_aborts_live_copy_multiparts_without_touching_other_files(upload_env):
+    _, run, store, _, s3, service, pr, clock = upload_env
+    grant = start(upload_env)
+    row = run(store.get_upload(grant.upload_id))
+    key = service.upload_service._live(row, row.manifest['files'][0])
+    orphan = s3.create_multipart_upload(Bucket=service.upload_service.bucket, Key=key)['UploadId']
+    unrelated = s3.create_multipart_upload(Bucket=service.upload_service.bucket, Key=key + '-other')['UploadId']
+    clock[0] += 100000
+    run(service.cancel_upload(pr, grant.upload_id))
+    assert orphan not in s3.uploads
+    assert unrelated in s3.uploads
+    assert run(store.get_upload(grant.upload_id)).manifest['cleanup_done']
+
+
+def test_upload_cleanup_cannot_complete_while_aborted_parts_linger(upload_env):
+    _, run, store, _, s3, service, pr, clock = upload_env
+    grant = start(upload_env)
+    s3.send(grant, b'abc')
+    s3.abort_multipart_upload = lambda **kwargs: None
+    clock[0] += 100000
+    run(service.cancel_upload(pr, grant.upload_id))
+    assert not run(store.get_upload(grant.upload_id)).manifest.get('cleanup_done', False)
+    # The provider no longer lists the aborted session, but ListParts still has it.
+    s3.list_multipart_uploads = lambda **kwargs: {'Uploads': []}
+    service = setup(upload_env)
+    assert run(service.upload_service.cleanup_expired_uploads())[0]['status'] == 'retry'
+    assert not run(store.get_upload(grant.upload_id)).manifest.get('cleanup_done', False)
+    s3.uploads.clear()
+    assert run(service.upload_service.cleanup_expired_uploads())[0]['status'] == 'cleaned'
+    assert run(store.get_upload(grant.upload_id)).manifest['cleanup_done']
+
+
+def test_upload_cancel_expiry_and_cleanup_audit_are_attributed_and_deduplicated(upload_env):
+    conn, run, _, _, s3, service, pr, clock = upload_env
+    grant = start(upload_env)
+    s3.fail_abort = True
+    for _ in range(2):
+        with pytest.raises(CollabError):
+            run(service.cancel_upload(pr, grant.upload_id))
+    for _ in range(2):
+        run(service.upload_service.cleanup_expired_uploads())
+    s3.fail_abort = False
+    clock[0] += 100000
+    run(service.upload_service.cleanup_expired_uploads())
+    run(service.cancel_upload(pr, grant.upload_id))
+    events = run(conn.fetch("SELECT * FROM collab_audit_events WHERE entity_id=$1", grant.upload_id))
+    cancel = [e for e in events if e['action'] == 'upload.cancelled']
+    assert len(cancel) == 1
+    assert (cancel[0]['actor_id'], cancel[0]['actor_kind'], cancel[0]['outcome']) == ('owner', 'user', 'complete')
+    cleanup = [e for e in events if e['action'] == 'upload.cleanup_completed']
+    assert len(cleanup) == 1 and cleanup[0]['actor_kind'] == 'system' and cleanup[0]['actor_id'] is None
+    assert len([e for e in events if e['action'] == 'upload.cleanup_retry']) == 1
+    assert 'SECRET' not in str(events)
+    other = start(upload_env, options={'upload_id': str(uuid4())})
+    clock[0] += 100000
+    run(service.upload_service.cleanup_expired_uploads())
+    run(service.upload_service.cleanup_expired_uploads())
+    expired = run(conn.fetch("SELECT * FROM collab_audit_events WHERE entity_id=$1 AND action='upload.expired'", other.upload_id))
+    assert len(expired) == 1 and expired[0]['actor_kind'] == 'system'
+
+
+def test_upload_renewal_and_cancel_roll_back_when_audit_cannot_commit(upload_env):
+    conn, run, store, _, _, service, pr, clock = upload_env
+    grant = start(upload_env)
+    before = run(store.get_upload(grant.upload_id))
+    clock[0] += 10
+    run(conn.execute("ALTER TABLE collab_audit_events ADD CONSTRAINT reject_upload_audit CHECK (action NOT IN ('upload.grant_renewed','upload.cancelled'))"))
+    for call in [lambda: service.start_upload(pr, ROOM, manifest(), {'upload_id': grant.upload_id}),
+                 lambda: service.cancel_upload(pr, grant.upload_id)]:
+        with pytest.raises(CollabError):
+            run(call())
+        assert run(store.get_upload(grant.upload_id)) == before
+    run(conn.execute('ALTER TABLE collab_audit_events DROP CONSTRAINT reject_upload_audit'))
+    for _ in range(2):
+        run(service.start_upload(pr, ROOM, manifest(), {'upload_id': grant.upload_id}))
+    renewed = run(conn.fetch("SELECT * FROM collab_audit_events WHERE entity_id=$1 AND action='upload.grant_renewed'", grant.upload_id))
+    assert len(renewed) == 1 and renewed[0]['actor_id'] == 'owner'
+
+
+@pytest.mark.parametrize('action', ['expired', 'cleanup_completed'])
+def test_upload_system_transition_rolls_back_if_audit_fails(upload_env, action):
+    conn, run, store, _, s3, service, _, clock = upload_env
+    grant = start(upload_env)
+    clock[0] += 100000
+    run(conn.execute(f"ALTER TABLE collab_audit_events ADD CONSTRAINT reject_system_audit CHECK (action != 'upload.{action}')"))
+    assert run(service.upload_service.cleanup_expired_uploads())[0]['status'] == 'retry'
+    row = run(store.get_upload(grant.upload_id))
+    assert not row.manifest.get('cleanup_done', False)
+    if action == 'expired':
+        assert row.status == 'uploading' and s3.uploads
+    run(conn.execute('ALTER TABLE collab_audit_events DROP CONSTRAINT reject_system_audit'))
+    run(service.upload_service.cleanup_expired_uploads())
+    run(service.upload_service.cleanup_expired_uploads())
+    assert run(store.get_upload(grant.upload_id)).manifest['cleanup_done']
+    assert run(conn.fetchval('SELECT count(*) FROM collab_audit_events WHERE entity_id=$1 AND action=$2', grant.upload_id, 'upload.' + action)) == 1
+
+
+def test_upload_agent_cancellation_audit_names_owner_and_agent(upload_env):
+    conn, run, _, _, _, _, _, _ = upload_env
+    service = setup(upload_env)
+    pr = agent(upload_env)
+    run(conn.execute("INSERT INTO collab_agent_permissions(room_id,agent_id,user_id) VALUES ($1,'agent_one','owner')", ROOM))
+    grant = run(service.start_upload(pr, ROOM, manifest(), {}))
+    run(service.cancel_upload(pr, grant.upload_id))
+    event = run(conn.fetchrow("SELECT * FROM collab_audit_events WHERE entity_id=$1 AND action='upload.cancelled'", grant.upload_id))
+    assert (event['actor_id'], event['actor_agent_id'], event['actor_kind']) == ('owner', 'agent_one', 'agent')
+
+
+def test_upload_archive_waits_for_verified_multipart_cleanup(upload_env):
+    _, run, store, _, s3, service, pr, _ = upload_env
+    grant = start(upload_env)
+    s3.send(grant, b'abc')
+    s3.fail_abort = True
+    run(service.finalize_upload(pr, grant.upload_id, {'data/a.csv': sha(b'abc')}))
+    assert run(store.list_room_files(ROOM))
+    with pytest.raises(ValueError, match='unfinished uploads'):
+        run(store.begin_archive(str(uuid4()), ROOM, 'owner'))
+    s3.fail_abort = False
+    run(service.upload_service.cleanup_expired_uploads())
+    assert run(store.begin_archive(str(uuid4()), ROOM, 'owner')).status == 'archiving'
