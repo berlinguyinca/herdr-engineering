@@ -77,13 +77,14 @@ const MODES={
 
 // Runs in the page: every visible element (open shadow roots included) whose own text is not blank
 // is checked against the background it sits on (its own and its ancestors' fills, composited over
-// the page); every element is checked for a light fill. Images and their parts are exempt.
+// the page); every element is checked for a light fill. Images are exempt. Inline SVG (charts,
+// graphs) is checked for its text only, by its fill colour.
 function audit({min}){
  const parse=s=>{const m=s.match(/rgba?\(([^)]+)\)/);if(!m)return null;const [r,g,b,a=1]=m[1].split(/[\s,/]+/).filter(Boolean).map(Number);return {r,g,b,a};};
  const lum=({r,g,b})=>{const f=v=>{v/=255;return v<=0.03928?v/12.92:((v+0.055)/1.055)**2.4;};return 0.2126*f(r)+0.7152*f(g)+0.0722*f(b);};
  const over=(top,bottom)=>({r:top.r*top.a+bottom.r*(1-top.a),g:top.g*top.a+bottom.g*(1-top.a),b:top.b*top.a+bottom.b*(1-top.a),a:1});
  const up=n=>n.parentElement||(n.getRootNode()?.host??null);
- const IMAGE='img,svg,canvas,video,picture,image';
+ const IMAGE='img,canvas,video,picture';
  const page=parse(getComputedStyle(document.body).backgroundColor);
  const backdrop=el=>{
   const layers=[];
@@ -101,13 +102,15 @@ function audit({min}){
  const walk=root=>{for(const el of root.querySelectorAll('*')){
   if(el.shadowRoot)walk(el.shadowRoot);
   if(el.closest(IMAGE)||!visible(el))continue;
+  const inSvg=!!el.closest('svg');
+  if(inSvg&&!el.matches('text,tspan'))continue;
   const cs=getComputedStyle(el);
   const fill=parse(cs.backgroundColor);
-  if(fill&&fill.a>=0.9&&lum(fill)>0.5)light.push(`${where(el)} ${cs.backgroundColor}`);
+  if(!inSvg&&fill&&fill.a>=0.9&&lum(fill)>0.5)light.push(`${where(el)} ${cs.backgroundColor}`);
   const own=[...el.childNodes].filter(n=>n.nodeType===3).map(n=>n.textContent).join('').trim();
   if(!own||el.matches('option,script,style,title')||el.closest(':disabled,[aria-disabled="true"]'))continue;
   const bg=backdrop(el);if(!bg)continue;
-  let fg=parse(cs.color);if(!fg)continue;
+  let fg=parse(inSvg?cs.fill:cs.color);if(!fg)continue;
   if(fg.a<1)fg=over(fg,bg);
   const [a,b]=[lum(fg),lum(bg)].sort((x,y)=>y-x);
   const ratio=(a+0.05)/(b+0.05);
@@ -134,6 +137,12 @@ async function tour(page,base,mode,state){
   await sleep(50);
   await settle(page,state,hash);
   await record(`${state} ${hash}`);
+  // An empty or populated page must really be one: a red chip means a view rejected the stub and
+  // the audit just saw its error page.
+  if(state==='empty'||state==='populated'){
+   const chip=await page.evaluate(()=>{const c=document.querySelector('#view herdr-freshness');return c?.dataset.state==='error'?c.textContent:null;});
+   if(chip)found.push(`${state} ${hash} chip is red: ${chip}`);
+  }
   if(hash==='/collab'&&state==='populated'){
    await page.locator('[data-room="room-one"]').first().click();
    await sleep(400);await page.clock.runFor(1000);await sleep(200);
