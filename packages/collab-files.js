@@ -53,7 +53,7 @@ export async function startBulkUploadPreview(roomId, pattern, { api } = {}) {
 
 export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, onPermissions }) {
   const state = { path: '', query: '', files: [], next: null, batches: new Map(), status: 'loading', error: '' };
-  let alive = true, loading = false, lastRefresh = 0, preview = null, manifest = null, pageCount = 1;
+  let alive = true, loading = false, lastRefresh = 0, pageCount = 1;
   const current = () => alive && isCurrent();
   const key = `upload:${roomId}`;
   const find = selector => root.querySelector(selector);
@@ -63,12 +63,13 @@ export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, o
     <p data-file-message role="status" class="cx-msg"></p>
     <div data-file-preview hidden class="cx-stack"></div>
     <h3 class="hd-card__title">Direct uploads</h3>
-    <p class="cx-sub">Expand your file pattern locally with your harness and paste its checksum manifest. Preview and start a grant here; use the harness to transfer bytes and finalize the batch.</p>
+    <p class="cx-sub">Expand your file pattern locally with your harness and paste its checksum manifest. Preview here, then give the room and manifest instructions below to your registered harness agent. The agent creates the upload and transfers the bytes.</p>
     <p data-upload-permission class="cx-msg"></p>
     <form data-upload-preview class="cx-stack"><label class="cx-field">Upload manifest<textarea name="manifest" rows="3" required spellcheck="false" placeholder='{"files":[…]}'></textarea></label><button class="hd-btn" type="submit">Preview upload</button></form>
-    <div data-upload-summary role="status"></div><div data-upload-start></div>
+    <div data-upload-summary role="status"></div><div data-upload-handoff class="cx-stack"></div>
     <p data-upload-message role="status" class="cx-msg"></p>
-    <form data-upload-watch class="cx-row"><label class="cx-field">Upload ID<input name="upload" required></label><button class="hd-btn hd-btn--ghost" type="submit">Track upload</button></form>
+    <form data-upload-watch class="cx-row"><label class="cx-field">Agent-created upload ID<input name="upload" required></label><button class="hd-btn hd-btn--ghost" type="submit">Track upload</button></form>
+    <p data-upload-status-loading class="cx-msg" role="status"></p>
     <p data-upload-status-error class="cx-msg" role="status"></p>
     <div data-upload-batches aria-live="polite"></div>`;
   const rendered = new Map();
@@ -84,7 +85,6 @@ export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, o
     if (!current()) return;
     const allowed = info.capabilities.canUpload;
     find('[data-upload-permission]').textContent = allowed ? 'You can upload files to this room.' : 'Ask the room owner to enable uploads for your membership.';
-    put('[data-upload-start]', preview?.can_upload === true && allowed ? button('Start upload', `data-start-upload${pending.has(key) ? ' disabled' : ''}`) : '');
     find('[data-upload-preview] button').disabled = pending.has(key);
     find('[name="manifest"]').disabled = pending.has(key);
   };
@@ -102,6 +102,33 @@ export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, o
     // Retain only aggregate status; grants and per-file transfer details never enter UI state.
     const { upload_id, room_id, status, file_count, total_bytes, uploaded_bytes, completed_parts, total_parts } = batch;
     state.batches.set(upload_id, { upload_id, room_id, status, file_count, total_bytes, uploaded_bytes, completed_parts, total_parts });
+  };
+  // Status requests have their own per-upload lifetimes. A stalled provider
+  // cannot hold file rendering, pagination, or refresh controls hostage.
+  const statusRequests = new Map(), statusErrors = new Map();
+  const drawStatus = () => {
+    if (!current()) return;
+    put('[data-upload-batches]', [...state.batches.values()].map(renderUploadBatch).join(''));
+    message('[data-upload-status-loading]', statusRequests.size ? 'Refreshing upload status…' : '');
+    message('[data-upload-status-error]', [...statusErrors.values()].join(' '), statusErrors.size > 0);
+  };
+  const loadStatus = uploadId => {
+    if (statusRequests.has(uploadId)) return statusRequests.get(uploadId);
+    const request = (async () => {
+      try {
+        const batch = await api.uploadStatus(uploadId);
+        if (!current()) return;
+        acceptBatch(batch); statusErrors.delete(uploadId);
+      } catch (error) {
+        if (current() && error.name !== 'AbortError') statusErrors.set(uploadId, `${error.message} Upload progress may be stale.`);
+        throw error;
+      } finally {
+        statusRequests.delete(uploadId);
+        drawStatus();
+      }
+    })();
+    statusRequests.set(uploadId, request); drawStatus();
+    return request;
   };
   const refresh = async (force = false, more = false) => {
     if (!current() || loading || (!force && Date.now() - lastRefresh < 3000)) return;
@@ -125,27 +152,15 @@ export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, o
       pageCount = more ? pageCount + 1 : loaded;
       state.files = [...records.values()]; state.next = cursor;
       state.error = ''; state.status = 'ready';
-      // One status request per active batch, never per file. Driven by the existing room poll.
-      const statusErrors = [];
-      for (const batch of state.batches.values()) {
-        if (!current()) return;
-        if (!['available', 'failed'].includes(batch.status)) {
-          try {
-            const status = await api.uploadStatus(batch.upload_id);
-            if (!current()) return;
-            acceptBatch(status);
-          } catch (error) {
-            if (error.name !== 'AbortError') statusErrors.push(`${error.message} Upload progress may be stale.`);
-          }
-        }
-      }
-      message('[data-upload-status-error]', statusErrors.join(' '), statusErrors.length > 0);
     } catch (error) {
       if (current() && error.name !== 'AbortError') { state.error = error.message; state.status = 'error'; }
     } finally { loading = false; if (current()) draw(); }
+    if (current()) for (const batch of state.batches.values()) {
+      if (!['available', 'failed'].includes(batch.status)) loadStatus(batch.upload_id).catch(() => {});
+    }
   };
   find('[data-file-search]').oninput = event => { if (current()) { state.query = event.target.value; draw(); } };
-  find('[name="manifest"]').oninput = () => { if (!current()) return; preview = null; manifest = null; put('[data-upload-summary]', ''); controls(); };
+  find('[name="manifest"]').oninput = () => { if (!current()) return; put('[data-upload-handoff]', ''); put('[data-upload-summary]', ''); controls(); };
   root.onclick = async event => {
     const target = event.target.closest('button');
     if (!current() || !target || target.disabled) return;
@@ -153,19 +168,7 @@ export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, o
     else if (target.hasAttribute('data-refresh-files')) await refresh(true);
     else if (target.hasAttribute('data-more-files')) await refresh(true, true);
     else if (target.hasAttribute('data-file-permissions')) onPermissions();
-    else if (target.hasAttribute('data-start-upload')) {
-      if (!manifest || preview?.can_upload !== true || !info.capabilities.canUpload || pending.has(key)) return;
-      pending.add(key); controls(); message('[data-upload-message]', 'Starting upload…');
-      try {
-        const grant = await api.startUpload(roomId, manifest);
-        if (!current()) return;
-        acceptBatch({ ...grant, status: 'created' });
-        preview = null; manifest = null; put('[data-upload-summary]', '');
-        message('[data-upload-message]', `Upload started: ${grant.upload_id}. Transfer and finalize with your harness.`);
-        draw();
-      } catch (error) { if (error.name !== 'AbortError') message('[data-upload-message]', error.message, true); }
-      finally { pending.delete(key); controls(); }
-    } else if (target.dataset.fileAction) {
+    else if (target.dataset.fileAction) {
       const file = state.files.find(file => file.file_id === target.closest('[data-file-id]')?.dataset.fileId);
       if (!file) return;
       const accessKey = `file:${roomId}:${file.file_id}`;
@@ -192,16 +195,17 @@ export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, o
   find('[data-upload-preview]').onsubmit = async event => {
     event.preventDefault();
     if (!current() || pending.has(key)) return;
-    preview = null; manifest = null; pending.add(key); controls();
+    put('[data-upload-handoff]', ''); pending.add(key); controls();
     put('[data-upload-summary]', ''); message('[data-upload-message]', 'Checking upload…');
     try {
       const candidate = JSON.parse(find('[name="manifest"]').value);
       const result = await startBulkUploadPreview(roomId, candidate, { api });
       if (!current()) return;
       if (result.room_id !== roomId || !Number.isSafeInteger(result.file_count) || result.file_count < 1 || !Number.isFinite(result.total_bytes) || result.total_bytes < 0) throw new Error('Invalid upload preview.');
-      preview = result; manifest = candidate;
       put('[data-upload-summary]', `${result.file_count} files · ${bytes(result.total_bytes)}`);
-      message('[data-upload-message]', result.can_upload === true ? 'Ready to start a direct-upload grant.' : 'Ask the room owner to enable uploads for your membership.');
+      const request = { name: 'room_upload_start', arguments: { room_id: roomId, manifest: candidate, options: {} } };
+      put('[data-upload-handoff]', `<p>Room: ${esc(roomId)}. Give this manifest to your registered harness agent. The agent must check its own room upload permission and call room_upload_start through MCP. Use that same registered agent to resume, check status, transfer bytes, and finalize with room_upload_finalize. Paste its returned upload ID below to track progress here.</p><label class="cx-field">Agent upload instructions<textarea readonly rows="6" spellcheck="false">${esc(JSON.stringify(request, null, 2))}</textarea></label>`);
+      message('[data-upload-message]', result.can_upload === true ? 'Preview ready. No upload session was created. Your agent must obtain its own authorization.' : 'Ask the room owner to enable uploads for your membership.');
     } catch (error) { if (error.name !== 'AbortError') message('[data-upload-message]', error.message, true); }
     finally { pending.delete(key); controls(); }
   };
@@ -211,9 +215,9 @@ export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, o
     if (!current() || submit.disabled) return;
     submit.disabled = true;
     try {
-      const batch = await api.uploadStatus(find('[name="upload"]').value.trim());
+      await loadStatus(find('[name="upload"]').value.trim());
       if (!current()) return;
-      acceptBatch(batch); message('[data-upload-message]', 'Tracking upload.'); draw();
+      message('[data-upload-message]', 'Tracking upload.');
     } catch (error) { if (error.name !== 'AbortError') message('[data-upload-message]', error.message, true); }
     finally { if (current()) submit.disabled = false; }
   };
