@@ -466,3 +466,43 @@ def test_missing_detail_table_degrades_without_breaking_the_catalog():
         assert made.make(identity="tok-b").load() is None  # and so does the identity purge
     finally:
         made.close()
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+@_needs_pg
+def test_reads_neither_lock_the_meta_row_nor_prune():
+    made = _PgBackend()
+    try:
+        clock = Clock()
+        store = made.make(now=clock)
+        store.upsert_repositories([repo("acme/app")], scope=None)
+        store.upsert_issues(A, [issue("I1", 1)], watermark="w")
+        store.put_detail(A, detail("I1", 1))
+        store.remove_issues(A, ["I1"])
+        clock.value += TOMBSTONE_RETENTION.total_seconds() + 60
+        blocker = made._run(made.factory())
+        try:
+            made._run(blocker.execute("BEGIN"))
+            made._run(blocker.execute("SELECT 1 FROM github_catalog_meta FOR UPDATE"))
+            seen = []
+            reader = threading.Thread(target=lambda: seen.append(
+                (store.revision(), store.changes_since(0)["resync"], store.watermark(A), store.detail(A, 1))))
+            reader.start()
+            reader.join(timeout=5)
+            answered_under_lock = list(seen)
+            made._run(blocker.execute("ROLLBACK"))
+            reader.join(timeout=5)
+            assert answered_under_lock and answered_under_lock[0][1] is True  # a writer held the meta row
+        finally:
+            made._run(blocker.close())
+        check = made._run(made.factory())
+        try:  # the expired tombstone is pruned by the next write, not by a read
+            assert made._run(check.fetchval("SELECT count(*) FROM github_catalog_tombstones")) == 1
+        finally:
+            made._run(check.close())
+        store.upsert_repositories([repo("acme/app"), repo("acme/lib")], scope=None)
+        assert store.changes_since(0)["resync"] is True
+    finally:
+        made.close()

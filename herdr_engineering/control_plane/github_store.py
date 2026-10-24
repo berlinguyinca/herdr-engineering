@@ -324,8 +324,8 @@ class MemoryGitHubStore:
 # ---------------------------------------------------------------- Postgres
 
 
-_META_SELECT = ("SELECT identity, viewer, revision, pruned_through FROM github_catalog_meta "
-                "WHERE family=$1 FOR UPDATE")
+_META_READ = "SELECT identity, viewer, revision, pruned_through FROM github_catalog_meta WHERE family=$1"
+_META_SELECT = _META_READ + " FOR UPDATE"
 
 
 async def _drop_details(conn, sql: str, *args) -> None:
@@ -422,6 +422,34 @@ class GitHubStore:
             await conn.execute("UPDATE github_catalog_meta SET pruned_through=$2 WHERE family=$1", FAMILY, pruned)
             meta["pruned_through"] = pruned
         return meta
+
+    async def _read_meta(self, conn) -> dict:
+        """Inside a read-only transaction: the family row without locking, claiming or pruning it.
+
+        Tombstones past ``TOMBSTONE_RETENTION`` are pruned by the next write;
+        a read treats them as already pruned (excluded, and ``pruned_through``
+        raised over them), so answers match what a pruning read would give.
+        No row yet reads as an empty catalog at revision 0.
+        """
+        meta = await conn.fetchrow(_META_READ, FAMILY)
+        if meta is None:
+            meta = {"identity": self._identity, "viewer": self._viewer, "revision": 0, "pruned_through": 0}
+        meta = dict(meta)
+        if not _matches(meta, self._identity, self._viewer):
+            raise GitHubStoreIdentityMismatch("stored GitHub catalog belongs to another credential")
+        meta["cutoff"] = self._stamp() - TOMBSTONE_RETENTION
+        expired = await conn.fetchval(
+            "SELECT max(rev) FROM github_catalog_tombstones WHERE removed_at < $1", meta["cutoff"])
+        if expired is not None and expired > meta["pruned_through"]:
+            meta["pruned_through"] = expired
+        return meta
+
+    def _read(self, work: Callable[[Any, dict], Any]):
+        """Run ``work(conn, meta)`` in a read-only snapshot (rows agree with the revision read)."""
+        async def run(conn):
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                return await work(conn, await self._read_meta(conn))
+        return self._call(run)
 
     @staticmethod
     async def _bump(conn) -> int:
@@ -597,44 +625,46 @@ class GitHubStore:
 
     def detail(self, repo_id: str, number: int) -> dict | None:
         """The stored detail of issue ``number``, or ``None`` when it was never opened."""
-        async def work(conn):
-            async with conn.transaction():
-                await self._claim(conn)
-                return await conn.fetchval(
-                    "SELECT data FROM github_issue_details WHERE repository_id=$1 AND number=$2 "
-                    "ORDER BY fetched_at DESC LIMIT 1", repo_id, number)
-        raw = self._call(work)
+        async def work(conn, meta):
+            return await conn.fetchval(
+                "SELECT data FROM github_issue_details WHERE repository_id=$1 AND number=$2 "
+                "ORDER BY fetched_at DESC LIMIT 1", repo_id, number)
+        raw = self._read(work)
         return None if raw is None else json.loads(raw)
 
     def watermark(self, repo_id: str) -> str | None:
-        async def work(conn):
-            async with conn.transaction():
-                await self._claim(conn)
-                return await conn.fetchval(
-                    "SELECT watermark FROM github_repositories WHERE repository_id=$1", repo_id)
+        async def work(conn, meta):
+            return await conn.fetchval(
+                "SELECT watermark FROM github_repositories WHERE repository_id=$1", repo_id)
         try:
-            return self._call(work)
+            return self._read(work)
         except GitHubStoreUnavailable:
             return None
 
     def revision(self) -> int:
-        async def work(conn):
-            async with conn.transaction():
-                return (await self._claim(conn))["revision"]
-        return self._call(work)
+        async def work(conn, meta):
+            return meta["revision"]
+        return self._read(work)
 
     def changes_since(self, rev: int) -> dict:
-        async def work(conn):
-            async with conn.transaction():
-                meta = await self._claim(conn)
-                rows = [_item("repository", r["repository_id"], r["repository_id"], r["rev"], json.loads(r["data"]))
-                        for r in await conn.fetch("SELECT repository_id, data, rev FROM github_repositories")]
-                rows += [_item("issue", r["repository_id"], r["github_id"], r["rev"], json.loads(r["data"]))
-                         for r in await conn.fetch("SELECT repository_id, github_id, data, rev FROM github_issues")]
-                tombs = [_item(r["kind"], r["repository_id"], r["key"], r["rev"])
-                         for r in await conn.fetch("SELECT kind, repository_id, key, rev FROM github_catalog_tombstones")]
-            return _delta(meta["revision"], meta["pruned_through"], rev, rows, tombs)
-        return self._call(work)
+        """Rows and live tombstones newer than ``rev``; the full list when ``rev`` cannot be answered."""
+        since = max(0, int(rev))
+
+        async def work(conn, meta):
+            resync = since < meta["pruned_through"] or since > meta["revision"]
+            floor = -1 if resync else since
+            rows = [_item("repository", r["repository_id"], r["repository_id"], r["rev"], json.loads(r["data"]))
+                    for r in await conn.fetch(
+                        "SELECT repository_id, data, rev FROM github_repositories WHERE rev > $1", floor)]
+            rows += [_item("issue", r["repository_id"], r["github_id"], r["rev"], json.loads(r["data"]))
+                     for r in await conn.fetch(
+                         "SELECT repository_id, github_id, data, rev FROM github_issues WHERE rev > $1", floor)]
+            tombs = [] if resync else [
+                _item(r["kind"], r["repository_id"], r["key"], r["rev"]) for r in await conn.fetch(
+                    "SELECT kind, repository_id, key, rev FROM github_catalog_tombstones "
+                    "WHERE rev > $1 AND removed_at >= $2", floor, meta["cutoff"])]
+            return _delta(meta["revision"], meta["pruned_through"], since, rows, tombs)
+        return self._read(work)
 
     @contextlib.contextmanager
     def advisory_lock(self):
