@@ -119,9 +119,12 @@ restored.
 
 - **Archify license/API** — unverified upstream; P5 uses the safe renderer
   until pinned.
-- **Live ingest wiring** — the emitters are unit-tested; wiring them into the
-  live ingest path (`api.py` `/api/v1/ingest`) so mission/repo/trace events
-  flow into the running graph is a follow-up integration task.
+- **Live ingest wiring — DONE (follow-up PR).** `GraphIngestAdapter`
+  (`graph_ingest.py`) translates mission/session/repository/request/span
+  lifecycle events into lineage envelopes and routes them through the real
+  `repo.ingest` path (admit + persist + apply). Opt-in via
+  `--system-graph` / fleet config `control_plane.system_graph`; off by
+  default. 8 tests.
 - **Dashboard UI** — the projection modules are unit-tested; wiring the new
   kinds into the running web UI (topology-view.js) is a follow-up.
 
@@ -135,7 +138,8 @@ restored.
 | Request/trace slice (P4) | ✅ complete | 2 tests |
 | Artifact renderer + CLI (P5) | ✅ complete | 4 tests + CLI |
 | History/scale/runbook (P6) | ✅ complete | 6 tests |
-| Live ingest + UI wiring | ⏳ follow-up | requires integration task |
+| Live ingest wiring | ✅ complete | graph_ingest.py + --system-graph opt-in, 8 tests |
+| Dashboard UI wiring | ⏳ follow-up | requires integration task |
 
 *Progress is tracked by passing tests and linked evidence, not generated-file
 counts (spec 08).*

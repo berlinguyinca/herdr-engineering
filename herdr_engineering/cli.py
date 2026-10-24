@@ -512,6 +512,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--pg-dsn", default=None,
                     help="optional Postgres DSN to hydrate the repo from "
                          "durable state on startup (Spec §106)")
+    p2.add_argument("--system-graph", action="store_true",
+                    help="opt-in: reflect mission/session/repo/trace lifecycle events "
+                         "into the running lineage graph (system-graph spec P2-P4)")
     p2.add_argument("--seed-demo", action="store_true",
                     help="seed a fresh in-memory repo with demo data so the "
                          "UI is populated (useful when no Postgres is present)")
@@ -2470,6 +2473,9 @@ def _cmd_cp_web(args) -> int:
             raise SystemExit("fleet config control_plane.lineage_key_scopes: an entry names an operator-role key; operator keys "
                              "are not restricted, so the entry would silently do nothing. Remove it or use a non-operator key")
         lineage_key_scopes = {str(k): v for k, v in raw_scopes.items()}
+    # Opt-in: reflect mission/session/repo/trace lifecycle events into the running
+    # lineage graph (system-graph spec P2-P4). Off by default.
+    system_graph = bool(cp.get("system_graph")) or bool(getattr(args, "system_graph", False))
     if args.collab_cognito_group is None:
         args.collab_cognito_group = "local.dev"
     # The Postgres DSN comes from the fleet file's control_plane section (the
@@ -2589,6 +2595,7 @@ def _cmd_cp_web(args) -> int:
                 return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("insights")
             collab.insights_source = _insights_from_yaml
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
+                             system_graph=system_graph,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
                              # collab-only has no operator listener, so nothing is left open
