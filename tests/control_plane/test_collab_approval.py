@@ -248,3 +248,56 @@ def test_explicit_user_approval_event_and_room_lifecycle_fields(s):
                    if row["user_id"] == "bob")
     assert bob_row["user_status"] == "approved"
     assert bob_row["memberships"][0]["room_membership_status"] == "removed"
+
+
+@pytest.mark.parametrize("invited_before_approval", [False, True])
+def test_approval_response_hides_private_memberships(s, invited_before_approval):
+    who(s, "bob")
+    owner = who(s, "lab")
+    project = s.create_project(owner, {"name": "private"})["project_id"]
+    room = s.create_room(owner, project, {"name": "private"})["room_id"]
+    if invited_before_approval:
+        s.invite_by_email(owner, room, {"email": "bob@example.org", "role": "contributor"})
+    status, queue = call(s, "GET", ["admin", "users"], "adm")
+    assert status == 200
+    pending = next(row for row in queue["users"] if row["user_id"] == "bob")
+    status, approved = call(s, "POST", ["admin", "users", "bob", "approve"], "adm",
+                            {"idempotency_key": "approve-private"})
+    assert status == 200 and approved["user_status"] == "approved"
+    assert not {"memberships", "rooms", "agents"} & approved.keys()
+    assert not {"memberships", "rooms", "agents"} & pending.keys()
+    status, people = call(s, "GET", ["admin", "users"], None, operator="op")
+    assert status == 200
+    bob = next(row for row in people["users"] if row["user_id"] == "bob")
+    assert [m["room_id"] for m in bob["memberships"]] == ([room] if invited_before_approval else [])
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_approval_replay_hides_later_private_memberships(s, restart):
+    who(s, "bob")
+    body = {"idempotency_key": "approve-private"}
+    assert call(s, "POST", ["admin", "users", "bob", "approve"], "adm", body)[0] == 200
+    owner, bob = who(s, "lab"), who(s, "bob")
+    project = s.create_project(owner, {"name": "private"})["project_id"]
+    room = s.create_room(owner, project, {"name": "private"})["room_id"]
+    s.add_member(owner, room, {"user_id": bob.id, "role": "contributor"})
+    agent = s.connect_agent(owner, {"harness_type": "codex"})["agent_id"]
+    s.grant_agent(owner, room, {"agent_id": agent, "actions": ["read", "execute"]})
+    s.set_agent_permission(owner, room, agent, bob.id, "approved")
+    s.set_file_upload_permission(owner, room, bob.id, True)
+    s.connect_agent(bob, {"harness_type": "codex"})
+    if restart:
+        again = CollabService(s.auth, sink=s._sink, now=s._now, approval=s.approval)
+        again.hydrate(s._sink.load())
+        s = again
+    seq = s.seq
+    status, replayed = call(s, "POST", ["admin", "users", "bob", "approve"], "adm", body)
+    assert status == 200 and replayed["user_status"] == "approved"
+    assert not {"memberships", "rooms", "agents"} & replayed.keys()
+    assert s.seq == seq
+    status, people = call(s, "GET", ["admin", "users"], None, operator="op")
+    assert status == 200
+    bob_row = next(row for row in people["users"] if row["user_id"] == "bob")
+    assert bob_row["rooms"] == bob_row["agents"] == 1
+    assert bob_row["memberships"][0]["agent_permission_status"] == {agent: "approved"}
+    assert bob_row["memberships"][0]["file_upload_permission"] is True

@@ -380,8 +380,10 @@ class CollabService:
         return datetime.fromtimestamp(self._now() if t is None else t, UTC).isoformat()
 
     def _commit(self, event_type: str, payload: dict) -> dict:
-        """Persist first, then apply: a failed write never changes state."""
+        """Persist each event before applying it; expire old grants before replacement."""
         with self._lock:
+            if event_type == "agent_granted":
+                self._expire_agent_grant(payload["room_id"], payload["agent_id"])
             if len(self._log) >= self.max_log_events:
                 self.stats["log_full"] += 1
                 raise CollabError(503, "collaboration log is full; ask the operator")
@@ -1235,18 +1237,22 @@ class CollabService:
                 project_ids=[room["project_id"]], resource_id=room_id, **transition))
         return {"room_id": room_id, "user_id": uid, "role": role, **self._member_fields(room_id, uid)}
 
-    def remove_member(self, pr: Principal, room_id: str, uid: str) -> dict:
-        self.remove_room_member(pr, room_id, uid)
+    def remove_member(self, pr: Principal, room_id: str, uid: str,
+                      *, idempotency_key: str | None = None) -> dict:
+        self.remove_room_member(pr, room_id, uid, idempotency_key=idempotency_key)
         return {"ok": True}
 
     # -- people: approval, disable, kick
-    def _user_row(self, uid: str, u: dict) -> dict:
-        rooms = sum(1 for room in self._rooms.values() if uid in room["members"])
-        agents = sum(1 for aid in self._agents_by_owner.get(uid, ()) if self._agents[aid]["status"] == "active")
-        return {"user_id": uid, "email": self._user_email.get(uid), "status": u["status"], "since": u.get("since"),
-                "decided_by": u.get("decided_by"), "decided_at": u.get("decided_at"), "reason": u.get("reason"),
-                "rooms": rooms, "agents": agents, "user_status": u["status"],
-                "memberships": [self.room_member(rid, uid) for rid, user in self._room_memberships if user == uid]}
+    def _user_row(self, pr: Principal, uid: str, u: dict) -> dict:
+        row = {"user_id": uid, "email": self._user_email.get(uid), "status": u["status"], "since": u.get("since"),
+               "decided_by": u.get("decided_by"), "decided_at": u.get("decided_at"), "reason": u.get("reason"),
+               "user_status": u["status"]}
+        # Platform approval authority does not confer visibility into private rooms or agents.
+        if pr.admin:
+            row.update(rooms=sum(1 for room in self._rooms.values() if uid in room["members"]),
+                       agents=sum(1 for aid in self._agents_by_owner.get(uid, ()) if self._agents[aid]["status"] == "active"),
+                       memberships=[self.room_member(rid, uid) for rid, user in self._room_memberships if user == uid])
+        return row
 
     def list_users(self, pr: Principal, status: str | None = None) -> dict:
         """The operator sees everyone; an approver sees only the people waiting."""
@@ -1256,7 +1262,7 @@ class CollabService:
         if status is not None and status not in USER_STATUSES:
             raise CollabError(400, "unknown status")
         with self._lock:
-            rows = [self._user_row(uid, u) for uid, u in self._users.items()
+            rows = [self._user_row(pr, uid, u) for uid, u in self._users.items()
                     if (status is None or u["status"] == status) and (pr.admin or u["status"] == "pending")]
             counts: dict[str, int] = defaultdict(int)
             for u in self._users.values():
@@ -1314,7 +1320,7 @@ class CollabService:
             if replayed:
                 if u["status"] == "approved" and self._user_email.get(uid):
                     self._deliver_pending(uid, self._user_email[uid])
-                return self._user_row(uid, u)
+                return self._user_row(pr, uid, u)
             if action in ("approve", "deny"):
                 if not pr.admin and u["status"] != "pending":
                     raise CollabError(403, "approvers only decide people who are waiting")
@@ -1351,7 +1357,7 @@ class CollabService:
                 self._expire_helpers()                # a disabled person's helpers end now
             elif action in ("approve", "enable") and self._user_email.get(uid):
                 self._deliver_pending(uid, self._user_email[uid])
-            return self._user_row(uid, self._users[uid])
+            return self._user_row(pr, uid, self._users[uid])
 
     # -- people: link email at sign-in, invite by email
     def me(self, pr: Principal) -> dict:
@@ -2703,6 +2709,7 @@ class CollabService:
             aid = body["agent_id"]
             actions = _actions(body.get("actions"))
             m = self._member(room, pr.id)
+            self._expire_agent_grant(room_id, aid)
             existing = room["grants"].get(aid)
             self._name_free(room, aid, agent["name"])
             narrowing = bool(existing) and set(actions) <= set(existing["actions"])
@@ -3083,6 +3090,16 @@ class CollabService:
             raise CollabError(400, "expires_at is too far away")
         return exp
 
+    def _expire_agent_grant(self, room_id: str, agent_id: str) -> None:
+        """Under the service lock, durably revoke lapsed access before it can be renewed."""
+        room = self._rooms[room_id]
+        grant = room["grants"].get(agent_id)
+        if grant and grant["expires_at"] is not None and self._now() >= grant["expires_at"]:
+            self._commit("agent_grant_expired", {
+                "actor_user_id": None, "actor_agent_id": None, "room_id": room_id, "agent_id": agent_id,
+                "project_ids": [room["project_id"]], "action": "agent.grant.expire",
+                "outcome": "allowed", "resource_id": agent_id})
+
     def _housekeeping(self) -> None:
         """Prune, and write down grants that lapsed (they were already refused; this keeps the
         roster and audit honest). Rate-limited: callers are hot paths."""
@@ -3096,10 +3113,7 @@ class CollabService:
             for aid, g in list(room["grants"].items()):
                 if g["expires_at"] is not None and now >= g["expires_at"]:
                     try:
-                        self._commit("agent_grant_expired", {
-                            "actor_user_id": None, "actor_agent_id": None, "room_id": rid, "agent_id": aid,
-                            "project_ids": [room["project_id"]], "action": "agent.grant.expire",
-                            "outcome": "allowed", "resource_id": aid})
+                        self._expire_agent_grant(rid, aid)
                     except CollabError:
                         return                      # log full / unavailable: the grant is refused anyway
 
@@ -3610,7 +3624,7 @@ class CollabService:
                     if n == 5 and parts[2] == "invites" and parts[4] == "cancel":
                         return 200, self.cancel_invite(pr, rid, parts[3])
                     if n == 5 and parts[2] == "members" and parts[4] == "remove":
-                        return 200, self.remove_member(pr, rid, parts[3])
+                        return 200, self.remove_member(pr, rid, parts[3], idempotency_key=body.get("idempotency_key"))
                     if parts[2:] == ["agents"]:
                         return 201, self.grant_agent(pr, rid, body)
                     if n == 5 and parts[2] == "agents" and parts[4] == "remove":
