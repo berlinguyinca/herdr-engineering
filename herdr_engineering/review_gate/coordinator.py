@@ -52,10 +52,28 @@ only: nothing decides on a verdict's ``reviewer_model``).
 
 Nothing derived from model output or PR text is logged, returned or stored
 except through ``parse_verdict``'s validated ``Verdict``.
+
+Claim tokens: ``claim`` returns ``claim_token = HMAC-SHA256(secret,
+"<job_id>|<worker_id>|<attempt>")`` where ``secret`` is 32 random bytes drawn
+when the coordinator is built (memory only; never stored or logged) and
+``attempt`` is the job's claim count. ``heartbeat``/``submit``/``fail`` verify
+the token (``hmac.compare_digest``) against the CURRENT claim count before any
+other check, so a re-claim invalidates older tokens and a caller who only knows
+the job id and worker id (both visible on ``GET /queue``) can do nothing. A
+wrong or missing token is answered exactly like a stale claim and writes
+nothing. A coordinator restart draws a new secret: in-flight reviews become
+stale (wasted, never wrongly recorded).
+
+Base ref: the verdict records the PR base the reviewer saw (``base_ref`` of the
+material fetched at claim, or re-fetched after a restart). A PASS approves for
+that base only; GateService re-reviews when the PR is retargeted.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets
 import threading
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -83,12 +101,19 @@ class Claim:
     messages: list[dict]
     lease_seconds: int
     attempt: int
+    claim_token: str
 
 
 @dataclass(frozen=True)
 class _Held:
     truncated: bool
     reviewer_model: str
+    base_ref: str | None
+
+
+def _base(material) -> str | None:
+    base = getattr(material, "base_ref", None)
+    return base if isinstance(base, str) and base else None
 
 
 class ReviewCoordinator:
@@ -100,6 +125,7 @@ class ReviewCoordinator:
         self._enrolled = frozenset(enrolled)
         self._held: dict[str, _Held] = {}
         self._lock = threading.RLock()
+        self._secret = secrets.token_bytes(32)  # per process; never persisted or logged
 
     # ------------------------------------------------------------ helpers
     def _fetch(self, job: ReviewJob):
@@ -114,6 +140,21 @@ class ReviewCoordinator:
     def _done(self, job_id: str, worker_id: str) -> None:
         self._held.pop(job_id, None)
         self._queue.complete(job_id, worker_id)
+
+    def _token(self, job_id: str, worker_id: str, attempt: int) -> str:
+        msg = f"{job_id}|{worker_id}|{attempt}".encode("utf-8", "surrogatepass")
+        return hmac.new(self._secret, msg, hashlib.sha256).hexdigest()
+
+    def _token_ok(self, job_id, worker_id, claim_token) -> bool:
+        """Constant-time check against the job's CURRENT claim count (lock held)."""
+        if not isinstance(claim_token, str) or not isinstance(job_id, str):
+            return False
+        if not isinstance(worker_id, str):
+            return False
+        expected = self._token(job_id, worker_id, self._queue.attempts(job_id))
+        return hmac.compare_digest(
+            claim_token.encode("utf-8", "surrogatepass"), expected.encode("ascii")
+        )
 
     def _prune(self) -> None:
         live = {row["job_id"] for row in self._queue.snapshot()}
@@ -160,7 +201,9 @@ class ReviewCoordinator:
                 if not self._is_current(job, (State.REVIEWING,)):
                     continue
                 messages = build_messages(material, prior, max_findings=self._config.max_findings)
-                self._held[job.job_id] = _Held(bool(material.truncated), reviewer_model)
+                self._held[job.job_id] = _Held(
+                    bool(material.truncated), reviewer_model, _base(material)
+                )
                 return Claim(
                     job_id=job.job_id,
                     repo=job.key.repo,
@@ -169,15 +212,20 @@ class ReviewCoordinator:
                     messages=messages,
                     lease_seconds=self._config.lease_seconds,
                     attempt=attempt,
+                    claim_token=self._token(job.job_id, worker_id, attempt),
                 )
         return None
 
-    def heartbeat(self, job_id: str, worker_id: str) -> bool:
+    def heartbeat(self, job_id: str, worker_id: str, *, claim_token) -> bool:
         with self._lock:
+            if not self._token_ok(job_id, worker_id, claim_token):
+                return False
             return self._queue.renew(job_id, worker_id)
 
-    def submit(self, job_id: str, worker_id: str, output: str) -> str:
+    def submit(self, job_id: str, worker_id: str, output: str, *, claim_token) -> str:
         with self._lock:
+            if not self._token_ok(job_id, worker_id, claim_token):
+                return "stale"
             job = self._queue.live_claim(job_id, worker_id)
             if job is None or not self._is_current(job, (State.REVIEWING,)):
                 return "stale"
@@ -195,8 +243,10 @@ class ReviewCoordinator:
                 return "rejected"
             if material is None:
                 return "rejected"
-            held = _Held(bool(material.truncated), UNKNOWN_REVIEWER)
+            held = _Held(bool(material.truncated), UNKNOWN_REVIEWER, _base(material))
         with self._lock:
+            if not self._token_ok(job_id, worker_id, claim_token):
+                return "stale"  # re-claimed while the lock was dropped
             job = self._queue.live_claim(job_id, worker_id)
             if job is None or not self._is_current(job, (State.REVIEWING,)):
                 return "stale"
@@ -213,14 +263,17 @@ class ReviewCoordinator:
                 reason = TRUNCATED_PASS if str(exc) == TRUNCATED_PASS else INVALID_OUTPUT
                 self._fail(job_id, worker_id, reason)
                 return "rejected"
-            recorded = self._store.on_verdict(job.key, verdict)
+            recorded = self._store.on_verdict(job.key, verdict, base_ref=held.base_ref)
             self._done(job_id, worker_id)
             return "recorded" if recorded else "stale"
 
-    def fail(self, job_id: str, worker_id: str, reason: str) -> str:
+    def fail(self, job_id: str, worker_id: str, reason: str, *, claim_token) -> str:
         """A worker reports it could not review. ``reason`` is never stored."""
         del reason  # worker text: ignored, the record uses a fixed string
-        return self._fail(job_id, worker_id, WORKER_FAILED)
+        with self._lock:
+            if not self._token_ok(job_id, worker_id, claim_token):
+                return "stale"
+            return self._fail(job_id, worker_id, WORKER_FAILED)
 
     def _fail(self, job_id: str, worker_id: str, fixed_reason: str) -> str:
         with self._lock:

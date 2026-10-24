@@ -23,7 +23,9 @@ KEY = PrKey(REPO, 7)
 PEM_TEXT = "not-a-real-key-PRIVATE"
 MAX_OUTPUT = 1000
 REV = "rk-reviewer-key-9f1c"
+REV2 = "rk-second-reviewer-55aa"
 KEYS = {
+    REV2: "reviewer",
     "read": "viewer",
     "write": "operator",
     REV: "reviewer",
@@ -32,7 +34,19 @@ KEYS = {
 }
 TOKEN = "ghs_FAKE_INSTALLATION_TOKEN"
 PASS = json.dumps({"verdict": "PASS", "findings": []})
-CLAIM_FIELDS = {"job_id", "repo", "number", "sha", "messages", "lease_seconds", "attempt"}
+CLAIM_FIELDS = {
+    "job_id",
+    "repo",
+    "number",
+    "sha",
+    "messages",
+    "lease_seconds",
+    "attempt",
+    "claim_token",
+}
+# A well-formed claim token for requests whose outcome does not depend on it;
+# tests that act on a real claim shadow it with the token the claim returned.
+tok = "f" * 64
 
 
 class FakeApp:
@@ -172,6 +186,7 @@ def test_reviewer_key_can_claim_and_submit(server):
     assert status == 200
     got = body["job"]
     assert set(got) == CLAIM_FIELDS
+    tok = got["claim_token"]
     assert got["job_id"] == job.job_id
     assert (got["repo"], got["number"], got["sha"]) == (REPO, 7, SHA)
     assert got["lease_seconds"] == 120 and got["attempt"] == 1
@@ -179,13 +194,23 @@ def test_reviewer_key_can_claim_and_submit(server):
     assert server.gate_store.snapshot(KEY).state == State.REVIEWING
 
     base = f"review-gate/jobs/{job.job_id}"
-    assert post(server, f"{base}/heartbeat", {"worker_id": "w1"}) == (200, {"ok": True})
-    assert post(server, f"{base}/heartbeat", {"worker_id": "other"}) == (200, {"ok": False})
-    status, body = post(server, f"{base}/result", {"worker_id": "w1", "output": PASS})
+    assert post(server, f"{base}/heartbeat", {"claim_token": tok, "worker_id": "w1"}) == (
+        200,
+        {"ok": True},
+    )
+    assert post(server, f"{base}/heartbeat", {"claim_token": tok, "worker_id": "other"}) == (
+        200,
+        {"ok": False},
+    )
+    status, body = post(
+        server, f"{base}/result", {"claim_token": tok, "worker_id": "w1", "output": PASS}
+    )
     assert (status, body) == (200, {"outcome": "recorded"})
     assert server.gate_store.snapshot(KEY).state != State.REVIEWING
     # the job is done: a second result is stale
-    assert post(server, f"{base}/result", {"worker_id": "w1", "output": PASS}) == (
+    assert post(
+        server, f"{base}/result", {"claim_token": tok, "worker_id": "w1", "output": PASS}
+    ) == (
         200,
         {"outcome": "stale"},
     )
@@ -193,13 +218,17 @@ def test_reviewer_key_can_claim_and_submit(server):
 
 def test_failure_route_releases_then_is_stale(server):
     job = ready(server)
-    claim(server)
+    tok = claim(server)[1]["job"]["claim_token"]
     base = f"review-gate/jobs/{job.job_id}"
-    assert post(server, f"{base}/failure", {"worker_id": "w1", "reason": "x" * 500}) == (
+    assert post(
+        server, f"{base}/failure", {"claim_token": tok, "worker_id": "w1", "reason": "x" * 500}
+    ) == (
         200,
         {"outcome": "released"},
     )
-    assert post(server, f"{base}/failure", {"worker_id": "w1", "reason": "again"}) == (
+    assert post(
+        server, f"{base}/failure", {"claim_token": tok, "worker_id": "w1", "reason": "again"}
+    ) == (
         200,
         {"outcome": "stale"},
     )
@@ -207,9 +236,11 @@ def test_failure_route_releases_then_is_stale(server):
 
 def test_invalid_output_is_rejected_outcome(server):
     job = ready(server)
-    claim(server)
+    tok = claim(server)[1]["job"]["claim_token"]
     status, body = post(
-        server, f"review-gate/jobs/{job.job_id}/result", {"worker_id": "w1", "output": "nope"}
+        server,
+        f"review-gate/jobs/{job.job_id}/result",
+        {"claim_token": tok, "worker_id": "w1", "output": "nope"},
     )
     assert (status, body) == (200, {"outcome": "rejected"})
 
@@ -244,9 +275,28 @@ def test_viewer_and_ingest_keys_cannot_claim(server, key):
     job = ready(server)
     assert claim(server, key=key)[0] == 403
     base = f"review-gate/jobs/{job.job_id}"
-    assert post(server, f"{base}/heartbeat", {"worker_id": "w1"}, key=key)[0] == 403
-    assert post(server, f"{base}/result", {"worker_id": "w1", "output": PASS}, key=key)[0] == 403
-    assert post(server, f"{base}/failure", {"worker_id": "w1", "reason": "r"}, key=key)[0] == 403
+    assert (
+        post(server, f"{base}/heartbeat", {"claim_token": tok, "worker_id": "w1"}, key=key)[0]
+        == 403
+    )
+    assert (
+        post(
+            server,
+            f"{base}/result",
+            {"claim_token": tok, "worker_id": "w1", "output": PASS},
+            key=key,
+        )[0]
+        == 403
+    )
+    assert (
+        post(
+            server,
+            f"{base}/failure",
+            {"claim_token": tok, "worker_id": "w1", "reason": "r"},
+            key=key,
+        )[0]
+        == 403
+    )
     assert server.gate_store.snapshot(KEY).state == State.CI_GREEN
 
 
@@ -266,7 +316,7 @@ def test_reviewer_unknown_job_route_is_404(server):
         "review-gate/claim/extra",
         "review-gate/claim/",
     ):
-        assert post(server, path, {"worker_id": "w1"})[0] == 404, path
+        assert post(server, path, {"claim_token": tok, "worker_id": "w1"})[0] == 404, path
     assert server.gate_store.snapshot(KEY).state == State.CI_GREEN
 
 
@@ -304,7 +354,7 @@ def test_unauthenticated_claim_is_401(server):
         {"worker_id": "w1\n", "reviewer_model": "m"},
         {"worker_id": 5, "reviewer_model": "m"},
         {"worker_id": "w1", "reviewer_model": "m;rm"},
-        {"worker_id": "w1"},
+        {"claim_token": tok, "worker_id": "w1"},
         {"worker_id": "w1", "reviewer_model": "m", "extra": 1},
         [],
         "w1",
@@ -321,18 +371,39 @@ def test_bad_claim_body_is_400(server, body):
 
 def test_bad_worker_id_job_id_and_oversize_body_rejected(server):
     job = ready(server)
-    claim(server)
+    tok = claim(server)[1]["job"]["claim_token"]
     base = f"review-gate/jobs/{job.job_id}"
     # worker id
-    assert post(server, f"{base}/heartbeat", {"worker_id": "w 1"})[0] == 400
-    assert post(server, f"{base}/result", {"worker_id": "w1\n", "output": PASS})[0] == 400
+    assert post(server, f"{base}/heartbeat", {"claim_token": tok, "worker_id": "w 1"})[0] == 400
+    assert (
+        post(server, f"{base}/result", {"claim_token": tok, "worker_id": "w1\n", "output": PASS})[0]
+        == 400
+    )
     # job id: not 32 lowercase hex
     for bad in ("abc", job.job_id.upper(), job.job_id + "0", "%0A" + job.job_id[1:]):
-        assert post(server, f"review-gate/jobs/{bad}/heartbeat", {"worker_id": "w1"})[0] == 400
+        assert (
+            post(
+                server, f"review-gate/jobs/{bad}/heartbeat", {"claim_token": tok, "worker_id": "w1"}
+            )[0]
+            == 400
+        )
     # field types
-    assert post(server, f"{base}/result", {"worker_id": "w1", "output": {"v": 1}})[0] == 400
-    assert post(server, f"{base}/failure", {"worker_id": "w1", "reason": "x" * 501})[0] == 400
-    assert post(server, f"{base}/failure", {"worker_id": "w1", "reason": 3})[0] == 400
+    assert (
+        post(server, f"{base}/result", {"claim_token": tok, "worker_id": "w1", "output": {"v": 1}})[
+            0
+        ]
+        == 400
+    )
+    assert (
+        post(
+            server, f"{base}/failure", {"claim_token": tok, "worker_id": "w1", "reason": "x" * 501}
+        )[0]
+        == 400
+    )
+    assert (
+        post(server, f"{base}/failure", {"claim_token": tok, "worker_id": "w1", "reason": 3})[0]
+        == 400
+    )
     # malformed / empty / deeply nested JSON
     assert post(server, f"{base}/heartbeat", b"{nope")[0] == 400
     assert post(server, f"{base}/heartbeat", b"")[0] == 400
@@ -342,13 +413,21 @@ def test_bad_worker_id_job_id_and_oversize_body_rejected(server):
     # result (JSON escaping expands a byte up to 6x; the coordinator's byte check is the limit)
     pad = "x" * (8 * 1024)
     assert post(server, "review-gate/claim", {"worker_id": "w1", "reviewer_model": pad})[0] == 413
-    assert post(server, f"{base}/heartbeat", {"worker_id": pad})[0] == 413
-    assert post(server, f"{base}/failure", {"worker_id": "w1", "reason": pad})[0] == 413
+    assert post(server, f"{base}/heartbeat", {"claim_token": tok, "worker_id": pad})[0] == 413
+    assert (
+        post(server, f"{base}/failure", {"claim_token": tok, "worker_id": "w1", "reason": pad})[0]
+        == 413
+    )
     big = "x" * (6 * MAX_OUTPUT + 4 * 1024)
-    assert post(server, f"{base}/result", {"worker_id": "w1", "output": big})[0] == 413
+    assert (
+        post(server, f"{base}/result", {"claim_token": tok, "worker_id": "w1", "output": big})[0]
+        == 413
+    )
     # a result body under the HTTP cap but over max_output_bytes is the coordinator's "rejected"
     assert post(
-        server, f"{base}/result", {"worker_id": "w1", "output": "x" * (MAX_OUTPUT + 1)}
+        server,
+        f"{base}/result",
+        {"claim_token": tok, "worker_id": "w1", "output": "x" * (MAX_OUTPUT + 1)},
     ) == (
         200,
         {"outcome": "rejected"},
@@ -360,8 +439,11 @@ def test_error_bodies_never_echo_request_text(server):
     secret = "SECRET-TEXT-123"
     for path, body in (
         ("review-gate/claim", {"worker_id": secret + " ", "reviewer_model": secret}),
-        (f"review-gate/jobs/{job.job_id}/failure", {"worker_id": "w1", "reason": secret * 100}),
-        (f"review-gate/jobs/{secret}/heartbeat", {"worker_id": secret}),
+        (
+            f"review-gate/jobs/{job.job_id}/failure",
+            {"claim_token": tok, "worker_id": "w1", "reason": secret * 100},
+        ),
+        (f"review-gate/jobs/{secret}/heartbeat", {"claim_token": tok, "worker_id": secret}),
         ("review-gate/claim", (secret + "{").encode()),
     ):
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -374,7 +456,11 @@ def test_error_bodies_never_echo_request_text(server):
 def test_disabled_gate_returns_503(plain_server, tmp_path, monkeypatch):
     assert plain_server.gate_coordinator is None
     assert claim(plain_server) == (503, {"error": "review gate disabled"})
-    status, body = post(plain_server, f"review-gate/jobs/{'a' * 32}/heartbeat", {"worker_id": "w1"})
+    status, body = post(
+        plain_server,
+        f"review-gate/jobs/{'a' * 32}/heartbeat",
+        {"claim_token": tok, "worker_id": "w1"},
+    )
     assert (status, body) == (503, {"error": "review gate disabled"})
     # disabled in config: same
     monkeypatch.setattr(github_app, "GitHubAppClient", FakeApp)
@@ -420,9 +506,9 @@ def test_coordinator_exception_is_fixed_500(server, monkeypatch, caplog):
     caplog.set_level(logging.DEBUG)
     for path, body in (
         ("review-gate/claim", {"worker_id": "w1", "reviewer_model": "m"}),
-        (f"review-gate/jobs/{jid}/heartbeat", {"worker_id": "w1"}),
-        (f"review-gate/jobs/{jid}/result", {"worker_id": "w1", "output": "o"}),
-        (f"review-gate/jobs/{jid}/failure", {"worker_id": "w1", "reason": "r"}),
+        (f"review-gate/jobs/{jid}/heartbeat", {"claim_token": tok, "worker_id": "w1"}),
+        (f"review-gate/jobs/{jid}/result", {"claim_token": tok, "worker_id": "w1", "output": "o"}),
+        (f"review-gate/jobs/{jid}/failure", {"claim_token": tok, "worker_id": "w1", "reason": "r"}),
     ):
         status, raw = raw_request(server, path, json.dumps(body).encode())
         assert status == 500
@@ -442,8 +528,11 @@ def test_csrf_and_content_type_checks_apply(server):
     assert post(server, "review-gate/claim", good, ctype="text/plain")[0] == 415
     assert post(server, "review-gate/claim", good, ctype=None)[0] == 415
     hb = f"review-gate/jobs/{job.job_id}/heartbeat"
-    assert post(server, hb, {"worker_id": "w1"}, headers={"Origin": "null"})[0] == 403
-    assert post(server, hb, {"worker_id": "w1"}, ctype="text/plain")[0] == 415
+    assert (
+        post(server, hb, {"claim_token": tok, "worker_id": "w1"}, headers={"Origin": "null"})[0]
+        == 403
+    )
+    assert post(server, hb, {"claim_token": tok, "worker_id": "w1"}, ctype="text/plain")[0] == 415
     assert server.gate_store.snapshot(KEY).state == State.CI_GREEN
     # a same-origin browser request is not refused by the CSRF check
     origin = f"http://127.0.0.1:{server.port}"
@@ -504,11 +593,16 @@ def test_result_cap_allows_json_escaping_of_a_legal_output(server):
     """An output within max_output_bytes whose JSON escaping expands it ~6x reaches the
     coordinator (its byte-exact check decides) instead of an HTTP 413."""
     job = ready(server)
-    claim(server)
+    tok = claim(server)[1]["job"]["claim_token"]
     base = f"review-gate/jobs/{job.job_id}"
     escaped = "\x01" * MAX_OUTPUT  # MAX_OUTPUT bytes, ~6 x MAX_OUTPUT once JSON-encoded
-    assert len(json.dumps({"worker_id": "w1", "output": escaped})) > MAX_OUTPUT + 4 * 1024
-    status, body = post(server, f"{base}/result", {"worker_id": "w1", "output": escaped})
+    assert (
+        len(json.dumps({"claim_token": tok, "worker_id": "w1", "output": escaped}))
+        > MAX_OUTPUT + 4 * 1024
+    )
+    status, body = post(
+        server, f"{base}/result", {"claim_token": tok, "worker_id": "w1", "output": escaped}
+    )
     assert (status, body) == (200, {"outcome": "rejected"})  # not a verdict, but not 413
 
 
@@ -525,7 +619,9 @@ def test_result_cap_allows_json_escaping_of_a_legal_output(server):
 )
 def test_encoded_slashes_in_reviewer_routes_are_404(server, path):
     job = ready(server)
-    status, body = post(server, path.replace("JOB", job.job_id), {"worker_id": "w1"})
+    status, body = post(
+        server, path.replace("JOB", job.job_id), {"claim_token": tok, "worker_id": "w1"}
+    )
     assert (status, body) == (404, {"error": "not found"})
     assert server.gate_store.snapshot(KEY).state == State.CI_GREEN
 
@@ -550,3 +646,72 @@ def test_reviewer_route_shapes_match_on_decoded_segments():
         [*root[:3], "reviews", "claim"],
     ):
         assert _reviewer_route(bad) is None, bad
+
+
+# ------------------------------------------------------------- claim tokens
+@pytest.mark.parametrize("token", [None, "", "f" * 63, "f" * 65, "F" * 64, "g" * 64, 5, ["f" * 64]])
+def test_missing_or_malformed_claim_token_is_400(server, token):
+    job = ready(server)
+    claim(server)
+    base = f"review-gate/jobs/{job.job_id}"
+    bodies = {
+        "heartbeat": {"worker_id": "w1"},
+        "result": {"worker_id": "w1", "output": PASS},
+        "failure": {"worker_id": "w1", "reason": "r"},
+    }
+    for action, body in bodies.items():
+        if token is not None:
+            body = {**body, "claim_token": token}
+        status, err = post(server, f"{base}/{action}", body)
+        assert (status, set(err)) == (400, {"error"}), action
+    assert server.gate_store.snapshot(KEY).state == State.REVIEWING
+    assert server.gate_queue.attempts(job.job_id) == 1
+
+
+def test_other_reviewer_with_job_and_worker_id_but_no_token_cannot_act(server):
+    job = ready(server)
+    real = claim(server)[1]["job"]["claim_token"]
+    base = f"review-gate/jobs/{job.job_id}"
+    other_key = REV2
+    forged = "0" * 64  # job id and worker id are visible on GET /queue; the token is not
+    for key in (other_key, REV):
+        hb = post(server, f"{base}/heartbeat", {"claim_token": forged, "worker_id": "w1"}, key=key)
+        assert hb == (200, {"ok": False})
+        res = {"claim_token": forged, "worker_id": "w1", "output": PASS}
+        assert post(server, f"{base}/result", res, key=key) == (200, {"outcome": "stale"})
+        fail = {"claim_token": forged, "worker_id": "w1", "reason": "r"}
+        assert post(server, f"{base}/failure", fail, key=key) == (200, {"outcome": "stale"})
+    assert server.gate_store.snapshot(KEY).state == State.REVIEWING
+    assert server.gate_queue.attempts(job.job_id) == 1
+    ok = {"claim_token": real, "worker_id": "w1"}
+    assert post(server, f"{base}/heartbeat", ok, key=other_key) == (200, {"ok": True})
+    res = {"claim_token": real, "worker_id": "w1", "output": PASS}
+    assert post(server, f"{base}/result", res) == (200, {"outcome": "recorded"})
+
+
+def test_token_from_an_older_attempt_fails_after_a_reclaim(server):
+    job = ready(server)
+    first = claim(server)[1]["job"]["claim_token"]
+    base = f"review-gate/jobs/{job.job_id}"
+    fail = {"claim_token": first, "worker_id": "w1", "reason": "model down"}
+    assert post(server, f"{base}/failure", fail) == (200, {"outcome": "released"})
+    second = claim(server)[1]["job"]
+    assert second["attempt"] == 2 and second["claim_token"] != first
+    old = {"claim_token": first, "worker_id": "w1", "output": PASS}
+    assert post(server, f"{base}/result", old) == (200, {"outcome": "stale"})
+    new = {"claim_token": second["claim_token"], "worker_id": "w1", "output": PASS}
+    assert post(server, f"{base}/result", new) == (200, {"outcome": "recorded"})
+
+
+def test_queue_hides_claimed_by_from_non_operators(server):
+    ready(server)
+    claim(server)
+    for key, visible in (("read", False), (REV, False), ("write", True)):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server.port}/api/v1/review-gate/queue", headers={"X-API-Key": key}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            (job,) = json.loads(resp.read())["jobs"]
+        assert ("claimed_by" in job) is visible, key
+        if visible:
+            assert job["claimed_by"] == "w1"

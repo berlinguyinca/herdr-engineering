@@ -417,3 +417,74 @@ def test_resume_clears_review_failed_escalation():
     snap = s.snapshot(KEY)
     assert snap.state == State.CI_PENDING
     assert snap.review_rounds == 0 and snap.ci_fix_rounds == 0 and snap.reason is None
+
+
+# ------------------------------------------------- base ref and resume generation
+def test_pass_records_the_reviewed_base_and_fail_clears_it():
+    _, s = make()
+    to_reviewing(s, "A")
+    assert s.on_verdict(KEY, Verdict("PASS", "A", (), "m"), base_ref="feature-x")
+    assert s.snapshot(KEY).approved_base_ref == "feature-x"
+    _, s2 = make()
+    to_reviewing(s2, "A")
+    assert s2.on_verdict(KEY, Verdict("PASS", "A", (), "m"))  # old caller: no base
+    assert s2.snapshot(KEY).approved_base_ref is None
+    s2.on_push(KEY, "B")
+    s2.on_ci_green(KEY, "B")
+    s2.on_review_started(KEY, "B", "m", base_ref="main")
+    s2.on_verdict(KEY, fail("B"), base_ref="main")
+    assert s2.snapshot(KEY).approved_base_ref is None
+
+
+def test_base_changed_sends_an_approved_head_back_to_ci_green():
+    repo, s = make()
+    to_reviewing(s, "A")
+    s.on_verdict(KEY, Verdict("PASS", "A", (), "m"), base_ref="feature-x")
+    assert s.on_base_changed(KEY, "A", "main")
+    snap = s.snapshot(KEY)
+    assert snap.state == State.CI_GREEN and snap.reason == "base branch changed"
+    assert (snap.approved_sha, snap.approved_base_ref) == (None, None)
+    # legal only for the current head while APPROVED
+    n = len(repo.stream("pr_gate", str(KEY)))
+    assert s.on_base_changed(KEY, "A", "main") is False
+    assert s.on_base_changed(KEY, "B", "main") is False
+    assert len(repo.stream("pr_gate", str(KEY))) == n
+    # and a re-review can start and approve for the new base
+    assert s.on_review_started(KEY, "A", "m")
+    assert s.on_verdict(KEY, Verdict("PASS", "A", (), "m"), base_ref="main")
+    assert s.snapshot(KEY).approved_base_ref == "main"
+
+
+def test_forged_base_changed_outside_approved_is_ignored_by_fold():
+    repo, s = make()
+    to_reviewing(s, "A")
+    repo.record_event("pr_gate", str(KEY), "base_changed", {"sha": "A", "base_ref": "x"})
+    assert s.snapshot(KEY).state == State.REVIEWING
+    s.on_verdict(KEY, Verdict("PASS", "A", (), "m"), base_ref="main")
+    repo.record_event("pr_gate", str(KEY), "base_changed", {"sha": "B", "base_ref": "x"})
+    assert s.snapshot(KEY).state == State.APPROVED
+
+
+def test_forged_verdict_base_must_be_a_non_empty_string():
+    repo, s = make()
+    to_reviewing(s, "A")
+    payload = {"sha": "A", "verdict": "PASS", "reviewer_model": "m", "findings": []}
+    repo.record_event("pr_gate", str(KEY), "verdict", {**payload, "base_ref": ["main"]})
+    assert s.snapshot(KEY).approved_base_ref is None
+
+
+def test_resume_count_counts_only_legal_resumes():
+    repo, s = make()
+    assert s.snapshot(KEY).resume_count == 0
+    repo.record_event("pr_gate", str(KEY), "resume", {})  # forged: not escalated
+    assert s.snapshot(KEY).resume_count == 0
+    to_reviewing(s, "A")
+    assert s.on_review_failed(KEY, "A", "boom")
+    assert s.resume(KEY)
+    assert s.snapshot(KEY).resume_count == 1
+    assert s.resume(KEY) is False
+    s.on_ci_green(KEY, "A")
+    s.on_review_started(KEY, "A", "m")
+    s.on_review_failed(KEY, "A", "boom")
+    assert s.resume(KEY)
+    assert s.snapshot(KEY).resume_count == 2

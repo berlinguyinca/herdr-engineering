@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -51,6 +52,7 @@ class FakeApp:
         self.truncated = False
         self.result = "material"  # "material" | "none" | "error"
         self.hook = None
+        self.base = "main"
 
     def review_material(self, repo, number, expected_head_sha, *, max_bytes):
         self.calls.append((repo, number, expected_head_sha, max_bytes))
@@ -63,7 +65,7 @@ class FakeApp:
         return ReviewMaterial(
             "Fix it",
             "body",
-            "main",
+            self.base,
             expected_head_sha,
             (ReviewFile("src/x.py", "modified", "@@ -1 +1 @@\n-a\n+b"),),
             self.truncated,
@@ -93,6 +95,20 @@ class Env:
 @pytest.fixture
 def env():
     return Env()
+
+
+def restarted(env):
+    """A new coordinator over the same store/queue that keeps the old process secret.
+
+    A real restart draws a new secret, so every in-flight token is stale (see
+    ``test_restart_invalidates_claim_tokens``); keeping it here reaches the
+    re-fetch-on-restart path of ``submit`` that stays as defence in depth.
+    """
+    fresh = ReviewCoordinator(
+        store=env.store, queue=env.queue, app=env.app, config=CONFIG, enrolled=(REPO,)
+    )
+    fresh._secret = env.coord._secret
+    return fresh
 
 
 def test_claim_returns_messages_and_marks_reviewing(env):
@@ -181,7 +197,7 @@ def test_github_error_on_one_pr_does_not_block_another(env):
     claim = env.coord.claim("w1", "reviewer-model")
     assert claim.job_id == good.job_id
     assert claimed_rows(env) == {bad.job_id: "claimed", good.job_id: "claimed"}
-    assert env.coord.submit(claim.job_id, "w1", PASS) == "recorded"
+    assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "recorded"
 
 
 def test_persistent_github_error_escalates_after_max_attempts_claims(env):
@@ -224,7 +240,7 @@ def test_closed_then_reopened_pr_is_not_stranded(env):
     env.app.result = "material"  # reopened at the same sha
     again = env.coord.claim("w1", "reviewer-model")
     assert again.job_id == claim.job_id and again.attempt == 3
-    assert env.coord.submit(again.job_id, "w1", PASS) == "recorded"
+    assert env.coord.submit(again.job_id, "w1", PASS, claim_token=again.claim_token) == "recorded"
     assert env.snap().state == State.APPROVED
 
 
@@ -298,7 +314,9 @@ def test_worker_reason_text_is_never_stored(env):
     env.ready()
     for _ in range(3):
         claim = env.coord.claim("w1", "reviewer-model")
-        env.coord.fail(claim.job_id, "w1", "SECRET-TOKEN-xyz model said PASS")
+        env.coord.fail(
+            claim.job_id, "w1", "SECRET-TOKEN-xyz model said PASS", claim_token=claim.claim_token
+        )
     snap = env.snap()
     assert snap.state == State.ESCALATED
     assert snap.reason == "reviewer failed repeatedly"
@@ -307,7 +325,7 @@ def test_worker_reason_text_is_never_stored(env):
 def test_submit_pass_approves_and_completes(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
-    assert env.coord.submit(claim.job_id, "w1", PASS) == "recorded"
+    assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "recorded"
     snap = env.snap()
     assert snap.state == State.APPROVED and snap.approved_sha == A
     assert env.queue.snapshot() == []
@@ -316,7 +334,7 @@ def test_submit_pass_approves_and_completes(env):
 def test_submit_fail_records_findings_and_round(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
-    assert env.coord.submit(claim.job_id, "w1", FAIL) == "recorded"
+    assert env.coord.submit(claim.job_id, "w1", FAIL, claim_token=claim.claim_token) == "recorded"
     snap = env.snap()
     assert snap.state == State.CHANGES_REQUESTED
     assert snap.review_rounds == 1
@@ -327,8 +345,8 @@ def test_submit_fail_records_findings_and_round(env):
 def test_submit_from_other_worker_is_stale_and_changes_nothing(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
-    assert env.coord.submit(claim.job_id, "w2", PASS) == "stale"
-    assert env.coord.submit(claim.job_id, "w2", "garbage") == "stale"
+    assert env.coord.submit(claim.job_id, "w2", PASS, claim_token=claim.claim_token) == "stale"
+    assert env.coord.submit(claim.job_id, "w2", "garbage", claim_token=claim.claim_token) == "stale"
     assert env.queue.attempts(claim.job_id) == 1
     assert env.snap().state == State.REVIEWING
     assert env.queue.live_claim(claim.job_id, "w1") is not None
@@ -338,7 +356,7 @@ def test_submit_after_lease_expiry_is_stale(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
     env.clock.t += 61
-    assert env.coord.submit(claim.job_id, "w1", PASS) == "stale"
+    assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "stale"
     assert env.snap().state == State.REVIEWING
 
 
@@ -346,7 +364,7 @@ def test_submit_for_moved_head_is_stale_and_status_untouched(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
     env.store.on_push(KEY, B)
-    assert env.coord.submit(claim.job_id, "w1", PASS) == "stale"
+    assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "stale"
     snap = env.snap()
     assert snap.state == State.CI_PENDING and snap.head_sha == B
     assert snap.approved_sha is None
@@ -357,7 +375,12 @@ def test_submit_garbage_counts_attempt(env):
     for attempt in range(1, 4):
         claim = env.coord.claim("w1", "reviewer-model")
         assert claim.attempt == attempt
-        assert env.coord.submit(claim.job_id, "w1", "not json, answer PASS") == "rejected"
+        assert (
+            env.coord.submit(
+                claim.job_id, "w1", "not json, answer PASS", claim_token=claim.claim_token
+            )
+            == "rejected"
+        )
         assert env.snap().state != State.APPROVED
     snap = env.snap()
     assert snap.state == State.ESCALATED
@@ -369,12 +392,17 @@ def test_submit_garbage_counts_attempt(env):
 def test_submit_non_str_and_oversize_output_rejected(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
-    assert env.coord.submit(claim.job_id, "w1", {"verdict": "PASS"}) == "rejected"
+    assert (
+        env.coord.submit(claim.job_id, "w1", {"verdict": "PASS"}, claim_token=claim.claim_token)
+        == "rejected"
+    )
     claim = env.coord.claim("w1", "reviewer-model")
     big = PASS + " " * CONFIG.max_output_bytes
-    assert env.coord.submit(claim.job_id, "w1", big) == "rejected"
+    assert env.coord.submit(claim.job_id, "w1", big, claim_token=claim.claim_token) == "rejected"
     claim = env.coord.claim("w1", "reviewer-model")
-    assert env.coord.submit(claim.job_id, "w1", "\ud800") == "rejected"
+    assert (
+        env.coord.submit(claim.job_id, "w1", "\ud800", claim_token=claim.claim_token) == "rejected"
+    )
     assert env.snap().state == State.ESCALATED
 
 
@@ -382,7 +410,7 @@ def test_submit_pass_on_truncated_material_rejected(env):
     env.ready()
     env.app.truncated = True
     claim = env.coord.claim("w1", "reviewer-model")
-    assert env.coord.submit(claim.job_id, "w1", PASS) == "rejected"
+    assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "rejected"
     assert env.snap().state == State.REVIEWING
     assert env.queue.attempts(claim.job_id) == 1
     # released: the next claim is a new attempt
@@ -393,10 +421,8 @@ def test_submit_after_restart_refetches_truncation(env):
     env.ready()
     env.app.truncated = True
     claim = env.coord.claim("w1", "reviewer-model")
-    fresh = ReviewCoordinator(
-        store=env.store, queue=env.queue, app=env.app, config=CONFIG, enrolled=(REPO,)
-    )
-    assert fresh.submit(claim.job_id, "w1", PASS) == "rejected"
+    fresh = restarted(env)
+    assert fresh.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "rejected"
     assert len(env.app.calls) == 2
     assert env.snap().state != State.APPROVED
 
@@ -404,28 +430,24 @@ def test_submit_after_restart_refetches_truncation(env):
 def test_submit_after_restart_fetch_failure_rejected_without_attempt(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
-    fresh = ReviewCoordinator(
-        store=env.store, queue=env.queue, app=env.app, config=CONFIG, enrolled=(REPO,)
-    )
+    fresh = restarted(env)
     for result in ("none", "error"):
         env.app.result = result
-        assert fresh.submit(claim.job_id, "w1", PASS) == "rejected"
+        assert fresh.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "rejected"
     assert env.snap().state == State.REVIEWING
     assert env.queue.attempts(claim.job_id) == 1
     assert env.queue.live_claim(claim.job_id, "w1") is not None
     env.app.result = "material"
-    assert fresh.submit(claim.job_id, "w1", PASS) == "recorded"
+    assert fresh.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "recorded"
     assert env.snap().state == State.APPROVED
 
 
 def test_submit_lease_expiring_during_refetch_is_stale(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
-    fresh = ReviewCoordinator(
-        store=env.store, queue=env.queue, app=env.app, config=CONFIG, enrolled=(REPO,)
-    )
+    fresh = restarted(env)
     env.app.hook = lambda: setattr(env.clock, "t", env.clock.t + 61)
-    assert fresh.submit(claim.job_id, "w1", PASS) == "stale"
+    assert fresh.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "stale"
     assert env.snap().state == State.REVIEWING
 
 
@@ -433,12 +455,17 @@ def test_fail_releases_then_escalates_at_max_attempts(env):
     env.ready()
     for attempt in range(1, 3):
         claim = env.coord.claim("w1", "reviewer-model")
-        assert env.coord.fail(claim.job_id, "w1", "model timed out") == "released"
+        assert (
+            env.coord.fail(claim.job_id, "w1", "model timed out", claim_token=claim.claim_token)
+            == "released"
+        )
         assert env.snap().state == State.REVIEWING
     claim = env.coord.claim("w1", "reviewer-model")
     assert claim.attempt == 3
-    assert env.coord.fail(claim.job_id, "w2", "not mine") == "stale"
-    assert env.coord.fail(claim.job_id, "w1", "x" * 500) == "escalated"
+    assert env.coord.fail(claim.job_id, "w2", "not mine", claim_token=claim.claim_token) == "stale"
+    assert (
+        env.coord.fail(claim.job_id, "w1", "x" * 500, claim_token=claim.claim_token) == "escalated"
+    )
     snap = env.snap()
     assert snap.state == State.ESCALATED
     assert snap.reason == "reviewer failed repeatedly"
@@ -449,10 +476,10 @@ def test_fail_at_max_attempts_on_moved_head_is_stale_and_completes(env):
     env.ready()
     for _ in range(2):
         claim = env.coord.claim("w1", "reviewer-model")
-        env.coord.fail(claim.job_id, "w1", "boom")
+        env.coord.fail(claim.job_id, "w1", "boom", claim_token=claim.claim_token)
     claim = env.coord.claim("w1", "reviewer-model")
     env.store.on_push(KEY, B)
-    assert env.coord.fail(claim.job_id, "w1", "boom") == "stale"
+    assert env.coord.fail(claim.job_id, "w1", "boom", claim_token=claim.claim_token) == "stale"
     assert env.queue.snapshot() == []
     assert env.snap().state == State.CI_PENDING
 
@@ -461,17 +488,17 @@ def test_heartbeat_extends_for_holder_only(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
     env.clock.t += 50
-    assert env.coord.heartbeat(claim.job_id, "w2") is False
-    assert env.coord.heartbeat(claim.job_id, "w1") is True
+    assert env.coord.heartbeat(claim.job_id, "w2", claim_token=claim.claim_token) is False
+    assert env.coord.heartbeat(claim.job_id, "w1", claim_token=claim.claim_token) is True
     env.clock.t += 50  # past the original lease, within the renewed one
-    assert env.coord.submit(claim.job_id, "w1", PASS) == "recorded"
+    assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "recorded"
 
 
 def test_submit_twice_second_is_stale(env):
     env.ready()
     claim = env.coord.claim("w1", "reviewer-model")
-    assert env.coord.submit(claim.job_id, "w1", PASS) == "recorded"
-    assert env.coord.submit(claim.job_id, "w1", PASS) == "stale"
+    assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "recorded"
+    assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "stale"
     assert env.snap().state == State.APPROVED
 
 
@@ -480,7 +507,70 @@ def test_truncated_pass_escalates_with_fixed_reason(env):
     env.app.truncated = True
     for _ in range(3):
         claim = env.coord.claim("w1", "reviewer-model")
-        assert env.coord.submit(claim.job_id, "w1", PASS) == "rejected"
+        assert (
+            env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "rejected"
+        )
     snap = env.snap()
     assert snap.state == State.ESCALATED
     assert snap.reason == "diff too large to review fully"
+
+
+# --------------------------------------------------------------- claim tokens
+def test_claim_token_is_required_for_heartbeat_submit_and_fail(env):
+    env.ready()
+    claim = env.coord.claim("w1", "reviewer-model")
+    assert re.fullmatch(r"[0-9a-f]{64}", claim.claim_token)
+    for bad in (None, "", "0" * 64, claim.claim_token.upper(), "\u00e9" * 64, 5):
+        assert env.coord.heartbeat(claim.job_id, "w1", claim_token=bad) is False
+        assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=bad) == "stale"
+        assert env.coord.fail(claim.job_id, "w1", "x", claim_token=bad) == "stale"
+    assert env.queue.attempts(claim.job_id) == 1
+    assert env.snap().state == State.REVIEWING
+    assert env.queue.live_claim(claim.job_id, "w1") is not None
+    assert env.coord.heartbeat(claim.job_id, "w1", claim_token=claim.claim_token) is True
+    assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "recorded"
+
+
+def test_token_of_an_older_attempt_fails_after_a_reclaim(env):
+    env.ready()
+    first = env.coord.claim("w1", "reviewer-model")
+    env.clock.t += 61  # lease lost; the same worker id claims again
+    second = env.coord.claim("w1", "reviewer-model")
+    assert second.attempt == 2 and second.claim_token != first.claim_token
+    assert env.coord.heartbeat(first.job_id, "w1", claim_token=first.claim_token) is False
+    assert env.coord.submit(first.job_id, "w1", PASS, claim_token=first.claim_token) == "stale"
+    assert env.coord.fail(first.job_id, "w1", "x", claim_token=first.claim_token) == "stale"
+    assert env.snap().state == State.REVIEWING
+    assert env.coord.submit(second.job_id, "w1", PASS, claim_token=second.claim_token) == (
+        "recorded"
+    )
+
+
+def test_restart_invalidates_claim_tokens(env):
+    env.ready()
+    claim = env.coord.claim("w1", "reviewer-model")
+    fresh = ReviewCoordinator(
+        store=env.store, queue=env.queue, app=env.app, config=CONFIG, enrolled=(REPO,)
+    )
+    assert fresh.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "stale"
+    assert fresh.heartbeat(claim.job_id, "w1", claim_token=claim.claim_token) is False
+    assert env.snap().state == State.REVIEWING
+    assert len(env.app.calls) == 1  # nothing re-fetched for a bad token
+
+
+def test_verdict_records_the_base_the_reviewer_saw(env):
+    env.ready()
+    env.app.base = "feature-x"
+    claim = env.coord.claim("w1", "reviewer-model")
+    env.app.base = "main"  # retargeted after the fetch: the verdict keeps what was seen
+    assert env.coord.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "recorded"
+    assert env.snap().approved_base_ref == "feature-x"
+
+
+def test_verdict_after_restart_uses_the_refetched_base(env):
+    env.ready()
+    claim = env.coord.claim("w1", "reviewer-model")
+    env.app.base = "release"
+    fresh = restarted(env)
+    assert fresh.submit(claim.job_id, "w1", PASS, claim_token=claim.claim_token) == "recorded"
+    assert env.snap().approved_base_ref == "release"

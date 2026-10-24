@@ -153,10 +153,24 @@ def _repo(raw):
     return RepoEnrollment(**kw)
 
 
+# Inclusive bounds; keys not listed only need to be >= 1.
+_REVIEWER_BOUNDS = {
+    "lease_seconds": (30, 86_400),
+    "max_output_bytes": (1_000, 2_000_000),
+    "max_diff_bytes": (1_000, 5_000_000),
+}
+
+
 def _reviewer(raw):
     raw = _mapping(raw, "review_gate.reviewer")
     _no_unknown(raw, _REVIEWER_KEYS, "review_gate.reviewer")
-    kw = {key: _int(raw, key, "review_gate.reviewer", 1) for key in raw}
+    kw = {}
+    for key in raw:
+        low, high = _REVIEWER_BOUNDS.get(key, (1, None))
+        val = _int(raw, key, "review_gate.reviewer", low)
+        if high is not None and val > high:
+            raise ValueError(f"review_gate.reviewer: {key} must be an integer <= {high}")
+        kw[key] = val
     return ReviewerConfig(**kw)
 
 

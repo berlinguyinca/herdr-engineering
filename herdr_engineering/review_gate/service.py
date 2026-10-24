@@ -61,8 +61,13 @@ Decisions and limits:
   when first seen, but only when known (kind != "unknown"): a first-wins pin of
   "unknown" would permanently disable same-model reviewer exclusion.
   ``PrInfo.author_login`` is never used as an identity.
-- Retargeting a PR to a different base keeps an approval for the same head
-  SHA (no new head means no re-review): known limitation.
+- Retargeting: an approval is for the base the reviewer saw (the verdict's
+  ``base_ref``). An APPROVED PR whose current ``base_ref`` differs, or whose
+  approval recorded no base (an old or forged event), is never merged:
+  ``store.on_base_changed`` sends it back to ``CI_GREEN``, the head is
+  re-queued (``queue.rearm``) and the status says "base branch changed,
+  re-reviewing". Otherwise a PR reviewed against branch X (holding unreviewed
+  commits) and then retargeted to main would merge those commits unreviewed.
 - A PR that leaves the open list (closed, merged elsewhere) has its queued
   review cancelled. Detection uses an in-memory memo of PR numbers per repo,
   so a PR closed while the service was down is not noticed.
@@ -399,6 +404,14 @@ class GateService:
     ) -> None:
         repo, sha = enrollment.repo, pr.head_sha
         if pr.draft:  # never merge a draft (drafts are skipped earlier too)
+            return
+        if snap.approved_base_ref is None or pr.base_ref != snap.approved_base_ref:
+            # Approved for another base (retargeted) or for an unknown one: fail
+            # closed and review this head again against the current base.
+            if self._store.on_base_changed(key, sha, pr.base_ref):
+                self._queue.rearm(key, sha, self._author_model(key, sha, pr.head_ref))
+                counts["enqueued"] += 1
+            self._status(repo, sha, "pending", "review gate: base branch changed, re-reviewing")
             return
         checks = []
         for event in enrollment.required_events:

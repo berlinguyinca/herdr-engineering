@@ -62,11 +62,21 @@ def _reviewer_route(parts):
     return None
 
 
-_CLAIM_FIELDS = ("job_id", "repo", "number", "sha", "messages", "lease_seconds", "attempt")
+_CLAIM_FIELDS = (
+    "job_id",
+    "repo",
+    "number",
+    "sha",
+    "messages",
+    "lease_seconds",
+    "attempt",
+    "claim_token",
+)
 _RESULT_OUTCOMES = frozenset({"recorded", "stale", "rejected"})
 _FAILURE_OUTCOMES = frozenset({"released", "escalated", "stale"})
 _REVIEWER_ID = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
 _REVIEWER_JOB_ID = re.compile(r"[0-9a-f]{32}")
+_REVIEWER_CLAIM_TOKEN = re.compile(r"[0-9a-f]{64}")
 _REVIEWER_SMALL_BODY = 8 * 1024
 _REVIEWER_REASON_MAX = 500
 _log = logging.getLogger(__name__)
@@ -1133,8 +1143,13 @@ def _make_handler(server, public=False, operator=False):
             if parts[4] == "prs":
                 return self._json([_gate_pr(snap) for snap in server.gate_store.snapshots()])
             if parts[4] == "queue":
+                jobs = server.gate_queue.snapshot()
+                if self._role() != "operator":
+                    # Who holds a claim is operator information (the claim token
+                    # is what protects a claim; this only narrows the view).
+                    jobs = [{k: v for k, v in j.items() if k != "claimed_by"} for j in jobs]
                 return self._json({"depth": server.gate_queue.depth(),
-                                   "jobs": server.gate_queue.snapshot(),
+                                   "jobs": jobs,
                                    "gate": server.gate_service.status()})
             if parts[4] == "notices":
                 from ..review_gate.notifier import recent_notices
@@ -1190,6 +1205,11 @@ def _make_handler(server, public=False, operator=False):
                     return None, (400, f"invalid {name}")
             if "output" in fields and not isinstance(body["output"], str):
                 return None, (400, "invalid output")
+            if "claim_token" in fields and not (
+                isinstance(body["claim_token"], str)
+                and _REVIEWER_CLAIM_TOKEN.fullmatch(body["claim_token"])
+            ):
+                return None, (400, "invalid claim_token")
             reason = body.get("reason", "")
             if not isinstance(reason, str) or len(reason) > _REVIEWER_REASON_MAX:
                 return None, (400, "invalid reason")
@@ -1215,9 +1235,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(400, "invalid job id")
             fields = {
                 "claim": {"worker_id", "reviewer_model"},
-                "heartbeat": {"worker_id"},
-                "result": {"worker_id", "output"},
-                "failure": {"worker_id", "reason"},
+                "heartbeat": {"worker_id", "claim_token"},
+                "result": {"worker_id", "output", "claim_token"},
+                "failure": {"worker_id", "reason", "claim_token"},
             }[action]
             # JSON escaping can expand each output byte up to 6x ("\u0001"); the
             # coordinator's byte-exact max_output_bytes check is the real limit.
@@ -1233,13 +1253,15 @@ def _make_handler(server, public=False, operator=False):
                     got = coord.claim(worker, body["reviewer_model"])
                     job = None if got is None else {f: getattr(got, f) for f in _CLAIM_FIELDS}
                     return self._json({"job": job})
+                token = body["claim_token"]
                 if action == "heartbeat":
-                    return self._json({"ok": coord.heartbeat(job_id, worker) is True})
+                    ok = coord.heartbeat(job_id, worker, claim_token=token) is True
+                    return self._json({"ok": ok})
                 if action == "result":
-                    outcome = coord.submit(job_id, worker, body["output"])
+                    outcome = coord.submit(job_id, worker, body["output"], claim_token=token)
                     allowed = _RESULT_OUTCOMES
                 else:
-                    outcome = coord.fail(job_id, worker, body["reason"])
+                    outcome = coord.fail(job_id, worker, body["reason"], claim_token=token)
                     allowed = _FAILURE_OUTCOMES
                 if not isinstance(outcome, str) or outcome not in allowed:
                     raise TypeError("unexpected coordinator outcome")

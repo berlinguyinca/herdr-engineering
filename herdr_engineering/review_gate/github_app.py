@@ -35,7 +35,9 @@ REFRESH_MARGIN = 60
 STATUS_DESCRIPTION_MAX = 140
 REVIEW_TITLE_MAX = 500
 REVIEW_BODY_MAX = 20000
-PR_FILES_CAP = 300  # GitHub's limit on the PR files listing
+# Files read for a review (3 pages of 100). GitHub lists up to 3000 files per PR;
+# a PR with 300 or more files is marked truncated, so it cannot PASS.
+PR_FILES_CAP = 300
 _NAME = re.compile(r"[A-Za-z0-9_.-]+")
 _SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 _BLOB = re.compile(r"[0-9a-fA-F]{40}")
@@ -329,7 +331,7 @@ class GitHubAppClient:
             if len(data) < 100:
                 break
         else:
-            truncated = True  # reached GitHub's 300-file listing limit
+            truncated = True  # read PR_FILES_CAP files: there may be more
         if self._review_pr(slug, number, sha) is None:
             return None
         title, body, base_ref = first

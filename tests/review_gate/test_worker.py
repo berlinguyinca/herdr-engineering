@@ -25,6 +25,7 @@ MODEL_URL = "https://llm.example.org"
 CP_KEY = "rk-reviewer-SECRET-41a7"
 MODEL_KEY = "sk-model-SECRET-93be"
 JOB_ID = "0123456789abcdef0123456789abcdef"
+TOKEN = "c0ffee" + "0" * 58
 MESSAGES = [
     {"role": "system", "content": "You review code."},
     {"role": "user", "content": "PROMPT-TEXT-ATTACKER-CONTROLLED"},
@@ -64,6 +65,7 @@ def job(**over):
         "messages": MESSAGES,
         "lease_seconds": 120,
         "attempt": 1,
+        "claim_token": TOKEN,
     }
     j.update(over)
     return j
@@ -266,7 +268,9 @@ def test_run_once_posts_model_output_as_result(tmp_path):
         "max_tokens": 2048,
     }
     assert "tools" not in model_body and "functions" not in model_body
-    assert fake.bodies("/result") == [{"worker_id": "worker-1", "output": OUTPUT}]
+    assert fake.bodies("/result") == [
+        {"worker_id": "worker-1", "output": OUTPUT, "claim_token": TOKEN}
+    ]
     assert fake.bodies("/failure") == []
     assert f"{MODEL_URL}/v1/chat/completions" in fake.urls()
     assert f"{CP}/api/v1/review-gate/jobs/{JOB_ID}/result" in fake.urls()
@@ -286,8 +290,8 @@ def test_every_control_plane_body_has_exact_keys(tmp_path):
     assert w.run_once() is True
     expected = {
         "/claim": {"worker_id", "reviewer_model"},
-        "/heartbeat": {"worker_id"},
-        "/result": {"worker_id", "output"},
+        "/heartbeat": {"worker_id", "claim_token"},
+        "/result": {"worker_id", "output", "claim_token"},
     }
     for suffix, keys in expected.items():
         bodies = fake.bodies(suffix)
@@ -298,7 +302,7 @@ def test_every_control_plane_body_has_exact_keys(tmp_path):
     happy(fake2)
     fake2.on("/v1/chat/completions", status=500, payload={"error": "boom"})
     assert ReviewWorker(cfg, http=fake2).run_once() is True
-    assert [set(b) for b in fake2.bodies("/failure")] == [{"worker_id", "reason"}]
+    assert [set(b) for b in fake2.bodies("/failure")] == [{"worker_id", "reason", "claim_token"}]
 
 
 def test_model_error_posts_failure_without_body_text(tmp_path, caplog):
@@ -323,7 +327,9 @@ def test_model_error_posts_failure_without_body_text(tmp_path, caplog):
     happy(fake2)
     fake2.on("/v1/chat/completions", fn=lambda b: Boom(f"refused {MODEL_URL} secret"))
     assert ReviewWorker(make_config(tmp_path), http=fake2).run_once() is True
-    assert fake2.bodies("/failure") == [{"worker_id": "worker-1", "reason": "Boom"}]
+    assert fake2.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "Boom", "claim_token": TOKEN}
+    ]
     assert "secret" not in caplog.text
 
 
@@ -343,7 +349,9 @@ def test_unexpected_model_shapes_are_bad_response(tmp_path, payload):
     fake = FakeHttp()
     happy(fake, model=payload)
     assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
-    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "bad_response"}]
+    assert fake.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "bad_response", "claim_token": TOKEN}
+    ]
     assert fake.bodies("/result") == []
 
 
@@ -352,7 +360,9 @@ def test_non_json_model_body_is_bad_response(tmp_path):
     happy(fake)
     fake.on("/v1/chat/completions", raw=b"<html>not json</html>")
     assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
-    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "bad_response"}]
+    assert fake.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "bad_response", "claim_token": TOKEN}
+    ]
 
 
 def test_authorization_headers_use_key_files_and_never_appear_in_logs(tmp_path, caplog):
@@ -451,7 +461,9 @@ def test_heartbeat_429_is_not_a_lost_lease(tmp_path):
     w._heartbeat_interval = lambda lease: 0.01
     assert w.run_once() is True
     assert len(fake.bodies("/heartbeat")) >= 1
-    assert fake.bodies("/result") == [{"worker_id": "worker-1", "output": OUTPUT}]
+    assert fake.bodies("/result") == [
+        {"worker_id": "worker-1", "output": OUTPUT, "claim_token": TOKEN}
+    ]
 
 
 def test_heartbeat_auth_error_abandons_then_raises(tmp_path):
@@ -489,7 +501,9 @@ def test_oversized_model_response_is_a_failure(tmp_path):
     happy(fake)
     fake.on("/v1/chat/completions", raw=b" " * (MAX_RESPONSE_BYTES + 1))
     assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
-    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "response_too_large"}]
+    assert fake.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "response_too_large", "claim_token": TOKEN}
+    ]
     assert fake.bodies("/result") == []
 
 
@@ -498,7 +512,9 @@ def test_result_413_posts_output_too_large(tmp_path):
     happy(fake)
     fake.on("/result", status=413, payload={"error": "request body too large"})
     assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
-    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "output_too_large"}]
+    assert fake.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "output_too_large", "claim_token": TOKEN}
+    ]
 
 
 def test_result_transport_error_posts_failure(tmp_path):
@@ -506,7 +522,9 @@ def test_result_transport_error_posts_failure(tmp_path):
     happy(fake)
     fake.on("/result", fn=lambda b: BrokenPipeError("pipe"))
     assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
-    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "BrokenPipeError"}]
+    assert fake.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "BrokenPipeError", "claim_token": TOKEN}
+    ]
 
 
 def test_unexpected_result_outcome_is_logged_not_trusted(tmp_path, caplog):
@@ -590,7 +608,9 @@ def test_malformed_job_posts_bad_response(tmp_path, over):
     fake = FakeHttp()
     happy(fake, claim_job=job(**over))
     assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
-    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "bad_response"}]
+    assert fake.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "bad_response", "claim_token": TOKEN}
+    ]
     assert fake.bodies("/v1/chat/completions") == []
 
 
@@ -861,7 +881,7 @@ def test_end_to_end_against_the_real_control_plane(tmp_path, monkeypatch, caplog
         # the job is finished server-side: posting again is stale
         status, _h, raw = w._post_cp(
             f"/api/v1/review-gate/jobs/{queued.job_id}/result",
-            {"worker_id": "worker-1", "output": OUTPUT},
+            {"worker_id": "worker-1", "output": OUTPUT, "claim_token": "0" * 64},
         )
         assert (status, json.loads(raw)) == (200, {"outcome": "stale"})
         assert w.run_once() is False  # nothing left to claim
@@ -951,7 +971,9 @@ def test_lease_seconds_above_a_day_is_bad_response(tmp_path):
     fake = FakeHttp()
     happy(fake, claim_job=job(lease_seconds=86401))
     assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
-    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "bad_response"}]
+    assert fake.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "bad_response", "claim_token": TOKEN}
+    ]
     assert fake.bodies("/v1/chat/completions") == []
     fake2 = FakeHttp()
     happy(fake2, claim_job=job(lease_seconds=86400))
@@ -985,12 +1007,16 @@ def test_truncated_model_output_is_a_failure(tmp_path):
     payload = {"choices": [{"message": {"content": OUTPUT[:5]}, "finish_reason": "length"}]}
     happy(fake, model=payload)
     assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
-    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "truncated"}]
+    assert fake.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "truncated", "claim_token": TOKEN}
+    ]
     assert fake.bodies("/result") == []
     fake2 = FakeHttp()
     happy(fake2, model={"choices": [{"message": {"content": OUTPUT}, "finish_reason": "stop"}]})
     assert ReviewWorker(make_config(tmp_path), http=fake2).run_once() is True
-    assert fake2.bodies("/result") == [{"worker_id": "worker-1", "output": OUTPUT}]
+    assert fake2.bodies("/result") == [
+        {"worker_id": "worker-1", "output": OUTPUT, "claim_token": TOKEN}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1008,5 +1034,123 @@ def test_bad_message_shapes_are_bad_response_without_a_model_call(tmp_path, mess
     fake = FakeHttp()
     happy(fake, claim_job=job(messages=messages))
     assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is True
-    assert fake.bodies("/failure") == [{"worker_id": "worker-1", "reason": "bad_response"}]
+    assert fake.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "bad_response", "claim_token": TOKEN}
+    ]
     assert fake.bodies("/v1/chat/completions") == []
+
+
+# ------------------------------------------------------ claim token, deadline
+def test_claim_token_is_sent_on_heartbeat_result_and_failure(tmp_path):
+    fake = FakeHttp()
+    happy(fake)
+    fake.on(
+        "/v1/chat/completions",
+        fn=lambda b: (time.sleep(0.2), (200, {}, json.dumps(chat()).encode()))[1],
+    )
+    w = ReviewWorker(make_config(tmp_path), http=fake)
+    w._heartbeat_interval = lambda lease: 0.02
+    assert w.run_once() is True
+    beats = fake.bodies("/heartbeat")
+    assert beats and all(b == {"worker_id": "worker-1", "claim_token": TOKEN} for b in beats)
+    assert fake.bodies("/result")[0]["claim_token"] == TOKEN
+
+
+@pytest.mark.parametrize("token", [None, "", "C" * 64, "c" * 63, 5, "../" + "c" * 61])
+def test_missing_or_malformed_claim_token_posts_nothing(tmp_path, token):
+    claimed = job()
+    if token is None:
+        del claimed["claim_token"]
+    else:
+        claimed["claim_token"] = token
+    fake = FakeHttp()
+    happy(fake, claim_job=claimed)
+    assert ReviewWorker(make_config(tmp_path), http=fake).run_once() is False
+    assert all(u.endswith("/claim") for u in fake.urls())  # the lease just expires
+
+
+class StepClock:
+    """Monotonic seam: the first call reads ``start``; every later call ``later``."""
+
+    def __init__(self, start=0.0, later=10_000.0):
+        self.calls = 0
+        self.start, self.later = start, later
+
+    def __call__(self):
+        self.calls += 1
+        return self.start if self.calls == 1 else self.later
+
+
+def test_model_call_has_a_total_wall_clock_deadline(tmp_path):
+    fake = FakeHttp()
+    happy(fake)
+    release = threading.Event()
+
+    def dripping(body):  # never finishes on its own: a slow drip holding the lease
+        release.wait(5)
+        return 200, {}, json.dumps(chat()).encode()
+
+    fake.on("/v1/chat/completions", fn=dripping)
+    before = {t.ident for t in threading.enumerate()}
+    w = ReviewWorker(make_config(tmp_path, poll=7), http=fake, clock=StepClock())
+    t0 = time.monotonic()
+    try:
+        assert w.run_once() is True
+    finally:
+        release.set()
+    assert time.monotonic() - t0 < 2
+    assert fake.bodies("/failure") == [
+        {"worker_id": "worker-1", "reason": "model_timeout", "claim_token": TOKEN}
+    ]
+    assert fake.bodies("/result") == []
+    assert w.backoff_seconds == 7  # a failed job: backs off
+    time.sleep(0.05)
+    alive = [t for t in threading.enumerate() if t.ident not in before and t.is_alive()]
+    assert [t for t in alive if t.name.startswith("review-gate-heartbeat")] == []
+
+
+def test_model_call_within_the_deadline_is_unaffected(tmp_path):
+    fake = FakeHttp()
+    happy(fake)
+    w = ReviewWorker(make_config(tmp_path), http=fake, clock=StepClock(later=0.0))
+    assert w.run_once() is True
+    assert fake.bodies("/result") and fake.bodies("/failure") == []
+
+
+class _Drip(http.server.BaseHTTPRequestHandler):
+    release = threading.Event()
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.send_response(200)
+        self.send_header("Content-Length", "1000")
+        self.end_headers()
+        self.wfile.write(b"x" * 10)
+        self.wfile.flush()
+        _Drip.release.wait(5)
+        try:
+            self.wfile.write(b"x" * 990)
+        except OSError:
+            pass
+
+
+def test_default_transport_enforces_a_total_deadline_between_reads():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Drip)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _Drip.release.clear()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/x"
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            worker_mod._urllib_http("POST", url, {}, b"{}", 5, clock=StepClock(later=6.0))
+        assert time.monotonic() - t0 < 2
+        _Drip.release.set()
+        status, _h, body = worker_mod._urllib_http("POST", url, {}, b"{}", 5)
+        assert status == 200 and len(body) == 1000
+    finally:
+        _Drip.release.set()
+        srv.shutdown()
+        srv.server_close()

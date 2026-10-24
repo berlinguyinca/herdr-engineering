@@ -214,6 +214,12 @@ def test_reviewer_overrides_parse(tmp_path):
     "bad",
     [
         {"lease_seconds": 0},
+        {"lease_seconds": 29},
+        {"lease_seconds": 86401},
+        {"max_output_bytes": 999},
+        {"max_output_bytes": 2_000_001},
+        {"max_diff_bytes": 999},
+        {"max_diff_bytes": 5_000_001},
         {"max_attempts": 0},
         {"max_diff_bytes": True},
         {"max_findings": "5"},
@@ -223,6 +229,15 @@ def test_reviewer_overrides_parse(tmp_path):
 def test_reviewer_rejects_bad_values(tmp_path, bad):
     with pytest.raises(ValueError):
         load_review_gate_config(section(tmp_path, reviewer=bad))
+
+
+def test_reviewer_bounds_are_inclusive(tmp_path):
+    for rev in (
+        {"lease_seconds": 30, "max_output_bytes": 1000, "max_diff_bytes": 1000},
+        {"lease_seconds": 86400, "max_output_bytes": 2_000_000, "max_diff_bytes": 5_000_000},
+    ):
+        got = load_review_gate_config(section(tmp_path, reviewer=rev)).reviewer
+        assert (got.lease_seconds, got.max_output_bytes, got.max_diff_bytes) == tuple(rev.values())
 
 
 def test_notify_commands_are_argv_lists(tmp_path):

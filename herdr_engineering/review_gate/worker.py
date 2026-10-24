@@ -11,8 +11,13 @@ control plane, so it is built to hold nothing worth stealing and to leak nothing
   sent to ``/failure`` are a fixed word or an exception class name. Response
   bodies, URLs, headers, prompt text and model output never reach a log line, a
   reason or an exception message.
-* Every request has a timeout, every response is read to at most 1 MiB, no
-  redirect is followed, and no proxy is taken from the environment.
+* Every request has a total wall-clock deadline (its timeout covers the whole
+  exchange, not one socket read, so a dripping endpoint cannot hold a lease
+  through heartbeats), every response is read to at most 1 MiB, no redirect is
+  followed, and no proxy is taken from the environment. A model call past
+  ``model.timeout_seconds`` is abandoned and reported as ``model_timeout``.
+* Claims are protected by the ``claim_token`` the control plane returns with a
+  job; it is sent with every heartbeat, result and failure and never logged.
 * Configuration comes only from the YAML file (no environment variables).
 * Failed attempts are spaced out on purpose. A ``/failure`` releases the job
   straight back to the queue and the PR escalates after ``max_attempts``, so a
@@ -52,8 +57,10 @@ _JOB_ID = re.compile(r"[0-9a-f]{32}")
 _MAX_LEASE_SECONDS = 86400
 _MESSAGE_ROLES = frozenset({"system", "user", "assistant"})
 _CLAIM_FIELDS = frozenset(
-    {"job_id", "repo", "number", "sha", "messages", "lease_seconds", "attempt"}
+    {"job_id", "repo", "number", "sha", "messages", "lease_seconds", "attempt", "claim_token"}
 )
+_CLAIM_TOKEN = re.compile(r"[0-9a-f]{64}")
+_READ_CHUNK = 64 * 1024
 _RESULT_OUTCOMES = frozenset({"recorded", "stale", "rejected"})
 _FAILURE_OUTCOMES = frozenset({"released", "escalated", "stale"})
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -71,6 +78,10 @@ class WorkerConfigError(ValueError):
 
 class WorkerAuthError(Exception):
     """The control plane refused the reviewer key (401/403). Stops the worker."""
+
+
+class _DeadlineExceeded(TimeoutError):
+    """The whole request (not one socket operation) ran past its timeout."""
 
 
 class _ModelError(Exception):
@@ -261,12 +272,16 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
-def _urllib_http(method, url, headers, body, timeout):
+def _urllib_http(method, url, headers, body, timeout, *, clock=time.monotonic):
     """POST via urllib: ``(status, headers, body)``; body read to MAX_RESPONSE_BYTES + 1.
 
+    ``timeout`` is both the per-socket-operation timeout and a TOTAL deadline:
+    the body is read in chunks and ``clock`` (monotonic seconds) is checked
+    between reads, raising ``_DeadlineExceeded`` (a TimeoutError) once past it.
     Error-status bodies are discarded unread; only the status and headers remain.
     Transport problems raise (the caller reports the exception class name only).
     """
+    deadline = clock() + timeout
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         resp = _OPENER.open(req, timeout=timeout)
@@ -275,7 +290,17 @@ def _urllib_http(method, url, headers, body, timeout):
         exc.close()
         return status, hdrs, b""
     with resp:
-        return resp.status, dict(resp.headers.items()), resp.read(MAX_RESPONSE_BYTES + 1)
+        chunks: list[bytes] = []
+        size = 0
+        while size <= MAX_RESPONSE_BYTES:
+            if clock() >= deadline:
+                raise _DeadlineExceeded()
+            chunk = resp.read1(min(_READ_CHUNK, MAX_RESPONSE_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return resp.status, dict(resp.headers.items()), b"".join(chunks)
 
 
 def _header(headers, name):
@@ -310,8 +335,14 @@ def _json_object(raw) -> dict:
     return value
 
 
+def _token_ok(token) -> bool:
+    return isinstance(token, str) and _CLAIM_TOKEN.fullmatch(token) is not None
+
+
 def _valid_job(job) -> bool:
     if set(job) != _CLAIM_FIELDS:
+        return False
+    if not _token_ok(job.get("claim_token")):
         return False
     messages = job["messages"]
     if not isinstance(messages, list) or not messages:
@@ -334,15 +365,18 @@ class ReviewWorker:
     ``http`` is the transport seam: ``http(method, url, headers, body, timeout)``
     returning ``(status, headers, body_bytes)``. ``sleep`` is accepted for
     interface compatibility; waits use ``threading.Event.wait`` so ``run(stop)``
-    and the heartbeat thread stop promptly.
+    and the heartbeat thread stop promptly. ``clock`` (monotonic seconds) times
+    the total model-call deadline.
     """
 
-    def __init__(self, config: WorkerConfig, *, http=None, sleep=time.sleep):
+    def __init__(self, config: WorkerConfig, *, http=None, sleep=time.sleep, clock=time.monotonic):
         self._config = config
+        self._clock = clock
         self._http = http or _urllib_http
         self._sleep = sleep
         self._stop = threading.Event()
         self._failures = 0
+        self._token = ""  # claim token of the job in hand
         # Seconds ``run`` waits before the next claim (0: claim again at once).
         self.backoff_seconds = config.poll_seconds
 
@@ -440,6 +474,12 @@ class ReviewWorker:
             # Nowhere safe to post a failure: let the lease expire.
             _log.warning("review gate claim bad_response")
             return False
+        token = job.get("claim_token")
+        if not _token_ok(token):
+            # Cannot authenticate a failure post: let the lease expire.
+            _log.warning("review gate claim bad_response")
+            return False
+        self._token = token
         _log.info("review gate job %s claimed", job_id)
         if not _valid_job(job):
             self._post_failure(job_id, "bad_response")
@@ -482,10 +522,15 @@ class ReviewWorker:
                 wake.set()
 
         model = threading.Thread(target=call_model, name="review-gate-model", daemon=True)
+        deadline = self._clock() + self._config.model.timeout_seconds
+        timed_out = False
         heartbeat.start()
         model.start()
         while not wake.wait(0.1):
             if self._stop.is_set():
+                break
+            if self._clock() >= deadline:
+                timed_out = True  # total wall clock, whatever the transport does
                 break
         done.set()
         heartbeat.join(CONTROL_PLANE_TIMEOUT + 5)
@@ -498,6 +543,9 @@ class ReviewWorker:
             raise WorkerConfigError("key file is no longer acceptable")
         if lost["lost"]:
             _log.info("review gate job %s abandoned", job_id)
+            return False
+        if timed_out:
+            self._post_failure(job_id, "model_timeout")
             return False
         if "text" not in box and "error" not in box:  # stopped mid-call
             _log.info("review gate job %s abandoned", job_id)
@@ -512,6 +560,7 @@ class ReviewWorker:
                 _BadResponse: "bad_response",
                 _TooLarge: "response_too_large",
                 _Truncated: "truncated",
+                _DeadlineExceeded: "model_timeout",
             }.get(type(error), type(error).__name__)
             self._post_failure(job_id, reason)
             return False
@@ -521,7 +570,9 @@ class ReviewWorker:
         path = f"{_JOBS_PATH}{job_id}/heartbeat"
         while not done.wait(interval):
             try:
-                status, _hdrs, raw = self._post_cp(path, {"worker_id": self._config.worker_id})
+                status, _hdrs, raw = self._post_cp(
+                    path, {"worker_id": self._config.worker_id, "claim_token": self._token}
+                )
             except WorkerAuthError:
                 lost.update(lost=True, auth=True)
                 break
@@ -544,7 +595,7 @@ class ReviewWorker:
             wake.set()
 
     def _post_result(self, job_id: str, text: str) -> bool:
-        body = {"worker_id": self._config.worker_id, "output": text}
+        body = {"worker_id": self._config.worker_id, "output": text, "claim_token": self._token}
         try:
             status, _hdrs, raw = self._post_cp(f"{_JOBS_PATH}{job_id}/result", body)
         except (WorkerAuthError, WorkerConfigError):
@@ -562,7 +613,7 @@ class ReviewWorker:
         return self._log_outcome(job_id, raw, _RESULT_OUTCOMES) in ("recorded", "stale")
 
     def _post_failure(self, job_id: str, reason: str) -> None:
-        body = {"worker_id": self._config.worker_id, "reason": reason}
+        body = {"worker_id": self._config.worker_id, "reason": reason, "claim_token": self._token}
         try:
             status, _hdrs, raw = self._post_cp(f"{_JOBS_PATH}{job_id}/failure", body)
         except (WorkerAuthError, WorkerConfigError):
@@ -594,8 +645,9 @@ class ReviewWorker:
 
         Raises ``WorkerAuthError`` (401/403) and ``WorkerConfigError`` (a key file
         went bad) without retrying. A job still in flight when ``stop`` is set is
-        abandoned without posting: the server re-queues it when its lease expires,
-        which does not escalate the PR on a routine restart.
+        abandoned without posting: the server re-offers it when its lease expires.
+        That abandoned claim has spent one of the job's ``max_attempts``, so
+        restarting workers mid-review again and again can escalate the PR.
         """
         self._stop = stop
         while not stop.is_set():

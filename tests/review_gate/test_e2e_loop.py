@@ -95,11 +95,11 @@ class FakeGitHub:
         self.calls.append(("update_branch", number, expected_head_sha))
 
     def review_material(self, repo, number, expected_head_sha, *, max_bytes):
-        head = next((p.head_sha for p in self.prs if p.number == number), None)
-        if repo != REPO or head != expected_head_sha:
+        pr = next((p for p in self.prs if p.number == number), None)
+        if repo != REPO or pr is None or pr.head_sha != expected_head_sha:
             return None
         files = (ReviewFile("src/widget.py", "modified", self.diff),)
-        return ReviewMaterial("Fix the widget", "PR body", "main", head, files, False)
+        return ReviewMaterial("Fix the widget", "PR body", pr.base_ref, pr.head_sha, files, False)
 
     def merges(self):
         return [c for c in self.calls if c[0] == "merge"]
@@ -229,13 +229,13 @@ class Loop:
             )
         )
 
-    def push(self, sha):
+    def push(self, sha, base="main"):
         self.app.prs = [
             PrInfo(
                 number=7,
                 head_sha=sha,
                 head_ref=BRANCH,
-                base_ref="main",
+                base_ref=base,
                 author_login="bot",
                 draft=False,
             )
@@ -272,9 +272,9 @@ class Loop:
         with response:
             return response.status, json.loads(response.read())
 
-    def review_ready(self, sha):
+    def review_ready(self, sha, base="main"):
         """Push ``sha``, turn its CI green and tick: one review job queued."""
-        self.push(sha)
+        self.push(sha, base)
         self.tick()
         self.ci.green(sha)
         self.tick()
@@ -484,7 +484,8 @@ def test_dead_worker_lease_expires_and_second_worker_finishes(loop):
     status, _h, raw = dead._post_cp(
         "/api/v1/review-gate/claim", {"worker_id": "dead", "reviewer_model": REVIEW_MODEL}
     )
-    assert status == 200 and json.loads(raw)["job"]["job_id"] == job_id
+    dead_job = json.loads(raw)["job"]
+    assert status == 200 and dead_job["job_id"] == job_id
     assert loop.state().state == State.REVIEWING
 
     second = loop.worker(worker_id="w2")
@@ -495,7 +496,8 @@ def test_dead_worker_lease_expires_and_second_worker_finishes(loop):
     assert loop.state().state == State.APPROVED
     assert loop.srv.gate_queue.attempts(job_id) == 2
     status, _h, raw = dead._post_cp(
-        f"/api/v1/review-gate/jobs/{job_id}/result", {"worker_id": "dead", "output": PASS}
+        f"/api/v1/review-gate/jobs/{job_id}/result",
+        {"worker_id": "dead", "output": PASS, "claim_token": dead_job["claim_token"]},
     )
     assert (status, json.loads(raw)) == (200, {"outcome": "stale"})
     loop.tick()
@@ -548,3 +550,55 @@ def test_three_garbage_replies_escalate(make_loop, tmp_path):
     assert w.run_once() is True
     loop.tick()
     assert loop.app.merges() == [("merge", REPO, 7, A)]
+
+
+def test_retargeted_pr_is_reviewed_again_before_it_can_merge(loop):
+    """PR feature -> X passes review; retargeted to main at the same head it must
+    not merge (main would get X's unreviewed commits) until reviewed for main."""
+    loop.review_ready(A, base="feature-x")
+    loop.model.replies = [PASS]
+    assert loop.worker().run_once() is True
+    assert loop.state().approved_base_ref == "feature-x"
+    loop.push(A, base="main")  # retarget: same head SHA, CI keyed by SHA stays green
+    loop.tick()
+    assert loop.app.merges() == []
+    assert "success" not in loop.app.states(A)
+    snap = loop.state()
+    assert snap.state == State.CI_GREEN and snap.reason == "base branch changed"
+    jobs = [j for j in loop.srv.gate_queue.snapshot() if j["sha"] == A]
+    assert [j["state"] for j in jobs] == ["queued"]
+    loop.tick()
+    assert loop.app.merges() == []
+    loop.model.replies = [PASS]
+    assert loop.worker().run_once() is True
+    assert loop.state().approved_base_ref == "main"
+    loop.tick()
+    assert loop.app.merges() == [("merge", REPO, 7, A)]
+
+
+def test_escalating_again_after_resume_on_the_same_head_pages_again(make_loop, tmp_path):
+    out = tmp_path / "paged.txt"
+    script = tmp_path / "page.sh"
+    script.write_text(f"#!/bin/sh\ncat >> {out}\necho --- >> {out}\n")
+    script.chmod(0o700)
+    loop = make_loop(notify={"notify_command": [str(script), "{repo}#{number}"]})
+    loop.review_ready(A)
+    w = loop.worker()
+    for round_ in range(2):
+        loop.model.replies = ["nope"] * 3
+        for _ in range(3):
+            assert w.run_once() is True
+        assert loop.state().state == State.ESCALATED
+        loop.tick()
+        loop.tick()  # deduped within one generation
+        if round_ == 0:
+            status, _ = loop.request("POST", f"review-gate/prs/{REPO}/7/resume", "write", body={})
+            assert status == 200
+            loop.tick()  # CI is still green for A: re-queued
+    assert out.read_text().count("---") == 2
+    _, notices = loop.request("GET", "review-gate/notices", "read")
+    assert [(n["sha"], n["kind"], n["channel"]) for n in notices] == [
+        (A, "escalated", "user"),
+        (A, "escalated", "user"),
+    ]
+    assert loop.app.merges() == []

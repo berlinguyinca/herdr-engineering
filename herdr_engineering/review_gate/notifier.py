@@ -16,7 +16,12 @@ Channels, per (key, head sha, kind) where kind is the state value:
 
 Idempotency: every attempt is recorded as a durable ``notified`` event on
 stream ``pr_gate_notice``/``str(key)`` AFTER the attempt; a channel already
-recorded for (sha, kind) is never attempted again, also after a restart. A
+recorded for (sha, kind, gen) is never attempted again, also after a restart.
+``gen`` is the PR's resume generation (``PrSnapshot.resume_count``; 0 for
+notices recorded before generations existed), so escalate -> resume ->
+escalate on the same head pages again. The author operation id is
+``gate:<key>:<sha>:<kind>:g<gen>``; within one generation the message text is
+stable, so a replayed operation id carries the same text. A
 failed record (ok False) lets the next channel run. The recorded ``detail`` is a
 fixed word, never message text or command output.
 
@@ -153,6 +158,17 @@ def run_child(argv, *, input, capture_output, timeout, check, env, cwd, start_ne
     return result
 
 
+def _gen(snap: PrSnapshot) -> int:
+    gen = getattr(snap, "resume_count", 0)
+    return gen if isinstance(gen, int) and not isinstance(gen, bool) and gen >= 0 else 0
+
+
+def _payload_gen(p: dict) -> int:
+    """A notice's generation; missing (older notices) or malformed counts as 0."""
+    gen = p.get("gen", 0)
+    return gen if isinstance(gen, int) and not isinstance(gen, bool) and gen >= 0 else 0
+
+
 def _clip(text: str) -> str:
     if len(text) <= MAX_TEXT:
         return text
@@ -236,7 +252,8 @@ class AuthorNotifier:
     def _notify(
         self, key: PrKey, snap: PrSnapshot, head_ref: str, failures, kind: str, sha: str
     ) -> None:
-        done = self._attempted(key, sha, kind)
+        gen = _gen(snap)
+        done = self._attempted(key, sha, kind, gen)
         if any(done.values()):
             return  # some channel already delivered for (sha, kind)
         text = self.message(key, snap, head_ref, failures)
@@ -245,22 +262,22 @@ class AuthorNotifier:
                 ok, detail = True, "recorded"
                 if self._config.notify_command:
                     ok, detail = self._launch(self._config.notify_command, key, sha, head_ref, text)
-                self._record(key, sha, kind, "user", ok, detail)
+                self._record(key, sha, kind, "user", ok, detail, gen)
             return
         if "author" not in done:
-            ok, detail = self._to_author(key, sha, kind, head_ref, text)
-            self._record(key, sha, kind, "author", ok, detail)
+            ok, detail = self._to_author(key, sha, kind, head_ref, text, gen)
+            self._record(key, sha, kind, "author", ok, detail, gen)
             if ok:
                 return
         if "fixer" not in done:
             ok, detail = False, "no_fixer"
             if self._config.fixer_command:
                 ok, detail = self._launch(self._config.fixer_command, key, sha, head_ref, text)
-            self._record(key, sha, kind, "fixer", ok, detail)
+            self._record(key, sha, kind, "fixer", ok, detail, gen)
             if ok:
                 return
         if "user" not in done:
-            self._record(key, sha, kind, "user", True, "recorded")
+            self._record(key, sha, kind, "user", True, "recorded", gen)
 
     def message(
         self, key: PrKey, snap: PrSnapshot, head_ref: str, failures: Sequence[str] = ()
@@ -307,14 +324,19 @@ class AuthorNotifier:
         return _clip(redact_text("\n".join(lines)))
 
     # -------------------------------------------------------------- helpers
-    def _attempted(self, key: PrKey, sha: str, kind: str) -> dict[str, bool]:
-        """channel -> ok for every durable notice of (key, sha, kind)."""
+    def _attempted(self, key: PrKey, sha: str, kind: str, gen: int) -> dict[str, bool]:
+        """channel -> ok for every durable notice of (key, sha, kind, gen)."""
         out: dict[str, bool] = {}
         for event in self._repo.stream(ENTITY, str(key)):
             if event.get("event_type") != EVENT:
                 continue
             p = _payload(event)
-            if p.get("sha") == sha and p.get("kind") == kind and isinstance(p.get("channel"), str):
+            if (
+                p.get("sha") == sha
+                and p.get("kind") == kind
+                and _payload_gen(p) == gen
+                and isinstance(p.get("channel"), str)
+            ):
                 out[p["channel"]] = out.get(p["channel"], False) or p.get("ok") is True
         return out
 
@@ -329,19 +351,22 @@ class AuthorNotifier:
                 names = [str(f) for f in p["failures"]]
         return names
 
-    def _record(self, key: PrKey, sha: str, kind: str, channel: str, ok: bool, detail: str):
+    def _record(
+        self, key: PrKey, sha: str, kind: str, channel: str, ok: bool, detail: str, gen: int
+    ):
         payload = {
             "sha": sha,
             "kind": kind,
             "channel": channel,
             "ok": ok,
             "detail": detail,
+            "gen": gen,
             "at": float(self._now()),
         }
         self._repo.record_event(ENTITY, str(key), EVENT, payload, require_durable=True)
 
     def _to_author(
-        self, key: PrKey, sha: str, kind: str, head_ref: str, text: str
+        self, key: PrKey, sha: str, kind: str, head_ref: str, text: str, gen: int
     ) -> tuple[bool, str]:
         try:
             author = self._registry.author_of(key, head_ref)
@@ -355,7 +380,7 @@ class AuthorNotifier:
             receipt = self._repo.send_message(
                 session_id,
                 text,
-                operation_id=f"gate:{key}:{sha}:{kind}",
+                operation_id=f"gate:{key}:{sha}:{kind}:g{gen}",
                 dispatcher=self._dispatcher,
             )
         except Exception:  # noqa: BLE001 - any failure is a failed attempt

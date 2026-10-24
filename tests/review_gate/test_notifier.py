@@ -56,7 +56,7 @@ class Runner:
         return subprocess.CompletedProcess(argv, self.returncode, b"secret stdout", b"secret err")
 
 
-def snap(state=State.CHANGES_REQUESTED, sha=A, findings=(FINDING,), reason=None):
+def snap(state=State.CHANGES_REQUESTED, sha=A, findings=(FINDING,), reason=None, gen=0):
     return PrSnapshot(
         key=KEY,
         head_sha=sha,
@@ -67,6 +67,7 @@ def snap(state=State.CHANGES_REQUESTED, sha=A, findings=(FINDING,), reason=None)
         approved_sha=None,
         approved_patch_id=None,
         reason=reason,
+        resume_count=gen,
     )
 
 
@@ -112,7 +113,7 @@ def test_changes_requested_message_sent_to_live_author():
     assert "untrusted text from an automated reviewer" in text
     assert "same branch" in text and "do not reply to the reviewer" in text
     queued = [e for e in cp.stream("session", "s1") if e["event_type"] == "SessionCommandQueued"]
-    assert queued[0]["payload"]["operation_id"] == f"gate:{KEY}:{A}:changes_requested"
+    assert queued[0]["payload"]["operation_id"] == f"gate:{KEY}:{A}:changes_requested:g0"
     assert channels(cp) == [(A, "changes_requested", "author", True)]
     n = notices(cp)[0]
     assert n["detail"] == "delivered" and n["at"] == 1234.5
@@ -389,7 +390,7 @@ def test_notice_detail_never_contains_message_text_or_output():
     allowed = {"delivered", "queued", "failed", "no_session", "no_fixer", "timeout"}
     allowed |= {"exit_nonzero", "bad_argument", "sent", "recorded"}
     for n in notices(cp):
-        assert set(n) == {"sha", "kind", "channel", "ok", "detail", "at"}
+        assert set(n) == {"sha", "kind", "channel", "ok", "detail", "gen", "at"}
         assert n["detail"] in allowed
         assert "off by one" not in str(n) and "secret" not in str(n)
 
@@ -576,3 +577,54 @@ def test_review_cap_escalation_lists_findings(reason):
     notifier, _, _, _ = make()
     text = notifier.message(KEY, snap(state=State.ESCALATED, reason=reason), BRANCH)
     assert "off by one" in text and "CI failed" not in text
+
+
+# ------------------------------------------------------- resume generation
+def test_escalate_resume_escalate_on_the_same_head_pages_again():
+    notifier, cp, dispatcher, run = make(notify=NOTIFY)
+    esc = dict(state=State.ESCALATED, reason="invalid review output")
+    notifier.begin_tick()
+    notifier.notify(KEY, snap(**esc), BRANCH)
+    notifier.notify(KEY, snap(**esc), BRANCH)  # same generation: deduped
+    notifier.begin_tick()
+    notifier.notify(KEY, snap(**esc, gen=1), BRANCH)  # after one resume
+    assert len(run.calls) == 2
+    assert [(n["kind"], n["channel"], n["gen"]) for n in notices(cp)] == [
+        ("escalated", "user", 0),
+        ("escalated", "user", 1),
+    ]
+    assert dispatcher.calls == []
+
+
+def test_changes_requested_after_resume_messages_the_author_again():
+    notifier, cp, dispatcher, _ = make()
+    notifier.notify(KEY, snap(), BRANCH)
+    notifier.notify(KEY, snap(), BRANCH)
+    notifier.notify(KEY, snap(gen=1), BRANCH)
+    notifier.notify(KEY, snap(gen=1), BRANCH)
+    assert len(dispatcher.calls) == 2
+    ops = [
+        e["payload"]["operation_id"]
+        for e in cp.stream("session", "s1")
+        if e["event_type"] == "SessionCommandQueued"
+    ]
+    assert ops == [
+        f"gate:{KEY}:{A}:changes_requested:g0",
+        f"gate:{KEY}:{A}:changes_requested:g1",
+    ]
+    # within one generation the text is stable, so a replayed operation id matches
+    assert notifier.message(KEY, snap(gen=1), BRANCH) == dispatcher.calls[1]
+
+
+def test_old_notice_without_gen_counts_as_generation_zero():
+    notifier, cp, dispatcher, _ = make()
+    cp.record_event(
+        ENTITY,
+        str(KEY),
+        "notified",
+        {"sha": A, "kind": "changes_requested", "channel": "author", "ok": True},
+    )
+    notifier.notify(KEY, snap(), BRANCH)
+    assert dispatcher.calls == []
+    notifier.notify(KEY, snap(gen=1), BRANCH)
+    assert len(dispatcher.calls) == 1

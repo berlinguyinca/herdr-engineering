@@ -54,9 +54,9 @@ class FakeApp:
         return [c for c in self.calls if c[0] == name]
 
 
-def pr(number=7, sha=A, *, draft=False, ref="feat/x"):
+def pr(number=7, sha=A, *, draft=False, ref="feat/x", base="main"):
     return PrInfo(
-        number=number, head_sha=sha, head_ref=ref, base_ref="main", author_login="bot", draft=draft
+        number=number, head_sha=sha, head_ref=ref, base_ref=base, author_login="bot", draft=draft
     )
 
 
@@ -117,9 +117,9 @@ def make(repos=(REPO,)):
     return svc, app, store, queue, registry, ci
 
 
-def approve(store, key, sha):
+def approve(store, key, sha, base="main"):
     assert store.on_review_started(key, sha, "reviewer-m")
-    assert store.on_verdict(key, Verdict("PASS", sha, (), "reviewer-m"))
+    assert store.on_verdict(key, Verdict("PASS", sha, (), "reviewer-m"), base_ref=base)
 
 
 def test_new_head_sets_pending_status_first():
@@ -728,7 +728,8 @@ def test_pr_closed_during_review_and_reopened_is_requeued():
     assert len(_live_jobs(queue)) == 1
     claim = coord.claim("w2", "reviewer-m")
     assert claim is not None and claim.sha == A
-    assert coord.submit(claim.job_id, "w2", '{"verdict": "PASS", "findings": []}') == "recorded"
+    out = '{"verdict": "PASS", "findings": []}'
+    assert coord.submit(claim.job_id, "w2", out, claim_token=claim.claim_token) == "recorded"
     assert store.snapshot(KEY).state == State.APPROVED
 
 
@@ -891,3 +892,47 @@ def test_one_external_launch_per_tick_and_backlog_drains():
         assert channels(n) == ["author", "fixer"]
     for sha in (A, B, c):
         assert app.last_status(sha) == "failure"
+
+
+# ------------------------------------------------------------ base retarget
+def _approved_on(base, pr_base):
+    svc, app, store, queue, _, ci = make()
+    app.prs[REPO] = [pr(base=pr_base)]
+    ci.set(ci_row(A, "success"))
+    svc.tick()
+    svc.tick()
+    approve(store, KEY, A, base=base)
+    queue.cancel(KEY)  # the coordinator completes the job when it records the verdict
+    return svc, app, store, queue
+
+
+def test_retargeted_pr_is_not_merged_and_is_reviewed_again():
+    svc, app, store, queue = _approved_on("feature-x", "main")
+    before = len([j for j in queue.snapshot() if j["sha"] == A])
+    svc.tick()
+    assert app.named("merge_pr") == []
+    assert "success" not in [c[3] for c in app.statuses(A)]
+    assert app.statuses(A)[-1][3:5] == ("pending", "review gate: base branch changed, re-reviewing")
+    snap = store.snapshot(KEY)
+    assert snap.state == State.CI_GREEN and snap.approved_sha is None
+    assert snap.reason == "base branch changed"
+    assert [j["state"] for j in queue.snapshot() if j["sha"] == A] == ["queued"]
+    assert before == 0
+    svc.tick()  # stays queued; no second rearm, no merge
+    assert len([j for j in queue.snapshot() if j["sha"] == A]) == 1
+    assert app.named("merge_pr") == []
+
+
+def test_approval_for_the_same_base_merges():
+    svc, app, store, _ = _approved_on("main", "main")
+    svc.tick()
+    assert app.named("merge_pr") == [("merge_pr", REPO, 7, A)]
+
+
+def test_approval_without_a_recorded_base_fails_closed():
+    svc, app, store, queue = _approved_on(None, "main")  # an old or forged approval
+    assert store.snapshot(KEY).approved_base_ref is None
+    svc.tick()
+    assert app.named("merge_pr") == []
+    assert store.snapshot(KEY).state == State.CI_GREEN
+    assert [j["state"] for j in queue.snapshot() if j["sha"] == A] == ["queued"]
