@@ -3,6 +3,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { reportFreshness } from './record-state.js';
 import { formatTimestamp, formatDuration } from './herdr-web-components/format.js';
 import { snapshotText, animateChanges } from './motion.js';
+import { patchText } from './patch.js';
 
 const metadataObservation = service => service.catalog?.metadata_observation ?? service.metadata_observation;
 const localOnly = service => service.endpoint_scope === 'local_only' || service.catalog?.endpoint_scope === 'local_only';
@@ -85,8 +86,8 @@ export function groupServices(services, by = 'project') {
   return [...groups.values()].sort((a,b) => a.label.localeCompare(b.label));
 }
 
-function lastSeen(s) {
-  const date = s.lifecycle?.last_seen_at || s.updated_at;
+function lastSeen(s) { return seenAgo(s.lifecycle?.last_seen_at || s.updated_at); }
+function seenAgo(date) {
   const age = date ? Date.now() - Date.parse(date) : NaN;
   return Number.isFinite(age) ? `${formatDuration(Math.max(0,age))} ago` : 'Not reported';
 }
@@ -107,7 +108,7 @@ function serviceRow(s) {
       <span class="sc-meta">${esc(typeLabel(s))}${s.owner ? ` · Process: ${esc(s.owner)}` : ''}</span></div>
     <div class="sc-location"><a href="#/hosts/${esc(encodeURIComponent(hostLabel(s)))}">${esc(hostLabel(s))}</a>
       <span>${localOnly(s) ? 'Observed port ' : `${s.catalog?.source_port != null ? `Source :${esc(s.catalog.source_port)} · ` : ''}Exposed `}${s.port != null ? `:${esc(s.port)}` : 'port unknown'}</span>${endpoint(s)}</div>
-    <div class="sc-health"><strong data-state="${serviceState(s)}">${stateLabel(s)}</strong><span>Last report ${esc(lastSeen(s))}</span>
+    <div class="sc-health"><strong data-state="${serviceState(s)}">${stateLabel(s)}</strong><span>Last report <span data-service-seen="${esc(s.lifecycle?.last_seen_at || s.updated_at || '')}">${esc(lastSeen(s))}</span></span>
       <span class="sc-meta">${esc(serviceReason(s))}</span></div>
   </article>`;
 }
@@ -322,6 +323,8 @@ export function mountServices(root, client, initial, {showAll = false, status, s
     if(disposed||document.hidden)return;
     const next=services.map(s=>serviceState(s)).join(',');
     if(next!==classification){classification=next;draw();}
+    // "Last report N ago" keeps counting between refreshes (written only when the text changes).
+    for(const age of root.querySelectorAll('[data-service-seen]'))patchText(age,seenAgo(age.dataset.serviceSeen));
   },1000);
   return {refresh,dispose(){disposed=true;clearInterval(timer);clearInterval(clock);root.removeEventListener('click',chooseStatus);}};
 }

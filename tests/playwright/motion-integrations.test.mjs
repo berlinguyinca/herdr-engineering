@@ -4,10 +4,6 @@
 // live chat rows slide in. Calm mode (or OS reduced motion) does none of it.
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {createServer} from 'node:http';
-import {readFile} from 'node:fs/promises';
-import {existsSync} from 'node:fs';
-import {chromium} from 'playwright';
 import {withPage} from './helpers/fixture.mjs';
 import {boot,until,sleep,T0} from './helpers/live.mjs';
 
@@ -40,6 +36,11 @@ test('services: a state change flashes that row and the counts count up; calm do
   await calm(page,mode);
   await boot(page,base,'/services?status=all',p=>p==='/api/v1/services'?{services:structuredClone(s.services)}:{});
   await until(()=>page.locator('[data-service-id]').count().then(n=>n===10),'ten services');
+  // "Last report N ago" ticks between the 30 s refreshes.
+  const seen=page.locator('[data-service-id="a"] [data-service-seen]');
+  const firstAge=await seen.textContent();
+  await page.clock.runFor(3000);
+  await until(()=>seen.textContent().then(t=>t!==firstAge),'last-report age ticks');
   await watch(page,{key:['data-service-id'],count:'[data-filter="current"] strong'});
   s.services[1].status='unhealthy';
   for(const sv of s.services)sv.updated_at=new Date(Date.parse(T0)+30000).toISOString();
@@ -165,20 +166,13 @@ test('GitHub: a changed issue row flashes and tab counts count up; calm does nei
  });
 });
 
-async function withCollab(fn,mode){
+// The real collab-view.js over the shared static fixture (helpers/fixture.mjs) and a mocked API.
+// mode: 'on' / 'off' set calm explicitly, 'auto' leaves it to the OS; reduced emulates reduced motion.
+async function withCollab(fn,{mode,reduced=false}){
  const T='2026-10-23T10:00:00+00:00';
  const m={events:[{sequence:1,event_id:'e1',event_type:'message',created_at:T,room_id:'room-one',sender:{type:'user',id:'bob',owner_user_id:'bob'},text:'first'}]};
- const server=createServer(async(req,res)=>{
-  if(req.url==='/'){res.setHeader('Content-Type','text/html');res.end('<link rel="stylesheet" href="/motion.css"><link rel="stylesheet" href="/collab.css"><div id="host"></div>');return;}
-  try{const file=new URL(`../../packages/${req.url.split('?')[0].slice(1)}`,import.meta.url);res.setHeader('Content-Type',req.url.endsWith('.css')?'text/css':'application/javascript');res.end(await readFile(file));}
-  catch{res.writeHead(404);res.end();}
- });
- await new Promise(r=>server.listen(0,'127.0.0.1',r));
- let browser;
- try{
-  const fallback='/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
-  browser=await chromium.launch({headless:true,args:['--no-sandbox'],executablePath:process.env.PLAYWRIGHT_CHROMIUM||(existsSync(fallback)?fallback:undefined)});
-  const page=await browser.newPage({viewport:{width:1100,height:900}});
+ await withPage(async(page,base)=>{
+  await page.emulateMedia({reducedMotion:reduced?'reduce':'no-preference'});
   await page.route('**/api/v1/collab/**',async route=>{
    const url=new URL(route.request().url());const path=url.pathname.replace('/api/v1/collab','');
    let body={};
@@ -194,23 +188,38 @@ async function withCollab(fn,mode){
    }
    await route.fulfill({json:body});
   });
-  await page.goto(`http://127.0.0.1:${server.address().port}/`);
-  await page.evaluate(async mode=>{document.documentElement.dataset.calm=mode;const {mountCollab}=await import('/collab-view.js');window.collab=mountCollab(document.querySelector('#host'));},mode);
+  await page.goto(`${base}/__blank`);
+  await page.evaluate(async mode=>{
+   if(mode!=='auto')document.documentElement.dataset.calm=mode;
+   const sheets=['/motion.css','/collab.css'].map(href=>new Promise(resolve=>{const link=document.createElement('link');link.rel='stylesheet';link.href=href;link.onload=resolve;document.head.append(link);}));
+   await Promise.all(sheets);
+   document.body.innerHTML='<div id="host"></div>';
+   const {mountCollab}=await import('/collab-view.js');window.collab=mountCollab(document.querySelector('#host'));
+  },mode);
   await page.locator('[data-room="room-one"]').click();
   await fn(page,m);
   await page.evaluate(()=>window.collab.dispose());
- }finally{await browser?.close();await new Promise(r=>server.close(r));}
+ });
 }
 
-test('collab: live chat rows slide in, history does not; calm does neither',async()=>{
- for(const mode of ['off','on'])await withCollab(async(page,m)=>{
+// A live message slides in; a live task status change slides in and glows (cx-flow-pulse) at once.
+for(const [name,opts,motion] of [['calm off',{mode:'off'},true],['calm on',{mode:'on'},false],['calm auto + reduced motion',{mode:'auto',reduced:true},false],['calm off + reduced motion',{mode:'off',reduced:true},true]]){
+ test(`collab (${name}): live rows ${motion?'slide in and task changes glow':'appear without motion'}; history never animates`,async()=>withCollab(async(page,m)=>{
   await page.locator('#hcn-log .cx-m').first().waitFor();
   assert.equal(await page.locator('#hcn-log [data-entering]').count(),0,'history appears without motion');
   await watch(page,{key:[]});
   m.events.push({sequence:2,event_id:'e2',event_type:'message',created_at:'2026-10-23T10:01:00+00:00',room_id:'room-one',sender:{type:'user',id:'bob',owner_user_id:'bob'},text:'second'});
   await until(()=>page.locator('#hcn-log .cx-m').count().then(n=>n===2),'second message');
   await sleep(50);
-  const w=await watched(page);
-  assert.equal(w.entered.length,mode==='off'?1:0,`live row enters only without calm, saw ${w.entered}`);
- },mode);
-});
+  assert.equal((await watched(page)).entered.length,motion?1:0,'live message enters only when motion is allowed');
+  m.events.push({sequence:3,event_id:'e3',event_type:'task_updated',created_at:'2026-10-23T10:02:00+00:00',room_id:'room-one',task:{status:'done',target_agent_id:'agent_1',result:'ok'}});
+  const card=page.locator('#hcn-log .cx-taskcard');
+  await card.waitFor();
+  const style=await card.evaluate(el=>({pulse:el.classList.contains('cx-flow-pulse'),names:getComputedStyle(el).animationName}));
+  if(motion){
+   assert.equal(style.pulse,true,'a live task change reuses cx-flow-pulse');
+   assert.match(style.names,/cx-flow-pulse/,'the glow runs');
+   assert.match(style.names,/hd-enter/,'together with the slide-in, not replaced by it');
+  }else assert.equal(style.names,'none','no animation');
+ },opts));
+}
