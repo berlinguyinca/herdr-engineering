@@ -27,6 +27,7 @@ import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
 import { createAttentionNotifier } from './attention-notify.js';
 import { mountRelated } from './related-panel.js';
+import { mountMissionStory } from './mission-story-view.js';
 import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
@@ -138,6 +139,7 @@ const ROUTES = {
 let disposeInspector = null;
 let disposeMissionActivity = null;
 let disposeRelated = null;
+let disposeStory = null;
 let refreshMissionHistory = null;
 let servicesView = null;
 let dashboardView = null;
@@ -154,6 +156,7 @@ async function render() {
   if (servicesView) { servicesView.dispose(); servicesView = null; }
   if (disposeMissionActivity) { disposeMissionActivity(); disposeMissionActivity = null; }
   if (disposeRelated) { disposeRelated(); disposeRelated = null; }
+  if (disposeStory) { disposeStory(); disposeStory = null; }
   if (disposeInspector) { disposeInspector(); disposeInspector = null; }
   const { parts } = route();
   const seg = parts.length ? parts.join('/') : 'overview';
@@ -244,7 +247,10 @@ async function viewMission(parts, revision) {
     return;
   }
   if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="related-panel"></div><div id="mission-history"></div>`;
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-story"></div><div id="related-panel"></div><div id="mission-history"></div>`;
+  // The story (what happened, how it ended, what needs you) sits above the recorded history; when it is unavailable the page is as before.
+  const story = mountMissionStory(document.getElementById('mission-story'), client, key);
+  disposeStory = story.dispose;
   showRelated('mission', key, null, relatedIntegrationLinks(m,'mission',key));
   if (key.startsWith('pi:')) disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
   const history = document.getElementById('mission-history');
