@@ -6,6 +6,7 @@ import {serviceState,serviceScope,safeServiceUrl} from './services-view.js';
 import {missionEntries} from './mission-catalog-view.js';
 import {integrationOutcome} from './integrations-view.js';
 import {snapshotText,animateChanges} from './motion.js';
+import { freshnessSources } from './freshness.js';
 
 const text=value=>typeof value==='string'?value.trim():'';
 const records=value=>Array.isArray(value)?value.filter(v=>v && typeof v==='object' && !Array.isArray(v)):[];
@@ -99,8 +100,9 @@ export function mountTopology(container,client,{status='current'}={}) {
   let disposed=false,clock=null,lastSignature='',hostSignature='';
   const data={},received={},sourceStates={},requests=new Map(),timers=new Map(),opened=new Map(),limits=new Map();
   const listeners=new AbortController();
+  const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
   const sources={hosts:{label:'Hosts',field:'hosts',read:signal=>client.listHosts({signal})},sessions:{label:'Agents',field:'sessions',read:signal=>client.listSessions(undefined,{signal})},services:{label:'Services',field:'services',read:signal=>client.listServices({signal})},missions:{label:'Recorded missions',field:'missions',read:signal=>client.listMissions(undefined,{signal})},projections:{label:'Live missions',field:'activities',read:signal=>client.listMissionActivity({signal})},ci:{label:'CI',read:signal=>client.getCi({signal})}};
-  container.innerHTML=`${styles}<h1>Topology</h1><p class="tx-intro">Explore current work and services started through HerdR by host or confirmed project identity. Expand a group to inspect its records. Stopped, finished and unconfirmed records remain in their own views.</p><div data-tx-metrics class="tx-metrics"></div>
+  container.innerHTML=`${styles}<div class="hd-live-head"><h1>Topology</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="tx-intro">Explore current work and services started through HerdR by host or confirmed project identity. Expand a group to inspect its records. Stopped, finished and unconfirmed records remain in their own views.</p><div data-tx-metrics class="tx-metrics"></div>
     <div class="tx-tabs" role="tablist" aria-label="Topology visibility">${TABS.map(([key,label])=>`<button type="button" id="tx-tab-${key}" role="tab" data-tx-tab="${key}" aria-controls="tx-results" aria-selected="${key===state.status}" tabindex="${key===state.status?0:-1}">${label}<small data-tab-count="${key}">…</small></button>`).join('')}</div>
     <div class="tx-controls"><label>Search topology<input type="search" data-tx-search placeholder="Service, project, agent, repository or host"></label><label>Group by<select data-tx-group><option value="host">Host</option><option value="project">Project / repository</option></select></label><label>Type<select data-tx-type><option value="">All types</option>${Object.entries(TYPES).map(([key,label])=>`<option value="${key}">${label}</option>`).join('')}</select></label><label>Host<select data-tx-host><option value="">All hosts</option></select></label></div>
     <div class="tx-toolbar"><p class="tx-note" data-tx-result role="status">Loading observations…</p><button type="button" class="hd-btn" data-tx-collapse>Collapse groups</button></div><div class="tx-feedback" data-tx-feedback role="status"></div><p class="tx-note" data-tx-policy></p><section id="tx-results" role="tabpanel" aria-labelledby="tx-tab-current"></section><div data-tx-more-groups></div>
@@ -180,8 +182,8 @@ export function mountTopology(container,client,{status='current'}={}) {
     const deadline=setTimeout(()=>{timeout=true;controller.abort();},15000);
     try{const response=await sources[key].read(controller.signal);if(disposed||controller.signal.aborted)return;
       if(!response||(key==='ci'?typeof response.available!=='boolean':!Array.isArray(response[sources[key].field])))throw new Error('Invalid response');
-      data[key]=key==='ci'?response:records(response[sources[key].field]);received[key]=Date.now();sourceStates[key]={loaded:true,error:false};draw();
-    }catch{if(!disposed&&(!controller.signal.aborted||timeout)){sourceStates[key]={...sourceStates[key],error:true};draw();}}
+      data[key]=key==='ci'?response:records(response[sources[key].field]);received[key]=Date.now();sourceStates[key]={loaded:true,error:false};chip.ok(key);draw();
+    }catch(error){if(!disposed&&(!controller.signal.aborted||timeout)){sourceStates[key]={...sourceStates[key],error:true};chip.fail(key,`${sources[key].label}: ${timeout?'timed out':error?.message||'request failed'}`);draw();}}
     finally{clearTimeout(deadline);if(requests.get(key)===controller)requests.delete(key);if(!disposed&&!document.hidden)timers.set(key,setTimeout(()=>poll(key),5000));}
   }
   const refresh=()=>Object.keys(sources).forEach(key=>poll(key));

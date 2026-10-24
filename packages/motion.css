@@ -34,6 +34,9 @@ progress, .hd-meter > *, .hd-stage-bar > *, .hv-meter__bar > i { transition: wid
   background-size: 200% 100%; animation: hd-skeleton 1.4s linear infinite;
 }
 
+/* A page head: the title with its freshness chip beside it (wraps below on narrow screens). */
+.hd-live-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.hd-live-head > h1 { min-width: 0; }
 herdr-freshness { display: inline-block; font-size: var(--text-sm); color: var(--text-secondary); }
 herdr-freshness[data-state="stale"] { color: var(--freshness-warn); }
 herdr-freshness[data-state="error"] { color: var(--status-failed); }

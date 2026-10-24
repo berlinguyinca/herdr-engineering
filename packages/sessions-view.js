@@ -4,6 +4,7 @@ import {formatDuration} from './herdr-web-components/format.js';
 import {recordOutcome,statusOutcome,recordVisibility} from './record-state.js';
 import {patchList,patchText,morph} from './patch.js';
 import {animateChanges} from './motion.js';
+import { freshnessSources } from './freshness.js';
 
 const text = value => typeof value === 'string' ? value.trim() : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -95,7 +96,8 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   const pageSize=20;
   let disposed=false,sessions=[],missions=[],loaded=false,sessionError='',missionError='',lastSignature='',hostSignature='';
   let sessionRequest=null,missionRequest=null;
-  container.innerHTML=`${styles}<h1>Agents</h1>
+  const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
+  container.innerHTML=`${styles}<div class="hd-live-head"><h1>Agents</h1><herdr-freshness interval="5000"></herdr-freshness></div>
     <p class="ss-intro">Find an agent by project, host or model. Current shows open agents reported in the last 15 minutes. Older or missing reports move to Unconfirmed automatically; Failed and Finished retain previous work.</p>
     <div class="ss-tabs" role="tablist" aria-label="Agent outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ss-controls"><label class="ss-search">Search agents<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
@@ -186,8 +188,9 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
       if(disposed||controller.signal.aborted)return;
       if(!Array.isArray(data?.[kind]))throw new Error('Invalid response');
       if(kind==='sessions'){sessions=records(data.sessions);loaded=true;sessionError='';}else{missions=records(data.missions);missionError='';}
-    } catch {
-      if(!disposed&&!document.hidden){if(kind==='sessions')sessionError=loaded?'Agent updates unavailable. Showing last received records.':'Agents could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}
+      chip.ok(kind);
+    } catch (error) {
+      if(!disposed&&!document.hidden){chip.fail(kind,`${kind==='sessions'?'Agents':'Mission context'}: ${error?.message||'request failed'}`);if(kind==='sessions')sessionError=loaded?'Agent updates unavailable. Showing last received records.':'Agents could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}
     } finally {
       clearTimeout(timeout);
       if(kind==='sessions')sessionRequest=null;else missionRequest=null;
