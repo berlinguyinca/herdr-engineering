@@ -412,6 +412,7 @@ class GitHubMonitor:
         self._deferred = {}  # repository -> when it was first deferred (budget or rate limit)
         self._resume_repos, self._issue_resume = None, {}
         self._store, self._store_viewer, self._store_dirty = None, None, False
+        self._bind_failed = False  # this pass already failed to read the viewer store
         self._revision = None  # the store's catalog revision after its last load or write
         self._touch()
 
@@ -630,11 +631,12 @@ class GitHubMonitor:
         """
         with self._lock:
             self._check_generation()
-            if self._store is None or self._store_viewer == account:
+            if self._store is None or self._store_viewer == account or self._bind_failed:
                 return self._store
             store, snapshot = self._open_store(self._credential, account)
             if snapshot is _UNREADABLE:
                 self._retire(store)
+                self._bind_failed = True  # once per pass: each try may wait out a connect timeout
                 return self._store
             self._retire(self._store)
             self._store, self._store_viewer = store, account
@@ -668,9 +670,11 @@ class GitHubMonitor:
 
     def _flush(self, store):
         """Rewrite the whole in-memory catalog after earlier writes failed."""
-        self._store_dirty = False
         with self._lock:
             self._check_generation()
+            if store is not self._store:
+                return  # superseded: it may not write, and the current store stays dirty
+            self._store_dirty = False
             repos = [self._stored_repository(record) for record in self._repos.values()]
             issues = {rid: dict(rows) for rid, rows in self._issues.items()}
             watermarks = dict(self._watermarks)
@@ -807,6 +811,7 @@ class GitHubMonitor:
         with self._lock:
             self._check_generation()
             store = self._store
+            self._bind_failed = False
             if allow:
                 # stop serving owners that left the allowlist now, not after the listing
                 for rid in [rid for rid, record in self._repos.items() if _owner(record) not in allow]:

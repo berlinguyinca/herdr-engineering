@@ -777,3 +777,35 @@ def test_a_revoked_token_never_serves_a_cached_issue_body():
         assert exc.reason in {"authentication", "not_found"}
     assert numbers(monitor) == []
     assert MemoryGitHubStore(identity=fake.credential_identity, shared=shared).load().repositories == {}
+
+
+def test_an_unreadable_viewer_store_is_retried_once_per_pass_not_per_page():
+    from herdr_engineering.control_plane.github_store import GitHubStoreUnavailable
+    fake, shared = seeded(), {}  # 3 repositories at 2 per page: two listing pages
+    monitor_for(fake, shared).refresh()
+    attempts = []
+
+    class Unreadable(MemoryGitHubStore):
+        def load(self):
+            if self._viewer is not None:
+                attempts.append(self._viewer)
+                raise GitHubStoreUnavailable("down")
+            return super().load()
+    restarted = GitHubMonitor(provider_factory=lambda: fake, store=lambda identity, viewer=None: Unreadable(
+        identity=identity, viewer=viewer, shared=shared))
+    restarted.refresh()
+    assert len(attempts) == 1
+    restarted.refresh()
+    assert len(attempts) == 2
+
+
+def test_a_flush_on_a_superseded_store_leaves_the_current_store_dirty():
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared)
+    monitor.refresh()
+    old_store = monitor._store
+    fake.credential_identity = "fingerprint-two"
+    monitor.refresh()
+    monitor._store_dirty = True  # the current store missed a write
+    monitor._flush(old_store)
+    assert monitor._store_dirty is True and monitor.revision() is None
