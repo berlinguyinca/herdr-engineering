@@ -5,7 +5,8 @@
 #   - Herdr (pinned compatible version)
 #   - Pi + provider config pointing all LLM traffic at https://llm.metabolomics.us
 #   - berlinguyinca/pi-engineering, berlinguyinca/autospec
-#   - Tailscale connectivity checks (no reusable auth keys in Git)
+#   - Tailscale (role: install, tailscaled, join when not logged in; auth key
+#     from Ansible Vault, never in Git)
 #   - vim, mc, btop
 #   - prerequisites for adopted Powerpack components
 #   - HerdR Engineering state/artifact directories
@@ -45,7 +46,7 @@
     # herdr_engineering.config._discover_config_paths()
     herdr_engineering_config_dir: "{{ fleet_home }}/.config/herdr-engineering"
     herdr_engineering_config_file: "{{ herdr_engineering_config_dir }}/config.yaml"
-    herdr_pinned_version: "0.9.1"
+    # herdr_pinned_version + fleet_pins: playbooks/group_vars/all.yml (one source).
     # Agents use the fabric LLM gateway (per-project keys, token accounting); it
     # forwards to https://llm.metabolomics.us with the single lab key.
     llm_endpoint: "http://dev.lan:8088"
@@ -71,6 +72,13 @@
       ansible.builtin.set_fact:
         fleet_home: "{{ ansible_env.HOME }}"
         fleet_user: "{{ ansible_user_id }}"
+
+    # Join/verify the tailnet BEFORE the platform role so herdr/pi can use it.
+    # Hosts already logged in are left alone; the auth key comes from Ansible
+    # Vault (tailscale_auth_key), never from Git. See roles/tailscale.
+    - name: "Converge Tailscale (install, tailscaled, join when not logged in)"
+      ansible.builtin.include_role:
+        name: tailscale
 
     - name: "Include platform-specific role (Linux vs macOS)"
       ansible.builtin.include_role:
@@ -102,16 +110,6 @@
         # become runs the tasks as root on Linux; without this the config
         # file is created root-owned and the fleet user cannot read it.
         owner: "{{ fleet_user }}"
-
-    - name: "Tailscale reachability check (informational, non-fatal)"
-      ansible.builtin.command: tailscale status
-      register: tailscale_status
-      changed_when: false
-      ignore_errors: true
-
-    - name: "Report Tailscale state"
-      ansible.builtin.debug:
-        msg: "tailscale: {{ 'up' if tailscale_status.rc == 0 and tailscale_status.stdout | length > 0 else 'down/not-logged-in' }}"
 
     # ----------------------------------------------------------------------
     # Private web UI as a persistent service (spec 0060 + dev-fabric-gateway
@@ -162,3 +160,12 @@
     # ----------------------------------------------------------------------
     - name: "Deploy pi build-gate extension (all fleet hosts)"
       ansible.builtin.include_tasks: ../tasks/pi-build-gate.yml
+
+    # ----------------------------------------------------------------------
+    # Fleet update timer (spec section 4, last in playbook order): the main host (= gateway host) runs
+    # playbooks/fleet-update.yml daily from cron against the fleet. Hosts hold
+    # no repo access or credentials for this.
+    # ----------------------------------------------------------------------
+    - name: "Install the daily fleet update cron entry (gateway host only)"
+      ansible.builtin.include_tasks: ../tasks/fleet-update-cron.yml
+      when: inventory_hostname == herdr_engineering_gateway_host

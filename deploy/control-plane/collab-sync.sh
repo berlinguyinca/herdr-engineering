@@ -14,6 +14,7 @@
 # mounts at /data; deploy.sh passes it).
 # Usage: collab-sync.sh once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR]
 #          [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]
+# Unless --certbot is explicit, Certbot is read from the ACME directory's sibling DIR-venv.
 set -euo pipefail
 USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]"
 ACTION="${1:-once}"; [ $# -gt 0 ] && shift
@@ -22,8 +23,9 @@ DIR="$HOME/.local/share/herdr-engineering/collab-sync"
 DATA_DIR="$HOME/.local/share/herdr-engineering/collab"
 CERT_DIR="$HOME/.local/share/herdr-engineering/collab-edge-certs"
 CERT_NAME="localdev.mcp.metabolomics.us"
-ACME="$HOME/.local/share/inferweave/bender-failover/acme"
-CERT_SRC=""; CERTBOT=""
+ACME="$HOME/.local/share/herdr-engineering/collab-acme"
+CERT_SRC=""
+CERTBOT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config needs a value}"; shift 2 ;;
@@ -38,7 +40,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 CERT_SRC="${CERT_SRC:-$ACME/config/live/$CERT_NAME}"
-CERTBOT="${CERTBOT:-$ACME/../acme-venv/bin/certbot}"
+CERTBOT="${CERTBOT:-${ACME}-venv/bin/certbot}"
 read -r POOL GROUP OPERATOR < <(python3 - "$CONFIG" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["collab"]
@@ -125,7 +127,7 @@ UNIT
 }
 
 certbot_dry_run() {   # proves the renewal path end to end against Let's Encrypt staging
-  "$CERTBOT" renew --dry-run --non-interactive --cert-name "$CERT_NAME" --config-dir "$ACME/config" --work-dir "$ACME/work" --logs-dir "$ACME/logs"
+  "$CERTBOT" renew --dry-run --no-random-sleep-on-renew --non-interactive --cert-name "$CERT_NAME" --config-dir "$ACME/config" --work-dir "$ACME/work" --logs-dir "$ACME/logs"
 }
 
 # Starts the fleets the dashboard owner asks for on their own hosts, over herdr (see collab-spawn.py).
@@ -135,13 +137,18 @@ install_spawn_timer() {
   install -m 0755 "$(dirname "$0")/collab-spawn.py" "$d/collab-spawn.py"
   install -m 0644 "$(dirname "$0")/collab-worker.sh" "$d/collab-worker.sh"
   install -m 0644 "$(dirname "$0")/collab-sandbox.sh" "$d/collab-sandbox.sh"
+  install -m 0755 "$(dirname "$0")/collab-egress.py" "$d/collab-egress.py"
   install -m 0755 "$(dirname "$0")/collab-audit-verify.py" "$d/collab-audit-verify.py"
+  install -m 0755 "$(dirname "$0")/collab-secrets.py" "$d/collab-secrets.py"     # room secrets for helpers
   cat > "$u/herdr-collab-spawn.service" <<UNIT
 [Unit]
 Description=Start collab agent fleets on the owner's hosts over herdr
 [Service]
 Type=oneshot
 TimeoutStartSec=10min
+# A helper's supervisor and egress proxy outlive the cycle that started them; the next cycles watch them
+# through the state directory. control-group (the default) would kill them when each cycle ends.
+KillMode=process
 ExecStart=/usr/bin/python3 "$d/collab-spawn.py" once --worker "$d/collab-worker.sh" --sandbox "$d/collab-sandbox.sh"
 UNIT
   cat > "$u/herdr-collab-spawn.timer" <<UNIT
