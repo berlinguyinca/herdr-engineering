@@ -54,6 +54,10 @@ class GitHubStoreUnavailable(RuntimeError):
     """The durable store cannot be used (tables not migrated yet, database down)."""
 
 
+class GitHubStoreNotMigrated(GitHubStoreUnavailable):
+    """The catalog tables do not exist yet (code rolled before the migration): nothing is stored."""
+
+
 class GitHubStoreIdentityMismatch(RuntimeError):
     """The stored catalog belongs to another credential/viewer; call ``load()`` first."""
 
@@ -392,7 +396,7 @@ class GitHubStore:
                 self._conn = self._run(self._connect(self._conn))
                 return self._run(work(self._conn))
             except asyncpg.exceptions.UndefinedTableError as exc:
-                raise GitHubStoreUnavailable("GitHub catalog tables are not migrated yet") from exc
+                raise GitHubStoreNotMigrated("GitHub catalog tables are not migrated yet") from exc
             except (asyncpg.exceptions.PostgresConnectionError, asyncpg.exceptions.InterfaceError,
                     ConnectionError, OSError) as exc:
                 raise GitHubStoreUnavailable("GitHub catalog store is unreachable") from exc
@@ -507,8 +511,8 @@ class GitHubStore:
             return snapshot
         try:
             return self._call(work)
-        except GitHubStoreUnavailable:
-            return None
+        except GitHubStoreNotMigrated:
+            return None  # truly nothing stored; an unreachable database raises (it is not a purge)
 
     def upsert_repositories(self, rows: Iterable[dict], scope: set[str] | None) -> None:
         incoming = {row["repository_id"]: _normal(row) for row in rows}

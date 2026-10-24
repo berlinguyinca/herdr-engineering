@@ -337,6 +337,9 @@ def _page(rows, page, per_page):
     return rows[start:start + per_page], {"page": page, "per_page": per_page, "total": len(rows), "has_next": start + per_page < len(rows)}
 
 
+_UNREADABLE = object()  # _open_store: the store could not be built or read (not a purge)
+
+
 class _Superseded(Exception):
     """A token rotation invalidated an in-flight catalog generation."""
 
@@ -534,7 +537,9 @@ class GitHubMonitor:
                 self._view["connection_generation"] = self._generation
                 if provider.available:
                     self._store, snapshot = self._open_store(self._credential, None)
-                    if snapshot is not None:
+                    if snapshot is not _UNREADABLE:
+                        self._remember_revision(self._store, snapshot.revision if snapshot else None)
+                    if snapshot not in (None, _UNREADABLE):
                         self._hydrate(snapshot)
                 if self._thread is not None and threading.current_thread() is not self._thread:
                     self._wake.set()
@@ -545,22 +550,22 @@ class GitHubMonitor:
     def _open_store(self, identity, viewer):
         """A store for this credential (and viewer, once known) plus its loaded catalog.
 
-        A store that cannot be opened or read leaves the monitor in memory: the
-        catalog must keep working while Postgres is down or not migrated yet.
+        The catalog is a ``Snapshot``, ``None`` when nothing is stored for this
+        tag (empty, or another tag's rows were just purged), or ``_UNREADABLE``
+        when the store could not be built or read: the catalog must keep working
+        in memory while Postgres is down or not migrated yet, and a transient
+        error must never read as a purge.
         """
         if self._store_factory is None:
             return None, None
-        self._revision = None
         try:
             store = self._store_factory(identity, viewer)
         except Exception:
-            return None, None
+            return None, _UNREADABLE
         try:
-            snapshot = store.load()
+            return store, store.load()
         except Exception:
-            return store, None
-        self._remember_revision(store, snapshot.revision if snapshot is not None else None)
-        return store, snapshot
+            return store, _UNREADABLE
 
     def _remember_revision(self, store, revision=None):
         """Cache the store's revision so serving a list never opens a store transaction."""
@@ -610,16 +615,25 @@ class GitHubMonitor:
                               account=snapshot.viewer)
 
     def _bind_viewer(self, account):
-        """Swap to a store tagged with the viewer login; a different stored viewer purges it."""
+        """Swap to a store tagged with the viewer login; a different stored viewer purges it.
+
+        A store that cannot be read now is not swapped in: the pass keeps
+        writing through the fingerprint store and memory stays as it is (only a
+        real purge clears it); the next listing page or pass retries the bind.
+        """
         with self._lock:
             self._check_generation()
             if self._store is None or self._store_viewer == account:
                 return self._store
             store, snapshot = self._open_store(self._credential, account)
+            if snapshot is _UNREADABLE:
+                self._retire(store)
+                return self._store
             self._retire(self._store)
             self._store, self._store_viewer = store, account
+            self._remember_revision(store, snapshot.revision if snapshot else None)
             if snapshot is None:
-                # the stored catalog belonged to another viewer (now purged) or is unreadable
+                # the stored catalog belonged to another viewer and was purged (or was empty)
                 self._issues, self._marks, self._watermarks, self._issue_resume = {}, {}, {}, {}
                 self._full_at = {}
                 self._store_dirty = False

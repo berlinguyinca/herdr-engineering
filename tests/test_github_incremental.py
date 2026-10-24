@@ -634,3 +634,30 @@ def test_issue_detail_without_a_store_uses_the_same_rule():
         assert monitor.issue_detail("github.com/acme/lib", 6)["issue"]["number"] == 6
         clock[0] += 120  # well past the old 60 s TTL
     assert fake.calls["detail"] == 1
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+def test_store_unavailable_at_viewer_bind_keeps_the_cache_and_rereads_nothing():
+    from herdr_engineering.control_plane.github_store import GitHubStoreUnavailable
+    fake, shared = seeded(), {}
+    monitor_for(fake, shared).refresh()
+
+    class BlipOnViewerLoad(MemoryGitHubStore):
+        def load(self):
+            if self._viewer is not None:
+                raise GitHubStoreUnavailable("blip")
+            return super().load()
+    restarted = GitHubMonitor(provider_factory=lambda: fake, store=lambda identity, viewer=None: BlipOnViewerLoad(
+        identity=identity, viewer=viewer, shared=shared))
+    assert numbers(restarted) == list(range(1, 9))
+    fake.calls.clear()
+    restarted.refresh()
+    assert fake.calls == Counter({"repos": 2})  # a transient error is not a purge: no issue re-read
+    assert numbers(restarted) == list(range(1, 9))
+    assert restarted.snapshot(start=False)["status"] == "ready"
+    healthy = monitor_for(fake, shared)  # the store kept the catalog too
+    fake.calls.clear()
+    healthy.refresh()
+    assert fake.calls == Counter({"repos": 2})

@@ -506,3 +506,13 @@ def test_reads_neither_lock_the_meta_row_nor_prune():
         assert store.changes_since(0)["resync"] is True
     finally:
         made.close()
+
+
+def test_unreachable_database_raises_from_load_instead_of_reading_as_purged():
+    from herdr_engineering.control_plane.bridge import _LoopRunner
+
+    async def refuse():
+        raise ConnectionRefusedError("down")
+    store = GitHubStore(refuse, identity="tok-a", viewer="alice", run=_LoopRunner().run)
+    with pytest.raises(GitHubStoreUnavailable):
+        store.load()
