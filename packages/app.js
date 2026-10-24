@@ -25,6 +25,7 @@ import { configBadge, configNotice, indexConfigStatus } from './fleet-config-bad
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
+import { createAttentionNotifier } from './attention-notify.js';
 import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
@@ -76,11 +77,19 @@ SHELL.setAttribute('brand', 'HerdR Dev Fabric');
 
 // The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
 function setAttentionBadge(badge) { SHELL.setBadge?.('/attention', badge); }
+let attentionStorage = null;
+try { attentionStorage = window.localStorage; } catch { /* Notification choices then last for this page only. */ }
+const attentionNotifier = createAttentionNotifier({
+  storage: attentionStorage, NotificationImpl: window.Notification,
+  onClick: (href) => { window.focus(); window.location.hash = href; },
+});
+function handleAttention(body) { setAttentionBadge(attentionBadge(body)); attentionNotifier.handle(body); }
 let attentionBadgeTimer = null;
 async function pollAttentionBadge() {
   clearTimeout(attentionBadgeTimer);
-  if (!document.hidden) {
-    try { setAttentionBadge(attentionBadge(await client.attention({ state: 'open' }))); }
+  // A hidden tab keeps polling only when browser notifications are on, so a new critical item still reaches the operator.
+  if (!document.hidden || attentionNotifier.active()) {
+    try { handleAttention(await client.attention({ state: 'open' })); }
     catch { /* The page itself explains an unreachable inbox; the badge just stays as it was. */ }
   }
   attentionBadgeTimer = setTimeout(pollAttentionBadge, ATTENTION_POLL_MS * 3);
@@ -171,7 +180,7 @@ async function viewOverview() {
 }
 
 async function viewAttention() {
-  dashboardView = mountAttention(root, client, { onBadge: setAttentionBadge });
+  dashboardView = mountAttention(root, client, { onBody: handleAttention, notifier: attentionNotifier });
 }
 
 async function viewCollab() {

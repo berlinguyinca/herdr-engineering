@@ -449,7 +449,8 @@ class AttentionInbox:
             per_kind[item["kind"]] += 1
             capped.append(item)
         body = {"items": capped, "counts": counts, "partial": bool(unavailable), "unavailable": unavailable,
-                "truncated": len(capped) < len(shown), "generated_at": _iso(now)}
+                "truncated": len(capped) < len(shown), "generated_at": _iso(now),
+                "notify": copy.deepcopy(self.config["notify"])}
         if state == "all":
             body["resolved"] = copy.deepcopy(resolved)
         return body

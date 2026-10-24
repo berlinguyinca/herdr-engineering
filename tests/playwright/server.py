@@ -153,6 +153,13 @@ def main():
     # rate-limit regression test fast and unambiguous (an un-throttled client
     # re-rendering on every event exceeds even 600/min within ~18s, but trips
     # this 200/min budget in a few seconds).
+    if os.environ.get("ATTENTION_TRIGGER"):
+        # A second failure that appears when the test creates this file, so a notification has something new to announce.
+        def _wait_for_trigger():
+            while not os.path.exists(os.environ["ATTENTION_TRIGGER"]):
+                time.sleep(0.1)
+            _seed_attention(repo)
+        threading.Thread(target=_wait_for_trigger, daemon=True).start()
     if os.environ.get("CI_OFFLINE") == "1":
         # The host may have a real Woodpecker token; a hermetic page must not list real runs.
         svr.ci_monitor._factory = lambda: type("Offline", (), {"available": False})()

@@ -64,6 +64,22 @@ function group(label, items, render, open = false) {
   return `<details class="at-group" ${open ? 'open' : ''}><summary>${esc(label)} (${items.length})</summary><ul class="at-list">${items.map(render).join('')}</ul></details>`;
 }
 
+const hour = (h) => `${String(h).padStart(2, '0')}:00`;
+/** The browser-notification line: its state, the policy the server's YAML sets, and the one control. */
+export function notifyLine(notify) {
+  if (!notify || notify.status === 'server-off') return '';
+  const policy = notify.policy || {};
+  const quiet = policy.quiet_hours ? `, quiet ${hour(policy.quiet_hours.start)}–${hour(policy.quiet_hours.end)} in this browser's time` : '';
+  const what = `new ${esc(policy.min_severity || 'critical')}${policy.min_severity && policy.min_severity !== 'critical' ? ' and worse' : ''} items`;
+  const line = {
+    unsupported: 'Browser notifications are not supported in this browser.',
+    blocked: 'Browser notifications are blocked. Allow them in this site\'s settings to hear about new critical items.',
+    off: `Browser notifications are off. <button type="button" class="at-btn" data-notify-toggle="on">Enable notifications</button>`,
+    on: `Browser notifications are on for ${what}${quiet}. <button type="button" class="at-btn" data-notify-toggle="off">Turn off</button>`,
+  }[notify.status];
+  return line ? `<p class="at-status" data-notify-status="${esc(notify.status)}">${line}</p>` : '';
+}
+
 const STYLES = `<style>
 .at-summary{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:8px 0 16px;font-size:14px}
 .at-partial{background:var(--surface);border:1px solid var(--status-attention);border-radius:var(--radius);padding:8px 12px;margin:0 0 12px;font-size:13px}
@@ -112,18 +128,19 @@ export function renderAttention(model = {}, now = Date.now()) {
   else if (partial) list = '<p class="at-status">Nothing is known to be open, but some sources could not be read.</p>';
   else list = '<p class="at-status">No attention items. Every source was read.</p>';
   const resolved = records(body.resolved);
-  return `${STYLES}${head}${summary}${message ? `<p class="at-status" role="status">${esc(message)}</p>` : ''}${stale}${filterRow}${list}${trunc}
+  return `${STYLES}${head}${summary}${message ? `<p class="at-status" role="status">${esc(message)}</p>` : ''}${notifyLine(model.notify)}${stale}${filterRow}${list}${trunc}
     <div data-state="acknowledged">${group('Acknowledged', acknowledged, (i) => row(i, now, { busy: busy.has(i.key) }))}</div>
     ${group('Snoozed', snoozed, (i) => row(i, now, { busy: busy.has(i.key) }))}
     ${group('Recently resolved', resolved, (i) => resolvedRow(i, now))}`;
 }
 
 /** Mount the page: polls every POLL_MS while visible; ack/snooze/clear go to the server and re-poll at once. */
-export function mountAttention(container, client, { onBadge } = {}) {
+export function mountAttention(container, client, { onBody, notifier } = {}) {
   const model = { body: null, error: '', loading: true, busy: new Set(), filters: {}, message: '' };
   let disposed = false, timer = null, controller = null, last = '';
   function draw() {
     if (disposed) return;
+    model.notify = notifier ? { status: notifier.status(), policy: model.body?.notify } : null;
     const html = renderAttention(model, Date.now());
     const signature = html.replace(/(<span data-attention-stamp="[^"]*">)[^<]*(<\/span>)/g, '$1$2');
     if (signature === last) return;
@@ -150,7 +167,7 @@ export function mountAttention(container, client, { onBadge } = {}) {
       if (disposed) return;
       if (!body || !Array.isArray(body.items)) throw new Error('Invalid response');
       model.body = body; model.error = ''; model.loading = false;
-      onBadge?.(attentionBadge(body));
+      onBody?.(body);
     } catch (err) {
       if (disposed || controller?.signal.aborted) return;
       model.error = err?.status === 404 ? 'The attention inbox is turned off on this server.' : (err?.message || 'request failed');
@@ -174,7 +191,13 @@ export function mountAttention(container, client, { onBadge } = {}) {
       poll();
     }
   }
-  container.addEventListener('click', (event) => {
+  container.addEventListener('click', async (event) => {
+    const toggle = event.target.closest?.('[data-notify-toggle]');
+    if (toggle && notifier) {
+      if (toggle.dataset.notifyToggle === 'on') await notifier.enable(); else notifier.disable();
+      last = ''; draw();
+      return;
+    }
     const b = event.target.closest?.('[data-ack],[data-clear]');
     if (!b) return;
     act(b.hasAttribute('data-ack') ? 'ack' : 'clear', { key: b.dataset.key, fingerprint: b.dataset.fingerprint }, b.dataset.key);
