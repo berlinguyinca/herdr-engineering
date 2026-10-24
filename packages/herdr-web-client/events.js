@@ -2,6 +2,8 @@
 // Live updates via SSE, not polling. createEventSource is injected so tests
 // can supply a fake; the real browser uses the global EventSource.
 
+const SEEN_LIMIT = 500;
+
 export function connectEvents({
   url,
   onEvent = () => {},
@@ -12,6 +14,18 @@ export function connectEvents({
   let es = null;
   let closed = false;
   let retryTimer = null;
+  // Page-lifetime dedupe so reconnect replays are not delivered twice.
+  const seenIds = new Set();
+
+  function isDuplicate(data) {
+    if (!data || typeof data !== 'object') return false;
+    if (data.event_id != null) {
+      if (seenIds.has(data.event_id)) return true;
+      seenIds.add(data.event_id);
+      if (seenIds.size > SEEN_LIMIT) seenIds.delete(seenIds.values().next().value);
+    }
+    return false;
+  }
 
   function open() {
     if (closed) return;
@@ -23,6 +37,8 @@ export function connectEvents({
       } catch {
         return; // ignore malformed frames; never crash the UI
       }
+      if (data && data.event_type === 'StreamConnected') return;
+      if (isDuplicate(data)) return;
       onEvent(data);
     };
     es.onerror = () => {
