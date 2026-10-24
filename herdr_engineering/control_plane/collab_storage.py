@@ -225,22 +225,23 @@ class CollabStorage:
         key = archive_key(self.config.environment, archive_id, name)
         body = None
         try:
-            body = self._archive._s3.get_object(Bucket=self.config.archive_bucket, Key=key)['Body']
-            chunks, size = [], 0
-            while chunk := body.read(1024 * 1024):
-                size += len(chunk)
-                if size > 64 * 1024 * 1024:
-                    raise ValueError('metadata exceeds limit')
-                chunks.append(chunk)
-            data = b''.join(chunks)
-            if hashlib.sha256(data).hexdigest() != expected_sha256:
-                raise ValueError('checksum mismatch')
-            return data
+            try:
+                body = self._archive._s3.get_object(Bucket=self.config.archive_bucket, Key=key)['Body']
+                chunks, size = [], 0
+                while chunk := body.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > 64 * 1024 * 1024:
+                        raise ValueError('metadata exceeds limit')
+                    chunks.append(chunk)
+                data = b''.join(chunks)
+                if hashlib.sha256(data).hexdigest() != expected_sha256:
+                    raise ValueError('checksum mismatch')
+                return data
+            finally:
+                if body is not None:
+                    body.close()
         except Exception:
             raise StorageError('archive metadata verification failed') from None
-        finally:
-            if body is not None:
-                body.close()
 
     def write_archive(self, archive_id: str, name: str, data: bytes) -> ObjectRef:
         key = archive_key(self.config.environment, archive_id, name)

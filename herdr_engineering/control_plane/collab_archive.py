@@ -11,6 +11,7 @@ import asyncio
 import copy
 import hashlib
 import json
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -87,19 +88,22 @@ class CollabArchive:
 
     async def _io(self, fn, *args):
         # S3's blocking SDK never stalls the owning asyncpg event loop.
-        task = asyncio.create_task(asyncio.to_thread(fn, *args))
+        # Runner shutdown cancels every Task, including a to_thread wrapper.
+        # An executor Future tracks the actual provider completion independently
+        # of that task sweep; shielding it retains ownership until the thread stops.
+        completion = asyncio.get_running_loop().run_in_executor(None, copy_context().run, fn, *args)
         cancelled = False
-        while True:
+        while not completion.done():
             try:
-                result = await asyncio.shield(task)
-                break
+                await asyncio.shield(completion)
             except asyncio.CancelledError:
-                # A thread cannot be cancelled. Keep the DB lock until its
-                # provider writes stop, even if the caller disconnects twice.
                 cancelled = True
+            except BaseException:
+                break  # Retrieve the provider outcome below, after completion.
         if cancelled:
+            completion.exception()  # Consume any provider error before propagating cancellation.
             raise asyncio.CancelledError
-        return result
+        return completion.result()
 
     async def archive_room(self, room_id: str, requested_by: str, *, authorize=None) -> ArchiveRecord:
         async with self.store.lifecycle_lock():
@@ -285,8 +289,12 @@ class CollabArchive:
         user, agents = payload['user_id'], payload['agent_ids']
         # Publish any interrupted restore before removing its requester. The
         # subsequent relational scrub then preserves its now room-owned bytes.
-        for pending in await self.store.jobs('restore'):
-            await self._restore(**pending['payload'])
+        while pending_restores := await self.store.jobs('restore'):
+            for pending in pending_restores:
+                await self._restore(**pending['payload'])
+                # Also retire stale checkpoints whose room was already published.
+                # Failed restores keep their checkpoint and abort account deletion.
+                await self.store.remove_job(pending['job_id'])
         count = 0
         for archive in await self.store.list_archives():
             job = await self.store.get_job(archive.archive_id)

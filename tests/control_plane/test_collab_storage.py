@@ -396,3 +396,37 @@ def test_empty_objects_manifest_has_a_deterministic_successful_report():
     result = storage().verify_manifest(doc, adapter(s3))
     assert result.ok and result.objects_checked == 0 and result.errors == ()
     assert not s3.requests
+
+
+@pytest.mark.parametrize('read_case', ['success', 'checksum_failure', 'read_failure'])
+def test_archive_metadata_close_errors_are_sanitized_including_tracebacks(read_case):
+    token = 'private-close-token-123'
+    detail = f'https://objects.example.org/archive?X-Amz-Security-Token={token}'
+
+    class CloseFailure(ChunkedBody):
+        def read(self, size=-1):
+            if read_case == 'read_failure':
+                raise OSError(detail)
+            return super().read(size)
+
+        def close(self):
+            super().close()
+            raise OSError(detail)
+
+    body = CloseFailure(b'hello')
+
+    class CloseFailureS3(MemoryS3):
+        def get_object(self, *, Bucket, Key):
+            return {'Body': body}
+
+    client = adapter(CloseFailureS3())
+    digest = '0' * 64 if read_case == 'checksum_failure' else HELLO_SHA
+    with pytest.raises(Exception) as caught:
+        client.read_archive(ARCHIVE, 'room.json', digest)
+    error = caught.value
+    assert body.closed
+    assert token not in str(error)
+    assert token not in repr(error)
+    assert token not in ''.join(traceback.format_exception(error))
+    assert isinstance(error, storage().StorageError)
+    assert error.__cause__ is None and error.__suppress_context__ is True
