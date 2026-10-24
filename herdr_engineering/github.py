@@ -557,6 +557,9 @@ class GitHubMonitor:
                     self._store, snapshot = self._open_store(self._credential, None)
                     if snapshot is not _UNREADABLE:
                         self._remember_revision(self._store, snapshot.revision if snapshot else None)
+                    elif self._store is not None:
+                        # memory cannot know what is stored: the first pass's flush reconciles it
+                        self._store_dirty = True
                     if snapshot not in (None, _UNREADABLE):
                         self._hydrate(snapshot)
                 if self._thread is not None and threading.current_thread() is not self._thread:

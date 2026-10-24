@@ -1012,3 +1012,28 @@ def test_dropping_an_owner_from_the_allowlist_counts_as_a_change_at_once():
     monitor.refresh()
     # the unlisted owner's rows left memory before the listing: no ETag may still describe them
     assert marks["at_listing"] > marks["after_allowlist"]
+
+
+def test_an_unreadable_startup_load_reconciles_ghost_rows_on_the_first_pass():
+    fake, shared = seeded(), {}
+    seed = MemoryGitHubStore(identity=fake.credential_identity, viewer=fake.login, shared=shared)
+    seed.upsert_repositories([{"repository_id": "github.com/acme/app", "name_with_owner": "acme/app"}], None)
+    seed.upsert_issues("github.com/acme/app", [{"github_id": "I_ghost", "number": 99, "title": "gone"}], None)
+    opened = []
+
+    def factory(identity, viewer=None):
+        store = MemoryGitHubStore(identity=identity, viewer=viewer, shared=shared)
+        if not opened:  # the startup load fails (database briefly down)
+
+            def unreadable():
+                raise OSError("database down")
+            store.load = unreadable
+        opened.append(store)
+        return store
+    monitor = GitHubMonitor(provider_factory=lambda: fake, store=factory)
+    monitor.snapshot(start=False)
+    assert monitor.revision() is None  # memory knows nothing of what is stored: no revision to trust
+    monitor.refresh()
+    stored = seed.load().issues["github.com/acme/app"]
+    assert "I_ghost" not in stored and len(stored) == 5
+    assert monitor.revision() is not None
