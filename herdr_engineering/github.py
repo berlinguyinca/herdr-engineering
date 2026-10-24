@@ -1033,6 +1033,14 @@ class GitHubMonitor:
         return view
 
     def issue_detail(self, repository_id, number):
+        """One issue with its body, fetched once per ``updatedAt`` the catalog has seen.
+
+        The stored detail (memory, then the store's detail table) is served with
+        zero calls while its ``updated_at`` is not older than the catalog row's;
+        once an incremental pass records a newer ``updatedAt`` the next request
+        refetches. An issue missing from the open catalog (closed, or not synced
+        yet) has nothing to compare against and falls back to a 60 s reuse.
+        """
         provider = self._sync_credentials()
         with self._lock:
             if provider.credential_identity != self._credential:
@@ -1040,12 +1048,23 @@ class GitHubMonitor:
             generation = self._generation
             if repository_id not in self._repos:
                 raise GitHubError("not_found")
-            cached = self._details.get((repository_id, number))
-        if cached and self._now() - datetime.fromisoformat(cached["checked_at"]).timestamp() < 60:
-            return copy.deepcopy(cached)
+            listed = next((issue for issue in self._issues.get(repository_id, {}).values()
+                           if issue["number"] == number), None)
+            cached = copy.deepcopy(self._details.get((repository_id, number)))
+            store, confirmed = self._store, self._view["checked_at"]
+        if cached is None and store is not None:
+            try:
+                stored = store.detail(repository_id, number)
+            except Exception:
+                stored = None  # no detail table yet, or the database is down: fetch
+            if stored is not None:
+                cached = {"issue": stored, "stale": False, "error": None,
+                          "checked_at": confirmed or _stamp(), "connection_generation": generation}
+        if cached and self._detail_fresh(cached, listed):
+            return cached
         if self._now() < self._retry_at:
             if cached:
-                return dict(copy.deepcopy(cached), stale=True, error="GitHub requests are temporarily paused.")
+                return dict(cached, stale=True, error="GitHub requests are temporarily paused.")
             raise GitHubError("rate_limited", retry_at=self._retry_at)
         try:
             issue = _issue(provider.issue(repository_id, number), repository_id)
@@ -1054,9 +1073,12 @@ class GitHubMonitor:
             with self._lock:
                 if generation != self._generation:
                     raise GitHubError("not_configured")
-                if len(self._details) >= 200:
-                    self._details.pop(next(iter(self._details)))
-                self._details[(repository_id, number)] = copy.deepcopy(result)
+                self._remember_detail(repository_id, number, result)
+            if store is not None:
+                try:
+                    store.put_detail(repository_id, issue)
+                except Exception:
+                    pass  # memory still serves it; the catalog itself is unaffected
             return result
         except GitHubError as exc:
             with self._lock:
@@ -1065,5 +1087,18 @@ class GitHubMonitor:
                 if exc.retry_at:
                     self._retry_at = max(self._retry_at, exc.retry_at)
             if cached:
-                return dict(copy.deepcopy(cached), stale=True, error=str(exc))
+                return dict(cached, stale=True, error=str(exc))
             raise
+
+    def _detail_fresh(self, cached, listed):
+        if listed is None:
+            return self._now() - datetime.fromisoformat(cached["checked_at"]).timestamp() < 60
+        have, want = _when(cached["issue"].get("updated_at")), _when(listed.get("updated_at"))
+        return have is not None and want is not None and have >= want
+
+    def _remember_detail(self, repository_id, number, result):
+        """Keep at most 200 opened details in memory (lock held); the store keeps the rest."""
+        self._details.pop((repository_id, number), None)
+        if len(self._details) >= 200:
+            self._details.pop(next(iter(self._details)))
+        self._details[(repository_id, number)] = copy.deepcopy(result)

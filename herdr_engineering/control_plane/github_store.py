@@ -24,6 +24,10 @@ Rules (spec "Builder-check rulings" 1 and 2):
   reset (not even by a purge). Each row keeps the revision of its last change.
   Re-upserting identical data changes nothing, so ETags stay stable across the
   overlapping re-reads of an incremental pass.
+* Issue bodies (``put_detail``/``detail``, migration ``0007``) are kept only
+  for issues whose detail was opened, with the ``updated_at`` they were fetched
+  at. They never bump the revision, and they go with their issue, repository,
+  owner and identity like every other row.
 * Removals are kept as tombstones for ``TOMBSTONE_RETENTION``. ``pruned_through``
   is the newest revision whose tombstone was discarded (or the revision of the
   last purge); ``changes_since(since)`` with ``since`` below it, or above the
@@ -120,6 +124,7 @@ class _MemoryState:
         self.repos: dict[str, dict] = {}       # rid -> {owner, data, watermark, rev}
         self.issues: dict[tuple, dict] = {}    # (rid, gid) -> {data, rev}
         self.tombstones: dict[tuple, dict] = {}  # (kind, rid, key) -> {rev, removed_at}
+        self.details: dict[tuple, dict] = {}     # (rid, gid) -> {number, updated_at, data}
 
 
 class MemoryGitHubStore:
@@ -174,6 +179,8 @@ class MemoryGitHubStore:
                 self._tombstone("issue", rid, key[1], rev)
             del state.repos[rid]
             self._tombstone("repository", rid, rid, rev)
+            for key in [k for k in state.details if k[0] == rid]:
+                del state.details[key]
 
     # -- interface
 
@@ -184,7 +191,7 @@ class MemoryGitHubStore:
                 self._claim()
                 return None
             if not _matches(state.meta, self._identity, self._viewer):
-                state.repos, state.issues, state.tombstones = {}, {}, {}
+                state.repos, state.issues, state.tombstones, state.details = {}, {}, {}, {}
                 revision = state.meta["revision"] + 1
                 state.meta = {"identity": self._identity, "viewer": self._viewer,
                               "revision": revision, "pruned_through": revision}
@@ -239,7 +246,10 @@ class MemoryGitHubStore:
         state = self._state
         with state.lock:
             self._claim()
-            present = [gid for gid in dict.fromkeys(github_ids) if (repo_id, gid) in state.issues]
+            wanted = list(dict.fromkeys(github_ids))
+            for gid in wanted:
+                state.details.pop((repo_id, gid), None)
+            present = [gid for gid in wanted if (repo_id, gid) in state.issues]
             if not present:
                 return
             rev = self._bump()
@@ -261,6 +271,24 @@ class MemoryGitHubStore:
             gone = [rid for rid, r in state.repos.items() if r["owner"] not in allowed]
             if gone:
                 self._remove_repos(gone, self._bump())
+
+    def put_detail(self, repo_id: str, issue: dict) -> None:
+        """Store an opened issue's detail (with its body) as fetched at ``issue["updated_at"]``."""
+        state = self._state
+        with state.lock:
+            self._claim()
+            state.details[(repo_id, issue["github_id"])] = {
+                "number": issue["number"], "updated_at": issue.get("updated_at"), "data": _normal(issue)}
+
+    def detail(self, repo_id: str, number: int) -> dict | None:
+        """The stored detail of issue ``number``, or ``None`` when it was never opened."""
+        state = self._state
+        with state.lock:
+            self._claim()
+            for (rid, _), row in state.details.items():
+                if rid == repo_id and row["number"] == number:
+                    return _normal(row["data"])
+            return None
 
     def watermark(self, repo_id: str) -> str | None:
         state = self._state
@@ -298,6 +326,16 @@ class MemoryGitHubStore:
 
 _META_SELECT = ("SELECT identity, viewer, revision, pruned_through FROM github_catalog_meta "
                 "WHERE family=$1 FOR UPDATE")
+
+
+async def _drop_details(conn, sql: str, *args) -> None:
+    """Delete issue details inside a savepoint; a missing ``0007`` table (mid-roll) is not an error."""
+    import asyncpg
+    try:
+        async with conn.transaction():
+            await conn.execute(sql, *args)
+    except asyncpg.exceptions.UndefinedTableError:
+        pass
 
 
 class GitHubStore:
@@ -393,6 +431,7 @@ class GitHubStore:
 
     async def _remove_repos(self, conn, rids: list[str], rev: int) -> None:
         now = self._stamp()
+        await _drop_details(conn, "DELETE FROM github_issue_details WHERE repository_id = ANY($1::text[])", rids)
         await conn.execute(
             "WITH gone AS (DELETE FROM github_issues WHERE repository_id = ANY($1::text[]) "
             "RETURNING repository_id, github_id) "
@@ -421,6 +460,7 @@ class GitHubStore:
                     await conn.execute("DELETE FROM github_issues")
                     await conn.execute("DELETE FROM github_repositories")
                     await conn.execute("DELETE FROM github_catalog_tombstones")
+                    await _drop_details(conn, "DELETE FROM github_issue_details")
                     await conn.execute(
                         "UPDATE github_catalog_meta SET identity=$2, viewer=$3, revision=revision+1, "
                         "pruned_through=revision+1, updated_at=now() WHERE family=$1",
@@ -504,6 +544,8 @@ class GitHubStore:
         async def work(conn):
             async with conn.transaction():
                 await self._claim(conn)
+                await _drop_details(conn, "DELETE FROM github_issue_details WHERE repository_id=$1 "
+                                          "AND github_id = ANY($2::text[])", repo_id, wanted)
                 present = [r["github_id"] for r in await conn.fetch(
                     "SELECT github_id FROM github_issues WHERE repository_id=$1 AND github_id = ANY($2::text[]) "
                     "FOR UPDATE", repo_id, wanted)]
@@ -536,6 +578,33 @@ class GitHubStore:
                 if gone:
                     await self._remove_repos(conn, gone, await self._bump(conn))
         self._call(work)
+
+    def put_detail(self, repo_id: str, issue: dict) -> None:
+        """Store an opened issue's detail; ``GitHubStoreUnavailable`` before migration 0007."""
+        data = _normal(issue)
+
+        async def work(conn):
+            async with conn.transaction():
+                await self._claim(conn)
+                await conn.execute(
+                    "INSERT INTO github_issue_details (repository_id, github_id, number, updated_at, data, fetched_at) "
+                    "VALUES ($1,$2,$3,$4,$5::jsonb,$6) ON CONFLICT (repository_id, github_id) DO UPDATE SET "
+                    "number=EXCLUDED.number, updated_at=EXCLUDED.updated_at, data=EXCLUDED.data, "
+                    "fetched_at=EXCLUDED.fetched_at",
+                    repo_id, data["github_id"], data["number"], data.get("updated_at"), json.dumps(data),
+                    self._stamp())
+        self._call(work)
+
+    def detail(self, repo_id: str, number: int) -> dict | None:
+        """The stored detail of issue ``number``, or ``None`` when it was never opened."""
+        async def work(conn):
+            async with conn.transaction():
+                await self._claim(conn)
+                return await conn.fetchval(
+                    "SELECT data FROM github_issue_details WHERE repository_id=$1 AND number=$2 "
+                    "ORDER BY fetched_at DESC LIMIT 1", repo_id, number)
+        raw = self._call(work)
+        return None if raw is None else json.loads(raw)
 
     def watermark(self, repo_id: str) -> str | None:
         async def work(conn):

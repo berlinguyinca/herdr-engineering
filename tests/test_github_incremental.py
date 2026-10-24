@@ -95,6 +95,14 @@ class FakeGitHub:
         self.log.append(("issues", repository_id, cursor))
         return self._connection(self._sorted(repository_id, "OPEN"), cursor)
 
+    def issue(self, repository_id, number):
+        self.calls["detail"] += 1
+        self.log.append(("detail", repository_id, number))
+        name = repository_id.removeprefix("github.com/")
+        issues = next((v for k, v in self.repos.items() if k.lower() == name.lower()), {})
+        row = next(i for i in issues.values() if i["number"] == number)
+        return dict(row, body=f"body of {number} at {row['updatedAt']}")
+
     def closed_issues_page(self, repository_id, since, cursor=None):
         self.calls["closed"] += 1
         self.log.append(("closed", repository_id, cursor))
@@ -588,3 +596,41 @@ def test_point_budget_is_read_from_yaml(fake_host_config):
     monitor._fixed_sync["point_budget"] = None
     monitor.refresh()
     assert len(monitor.snapshot(start=False)["deferred_repos"]) == 2
+
+
+# ---------------------------------------------------------------- G6
+
+
+def test_issue_detail_is_served_from_the_store_until_the_issue_changes():
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared)
+    monitor.refresh()
+    first = monitor.issue_detail("github.com/acme/app", 2)
+    assert fake.calls["detail"] == 1 and first["issue"]["body"].startswith("body of 2")
+    second = monitor.issue_detail("github.com/acme/app", 2)
+    assert fake.calls["detail"] == 1  # unchanged updatedAt: zero calls, no TTL
+    assert second["issue"]["body"] == first["issue"]["body"]
+    restarted = monitor_for(fake, shared)
+    assert restarted.issue_detail("github.com/acme/app", 2)["issue"]["body"] == first["issue"]["body"]
+    assert fake.calls["detail"] == 1  # the body persisted with the catalog
+    gid = next(g for g, i in fake.repos["acme/app"].items() if i["number"] == 2)
+    fake.tick(600)
+    fake.edit("acme/app", gid, title="edited")
+    assert monitor.issue_detail("github.com/acme/app", 2)["issue"]["title"] == "Issue 2"
+    assert fake.calls["detail"] == 1  # the pass has not seen the change yet
+    monitor.refresh()
+    third = monitor.issue_detail("github.com/acme/app", 2)
+    assert fake.calls["detail"] == 2 and third["issue"]["title"] == "edited"
+    monitor.issue_detail("github.com/acme/app", 2)
+    assert fake.calls["detail"] == 2  # refetched once, then served again
+
+
+def test_issue_detail_without_a_store_uses_the_same_rule():
+    import time
+    fake, clock = seeded(), [time.time()]
+    monitor = GitHubMonitor(provider_factory=lambda: fake, now=lambda: clock[0])
+    monitor.refresh()
+    for _ in range(3):
+        assert monitor.issue_detail("github.com/acme/lib", 6)["issue"]["number"] == 6
+        clock[0] += 120  # well past the old 60 s TTL
+    assert fake.calls["detail"] == 1

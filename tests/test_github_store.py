@@ -24,8 +24,9 @@ from herdr_engineering.control_plane.github_store import (
 )
 
 _PG_DSN = os.environ.get("HERDR_E2E_PG_DSN")
-_MIGRATION = (Path(__file__).parents[1] / "deploy" / "control-plane" / "migrations"
-              / "0006_github_catalog.sql")
+_MIGRATIONS_DIR = Path(__file__).parents[1] / "deploy" / "control-plane" / "migrations"
+_MIGRATION = _MIGRATIONS_DIR / "0006_github_catalog.sql"
+_DETAIL_MIGRATION = _MIGRATIONS_DIR / "0007_github_issue_details.sql"
 
 
 class Clock:
@@ -68,7 +69,7 @@ class _MemoryBackend:
 
 
 class _PgBackend:
-    def __init__(self, *, migrate=True):
+    def __init__(self, *, migrate=True, details=True):
         import asyncpg
 
         from herdr_engineering.control_plane.bridge import _LoopRunner
@@ -82,6 +83,8 @@ class _PgBackend:
             if migrate:
                 self._run(conn.execute(f"SET search_path TO {self.schema}"))
                 self._run(conn.execute(_MIGRATION.read_text(encoding="utf-8")))
+                if details:
+                    self._run(conn.execute(_DETAIL_MIGRATION.read_text(encoding="utf-8")))
         finally:
             self._run(conn.close())
 
@@ -120,8 +123,9 @@ def backend(request):
 
 def test_migration_file_follows_numbering():
     names = sorted(p.name for p in _MIGRATION.parent.glob("*.sql"))
-    assert names[-1] == "0006_github_catalog.sql"
+    assert names[-2:] == ["0006_github_catalog.sql", "0007_github_issue_details.sql"]
     assert "CONCURRENTLY" not in _MIGRATION.read_text()
+    assert "CONCURRENTLY" not in _DETAIL_MIGRATION.read_text()
 
 
 def test_load_is_none_before_anything_is_stored(backend):
@@ -396,5 +400,69 @@ def test_postgres_store_reconnects_after_a_dropped_connection():
         store._run(store._conn.close())  # simulate a dropped data connection
         store.upsert_repositories([repo("acme/lib")], scope=set())
         assert set(made.make().load().repositories) == {A, B}
+    finally:
+        made.close()
+
+
+# ---------------------------------------------------------------- issue detail (G6)
+
+
+def detail(gid, number, updated="2026-10-24T00:00:00Z"):
+    return dict(issue(gid, number, updated), body=f"body of {number}", body_truncated=False)
+
+
+def test_detail_round_trip_never_bumps_the_revision(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app")], scope=None)
+    store.upsert_issues(A, [issue("I1", 1)], watermark=None)
+    revision = store.revision()
+    assert store.detail(A, 1) is None
+    store.put_detail(A, detail("I1", 1))
+    assert backend.make().detail(A, 1)["body"] == "body of 1"
+    store.put_detail(A, detail("I1", 1, updated="2026-10-25T00:00:00Z"))
+    assert store.detail(A, 1)["updated_at"] == "2026-10-25T00:00:00Z"
+    assert store.revision() == revision  # bodies are not part of the listed catalog
+    assert store.changes_since(revision)["upserted"] == []
+
+
+def test_detail_goes_with_its_issue_repository_and_owner(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app"), repo("acme/lib"), repo("other/tool")], scope=None)
+    for rid, gid in ((A, "I1"), (A, "I2"), (B, "I3"), (C, "I4")):
+        store.upsert_issues(rid, [issue(gid, int(gid[1:]))], watermark=None)
+        store.put_detail(rid, detail(gid, int(gid[1:])))
+    store.remove_issues(A, ["I1"])
+    assert store.detail(A, 1) is None and store.detail(A, 2) is not None
+    store.upsert_repositories([repo("acme/app"), repo("other/tool")], scope=None)  # acme/lib is gone
+    assert store.detail(B, 3) is None
+    store.purge_owners_not_in({"acme"})
+    assert store.detail(C, 4) is None and store.detail(A, 2) is not None
+
+
+def test_detail_is_dropped_with_the_catalog_on_an_identity_change(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app")], scope=None)
+    store.upsert_issues(A, [issue("I1", 1)], watermark=None)
+    store.put_detail(A, detail("I1", 1))
+    other = backend.make(identity="tok-b")
+    assert other.load() is None
+    assert other.detail(A, 1) is None  # a private body never survives a token change
+    with pytest.raises(GitHubStoreIdentityMismatch):
+        store.detail(A, 1)
+
+
+@_needs_pg
+def test_missing_detail_table_degrades_without_breaking_the_catalog():
+    made = _PgBackend(details=False)
+    try:
+        store = made.make()
+        store.upsert_repositories([repo("acme/app")], scope=None)
+        store.upsert_issues(A, [issue("I1", 1)], watermark=None)
+        with pytest.raises(GitHubStoreUnavailable):
+            store.put_detail(A, detail("I1", 1))
+        with pytest.raises(GitHubStoreUnavailable):
+            store.detail(A, 1)
+        store.remove_issues(A, ["I1"])  # removal still works without the detail table
+        assert made.make(identity="tok-b").load() is None  # and so does the identity purge
     finally:
         made.close()
