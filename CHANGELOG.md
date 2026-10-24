@@ -5,6 +5,26 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Lineage graph projection (T02, Herdr side)
+- Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
+- Migration `0005_event_id_per_actor.sql`: `event_id` is unique per principal (global primary key dropped).
+- Lineage review round 6: commons fallback primary is the writer who wrote the field first (stable under updates) and
+  readers apply the earliest VISIBLE owner; neighborhood stops rendering neighbours once its budget is spent;
+  commons admission-limit errors are generic; known-limitations list in the lineage contract.
+- Lineage review round 5: commons field visibility is per writer (a widened node no longer exposes another writer's
+  private fields); an empty ensure never makes the ensurer the commons owner; commons endpoints confer no tombstone
+  authority; tombstoned edge instances free their slot; contribution caps keep operator/owner/own entries; migration 0005
+  rollout order and rollback documented (`docs/operations/event-id-per-actor-rollout.md`).
+- Lineage review round 4: admission mode/sequence are server-only (reserved `_` payload keys rejected); commons nodes keep
+  an owner/operator primary value with attributed `fields`/`contributions`, widest-scope visibility, per-writer attr budgets
+  and per-writer `from`-commons edge instances; `node.state` on a missing commons node creates it.
+- Lineage refusals are HTTP 403 `{"reason": "lineage_forbidden"}`; shared COMMONS nodes (commit/pr/issue/ci/artifact) and
+  idempotent "ensure" upserts are accepted from any ingest key.
+- `lineage` envelope events (v2 only) project into a durable graph derived from `fabric_events`
+  (no new table; rebuilt on hydrate). See `docs/contracts/lineage-events.md`.
+- `GET /api/v1/graph/nodes/{id}`, `.../neighborhood`, `/api/v1/graph/edge`: viewer-level reads,
+  visibility-filtered at every hop, depth/node/edge capped, fail closed.
+
 ### Event envelope v2 (T01, Herdr side)
 - `POST /api/v1/ingest` accepts `schema_version: 2` bodies per
   `docs/contracts/event-envelope-v2.md`: server-set `actor`/`received_at`,

@@ -15,6 +15,7 @@ import re
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
+from .graph import validate_lineage
 from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
 from .project_links import canonical_repository
 from .sink import EventAlreadyStored
@@ -89,10 +90,12 @@ class IngestService:
         if entity_type.strip().lower().startswith(RESERVED_ENTITY_PREFIXES):
             raise ValueError("reserved review-gate entity type is not accepted by generic ingestion")
         env = normalize_envelope(body, principal, self.repo._stamp())
+        if env is None and entity_type == "lineage":
+            raise ValueError("lineage events require schema_version 2")
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type
-        self._prevalidate(entity_type, entity_id, payload)
+        self._prevalidate(entity_type, entity_id, payload, event_type)
         ledger = self.repo.ledger
         ack = {"event_id": env["event_id"], "source": env["source"],
                "source_sequence": env["source_sequence"]}
@@ -103,6 +106,17 @@ class IngestService:
         with ledger.lock:
             if ledger.check(env) == "duplicate":
                 return {**head, "envelope": {**ack, "duplicate": True}}
+            if entity_type == "lineage":
+                # Ownership/capacity gate: runs under the ledger lock and BEFORE
+                # the row is persisted, so a refused change is never stored and
+                # its sequence is not consumed. Raises PermissionError (403).
+                decision = self.repo.graph.admit(env["actor"], event_type, payload, env["source"])
+                if decision["mode"] != "normal":
+                    env["lineage_mode"] = decision["mode"]
+                # Server-assigned monotonic admission number, persisted with the
+                # row: ownership and cross-writer ordering never depend on the
+                # wall clock, source names or client sequences.
+                env["lineage_seq"] = self.repo.graph.next_seq()
             # The envelope row is persisted FIRST. If that fails nothing has
             # been applied and the ledger is untouched, so the emitter retries.
             try:
@@ -110,38 +124,55 @@ class IngestService:
                     entity_type, entity_id, event_type, row_payload,
                     envelope=env, feed=entity_type not in ENVELOPE_ONLY_TYPES,
                     publish=entity_type not in ENVELOPE_ONLY_TYPES)
-            except SequenceCollision:
+            except SequenceCollision as exc:
+                if exc.event_id_clash:
+                    raise EnvelopeConflict(str(exc)) from None
                 raise EnvelopeConflict("source_sequence is already used by another event") from None
             except EventAlreadyStored:
                 # Durable insert landed earlier but the ack was lost (or the
                 # in-memory index evicted it): same identity => already stored.
-                if self._stored_identity(env["event_id"]) != (env["source"], env["source_sequence"]):
+                if self._stored_identity(env["event_id"], (env.get("actor") or {}).get("id") or "") != (env["source"], env["source_sequence"]):
                     raise EnvelopeConflict("event_id already stored for a different source sequence") from None
                 ledger.commit(env)
                 return {**head, "envelope": {**ack, "duplicate": True}}
             try:
-                result = self._dispatch(entity_type, entity_id, event_type, payload, source,
-                                        record_generic=False)
+                if entity_type == "lineage":
+                    result = self._apply_lineage(entity_id, event_type, payload, env)
+                else:
+                    result = self._dispatch(entity_type, entity_id, event_type, payload, source,
+                                            record_generic=False)
             finally:
                 # The row is durable, so its (source, sequence) is consumed even
                 # if the handler then fails; the failure is reported once.
                 ledger.commit(env)
         return {**result, "envelope": {**ack, "duplicate": False}}
 
-    def _stored_identity(self, event_id):
+    def _apply_lineage(self, entity_id, event_type, payload, env) -> dict:
+        """Project a persisted lineage envelope into the graph (never infers edges)."""
+        self.repo.graph.apply({
+            "event_id": env["event_id"], "source": env["source"],
+            "source_sequence": env["source_sequence"], "event_type": event_type,
+            "payload": payload, "visibility_scope": env["visibility_scope"],
+            "actor": env.get("actor"), "ingest_timestamp": env["received_at"],
+            "lineage_seq": env.get("lineage_seq"), "lineage_mode": env.get("lineage_mode")})
+        return {"entity_type": "lineage", "entity_id": entity_id, "event_type": event_type}
+
+    def _stored_identity(self, event_id, actor_id=""):
         lookup = getattr(getattr(self.repo, "_sink", None), "stored_identity", None)
         if not callable(lookup):
             raise RuntimeError("durable event identity is unavailable")
-        found = lookup(event_id)
+        found = lookup(event_id, actor_id)
         if found is None:
             raise RuntimeError("durable event identity is unavailable")
         return tuple(found)
 
     @staticmethod
-    def _prevalidate(entity_type, entity_id, payload) -> None:
+    def _prevalidate(entity_type, entity_id, payload, event_type="") -> None:
         """Reject what a handler would reject BEFORE the envelope is persisted."""
         if entity_type == "mission" and ":" in entity_id:
             raise ValueError("invalid mission id")
+        if entity_type == "lineage":
+            validate_lineage(event_type, payload)
         if entity_type in ("session", "mission"):
             _git_identity(payload)
         if entity_type == "service" and any(

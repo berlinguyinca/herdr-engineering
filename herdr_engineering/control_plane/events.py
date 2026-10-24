@@ -52,8 +52,20 @@ V2_COLUMNS = ("source", "source_sequence", "causation_id", "correlation_id",
 _UNIQUE_VIOLATION = "23505"
 
 
+def _actor_domain(actor) -> str:
+    """The principal id of an actor dict ('' when absent): the event_id/sequence domain."""
+    value = actor.get("id") if isinstance(actor, dict) else None
+    return value if isinstance(value, str) else ""
+
+
 class SequenceCollision(Exception):
-    """(source, source_sequence) is already held by a different event."""
+    """(source, source_sequence) is already held by a different event, or (``event_id_clash``,
+    only on a database that has not applied migration 0005) the event_id belongs to another
+    principal."""
+
+    def __init__(self, message: str = "", *, event_id_clash: bool = False):
+        super().__init__(message)
+        self.event_id_clash = event_id_clash
 
 
 def _is_unique_violation(exc: BaseException) -> bool:
@@ -135,7 +147,7 @@ class EventStore:
                 " room_id, workspace_id, task_id, agent_id) "
                 "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,"
                 "$16,$17,$18,$19,$20,$21,$22,$23,$24) "
-                "ON CONFLICT (event_id) DO NOTHING RETURNING event_id")
+                "ON CONFLICT DO NOTHING RETURNING event_id")
             args = legacy_args + (
                 event.source, event.source_sequence, event.causation_id,
                 event.correlation_id,
@@ -152,25 +164,43 @@ class EventStore:
                 " mission_id, session_id, payload, source_timestamp, "
                 " ingest_timestamp, schema_version) "
                 "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) "
-                "ON CONFLICT (event_id) DO NOTHING RETURNING event_id")
+                "ON CONFLICT DO NOTHING RETURNING event_id")
             args = legacy_args
         try:
             row = await self._conn.fetchrow(sql, *args)
         except Exception as exc:
-            # ON CONFLICT (event_id) absorbs event_id duplicates, so a unique
-            # violation reaching here is the (source, source_sequence) index.
             if v2 and _is_unique_violation(exc):
                 raise SequenceCollision(
                     f"source {event.source!r} sequence "
                     f"{event.source_sequence} is already used") from exc
             raise
+        if row is None and v2:
+            # DO NOTHING swallowed a unique violation: either THIS principal already stored
+            # this event_id (a duplicate), or the (actor, source, source_sequence) index
+            # (or, before migration 0005, another principal's event_id) refused it.
+            if await self.identity(event.event_id, _actor_domain(event.actor)) is None:
+                clash = await self._conn.fetch(
+                    f"SELECT 1 FROM {self._table} WHERE event_id=$1 LIMIT 1", event.event_id)
+                if clash:
+                    # only possible before migration 0005: event_id is still one global namespace
+                    raise SequenceCollision(
+                        f"event_id {event.event_id!r} is already used by another principal "
+                        "(the database still has a global event_id key; apply migration "
+                        "0005_event_id_per_actor.sql)", event_id_clash=True)
+                raise SequenceCollision(
+                    f"source {event.source!r} sequence "
+                    f"{event.source_sequence} is already used")
         return row is not None
 
-    async def identity(self, event_id: str) -> tuple[str | None, int | None] | None:
-        """(source, source_sequence) stored for ``event_id``, or None if absent."""
+    async def identity(self, event_id: str, actor_id: str = "") -> tuple[str | None, int | None] | None:
+        """(source, source_sequence) stored for this principal's ``event_id``, or None.
+
+        event_id uniqueness is per ACTOR (migration 0005): two principals may use the
+        same client event_id without interfering."""
         rows = await self._conn.fetch(
-            f"SELECT source, source_sequence FROM {self._table} WHERE event_id=$1",
-            event_id)
+            f"SELECT source, source_sequence FROM {self._table} "
+            "WHERE event_id=$1 AND COALESCE(actor->>'id','')=$2",
+            event_id, actor_id)
         if not rows:
             return None
         return rows[0]["source"], rows[0]["source_sequence"]

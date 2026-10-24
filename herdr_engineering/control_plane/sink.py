@@ -104,11 +104,11 @@ class DurableEventSink:
                     "durable event insert was not acknowledged "
                     "(event_id already stored)")
 
-    def stored_identity(self, event_id: str):
-        """(source, source_sequence) of a stored event, or None when absent."""
+    def stored_identity(self, event_id: str, actor_id: str = ""):
+        """(source, source_sequence) of this principal's stored event, or None when absent."""
         with self._write_lock:
             self._ensure_store()
-            return self._run(self._store.identity(event_id))
+            return self._run(self._store.identity(event_id, actor_id))
 
     def record_source_state(self, state: dict) -> None:
         """Best-effort upsert of per-source ingest state (fabric_event_sources)."""
@@ -118,11 +118,11 @@ class DurableEventSink:
                 self._ensure_store()
                 self._run(self._store._conn.execute(
                     "INSERT INTO fabric_event_sources "
-                    "(source, last_sequence, last_seen_at, gaps) VALUES ($1,$2,$3,$4) "
-                    "ON CONFLICT (source) DO UPDATE SET "
+                    "(source_actor, source, last_sequence, last_seen_at, gaps) VALUES ($1,$2,$3,$4,$5) "
+                    "ON CONFLICT (source_actor, source) DO UPDATE SET "
                     "last_sequence=EXCLUDED.last_sequence, "
                     "last_seen_at=EXCLUDED.last_seen_at, gaps=EXCLUDED.gaps",
-                    state["source"], state["last_sequence"],
+                    state.get("actor") or "", state["source"], state["last_sequence"],
                     _parse_dt(state["last_seen_at"]), json.dumps(state["gaps"])))
         except Exception:
             log.exception("durable sink failed to persist source state %s",

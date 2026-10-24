@@ -22,6 +22,10 @@ from uuid import uuid4
 
 from .agent_identity import AgentIdentityRegistry
 from .envelope import SourceLedger, envelope_event_fields
+from .graph import GraphProjection
+from .graph import _lseq as _graph_lseq
+from .graph import _rank as _graph_rank
+from .graph import from_stored as _graph_from_stored
 from .host_metrics_store import ENTITY_TYPE as HOST_METRICS_ENTITY
 from .host_metrics_store import STATE_KEYS as HOST_STATE_KEYS
 from .host_metrics_store import HostMetricsStore, clean_metrics, clean_state
@@ -185,6 +189,9 @@ class ControlPlaneRepo:
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+        # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
+        # from them on import_state; owns no storage of its own.
+        self.graph = GraphProjection()
         self.host_metrics = self._new_host_metrics()
 
     def _new_host_metrics(self):
@@ -1718,6 +1725,10 @@ class ControlPlaneRepo:
                 ev["ingest_timestamp"] = env["received_at"]
                 ev["mission_id"] = mission_id or env.get("mission_id")
                 meta = {"content_sha256": env["content_hash"]}
+                if env.get("lineage_seq") is not None:
+                    meta["lineage_seq"] = env["lineage_seq"]
+                if env.get("lineage_mode"):
+                    meta["lineage_mode"] = env["lineage_mode"]
                 if env.get("claimed_actor") is not None:
                     meta["claimed_actor"] = _bounded_claim(env["claimed_actor"])
                 ev["payload"] = {**ev["payload"], "_envelope": meta}
@@ -2061,6 +2072,7 @@ class ControlPlaneRepo:
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
         self.ledger.hydrate([e for stream in self._events.values() for e in stream])
+        self._rebuild_graph()
         self._ci_sequence = max(int(state.get("ci_sequence", 0)),
                                 max((event.get("sequence", -1) + 1
                                      for key, stream in self._events.items()
@@ -2110,6 +2122,27 @@ class ControlPlaneRepo:
             host = self._hosts.get(hid)
             if host is not None:
                 host.update({k: v for k, v in rec.items() if v is not None})
+
+    def _rebuild_graph(self):
+        """Replay stored ``lineage`` envelope rows into a fresh projection.
+
+        Lineage is envelope-only: it never sits in the global feed. Rows that no
+        longer validate are skipped and counted, never fatal to startup.
+        """
+        graph = GraphProjection()
+        rows = [e for key, stream in self._events.items() if key[0] == "lineage"
+                for e in stream if e.get("source") is not None
+                and e.get("source_sequence") is not None]
+        rows = [_graph_from_stored({**e, "payload": _payload(e)}) for e in rows]
+        rows.sort(key=_graph_rank)          # admission order, independent of stream grouping
+        for event in rows:
+            try:
+                graph.apply(event)
+            except ValueError:
+                graph.events_rejected += 1
+        graph._seq = max([graph._seq] + [_graph_lseq(e) for e in rows])
+        self.graph = graph
+        self._event_order = [t for t in self._event_order if t[0] != "lineage"]
 
     def take_collab_replay(self):
         """Hand the diverted durable HCN events to the collaboration service (once)."""

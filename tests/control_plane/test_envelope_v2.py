@@ -147,16 +147,23 @@ def test_typed_entity_carries_envelope_on_its_event():
 
 
 # ------------------------------------------------------------ durability
+def _actor_dom(r):
+    actor = r.get("actor")
+    actor = json.loads(actor) if isinstance(actor, str) else (actor or {})
+    return actor.get("id") or ""
+
+
 class V2Conn:
     """Fake asyncpg conn honouring the unique indexes and the v2 INSERT."""
 
     def __init__(self):
         self.rows, self.fail = [], None
+        self.pre0005 = False          # True: event_id is still one global primary key
 
     async def fetch(self, sql, *a):
         if "WHERE event_id" in sql:
             return [{"source": r.get("source"), "source_sequence": r.get("source_sequence")}
-                    for r in self.rows if r["event_id"] == a[0]]
+                    for r in self.rows if r["event_id"] == a[0] and (len(a) < 2 or _actor_dom(r) == a[1])]
         if "ORDER BY sequence" in sql:
             return [r for r in self.rows if (r["entity_type"], r["entity_id"]) == (a[0], a[1])]
         return []
@@ -169,14 +176,16 @@ class V2Conn:
             raise self.fail
         cols = [c.strip() for c in sql.split("(", 1)[1].split(")", 1)[0].split(",")]
         row = dict(zip(cols, a))
-        if any(r["event_id"] == row["event_id"] for r in self.rows):
+        # migration 0005: event_id unique per actor; 0004: (actor, source, seq) unique.
+        # Bare ON CONFLICT DO NOTHING absorbs BOTH violations and returns no row.
+        if any(r["event_id"] == row["event_id"] and (self.pre0005 or _actor_dom(r) == _actor_dom(row))
+               for r in self.rows):
             return None
         if row.get("source") is not None and any(
-                (r.get("source"), r.get("source_sequence")) == (row["source"], row["source_sequence"])
+                (_actor_dom(r), r.get("source"), r.get("source_sequence"))
+                == (_actor_dom(row), row.get("source"), row.get("source_sequence"))
                 for r in self.rows):
-            exc = Exception("duplicate key")
-            exc.sqlstate = "23505"
-            raise exc
+            return None
         self.rows.append(row)
         return {"event_id": row["event_id"]}
 
@@ -428,7 +437,10 @@ def test_gaps_and_sources_are_bounded():
 def test_http_sequence_collision_is_409_and_storage_errors_are_not_echoed():
     conn = V2Conn()
     repo = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
-    IngestService(repo).ingest(body(0, event_id="secret-other-event"), PRINCIPAL)
+    import hashlib   # the same key's earlier event: the sequence domain is (principal, source)
+    same_key = {"kind": "ingest", "id": "key:" + hashlib.sha256(b"ing-1").hexdigest()[:12],
+                "authenticated_by": "api_key"}
+    IngestService(repo).ingest(body(0, event_id="secret-other-event"), same_key)
     repo2 = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
     svr = ControlPlaneServer(repo2, api_keys={"ing-1": "ingest"})
     threading.Thread(target=svr.serve, daemon=True).start()
@@ -442,3 +454,73 @@ def test_http_sequence_collision_is_409_and_storage_errors_are_not_echoed():
         assert status == 500 and "internal-host" not in json.dumps(out)
     finally:
         svr.shutdown()
+
+
+OTHER_PRINCIPAL = {"kind": "agent", "id": "key:other", "authenticated_by": "api_key"}
+
+
+def test_sequence_domain_is_per_principal_and_source():
+    repo, s = svc()
+    s.ingest(body(5, event_id="attacker-5"), OTHER_PRINCIPAL)         # another key takes pi/5 first
+    mine = s.ingest(body(5, event_id="mine-5"), PRINCIPAL)             # not a collision for this key
+    assert mine["envelope"]["duplicate"] is False
+    with pytest.raises(EnvelopeConflict):                              # a true conflict inside one domain
+        s.ingest(body(5, event_id="mine-5b"), PRINCIPAL)
+    s.ingest(body(8, event_id="other-8"), OTHER_PRINCIPAL)             # gap opens in the other domain only
+    mine_state = repo.ledger.source_state("pi", PRINCIPAL["id"])
+    other_state = repo.ledger.source_state("pi", OTHER_PRINCIPAL["id"])
+    assert mine_state["gaps"] == [] and mine_state["actor"] == PRINCIPAL["id"]
+    assert [(g["from"], g["to"]) for g in other_state["gaps"]] == [(6, 7)]
+    listed = repo.ledger.source_states()
+    assert {(st["actor"], st["source"]) for st in listed} == {(PRINCIPAL["id"], "pi"), (OTHER_PRINCIPAL["id"], "pi")}
+    # an identical retry by the owning key is still a duplicate; by another key it is not a free pass
+    assert s.ingest(body(5, event_id="mine-5"), PRINCIPAL)["envelope"]["duplicate"] is True
+
+
+def test_per_principal_domain_survives_restart_and_durable_unique_index():
+    conn, repo, s = durable()
+    s.ingest(body(5, event_id="a-5"), OTHER_PRINCIPAL)
+    s.ingest(body(5, event_id="m-5"), PRINCIPAL)
+    assert len(conn.rows) == 2                                          # both stored under the (actor, source, seq) index
+    fresh = ControlPlaneRepo()
+    fresh.import_state({"events": {"task|t1": [
+        {**r, "payload": json.loads(r["payload"]), "ingest_timestamp": f"2026-10-22T10:00:0{i}+00:00"}
+        for i, r in enumerate(conn.rows)]}, "event_order": []})
+    assert {(st["actor"], st["source"]) for st in fresh.ledger.source_states()} == {
+        (PRINCIPAL["id"], "pi"), (OTHER_PRINCIPAL["id"], "pi")}
+    with pytest.raises(EnvelopeConflict):
+        IngestService(fresh).ingest(body(5, event_id="m-5b"), PRINCIPAL)
+    assert IngestService(fresh).ingest(body(5, event_id="m-5"), PRINCIPAL)["envelope"]["duplicate"] is True
+
+
+def test_durable_event_id_is_per_principal_and_survives_ledger_loss():
+    other = {"kind": "agent", "id": "key:other", "authenticated_by": "api_key"}
+    conn = V2Conn()
+    repo = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
+    s = IngestService(repo)
+    s.ingest(body(0, event_id="shared-id"), other)
+    repo.ledger._events.clear()          # ledger evicted / restarted without hydrate
+    repo.ledger._sequences.clear()
+    ack = s.ingest(body(0, event_id="shared-id"), PRINCIPAL)
+    assert ack["envelope"]["duplicate"] is False
+    assert sorted(r["event_id"] for r in conn.rows) == ["shared-id", "shared-id"]
+    # the owner's own replay after eviction is recognised as a duplicate by (actor, id)
+    again = s.ingest(body(0, event_id="shared-id"), PRINCIPAL)
+    assert again["envelope"]["duplicate"] is True
+
+
+def test_cross_principal_event_id_before_migration_0005_says_what_happened():
+    other = {"kind": "agent", "id": "key:other", "authenticated_by": "api_key"}
+    conn = V2Conn()
+    conn.pre0005 = True
+    repo = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
+    s = IngestService(repo)
+    s.ingest(body(0, event_id="shared-id"), other)
+    with pytest.raises(EnvelopeConflict) as ei:
+        s.ingest(body(0, event_id="shared-id"), PRINCIPAL)
+    assert "event_id" in str(ei.value) and "0005" in str(ei.value) and "another principal" in str(ei.value)
+    # a genuine sequence clash keeps its own message
+    s.ingest(body(1, event_id="mine"), PRINCIPAL)
+    with pytest.raises(EnvelopeConflict) as ei:
+        s.ingest(body(1, event_id="other-id"), PRINCIPAL)
+    assert "sequence" in str(ei.value) and "0005" not in str(ei.value)
