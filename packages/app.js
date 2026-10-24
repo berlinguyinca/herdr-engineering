@@ -26,6 +26,7 @@ import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
 import { createAttentionNotifier } from './attention-notify.js';
+import { mountRelated } from './related-panel.js';
 import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
@@ -136,6 +137,7 @@ const ROUTES = {
 // The agent inspector owns a per-session stream; dispose it whenever the view changes.
 let disposeInspector = null;
 let disposeMissionActivity = null;
+let disposeRelated = null;
 let refreshMissionHistory = null;
 let servicesView = null;
 let dashboardView = null;
@@ -151,6 +153,7 @@ async function render() {
   if (sessionRequest) { sessionRequest.abort(); sessionRequest = null; }
   if (servicesView) { servicesView.dispose(); servicesView = null; }
   if (disposeMissionActivity) { disposeMissionActivity(); disposeMissionActivity = null; }
+  if (disposeRelated) { disposeRelated(); disposeRelated = null; }
   if (disposeInspector) { disposeInspector(); disposeInspector = null; }
   const { parts } = route();
   const seg = parts.length ? parts.join('/') : 'overview';
@@ -220,6 +223,14 @@ function relatedIntegrationLinks(record, kind, id) {
   return `<nav class="hd-inline" aria-label="Related reviews and builds" style="margin:14px 0;font-size:13px"><a href="#/reviews?${esc(context)}">Related reviews</a><a href="#/ci?${esc(context)}">Related CI</a>${ci.size ? `<a href="#/ci?${esc(ci)}">CI for this ${revision ? 'revision' : 'repository'}</a>` : ''}</nav>`;
 }
 
+// The Related panel replaces the ad-hoc link rows; the filter links stay as its footer.
+function showRelated(kind, id, host, footer = '', extra = {}) {
+  const el = host || document.getElementById('related-panel');
+  if (!el) return;
+  if (disposeRelated) disposeRelated();
+  disposeRelated = mountRelated(el, client, kind, id, { footer, ...extra });
+}
+
 async function viewMission(parts, revision) {
   const key = decodeURIComponent(parts[1]);
   let m;
@@ -227,12 +238,14 @@ async function viewMission(parts, revision) {
   catch (error) { if (error.status !== 404 || !key.startsWith('pi:')) throw error; }
   if (revision !== renderRevision) return;
   if (key.startsWith('pi:') && !m) {
-    root.innerHTML = `<a href="#/missions">← Missions</a><h1>Pi mission</h1>${relatedIntegrationLinks({},'mission',key)}<div id="live-mission-detail"></div>`;
+    root.innerHTML = `<a href="#/missions">← Missions</a><h1>Pi mission</h1><div id="related-panel"></div><div id="live-mission-detail"></div>`;
+    showRelated('mission', key, null, relatedIntegrationLinks({},'mission',key));
     disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
     return;
   }
   if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}${relatedIntegrationLinks(m,'mission',key)}<div id="mission-history"></div>`;
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="related-panel"></div><div id="mission-history"></div>`;
+  showRelated('mission', key, null, relatedIntegrationLinks(m,'mission',key));
   if (key.startsWith('pi:')) disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
   const history = document.getElementById('mission-history');
   let pending = false;
@@ -312,12 +325,13 @@ async function viewSession(parts, revision) {
       <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.` : 'Agent status reflects the last report; it is not a live process check.'}</p>
       ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
-      ${relatedIntegrationLinks(s,'session',s.session_id)}
+      <div id="related-panel"></div>
       <div id="session-terminal" class="sd-details"></div>
       <details class="hd-card sd-details" id="session-details"><summary>Agent details</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}</details>
       <div id="session-workspace-host"></div>
       <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
       <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream"><span class="muted">Loading recorded events…</span></div></details>`;
+    showRelated('session', s.session_id, null, relatedIntegrationLinks(s,'session',s.session_id), { sessionId: s.session_id });
     const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s, {onRename: profile => { s.display_name = profile.display_name; const title = root.querySelector('.sd-title'); if (title) title.textContent = `${profile.display_name}${project ? ` · ${clip(project)}` : ''}`; }});
     let disposeAdvanced = null;
     const advanced = document.getElementById('advanced-inspector');
@@ -379,6 +393,8 @@ async function viewService(parts, revision) {
   if (revision !== renderRevision) return;
   if (!svc || svc.error) { root.innerHTML = '<herdr-error message="Service not found"></herdr-error>'; return; }
   dashboardView = mountServiceDetails(root, client, svc);
+  const slot = document.createElement('div'); slot.id = 'related-panel'; root.appendChild(slot);
+  showRelated('service', svc.service_id || decodeURIComponent(parts[1]), slot);
 }
 
 async function viewHosts() {
@@ -412,6 +428,8 @@ async function viewHost(parts, revision) {
   if (revision !== renderRevision) return;
   if (!h || h.error) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
   root.innerHTML = renderHostDetail(h, telemetry, { range, now: Date.now() });
+  const slot = document.createElement('div'); slot.id = 'related-panel'; root.appendChild(slot);
+  showRelated('host', decodeURIComponent(parts[1]), slot);
 }
 
 async function viewActivity() {
@@ -590,6 +608,11 @@ async function viewLlmSession(parts) {
   root.innerHTML = renderLlmSession({
     window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '',
   }, { total, models, problems, series: { requests, errors, ttft, speed } });
+  if (session) {
+    const slot = document.createElement('div'); slot.id = 'related-panel';
+    root.insertBefore(slot, root.children[1] || null);
+    showRelated('session', id, slot);
+  }
 }
 async function viewAnalyticsHosts() {
   const h = await client.analytics('hosts');

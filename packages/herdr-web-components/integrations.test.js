@@ -142,3 +142,10 @@ test('a failed run offers Fix with Pi next to Send to Pi, disabled until an agen
   assert.match(renderPipeline(failed,{debugSessions:sessions,debugSessionId:'a'}),/data-debug-fix >Fix with Pi/);
   assert.doesNotMatch(renderPipeline({state:'running'}),/Fix with Pi/);
 });
+
+test('a selected CI run shows its related items above the steps',()=>{
+  const related=renderPipeline({run_number:12,repository:'org/app',state:'success',tasks:[]},{relatedHtml:'<section class="rel">RELATED-HERE</section>'});
+  assert.match(related,/RELATED-HERE/);
+  assert.ok(related.indexOf('RELATED-HERE')<related.indexOf('Pipeline')||!related.includes('Pipeline'));
+  assert.doesNotMatch(renderPipeline({run_number:12,tasks:[]}),/RELATED-HERE|class="rel"/);
+});
