@@ -1,9 +1,121 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { pkcePair, authorizeUrl, parseRedirect, exchangeCode, TokenStore, tokenExpiry, CollabApi, AuthError } from './collab.js';
+import * as collab from './collab.js';
 
 const cfg = { client_id: 'web', hosted_ui_domain: 'https://auth.example/' };
 const jwt = (exp) => `h.${btoa(JSON.stringify({ exp })).replaceAll('+', '-').replaceAll('/', '_')}.s`;
+
+const response = (data, status = 200) => ({ ok: status < 400, status, json: async () => structuredClone(data) });
+
+test('collab public and dashboard clients normalize identity and room capabilities identically', async () => {
+  const identity = { user_id: 'u1', email: 'one@example.org', user_status: 'approved', approver: true };
+  const room = { room_id: 'r1', name: 'Lab', role: 'contributor', user_status: 'approved',
+    room_membership_status: 'approved', agent_permission_status: { a1: 'pending' }, file_upload_permission: false };
+  for (const access of ['public-token', 'operator']) {
+    const api = new CollabApi(() => ({ access }), async (url, init) => {
+      assert.equal(init.headers.Authorization, `Bearer ${access}`);
+      return response(url.endsWith('/me') ? identity : url.endsWith('/rooms') ? { rooms: [room] } : room);
+    });
+    const me = await api.me();
+    assert.equal(me.status, 'approved');
+    assert.deepEqual(me.capabilities, { canManagePeople: true });
+    assert.deepEqual(await api.link('id-token'), me);
+    const result = (await api.rooms()).rooms[0];
+    assert.deepEqual(result, await api.room('r1'));
+    assert.deepEqual(result.capabilities, { canRead: true, canPost: true, canInvite: false, canUpload: false });
+    assert.deepEqual(result.agent_permission_status, { a1: 'pending' });
+  }
+});
+
+test('collab room capabilities keep approval, membership and upload permission independent', () => {
+  const room = { role: 'owner', user_status: 'approved', room_membership_status: 'approved', file_upload_permission: true };
+  assert.deepEqual(collab.normalizeRoom(room).capabilities, { canRead: true, canPost: true, canInvite: true, canUpload: true });
+  for (const change of [{ user_status: 'disabled' }, { room_membership_status: 'removed' }, { room_membership_status: 'pending' }]) {
+    assert.deepEqual(collab.normalizeRoom({ ...room, ...change }).capabilities,
+      { canRead: false, canPost: false, canInvite: false, canUpload: false });
+  }
+  for (const role of ['viewer', 'guest']) {
+    assert.deepEqual(collab.normalizeRoom({ ...room, role }).capabilities,
+      { canRead: true, canPost: false, canInvite: false, canUpload: true });
+  }
+  assert.equal(collab.normalizeRoom({ ...room, file_upload_permission: 'false' }).capabilities.canUpload, false);
+  assert.deepEqual(collab.normalizeRoom({ role: 'contributor' }).capabilities,
+    { canRead: true, canPost: true, canInvite: false, canUpload: false }, 'legacy roles remain usable without granting upload');
+  assert.deepEqual(collab.normalizeRoom({}).capabilities,
+    { canRead: false, canPost: false, canInvite: false, canUpload: false });
+});
+
+test('collab explicit user status wins over legacy status and admin cannot bypass approval', async () => {
+  const api = new CollabApi(() => ({ access: 'operator' }), async () => response({
+    user_id: 'u1', status: 'approved', user_status: 'disabled', admin: true,
+  }));
+  assert.equal((await api.me()).status, 'disabled');
+  assert.equal((await api.me()).capabilities.canManagePeople, false);
+});
+
+test('collab roomFiles, uploadStatus and skills preserve data and encode identifiers and queries', async () => {
+  const files = { files: [{ file_id: 'f1', room_id: 'r/1', relative_path: 'results/a.json', status: 'available' }], next_cursor: 'next', has_more: true };
+  const upload = { upload_id: 'u/1', room_id: 'r/1', status: 'uploading', file_count: 1,
+    total_bytes: 12, uploaded_bytes: 6, completed_parts: 1, total_parts: 2 };
+  const skills = { skills: [{ skill_id: 's1', scope: 'room', version: 'v1' }] };
+  for (const access of ['public-token', 'operator']) {
+    const calls = [];
+    const api = new CollabApi(() => ({ access }), async (url, init) => {
+      calls.push([init.method, url]);
+      return response(url.includes('/files') ? files : url.includes('/uploads/') ? upload : skills);
+    });
+    assert.equal(typeof api.roomFiles, 'function');
+    assert.equal(typeof api.uploadStatus, 'function');
+    assert.equal(typeof api.skills, 'function');
+    assert.deepEqual(await api.roomFiles('r/1', 'a&b=1'), files);
+    await api.roomFiles('r/1');
+    await api.roomFiles('r/1', 0);
+    assert.deepEqual(await api.uploadStatus('u/1'), upload);
+    assert.deepEqual(await api.skills('room & shared'), skills);
+    await api.skills();
+    assert.deepEqual(calls, [
+      ['GET', '/api/v1/collab/rooms/r%2F1/files?cursor=a%26b%3D1'],
+      ['GET', '/api/v1/collab/rooms/r%2F1/files'],
+      ['GET', '/api/v1/collab/rooms/r%2F1/files?cursor=0'],
+      ['GET', '/api/v1/collab/uploads/u%2F1'],
+      ['GET', '/api/v1/collab/skills?scope=room%20%26%20shared'],
+      ['GET', '/api/v1/collab/skills'],
+    ]);
+  }
+});
+
+test('collab errors expose stable HTTP codes without losing messages or AuthError compatibility', async () => {
+  for (const [status, code] of [[401, 'unauthorized'], [403, 'forbidden'], [404, 'not_found'],
+    [409, 'conflict'], [429, 'rate_limited'], [503, 'unavailable'], [400, 'request_failed']]) {
+    const api = new CollabApi(() => ({ access: 't' }), async () => response({ error: 'server message' }, status));
+    await assert.rejects(api.me(), (error) => {
+      assert.equal(error.status, status);
+      assert.equal(error.code, code);
+      if (status === 401) assert.ok(error instanceof AuthError);
+      else assert.equal(error.message, 'server message');
+      return true;
+    });
+  }
+  await assert.rejects(new CollabApi(() => null).me(), { code: 'unauthorized', status: 401 });
+});
+
+test('collab network and malformed responses degrade while cancellation is preserved', async () => {
+  const api = (fetchFn) => new CollabApi(() => ({ access: 't' }), fetchFn);
+  await assert.rejects(api(async () => { throw new TypeError('offline'); }).me(), { code: 'network_error', status: 0 });
+  const broken = (status) => ({ ok: status < 400, status, json: async () => { throw new SyntaxError('bad JSON'); } });
+  await assert.rejects(api(async () => broken(503)).me(), { code: 'unavailable', status: 503 });
+  await assert.rejects(api(async () => broken(200)).me(), { code: 'invalid_response', status: 200 });
+  const abort = new DOMException('cancelled', 'AbortError');
+  await assert.rejects(api(async () => { throw abort; }).me(), (error) => error === abort);
+});
+
+test('collab malformed room lists reject with the shared response error instead of appearing empty', async () => {
+  for (const data of [{}, { rooms: null }, { rooms: 'bad' }, { rooms: [null] }]) {
+    const api = new CollabApi(() => ({ access: 't' }), async () => response(data));
+    await assert.rejects(api.rooms(), { code: 'invalid_response', status: 200 });
+  }
+});
 
 test('PKCE challenge is the S256 of the verifier', async () => {
   const { verifier, challenge } = await pkcePair();
