@@ -286,3 +286,27 @@ def test_updates_old_when_never_recorded_and_host_older_than_two_weeks():
     # a recorded (recent) fleet update clears it
     assert "updates_old" not in codes(host(created_at=iso(NOW - 30 * 86400),
                                            fleet_update={"last_updated": iso(NOW - 86400)}))
+
+
+@pytest.mark.parametrize("fu,created_age_d,fires", [
+    ({"last_updated": None, "deferred_since": None, "result": "failed"}, 15, True),
+    ({"last_updated": None, "result": "deferred"}, 13, False),
+    ({"last_updated": "garbage"}, 15, True),
+    ({"last_updated": iso(NOW - 86400)}, 30, False),
+    (None, 15, True),
+])
+def test_updates_old_when_fleet_update_never_succeeded(fu, created_age_d, fires):
+    h = host(created_at=iso(NOW - created_age_d * 86400), fleet_update=fu)
+    assert ("updates_old" in codes(h)) is fires
+
+
+def test_never_updated_record_message_and_coexists_with_deferred():
+    h = host(created_at=iso(NOW - 20 * 86400),
+             fleet_update={"last_updated": None, "deferred_since": iso(NOW - 8 * 86400),
+                           "result": "deferred"})
+    probs = compute_problems(h, [], NOW)
+    assert [p["code"] for p in probs] == ["updates_deferred", "updates_old"]
+    assert probs[1] == {"code": "updates_old", "severity": "warning",
+                        "message": "Never updated by the fleet update"}
+    # no creation time: no basis to call it old
+    assert "updates_old" not in codes(host(fleet_update={"last_updated": None}))

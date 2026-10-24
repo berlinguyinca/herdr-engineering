@@ -139,6 +139,10 @@ def compute_problems(host: dict, history: list[dict], now: float,
                                "Version differs from pin: " + ", ".join(drift)))
 
     fu = host.get("fleet_update")
+    # A host registered longer than the update-age limit with no successful
+    # fleet update is itself old; a brand-new (or undated) host is not.
+    created = _epoch(host.get("created_at"))
+    host_old = created is not None and now - created > t.updates_old_s
     if isinstance(fu, dict):
         deferred = _epoch(fu.get("deferred_since"))
         if deferred is not None and now - deferred > t.updates_deferred_s:
@@ -148,12 +152,11 @@ def compute_problems(host: dict, history: list[dict], now: float,
         if last is not None and now - last > t.updates_old_s:
             problems.append(_p("updates_old", "warning",
                                f"Last updated {_days(now - last)} d ago"))
-    elif fu is None:
-        # No fleet update has ever reported for this host: once it has been
-        # registered longer than the update-age limit, that is itself old.
-        created = _epoch(host.get("created_at"))
-        if created is not None and now - created > t.updates_old_s:
-            problems.append(_p("updates_old", "warning", "Fleet update never recorded"))
+        elif last is None and host_old:
+            # Every run so far failed or deferred: the record carries no success time.
+            problems.append(_p("updates_old", "warning", "Never updated by the fleet update"))
+    elif fu is None and host_old:
+        problems.append(_p("updates_old", "warning", "Fleet update never recorded"))
 
     problems.sort(key=lambda p: (_ORDER[p["severity"]], p["code"]))
     return problems
