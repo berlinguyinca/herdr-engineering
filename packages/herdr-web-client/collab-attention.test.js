@@ -89,3 +89,12 @@ test('a failed action is announced next to the list and does not hide it', () =>
   assert.match(h, /role="alert">Too many changes/);
   assert.match(h, /Items that need attention/);
 });
+
+test('a panel whose first load failed shows its error, never a loading skeleton', () => {
+  for (const render of [renderInbox, renderProgress, renderAnalytics]) {
+    const h = render({ data: null, error: 'Could not load this view. It will retry.' });
+    assert.doesNotMatch(h, /data-skeleton/);
+    assert.match(h, /Could not load this view/);
+    assert.match(render({ data: null, error: null }), /data-skeleton/, 'still loading: skeleton');
+  }
+});

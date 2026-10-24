@@ -116,7 +116,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     const view=JSON.stringify([state.tab,state.search,state.host,state.group,state.page]);
     const live=view===lastView&&!!panel.querySelector('.ss-group');lastView=view;
     if(!visible.length){
-      const html=loaded?'<p class="ss-empty">No agents match this tab and these filters.</p>':skeleton('agents');
+      const html=loaded?'<p class="ss-empty">No agents match this tab and these filters.</p>':sessionError?'<p class="ss-empty">Agents could not be loaded yet; retrying automatically.</p>':skeleton('agents');
       if(panel.innerHTML!==html)panel.innerHTML=html;
       return;
     }
@@ -136,7 +136,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     const all=entries(), selected=selectSessions(all,state);
     state.page=Math.min(state.page,Math.max(0,Math.ceil(selected.length/pageSize)-1));
     el('error').textContent=[sessionError,missionError].filter(Boolean).join(' ');
-    const signature=JSON.stringify([state,sessions,missions,loaded,all.map(e=>e.tab)]);
+    const signature=JSON.stringify([state,sessions,missions,loaded,!!sessionError,all.map(e=>e.tab)]);
     if(signature===lastSignature)return;
     lastSignature=signature;
     const focused=document.activeElement;
