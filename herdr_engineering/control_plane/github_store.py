@@ -371,23 +371,30 @@ class MemoryGitHubStore:
             if gone:
                 self._remove_repos(gone, self._bump())
 
-    def put_detail(self, repo_id: str, issue: dict) -> None:
-        """Store an opened issue's detail (with its body) as fetched at ``issue["updated_at"]``."""
+    def put_detail(self, repo_id: str, issue: dict, fetched_at: float | None = None) -> None:
+        """Store an opened issue's detail (with its body) as fetched at ``issue["updated_at"]``,
+        at ``fetched_at`` (epoch seconds; default now)."""
         state = self._state
         with state.lock:
             self._claim()
             state.details[(repo_id, issue["github_id"])] = {
-                "number": issue["number"], "updated_at": issue.get("updated_at"), "data": _normal(issue)}
+                "number": issue["number"], "updated_at": issue.get("updated_at"), "data": _normal(issue),
+                "fetched_at": self._now() if fetched_at is None else float(fetched_at)}
 
-    def detail(self, repo_id: str, number: int) -> dict | None:
-        """The stored detail of issue ``number``, or ``None`` when it was never opened."""
+    def stored_detail(self, repo_id: str, number: int) -> tuple[dict, float] | None:
+        """``(detail, fetched_at)`` of issue ``number``, or ``None`` when it was never opened."""
         state = self._state
         with state.lock:
             self._claim()
             for (rid, _), row in state.details.items():
                 if rid == repo_id and row["number"] == number:
-                    return _normal(row["data"])
+                    return _normal(row["data"]), row["fetched_at"]
             return None
+
+    def detail(self, repo_id: str, number: int) -> dict | None:
+        """The stored detail of issue ``number``, or ``None`` when it was never opened."""
+        found = self.stored_detail(repo_id, number)
+        return None if found is None else found[0]
 
     def watermark(self, repo_id: str) -> str | None:
         state = self._state
@@ -783,9 +790,11 @@ class GitHubStore:
                     await self._remove_repos(conn, gone, await self._bump(conn))
         self._call(work)
 
-    def put_detail(self, repo_id: str, issue: dict) -> None:
-        """Store an opened issue's detail; ``GitHubStoreUnavailable`` before migration 0007."""
+    def put_detail(self, repo_id: str, issue: dict, fetched_at: float | None = None) -> None:
+        """Store an opened issue's detail, fetched at ``fetched_at`` (epoch seconds; default
+        now); ``GitHubStoreUnavailable`` before migration 0007."""
         data = _normal(issue)
+        stamp = self._stamp() if fetched_at is None else datetime.fromtimestamp(fetched_at, UTC)
 
         async def work(conn):
             async with conn.transaction():
@@ -796,17 +805,22 @@ class GitHubStore:
                     "number=EXCLUDED.number, updated_at=EXCLUDED.updated_at, data=EXCLUDED.data, "
                     "fetched_at=EXCLUDED.fetched_at",
                     repo_id, data["github_id"], data["number"], data.get("updated_at"), json.dumps(data),
-                    self._stamp())
+                    stamp)
         self._call(work)
+
+    def stored_detail(self, repo_id: str, number: int) -> tuple[dict, float] | None:
+        """``(detail, fetched_at)`` of issue ``number``, or ``None`` when it was never opened."""
+        async def work(conn, meta):
+            return await conn.fetchrow(
+                "SELECT data, fetched_at FROM github_issue_details WHERE repository_id=$1 AND number=$2 "
+                "ORDER BY fetched_at DESC LIMIT 1", repo_id, number)
+        row = self._read(work)
+        return None if row is None else (json.loads(row["data"]), row["fetched_at"].timestamp())
 
     def detail(self, repo_id: str, number: int) -> dict | None:
         """The stored detail of issue ``number``, or ``None`` when it was never opened."""
-        async def work(conn, meta):
-            return await conn.fetchval(
-                "SELECT data FROM github_issue_details WHERE repository_id=$1 AND number=$2 "
-                "ORDER BY fetched_at DESC LIMIT 1", repo_id, number)
-        raw = self._read(work)
-        return None if raw is None else json.loads(raw)
+        found = self.stored_detail(repo_id, number)
+        return None if found is None else found[0]
 
     def watermark(self, repo_id: str) -> str | None:
         async def work(conn, meta):

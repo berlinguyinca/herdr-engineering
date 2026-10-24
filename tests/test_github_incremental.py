@@ -956,3 +956,37 @@ def test_a_revision_read_never_moves_back_or_comes_from_another_store():
     other.upsert_repositories([{"repository_id": "github.com/acme/zzz", "name_with_owner": "acme/zzz"}], None)
     monitor._remember_revision(other)  # not the monitor's store: never adopted
     assert monitor.revision() == current
+
+
+def test_a_stored_detail_of_an_unlisted_issue_is_judged_by_when_it_was_fetched():
+    fake, shared, clock = seeded(), {}, [1_000_000.0]
+    monitor = monitor_for(fake, shared, now=lambda: clock[0])
+    monitor.refresh()
+    gid = fake.add_issue("acme/app")  # opened before any pass has seen it
+    number = fake.repos["acme/app"][gid]["number"]
+    monitor.issue_detail("github.com/acme/app", number)
+    clock[0] += 120
+    restarted = monitor_for(fake, shared, now=lambda: clock[0])
+    restarted.issue_detail("github.com/acme/app", number)
+    assert fake.calls["detail"] == 2  # fetched 120 s ago: refetched, not served as just checked
+    clock[0] += 30
+    restarted.issue_detail("github.com/acme/app", number)
+    assert fake.calls["detail"] == 2  # within 60 s of that fetch: reused
+
+
+def test_a_store_hit_is_kept_in_memory():
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared)
+    monitor.refresh()
+    monitor.issue_detail("github.com/acme/app", 2)
+    restarted = monitor_for(fake, shared)
+    restarted.snapshot(start=False)  # opens its store
+    reads, original = [], restarted._store.stored_detail
+
+    def counting(*args):
+        reads.append(args)
+        return original(*args)
+    restarted._store.stored_detail = counting
+    for _ in range(3):
+        assert restarted.issue_detail("github.com/acme/app", 2)["issue"]["number"] == 2
+    assert len(reads) == 1 and fake.calls["detail"] == 1

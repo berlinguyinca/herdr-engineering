@@ -1292,15 +1292,21 @@ class GitHubMonitor:
             listed = next((issue for issue in self._issues.get(repository_id, {}).values()
                            if issue["number"] == number), None)
             cached = copy.deepcopy(self._details.get((repository_id, number)))
-            store, confirmed = self._store, self._view["checked_at"]
+            store = self._store
         if cached is None and store is not None:
             try:
-                stored = store.detail(repository_id, number)
+                found = store.stored_detail(repository_id, number)
             except Exception:
-                stored = None  # no detail table yet, or the database is down: fetch
-            if stored is not None:
+                found = None  # no detail table yet, or the database is down: fetch
+            if found is not None:
+                # as old as when it was fetched, not as fresh as this pass or this request
+                stored, fetched_at = found
                 cached = {"issue": stored, "stale": False, "error": None,
-                          "checked_at": confirmed or _stamp(), "connection_generation": generation}
+                          "checked_at": datetime.fromtimestamp(fetched_at, UTC).isoformat(),
+                          "connection_generation": generation}
+                with self._lock:
+                    if generation == self._generation:
+                        self._remember_detail(repository_id, number, cached)
         if cached and self._detail_fresh(cached, listed):
             return cached
         if self._now() < self._retry_at:
@@ -1308,8 +1314,10 @@ class GitHubMonitor:
                 return dict(cached, stale=True, error="GitHub requests are temporarily paused.")
             raise GitHubError("rate_limited", retry_at=self._retry_at)
         try:
+            fetched_at = self._now()
             issue = _issue(provider.issue(repository_id, number), repository_id)
-            result = {"issue": issue, "stale": False, "error": None, "checked_at": _stamp(),
+            result = {"issue": issue, "stale": False, "error": None,
+                      "checked_at": datetime.fromtimestamp(fetched_at, UTC).isoformat(),
                       "connection_generation": generation}
             with self._lock:
                 if generation != self._generation:
@@ -1317,7 +1325,7 @@ class GitHubMonitor:
                 self._remember_detail(repository_id, number, result)
             if store is not None:
                 try:
-                    store.put_detail(repository_id, issue)
+                    store.put_detail(repository_id, issue, fetched_at=fetched_at)
                 except Exception:
                     pass  # memory still serves it; the catalog itself is unaffected
             return result
@@ -1336,7 +1344,8 @@ class GitHubMonitor:
 
     def _detail_fresh(self, cached, listed):
         if listed is None:
-            return self._now() - datetime.fromisoformat(cached["checked_at"]).timestamp() < 60
+            age = self._now() - datetime.fromisoformat(cached["checked_at"]).timestamp()
+            return 0 <= age < 60  # a fetch "from the future" (clock change) is not trusted
         have, want = _when(cached["issue"].get("updated_at")), _when(listed.get("updated_at"))
         return have is not None and want is not None and have >= want
 

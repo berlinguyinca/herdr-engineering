@@ -693,3 +693,16 @@ def test_a_restart_never_answers_an_old_since_with_a_silent_delta(backend):
     else:  # the stored catalog survived: a true delta
         assert delta["resync"] is False
         assert [row["title"] for row in delta["upserted"]] == ["changed while down"]
+
+
+def test_a_stored_detail_carries_when_it_was_fetched(backend):
+    clock = Clock()
+    store = backend.make(now=clock)
+    store.upsert_repositories([repo("acme/app")], scope=None)
+    store.upsert_issues(A, [issue("I1", 1)], watermark="w")
+    store.put_detail(A, detail("I1", 1))
+    data, fetched_at = store.stored_detail(A, 1)
+    assert data["body"] == "body of 1" and fetched_at == clock.value
+    store.put_detail(A, detail("I1", 1), fetched_at=clock.value - 500)  # the monitor's own clock
+    assert store.stored_detail(A, 1)[1] == clock.value - 500
+    assert store.stored_detail(A, 2) is None
