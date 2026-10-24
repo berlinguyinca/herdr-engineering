@@ -77,3 +77,12 @@ test('a throwing view does not block others',()=>{
   bus.dispatch({event_type:'X'});advance(0);
   assert.equal(b.calls.length,1);
 });
+
+test('register({fresh:true}) treats registration as a refresh: first event waits out the window',()=>{
+  const {bus,advance}=harness();const a=view(),b=view();
+  bus.register(a,{fresh:true});bus.register(b);
+  bus.dispatch({event_type:'X'});advance(0);
+  assert.equal(a.calls.length,0);assert.equal(b.calls.length,1);
+  advance(4999);assert.equal(a.calls.length,0);
+  advance(1);assert.equal(a.calls.length,1);
+});

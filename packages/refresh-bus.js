@@ -31,8 +31,9 @@ export function createRefreshBus({
   }
 
   return {
-    register(view) {
-      const entry = { view, timer: null, last: -Infinity, hint: undefined };
+    // fresh: the view just loaded its data, so the first event waits out one window.
+    register(view, { fresh = false } = {}) {
+      const entry = { view, timer: null, last: fresh ? now() : -Infinity, hint: undefined };
       entries.add(entry);
       return () => { cancel(entry); entries.delete(entry); };
     },

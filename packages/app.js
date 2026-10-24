@@ -3,6 +3,7 @@
 // stream. Views render loading / empty / error / data states (Spec §91).
 import { HerdrClient } from './herdr-web-client/client.js';
 import { connectEvents } from './herdr-web-client/events.js';
+import { createRefreshBus } from './refresh-bus.js';
 import { formatTimestamp } from './herdr-web-components/format.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
@@ -100,73 +101,124 @@ const ROUTES = {
   '/analytics/tokens': viewAnalyticsTokens,
 };
 
-// The agent inspector owns a per-session stream; dispose it whenever the view changes.
-let disposeInspector = null;
-let disposeMissionActivity = null;
-let refreshMissionHistory = null;
-let servicesView = null;
-let dashboardView = null;
+// Router rule: render() runs only on a route change (any hash change, query
+// included, since links like ?tab= / ?drift=1 still navigate). A same-route
+// trigger (SSE event, tab becoming visible) goes through the refresh bus to
+// currentView.refresh(hint) and never replaces the page; the spinner shows only
+// on a route's first load.
+//
+// View contract: a view* function may return {refresh(hint), dispose()}. One
+// that returns nothing gets NO_REFRESH, except the full-render routes below,
+// which a compat view re-runs in place (no spinner) until Tasks 7-9 mount them.
+const RERENDER_ROUTES = new Set(['/hosts', '/hosts/:id', '/activity', '/analytics', '/analytics/missions',
+  '/analytics/models', '/analytics/hosts', '/analytics/tokens', '/missions/:id']);
+const NO_REFRESH = { refresh() {}, dispose() {} };
+// These dashboards own their polling; SSE must preserve their filters and focus.
+const ownPolling = (view) => ({ refresh() {}, dispose: () => view.dispose() });
+
+// Same throttle as before: SSE-driven refreshes re-fetch view data, so at most
+// one per LIVE_REFRESH_MS per view keeps clear of the API's per-IP rate limit.
+const LIVE_REFRESH_MS = 5000;
+const bus = createRefreshBus({ throttleMs: LIVE_REFRESH_MS });
+let currentView = null;
+let unregisterView = null;
 let sessionRequest = null;
 let renderRevision = 0;
-const onMissionPage = () => route().parts[0] === 'missions';
-const onSessionPage = () => route().parts[0] === 'herd' && route().parts[1] === 'session';
 
-async function render() {
-  const revision = ++renderRevision;
-  refreshMissionHistory = null;
-  if (dashboardView) { dashboardView.dispose(); dashboardView = null; }
-  if (sessionRequest) { sessionRequest.abort(); sessionRequest = null; }
-  if (servicesView) { servicesView.dispose(); servicesView = null; }
-  if (disposeMissionActivity) { disposeMissionActivity(); disposeMissionActivity = null; }
-  if (disposeInspector) { disposeInspector(); disposeInspector = null; }
-  const { parts } = route();
-  const seg = parts.length ? parts.join('/') : 'overview';
-  const match = Object.keys(ROUTES).find((r) => {
+function matchRoute(parts) {
+  return Object.keys(ROUTES).find((r) => {
     const rp = r.split('/').filter(Boolean);
     if (rp.length !== parts.length) return false;
     return rp.every((rpseg, i) => rpseg.startsWith(':') || rpseg === parts[i]);
-  });
+  }) || '/overview';
+}
+
+function mountView(view) {
+  currentView = view;
+  // The view just loaded its data; the first event waits out one throttle window.
+  unregisterView = bus.register(view, { fresh: true });
+}
+
+function unmountView() {
+  if (unregisterView) { unregisterView(); unregisterView = null; }
+  if (currentView) { currentView.dispose(); currentView = null; }
+}
+
+// Compat for routes not yet mounted: re-run the route's view function in place.
+// A failed refresh keeps the last page; a refresh that yields a real view
+// (e.g. retrying a page whose first load failed) adopts it.
+function rerenderView(load) {
+  let running = false;
+  return {
+    async refresh() {
+      if (running) return;
+      running = true;
+      const revision = ++renderRevision;
+      try {
+        const view = await load(revision);
+        if (view && revision === renderRevision) { unmountView(); mountView(view); }
+        else if (view && revision !== renderRevision) view.dispose();
+      } catch { /* keep the last page; the next event retries */ } finally { running = false; }
+    },
+    dispose() {},
+  };
+}
+
+async function render() {
+  const revision = ++renderRevision;
+  unmountView();
+  if (sessionRequest) { sessionRequest.abort(); sessionRequest = null; }
+  const { parts } = route();
+  const match = matchRoute(parts);
+  const load = (rev) => ROUTES[match](parts, rev);
   root.innerHTML = '<herdr-spinner label="Loading"></herdr-spinner>';
+  let view;
   try {
-    await ROUTES[match || '/overview'](parts, revision);
+    view = await load(revision);
   } catch (err) {
     if (revision !== renderRevision) return;
     root.innerHTML = `<herdr-error message="${esc(err.message || 'request failed')}"></herdr-error>`;
+    // As before, a live event retries a failed page, except pages that stream their own detail.
+    const streamsOwnDetail = match === '/herd/session/:id' || (match === '/missions/:id' && decodeURIComponent(parts[1]).startsWith('pi:'));
+    if (!streamsOwnDetail) mountView(rerenderView(load));
+    return;
   }
+  if (revision !== renderRevision) { view?.dispose(); return; }
+  mountView(view || (RERENDER_ROUTES.has(match) ? rerenderView(load) : NO_REFRESH));
 }
 
 // ------------------------------------------------------------- views
 // ------------------------------------------------------------- topology
 async function viewTopology() {
-  dashboardView = mountTopology(root, client, {status: route().query.get('status') || 'current'});
+  return ownPolling(mountTopology(root, client, {status: route().query.get('status') || 'current'}));
 }
 
 async function viewOverview() {
   root.innerHTML = '<h1>Overview</h1><div id="overview-dashboard"></div>';
-  dashboardView = mountOverview(document.getElementById('overview-dashboard'), client);
+  return ownPolling(mountOverview(document.getElementById('overview-dashboard'), client));
 }
 
 async function viewCollab() {
-  dashboardView = mountCollab(root, { fabricSessions: () => client.listSessions('active') });
+  return ownPolling(mountCollab(root, { fabricSessions: () => client.listSessions('active') }));
 }
 
 async function viewGithub() {
-  dashboardView = mountGithub(root, client);
+  return ownPolling(mountGithub(root, client));
 }
 
 async function viewIntegrations(parts) {
   const query = route().query;
-  dashboardView = mountIntegrations(root, client, {
+  return ownPolling(mountIntegrations(root, client, {
     kind: parts[0], tab: query.get('tab') || 'current', search: query.get('search') || '',
     repository: query.get('repository') || '', provider: query.get('provider') || '', mission: query.get('mission') || '', session: query.get('session') || '',
-  });
+  }));
 }
 
 async function viewMissions() {
   root.innerHTML = '<h1>Missions</h1><div id="live-missions"></div>';
   const catalog = mountMissionCatalog(document.getElementById('live-missions'), client, {tab: route().query.get('tab') || 'current', status: route().query.get('status') || 'all'});
-  disposeMissionActivity = catalog.dispose;
-  refreshMissionHistory = catalog.refreshRecorded;
+  // Recorded lifecycle data refreshes separately so live telemetry and filters stay put.
+  return { refresh: () => catalog.refreshRecorded(), dispose: () => catalog.dispose() };
 }
 
 function relatedIntegrationLinks(record, kind, id) {
@@ -187,12 +239,11 @@ async function viewMission(parts, revision) {
   if (revision !== renderRevision) return;
   if (key.startsWith('pi:') && !m) {
     root.innerHTML = `<a href="#/missions">← Missions</a><h1>Pi mission</h1>${relatedIntegrationLinks({},'mission',key)}<div id="live-mission-detail"></div>`;
-    disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
-    return;
+    return { refresh() {}, dispose: mountMissionActivity(document.getElementById('live-mission-detail'), client, key) };
   }
   if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
   root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}${relatedIntegrationLinks(m,'mission',key)}<div id="mission-history"></div>`;
-  if (key.startsWith('pi:')) disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
+  const disposeLive = key.startsWith('pi:') ? mountMissionActivity(document.getElementById('live-mission-detail'), client, key) : null;
   const history = document.getElementById('mission-history');
   let pending = false;
   const refreshHistory = async (initial) => {
@@ -229,8 +280,10 @@ async function viewMission(parts, revision) {
       if (history.isConnected) history.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
     } finally { pending = false; }
   };
-  if (key.startsWith('pi:')) refreshMissionHistory = refreshHistory;
   await refreshHistory(m);
+  // Mission telemetry owns its polling; refreshing only the recorded history keeps disclosures open.
+  // Non-Pi missions still re-render through the compat view until Task 9.
+  if (disposeLive) return { refresh: () => refreshHistory(), dispose: disposeLive };
 }
 
 async function missionSessions(m) {
@@ -246,7 +299,7 @@ async function missionSessions(m) {
 }
 
 async function viewSessions() {
-  dashboardView = mountSessionsView(root, client, {tab: route().query.get('tab') || 'current'});
+  return ownPolling(mountSessionsView(root, client, {tab: route().query.get('tab') || 'current'}));
 }
 
 async function viewSession(parts, revision) {
@@ -285,7 +338,7 @@ async function viewSession(parts, revision) {
       else if (!advanced.open && disposeAdvanced) { disposeAdvanced(); disposeAdvanced = null; document.getElementById('inspector-host').replaceChildren(); }
     });
     const disposeTerminal = mountTerminalAttach(document.getElementById('session-terminal'), client, s, {copyText});
-    disposeInspector = () => { disposeWorkspace(); disposeTerminal(); if (disposeAdvanced) disposeAdvanced(); };
+    const disposeSession = () => { disposeWorkspace(); disposeTerminal(); if (disposeAdvanced) disposeAdvanced(); };
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();
@@ -302,6 +355,14 @@ async function viewSession(parts, revision) {
     }
     const stream = document.getElementById('session-stream');
     streamList('session',s.session_id).then(html=>{if(stream.isConnected && revision===renderRevision)stream.innerHTML=html;}).catch(()=>{if(stream.isConnected)stream.innerHTML='<span class="muted">Recorded events could not load.</span>';});
+    // The page streams its own detail; a live event refreshes only the (cheap) recorded event list.
+    return {
+      async refresh() {
+        if (!stream.isConnected) return;
+        try { const html = await streamList('session', s.session_id); if (stream.isConnected) stream.innerHTML = html; } catch { /* keep last */ }
+      },
+      dispose: disposeSession,
+    };
   } catch (error) {
     if (revision !== renderRevision) return;
     throw new Error(controller.signal.aborted ? 'Agent details could not load. Try again.' : error.message);
@@ -330,22 +391,23 @@ async function copyText(text, btn) {
 async function viewServices(_parts, revision) {
   const { services } = await client.listServices();
   if (revision !== renderRevision) return;
-  servicesView = mountServices(root, client, services, { scope: ({'system-services':'system','local-services':'local'})[_parts[0]] || 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
+  return mountServices(root, client, services, { scope: ({'system-services':'system','local-services':'local'})[_parts[0]] || 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
 }
 
 async function viewService(parts, revision) {
   const svc = await client.request(`/api/v1/services/${encodeURIComponent(decodeURIComponent(parts[1]))}`);
   if (revision !== renderRevision) return;
   if (!svc || svc.error) { root.innerHTML = '<herdr-error message="Service not found"></herdr-error>'; return; }
-  dashboardView = mountServiceDetails(root, client, svc);
+  return ownPolling(mountServiceDetails(root, client, svc));
 }
 
-async function viewHosts() {
+async function viewHosts(_parts, revision) {
   const [{ hosts }, matrix, configStatus] = await Promise.all([
     client.listHosts(),
     client.request('/api/v1/fleet/inventory').catch(() => ({ hosts: [], components: [] })),
     client.getFleetConfigStatus().catch(() => null),
   ]);
+  if (revision !== renderRevision) return;
   const cfg = indexConfigStatus(configStatus);
   if (!hosts.length) { root.innerHTML = '<herdr-empty message="No hosts reporting"></herdr-empty>'; return; }
   const driftedOnly = route().query.get('drift') === '1';
@@ -373,13 +435,15 @@ async function viewHost(parts, revision) {
   root.innerHTML = renderHostDetail(h, telemetry, { range, now: Date.now() });
 }
 
-async function viewActivity() {
+async function viewActivity(_parts, revision) {
   const { events } = await client.activity(50);
+  if (revision !== renderRevision) return;
   if (!events.length) {
     root.innerHTML = '<h1>Activity</h1><herdr-empty message="No activity yet"></herdr-empty>';
     return;
   }
   const missionTitleLookup = titles(await missionTitles());
+  if (revision !== renderRevision) return;
   const entries = events.map((event) => {
     const description = describeEvent(event, { missionTitles: missionTitleLookup });
     const rawPayload = JSON.stringify(event.payload || {}, null, 2);
@@ -456,10 +520,11 @@ async function viewActivity() {
   });
 }
 
-async function viewAnalytics() {
+async function viewAnalytics(_parts, revision) {
   const [missions, models, hosts] = await Promise.all([
     client.analytics('missions'), client.analytics('models'), client.analytics('hosts'),
   ]);
+  if (revision !== renderRevision) return;
   root.innerHTML = `
     <style>
       .an-dashboard{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:var(--density-gap,16px);align-items:start;width:100%}.an-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--density-panel-padding,16px)}.an-panel h2{font-size:16px;margin:0 0 12px}.an-panel p{font-size:12px;color:var(--text-secondary)}
@@ -479,9 +544,10 @@ async function viewAnalytics() {
     </div>`;
 }
 
-async function viewAnalyticsMissions() { await viewAnalytics(); }
-async function viewAnalyticsModels() {
+async function viewAnalyticsMissions(parts, revision) { await viewAnalytics(parts, revision); }
+async function viewAnalyticsModels(_parts, revision) {
   const { models, total_sessions } = await client.analytics('models');
+  if (revision !== renderRevision) return;
   root.innerHTML = `<h1>Model analytics</h1><p>${total_sessions} total agents</p><div class="hd-grid">` +
     Object.entries(models).map(([model, u]) => `
       <div class="hd-card">
@@ -489,8 +555,9 @@ async function viewAnalyticsModels() {
         <div class="hd-card__sub">${u.sessions} agent(s) · ${u.messages} messages</div>
       </div>`).join('') + '</div>';
 }
-async function viewAnalyticsTokens() {
+async function viewAnalyticsTokens(_parts, revision) {
   const t = await client.analytics('tokens');
+  if (revision !== renderRevision) return;
   const fmt = (n) => Number(n || 0).toLocaleString();
   const rows = (bucket) => Object.entries(bucket).map(([k, u]) => `
       <tr><td>${esc(k)}</td><td>${fmt(u.requests)}</td><td>${fmt(u.input_tokens)}</td>
@@ -507,8 +574,9 @@ async function viewAnalyticsTokens() {
     </div>` + table('By project', t.by_project) + table('By model', t.by_model) +
     table('By day', t.by_day);
 }
-async function viewAnalyticsHosts() {
+async function viewAnalyticsHosts(_parts, revision) {
   const h = await client.analytics('hosts');
+  if (revision !== renderRevision) return;
   root.innerHTML = `
     <h1>Host analytics</h1>
     <div class="hd-grid">
@@ -546,67 +614,18 @@ async function streamList(entityType, entityId) {
   }).join('');
 }
 
-// Live updates (Spec §52, §85): subscribe to the SSE stream and refresh the
-// current view when new events arrive. A full re-render re-fetches all data
-// for the view, so refreshing on *every* event (the fleet emits several per
-// second) would trip the API's per-IP rate limit ("too many requests") and
-// exhaust the browser's HTTP/1.1 connection pool ("Failed to fetch"). We
-// therefore throttle the SSE-driven refresh to at most once per
-// LIVE_REFRESH_MS (trailing edge). User navigation still renders immediately.
-let liveTimer = null;
-let lastLiveRender = 0;
-const LIVE_REFRESH_MS = 5000;
+// Live updates (Spec §52, §85): SSE events feed the refresh bus, which calls
+// the current view's refresh() at most once per LIVE_REFRESH_MS (first event
+// after idle at once, the rest coalesced to the window's end). A hidden tab
+// pauses the bus; becoming visible refreshes the view once.
 connectEvents({
   url: '/api/v1/events/stream',
-  onEvent: () => {
-    // Overview and Sessions own polling; SSE must preserve filters and focus.
-    if (dashboardView) return;
-    if (servicesView) {
-      if (!liveTimer) liveTimer = setTimeout(() => { liveTimer = null; servicesView?.refresh(); }, LIVE_REFRESH_MS);
-      return;
-    }
-    // Mission telemetry owns its polling; SSE must not reset worker inspection.
-    if (onMissionPage() && (disposeMissionActivity || decodeURIComponent(route().parts[1] || '').startsWith('pi:'))) {
-      // Refresh recorded lifecycle data separately so disclosures stay open.
-      if (refreshMissionHistory && !liveTimer) liveTimer = setTimeout(() => {
-        liveTimer = null;
-        refreshMissionHistory?.();
-      }, LIVE_REFRESH_MS);
-      return;
-    }
-    // The session page streams its own detail; a full re-render would reset it.
-    // Only the (cheap) generic event list below the inspector is refreshed there.
-    if (onSessionPage()) {
-      const el = document.getElementById('session-stream');
-      if (el && !liveTimer) {
-        const sid = decodeURIComponent(route().parts.at(-1) || '');
-        liveTimer = setTimeout(async () => {
-          liveTimer = null;
-          if (!onSessionPage()) return;
-          try { el.innerHTML = await streamList('session', sid); } catch { /* keep last */ }
-        }, LIVE_REFRESH_MS);
-      }
-      return;
-    }
-    if (liveTimer) clearTimeout(liveTimer);
-    // Fire shortly after the last event, but never more often than once per
-    // LIVE_REFRESH_MS since the previous live refresh.
-    const wait = Math.max(150, LIVE_REFRESH_MS - (Date.now() - lastLiveRender));
-    liveTimer = setTimeout(() => {
-      liveTimer = null;
-      lastLiveRender = Date.now();
-      // The event may have arrived while the view was still loading; a view that
-      // mounted since then owns its refresh (a full re-render would reset filters).
-      if (servicesView) { servicesView.refresh(); return; }
-      if (dashboardView) return;
-      render();
-    }, wait);
-  },
+  onEvent: (event) => bus.dispatch(event),
   onError: () => { /* keep last view; the client auto-reconnects */ },
 });
 
-window.addEventListener('hashchange', () => {
-  if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
-  lastLiveRender = Date.now(); render();
-});
+document.addEventListener('visibilitychange', () => { if (document.hidden) bus.pause(); else bus.resume(); });
+if (document.hidden) bus.pause();
+
+window.addEventListener('hashchange', () => render());
 completeSignInIfRedirected().finally(() => render());
