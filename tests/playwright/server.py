@@ -148,6 +148,21 @@ def _seed_related(repo, session_id, mission_id):
                               "branch": "fix/parser", "state": "success"})
 
 
+def _seed_missions(repo, m1, s1):
+    """Missions in each state for the story page: Alpha succeeded with an outcome, Gamma failed, Delta ended
+    before outcomes were kept, Beta (the base seed) still running."""
+    from herdr_engineering.control_plane.mission_outcome import MissionOutcomes, missions_config
+    outcomes = MissionOutcomes(repo, missions_config(None))
+    repo.mission_outcomes = outcomes
+    _seed_related(repo, s1, m1)
+    repo.set_mission_stage(m1, "complete")
+    repo.upsert_mission("gamma", title="Gamma", stage="implementation")
+    repo.set_mission_stage("gamma", "failed")
+    repo.upsert_mission("delta", title="Delta", stage="implementation")
+    repo.mission_outcomes = None
+    repo.set_mission_stage("delta", "complete")
+
+
 def main():
     repo = ControlPlaneRepo()
     _m1, _m2, _s1 = _seed(repo)
@@ -159,6 +174,8 @@ def main():
         _seed_attention(repo)
     if os.environ.get("RELATED_SEED") == "1":
         _seed_related(repo, _s1, _m1)
+    if os.environ.get("MISSION_STORY_SEED") == "1":
+        _seed_missions(repo, _m1, _s1)
 
     svr = ControlPlaneServer(repo, host="127.0.0.1", port=0,
                              web_root=_REPO / "packages")

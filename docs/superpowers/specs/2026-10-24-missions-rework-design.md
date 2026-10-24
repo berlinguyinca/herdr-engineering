@@ -139,3 +139,26 @@ Defaults stand until you answer; each can change on request.
 3. **Stale-close.** Default: 72 h of silence closes a mission as `unknown`. Say if a mission can legitimately stay quiet longer.
 4. **What counts as success.** Default: the final stage (`complete`) decides the chip; tests, CI and PR state are shown next to it and never override it. Alternative: derive "succeeded" only when CI and tests also passed, which is stricter but can contradict the owning system.
 5. **Pi-owned state.** Default: herdr copies a bounded outcome at the end. Alternative: ask Pi for durable history on demand, which keeps one owner but needs a Pi API **(guess: none exists today)**.
+
+## Built notes (2026-10-24)
+
+Steps 1 to 4 are built; step 5 (backfill) is not. Decisions used the defaults above.
+
+What was built:
+
+- **Outcome event** (`control_plane/mission_outcome.py`): `MissionOutcome` is written once when a mission moves into `complete`, `failed` or `cancelled` from a non-terminal stage, from both `set_mission_stage` and `upsert_mission`. Written with `feed=False`, so it does not appear in the activity feed. Fields a source could not supply are `null` and `sources` lists what was read. Text is redacted and bounded; agents are capped by `max_agents`; the payload stays under 16 KiB (agent summaries are dropped first). Idempotent per transition: terminal to terminal writes nothing, a reopen then a new end writes a second event and the latest wins.
+- **Stale close:** a mission with no change for `stale_close_hours` (72) gets an outcome with `final_stage: unknown` and `inferred: true`; it is never reported as success. The sweep is not a timer: it runs, throttled to once per 5 minutes, when the missions list, the outcome summaries or the story are read.
+- **Story API:** `GET /api/v1/missions/<key>/story` returns `{header, needs, events, more, agents, outcome, usage, objective, related, partial}`. It reads the stored outcome for an ended mission and assembles the same shape live for a running or reopened one. Needs come from the attention inbox derivation (same open items, filtered to the mission and its agents). Events are capped (newest kept, `more` counts the rest), waits become one span event once they pass `wait_span_seconds`. Operator listener only.
+- **Mission page:** the story (result chip, one-line outcome, needs, what happened, agents, outcome and cost) sits above the Related panel and the existing recorded history, which stays as the raw record. If the story cannot be loaded the page is exactly as before. A running mission refreshes every 15 s when the tab is visible.
+- **Catalog:** `GET /api/v1/mission-outcomes` (per-key summaries, newest outcome wins, a reopened mission has none) adds a result chip, duration, agents and a last-event line to rows, and Result and Repository filters. Search also matches the result and last event.
+- **Config:** `control_plane.missions.outcomes.{enabled, stale_close_hours, max_agents}` and `story.{max_events, wait_span_seconds}`, validated, YAML only. `outcomes.enabled: false` writes no outcomes and the page shows what exists today.
+
+Deviations and unverified:
+
+- **Live-only Pi missions** (no recorded mission record) have no story: the story route answers 404 and the page keeps its live panel, now with the Related panel. Their live telemetry is still ephemeral; an outcome is written only when the mission record reaches an end.
+- **What counts as success** is the final stage alone (default decision 4). Tests, CI and PR state are shown beside it and never override it.
+- **Agent ends:** an agent's `ended_at` is its last update time when its status is a terminal one, since sessions carry no explicit end time.
+- **CI for a mission** is matched through its agents' repository and branch (no direct key exists), so a mission whose agents did not report a repository id shows no CI.
+- **Usage** is read from the proxy records with this mission id over the retained 30 days; `lower_bound` is set when older usage has been trimmed.
+- **Not unit-tested against live data:** the shape of Pi's live `activity` fields (`currentObjective`, `waitingSince`) is taken from `mission_activity.py`, not from a live Pi report.
+- **Backfill** for missions that ended before outcomes (step 5) is not built; they show "Recorded before outcomes were kept".

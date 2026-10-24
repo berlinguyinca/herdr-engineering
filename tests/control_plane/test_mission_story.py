@@ -212,3 +212,37 @@ def test_story_does_not_exist_on_the_public_listener(stack, path):
     status, _ = stack.pub.call("GET", path)
     assert status == 404
 
+
+def test_outcome_summaries_feed_the_catalog_rows():
+    from herdr_engineering.control_plane.mission_outcome import outcome_summaries
+    world = _world(stale_close_hours=1)
+    repo, clock = world[0], world[1]
+    _full_mission(repo)
+    clock[0] += HOUR
+    repo.set_mission_stage("m1", "complete")
+    repo.upsert_mission("bad", title="bad", stage="implementation")
+    repo.set_mission_stage("bad", "failed")
+    repo.upsert_mission("quiet", title="quiet", stage="implementation")
+    repo.upsert_mission("running", title="running", stage="implementation")
+    clock[0] += 3 * HOUR
+    repo.mission_outcomes.sweep(force=True)
+    out = outcome_summaries(repo)
+    assert out["m1"] == {"result": "succeeded", "final_stage": "complete", "inferred": False, "ended_at": out["m1"]["ended_at"],
+                         "duration_s": HOUR, "agent_count": 2, "repository": "org/app", "last_event": "PR #214 merged"}
+    assert out["bad"]["result"] == "failed" and out["bad"]["last_event"] == "Ended: failed"
+    assert out["quiet"]["result"] == "unknown" and out["quiet"]["inferred"] is True
+    repo.set_mission_stage("m1", "implementation")                 # reopened: its old outcome no longer describes it
+    assert "m1" not in outcome_summaries(repo)
+
+
+def test_catalog_outcomes_route_and_public_404(stack):
+    repo = ControlPlaneRepo()
+    repo.upsert_mission("m", title="t", stage="implementation")
+    svr = _serve(repo, allow_open=True)
+    try:
+        repo.set_mission_stage("m", "complete")
+        st, body = _get(svr, "/api/v1/mission-outcomes")
+        assert st == 200 and body["outcomes"]["m"]["result"] == "succeeded"
+    finally:
+        svr.shutdown()
+    assert stack.pub.call("GET", "/api/v1/mission-outcomes")[0] == 404
