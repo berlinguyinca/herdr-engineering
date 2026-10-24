@@ -128,6 +128,18 @@ export class CollabApi {
     const q = new URLSearchParams({ node_type: nodeType, room_id: room, limit: '500', ...(edgeType ? { edge_type: edgeType } : {}) });
     return this.call('GET', `/graph/nodes?${q}`);
   }
+  // External coworker / remote agents (T10). The invite code is returned once by inviteExternal.
+  externals(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/externals`); }
+  inviteExternal(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/invites`, body); }
+  revokeExternal(room, agentId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/${encodeURIComponent(agentId)}/revoke`, {}); }
+  revokeExternalInvite(room, inviteId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/invites/${encodeURIComponent(inviteId)}/revoke`, {}); }
+  // Bounded delegation and artifact proposals (T11). Owner side only; a proposal's content is untrusted text.
+  delegations(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/delegations`); }
+  delegate(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/delegations`, body); }
+  cancelDelegation(room, taskId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/tasks/${encodeURIComponent(taskId)}/cancel`, {}); }
+  proposals(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/proposals`); }
+  proposal(room, id) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/proposals/${encodeURIComponent(id)}`); }
+  decideProposal(room, id, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/proposals/${encodeURIComponent(id)}/decide`, body); }
   // Read-only lineage views of ONE room (T09). `step` replays the reader's own visible ledger up to that event;
   // omitted = now. The server filters by the caller's CURRENT membership.
   lineage(room, o = {}) {
@@ -193,4 +205,21 @@ export class CollabApi {
   removeMember(id, user) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/members/${encodeURIComponent(user)}/remove`, {});
   }
+  // agent helpers: the room profile (names only, never secret values), host-access requests, the panic switch
+  roomProfile(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/profile`); }
+  setRoomProfile(id, profile) { return this.call('POST', `/rooms/${encodeURIComponent(id)}/profile`, profile); }
+  egressRequests() { return this.call('GET', '/fleet/egress'); }
+  decideEgress(requestId, decision, ttlSeconds) {
+    return this.call('POST', `/fleet/egress/${encodeURIComponent(requestId)}/decide`,
+      { decision, ...(ttlSeconds ? { ttl_seconds: ttlSeconds } : {}) });
+  }
+  promoteEgress(room, hostPort) { return this.call('POST', '/fleet/egress/promote', { room_id: room, host_port: hostPort }); }
+  removeEgress(room, hostPort) { return this.call('POST', '/fleet/egress/remove', { room_id: room, host_port: hostPort }); }
+  egressAllowlist(room) { return this.call('GET', `/fleet/egress/${encodeURIComponent(room)}`); }
+  helpers() { return this.call('GET', '/fleet/helpers'); }
+  myHelpers() { return this.call('GET', '/helpers'); }
+  summaryFixHelpers() { return this.call('GET', '/fleet/summary-fix/helpers'); }   // operator: results of summary-fix helpers (untrusted text)
+  fleetCancelHelper(id) { return this.call('POST', `/fleet/helpers/${encodeURIComponent(id)}/cancel`, {}); }
+  cancelHelper(id) { return this.call('POST', `/helpers/${encodeURIComponent(id)}/cancel`, {}); }
+  pauseHelpers(paused) { return this.call('POST', '/fleet/helpers/pause', { paused: Boolean(paused) }); }
 }

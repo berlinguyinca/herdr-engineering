@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import re
 
+from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .graph import validate_lineage
+from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
 from .project_links import canonical_repository
 from .sink import EventAlreadyStored
 
@@ -35,6 +37,14 @@ def _git_identity(payload):
     return {"repository_id": next(iter(identities), None), "commit_sha": commit_sha}
 
 
+# Sources whose host events prove the host is alive: its fabric agent, and the
+# herdr feed plugin on the host (deploy/herdr-cp-feed-plugin posts host.heartbeat
+# / host.inventory with no source, i.e. the default "herdr"). Any other source
+# may only update host state keys (see IngestService._ingest_host_state).
+LIVENESS_SOURCES = frozenset({"fabric-agent", "herdr"})
+_AGENT_ONLY_HOST_KEYS = ("telemetry", "cpu", "mem", "disk", "inventory")
+
+
 class IngestService:
     """Translates lifecycle event envelopes into idempotent repo mutations."""
 
@@ -45,6 +55,13 @@ class IngestService:
         # {principal_id: {"rooms": set, "missions": set}}. A key with no entry may write only
         # org/private scopes. "*" in a set is an explicit operator opt-in for every id (and for bare, id-less scopes).
         self.key_scopes = key_scopes if key_scopes is not None else {}
+        # T10: node ids inside an external agent's namespace belong to that agent alone. Set by the server
+        # to the HCN service's `is_external_node`; None = no external agents on this process.
+        self.reserved_node = None
+        # T11: ids only the HCN service writes (delegation task and accepted-proposal nodes). Set by the server to
+        # the HCN service's `is_hcn_node`; checked on EVERY endpoint of an edge, so an ingest key cannot attach
+        # a fake `produced` edge to an accepted artifact either.
+        self.service_node = None
 
     def _check_lineage_scope(self, env: dict) -> None:
         """Fail closed: a non-operator key may address a room or mission only if the operator listed it.
@@ -67,8 +84,29 @@ class IngestService:
         if not good:
             raise PermissionError("not permitted to modify this lineage object")
 
-    def ingest(self, body: dict, principal: dict | None = None) -> dict:
+    def _check_reserved_nodes(self, env: dict, event_type: str, payload: dict) -> None:
+        """Only an external agent itself (or an authenticated operator key) may write a node or edge
+        source inside that agent's namespace; anyone else is refused exactly like any lineage refusal."""
+        actor = env.get("actor") or {}
+        if self.service_node is not None and actor.get("kind") != "collab" and not (
+                actor.get("kind") == "operator"
+                and actor.get("authenticated_by") not in (None, "none", "open_listener")):   # an open listener is no operator here
+            ends = (payload.get("from_id"), payload.get("to_id")) if event_type.startswith("edge.") else (payload.get("node_id"),)
+            if any(isinstance(e, str) and self.service_node(e) for e in ends):
+                raise PermissionError("not permitted to modify this lineage object")
+        if self.reserved_node is None or actor.get("kind") == "external" or (
+                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
+            return
+        written = payload.get("from_id") if event_type.startswith("edge.") else payload.get("node_id")
+        if isinstance(written, str) and self.reserved_node(written):
+            raise PermissionError("not permitted to modify this lineage object")
+
+    def ingest(self, body: dict, principal: dict | None = None, valid=None) -> dict:
         """Apply one ingest body.
+
+        ``valid`` (T10) is an optional zero-argument callable evaluated inside the ledger lock,
+        immediately before a lineage envelope is admitted: a falsy result refuses the event exactly
+        like any lineage refusal, so a credential revoked while its request was in flight cannot land.
 
         ``principal`` is the authenticated caller (``{kind, id, authenticated_by}``)
         and becomes the ``actor`` of a schema_version 2 envelope. v1 bodies
@@ -101,11 +139,16 @@ class IngestService:
         if entity_type in {"plannotator_review", "ci_pipeline", "agent_identity", "agent_summary",
                            "custom_model", "llm_key", "token_usage"}:
             raise ValueError("provider-owned entity type is not accepted by generic ingestion")
+        # The review gate's streams decide merges; a forged verdict/resume/pin
+        # would merge unreviewed code, so they are reserved for the gate itself.
+        if entity_type.strip().lower().startswith(RESERVED_ENTITY_PREFIXES):
+            raise ValueError("reserved review-gate entity type is not accepted by generic ingestion")
         env = normalize_envelope(body, principal, self.repo._stamp())
         if env is None and entity_type == "lineage":
             raise ValueError("lineage events require schema_version 2")
         if env is not None and entity_type == "lineage":
             self._check_lineage_scope(env)
+            self._check_reserved_nodes(env, event_type, payload)
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type
@@ -121,6 +164,8 @@ class IngestService:
             if ledger.check(env) == "duplicate":
                 return {**head, "envelope": {**ack, "duplicate": True}}
             if entity_type == "lineage":
+                if valid is not None and not valid():
+                    raise PermissionError("not permitted to modify this lineage object")
                 # Ownership/capacity gate: runs under the ledger lock and BEFORE
                 # the row is persisted, so a refused change is never stored and
                 # its sequence is not consumed. Raises PermissionError (403).
@@ -207,7 +252,7 @@ class IngestService:
             result = self.repo.mission_activity.ingest(entity_id, payload, source=source)
             return {"entity_type": entity_type, "entity_id": entity_id, **result}
         if entity_type == "host":
-            return self._ingest_host(entity_id, event_type, payload)
+            return self._ingest_host(entity_id, event_type, payload, source)
         if entity_type == "session":
             return self._ingest_session(entity_id, event_type, payload,
                                         source)
@@ -233,23 +278,62 @@ class IngestService:
         return {"entity_type": entity_type, "entity_id": entity_id,
                 "event_type": event_type}
 
-    def _ingest_host(self, entity_id, event_type, payload) -> dict:
+    def _ingest_host(self, entity_id, event_type, payload, source="herdr") -> dict:
+        if source not in LIVENESS_SOURCES:
+            return self._ingest_host_state(entity_id, payload)
         status = ("unavailable" if "unavailable" in event_type.lower()
                   else "healthy")
-        host = self.repo.upsert_host(
-            entity_id,
-            payload.get("host_name") or payload.get("name") or entity_id,
-            payload.get("tailnet_ip") or payload.get("ip"),
-            cpu=payload.get("cpu"), mem=payload.get("mem"), status=status,
-            inventory=payload.get("inventory"))
-        sample = {k: payload[k] for k in ("cpu", "mem", "disk")
-                  if isinstance(payload.get(k), (int, float))
-                  and not isinstance(payload.get(k), bool)}
-        if sample:
+        # Validate everything before touching the host: a bad sample is a 400
+        # and must leave the stored record as it was.
+        telemetry = payload.get("telemetry")
+        sample = clean_metrics(telemetry) if telemetry is not None else None
+        state = {k: clean_state(k, payload.get(k)) for k in STATE_KEYS}
+        legacy = {k: clean_metrics({k: payload.get(k)}).get(k) for k in ("cpu", "mem", "disk")}
+        cpu = sample.get("cpu") if sample is not None else legacy["cpu"]
+        mem = sample.get("mem") if sample is not None else legacy["mem"]
+        name = payload.get("host_name") or payload.get("name")
+        ip = payload.get("tailnet_ip") or payload.get("ip")
+        inventory = payload.get("inventory")
+        # A routine heartbeat (known healthy host, same identity, no inventory)
+        # only refreshes liveness in memory: a durable HostHeartbeat per 30 s
+        # sample would grow the event log and the Activity feed without bound.
+        # Registration, identity changes, inventory and status transitions
+        # still go through upsert_host and are recorded as events.
+        existing = self.repo.get_host_record(entity_id)
+        if (existing is not None and status == "healthy"
+                and existing.get("status") == "healthy"
+                and (not name or name == existing.get("host_name"))
+                and (not ip or ip == existing.get("tailnet_ip"))
+                and not inventory):
+            self.repo.record_heartbeat(entity_id, cpu=cpu, mem=mem)
+            host = self.repo.get_host_record(entity_id) or existing
+        else:
+            host = self.repo.upsert_host(
+                entity_id, name or entity_id, ip,
+                cpu=cpu, mem=mem, status=status, inventory=inventory)
+        if sample is not None or any(v is not None for v in state.values()):
+            self.repo.record_host_metrics(entity_id, sample, **state)
+            return host
+        legacy = {k: v for k, v in legacy.items() if v is not None}
+        if legacy:
             self.repo.record_telemetry(entity_id, {
-                "cpu_pct": sample.get("cpu"), "mem_pct": sample.get("mem"),
-                "disk_pct": sample.get("disk")})
+                "cpu_pct": legacy.get("cpu"), "mem_pct": legacy.get("mem"),
+                "disk_pct": legacy.get("disk")})
         return host
+
+    def _ingest_host_state(self, entity_id, payload) -> dict:
+        """A host event from a source that is not the host's own agent (e.g. the
+        Ansible fleet update on the main host): it may only set host STATE keys.
+        It never touches liveness (status, last_seen), identity (host_name, ip)
+        or metrics, and never creates a host the agent has not registered."""
+        bad = sorted(k for k in _AGENT_ONLY_HOST_KEYS if k in payload)
+        if bad:
+            raise ValueError("host metrics/inventory are accepted from the host agent only: "
+                             + ", ".join(bad))
+        state = {k: clean_state(k, payload.get(k)) for k in STATE_KEYS}
+        self.repo.record_host_metrics(entity_id, None, **state)
+        return self.repo.get_host(entity_id) or {"entity_id": entity_id,
+                                                  "ignored": "unknown host"}
 
     def _ingest_session(self, entity_id, event_type, payload,
                         source="herdr") -> dict:
@@ -271,7 +355,7 @@ class IngestService:
             **{k: payload.get(k) for k in (
                 "pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
                 "revision", "interactive_ready", "launch_pending", "state_change_seq",
-                "transcript", "parent_session_id", "name")})
+                "transcript", "parent_session_id", "name", "runtime")})
 
     def _ingest_mission(self, entity_id, event_type, payload,
                         source="herdr") -> dict:

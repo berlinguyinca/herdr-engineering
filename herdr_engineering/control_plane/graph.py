@@ -421,6 +421,12 @@ def _narrow(a, b):
     return "mission"                                    # bare room vs contextual mission meets at bare mission
 
 
+# Registers whose recent write history is kept (see _Reg.recent): only the PR head, so the
+# bookkeeping costs nothing for every other attribute.
+_TRACKED_ATTRS = frozenset({"head_sha"})
+_RECENT_VALUES = 8
+
+
 class _Reg:
     """Last-writer-wins register per (source, actor), merged across writers by admission order.
 
@@ -429,12 +435,19 @@ class _Reg:
     server's admission order counts: a client-chosen sequence can never beat
     another principal, even on a shared source name.
     """
-    __slots__ = ("by", "firsts")
+    __slots__ = ("by", "firsts", "lasts", "recent", "track")
 
-    def __init__(self):
+    def __init__(self, track: bool = False):
+        self.track = track
+        # tracked registers only: writer key -> {value: [first_rank, last_rank, last_seq,
+        # last_event_id]}, one entry per DISTINCT value (so re-emits of one head cannot evict
+        # the evidence about another), at most _RECENT_VALUES values, oldest evicted first.
+        # min/max aggregates, so replay order cannot change it.
+        self.recent: dict[tuple, dict] = {}
         # writer key -> (seq, event_id, rank, value, key, is_op, scope)
         self.by: dict[tuple, tuple] = {}
         self.firsts: dict[tuple, tuple] = {}   # writer key -> rank of that writer's EARLIEST event here
+        self.lasts: dict[tuple, tuple] = {}    # writer key -> rank of that writer's LATEST event here (kept or not)
 
     def set(self, ev: dict, value: Any = None) -> None:
         key, seq, eid = _writer_key(ev), int(ev["source_sequence"]), str(ev["event_id"])
@@ -442,6 +455,20 @@ class _Reg:
         first = self.firsts.get(key)
         if first is None or rank < first:
             self.firsts[key] = rank            # min over ALL events, whichever order they arrive in
+        last = self.lasts.get(key)
+        if last is None or rank > last:
+            self.lasts[key] = rank             # max over ALL events: order independent
+        if self.track and isinstance(value, str) and value.strip():
+            hist = self.recent.setdefault(key, {})
+            ent = hist.get(value)
+            if ent is None:
+                hist[value] = [rank, rank, seq, eid]
+                if len(hist) > _RECENT_VALUES:
+                    del hist[min(hist, key=lambda v: hist[v][1])]
+            else:
+                ent[0] = min(ent[0], rank)
+                if rank > ent[1]:
+                    ent[1], ent[2], ent[3] = rank, seq, eid
         cur = self.by.get(key)
         if cur is None or (seq, eid) > (cur[0], cur[1]):
             self.by[key] = (seq, eid, _rank(ev), value, key, _is_operator(ev.get("actor")),
@@ -570,7 +597,7 @@ class _Claims:
 
     def _put_attrs(self, attrs: dict, ev: dict) -> None:
         for k, v in attrs.items():
-            self.attrs.setdefault(k, _Reg()).set(ev, v)
+            self.attrs.setdefault(k, _Reg(k in _TRACKED_ATTRS)).set(ev, v)
         if "co_writers" in attrs:
             self._w = None
 
@@ -1427,6 +1454,122 @@ class GraphProjection:
             matches.sort(key=lambda e: e.adds.best()[2])
             ctx: dict = {}
             return {"edges": [self._edge_view(e, principal, ctx) for e in matches[:MAX_NODE_EDGES]]}
+
+    @staticmethod
+    def _owner_attr(edge: _Edge, owner: str, name: str) -> Any:
+        """Newest value of attr ``name`` written by ``owner`` itself.
+
+        An operator or a ``co_writer`` may add to the same edge key, and the plain
+        :meth:`_Claims.attr_values` would report THEIR value under the owner's name; a verdict
+        is the reviewer's own statement, so only the reviewer's own entries are read.
+        """
+        reg = edge.attrs.get(name)
+        ents = [e for e in (reg.by.values() if reg else ()) if e[4][1] == owner]
+        return max(ents, key=lambda t: t[2])[3] if ents else None
+
+    def _owner_live(self, edge: _Edge, owner: str) -> bool:
+        """Does ``owner`` currently stand behind ``edge``? Only the owner's own add/remove count.
+
+        A remove by anyone else (operator, co_writer, wildcard) must not erase a reviewer's
+        ``blocked``, nor must another writer's add keep an edge the owner never made alive.
+        """
+        adds = [e for e in edge.adds.by.values() if e[4][1] == owner]
+        if not adds:
+            return False
+        add = max(adds, key=lambda t: t[2])
+        removes = [r for r in edge.removes.by.values() if r[4][1] == owner]
+        wild = self._wild.get(edge.key[:3])
+        if wild is not None:
+            removes += [r for r in wild.removes.by.values() if r[4][1] == owner]
+        return not removes or not _after(max(removes, key=lambda t: t[2]), add)
+
+    def review_evidence(self, principal, pr_id: str, reviewer_ids, head_writers) -> dict:
+        """Raw, UNFILTERED inputs for the head-bound review quorum of one PR (T06).
+
+        The quorum decision must not depend on who asks (a private ``blocked`` edge a
+        viewer cannot see still blocks), so every candidate edge is included and carries a
+        ``visible`` flag the caller uses only to redact identities. KeyError if the PR node
+        is absent or hidden from ``principal``.
+
+        Bounded by construction: reviews are found through the by-owner index of the
+        CONFIGURED reviewer ids, never by scanning the PR's incident edges, so junk edges
+        from other principals cost nothing and cannot cause a denial of service.
+        ``head`` and ``author`` come only from the register entries of ``head_writers``
+        (the PR is a commons node: its primary value may be anyone's).
+        """
+        with self._lock:
+            node = self._nodes.get(pr_id)
+            if node is None or node.node_type != "pr" or not self._node_visible(principal, node):
+                raise KeyError(pr_id)
+
+            def trusted(name):
+                """(value, event_id): newest non-empty string from a trusted writer."""
+                reg = node.attrs.get(name)
+                ents = [e for e in (reg.by.values() if reg else ())
+                        if e[4][1] in head_writers and isinstance(e[3], str) and e[3].strip()]
+                if not ents:
+                    return None, None
+                best = max(ents, key=lambda t: t[2])
+                return best[3], best[1]
+
+            def trusted_head():
+                """(value, event_id, state, candidate): the PR head from the trusted writers.
+
+                A trusted writer's applied head is its highest-``source_sequence`` write. A
+                write admitted AFTER it (so lower in sequence) with a different value is only
+                harmless if that value is an OLD head the writer had already reported before
+                (a late redelivery). Any other lower-sequence different head, however near,
+                could equally be a restart that reset the sequence, so the head is
+                ``unverified`` (alert, never satisfied). It clears when the writer writes
+                past the applied sequence, or when an operator acknowledges the candidate
+                write with ``head_resync`` (``resynced``). Nothing is adopted automatically.
+                """
+                reg = node.attrs.get("head_sha")
+                if reg is None:
+                    return None, None, "ok", None
+                acks = {e[3] for e in (node.attrs["head_resync"].by.values()
+                                       if "head_resync" in node.attrs else ()) if e[5]}
+                cands, state, candidate = [], "ok", None
+                for e in reg.by.values():
+                    if e[4][1] not in head_writers or not isinstance(e[3], str) or not e[3].strip():
+                        continue
+                    value, eid, rank = e[3], e[1], e[2]
+                    unknown = [(h[1], v, h[3]) for v, h in reg.recent.get(e[4], {}).items()
+                               if v != e[3] and h[1] > e[2] and h[0] > e[2]]
+                    if unknown:
+                        last_rank, last_value, last_eid = max(unknown)
+                        if last_eid in acks:
+                            value, eid, rank = last_value, last_eid, last_rank
+                            if state == "ok":
+                                state = "resynced"
+                        else:
+                            state, candidate = "unverified", last_eid
+                    cands.append((rank, value, eid))
+                if not cands:
+                    return None, None, "ok", None
+                best = max(cands)
+                return best[1], best[2], state, candidate
+            head, head_event, head_state, candidate = trusted_head()
+            author, _ = trusted("author")
+            reviews, authors = [], set()
+            for rid in sorted(reviewer_ids):
+                for key in list(self._edges_by_owner.get(rid, ())):
+                    e = self._edges.get(key)
+                    if e is None or e.to_id != pr_id or e.owner() != rid or not self._owner_live(e, rid):
+                        continue
+                    if e.edge_type == "produced":
+                        authors.add(rid)
+                    elif e.edge_type == "reviewed" and e.binding and e.binding[0] == "commit":
+                        reviews.append({
+                            "reviewer": rid, "commit": e.binding[1], "from_id": e.from_id,
+                            "verdict": self._owner_attr(e, rid, "verdict"),
+                            "receipt_digest": self._owner_attr(e, rid, "receipt_digest"),
+                            "receipt_binding": self._owner_attr(e, rid, "receipt_binding"),
+                            "event_id": e.adds.best()[1],
+                            "visible": self._edge_visible(principal, e)})
+            return {"pr": pr_id, "head": head, "head_event_id": head_event,
+                    "head_state": head_state, "head_resync_candidate": candidate, "author": author,
+                    "reviews": reviews, "authors": sorted(authors)}
 
     def list_nodes(self, principal, node_type: str, *, edge_type: str | None = None,
                    limit: int = DEFAULT_NODES, contexts: frozenset | None = None) -> dict:
