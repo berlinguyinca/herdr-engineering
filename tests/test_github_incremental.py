@@ -737,3 +737,43 @@ def test_a_flush_on_a_superseded_store_cannot_purge_the_new_credentials_catalog(
     stored = MemoryGitHubStore(identity="fingerprint-two", shared=shared).load()
     assert stored is not None and len(stored.repositories) == 3
     assert monitor.revision() is not None  # a refused old store does not dirty the new catalog
+
+
+def _revoke(fake):
+    from herdr_engineering.github import GitHubError
+
+    def rejected(*args, **kwargs):
+        raise GitHubError("authentication")
+    fake.repositories_page = fake.issues_page = fake.issue = rejected
+
+
+def test_a_revoked_token_stops_serving_and_purges_its_private_catalog():
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared)
+    monitor.refresh()
+    _revoke(fake)  # same token, same fingerprint, but GitHub now answers 401
+    monitor.refresh()
+    view = monitor.repositories(start=False)
+    assert view["status"] == "auth_error" and view["available"] is False and view["stale"] is False
+    assert view["repositories"] == [] and numbers(monitor) == []
+    restarted = monitor_for(fake, shared)  # a restart has nothing left to serve
+    assert restarted.repositories(start=False)["repositories"] == [] and numbers(restarted) == []
+
+
+def test_a_revoked_token_never_serves_a_cached_issue_body():
+    from herdr_engineering.github import GitHubError
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared, now=lambda: 4_000_000_000.0)
+    monitor.refresh()
+    monitor.issue_detail("github.com/acme/app", 2)
+    fake.tick(600)
+    fake.edit("acme/app", next(g for g, i in fake.repos["acme/app"].items() if i["number"] == 2), title="new")
+    monitor.refresh()  # the catalog now knows a newer updatedAt: the detail must be refetched
+    _revoke(fake)
+    try:
+        monitor.issue_detail("github.com/acme/app", 2)
+        raise AssertionError("served a cached body after a 401")
+    except GitHubError as exc:
+        assert exc.reason in {"authentication", "not_found"}
+    assert numbers(monitor) == []
+    assert MemoryGitHubStore(identity=fake.credential_identity, shared=shared).load().repositories == {}

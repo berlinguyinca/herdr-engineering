@@ -728,6 +728,8 @@ class GitHubMonitor:
         except _Superseded:
             pass
         except GitHubError as exc:
+            if exc.reason == "authentication":
+                self._revoke_catalog(generation)
             with self._lock:
                 if generation == self._generation:
                     self._retry_at = max(self._retry_at, exc.retry_at or self._now() + 60)
@@ -743,6 +745,35 @@ class GitHubMonitor:
                     self._view.update(refreshing=False, checked_at=_stamp())
             del self._local.generation
             self._refresh_lock.release()
+
+    def _revoke_catalog(self, generation):
+        """GitHub rejected the token (401): stop serving its catalog and purge the stored one.
+
+        A revoked token keeps its fingerprint, so nothing else would ever drop
+        the private rows it could read (ruling 2: revoked access never leaks).
+        """
+        with self._lock:
+            if generation != self._generation:
+                return
+            store = self._store
+            self._repos, self._issues, self._details = {}, {}, {}
+            self._marks, self._watermarks, self._full_at, self._deferred = {}, {}, {}, {}
+            self._resume_repos, self._issue_resume = None, {}
+            self._view.update(available=False, status="auth_error", stale=False, partial=False, account=None,
+                              error=str(GitHubError("authentication")))
+            self._touch()
+        if store is None:
+            return
+        try:
+            store.purge()
+        except Exception:
+            with self._lock:
+                if store is self._store:
+                    self._store_dirty = True  # the next 401 purges again
+            return
+        with self._lock:
+            if store is self._store:
+                self._remember_revision(store)
 
     def _collect(self, provider):
         with self._lock:
@@ -1209,6 +1240,9 @@ class GitHubMonitor:
                     pass  # memory still serves it; the catalog itself is unaffected
             return result
         except GitHubError as exc:
+            if exc.reason == "authentication":
+                self._revoke_catalog(generation)
+                raise  # never a cached private body for a revoked token
             with self._lock:
                 if generation != self._generation:
                     raise GitHubError("not_configured") from None

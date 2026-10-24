@@ -311,6 +311,20 @@ class MemoryGitHubStore:
                 state.meta, state.repos, state.issues, state.tombstones, state.details = saved
                 raise
 
+    def purge(self) -> None:
+        """Drop this credential's whole catalog, tombstones and details included (a revoked
+        token); the revision moves on and every older ``since`` resyncs. Another
+        credential's catalog is never touched."""
+        state = self._state
+        with state.lock:
+            if self._retired:
+                raise GitHubStoreRetired("this GitHub catalog store was replaced")
+            if state.meta is None or not _matches(state.meta, self._identity, self._viewer):
+                return
+            state.repos, state.issues, state.tombstones, state.details = {}, {}, {}, {}
+            revision = state.meta["revision"] + 1
+            state.meta.update(revision=revision, pruned_through=revision)
+
     def purge_owners_not_in(self, owners: set[str]) -> None:
         """Drop repositories (and issues) of owners outside the allowlist.
 
@@ -552,6 +566,28 @@ class GitHubStore:
 
     # -- interface
 
+    async def _wipe(self, conn) -> None:
+        """Drop every row and tombstone and tag the family with this store's credential."""
+        await conn.execute("DELETE FROM github_issues")
+        await conn.execute("DELETE FROM github_repositories")
+        await conn.execute("DELETE FROM github_catalog_tombstones")
+        await _drop_details(conn, "DELETE FROM github_issue_details")
+        await conn.execute(
+            "UPDATE github_catalog_meta SET identity=$2, viewer=$3, revision=revision+1, "
+            "pruned_through=revision+1, updated_at=now() WHERE family=$1",
+            FAMILY, self._identity, self._viewer)
+
+    def purge(self) -> None:
+        """Drop this credential's whole catalog, tombstones and details included (a revoked
+        token); the revision moves on and every older ``since`` resyncs. Another
+        credential's catalog is never touched."""
+        async def work(conn):
+            async with conn.transaction():
+                meta = await conn.fetchrow(_META_SELECT, FAMILY)
+                if meta is not None and _matches(dict(meta), self._identity, self._viewer):
+                    await self._wipe(conn)
+        self._call(work)
+
     def load(self) -> Snapshot | None:
         async def work(conn):
             async with conn.transaction():
@@ -560,14 +596,7 @@ class GitHubStore:
                     await self._claim(conn)
                     return None
                 if not _matches(dict(meta), self._identity, self._viewer):
-                    await conn.execute("DELETE FROM github_issues")
-                    await conn.execute("DELETE FROM github_repositories")
-                    await conn.execute("DELETE FROM github_catalog_tombstones")
-                    await _drop_details(conn, "DELETE FROM github_issue_details")
-                    await conn.execute(
-                        "UPDATE github_catalog_meta SET identity=$2, viewer=$3, revision=revision+1, "
-                        "pruned_through=revision+1, updated_at=now() WHERE family=$1",
-                        FAMILY, self._identity, self._viewer)
+                    await self._wipe(conn)
                     return None
                 meta = await self._claim(conn)
                 repos = await conn.fetch("SELECT repository_id, data, watermark FROM github_repositories")

@@ -577,3 +577,23 @@ def test_retired_store_can_neither_purge_nor_claim(backend):
     with old.advisory_lock() as held:  # the pass that holds it can still release it
         assert held in (True, False)
     old.close()
+
+
+def test_purge_drops_the_catalog_but_keeps_the_identity(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app")], scope=None)
+    store.upsert_issues(A, [issue("I1", 1), issue("I2", 2)], watermark="w")
+    store.put_detail(A, detail("I1", 1))
+    store.remove_issues(A, ["I2"])  # a tombstone naming a private repository
+    before = store.revision()
+    store.purge()
+    snap = backend.make().load()
+    assert snap is not None and snap.repositories == {} and snap.issues == {}
+    assert store.revision() > before
+    assert store.detail(A, 1) is None
+    delta = store.changes_since(before)
+    assert delta["resync"] is True and delta["upserted"] == [] and delta["removed"] == []
+    assert store.changes_since(0)["resync"] is True
+    other = backend.make(identity="tok-b")
+    other.purge()  # never another credential's catalog
+    assert backend.make().load() is not None
