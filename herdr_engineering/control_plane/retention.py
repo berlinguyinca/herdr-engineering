@@ -9,7 +9,10 @@ in-memory RustFS stand-in) are pruned after a longer TTL.
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 from collections import deque
+
+log = logging.getLogger(__name__)
 
 
 def _parse(iso: str) -> _dt.datetime:
@@ -66,4 +69,77 @@ def apply_retention(repo, *, telemetry_ttl_hours=24, events_ttl_days=30,
             repo._blobs.pop(aid, None)
             removed["artifacts"] += 1
 
+    return removed
+
+
+# ------------------------------------------------------------ token usage
+# LLM page design (docs/superpowers/specs/2026-10-23-llm-page-design.md): raw usage
+# records are kept ``raw_retention_days``; hourly rollups (slice 2) are kept
+# ``rollup_retention_days``. Both live in ``control_plane.llm_proxy`` (YAML).
+
+DEFAULT_RAW_RETENTION_DAYS = 14
+DEFAULT_ROLLUP_RETENTION_DAYS = 400
+USAGE_ENTITY_TYPE = "token_usage"
+
+
+def usage_retention_config(mapping) -> dict:
+    """Validated retention settings from ``control_plane.llm_proxy`` (None = defaults).
+
+    Raises ValueError naming the bad key; days must be whole numbers >= 1.
+    """
+    if mapping is None:
+        mapping = {}
+    if not isinstance(mapping, dict):
+        raise ValueError("control_plane.llm_proxy must be a mapping")
+    out = {}
+    for key, default in (("raw_retention_days", DEFAULT_RAW_RETENTION_DAYS),
+                         ("rollup_retention_days", DEFAULT_ROLLUP_RETENTION_DAYS)):
+        value = mapping.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"control_plane.llm_proxy.{key} must be a whole number of days >= 1")
+        out[key] = value
+    return out
+
+
+def sweep_token_usage(repo, *, raw_retention_days, now=None) -> int:
+    """Drop token_usage records older than ``raw_retention_days``, in memory and in
+    the durable event log; no other entity type is touched. Returns records removed."""
+    if isinstance(raw_retention_days, bool) or not isinstance(raw_retention_days, int) \
+            or raw_retention_days < 1:
+        raise ValueError("raw_retention_days must be a whole number of days >= 1")
+    now_dt = _parse(now) if now else _dt.datetime.fromtimestamp(repo._now(), _dt.UTC)
+    cutoff = now_dt - _dt.timedelta(days=raw_retention_days)
+    removed = 0
+    with repo._event_lock:
+        survivors = {}
+        for key in [k for k in repo._events if k[0] == USAGE_ENTITY_TYPE]:
+            stream = repo._events[key]
+            kept = []
+            for event in stream:
+                keep = _parse(event["source_timestamp"]) >= cutoff
+                survivors.setdefault((*key, event["sequence"]), deque()).append(keep)
+                if keep:
+                    kept.append(event)
+            removed += len(stream) - len(kept)
+            if kept:
+                repo._events[key] = kept
+            else:
+                repo._events.pop(key, None)
+        if removed:
+            order = []
+            for reference in repo._event_order:
+                if reference[0] != USAGE_ENTITY_TYPE:
+                    order.append(reference)
+                    continue
+                occurrences = survivors.get(tuple(reference))
+                if occurrences and occurrences.popleft():
+                    order.append(reference)
+            repo._event_order = order
+    # Durable I/O outside the event lock; without it a restart would re-hydrate them.
+    prune = getattr(getattr(repo, "_sink", None), "prune_events_before", None)
+    if callable(prune):
+        try:
+            prune(USAGE_ENTITY_TYPE, cutoff)
+        except Exception as exc:  # retried on the next sweep; never breaks serving
+            log.warning("durable token_usage prune failed: %s", type(exc).__name__)
     return removed

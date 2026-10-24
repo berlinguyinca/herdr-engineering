@@ -7,7 +7,6 @@
 // covered via mergeDetail's contract and a live smoke test on the host.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import os from "node:os";
 import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,14 +49,14 @@ test("mergeDetail adds non-empty detail fields to a session payload", () => {
   const e = sessionEnvelope();
   const out = mergeDetail(e, {
     agent_role: "claude", cwd: "/work", branch: "main@abc123",
-    pid: "1234", cmdline: "pi --x", summary: "fixing bug", attach: "herdr workspace focus w1H",
+    pid: "1234", cmdline: "pi --x", summary: "fixing bug", attach: `ssh -t beast "bash -lc 'herdr --session default agent attach w1:p1'"`,
   });
   assert.equal(out.payload.cwd, "/work");
   assert.equal(out.payload.branch, "main@abc123");
   assert.equal(out.payload.pid, "1234");
   assert.equal(out.payload.cmdline, "pi --x");
   assert.equal(out.payload.summary, "fixing bug");
-  assert.equal(out.payload.attach, "herdr workspace focus w1H");
+  assert.equal(out.payload.attach, `ssh -t beast "bash -lc 'herdr --session default agent attach w1:p1'"`);
   // agent_role from detail updates when empty, but existing identity wins
   assert.equal(out.payload.agent_role, "pi");
 });
@@ -92,15 +91,27 @@ test("mergeDetail handles a missing envelope or detail gracefully", () => {
 // ---------------------------------------------------------------------------
 // attachCommand
 // ---------------------------------------------------------------------------
-test("attachCommand is host-local when host matches os.hostname", () => {
-  assert.equal(attachCommand({ HOSTNAME: os.hostname() }, os.hostname(), "w1H"),
-    "herdr workspace focus w1H");
+// Same form as herdr_engineering/control_plane/terminal_attach.py's "remote" command: one
+// ssh invocation whose remote side runs herdr. Never "ssh host && ..." (the && half would
+// run on the viewer's machine, not on the host).
+test("attachCommand builds the single ssh command terminal_attach uses", () => {
+  assert.equal(attachCommand("beast", "default", "w1:p2"),
+    `ssh -t beast "bash -lc 'herdr --session default agent attach w1:p2'"`);
 });
 
-test("attachCommand prefixes ssh for a remote host", () => {
-  const cmd = attachCommand({ HOSTNAME: os.hostname() }, "beast", "wG");
-  assert.ok(cmd.startsWith("ssh beast && "));
-  assert.ok(cmd.endsWith("herdr workspace focus wG"));
+test("attachCommand never chains a local command after ssh", () => {
+  const cmd = attachCommand("beast", "eng", "wG");
+  assert.ok(!cmd.includes("&&"));
+  assert.ok(!cmd.includes("workspace focus"));
+});
+
+test("attachCommand refuses unsafe or missing identity", () => {
+  assert.equal(attachCommand("beast; rm -rf ~", "default", "w1:p2"), null);
+  assert.equal(attachCommand("beast", "de'fault", "w1:p2"), null);
+  assert.equal(attachCommand("beast", "default", "w1 p2"), null);
+  assert.equal(attachCommand(undefined, "default", "w1:p2"), null);
+  assert.equal(attachCommand("beast", null, "w1:p2"), null);
+  assert.equal(attachCommand("beast", "default", ""), null);
 });
 
 test("namespaced telemetry queries its native pane on the named server", async () => {
@@ -124,5 +135,6 @@ console.log(JSON.stringify({ok:true,result:{pane:{terminal_id:'terminal-1',revis
     assert.equal(result.payload.terminal_id, "terminal-1");
     assert.equal(result.payload.agent_session.value, "/tmp/conversation.jsonl");
     assert.equal(result.payload.revision, 5);
+    assert.equal(result.payload.attach, `ssh -t beast "bash -lc 'herdr --session eng agent attach w1:p1'"`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

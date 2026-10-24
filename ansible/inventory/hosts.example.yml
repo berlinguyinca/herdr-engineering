@@ -6,6 +6,10 @@ all:
           hosts:
             fry: {}
             beast: {}
+            # A host under maintenance is exempt from stale alarms; the fleet
+            # update sends this flag (default false) on every run:
+            # beast:
+            #   maintenance: true
             bender: {}
         macos:
           hosts:

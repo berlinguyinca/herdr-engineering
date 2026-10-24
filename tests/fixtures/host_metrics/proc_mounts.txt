@@ -1,0 +1,5 @@
+/dev/nvme0n1p2 / ext4 rw,relatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /run tmpfs rw,nosuid,nodev 0 0
+/dev/nvme1n1p1 /data ext4 rw,relatime 0 0
+/dev/nvme0n1p1 /boot/efi vfat rw,relatime 0 0

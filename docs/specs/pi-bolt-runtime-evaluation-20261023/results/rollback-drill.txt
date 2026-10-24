@@ -1,0 +1,9 @@
+Live rollback drill through the real launcher (pi-engineering scripts/pi-session-auto-resume.ts), real binaries, real gateway, 2026-10-23.
+One session, three launches, private agent dir (deleted), extension-free, print mode. The config file is the only thing changed between launches.
+1 default: pi-bolt, binary verified (sha256 + stamp)  -> runtime=pi-bolt source=default, exit 0, told "HERON-3"
+2 config edited to default: standard-pi (the rollback) -> runtime=standard-pi, exit 0, answered "HERON-3" (session carried over)
+3 config pins version 9.9.9 (mismatch)                 -> requested pi-bolt, ran standard-pi source=fallback,
+                                                          fallbackReason="verified version 1.0.0 differs from pinned 9.9.9", exit 0
+Session after all three: 11 JSONL lines, all valid, exactly 3 user turns (no duplicated or replayed turn).
+runtime-selection.jsonl recorded all three decisions. PASS for config rollback, fallback-before-start, and no replay.
+Limit: not a live Herdr mission, no side-effecting tools, one pass.

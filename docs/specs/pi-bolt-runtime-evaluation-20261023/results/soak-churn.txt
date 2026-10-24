@@ -1,0 +1,4 @@
+Churn soak, Pi-Bolt (AOT) only, 6 concurrent no-op agents x 40 rounds = 240 process launches (~25 min wall), load ~170+, 2026-10-23.
+240/240 exit 0. Peak RSS 50.8 MiB in both halves (no growth). Median wall 6.1 s first half, 7.2 s second half (gateway/host load drift, not a trend claim).
+This is process-churn stability, NOT a long-lived-session soak: print-mode agents exit after one reply, so leak behaviour of one
+multi-hour interactive session is untested.

@@ -101,7 +101,14 @@ fi
 # --- 4/4 enable + (re)start the service ------------------------------------
 step "4/4 enabling + (re)starting herdr-eng-fabric-agent.service"
 systemctl --user enable herdr-eng-fabric-agent.service >/dev/null 2>&1 || true
-systemctl --user restart herdr-eng-fabric-agent.service
+# HERDR_FABRIC_AGENT_NO_RESTART=1 (the Ansible fleet update): leave a running
+# agent alone; the caller restarts it once, after all of its updates succeeded.
+if [ "${HERDR_FABRIC_AGENT_NO_RESTART:-}" = "1" ] \
+    && systemctl --user is-active herdr-eng-fabric-agent.service >/dev/null 2>&1; then
+  echo "  running agent left alone (HERDR_FABRIC_AGENT_NO_RESTART=1; caller restarts it)"
+else
+  systemctl --user restart herdr-eng-fabric-agent.service
+fi
 systemctl --user is-active herdr-eng-fabric-agent.service >/dev/null 2>&1 \
   && echo "  active: herdr-eng-fabric-agent.service" \
   || warn "  service not active yet — check: systemctl --user status herdr-eng-fabric-agent.service"

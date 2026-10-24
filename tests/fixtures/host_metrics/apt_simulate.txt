@@ -1,0 +1,10 @@
+Reading package lists...
+Building dependency tree...
+Calculating upgrade...
+The following packages will be upgraded:
+  curl libssl3 vim
+3 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+Inst curl [7.81.0-1ubuntu1.15] (7.81.0-1ubuntu1.16 Ubuntu:22.04/jammy-updates [amd64])
+Inst libssl3 [3.0.2-0ubuntu1.10] (3.0.2-0ubuntu1.12 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64])
+Inst vim [2:8.2.3995-1ubuntu2.10] (2:8.2.3995-1ubuntu2.11 Ubuntu:22.04/jammy-updates [amd64])
+Conf curl (7.81.0-1ubuntu1.16 Ubuntu:22.04/jammy-updates [amd64])

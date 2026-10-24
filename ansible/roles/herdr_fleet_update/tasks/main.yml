@@ -1,0 +1,362 @@
+---
+# Fleet update from the main host (spec section 4, herdr_fleet_update).
+#
+# Per host (the playbook runs serial: 1): decide busy -> defer (record
+# deferred_since) or update (OS packages, herdr/pi/extensions/autospec via the
+# existing tasks) -> restart the fabric agent ONCE, only when something changed
+# and the host is still idle -> post one host event with pins + fleet_update +
+# maintenance. Once a host fails (fleet_update_stop_on_failure), the remaining
+# hosts of the run record "skipped: an earlier host failed" and change nothing.
+#
+# Every control-plane call and the state file run on the main host
+# (delegate_to: localhost, become: false). GETs are reads and run in --check
+# too; the state write and the event POST never do. HTTP tasks and every task
+# whose input carries control-plane data are no_log: they may carry the
+# X-API-Key header, and the cron log keeps output.
+# Pure decision logic: ansible/files/fleet-update-state.py (tested by
+# tests/test_fleet_update_state.py).
+
+# ---- 0. stop after an earlier host failed ----------------------------------
+- name: "Fleet update: did an earlier host of this run fail?"
+  ansible.builtin.set_fact:
+    fleet_update_earlier_failed: >-
+      {{ (fleet_update_stop_on_failure | bool) and not ansible_check_mode
+         and (ansible_play_hosts_all | difference([inventory_hostname])
+              | map('extract', hostvars) | selectattr('fleet_update_outcome', 'defined')
+              | selectattr('fleet_update_outcome', 'equalto', 'failed') | list | length > 0) }}
+
+# ---- 1. busy signal ---------------------------------------------------------
+- name: "Fleet update: busy signals"
+  ansible.builtin.include_tasks: busy-probe.yml
+  when: not fleet_update_earlier_failed
+
+# ---- 2. decide ---------------------------------------------------------------
+- name: "Fleet update: Decide update vs defer"
+  ansible.builtin.command:
+    argv: [python3, "{{ fleet_update_helper }}", decide]
+    stdin: >-
+      {{ {'state_file': fleet_update_state_file,
+          'force': fleet_update_force | bool,
+          'max_defer_days': fleet_update_max_defer_days | int,
+          'active_hosts': fleet_update_active_hosts,
+          'hosts': {fleet_update_host_id: fleet_update_busy_input}} | to_json }}
+  register: fleet_update_decide
+  changed_when: false
+  check_mode: false
+  delegate_to: localhost
+  become: false
+  no_log: true
+  when: not fleet_update_earlier_failed
+
+- name: "Fleet update: this host's decision"
+  ansible.builtin.set_fact:
+    fleet_update_decision: >-
+      {{ (fleet_update_decide.stdout | from_json)[fleet_update_host_id]
+         if not fleet_update_earlier_failed
+         else {'action': 'skip', 'busy': 'not checked', 'forced': false,
+               'reason': 'an earlier host failed',
+               'last_updated': none, 'deferred_since': none} }}
+    fleet_update_outcome: "{{ 'skipped' if fleet_update_earlier_failed else 'deferred' }}"
+    fleet_update_reason: ""
+    fleet_update_restart_done: false
+
+- name: "Fleet update: report the decision"
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} ({{ fleet_update_host_id }}): {{ fleet_update_verdict }}
+      | busy={{ fleet_update_decision.busy }}
+      | deferred_since={{ fleet_update_decision.deferred_since }}
+  vars:
+    fleet_update_verdict: >-
+      {{ ('update (forced)' if fleet_update_decision.forced else 'update')
+         if fleet_update_decision.action == 'update'
+         else ('skipped: ' if fleet_update_decision.action == 'skip' else 'deferred: ')
+              ~ fleet_update_decision.reason }}
+
+- name: "Fleet update: record the deferral or skip reason"
+  ansible.builtin.set_fact:
+    fleet_update_reason: "{{ fleet_update_decision.reason }}"
+  when: fleet_update_decision.action in ['defer', 'skip']
+
+# ---- 3. update ---------------------------------------------------------------
+- name: "Update this host (OS packages, herdr, pi, extensions, autospec, agent)"
+  when: fleet_update_decision.action == 'update'
+  block:
+    - name: "Fleet update: OS packages"
+      ansible.builtin.include_tasks: os-packages.yml
+
+    # Crash-safe retry marker: written as soon as something the agent depends
+    # on changed, so a host that drops mid-update (or a killed controller)
+    # still gets its agent restarted by a later run. The final record clears it
+    # only after a confirmed restart.
+    - name: "Fleet update: persist the pending-restart marker (OS packages changed)"
+      ansible.builtin.command:
+        argv: [python3, "{{ fleet_update_helper }}", mark-pending]
+        stdin: "{{ {'state_file': fleet_update_state_file, 'host_id': fleet_update_host_id} | to_json }}"
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      when:
+        - not ansible_check_mode
+        - fleet_update_restart_agent | bool
+        - (fleet_update_security_install | default({}) is changed)
+          or (fleet_update_full_upgrade | default({}) is changed)
+          or (fleet_update_brew | default({}) is changed)
+
+    # Existing roles own herdr/pi install: herdr pinned-version check, pi
+    # presence, pi-engineering + autospec clones (at main, pre-existing).
+    - name: "Fleet update: herdr / pi / autospec via the platform role"
+      ansible.builtin.include_role:
+        name: "{{ 'herdr_linux' if ansible_facts['system'] == 'Linux' else 'herdr_macos' }}"
+
+    # herdr-eng (fabric agent) + build-gate ONLY at an explicitly pinned
+    # revision: fabric-agent.yml would otherwise roll out whatever HEAD the
+    # main host's checkout is on, fleet-wide, every night.
+    - name: "Fleet update: select the pinned herdr-eng revision"
+      ansible.builtin.set_fact:
+        herdr_engineering_revision: "{{ fleet_update_herdr_engineering_revision }}"
+      when:
+        - herdr_engineering_revision is not defined
+        - fleet_update_herdr_engineering_revision | length > 0
+
+    - name: "Fleet update: herdr-eng skipped (no pinned revision)"
+      ansible.builtin.debug:
+        msg: >-
+          herdr-eng and the build-gate extension are not updated: set
+          fleet_update_herdr_engineering_revision (full commit id) or pass
+          -e herdr_engineering_revision=<sha>.
+      when: herdr_engineering_revision is not defined
+
+    # fabric_agent_defer_restart: fabric-agent.sh leaves a running agent alone
+    # (HERDR_FABRIC_AGENT_NO_RESTART=1); the single restart is below.
+    - name: "Fleet update: herdr-eng + fabric agent release"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/fabric-agent.yml"
+      vars:
+        fabric_agent_defer_restart: true
+      when: herdr_engineering_revision is defined
+
+    - name: "Fleet update: persist the pending-restart marker (herdr-eng staged)"
+      ansible.builtin.command:
+        argv: [python3, "{{ fleet_update_helper }}", mark-pending]
+        stdin: "{{ {'state_file': fleet_update_state_file, 'host_id': fleet_update_host_id} | to_json }}"
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      when:
+        - not ansible_check_mode
+        - fleet_update_restart_agent | bool
+        - fabric_agent_provision | default({}) is changed
+
+    - name: "Fleet update: pi build-gate extension"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/pi-build-gate.yml"
+      when: herdr_engineering_revision is defined
+
+    - name: "Fleet update: pi-engineering runtime (when a revision is selected)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/pi-runtime.yml"
+      when: pi_engineering_revision is defined
+
+    - name: "Fleet update: converge fabric systemd units (Linux)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/fabric-systemd.yml"
+      when: ansible_facts['system'] == 'Linux'
+
+    # No agent to restart (Linux: no herdr-eng; macOS: no LaunchAgent plist)
+    # means no restart is needed and none can be pending: a stale flag clears.
+    - name: "Fleet update: look for the macOS LaunchAgent"
+      ansible.builtin.stat:
+        path: "{{ fleet_home }}/Library/LaunchAgents/com.herdr-engineering.fabric-agent.plist"
+      become: false
+      register: fleet_update_launchagent
+      when: ansible_facts['system'] == 'Darwin'
+
+    - name: "Fleet update: is there a fabric agent to restart?"
+      ansible.builtin.set_fact:
+        fleet_update_agent_present: >-
+          {{ (herdr_eng_resolve.stdout | default('not-found') | trim) != 'not-found'
+             if ansible_facts['system'] == 'Linux'
+             else (fleet_update_launchagent.stat.exists | default(false)) }}
+
+    # Every update step above succeeded. Restart only when something the agent
+    # depends on changed, or an earlier run left a restart pending (deferred,
+    # failed, or a later step failed after staging), so an idle host that is
+    # current is not restarted and a missed restart is retried.
+    - name: "Fleet update: decide whether the agent needs a restart"
+      ansible.builtin.set_fact:
+        fleet_update_restart_needed: >-
+          {{ (fleet_update_restart_agent | bool)
+             and (fleet_update_agent_present | bool)
+             and ((fleet_update_decision.restart_pending | default(false) | bool)
+                  or (fabric_agent_provision | default({}) is changed)
+                  or (fleet_update_security_install | default({}) is changed)
+                  or (fleet_update_full_upgrade | default({}) is changed)
+                  or (fleet_update_brew | default({}) is changed)) }}
+
+    # The decision may be minutes old: an agent may have started meanwhile.
+    # A forced run (fleet_update_force) restarts regardless: no re-check.
+    - name: "Fleet update: re-read busy state right before the restart"
+      ansible.builtin.include_tasks: busy-probe.yml
+      when:
+        - fleet_update_restart_needed | bool
+        - not (fleet_update_decision.forced | default(false) | bool)
+
+    - name: "Fleet update: busy re-check"
+      ansible.builtin.command:
+        argv: [python3, "{{ fleet_update_helper }}", busy]
+        stdin: >-
+          {{ {'host_id': fleet_update_host_id, 'host': fleet_update_busy_input,
+              'active_hosts': fleet_update_active_hosts} | to_json }}
+      register: fleet_update_recheck
+      changed_when: false
+      check_mode: false
+      delegate_to: localhost
+      become: false
+      no_log: true
+      when:
+        - fleet_update_restart_needed | bool
+        - not (fleet_update_decision.forced | default(false) | bool)
+
+    - name: "Fleet update: defer the agent restart (host became busy or unknown)"
+      ansible.builtin.set_fact:
+        fleet_update_reason: "agent restart deferred"
+      when:
+        - fleet_update_restart_needed | bool
+        - not (fleet_update_decision.forced | default(false) | bool)
+        - (fleet_update_recheck.stdout | from_json).busy != 'no'
+
+    - name: "Fleet update: Restart the fabric agent (systemd user unit)"
+      ansible.builtin.systemd:
+        name: herdr-eng-fabric-agent.service
+        state: restarted
+        scope: user
+      become: false
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+      when:
+        - fleet_update_restart_needed | bool
+        - fleet_update_reason != 'agent restart deferred'
+        - ansible_facts['system'] == 'Linux'
+        - (herdr_eng_resolve.stdout | default('not-found') | trim) != 'not-found'
+      register: fleet_update_systemd_restart
+
+    - name: "Fleet update: agent restarted (systemd)"
+      ansible.builtin.set_fact:
+        fleet_update_restart_done: true
+      when: fleet_update_systemd_restart is not skipped
+
+    # Best-effort on macOS: a LaunchAgent that is not loaded (no GUI session,
+    # never installed) must not turn a successful update into "failed".
+    - name: "Fleet update: Restart the fabric agent (macOS launchd)"
+      ansible.builtin.command:
+        argv: [launchctl, kickstart, -k, "gui/{{ ansible_user_uid }}/com.herdr-engineering.fabric-agent"]
+      become: false
+      register: fleet_update_kickstart
+      changed_when: fleet_update_kickstart.rc == 0
+      failed_when: false
+      when:
+        - fleet_update_restart_needed | bool
+        - fleet_update_reason != 'agent restart deferred'
+        - ansible_facts['system'] == 'Darwin'
+
+    - name: "Fleet update: macOS agent restart did not happen"
+      ansible.builtin.debug:
+        msg: >-
+          launchctl kickstart failed (rc={{ fleet_update_kickstart.rc }}): the
+          LaunchAgent com.herdr-engineering.fabric-agent is probably not loaded
+          (no GUI login session, or never installed). The update itself
+          succeeded; the agent picks up the new release at its next start.
+      when:
+        - fleet_update_kickstart is defined
+        - fleet_update_kickstart is not skipped
+        - fleet_update_kickstart.rc | default(0) != 0
+
+    - name: "Fleet update: note the failed macOS restart"
+      ansible.builtin.set_fact:
+        fleet_update_reason: "agent restart failed"
+      when:
+        - fleet_update_kickstart is defined
+        - fleet_update_kickstart is not skipped
+        - fleet_update_kickstart.rc | default(0) != 0
+
+    - name: "Fleet update: agent restarted (launchd)"
+      ansible.builtin.set_fact:
+        fleet_update_restart_done: true
+      when:
+        - fleet_update_kickstart is defined
+        - fleet_update_kickstart is not skipped
+        - fleet_update_kickstart.rc | default(1) == 0
+
+    - name: "Fleet update: mark updated"
+      ansible.builtin.set_fact:
+        fleet_update_outcome: updated
+  rescue:
+    # Only the failed task's NAME: results/messages may contain secrets.
+    - name: "Fleet update: mark failed"
+      ansible.builtin.set_fact:
+        fleet_update_outcome: failed
+        fleet_update_reason: "{{ ansible_failed_task.name | default('unknown step') | truncate(100) }}"
+
+# ---- 4. record + publish -----------------------------------------------------
+- name: "Fleet update: Collect this host's report"
+  ansible.builtin.set_fact:
+    fleet_update_report:
+      outcome: "{{ fleet_update_outcome }}"
+      reason: "{{ fleet_update_reason }}"
+      # The agent depends on something that changed (now or in an earlier run)
+      # but was not restarted onto it: kept in the state file, retried next run.
+      # (For deferred/skipped runs the helper keeps the state file's value.)
+      restart_pending: >-
+        {{ (fleet_update_restart_agent | bool)
+           and (fleet_update_agent_present | default(true) | bool)
+           and not (fleet_update_restart_done | default(false) | bool)
+           and ((fleet_update_decision.restart_pending | default(false) | bool)
+                or (fabric_agent_provision | default({}) is changed)
+                or (fleet_update_security_install | default({}) is changed)
+                or (fleet_update_full_upgrade | default({}) is changed)
+                or (fleet_update_brew | default({}) is changed)) }}
+      maintenance: "{{ maintenance | default(false) | bool }}"
+      pins: "{{ fleet_pins | default({}) }}"
+      # a skipped host's previous dates come from the state file (record keeps them)
+      last_updated: "{{ fleet_update_decision.last_updated }}"
+      deferred_since: "{{ fleet_update_decision.deferred_since }}"
+
+- name: "Fleet update: Record results in the main host's state file"
+  ansible.builtin.command:
+    argv: [python3, "{{ fleet_update_helper }}", record]
+    stdin: >-
+      {{ {'state_file': fleet_update_state_file,
+          'dry_run': ansible_check_mode,
+          'hosts': {fleet_update_host_id: fleet_update_report}} | to_json }}
+  register: fleet_update_record
+  changed_when: not ansible_check_mode
+  check_mode: false
+  delegate_to: localhost
+  become: false
+
+- name: "Fleet update: Post the fleet-update event to the control plane"
+  ansible.builtin.uri:
+    url: "{{ fleet_update_control_plane_url | regex_replace('/+$', '') }}/api/v1/ingest"
+    method: POST
+    headers: "{{ fleet_update_request_headers }}"
+    body_format: json
+    body: "{{ (fleet_update_record.stdout | from_json)[fleet_update_host_id] }}"
+    timeout: "{{ fleet_update_http_timeout }}"
+    status_code: [200, 201, 202]
+  register: fleet_update_post
+  failed_when: false
+  delegate_to: localhost
+  become: false
+  no_log: true
+  when: not ansible_check_mode
+
+- name: "Fleet update: Warn when the control plane refused the event"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: the control plane did not accept the fleet-update event for
+      {{ fleet_update_host_id }} (HTTP {{ fleet_update_post.status | default('n/a') }});
+      the update result is still recorded in {{ fleet_update_state_file }}.
+  when:
+    - not ansible_check_mode
+    - (fleet_update_post.status | default(-1) | int) not in [200, 201, 202]
+
+- name: "Fleet update: result"
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: {{ (fleet_update_record.stdout | from_json)[fleet_update_host_id].payload.fleet_update.result }}"

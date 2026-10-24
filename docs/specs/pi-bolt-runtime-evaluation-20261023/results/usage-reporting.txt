@@ -1,0 +1,7 @@
+Client-visible gateway usage, same prompt ("Reply with exactly: OK"), 3 runs per runtime, bender, 2026-10-23 (--mode json, assistant message usage):
+standard Pi 1.4.0: run1 input 421 cacheRead 106 output 14 total 541 | run2 input 4 cacheRead 523 output 14 total 541 | run3 same as run2
+Pi-Bolt:           run1 input 516 cacheRead  80 output  4 total 600 | run2 input 4 cacheRead 592 output 15 total 611 | run3 input 4 cacheRead 592 output 14 total 610
+Reading: the gateway's usage object is parsed identically by both runtimes (same fields, prompt-cache hits on runs 2-3 in both). Pi-Bolt's input total is
+~69 tokens higher (592 vs 523 cached input), consistent with its longer system prompt (+212 bytes, results/parity.txt). Output tokens match to +-1 (model variation).
+This establishes that usage reporting and caching behave the same from the client side. It does NOT establish what the gateway recorded per client:
+that needs the gateway's own per-client rows (operator access), and attribution keyed on user-agent would differ (bun vs node).

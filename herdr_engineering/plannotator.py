@@ -182,6 +182,11 @@ def run_review(*, kind, cwd, control_plane, plan_file=None, repository=None,
                 json.dump({"review_id": rid, "receipt": receipt}, stream)
             post(control_plane, path + "/result", receipt)
             receipt_path.unlink()
+            # Echo the digest the receipt was bound to so a caller (Pi's plan-review
+            # gate) can verify the decision belongs to the exact plan bytes it sent.
+            # The bridge-computed value is authoritative over anything upstream says.
+            if isinstance(result, dict) and binding["plan_digest"] is not None:
+                return dict(result, plan_digest=binding["plan_digest"], review_id=rid)
             return result
         except BaseException as exc:
             if child and child.poll() is None:

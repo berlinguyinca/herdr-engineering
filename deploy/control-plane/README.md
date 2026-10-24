@@ -87,7 +87,9 @@ Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
 `ci_actions` (true enables CI retry/cancel), `inspector_limits` (`max_events`,
 `max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
 `sensitive_role`, `store_reasoning`) and `llm_proxy` (`max_inflight`,
-`queue_wait_seconds`). `control_plane.compose` is the mapping `deploy.sh` renders
+`queue_wait_seconds`, `raw_retention_days` (default 14: the web server drops older
+`token_usage` records, in memory and in `fabric_events`), `rollup_retention_days`
+(default 400, reserved for the hourly rollups)). `control_plane.compose` is the mapping `deploy.sh` renders
 for compose itself (e.g. `HERDR_CP_WEB_BIND`, `HERDR_CP_WEB_PUBLIC_PORT`,
 `HERDR_CP_PG_PORT`, `GATEWAY_TAILNET_IP`; all eight are required and `fleet config
 validate` names any that are missing). `fleet config init` asks for the gateway tailnet
@@ -174,7 +176,7 @@ Sessions started with `herdr-eng session run --project P -- <cmd>` mint a per-se
 `POST /api/v1/llm/keys` and revoke it at `/api/v1/llm/keys/<id>/revoke` when the command ends, so
 token analytics are per project without hand-sourcing a file. When this stack runs with
 `--api-keys`, the host running sessions needs an **operator** key in
-`HERDR_ENGINEERING_CONTROL_PLANE_KEY` or `~/.config/herdr-engineering/control-plane-key` (0600).
+`~/.config/herdr-engineering/control-plane-key` (0600).
 A key the host failed to revoke is named on stderr (`key_id`); revoke it with the same endpoint.
 See the README section "Sessions get the LLM env automatically".
 

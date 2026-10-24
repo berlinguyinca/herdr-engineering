@@ -1,0 +1,60 @@
+---
+# Read this host's busy signals from the control plane (read-only; runs in
+# --check too). Used for the update/defer decision and again right before the
+# agent restart. Sets two PRE-FILTERED facts, so no session row (cmdline, cwd,
+# summary) or host record (top processes) is ever printed, even at -v:
+#   fleet_update_active_hosts: host ids with an active session, or None when
+#                              the sessions list could not be read
+#   fleet_update_busy_input:   {agents_running: n|None, names: [...]}
+# The uri tasks are no_log: they may carry the X-API-Key header and their
+# results hold full session rows.
+- name: "Fleet update: read active sessions from the control plane (read-only)"
+  ansible.builtin.uri:
+    url: "{{ fleet_update_control_plane_url | regex_replace('/+$', '') }}/api/v1/sessions?status=active"
+    method: GET
+    headers: "{{ fleet_update_request_headers }}"
+    timeout: "{{ fleet_update_http_timeout }}"
+    status_code: [200]
+  register: fleet_update_sessions_probe
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: "Fleet update: read this host's control-plane record (read-only)"
+  ansible.builtin.uri:
+    url: "{{ fleet_update_control_plane_url | regex_replace('/+$', '') }}/api/v1/hosts/{{ fleet_update_host_id | urlencode }}"
+    method: GET
+    headers: "{{ fleet_update_request_headers }}"
+    timeout: "{{ fleet_update_http_timeout }}"
+    status_code: [200]
+  register: fleet_update_host_probe
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: "Fleet update: keep only host ids of active sessions and agents_running"
+  ansible.builtin.set_fact:
+    fleet_update_active_hosts: >-
+      {{ (fleet_update_sessions_probe.json.sessions
+          | select('mapping')
+          | selectattr('status', 'defined') | selectattr('status', 'equalto', 'active')
+          | selectattr('host_id', 'defined') | map(attribute='host_id')
+          | select('string') | list)
+         if ((fleet_update_sessions_probe.status | default(-1)) == 200
+             and (fleet_update_sessions_probe.json | default(none)) is mapping
+             and (fleet_update_sessions_probe.json.sessions | default(none)) is sequence
+             and (fleet_update_sessions_probe.json.sessions | default(none)) is not string)
+         else none }}
+    fleet_update_busy_input:
+      agents_running: >-
+        {{ (fleet_update_host_probe.json.latest.agents_running | default(none))
+           if ((fleet_update_host_probe.status | default(-1)) == 200
+               and (fleet_update_host_probe.json | default(none)) is mapping
+               and (fleet_update_host_probe.json.latest | default(none)) is mapping)
+           else none }}
+      # every form a session's host_id may take for this host
+      names: "{{ ([fleet_update_host_id, ansible_facts['hostname'], inventory_hostname] + fleet_update_host_aliases) | unique }}"

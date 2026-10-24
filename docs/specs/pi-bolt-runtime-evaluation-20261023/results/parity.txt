@@ -1,0 +1,16 @@
+pi-bolt      exit=0 
+pi-bolt-jit  exit=0 
+standard-pi  exit=0 
+pi-bolt: path_same=true body_same_except_system_prompt=true system_prompt_same=false (std 1865 bytes, pi-bolt 2077 bytes) header_diffs=5
+  header accept-encoding: std=Some("gzip, deflate") pi-bolt=Some("gzip, deflate, br, zstd")
+  header accept-language: std=Some("*") pi-bolt=None
+  header sec-fetch-mode: std=Some("cors") pi-bolt=None
+  header user-agent: std=Some("pi/1.4.0 (linux; node/v22.23.3; x64)") pi-bolt=Some("pi/1.4.0 (linux; bun/1.4.3; x64)")
+  header x-stainless-runtime-version: std=Some("v22.23.3") pi-bolt=Some("v26.3.0")
+pi-bolt-jit: path_same=true body_same_except_system_prompt=true system_prompt_same=false (std 1865 bytes, pi-bolt-jit 2088 bytes) header_diffs=5
+  header accept-encoding: std=Some("gzip, deflate") pi-bolt-jit=Some("gzip, deflate, br, zstd")
+  header accept-language: std=Some("*") pi-bolt-jit=None
+  header sec-fetch-mode: std=Some("cors") pi-bolt-jit=None
+  header user-agent: std=Some("pi/1.4.0 (linux; node/v22.23.3; x64)") pi-bolt-jit=Some("pi/1.4.0 (linux; bun/1.4.3; x64)")
+  header x-stainless-runtime-version: std=Some("v22.23.3") pi-bolt-jit=Some("v26.3.0")
+parity PASS: same path, auth and request body apart from the system prompt; headers differ only as listed

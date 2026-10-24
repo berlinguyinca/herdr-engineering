@@ -1,0 +1,5 @@
+standard-pi  ok=10/10 wall_ms med=24509 p95=89559 ci95=[16076,32604] cpu_s med=0.850 rss_MiB med=122 start=3755/5833 prep=2595/3554 ttft=2234/22590 exit=127/296 quality=9/10 tool_ms=320
+pi-bolt      ok=10/10 wall_ms med=28508 p95=92860 ci95=[18996,55701] cpu_s med=0.153 rss_MiB med=48 start=535/1783 prep=2035/2069 ttft=2774/28208 exit=33/83 quality=10/10 tool_ms=55
+  wall vs standard-pi: not clearly different
+pi-bolt-jit  ok=10/10 wall_ms med=23969 p95=87946 ci95=[19897,61625] cpu_s med=0.156 rss_MiB med=56 start=245/2396 prep=2033/2215 ttft=2779/31746 exit=57/119 quality=10/10 tool_ms=31
+  wall vs standard-pi: not clearly different

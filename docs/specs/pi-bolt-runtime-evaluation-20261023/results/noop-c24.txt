@@ -1,0 +1,5 @@
+24 concurrent no-op agents, 2 reps (48 runs per arm), load ~170-225 on bender, same model/gateway. Raw: noop-c24.jsonl
+standard-pi  ok=48/48 wall med=15695ms ci95=[13166,19179] cpu=0.711s rss=122MiB start=3480ms
+pi-bolt      ok=48/48 wall med=10813ms ci95=[8479,12302]  cpu=0.073s rss=50MiB  start=438ms  (wall: clearly lower)
+pi-bolt-jit  ok=48/48 wall med=13465ms ci95=[11202,14707] cpu=0.081s rss=53MiB  start=391ms  (wall: not clearly different)
+Prep and time-to-first-token were not different; the wall gain tracks the startup/CPU saving under contention. No failures.

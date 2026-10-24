@@ -216,11 +216,18 @@ PLIST
 
 # (re)load the agent into the GUI login domain
 UID_="$(id -u)"
-launchctl bootout "gui/$UID_/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$UID_" "$PLIST" || { launchctl load -w "$PLIST" 2>/dev/null || true; }
-launchctl enable "gui/$UID_/$LABEL" 2>/dev/null || true
-launchctl kickstart -k "gui/$UID_/$LABEL" 2>/dev/null || true
-sleep 3
+# HERDR_FABRIC_AGENT_NO_RESTART=1 (the Ansible fleet update): leave a loaded
+# agent alone; the caller restarts it once, after all of its updates succeeded.
+if [ "${HERDR_FABRIC_AGENT_NO_RESTART:-}" = "1" ] \
+    && launchctl print "gui/$UID_/$LABEL" >/dev/null 2>&1; then
+  echo "  loaded agent left alone (HERDR_FABRIC_AGENT_NO_RESTART=1; caller restarts it)"
+else
+  launchctl bootout "gui/$UID_/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID_" "$PLIST" || { launchctl load -w "$PLIST" 2>/dev/null || true; }
+  launchctl enable "gui/$UID_/$LABEL" 2>/dev/null || true
+  launchctl kickstart -k "gui/$UID_/$LABEL" 2>/dev/null || true
+  sleep 3
+fi
 
 if launchctl print "gui/$UID_/$LABEL" >/dev/null 2>&1; then
   echo "  LaunchAgent running: $LABEL"

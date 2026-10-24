@@ -1,0 +1,5 @@
+{
+  "standard-pi": {"argv": ["/home/wohlgemuth/.local/share/pi-bolt-eval/pi-1.4.0/node_modules/.bin/pi"], "note": "npm @earendil-works/pi-coding-agent@1.4.0 on node v22"},
+  "pi-bolt": {"argv": ["/home/wohlgemuth/.local/share/pi-bolt-eval/bolt-v1.0.0/std/pi-bolt-linux-x64/pi"], "note": "bolt-v1.0.0 linux-x64, JIT off, sha256+sig verified"},
+  "pi-bolt-jit": {"argv": ["/home/wohlgemuth/.local/share/pi-bolt-eval/bolt-v1.0.0/jit/pi-bolt-linux-x64-jit/pi"], "note": "bolt-v1.0.0 linux-x64-jit, JIT on"}
+}

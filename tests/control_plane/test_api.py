@@ -253,8 +253,8 @@ def test_ingest_endpoint_upserts_host(server):
     # the ingested events are visible to a GET on the same stream
     _, _, stream = c.get("/api/v1/events?entity_type=host&entity_id=bender")
     evs = json.loads(stream)["events"]
-    assert [e["event_type"] for e in evs] == [
-        "HostRegistered", "HostHeartbeat"]
+    # a routine heartbeat (same identity) records no HostHeartbeat event
+    assert [e["event_type"] for e in evs] == ["HostRegistered"]
 
 
 def test_ingest_endpoint_validates_body(server):

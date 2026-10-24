@@ -1,0 +1,25 @@
+17:28:43 round=1 bolt: rss_MiB=297 cpu_s=23
+17:29:43 round=2 bolt: rss_MiB=294 cpu_s=24
+17:30:42 round=3 bolt: rss_MiB=294 cpu_s=24
+17:31:42 round=4 bolt: rss_MiB=294 cpu_s=24
+17:32:42 round=5 bolt: rss_MiB=294 cpu_s=24
+17:33:43 round=6 bolt: rss_MiB=295 cpu_s=24
+17:34:44 round=7 bolt: rss_MiB=296 cpu_s=24
+17:35:43 round=8 bolt: rss_MiB=296 cpu_s=24
+17:36:43 round=9 bolt: rss_MiB=296 cpu_s=25
+17:37:43 round=10 bolt: rss_MiB=293 cpu_s=25
+17:38:44 round=11 bolt: rss_MiB=294 cpu_s=25
+17:39:44 round=12 bolt: rss_MiB=294 cpu_s=25
+17:40:47 round=13 bolt: rss_MiB=295 cpu_s=25
+17:41:46 round=14 bolt: rss_MiB=296 cpu_s=25
+17:42:47 round=15 bolt: rss_MiB=296 cpu_s=25
+17:43:48 round=16 bolt: rss_MiB=294 cpu_s=25
+17:44:52 round=17 bolt: rss_MiB=296 cpu_s=25
+17:45:51 round=18 bolt: rss_MiB=297 cpu_s=25
+17:46:51 round=19 bolt: rss_MiB=297 cpu_s=26
+17:47:52 round=20 bolt: rss_MiB=298 cpu_s=26
+DONE
+Interactive Pi-Bolt (AOT) with the real engineering extension set (release ef5130f2), real herdr pane on bender (load >100), 20 prompts over ~20 min.
+Steady state after load: RSS 293-298 MiB (no growth), CPU 23 s at the first sample (the load cost) then +3 s over 19 rounds (~0.15 s per turn).
+The session handled every turn. Limit: 20 minutes, not multi-hour. The side-by-side standard-Pi sampler failed (empty column, a bug in my
+ps pattern), so this file has NO same-run standard-Pi steady-state; use the earlier standard-Pi extension numbers (141 MiB, 1.9 s to ready) with that caveat.

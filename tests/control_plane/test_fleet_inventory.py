@@ -1,4 +1,6 @@
 """Fleet version inventory: hosts report tool/plugin versions, the repo diffs them."""
+import pytest
+
 from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
@@ -85,3 +87,49 @@ def test_alias_alone_is_presented_under_the_canonical_name():
     IngestService(repo).ingest({"entity_type": "host", "entity_id": "old",
                                 "event_type": "host.heartbeat", "payload": {"host_name": "old"}})
     assert [(h["host_id"], h["host_name"]) for h in repo.list_hosts()] == [("new", "new")]
+
+
+@pytest.mark.parametrize("agent_on_alias", [True, False])
+@pytest.mark.parametrize("agent_fresher", [True, False])
+def test_alias_merge_keeps_state_held_only_by_either_record(agent_on_alias, agent_fresher):
+    """Agent heartbeats under one id, the Ansible fleet update posts under the
+    other: the merged host carries both, whichever id and whichever is fresher."""
+    clock = [1_800_000_000.0]
+    repo = ControlPlaneRepo(now=lambda: clock[0], host_aliases={"Gerts-MacBook-Pro.local": "mac.lan"})
+    agent, ansible = (("Gerts-MacBook-Pro.local", "mac.lan") if agent_on_alias
+                      else ("mac.lan", "Gerts-MacBook-Pro.local"))
+    fu = {"last_updated": None, "deferred_since": None, "result": "failed"}
+    pins = {"herdr": "1.0"}
+    upd = {"outdated": 3}
+    # the staler record first, then the fresher one
+    first, second = (ansible, agent) if agent_fresher else (agent, ansible)
+    for hid in (first, second):
+        repo.upsert_host(hid, hid, "100.64.0.9")
+        if hid == agent:
+            repo.record_host_metrics(hid, {"cpu": 5, "mem": 30, "disk": 10},
+                                     updates=upd, versions={"herdr": "1.0"})
+        else:
+            repo.record_host_metrics(hid, None, fleet_update=fu, pins=pins, maintenance=True)
+        clock[0] += 60
+    h = repo.get_host("mac.lan")
+    assert h["host_id"] == "mac.lan"
+    assert h["latest"]["cpu"] == 5
+    assert h["updates"] == upd and h["versions"] == {"herdr": "1.0"}
+    assert h["fleet_update"] == fu and h["pins"] == pins and h["maintenance"] is True
+    # liveness still follows the freshest record
+    fresher = repo.get_host_record(second)
+    assert h["last_seen"] == fresher["last_seen"]
+
+
+def test_alias_merge_prefers_fresher_record_for_a_shared_state_key():
+    clock = [1_800_000_000.0]
+    repo = ControlPlaneRepo(now=lambda: clock[0], host_aliases={"old": "new"})
+    for hid, pins in (("new", {"herdr": "1.0"}), ("old", {"herdr": "2.0"})):
+        repo.upsert_host(hid, hid, "100.64.0.9")
+        repo.record_host_metrics(hid, {"cpu": 1, "mem": 1, "disk": 1}, pins=pins)
+        clock[0] += 60
+    assert repo.get_host("new")["pins"] == {"herdr": "2.0"}
+    repo.record_host_metrics("new", None, pins={"herdr": "3.0"})
+    clock[0] += 60
+    repo.upsert_host("new", "new", "100.64.0.9")  # canonical becomes fresher
+    assert repo.get_host("new")["pins"] == {"herdr": "3.0"}

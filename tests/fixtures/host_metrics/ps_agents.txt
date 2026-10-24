@@ -1,0 +1,11 @@
+    1     0 root       0.1  0.2 systemd
+  500     1 alice      0.0  0.1 bash
+  501   500 alice     12.0  2.0 pi
+  502   500 alice      3.0  1.5 pi
+  503   501 alice      0.5  0.3 node
+  600     1 bob        0.0  0.1 autospec
+  601   600 bob       25.0  4.0 claude
+  602   601 bob        1.0  0.5 claude
+  700     1 carol     40.0  9.0 python3
+  701     1 carol      0.1  0.1 pi-helper
+  702     1 carol      0.1  0.1 /usr/local/bin/codex-code-mode-host

@@ -1,0 +1,5 @@
+hop 0 standard-pi  exit=0 remembered=true session_files=1 session_lines=6 valid_jsonl=true 
+hop 1 pi-bolt      exit=0 remembered=true session_files=1 session_lines=9 valid_jsonl=true 
+hop 2 standard-pi  exit=0 remembered=true session_files=1 session_lines=12 valid_jsonl=true 
+hop 3 pi-bolt-jit  exit=0 remembered=true session_files=1 session_lines=15 valid_jsonl=true 
+roundtrip PASS
