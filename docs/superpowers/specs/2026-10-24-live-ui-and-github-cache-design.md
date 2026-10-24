@@ -184,3 +184,36 @@ mechanics; which count of repos the staggered 24 h reconcile processes per pass.
    the page show (board by status column, or a flat item list)?
 2. Is a dark theme wanted now, or is that scope creep for this effort?
 3. Is "calm mode" (a visible motion toggle) wanted beyond following the OS reduced-motion setting?
+
+## Builder-check rulings (2026-10-24)
+
+A fresh reader asked eight questions; none needs the operator. Rulings, each a call by the author:
+
+1. **Revision scope.** One monotonically increasing integer per resource family (GitHub catalog is
+   one family), stored in Postgres; each row keeps the revision of its last change. Removals are
+   kept as tombstones for 7 days; a `since` older than the oldest tombstone gets `{"resync": true}`
+   plus the full list. The generic ETag on hosts/sessions/services/missions is a content hash of
+   the serialized body: it saves bandwidth and client re-render, not server work (stated plainly).
+2. **Token identity.** Stored rows and watermarks are tagged with the existing credential
+   fingerprint (`credential_identity`) and viewer login. On mismatch the catalog is dropped, never
+   served; revoked access cannot leak private issues.
+3. **G2 probe is unproven.** A spike task (G0) runs first against the real token: measures listing
+   cost with the extra `issues(first:1,orderBy UPDATED_AT)` field at 100 repos/page, and confirms
+   comments, label changes and edits bump `updatedAt`. G2-G4 are gated on its result. Fallback:
+   smaller listing pages (50) or aliased per-repo probes batched into one query.
+4. **Process model.** The monitor lives only in `control-plane-web` (one replica; the worker never
+   starts it). A Postgres advisory lock still wraps each sync pass. The web container has no
+   writable volume and the monitor is synchronous/threaded, so G1 uses a small synchronous Postgres
+   adapter on the existing `control_plane.pg_dsn`; G0 confirms which driver is already installed
+   and, if none fits, falls back to SQLite on a new named volume.
+5. **Detail/comments.** Comments are not fetched today and stay out. Issue bodies are stored only
+   for issues whose detail was opened (a detail table), refetched when the incremental pass sees
+   that issue's `updatedAt` change.
+6. **Sync state for the chip.** The existing snapshot fields (`status`, `stale`, `partial`,
+   `last_success_at`, `progress`, `rate_limit`) feed the chip; add `deferred_repos` so a repo the
+   point budget keeps deferring shows as stale instead of silently old.
+7. **Test harness.** Pure logic uses `node:test`. DOM behaviour (zero writes on identical data,
+   focus/`<details>` preservation) uses Playwright, already in the repo (`tests/playwright`); the
+   first task adds a fixture-page harness. No jsdom is added.
+8. **SSE proxying.** Keepalive every 10 s plus `X-Accel-Buffering: no`; verified live on bender
+   (via `dev.lan`) in step 1, since that is the real path.
