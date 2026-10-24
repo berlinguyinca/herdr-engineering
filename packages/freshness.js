@@ -1,4 +1,5 @@
-// <herdr-freshness interval="5000">: "live · updated Ns ago". Amber past 2x interval, red after a failed touch.
+// <herdr-freshness interval="5000">: "live · updated Ns ago". Amber ("stale · …") past 2x interval, red ("error · …")
+// after a failed touch, "waiting for first update" before any data.
 // setDetail(text, {warn}) appends a source-specific note (e.g. GitHub sync state); warn keeps it amber.
 // Views importing freshnessSources also load in Node (logic tests), where HTMLElement is absent.
 const Base = typeof HTMLElement === 'undefined' ? class {} : HTMLElement;
@@ -56,13 +57,16 @@ export class HerdrFreshness extends Base {
     const age = this._last == null ? null : Math.max(0, Math.floor((Date.now() - this._last) / 1000));
     const ago = age == null ? 'not yet updated'
       : `updated ${age < 60 ? `${age}s` : age < 3600 ? `${Math.floor(age / 60)}m` : `${Math.floor(age / 3600)}h`} ago`;
+    // Only a chip that has data and is fresh says "live"; amber says "stale", and a chip with no
+    // data yet says it is waiting.
     let state = 'fresh';
-    let text = `live · ${ago}`;
+    let text = age == null ? 'waiting for first update' : `live · ${ago}`;
     if (this._error != null) {
       state = 'error';
       text = `error · ${this._error} · ${ago}`;
     } else if (this._warn || (age != null && age * 1000 > 2 * this.interval)) {
       state = 'stale';
+      text = `stale · ${ago}`;
     }
     if (this._detail) text += ` · ${this._detail}`;
     if (state !== this._state) { this._state = state; this.setAttribute('data-state', state); }

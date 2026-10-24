@@ -441,8 +441,9 @@ Pages update in place:
   refresh per view every 5 s) and a few dashboards' own polls patch only what
   changed. Focus, open sections and the text selection survive a refresh.
 - Changed values flash or count up.
-- Every page head has a freshness chip: "live · updated Ns ago", amber when
-  stale, red with the error when a refresh fails.
+- Every page head has a freshness chip: "live · updated Ns ago" when fresh,
+  amber "stale · …" when stale, red "error · <message> · …" when a refresh
+  fails, and "waiting for first update" before any data.
 - The sidebar has Theme (auto, light, dark) and Calm (auto, on, off) controls,
   stored per browser. Calm, which is on by default when the OS asks for reduced
   motion, applies every change at once with no animation.
