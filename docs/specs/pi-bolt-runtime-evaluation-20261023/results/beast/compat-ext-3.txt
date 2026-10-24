@@ -1,0 +1,6 @@
+pi-bolt      exit=0 wall_ms=26072 cpu_s=22.7 maxrss_MiB=448 loaded=true
+pi-bolt-jit  exit=0 wall_ms=25459 cpu_s=22.2 maxrss_MiB=463 loaded=true
+standard-pi  exit=0 wall_ms=6417 cpu_s=3.0 maxrss_MiB=142 loaded=true
+pi-bolt: commands=45 tools=17 fallback=None runtime=bun extra_commands=["usage"] missing_commands=[] extra_tools=[] missing_tools=[] err=""
+pi-bolt-jit: commands=45 tools=17 fallback=None runtime=bun extra_commands=["usage"] missing_commands=[] extra_tools=[] missing_tools=[] err=""
+standard-pi: commands=44 tools=17 fallback=None runtime=node extra_commands=[] missing_commands=[] extra_tools=[] missing_tools=[] err=""

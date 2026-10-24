@@ -277,3 +277,14 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-section h3, .cx-section h4 { margin: 18px 0 8px; }
 
 .cx-flow-edge--spawn { stroke-dasharray: 3 5; opacity: .6; cursor: default; }
+
+/* agent helpers */
+.cx-panic { justify-content: space-between; }
+.cx-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm, 13px); }
+.cx-table th, .cx-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border, rgba(128,128,128,.25)); overflow-wrap: anywhere; }
+.cx-tree { list-style: none; margin: 4px 0 0; padding-left: 16px; border-left: 1px solid var(--border, rgba(128,128,128,.35)); }
+.cx-helpers { margin-top: 8px; }
+.cx-helpers-panel { margin-top: 18px; }
+.cx-helpers-panel .cx-sub1 { display: block; }
+.cx-internal { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 4px; font-size: 0.8em; font-weight: 600; color: var(--status-failed, #b00020); border: 1px solid currentColor; }
+.cx-fix-results .cx-pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; margin: .25rem 0 0; font-size: .85em; }

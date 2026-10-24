@@ -55,9 +55,17 @@ class Feed:
         return self.send("edge.add", p, scope, **kw)
 
 
+class _AnyKey:
+    """Test double for control_plane.lineage_key_scopes: every key may address any room/mission."""
+
+    @staticmethod
+    def get(_id, default=None):
+        return {"rooms": ("*",), "missions": ("*",)}
+
+
 def make():
     repo = ControlPlaneRepo()
-    svc = IngestService(repo)
+    svc = IngestService(repo, key_scopes=_AnyKey())
     return repo, svc, Feed(svc)
 
 
@@ -391,7 +399,9 @@ def test_attrs_size_bounded():
 @pytest.fixture
 def http():
     keys = {"op-" + "k": "operator", "vw-" + "k": "viewer", "in-" + "k": "ingest"}
-    server = ControlPlaneServer(ControlPlaneRepo(), api_keys=keys)
+    # the ingest key is explicitly allowed to address any room (operator YAML control_plane.lineage_key_scopes)
+    server = ControlPlaneServer(ControlPlaneRepo(), api_keys=keys,
+                                lineage_key_scopes={"in-" + "k": {"rooms": ["*"], "missions": ["*"]}})
     threading.Thread(target=server.serve, daemon=True).start()
     server.wait_until_ready()
     base = f"http://127.0.0.1:{server.port}"
@@ -459,7 +469,7 @@ def test_rebuild_from_durable_rows_equals_live_state():
 
     conn = V2Conn()
     repo = ControlPlaneRepo(sink=DurableEventSink(conn=conn, run=asyncio.run))
-    f = Feed(IngestService(repo))
+    f = Feed(IngestService(repo, key_scopes=_AnyKey()))
     f.node("agent:a1", label="A", scope="room")
     f.node("task:t1", scope="private")
     f.edge("reviewed", "review:r1", "task:t1", {"commit": "c1"}, scope="org")
@@ -489,7 +499,7 @@ class Clock:
 def make_clocked():
     clock = Clock()
     repo = ControlPlaneRepo(now=clock)
-    return repo, IngestService(repo), clock
+    return repo, IngestService(repo, key_scopes=_AnyKey()), clock
 
 
 def rows(repo):
@@ -859,7 +869,7 @@ def test_ownership_is_pinned_to_admission_order_not_clock_or_source_name():
     repo = ControlPlaneRepo()
     t = [1_800_000_000.0]
     repo._now = lambda: t[0]
-    svc = IngestService(repo)
+    svc = IngestService(repo, key_scopes=_AnyKey())
     fz, fo, fa = Feed(svc, "zeta"), Feed(svc, "op"), Feed(svc, "alpha")
     fz.send("node.upsert", {"node_type": "agent", "node_id": "agent:x"}, principal=V)
     with pytest.raises(PermissionError):                    # same instant, source sorts first

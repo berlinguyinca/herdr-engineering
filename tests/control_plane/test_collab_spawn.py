@@ -67,6 +67,11 @@ elif a[:2] == ["pane", "list"]: out({"panes": list(st["panes"].values())})
 elif a[:2] == ["tab", "list"]: out({"tabs": list(st["tabs"].values())})
 elif a[:2] == ["workspace", "list"]: out({"workspaces": list(st["ws"].values())})
 elif a[:2] == ["pane", "run"]: pass
+elif a[:2] == ["pane", "close"]:
+    p = st["panes"].pop(a[2]); t = st["tabs"][p["tab_id"]]; t["pane_count"] = t.get("pane_count", 1) - 1
+    if t["pane_count"] <= 0:
+        del st["tabs"][p["tab_id"]]
+    save(); out({"type": "ok"})
 elif a[1:2] == ["rename"] and a[0] in ("pane", "tab", "workspace"):
     key = {"pane": "panes", "tab": "tabs", "workspace": "ws"}[a[0]]
     st[key][a[2]]["label"] = " ".join(a[3:]); save(); out({"type": "ok"})

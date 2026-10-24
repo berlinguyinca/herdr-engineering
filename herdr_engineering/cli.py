@@ -1870,7 +1870,7 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent
+    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -1909,6 +1909,11 @@ def _cmd_dev_agent(args) -> int:
     # extra excluded ports + the dev-port window the agent will register.
     extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
         "agent_exclude_ports", []))
+    try:
+        agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
+    except ValueError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
     def control_plane_for(host_cfg):
         return fabric_cfg.get("control_plane_url") or host_cfg.control_plane_url
 
@@ -1923,6 +1928,9 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=control_plane_for(live),
+            host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
+            host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
+            agent_binaries=agent_binaries,
         ))
     if args.once:
         summary = agent.scan_once()
@@ -2320,6 +2328,22 @@ def _parse_host_aliases(raw: str) -> dict[str, str]:
     return {a.strip(): c.strip() for a, c in pairs if a.strip() and c.strip()}
 
 
+def _require_durable_review_gate(cp: dict, dsn) -> None:
+    """An enabled review gate needs Postgres (``control_plane.pg_dsn``).
+
+    Gate state (PR states, review queue, author pins) is event-sourced and
+    written with ``require_durable=True``. Without a DSN the repo has no sink,
+    those writes would live only in memory and a restart would forget every
+    approval and escalation, so the real server refuses to start. The check
+    lives here, where the DSN is known: a ``ControlPlaneServer`` built directly
+    on an in-memory ``ControlPlaneRepo()`` (tests, embedding) is not refused.
+    """
+    gate = cp.get("review_gate")
+    if not dsn and isinstance(gate, dict) and gate.get("enabled") is True:
+        raise SystemExit("control_plane.review_gate needs durable storage: set "
+                         "control_plane.pg_dsn, or disable the review gate")
+
+
 def _cmd_cp_web(args) -> int:
     """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
 
@@ -2333,6 +2357,7 @@ def _cmd_cp_web(args) -> int:
 
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
+    lineage_key_scopes = {}
     if args.collab_only:
         # The public collab container is given only the collab slice of the central
         # file (`fleet config render-collab`): no fleet endpoint, no API keys, no DSN.
@@ -2358,6 +2383,19 @@ def _cmd_cp_web(args) -> int:
         merged = {str(k): str(v) for k, v in file_keys.items()}
         merged.update(api_keys or {})
         api_keys = merged or None
+        raw_scopes = cp.get("lineage_key_scopes") or {}
+        if not isinstance(raw_scopes, dict):
+            raise SystemExit("fleet config control_plane.lineage_key_scopes must map an api key to {rooms: [...], missions: [...]}")
+        for key, allow in raw_scopes.items():
+            if (str(key) not in (api_keys or {}) or not isinstance(allow, dict) or set(allow) - {"rooms", "missions"}
+                    or not all(isinstance(allow.get(n, []), list) and all(isinstance(v, str) and v for v in allow.get(n, []))
+                               for n in ("rooms", "missions"))):
+                raise SystemExit("fleet config control_plane.lineage_key_scopes: each entry must name a configured api key "
+                                 "and hold only rooms/missions lists of non-empty strings")
+        if any((api_keys or {}).get(str(k)) == "operator" for k in raw_scopes):
+            raise SystemExit("fleet config control_plane.lineage_key_scopes: an entry names an operator-role key; operator keys "
+                             "are not restricted, so the entry would silently do nothing. Remove it or use a non-operator key")
+        lineage_key_scopes = {str(k): v for k, v in raw_scopes.items()}
     if args.collab_cognito_group is None:
         args.collab_cognito_group = "local.dev"
     # The Postgres DSN comes from the fleet file's control_plane section (the
@@ -2366,6 +2404,12 @@ def _cmd_cp_web(args) -> int:
     inspector_limits = cp.get("inspector_limits") or {}
     if not isinstance(inspector_limits, dict):
         raise SystemExit("fleet config control_plane.inspector_limits must be a mapping")
+    from .control_plane.retention import usage_retention_config
+    try:
+        usage_retention = usage_retention_config(cp.get("llm_proxy"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    _require_durable_review_gate(cp, dsn)
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
@@ -2420,7 +2464,8 @@ def _cmd_cp_web(args) -> int:
             from .control_plane.collab import ApprovalPolicy
             approval = ApprovalPolicy(auto_groups=[args.collab_cognito_group],
                                       approver_groups=args.collab_approver_group)
-        collab = CollabService(auth, sink=sink, public_config=public, approval=approval)
+        collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
+                               summary_fix=getattr(args, "collab_summary_fix", None))
         if args.collab_only:
             collab.hydrate(sink.load())
     elif args.collab_users_file:
@@ -2436,7 +2481,7 @@ def _cmd_cp_web(args) -> int:
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
         collab = CollabService(StaticTokenAuthenticator(users), sink=sink)
-    svr = ControlPlaneServer(repo, api_keys=api_keys,
+    svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
                              # collab-only has no operator listener, so nothing is left open
@@ -2447,6 +2492,7 @@ def _cmd_cp_web(args) -> int:
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              summary_config=cp.get("agent_summaries") or {},
                              review_quorum=_review_quorum_config(cp),
+                             usage_retention=usage_retention,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
@@ -2512,6 +2558,8 @@ COLLAB_CONFIG_KEYS = {
     "open_signup": ("collab_open_signup", bool),
     "approver_groups": ("collab_approver_group", list),
     "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
+    # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
+    "summary_fix": ("collab_summary_fix", dict),
 }
 
 
@@ -2527,6 +2575,13 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
+        if kind is dict:
+            from .control_plane.collab import summary_fix_config
+            try:
+                setattr(args, dest, summary_fix_config(value))
+            except ValueError as exc:
+                raise SystemExit(f"fleet config {exc}") from None
+            continue
         if kind is list:
             if isinstance(value, str):
                 value = [value]
