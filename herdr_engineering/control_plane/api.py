@@ -697,7 +697,8 @@ def _make_handler(server, public=False, operator=False):
             return self._jsonrpc(collab_mcp.handle, "MCP")
 
         def _jsonrpc(self, handle, label):
-            from .collab import MAX_BODY
+            from .collab import MAX_BODY, CollabError
+            from .collab_mcp import MAX_UPLOAD_BODY, UPLOAD_MANIFEST_TOOLS
             if server.collab is None:
                 return self._deny(404, "not found")
             if self._rate_limit(self._proxied_client()):
@@ -712,13 +713,30 @@ def _make_handler(server, public=False, operator=False):
             if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                 return self._deny(415, "application/json required")
             length = _content_length(self.headers.get("Content-Length"))
-            if length is None or length <= 0 or length > MAX_BODY:
+            limit = MAX_UPLOAD_BODY if label == "MCP" else MAX_BODY
+            if length is None or length <= 0 or length > limit:
                 return self._deny(413, "request body size not allowed")
+            if length > MAX_BODY:
+                # Authenticate before allocating a high-volume manifest. Normal
+                # room tools and A2A retain their original request-size boundary.
+                try:
+                    principal = server.collab.authenticate(
+                        self.headers.get("Authorization", ""), self.headers.get("X-Herdr-Device"))
+                except CollabError:
+                    return self._deny(401, "unauthorized")
+                if not principal.is_agent:
+                    return self._deny(413, "request body size not allowed")
             try:
                 message = json.loads(self.rfile.read(length))
             except (ValueError, RecursionError):
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32700, "message": "parse error"}}, 400)
+            if length > MAX_BODY:
+                params = message.get("params") if isinstance(message, dict) else None
+                name = params.get("name") if isinstance(params, dict) else None
+                if (not isinstance(message, dict) or message.get("method") != "tools/call" or not isinstance(name, str)
+                        or name not in UPLOAD_MANIFEST_TOOLS):
+                    return self._deny(413, "request body size not allowed")
             try:
                 status, payload = handle(
                     server.collab, message, self.headers.get("Authorization", ""),
