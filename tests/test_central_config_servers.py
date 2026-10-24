@@ -185,6 +185,18 @@ def test_web_reads_everything_from_the_fleet_file_and_ignores_env(tmp_path, monk
     assert seen["server_kw"]["ci_actions"] is True
 
 
+def test_web_reads_usage_retention_from_llm_proxy_section(tmp_path, monkeypatch, old_env, capsys):
+    seen = _run_web(monkeypatch, make_file(tmp_path, llm_proxy={"max_inflight": 4, "raw_retention_days": 3}))
+    assert seen["server_kw"]["usage_retention"] == {"raw_retention_days": 3, "rollup_retention_days": 400}
+    seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
+    assert seen["server_kw"]["usage_retention"] == {"raw_retention_days": 14, "rollup_retention_days": 400}
+
+
+def test_web_refuses_invalid_usage_retention(tmp_path, monkeypatch, old_env, capsys):
+    with pytest.raises(SystemExit, match="raw_retention_days"):
+        _run_web(monkeypatch, make_file(tmp_path, llm_proxy={"raw_retention_days": 0}))
+
+
 def test_web_without_file_has_no_durable_config_even_with_env(tmp_path, monkeypatch, old_env, capsys):
     seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
     assert "sink_dsn" not in seen and seen["self_report"]["dsn"] is None
@@ -498,6 +510,43 @@ def test_dashboard_host_names_are_a_collab_config_key():
     cli._apply_collab_config(args, {"collab": {"dashboard_hosts": ["dev.lan"]}})
     assert args.collab_dashboard_host == ["dev.lan"]
     assert "dashboard_hosts" in fcc.COLLAB_KEYS
+
+
+SUMMARY_FIX = {"room_id": "collab_room1", "requester_agent_id": "collab_agent1"}
+
+
+def test_summary_fix_room_is_a_validated_collab_config_key():
+    import argparse
+    args = argparse.Namespace()
+    cli._apply_collab_config(args, {"collab": {"summary_fix": dict(SUMMARY_FIX)}})
+    assert args.collab_summary_fix == SUMMARY_FIX
+    for bad in ({"room_id": "collab_room1"}, dict(SUMMARY_FIX, api_key="hca_x"), "collab_room1",
+                dict(SUMMARY_FIX, room_id=""), dict(SUMMARY_FIX, requester_agent_id="bad id")):
+        with pytest.raises(SystemExit, match="summary_fix"):
+            cli._apply_collab_config(argparse.Namespace(), {"collab": {"summary_fix": bad}})
+
+
+def test_summary_fix_room_rides_in_the_collab_slice(tmp_path):
+    import json as _json
+    out = tmp_path / "collab.json"
+    fcc.render_collab(fcc.load_fleet_config(make_file(tmp_path, collab=dict(COLLAB, summary_fix=SUMMARY_FIX))), out)
+    assert _json.loads(out.read_text())["sections"]["control_plane"]["values"]["collab"]["summary_fix"] == SUMMARY_FIX
+    out.unlink()
+    (tmp_path / "fleet-config.yaml").unlink()
+    bad = make_file(tmp_path, collab=dict(COLLAB, summary_fix=dict(SUMMARY_FIX, secret="s3cret")))
+    with pytest.raises(fcc.FleetConfigError, match="summary_fix: unknown keys: secret"):
+        fcc.render_collab(fcc.load_fleet_config(bad), out)
+
+
+def test_collab_service_refuses_a_malformed_summary_fix_config():
+    from herdr_engineering.control_plane.collab import (
+        CollabError,
+        CollabService,
+        StaticTokenAuthenticator,
+    )
+    with pytest.raises(CollabError):
+        CollabService(StaticTokenAuthenticator({}), summary_fix={"room_id": 3})
+    assert CollabService(StaticTokenAuthenticator({}), summary_fix=SUMMARY_FIX).summary_fix == SUMMARY_FIX
 
 
 # ------------------------------------------------------------- review gate durability

@@ -9,6 +9,7 @@ import { defineComponents } from './herdr-web-components/index.js';
 import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
 import { mountInspector } from './inspector-view.js';
 import { mountSessionWorkspace } from './session-workspace.js';
+import { mountTerminalAttach } from './terminal-attach.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
@@ -16,8 +17,9 @@ import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
-import { recordOutcome, statusOutcome, reportFreshness } from './record-state.js';
+import { recordOutcome, statusOutcome } from './record-state.js';
 import { renderFleetMatrix } from './fleet-view.js';
+import { renderHostDetail, renderHostCard, HOST_CARD_STYLE, RANGES, safeHostId } from './host-view.js';
 import { configBadge, configNotice, indexConfigStatus } from './fleet-config-badge.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
@@ -261,7 +263,6 @@ async function viewSession(parts, revision) {
     const reportedStatus = terminal && statusOutcome(s.status) !== outcome ? s.stage : s.status;
     const clip = value => typeof value === 'string' ? value.slice(0, 180) : '';
     const project = typeof s.cwd === 'string' ? s.cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
-    const attach = typeof s.attach === 'string' ? s.attach : '';
     const fields = [['Agent ID',s.session_id],['Last reported status',s.status],['Stage',s.stage],['Directory',s.cwd],['Git branch',s.branch],['PID',s.pid],['Command line',s.cmdline],['Model',s.model],['Last reported',formatTimestamp(s.updated_at)]].filter(([,v])=>v != null && v !== '');
     root.innerHTML = `<style>.sd-head{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:14px 0}.sd-meta{color:var(--text-secondary);line-height:1.6;overflow-wrap:anywhere}.sd-details{margin:14px 0;overflow-wrap:anywhere}.sd-details summary{cursor:pointer;font-weight:600}.sd-details dl{display:grid;grid-template-columns:minmax(100px,auto) minmax(0,1fr);gap:8px 16px}.sd-details dt{color:var(--text-secondary)}.sd-details dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.sd-title{overflow-wrap:anywhere}@media(max-width:600px){.sd-details dl{display:block}.sd-details dd{margin:4px 0 12px}}</style>
       <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Agents</a>
@@ -271,7 +272,8 @@ async function viewSession(parts, revision) {
       ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       ${relatedIntegrationLinks(s,'session',s.session_id)}
-      <details class="hd-card sd-details" id="session-details"><summary>Agent details and attachment</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}${attach ? `<div class="hd-inline"><code style="flex:1;overflow-wrap:anywhere">${esc(attach)}</code><button class="hd-btn" id="copy-attach">Copy attach command</button></div>` : ''}</details>
+      <div id="session-terminal" class="sd-details"></div>
+      <details class="hd-card sd-details" id="session-details"><summary>Agent details</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}</details>
       <div id="session-workspace-host"></div>
       <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
       <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream"><span class="muted">Loading recorded events…</span></div></details>`;
@@ -282,7 +284,8 @@ async function viewSession(parts, revision) {
       if (advanced.open && !disposeAdvanced) disposeAdvanced = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
       else if (!advanced.open && disposeAdvanced) { disposeAdvanced(); disposeAdvanced = null; document.getElementById('inspector-host').replaceChildren(); }
     });
-    disposeInspector = () => { disposeWorkspace(); if (disposeAdvanced) disposeAdvanced(); };
+    const disposeTerminal = mountTerminalAttach(document.getElementById('session-terminal'), client, s, {copyText});
+    disposeInspector = () => { disposeWorkspace(); disposeTerminal(); if (disposeAdvanced) disposeAdvanced(); };
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();
@@ -299,8 +302,6 @@ async function viewSession(parts, revision) {
     }
     const stream = document.getElementById('session-stream');
     streamList('session',s.session_id).then(html=>{if(stream.isConnected && revision===renderRevision)stream.innerHTML=html;}).catch(()=>{if(stream.isConnected)stream.innerHTML='<span class="muted">Recorded events could not load.</span>';});
-    const copyBtn = document.getElementById('copy-attach');
-    if (copyBtn) copyBtn.addEventListener('click',()=>copyText(attach,copyBtn));
   } catch (error) {
     if (revision !== renderRevision) return;
     throw new Error(controller.signal.aborted ? 'Agent details could not load. Try again.' : error.message);
@@ -350,46 +351,26 @@ async function viewHosts() {
   const driftedOnly = route().query.get('drift') === '1';
   const now = Date.now();
   root.innerHTML = `<h1>Hosts</h1>
-    ${configNotice(cfg)}
-    <div class="hd-grid">` + hosts.map((h) => {
-      const fresh = reportFreshness(h.last_seen, now) === 'current';
-      return `<div class="hd-card">
-      <div class="hd-card__title"><a href="#/hosts/${esc(h.host_id)}">${esc(h.host_name)}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${fresh ? esc(h.status) : 'stalled'}"></herdr-status> ${configBadge(cfg, h)}</div>
-      <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code> · ` : ''}${fresh ? 'seen' : '<strong>no report since</strong>'} ${h.last_seen ? formatTimestamp(h.last_seen) : 'never'}</div>
-      ${Number.isFinite(h.cpu) || Number.isFinite(h.mem) ? `<div class="hd-card__sub">${[Number.isFinite(h.cpu) ? `CPU ${h.cpu}%` : '', Number.isFinite(h.mem) ? `memory ${h.mem}%` : ''].filter(Boolean).join(' · ')}</div>` : ''}
-    </div>`; }).join('') + `</div>
+    ${HOST_CARD_STYLE}${configNotice(cfg)}
+    <div class="hd-grid">` + hosts.map((h) => renderHostCard(h, { now, cfg })).join('') + `</div>
     <h2 style="margin-top:24px">Fleet versions</h2>
     <p class="hd-card__sub"><a href="#/hosts${driftedOnly ? '' : '?drift=1'}">${driftedOnly ? 'Show all components' : 'Show only components that differ'}</a></p>
     ${renderFleetMatrix(matrix, { driftedOnly })}`;
 }
 
-async function viewHost(parts) {
-  const h = await client.request(`/api/v1/hosts/${esc(parts[1])}`);
+async function viewHost(parts, revision) {
+  const id = safeHostId(parts[1]);
+  if (!id) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
+  const requested = route().query.get('range');
+  const range = RANGES.includes(requested) ? requested : '1h';
+  // Only the host fetch may fail the page; missing history degrades to empty sparklines.
+  const [h, telemetry] = await Promise.all([
+    client.request(`/api/v1/hosts/${id}`).catch((err) => { if (err?.status === 404) return null; throw err; }),
+    client.request(`/api/v1/hosts/${id}/telemetry?range=${range}`).catch(() => ({ samples: [] })),
+  ]);
+  if (revision !== renderRevision) return;
   if (!h || h.error) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
-  let cpu = '—', mem = '—', disk = '—', seen = '—';
-  try {
-    const { samples } = await client.request(`/api/v1/hosts/${esc(parts[1])}/telemetry?limit=1`);
-    if (samples && samples.length) {
-      const s = samples[samples.length - 1];
-      const pct = (v) => (Number.isFinite(v) ? `${v}%` : '—');
-      cpu = pct(s.cpu ?? s.cpu_pct);
-      mem = pct(s.mem ?? s.mem_pct);
-      disk = pct(s.disk_pct);
-      seen = formatTimestamp(s.at ?? h.last_seen);
-    }
-  } catch { /* telemetry optional */ }
-  root.innerHTML = `
-    <h1>${esc(h.host_name)}</h1>
-    <div style="margin:8px 0"><herdr-status stage="${esc(h.status)}"></herdr-status>
-      <span class="hd-card__sub"> · <herdr-ident kind="host" id="${esc(h.host_id)}"></herdr-ident></span></div>
-    <div class="hd-grid">
-      <herdr-metric label="Tailnet IP" value="${esc(h.tailnet_ip)}"></herdr-metric>
-      <herdr-metric label="CPU" value="${esc(cpu)}"></herdr-metric>
-      <herdr-metric label="Memory" value="${esc(mem)}"></herdr-metric>
-      <herdr-metric label="Disk" value="${esc(disk)}"></herdr-metric>
-    </div>
-    <p class="hd-card__sub">last telemetry ${esc(seen)}</p>`;
+  root.innerHTML = renderHostDetail(h, telemetry, { range, now: Date.now() });
 }
 
 async function viewActivity() {

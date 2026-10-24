@@ -104,3 +104,36 @@ def redact_payload(payload: Any, *, _seen=None) -> Any:
     if isinstance(payload, tuple):
         return tuple(redact_payload(item, _seen=_seen) for item in payload)
     return payload
+
+
+def redact_values(payload: Any) -> Any:
+    """Like ``redact_payload`` but never by key name: only string values are scanned."""
+    if isinstance(payload, str):
+        return redact_text(payload)
+    if isinstance(payload, dict):
+        return {key: redact_values(value) for key, value in payload.items()}
+    if isinstance(payload, (list, tuple)):
+        return type(payload)(redact_values(item) for item in payload)
+    return payload
+
+
+#: Host state keys whose dict KEYS are data (package / extension / unit names),
+#: so key-name redaction would turn e.g. a pi extension ``auth-helper`` into
+#: "[REDACTED]" and report permanent version drift. Their values are still scanned.
+HOST_STATE_VALUE_ONLY = ("versions", "pins", "updates", "fleet_update")
+
+
+def redact_ingest_body(body: Any) -> Any:
+    """Redaction for a generic ``/api/v1/ingest`` envelope (see ``HOST_STATE_VALUE_ONLY``)."""
+    if not (isinstance(body, dict) and body.get("entity_type") == "host"
+            and isinstance(body.get("payload"), dict)):
+        return redact_payload(body)
+    payload = body["payload"]
+    rest = {k: v for k, v in body.items() if k != "payload"}
+    out = redact_payload(rest)
+    out["payload"] = redact_payload(
+        {k: v for k, v in payload.items() if k not in HOST_STATE_VALUE_ONLY})
+    for key in HOST_STATE_VALUE_ONLY:
+        if key in payload:
+            out["payload"][key] = redact_values(payload[key])
+    return out

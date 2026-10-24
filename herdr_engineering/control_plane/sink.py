@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Any
 
 from .bridge import _LoopRunner
-from .events import Event, EventStore
+from .events import V2_COLUMNS, Event, EventStore
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +48,12 @@ def _dict_to_event(ev: dict) -> Event:
         sequence=ev.get("sequence", 0),
         event_type=ev.get("event_type", ""),
         payload=ev.get("payload") or {},
+        **{name: ev.get(name) for name in V2_COLUMNS},
     )
+
+
+class EventAlreadyStored(RuntimeError):
+    """The durable log already holds this event_id (not a write failure)."""
 
 
 class DurableEventSink:
@@ -92,5 +97,42 @@ class DurableEventSink:
         # permits one operation per connection, including reconnection.
         with self._write_lock:
             self._ensure_store()
+            # append() returns False only for an existing event_id; any write
+            # error propagates from here unchanged.
             if not self._run(self._store.append(_dict_to_event(ev))):
-                raise RuntimeError("durable event insert was not acknowledged")
+                raise EventAlreadyStored(
+                    "durable event insert was not acknowledged "
+                    "(event_id already stored)")
+
+    def stored_identity(self, event_id: str, actor_id: str = ""):
+        """(source, source_sequence) of this principal's stored event, or None when absent."""
+        with self._write_lock:
+            self._ensure_store()
+            return self._run(self._store.identity(event_id, actor_id))
+
+    def record_source_state(self, state: dict) -> None:
+        """Best-effort upsert of per-source ingest state (fabric_event_sources)."""
+        import json
+        try:
+            with self._write_lock:
+                self._ensure_store()
+                self._run(self._store._conn.execute(
+                    "INSERT INTO fabric_event_sources "
+                    "(source_actor, source, last_sequence, last_seen_at, gaps) VALUES ($1,$2,$3,$4,$5) "
+                    "ON CONFLICT (source_actor, source) DO UPDATE SET "
+                    "last_sequence=EXCLUDED.last_sequence, "
+                    "last_seen_at=EXCLUDED.last_seen_at, gaps=EXCLUDED.gaps",
+                    state.get("actor") or "", state["source"], state["last_sequence"],
+                    _parse_dt(state["last_seen_at"]), json.dumps(state["gaps"])))
+        except Exception:
+            log.exception("durable sink failed to persist source state %s",
+                          state.get("source"))
+
+
+    def prune_events_before(self, entity_type: str, cutoff: datetime) -> None:
+        """Delete one entity type's durable events older than ``cutoff`` (retention)."""
+        with self._write_lock:
+            self._ensure_store()
+            self._run(self._store._conn.execute(
+                f"DELETE FROM {self._events_table} WHERE entity_type=$1 AND source_timestamp < $2",
+                entity_type, cutoff))

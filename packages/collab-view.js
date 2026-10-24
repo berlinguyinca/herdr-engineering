@@ -3,6 +3,9 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
+import {
+  createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
+} from './collab-helpers.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import {
@@ -13,8 +16,8 @@ const store = new TokenStore(window.sessionStorage);
 let operator = false;   // the local owner on the dashboard: no sign-in, the server knows who they are
 const api = new CollabApi(() => (operator ? { access: 'operator', id: 'operator' } : store.get()));
 const ROLES = [['contributor', 'Can chat'], ['viewer', 'Read only'], ['guest', 'Guest (read only, expires)']];
-const PERMS = [['read', 'Read messages'], ['post', 'Write messages'], ['execute', 'Receive tasks'], ['instruct', 'Send tasks to agents']];
-const PERM_SHORT = { read: 'Read', post: 'Write', execute: 'Receive tasks', instruct: 'Send tasks' };
+const PERMS = [['read', 'Read messages'], ['post', 'Write messages'], ['execute', 'Receive tasks'], ['instruct', 'Send tasks to agents'], ['spawn_helpers', 'Start helper agents']];
+const PERM_SHORT = { read: 'Read', post: 'Write', execute: 'Receive tasks', instruct: 'Send tasks', spawn_helpers: 'Start helpers' };
 const ROLE_LABEL = { owner: 'Owner', contributor: 'Can chat', viewer: 'Read only', guest: 'Guest' };
 
 async function loadConfig() {
@@ -213,10 +216,16 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           <span class="hd-card__title">${esc(r.name)}</span>
           <span class="cx-row cx-row--between">${pill(roleLabel(r.role), r.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}<span class="hd-card__sub">Open →</span></span></button>`).join('')}</div>`
         : '<div class="hd-empty">No rooms yet. Create your first one below.</div>'}
+      ${operator ? '<div id="hcn-helpers-panel"></div>' : ''}
       <section class="cx-section"><h2>New room</h2>
         <form id="hcn-new" class="hd-card cx-form"><label class="cx-field">Room name<input name="name" required maxlength="120" placeholder="e.g. Metabolomics review"></label>
           <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></section>`, strip);
-    document.querySelectorAll('[data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
+    document.querySelectorAll('#hcn-rooms [data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
+    if (operator && $('hcn-helpers-panel')) {   // all rooms' host requests, helpers and the panic switch; the operator is rarely a member of the rooms asking
+      const panel = createHelpersPanel({ container: $('hcn-helpers-panel'), api, operator, getRooms: async () => (await api.rooms()).rooms || [], go, hidden: () => document.hidden });
+      teardown = () => panel.destroy();
+      panel.start();
+    }
     $('hcn-new').onsubmit = async (ev) => {
       ev.preventDefault();
       const name = new FormData(ev.target).get('name');
@@ -547,7 +556,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [] };
+    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
     const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents']]), ...(canInvite ? [['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
@@ -567,7 +576,9 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       ${guest ? '' : `<section class="cx-panel cx-cols" id="hcn-p-agents" hidden>
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
-        ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}</section>`}
+        ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}
+        ${operator ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helpers</div><div id="hcn-panic"></div><div class="hd-card__title">Host access requests</div><div id="hcn-egress"></div><div class="hd-card__title">External hosts</div><div id="hcn-hosts-table"></div></div>' : ''}
+        ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helper profile</div><div id="hcn-profile-box"></div></div>' : ''}</section>`}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
@@ -583,7 +594,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const stale = new Set();               // panels whose redraw was held back because you were typing in them
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
-    teardown = () => { alive = false; composer?.dispose(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
+    teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
     const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
 
     // Replace a container's markup only when it changed and you are not typing in it.
@@ -719,6 +730,30 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       });
     };
 
+    // ---- agent helpers: panic switch, host-access requests and hosts (operator), profile (owner)
+    const loadHelpers = async () => {
+      if (operator) {
+        try { S.egress = ((await api.egressRequests()).requests || []).filter((r) => r.room_id === roomId); } catch { /* keep the old list */ }
+        try { const h = await api.helpers(); S.helpers = h.helpers || []; S.paused = Boolean(h.paused); } catch { /* keep */ }
+      } else { try { S.helpers = (await api.myHelpers()).helpers || []; } catch { /* guests and old servers: no helper list */ } }
+      if (operator) { try { const x = await api.egressAllowlist(roomId); S.allow = x.allowlist || []; S.entries = Array.isArray(x.entries) ? x.entries : null; } catch { /* keep */ } }
+      if (canInvite) { try { S.profile = await api.roomProfile(roomId); } catch { /* not readable: keep */ } }
+    };
+    const drawHelpers = () => {
+      if (operator) {
+        put('hcn-panic', renderPanic(S.paused, { operator }));
+        put('hcn-egress', renderEgressRequests(S.egress, { operator }));
+        put('hcn-hosts-table', renderHostsTable(S.allow || [], S.egress, { operator, room: roomId, permanent: S.profile && Array.isArray(S.profile.permanent_hosts) ? S.profile.permanent_hosts : null, entries: S.entries }));
+      }
+      if (canInvite && S.profile) put('hcn-profile-box', renderProfileEditor(S.profile, { owner: canInvite }));
+    };
+    const unbindHelpers = wireHelperHandlers(root, {
+      api, roomId, operator, owner: canInvite, act, getProfile: () => S.profile, setProfile: (p) => { S.profile = p; $('hcn-profile-msg').textContent = 'Saved.'; },
+      onError: (m) => { $('hcn-profile-msg').textContent = m; },
+      refresh: async () => { await loadHelpers(); drawHelpers(); },
+      readForm: (f) => { const fd = new FormData(f); return { services: fd.get('services'), ssh_secret_names: fd.get('ssh_secret_names'), allowed_models: fd.get('allowed_models'), allowed_families: fd.getAll('allowed_families'), tools_allowed: fd.get('tools_allowed') !== null, permanent_hosts: fd.get('permanent_hosts') }; },
+    });
+
     // ---- live flow: nodes are people/agents, edges are tasks; the dashboard adds fabric session state
     let flowSig = new Map();
     const showDetail = (html) => { const d = $('hcn-flow-detail'); if (d) d.innerHTML = html; };
@@ -736,7 +771,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         onNode: (n) => {
           const mine = flow.edges.filter((e) => e.from === n.id || e.to === n.id).map((e) => `${esc(flow.nodes.find((x) => x.id === e.from)?.name)} → ${esc(flow.nodes.find((x) => x.id === e.to)?.name)}: ${esc(Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}`);
           const f = n.fabric ? `<br>Fabric agent ${esc(n.fabric.status || '')}${n.fabric.host ? ` on ${esc(n.fabric.host)}` : ''}${n.fabric.mission_title ? ` · mission ${esc(n.fabric.mission_title)}` : ''}${n.fabric.branch ? ` · ${esc(n.fabric.branch)}` : ''}${n.fabric.parent_session_id ? ` · started by agent ${esc(n.fabric.parent_session_id)}` : ''}${nativeSessionLink(n.fabric.session_id) ? `<br>${nativeSessionLink(n.fabric.session_id)}` : ''}` : '';
-          showDetail(`<b>${esc(n.fabric?.display_name || (n.kind === 'agent' ? `@${n.name}` : n.name))}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}`);
+          showDetail(`<b>${esc(n.fabric?.display_name || (n.kind === 'agent' ? `@${n.name}` : n.name))}</b> ${n.owner_email ? `(${esc(n.owner_email)}) ` : ''}${n.actions && n.actions.length ? permPills(n.actions) : ''}${n.group ? `<br>herdr workspace ${esc(n.group)}` : ''}${n.parent_agent_id ? `<br>started under @${esc((flow.nodes.find((x) => x.agent_id === n.parent_agent_id) || {}).name || 'another agent')}` : ''}${f}${mine.length ? `<br>${mine.join('<br>')}` : ''}${n.kind === 'agent' ? renderHelperTree(n.agent_id, flow, S.helpers, { operator, viewerId: me && me.user_id }) : ''}`);
         },
         onEdge: (e) => {
           const ts = flow.tasks.filter((t) => t.from === e.from && t.to === e.to).slice(0, 5);
@@ -768,10 +803,11 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       setBadge('tasks', S.tasks.filter((t) => ['pending', 'accepted'].includes(t.status)).length);
       if (sub === 'tasks') drawTasks();
       else if (sub === 'flow') drawFlow();
-      else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); }
+      else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); }
     }
     const paintPanel = async () => {
       if (sub === 'agents' && canPost) await loadMine();
+      if (sub === 'agents') await loadHelpers();
       if (sub === 'people') await drawPeople();
       paint();
     };

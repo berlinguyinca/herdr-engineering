@@ -107,6 +107,20 @@ export class HerdrClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { method: 'POST', body: {} });
   }
 
+  // Hand one stored blocker/next step back to the agent that owns the summary.
+  // The server re-checks `text` against the stored item and dedupes replays.
+  fixSummaryItem(id, list, index, text) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary/fix`, {
+      method: 'POST', body: { list, index, text },
+    });
+  }
+
+  // Terminal button: the server builds the attach command from the session record; the
+  // viewer runs it in their own terminal. Nothing is sent but the session id.
+  getTerminalAttach(id) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/terminal`, { method: 'POST', body: {} });
+  }
+
   renameAgent(id, name, expectedVersion) {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/name`, {
       method: 'POST', body: { name, expected_version: expectedVersion },

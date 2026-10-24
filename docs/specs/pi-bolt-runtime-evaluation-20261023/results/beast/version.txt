@@ -1,0 +1,5 @@
+standard-pi  ok=12/12 wall_ms med=363 p95=415 ci95=[351,387] cpu_s med=0.422 rss_MiB med=95
+pi-bolt      ok=12/12 wall_ms med=17 p95=23 ci95=[16,20] cpu_s med=0.018 rss_MiB med=57
+  wall vs standard-pi: clearly lower (disjoint 95% CIs)
+pi-bolt-jit  ok=12/12 wall_ms med=19 p95=22 ci95=[17,21] cpu_s med=0.019 rss_MiB med=57
+  wall vs standard-pi: clearly lower (disjoint 95% CIs)

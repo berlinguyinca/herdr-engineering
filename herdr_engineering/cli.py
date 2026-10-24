@@ -1880,7 +1880,7 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent
+    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -1919,6 +1919,11 @@ def _cmd_dev_agent(args) -> int:
     # extra excluded ports + the dev-port window the agent will register.
     extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
         "agent_exclude_ports", []))
+    try:
+        agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
+    except ValueError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
     def control_plane_for(host_cfg):
         return fabric_cfg.get("control_plane_url") or host_cfg.control_plane_url
 
@@ -1933,6 +1938,9 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=control_plane_for(live),
+            host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
+            host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
+            agent_binaries=agent_binaries,
         ))
     if args.once:
         summary = agent.scan_once()
@@ -2425,6 +2433,11 @@ def _cmd_cp_web(args) -> int:
     inspector_limits = cp.get("inspector_limits") or {}
     if not isinstance(inspector_limits, dict):
         raise SystemExit("fleet config control_plane.inspector_limits must be a mapping")
+    from .control_plane.retention import usage_retention_config
+    try:
+        usage_retention = usage_retention_config(cp.get("llm_proxy"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
@@ -2480,7 +2493,8 @@ def _cmd_cp_web(args) -> int:
             from .control_plane.collab import ApprovalPolicy
             approval = ApprovalPolicy(auto_groups=[args.collab_cognito_group],
                                       approver_groups=args.collab_approver_group)
-        collab = CollabService(auth, sink=sink, public_config=public, approval=approval)
+        collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
+                               summary_fix=getattr(args, "collab_summary_fix", None))
         if args.collab_only:
             collab.hydrate(sink.load())
     elif args.collab_users_file:
@@ -2506,6 +2520,7 @@ def _cmd_cp_web(args) -> int:
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              summary_config=cp.get("agent_summaries") or {},
+                             usage_retention=usage_retention,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
@@ -2571,6 +2586,8 @@ COLLAB_CONFIG_KEYS = {
     "open_signup": ("collab_open_signup", bool),
     "approver_groups": ("collab_approver_group", list),
     "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
+    # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
+    "summary_fix": ("collab_summary_fix", dict),
 }
 
 
@@ -2586,6 +2603,13 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
+        if kind is dict:
+            from .control_plane.collab import summary_fix_config
+            try:
+                setattr(args, dest, summary_fix_config(value))
+            except ValueError as exc:
+                raise SystemExit(f"fleet config {exc}") from None
+            continue
         if kind is list:
             if isinstance(value, str):
                 value = [value]

@@ -65,6 +65,30 @@ def test_only_the_work_directory_is_writable_and_nothing_else_is_visible(home):
 
 
 @needs_box
+def test_a_harness_behind_a_chain_of_symlinks_is_found_in_the_box(home, monkeypatch):
+    """codex's standalone install: ~/.local/bin/codex -> ~/.codex/packages/standalone/current/bin/codex, where
+    `current` is itself a link to releases/<version>. Every hop must resolve inside the box, not just both ends."""
+    rel = home / ".codex" / "packages" / "standalone" / "releases" / "9.9.9" / "bin"
+    rel.mkdir(parents=True)
+    (rel / "codex").write_text("#!/bin/sh\necho harness-ran\n")
+    (rel / "codex").chmod(0o755)
+    (home / ".codex" / "packages" / "standalone" / "current").symlink_to("releases/9.9.9")
+    lb = home / ".local" / "bin"
+    lb.mkdir(parents=True)
+    (lb / "codex").symlink_to(home / ".codex" / "packages" / "standalone" / "current" / "bin" / "codex")
+    monkeypatch.setenv("PATH", f"{lb}:{os.environ['PATH']}")
+    # helper mode: the operator's ~/.codex is NOT bound, so only the bound hops can make the link resolve
+    hd = home.parent / "harness"
+    for sub in ("", "claude", "codex", "pi"):
+        (hd / sub).mkdir(mode=0o700, exist_ok=True)
+    hd.chmod(0o700)
+    monkeypatch.setenv("HERDR_SANDBOX_HARNESS_DIR", str(hd))
+    r = box(home, "codex")
+    assert r.returncode == 0, r.stderr
+    assert "harness-ran" in r.stdout
+
+
+@needs_box
 def test_it_refuses_to_run_outside_the_work_area_or_without_bwrap(home, tmp_path):
     r = subprocess.run(["bash", str(SANDBOX), str(tmp_path), "true"], capture_output=True, text=True)
     assert r.returncode == 126 and "work/" in r.stderr

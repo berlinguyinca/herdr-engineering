@@ -137,13 +137,18 @@ install_spawn_timer() {
   install -m 0755 "$(dirname "$0")/collab-spawn.py" "$d/collab-spawn.py"
   install -m 0644 "$(dirname "$0")/collab-worker.sh" "$d/collab-worker.sh"
   install -m 0644 "$(dirname "$0")/collab-sandbox.sh" "$d/collab-sandbox.sh"
+  install -m 0755 "$(dirname "$0")/collab-egress.py" "$d/collab-egress.py"
   install -m 0755 "$(dirname "$0")/collab-audit-verify.py" "$d/collab-audit-verify.py"
+  install -m 0755 "$(dirname "$0")/collab-secrets.py" "$d/collab-secrets.py"     # room secrets for helpers
   cat > "$u/herdr-collab-spawn.service" <<UNIT
 [Unit]
 Description=Start collab agent fleets on the owner's hosts over herdr
 [Service]
 Type=oneshot
 TimeoutStartSec=10min
+# A helper's supervisor and egress proxy outlive the cycle that started them; the next cycles watch them
+# through the state directory. control-group (the default) would kill them when each cycle ends.
+KillMode=process
 ExecStart=/usr/bin/python3 "$d/collab-spawn.py" once --worker "$d/collab-worker.sh" --sandbox "$d/collab-sandbox.sh"
 UNIT
   cat > "$u/herdr-collab-spawn.timer" <<UNIT

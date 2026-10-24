@@ -10,6 +10,7 @@ Optional `X-API-Key` auth for multi-operator deployments (Spec §104).
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import logging
@@ -29,10 +30,18 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
-from .redact import redact_payload
+from .envelope import EnvelopeConflict
+from .events import SequenceCollision
+from .graph import DEFAULT_DEPTH, DEFAULT_EDGES, DEFAULT_NODES
+from .redact import redact_ingest_body, redact_payload
+
+log = logging.getLogger(__name__)
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
+_SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
+# Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
+_TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
 # The only routes the `reviewer` role may POST (review gate workers), and only it:
@@ -185,7 +194,7 @@ class ControlPlaneServer:
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 summary_config=None, summary_client=None):
+                 summary_config=None, summary_client=None, usage_retention=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -201,6 +210,9 @@ class ControlPlaneServer:
         other and are encrypted end-to-end via WireGuard.
         """
         self.repo = repo
+        from .retention import usage_retention_config
+        # control_plane.llm_proxy raw/rollup retention (validated; None = defaults).
+        self.usage_retention = usage_retention_config(usage_retention)
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row),
@@ -280,6 +292,12 @@ class ControlPlaneServer:
         # collab service, so the local owner needs no sign-in.
         self.collab_operator_url = collab_operator_url.rstrip("/") if collab_operator_url else None
         self.collab_dashboard_hosts = frozenset(h.lower() for h in collab_dashboard_hosts)
+        # "Let the agent fix this" on a dead session: start a text-only helper through the collab
+        # service's summary-fix room (it answers 409 helper_unavailable when none is configured).
+        from .summary_fix import http_helper_spawner, inprocess_helper_spawner
+        self.summary_fix_helper = (
+            inprocess_helper_spawner(collab, operator_user) if collab is not None and operator_user
+            else http_helper_spawner(self.collab_operator_url) if self.collab_operator_url else None)
         if collab_only and public_port is None:
             raise ValueError("collab-only mode needs the public collaboration port")
         self.public_port = public_port
@@ -446,13 +464,23 @@ class ControlPlaneServer:
         self._httpd.serve_forever()
 
     def _sweep_loop(self, interval=300):
-        """Apply inspector age retention to idle sessions too (ingest only prunes the active one)."""
+        """Periodic retention, starting at once so re-hydrated expired rows do not linger."""
         while self._httpd is not None:
+            self.sweep_once()
             time.sleep(interval)
-            try:
-                self.repo.inspector.sweep()
-            except Exception:
-                pass
+
+    def sweep_once(self):
+        """Inspector age retention for idle sessions too (ingest only prunes the active
+        one) and token_usage raw retention (control_plane.llm_proxy.raw_retention_days)."""
+        from .retention import sweep_token_usage
+        try:
+            self.repo.inspector.sweep()
+        except Exception:
+            pass
+        try:
+            sweep_token_usage(self.repo, raw_retention_days=self.usage_retention["raw_retention_days"])
+        except Exception as exc:
+            log.warning("token_usage retention sweep failed: %s", type(exc).__name__)
 
     def wait_until_ready(self, timeout=5.0):
         self._ready.wait(timeout=timeout)
@@ -616,6 +644,21 @@ def _make_handler(server, public=False, operator=False):
                 if secrets.compare_digest(supplied, candidate):
                     return role
             return None
+
+        def _principal(self):
+            """Who the request authenticated as (server-side actor of ingest envelopes).
+
+            The API key itself is never recorded, only a short digest so
+            events from one credential can be grouped.
+            """
+            if not server._keys:
+                return {"kind": "operator", "id": "open-listener", "authenticated_by": "open_listener"}
+            supplied = self.headers.get("X-API-Key", "")
+            for candidate, role in server._keys.items():
+                if secrets.compare_digest(supplied, candidate):
+                    digest = hashlib.sha256(candidate.encode()).hexdigest()[:12]
+                    return {"kind": role, "id": f"key:{digest}", "authenticated_by": "api_key"}
+            return {"kind": "unknown", "id": None, "authenticated_by": "none"}
 
         def _deny(self, status, message):
             """Send the error response, close the connection, and report the refusal.
@@ -864,7 +907,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4):
+            if res.startswith("reviews") or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -1119,6 +1162,16 @@ def _make_handler(server, public=False, operator=False):
                 return self._api_post(parts, resource)
             except KeyError:
                 return self._send_json(404, {"error": "not found"})
+            except EnvelopeConflict as exc:
+                return self._send_json(409, {"error": str(exc), "reason": "conflict"})
+            except SequenceCollision:
+                return self._send_json(409, {"error": "sequence conflict", "reason": "conflict"})
+            except PermissionError:
+                # "reason" lets an emitter tell a lineage refusal from an auth failure
+                # (which has no reason); the body is identical whether or not the
+                # object exists.
+                return self._send_json(403, {"error": "not permitted to modify this lineage object",
+                                             "reason": "lineage_forbidden"})
             except ValueError as exc:
                 message = "Invalid GitHub query." if resource == "github" else str(exc)
                 return self._send_json(400, {"error": message})
@@ -1132,6 +1185,10 @@ def _make_handler(server, public=False, operator=False):
                     return self._send_json(503, {"error": "Review persistence is unavailable; no launch or decision was acknowledged."})
                 return self._send_json(503, {"error": "Integration service is unavailable."})
             except Exception as exc:  # never drop a connection: surface 500
+                if resource == "ingest":
+                    # Storage/driver errors can name tables, hosts or other events.
+                    logging.getLogger(__name__).exception("ingest failed")
+                    return self._send_json(500, {"error": "ingest failed"})
                 message = "GitHub service is unavailable." if resource == "github" else str(exc)
                 return self._send_json(500, {"error": message})
 
@@ -1333,7 +1390,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(r.fleet_inventory())
             if resource == "hosts":
                 if len(parts) > 5 and parts[5] == "telemetry":
-                    return self._json({"samples": r.list_telemetry(parts[4])})
+                    rng = _q(self.path, "range")
+                    if rng is not None:  # unknown range: ValueError -> 400
+                        return self._json({"samples": r.host_history(parts[4], rng), "range": rng})
+                    # ?limit= (the page asks for 1): full samples are up to 16 KiB each.
+                    limit = min(max(_qint(self.path, "limit", 100), 1), 500)
+                    return self._json({"samples": r.list_telemetry(parts[4], limit)})
                 if len(parts) == 5:
                     h = r.get_host(parts[4])
                     return self._json(h) if h else self._json(
@@ -1362,6 +1424,8 @@ def _make_handler(server, public=False, operator=False):
                     # per-entity stream: /api/v1/events?entity_type=mission&entity_id=m1
                     etype = _q(self.path, "entity_type")
                     eid = _q(self.path, "entity_id")
+                    if etype == "lineage":
+                        return self._json({"error": "not found"}, 404)  # read via the scope-checked /api/v1/graph
                     if etype and etype.startswith("collab"):
                         return self._json({"error": "not found"}, 404)  # HCN has its own authenticated API
                     if not etype or not eid:
@@ -1392,6 +1456,10 @@ def _make_handler(server, public=False, operator=False):
                 if what == "models":
                     return self._json({"models": list(r.list_custom_models().values())})
                 return self._json({"error": "not found"}, 404)
+            if resource == "graph":
+                return self._graph_get(parts)
+            if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
+                return self._json({"sources": r.ledger.source_states(), "server_time": r._stamp()})
             if resource == "ingest":
                 return self._json({"endpoint": "POST /api/v1/ingest",
                                    "entities": ["host", "session", "mission"]})
@@ -1547,6 +1615,26 @@ def _make_handler(server, public=False, operator=False):
                 if receipt.get("error") in {"receipt_persistence_unavailable", "receipt_persistence_failed"}:
                     status = 503
                 return self._json({"ok": receipt["status"] == "delivered", **receipt}, status)
+            if resource == "sessions" and len(parts) == 6 and parts[5] == "terminal":
+                from .terminal_attach import AttachRefused, attach_commands
+                s = r.get_session(parts[4])
+                if s is None:
+                    return self._json({"error": "agent not found"}, 404)
+                try:
+                    return self._json(attach_commands(s, hosts=r.list_hosts(),
+                                                      peer=self.client_address[0]))
+                except AttachRefused as exc:
+                    return self._json(exc.body, exc.status)
+            if resource == "sessions" and len(parts) == 7 and parts[5:] == ["summary", "fix"]:
+                from .summary_fix import SummaryFixRefused, fix_summary_item
+                actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
+                try:
+                    status, result = fix_summary_item(server.agent_summaries, r, server.dispatcher,
+                                                      parts[4], body, actor=actor,
+                                                      helper_spawner=server.summary_fix_helper)
+                except SummaryFixRefused as exc:
+                    return self._json(exc.body, exc.status)
+                return self._json(result, status)
             if resource == "sessions" and len(parts) == 6 and parts[5] in {"name", "summary"}:
                 sid = parts[4]
                 if r.get_session(sid) is None:
@@ -1580,13 +1668,7 @@ def _make_handler(server, public=False, operator=False):
             if resource == "token-usage" and len(parts) == 4:
                 rows = body.get("records") if isinstance(body.get("records"), list) else [body]
                 for row in rows[:500]:
-                    r.record_token_usage(
-                        row.get("project"), row.get("model"), row.get("input_tokens"),
-                        row.get("output_tokens"), reasoning_tokens=row.get("reasoning_tokens"),
-                        cache_read_tokens=row.get("cache_read_tokens"),
-                        duration_ms=row.get("duration_ms"), success=row.get("success", True),
-                        request_id=row.get("request_id"), session_id=row.get("session_id"),
-                        mission_id=row.get("mission_id"), key_id=row.get("key_id"))
+                    r.record_token_usage_row(row)  # whitelisted fields only, never bodies
                 return self._json({"ok": True, "recorded": min(len(rows), 500)})
             if resource == "llm" and len(parts) >= 5:
                 what = parts[4]
@@ -1612,9 +1694,9 @@ def _make_handler(server, public=False, operator=False):
                 # blanket key-hint redaction would mangle ``input_tokens`` and
                 # ``passed``.
                 if isinstance(body, dict) and body.get("entity_type") in ("inspector", "mission_activity"):
-                    entity = server.ingest.ingest(body)
+                    entity = server.ingest.ingest(body, principal=self._principal())
                 else:
-                    entity = server.ingest.ingest(redact_payload(body))
+                    entity = server.ingest.ingest(redact_ingest_body(body), principal=self._principal())
                 if (server.agent_summaries and server.agent_summaries.config.enabled
                         and body.get("entity_type") == "inspector"):
                     payload = body.get("payload") or {}
@@ -1627,10 +1709,56 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"ok": True, "entity": entity})
             return self._json({"error": "not found"}, 404)
 
+        def _graph_get(self, parts):
+            """Lineage graph reads (viewer level). Every result is filtered by the
+            caller's principal; hidden and missing both answer 404."""
+            g = server.repo.graph
+            principal = self._principal()
+            if len(parts) >= 6 and parts[4] == "nodes" and len(parts) == 6:
+                def qi(name, default):
+                    raw = _q(self.path, name)
+                    if raw in (None, ""):
+                        return default
+                    try:
+                        return int(raw)
+                    except ValueError:
+                        raise ValueError(f"{name} must be an integer") from None
+                return self._json(g.get_node(
+                    principal, parts[5], edge_type=_q(self.path, "edge_type") or None,
+                    from_id=_q(self.path, "from_id") or None,
+                    limit=qi("limit", 200), offset=qi("offset", 0)))
+            if len(parts) == 7 and parts[4] == "nodes" and parts[6] in ("neighborhood", "subgraph"):
+                def num(name, default):
+                    raw = _q(self.path, name)
+                    if raw is None or raw == "":
+                        return default
+                    try:
+                        return int(raw)
+                    except ValueError:
+                        raise ValueError(f"{name} must be an integer") from None
+                kinds = _q(self.path, "edge_types")
+                return self._json(g.neighborhood(
+                    principal, parts[5], depth=num("depth", DEFAULT_DEPTH),
+                    max_nodes=num("max_nodes", DEFAULT_NODES),
+                    max_edges=num("max_edges", DEFAULT_EDGES),
+                    direction=_q(self.path, "direction") or "both",
+                    edge_types=set(kinds.split(",")) if kinds else None,
+                    include_removed=_q(self.path, "include_removed") == "true"))
+            if len(parts) == 5 and parts[4] == "edge":
+                edge_type, frm, to = (_q(self.path, n) for n in ("edge_type", "from_id", "to_id"))
+                if not (edge_type and frm and to):
+                    raise ValueError("edge_type, from_id and to_id are required")
+                return self._json(g.get_edge(principal, edge_type, frm, to,
+                                             commit=_q(self.path, "commit"),
+                                             plan_digest=_q(self.path, "plan_digest")))
+            return self._json({"error": "not found"}, 404)
+
         def _agent_capabilities(self, session):
             operator = self._role() == "operator"
             return {**session, "capabilities": {"rename_agent": operator,
-                                                "regenerate_summary": operator}}
+                                                "regenerate_summary": operator,
+                                                "fix_summary_item": operator,
+                                                "attach_terminal": operator}}
 
         def _named_inspector(self, data, sid):
             # Claim an existing provider preference before a helper/read path
