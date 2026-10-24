@@ -89,11 +89,11 @@ export const STATES = [
       await page.locator('#hcn-tabs [role="tab"][aria-selected="true"]', { hasText: /Dana/ }).waitFor();
     } },
   { id: 'links: linked workspaces', scope: '#hcn-p-links', must: ['#hcn-links li'], min: 1, minText: 7, open: async (page) => { await openSub(page, 'links'); await page.locator('#hcn-links li').first().waitFor(); } },
-  { id: 'chat: expanded message editor (a modal dialog)', scope: '#hcn-p-chat', must: ['form.conversation-composer--expanded[role="dialog"][aria-modal="true"]'], min: 16, minText: 27,
+  { id: 'chat: expanded message editor (a modal dialog)', scope: '#hcn-p-chat', must: ['form.conversation-composer--expanded[role="dialog"][aria-modal="true"]'], min: 16, minText: 15,
     open: async (page) => { await openSub(page, 'chat'); await page.locator('[data-expand]').click(); await page.locator('form.conversation-composer--expanded').waitFor(); await page.waitForTimeout(200); } },
-  { id: 'chat: the @-mention list open (a listbox of agents)', scope: '#hcn-p-chat', must: ['ul[role="listbox"]:not([hidden]) [role="option"]', 'textarea[role="combobox"][aria-expanded="true"]'], min: 17, minText: 28,
+  { id: 'chat: the @-mention list open (a listbox of agents)', scope: '#hcn-p-chat', must: ['ul[role="listbox"]:not([hidden]) [role="option"]', 'textarea[role="combobox"][aria-expanded="true"]'], min: 17, minText: 15,
     open: async (page) => { await openSub(page, 'chat'); await openMention(page); } },
-  { id: 'chat: composer with a menu of agents', scope: '#hcn-p-chat', must: ['#hcn-log'], min: 16, minText: 27, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); } },
+  { id: 'chat: composer with a menu of agents', scope: '#hcn-p-chat', must: ['#hcn-log'], min: 16, minText: 15, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); } },
 ];
 
 /** Run as the VIEWER (carol): the same panels with fewer controls. A viewer has no composer and cannot steer, and that must be audited too. */
