@@ -1974,10 +1974,15 @@ def _make_handler(server, public=False, operator=False):
                 for ev in reversed(server.repo.recent_events(limit=100)):
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()
-                while True:
+                started = time.monotonic()
+                # Bounded lifetime frees threads held by half-open clients;
+                # EventSource reconnects and replays.
+                while time.monotonic() - started < _MAX_SSE_SECONDS:
                     try:
                         ev = q.get(timeout=_SSE_IDLE_SECONDS)
                     except queue.Empty:
+                        if q not in server._subscribers:
+                            break  # dropped as a slow subscriber: close so the client reconnects
                         # comment frame keeps proxies/EventSource from timing out
                         self.wfile.write(b": keep-alive\n\n")
                         self.wfile.flush()
@@ -1988,6 +1993,7 @@ def _make_handler(server, public=False, operator=False):
                 pass
             finally:
                 server._subscribers.discard(q)
+                self.close_connection = True
             return None
 
         # ------------------------------------------------------------ static
