@@ -9,7 +9,8 @@ Packages are bounded canonical UTF-8 JSON (sorted keys, compact separators, not
 RFC 8785), with base64 file bytes. SHA-256 and Ed25519 cover the entire unsigned
 body including the manifest, file bytes and key ID. Postgres holds only manifests,
 references and audit tombstones. S3 conditional writes prohibit replacement.
-The supplied asyncpg connection must be used exclusively on its owning loop.
+Both asyncpg connections must be used exclusively on their owning loop. The
+journal connection must use autocommit and the same database/schema as the registry.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import base64
 import hashlib
 import json
 import re
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -152,9 +154,12 @@ def verify_skill_package(package: SkillPackage, trusted_keys: dict) -> Verificat
 
 
 class SkillRegistry:
-    def __init__(self, conn, *, s3, bucket: str, environment: str, signing_key,
+    def __init__(self, conn, *, journal_conn, s3, bucket: str, environment: str, signing_key,
                  key_id: str, trusted_keys: dict, principal_valid, maintainers=()):
         self.conn, self.s3, self.bucket = conn, s3, bucket
+        if journal_conn is conn:
+            raise ValueError('package journal requires an independent autocommit connection')
+        self.journal_conn = journal_conn
         self.environment = _segment(environment)
         self.signing_key, self.key_id = signing_key, _segment(key_id)
         self.trusted_keys = dict(trusted_keys)
@@ -189,22 +194,64 @@ class SkillRegistry:
         finally:
             body.close()
 
-    async def _write(self, package: SkillPackage) -> str:
+    async def _write(self, package: SkillPackage, *, request_key: str | None = None) -> str:
         key, data = self._key(package.sha256), _encode(package)
-        def put():
-            try:
-                self.s3.put_object(Bucket=self.bucket, Key=key, Body=data,
-                                   ContentType='application/json', IfNoneMatch='*')
-            except ClientError as exc:
-                if exc.response.get('Error', {}).get('Code') != 'PreconditionFailed':
-                    raise
-            if self._read_bytes(key) != data:
-                raise ValueError('persisted package differs')
+        # This connection must target the same database/schema, and must never
+        # participate in the caller's transaction. No PUT before durable ownership.
+        if self.journal_conn.is_in_transaction():
+            raise CollabError(503, 'package journal requires autocommit')
+        # Independent session ownership also survives loss of the registry's
+        # transaction connection while S3 is still writing.
         try:
-            await asyncio.to_thread(put)
+            acquired = await self.journal_conn.fetchval(
+                'SELECT pg_try_advisory_lock_shared($1)', LIFECYCLE_LOCK)
         except Exception:
-            raise CollabError(503, 'package storage unavailable') from None
-        return key
+            raise CollabError(503, 'package journal unavailable') from None
+        if not acquired:
+            raise CollabError(503, 'collaboration lifecycle busy; retry later')
+        try:
+            try:
+                await self.journal_conn.execute(
+                    'INSERT INTO collab_skill_package_journal '
+                    '(creator_id,storage_bucket,storage_key,request_key) VALUES ($1,$2,$3,$4) '
+                    'ON CONFLICT (creator_id,storage_bucket,storage_key) DO NOTHING',
+                    package.manifest['creator_id'], self.bucket, key, request_key or 'package:' + package.sha256)
+            except Exception:
+                raise CollabError(503, 'package journal unavailable') from None
+            def put():
+                try:
+                    self.s3.put_object(Bucket=self.bucket, Key=key, Body=data,
+                                       ContentType='application/json', IfNoneMatch='*')
+                except ClientError as exc:
+                    if exc.response.get('Error', {}).get('Code') != 'PreconditionFailed':
+                        raise
+                if self._read_bytes(key) != data:
+                    raise ValueError('persisted package differs')
+            try:
+                # A cancelled asyncio wrapper does not stop a blocking S3 PUT. Keep
+                # the transaction/lifecycle lock until the provider actually stops,
+                # including repeated cancellation and Runner shutdown task sweeps.
+                completion = asyncio.get_running_loop().run_in_executor(None, copy_context().run, put)
+                cancelled = False
+                while not completion.done():
+                    try:
+                        await asyncio.shield(completion)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                    except BaseException:
+                        break
+                if cancelled:
+                    completion.exception()
+                    raise asyncio.CancelledError
+                completion.result()
+            except Exception:
+                raise CollabError(503, 'package storage unavailable') from None
+            return key
+        finally:
+            try:
+                await self.journal_conn.execute('SELECT pg_advisory_unlock_shared($1)', LIFECYCLE_LOCK)
+            except Exception:
+                raise CollabError(503, 'package journal unavailable') from None
 
     async def _load(self, row) -> SkillPackage:
         try:
@@ -332,7 +379,7 @@ class SkillRegistry:
                         'files': {p: {'sha256': hashlib.sha256(b).hexdigest(), 'size_bytes': len(b)}
                                   for p, b in files.items()}}
             package = self._sign(manifest, files)
-            key = await self._write(package)
+            key = await self._write(package, request_key='draft:' + request_key)
             await self._principal(principal, human=True)
             await self.conn.execute(
                 'INSERT INTO collab_skill_drafts '
@@ -371,7 +418,7 @@ class SkillRegistry:
             package = self._sign({**draft_package.manifest, 'scope': scope, 'room_id': room_id,
                                   'published_by': principal.id, 'published_at': datetime.now(UTC).isoformat()},
                                  draft_package.files)
-            key = await self._write(package)
+            key = await self._write(package, request_key='publish:' + draft_id + ':' + scope)
             await self._publication(principal, scope, room_id)
             await self.conn.execute(
                 "UPDATE collab_skills SET scope=$2,room_id=$3,status='published' WHERE skill_id=$1",

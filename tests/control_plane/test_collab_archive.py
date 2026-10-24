@@ -60,6 +60,9 @@ class MemoryS3:
     def list_objects_v2(self, *, Bucket, Prefix, **kwargs):
         return {'Contents': [{'Key': k} for b, k in self.objects if b == Bucket and k.startswith(Prefix)]}
 
+    def get_bucket_versioning(self, *, Bucket):
+        return {}
+
 
 @pytest.fixture
 def env():
@@ -108,6 +111,31 @@ def env():
 def lifecycle(env):
     mod = importlib.import_module('herdr_engineering.control_plane.collab_archive')
     return mod.CollabArchive(env[2], env[3])
+
+
+@pytest.mark.parametrize('versioning', ['Enabled', 'Suspended', 'denied', 'unavailable'])
+@pytest.mark.parametrize('current_scrubbed', [False, True])
+def test_archive_history_blocks_user_deletion_even_when_current_content_is_clean(env, versioning, current_scrubbed):
+    from herdr_engineering.control_plane.collab_storage import StorageError
+    conn, run, store, _, s3 = env
+    archive = run(lifecycle(env).archive_room(ROOM, 'owner'))
+    history = dict(s3.objects)
+    if current_scrubbed:
+        run(lifecycle(env).scrub_deleted_user('member'))
+        run(conn.execute("INSERT INTO collab_users(user_id,status) VALUES ('member','approved')"))
+    def bucket_versioning(**kwargs):
+        if versioning == 'denied':
+            raise RuntimeError('provider secret')
+        return {'Status': versioning}
+    s3.get_bucket_versioning = None if versioning == 'unavailable' else bucket_versioning
+    with pytest.raises(StorageError, match='archive.*version'):
+        run(lifecycle(env).scrub_deleted_user('member'))
+    assert run(conn.fetchval("SELECT status FROM collab_users WHERE user_id='member'")) == 'disabled'
+    assert run(store.jobs('scrub'))
+    assert any(b'private member' in data for (bucket, _), data in history.items() if bucket == ARCHIVE)
+    blob = next(data for (bucket, key), data in s3.objects.items() if bucket == ARCHIVE and key.endswith('/blob'))
+    assert blob == BLOB
+    assert run(store.get_archive(archive.archive_id)).status == 'verified'
 
 
 def test_archive_verifies_all_exports_before_deleting_live_data(env):
