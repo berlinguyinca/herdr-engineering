@@ -627,3 +627,48 @@ Other keys: `max_instruction_chars`, `propose_per_10min`, `confirm_per_10min`, `
 - Every offer, redeliveries included, is a `steer_delivered` audit event with its `delivery` number; the counter is rebuilt from those events on restart.
 - `GET /api/v1/steering/pending?instance_id=<id>`: when the target node carries an `instance_id` attribute, only a caller presenting that id is offered the request, so two Pi instances sharing one key do not consume each other's requests. Nodes without the attribute keep key-only pinning.
 - The steering routes refuse (403, `authentication_required`) on an open listener, which has no principal to pin to.
+
+## Forks and promotion (T13)
+
+Alternative implementations reuse the existing vocabulary; there is no second store.
+
+- A fork is an OWNED node `approach:<id>` (written by the Pi emitter) plus a `fork` edge from the origin
+  (`attempt`, `agent`, `task` or another `approach`) to it. Siblings are approaches that share an origin.
+- A decision is a `supersession` edge winner -> loser. Nothing is ever deleted; the loser is only marked
+  `superseded`, the winner `selected`.
+- Approach attrs (all self-reported by the fork's own emitter, shown as `source: approach_owner, verified: false`
+  and never used to gate anything): `approach_id, origin_id, mission_id, task_id, base_sha, head_sha, branch, repo,
+  worktree_id, files_changed, insertions, deletions, touched_paths, elapsed_s, cost_usd, tokens, pr, pushed_head`.
+- Fork and promote are steering actions (T12 flow: propose, a different member confirms, keyed delivery to the
+  node owner's key, ack). They are not in the default `actions`; both the `actions` list and
+  `control_plane.collab.steering.forks.enabled: true` must opt in. YAML under `steering.forks`:
+  `enabled`, `max_forks_per_origin` (5), `max_open_forks_per_room` (20), `require_validation` (true),
+  `min_reviews` (0), `evidence_writers` (principals trusted to write validation/review evidence), `max_compared` (10).
+- `fork` needs a `base_sha` that the graph shows for the origin. `promote` needs a live, non-superseded approach
+  with a full `head_sha` and `expected_head`; readiness is re-checked at propose, confirm and delivery.
+- Evidence that counts: `validated` / `reviewed` (verdict `lgtm`) edges bound to the exact head, not stale or removed,
+  written by an `evidence_writers` principal. A `blocked` edge from such a writer blocks promotion.
+- Promotion race: the earliest confirmation wins, an acked-applied promotion closes the group, and Pi holds a
+  cross-process claim per origin. Pi pushes exactly the confirmed sha (never forced), opens a DRAFT PR, links it
+  (T05) and acks `applied` only after all three. It never merges.
+- `GET /api/v1/collab/rooms/{id}/forks?node_id=` returns the comparison read model (403 `forks_disabled` when off).
+
+| Threat | Control | Tests (`tests/control_plane/test_forks.py` unless noted) |
+|---|---|---|
+| Fork flood, disk | per-origin and per-room caps on both sides, free-disk floor on Pi | `test_fork_flood_is_capped_per_origin_and_per_room`, `test_a_fork_is_refused_at_confirmation_when_the_limit_filled_meanwhile`; Pi `flood and disk limits` |
+| Fork of a node the actor cannot see | target resolved through room visibility | `test_who_may_fork_and_what_they_cannot_see`, `test_comparison_hides_what_the_reader_cannot_see_and_is_bounded` |
+| Stale, superseded or unvalidated promotion | `promotion_check` at propose, confirm, delivery; Pi re-checks the head | `test_promotion_is_refused_until_trusted_head_bound_validation_exists`, `test_promote_needs_the_exact_head_the_person_saw`, `test_only_approaches_can_be_promoted_and_a_losing_fork_cannot`, `test_stale_head_after_confirmation_never_reaches_the_pusher`, `test_revoked_evidence_between_confirmation_and_delivery_blocks_delivery`, `test_trusted_evidence_removed_after_proposal_blocks_confirmation` |
+| Comparison forged by the fork's agent | self-reported labels; only operator-listed writers count | `test_comparison_shows_every_sibling_with_provenance_and_never_trusts_the_forks_own_numbers`, `test_the_forks_own_agent_cannot_forge_evidence`, `test_no_trusted_writers_configured_means_nothing_can_ever_validate` |
+| Promotion race | `_promotion_conflict` (earliest confirmation wins) plus Pi registry claim | `test_promotion_race_only_one_sibling_can_be_confirmed_and_delivered`, `test_an_applied_promotion_closes_the_group_even_if_the_state_is_not_reported_yet`, `test_a_refused_or_stale_promotion_does_not_block_the_next_one`; Pi `only one promotion per origin`, `two processes sharing a state dir` (two registry instances in one process, not separate processes) |
+| Branch or path injection | Pi derives every name from the steering id; params are shas and a cleaned label | `test_nothing_in_a_fork_or_promote_delivery_is_a_command`, `test_hostile_text_in_a_fork_is_neutralised`; Pi `derives every name itself`, `fork parameters are typed and strict`, wire-fixture test |
+| Closing siblings destroys work | siblings only marked; branches and worktrees kept; no delete in `CliForkGit` | Pi `pushes exactly the confirmed commit, opens a DRAFT PR...`, `refuses rather than delete` |
+| Confused deputy across rooms | room checked on propose, delivery and on Pi | `test_http_routes`, `test_self_confirmation_and_replay_are_refused_like_any_steering`; Pi `never promotes from another room` |
+
+Unmet or partial against the spec, stated plainly: a fork prepares an isolated worktree and records it but does not
+start an agent in it; "invalidates stale reviews" is done by binding evidence to the exact head (a moved head makes
+evidence stale at read time and blocks promotion) and no gate node is rewritten; promotion is unreachable until the
+operator lists `evidence_writers` and something writes `validated` edges for the fork head.
+
+Limitations: T06 review quorum is not on this stack (comparison reports `quorum: unavailable`); independent
+evidence writers must be keys that can see room-scoped nodes, i.e. operator keys; an older Pi ignores the new actions
+and Herdr re-offers up to 5 times.
