@@ -645,7 +645,7 @@ class ReviewWorker:
         return None
 
     # ------------------------------------------------------------------- loop
-    def run(self, stop: threading.Event) -> None:
+    def run(self, stop: threading.Event, *, before_cycle=None, after_cycle=None) -> None:
         """Claim and handle jobs until ``stop`` is set.
 
         Raises ``WorkerAuthError`` (401/403) and ``WorkerConfigError`` (a key file
@@ -653,15 +653,24 @@ class ReviewWorker:
         abandoned without posting: the server re-offers it when its lease expires.
         That abandoned claim has spent one of the job's ``max_attempts``, so
         restarting workers mid-review again and again can escalate the PR.
+
+        The optional hooks serve the reviewer pool: ``before_cycle() -> bool`` runs
+        immediately before each claim cycle (False returns without claiming) and
+        ``after_cycle(claimed)`` right after it, before the back-off wait.
         """
         self._stop = stop
         while not stop.is_set():
+            if before_cycle is not None and not before_cycle():
+                return
+            claimed = False
             try:
-                self.run_once()
+                claimed = self.run_once()
             except (WorkerAuthError, WorkerConfigError):
                 raise
             except Exception as exc:  # noqa: BLE001 - keep serving; class name only
                 _log.error("review gate worker error: %s", type(exc).__name__)
                 self.backoff_seconds = self._config.poll_seconds
+            if after_cycle is not None:
+                after_cycle(claimed)
             if self.backoff_seconds > 0 and not stop.is_set():
                 stop.wait(self.backoff_seconds)
