@@ -139,18 +139,18 @@ test('connectEvents swallows StreamConnected and replayed event_ids', () => {
   assert.deepEqual(seen.map((e) => e.event_id), ['e1', 'e2']);
 });
 
-test('connectEvents drops replayed per-entity sequences but forwards newer ones', () => {
+test('connectEvents does not filter on sequence (sequences restart after a server restart)', () => {
   const seen = [];
   const fakeES = { onmessage: null, onerror: null, close() {} };
   connectEvents({
     url: '/events', onEvent: (e) => seen.push(e),
     createEventSource: () => fakeES, autoReconnectMs: 0,
   });
-  const send = (seq, id = 'm1') => fakeES.onmessage({
-    data: JSON.stringify({ event_type: 'X', entity_type: 'mission', entity_id: id, sequence: seq }),
+  const send = (seq, eid) => fakeES.onmessage({
+    data: JSON.stringify({ event_type: 'X', event_id: eid, entity_type: 'mission', entity_id: 'm1', sequence: seq }),
   });
-  send(1); send(2); send(2); send(1); send(3); send(1, 'm2');
-  assert.deepEqual(seen.map((e) => `${e.entity_id}:${e.sequence}`), ['m1:1', 'm1:2', 'm1:3', 'm2:1']);
+  send(5, 'a'); send(1, 'b'); send(1, 'b');
+  assert.deepEqual(seen.map((e) => e.event_id), ['a', 'b']);
 });
 
 test('connectEvents seen-set is bounded to 500 event_ids', () => {

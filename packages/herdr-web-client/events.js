@@ -3,7 +3,6 @@
 // can supply a fake; the real browser uses the global EventSource.
 
 const SEEN_LIMIT = 500;
-const ENTITY_LIMIT = 2000;
 
 export function connectEvents({
   url,
@@ -17,7 +16,6 @@ export function connectEvents({
   let retryTimer = null;
   // Page-lifetime dedupe so reconnect replays are not delivered twice.
   const seenIds = new Set();
-  const lastSeq = new Map();
 
   function isDuplicate(data) {
     if (!data || typeof data !== 'object') return false;
@@ -25,14 +23,6 @@ export function connectEvents({
       if (seenIds.has(data.event_id)) return true;
       seenIds.add(data.event_id);
       if (seenIds.size > SEEN_LIMIT) seenIds.delete(seenIds.values().next().value);
-    }
-    if (data.entity_type != null && data.entity_id != null && Number.isFinite(data.sequence)) {
-      const key = `${data.entity_type}:${data.entity_id}`;
-      const last = lastSeq.get(key);
-      if (last !== undefined && data.sequence <= last) return true;
-      lastSeq.delete(key);
-      lastSeq.set(key, data.sequence);
-      if (lastSeq.size > ENTITY_LIMIT) lastSeq.delete(lastSeq.keys().next().value);
     }
     return false;
   }
