@@ -7,12 +7,22 @@ from __future__ import annotations
 
 import os
 import stat
+import string
 from dataclasses import dataclass
 
 from herdr_engineering.control_plane.project_links import canonical_repository
 
-_SECTION_KEYS = {"enabled", "app", "repos", "poll_seconds"}
+_SECTION_KEYS = {"enabled", "app", "repos", "poll_seconds", "reviewer", "notify"}
 _APP_KEYS = {"app_id", "installation_id", "private_key_file"}
+_REVIEWER_KEYS = {
+    "lease_seconds",
+    "max_diff_bytes",
+    "max_findings",
+    "max_attempts",
+    "max_output_bytes",
+}
+_NOTIFY_KEYS = {"fixer_command", "notify_command"}
+_PLACEHOLDERS = {"repo", "number", "branch", "sha"}
 _REPO_KEYS = {
     "repo",
     "required_events",
@@ -43,11 +53,28 @@ class AppConfig:
 
 
 @dataclass(frozen=True)
+class ReviewerConfig:
+    lease_seconds: int = 900
+    max_diff_bytes: int = 400_000
+    max_findings: int = 50
+    max_attempts: int = 3
+    max_output_bytes: int = 200_000
+
+
+@dataclass(frozen=True)
+class NotifyConfig:
+    fixer_command: tuple[str, ...] = ()
+    notify_command: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ReviewGateConfig:
     enabled: bool
     app: AppConfig | None
     repos: tuple[RepoEnrollment, ...]
     poll_seconds: int = 15
+    reviewer: ReviewerConfig = ReviewerConfig()
+    notify: NotifyConfig = NotifyConfig()
 
 
 def _mapping(raw, where):
@@ -126,6 +153,62 @@ def _repo(raw):
     return RepoEnrollment(**kw)
 
 
+# Inclusive bounds; keys not listed only need to be >= 1.
+_REVIEWER_BOUNDS = {
+    "lease_seconds": (30, 86_400),
+    "max_output_bytes": (1_000, 2_000_000),
+    "max_diff_bytes": (1_000, 5_000_000),
+}
+
+
+def _reviewer(raw):
+    raw = _mapping(raw, "review_gate.reviewer")
+    _no_unknown(raw, _REVIEWER_KEYS, "review_gate.reviewer")
+    kw = {}
+    for key in raw:
+        low, high = _REVIEWER_BOUNDS.get(key, (1, None))
+        val = _int(raw, key, "review_gate.reviewer", low)
+        if high is not None and val > high:
+            raise ValueError(f"review_gate.reviewer: {key} must be an integer <= {high}")
+        kw[key] = val
+    return ReviewerConfig(**kw)
+
+
+def _argv(raw, key):
+    where = f"review_gate.notify: {key}"
+    val = raw[key]
+    if not isinstance(val, list) or not val or not all(isinstance(v, str) and v for v in val):
+        raise ValueError(f"{where} must be a non-empty list of non-empty strings")
+    if not os.path.isabs(val[0]):
+        raise ValueError(f"{where}: first element must be an absolute path")
+    try:
+        exe_fields = [f for _l, f, _s, _c in string.Formatter().parse(val[0]) if f is not None]
+    except ValueError:
+        raise ValueError(f"{where}: malformed placeholder in the executable path") from None
+    if exe_fields:
+        raise ValueError(f"{where}: the executable path must not contain placeholders")
+    for arg in val:
+        try:
+            parsed = list(string.Formatter().parse(arg))
+        except ValueError:
+            raise ValueError(f"{where}: malformed placeholder in {arg!r}") from None
+        for _lit, field, spec, conv in parsed:
+            if field is None:
+                continue
+            if field not in _PLACEHOLDERS or spec or conv:
+                raise ValueError(
+                    f"{where}: placeholder must be one of "
+                    f"{{{'}, {'.join(sorted(_PLACEHOLDERS))}}} with no format spec"
+                )
+    return tuple(val)
+
+
+def _notify(raw):
+    raw = _mapping(raw, "review_gate.notify")
+    _no_unknown(raw, _NOTIFY_KEYS, "review_gate.notify")
+    return NotifyConfig(**{key: _argv(raw, key) for key in raw})
+
+
 def parse_review_gate_section(raw, *, check_key_file=True) -> ReviewGateConfig:
     """Validate a ``review_gate`` mapping; raises ValueError naming the problem.
 
@@ -150,7 +233,16 @@ def parse_review_gate_section(raw, *, check_key_file=True) -> ReviewGateConfig:
         raise ValueError("review_gate.repos: duplicate repo")
     if enabled and app is None:
         raise ValueError("review_gate: enabled requires app")
-    return ReviewGateConfig(enabled=enabled, app=app, repos=repos, poll_seconds=poll)
+    reviewer = _reviewer(raw["reviewer"]) if raw.get("reviewer") is not None else ReviewerConfig()
+    notify = _notify(raw["notify"]) if raw.get("notify") is not None else NotifyConfig()
+    return ReviewGateConfig(
+        enabled=enabled,
+        app=app,
+        repos=repos,
+        poll_seconds=poll,
+        reviewer=reviewer,
+        notify=notify,
+    )
 
 
 def load_review_gate_config(cfg: dict) -> ReviewGateConfig:

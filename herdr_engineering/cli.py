@@ -12,8 +12,10 @@ import json
 import logging
 import os
 import re
+import signal
 import socket
 import sys
+import threading
 from typing import Any
 
 from .version import __version__
@@ -454,6 +456,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = rsub.add_parser("resolve", help="resolve a review")
     p2.add_argument("review_id"); p2.add_argument("decision")
     p2.add_argument("--comment"); p2.set_defaults(func=_cmd_review_resolve)
+
+    # review-gate ----------------------------------------------------------
+    p = sub.add_parser("review-gate", help="PR review gate tools")
+    gsub = p.add_subparsers(dest="review_gate_command", required=True)
+    p2 = gsub.add_parser("worker", help="run the reviewer worker (claims jobs, calls the model)")
+    p2.add_argument("--config", required=True, help="worker YAML config file")
+    p2.add_argument("--once", action="store_true", help="run one claim cycle and exit")
+    p2.set_defaults(func=_cmd_review_gate_worker)
 
     # candidates -----------------------------------------------------------
     p = sub.add_parser("candidates", help="multi-agent worktree comparison (spec 0140)")
@@ -2205,6 +2215,39 @@ def _cmd_browser(args) -> int:
               + (f" artifact={cap.artifact.id}" if cap.artifact else "")
               + (f" error={cap.error}" if cap.error else ""))
     return 0 if cap.ok else 1
+
+
+def _cmd_review_gate_worker(args) -> int:
+    """Exit 0 on a clean stop, 1 when the reviewer key is refused, 2 on a config error.
+
+    Messages are fixed text (config errors carry no key material); nothing from a
+    response, URL or key file is printed.
+    """
+    from .review_gate import worker as rgw
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        config = rgw.load_worker_config(args.config)
+        reviewer = rgw.ReviewWorker(config)
+        if args.once:
+            print("handled" if reviewer.run_once() else "idle")
+            return 0
+        stop = threading.Event()
+
+        def _request_stop(_signum, _frame):
+            stop.set()
+
+        signal.signal(signal.SIGINT, _request_stop)
+        signal.signal(signal.SIGTERM, _request_stop)
+        reviewer.run(stop)
+        return 0
+    except rgw.WorkerAuthError:
+        print("review-gate worker: the control plane refused the reviewer key", file=sys.stderr)
+        return 1
+    except rgw.WorkerConfigError as exc:
+        print(f"review-gate worker: config error: {exc}", file=sys.stderr)
+        return 2
 
 
 def _cmd_review_request(args) -> int:
