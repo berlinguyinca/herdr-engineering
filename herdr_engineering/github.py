@@ -836,10 +836,13 @@ class GitHubMonitor:
             self._bind_failed = False
             if allow:
                 # stop serving owners that left the allowlist now, not after the listing
-                for rid in [rid for rid, record in self._repos.items() if _owner(record) not in allow]:
+                dropped = [rid for rid, record in self._repos.items() if _owner(record) not in allow]
+                for rid in dropped:
                     for table in (self._repos, self._issues, self._marks, self._watermarks,
                                   self._issue_resume, self._full_at, self._deferred):
                         table.pop(rid, None)
+                if dropped:
+                    self._touch()  # no 304 may still describe the dropped owner's rows
                 if self._resume_repos is not None:
                     self._resume_repos = {rid: r for rid, r in self._resume_repos.items() if _owner(r) in allow}
             relist = self._resume_repos is None or self._resume_passes >= RESUME_PASSES_BEFORE_RELIST

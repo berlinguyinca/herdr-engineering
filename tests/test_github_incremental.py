@@ -990,3 +990,25 @@ def test_a_store_hit_is_kept_in_memory():
     for _ in range(3):
         assert restarted.issue_detail("github.com/acme/app", 2)["issue"]["number"] == 2
     assert len(reads) == 1 and fake.calls["detail"] == 1
+
+
+def test_dropping_an_owner_from_the_allowlist_counts_as_a_change_at_once():
+    fake = scoped()
+    allow = [["acme", "other"]]
+    monitor = monitor_for(fake, {}, organizations=lambda: allow[0])
+    monitor.refresh()
+    allow[0] = ["acme"]
+    marks, read_allowlist, list_page = {}, monitor._allowlist, fake.repositories_page
+
+    def allowlist():
+        value = read_allowlist()
+        marks["after_allowlist"] = monitor._epoch
+        return value
+
+    def repositories_page(cursor=None):
+        marks.setdefault("at_listing", monitor._epoch)
+        return list_page(cursor)
+    monitor._allowlist, fake.repositories_page = allowlist, repositories_page
+    monitor.refresh()
+    # the unlisted owner's rows left memory before the listing: no ETag may still describe them
+    assert marks["at_listing"] > marks["after_allowlist"]
