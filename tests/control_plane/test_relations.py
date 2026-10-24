@@ -132,7 +132,7 @@ def test_route_statuses():
         svr.shutdown()
 
 
-@pytest.mark.parametrize("path", ["/api/v1/related?kind=session&id=s1", "/entity-links.js"])
+@pytest.mark.parametrize("path", ["/api/v1/related?kind=session&id=s1", "/entity-links.js", "/entity-refs.js", "/related-panel.js"])
 def test_related_does_not_exist_on_the_public_listener(stack, path):
     status, _ = stack.pub.call("GET", path)
     assert status == 404
