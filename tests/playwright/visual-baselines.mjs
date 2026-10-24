@@ -29,7 +29,9 @@ export const REPORT_DIR = path.join(REPO, '.autospec', 'reports', 'visual');
 export const FONT_DIR = path.join(import.meta.dirname, 'fonts');
 export const VIEWPORTS = ['desktop', 'tablet', 'mobile'];
 export const UPDATE_FLAG = '--i-understand-this-rewrites-baselines';
-const MAX_HEIGHT = 2400;     // taller pages are clipped so a long list cannot make a baseline huge
+// Pages are captured to their FULL height. A page taller than this is an error, never silently clipped: the part below a clip was
+// once never compared at all (the whole workbench of a selected node sat below 2400px). Raise the cap or add component regions.
+const MAX_HEIGHT = 10000;
 
 const selectNode = async (page) => { await page.locator('g[data-node="attempt:a1"]').focus(); await page.keyboard.press('Enter'); await page.locator('.wb-comment').first().waitFor(); await page.locator('.wb-steer').first().waitFor(); await page.evaluate(() => document.activeElement?.blur()); };
 
@@ -39,7 +41,10 @@ export const SURFACES = [
   { slug: 'collab-chat', sub: 'chat', proof: '#hcn-log', regions: [{ name: 'logo', selector: '.cx-logo' }, { name: 'subtabs', selector: '.cx-stabs' }, { name: 'log', selector: '#hcn-log' }] },
   { slug: 'collab-tabs', sub: 'tabs', proof: '#hcn-tabs [role=tab]' },
   { slug: 'collab-lineage', sub: 'lineage', proof: 'svg.lin-svg g[data-node]', steps: selectNode, resetScroll: true,
-    regions: [{ name: 'graph', selector: '.lin-scroll' }, { name: 'node', selector: 'g[data-node="attempt:a1"]' }, { name: 'inspector', selector: '.lin-inspector' }] },
+    regions: [{ name: 'graph', selector: '.lin-scroll' }, { name: 'node', selector: 'g[data-node="attempt:a1"]' }, { name: 'inspector', selector: '.lin-inspector' },
+      // the workbench of a selected node: comments, fork table, steering form, requests. Each is its own region because a
+      // paragraph of text or one button is far below the page-level budget (a transparent first comment scored 0.0025%).
+      { name: 'wbcomments', selector: 'ul.wb-comments' }, { name: 'wbfork', selector: '.wb-table-wrap' }, { name: 'wbpropose', selector: 'form[data-wb-form="propose"]' }, { name: 'wbsteers', selector: 'ul.wb-steers' }] },
   { slug: 'collab-lineage-gantt', sub: 'lineage', proof: 'svg.lin-svg', resetScroll: true, steps: async (page) => { await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role=img]').waitFor(); },
     regions: [{ name: 'gantt', selector: 'svg.lin-svg[role=img]' }] },
   { slug: 'collab-flow', sub: 'flow', proof: '#hcn-flow svg.cx-flow', regions: [{ name: 'flowhead', selector: '#hcn-p-flow .cx-row--between' }] },
@@ -68,31 +73,54 @@ export async function newDeterministicServer() {
 // ---- fonts -----------------------------------------------------------------------------------------------------------
 const b64 = (f) => readFileSync(path.join(FONT_DIR, f)).toString('base64');
 let fontCss = null;
-/** @font-face rules that map the design system's first-choice families onto the bundled Liberation subsets. */
+/**
+ * @font-face rules that map the design system's first-choice families onto bundled subsets: Liberation for text, and, through
+ * unicode-range on the SAME family names, a symbol font for the geometric shapes, dingbats and media glyphs the page paints
+ * (so a glyph the text face lacks never falls through to whatever the host has installed).
+ */
 export function bundledFontCss() {
   if (fontCss) return fontCss;
-  const face = (family, weight, file) => `@font-face{font-family:"${family}";font-style:normal;font-weight:${weight};src:url(data:font/ttf;base64,${b64(file)}) format("truetype")}`;
-  fontCss = [face('Inter', '100 599', 'LiberationSans-Regular.subset.ttf'), face('Inter', '600 900', 'LiberationSans-Bold.subset.ttf'),
-    face('JetBrains Mono', '100 599', 'LiberationMono-Regular.subset.ttf'), face('JetBrains Mono', '600 900', 'LiberationMono-Bold.subset.ttf')].join('\n');
+  const face = (family, weight, file, range = '') => `@font-face{font-family:"${family}";font-style:normal;font-weight:${weight};src:url(data:font/ttf;base64,${b64(file)}) format("truetype")${range ? `;unicode-range:${range}` : ''}}`.replace('format("truetype");', 'format("truetype");');
+  const SYMBOLS = 'U+2010-2027,U+2190-21FF,U+2212,U+25A0-25FF,U+2600-27BF';
+  const MEDIA = 'U+23E9-23F3';
+  const rules = [];
+  for (const fam of ['Inter', 'JetBrains Mono']) {
+    const mono = fam === 'JetBrains Mono';
+    rules.push(face(fam, '100 599', mono ? 'LiberationMono-Regular.subset.ttf' : 'LiberationSans-Regular.subset.ttf'));
+    rules.push(face(fam, '600 900', mono ? 'LiberationMono-Bold.subset.ttf' : 'LiberationSans-Bold.subset.ttf'));
+    rules.push(face(fam, '100 599', 'HerdrSymbols-Regular.subset.ttf', SYMBOLS), face(fam, '600 900', 'HerdrSymbols-Bold.subset.ttf', SYMBOLS));
+    // two weight ranges, like the other faces: a face whose range differs from its siblings' is not merged into the family's coverage
+    rules.push(face(fam, '100 599', 'HerdrSymbols2-Regular.subset.ttf', MEDIA), face(fam, '600 900', 'HerdrSymbols2-Regular.subset.ttf', MEDIA));
+  }
+  fontCss = rules.join('\n');
   return fontCss;
 }
 
-/** Ask Chromium which font file really painted each probe element: every one must be a bundled (custom) font, never a host font. */
+/** Ask Chromium which font file really painted EVERY element (and ::before / ::after) with text: each must be a bundled font. */
 export async function assertBundledFonts(page, ctx) {
   const cdp = await ctx.newCDPSession(page);
   try {
     await cdp.send('DOM.enable'); await cdp.send('CSS.enable');
-    const { root } = await cdp.send('DOM.getDocument', { depth: 0 });
-    const seen = [];
-    for (const sel of ['.hd-card__title, .cx-stab', 'button.hd-btn, .cx-stab', '.hd-ident, code, .cx-code']) {
-      const { nodeId } = await cdp.send('DOM.querySelector', { nodeId: root.nodeId, selector: sel });
-      if (!nodeId) continue;
-      const { fonts } = await cdp.send('CSS.getPlatformFontsForNode', { nodeId });
-      for (const f of fonts) seen.push(`${sel.split(',')[0]} -> ${f.familyName}${f.isCustomFont ? ' (bundled)' : ' (HOST FONT)'}`);
-      for (const f of fonts) if (!f.isCustomFont) throw new Error(`screenshots must use the bundled fonts but "${sel}" was painted with the host font "${f.familyName}": ${seen.join('; ')}`);
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const ids = [];
+    const walk = (n) => {
+      if (n.nodeType === 1 && !['SCRIPT', 'STYLE', 'HEAD', 'HTML', 'META', 'LINK', 'TITLE'].includes(n.nodeName)) ids.push(n.nodeId);
+      for (const c of [...(n.children || []), ...(n.pseudoElements || []), ...(n.shadowRoots || [])]) walk(c);
+    };
+    walk(root);
+    const host = new Map(); const used = new Map(); let checked = 0;
+    for (const nodeId of ids) {
+      let fonts; try { ({ fonts } = await cdp.send('CSS.getPlatformFontsForNode', { nodeId })); } catch { continue; }
+      for (const f of fonts) {
+        if (!f.glyphCount) continue;
+        checked += 1;
+        if (f.isCustomFont) used.set(f.familyName, (used.get(f.familyName) || 0) + f.glyphCount);
+        else host.set(f.familyName, (host.get(f.familyName) || 0) + f.glyphCount);
+      }
     }
-    if (!seen.length) throw new Error('could not read which fonts painted the page');
-    return seen;
+    if (host.size) throw new Error(`screenshots must use the bundled fonts only, but these host fonts painted glyphs: ${[...host].map(([f, n]) => `${f} (${n} glyphs)`).join(', ')}`);
+    if (!used.size) throw new Error('could not read which fonts painted the page');
+    return { checked, used: Object.fromEntries(used) };
   } finally { await cdp.detach().catch(() => {}); }
 }
 
@@ -117,7 +145,9 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     // its newest message on purpose, is not touched)
     if (surface.resetScroll) { await page.evaluate(() => { window.scrollTo(0, 0); document.scrollingElement.scrollTop = 0; }); await page.waitForTimeout(100); }
     await assertBundledFonts(page, ctx);
-    const height = Math.min(MAX_HEIGHT, await page.evaluate(() => Math.max(document.documentElement.scrollHeight, innerHeight)));
+    const full = await page.evaluate(() => Math.max(document.documentElement.scrollHeight, innerHeight));
+    if (full > MAX_HEIGHT) throw new Error(`${surface.slug} at ${viewport} is ${full}px tall, above the ${MAX_HEIGHT}px capture cap: the rest would never be compared`);
+    const height = full;
     const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: CFG.viewports[viewport].width, height }, animations: 'disabled', caret: 'hide' }), regions: {} };
     if (regions) {
       for (const r of surface.regions || []) {
@@ -176,6 +206,21 @@ export const checkRegion = (browser, png, slug, region, scheme) => checkFile(bro
 /** All (surface, viewport, scheme) combinations: light everywhere, dark at every viewport (autospec requires both themes). */
 export const combos = (filter = '') => SURFACES.filter((s) => s.slug.includes(filter)).flatMap((s) => VIEWPORTS.flatMap((v) => ['light', 'dark'].map((scheme) => ({ surface: s, viewport: v, scheme }))));
 
+/** Every PNG the suite owns: a page per (surface, viewport, scheme) and a component per (surface, region, scheme). */
+export function expectedBaselineFiles() {
+  const out = new Set();
+  for (const s of SURFACES) for (const scheme of ['light', 'dark']) {
+    for (const v of VIEWPORTS) out.add(path.basename(fileFor(s.slug, v, scheme)));
+    for (const r of s.regions || []) out.add(path.basename(regionFileFor(s.slug, r.name, scheme)));
+  }
+  return out;
+}
+/** PNGs in the baseline folder that no surface produces any more: they would sit there looking like coverage. Never deleted by the tool. */
+export function orphanBaselines(dir = BASELINE_DIR) {
+  const want = expectedBaselineFiles();
+  return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.png') && !want.has(f)).sort() : [];
+}
+
 /** Total size of the committed baselines, and the biggest file: the policy caps both (ui-gates.yaml screenshots.max_total_kb / max_file_kb). */
 export function baselineSizes() {
   const files = existsSync(BASELINE_DIR) ? readdirSync(BASELINE_DIR).filter((f) => f.endsWith('.png')).map((f) => ({ f, kb: statSync(path.join(BASELINE_DIR, f)).size / 1024 })) : [];
@@ -200,6 +245,7 @@ async function main() {
   const [cmd, ...rest] = argv;
   const filter = rest.find((a) => !a.startsWith('--')) || '';
   if (!['update', 'check'].includes(cmd)) { console.error(`usage: visual-baselines.mjs check [slug-filter] | update ${UPDATE_FLAG} [slug-filter]`); process.exit(2); }
+  if (!combos(filter).length) { console.error(`no surface matches "${filter}" (surfaces: ${SURFACES.map((x) => x.slug).join(', ')})`); process.exit(2); }
   if (cmd === 'update') refuseUnlessAllowed(argv);
   const srv = await newDeterministicServer();
   const browser = await launch();
@@ -220,6 +266,11 @@ async function main() {
         console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}: ${r.why}`);
         if (!r.ok) failed += 1;
       }
+    }
+    const orphans = orphanBaselines();
+    if (orphans.length) {
+      console.error(`${cmd === 'check' && !filter ? 'FAIL' : 'note'} orphan baselines that no surface produces: ${orphans.join(', ')} (remove them by hand after review)`);
+      if (cmd === 'check' && !filter) failed += orphans.length;
     }
     const sz = baselineSizes();
     console.log(`${sz.count} baselines, ${(sz.totalKb).toFixed(0)} KB total (cap ${CFG.screenshots.max_total_kb} KB), biggest ${sz.biggest ? `${sz.biggest.f} ${sz.biggest.kb.toFixed(0)} KB` : 'none'}`);

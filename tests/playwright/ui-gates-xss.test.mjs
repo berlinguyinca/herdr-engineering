@@ -16,16 +16,18 @@ import assert from 'node:assert/strict';
 import { launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
 import { STATES } from './ui-gates-states.mjs';
 
+const allUsed = new Set();      // every field the proxy tainted, over all tests
 let srv; let browser;
-before(async () => { srv = await startRealServer({ rich: true }); browser = await launch(); });
+before(async () => { srv = await startRealServer({ rich: true, mention_agent: true }); browser = await launch(); });
 after(async () => { await browser?.close(); srv?.stop(); });
 
 const SUBS = ['chat', 'flow', 'tasks', 'agents', 'tabs', 'lineage', 'attention', 'progress', 'links', 'proposals', 'people'];
-// Fields that are shown to people. Identifiers the page uses to look things up (ids, fences, digests, states) are left alone:
-// changing them would break the page rather than test it.
-const DISPLAY = new Set(['name', 'label', 'title', 'text', 'instruction', 'content', 'reason', 'activity', 'message', 'summary', 'description', 'detail', 'note',
-  'workspace_id', 'host', 'display_name', 'instance_id', 'email', 'question', 'answer', 'why', 'branch', 'delegate_label', 'reported_by', 'attestor', 'agent_name',
-  'path', 'paths', 'touched_paths', 'questions', 'task', 'goal', 'what', 'owner_label', 'role_label', 'status_text', 'last_activity', 'headline', 'body', 'error', 'notice']);
+// EVERY string the server sends is tainted unless it is an identifier or a value the page branches on (an id, a fence, a digest, a
+// state, a kind, a timestamp, a handle used to look something up): changing those breaks the page rather than testing it. The
+// earlier version listed the display fields by hand, and a field nobody listed (a bounded task's target_name) was never tested.
+const KEEP = /(^|_)(id|ids|key|fence|digest|sha|token|state|status|kind|type|role|action|actions|mode|family|visibility|source|scope|version|revision|cursor|offset|code|stage|tone|level|severity|schema|handle|instance|device|credential|ref|fp|cmd|channel|transport|direction|format|mime|encoding|lang|tz|unit|tier|phase|outcome|result|verdict|decision|trust|origin|namespace|prefix|suffix|field|fields|path_kind|edge|edge_type|node_type|anchor|target|subject|expected|binding|principal|session|surface|pane|tab|workspace|from|to|by|domain|issuer|audience|public_url)$|_at$|^(next|prev|since|until|ts|time|ttl|seq|sequence|ok|id|n|kind|type|state|status|role)$/;
+// Identifier-looking keys that ARE shown to people and that the server restricts, so only a proxy can test them.
+const FORCE = new Set(['workspace_id', 'host', 'instance_id', 'display_name', 'email', 'reported_by', 'agent_name', 'delegate_label', 'owner_label', 'role_label', 'last_activity', 'target_name', 'attestor']);
 const URLS = new Set(['url', 'href', 'link_url', 'pr_url', 'html_url', 'web_url']);
 const tag = (k) => String(k).replace(/[^a-z0-9]/gi, '').slice(0, 24);
 // The payload breaks out of both contexts: a double quote first (out of an attribute value, leaving an event handler and a marker
@@ -35,7 +37,7 @@ const payload = (k) => `" onfocus=window.__xss=1 data-cx-attr x="'><img src=x on
 function taint(v, key, used) {
   if (typeof v === 'string') {
     if (URLS.has(key)) { used.add(key); return 'javascript:window.__xss=9'; }
-    if (DISPLAY.has(key) && v.length) { used.add(key); return `${payload(key)} ${v}`; }
+    if (v.length && key && (FORCE.has(key) || !KEEP.test(key)) && !/^[0-9a-f-]{8,}$/i.test(v) && !/^\d{4}-\d\d-\d\dT/.test(v)) { used.add(key); return `${payload(key)} ${v}`; }
     return v;
   }
   if (Array.isArray(v)) return v.map((x) => taint(x, key, used));
@@ -44,14 +46,18 @@ function taint(v, key, used) {
 }
 
 async function hostile(browser, state) {
-  const used = new Set();
+  const used = allUsed;
   const { ctx, page } = await openReal(browser, srv.info, 'alice', { viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' }, async (c) => {
     await c.route('**/api/v1/collab/**', async (route) => {
       try {
         if (route.request().method() !== 'GET') return await route.continue();
         const res = await route.fetch();
-        if (!/json/.test(res.headers()['content-type'] || '')) return await route.fulfill({ response: res });
+        if (!/json/.test(res.headers()['content-type'] || '') || /\/collab\/config(\?|$)/.test(route.request().url())) return await route.fulfill({ response: res });   // the sign-in config is how the page finds its own server
         let body; try { body = await res.json(); } catch { return await route.fulfill({ response: res }); }
+        // a room with no linked mission has no milestone to show: give the progress view one, so its label renders
+        if (/\/progress(\?|$)/.test(route.request().url()) && body && Array.isArray(body.milestones) && !body.milestones.length) {
+          body.milestones.push({ ...(body.room || {}), milestone: 'mission:m1', label: 'Milestone one', tasks: 1, complete: 0 });
+        }
         return await route.fulfill({ response: res, json: taint(body, '', used) });
       } catch { /* the page went away mid-request */ }
     });
@@ -102,10 +108,44 @@ for (const st of STATES) {
   });
 }
 
+// Where a particular canary must be visible: one entry per renderer that earlier slipped through because nothing put hostile text there.
+const PLACEMENTS = [
+  ['tabs', 'a remote agent tab: the lineage it reported, named by the agent label', '[aria-label^="Lineage reported by"]', 'cx-canary-label',
+    async (page) => { await openSub(page, 'tabs'); await page.locator('#hcn-tabs [role="tab"]', { hasText: /Dana/ }).first().click(); await page.locator('[aria-label^="Lineage reported by"]').first().waitFor(); }],
+  ['progress', 'a milestone label', '[aria-label="Milestones"]', 'cx-canary-label', async (page) => { await openSub(page, 'progress'); await page.locator('[aria-label="Milestones"]').first().waitFor(); }],
+  ['proposals', 'the target of a bounded task', '[aria-label="Bounded tasks"]', 'cx-canary-targetname', async (page) => { await openSub(page, 'proposals'); await page.locator('[aria-label="Bounded tasks"]').first().waitFor(); }],
+];
+for (const [, what, sel, canary, open] of PLACEMENTS) {
+  test(`a canary is visible, as text, in ${what}`, async () => {
+    const { ctx, page } = await hostile(browser);
+    await open(page);
+    await page.waitForTimeout(500);
+    const shown = await page.locator(sel).first().innerText();
+    assert.ok(shown.includes(canary), `${canary} is not on screen inside ${sel}: ${shown.slice(0, 120)}`);
+    const d = await damage(page);
+    assert.equal(d.executed, undefined); assert.deepEqual(d.elements, []);
+    await ctx.unrouteAll({ behavior: 'ignoreErrors' });
+    await ctx.close();
+  });
+}
+
+// Fields the server sends and the proxy taints that no surface or state paints (found by the run itself, then checked by hand): they
+// are consumed as data by the page, or shown only in states this gate does not open. Keep the list honest: a new unrendered field
+// must be added here on purpose, and one that starts to render must be removed.
+// Honest gap: these 21 are NOT proven inert by this gate. Most are analytics and review-evidence tables (basis, value, category, order,
+// method, means, selfreports, reviewquorum, progress) that the small fixture room suppresses (the page shows "too few items"), PR and
+// diff statistics (head, changedfiles, diffsummary, touchedpaths, paths) shown only in states with a real PR, and identifiers the page
+// reads but does not paint (milestone, owneremail, reportedby, statereason, bindings, error). See docs/operations/ui-gates.md.
+const UNRENDERED = ['basis', 'bindings', 'categories', 'category', 'changedfiles', 'diffsummary', 'error', 'head', 'means', 'method', 'milestone', 'order', 'owneremail',
+  'paths', 'progress', 'reportedby', 'reviewquorum', 'selfreports', 'statereason', 'touchedpaths', 'value'];
+
 test('the canaries really reached the screen for a wide set of fields (otherwise "inert" proves nothing)', () => {
   const table = [...seen].map(([k, w]) => `${k}: ${[...w].map((x) => x.slice(0, 24)).join(' | ')}`).sort();
   console.log(`canary fields seen on screen (${table.length}):\n  ${table.join('\n  ')}`);
   const REQUIRED = ['instruction', 'workspaceid', 'label', 'title', 'text', 'name', 'question', 'lastactivity', 'content'];
   for (const k of REQUIRED) assert.ok(seen.has(k), `no canary for "${k}" ever reached the screen: a renderer that stops escaping it would go unnoticed`);
+  const unseen = [...new Set([...allUsed].filter((k) => !URLS.has(k)).map(tag))].filter((k) => !seen.has(k)).sort();
+  console.log(`fields tainted but never visible on any surface or state (${unseen.length}): ${unseen.join(', ')}`);
+  assert.deepEqual(unseen, UNRENDERED, 'a field the proxy taints must reach the screen somewhere, or be listed (and justified) in UNRENDERED: a field that is never shown cannot be tested by this gate');
   assert.ok(seen.size >= 10, `only ${seen.size} fields reached the screen`);
 });

@@ -180,6 +180,10 @@ class Seeder:
         s.submit_proposal(agent, tid, {"kind": "doc", "title": "Parser notes <b>x</b>", "content": "notes\n" + HOSTILE,
                                        "expected_version": inbox_version()})
         self.agent_auth = (auth, dev)
+        if self.cfg.get("mention_agent"):
+            # an agent that may be handed a task: it is what the composer offers when a person types "@"
+            out = s.connect_agent(a, {"harness_type": "claude-code", "name": "helper-bot"})
+            s.grant_agent(a, self.room, {"agent_id": out["agent_id"], "actions": ["read", "post", "execute"]})
         if self.cfg.get("rich"):
             self.rich()
         if self.cfg.get("long_labels"):
@@ -196,6 +200,10 @@ class Seeder:
         s.ask_consultation(a, self.room, {"target": {"kind": "user", "id": "bob"}, "subject": {"kind": "node", "node_id": "attempt:a1"},
                                           "question": "which approach is safer for the parser?", "idempotency_key": "seed-rich-q"})
         s.external_heartbeat(self.agent_principal, {"status": "working", "activity": "reading parser.py"})
+        # lineage the external agent reports about itself: shown under its tab ("Lineage reported by <label>")
+        s.external_lineage(self.agent_principal, {"event_id": "seed-rich-l1", "source_sequence": 1, "event_type": "node.upsert",
+                                                  "payload": {"node_type": "agent", "node_id": f"agent:{self.agent_id}.worker",
+                                                              "label": "Reported worker", "state": "running"}})
 
     def long_labels(self):
         """Unbroken 300-character text in every place a person can type, so the 320px reflow gate meets what real users paste

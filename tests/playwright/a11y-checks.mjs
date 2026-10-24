@@ -79,6 +79,8 @@ function staticInPage(arg, L) {
       const al = (el.getAttribute('aria-label') || '').trim();
       if (al) return al;
       if (el.labels && el.labels.length) { const t = [...el.labels].map(text).join(' ').trim(); if (t) return t; }
+      // a select's name is NOT its option text and a textarea's name is NOT its content: both are the value a person chose or typed
+      if (el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') return (el.getAttribute('title') || '').trim();
       if (el.tagName === 'INPUT' && ['submit', 'button', 'reset'].includes(el.type) && el.value) return el.value;
       if (el.tagName === 'IMG') return (el.getAttribute('alt') || '').trim();
       if (el.tagName === 'SVG' || el.tagName === 'svg') { const t = el.querySelector(':scope > title'); if (t) return text(t); }
@@ -135,6 +137,15 @@ function staticInPage(arg, L) {
       if (!role && live === null && visible(el) && el.children.length === 0 && /(^|[\s_-])(toast|snackbar|flash|notice|status-msg|alert|error-msg|form-error)([\s_-]|$)/.test(`${el.id} ${el.className && el.className.baseVal === undefined ? el.className : ''}`) && !el.closest('[role=status],[role=alert],[aria-live]')) add('live-region', '4.1.3', el, 'looks like a status or error message but is not a live region');
     }
     for (const el of scope.querySelectorAll('[aria-live=assertive]')) if (!el.matches('[role=alert]')) add('live-assertive', '4.1.3', el, 'assertive live region (interrupts); prefer polite/role=status');
+    // ---- focus order must follow the visual order: CSS that re-orders children (order, *-reverse) separates what Tab does from what is seen
+    const hasFocusable = (el) => (focusableNow(el) || [...el.querySelectorAll('*')].some(focusableNow));
+    for (const el of all) {
+      if (!visible(el)) continue;
+      const cs = getComputedStyle(el);
+      if (/-reverse$/.test(cs.flexDirection) && /flex/.test(cs.display) && hasFocusable(el)) add('focus-order', '2.4.3', el, `flex-direction: ${cs.flexDirection} shows its children in the opposite order to the one Tab follows`);
+      const parent = el.parentElement;
+      if (parent && /flex|grid/.test(getComputedStyle(parent).display) && cs.order !== '0' && hasFocusable(el)) add('focus-order', '2.4.3', el, `order: ${cs.order} moves it away from its place in the Tab order`);
+    }
     // ---- ARIA validity
     const ids = new Map();
     for (const el of scope.querySelectorAll('[id]')) ids.set(el.id, (ids.get(el.id) || 0) + 1);
@@ -193,7 +204,7 @@ function staticInPage(arg, L) {
       seen.add(el); stats.textNodes += 1;
       const cs = getComputedStyle(el);
       const svg = el.closest('svg');
-      const paint = svg && el.namespaceURI === 'http://www.w3.org/2000/svg' ? cs.fill : cs.color;
+      const paint = svg && el.namespaceURI === 'http://www.w3.org/2000/svg' ? cs.fill : (cs.webkitTextFillColor && cs.webkitTextFillColor !== cs.color ? cs.webkitTextFillColor : cs.color);
       const fg = parse(paint);
       if (!fg) continue;                       // fill: none / a paint server (gradient): not judged
       const alpha = fg[3] * opacityOf(el);
@@ -287,6 +298,9 @@ function staticInPage(arg, L) {
       if (cs.cursor !== 'pointer') continue;
       if (el.matches('button,a[href],input,select,textarea,summary,label,[tabindex],[role=button],[role=tab],option') || el.closest('button,a[href],summary,label,[tabindex],[role=button]')) continue;
       if (el.closest('svg') && el.ownerSVGElement && el.closest('[tabindex],[role=button]')) continue;
+      // the options of a listbox that a combobox controls are chosen with the arrow keys through aria-activedescendant
+      const lb = el.closest('[role=listbox]');
+      if (lb && lb.id && document.querySelector(`[role=combobox][aria-controls~="${lb.id}"]`)) continue;
       add('keyboard-operable', '2.1.1', el, 'looks clickable (cursor:pointer) but is not focusable');
     }
     // ---- `transition: all` animates properties nobody chose (layout, colour, shadow together) and defeats reduced-motion overrides

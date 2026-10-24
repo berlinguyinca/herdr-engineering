@@ -8,9 +8,12 @@
 // Run: node --test --test-concurrency=1 tests/visual/ui-gates-visual.test.mjs
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { CFG } from '../playwright/ui-gates-lib.mjs';
-import { launch } from '../playwright/ui-gates-lib.mjs';
-import { SURFACES, VIEWPORTS, baselineSizes, capture, checkAgainstBaseline, checkRegion, diffPng, newDeterministicServer } from '../playwright/visual-baselines.mjs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, readdirSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { CFG, launch, openReal, openSub } from '../playwright/ui-gates-lib.mjs';
+import { FONT_DIR, SURFACES, VIEWPORTS, assertBundledFonts, baselineSizes, bundledFontCss, capture, expectedBaselineFiles, orphanBaselines, checkAgainstBaseline, checkRegion, diffPng, newDeterministicServer } from '../playwright/visual-baselines.mjs';
 
 let srv; let browser;
 before(async () => { srv = await newDeterministicServer(); browser = await launch(); });
@@ -36,9 +39,60 @@ test('the capture is deterministic: three fresh loads of the same surfaces agree
 
 test('the baselines respect the size policy (total and per file)', () => {
   const sz = baselineSizes();
-  assert.ok(sz.count >= 60, `${sz.count} baselines`);
+  assert.ok(sz.count >= expectedBaselineFiles().size, `${sz.count} baselines`);
   assert.ok(sz.totalKb <= CFG.screenshots.max_total_kb, `${sz.totalKb.toFixed(0)} KB of baselines exceed the ${CFG.screenshots.max_total_kb} KB cap`);
   assert.ok(sz.biggest.kb <= CFG.screenshots.max_file_kb, `${sz.biggest.f} is ${sz.biggest.kb.toFixed(0)} KB, above ${CFG.screenshots.max_file_kb} KB`);
+});
+
+test('no baseline is an orphan, and the tool notices one', () => {
+  assert.deepEqual(orphanBaselines(), [], 'every PNG in docs/assets/screenshots is produced by a surface of the suite');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'orphans-'));
+  const [one] = [...expectedBaselineFiles()];
+  writeFileSync(path.join(dir, one), ''); writeFileSync(path.join(dir, 'collab-gone__desktop.png'), '');
+  assert.deepEqual(orphanBaselines(dir), ['collab-gone__desktop.png']);
+  assert.equal(readdirSync(dir).length, 2, 'the tool does not delete what it finds');
+});
+
+test('the CLI refuses a slug that matches nothing, for check and for update, instead of exiting quietly', () => {
+  for (const args of [['check', 'no-such-surface'], ['update', '--i-understand-this-rewrites-baselines', 'no-such-surface']]) {
+    const r = spawnSync(process.execPath, [path.join(FONT_DIR, '..', 'visual-baselines.mjs'), ...args], { encoding: 'utf8' });
+    assert.equal(r.status, 2, `${args.join(' ')} exits 2 (got ${r.status})`);
+    assert.match(r.stderr, /no surface matches "no-such-surface"/);
+  }
+});
+
+test('the font assertion looks at every element: a host font on ANY element fails the capture', async () => {
+  const { ctx, page } = await openReal(browser, srv.info, 'alice', { bypassCSP: true, reducedMotion: 'reduce' });
+  try {
+    await page.addStyleTag({ content: bundledFontCss() });
+    await openSub(page, 'chat');
+    await page.locator('#hcn-log').waitFor();
+    const ok = await assertBundledFonts(page, ctx);
+    assert.ok(ok.checked >= 20, `${ok.checked} font runs were checked`);
+    assert.deepEqual(Object.keys(ok.used).sort().filter((f) => /Liberation|Herdr/.test(f)).length > 0, true, `the bundled fonts painted the page: ${JSON.stringify(ok.used)}`);
+    for (const [css, text] of [["font-family:'DejaVu Sans'", 'host sans'], ["font-family:serif", 'host serif'], ['font-family:Inter', '\u{1F916}']]) {
+      await page.evaluate(([c, t]) => { const s = document.createElement('span'); s.id = 'host-probe'; s.setAttribute('style', c); s.textContent = t; document.body.appendChild(s); }, [css, text]);
+      await assert.rejects(() => assertBundledFonts(page, ctx), /host fonts painted glyphs/, `${css} / ${text} must be caught`);
+      await page.evaluate(() => document.getElementById('host-probe').remove());
+    }
+  } finally { await ctx.close(); }
+});
+
+test('the baselines do not depend on the host: the whole suite passes under a fontconfig that knows ONLY the bundled fonts', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'fc-'));
+  const conf = path.join(dir, 'fonts.conf');
+  // rendering settings (hinting, antialiasing, subpixel) still come from the system's conf.d: they are NOT a font, and they are the
+  // part of the host that a baseline can still depend on (documented in docs/operations/ui-gates.md)
+  writeFileSync(conf, `<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd"><fontconfig><dir>${FONT_DIR}</dir><cachedir>${path.join(dir, 'cache')}</cachedir>`
+    + '<include ignore_missing="yes">/etc/fonts/conf.d</include></fontconfig>');
+  const env = { ...process.env, FONTCONFIG_FILE: conf };
+  const fc = spawnSync('fc-list', ['--format', '%{family}\\n'], { encoding: 'utf8', env });
+  if (!fc.error) {
+    const families = [...new Set(fc.stdout.split('\n').map((l) => l.trim()).filter(Boolean))];
+    assert.ok(families.length > 0 && families.every((f) => /Liberation|Herdr/.test(f)), `only the bundled fonts are visible: ${families.join(' | ')}`);
+  }
+  const r = spawnSync(process.execPath, [path.join(FONT_DIR, '..', 'visual-baselines.mjs'), 'check'], { encoding: 'utf8', env, maxBuffer: 1 << 26, timeout: 900000 });
+  assert.equal(r.status, 0, `baselines:check under the bundled-fonts-only fontconfig failed:\n${(r.stdout + r.stderr).split('\n').filter((l) => !l.startsWith('ok')).slice(0, 25).join('\n')}`);
 });
 
 // ---- the gate has teeth: each defect below is one a reviewer found slipping past an earlier, looser budget, or one a person would
@@ -57,6 +111,10 @@ const TEETH = [
   ['cards gained a pixel of padding', 'collab-attention', '.hd-card { padding: 17px !important }', []],
   ['the sub-tab bar gained 4px of padding', 'collab-attention', '.cx-stabs { padding-top: 4px !important }', []],
   ['the Pause motion label is gone (the button is an empty box)', 'collab-flow', '#hcn-flow-still { font-size: 0 !important; width: 10px; padding: 0 !important; overflow: hidden }', ['flowhead']],
+  ['the first comment of the workbench is transparent', 'collab-lineage', 'p.wb-text { color: transparent !important; -webkit-text-fill-color: transparent !important }', ['wbcomments']],
+  ['the fork button is hidden', 'collab-lineage', '.wb-table-wrap button { visibility: hidden !important }', ['wbfork']],
+  ['the steering request buttons are hidden', 'collab-lineage', 'ul.wb-steers button { visibility: hidden !important }', ['wbsteers']],
+  ['the steering form submit button is hidden', 'collab-lineage', 'form[data-wb-form="propose"] > button { visibility: hidden !important }', ['wbpropose']],
   ['the lineage node boxes lost their borders', 'collab-lineage', '.lin-box { stroke: transparent !important }', ['node', 'graph']],
   ['a failed node is painted the wrong colour', 'collab-lineage', '.lin-node--failed .lin-box { fill: #ccc !important }', ['graph']],
 ];

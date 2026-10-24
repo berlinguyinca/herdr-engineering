@@ -61,7 +61,7 @@ export function watch(page) {
   page.on('console', (m) => { if (['error', 'warning'].includes(m.type())) w.errors.push(`${m.type()}: ${m.text()}`); });
   page.on('pageerror', (e) => w.errors.push(`pageerror: ${e.message}`));
   page.on('requestfailed', (r) => w.failed.push(`${r.method()} ${r.url()} ${r.failure()?.errorText}`));
-  page.on('response', (r) => { if (r.status() >= 400 && !/favicon/.test(r.url())) w.bad.push(`${r.status()} ${r.request().method()} ${r.url()}`); });
+  page.on('response', (r) => { if (r.status() >= 400) w.bad.push(`${r.status()} ${r.request().method()} ${r.url()}`); });
   page.addInitScript(() => { document.addEventListener('securitypolicyviolation', (e) => { (window.__csp ||= []).push(`${e.violatedDirective} ${e.blockedURI}`); }); });
   w.collectCsp = async () => { try { w.csp = await page.evaluate(() => window.__csp || []); } catch { /* page gone */ } return w.csp; };
   return w;

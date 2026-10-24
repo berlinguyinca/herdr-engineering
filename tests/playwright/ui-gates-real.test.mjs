@@ -72,6 +72,8 @@ test('every surface renders real content and a full tour is free of console erro
     assert.match(await page.locator(`#hcn-p-${sub}`).innerText(), PROOF[sub], `${sub} shows its seeded content`);
   }
   assert.ok(await page.locator('svg.lin-svg g[data-node]').count() >= 8, 'the graph shows the seeded nodes');
+  // the page declares its icon, so the browser never asks the server for /favicon.ico (which is a 404): no special case in the watcher
+  assert.ok(await page.locator('link[rel~="icon"][href]').count() === 1, 'the page declares exactly one icon');
   await noProblems(w, 'tour as alice');
   await ctx.close();
 });
@@ -390,7 +392,8 @@ for (const [label, opts] of [['desktop light', { colorScheme: 'light' }], ['desk
     const { ctx, page } = await session('alice', { ...opts, reducedMotion: 'reduce' });
     let controls = 0; let focused = 0; let text = 0;
     for (const sub of SUBS) { await render(page, sub); const a = await staticAudit(page, `#hcn-p-${sub}`); const b = await focusIndicatorAudit(page, `#hcn-p-${sub}`); controls += a.stats.controls; text += a.stats.textNodes; focused += b.stats.focused; }
-    assert.ok(controls >= 60 && focused >= 40 && text >= 100, `audited ${controls} controls, focused ${focused}, read ${text} text nodes: a silent skip would show here`);
+    console.log(`# default views ${label}: controls ${controls} focused ${focused} text ${text}`);
+    assert.ok(controls >= 89 && focused >= 71 && text >= 227, `audited ${controls} controls, focused ${focused}, read ${text} text nodes: a silent skip would show here`);
     await ctx.close();
   });
 }

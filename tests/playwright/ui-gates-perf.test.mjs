@@ -119,6 +119,47 @@ for (const n of SIZES) {
   });
 }
 
+// The key-to-frame budget is a stopwatch and flakes on a loaded host; this is the same property counted: typing six characters quickly
+// into the filter of a graph above the draw cap must redraw the lineage ONCE (the debounce), not once per key. A call count does not
+// depend on how busy the machine is.
+test('typing in the filter of a graph above the draw cap redraws once, not once per key (the debounce)', { timeout: 300000 }, async () => {
+  const srv = await startRealServer({ graph_nodes: 700 });
+  try {
+    const { ctx, page } = await openReal(browser, srv.info, 'alice');
+    await page.locator('[data-sub="lineage"]').click();
+    await page.locator('#hcn-lineage svg.lin-svg g[data-node]').first().waitFor({ timeout: 60000 });
+    // page with a click from inside the page: the button is replaced by each redraw, and a locator can lose it between two steps
+    for (let i = 0; i < 40; i += 1) {
+      const before = await page.evaluate(() => { const b = document.querySelector('[data-more]'); const t = document.querySelector('#hcn-lineage')?.innerText; if (b) b.click(); return b ? t : null; });
+      if (before === null) break;
+      await page.waitForFunction((b) => document.querySelector('#hcn-lineage')?.innerText !== b, before, { timeout: 60000 });
+    }
+    assert.equal(await page.locator('#hcn-lineage svg.lin-svg g[data-node]').count(), 0, 'above the cap, so nothing is drawn');
+    const cdp = await ctx.newCDPSession(page);
+    await cdp.send('Profiler.enable');
+    await cdp.send('Profiler.startPreciseCoverage', { callCount: true, detailed: false });
+    const calls = async () => {
+      const { result } = await cdp.send('Profiler.takePreciseCoverage');
+      let render = 0;
+      for (const sc of result) for (const fn of sc.functions) {
+        if (!/collab-lineage\.js/.test(sc.url)) continue;
+        if (fn.functionName === 'renderLineage') render += fn.ranges[0].count;
+      }
+      return { render };
+    };
+    await calls();      // reset: whatever the paging did is not counted
+    await page.locator('[data-filter="q"]').waitFor();
+    await page.locator('[data-filter="q"]').focus();
+    await page.keyboard.type('bulk12', { delay: 20 });
+    await page.waitForTimeout(900);
+    const c = await calls();
+    console.log(JSON.stringify({ keystrokes: 6, renderLineageCalls: c.render }));
+    assert.ok(c.render >= 1, 'the filter redrew the lineage at least once (the counter works)');
+    assert.ok(c.render <= 2, `six quick keystrokes redrew the lineage ${c.render} times: the debounce is gone`);
+    await ctx.close();
+  } finally { srv.stop(); }
+});
+
 // The layout of a graph this size is expensive, and above the draw cap nothing is drawn from it. Typing is debounced, but a checkbox is
 // not: it must redraw at once, so it is the path that proves the layout is skipped when there is no SVG to lay out for.
 test('toggling a type filter on a graph above the draw cap is cheap: the layout is not computed for a graph that is not drawn', { timeout: 600000 }, async () => {
