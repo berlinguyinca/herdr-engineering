@@ -158,7 +158,17 @@ because the SHA names the content. Gate on the quorum, show the flag only as a h
 
 `GET /api/v1/graph/nodes/{pr_id}/review-quorum` (viewer level; 404 when the PR is absent/hidden or the feature is off)
 DERIVES the quorum; it writes nothing and Herdr does not request reviews itself. `rereview_required` / `rereview_needed`
-are the re-review request: whoever owns review dispatch (Pi on `github.evidence_stale`, AutoSpec) polls or subscribes.
+are the re-review need: whoever owns review dispatch (Pi on `github.evidence_stale`, AutoSpec) polls or subscribes.
+
+`POST /api/v1/graph/nodes/{pr_id}/review-quorum/rereview` `{head?: <full sha>}` (T16 gap C) RECORDS the ask for the PR's CURRENT head
+(ingest-role key; still dispatches nothing). Scope: the PR must be visible to the caller (hidden == absent == 404), and the caller must be a
+configured `trusted_head_writers` or `reviewers` principal or an authenticated operator (otherwise 403 `not_permitted`). 201 new, 200 replay
+(one request per PR head; the same record is returned), 409 `not_required` (status other than `insufficient`), `stale_head` (the supplied
+`head` is not the current one), `head_unknown`; 429 `rate_limited` (60 per principal per hour) or `pr_limit` (64 heads per PR). The record is a
+server-owned stream (`review_request`, never accepted by ingest, 404 on `/api/v1/events`) written durably before the 201, and carries the
+requesting principal and time. The quorum read then shows `rereview_request: {request_id, head, requested_at, needed}` while the PR is at
+that head and `null` for any other. AutoSpec's `review-quorum request` should dispatch when `rereview_required` OR `rereview_request` is
+set, once per (PR, head).
 
 Producer contract. Each independent reviewer publishes with its OWN ingest key (reviewer identity is server-authenticated;
 a shared emitter key is one identity): `node.upsert review:<id>` then `edge.add reviewed review:<id> -> pr:<id>` with
@@ -542,7 +552,7 @@ API. Neither feature exists in `collab_only` mode (no graph there): the routes a
   trail records `comment.add/edit/retract` but not the text.
 
 ### Steering (explicit, typed, two-step)
-Closed set of actions: `pause`, `resume`, `stop_after_step`, `redirect` (the only one with free text, `instruction` <= 1000 chars),
+Closed set of actions: `pause`, `resume`, `stop_after_step`, `redirect` (free text, `instruction` <= 1000 chars, required; a `fork` may carry the same bounded, redacted `instruction` optionally: the changed requirement for the new attempt, delivered as untrusted text),
 `approve`, `reject`. There is no command, shell, argv or terminal field anywhere; unknown fields are 400.
 - **Targets.** Control actions: `attempt`, `agent`, `task` or `mission` nodes. `approve`/`reject`: `gate` nodes only, and only with
   `expected_digest` equal to a digest/commit the gate carries. **`plan` and `review` nodes are refused: plan decisions belong to
@@ -568,7 +578,14 @@ Closed set of actions: `pause`, `resume`, `stop_after_step`, `redirect` (the onl
   one extra POST). Not an HCN agent credential: agents never receive or send steering through MCP/A2A. Each item carries
   `steering_id` (the idempotency key: apply once), `trust: "untrusted"`, `provenance`, `proposed_by`, `confirmed_by`, the room, the
   target and fence, `valid_until_epoch`, and a fixed notice telling the receiver the free text is untrusted instruction text from a
-  named person, never authority to run commands, and to answer `unsupported` rather than fake an action. At fetch time Herdr re-checks
+  named person, never authority to run commands, and to answer `unsupported` rather than fake an action.
+  `GET /api/v1/steering/targets/{node_id}?instance_id=` (T16 gap A) is the read an ingest key makes at APPLY time: the CURRENT `fence`,
+  `digest` (first of `plan_digest`, `digest`, `commit`, `head_sha`), `digests`, `state` and `superseded` of a node the caller OWNS and that has a
+  live (confirmed or delivered, unexpired) request, computed from the confirmer's room view exactly as delivery computes it, so it is comparable with
+  the request's `target.fence` although the key cannot read a room-scoped node through the graph. It delivers nothing, counts no delivery and
+  writes nothing; every other case (not the owner, no live request, hidden, absent, steering off) is the one `404`. `GET /api/v1/graph/nodes/{id}`
+  also carries `fence`/`digest`/`digests` (steering on) for a node the caller may read through the graph (org-scoped or its own private nodes);
+  a hidden or absent node is 404 exactly as before. At fetch time Herdr re-checks
   that steering is still on, the proposer still holds `task`, the confirmer still holds a confirming role, the room still exists and
   the fence still matches; otherwise the request is closed (`rejected`/`fenced`) and not delivered. A request is re-offered until
   acked at most 5 times and for `delivery_ttl_seconds` (300); an unconfirmed proposal lives `proposal_ttl_seconds` (900).
@@ -688,7 +705,9 @@ Remote agents use MCP `consult_inbox` / `consult_answer` (listed only while the 
   the asker reads its answer labelled untrusted.
 - The question and answer travel only to the asker and the target (never in the room feed, a notification or the graph).
 - **Graph record.** The service writes `thread:hcn-consult.<id>` (attrs: asker, target, timestamps; no text) and a `consultation` edge from it
-  to the subject, as the room's service principal. The prefix is reserved: no ingest key can write, edit or point at it. State changes
+  to the subject, as the room's service principal. T16: it also writes two reference nodes `thread:hcn-consult-asker.<id>` and
+  `thread:hcn-consult-target.<id>` (attrs `role`, `kind` user|agent, `ref` the person or agent id; same scope label, no text) and a
+  `consultation` edge asker -> target, so "who asked whom" is a graph fact in the direction the edge table above states (own source `hcn-cr-*`). The prefix is reserved: no ingest key can write, edit or point at it. State changes
   (answered, declined, cancelled) are published as `node.state`; expiry is NOT pushed (the node carries `expires_at`).
 
 ### 3. Cross-workspace links: edge kind `cross_link`

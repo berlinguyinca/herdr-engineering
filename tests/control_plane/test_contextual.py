@@ -831,6 +831,9 @@ def test_the_graph_records_the_asker_and_the_target_as_an_edge_never_the_text(cx
         cx.feed.send("node.upsert", {"node_type": "thread", "node_id": ask_node, "label": "forged"}, "room", room_id=cx.room)
     with pytest.raises(PermissionError):
         cx.feed.send("edge.add", {"edge_type": "consultation", "from_id": ask_node, "to_id": "task:a"}, "room", room_id=cx.room)
+    with pytest.raises(PermissionError):                                       # nor can a key claim an id in the namespace ahead of time
+        cx.feed.send("node.upsert", {"node_type": "thread", "node_id": "thread:hcn-consult-asker.collab_future",
+                                     "label": "pre-claimed"}, "room", room_id=cx.room)
     with pytest.raises(PermissionError):
         cx.feed.send("edge.add", {"edge_type": "consultation", "from_id": "task:a", "to_id": tgt_node}, "room", room_id=cx.room)
 

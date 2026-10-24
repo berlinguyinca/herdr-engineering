@@ -115,10 +115,9 @@ Rules: every refusal is paired with a positive control; `Plane.verify_features` 
   covered only through raw ingest at the server contract).
 * **S4 external agents** - Herdr `test_s4_external` (14): join/heartbeat/MCP surface, delegation bounds, consultation,
   no onward delegation by externals. Pi `s4-external-bridge` (2). GAPs: Pi has no external-agent bridge client (Herdr
-  docs say none ships). Four strict xfails in Herdr `test_s4_external`: `authorize` answers an existence oracle for
-  workspace link ids; MCP `tools/list` advertises the same menu to every external (including always-refused tools);
-  no `max_turns`/`max_hops` in a delegation budget (nearest: `max_steps`); the consultation edge runs thread -> subject, not
-  asker -> target.
+  docs say none ships). The four former strict xfails in Herdr `test_s4_external` are real tests since the
+  T16 Herdr-gaps PR (workspace-link `authorize` answers one way; MCP `tools/list` is per agent; `max_turns` is enforced and
+  `max_hops` echoed; the consultation records asker -> target). `max_xfail` for that file is gone.
 * **S5 comment on failed review, fork, compare, promote** - Herdr `test_s5_steering_forks` (14), Pi
   `s5-fork-compare-promote` (19): real git repos with a bare remote, real forks, instance_id pinning ("same key under
   another instance_id is NOT offered"). Fences are tested one stage at a time (propose / confirm / delivery) by changing only a fenced attribute, and self-confirmation is refused with an operator-switch control. GAPs: strict xfail - fork promotion marks no dependent gate stale; changed

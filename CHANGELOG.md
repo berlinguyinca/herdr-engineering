@@ -5,6 +5,17 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### T16 Herdr-side gaps from the Pi and AutoSpec wiring (stacked on #179)
+- Steering: an ingest key can read the CURRENT fence and gate digest at apply time: `GET /api/v1/steering/targets/{node_id}` (owner of the node, live
+  request, room-scoped nodes included) and `fence`/`digest`/`digests` on `GET /api/v1/graph/nodes/{id}` for nodes the key may read. A `fork` may carry
+  a bounded, redacted `instruction` (the changed requirement), delivered in the pending item like a redirect's.
+- Review quorum: `POST /api/v1/graph/nodes/{pr}/review-quorum/rereview` records a durable, idempotent-per-head, scoped (trusted head writer, reviewer or
+  operator), rate-limited, audited re-review request; the quorum read shows it as `rereview_request` for that head.
+- External agents: workspace-link authorize no longer tells a non-owner whether a link id exists; MCP `tools/list` is per agent; delegation budgets accept
+  and enforce `max_turns` (and echo `max_hops`, the chain-depth ceiling); a consultation also records `asker -> target` as a graph edge (reference nodes).
+- Acceptance: four Herdr strict xfails became real tests; the manifest minimums rise (s2 20, s5 15); no minimum is lowered.
+- No migration, no environment variable. Rollback: revert the PR; the new `review_request` rows are ignored by older builds.
+
 ### T16 security fixes, Herdr side (stacked on the T16 release-gate branch)
 - Ingest is an allow-list of entity types; `collab`, `ci_*` and other adapter-owned streams and the server's session receipts can no longer be forged
   by an ingest key (H1, M1, M5). Foreign `collab` rows already in a database are quarantined at startup, and a corrupt collab log disables collaboration
