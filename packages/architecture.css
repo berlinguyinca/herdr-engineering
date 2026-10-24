@@ -63,3 +63,4 @@
 .arch-request form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
 .arch-request label { display: flex; flex-direction: column; gap: 4px; font-size: .8rem; color: var(--a-muted); }
 .arch-explain { border-left: 3px solid var(--a-accent); padding-left: 10px; margin-top: 8px; font-size: .85rem; }
+.arch-request input { background: var(--a-node); color: var(--a-fg); border: 1px solid var(--a-border); border-radius: 4px; padding: 4px 6px; font: inherit; }
