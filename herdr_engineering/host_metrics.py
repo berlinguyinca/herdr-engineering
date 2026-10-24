@@ -13,6 +13,7 @@ import platform
 import re
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -23,6 +24,21 @@ _PSEUDO_FS = {
     "pstore", "configfs", "fusectl", "binfmt_misc", "bpf", "nsfs", "ramfs", "efivarfs",
     "rpc_pipefs", "fuse.lxcfs",
 }
+# Remote / network filesystem types (``/proc/mounts`` column 3). They are never
+# statvfs'd: a stalled server blocks statvfs uninterruptibly, and their usage is
+# the server's business, not this host's.
+NETWORK_FS = frozenset({
+    "nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "ceph", "glusterfs", "afs",
+    "9p", "lustre", "beegfs", "gpfs", "ocfs2", "gfs2", "davfs", "coda",
+    "fuse.sshfs", "fuse.quobyte", "fuse.mfs", "fuse.glusterfs", "fuse.cephfs",
+    "fuse.ceph-fuse", "fuse.s3fs", "fuse.rclone", "fuse.gcsfuse", "fuse.davfs",
+    "fuse.juicefs", "fuse.lizardfs", "fuse.moosefs",
+})
+# Hard bound on one disk probe (statvfs + stat), and on all probes in one sample.
+# A probe that overruns is abandoned in its daemon thread; that path is skipped
+# until the stuck probe returns, so at most one thread per path is ever stuck.
+PROBE_TIMEOUT_S = 2.0
+PROBE_BUDGET_S = 4.0
 MAX_MOUNTS = 8
 MAX_GPUS = 8
 TOP_N = 5
@@ -205,6 +221,9 @@ class HostSampler:
         self._agent_binaries = tuple(agent_binaries)
         self._prev_cpu: tuple[int, int] | None = None
         self._prev_net: tuple[float, int, int] | None = None
+        self._probe_lock = threading.Lock()
+        self._stuck: dict[str, threading.Thread] = {}
+        self._probe_deadline = 0.0
 
     # -- I/O seams (patched in tests) ------------------------------------
     def _read(self, path: str) -> str:
@@ -223,6 +242,7 @@ class HostSampler:
     # -- public ----------------------------------------------------------
     def sample(self) -> dict:
         out: dict = {}
+        self._probe_deadline = None  # the probe budget starts at this sample's first probe
         darwin = platform.system() == "Darwin"
         steps = ([self._mac_cpu, self._mac_mem, self._mac_uptime, self._mac_net,
                   self._load, self._disk_pct, self._mounts_df, self._gpus, self._top]
@@ -260,7 +280,48 @@ class HostSampler:
         l1, l5, l15 = os.getloadavg()
         return {"load1": l1, "load5": l5, "load15": l15}
 
+    def _bounded(self, key: str, fn: Callable[[], dict | None]) -> dict | None:
+        """Run the disk probe ``fn`` in a daemon thread; ``TimeoutError`` (an
+        ``OSError``) if it overruns ``PROBE_TIMEOUT_S`` or this sample's
+        ``PROBE_BUDGET_S``, or if the previous probe for ``key`` is still stuck.
+
+        A hung network mount blocks statvfs/stat uninterruptibly, so the
+        thread cannot be killed; it is left behind and ``key`` is skipped until
+        it returns, which bounds stuck threads to one per key."""
+        now = time.monotonic()
+        if self._probe_deadline is None:
+            self._probe_deadline = now + PROBE_BUDGET_S
+        timeout = min(PROBE_TIMEOUT_S, self._probe_deadline - now)
+        with self._probe_lock:
+            prev = self._stuck.get(key)
+            if prev is not None:
+                if prev.is_alive():
+                    raise TimeoutError(f"disk probe still stuck: {key}")
+                del self._stuck[key]
+        if timeout <= 0:
+            raise TimeoutError("disk probe budget spent")
+        box: dict = {}
+
+        def run():
+            try:
+                box["value"] = fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+                box["error"] = exc
+        t = threading.Thread(target=run, name="host-disk-probe", daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            with self._probe_lock:
+                self._stuck[key] = t
+            raise TimeoutError(f"disk probe timed out: {key}")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
     def _usage(self, path: str) -> dict | None:
+        return self._bounded(path, lambda: self._usage_now(path))
+
+    def _usage_now(self, path: str) -> dict | None:
         st = self._statvfs(path)
         total = st.f_blocks * st.f_frsize
         if total <= 0:
@@ -279,11 +340,15 @@ class HostSampler:
         """``disk``: pct used of the fs holding the herdr data dir.
 
         Independent of the mount list: statvfs on the nearest existing ancestor.
+        The whole walk is one bounded probe (the data dir may sit on a network
+        home), so a stalled filesystem omits ``disk`` instead of blocking.
         """
-        p = Path(_herdr_data_dir())
-        while not p.exists() and p != p.parent:
-            p = p.parent
-        u = self._usage(str(p))
+        def probe():
+            p = Path(_herdr_data_dir())
+            while not p.exists() and p != p.parent:
+                p = p.parent
+            return self._usage_now(str(p))
+        u = self._bounded("\0disk", probe)
         return {"disk": u["pct"]} if u else {}
 
     def _cap_mounts(self, mounts: list[dict]) -> dict:
@@ -377,7 +442,8 @@ class HostSampler:
         mounts, seen = [], set()
         for line in self._read("/proc/mounts").splitlines():
             f = line.split()
-            if len(f) < 3 or f[2] in _PSEUDO_FS or not f[0].startswith("/"):
+            if (len(f) < 3 or f[2] in _PSEUDO_FS or f[2] in NETWORK_FS
+                    or not f[0].startswith("/")):
                 continue
             path = f[1].replace("\\040", " ")
             if path in seen:
@@ -456,7 +522,8 @@ class HostSampler:
 
     def _mounts_df(self) -> dict:
         mounts = []
-        for line in self._run(["df", "-k"]).splitlines()[1:]:
+        # -l: local filesystems only, so df itself never stats a network mount.
+        for line in self._run(["df", "-k", "-l"]).splitlines()[1:]:
             f = line.split()
             if len(f) < 6 or not f[0].startswith("/dev/"):
                 continue
