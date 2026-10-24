@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import fcntl
 import hashlib
 import json
@@ -18,8 +19,9 @@ import math
 import os
 import re
 import shutil
-import tempfile
+import stat
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -177,7 +179,10 @@ class SkillTransfer:
 
 
 class HarnessSkillInstaller:
-    """Harness-only installer. Root must be private to the harness OS account.
+    """Harness-only installer with trusted ancestry and descriptor-anchored writes.
+
+    Ancestors must be root/harness-owned and not group/other-writable unless
+    sticky (e.g. root-owned /tmp). The root and internal directories are private.
 
     Cache entries are immutable directories named by the signed body SHA-256.
     A SHA-256 of the skill ID names the active symlink, replaced atomically only
@@ -216,66 +221,155 @@ class HarnessSkillInstaller:
             raise ValueError('skill package verification failed') from None
 
     @staticmethod
-    def _directory(path):
-        if any(p.is_symlink() for p in (path, *path.parents)):
-            raise ValueError('symlink in install path')
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if not path.is_dir():
-            raise ValueError('invalid install directory')
+    def _trusted_directory(info, *, private=False):
+        if private:
+            if info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise ValueError('skill install directory must be private to the harness user')
+        elif (info.st_uid not in {0, os.getuid()}
+              or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            # Root-owned sticky /tmp is safe only because every descendant is
+            # also root/harness-owned. Foreign owners can chmod/replace children.
+            raise ValueError('untrusted skill install ancestor')
 
-    @staticmethod
-    def _check_cache(path, files):
-        if path.is_symlink() or not path.is_dir():
-            raise ValueError('invalid skill cache')
+    @classmethod
+    def _open_directory(cls, stack, name, parent=None, *, create=False, private=False):
+        if create:
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ValueError('symlink or invalid install directory') from None
+            raise
+        stack.callback(os.close, fd)
+        cls._trusted_directory(os.fstat(fd), private=private)
+        return fd
+
+    @classmethod
+    def _check_directories(cls, anchors):
+        for parent, name, fd, private in anchors:
+            try:
+                info = os.fstat(fd)
+                linked = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if (info.st_dev, info.st_ino) != (linked.st_dev, linked.st_ino):
+                    raise ValueError('skill install directory changed')
+                cls._trusted_directory(info, private=private)
+            except OSError:
+                raise ValueError('skill install directory changed') from None
+
+    @classmethod
+    def _check_cache(cls, fd, files, prefix=''):
         actual = {}
-        for entry in path.rglob('*'):
-            if entry.is_symlink() or (not entry.is_dir() and not entry.is_file()):
+        for name in os.listdir(fd):
+            relative = prefix + name
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                with ExitStack() as stack:
+                    child = cls._open_directory(stack, name, fd)
+                    actual.update(cls._check_cache(child, files, relative + '/'))
+            elif stat.S_ISREG(info.st_mode) and relative in files:
+                # Nonblocking + fstat prevents a raced FIFO/device from being read.
+                source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                with os.fdopen(source, 'rb') as stream:
+                    opened = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(opened.st_mode) or opened.st_size != len(files[relative]):
+                        raise ValueError('skill cache mismatch')
+                    actual[relative] = stream.read(len(files[relative]) + 1)
+            else:
                 raise ValueError('invalid skill cache entry')
-            if entry.is_file():
-                relative = entry.relative_to(path).as_posix()
-                if relative not in files or entry.stat().st_size != len(files[relative]):
-                    raise ValueError('skill cache mismatch')
-                actual[relative] = entry.read_bytes()
-        if actual != files:
+        if not prefix and actual != files:
             raise ValueError('skill cache mismatch')
+        return actual
+
+    @classmethod
+    def _write_cache(cls, fd, files):
+        for relative, content in files.items():
+            with ExitStack() as stack:
+                parent = fd
+                parts = relative.split('/')
+                for part in parts[:-1]:
+                    parent = cls._open_directory(stack, part, parent, create=True, private=True)
+                output = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=parent)
+                with os.fdopen(output, 'wb') as stream:
+                    stream.write(content)
 
     def install(self, ref: SignedPackageRef, data: bytes) -> Path:
         package = self._verify(ref, data)
-        self._directory(self.root)
-        root_stat = self.root.stat()
-        if root_stat.st_uid != os.getuid() or root_stat.st_mode & 0o077:
-            raise ValueError('skill install root must be private to the harness user')
-        # O_NOFOLLOW also prevents replacing the installer lock with a symlink.
-        fd = os.open(self.root / '.install.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, 'w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            cache, active = self.root / 'cache', self.root / 'installed'
-            self._directory(cache)
-            self._directory(active)
-            target = cache / ref.sha256
-            if target.exists() or target.is_symlink():
-                self._check_cache(target, package.files)
-            else:
-                staging = Path(tempfile.mkdtemp(prefix='package-', suffix='.tmp', dir=cache))
+        if '..' in self.root.parts:
+            raise ValueError('invalid install ancestry')
+        with ExitStack() as stack:
+            # Walk from the filesystem root without resolving any symlink. Keep
+            # every ancestor open, so all writes and checks use the same objects.
+            root = self._open_directory(stack, '/')
+            anchors = [(None, '/', root, False)]
+            for index, name in enumerate(self.root.parts[1:], start=1):
+                private = index == len(self.root.parts) - 1
+                child = self._open_directory(stack, name, root, create=True, private=private)
+                anchors.append((root, name, child, private))
+                root = child
+            self._trusted_directory(os.fstat(root), private=True)
+            lock_fd = os.open('.install.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                              0o600, dir_fd=root)
+            stack.callback(os.close, lock_fd)
+            lock_info = os.fstat(lock_fd)
+            if not stat.S_ISREG(lock_info.st_mode):
+                raise ValueError('invalid install lock')
+            self._trusted_directory(lock_info, private=True)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            self._check_directories(anchors)
+            cache = self._open_directory(stack, 'cache', root, create=True, private=True)
+            active = self._open_directory(stack, 'installed', root, create=True, private=True)
+            anchors.extend([(root, 'cache', cache, True), (root, 'installed', active, True)])
+            try:
+                os.stat(ref.sha256, dir_fd=cache, follow_symlinks=False)
+            except FileNotFoundError:
+                staging = f'package-{uuid4().hex}.tmp'
+                os.mkdir(staging, mode=0o700, dir_fd=cache)
                 try:
-                    for relative, content in package.files.items():
-                        destination = staging / relative
-                        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                        with destination.open('xb') as output:
-                            os.chmod(destination, 0o600)
-                            output.write(content)
-                    os.replace(staging, target)
+                    with ExitStack() as staged:
+                        staging_fd = self._open_directory(staged, staging, cache, private=True)
+                        self._write_cache(staging_fd, package.files)
+                        self._check_directories(anchors)
+                        os.replace(staging, ref.sha256, src_dir_fd=cache, dst_dir_fd=cache)
                 finally:
-                    if staging.exists():
-                        shutil.rmtree(staging)
-            # Recheck expiration after waiting on the lock / filesystem I/O.
+                    # rmtree uses fd-based traversal; never re-resolve self.root.
+                    try:
+                        shutil.rmtree(staging, dir_fd=cache)
+                    except FileNotFoundError:
+                        pass
+            target = self._open_directory(stack, ref.sha256, cache, private=True)
+            self._check_cache(target, package.files)
+            anchors.append((cache, ref.sha256, target, True))
             if self.now() >= ref.expires_at:
                 raise ValueError('skill transfer expired')
+            self._check_directories(anchors)
             slot = hashlib.sha256(ref.skill_id.encode()).hexdigest()
-            pending = active / f'{uuid4().hex}.tmp'
+            pending = f'{uuid4().hex}.tmp'
             try:
-                pending.symlink_to(Path('..') / 'cache' / ref.sha256, target_is_directory=True)
-                os.replace(pending, active / slot)
+                previous = os.readlink(slot, dir_fd=active)
+            except FileNotFoundError:
+                previous = None
+            try:
+                os.symlink(f'../cache/{ref.sha256}', pending, dir_fd=active)
+                os.replace(pending, slot, src_dir_fd=active, dst_dir_fd=active)
+                try:
+                    self._check_directories(anchors)
+                except ValueError:
+                    # If a pathname moved during rename, undo activation only in
+                    # the original directory. Never touch an attacker replacement.
+                    if previous is None:
+                        os.unlink(slot, dir_fd=active)
+                    else:
+                        os.symlink(previous, pending, dir_fd=active)
+                        os.replace(pending, slot, src_dir_fd=active, dst_dir_fd=active)
+                    raise
             finally:
-                pending.unlink(missing_ok=True)
-            return target
+                try:
+                    os.unlink(pending, dir_fd=active)
+                except FileNotFoundError:
+                    pass
+            return self.root / 'cache' / ref.sha256

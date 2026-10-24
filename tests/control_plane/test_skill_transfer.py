@@ -241,10 +241,12 @@ def test_harness_activation_failure_after_staging_preserves_old_link(harness, tr
     backend, run, _, s3, _ = transfer
     second = run(backend.install_skill(agent(), v.skill_id, v.version))
     original = os.replace
-    def fail_pointer(source, target):
-        if source.is_symlink():
+    def fail_pointer(source, target, **kwargs):
+        import stat
+        info = os.stat(source, dir_fd=kwargs.get('src_dir_fd'), follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode):
             raise OSError('activation unavailable')
-        return original(source, target)
+        return original(source, target, **kwargs)
     monkeypatch.setattr(os, 'replace', fail_pointer)
     with pytest.raises(OSError):
         installer.install(second, s3.objects['skills', v.storage_key])
@@ -323,3 +325,120 @@ def test_harness_rejects_signed_file_directory_collision(transfer, env, tmp_path
     with pytest.raises(ValueError):
         HarnessSkillInstaller(tmp_path, trusted_keys=env[0].trusted_keys).install(ref, s3.objects['skills', v.storage_key])
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('mode', [0o777, 0o775])
+def test_harness_rejects_writable_nonsticky_ancestor(harness, tmp_path, mode):
+    installer, ref, data = harness
+    parent = tmp_path / 'unsafe'
+    parent.mkdir(mode=mode)
+    parent.chmod(mode)
+    installer.root = parent / 'private' / 'skills'
+    installer.root.mkdir(parents=True, mode=0o700)
+    with pytest.raises(ValueError, match='ancestor'):
+        installer.install(ref, data)
+    assert not list(installer.root.iterdir())
+
+
+@pytest.mark.parametrize('sticky', [False, True])
+def test_harness_rejects_foreign_owned_ancestor(harness, tmp_path, monkeypatch, sticky):
+    import os
+    installer, ref, data = harness
+    parent = tmp_path / 'foreign'
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o1777 if sticky else 0o755)
+    installer.root = parent / 'skills'
+    installer.root.mkdir(mode=0o700)
+    inode = parent.stat().st_ino
+    stat, fstat = os.stat, os.fstat
+    def foreign_owner(st):
+        if st.st_ino != inode:
+            return st
+        fields = list(st)
+        fields[4] = 987654  # Ownership metadata only; no elevated chown required.
+        return os.stat_result(fields)
+    monkeypatch.setattr(os, 'stat', lambda *a, **kw: foreign_owner(stat(*a, **kw)))
+    monkeypatch.setattr(os, 'fstat', lambda fd: foreign_owner(fstat(fd)))
+    with pytest.raises(ValueError, match='ancestor'):
+        installer.install(ref, data)
+    assert not list(installer.root.iterdir())
+
+
+def test_harness_accepts_owned_sticky_ancestor(harness, tmp_path):
+    installer, ref, data = harness
+    parent = tmp_path / 'sticky'
+    parent.mkdir()
+    parent.chmod(0o1777)
+    installer.root = parent / 'skills'
+    assert (installer.install(ref, data) / 'SKILL.md').read_bytes() == b'# CSV summary'
+
+
+@pytest.mark.parametrize('part', ['ancestor', 'root', 'cache', 'installed'])
+def test_harness_rejects_directory_replacement_before_activation(harness, tmp_path, monkeypatch, part):
+    import shutil
+    installer, ref, data = harness
+    installer.root = tmp_path / 'parent' / 'skills'
+    installer.install(ref, data)
+    directory = (installer.root.parent if part == 'ancestor' else
+                 installer.root if part == 'root' else installer.root / part)
+    detached = tmp_path / 'detached'
+    now = installer.now
+    calls = 0
+    def swap_after_verification():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            directory.rename(detached)
+            shutil.copytree(detached, directory, symlinks=True)
+            if part != 'installed':
+                cached = (directory / 'skills' / 'cache' if part == 'ancestor' else
+                          directory / 'cache' if part == 'root' else directory)
+                (cached / ref.sha256 / 'SKILL.md').write_text('UNVERIFIED replacement')
+        return now()
+    monkeypatch.setattr(installer, 'now', swap_after_verification)
+    with pytest.raises(ValueError, match='changed'):
+        installer.install(ref, data)
+    assert not list(tmp_path.rglob('*.tmp'))
+
+
+@pytest.mark.parametrize('existing', [False, True])
+def test_harness_anchors_activation_when_root_moves_at_replace(harness, transfer, env, tmp_path, monkeypatch, existing):
+    import os
+    import shutil
+    import stat
+    installer, ref, data = harness
+    installer.root = tmp_path / 'skills'
+    active = installer.root / 'installed'
+    slot = hashlib.sha256(ref.skill_id.encode()).hexdigest()
+    old = None
+    if existing:
+        installer.install(ref, data)
+        old = os.readlink(active / slot)
+        _, version = publish(env, skill_id=ref.skill_id, version='2.0.0')
+        backend, run, _, s3, _ = transfer
+        ref = run(backend.install_skill(agent(), version.skill_id, version.version))
+        data = s3.objects['skills', version.storage_key]
+    detached = tmp_path / 'detached'
+    replace_file = os.replace
+    swapped = False
+    def swap_at_activation(source, destination, **kwargs):
+        nonlocal swapped
+        info = os.stat(source, dir_fd=kwargs.get('src_dir_fd'), follow_symlinks=False)
+        if not swapped and stat.S_ISLNK(info.st_mode):
+            swapped = True
+            installer.root.rename(detached)
+            shutil.copytree(detached, installer.root, symlinks=True)
+            # The untrusted replacement must not receive the real activation.
+            (active / slot).unlink(missing_ok=True)
+        return replace_file(source, destination, **kwargs)
+    monkeypatch.setattr(os, 'replace', swap_at_activation)
+    with pytest.raises(ValueError, match='changed'):
+        installer.install(ref, data)
+    assert swapped
+    assert not (active / slot).is_symlink()
+    if existing:
+        assert os.readlink(detached / 'installed' / slot) == old
+    else:
+        assert not (detached / 'installed' / slot).is_symlink()
+    # The replacement copy is attacker-owned data; only anchored original temps are removed.
+    assert not list((detached / 'installed').glob('*.tmp'))
