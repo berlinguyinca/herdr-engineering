@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import io
 import json
+import traceback
 
 import pytest
 from botocore.exceptions import ClientError
@@ -288,13 +289,97 @@ def test_interrupted_stream_is_closed_and_error_details_are_not_reported():
     assert "secret" not in repr(report)
 
 
-def test_failed_write_does_not_return_an_object_reference():
+@pytest.mark.parametrize("error_type", ["provider", "transport"])
+def test_failed_write_does_not_return_an_object_reference(error_type):
+    token = "raw-private-signed-token"
+    detail = f"https://objects.example.org/archive?X-Amz-Security-Token={token}"
+    provider_error = (ClientError({"Error": {"Code": "AccessDenied", "Message": detail}},
+                                  "PutObject") if error_type == "provider" else OSError(detail))
+
     class UnwritableS3(MemoryS3):
         def put_object(self, *, Bucket, Key, Body):
-            raise ClientError({"Error": {"Code": "AccessDenied"}}, "PutObject")
+            raise provider_error
 
-    with pytest.raises(ClientError):
-        adapter(UnwritableS3()).write_manifest(ARCHIVE, manifest())
+    client = adapter(UnwritableS3())
+    ref = None
+    with pytest.raises(Exception) as caught:
+        ref = client.write_manifest(ARCHIVE, manifest())
+    assert ref is None
+    error = caught.value
+    assert token not in str(error)
+    assert token not in repr(error)
+    assert token not in "".join(traceback.format_exception(error))
+    assert isinstance(error, storage().StorageError)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("operation", ["write", "verify"])
+@pytest.mark.parametrize("field", ["created_at", "encryption", "integrity"])
+def test_manifest_requires_metadata_before_io(operation, field):
+    doc = manifest()
+    del doc[field]
+    s3 = MemoryS3()
+    client = adapter(s3)
+    with pytest.raises(ValueError):
+        if operation == "write":
+            client.write_manifest(ARCHIVE, doc)
+        else:
+            storage().verify_manifest(doc, client)
+    assert not s3.requests
+
+
+@pytest.mark.parametrize("operation", ["write", "verify"])
+@pytest.mark.parametrize(("field", "value"), [
+    ("created_at", None),
+    ("created_at", 1792843200),
+    ("created_at", {}),
+    ("created_at", ""),
+    ("created_at", "not-a-timestamp"),
+    ("created_at", "2026-02-30T12:00:00Z"),
+    ("created_at", "2026-10-24"),
+    ("created_at", "2026-10-24T12:00:00"),
+    ("encryption", None),
+    ("encryption", "provider-managed"),
+    ("encryption", []),
+    ("encryption", {}),
+    ("encryption", {"mode": None}),
+    ("encryption", {"mode": True}),
+    ("encryption", {"mode": ""}),
+    ("encryption", {"mode": "   "}),
+    ("integrity", None),
+    ("integrity", "sha256"),
+    ("integrity", []),
+    ("integrity", {}),
+    ("integrity", {"algorithm": None}),
+    ("integrity", {"algorithm": True}),
+    ("integrity", {"algorithm": ""}),
+    ("integrity", {"algorithm": "md5"}),
+])
+def test_manifest_rejects_malformed_metadata_before_io(operation, field, value):
+    doc = manifest()
+    doc[field] = value
+    s3 = MemoryS3()
+    client = adapter(s3)
+    with pytest.raises(ValueError):
+        if operation == "write":
+            client.write_manifest(ARCHIVE, doc)
+        else:
+            storage().verify_manifest(doc, client)
+    assert not s3.requests
+
+
+def test_valid_metadata_is_preserved_with_an_explicit_timestamp_offset():
+    doc = manifest()
+    doc["created_at"] = "2026-10-24T05:00:00.123456-07:00"
+    doc["encryption"]["algorithm"] = "AES256"
+    doc["integrity"]["description"] = "full object SHA-256"
+    s3 = MemoryS3()
+    s3.objects["herdr-collab-archive", PREFIX + "room.json"] = b"hello"
+    client = adapter(s3)
+    ref = client.write_manifest(ARCHIVE, doc)
+    assert json.loads(s3.objects[ref.bucket, ref.key]) == doc
+    assert storage().verify_manifest(doc, client).ok
 
 
 @pytest.mark.parametrize("name", ["room.json", "members.ndjson", "messages.ndjson", "tasks.ndjson",
