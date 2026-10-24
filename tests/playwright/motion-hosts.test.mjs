@@ -216,3 +216,20 @@ test('snapshotText during a running tween reads its target, so an identical redr
  assert.notEqual(r.mid,'20','the tween is still running');
  assert.deepEqual({snap:r.snap,changed:r.changed,flash:r.flash},{snap:'20',changed:0,flash:false});
 }));
+
+test('OS reduced motion: calm auto writes the value at once with no flash; explicit calm off still animates',async()=>{
+ for(const mode of ['auto','off'])await withPage(async(page,base)=>{
+  const s=state();
+  await page.emulateMedia({reducedMotion:'reduce'});
+  if(mode==='off')await calm(page,'off');
+  await boot(page,base,'/hosts/beast',api(s));
+  await until(()=>page.locator('[data-section=cpu] .hv-value').textContent().then(t=>t==='10%'),'cpu 10%');
+  await record(page,'[data-section=cpu] .hv-value');
+  s.hosts[0].latest.cpu=20;
+  await liveRefresh(page);
+  await page.clock.runFor(400);await sleep(30);
+  const r=await recorded(page);
+  if(mode==='auto'){assert.deepEqual(r.texts,['20%']);assert.equal(r.flashes,0);}
+  else{assert.ok(r.texts.some(t=>t!=='20%'),`counts up, saw ${r.texts}`);assert.ok(r.flashes>0);}
+ });
+});
