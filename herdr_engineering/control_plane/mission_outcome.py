@@ -147,6 +147,7 @@ def assemble(repo, key, *, max_agents=12, final_stage=None, ended_at=None, infer
                 "outcome": _text(status, 40), "summary": _text(summary.get("overview"), 200)})
         out["agents"] = agents
         out["agent_count"] = len(sessions)
+        out["repository"] = out["repository"] or next((_text(x.get("repository_id"), 120) for x in sessions if x.get("repository_id")), None)
         sources.append("sessions")
     except Exception:  # noqa: BLE001
         pass
