@@ -190,6 +190,24 @@ def test_debug_route_requires_operator_and_reports_delivery(server, monkeypatch)
     assert calls[0][3:] == ('17', 2, 'pi:session', 'op')
 
 
+def test_debug_route_passes_the_fix_mode_only_when_sent_and_needs_operator_access(server, monkeypatch):
+    from herdr_engineering.control_plane import ci_debug
+    calls = []
+
+    def dispatch(*args, **kwargs):
+        calls.append(kwargs)
+        return {'ok': True, 'status': 'delivered', 'handoff_type': 'fix-with-pi'}
+
+    monkeypatch.setattr(ci_debug, 'debug_ci', dispatch)
+    body = {'repository': '17', 'number': 2, 'session_id': 'pi:session', 'operation_id': 'op', 'mode': 'fix'}
+    assert request(server, 'ci/debug', body)[0] == 403
+    assert request(server, 'ci/debug', body, key='write')[0] == 200
+    assert calls == [{'mode': 'fix'}]
+    del body['mode']
+    request(server, 'ci/debug', body, key='write')
+    assert calls[1] == {}
+
+
 def test_provider_bounded_preview_keeps_truncation_flag():
     class Provider:
         token = None

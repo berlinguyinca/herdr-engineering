@@ -260,9 +260,9 @@ export class HerdrClient {
     });
   }
 
-  debugCi(repository, number, sessionId, operationId, { signal, providerUrl } = {}) {
+  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode } = {}) {
     return this.request('/api/v1/ci/debug', {
-      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
+      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'?{mode}:{}) }, signal,
     });
   }
 
