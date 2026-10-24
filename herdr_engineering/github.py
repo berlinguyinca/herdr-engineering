@@ -586,11 +586,24 @@ class GitHubMonitor:
             return store, _UNREADABLE
 
     def _remember_revision(self, store, revision=None):
-        """Cache the store's revision so serving a list never opens a store transaction."""
-        try:
-            self._revision = revision if revision is not None else store.revision()
-        except Exception:
-            self._revision = None
+        """Cache the store's revision so serving a list never opens a store transaction.
+
+        Read outside the lock, assigned under it and only for the current store:
+        a superseded store's revision is never adopted, and a read that raced a
+        newer write (or a purge) never moves the cached revision back.
+        """
+        if revision is None:
+            try:
+                revision = store.revision()
+            except Exception:
+                revision = None
+        with self._lock:
+            if store is not self._store:
+                return
+            if revision is None or self._revision is None:
+                self._revision = revision
+            else:
+                self._revision = max(self._revision, revision)
 
     def _allowlist(self):
         """The validated owner allowlist (empty = every owner); ``GitHubError`` when invalid."""
@@ -782,6 +795,7 @@ class GitHubMonitor:
             self._repos, self._issues, self._details = {}, {}, {}
             self._marks, self._watermarks, self._full_at, self._deferred = {}, {}, {}, {}
             self._resume_repos, self._issue_resume = None, {}
+            self._revision = None  # until the purge lands, no since can be answered from memory
             self._view.update(available=False, status="auth_error", stale=False, partial=False, account=None,
                               error=str(GitHubError("authentication")))
             self._touch()
@@ -794,9 +808,7 @@ class GitHubMonitor:
                 if store is self._store:
                     self._store_dirty = True  # the next 401 purges again
             return
-        with self._lock:
-            if store is self._store:
-                self._remember_revision(store)
+        self._remember_revision(store)
 
     def _collect(self, provider):
         with self._lock:
@@ -1228,10 +1240,11 @@ class GitHubMonitor:
             raise ValueError("unknown GitHub list")
         with self._lock:
             view = self.snapshot(start=start)
-            store = None if self._store_dirty else self._store
             current_revision = self._revision
+            # no trusted revision (writes failing, or a purge under way): every since resyncs
+            store = None if self._store_dirty or current_revision is None else self._store
         delta = None
-        if store is not None and current_revision is not None and since == current_revision:
+        if store is not None and since == current_revision:
             # the common poll: nothing written since the client's revision, so no store read
             delta = {"revision": since, "resync": False, "upserted": [], "removed": []}
         elif store is not None:

@@ -924,3 +924,35 @@ def test_a_flush_on_a_superseded_store_leaves_the_current_store_dirty():
     monitor._store_dirty = True  # the current store missed a write
     monitor._flush(old_store)
     assert monitor._store_dirty is True and monitor.revision() is None
+
+
+def test_a_poll_during_a_purge_never_answers_an_empty_delta():
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared)
+    monitor.refresh()
+    since = monitor.revision()
+    store, seen = monitor._store, []
+    original = store.purge
+
+    def purge():  # a client polls while memory is already cleared but the store not yet purged
+        seen.append(monitor.changes(kind="issues", since=since, start=False))
+        original()
+    store.purge = purge
+    _revoke(fake)
+    monitor.refresh()
+    assert seen and seen[0]["resync"] is True and seen[0]["issues"] == []
+    after = monitor.changes(kind="issues", since=since, start=False)
+    assert after["resync"] is True and after["issues"] == []
+
+
+def test_a_revision_read_never_moves_back_or_comes_from_another_store():
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared)
+    monitor.refresh()
+    current, store = monitor.revision(), monitor._store
+    monitor._remember_revision(store, current - 3)  # a read that raced a newer write
+    assert monitor.revision() == current
+    other = store_factory(shared)("fingerprint-one", "fixture-user")
+    other.upsert_repositories([{"repository_id": "github.com/acme/zzz", "name_with_owner": "acme/zzz"}], None)
+    monitor._remember_revision(other)  # not the monitor's store: never adopted
+    assert monitor.revision() == current
