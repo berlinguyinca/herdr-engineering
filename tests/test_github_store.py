@@ -627,3 +627,12 @@ def test_a_hung_query_times_out_as_unavailable_and_the_store_recovers():
         assert store._call(lambda conn: conn.fetchval("SELECT 1")) == 1
     finally:
         store.close()
+
+
+def test_purging_an_empty_catalog_does_not_move_the_revision(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app")], scope=None)
+    store.purge()
+    revision = store.revision()
+    store.purge()  # a revoked token is retried every minute: no new revision each time
+    assert store.revision() == revision

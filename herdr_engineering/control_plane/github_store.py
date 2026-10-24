@@ -325,6 +325,8 @@ class MemoryGitHubStore:
                 raise GitHubStoreRetired("this GitHub catalog store was replaced")
             if state.meta is None or not _matches(state.meta, self._identity, self._viewer):
                 return
+            if not (state.repos or state.issues or state.tombstones or state.details):
+                return  # nothing left: a repeated 401 must not move the revision
             state.repos, state.issues, state.tombstones, state.details = {}, {}, {}, {}
             revision = state.meta["revision"] + 1
             state.meta.update(revision=revision, pruned_through=revision)
@@ -588,7 +590,16 @@ class GitHubStore:
         async def work(conn):
             async with conn.transaction():
                 meta = await conn.fetchrow(_META_SELECT, FAMILY)
-                if meta is not None and _matches(dict(meta), self._identity, self._viewer):
+                if meta is None or not _matches(dict(meta), self._identity, self._viewer):
+                    return
+                stored = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM github_repositories) OR EXISTS (SELECT 1 FROM github_issues) "
+                    "OR EXISTS (SELECT 1 FROM github_catalog_tombstones)")
+                details = False
+                with contextlib.suppress(Exception):
+                    async with conn.transaction():
+                        details = await conn.fetchval("SELECT EXISTS (SELECT 1 FROM github_issue_details)")
+                if stored or details:  # nothing left: a repeated 401 must not move the revision
                     await self._wipe(conn)
         self._call(work)
 
