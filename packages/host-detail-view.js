@@ -4,6 +4,7 @@
 // are in-page: setRange swaps the series and rewrites the hash without a navigation.
 import { morph } from './patch.js';
 import { liveRefresher } from './refresh-bus.js';
+import { snapshotText, animateChanges } from './motion.js';
 import { renderHostDetail, RANGES } from './host-view.js';
 import { HOST_INTERESTS } from './hosts-view.js';
 
@@ -33,7 +34,11 @@ export function mountHostDetail(container, client, hostId, range, { data = null 
     // A refresh that started before a range switch keeps the new range's series.
     if (next.range !== current && last) next = { ...next, telemetry: last.telemetry, range: current };
     last = next;
+    const values = snapshotText(body, '.hv-value');
     morph(body, next.host ? renderHostDetail(next.host, next.telemetry, { range: current, now: Date.now() }) : NOT_FOUND);
+    animateChanges(body, '.hv-value', values);
+    // Draw-in runs once per line (CSS keys it on data-drawn, which morph preserves).
+    for (const line of body.querySelectorAll('.hv-spark__line:not([data-drawn])')) line.setAttribute('data-drawn', '');
   }
 
   const live = liveRefresher(() => loadHostDetail(client, hostId, current), apply, () => container.querySelector('herdr-freshness'));

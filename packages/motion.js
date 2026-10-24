@@ -44,6 +44,43 @@ export function tween(el,from,to,{format=v=>String(Math.round(v)),duration=300}=
  requestAnimationFrame(step);
 }
 
+// Changed-value motion for views whose update path rewrites text (morph or innerHTML).
+// snapshotText() before the write, animateChanges() after it: a value that differs flashes, and a
+// single number with the same prefix/suffix (e.g. "10%" -> "20%") counts up from the old value.
+// keyOf pairs old and new nodes; the default (node identity) suits morph, a stable attribute
+// (an href, a data-key) suits innerHTML swaps. Under calm, the new text simply stays.
+const NUM=/^(\D*?)(-?\d+(?:\.\d+)?)(\D*)$/;
+const identity=el=>el;
+
+export function snapshotText(root,selector,keyOf=identity){
+ const out=new Map();
+ if(!root)return out;
+ for(const el of root.querySelectorAll(selector)){const k=keyOf(el);if(k!=null&&!out.has(k))out.set(k,el.textContent);}
+ return out;
+}
+
+export function animateChanges(root,selector,before,keyOf=identity,{target=identity,count=true}={}){
+ const changed=[];
+ if(!root||!before?.size)return changed;
+ for(const el of root.querySelectorAll(selector)){
+  const k=keyOf(el);
+  if(k==null||!before.has(k))continue;
+  const old=before.get(k),now=el.textContent;
+  if(old===now)continue;
+  changed.push(el);
+  if(isCalm())continue;
+  const a=count&&old.trim().match(NUM),b=now.trim().match(NUM);
+  if(count&&a&&b&&a[1]===b[1]&&a[3]===b[3]&&now===now.trim()){
+   const places=(b[2].split('.')[1]||'').length;
+   const format=v=>`${b[1]}${(Math.abs(v)<1e-9?0:v).toFixed(places)}${b[3]}`;
+   el.textContent=format(+a[2]);// start from the old value in the same task: no jump to the end and back
+   tween(el,+a[2],+b[2],{format});
+  }
+  flash(target(el));
+ }
+ return changed;
+}
+
 // Note: under calm, [data-leaving] runs no transition, so no transitionend fires; patch.js removes
 // leaving nodes at once under calm and has a fallback timer otherwise.
 export function flash(el){

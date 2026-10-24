@@ -3,13 +3,19 @@
 @keyframes hd-enter { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
 @keyframes hd-flash { from { background-color: var(--accent-weak); } to { background-color: transparent; } }
 @keyframes hd-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+@keyframes hd-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
 @keyframes hd-skeleton { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
 
 [data-entering] { animation: hd-enter var(--motion-normal) ease-out; }
 [data-leaving] { opacity: 0; max-height: 0; overflow: hidden; transition: opacity var(--motion-normal), max-height var(--motion-normal); }
 [data-flash] { animation: hd-flash 600ms ease-out; transition: background-color 600ms; }
 [data-pulse] { animation: hd-pulse 2s ease-in-out infinite; }
-progress, .hd-meter > *, .hd-stage-bar > * { transition: width var(--motion-normal), inline-size var(--motion-normal); }
+/* A finite pulse for "this just appeared" (a new critical item): three beats, then still. */
+[data-pulse="once"] { animation: hd-pulse 2s ease-in-out 3; }
+/* Sparkline draw-in: the line's base state is fully drawn; only the animation hides it, so calm
+ * (animation: none) shows the whole line. pathLength="1" makes the dash one line long. */
+.hv-spark__line[data-drawn] { stroke-dasharray: 1; animation: hd-draw 600ms ease-out; }
+progress, .hd-meter > *, .hd-stage-bar > *, .hv-meter__bar > i { transition: width var(--motion-normal), inline-size var(--motion-normal); }
 
 .hd-skeleton {
   min-height: 1em; border-radius: var(--radius-sm);

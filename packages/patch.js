@@ -48,7 +48,7 @@ function build(rendered,key){
 // This DISCARDS state of unfocused descendants (typed input values, toggled <details>); supply
 // opts.update to patch finer-grained. Focused/open/selected rows are skipped before this runs.
 function defaultUpdate(el,fresh){
- for(const {name} of [...el.attributes])if(!fresh.hasAttribute(name)&&name!=='data-key'&&!name.startsWith('data-entering'))el.removeAttribute(name);
+ for(const {name} of [...el.attributes])if(!fresh.hasAttribute(name)&&!PRESERVED.has(name))el.removeAttribute(name);
  for(const {name,value} of [...fresh.attributes])if(name!=='data-key')patchAttr(el,name,value);
  if(el.innerHTML!==fresh.innerHTML)el.innerHTML=fresh.innerHTML;
 }
@@ -114,7 +114,8 @@ export function patchList(container,items,opts){
 // attribute changes and removals are patched when the element observes them, otherwise the
 // element is replaced (herdr-metric and friends render once on connect). Attributes an element
 // stamps on itself (role, data-state) are not markup and are never removed.
-const PRESERVED=new Set(['data-key','data-entering','data-leaving']);
+// data-flash / data-drawn are motion state stamped by motion.js and the views, not markup.
+const PRESERVED=new Set(['data-key','data-entering','data-leaving','data-flash','data-drawn']);
 const keyOf=n=>n.nodeType!==1?null:(n.getAttribute('data-key')??n.getAttribute('data-section')??n.getAttribute('data-host-id')??(n.id||null));
 const isCustom=el=>el.localName.includes('-');
 const markupAttrs=new WeakMap();// custom element -> attribute names its markup carried
