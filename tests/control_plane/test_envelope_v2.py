@@ -138,7 +138,7 @@ def test_v1_body_is_unchanged():
 
 def test_typed_entity_carries_envelope_on_its_event():
     repo, s = svc()
-    s.ingest({"schema_version": 2, "event_id": "h1", "source": "pi", "source_sequence": 0,
+    s.ingest({"schema_version": 2, "event_id": "h1", "source": "herdr", "source_sequence": 0,
               "entity_type": "host", "entity_id": "bender", "event_type": "host.registered",
               "payload": {"host_name": "bender"}}, PRINCIPAL)
     ev = repo.stream("host", "bender")[0]
