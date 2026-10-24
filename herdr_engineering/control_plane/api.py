@@ -238,7 +238,7 @@ class ControlPlaneServer:
         self.attention = None
         if self.attention_config["enabled"] and not collab_only:
             self.attention = AttentionInbox(repo, config=self.attention_config, health=self._health,
-                                            ci_snapshot=self.ci_monitor.snapshot)
+                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix)
         if github_monitor is None:
             from ..github import GitHubMonitor
             github_monitor = GitHubMonitor()
