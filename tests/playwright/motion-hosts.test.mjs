@@ -194,3 +194,25 @@ test('sparkline: scaled 2× it is a solid line once drawn, with and without calm
   assert.equal(style.dash,'none',`${mode}: the line is not dashed`);
  });
 });
+
+test('snapshotText during a running tween reads its target, so an identical redraw does not flash',async()=>withPage(async(page,base)=>{
+ await page.goto(`${base}/__blank`);
+ const r=await page.evaluate(async()=>{
+  const m=await import('/motion.js');
+  m.setCalm('off');
+  document.body.innerHTML='<div id="box"><b>10</b></div>';
+  const box=document.getElementById('box');
+  let before=m.snapshotText(box,'b',()=>'k');
+  box.innerHTML='<b>20</b>';
+  m.animateChanges(box,'b',before,()=>'k');
+  await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+  const mid=box.querySelector('b').textContent;
+  box.querySelector('b').removeAttribute('data-flash');
+  before=m.snapshotText(box,'b',()=>'k');// mid-tween: must read the target, not the in-between number
+  box.innerHTML='<b>20</b>';
+  const changed=m.animateChanges(box,'b',before,()=>'k');
+  return {mid,snap:before.get('k'),changed:changed.length,flash:box.querySelector('b').hasAttribute('data-flash')};
+ });
+ assert.notEqual(r.mid,'20','the tween is still running');
+ assert.deepEqual({snap:r.snap,changed:r.changed,flash:r.flash},{snap:'20',changed:0,flash:false});
+}));
