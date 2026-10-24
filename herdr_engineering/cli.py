@@ -471,6 +471,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--config", required=True, help="worker YAML config file")
     p2.add_argument("--once", action="store_true", help="run one claim cycle and exit")
     p2.set_defaults(func=_cmd_review_gate_worker)
+    p2 = gsub.add_parser("pool", help="run a pool of reviewer workers sized by the review queue")
+    p2.add_argument("--config", required=True, help="pool YAML config file")
+    p2.set_defaults(func=_cmd_review_gate_pool)
 
     # candidates -----------------------------------------------------------
     p = sub.add_parser("candidates", help="multi-agent worktree comparison (spec 0140)")
@@ -2275,6 +2278,32 @@ def _cmd_review_gate_worker(args) -> int:
         return 1
     except rgw.WorkerConfigError as exc:
         print(f"review-gate worker: config error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_review_gate_pool(args) -> int:
+    """Same exit codes and fixed-text messages as ``review-gate worker``."""
+    from .review_gate import pool as rgp
+    from .review_gate import worker as rgw
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        pool = rgp.ReviewPool(rgp.load_pool_config(args.config))
+        stop = threading.Event()
+
+        def _request_stop(_signum, _frame):
+            stop.set()
+
+        signal.signal(signal.SIGINT, _request_stop)
+        signal.signal(signal.SIGTERM, _request_stop)
+        pool.run(stop)
+        return 0
+    except rgw.WorkerAuthError:
+        print("review-gate pool: the control plane refused the reviewer key", file=sys.stderr)
+        return 1
+    except rgw.WorkerConfigError as exc:
+        print(f"review-gate pool: config error: {exc}", file=sys.stderr)
         return 2
 
 

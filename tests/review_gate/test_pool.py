@@ -469,3 +469,50 @@ def _crashing_worker(config):
     w = FakeWorker(config)
     w.error = RuntimeError("x")
     return w
+
+
+# ------------------------------------------------------------------------- CLI
+def test_pool_command_parses_and_runs_with_stop(tmp_path, monkeypatch):
+    from herdr_engineering import cli
+    from herdr_engineering.review_gate import pool as pool_mod
+
+    path = write_yaml(tmp_path, good_yaml(tmp_path, max_workers=2))
+    installed = {}
+    monkeypatch.setattr(cli.signal, "signal", lambda sig, fn: installed.setdefault(sig, fn))
+    seen = []
+
+    class FakePool:
+        def __init__(self, cfg):
+            seen.append(cfg)
+
+        def run(self, stop):
+            installed[cli.signal.SIGTERM](cli.signal.SIGTERM, None)
+            assert stop.is_set()
+
+    monkeypatch.setattr(pool_mod, "ReviewPool", FakePool)
+    assert cli.main(["review-gate", "pool", "--config", path]) == 0
+    assert isinstance(seen[0], PoolConfig) and seen[0].max_workers == 2
+    assert set(installed) == {cli.signal.SIGINT, cli.signal.SIGTERM}
+
+
+def test_pool_command_exit_codes(tmp_path, monkeypatch, capsys):
+    from herdr_engineering import cli
+    from herdr_engineering.review_gate import pool as pool_mod
+
+    bad = write_yaml(tmp_path, good_yaml(tmp_path, max_workers=99))
+    assert cli.main(["review-gate", "pool", "--config", bad]) == 2
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1 and "rk-reviewer-SECRET" not in err
+
+    class RefusedPool:
+        def __init__(self, cfg):
+            pass
+
+        def run(self, stop):
+            raise WorkerAuthError("refused")
+
+    monkeypatch.setattr(pool_mod, "ReviewPool", RefusedPool)
+    monkeypatch.setattr(cli.signal, "signal", lambda sig, fn: None)
+    ok = write_yaml(tmp_path, good_yaml(tmp_path))
+    assert cli.main(["review-gate", "pool", "--config", ok]) == 1
+    assert "refused the reviewer key" in capsys.readouterr().err

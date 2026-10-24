@@ -201,6 +201,73 @@ when its lease expires, but the abandoned claim has spent one of its
 `max_attempts`. Restarting workers mid-review again and again can therefore
 escalate a PR.
 
+### Reviewer pool
+
+`review-gate pool` runs several workers in one process and sizes them from the
+review queue, so a burst of PRs is reviewed in parallel and the extra workers
+go away afterwards. Each slot is a thread running the same worker loop under
+its own id, `<worker_id>-<n>`. The pool config is the worker config above plus
+a `pool` mapping; `worker_id` becomes the slot-id prefix.
+
+```yaml
+control_plane_url: https://cp.example.org
+api_key_file: /etc/herdr/reviewer.key
+worker_id: bender-review                       # slots: bender-review-1, bender-review-2, ...
+model:
+  base_url: https://llm.example.org
+  model: qwen3-review
+pool:
+  min_workers: 1                               # 0-64, default 1 (0: no slot while the queue is empty)
+  max_workers: 4                               # 1-64, default 4, at least min_workers
+  idle_seconds: 120                            # a slot idle this long may be retired (10-86400, default 120)
+  interval_seconds: 10                         # how often the queue is read (1-3600, default 10)
+```
+
+```
+herdr-eng review-gate pool --config /etc/herdr/review-pool.yaml   # loop until SIGINT/SIGTERM
+```
+
+**Scaling rule.** Every `interval_seconds` the pool reads
+`GET /api/v1/review-gate/queue` (the `reviewer` key may) and counts the queued
+jobs its model may claim: jobs whose author model differs from the pool's
+`model`, as for a single worker. Idle slots already claim queued jobs, so a
+non-empty count means every slot is busy or backing off. The pool then adds
+`min(count, max_workers - slots)` slots. With nothing eligible it retires one
+slot per evaluation, and only a slot idle longer than `idle_seconds`, down to
+`min_workers`. A slot is retired only between claim cycles, so scaling never
+abandons a claim. A slot in failure back-off counts as busy and can trigger a
+scale-up, bounded by `max_workers`.
+
+**One pool per host and model.** Pool size is per process: two pool processes
+with `max_workers: 4` can run eight workers. Give each process its own
+`worker_id` prefix. Pools are threads, not herdr sessions: a crash of the
+process drops all its slots, and their jobs are offered again when the leases
+expire.
+
+**Failures.** If the queue cannot be read (unreachable, an error status, a
+malformed or over-1-MiB body) the pool keeps its size and waits
+`interval_seconds`, doubling per consecutive failure up to 300 s. A 401/403
+from the queue or from any slot, or a key file that goes bad, stops the whole
+pool; the exit codes are those of `worker` (1 refused key, 2 config error). The
+pool never reads or logs key contents; log lines carry counts and class names.
+
+A systemd unit needs no `Environment=` lines:
+
+```ini
+[Unit]
+Description=herdr review gate reviewer pool
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/herdr-eng review-gate pool --config /etc/herdr/review-pool.yaml
+Restart=on-failure
+RestartPreventExitStatus=1 2
+User=herdr-review
+
+[Install]
+WantedBy=multi-user.target
+```
+
 ### What gets reviewed
 
 - The reviewer sees only the PR title, body and diff, bounded to
