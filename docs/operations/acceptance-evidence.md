@@ -178,7 +178,7 @@ is a text scan. Behavioural GAPs (plan CLI writes nothing, review verdict never 
   and the throwaway Postgres socket dirs. Directories left in `/tmp` by earlier runs of this suite were not deleted.
 * Wording: the first Pi "kill -9" test kills the SERVER (Pi stays up) and is now named so. The new test kills a
   real separate Pi process (`test/e2e/support/piChild.ts`).
-* Sibling checkouts: `pi_repo`/`herdr_repo` may be `auto` (discovered by content, same `-tNN` suffix wins). The AutoSpec
+* Sibling checkouts: `pi_repo`/`herdr_repo` may be `auto` (discovered by content; same `-tNN` suffix wins, otherwise the first match, so it is ambiguous when several worktrees coexist: pin `pi_repo` in the untracked `tests/e2e/acceptance.local.yaml`, which wins over `acceptance.yaml`). The AutoSpec
   checkout stays an explicit path because several autospec worktrees coexist.
 * asyncpg must be installed for S6 (README prerequisites). Pi `biome check .` has pre-existing format failures in
   unrelated test files (e.g. `test/unit/attach-inspector.test.ts`); T16 files are clean.

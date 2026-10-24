@@ -154,7 +154,19 @@ def _clean(value: Any, what: str, limit: int, required: bool = True) -> str | No
     text = _SPOOF.sub("", _CONTROL.sub("", value))
     if (required and not text.strip()) or len(text) > limit:
         raise WorkbenchError(400, f"{what} must be 1-{limit} characters")
-    return redact_text(text)
+    return _defuse_framing(redact_text(text))
+
+
+_FRAMING = re.compile(r"(?im)^([ \t>*#_`\-]*)((?:system|assistant|user|developer|human|tool|ai|instructions?)\b[ \t]*[:>])")
+_CHAT_MARKUP = re.compile(r"<\|[^|>\n]{0,40}\|>|\[/?(?:INST|SYS)\]|<</?SYS>>|</?(?:system|assistant|user)>", re.IGNORECASE)
+
+
+def _defuse_framing(text: str) -> str:
+    """The text is delivered as untrusted text from a named person, but a model reads it inline, so a line that
+    LOOKS like a role turn ("SYSTEM: ...") or chat-template markup is neutralised: the line is quoted ("> ") and the
+    markup is bracketed. Content is kept, so a reviewer still sees what was asked."""
+    text = _CHAT_MARKUP.sub(lambda m: "[" + m.group(0).strip("<>|[]/ ") + "]", text)
+    return _FRAMING.sub(lambda m: "> " + m.group(1) + m.group(2), text)
 
 
 def _key(value: Any) -> str:

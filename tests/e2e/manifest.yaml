@@ -1,7 +1,7 @@
 # Expected suites of the T16 acceptance run (scripts/run-acceptance.sh). A file that runs fewer tests than min_tests,
 # zero tests, exceeds max_xfail, or is not listed here fails the run. min_tests counts passed + xfailed.
 # max_xfail / max_gap: strict xfails (Herdr) / tests named `GAP:` (Pi) that document a known product gap; a failing test cannot be
-# renamed GAP without this cap rising in a reviewed diff. Old comment: strict xfails that document a known product gap (see docs/operations/acceptance-evidence.md).
+# renamed GAP without this cap rising in a reviewed diff. See docs/operations/acceptance-evidence.md.
 herdr:
   tests/e2e/test_smoke_harness.py: {scenario: harness, min_tests: 2}
   tests/e2e/test_runner_guards.py: {scenario: harness, min_tests: 4}

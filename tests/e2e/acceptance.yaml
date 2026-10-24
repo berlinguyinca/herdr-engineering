@@ -2,8 +2,9 @@
 # Relative paths resolve against the herdr-engineering checkout root. To point a run at other checkouts, copy this
 # file to tests/e2e/acceptance.local.yaml (untracked) and edit it; that file wins when present.
 version: 1
-pi_repo: auto                                   # `auto` = the sibling checkout that holds src/runtime/herdr/lineage.ts (same -tNN suffix wins);
-                                                # or an explicit path relative to this checkout, e.g. ../pi-t16
+pi_repo: auto                                   # `auto` picks a sibling checkout holding src/runtime/herdr/lineage.ts and is AMBIGUOUS when several
+                                                # pi worktrees coexist (it prefers the same -tNN suffix, else the first found). For a reproducible run set an
+                                                # explicit path in the untracked tests/e2e/acceptance.local.yaml (it wins), e.g. `pi_repo: ../pi-t16`
 autospec_repo: ../autospec-t06                  # AutoSpec checkout holding the Rust CLI (explicit: several autospec worktrees coexist, `auto` would be ambiguous)
 autospec_bin: ../autospec-t06/target/debug/autospec
 node: node

@@ -303,7 +303,8 @@ def pr_review_quorum(graph, principal, pr_id: str, config: QuorumConfig) -> dict
 REREVIEW_ENTITY = "review_request"      # server-owned stream (never in INGEST_ENTITY_TYPES, hidden from /events)
 REREVIEW_EVENT = "ReviewRereviewRequested"
 REREVIEW_PER_HOUR = 60                  # per requesting principal
-REREVIEW_MAX_PER_PR = 64                # distinct heads kept per PR (each head is one request at most)
+REREVIEW_MAX_PER_PR = 64                # distinct heads asked for per PR within REREVIEW_WINDOW (each head is one request at most)
+REREVIEW_WINDOW = 24 * 3600.0           # a sliding window: the cap never locks a PR out for good
 
 
 class RereviewError(Exception):
@@ -331,12 +332,26 @@ class RereviewLedger:
         """The request recorded for exactly this head of this PR (None for any other head)."""
         if not head:
             return None
+        from .repo import _payload              # a payload hydrated from Postgres arrives as JSON text
         for ev in reversed(self.repo.stream(REREVIEW_ENTITY, pr_id)):
-            p = ev.get("payload") or {}
+            p = _payload(ev)
             if p.get("head") == head:
                 return {"request_id": ev["event_id"], "head": head, "requested_at": ev.get("ingest_timestamp"),
                         "needed": p.get("needed")}
         return None
+
+    def _recent(self, pr_id: str, now: float) -> int:
+        """Requests for this PR inside the sliding window (an unreadable timestamp counts as recent: fail closed)."""
+        from datetime import datetime
+        n = 0
+        for ev in self.repo.stream(REREVIEW_ENTITY, pr_id):
+            try:
+                at = datetime.fromisoformat(str(ev.get("ingest_timestamp"))).timestamp()
+            except ValueError:
+                at = now
+            if now - at < REREVIEW_WINDOW:
+                n += 1
+        return n
 
     def request(self, graph, principal: dict, pr_id: str, config: QuorumConfig, head: str | None) -> tuple[int, dict]:
         """201 new, 200 replay. KeyError when the PR is absent/hidden (the caller answers 404, same as the quorum read).
@@ -365,7 +380,7 @@ class RereviewLedger:
             window = [t for t in self._times.get(who or "", ()) if now - t < 3600.0]
             if len(window) >= REREVIEW_PER_HOUR:
                 raise RereviewError(429, "too many re-review requests", "rate_limited")
-            if len(self.repo.stream(REREVIEW_ENTITY, real)) >= REREVIEW_MAX_PER_PR:
+            if self._recent(real, now) >= REREVIEW_MAX_PER_PR:
                 raise RereviewError(429, "this PR has reached its re-review request limit", "pr_limit")
             ev = self.repo.record_event(REREVIEW_ENTITY, real, REREVIEW_EVENT,
                                         {"head": q["head"], "requested_by": who, "needed": q["rereview_needed"],

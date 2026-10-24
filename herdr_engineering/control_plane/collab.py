@@ -2757,8 +2757,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
 
     def authorize_workspace(self, pr: Principal, room_id: str, link_id: str, action: str) -> dict:
         """The one place that answers 'may this principal do `action` on the workspace linked to this room?'
-        action is status, tabs, panes or terminal. Fails closed: anything unknown is a 404, anything not
-        explicitly granted a 403, and both are audited. Allowed terminal use is audited too, at most once
+        action is status, tabs, panes or terminal. Fails closed: a principal who cannot manage links gets one
+        audited 403 for anything not explicitly granted (an unknown link and another room's link look the same);
+        only a link manager is told 404 for an unknown link. Every denial is audited. Allowed terminal use is audited too, at most once
         per principal and link per TERMINAL_AUDIT_EVERY seconds, and at once after any denial or change."""
         with self._lock:
             room, _ = self._authorize(pr, room_id, "read", "workspace.access")
@@ -3463,8 +3464,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
 
     @staticmethod
     def _turns_left(t: dict) -> bool:
-        """May the delegate send one more answer? (``max_turns`` is absent on tasks stored before it existed.)"""
-        return t.get("turns", 0) + 1 <= t["bounds"]["budget"].get("max_turns", dlg.DEFAULT_TURNS)
+        """May the delegate send one more NON-FINAL answer? ``complete`` (the result), ``fail``, ``decline`` and ``cancel`` are
+        never refused for turns, so a delegate at the ceiling can still deliver its result."""
+        ceiling = t["bounds"]["budget"].get("max_turns")
+        return ceiling is None or t.get("turns", 0) + 1 <= ceiling      # a task stored before max_turns existed has no ceiling
 
     def _proposal_state(self, p: dict) -> str:
         if p["state"] == "quarantined" and self._now() - p["created_epoch"] >= dlg.PROPOSAL_TTL:
@@ -3619,7 +3622,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         idempotency_key=ikey, fingerprint=fp, visibility_scope="room", outcome="allowed",
                         project_ids=[x["project_id"]], resource_id=task_id)
             b = t["bounds"]["budget"]
-            if action not in ("decline", "cancel", "fail") and not self._turns_left(t):
+            if action not in ("decline", "cancel", "fail", "complete") and not self._turns_left(t):
                 return self._exhaust(pr, t, task_id, base)          # the turn ceiling: the task is closed
             if action == "progress":
                 if t["steps"] + 1 > b["max_steps"] or t["tokens"] + tokens > b["max_tokens"]:

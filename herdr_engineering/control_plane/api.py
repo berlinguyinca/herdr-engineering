@@ -223,7 +223,8 @@ class ControlPlaneServer:
         self.fleet_config = fleet_config
         self.review_quorum = review_quorum      # QuorumConfig | None (feature off)
         from .review_quorum import RereviewLedger
-        self.rereview = RereviewLedger(repo)    # T16 gap C: durable re-review requests (the route 404s when the quorum is off)
+        self.rereview = RereviewLedger(repo)
+        self._refusal_logged: dict = {}    # T16 gap C: durable re-review requests (the route 404s when the quorum is off)
         self.collab = collab
         self.collab_require_https = collab_require_https
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
@@ -399,6 +400,18 @@ class ControlPlaneServer:
             except Exception:
                 pass  # Retain continuity notes through temporary storage/model outages.
             self._summary_stop.wait(2)
+
+    def _refusal_log_due(self, key, every: float = 300.0, cap: int = 512) -> bool:
+        """At most one refused-request log line per key per `every` seconds (an unnamed key cannot flood the log)."""
+        import time as _t
+        now = _t.monotonic()
+        last = self._refusal_logged.get(key)
+        if last is not None and now - last < every:
+            return False
+        if len(self._refusal_logged) >= cap:
+            self._refusal_logged.clear()
+        self._refusal_logged[key] = now
+        return True
 
     def shutdown(self):
         self._summary_stop.set()
@@ -1488,7 +1501,7 @@ def _make_handler(server, public=False, operator=False):
             except KeyError:
                 return self._json({"error": "not found"}, 404)
             except RereviewError as exc:
-                if exc.code == "not_permitted":
+                if exc.code == "not_permitted" and server._refusal_log_due(principal.get("id")):
                     logging.getLogger(__name__).warning("review quorum: %s refused a re-review request", principal.get("id"))
                 return self._json({"error": exc.message, "code": exc.code, **exc.extra}, exc.status)
             return self._json(out, status)

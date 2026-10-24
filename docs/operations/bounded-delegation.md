@@ -38,10 +38,10 @@ none, so there `POST /rooms/{room}/delegations` answers 409 `graph_unavailable` 
      A patch needs `paths`; an analysis needs `questions` or `nodes`. The scope grants **no read access** to anything: it is the
      list a proposal's references and patch paths are checked against.
    * `budget`: `max_proposals` 1-5, `max_steps` 1-200 (progress calls + proposals), `max_artifact_bytes` 256-32768, `max_tokens`
-     (see limitations: advisory), `max_turns` 1-200 (default 60: every answer the delegate sends, i.e. accept, progress, complete and each
-     proposal; the next one closes the task `failed`, 409 `budget_exhausted`, while `decline`, `fail` and `cancel` are always allowed), `max_hops` 1-3
+     (see limitations: advisory), `max_turns` 1-200 (default 60: every answer the delegate sends, i.e. accept, progress and each
+     proposal are the non-final turns; the next one closes the task `failed`, 409 `budget_exhausted`, while `complete` (the result), `decline`, `fail` and `cancel` are always allowed), `max_hops` 1-3
      (default 1: the ceiling on delegation-chain depth; the delegate is hop 1 and an external agent has no route to delegate onward, so 1 is the
-     only depth reached today; it is echoed so a future onward path has the bound already). A task stored before `max_turns` existed is held to 60. `expires_in_seconds` 60-86400, never past the delegate's credential expiry.
+     only depth reached today; it is echoed so a future onward path has the bound already). A task stored before `max_turns` existed has no turn ceiling (it is not failed on replay). `expires_in_seconds` 60-86400, never past the delegate's credential expiry.
    * `output_kinds` is a non-empty subset of `patch`, `doc`, `analysis`, `link`.
    * Only room owners delegate; at most 3 open delegations per agent, 20 per owner per 10 minutes; `idempotency_key` supported.
 3. The delegate (REST, MCP or A2A, same service methods) reads its inbox, answers `accept` | `decline`, may send `progress`, and
