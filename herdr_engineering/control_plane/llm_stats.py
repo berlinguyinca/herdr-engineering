@@ -129,9 +129,15 @@ class Group:
         self.last = ts if self.last is None else max(self.last, ts)
 
     def out(self):
-        return {"key": self.key, "source": self.source, "requests": self.requests,
-                "errors": self.errors,
-                "error_rate": round(self.errors / self.requests, 4) if self.requests else None,
+        # A transcript source reports tokens per usage event, not requests, errors or timings:
+        # those stay unknown (None), and the event count is given as ``events``.
+        transcript = self.source == "transcript"
+        return {"key": self.key, "source": self.source,
+                "requests": None if transcript else self.requests,
+                "errors": None if transcript else self.errors,
+                "events": self.requests if transcript else None,
+                "partial_source": transcript,
+                "error_rate": None if transcript else (round(self.errors / self.requests, 4) if self.requests else None),
                 "tokens": dict(self.tokens, lower_bound=self.lower_bound),
                 "ttft_ms": self.ttft.summary(), "queue_ms": self.queue.summary(),
                 "speed_tps": self.speed.summary(), "e2e_tps": self.e2e.summary(),
@@ -194,7 +200,13 @@ def stats(records, by, resolve):
             continue
         source = p.get("source") or "llm-proxy"
         groups.setdefault((key, source), Group(key, source)).add(p, ts)
-    return sorted((g.out() for g in groups.values()), key=lambda g: (-g["requests"], g["key"]))
+    out = [g.out() for g in groups.values()]
+    if by == "session":    # the proxy's figures win; a transcript row for the same agent is a cross-check
+        proxied = {g["key"] for g in out if g["source"] == "llm-proxy"}
+        for g in out:
+            g["cross_check"] = g["source"] == "transcript" and g["key"] in proxied
+    return sorted(out, key=lambda g: (-(g["requests"] if g["requests"] is not None else g["events"] or 0),
+                                      g["key"], g["source"]))
 
 
 def timeseries(records, metric, *, since, until, step):
@@ -250,3 +262,15 @@ def errors(records, resolve, *, error_class=None, session_limit=20):
         out.append(dict(g, first_seen=_iso(g["first_seen"]), last_seen=_iso(g["last_seen"]),
                         session_count=len(sessions), sessions=sessions[:session_limit]))
     return sorted(out, key=lambda g: (-g["count"], g["class"], g["model"]))
+
+
+def transcript_events(usage_events):
+    """Pseudo token_usage events from inspector usage events (the agent's own transcript),
+    carrying tokens only: no status, timings or stream flag, so nothing is invented."""
+    for session_id, ts, data in usage_events:
+        yield {"source_timestamp": ts, "session_id": session_id, "payload": {
+            "schema": 2, "source": "transcript", "project": None, "session_id": session_id,
+            "model": data.get("model") or "unknown", "usage_known": True, "success": True,
+            "status": None, "error_class": None, "stream": None,
+            **{k: data.get(k) for k in ("input_tokens", "output_tokens", "reasoning_tokens",
+                                        "cache_read_tokens")}}}

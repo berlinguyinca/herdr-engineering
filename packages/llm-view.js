@@ -13,6 +13,9 @@ const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 const list = (v) => (Array.isArray(v) ? v : []);
 const nf = new Intl.NumberFormat('en-US');
 const count = (v) => (num(v) == null ? GAP : nf.format(v));
+/** Requests for a proxy row, or the usage-event count of a transcript row (which has no requests). */
+const reqs = (g) => (num(g.requests) != null ? count(g.requests) : (num(g.events) != null ? `${count(g.events)} events` : GAP));
+const sourceLabel = (g) => (g.cross_check ? `${g.source} (cross-check)` : g.source);
 const round1 = (v) => Math.round(v * 10) / 10;
 
 export function compact(v) {
@@ -87,7 +90,7 @@ function tiles(total) {
   const tokens = t.tokens || {};
   const bound = tokens.lower_bound ? '≥ ' : '';
   const cards = [
-    ['Requests', count(t.requests), t.requests == null ? 'no records in this window' : ''],
+    ['Requests', total ? reqs(t) : GAP, !total ? 'no records in this window' : t.source === 'transcript' ? 'tokens only, from the agent\'s transcript' : ''],
     ['Output tokens', total ? `${bound}${compact(tokens.output)}` : GAP,
       tokens.lower_bound ? 'some replies carried no usage figure' : ''],
     ['TTFT p50 / p95', pair(t.ttft_ms, ms), 'streams only'],
@@ -105,7 +108,7 @@ const table = (headers, rows, empty) => `<div class="llm-table"><table><thead><t
 
 function modelsTable(models) {
   return table(['Model', 'Source', 'Requests', 'Output tokens', 'TTFT p95', 'Speed p50', 'Errors'],
-    list(models?.groups).map((g) => [esc(g.key), esc(g.source), count(g.requests),
+    list(models?.groups).map((g) => [esc(g.key), esc(g.source), reqs(g),
       `${g.tokens?.lower_bound ? '≥ ' : ''}${compact(g.tokens?.output)}`,
       single(g.ttft_ms, ms, 'p95'), single(g.speed_tps, rate), percent(g.error_rate)].map((c, i) => (i === 0 ? c : esc(c)))),
     'No requests recorded in this window.');
@@ -113,7 +116,7 @@ function modelsTable(models) {
 
 function agentsTable(agents, names) {
   return table(['Agent', 'Source', 'Requests', 'Output tokens', 'Speed p50', 'Errors', 'Last seen'],
-    list(agents?.groups).map((g) => [link(g.key, names, llmSessionHref), esc(g.source), esc(count(g.requests)),
+    list(agents?.groups).map((g) => [link(g.key, names, llmSessionHref), esc(sourceLabel(g)), esc(reqs(g)),
       esc(`${g.tokens?.lower_bound ? '≥ ' : ''}${compact(g.tokens?.output)}`), esc(single(g.speed_tps, rate)),
       esc(count(g.errors)), esc(when(g.last_seen))]),
     'No request carried a session id in this window.');
@@ -226,7 +229,8 @@ export function renderLlm(state, data) {
   const extra = list(d.total?.groups).filter((g) => g !== pickTotal(d.total)).map((g) => g.source);
   return `${llmStyles}<h1>LLM</h1>${controls(state)}
     <p class="llm-note" data-llm-disclosure>${esc(disclosure(d.total))}${
-      extra.length ? ` Other sources (${esc(extra.join(', '))}) are listed in the tables and never added to these figures.` : ''}</p>
+      extra.length ? ` Other sources (${esc(extra.join(', '))}) are listed in the tables and never added to these figures.` : ''}${
+      list(d.agents?.groups).some((g) => g.partial_source) ? ' Transcript rows cover only the events still retained for each agent, and carry tokens only.' : ''}</p>
     ${tiles(pickTotal(d.total))}${charts(d.series)}
     <section class="llm-section"><h2>Models</h2>${modelsTable(d.models)}</section>
     <section class="llm-section"><h2>Agents</h2>${agentsTable(d.agents, state.names)}</section>
