@@ -527,7 +527,7 @@ macOS convergence is a documented `BLOCKED_EXTERNAL` item pending a fleet run.
 | stale dev port | `herdr-eng devfabric reconcile` expires stale leases |
 | `ci` says offline / stale | set the CI token: it is `ci.token` in the central fleet config (`herdr-eng fleet config init` asks for it); the token is a secret and never lives in the repo. Without it the view is explicitly stale, never guessed |
 | `ci logs` returns no log text | expected on this Woodpecker 3.x instance: logs stream over WebSocket (no REST endpoint) and the OAuth2 proxy doesn't forward a bearer token on the upgrade. Use the `view_in_web_ui` link it prints; `ci debug` still gives the failing tasks + exit codes |
-| `dev:<port>` unreachable from other hosts | is the gateway up? `herdr-eng devfabric gateway` on the gateway host; point commands at it with `HERDR_ENGINEERING_FABRIC_URL=http://<gateway>:29999` (or `fabric.gateway_url` in config); the app must be bound to the tailnet interface or `0.0.0.0` |
+| `dev:<port>` unreachable from other hosts | is the gateway up? `herdr-eng devfabric gateway` on the gateway host; point hosts at it with `fabric.url` in the central `fleet-config.yaml` (or `fabric.gateway_url` in `config.yaml`); the app must be bound to the tailnet interface or `0.0.0.0` |
 
 ## Dev fabric fleet lifecycle (multi-operator)
 
@@ -549,8 +549,8 @@ that expires dead apps and releases their ports. Every lease then gets a
 stable fleet-wide address — `http://<gateway-magicdns>:<port>` — reachable
 from any tailnet device (desktop, phone, iPad) without knowing the physical
 host. Registrar commands (`register`/`heartbeat`/`close`/`list`) use the
-gateway automatically when configured (`fabric.gateway_url` or
-`HERDR_ENGINEERING_FABRIC_URL`) and degrade to local mode with an explicit
+gateway automatically when configured (`fabric.url` in the central
+`fleet-config.yaml`, or `fabric.gateway_url` in `config.yaml`) and degrade to local mode with an explicit
 warning when it is not reachable. The control API is tailnet+loopback only
 and bearer-token protected when a token is configured. Design and live
 evidence: [`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabric-gateway.md).

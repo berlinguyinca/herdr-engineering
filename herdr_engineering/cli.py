@@ -1888,8 +1888,8 @@ def _cmd_dev_agent(args) -> int:
     if not base:
         _print_json({
             "code": "config",
-            "message": "no gateway configured: set fabric.gateway_url or "
-                       "HERDR_ENGINEERING_FABRIC_URL",
+            "message": "no gateway configured: set fabric.url in the central "
+                       "fleet-config.yaml, or fabric.gateway_url in config.yaml",
         })
         return 1
     tailnet_ip = tailnet_ipv4()

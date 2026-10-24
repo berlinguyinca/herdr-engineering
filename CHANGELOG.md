@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### YAML-only fabric agent configuration
+- The fabric agent, its install scripts, the enroll-sync/service-metadata units and the Ansible fabric tasks no longer
+  write or read `fabric.env` (`HERDR_ENGINEERING_FABRIC_URL`). The gateway URL is `fabric.url` in the central
+  `fleet-config.yaml` (fallback: `fabric.gateway_url` in `config.yaml`). `--gateway`/`--control-plane` on the install
+  scripts are ignored with a warning. Existing `fabric.env` files are left in place and are harmless.
+
 ### Lineage graph projection (T02, Herdr side)
 - Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
 - Migration `0005_event_id_per_actor.sql`: `event_id` is unique per principal (global primary key dropped).
