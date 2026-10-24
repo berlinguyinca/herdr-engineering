@@ -22,6 +22,7 @@ from .control_plane.project_links import (
     repository_language,
 )
 from .control_plane.redact import redact_text
+from .errors import InvalidError
 
 MAX_RESPONSE = 4 * 1024 * 1024
 TABS = {"all", "autospec", "preparation", "in_progress", "blocked"}
@@ -96,6 +97,7 @@ class GitHubError(RuntimeError):
             "response_too_large": "The GitHub response exceeded the bounded read limit.",
             "redirect": "GitHub redirected the request; credentials were not forwarded.",
             "capacity": "The configured catalog safety limit was reached; coverage is partial.",
+            "invalid_config": "github.organizations must be a list of non-empty GitHub owner logins; fix the YAML configuration.",
         }.get(reason, "GitHub is temporarily unavailable."))
 
 
@@ -297,6 +299,20 @@ def _issue(row, repository_id):
     return record
 
 
+def _owner(record):
+    return record["name_with_owner"].split("/", 1)[0].lower()
+
+
+def _configured_organizations():
+    """``github.organizations`` from the central fleet file's ``github`` section.
+
+    That YAML is what control-plane-web reads (live, like ``github.token``), so
+    an edit applies on the next pass without a restart.
+    """
+    from .host_config import host_value
+    return host_value("github.organizations")
+
+
 def _tab(issue, tab):
     state = issue["autospec"]
     return tab == "all" or (tab == "autospec" and state["managed"]) or state["state"] == tab
@@ -337,7 +353,7 @@ class GitHubMonitor:
     """
 
     def __init__(self, *, provider_factory=None, interval=300, repo_limit=5000, issue_limit=100000, now=None,
-                 store=None, full_reconcile_interval=86400, reconcile_per_pass=None):
+                 store=None, full_reconcile_interval=86400, reconcile_per_pass=None, organizations=None):
         self._factory = provider_factory or GitHubProvider
         self._interval = max(30, interval)
         self._repo_limit, self._issue_limit = repo_limit, issue_limit
@@ -345,6 +361,8 @@ class GitHubMonitor:
         self._store_factory = store
         self._full_interval = max(self._interval, full_reconcile_interval)
         self._reconcile_per_pass = reconcile_per_pass
+        # owner allowlist: a list, a callable returning one, or None = read the YAML each pass
+        self._organizations = organizations
         self._lock = threading.RLock()
         self._refresh_lock = threading.Lock()
         self._stop, self._wake = threading.Event(), threading.Event()
@@ -368,6 +386,7 @@ class GitHubMonitor:
     def _empty():
         return {"available": False, "status": "not_configured", "connection_generation": 0, "refreshing": False, "stale": False,
                 "partial": False, "account": None, "checked_at": None, "last_success_at": None,
+                "scope": {"owners": [], "excluded_repositories": 0, "restricted": False},
                 "error": None, "rate_limit": None, "progress": {"phase": "idle", "repositories_seen": 0,
                     "repositories_total": None, "issue_repositories_complete": 0, "issue_repositories_total": None,
                     "issues_seen": 0, "issues_total_known": None, "current_repository": None}}
@@ -460,9 +479,28 @@ class GitHubMonitor:
         except Exception:
             return store, None
 
+    def _allowlist(self):
+        """The validated owner allowlist (empty = every owner); ``GitHubError`` when invalid."""
+        from .config import github_organizations
+        source = self._organizations
+        try:
+            value = _configured_organizations() if source is None else source() if callable(source) else list(source)
+            return set(github_organizations(value))
+        except InvalidError:
+            raise GitHubError("invalid_config") from None
+
     def _hydrate(self, snapshot):
-        """Serve a stored catalog (lock held) as ``stale`` until the first pass completes."""
+        """Serve a stored catalog (lock held) as ``stale`` until the first pass completes.
+
+        Owners outside the allowlist are never served, even before the pass that purges them.
+        """
+        try:
+            allow = self._allowlist()
+        except GitHubError:
+            return
         for rid, data in snapshot.repositories.items():
+            if allow and _owner(data) not in allow:
+                continue
             record = dict(data)
             synced = record.pop("synced", None)
             issues = dict(snapshot.issues.get(rid, {}))
@@ -603,15 +641,29 @@ class GitHubMonitor:
         self._update(refreshing=True, error=None, status="syncing", partial=True, available=True)
         self._progress(phase="repositories", repositories_seen=0, repositories_total=None,
                        issues_seen=0, issues_total_known=None, issue_repositories_complete=0, current_repository=None)
+        allow = self._allowlist()
         with self._lock:
+            self._check_generation()
             store = self._store
+            if allow:
+                # stop serving owners that left the allowlist now, not after the listing
+                for rid in [rid for rid, record in self._repos.items() if _owner(record) not in allow]:
+                    for table in (self._repos, self._issues, self._marks, self._watermarks,
+                                  self._issue_resume, self._full_at):
+                        table.pop(rid, None)
+                if self._resume_repos is not None:
+                    self._resume_repos = {rid: r for rid, r in self._resume_repos.items() if _owner(r) in allow}
         if self._resume_repos is None:
-            discovered, cursor, cursors = {}, None, set()
+            discovered, cursor, cursors, excluded, owners = {}, None, set(), 0, set()
             while not self._stop.is_set():
                 account, connection = provider.repositories_page(cursor)
                 store = self._bind_viewer(account)
                 for row in connection["nodes"]:
                     record = _repository(row)
+                    if allow and _owner(record) not in allow:
+                        excluded += 1  # filtered before any issue work: no issue calls, not stored
+                        continue
+                    owners.add(_owner(record))
                     record["issues_loaded"] = len(self._issues.get(record["repository_id"], {}))
                     discovered[record["repository_id"]] = record
                     if len(discovered) > self._repo_limit:
@@ -641,8 +693,15 @@ class GitHubMonitor:
                         del table[key]
                 self._resume_repos = discovered
                 rows = [self._stored_repository(record) for record in discovered.values()]
-            # the listing is complete: stored repositories missing from it are gone
-            self._write(store, lambda target: target.upsert_repositories(rows, None))
+            self._update(scope={"owners": sorted(allow or owners), "excluded_repositories": excluded,
+                                "restricted": bool(allow)})
+
+            def replace_listing(target):
+                # the listing is complete: stored repositories missing from it are gone,
+                # and so is every repository of an owner outside the allowlist
+                target.upsert_repositories(rows, None)
+                target.purge_owners_not_in(allow)
+            self._write(store, replace_listing)
         else:
             discovered = self._resume_repos
             self._progress(repositories_seen=len(discovered), repositories_total=len(discovered))

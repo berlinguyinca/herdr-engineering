@@ -79,7 +79,40 @@ DEFAULTS: dict[str, Any] = {
     "notifications": {"enabled": True, "minimum_severity": "notice",
                       "quiet_hours": None, "dedupe_window_seconds": 300},
     "security": {"allow_public_listeners": False, "persist_hidden_reasoning": False},
+    # GitHub catalog (control-plane-web). organizations: allowlist of owner
+    # logins (organizations and your own account); empty = every owner the
+    # token sees. Excluded owners cost no issue calls and are purged from the
+    # stored catalog on the next pass.
+    "github": {"organizations": [], "sync": {"full_reconcile_interval": 86400}},
 }
+
+
+def github_organizations(value: Any) -> list[str]:
+    """Validate ``github.organizations``; the normalised (lower-case, unique) allowlist.
+
+    ``None`` or ``[]`` means every owner. GitHub logins are case-insensitive.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise InvalidError("github.organizations must be a list of non-empty GitHub owner logins "
+                           "(organizations or your own account); leave it empty for every owner")
+    return sorted({item.strip().lower() for item in value})
+
+
+def validate_github(section: Any) -> None:
+    """Reject an invalid ``github`` section with a message naming the key."""
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise InvalidError("github must be a mapping")
+    github_organizations(section.get("organizations"))
+    sync = section.get("sync") or {}
+    if not isinstance(sync, dict):
+        raise InvalidError("github.sync must be a mapping")
+    interval = sync.get("full_reconcile_interval", 86400)
+    if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
+        raise InvalidError("github.sync.full_reconcile_interval must be a positive number of seconds")
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -153,6 +186,7 @@ def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
         if "version" in data and data["version"] != 1:
             raise InvalidError(f"config file {path} has unsupported version")
         cfg = _deep_merge(cfg, data)
+    validate_github(cfg.get("github"))
     return _expand_env(cfg)
 
 

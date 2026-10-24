@@ -85,8 +85,9 @@ class FakeGitHub:
         return self.login, self._connection(nodes, cursor)
 
     def _sorted(self, repository_id, state):
-        name = repository_id.removeprefix("github.com/")
-        rows = [dict(i) for i in self.repos.get(name, {}).values() if i["state"] == state]
+        name = repository_id.removeprefix("github.com/")  # canonical ids are lower-case
+        issues = next((v for k, v in self.repos.items() if k.lower() == name.lower()), {})
+        rows = [dict(i) for i in issues.values() if i["state"] == state]
         return sorted(rows, key=lambda i: i["updatedAt"], reverse=True)
 
     def issues_page(self, repository_id, cursor=None):
@@ -362,3 +363,98 @@ def test_restart_spreads_reconcile_instead_of_making_every_repository_due():
     fake.log.clear()
     monitor_for(fake, shared, now=lambda: clock[0], full_reconcile_interval=3000, reconcile_per_pass=12).refresh()
     assert len({entry[1] for entry in issue_calls(fake)}) < 12
+
+
+# ---------------------------------------------------------------- G4
+
+
+def scoped():
+    fake = FakeGitHub(page_size=100)
+    for _ in range(2):
+        fake.add_issue("acme/app")
+    fake.add_issue("Other/tool")
+    fake.add_issue("third/lib")
+    return fake
+
+
+def test_allowlist_fetches_and_stores_only_listed_owners():
+    fake, shared = scoped(), {}
+    monitor = monitor_for(fake, shared, organizations=["ACME"])
+    monitor.refresh()
+    assert {entry[1] for entry in fake.log if entry[0] in {"issues", "closed"}} == {"github.com/acme/app"}
+    view = monitor.repositories(start=False)
+    assert [r["repository_id"] for r in view["repositories"]] == ["github.com/acme/app"]
+    assert view["scope"] == {"owners": ["acme"], "excluded_repositories": 2, "restricted": True}
+    assert numbers(monitor) == [1, 2]
+    snapshot = MemoryGitHubStore(identity=fake.credential_identity, shared=shared).load()
+    assert set(snapshot.repositories) == {"github.com/acme/app"}
+
+
+def test_no_allowlist_means_every_owner_and_reports_them():
+    fake = scoped()
+    monitor = monitor_for(fake, {}, organizations=[])
+    monitor.refresh()
+    assert monitor.snapshot(start=False)["scope"] == {"owners": ["acme", "other", "third"],
+                                                      "excluded_repositories": 0, "restricted": False}
+    assert numbers(monitor) == [1, 2, 3, 4]
+
+
+def test_removing_an_owner_purges_its_rows_and_tombstones_them():
+    fake, shared, allow = scoped(), {}, [[]]
+    monitor = monitor_for(fake, shared, organizations=lambda: allow[0])
+    monitor.refresh()
+    revision = MemoryGitHubStore(identity=fake.credential_identity, shared=shared).revision()
+    allow[0] = ["acme", "third"]
+    # out-of-scope rows stop being served at once, not only after the listing
+    fake.log.clear()
+    monitor.refresh()
+    assert [entry for entry in fake.log if entry[0] != "repos"] == []  # nothing changed in scope
+    assert numbers(monitor) == [1, 2, 4]
+    changes = MemoryGitHubStore(identity=fake.credential_identity, shared=shared).changes_since(revision)
+    assert sorted((item["kind"], item["repository_id"]) for item in changes["removed"]) == [
+        ("issue", "github.com/other/tool"), ("repository", "github.com/other/tool")]
+    assert monitor.snapshot(start=False)["scope"]["excluded_repositories"] == 1
+
+
+def test_restart_with_a_narrower_allowlist_never_serves_unlisted_owners():
+    fake, shared = scoped(), {}
+    monitor_for(fake, shared, organizations=[]).refresh()
+    fake.calls.clear()
+    restarted = monitor_for(fake, shared, organizations=["acme"])
+    assert numbers(restarted) == [1, 2]
+    assert [r["repository_id"] for r in restarted.repositories(start=False)["repositories"]] == ["github.com/acme/app"]
+    assert fake.calls == Counter()
+
+
+def test_allowlist_comes_from_the_github_yaml_section_and_invalid_values_stop_the_pass(fake_host_config):
+    fake = scoped()
+    fake_host_config({"github": {"organizations": ["third"]}})
+    monitor = monitor_for(fake, {})
+    monitor.refresh()
+    assert numbers(monitor) == [4]
+    fake_host_config({"github": {"organizations": "third"}})
+    fake.calls.clear()
+    monitor.refresh()
+    view = monitor.snapshot(start=False)
+    assert view["status"] == "invalid_config" and "github.organizations" in view["error"]
+    assert fake.calls == Counter()
+
+
+def test_fleet_file_github_section_carries_the_allowlist_list(tmp_path, fake_host_config):
+    import hashlib
+
+    import yaml
+
+    from herdr_engineering.fleet_config import load_fleet_config
+    path = tmp_path / "fleet-config.yaml"
+    path.write_text(yaml.safe_dump({"version": 1, "sections": {
+        "github": {"roles": ["ci"], "values": {"token": "placeholder-token-value", "organizations": ["acme"]}}},
+        "hosts": {"cp": {"roles": ["ci"], "token_sha256": hashlib.sha256(b"placeholder-host").hexdigest()}}}))
+    path.chmod(0o600)
+    fleet = load_fleet_config(path)
+    fake_host_config({"github": fleet.section("github")})  # what the web process installs
+    fake = scoped()
+    monitor = monitor_for(fake, {})
+    monitor.refresh()
+    assert monitor.snapshot(start=False)["scope"]["owners"] == ["acme"]
+    assert numbers(monitor) == [1, 2]

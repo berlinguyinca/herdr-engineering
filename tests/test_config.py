@@ -2,6 +2,8 @@
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from herdr_engineering.config import (
     DEFAULTS,
     _deep_merge,
@@ -109,3 +111,38 @@ def test_invalid_version_rejected(tmp_path):
         raise AssertionError("expected InvalidError")
     except InvalidError:
         pass
+
+
+def test_github_organizations_default_to_every_owner(tmp_path):
+    from herdr_engineering.config import github_organizations
+    assert DEFAULTS["github"]["organizations"] == []
+    assert github_organizations(None) == [] and github_organizations([]) == []
+    assert github_organizations(["Acme", "acme", " fiehnlab "]) == ["acme", "fiehnlab"]
+    p = _write(tmp_path / "gh.yaml", """
+        version: 1
+        github:
+          organizations: [Acme, fiehnlab]
+    """)
+    assert load_config([p])["github"]["organizations"] == ["Acme", "fiehnlab"]
+
+
+
+@pytest.mark.parametrize("value", ["acme", {"acme": True}, [""], ["  "], ["acme", 3], [None]])
+def test_invalid_github_organizations_are_rejected_with_a_clear_error(tmp_path, value):
+    from herdr_engineering.config import github_organizations
+    with pytest.raises(InvalidError, match="github.organizations"):
+        github_organizations(value)
+    import yaml
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"version": 1, "github": {"organizations": value}}))
+    with pytest.raises(InvalidError, match="github.organizations"):
+        load_config([p])
+
+
+@pytest.mark.parametrize("value", [0, -5, "daily", True])
+def test_invalid_full_reconcile_interval_is_rejected(tmp_path, value):
+    import yaml
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"version": 1, "github": {"sync": {"full_reconcile_interval": value}}}))
+    with pytest.raises(InvalidError, match="github.sync.full_reconcile_interval"):
+        load_config([p])

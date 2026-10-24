@@ -67,3 +67,15 @@ build_cleanup:
   high_water_percent: 85
   low_water_percent: 80
   min_age_hours: 24
+
+# GitHub catalog (control-plane-web). The catalog runs only in the control
+# plane, which reads these keys from the central fleet file's `github` section
+# (next to github.token), live on the next sync pass; they are listed here for
+# reference and validated by the same rules wherever they appear.
+#   github:
+#     values:
+#       token: ...                       # set by `herdr-eng fleet config init`
+#       organizations: [acme, my-login]  # owner allowlist (orgs + your own account),
+#                                        # case-insensitive; empty/absent = every owner.
+#                                        # Excluded owners cost no issue calls and their
+#                                        # stored rows are purged on the next pass.
