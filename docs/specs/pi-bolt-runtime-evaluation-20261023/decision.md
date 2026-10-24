@@ -51,10 +51,13 @@ used for magnitudes. Magnitudes above come from the lower-load repetitions 1-2.
   Covered: precedence, deterministic canary, unsupported host, unpinned/changed/mis-versioned binary all fall back to standard Pi before start,
   a started runtime's exit code is propagated and never replayed on standard Pi, malformed config never blocks Pi.
 
+## Where Pi-Bolt can apply (important scope finding)
+Mission workers run in-process through the Pi SDK (`PiWorkerExecutor` -> `createAgentSession`), not through a spawned `pi` binary, and the pane-based `HerdrAgentRuntime` has no production caller. The launcher selector therefore covers only agents started with the `pi` command. Plan gates, Autospec/Planotator execution and lineage run on paths Pi-Bolt does not touch. Pi-Bolt's RPC mode works (live check) and is the route if mission workers ever need it, but that is a new RPC-backed executor, not an adapter flag. Details: results/mission-worker-scope.txt.
+
 ## Acceptance criteria status
 | Criterion | Status |
 |---|---|
-| 100% pass of lifecycle/session/permissions/plan gates/collaboration/issue linkage/routing/accounting/trace tests | PARTIAL: adapter, fallback and session restore pass; plan gates, collaboration, issue linkage, accounting, trace continuity NOT run under Pi-Bolt (need a full Herdr mission) |
+| 100% pass of lifecycle/session/permissions/plan gates/collaboration/issue linkage/routing/accounting/trace tests | PARTIAL: adapter, fallback, session restore, worker->control-plane->dashboard pass; existing collaboration tests (45) pass because that layer is runtime-independent; plan gates, issue linkage and lineage cannot run under Pi-Bolt today (SDK in-process workers, see scope finding); accounting only at the wire level |
 | No unreviewed security regressions, missing audit events, corrupted sessions | Sessions OK; security review of the binary's network behavior NOT done |
 | Statistically credible improvement in an important bottleneck without quality regression | Only for extension-free agents (CPU, RSS, startup: yes). For real engineering agents: regression |
 | Rollback to standard Pi without data loss or duplicate side effects | PASS live through the real launcher (results/rollback-drill.txt) and after kill -9/SIGTERM (results/cancel-drill.txt); NOT drilled inside a live Herdr mission |

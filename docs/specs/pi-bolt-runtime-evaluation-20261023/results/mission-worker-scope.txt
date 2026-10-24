@@ -1,0 +1,13 @@
+Where Pi-Bolt can and cannot apply to a Herdr mission (code read + live check), 2026-10-23.
+1. Mission workers (scout/reviewer/implementer, plan gates, Autospec/Planotator execution) run through
+   pi-engineering src/workers/PiWorkerExecutor.ts, which calls createAgentSession() from the @earendil-works/pi-coding-agent
+   SDK IN PROCESS. No `pi` binary is spawned, so the launcher-level runtime selector (pi_runtime) never sees them.
+   Pi-Bolt is a standalone binary; it cannot be imported by that code path.
+2. HerdrAgentRuntime (pane-based agents, collaboration layout, parent links) has no production caller (see memory
+   collab-join-script-and-herd-layout), so no production mission launches agents through the launcher today either.
+3. What the launcher selector DOES cover: agents a person or fleet starts with the `pi` command (the managed launcher hook).
+4. Pi-Bolt's RPC mode (`--mode rpc`) works against the gateway: one get_state + one prompt returned responses plus a complete
+   agent_start..agent_settled event stream, exit 0. That is the realistic way to drive Pi-Bolt as a mission worker.
+Consequence: Autospec/Planotator/lineage/issue-graph gates and collaboration events run in the control plane and the in-process
+SDK workers, which Pi-Bolt does not touch. Validating "gates under Pi-Bolt" would first need an RPC-backed WorkerExecutor
+(new work, not part of this evaluation), and it would still have to load the engineering extensions, which is the measured blocker.
