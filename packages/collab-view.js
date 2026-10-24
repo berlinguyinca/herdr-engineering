@@ -467,8 +467,12 @@ export function mountCollab(root, { fabricSessions = null, previewServices = {},
         for (const el of form.elements) el.disabled = true;
         close.disabled = true; message('Publishing…');
         try {
-          await api.publishSkill(skill.draft_id, target);
+          const published = await api.publishSkill(skill.draft_id, target);
           if (!active(rev)) return;
+          if (published.skill_id !== skill.skill_id || published.version !== skill.version
+              || ('status' in published && published.status !== 'published')) {
+            throw new Error('Invalid skill publication response');
+          }
           await load(`Published version ${skill.version} to ${target}.`);
         } catch (e) {
           if (!active(rev) || cancelled(e)) return;

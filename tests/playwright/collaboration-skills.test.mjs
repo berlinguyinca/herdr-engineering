@@ -104,6 +104,41 @@ for (const surface of ['public', 'dashboard']) {
     }, { scopes }));
   }
 
+  for (const [label, result] of [
+    ['empty object', {}],
+    ['missing skill ID', { version: '2.0.0' }],
+    ['missing version', { skill_id: 's1' }],
+    ['wrong skill ID', { skill_id: 'other', version: '2.0.0' }],
+    ['wrong version', { skill_id: 's1', version: '1.2.0' }],
+    ['unpublished status', { skill_id: 's1', version: '2.0.0', status: 'draft' }],
+    ['null status', { skill_id: 's1', version: '2.0.0', status: null }],
+  ]) {
+    test(`skills ${surface}: rejects successful HTTP publication with ${label}`, async () => withSkills(surface, async ({ page, calls, holds, state }) => {
+      await page.getByRole('button', { name: 'Review draft', exact: true }).click();
+      holds.set('/skills/drafts/d1/publish', Promise.resolve(result));
+      const acknowledged = page.getByLabel('I reviewed this version and its publication visibility');
+      const confirm = page.getByRole('button', { name: 'Confirm publication' });
+      const listRequests = calls.filter(c => c.path === '/skills').length;
+      await acknowledged.check();
+      await confirm.click();
+      await page.getByRole('alert').filter({ hasText: 'Invalid skill publication response' }).waitFor();
+      assert.equal(await page.getByRole('status').filter({ hasText: 'Published version' }).count(), 0);
+      assert.equal(calls.filter(c => c.path === '/skills').length, listRequests, 'invalid acknowledgment must not trigger a success refresh');
+      assert.equal(await page.getByRole('region', { name: 'Skill review' }).isVisible(), true);
+      assert.equal(await acknowledged.isChecked(), false);
+      assert.equal(await confirm.isDisabled(), true);
+      assert.equal(await page.getByRole('button', { name: 'Cancel review' }).isEnabled(), true);
+      // A new explicit confirmation can accept the exact identity, with published
+      // status supplied. Existing publication tests cover status-less responses.
+      holds.set('/skills/drafts/d1/publish', Promise.resolve({ skill_id: 's1', version: '2.0.0', status: 'published' }));
+      state.published = true;
+      await acknowledged.check();
+      await confirm.click();
+      await page.getByRole('status').filter({ hasText: 'Published version 2.0.0' }).waitFor();
+      assert.equal(calls.filter(c => c.path.endsWith('/publish')).length, 2);
+    }));
+  }
+
   test(`skills ${surface}: cancel does not publish; revoked authority and download denial stay visible`, async () => withSkills(surface, async ({ page, calls, holds }) => {
     await page.getByRole('button', { name: 'Review draft', exact: true }).click();
     await page.getByRole('button', { name: 'Cancel review' }).click();
