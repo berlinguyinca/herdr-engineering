@@ -529,9 +529,13 @@ class GitHubStore:
 
     def _discard(self) -> None:
         conn, self._conn = self._conn, None
-        if conn is not None:
-            with contextlib.suppress(Exception):
-                conn.terminate()
+        if conn is None:
+            return
+
+        async def terminate():
+            conn.terminate()  # on the store's loop: asyncio transports are not thread-safe
+        with contextlib.suppress(Exception):
+            self._run(terminate())
 
     def _stamp(self) -> datetime:
         return datetime.fromtimestamp(self._now(), UTC)
