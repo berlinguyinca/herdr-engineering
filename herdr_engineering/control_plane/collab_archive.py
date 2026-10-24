@@ -291,6 +291,8 @@ class CollabArchive:
             await self._scrub_user(job['job_id'], job['payload'])
 
     async def _scrub_user(self, job_id: str, payload: dict) -> ScrubReport:
+        # Refresh legacy checkpoints and retain package references before deletion.
+        payload = await self.store.start_scrub(payload['user_id'], job_id)
         user, agents = payload['user_id'], payload['agent_ids']
         # Publish any interrupted restore before removing its requester. The
         # subsequent relational scrub then preserves its now room-owned bytes.
@@ -357,6 +359,10 @@ class CollabArchive:
             await self.store.verified_archive(archive.archive_id, ref.key, ref.sha256)
             await self.store.remove_job(rewrite_id)
             count += 1
+        for ref in payload['skill_packages']:
+            await self._io(self.storage.delete_skill_package, ref['bucket'], ref['storage_key'])
+        payload['skill_packages_verified'] = True
+        await self.store.put_job(job_id, 'scrub', payload)
         await self.store.finish_scrub(user, job_id)
         return ScrubReport('complete', count)
 

@@ -23,6 +23,7 @@ class S3:
     def __init__(self):
         self.objects = {}
         self.fail = False
+        self.cleanup_failure = None
 
     def put_object(self, *, Bucket, Key, Body, IfNoneMatch, **kwargs):
         assert IfNoneMatch == '*'
@@ -34,6 +35,23 @@ class S3:
 
     def get_object(self, *, Bucket, Key):
         return {'Body': io.BytesIO(self.objects[Bucket, Key])}
+
+
+    def get_bucket_versioning(self, *, Bucket):
+        return {'Status': 'Enabled'} if self.cleanup_failure == 'versioned' else {}
+
+    def delete_object(self, *, Bucket, Key):
+        if self.cleanup_failure == 'delete_error':
+            raise RuntimeError('provider secret')
+        if self.cleanup_failure != 'silent_delete':
+            self.objects.pop((Bucket, Key), None)
+
+    def head_object(self, *, Bucket, Key):
+        if self.cleanup_failure == 'head_error':
+            raise ClientError({'Error': {'Code': 'AccessDenied'}}, 'HeadObject')
+        if (Bucket, Key) not in self.objects:
+            raise ClientError({'Error': {'Code': '404'}}, 'HeadObject')
+        return {'ContentLength': len(self.objects[Bucket, Key])}
 
 
 @pytest.fixture
@@ -88,7 +106,7 @@ def agent(name='alice'):
 
 def metadata(**changes):
     return {
-        'name': 'Summarize CSV', 'version': '1.0.0',
+        'name': 'Summarize CSV', 'version': '1.0.0', 'request_key': str(uuid4()),
         'files': {'SKILL.md': b'# CSV summary', 'scripts/run.py': b'raise RuntimeError("never execute")',
                   'fixtures/input.csv': b'a\n1\n', 'requirements.lock': b''},
         'input_schema': {'type': 'object'}, 'output_schema': {'type': 'object'},
@@ -388,3 +406,219 @@ def test_valid_signature_does_not_excuse_invalid_manifest_headers(env, header):
     package = run(registry.get_skill_version(version.skill_id, version.version, principal=agent()))
     altered = registry._sign({**package.manifest, **header}, package.files)
     assert not registry.verify_skill_package(altered).ok
+
+
+def test_draft_request_key_replays_across_restart_without_new_object_or_audit(env):
+    registry, run, conn, s3, restart, _ = env
+    data = metadata(request_key='create-summary')
+    first = run(registry.create_skill_draft(user(), data))
+    reordered = dict(reversed(list(data.items())))
+    reordered['files'] = dict(reversed(list(data['files'].items())))
+    assert run(restart().create_skill_draft(user(), reordered)) == first
+    assert len(s3.objects) == 1
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_drafts')) == 1
+    assert run(conn.fetchval("SELECT count(*) FROM collab_audit_events WHERE action='skill.drafted'")) == 1
+    assert run(conn.fetchval('SELECT request_fingerprint FROM collab_skill_drafts'))
+
+
+@pytest.mark.parametrize('change', [{'name': 'different'}, {'room_id': 'room_one'},
+                                    {'files': {**metadata()['files'], 'SKILL.md': b'changed'}}])
+def test_conflicting_draft_request_key_fails_without_storage_or_audit_changes(env, change):
+    registry, run, conn, s3, *_ = env
+    data = metadata(request_key='same-request')
+    run(registry.create_skill_draft(user(), data))
+    with pytest.raises(CollabError) as error:
+        run(registry.create_skill_draft(user(), {**data, **change}))
+    assert error.value.status == 409
+    assert len(s3.objects) == 1
+    assert run(conn.fetchval('SELECT count(*) FROM collab_audit_events')) == 1
+
+
+def test_request_keys_are_scoped_to_authenticated_creator(env):
+    registry, run, conn, _, _, invalid = env
+    data = metadata(request_key='same-request')
+    alice = run(registry.create_skill_draft(user(), data))
+    bob = run(registry.create_skill_draft(user('bob'), data))
+    assert alice != bob
+    invalid.add(user().key)
+    with pytest.raises(CollabError):
+        run(registry.create_skill_draft(user(), data))
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_drafts')) == 2
+
+
+def test_concurrent_identical_requests_create_one_draft(env):
+    registry, run, conn, s3, *_ = env
+    import asyncpg
+    async def concurrent():
+        other = await asyncpg.connect(os.environ['HERDR_E2E_PG_DSN'])
+        try:
+            schema = await conn.fetchval('SELECT current_schema()')
+            await other.execute(f'SET search_path TO {schema}')
+            second = copy.copy(registry)
+            second.conn = other
+            data = metadata(request_key='concurrent')
+            return await asyncio.gather(registry.create_skill_draft(user(), data),
+                                        second.create_skill_draft(user(), data))
+        finally:
+            await other.close()
+    first, second = run(concurrent())
+    assert first == second
+    assert len(s3.objects) == 1
+    assert run(conn.fetchval('SELECT count(*) FROM collab_audit_events')) == 1
+
+
+def test_scrub_captures_package_references_and_finish_fails_closed(env):
+    from herdr_engineering.control_plane.collab_store import CollabStore
+    _, run, conn, s3, *_ = env
+    publish(env)
+    store = CollabStore(conn)
+    payload = run(store.start_scrub('alice', 'scrub-test'))
+    assert {(r['bucket'], r['storage_key']) for r in payload['skill_packages']} == set(s3.objects)
+    with pytest.raises(ValueError, match='skill package cleanup'):
+        run(store.finish_scrub('alice', 'scrub-test'))
+    assert run(conn.fetchval("SELECT status FROM collab_users WHERE user_id='alice'")) == 'disabled'
+    assert run(store.get_job('scrub-test'))['payload']['skill_packages']
+    assert len(s3.objects) == 2
+
+
+@pytest.mark.parametrize('failure', ['delete_error', 'silent_delete', 'head_error', 'versioned'])
+def test_skill_scrub_verifies_deletion_and_retries_from_durable_references(env, failure):
+    from herdr_engineering.control_plane.collab_archive import CollabArchive
+    from herdr_engineering.control_plane.collab_storage import CollabStorage, S3Config, StorageError
+    from herdr_engineering.control_plane.collab_store import CollabStore
+    _, run, conn, s3, *_ = env
+    publish(env)
+    s3.objects['skills', 'unrelated'] = b'keep'
+    store = CollabStore(conn)
+    storage = CollabStorage(S3Config(environment='test'), s3=s3)
+    s3.cleanup_failure = failure
+    with pytest.raises(StorageError, match='skill package cleanup'):
+        run(CollabArchive(store, storage).scrub_deleted_user('alice'))
+    jobs = run(store.jobs('scrub'))
+    assert len(jobs) == 1 and len(jobs[0]['payload']['skill_packages']) == 2
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_versions')) == 1
+    assert not run(conn.fetchval("SELECT EXISTS(SELECT 1 FROM collab_audit_events WHERE action='user.deleted')"))
+    s3.cleanup_failure = None
+    assert run(CollabArchive(CollabStore(conn), storage).scrub_deleted_user('alice')).status == 'complete'
+    assert s3.objects == {('skills', 'unrelated'): b'keep'}
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_versions')) == 0
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_drafts')) == 0
+    assert run(store.jobs('scrub')) == []
+
+
+def test_legacy_package_without_known_bucket_blocks_scrub(env):
+    from herdr_engineering.control_plane.collab_archive import CollabArchive
+    from herdr_engineering.control_plane.collab_storage import CollabStorage, S3Config, StorageError
+    from herdr_engineering.control_plane.collab_store import CollabStore
+    _, run, conn, s3, *_ = env
+    run(conn.execute("""
+        INSERT INTO collab_skills(skill_id,owner_id,name) VALUES ('legacy','alice','Legacy');
+        INSERT INTO collab_skill_versions(skill_id,version,storage_key,sha256)
+            VALUES ('legacy','1','unknown-location',repeat('a',64));
+    """))
+    with pytest.raises(StorageError, match='skill package cleanup'):
+        run(CollabArchive(CollabStore(conn), CollabStorage(S3Config(environment='test'), s3=s3)).scrub_deleted_user('alice'))
+    assert run(conn.fetchval("SELECT count(*) FROM collab_users WHERE user_id='alice'")) == 1
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_versions')) == 1
+
+
+def test_forward_migration_upgrades_pre_registry_database_and_quarantines_unsigned_versions(env, tmp_path):
+    import shutil
+    _, run, conn, *_ = env
+    migrations = Path(__file__).parents[2] / 'deploy/control-plane/migrations'
+    old = tmp_path / 'old'
+    old.mkdir()
+    for source in sorted(migrations.glob('*.sql'))[:5]:
+        shutil.copy(source, old / source.name)
+    current = run(conn.fetchval('SELECT current_schema()'))
+    schema = 'upgrade_test_' + uuid4().hex
+    run(conn.execute(f'CREATE SCHEMA {schema}'))
+    try:
+        run(conn.execute(f'SET search_path TO {schema}'))
+        run(Migrator(conn).apply(str(old)))
+        assert run(conn.fetchval("SELECT to_regclass('collab_skill_drafts')")) is None
+        run(conn.execute("""
+            INSERT INTO collab_users(user_id,status) VALUES ('legacy-owner','approved');
+            INSERT INTO collab_skills(skill_id,owner_id,name,status)
+                VALUES ('legacy-skill','legacy-owner','Old','published');
+            INSERT INTO collab_skill_versions(skill_id,version,storage_key,sha256,status)
+                VALUES ('legacy-skill','1','old-package',repeat('b',64),'published');
+        """))
+        assert run(Migrator(conn).apply(str(migrations))) == ['0006_collaboration_skill_registry.sql']
+        row = run(conn.fetchrow('SELECT * FROM collab_skill_versions'))
+        assert row['status'] == 'revoked' and row['legacy_unverified']
+        assert row['storage_key'] == 'old-package' and row['storage_bucket'] is None
+        assert run(conn.fetchval("SELECT to_regclass('collab_skill_drafts')"))
+        assert run(Migrator(conn).apply(str(migrations))) == []
+    finally:
+        run(conn.execute(f'SET search_path TO {current}'))
+        run(conn.execute(f'DROP SCHEMA {schema} CASCADE'))
+
+
+def test_forward_migration_preserves_existing_signed_versions_and_drafts(env):
+    _, run, conn, *_ = env
+    publish(env)
+    before = run(conn.fetchrow('SELECT * FROM collab_skill_versions'))
+    path = Path(__file__).parents[2] / 'deploy/control-plane/migrations/0006_collaboration_skill_registry.sql'
+    assert path.is_file()
+    run(conn.execute(path.read_text()))
+    assert run(conn.fetchrow('SELECT * FROM collab_skill_versions')) == before
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_drafts')) == 1
+
+
+def test_draft_retry_rechecks_live_authority_after_waiting_for_request_lock(env):
+    registry, run, *_ = env
+    data = metadata(request_key='revoked-retry')
+    run(registry.create_skill_draft(user(), data))
+    checks = iter([True, False])
+    registry.principal_valid = lambda p: next(checks)
+    with pytest.raises(CollabError):
+        run(registry.create_skill_draft(user(), data))
+
+
+def test_cleanup_checkpoint_survives_cascade_and_old_scrub_job_is_upgraded(env):
+    from herdr_engineering.control_plane.collab_archive import CollabArchive
+    from herdr_engineering.control_plane.collab_storage import CollabStorage, S3Config
+    from herdr_engineering.control_plane.collab_store import CollabStore
+    _, run, conn, s3, *_ = env
+    publish(env)
+    store = CollabStore(conn)
+    run(store.put_job('old-scrub', 'scrub', {'user_id': 'alice', 'agent_ids': ['agent_alice']}))
+    payload = run(store.start_scrub('alice', 'old-scrub'))
+    assert len(payload['skill_packages']) == 2
+    run(conn.execute("DELETE FROM collab_users WHERE user_id='alice'"))
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_drafts')) == 0
+    assert run(store.get_job('old-scrub'))['payload']['skill_packages'] == payload['skill_packages']
+    assert run(CollabArchive(store, CollabStorage(S3Config(environment='test'), s3=s3)).resume_pending_archives()) == []
+    assert not s3.objects and not run(store.jobs('scrub'))
+
+
+@pytest.mark.parametrize('key', [None, '', ' ', 'a' * 201])
+def test_request_key_is_required_and_bounded(env, key):
+    registry, run, conn, s3, *_ = env
+    with pytest.raises(CollabError) as error:
+        run(registry.create_skill_draft(user(), metadata(request_key=key)))
+    assert error.value.status == 400
+    assert not s3.objects
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_drafts')) == 0
+
+
+def test_forward_migration_accepts_previously_amended_0003_with_signed_rows(env):
+    _, run, conn, *_ = env
+    publish(env)
+    before = dict(run(conn.fetchrow('SELECT * FROM collab_skill_versions')))
+    # The amended 0003 has the signed fields/triggers but none of the new columns.
+    run(conn.execute("""
+        ALTER TABLE collab_skill_drafts DROP COLUMN request_key CASCADE,
+            DROP COLUMN request_fingerprint CASCADE, DROP COLUMN storage_bucket;
+        ALTER TABLE collab_skill_versions DROP COLUMN storage_bucket,
+            DROP COLUMN legacy_unverified CASCADE;
+        DELETE FROM schema_migrations WHERE version='0006_collaboration_skill_registry.sql';
+    """))
+    migrations = Path(__file__).parents[2] / 'deploy/control-plane/migrations'
+    assert run(Migrator(conn).apply(str(migrations))) == ['0006_collaboration_skill_registry.sql']
+    after = dict(run(conn.fetchrow('SELECT * FROM collab_skill_versions')))
+    for key in ('manifest', 'sha256', 'signature', 'key_id', 'source_draft_id', 'status'):
+        assert after[key] == before[key]
+    assert not after['legacy_unverified'] and after['storage_bucket'] is None
+    assert run(conn.fetchval('SELECT request_key FROM collab_skill_drafts')) is None
