@@ -23,6 +23,7 @@ node --test --test-concurrency=1 tests/playwright/ui-gates-perf.test.mjs      # 
 node --test --test-concurrency=1 tests/playwright/ui-gates-tokens.test.mjs    # raw colour, spacing, z-index, font tokens
 node --test --test-concurrency=1 tests/playwright/ui-gates-states.test.mjs    # every control in every state (inspector forms, Gantt, replay, review...)
 node --test --test-concurrency=1 tests/playwright/ui-gates-xss.test.mjs       # hostile text injected into every API field, every surface and state
+node --test --test-concurrency=1 tests/playwright/ui-gates-interaction.test.mjs  # one-Tab-stop graph, Enter/Space on nodes, aria-expanded, tabpanels, modal editor, @-mention listbox
 node --test --test-concurrency=1 tests/visual/ui-gates-visual.test.mjs        # screenshots vs docs/assets/screenshots (not in plain `npm test`)
 
 # screenshots
@@ -56,9 +57,11 @@ run it; `npm run test:ui-gates` does.
 The states test (`ui-gates-states.mjs`) opens each place where controls live, because the default view of a tab holds only a
 fraction of them: a selected lineage node with its comment, steering, consult and link forms; the fork form; the steering confirm
 step; the Gantt; the replay bar; the table alternative; a proposal under review; expanded attention items; a remote agent tab;
-links; chat. Each state names selectors that must exist once open (a state that fails to open is a failure, not a skip) and a least
-number of audited controls. It runs at desktop light, desktop dark and phone 375, each on its own server (acknowledging an
-attention item is server state).
+links; chat; an edited comment (History) and a retracted one; the expanded message editor; the @-mention list open. Each state names
+selectors that must exist once open (a state that fails to open is a failure, not a skip) and a least number of audited controls and
+text nodes, set at 90% of what the audit counted (the owner total is 512 controls, floor 460; the first version's floors were about a
+third of the count). Two viewer states (chat, and lineage with a node selected) run as the read-only account. Everything runs at
+desktop light, desktop dark and phone 375, each on its own server (acknowledging an attention item is server state).
 
 Every real-page test also fails on any console error, CSP violation, failed request or HTTP status of 400 or more.
 
@@ -79,11 +82,34 @@ Added after the independent review (each rule has a known-bad and a known-good f
 The checker evaluates through string expressions with a serialised colour library, so the page CSP does not matter, and every audit
 returns `.stats` (controls, text nodes, pixels sampled, focused) so a test can assert the audit really covered the page.
 
+Third round: the name of a `select` or `textarea` must come from a label, `aria-label`, `aria-labelledby` or `title`, never from its
+option text or its content (an unlabelled fork select and snooze select passed before); CSS that reorders focusable children
+(`order`, `*-reverse`) is flagged (`focus-order`: Tab no longer follows what is seen); `-webkit-text-fill-color` is the paint colour
+when it differs from `color` (transparent text was invisible to the contrast rule); the options of a listbox that a combobox
+controls are not asked to be focusable themselves.
+
+Widgets (`ui-gates-interaction.test.mjs`, real page): the lineage graph has exactly one node in the Tab order and Tab leaves it; a
+flow node answers Enter and answers Space; the acknowledged-items disclosure says `aria-expanded` false, true, false and shows and
+hides its items; every sub-tab has `aria-controls`, its panel is a `tabpanel` labelled by it, and its name is the label with the
+count after a comma; the expanded message editor is `role=dialog` with `aria-modal` and a name, Tab and Shift+Tab never leave it,
+Escape closes it and returns focus to the button; the @-mention input is a combobox whose `aria-activedescendant` names a selected
+option of an open listbox, the arrow keys move it, Escape closes it and clears it. The two composer states are also audited in the
+states test (they need an agent that may receive tasks: fixture flag `mention_agent`). The favicon special case in the request
+watcher is gone: the page must declare its icon (one `link[rel~=icon]`) so the browser never asks for `/favicon.ico`.
+
 Hostile text (`ui-gates-xss.test.mjs`): a rewriting proxy prefixes a canary payload to every display field of every collaboration
 GET response and swaps URL fields for `javascript:`, across all 11 surfaces and every state, against a real server seeded with a
 `rich` fixture (redirect instruction, consultation question, external heartbeat activity). It asserts that nothing executes, no
 element or handler is created, and that canaries reached the screen for the required fields (otherwise "inert" proves nothing).
-`workspace_id` is validated by the server to `[A-Za-z0-9._:-]`, so only the proxy can exercise it.
+`workspace_id` is validated by the server to `[A-Za-z0-9._:-]`, so only the proxy can exercise it. Every string the server sends is
+tainted unless it is an identifier or a value the page branches on (a key pattern list, plus hex ids and timestamps); a
+hand-written list of display fields once left a bounded task's `target_name` untested. The sign-in config response is left alone
+(the page finds its server through it). The test lists which tainted fields never reached the screen and requires that list to equal
+`UNRENDERED`, so a new unrendered field cannot hide: 21 are listed (analytics and review-evidence tables that the small fixture room
+suppresses, PR and diff statistics, and identifiers the page reads but does not paint). **Those 21 are not proven inert.** Three
+placements are asserted directly: the lineage an external agent reported, named by its label (the fixture now reports one), a
+milestone label (the proxy adds a milestone to an empty progress response, because a real one needs a linked mission), and the
+target of a bounded task. The payload also breaks out of attributes (a quote, an event handler and a marker attribute first).
 
 Keyboard: after any action, focus returns to the same control (or its successor: confirm lands on "Confirm and send", cancel on
 "Review and confirm", a decided proposal on its row), asserted exactly rather than "not the body". The flow diagram is one Tab stop
@@ -102,6 +128,7 @@ a pause control (the flow view has a "Pause motion" button with `aria-pressed`);
 | Baseline size | at most 6144 KB in total, 300 KB per file (3439 KB, biggest 101 KB now) |
 | First render of a large graph | 6000 ms |
 | Filter key to next frame, p95 | 500 ms |
+| Redraws for six quick keystrokes in the filter above the draw cap | at most 2 (counted through CDP coverage, not timed; measured 1) |
 | Type-filter toggle above the draw cap, median | 250 ms (measured 32 ms) |
 | Load more, p95 | 3000 ms (loose: it goes through the server) |
 | CPU calibration | a fixed loop is timed in the page; budgets are multiplied by max(1, measured / `calibration_ref_ms` 100) so a slow CI host does not flake |
@@ -134,24 +161,42 @@ now says so ("The server stopped reading here, so more nodes may exist") instead
 ## Screenshots
 
 PNGs live in `docs/assets/screenshots/`: 10 surfaces x 3 viewports x light and dark page captures, plus component captures cut by
-bounding box (80 files, 3439 KB). Capture is deterministic: the server clock and ingest stamps are fixed, the browser clock is
-fixed, reduced motion and `animation:none` are forced, the caret is hidden, scroll is reset on the lineage and Gantt surfaces, and
-random server ids are rewritten to stable tokens. **Fonts are bundled** (Liberation Sans and Mono, Regular and Bold, subset, under
-`tests/playwright/fonts/` with `OFL.txt`) and injected as `@font-face` data URLs for capture only (`bypassCSP`, because the page CSP
-is `default-src 'none'`); a CDP `CSS.getPlatformFontsForNode` check asserts the bundled fonts were really used. Three fresh loads
-agree within half the page budget (asserted).
+bounding box (88 files, 3616 KB). Pages are captured to their FULL height (no clipping: a page above 10000px is an error, not a
+silent cut; the first version clipped at 2400px and never compared the workbench of a selected node, which sits at 2900 to 3900px).
+The workbench has its own regions (comments, fork table, steering form, requests) because a paragraph or one button is far below the
+page budget: a transparent first comment scored 0.0025% of the page. Capture is deterministic: the server clock and ingest stamps are
+fixed, the browser clock is fixed, reduced motion and `animation:none` are forced, the caret is hidden, scroll is reset on the
+lineage and Gantt surfaces, and random text (server ids, key ids, short digests such as the steering fence) is rewritten to stable
+tokens by a MutationObserver that keeps doing so while the page redraws on its poll.
 
-The suite has teeth (14 injected defects, each of which must fail on the page or the component): hidden edges, transparent
+**Fonts are bundled** under `tests/playwright/fonts/` (licences in `OFL.txt`, `DEJAVU-LICENSE.txt`, `NOTICE.txt`): Liberation Sans and
+Mono (Regular, Bold) for text, `Herdr Symbols` (a renamed subset of DejaVu Sans: geometric shapes, dingbats, arrows) and
+`Herdr Symbols Two` (a subset of Noto Sans Symbols2: the media glyphs) for the symbols the page paints. They are injected as
+`@font-face` rules on the design system's own family names (`Inter`, `JetBrains Mono`, with `unicode-range` for the symbol fonts) as
+data URLs for capture only (`bypassCSP`, because the page CSP is `default-src 'none'`). The room tab's plus sign is now an ASCII `+`
+(it was U+FF0B, which only a CJK font has). `assertBundledFonts` walks EVERY element and ::before/::after of the page through the
+DevTools protocol (`CSS.getPlatformFontsForNode`) and fails the capture if any glyph was painted by a host font; its own test puts a
+host-font span (and an emoji) on the page and requires the failure. **Portability is proved, not assumed:** the visual suite runs
+`baselines:check` in a child process under a `FONTCONFIG_FILE` that lists only `tests/playwright/fonts` (plus `/etc/fonts/conf.d`
+for rendering settings) and requires the whole suite to pass; `fc-list` under that file shows only the four bundled families.
+
+The suite has teeth (18 injected defects, each of which must fail on the page or the component): hidden edges, transparent
 inspector text, hidden logo and glyphs, missing badges, an invisible Send button, a +7 colour shift, a 1px shift, a 1px wider button,
-a card with one more pixel of padding, 4px of tab-bar padding, borderless nodes and a wrongly coloured failed node.
+a card with one more pixel of padding, 4px of tab-bar padding, borderless nodes, a wrongly coloured failed node, a Pause motion
+label that is gone, a transparent first comment, a hidden fork button, hidden steering request buttons and a hidden submit button.
 
 Baseline policy:
 
 - `update` needs `--i-understand-this-rewrites-baselines` and a clean git tree, so a baseline cannot be regenerated by accident or
   to hide an unreviewed change. Say why in the PR (browser build, font, intended CSS).
 - Total size and per-file size are capped (yaml) and enforced by a test and by `check` and `update`.
-- Baselines are tied to the Chromium build Playwright resolves and to the bundled fonts. Residual host dependence: emoji and symbol
-  glyphs that the bundled fonts do not cover still fall back to the system. Another Chromium build needs an `update` with review.
+- Baselines are tied to the Chromium build Playwright resolves (its FreeType and Skia) and to the bundled fonts. No glyph may fall
+  back to a host font (asserted per element). What a baseline can STILL depend on, honestly: the host's fontconfig RENDERING
+  settings (hinting level, anti-aliasing, sub-pixel layout: they come from `/etc/fonts/conf.d`, are not fonts, and were left
+  as the system has them in the portability run), device scale factor 1, and the Chromium build. A machine with different
+  rendering settings, or another Chromium build, needs an `update` with the PNG diff reviewed. An emoji on a surface would fail the
+  font assertion rather than silently paint with a colour-emoji font.
+- `check` fails on an orphan PNG (a baseline no surface produces); `update` and `check` exit 2 on a slug that matches nothing.
 - A miss writes `<name>.actual.png` and `<name>.diff.png` under `.autospec/reports/visual/` (not committed).
 - A one-colour change of +1 per channel is below the tolerance of 2 and is not detected, by design.
 
@@ -187,6 +232,9 @@ Found by the strengthened gates (second round):
     which kind of cut it was.
 19. The pause-motion button changed its label and aria-pressed together (read twice) and forgot the choice; one label, remembered.
 20. The flow diagram was a Tab stop per node and per line; it is one stop with arrow keys.
+21. Sub-tabs had no `aria-controls` and their panels no `tabpanel` role; the badge count was glued onto the name ("Tasks1"). The tabs
+    are wired to their panels now and the name is "Tasks, 3 waiting".
+22. The room-tab "+ New room" used U+FF0B, a glyph only a CJK font has (so its look depended on the host); it is an ASCII plus.
 
 ## What is not covered (honest gaps)
 
@@ -199,8 +247,7 @@ Found by the strengthened gates (second round):
 - **Ratchets are debt.** 5 raw hex colours and 72 off-grid spacing values remain; the tests only stop them growing.
   `motion.duration-from-scale` is deliberately unmapped because DESIGN.md has no motion scale (the autospec runner reports
   1 unmapped rule, and still passes in `--strict`, so it is not a blocker rule).
-- **Known accessibility rough edges left alone:** accept and reject use the browser's `window.confirm`; sub-tab accessible names
-  include the badge count (for example "Tasks1"); sub-tab panels have no `aria-controls` or `tabpanel` role.
+- **Known accessibility rough edge left alone:** accept and reject use the browser's `window.confirm`.
 - **Mutation check of the gates (second round).** Each previously surviving mutant was re-run against the strengthened gates.
   Caught: N10, N1c, N2a, N3b, N3c, N4d, N5a, N5b, N5c, N8a-c, N9b, N9d, N9e, R5b, R7c, R10, R13c, S1-S6, X5-X8. Three mutants
   (N4d, N9e, S3) first survived because the mutant CSS was appended near the top of `collab.css` (line 3) and later rules of equal
@@ -211,7 +258,7 @@ Found by the strengthened gates (second round):
 - **R7c** (the layout skip above the draw cap) is caught by counting `layoutGraph` calls through CDP precise coverage, not by timing:
   the layout costs tens of milliseconds, which no budget separates from noise.
 - **N5b** (the Pause motion label gone, an empty box) was invisible to every gate until the flow surface joined the visual suite.
-- **Not covered by the pixel gate:** a change of one colour step (+1 per channel), and emoji or symbol glyphs that fall back to the host fonts.
+- **Not covered by the pixel gate:** a change of one colour step (+1 per channel); a host whose fontconfig rendering settings differ.
 - **Search is client-side** and covers only loaded nodes; the server caps lineage paging at 3,000 nodes.
 - **Performance numbers come from a loaded host** (see above).
 - **Screenshot determinism is bounded, not proven exact.** The determinism test allows half the page budget between fresh loads. The deterministic server stamps
