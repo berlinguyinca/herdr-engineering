@@ -266,6 +266,26 @@ export class HerdrClient {
     });
   }
 
+  // Sandboxed CI fix agent. The control plane only records the request; a runner on a host does the work.
+  ciFix(repository, number, operationId, { signal, providerUrl } = {}) {
+    return this.request('/api/v1/ci/fix', {
+      method: 'POST', body: { repository, number, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
+    });
+  }
+
+  listCiFix({ run, signal } = {}) {
+    const query = new URLSearchParams(run ? { run } : {});
+    return this.request(`/api/v1/ci/fix${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  getCiFix(id, { signal } = {}) {
+    return this.request(`/api/v1/ci/fix/${encodeURIComponent(id)}`, { signal });
+  }
+
+  cancelCiFix(id, { signal } = {}) {
+    return this.request(`/api/v1/ci/fix/${encodeURIComponent(id)}/cancel`, { method: 'POST', body: {}, signal });
+  }
+
   getReview(id, { signal } = {}) {
     return this.request(`/api/v1/reviews/${encodeURIComponent(id)}`, { signal });
   }
