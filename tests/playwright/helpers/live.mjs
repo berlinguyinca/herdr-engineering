@@ -34,13 +34,13 @@ export async function boot(page,base,hash,handler){
  return reads;
 }
 
-// Records DOM mutations under #view (ignoring self-ticking clocks) and inserted spinners.
+// Records DOM mutations under #view (ignoring self-ticking clocks) and inserted loaders (spinner or skeleton).
 export const observe=page=>page.evaluate(()=>{
  window.__view=document.getElementById('view');window.__muts=[];window.__spinners=0;
  const ticking=n=>{const el=n.nodeType===1?n:n.parentElement;return !!el?.closest('herdr-freshness,herdr-mission-activity');};
  window.__obs?.disconnect();
  window.__obs=new MutationObserver(records=>{for(const r of records){
-  for(const n of r.addedNodes)if(n.nodeType===1&&(n.matches('herdr-spinner')||n.querySelector('herdr-spinner')))window.__spinners++;
+  for(const n of r.addedNodes)if(n.nodeType===1&&(n.matches('herdr-spinner,[data-skeleton]')||n.querySelector('herdr-spinner,[data-skeleton]')))window.__spinners++;
   if(!ticking(r.target))window.__muts.push(r);
  }});
  window.__obs.observe(window.__view,{childList:true,subtree:true,attributes:true,characterData:true});

@@ -114,3 +114,11 @@ export function flash(el){
  el.setAttribute('data-flash','');
  setTimeout(()=>el.removeAttribute('data-flash'),600);
 }
+
+// Skeleton placeholder for a first load: grey rows with a shimmer (still under calm), announced
+// as "Loading <label>" to assistive tech. Views replace it wholesale when their data arrives.
+// bare: rows only, for a placeholder nested inside an outer [data-skeleton] that announces itself.
+export function skeleton(label,{rows=3,height=44,bare=false}={}){
+ const safe=String(label).replace(/[&<>"']/g,c=>`&#${c.charCodeAt(0)};`);
+ return `<div class="hd-skeleton-group"${bare?'':` data-skeleton role="status" aria-label="Loading ${safe}"`}>${`<div class="hd-skeleton" style="height:${Number(height)}px"></div>`.repeat(Math.max(1,rows))}</div>`;
+}

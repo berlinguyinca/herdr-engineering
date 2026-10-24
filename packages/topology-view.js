@@ -5,7 +5,7 @@ import {recordVisibility,reportFreshness,reportTimestamp} from './record-state.j
 import {serviceState,serviceScope,safeServiceUrl} from './services-view.js';
 import {missionEntries} from './mission-catalog-view.js';
 import {integrationOutcome} from './integrations-view.js';
-import {snapshotText,animateChanges} from './motion.js';
+import {snapshotText,animateChanges,skeleton} from './motion.js';
 import { freshnessSources } from './freshness.js';
 
 const text=value=>typeof value==='string'?value.trim():'';
@@ -105,7 +105,7 @@ export function mountTopology(container,client,{status='current'}={}) {
   container.innerHTML=`${styles}<div class="hd-live-head"><h1>Topology</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="tx-intro">Explore current work and services started through HerdR by host or confirmed project identity. Expand a group to inspect its records. Stopped, finished and unconfirmed records remain in their own views.</p><div data-tx-metrics class="tx-metrics"></div>
     <div class="tx-tabs" role="tablist" aria-label="Topology visibility">${TABS.map(([key,label])=>`<button type="button" id="tx-tab-${key}" role="tab" data-tx-tab="${key}" aria-controls="tx-results" aria-selected="${key===state.status}" tabindex="${key===state.status?0:-1}">${label}<small data-tab-count="${key}">…</small></button>`).join('')}</div>
     <div class="tx-controls"><label>Search topology<input type="search" data-tx-search placeholder="Service, project, agent, repository or host"></label><label>Group by<select data-tx-group><option value="host">Host</option><option value="project">Project / repository</option></select></label><label>Type<select data-tx-type><option value="">All types</option>${Object.entries(TYPES).map(([key,label])=>`<option value="${key}">${label}</option>`).join('')}</select></label><label>Host<select data-tx-host><option value="">All hosts</option></select></label></div>
-    <div class="tx-toolbar"><p class="tx-note" data-tx-result role="status">Loading observations…</p><button type="button" class="hd-btn" data-tx-collapse>Collapse groups</button></div><div class="tx-feedback" data-tx-feedback role="status"></div><p class="tx-note" data-tx-policy></p><section id="tx-results" role="tabpanel" aria-labelledby="tx-tab-current"></section><div data-tx-more-groups></div>
+    <div class="tx-toolbar"><p class="tx-note" data-tx-result role="status"></p><button type="button" class="hd-btn" data-tx-collapse>Collapse groups</button></div><div class="tx-feedback" data-tx-feedback role="status"></div><p class="tx-note" data-tx-policy></p><section id="tx-results" role="tabpanel" aria-labelledby="tx-tab-current"></section><div data-tx-more-groups></div>
     <nav class="tx-footer" aria-label="Detailed catalogs"><a href="#/hosts">Hosts</a><a href="#/services">HerdR services</a><a href="#/system-services">System services</a><a href="#/herd">Agents</a><a href="#/missions">Missions</a><a href="#/ci">CI</a><a href="#/reviews">Reviews</a></nav><p class="tx-note">Reports refresh independently every 5 seconds. A recent report does not prove a process is currently running.</p>`;
   const el=selector=>container.querySelector(selector);
   const allEntries=()=>topologyEntries(data,received);
@@ -145,9 +145,9 @@ export function mountTopology(container,client,{status='current'}={}) {
     for(const [key] of TABS){const button=el(`[data-tx-tab="${key}"]`);button.setAttribute('aria-selected',String(state.status===key));button.tabIndex=state.status===key?0:-1;el(`[data-tab-count="${key}"]`).textContent=Object.values(sourceStates).some(s=>s.loaded)?selectTopology(all,{...state,status:key}).length:'…';}
     const hostIds=[...new Set([...hosts.map(h=>text(h.host_id)),...all.map(e=>e.host),state.host].filter(Boolean))].sort();
     if(JSON.stringify(hostIds)!==hostSignature){hostSignature=JSON.stringify(hostIds);el('[data-tx-host]').innerHTML='<option value="">All hosts</option>'+hostIds.map(id=>`<option value="${esc(id)}">${esc(id)}</option>`).join('');el('[data-tx-host]').value=state.host;}
-    const unavailable=Object.entries(sources).filter(([key])=>!sourceStates[key]?.loaded).map(([,source])=>source.label);
+    const unavailable=Object.entries(sources).filter(([key])=>!sourceStates[key]?.loaded).map(([,source])=>source.label),anyLoaded=unavailable.length<Object.keys(sources).length;
     el('[data-tx-result]').textContent=`${selected.length} matching ${state.status==='current'?'current ':''}records · ${groups.length} ${state.group==='host'?'host / provider':'project / repository'} groups${unavailable.length?' · Partial view':''}`;
-    const notices=Object.entries(sources).map(([key,source])=>sourceStates[key]?.error?`${source.label} could not refresh.${sourceStates[key].loaded?' Showing last received records.':' Retrying automatically.'}`:!sourceStates[key]?.loaded?`Loading ${source.label.toLowerCase()}…`:null).filter(Boolean);
+    const notices=Object.entries(sources).map(([key,source])=>sourceStates[key]?.error?`${source.label} could not refresh.${sourceStates[key].loaded?' Showing last received records.':' Retrying automatically.'}`:!sourceStates[key]?.loaded&&anyLoaded?`${source.label}: waiting for the first report.`:null).filter(Boolean);
     if(data.ci?.status==='auth_error')notices.push('Woodpecker authentication needs attention.');
     else if(data.ci?.available===false)notices.push(data.ci.status==='syncing'?'Woodpecker is discovering repositories and runs.':'CI reports are unavailable.');
     if(data.ci?.stale)notices.push('CI reports are stale; open runs are shown under Unconfirmed.');
@@ -162,7 +162,7 @@ export function mountTopology(container,client,{status='current'}={}) {
     const previousGroups=focusGroupPager?new Set([...results.children].map(group=>group.dataset.txDisclosure)):null;
     const scroll={x:window.scrollX,y:window.scrollY};
     results.setAttribute('aria-labelledby',`tx-tab-${state.status}`);
-    results.innerHTML=groups.slice(0,state.groupLimit).map(g=>groupMarkup(g,now)).join('')||`<div class="tx-group tx-empty">${unavailable.length?'Waiting for matching reports. Source availability is shown above.':'No records match this view. Change the filters or open Unconfirmed / History to inspect previous observations.'}</div>`;
+    results.innerHTML=!anyLoaded?skeleton('observations',{rows:4}):groups.slice(0,state.groupLimit).map(g=>groupMarkup(g,now)).join('')||`<div class="tx-group tx-empty">${unavailable.length?'Waiting for matching reports. Source availability is shown above.':'No records match this view. Change the filters or open Unconfirmed / History to inspect previous observations.'}</div>`;
     animateChanges(container,'[data-tab-count]',tabsBefore);
     animateChanges(results,'[data-topology-entry] .tx-state strong',rowsBefore,entryKey,{count:false,target:node=>node.closest('[data-topology-entry]')});
     el('[data-tx-more-groups]').innerHTML=groups.length>state.groupLimit?`<button type="button" class="hd-btn" data-tx-more-groups-button>Show ${Math.min(12,groups.length-state.groupLimit)} more groups · ${groups.length-state.groupLimit} remaining</button>`:'';

@@ -25,7 +25,7 @@ import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
 import { mountAnalytics, loadAnalytics } from './analytics-view.js';
 import { morph, patchList, patchText } from './patch.js';
-import { flash } from './motion.js';
+import { flash, skeleton } from './motion.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { freshnessSources } from './freshness.js';
@@ -185,7 +185,7 @@ async function render() {
   const load = (rev) => ROUTES[match](parts, rev);
   // As before, live events retry a failed or not-found page, except pages that stream their own detail.
   const streamsOwnDetail = match === '/herd/session/:id' || (match === '/missions/:id' && decodeURIComponent(parts[1]).startsWith('pi:'));
-  root.innerHTML = '<herdr-spinner label="Loading"></herdr-spinner>';
+  root.innerHTML = routeSkeleton(match, parts);
   let view;
   try {
     view = await load(revision);
@@ -210,6 +210,18 @@ function statusPage(html, ok, message) {
   root.querySelector('herdr-freshness').touch(ok, message);
 }
 
+// First-load placeholder for a route: its head (title bar, and the back link detail pages put
+// above it) at the real page's position, then content rows sized roughly to the page that follows
+// (a Pi mission without a record is short; agent detail and the analytics dashboard fill a screen),
+// so the page does not jump on arrival.
+const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></div>';
+function routeSkeleton(match, parts) {
+  const back = match === '/missions/:id' || match === '/herd/session/:id' ? BACK_LINK_SKELETON : '';
+  const piMission = match === '/missions/:id' && decodeURIComponent(parts[1] || '').startsWith('pi:');
+  const rows = piMission ? 1 : match === '/herd/session/:id' || match === '/analytics' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  return `<div data-skeleton role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
+}
+
 // ------------------------------------------------------------- views
 // ------------------------------------------------------------- topology
 async function viewTopology() {
@@ -223,7 +235,7 @@ async function viewOverview() {
 
 async function viewCollab() {
   // The chip sits outside the collab root: collab redraws its whole frame on every page change.
-  root.innerHTML = `${liveHead('', 30000)}<div id="collab-root"></div>`;
+  root.innerHTML = `${liveHead('', 30000)}<div id="collab-root">${skeleton('collaboration', { rows: 8, height: 64 })}</div>`;
   const chip = chipIn(root);
   return ownPolling(mountCollab(document.getElementById('collab-root'), {
     fabricSessions: () => client.listSessions('active'),
@@ -369,7 +381,7 @@ async function viewSession(parts, revision) {
       <details class="hd-card sd-details" id="session-details"><summary>Agent details</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}</details>
       <div id="session-workspace-host"></div>
       <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
-      <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream"><span class="muted">Loading recorded events…</span></div></details>`;
+      <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream">${skeleton('recorded events', { rows: 2 })}</div></details>`;
     const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s, {onRename: profile => { s.display_name = profile.display_name; const title = root.querySelector('.sd-title'); if (title) title.textContent = `${profile.display_name}${project ? ` · ${clip(project)}` : ''}`; }});
     let disposeAdvanced = null;
     const advanced = document.getElementById('advanced-inspector');

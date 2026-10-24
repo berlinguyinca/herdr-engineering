@@ -34,6 +34,10 @@ progress, .hd-meter > *, .hd-stage-bar > *, .hv-meter__bar > i { transition: wid
   background-size: 200% 100%; animation: hd-skeleton 1.4s linear infinite;
 }
 
+.hd-skeleton-group { display: grid; gap: 10px; margin: 12px 0; }
+.hd-skeleton--title { height: 1.875rem; width: min(14em, 60%); margin: 0 0 .5rem; }
+.hd-skeleton--line { height: 1em; width: 8em; }
+
 /* A page head: the title with its freshness chip beside it (wraps below on narrow screens). */
 .hd-live-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
 .hd-live-head > h1 { min-width: 0; }
