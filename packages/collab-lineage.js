@@ -36,6 +36,21 @@ export const EDGE_STYLE = {
   reviewed: { dash: '6 2 2 2', tag: 'reviewed', word: 'reviewed' },
   produced: { dash: '14 3', tag: 'produced', word: 'produced' },
   validated: { dash: '4 2', tag: 'validated', word: 'validated' },
+  // system-intelligence edge kinds (spec 02): observed topology vs static intent.
+  calls: { dash: '1 1', tag: 'calls', word: 'calls' },
+  observed_in: { dash: '1 2', tag: 'seen-in', word: 'observed in' },
+  belongs_to: { dash: '2 2', tag: 'part-of', word: 'belongs to' },
+  blocked_by: { dash: '3 1', tag: 'blocked-by', word: 'blocked by' },
+  implements: { dash: '2 6', tag: 'implements', word: 'implements' },
+  references: { dash: '2 3 6 3', tag: 'references', word: 'references' },
+  runs_on: { dash: '6 1 2 1', tag: 'runs-on', word: 'runs on' },
+  serves: { dash: '5 1', tag: 'serves', word: 'serves' },
+  deploys_to: { dash: '3 3 1 3', tag: 'deploys-to', word: 'deploys to' },
+  assigned_to: { dash: '4 4 1 4', tag: 'assigned-to', word: 'assigned to' },
+  precedes: { dash: '1 5', tag: 'precedes', word: 'precedes' },
+  imports: { dash: '2 2 2 2', tag: 'imports', word: 'imports' },
+  routes_to: { dash: '8 1 2 1', tag: 'routes-to', word: 'routes to' },
+  queued_on: { dash: '3 5', tag: 'queued-on', word: 'queued on' },
 };
 export const EDGE_TYPES = Object.keys(EDGE_STYLE);
 
@@ -45,6 +60,12 @@ const SHAPE = {
   issue: 'tag', pr: 'tag', commit: 'tag', ci: 'tag', artifact: 'tag',
   review: 'diamond', finding: 'diamond', gate: 'diamond', decision: 'diamond',
   handoff: 'hex', thread: 'hex', message: 'hex',
+  // system-intelligence node kinds (spec 02): infrastructure/repo/trace shapes.
+  repository: 'round', branch: 'round', module: 'round', package: 'tag',
+  service: 'round', endpoint: 'round', deployment: 'round', host: 'hex',
+  gpu: 'hex', model: 'round', worker: 'round',
+  request: 'tag', span: 'tag', trace: 'tag', queue: 'tag', dataset: 'tag',
+  memory_reference: 'tag', external_dependency: 'tag', symbol: 'tag',
 };
 export const shapeOf = (type) => SHAPE[type] || 'rect';
 export const NODE_TYPES = Object.keys(SHAPE);
@@ -215,8 +236,12 @@ function edgePath(a, b, back) {
 
 export function renderGraphLegend() {
   const edges = EDGE_TYPES.map((t) => `<li><svg width="46" height="10" aria-hidden="true" focusable="false"><line x1="1" y1="5" x2="45" y2="5" class="lin-edge-line" stroke-dasharray="${esc(EDGE_STYLE[t].dash)}"/></svg> ${esc(EDGE_STYLE[t].tag)}</li>`).join('');
-  const shapes = [['round', 'agent, attempt, session'], ['rect', 'task, plan, mission'], ['tag', 'issue, PR, commit, CI, artifact'],
-    ['diamond', 'review, finding, gate, decision'], ['hex', 'handoff, thread']].map(([s, w]) => `<li>${esc(s)}: ${esc(w)}</li>`).join('');
+  const byShape = new Map();
+  for (const t of NODE_TYPES) byShape.set(shapeOf(t), [...(byShape.get(shapeOf(t)) || []), t]);
+  const shapeOrder = ['round', 'rect', 'tag', 'diamond', 'hex'];
+  const shapes = shapeOrder
+    .filter((s) => byShape.has(s))
+    .map((s) => `<li>${esc(s)}: ${esc(byShape.get(s).sort().join(', '))}</li>`).join('');
   const states = GLYPH.map(([, g, k]) => `<li><span aria-hidden="true">${g}</span> ${esc(k)}</li>`).join('') + '<li><span aria-hidden="true">○</span> no state recorded</li>';
   return `<details class="lin-legend"><summary>Legend</summary><div class="lin-legend__cols"><ul aria-label="Link types">${edges}</ul><ul aria-label="Node shapes">${shapes}</ul><ul aria-label="States">${states}</ul></div></details>`;
 }
