@@ -431,7 +431,8 @@ def test_disabled_by_default_every_route_is_404():
                 ("ci/fix/claim", {"host": "bender"}, "runner"),
                 ("ci/fix/cifix_" + "0" * 26 + "/state", {"state": "failed"}, "runner"),
                 ("ci/fix/cifix_" + "0" * 26 + "/cancel", {}, "write"),
-                ("ci/fix", None, "write"), ("ci/fix/cifix_" + "0" * 26, None, "write")]:
+                ("ci/fix", None, "write"), ("ci/fix/cifix_" + "0" * 26, None, "write"),
+                ("ci/fix/config", None, "runner"), ("ci/fix?host=bender&active=1", None, "runner")]:
             assert call(server, path, body, key=key)[0] == 404, path
         assert call(server, "ci", key="write")[0] == 200                          # the rest of CI is untouched
     finally:
@@ -463,8 +464,65 @@ def test_public_listener_has_no_ci_fix_routes(acknowledged_sink, tmp_path):
                 ("POST", f"/api/v1/ci/fix/{fix}/state", {"state": "failed"}),
                 ("POST", f"/api/v1/ci/fix/{fix}/result", {}),
                 ("POST", f"/api/v1/ci/fix/{fix}/cancel", {}),
-                ("GET", "/api/v1/ci/fix", None), ("GET", f"/api/v1/ci/fix/{fix}", None)]:
+                ("GET", "/api/v1/ci/fix", None), ("GET", f"/api/v1/ci/fix/{fix}", None),
+                ("GET", "/api/v1/ci/fix/config", None)]:
             assert public.call(method, path, body, headers=headers)[0] == 404, path
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+# ------------------------------------------------------------------ runner support
+def test_runner_config_is_served_and_has_the_queue_timeout(api):
+    status, cfg = call(api, "ci/fix/config", key="runner")
+    assert status == 200 and cfg["hosts"] == ["bender", "beast"] and cfg["queue_timeout_minutes"] == 30
+    assert cfg["pull_request"]["draft"] is True
+    assert "token" not in json.dumps(cfg).lower()
+
+
+def test_defer_shows_a_reason_and_times_out_a_request_waiting_for_a_model():
+    clock = [1_000_000.0]
+    repo = ControlPlaneRepo(now=lambda: clock[0])
+    service = CIFixService(repo, ci_fix_config({**CONFIG, "queue_timeout_minutes": 10}))
+    monitor = SimpleNamespace(_factory=Provider)
+    fix, _ = service.request(monitor, "17", 12, "op")
+    out = service.claim("bender", {"kind": "no_model", "reason": "no model available: none listed"})
+    assert out["request"] is None and service.get(fix["id"])["state"] == "queued"
+    assert "none listed" in service.get(fix["id"])["reason"]
+    events = len(repo.stream("ci_fix", fix["id"]))
+    service.claim("beast", {"kind": "no_model", "reason": "no model available: none listed"})
+    assert len(repo.stream("ci_fix", fix["id"])) == events           # the same reason is not re-recorded
+    clock[0] += 11 * 60
+    service.claim("bender", {"kind": "no_model", "reason": "no model available: none listed"})
+    gone = service.get(fix["id"])
+    assert gone["state"] == "failed" and "gave up after 10 min" in gone["reason"]
+    assert service.claim("bender")["request"] is None                # and it cannot be claimed any more
+
+
+@pytest.mark.parametrize("defer", [{"kind": "other"}, {"kind": "no_model", "extra": 1}, "text", []])
+def test_defer_is_validated(defer):
+    _, service, monitor = make()
+    ask(service, monitor)
+    with pytest.raises(ValueError):
+        service.claim("bender", defer)
+
+
+def test_list_filters_by_host_and_active():
+    _, service, monitor = make()
+    first, _ = ask(service, monitor, number=1, op="a")
+    ask(service, monitor, number=2, op="b")
+    service.claim("bender")
+    assert [row["id"] for row in service.list(host="bender")["fixes"]] == [first["id"]]
+    assert [row["id"] for row in service.list(active=True)["fixes"]] == [first["id"]]
+    assert service.list(host="beast")["fixes"] == []
+    service.set_state(first["id"], "failed", reason="x")
+    assert service.list(active=True)["fixes"] == []
+
+
+def test_api_serves_the_runner_filters_and_defer(api):
+    fix = call(api, "ci/fix", {"repository": "17", "number": 12, "operation_id": "op"}, key="write")[1]["id"]
+    out = call(api, "ci/fix/claim", {"host": "bender", "defer": {"kind": "no_model", "reason": "none"}}, key="runner")[1]
+    assert out["request"] is None and out["reason"] == "none"
+    assert call(api, "ci/fix/claim", {"host": "bender"}, key="runner")[1]["request"]["id"] == fix
+    assert call(api, "ci/fix?host=bender&active=1", key="runner")[1]["fixes"][0]["id"] == fix
+    assert call(api, "ci/fix?host=beast&active=1", key="runner")[1]["fixes"] == []

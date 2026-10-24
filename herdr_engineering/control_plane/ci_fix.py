@@ -44,6 +44,7 @@ _DEFAULTS = {
     "models": [],
     "deadline_minutes": 60,
     "idle_minutes": 15,
+    "queue_timeout_minutes": 30,
     "egress": {"default": ["gateway"], "per_project": {}},
     "limits": {"max_commits": 10, "max_files": 50, "max_diff_kb": 512, "mirror_gb": 5, "free_disk_gb": 10},
     "paths": {"flag": [".woodpecker/**", ".github/**", "*.lock"], "block": [".git*/hooks/**"]},
@@ -113,7 +114,7 @@ def ci_fix_config(raw):
         cfg["hosts"] = _strings(top["hosts"], "hosts", _HOST, 32)
     if "models" in top:
         cfg["models"] = _strings(top["models"], "models", _MODEL, 20)
-    for key, high in (("deadline_minutes", 1440), ("idle_minutes", 240)):
+    for key, high in (("deadline_minutes", 1440), ("idle_minutes", 240), ("queue_timeout_minutes", 1440)):
         if key in top:
             cfg[key] = _int(top[key], key, 1, high)
     for section in ("max_concurrent", "limits"):
@@ -246,10 +247,14 @@ class CIFixService:
             raise KeyError(fix_id)
         return self.view(self._fold(fix_id), runner=runner)
 
-    def list(self, run=None, limit=100):
+    def list(self, run=None, limit=100, host=None, active=False):
         rows = self._all()
         if run is not None:
             rows = [row for row in rows if row["run"] == run]
+        if host is not None:
+            rows = [row for row in rows if row["host"] == host]
+        if active:
+            rows = [row for row in rows if row["state"] in ACTIVE]
         return {"fixes": [self.view(row) for row in reversed(rows)][:max(1, min(int(limit), 200))]}
 
     # ------------------------------------------------------------------ writing
@@ -296,16 +301,43 @@ class CIFixService:
                 return row
         return None
 
-    def claim(self, host):
+    def runner_config(self):
+        """The settings a runner follows, from the one YAML block. Nothing secret lives in it."""
+        return {key: self.config[key] for key in self.config}
+
+    def _age_minutes(self, record):
+        import datetime
+        then = datetime.datetime.fromisoformat(record["requested_at"]).timestamp()
+        return (self.repo._now() - then) / 60
+
+    def claim(self, host, defer=None):
         """Hand the runner the oldest queued request it may start on ``host``, once. Over a cap the
-        request stays queued and says why."""
+        request stays queued and says why.
+
+        ``defer`` is the runner saying it cannot start anything right now for a reason that holds for
+        every host (``{"kind": "no_model", "reason": ...}``): nothing is claimed, the oldest queued
+        request shows the reason, and a request that has waited past ``queue_timeout_minutes`` for a
+        model fails with it instead of waiting for ever."""
         if not isinstance(host, str) or not _HOST.fullmatch(host) or host not in self.config["hosts"]:
             raise ValueError("host is not enabled for CI fix agents")
+        if defer is not None:
+            if not isinstance(defer, dict) or defer.get("kind") != "no_model" or set(defer) - {"kind", "reason"}:
+                raise ValueError("defer must be {kind: no_model, reason}")
+            note = _reason(defer.get("reason")) or "no model available"
         with self._lock:
             rows = self._all()
             queued = [row for row in rows if row["state"] == "queued"]
             if not queued:
                 return {"request": None, "reason": "nothing queued"}
+            if defer is not None:
+                limit = self.config["queue_timeout_minutes"]
+                for row in queued:
+                    if self._age_minutes(row) > limit:
+                        self._event(row["id"], "CIFixStateChanged",
+                                    {"state": "failed", "reason": f"gave up after {limit} min: {note}"[:500]})
+                    elif row["reason"] != note:
+                        self._event(row["id"], "CIFixStateChanged", {"state": "queued", "reason": note})
+                return {"request": None, "reason": note}
             active = [row for row in rows if row["state"] in ACTIVE]
             limits = self.config["max_concurrent"]
             reason = None
