@@ -1416,6 +1416,14 @@ def _make_handler(server, public=False, operator=False):
                         {"error": "not found"}, 404)
                 status = _q(self.path, "status")
                 return self._json({"missions": r.list_missions(status)})
+            if resource == "related" and len(parts) == 4:
+                from .relations import related
+                kind, entity_id = _q(self.path, "kind"), _q(self.path, "id")
+                try:
+                    answer = related(r, kind, entity_id)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
+                return self._json(answer) if answer is not None else self._json({"error": "not found"}, 404)
             if resource == "attention" and len(parts) == 4:
                 if server.attention is None:
                     return self._json({"error": "not found"}, 404)

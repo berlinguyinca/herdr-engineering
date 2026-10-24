@@ -147,6 +147,12 @@ export class HerdrClient {
     return this.request(`/api/v1/llm/${encodeURIComponent(what)}${q.size ? `?${q}` : ''}`);
   }
 
+  /** Neighbours of one entity (cross-linking). Rejects with status 404 for an unknown entity. */
+  related(kind, id, { signal } = {}) {
+    const q = new URLSearchParams({ kind, id });
+    return this.request(`/api/v1/related?${q}`, { signal });
+  }
+
   /** Fleet attention inbox (derived server-side; ack/snooze are shared by every browser). */
   attention(params = {}, { signal } = {}) {
     const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v != null && v !== ''));

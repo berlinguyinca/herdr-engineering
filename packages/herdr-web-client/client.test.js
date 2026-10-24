@@ -36,6 +36,13 @@ test('debugCi sends mode only for a fix request', async () => {
   assert.equal('mode' in bodies[2], false);
 });
 
+test('related encodes the kind and id into the query', async () => {
+  const urls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url) => { urls.push(url); return { ok: true, status: 200, text: async () => '{}' }; } });
+  await client.related('session', 'herdr:b:e:p 1&x');
+  assert.equal(urls[0], '/api/v1/related?kind=session&id=herdr%3Ab%3Ae%3Ap+1%26x');
+});
+
 function fakeFetch(routes) {
   return async (url, opts) => {
     const hit = routes.find((r) => url.endsWith(r.path));
