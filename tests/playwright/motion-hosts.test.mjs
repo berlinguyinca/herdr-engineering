@@ -71,7 +71,6 @@ test('host detail: identical data neither flashes nor redraws; the sparkline is 
  await page.locator('[data-series=cpu] path.hv-spark__line').waitFor();
  const line=page.locator('[data-series=cpu] path.hv-spark__line');
  assert.equal(await line.getAttribute('data-drawn'),'','first paint marks the line drawn');
- assert.equal(await line.getAttribute('pathLength'),'1');
  await page.evaluate(()=>{window.__line=document.querySelector('[data-series=cpu] path.hv-spark__line');});
  await record(page,'.hv-value');
  await observe(page);
@@ -180,3 +179,18 @@ test('overview: critical items present on first load do not pulse',async()=>with
  await sleep(100);
  assert.equal(await page.locator('[data-attention-key="session:broken"] .ov-alert').getAttribute('data-pulse'),null);
 }));
+
+test('sparkline: scaled 2× it is a solid line once drawn, with and without calm (no dash fragments)',async()=>{
+ for(const mode of ['off','on'])await withPage(async(page,base)=>{
+  const s=state();
+  await calm(page,mode);
+  await boot(page,base,'/hosts/beast',api(s));
+  const line=page.locator('[data-series=cpu] path.hv-spark__line');
+  await line.waitFor();
+  const scale=await line.evaluate(el=>{el.ownerSVGElement.style.width='600px';return el.ownerSVGElement.getBoundingClientRect().width/el.ownerSVGElement.viewBox.baseVal.width;});
+  assert.ok(scale>=2,`rendered at ${scale}× its viewBox`);
+  await page.clock.runFor(1000);await sleep(30);
+  const style=await line.evaluate(el=>({dash:getComputedStyle(el).strokeDasharray,animation:getComputedStyle(el).animationName}));
+  assert.equal(style.dash,'none',`${mode}: the line is not dashed`);
+ });
+});

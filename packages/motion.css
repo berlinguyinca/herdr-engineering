@@ -3,7 +3,10 @@
 @keyframes hd-enter { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
 @keyframes hd-flash { from { background-color: var(--accent-weak); } to { background-color: transparent; } }
 @keyframes hd-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
-@keyframes hd-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+/* Draw-in reveals the line left to right with a clip. No dash state exists outside the animation:
+ * with vector-effect: non-scaling-stroke Chromium ignores pathLength, so a stroke-dasharray would
+ * leave the line in dash fragments at any scale other than 1x. */
+@keyframes hd-draw { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
 @keyframes hd-grow { from { transform: scaleY(0); } to { transform: none; } }
 @keyframes hd-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes hd-skeleton { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
@@ -14,13 +17,13 @@
 [data-pulse] { animation: hd-pulse 2s ease-in-out infinite; }
 /* A finite pulse for "this just appeared" (a new critical item): three beats, then still. */
 [data-pulse="once"] { animation: hd-pulse 2s ease-in-out 3; }
-/* Sparkline draw-in: the line's base state is fully drawn; only the animation hides it, so calm
- * (animation: none) shows the whole line. pathLength="1" makes the dash one line long. */
-.hv-spark__line[data-drawn] { stroke-dasharray: 1; animation: hd-draw 600ms ease-out; }
+/* Sparkline draw-in: the base state is the whole line; only the animation clips it, so calm
+ * (animation: none) shows the whole line. */
+.hv-spark__line[data-drawn] { animation: hd-draw 600ms ease-out; }
 /* Running CI rows pulse their state label. */
 .ig-row[data-state="running"] .ig-state strong { animation: hd-pulse 2s ease-in-out infinite; }
 /* CI charts draw in on their first paint only (data-drawn is set once by the view). */
-.ci-chart-card svg polyline[data-drawn] { stroke-dasharray: 1; animation: hd-draw 600ms ease-out; }
+.ci-chart-card svg polyline[data-drawn] { animation: hd-draw 600ms ease-out; }
 .ci-chart-card svg rect[data-drawn] { transform-box: fill-box; transform-origin: bottom; animation: hd-grow 600ms ease-out; }
 .ci-chart-card svg circle[data-drawn] { animation: hd-fade 600ms ease-out; }
 progress, .hd-meter > *, .hd-stage-bar > *, .hv-meter__bar > i { transition: width var(--motion-normal), inline-size var(--motion-normal); }

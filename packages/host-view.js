@@ -67,7 +67,7 @@ export function sparkline(points, { width = 160, height = 32, max } = {}) {
   const area = `${d} L${round1(pad + (vals.length - 1) * step)} ${h - pad} L${pad} ${h - pad} Z`;
   return `<svg class="hv-spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" preserveAspectRatio="none" role="img" aria-label="${vals.length} points, latest ${round1(vals[vals.length - 1])}">`
     + `<path d="${area}" fill="var(--accent-weak, #e8f0fe)" stroke="none"/>`
-    + `<path class="hv-spark__line" pathLength="1" d="${d}" fill="none" stroke="var(--accent, #2563eb)" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
+    + `<path class="hv-spark__line" d="${d}" fill="none" stroke="var(--accent, #2563eb)" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
 }
 
 export function historyPoints(history) {
