@@ -4,6 +4,9 @@ Only opaque entity IDs belong in keys. Upload paths remain in relational metadat
 their UTF-8 SHA-256 identifies staged bytes without exposing filenames. Manifests
 use sorted, compact UTF-8 JSON (not RFC 8785). This boundary does not authorize
 callers, publish uploads, create buckets, or implement archive lifecycle actions.
+Version 1 manifests require a timezone-aware ISO 8601 ``created_at``, an
+``encryption`` mapping with a nonempty ``mode``, and an ``integrity`` mapping
+declaring ``algorithm: sha256``. Additional JSON metadata is preserved.
 """
 from __future__ import annotations
 
@@ -12,11 +15,16 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from . import ids
 from .rustfs import RustFSClient
+
+
+class StorageError(Exception):
+    """Storage operation failed without exposing provider error details."""
 
 
 def _segment(value: str) -> str:
@@ -141,6 +149,22 @@ def _manifest_objects(manifest: dict[str, Any], environment: str,
             or manifest["schema_version"] != 1 or manifest.get("archive_id") != archive_id):
         raise ValueError("invalid manifest version or archive identity")
     _opaque_id(manifest.get("original_room_id"), "room")
+    created_at = manifest.get("created_at")
+    if not isinstance(created_at, str):
+        raise ValueError("manifest created_at must be an ISO 8601 timestamp")
+    try:
+        timestamp = datetime.fromisoformat(created_at)
+    except ValueError:
+        raise ValueError("manifest created_at must be an ISO 8601 timestamp") from None
+    if timestamp.tzinfo is None:
+        raise ValueError("manifest created_at must include a timezone")
+    encryption = manifest.get("encryption")
+    if (not isinstance(encryption, dict) or not isinstance(encryption.get("mode"), str)
+            or not encryption["mode"].strip()):
+        raise ValueError("manifest encryption must declare a nonempty mode")
+    integrity = manifest.get("integrity")
+    if not isinstance(integrity, dict) or integrity.get("algorithm") != "sha256":
+        raise ValueError("manifest integrity must declare the sha256 algorithm")
     prefix = archive_key(environment, archive_id, "manifest.json").removesuffix("manifest.json")
     objects = manifest.get("objects")
     if not isinstance(objects, list):
@@ -184,7 +208,11 @@ class CollabStorage:
         data = json.dumps(manifest, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False, allow_nan=False).encode("utf-8")
         key = archive_key(self.config.environment, archive_id, "manifest.json")
-        digest = self._archive.put_at(key, data)
+        try:
+            digest = self._archive.put_at(key, data)
+        except Exception:
+            # Suppress provider exception text and chained tracebacks, including signed URLs.
+            raise StorageError("archive manifest write failed") from None
         return ObjectRef(self.config.archive_bucket, key, len(data), digest)
 
     def checksum(self, key: str) -> tuple[int, str]:
