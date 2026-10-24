@@ -71,6 +71,7 @@ test('the GitHub chip shows sync status, stale, partial and deferred repositorie
  let [chip]=await chips(page);
  assert.match(chip.text,/partial/);assert.match(chip.text,/stale/);assert.match(chip.text,/2 repositories deferred/);
  assert.equal(chip.state,'stale','a sync problem never reads as plain live');
+ assert.match(chip.text,/^stale · updated \d+s ago · /,'the amber chip says stale, not live');
  snapshot={status:'ready',stale:false,partial:false,deferred_repos:3};
  await page.clock.runFor(6000);
  await until(async()=>/3 repositories deferred/.test((await chips(page))[0]?.text||''),'numeric deferred',8000);

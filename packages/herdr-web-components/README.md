@@ -143,8 +143,10 @@ Calm (auto, on, off).
 `<herdr-freshness interval="5000">` sits in every page head (`.hd-live-head`) and shows
 "live · updated Ns ago".
 
-- It turns amber (`data-state="stale"`) past twice the interval, and red (`error`) after
-  `touch(false, message)`. `touch(true)` records a successful refresh.
+- It turns amber (`data-state="stale"`, text "stale · updated …") past twice the interval, and
+  red (`error`, text "error · <message> · …") after `touch(false, message)`. `touch(true)`
+  records a successful refresh. Before the first one it reads "waiting for first update"; only a
+  fresh chip says "live".
 - `setDetail(text, { warn })` appends a note, such as the GitHub sync state. `warn` keeps the chip
   amber.
 - A page with several sources wraps the chip in `freshnessSources(() => chip)` and reports each
