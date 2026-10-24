@@ -706,3 +706,67 @@ def test_a_stored_detail_carries_when_it_was_fetched(backend):
     store.put_detail(A, detail("I1", 1), fetched_at=clock.value - 500)  # the monitor's own clock
     assert store.stored_detail(A, 1)[1] == clock.value - 500
     assert store.stored_detail(A, 2) is None
+
+
+class _FakeConn:
+    def __init__(self):
+        self.closed = self.terminated = False
+
+    def is_closed(self):
+        return self.closed or self.terminated
+
+    def terminate(self):
+        self.terminated = True
+
+    async def close(self):
+        self.closed = True
+
+
+def test_a_timed_out_call_discards_its_connection():
+    import asyncio
+    made = []
+
+    async def connect():
+        made.append(_FakeConn())
+        return made[-1]
+    store = GitHubStore(connect, identity="tok-a", run=lambda coro: asyncio.new_event_loop().run_until_complete(coro))
+
+    async def hang(conn):
+        raise TimeoutError("command timed out")  # what asyncpg raises past command_timeout
+    with pytest.raises(GitHubStoreUnavailable):
+        store._call(hang)
+    assert made[0].terminated and store._conn is None  # never reused mid-transaction
+
+    async def ok(conn):
+        return conn
+    assert store._call(ok) is made[1]
+
+
+@_needs_pg
+def test_a_timeout_inside_apply_repository_commits_nothing_and_the_store_recovers():
+    backend = _PgBackend()
+    try:
+        store = GitHubStore(lambda: backend._asyncpg.connect(
+            _PG_DSN, server_settings={"search_path": backend.schema}, command_timeout=0.3),
+            identity="tok-a", viewer="alice", now=Clock(), run=backend._run)
+        backend._stores.append(store)
+        store.upsert_repositories([repo("acme/app")], scope=None)
+        store.apply_repository(dict(repo("acme/app"), synced={"open": 1}), [issue("I1", 1)], [], "w1")
+        before, conn = store.revision(), store._conn
+        original = store._put_issues
+
+        async def slow(conn, *args):
+            await original(conn, *args)
+            await conn.execute("SELECT pg_sleep(2)")  # hangs inside the transaction
+        store._put_issues = slow
+        with pytest.raises(GitHubStoreUnavailable):
+            store.apply_repository(dict(repo("acme/app"), synced={"open": 2}),
+                                   [issue("I2", 2)], ["I1"], "w2")
+        assert store._conn is not conn  # the timed-out connection is not reused
+        store._put_issues = original
+        snap = store.load()
+        assert store.revision() == before and set(snap.issues[A]) == {"I1"} and snap.watermarks[A] == "w1"
+        store.apply_repository(dict(repo("acme/app"), synced={"open": 2}), [issue("I2", 2)], ["I1"], "w2")
+        assert set(store.load().issues[A]) == {"I2"}
+    finally:
+        backend.close()

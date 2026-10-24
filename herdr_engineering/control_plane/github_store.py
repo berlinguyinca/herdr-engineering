@@ -522,7 +522,16 @@ class GitHubStore:
                 raise GitHubStoreNotMigrated("GitHub catalog tables are not migrated yet") from exc
             except (asyncpg.exceptions.PostgresConnectionError, asyncpg.exceptions.InterfaceError,
                     ConnectionError, OSError) as exc:
+                # a timeout (TimeoutError is an OSError) can leave the connection mid-query or
+                # mid-transaction: never reuse it, the next call connects afresh
+                self._discard()
                 raise GitHubStoreUnavailable("GitHub catalog store is unreachable") from exc
+
+    def _discard(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.terminate()
 
     def _stamp(self) -> datetime:
         return datetime.fromtimestamp(self._now(), UTC)
