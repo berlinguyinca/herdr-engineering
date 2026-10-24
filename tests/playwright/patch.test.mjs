@@ -84,6 +84,21 @@ test('focused input and open details survive an update of that item',async()=>wi
  assert.equal(r.focus,true);assert.equal(r.value,'typed');assert.equal(r.aText,'A');assert.equal(r.open,true);assert.equal(r.bText,'B');
 }));
 
+test('inPlace: a focus-safe update also runs on the focused row and the one with open details',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ const r=await page.evaluate(()=>{
+  const o={key:i=>i.id,render:i=>`<div data-key="${i.id}"><span>${i.text}</span><input><details><summary>s</summary>x</details></div>`,
+   update:(el,i)=>{el.querySelector('span').textContent=i.text;},inPlace:true};
+  patchList(c,[{id:'a',text:'A'},{id:'b',text:'B'}],o);
+  const input=c.children[0].querySelector('input');input.focus();
+  c.children[1].querySelector('details').open=true;
+  patchList(c,[{id:'a',text:'A2'},{id:'b',text:'B2'}],o);
+  return {focus:document.activeElement===input,aText:c.children[0].querySelector('span').textContent,
+   open:c.children[1].querySelector('details').open,bText:c.children[1].querySelector('span').textContent};
+ });
+ assert.deepEqual(r,{focus:true,aText:'A2',open:true,bText:'B2'});
+}));
+
 test('patchText and patchAttr report whether they wrote',async()=>withPage(async(page,base)=>{
  await open(page,base);
  const r=await page.evaluate(async()=>{

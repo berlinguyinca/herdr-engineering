@@ -71,7 +71,10 @@ function leave(el,animate){
 }
 
 export function patchList(container,items,opts){
- const {key,render,update,animate=true}=opts;
+ // inPlace: opts.update is itself focus-safe (e.g. morph), so it also runs on a row that holds
+ // focus, an open <details> or the selection, instead of that row waiting until the user moves on.
+ const {key,render,update,animate=true,inPlace=false}=opts;
+ const held=el=>!(inPlace&&update)&&protectedNode(el);
  const existing=new Map();
  for(const child of container.children)if(child.hasAttribute('data-key'))existing.set(child.getAttribute('data-key'),child);
  const wanted=[];const seen=new Set();
@@ -88,8 +91,8 @@ export function patchList(container,items,opts){
    }
   }else if(el.hasAttribute('data-leaving')){
    el.removeAttribute('data-leaving');// key reappeared: revive instead of duplicating
-   if(snapshots.get(el)!==snap&&!protectedNode(el)){if(update)update(el,item);else defaultUpdate(el,build(render(item),k));snapshots.set(el,snap);}
-  }else if(snapshots.get(el)!==snap&&!protectedNode(el)){
+   if(snapshots.get(el)!==snap&&!held(el)){if(update)update(el,item);else defaultUpdate(el,build(render(item),k));snapshots.set(el,snap);}
+  }else if(snapshots.get(el)!==snap&&!held(el)){
    if(update)update(el,item);else defaultUpdate(el,build(render(item),k));
    snapshots.set(el,snap);
   }

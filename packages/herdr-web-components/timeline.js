@@ -33,7 +33,7 @@ export function renderTimeline(items) {
       ? ` <a href="${escapeHtml(it.ref)}" target="_blank" rel="noopener">link</a>`
       : '';
     return (
-      `<li class="hd-timeline__item" data-kind="${kind}">` +
+      `<li class="hd-timeline__item" data-kind="${kind}" data-key="${escapeHtml(JSON.stringify([ts, it.kind ?? '', it.title ?? '', status ?? '', isSafeHref(it.ref) ? it.ref : '']))}">` +
       badge +
       `<span class="hd-timeline__title">${title}</span>` +
       `<time datetime="${rawTs}">${escapeHtml(formatTimestamp(ts))}</time>` +
@@ -74,6 +74,7 @@ export class HerdrTimeline extends ELEMENT_BASE {
   }
 
   render() {
+    if (this._items !== undefined && this.patch(this._items)) return;
     if (this._items === undefined) {
       const raw = this.getAttribute('items');
       if (raw == null) {
@@ -91,4 +92,42 @@ export class HerdrTimeline extends ELEMENT_BASE {
     }
     this.innerHTML = renderTimeline(this._items);
   }
+
+  // A later item list keeps the nodes of items already shown (keyed by data-key) and slides the
+  // new ones in (data-entering, the shared motion.css rule), unless calm mode or reduced motion
+  // is on. Returns false when there is no rendered list to patch (first paint, empty list).
+  patch(items) {
+    const list = this.querySelector(':scope > ol.hd-timeline');
+    if (!list || !Array.isArray(items) || !items.length) return false;
+    const template = document.createElement('template');
+    template.innerHTML = renderTimeline(items);
+    const fresh = [...template.content.querySelectorAll('ol.hd-timeline > li')];
+    const shown = new Map([...list.children].map((li) => [li.getAttribute('data-key'), li]));
+    const animate = !calm();
+    const wanted = fresh.map((li) => {
+      const key = li.getAttribute('data-key'), old = shown.get(key);
+      if (old) { shown.delete(key); return old; } // the key carries every rendered field: unchanged
+      if (animate) {
+        li.setAttribute('data-entering', '');
+        const clear = () => li.removeAttribute('data-entering');
+        li.addEventListener('animationend', clear, { once: true });
+        setTimeout(clear, 1000);
+      }
+      return li;
+    });
+    const keep = new Set(wanted);
+    for (const li of [...list.children]) if (!keep.has(li)) li.remove();
+    let cursor = list.firstElementChild;
+    for (const li of wanted) {
+      if (li === cursor) { cursor = li.nextElementSibling; continue; }
+      list.insertBefore(li, cursor);
+    }
+    return true;
+  }
+}
+
+function calm() {
+  const mode = document.documentElement.getAttribute('data-calm');
+  if (mode === 'off') return false;
+  return mode === 'on' || (typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches);
 }

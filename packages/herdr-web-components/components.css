@@ -151,3 +151,7 @@
 .hd-fleet__cell { font-family: ui-monospace, monospace; }
 .hd-fleet__cell--drifted { background: var(--drift-bg); color: var(--drift-text); font-weight: 600; }
 .hd-fleet__cell--missing { color: var(--text-muted, #667085); background: var(--missing-bg); }
+
+/* Freshness badges (mission catalog and live missions) change colour gradually when their state
+ * ticks over; calm mode and reduced motion zero the duration (motion.css). */
+[data-freshness] { transition: color var(--motion-normal, 200ms), background-color var(--motion-normal, 200ms); }

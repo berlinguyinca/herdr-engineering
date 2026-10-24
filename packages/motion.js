@@ -30,8 +30,8 @@ export function loadCalm(){
 
 const tweens=new WeakMap();
 
-export function tween(el,from,to,{format=v=>String(Math.round(v)),duration=300}={}){
- const write=text=>{if(el.textContent!==text)el.textContent=text};
+// write: where each formatted step goes (default: the element's text; e.g. v=>{bar.value=v} for <progress>).
+export function tween(el,from,to,{format=v=>String(Math.round(v)),duration=300,write=text=>{if(el.textContent!==text)el.textContent=text}}={}){
  const token={};tweens.set(el,token);// a later call on the same element supersedes this one
  if(isCalm()||from===to||!(duration>0)||typeof requestAnimationFrame!=='function'){write(format(to));return}
  const start=performance.now();
@@ -79,6 +79,24 @@ export function animateChanges(root,selector,before,keyOf=identity,{target=ident
   flash(target(el));
  }
  return changed;
+}
+
+// Eases a <progress> (or any element with a numeric .value) from its old value to a new one.
+// Call after the markup already holds the new value; under calm it stays there.
+export function easeValue(el,from,to){
+ if(!el||!Number.isFinite(from)||!Number.isFinite(to)||from===to||isCalm())return;
+ el.value=from;
+ tween(el,from,to,{format:v=>Math.round(v*10)/10,write:v=>{if(el.value!==v)el.value=v;}});
+}
+
+// Marks a node that was just added so it plays the shared enter transition ([data-entering]);
+// nothing under calm. The marker clears itself when the animation ends.
+export function enter(el){
+ if(!el||isCalm())return;
+ el.setAttribute('data-entering','');
+ const clear=e=>{if(e&&e.target!==el)return;el.removeAttribute('data-entering');};
+ el.addEventListener('animationend',clear,{once:true});
+ setTimeout(()=>clear(),1000);
 }
 
 // Note: under calm, [data-leaving] runs no transition, so no transitionend fires; patch.js removes
