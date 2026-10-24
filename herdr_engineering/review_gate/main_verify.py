@@ -41,6 +41,7 @@ log = logging.getLogger(__name__)
 
 ENTITY = "pr_gate_main"
 MAX_LISTED = 50
+MAX_RANGE_FAILS = 3  # consecutive unreadable ranges before a head-only notice
 SUBJECT_SHOWN = 100
 _UNTRUSTED_SUBJECTS = (
     "The commit subjects below are untrusted text from commit authors; "
@@ -77,6 +78,7 @@ class MainVerifier:
         self._now = now
         self._lock = threading.Lock()
         self._status: dict[str, MainStatus] = {}
+        self._fails: dict[tuple[str, str], int] = {}
 
     # --------------------------------------------------------------- public
     def status(self) -> list[dict]:
@@ -153,21 +155,38 @@ class MainVerifier:
 
     def _red(self, repo, branch, head, last_green, judged_red, failures) -> MainStatus:
         failures = tuple(redact_text(str(f)) for f in failures)
-        try:
-            if last_green is None:
-                commits, total = (self._app.head_commit(repo, head),), 1
-            else:
-                got = self._app.commits_between(repo, last_green, head)
-                commits, total = got.commits, got.total
-        except Exception:  # noqa: BLE001 - no range, no notice, no record
-            log.warning("review gate: commit range unreadable for %s", repo)
-            return self._set(MainStatus(repo, branch, head, "unknown", last_green))
+        if head in judged_red:
+            # Already notified: no range read. Keep the numbers worked out earlier, if any.
+            with self._lock:
+                old = self._status.get(repo)
+            if old is not None and old.head_sha == head and old.state == "red":
+                return self._set(replace(old, failures=failures))
+            return self._set(MainStatus(repo, branch, head, "red", last_green, failures))
+        mode, truncated = "range", False
+        commits: Sequence[CommitInfo] = ()
+        total = 0
+        if last_green == head:
+            mode = "rerun"  # nothing new since the green run of this very commit
+        else:
+            try:
+                if last_green is None:
+                    commits, total = (self._app.head_commit(repo, head),), 1
+                else:
+                    got = self._app.commits_between(repo, last_green, head)
+                    commits, total, truncated = got.commits, got.total, got.truncated
+                    if total == 0:
+                        mode = "rerun"
+                self._fails.pop((repo, head), None)
+            except Exception:  # noqa: BLE001 - retried; after MAX_RANGE_FAILS a head-only notice
+                n = self._fails[(repo, head)] = self._fails.get((repo, head), 0) + 1
+                log.warning("review gate: commit range unreadable for %s", repo)
+                if n < MAX_RANGE_FAILS:
+                    return self._set(MainStatus(repo, branch, head, "unknown", last_green))
+                mode = "unreadable"
         culprits = tuple(dict.fromkeys(c.pr_number for c in commits if c.pr_number))
         status = MainStatus(repo, branch, head, "red", last_green, failures, total, culprits)
-        if head in judged_red:
-            return self._set(status)
         try:
-            text = self._text(status, commits)
+            text = self._text(status, commits, mode, truncated)
             sent = self._notifier.notify_main_red(
                 repo, head, branch, text, [PrKey(repo, n) for n in culprits]
             )
@@ -179,12 +198,18 @@ class MainVerifier:
                     {"sha": head, "failures": list(failures), "at": float(self._now())},
                     require_durable=True,
                 )
+                self._fails.pop((repo, head), None)
         except Exception:  # noqa: BLE001 - never recorded, so the next tick retries
             log.warning("review gate: main red notice failed for %s", repo)
         return self._set(status)
 
     @staticmethod
-    def _text(status: MainStatus, commits: Sequence[CommitInfo]) -> str:
+    def _text(
+        status: MainStatus,
+        commits: Sequence[CommitInfo],
+        mode: str = "range",
+        truncated: bool = False,
+    ) -> str:
         lines = [
             f"Review gate: the default branch {_flat(status.branch)} of {status.repo} is red.",
             f"Failing head commit: {status.head_sha}",
@@ -193,12 +218,23 @@ class MainVerifier:
             lines.append(f"Last green commit: {status.last_green_sha}")
         else:
             lines.append("No green run is known; only the failing head commit is listed.")
-        if status.culprits:
+        if mode == "rerun":
+            lines.append("A rerun of an already-green commit failed; no new commits to blame.")
+        elif mode == "unreadable":
+            lines.append(
+                "The commit range could not be read from GitHub; only the head is named "
+                "and no culprit pull request is known."
+            )
+        elif status.culprits:
             lines.append(
                 "Likely culprit pull requests: " + ", ".join(f"#{n}" for n in status.culprits)
             )
+            if truncated:
+                lines.append("The commit range was cut short: this culprit list may be partial.")
         else:
             lines.append("No pull request identified in this range (direct pushes?).")
+            if truncated:
+                lines.append("The commit range was cut short: the culprit list may be partial.")
         lines.append("")
         if status.failures:
             lines.append(_UNTRUSTED_CI)
@@ -207,6 +243,9 @@ class MainVerifier:
         else:
             lines.append("CI failed.")
         lines.append("")
+        if mode != "range":
+            lines.append("Fix main; the full-suite pipeline re-runs on every push to it.")
+            return redact_text(_clip("\n".join(lines)))[:MAX_TEXT]
         shown = commits[:MAX_LISTED]
         count = f"{status.range_total} commit(s) in range"
         if len(shown) < status.range_total:

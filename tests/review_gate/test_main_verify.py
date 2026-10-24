@@ -43,6 +43,8 @@ class App:
         self.ranges: dict[tuple[str, str], list[tuple[str, str]]] = {}
         self.total_override = None
         self.fail = False
+        self.range_fail = False
+        self.truncated = False
         self.calls = []
 
     def default_branch_head(self, repo):
@@ -52,13 +54,13 @@ class App:
 
     def commits_between(self, repo, base, head):
         self.calls.append(("range", base, head))
-        if self.fail:
+        if self.fail or self.range_fail:
             raise GitHubAppError("unavailable", status=503)
         commits = tuple(
             CommitInfo(f"{i:040x}", s, pr_number_from_subject(s))
             for i, s in enumerate(self.ranges.get((base, head), []), 1)
         )
-        return CommitRange(commits, self.total_override or len(commits), False)
+        return CommitRange(commits, self.total_override or len(commits), self.truncated)
 
     def head_commit(self, repo, sha):
         self.calls.append(("head", sha))
@@ -306,3 +308,58 @@ def test_status_lists_each_repo():
     ver.observe(ENR, [row(H1, "success")], False)
     [s] = ver.status()
     assert s["repo"] == REPO and s["state"] == "green" and s["last_green_sha"] == H1
+
+
+def test_permanent_range_failure_falls_back_to_head_only_notice():
+    ver, cp, app, _, dispatcher, runner = make()
+    go_green(ver, app, G)
+    app.head = ("main", H1)
+    app.range_fail = True
+    for _ in range(2):
+        assert ver.observe(ENR, [row(H1, "failure")], False).state == "unknown"
+    assert runner.calls == [] and events(cp, "red") == []
+    st = ver.observe(ENR, [row(H1, "failure")], False)
+    assert st.state == "red" and st.culprits == ()
+    text = runner.calls[0][1]["input"].decode()
+    assert "could not be read" in text and H1 in text and "No pull request identified" not in text
+    assert dispatcher.calls == [] and len(events(cp, "red")) == 1
+
+
+def test_truncated_range_says_culprits_may_be_partial():
+    ver, cp, app, _, _, runner = make()
+    go_green(ver, app, G)
+    app.head = ("main", H1)
+    app.ranges[(G, H1)] = ["x (#4)"]
+    app.truncated = True
+    ver.observe(ENR, [row(H1, "failure")], False)
+    assert "may be partial" in runner.calls[0][1]["input"].decode()
+
+
+def test_rerun_of_already_green_commit_is_called_out():
+    ver, cp, app, _, _, runner = make()
+    go_green(ver, app, G)
+    ranges_before = len(app.calls)
+    st = ver.observe(ENR, [row(G, "success", n=1), row(G, "failure", n=2)], False)
+    assert st.state == "red" and st.last_green_sha == G
+    text = runner.calls[0][1]["input"].decode()
+    assert "rerun of an already-green commit failed" in text
+    assert "0 commit(s)" not in text and "No pull request identified" not in text
+    assert len(app.calls) == ranges_before  # nothing to read
+    # an empty range from GitHub reads the same way
+    ver2, cp2, app2, _, _, runner2 = make()
+    go_green(ver2, app2, G)
+    app2.head = ("main", H1)
+    ver2.observe(ENR, [row(H1, "failure")], False)
+    text = runner2.calls[0][1]["input"].decode()
+    assert "rerun of an already-green commit failed" in text and "0 commit(s)" not in text
+
+
+def test_judged_red_head_does_not_reread_the_range():
+    ver, cp, app, _, _, runner = make()
+    go_green(ver, app, G)
+    app.head = ("main", H1)
+    app.ranges[(G, H1)] = ["x (#4)"]
+    ver.observe(ENR, [row(H1, "failure")], False)
+    reads = len(app.calls)
+    st = ver.observe(ENR, [row(H1, "failure")], False)
+    assert len(app.calls) == reads and st.culprits == (4,) and st.range_total == 1

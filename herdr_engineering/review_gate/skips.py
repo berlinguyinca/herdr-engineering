@@ -38,6 +38,20 @@ class SkipReport:
     unused_disabled: tuple[str, ...]
 
 
+_ENCODING = re.compile(rb"^\s*<\?xml[^>]*?encoding\s*=\s*[\"']([^\"']+)[\"']")
+_BOMS = (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00")
+
+
+def _utf8_only(raw: bytes) -> bool:
+    """Refuse UTF-16/32 (the DTD scan is byte-level) and any non-UTF-8/ASCII declaration."""
+    if raw.startswith(_BOMS[1:]) or b"\x00" in raw[:4] or b"\x00" in raw:
+        return False
+    if raw.startswith(_BOMS[0]):
+        raw = raw[3:]
+    match = _ENCODING.match(raw)
+    return match is None or match.group(1).lower() in (b"utf-8", b"utf8", b"us-ascii", b"ascii")
+
+
 def _read(path: str, what: str) -> bytes:
     try:
         with open(path, "rb") as handle:
@@ -99,6 +113,8 @@ def check_junit(paths: Sequence[str], disabled: frozenset[str]) -> SkipReport:
     skipped: set[str] = set()
     for path in _files(paths):
         raw = _read(path, "junit file")
+        if not _utf8_only(raw):
+            raise SkipsError(f"junit file is not UTF-8/ASCII: {path}")
         if _DTD.search(raw):
             raise SkipsError(f"junit file carries a DTD or entity declaration: {path}")
         try:

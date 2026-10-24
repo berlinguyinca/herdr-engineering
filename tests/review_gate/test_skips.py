@@ -119,3 +119,30 @@ def test_cli_exit_codes(tmp_path, capsys):
     assert "a::x" in capsys.readouterr().out
     assert run(str(tmp_path / "missing.xml")) == 2
     assert run(clean, disabled=str(tmp_path / "missing.yaml")) == 2
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY e "b">]><testsuite><testcase classname="a" name="b"/></testsuite>'.encode(
+            "utf-16"
+        ),
+        '<testsuite><testcase classname="a" name="b"/></testsuite>'.encode("utf-16-le"),
+        b'<?xml version="1.0" encoding="UTF-16"?><testsuite><testcase classname="a" name="b"/></testsuite>',
+        b'<?xml version="1.0" encoding="latin-1"?><testsuite><testcase classname="a" name="b"/></testsuite>',
+    ],
+)
+def test_non_utf8_input_is_bad_input(tmp_path, raw):
+    path = tmp_path / "u.xml"
+    path.write_bytes(raw)
+    with pytest.raises(SkipsError):
+        check_junit([str(path)], frozenset())
+
+
+def test_utf8_declaration_and_bom_are_fine(tmp_path):
+    path = tmp_path / "ok.xml"
+    path.write_bytes(
+        b'\xef\xbb\xbf<?xml version="1.0" encoding="UTF-8"?>'
+        b'<testsuite><testcase classname="a" name="b"/></testsuite>'
+    )
+    assert check_junit([str(path)], frozenset()).total == 1

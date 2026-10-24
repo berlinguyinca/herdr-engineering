@@ -435,7 +435,12 @@ is skipped), and the user ALWAYS gets a `user` notice (`kind` `main_red`, key
 `<repo>#0`), after `notify_command` when one is configured. For main notices
 `{number}` is the newest culprit PR (0 when none) and `{branch}` the default
 branch. A later red head notifies again. The `notify_command` launch shares the
-one-launch-per-tick budget, so a deferred notice is retried on a later tick.
+one-launch-per-tick budget, so a deferred notice is retried on a later tick. `notify_command` is
+at-least-once: if the notice cannot be recorded after the command ran, the next
+tick runs it again. If the commit range cannot be read after 3 attempts, the
+notice names the head only and says so (no author messages). A rerun of an
+already-green commit is called out as such, and a cut-short range says the
+culprit list may be partial.
 
 **Disabled-tests file** (YAML in the repo, passed with `--disabled`):
 

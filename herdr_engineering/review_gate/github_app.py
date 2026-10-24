@@ -43,8 +43,8 @@ _SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 _BLOB = re.compile(r"[0-9a-fA-F]{40}")
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*$", re.MULTILINE)
 SUBJECT_MAX = 200
-_SQUASH_PR = re.compile(r"\(#(\d{1,9})\)\s*$")
-_MERGE_PR = re.compile(r"Merge pull request #(\d{1,9})(?!\d)")
+_SQUASH_PR = re.compile(r"\(#([0-9]{1,9})\)\s*$")
+_MERGE_PR = re.compile(r"Merge pull request #([0-9]{1,9})(?![0-9])")
 _STATES = ("pending", "success", "failure", "error")
 _MESSAGES = {
     "authentication": "GitHub rejected the App credential.",
@@ -113,7 +113,7 @@ class CommitRange:
 
 def pr_number_from_subject(subject: str) -> int | None:
     """The PR a commit subject names: a trailing ``(#N)`` (squash) or ``Merge pull request #N``."""
-    match = _SQUASH_PR.search(subject) or _MERGE_PR.match(subject)
+    match = _MERGE_PR.match(subject) or _SQUASH_PR.search(subject)
     return int(match.group(1)) if match else None
 
 
@@ -491,7 +491,7 @@ class GitHubAppClient:
         data = self._send("GET", f"/repos/{slug}/compare/{base}...{head}")
         raw = data.get("commits") if isinstance(data, dict) else None
         total = data.get("total_commits") if isinstance(data, dict) else None
-        if not isinstance(raw, list) or type(total) is not int or total < len(raw):
+        if not isinstance(raw, list) or type(total) is not int or total < 0 or total < len(raw):
             raise GitHubAppError("invalid_response")
         out = []
         failed = False

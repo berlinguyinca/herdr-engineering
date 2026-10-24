@@ -960,3 +960,16 @@ def test_head_commit_reads_subject_and_pr(keypair):
         c, _ = client_for(cfg, {("GET", "/repos/acme/widget/commits/"): Resp(200, bad)})
         with pytest.raises(GitHubAppError):
             c.head_commit(REPO, "a" * 40)
+
+
+def test_merge_pattern_wins_and_only_ascii_digits_parse():
+    assert pr_number_from_subject("Merge pull request #7 from evil/x(#9)") == 7
+    assert pr_number_from_subject("fix (#\u0661\u0662)") is None
+    assert pr_number_from_subject("Merge pull request #\u0667 from a/b") is None
+
+
+def test_commits_between_rejects_negative_total(keypair):
+    cfg, _ = keypair
+    with pytest.raises(GitHubAppError) as ei:
+        range_for(cfg, {"total_commits": -1, "commits": []})
+    assert ei.value.reason == "invalid_response"
