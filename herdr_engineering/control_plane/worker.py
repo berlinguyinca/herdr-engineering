@@ -15,7 +15,7 @@ ARTIFACT_TTL = 3600.0
 
 async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        service_store=None, host_store=None,
-                       snapshot_store=None, artifact_store=None, collab_archive=None,
+                       snapshot_store=None, artifact_store=None, collab_archive=None, collab_uploads=None,
                        lease_ttl=LEASE_TTL, host_ttl=HOST_TTL,
                        artifact_ttl=ARTIFACT_TTL) -> dict:
     summary: dict[str, Any] = {}
@@ -57,6 +57,13 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                                       dict(m), sequence=0)
             snapshots += 1
     summary["snapshots"] = snapshots
+
+    if collab_uploads is not None:
+        try:
+            summary["collab_uploads"] = await collab_uploads.cleanup_expired_uploads()
+        except Exception:
+            summary["collab_uploads"] = []
+            summary["collab_upload_error"] = "upload cleanup retry required"
 
     if collab_archive is not None:
         try:

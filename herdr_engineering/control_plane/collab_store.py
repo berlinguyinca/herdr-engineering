@@ -216,6 +216,105 @@ class CollabStore:
             dict(upload_id=upload_id, room_id=room_id, created_by=created_by, manifest=manifest),
             actor_id=created_by, entity_type='upload'))
 
+    async def upload_permission(self, room_id: str, user_id: str, agent_id: str | None,
+                                now: float) -> bool | None:
+        """None conceals inaccessible rooms; False permits preview/request only.
+
+        SHARE locks also make this check safe inside the publication transaction.
+        """
+        member = await self._conn.fetchrow(
+            "SELECT m.role,m.can_upload FROM collab_room_memberships m "
+            "JOIN collab_users u USING(user_id) JOIN collab_rooms r USING(room_id) "
+            "WHERE m.room_id=$1 AND m.user_id=$2 AND u.status='approved' "
+            "AND r.status='active' AND m.status='approved' AND m.role!='guest' "
+            "AND (m.expires_at IS NULL OR m.expires_at>$3) FOR SHARE OF m,u,r",
+            room_id, user_id, now)
+        if member is None:
+            return None
+        allowed = member['can_upload'] or member['role'] == 'owner'
+        if agent_id is not None:
+            attached = await self._conn.fetchrow(
+                "SELECT a.agent_id,t.actions FROM collab_agents a "
+                "JOIN collab_agent_room_attachments t USING(agent_id) "
+                "WHERE a.agent_id=$1 AND a.owner_id=$2 AND t.room_id=$3 "
+                "AND a.status='active' AND t.status='active' "
+                "AND (t.expires_at IS NULL OR t.expires_at>$4) FOR SHARE OF a,t",
+                agent_id, user_id, room_id, now)
+            if attached is None or 'read' not in attached['actions']:
+                return None
+            permission = await self._conn.fetchval(
+                'SELECT status FROM collab_agent_permissions WHERE room_id=$1 '
+                'AND agent_id=$2 AND user_id=$3 FOR SHARE', room_id, agent_id, user_id)
+            allowed = allowed and permission == 'approved' and 'post' in attached['actions']
+        return bool(allowed)
+
+    async def request_upload_access(self, room_id: str, agent_id: str, user_id: str) -> dict:
+        from uuid import uuid4
+        async with self._conn.transaction():
+            row = await self._conn.fetchrow(
+                "INSERT INTO collab_agent_access_requests(request_id,room_id,agent_id,user_id) "
+                "VALUES ($1,$2,$3,$4) ON CONFLICT(room_id,agent_id,user_id) WHERE status='pending' "
+                "DO UPDATE SET status='pending' RETURNING request_id,status",
+                str(uuid4()), room_id, agent_id, user_id)
+            await self._audit('upload.access_requested', row['request_id'])
+            return dict(row)
+
+    async def get_upload(self, upload_id: str) -> UploadRecord | None:
+        row = await self._conn.fetchrow('SELECT * FROM collab_room_uploads WHERE upload_id=$1', upload_id)
+        if row is None:
+            return None
+        values = dict(row)
+        if isinstance(values['manifest'], str):
+            values['manifest'] = json.loads(values['manifest'])
+        return UploadRecord(**values)
+
+    async def update_upload(self, upload_id: str, status: str, manifest: dict) -> None:
+        await self._conn.execute(
+            'UPDATE collab_room_uploads SET status=$2,manifest=$3::jsonb WHERE upload_id=$1',
+            upload_id, status, json.dumps(manifest))
+
+    async def upload_parts(self, upload_id: str) -> list[dict]:
+        return [dict(row) for row in await self._conn.fetch(
+            'SELECT * FROM collab_room_upload_parts WHERE upload_id=$1 ORDER BY relative_path,part_number', upload_id)]
+
+    async def save_upload_parts(self, upload_id: str, path: str, multipart_id: str, parts: list[dict]) -> None:
+        await self._conn.executemany(
+            'INSERT INTO collab_room_upload_parts(upload_id,relative_path,part_number,multipart_id,size_bytes,sha256) '
+            'VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(upload_id,relative_path,part_number) '
+            'DO UPDATE SET multipart_id=EXCLUDED.multipart_id',
+            [(upload_id, path, n, multipart_id, p['size_bytes'], p['sha256'])
+             for n, p in enumerate(parts, 1)])
+
+    async def publish_upload(self, upload_id: str, files: list[dict], authorize) -> list[RoomFileRecord]:
+        async with self._conn.transaction():
+            await authorize()
+            row = await self._conn.fetchrow(
+                'SELECT status FROM collab_room_uploads WHERE upload_id=$1 FOR UPDATE', upload_id)
+            if row is None or row['status'] != 'verifying':
+                raise ValueError('upload is not verifying')
+            # One set-based insert and one visibility transition, regardless of file count.
+            await self._conn.execute(
+                "INSERT INTO collab_room_files(file_id,room_id,upload_id,uploaded_by,relative_path,storage_key,size_bytes,sha256,status) "
+                "SELECT file_id,room_id,upload_id,uploaded_by,relative_path,storage_key,size_bytes,sha256,'available' "
+                "FROM jsonb_to_recordset($1::jsonb) AS f(file_id text,room_id text,upload_id text,uploaded_by text,"
+                "relative_path text,storage_key text,size_bytes bigint,sha256 text)", json.dumps(files))
+            await self._conn.execute("UPDATE collab_room_uploads SET status='available' WHERE upload_id=$1", upload_id)
+            await self._audit('upload.finalized', upload_id)
+        return await self.upload_files(upload_id)
+
+    async def upload_files(self, upload_id: str) -> list[RoomFileRecord]:
+        return [RoomFileRecord(**dict(row)) for row in await self._conn.fetch(
+            "SELECT f.* FROM collab_room_files f JOIN collab_room_uploads u USING(upload_id) "
+            "WHERE f.upload_id=$1 AND u.status='available' ORDER BY f.relative_path,f.file_id", upload_id)]
+
+    async def uploads_for_cleanup(self, now: float, limit: int) -> list[UploadRecord]:
+        rows = await self._conn.fetch(
+            "SELECT upload_id FROM collab_room_uploads WHERE manifest->>'schema_version'='1' "
+            "AND COALESCE((manifest->>'cleanup_done')::boolean,false)=false "
+            "AND (status='available' OR status='failed' OR (manifest->>'session_expires_at')::float8 <= $1) "
+            "ORDER BY created_at,upload_id LIMIT $2", now, limit)
+        return [await self.get_upload(row['upload_id']) for row in rows]
+
     async def list_room_files(self, room_id: str) -> list[RoomFileRecord]:
         rows = await self._conn.fetch(
             "SELECT f.* FROM collab_room_files f "
@@ -305,7 +404,7 @@ class CollabStore:
             if await self._conn.fetchval('SELECT EXISTS(SELECT 1 FROM collab_skills WHERE room_id=$1)', room_id):
                 raise ValueError('room skill storage requires an archive exporter')
             if await self._conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM collab_room_uploads WHERE room_id=$1 AND status!='available')", room_id):
+                "SELECT EXISTS(SELECT 1 FROM collab_room_uploads WHERE room_id=$1 AND status!='available' AND COALESCE(manifest->>'cleanup_done','false')!='true')", room_id):
                 raise ValueError('room has unfinished uploads')
             snapshot = {'room': dict(room)}
             for name in ROOM_TABLES:
@@ -387,6 +486,10 @@ class CollabStore:
 
     async def finish_scrub(self, user_id: str, job_id: str) -> None:
         async with self._conn.transaction():
+            if await self._conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM collab_room_uploads WHERE created_by=$1 "
+                "AND manifest->>'schema_version'='1' AND COALESCE(manifest->>'cleanup_done','false')!='true')", user_id):
+                raise ValueError('upload cleanup required before user deletion')
             # The approved FKs remove authored content and access, not room bytes.
             # Upload manifests are user-authored metadata; do not retain their content.
             await self._conn.execute("UPDATE collab_room_uploads SET manifest='{}'::jsonb WHERE created_by=$1", user_id)
