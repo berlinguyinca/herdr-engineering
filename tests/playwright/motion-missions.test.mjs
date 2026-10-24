@@ -80,8 +80,9 @@ test('missions: unchanged rows keep their nodes, a new row enters, progress ease
  });
 });
 
-test('mission detail: a new timeline item slides in and earlier items keep their nodes',async()=>withPage(async(page,base)=>{
- const s={timeline:[{kind:'stage',title:'Planned',ts:'2026-01-01T00:00:01Z'}]};
+test('mission detail: a new timeline item slides in; unchanged, duplicate and edited items do not',async()=>withPage(async(page,base)=>{
+ const item=(title,ts,extra={})=>({kind:'stage',title,ts,entity_id:'m1',...extra});
+ const s={timeline:[item('Planned','2026-01-01T00:00:01Z'),item('Planned','2026-01-01T00:00:01Z'),item('Review','2026-01-01T00:00:02Z',{status:'pending'})]};
  await calm(page,'off');
  await boot(page,base,'/missions/m1',p=>{
   if(p==='/api/v1/missions/m1')return {mission_id:'m1',title:'Mission one',status:'running',sessions:[]};
@@ -90,15 +91,21 @@ test('mission detail: a new timeline item slides in and earlier items keep their
   if(p==='/api/v1/missions')return {missions:[]};
   return {};
  });
- await page.locator('#mission-timeline li').first().waitFor({state:'attached'});
- await page.evaluate(()=>{window.__first=document.querySelector('#mission-timeline li');});
+ await until(()=>page.locator('#mission-timeline li').count().then(n=>n===3),'three timeline items');
+ await page.evaluate(()=>{window.__items=[...document.querySelectorAll('#mission-timeline li')];});
  await watch(page);
- s.timeline.push({kind:'stage',title:'Executing',ts:'2026-01-01T00:00:08Z'});
+ s.timeline[2]={...s.timeline[2],status:'done'};// edited
+ s.timeline.push(item('Executing','2026-01-01T00:00:08Z'));
  await page.evaluate(()=>window.__emit({event_id:'x1',event_type:'MissionStageChanged'}));
  await page.clock.runFor(6000);
- await until(()=>page.locator('#mission-timeline li').count().then(n=>n===2),'second timeline item');
- const r=await page.evaluate(()=>({same:document.querySelector('#mission-timeline li')===window.__first,entered:[...new Set(window.__entered)].map(t=>t.replace(/\s+/g,' ').trim())}));
- assert.equal(r.same,true,'the earlier item keeps its node');
+ await until(()=>page.locator('#mission-timeline li').count().then(n=>n===4),'fourth timeline item');
+ const r=await page.evaluate(()=>{
+  const items=[...document.querySelectorAll('#mission-timeline li')];
+  return {kept:[0,1].map(i=>items[i]===window.__items[i]),edited:items[2].textContent.includes('Review'),
+   entered:[...new Set(window.__entered)].map(k=>items.find(li=>li.getAttribute('data-key')===k)?.textContent.trim()||k)};
+ });
+ assert.deepEqual(r.kept,[true,true],'unchanged items (including the duplicate) keep their nodes');
+ assert.equal(r.edited,true);
  assert.equal(r.entered.length,1,`only the new item enters, saw ${r.entered}`);
  assert.match(r.entered[0],/Executing/);
 }));

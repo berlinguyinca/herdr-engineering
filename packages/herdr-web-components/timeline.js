@@ -13,11 +13,23 @@ function isSafeHref(ref) {
     /^(https?:\/\/)/.test(ref);
 }
 
+// Stable identity of an item across refreshes: its id when the server sends one, else what does not
+// change when the item is edited (entity, kind, time). Identical items get an occurrence suffix, so
+// duplicates pair one-to-one instead of colliding.
+function itemKey(it, seen) {
+  const id = it.id ?? it.event_id ?? it.sequence;
+  const base = id != null ? `id:${id}` : JSON.stringify([it.entity_id ?? '', it.kind ?? '', it.ts ?? '']);
+  const n = seen.get(base) ?? 0;
+  seen.set(base, n + 1);
+  return n ? `${base}#${n}` : base;
+}
+
 // Pure: list of timeline items -> HTML string.
 export function renderTimeline(items) {
   if (!Array.isArray(items) || items.length === 0) {
     return EMPTY;
   }
+  const seen = new Map();
   const rows = items.map((item) => {
     const it = item || {};
     const kind = escapeHtml(it.kind ?? '');
@@ -33,7 +45,7 @@ export function renderTimeline(items) {
       ? ` <a href="${escapeHtml(it.ref)}" target="_blank" rel="noopener">link</a>`
       : '';
     return (
-      `<li class="hd-timeline__item" data-kind="${kind}" data-key="${escapeHtml(JSON.stringify([ts, it.kind ?? '', it.title ?? '', status ?? '', isSafeHref(it.ref) ? it.ref : '']))}">` +
+      `<li class="hd-timeline__item" data-kind="${kind}" data-key="${escapeHtml(itemKey(it, seen))}" data-sig="${escapeHtml(JSON.stringify([it.title ?? '', status ?? '', isSafeHref(it.ref) ? it.ref : '']))}">` +
       badge +
       `<span class="hd-timeline__title">${title}</span>` +
       `<time datetime="${rawTs}">${escapeHtml(formatTimestamp(ts))}</time>` +
@@ -106,7 +118,11 @@ export class HerdrTimeline extends ELEMENT_BASE {
     const animate = !calm();
     const wanted = fresh.map((li) => {
       const key = li.getAttribute('data-key'), old = shown.get(key);
-      if (old) { shown.delete(key); return old; } // the key carries every rendered field: unchanged
+      if (old) {
+        shown.delete(key);
+        if (old.getAttribute('data-sig') === li.getAttribute('data-sig')) return old; // unchanged: keep the node
+        return li; // edited (e.g. a new status): replace in place, it is not a new item
+      }
       if (animate) {
         li.setAttribute('data-entering', '');
         const clear = () => li.removeAttribute('data-entering');
