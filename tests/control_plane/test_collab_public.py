@@ -85,15 +85,31 @@ def test_public_listener_serves_shared_conversation_components(stack):
         assert stack.pub.call("GET", f"/{name}", headers=H)[0] == 200
 
 
-def test_public_listener_serves_file_browser_import_from_real_packages(stack):
+def test_public_listener_serves_bootstrap_import_graph_from_real_packages(stack):
     import http.client
+    import re
+    from urllib.parse import urljoin
 
     stack.srv.web_root = ROOT_DIR / "packages"
     connection = http.client.HTTPConnection("127.0.0.1", stack.srv.public_port, timeout=5)
     try:
-        for path in ("/collab-view.js", "/collab-files.js", "/herdr-web-components/util.js",
-                     "/collab-previews.js", "/collab-preview-msp.js", "/collab-preview-text.js",
-                     "/collab-preview-pdf.js", "/collab-preview-flasheic.js"):
+        connection.request("GET", "/", headers=H)
+        response = connection.getresponse()
+        html = response.read()
+        assert response.status == 200
+        assert html == (ROOT_DIR / "packages" / "collab.html").read_bytes()
+        entries = re.findall(r'<script\s+type="module"\s+src="([^"]+)"', html.decode())
+        assert entries, "The public page must bootstrap an ES module"
+        pending, visited = [urljoin("/", entry) for entry in entries], set()
+        # Follow this project's static ES module imports (including multiline
+        # bindings) rather than maintaining a hand-picked asset list. Each
+        # discovered module is fetched from the real restricted listener.
+        imports = re.compile(r"(?:^import\s+(?:[^;]+?\s+from\s+)?|^export\s+[^;]+?\s+from\s+)[\"']([^\"']+)[\"']", re.MULTILINE)
+        while pending:
+            path = pending.pop()
+            if path in visited:
+                continue
+            visited.add(path)
             connection.request("GET", path, headers=H)
             response = connection.getresponse()
             body = response.read()
@@ -101,6 +117,11 @@ def test_public_listener_serves_file_browser_import_from_real_packages(stack):
             assert response.getheader("Content-Type").startswith("text/javascript"), path
             assert response.getheader("X-Content-Type-Options") == "nosniff"
             assert body == (ROOT_DIR / "packages" / path.lstrip("/")).read_bytes()
+            for specifier in imports.findall(body.decode()):
+                assert specifier.startswith(("./", "../", "/")), specifier
+                pending.append(urljoin(path, specifier))
+        assert {"/collab-view.js", "/collab-helpers.js", "/collab-previews.js",
+                "/collab-preview-pdf.js", "/herdr-web-client/collab.js"} <= visited
         connection.request("GET", "/app.js", headers=H)
         response = connection.getresponse()
         response.read()
