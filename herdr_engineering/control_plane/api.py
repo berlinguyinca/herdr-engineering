@@ -511,6 +511,11 @@ _PUBLIC_STATIC = {
     "/collab.css": ("collab.css", "text/css"),
     "/collab-view.js": ("collab-view.js", "text/javascript"),
     "/collab-files.js": ("collab-files.js", "text/javascript"),
+    "/collab-previews.js": ("collab-previews.js", "text/javascript"),
+    "/collab-preview-msp.js": ("collab-preview-msp.js", "text/javascript"),
+    "/collab-preview-text.js": ("collab-preview-text.js", "text/javascript"),
+    "/collab-preview-pdf.js": ("collab-preview-pdf.js", "text/javascript"),
+    "/collab-preview-flasheic.js": ("collab-preview-flasheic.js", "text/javascript"),
     "/collab-scripts.js": ("collab-scripts.js", "text/javascript"),
     "/collab-flow.js": ("collab-flow.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
@@ -528,7 +533,7 @@ _PUBLIC_STATIC = {
 }
 _SCRIPT_FILES = {"join.sh": "join.sh", "worker.sh": "worker.sh", "sandbox.sh": "sandbox.sh"}
 _PUBLIC_CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-               "connect-src 'self' https://*.amazoncognito.com; img-src 'self' data:; "
+               "connect-src 'self' https:; frame-src 'self' blob:; img-src 'self' data:; "
                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 

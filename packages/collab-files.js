@@ -51,9 +51,11 @@ export async function startBulkUploadPreview(roomId, pattern, { api } = {}) {
   return api.previewUpload(roomId, pattern);
 }
 
-export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, onPermissions }) {
+export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, onPermissions, onPreview }) {
   const state = { path: '', query: '', files: [], next: null, batches: new Map(), status: 'loading', error: '' };
   let alive = true, loading = false, lastRefresh = 0, pageCount = 1;
+  let preview = null, previewTurn = 0;
+  const clearPreview = () => { previewTurn++; preview?.dispose?.(); preview = null; const el = root.querySelector('[data-file-preview]'); el.replaceChildren(); el.hidden = true; };
   const current = () => alive && isCurrent();
   const key = `upload:${roomId}`;
   const find = selector => root.querySelector(selector);
@@ -173,11 +175,14 @@ export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, o
       if (!file) return;
       const accessKey = `file:${roomId}:${file.file_id}`;
       if (pending.has(accessKey)) return;
+      const isPreview = target.dataset.fileAction === 'preview';
+      if (isPreview) clearPreview();
+      const turn = previewTurn;
       pending.add(accessKey); target.disabled = true;
       message('[data-file-message]', 'Authorizing file access…');
       try {
         const source = await openAuthorizedFile(file, { api, purpose: target.dataset.fileAction });
-        if (!current()) return;
+        if (!current() || (isPreview && turn !== previewTurn)) return;
         if (target.dataset.fileAction === 'download') {
           const link = document.createElement('a');
           link.href = source.url; link.download = file.relative_path.split('/').at(-1); link.rel = 'noopener noreferrer';
@@ -185,10 +190,11 @@ export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, o
           message('[data-file-message]', 'Download authorized.');
         } else {
           const detail = find('[data-file-preview]'); detail.hidden = false;
-          detail.textContent = `Preview authorized: ${file.relative_path} · ${bytes(file.size_bytes)}. Specialized preview rendering is not available yet; use Download to open the file locally.`;
+          if (onPreview) { preview = onPreview(file, source); detail.replaceChildren(preview); }
+          else detail.textContent = `Preview authorized: ${file.relative_path}. Use Download to open the file locally.`;
           message('[data-file-message]', '');
         }
-      } catch (error) { if (error.name !== 'AbortError') message('[data-file-message]', error.message, true); }
+      } catch (error) { if ((!isPreview || turn === previewTurn) && error.name !== 'AbortError') message('[data-file-message]', error.message, true); }
       finally { pending.delete(accessKey); if (current()) target.disabled = false; }
     }
   };
@@ -222,5 +228,5 @@ export function mountFilesPanel(root, { api, roomId, info, isCurrent, pending, o
     finally { if (current()) submit.disabled = false; }
   };
   draw();
-  return { refresh, dispose: () => { alive = false; root.onclick = null; } };
+  return { refresh, dispose: () => { alive = false; previewTurn++; preview?.dispose?.(); root.onclick = null; } };
 }
