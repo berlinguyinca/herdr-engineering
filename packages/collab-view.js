@@ -133,6 +133,64 @@ export function renderRoomAdministration({ room, invites = [], canManage = false
   }).join('')}${invites.map(i => `<li><span class="grow">${esc(i.email)}</span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>`;
 }
 
+const SKILL_SCOPES = ['private', 'room', 'shared'];
+// Publication authority comes from the authenticated registry adapter, never from
+// a shell's operator flag or a room role supplied in package metadata.
+const publicationScopes = skill => skill.status === 'draft' && skill.draft_id
+  ? SKILL_SCOPES.filter(scope => Array.isArray(skill.publish_scopes) && skill.publish_scopes.includes(scope)
+    && (scope !== 'room' || skill.target_room_id)) : [];
+
+export function renderSkillReview(skillVersion) {
+  const m = skillVersion.manifest, scopes = publicationScopes(skillVersion);
+  const json = value => esc(JSON.stringify(value ?? {}, null, 2));
+  return `<section class="hd-card cx-stack cx-skill-review" role="region" aria-label="Skill review">
+    <h2>${esc(m.name)} · ${esc(skillVersion.version)}</h2>
+    <p>Untrusted skill · ${esc(skillVersion.status)} · ${esc(m.scope)}${m.room_id ? ` · Room ${esc(m.room_id)}` : ''}</p>
+    <p>A checksum or signature proves package integrity, not code safety. Installation belongs to your authorized agent's harness and does not execute the skill or grant capabilities.</p>
+    <dl><dt>Creator</dt><dd>${esc(m.creator_id)}</dd><dt>Package SHA-256</dt><dd>${esc(skillVersion.sha256)}</dd>
+      ${skillVersion.key_id ? `<dt>Signing key</dt><dd>${esc(skillVersion.key_id)}</dd>` : ''}</dl>
+    <h3>Capabilities</h3><pre>${json(m.capabilities || [])}</pre>
+    <h3>Files</h3><ul>${Object.entries(m.files || {}).map(([path, file]) => `<li><b>${esc(path)}</b> · ${esc(file.size_bytes)} bytes <code>${esc(file.sha256)}</code></li>`).join('')}</ul>
+    <h3>Dependencies</h3><p>Dependency lock: ${esc(m.dependency_lock)}</p>
+    <h3>Provenance</h3><pre>${json(m.provenance)}</pre>
+    <details><summary>Schemas, fixtures and tests</summary><pre>${json({ input_schema: m.input_schema, output_schema: m.output_schema, fixtures: m.fixtures, tests: m.tests })}</pre></details>
+    ${scopes.length ? `<form data-publication-form class="cx-stack">
+      <h3>Confirm publication</h3><p>Publishing creates an immutable version. Private is for you and your agents; room is for authorized room members; shared is for approved collaboration users.</p>
+      ${skillVersion.target_room_id ? `<p>Target room: ${esc(skillVersion.target_room_id)}</p>` : ''}
+      <label class="cx-field">Publication visibility<select name="scope">${scopes.map(scope => `<option value="${scope}">${scope}</option>`).join('')}</select></label>
+      <label class="cx-check"><input type="checkbox" name="reviewed"> I reviewed this version and its publication visibility</label>
+      <button type="submit" class="hd-btn" data-confirm-publication disabled>Confirm publication</button>
+    </form>` : skillVersion.status === 'draft' ? '<p role="status">Publication is not authorized for this draft.</p>' : ''}
+    <button type="button" class="hd-btn hd-btn--ghost" data-close-skill-review>Cancel review</button>
+  </section>`;
+}
+
+export function renderSkillLibrary({ skills = [], drafts = [], identity, scope = 'private', status = 'ready', error } = {}) {
+  // The server supplies only authorized records. Filtering here separates tabs;
+  // it is not a replacement for registry authorization on every request.
+  const versions = skills.filter(s => s.status === 'published' && s.manifest.scope === scope
+    && (scope !== 'private' || s.manifest.creator_id === identity?.user_id));
+  const ownDrafts = scope === 'private' && identity?.user_id
+    ? drafts.filter(d => d.status === 'draft' && d.manifest.creator_id === identity.user_id) : [];
+  const card = (skill, draft = false) => `<article class="hd-card cx-stack cx-skill" ${draft ? `data-skill-draft="${esc(skill.draft_id)}"` : `data-skill-version="${esc(skill.version)}"`}>
+    <h2>${esc(skill.manifest.name)}</h2><p>Version ${esc(skill.version)} · ${draft ? 'Draft' : esc(scope)} · Untrusted</p>
+    <p>Creator: ${esc(skill.manifest.creator_id)}${skill.manifest.room_id ? ` · Room ${esc(skill.manifest.room_id)}` : ''}</p>
+    <p>Provenance: <code>${esc(JSON.stringify(skill.manifest.provenance))}</code></p>
+    <div class="cx-row">${draft ? `<button type="button" class="hd-btn" data-review-draft="${esc(skill.draft_id)}">Review draft</button>` : `
+      <button type="button" class="hd-btn hd-btn--ghost" data-review-skill="${skills.indexOf(skill)}">Review version</button>
+      <button type="button" class="hd-btn" data-download-skill="${skills.indexOf(skill)}">Download</button>
+      <button type="button" class="hd-btn hd-btn--ghost" data-install-skill="${skills.indexOf(skill)}">Install with agent</button>`}</div>
+  </article>`;
+  return `<div class="cx-stack cx-skills"><div class="cx-head"><h1>Skill library</h1><button type="button" class="hd-btn hd-btn--ghost" data-refresh-skills${status === 'loading' ? ' disabled' : ''}>Refresh skills</button></div>
+    <div class="cx-chips" role="tablist" aria-label="Skill visibility">${SKILL_SCOPES.map(s => `<button type="button" class="cx-chip" role="tab" data-skill-scope="${s}" aria-selected="${scope === s}">${s}</button>`).join('')}</div>
+    <p>Versioned skills from the collaboration registry. Review the package before downloading or installing it.</p>
+    ${status === 'loading' ? '<p role="status">Loading skills…</p>' : error ? `<p role="alert">${esc(error)}</p>` : `
+      <div class="cx-stack">${versions.length ? versions.map(s => card(s)).join('') : '<p>No published skills in this visibility.</p>'}</div>
+      ${ownDrafts.length ? `<h2>Your drafts</h2><div class="cx-stack">${ownDrafts.map(s => card(s, true)).join('')}</div>` : ''}`}
+    <p data-skill-message role="status"></p><div data-skill-review></div><div data-skill-install></div>
+  </div>`;
+}
+
 export function mountCollab(root, { fabricSessions = null, previewServices = {}, surface = root.dataset.standalone === '1' ? 'public' : 'dashboard' } = {}) {
   ensureConversationStyles(root.ownerDocument);
   const store = new TokenStore(window.sessionStorage);
@@ -141,6 +199,7 @@ export function mountCollab(root, { fabricSessions = null, previewServices = {},
   let teardown = null;      // stops the open room's live loop
   let cursor = 0;
   const pendingAdministration = new Set();
+  const pendingSkillPublications = new Set();
   let lastCfg = null;
   let me = null;
   const standalone = surface === 'public';
@@ -207,7 +266,7 @@ export function mountCollab(root, { fabricSessions = null, previewServices = {},
     root.innerHTML = `<div class="hd-shell">
       <aside class="hd-shell__sidebar">
         <div class="hd-shell__brand"><span class="cx-logo" aria-hidden="true">◆</span>HerdR Collaboration</div>
-        <nav class="hd-shell__nav" aria-label="Collaboration">${link('/rooms', 'Rooms')}${link('/agents', 'AI agents')}${canManagePeople() ? link('/people', 'People') : ''}<a class="hd-shell__link" href="/guide" target="_blank" rel="noopener">Guide</a></nav>
+        <nav class="hd-shell__nav" aria-label="Collaboration">${link('/rooms', 'Rooms')}${link('/agents', 'AI agents')}${link('/skills', 'Skills')}${canManagePeople() ? link('/people', 'People') : ''}<a class="hd-shell__link" href="/guide" target="_blank" rel="noopener">Guide</a></nav>
         <div class="cx-user"><span>${esc(me ? (me.email || me.user_id) : '')}</span>${operator ? '' : '<button id="hcn-out" class="hd-btn hd-btn--ghost hd-btn--sm" type="button">Sign out</button>'}</div>
       </aside>
       <main class="hd-shell__main"><div class="hd-shell__content">${strip}${content}</div></main></div>`;
@@ -336,6 +395,7 @@ export function mountCollab(root, { fabricSessions = null, previewServices = {},
     try {
       if (routeState.roomId) await showRoom(routeState.roomId, turn);
       else if (routeState.route === '/agents') await showAgents(turn);
+      else if (routeState.route === '/skills') await showSkills(turn);
       else if (routeState.route === '/people' && canManagePeople()) await showPeople('pending', false, turn);
       else {
         if (routeState.route === '/people') { setStatus('forbidden'); centered('<h1>Collaboration</h1><p role="alert">Access denied.</p>'); return; }
@@ -349,6 +409,126 @@ export function mountCollab(root, { fabricSessions = null, previewServices = {},
       setStatus('error', e);
       centered(`<h1>Collaboration</h1><p role="alert">${esc(e.message)}</p>`);
     }
+  }
+
+  async function showSkills(turn) {
+    const strip = await tabsStrip(null, '/skills', turn);
+    if (!isCurrent(turn)) return;
+    frame('/skills', '<div id="hcn-skills"></div>', strip, turn);
+    const panel = root.querySelector('#hcn-skills');
+    let scope = 'private', revision = 0, skills = [], drafts = [];
+    const active = rev => isCurrent(turn) && revision === rev;
+    const message = (text, error = false) => {
+      const node = panel.querySelector('[data-skill-message]');
+      node.textContent = text; node.setAttribute('role', error ? 'alert' : 'status');
+    };
+    const validVersion = s => s && typeof s === 'object' && typeof s.skill_id === 'string'
+      && typeof s.version === 'string' && s.manifest && typeof s.manifest === 'object'
+      && s.manifest.skill_id === s.skill_id && s.manifest.version === s.version;
+
+    async function load(success = '') {
+      const rev = ++revision;
+      skills = []; drafts = []; draw('loading');
+      try {
+        const data = await api.skills(scope);
+        if (!active(rev)) return;
+        if (!Array.isArray(data.skills) || !data.skills.every(validVersion)
+            || (data.drafts !== undefined && (!Array.isArray(data.drafts) || !data.drafts.every(d => validVersion(d) && typeof d.draft_id === 'string')))) {
+          throw new Error('Invalid skill library response');
+        }
+        skills = data.skills; drafts = data.drafts || [];
+        draw(); message(success);
+      } catch (e) {
+        if (!active(rev) || cancelled(e)) return;
+        draw('error', e.message);
+      }
+    }
+
+    function review(skill, rev) {
+      if (!active(rev)) return;
+      const container = panel.querySelector('[data-skill-review]');
+      container.innerHTML = renderSkillReview(skill);
+      const close = container.querySelector('[data-close-skill-review]');
+      close.onclick = () => { if (!active(rev)) return; ++revision; container.replaceChildren(); };
+      const form = container.querySelector('[data-publication-form]');
+      if (!form) return;
+      let pending = false;
+      const confirm = form.querySelector('[data-confirm-publication]');
+      form.elements.reviewed.onchange = () => { confirm.disabled = !form.elements.reviewed.checked; };
+      form.elements.scope.onchange = () => { form.elements.reviewed.checked = false; confirm.disabled = true; };
+      form.onsubmit = async event => {
+        event.preventDefault();
+        if (!active(rev) || pending || !form.elements.reviewed.checked) return;
+        if (pendingSkillPublications.has(skill.draft_id)) { message('Publication already in progress.', true); return; }
+        const target = form.elements.scope.value;
+        if (!publicationScopes(skill).includes(target)) return;
+        pending = true;
+        pendingSkillPublications.add(skill.draft_id);
+        for (const el of form.elements) el.disabled = true;
+        close.disabled = true; message('Publishing…');
+        try {
+          await api.publishSkill(skill.draft_id, target);
+          if (!active(rev)) return;
+          await load(`Published version ${skill.version} to ${target}.`);
+        } catch (e) {
+          if (!active(rev) || cancelled(e)) return;
+          message(e.message, true);
+          pending = false;
+          for (const el of form.elements) el.disabled = false;
+          form.elements.reviewed.checked = false; confirm.disabled = true; close.disabled = false;
+        } finally { pendingSkillPublications.delete(skill.draft_id); }
+      };
+    }
+
+    function draw(status = 'ready', error) {
+      panel.innerHTML = renderSkillLibrary({ skills, drafts, identity: me, scope, status, error });
+      panel.querySelectorAll('[data-skill-scope]').forEach(button => { button.onclick = () => {
+        if (!isCurrent(turn)) return;
+        scope = button.dataset.skillScope; load();
+      }; });
+      panel.querySelector('[data-refresh-skills]').onclick = () => { if (isCurrent(turn)) load(); };
+      panel.querySelectorAll('[data-review-draft]').forEach(button => { button.onclick = async () => {
+        if (!isCurrent(turn) || button.disabled) return;
+        const rev = ++revision, draft = drafts.find(d => d.draft_id === button.dataset.reviewDraft);
+        button.disabled = true; panel.querySelector('[data-skill-review]').replaceChildren();
+        message('Loading draft review…');
+        try {
+          const fresh = await api.skillDraft(draft.draft_id);
+          if (!active(rev)) return;
+          if (!validVersion(fresh) || fresh.status !== 'draft' || fresh.draft_id !== draft.draft_id
+              || fresh.skill_id !== draft.skill_id || fresh.version !== draft.version || fresh.manifest.creator_id !== me.user_id) {
+            throw new Error('Invalid skill draft response');
+          }
+          message(''); review(fresh, rev);
+        } catch (e) { if (active(rev) && !cancelled(e)) message(e.message, true); }
+        finally { if (isCurrent(turn) && button.isConnected) button.disabled = false; }
+      }; });
+      panel.querySelectorAll('[data-review-skill]').forEach(button => { button.onclick = () => {
+        if (isCurrent(turn)) review(skills[Number(button.dataset.reviewSkill)], ++revision);
+      }; });
+      panel.querySelectorAll('[data-download-skill]').forEach(button => { button.onclick = async () => {
+        if (!isCurrent(turn) || button.disabled) return;
+        const rev = revision, skill = skills[Number(button.dataset.downloadSkill)];
+        button.disabled = true; message('Authorizing download…');
+        try {
+          const grant = await api.downloadSkill(skill.skill_id, skill.version);
+          if (!active(rev)) return;
+          const link = document.createElement('a');
+          link.href = grant.url; link.download = 'skill-package.json'; link.rel = 'noopener noreferrer';
+          panel.append(link); link.click(); link.remove();
+          message(`Download requested for version ${skill.version}.`);
+        } catch (e) { if (active(rev) && !cancelled(e)) message(e.message, true); }
+        finally { if (isCurrent(turn) && button.isConnected) button.disabled = false; }
+      }; });
+      panel.querySelectorAll('[data-install-skill]').forEach(button => { button.onclick = () => {
+        if (!isCurrent(turn)) return;
+        const skill = skills[Number(button.dataset.installSkill)];
+        const container = panel.querySelector('[data-skill-install]');
+        container.innerHTML = `<section class="hd-card cx-stack"><h2>Install with your agent</h2><p>Give these instructions to your registered agent. Its harness requests fresh authorization, verifies the signed package with trusted keys and installs this exact version locally. This page has not installed or executed anything.</p><label class="cx-field">Agent skill install instructions<textarea readonly rows="7"></textarea></label></section>`;
+        container.querySelector('textarea').value = JSON.stringify({ name: 'skills_install', arguments: { skill_id: skill.skill_id, version: skill.version } }, null, 2);
+      }; });
+    }
+    await load();
   }
 
   async function showRooms(turn) {
@@ -738,7 +918,7 @@ export function mountCollab(root, { fabricSessions = null, previewServices = {},
     if (canManagePeople()) { try { waitingCount = (await api.users('pending')).users.length; } catch { /* not an approver */ } }
     if (!isCurrent(turn)) return '';
     const t = (to, label, on, extra = '') => `<button type="button" class="cx-rtab${extra}" role="tab" data-go="${to}" aria-selected="${on}">${label}</button>`;
-    return `<div class="cx-rtabs" role="tablist" aria-label="Rooms">${roomsCache.map((r) => t(`/room/${encodeURIComponent(r.room_id)}`, esc(r.name), r.room_id === activeRoom)).join('')}${t('/rooms', '＋ New room', activePage === '/rooms', ' cx-rtab--new')}<span class="grow"></span>${canManagePeople() ? t('/people', `People${waitingCount ? ` <span class="cx-badge" title="waiting for approval">${waitingCount}</span>` : ''}`, activePage === '/people') : ''}${t('/agents', 'AI agents', activePage === '/agents')}</div>`;
+    return `<div class="cx-rtabs" role="tablist" aria-label="Rooms">${roomsCache.map((r) => t(`/room/${encodeURIComponent(r.room_id)}`, esc(r.name), r.room_id === activeRoom)).join('')}${t('/rooms', '＋ New room', activePage === '/rooms', ' cx-rtab--new')}<span class="grow"></span>${canManagePeople() ? t('/people', `People${waitingCount ? ` <span class="cx-badge" title="waiting for approval">${waitingCount}</span>` : ''}`, activePage === '/people') : ''}${t('/agents', 'AI agents', activePage === '/agents')}${t('/skills', 'Skills', activePage === '/skills')}</div>`;
   }
 
   const hueOf = (s) => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
