@@ -2092,9 +2092,9 @@ class GraphProjection:
     def strip_before(self, out: Any, joins: dict | None) -> Any:
         """T16 M2: ``replay_history: since_join`` for EVERY read, not just ``/lineage``. ``joins`` maps each room the
         reader reads through to the reader's join time. The horizon of an event is the join time of the room that
-        SCOPES the event (never a room the caller merely named); an event with no room uses the LATEST join; an
-        event of a room the reader has no join time for, an unknown event id, or an id shared with an earlier event
-        is treated as pre-join. Pre-join events lose their id, admission time and removal reason, and an edge that
+        SCOPES the event (never a room the caller merely named); an event with no room, or written from a room the
+        reader has no join time for (a mission shared with the reader's room), uses the reader's LATEST join; an
+        unknown event id, or an id shared with an earlier event, is treated as pre-join. Pre-join events lose their id, admission time and removal reason, and an edge that
         was removed before the reader joined is dropped altogether (no endpoints, no writer). Mutates ``out``."""
         if joins is None:
             return out
@@ -2106,7 +2106,9 @@ class GraphProjection:
             if got is None or latest is None:
                 return True
             ts, room = got
-            horizon = latest if room is None else joins.get(room)
+            # a mission event written from a room this reader is not in (shared mission) is still visible to the
+            # reader through THEIR room: fall back to their latest join, never to "everything is pre-join"
+            horizon = joins.get(room, latest) if room is not None else latest
             return horizon is None or ts < horizon
 
         def dead(edge):          # removed before the reader joined: its existence is pre-join history

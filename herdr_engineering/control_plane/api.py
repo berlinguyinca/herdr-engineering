@@ -33,8 +33,8 @@ from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .graph import read_graph
 from .ingest import INGEST_ENTITY_TYPES
-from .review_quorum import pr_review_quorum
 from .redact import redact_payload
+from .review_quorum import pr_review_quorum
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
@@ -1032,7 +1032,10 @@ def _make_handler(server, public=False, operator=False):
             except KeyError:
                 return self._send_json(404, {"error": "not found"})
             except EnvelopeConflict as exc:
-                return self._send_json(409, {"error": str(exc), "reason": "conflict"})
+                body = {"error": str(exc), "reason": exc.reason}
+                if exc.last_sequence is not None:
+                    body["last_sequence"] = exc.last_sequence
+                return self._send_json(409, body)
             except SequenceCollision:
                 return self._send_json(409, {"error": "sequence conflict", "reason": "conflict"})
             except PermissionError:

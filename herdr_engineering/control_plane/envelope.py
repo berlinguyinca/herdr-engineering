@@ -40,7 +40,16 @@ MAX_SOURCES_PER_ACTOR = 32      # T16 M6: one principal can never push another's
 
 
 class EnvelopeConflict(Exception):
-    """The envelope contradicts something already stored (HTTP 409)."""
+    """The envelope contradicts something already stored (HTTP 409).
+
+    ``reason`` is the machine-readable cause in the response body (``conflict`` or ``sequence_conflict``);
+    ``last_sequence`` is set only for ``sequence_conflict``: the highest sequence accepted from the CALLER's own
+    (principal, source) domain, so a restarted emitter can resume (never another source's state)."""
+
+    def __init__(self, message: str, *, reason: str = "conflict", last_sequence: int | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.last_sequence = last_sequence
 
 
 def _opt_str(body: dict, name: str) -> str | None:
@@ -210,8 +219,14 @@ class SourceLedger:
         if owner is not None and owner != env["event_id"]:
             raise EnvelopeConflict(
                 f"sequence {env['source_sequence']} of source {env['source']!r} "
-                f"already belongs to event {owner!r}")
+                f"already belongs to event {owner!r}", reason="sequence_conflict",
+                last_sequence=self.last_sequence(env.get("actor"), env["source"]))
         return "new"
+
+    def last_sequence(self, actor, source: str) -> int | None:
+        """Highest sequence accepted from this principal's own ``source`` (None if nothing is remembered)."""
+        st = self._sources.get((_actor_id(actor), source))
+        return st["last_sequence"] if st else None
 
     def commit(self, env: dict, seen_at: str | None = None, *, persist: bool = True) -> None:
         source, seq, eid = env["source"], env["source_sequence"], env["event_id"]

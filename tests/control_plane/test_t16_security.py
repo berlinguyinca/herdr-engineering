@@ -641,10 +641,14 @@ def test_pre_fix_v1_forged_rows_without_a_collab_payload_are_quarantined_and_col
     assert len(again._log) == good                                                       # the real log, nothing else
 
 
+STAMP = "2026-01-01T00:00:00+00:00"
+
+
 def test_pre_fix_forged_rows_that_copy_the_payload_shape_are_quarantined_by_sequence():
     """A forger who copies org_id/correlation_id/created_at still collides with a real sequence: the first row wins."""
     mimic = {"entity_type": "collab", "entity_id": "log", "sequence": 1, "event_type": "member_added",
-             "event_id": "forged2", "payload": {"org_id": "default", "correlation_id": "c", "created_at": "t",
+             "event_id": "forged2", "source_timestamp": STAMP, "ingest_timestamp": STAMP,
+             "payload": {"org_id": "default", "correlation_id": "c", "created_at": STAMP,
                                                 "room_id": "r", "subject_user_id": "mallory", "role": "owner"}}
     repo, again, good = _restart_with([mimic])
     assert repo.collab_quarantine_reasons == ["duplicate_sequence"] and not again.degraded
@@ -703,6 +707,7 @@ def _file_log(tmp_path, extra=()):
     log = FileEventLog(str(path))
     svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), sink=log)
     W(svc)
+    os.close(log._fd)           # the server that wrote it has stopped (a live one is covered by its own tests)
     with open(path, "ab") as fh:
         for row in extra:
             fh.write((json.dumps(row) + "\n").encode())
@@ -745,7 +750,8 @@ def test_collab_repair_apply_needs_confirmation_then_moves_rows_and_never_delete
 def test_collab_repair_gap_tail_is_only_set_aside_on_explicit_request(tmp_path):
     from herdr_engineering.control_plane.collab_repair import classify
     rows = [{"entity_type": "collab", "entity_id": "log", "sequence": n, "event_type": "x", "event_id": f"e{n}",
-             "payload": {"org_id": "d", "correlation_id": "c", "created_at": "t"}} for n in (1, 2, 4, 5)]
+             "source_timestamp": STAMP, "ingest_timestamp": STAMP,
+             "payload": {"org_id": "d", "correlation_id": "c", "created_at": STAMP}} for n in (1, 2, 4, 5)]
     keep, bad = classify(rows)
     assert len(keep) == 4 and not bad                                    # a gap is the service's call (it degrades)
     keep, bad = classify(rows, cut_tail=True)
@@ -763,9 +769,10 @@ def test_collab_repair_postgres_plan_and_apply_use_one_transaction_and_a_quarant
 
         async def fetch(self, q, *a):
             self.sql.append(q)
-            ok = {"org_id": "d", "correlation_id": "c", "created_at": "t"}
+            ok = {"org_id": "d", "correlation_id": "c", "created_at": STAMP}
             return [{"tid": "(0,1)", "event_id": "g1", "entity_id": "log", "sequence": 1, "event_type": "x",
-                     "payload": json.dumps(ok), "source": None, "source_sequence": None, "actor": None},
+                     "payload": json.dumps(ok), "source": None, "source_sequence": None, "actor": None,
+                     "source_timestamp": STAMP, "ingest_timestamp": STAMP},
                     {"tid": "(0,2)", "event_id": "f1", "entity_id": "log", "sequence": 1, "event_type": "x",
                      "payload": "{}", "source": "pi", "source_sequence": 0, "actor": "{}"}]
 
@@ -880,11 +887,11 @@ def test_revocation_accounting_survives_a_restart():
     sink = Sink()
     c = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), sink=sink)
     cast = W(c)
-    mid = c._revocable["member"]
+    mid = c._recount()["member"]
     c.add_member(cast.alice, cast.room, {"user_id": "mallory", "role": "viewer"})
     again = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}))
     again.hydrate(copy.deepcopy(sink.rows))
-    assert again._revocable["member"] == c._revocable["member"] == mid + 1
+    assert again._recount()["member"] == c._recount()["member"] == mid + 1
 
 
 # ======================================================================== M4 round 2
@@ -959,7 +966,7 @@ def test_an_event_without_a_room_uses_the_latest_join_of_the_readers_rooms(fab):
     assert out({fab.room: 150.0, fab.room2: 40.0})[1]["event_id"] is None      # its own room's join decides
 
 
-def test_a_missing_join_time_hides_history_before_now_and_an_unknown_room_is_pre_join(fab):
+def test_a_missing_join_time_hides_history_before_now_and_a_foreign_room_falls_back_to_the_latest_join(fab):
     f = fab.feed
     put(f, "task:old", "room", label="old", room_id=fab.room)
     fab.s.replay_history = "since_join"
@@ -967,8 +974,9 @@ def test_a_missing_join_time_hides_history_before_now_and_an_unknown_room_is_pre
     node = fab.s.graph_read(fab.bob, ["nodes", "task:old"], {"room_id": fab.room})["node"]
     assert node["first_event_id"] is None and node["fields"]["label"]["admitted_at"] is None
     g = fab.repo.graph
-    g._first_ts["x"] = (500.0, "room-the-reader-never-joined")
-    assert g.strip_before({"event_id": "x"}, {fab.room: 1.0}) == {"event_id": None}
+    g._first_ts["x"] = (500.0, "room-the-reader-never-joined")        # a shared mission written from another room
+    assert g.strip_before({"event_id": "x"}, {fab.room: 1.0}) == {"event_id": "x"}      # after the reader's join: shown
+    assert g.strip_before({"event_id": "x"}, {fab.room: 900.0}) == {"event_id": None}   # before it: still stripped
 
 
 def test_strip_before_treats_an_unknown_event_id_as_pre_join_and_none_as_unrestricted(fab):

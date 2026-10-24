@@ -190,7 +190,8 @@ class IngestService:
             except SequenceCollision as exc:
                 if exc.event_id_clash:
                     raise EnvelopeConflict(str(exc)) from None
-                raise EnvelopeConflict("source_sequence is already used by another event") from None
+                raise EnvelopeConflict("source_sequence is already used by another event", reason="sequence_conflict",
+                                       last_sequence=ledger.last_sequence(env.get("actor"), env["source"])) from None
             except EventAlreadyStored:
                 # Durable insert landed earlier but the ack was lost (or the
                 # in-memory index evicted it): same identity => already stored.

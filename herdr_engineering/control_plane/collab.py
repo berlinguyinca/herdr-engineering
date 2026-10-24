@@ -15,6 +15,7 @@ to a terminal.
 from __future__ import annotations
 
 import bisect
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -54,13 +55,14 @@ SAFETY_EVENTS = frozenset({
     "xlink_revoked", "workspace_unlinked", "mission_unlinked", "agent_grant_revoked"})
 BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_denied", "task_progress",
                          "steer_proposed", "consult_asked", "proposal_submitted", "external_status_changed"})
-# creation event -> kind; revocation event -> the kind it settles
+# creation event -> kind (what is outstanding is recomputed from state, see _recount)
 REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_enrolled": "agent",
                     "join_token_created": "join", "xlink_created": "xlink", "workspace_linked": "workspace",
                     "mission_linked": "mission"}
-REVOCABLE_SETTLE = {"member_removed": "member", "agent_grant_revoked": "grant", "agent_grant_expired": "grant",
-                    "agent_revoked": "agent", "join_token_revoked": "join", "xlink_revoked": "xlink",
-                    "workspace_unlinked": "workspace", "mission_unlinked": "mission"}
+# every event that can change what _recount() returns (the cache is cleared when one is committed)
+COUNT_EVENTS = frozenset(REVOCABLE_CREATE) | {
+    "member_removed", "agent_grant_revoked", "agent_grant_expired", "agent_revoked", "join_token_revoked",
+    "xlink_revoked", "workspace_unlinked", "mission_unlinked"}
 ORG_ID = "default"  # single-organization deployment (spec: no federation in v1)
 
 # "task" is the human right to give an agent work; the agent-side rights are "instruct"
@@ -216,6 +218,13 @@ class FileEventLog:
         self._lock = threading.Lock()
         self._broken = False
         self._fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            # A shared advisory lock for the life of the writer: `collab-repair --apply` needs it exclusively, so it
+            # can never swap the file out from under an open append descriptor (that would lose acknowledged events).
+            fcntl.flock(self._fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self._fd)
+            raise OSError(f"the collaboration log {path} is being repaired; retry when collab-repair has finished") from None
 
     def load(self) -> list[dict]:
         rows = []
@@ -265,7 +274,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, delegation_enabled: bool = False):
         self.auth = authenticator
-        self._revocable: dict[str, int] = defaultdict(int)     # outstanding revocable creations per kind (H2)
+        self._revocable: dict[str, int] = {}                   # outstanding revocable things per kind (H2), from state
+        self._outstanding_key = None
         self.degraded: str | None = None     # set when the durable log failed its startup integrity check
         # Kill switch for bounded task delegation and artifact proposals (T11), from the fleet YAML
         # (control_plane.collab.delegation_enabled). Off by default: while off, no delegation can be created,
@@ -412,16 +422,31 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
     def replay_history(self, value: str) -> None:
         self._replay_history = value
 
-    def _outstanding(self) -> int:
-        return sum(self._revocable.values())
+    def _recount(self) -> dict:
+        """Revocable things that exist RIGHT NOW, recomputed from state. Counting from state (not by adding on
+        create and subtracting on revoke) makes the figure idempotent: a repeated or no-op revocation, a re-grant,
+        a lapsed guest or a used-up token can never push it above or below what is really outstanding."""
+        now = self._now()
+        out: dict[str, int] = defaultdict(int)
+        for room in self._rooms.values():
+            for uid, m in room["members"].items():
+                if uid != room["created_by"] and (m.get("expires_at") is None or m["expires_at"] > now):
+                    out["member"] += 1
+            out["grant"] += len(room["grants"])
+        out["agent"] = sum(1 for a in self._agents.values() if a["status"] == "active")
+        out["join"] = sum(1 for j in self._joins.values()
+                          if not j["revoked"] and j["uses"] < j["max_uses"] and j["expires_at"] > now)
+        out["xlink"] = sum(1 for x in self._xlinks.values() if x["state"] == "active")
+        out["workspace"] = len(self._links)
+        out["mission"] = len(self._missions)
+        return out
 
-    def _track_revocable(self, event_type: str) -> None:
-        kind = REVOCABLE_CREATE.get(event_type)
-        if kind:
-            self._revocable[kind] += 1
-        kind = REVOCABLE_SETTLE.get(event_type)
-        if kind and self._revocable[kind] > 0:
-            self._revocable[kind] -= 1
+    def _outstanding(self) -> int:
+        key = int(self._now() // 30)       # the count changes with a COUNT_EVENTS commit (which clears the key) or with
+        if self._outstanding_key != key:   # the clock (expiries), so a chat flood does not recount the whole state
+            self._revocable = self._recount()
+            self._outstanding_key = key
+        return sum(self._revocable.values())
 
     def _log_limit(self, event_type: str) -> int:
         """The log length below which ``event_type`` is still admitted (see SAFETY_EVENTS for the design)."""
@@ -461,7 +486,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                     raise CollabError(503, "collaboration log unavailable") from exc
             self._seq += 1
             self._log.append(ev)
-            self._track_revocable(event_type)
+            if event_type in COUNT_EVENTS:
+                self._outstanding_key = None
             self._apply(ev)
             self._touch_rooms(payload, ev["sequence"], event_type)
             self._cv.notify_all()
@@ -523,7 +549,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 expected += 1
                 self._seq = ev["sequence"]
                 self._log.append(ev)
-                self._track_revocable(ev["event_type"])
+                self._outstanding_key = None
                 self._apply(ev)
             for k, v in self._usage_reserved.items():
                 self._usage[k] = max(self._usage[k], v)      # restart: the durable ceiling, never lower than used
@@ -824,10 +850,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
 
     # ------------------------------------------------------ authentication
     def authenticate(self, authorization: str, device: str | None) -> Principal:
-        if self.degraded:
-            raise CollabError(503, "collaboration is disabled; ask the operator")
         scheme, _, token = (authorization or "").partition(" ")
         token = token.strip()
+        if self.degraded and scheme != "Bearer":
+            self.stats["auth_failures"] += 1       # agents cannot be verified without the log: same 401 as any bad token
+            raise CollabError(401, "unauthorized")
         if not token:
             self.stats["auth_failures"] += 1
             raise CollabError(401, "unauthorized")
@@ -841,6 +868,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             if got is None:
                 self.stats["auth_failures"] += 1
                 raise CollabError(401, "unauthorized")
+            if self.degraded:                      # only a caller with a VALID token learns that collaboration is down
+                raise CollabError(503, "collaboration is disabled; ask the operator")
             pr = Principal("user", got[0], got[0], exp=got[1])
             if self.approval is not None:
                 self._admit(pr, set(groups))
@@ -1225,9 +1254,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 raise CollabError(409, "only an approved person can be disabled")
             self._throttle("userdecide:" + pr.id, 300, 600.0, "user decision")
             new = USER_ACTIONS[action]
-            self._commit("user_decided", self._actor(
-                pr, user_id=uid, at=self._iso(), status=new, decided_by=pr.id, reason=reason,
-                action=f"user.{action}", outcome="allowed", project_ids=[], resource_id=uid))
+            if u["status"] != new:          # a repeat of the same decision is not a new event (safety events are free)
+                self._commit("user_decided", self._actor(
+                    pr, user_id=uid, at=self._iso(), status=new, decided_by=pr.id, reason=reason,
+                    action=f"user.{action}", outcome="allowed", project_ids=[], resource_id=uid))
             if action == "kick":
                 # Out of every room, and every agent they own stops working for good.
                 for rid, room in list(self._rooms.items()):
@@ -1804,6 +1834,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         with self._lock:
             a = self._require_external(pr)
             x = a["external"]
+            if a["status"] != "active":
+                return {"ok": True}
             self._commit("agent_revoked", self._actor(
                 pr, agent_id=pr.id, room_id=x["room_id"], room_ids=[x["room_id"]], project_id=x["project_id"],
                 action="external.leave", outcome="allowed", project_ids=[x["project_id"]], resource_id=pr.id))
@@ -2313,6 +2345,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             agent = self._agents.get(agent_id)
             if not agent or agent["owner"] != pr.id:
                 raise CollabError(404, "not found")
+            if agent["status"] != "active":
+                return {"ok": True}         # already revoked: no second event (a safety event must not be repeatable)
             rooms = [r for r, room in self._rooms.items() if agent_id in room["grants"]]
             self._commit("agent_revoked", self._actor(
                 pr, agent_id=agent_id, room_ids=rooms, action="agent.revoke", outcome="allowed",

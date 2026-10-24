@@ -776,10 +776,12 @@ def test_legacy_endpoints_unchanged_with_collab_enabled(env):
 
 def test_hydrate_ignores_collab_streams_in_repo_import(env):
     """repo.import_state diverts collab streams so a durable reload cannot expose them."""
-    ev = {"event_id": "e1", "schema_version": 1, "source_timestamp": "t", "ingest_timestamp": "t",
+    ev = {"event_id": "e1", "schema_version": 1, "source_timestamp": "2026-01-01T00:00:00+00:00",
+          "ingest_timestamp": "2026-01-01T00:00:00+00:00",
           "entity_type": "collab", "entity_id": "log", "mission_id": None, "session_id": None,
           "sequence": 0, "event_type": "x",
-          "payload": {"text": "leak-me", "org_id": "o", "correlation_id": "c", "created_at": "t"}}
+          "payload": {"text": "leak-me", "org_id": "o", "correlation_id": "c",
+                      "created_at": "2026-01-01T00:00:00+00:00"}}
     repo = ControlPlaneRepo()
     repo.import_state({"events": {"collab|log": [ev]}, "event_order": [("collab", "log", 0)]})
     assert repo.recent_events(10) == [] and repo.stream("collab", "log") == []

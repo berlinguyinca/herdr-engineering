@@ -18,6 +18,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   selected before the contribution cap (M7); the quorum route hides a head the reader cannot read (M9); the generic rate limiter keys clients behind a
   proxy by their forwarded address (M12); an open listener is no operator in a reserved namespace (L1).
 - Test: the graph neighbourhood budget test counts rendered nodes instead of timing a wall clock.
+- Ingest sequence-conflict 409 now says `reason: "sequence_conflict"` and `last_sequence` (the caller's own source only) so a restarted emitter can resume (Pi H6).
+- Round 3: safety events are idempotent (a repeated `revoke_agent`/`external_leave`/user decision commits nothing, so they cannot fill the log); the
+  revocation reserve is recomputed from state; `collab-repair --apply` works on a real PostgreSQL (tid binding fixed, tested against a throwaway
+  server), refuses to rewrite a log a live server holds, reports a gap tail it cannot fix by default, and also quarantines rows whose
+  timestamps disagree; unauthenticated callers cannot see that collaboration is degraded; a shared-mission event written from another room is shown
+  to the reader after their join.
 - No migration, no environment variable. Rollback: revert the PR.
 
 ### Attention inbox, evidence-based progress and optimization analytics (T15, stacked on #174, #173, #168, #169)
