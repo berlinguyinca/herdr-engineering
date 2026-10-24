@@ -431,9 +431,26 @@ Note: the web hydrates from Postgres **once at startup**, so it reflects a
 snapshot of durable state; live updates flow over SSE. Restart the web to
 re-hydrate after external writes.
 
-The UI subscribes to `/api/v1/events/stream` (SSE) for live updates — no
-polling. Secrets in event payloads and messages are redacted at the API
-boundary (never stored or rendered).
+The UI subscribes to `/api/v1/events/stream` (SSE) for live updates. Secrets
+in event payloads and messages are redacted at the API boundary (never stored
+or rendered).
+
+Pages update in place:
+
+- A page loads once, behind a skeleton. After that, events (throttled to one
+  refresh per view every 5 s) and a few dashboards' own polls patch only what
+  changed. Focus, open sections and the text selection survive a refresh.
+- Changed values flash or count up.
+- Every page head has a freshness chip: "live · updated Ns ago", amber when
+  stale, red with the error when a refresh fails.
+- The sidebar has Theme (auto, light, dark) and Calm (auto, on, off) controls,
+  stored per browser. Calm, which is on by default when the OS asks for reduced
+  motion, applies every change at once with no animation.
+
+The conventions for writing a view are in
+[`packages/herdr-web-components/README.md`](packages/herdr-web-components/README.md#live-views-conventions):
+the mounted-view contract, the refresh bus, the patcher, motion helpers, calm
+and dark, and the freshness chip.
 
 #### Live-Postgres end-to-end test (opt-in)
 

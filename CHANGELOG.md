@@ -5,6 +5,30 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Live web UI: pages update in place (#218, #221 and the PRs stacked on them)
+- Pages no longer re-render on live events. A route loads once, behind a skeleton, and then returns
+  a mounted view `{ refresh(hint), dispose() }`. A shared refresh bus throttles SSE events to one
+  refresh per view every 5 s.
+- A keyed patcher (`patchList`, `morph`, `patchText`, `patchAttr`) writes only what changed. It
+  keeps focus, open `<details>` and the text selection.
+- The SSE stream sends a keep-alive every 10 s and no longer ends when idle.
+- Motion marks data changes: values count up, changed values flash, rows enter and leave.
+  `motion.js` also has the skeleton placeholder used on first loads.
+- Every page head has a freshness chip. It turns amber when stale and red with the error, and a page
+  with several sources names every one that is failing. On GitHub the chip also shows the sync state.
+- Theme (auto, light, dark) and Calm (auto, on, off) controls are in the sidebar, stored per browser
+  and applied before first paint.
+  - Calm, and OS reduced motion unless calm is off, applies every change at once with no animation.
+    `tests/playwright/calm.test.mjs` guards this on every route.
+  - The dark palette is token-based. It covers every view, including the CI health map, pipeline
+    steps and test results, which used to hard-code light colours. `tests/playwright/dark-theme.test.mjs`
+    checks 4.5:1 text contrast and no light fills on every route, in the loading, error, empty and
+    populated states.
+  - The light theme looks the same as before.
+- Conventions for new views are in `packages/herdr-web-components/README.md` ("Live views:
+  conventions").
+- UI only; no API, config or migration change beyond the SSE keep-alive. Rollback: revert the PRs.
+
 ### Attention inbox, evidence-based progress and optimization analytics (T15, stacked on #174, #173, #168, #169)
 - New read routes `GET /rooms/{id}/attention|progress|analytics` and `POST /rooms/{id}/attention/ack|snooze|restore`, plus Attention and Progress
   tabs. Everything is derived from what the reader can see in the room graph, review quorum (T06), steering/promotion (T12/T13), proposals (T11),
