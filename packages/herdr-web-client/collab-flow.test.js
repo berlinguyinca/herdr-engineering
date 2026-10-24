@@ -402,6 +402,99 @@ for (const surface of ['public', 'dashboard']) for (const leave of ['navigation'
   });
 }
 
+for (const surface of ['public', 'dashboard']) {
+  for (const leave of ['navigation', 'disposal']) for (const outcome of ['success', 'auth', 'error', 'abort']) {
+    test(`collab ${surface} live polling ignores ${outcome} after ${leave} before hashchange`, async (t) => {
+      const h = await collabHarness(t, surface);
+      await h.view.ready;
+      const pending = deferred(), following = deferred();
+      let held = false;
+      h.model.intercept = (path) => {
+        if (path.startsWith('/rooms/old/state')) {
+          if (!held) { held = true; return pending.promise; }
+          return following.promise;
+        }
+      };
+      h.document.hidden = false;
+      const appendable = () => ({ textContent: '', appendChild(child) { this.textContent += child.textContent; } });
+      h.document.createDocumentFragment = appendable;
+      h.document.createElement = appendable;
+      h.elements.get('hcn-log').appendChild = function(child) { this.textContent += child.textContent; };
+      await h.navigate('/room/old');
+      assert.ok(held);
+      if (leave === 'disposal') { h.view.dispose(); h.root.innerHTML = 'replacement view'; }
+      else if (surface === 'public') h.window.location.hash = '#/rooms'; // deliberately do not dispatch hashchange
+      else await h.navigate('/rooms');
+      const snapshot = actionSnapshot(h);
+      if (outcome === 'abort') pending.reject(new DOMException('cancelled', 'AbortError'));
+      else pending.resolve(outcome === 'success' ? jsonResponse({ changed: true, seq: 1, next_cursor: 1,
+        agents: [], tasks: [], events: [{ event_type: 'room_updated' }] })
+        : jsonResponse({ error: 'old poll failure' }, outcome === 'auth' ? 401 : 503));
+      await flush();
+      assert.deepEqual(actionSnapshot(h), snapshot, 'old poll cannot apply events, sign out, repoll, or schedule a retry');
+    });
+  }
+
+  test(`collab ${surface} cancelled current People decision is silent and can be retried`, async (t) => {
+    const action = actionCases.find((candidate) => candidate.name === 'People decision');
+    const h = await actionHarness(t, surface, action);
+    const pending = deferred();
+    h.model.intercept = (path, init) => path === action.path && init?.method === 'POST' ? pending.promise : h.responses(path, init);
+    const completion = h.invoke();
+    await flush();
+    assert.equal(h.elements.get('decision').disabled, true);
+    const state = h.view.state;
+    pending.reject(new DOMException('cancelled', 'AbortError'));
+    await completion;
+    assert.equal(h.elements.get('decision').disabled, false, 'current cancelled action restores the control');
+    assert.equal(h.elements.get('hcn-people-msg').textContent, '');
+    assert.deepEqual(h.view.state, state);
+    h.model.intercept = h.responses;
+    const before = h.calls.length;
+    await h.invoke();
+    assert.ok(h.calls.slice(before).includes(action.path));
+  });
+
+  const stages = ['/fleet/egress', '/fleet/helpers', '/fleet/egress/old'];
+  if (surface === 'public') stages.push('/helpers');
+  for (const stage of stages) for (const leave of ['navigation', 'disposal']) for (const outcome of ['success', 'error']) {
+    test(`collab ${surface} nested helper ${stage} suppresses followups after ${leave} on ${outcome}`, async (t) => {
+      const h = await collabHarness(t, surface, 'approved', (path) => path === '/config' && stage !== '/helpers'
+        ? jsonResponse({ client_id: 'web', hosted_ui_domain: 'https://auth.example', public_url: 'https://collab.example', operator: { user_id: 'u1' } }) : null);
+      await h.view.ready;
+      const pending = deferred();
+      let held = false;
+      const helperReads = [];
+      h.model.intercept = (path) => {
+        if (path === '/rooms/old') return jsonResponse({ room_id: 'old', name: 'Old', role: 'owner' });
+        if (path === stage) { held = true; return pending.promise; }
+        if (path === '/fleet/egress') return jsonResponse({ requests: [] });
+        if (path === '/fleet/helpers' || path === '/helpers') return jsonResponse({ helpers: [], paused: false });
+        if (path === '/fleet/egress/old') return jsonResponse({ allowlist: [], entries: [] });
+        if (path === '/rooms/old/profile') return jsonResponse({ services: [] });
+      };
+      const agentsTab = { ...h.element(), dataset: { sub: 'agents' } };
+      const query = h.root.querySelectorAll;
+      h.root.querySelectorAll = (selector) => selector === '[data-sub]' ? [agentsTab] : query(selector);
+      await h.navigate('/room/old');
+      agentsTab.onclick();
+      await flush();
+      assert.ok(held, 'the selected nested helper read is pending');
+      if (leave === 'navigation') await h.navigate('/room/new');
+      else { h.view.dispose(); h.root.innerHTML = 'replacement view'; }
+      const snapshot = actionSnapshot(h);
+      const data = {};
+      for (const [key, value] of Object.entries({ requests: [], helpers: [], paused: false, allowlist: [], entries: [] })) {
+        Object.defineProperty(data, key, { get: () => { helperReads.push(key); return value; } });
+      }
+      pending.resolve(outcome === 'success' ? jsonResponse(data) : jsonResponse({ error: 'old helper failure' }, 503));
+      await flush();
+      assert.deepEqual(actionSnapshot(h), snapshot, 'obsolete helper results cannot start another request or render');
+      assert.deepEqual(helperReads, [], 'obsolete helper payloads are not consumed into room state');
+    });
+  }
+}
+
 const flow = {
   nodes: [
     { id: 'u:alice', kind: 'person', name: 'alice' },
