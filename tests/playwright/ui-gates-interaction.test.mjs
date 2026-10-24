@@ -7,6 +7,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
+import { openMention } from './ui-gates-states.mjs';
 
 let srv; let browser;
 before(async () => { srv = await startRealServer({ mention_agent: true }); browser = await launch(); });
@@ -117,10 +118,8 @@ test('the expanded message editor is a modal dialog: role, name, Tab stays insid
 test('the @-mention list is a combobox with a listbox: aria-expanded, an active option that exists, arrow keys, Escape', async () => {
   const { ctx, page } = await composerPage();
   const input = page.locator('textarea.conversation-input');
-  await input.focus();
-  await page.keyboard.type('@');
+  await openMention(page);
   const list = page.locator('ul[role="listbox"]:not([hidden])');
-  await list.waitFor();
   assert.equal(await input.getAttribute('aria-expanded'), 'true');
   const options = list.locator('[role="option"]');
   assert.ok(await options.count() >= 1, 'the list offers someone to mention');

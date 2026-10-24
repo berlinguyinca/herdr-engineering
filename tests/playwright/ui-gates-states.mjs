@@ -8,6 +8,16 @@
 // Used by ui-gates-states.test.mjs (accessibility) and ui-gates-xss.test.mjs (inert hostile text).
 import { openSub } from './ui-gates-lib.mjs';
 
+/** Type "@" until the list opens: the room's agents arrive after the chat does, and a list asked for too early is simply empty. */
+export async function openMention(page) {
+  const input = page.locator('textarea.conversation-input');
+  const opt = page.locator('ul[role="listbox"]:not([hidden]) [role="option"]').first();
+  for (let i = 0; i < 20; i += 1) {
+    await input.focus(); await input.fill(''); await page.keyboard.type('@');
+    if (await opt.waitFor({ timeout: 1500 }).then(() => true, () => false)) return;
+  }
+  throw new Error('the @-mention list never opened: the room has no agent that accepts tasks');
+}
 const nodeSelected = async (page, node = 'attempt:a1') => {
   await openSub(page, 'lineage');
   await page.locator('svg.lin-svg g[data-node]').first().waitFor();
@@ -82,7 +92,7 @@ export const STATES = [
   { id: 'chat: expanded message editor (a modal dialog)', scope: '#hcn-p-chat', must: ['form.conversation-composer--expanded[role="dialog"][aria-modal="true"]'], min: 16, minText: 27,
     open: async (page) => { await openSub(page, 'chat'); await page.locator('[data-expand]').click(); await page.locator('form.conversation-composer--expanded').waitFor(); await page.waitForTimeout(200); } },
   { id: 'chat: the @-mention list open (a listbox of agents)', scope: '#hcn-p-chat', must: ['ul[role="listbox"]:not([hidden]) [role="option"]', 'textarea[role="combobox"][aria-expanded="true"]'], min: 17, minText: 28,
-    open: async (page) => { await openSub(page, 'chat'); await page.locator('textarea.conversation-input').focus(); await page.keyboard.type('@'); await page.locator('ul[role="listbox"]:not([hidden]) [role="option"]').first().waitFor(); } },
+    open: async (page) => { await openSub(page, 'chat'); await openMention(page); } },
   { id: 'chat: composer with a menu of agents', scope: '#hcn-p-chat', must: ['#hcn-log'], min: 16, minText: 27, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); } },
 ];
 
