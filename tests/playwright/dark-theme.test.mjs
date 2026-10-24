@@ -122,8 +122,8 @@ function audit({min}){
 
 const settle=async(page,state,hash='')=>{
  if(state==='loading'){await until(()=>page.evaluate(()=>!!document.querySelector('#view [data-skeleton]')),`skeleton on ${hash}`,8000);return;}
- // Loaded: the skeleton gave way, or (a page whose sources all failed) its chip turned red.
- await until(()=>page.evaluate(()=>document.getElementById('view').children.length>0&&(!document.querySelector('#view [data-skeleton]')||document.querySelector('#view herdr-freshness')?.dataset.state==='error')),`${hash} loaded`,8000);
+ // Loaded: the skeleton gave way. A skeleton left beside a red chip is not a loaded page.
+ await until(()=>page.evaluate(()=>document.getElementById('view').children.length>0&&!document.querySelector('#view [data-skeleton]')),`${hash} loaded`,8000);
  await page.clock.runFor(1000);await sleep(150);
 };
 

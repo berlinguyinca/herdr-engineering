@@ -62,3 +62,17 @@ test('a live refresh never shows a skeleton again',async()=>withPage(async(page,
  await page.clock.runFor(6000);await sleep(200);
  assert.equal(await page.evaluate(()=>window.__sk),0);
 }));
+
+// A skeleton means "loading". Once the first load has failed (the chip is red), no skeleton may stay
+// beside the error: the region shows its error text instead.
+test('a failed first load leaves no skeleton on any route',async()=>{
+ const stuck=[];
+ for(const hash of ROUTES)await withPage(async(page,base)=>{
+  await boot(page,base,hash,()=>({__status:500,json:{error:'backend down'}}));
+  await until(()=>page.evaluate(()=>document.querySelector('#view herdr-freshness')?.dataset.state==='error'),`${hash}: red chip`,8000);
+  await page.clock.runFor(1000);await sleep(300);
+  const left=await page.evaluate(()=>[...document.querySelectorAll('#view [data-skeleton]')].map(e=>e.getAttribute('aria-label')));
+  if(left.length)stuck.push(`${hash}: ${left.join(', ')}`);
+ });
+ assert.deepEqual(stuck,[]);
+});

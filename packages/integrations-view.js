@@ -64,8 +64,9 @@ const external = (url,label) => {
   const safe=safeServiceUrl(url);
   return safe ? `<a href="${esc(safe)}" target="_blank" rel="noopener noreferrer">${esc(label)} ↗</a>` : '';
 };
-export function integrationHealth(data,kind='ci') {
-  if (!data) return skeleton(kind==='ci'?'CI runs':'reviews',{rows:1,height:20});
+// failed: the first load failed (its message shows in [data-ig-error]), so no skeleton is left behind.
+export function integrationHealth(data,kind='ci',{failed=false}={}) {
+  if (!data) return failed ? '' : skeleton(kind==='ci'?'CI runs':'reviews',{rows:1,height:20});
   const labels={not_configured:'Woodpecker is not configured. Add a CI token to the server configuration.',auth_error:'Woodpecker authentication failed. The server credential needs attention.',unavailable:'Woodpecker could not be reached.',partial:'Some CI repositories could not refresh.',syncing:'Discovering CI repositories and runs…'};
   const error=kind==='ci' ? labels[data.status] || (data.available===false ? 'CI data is unavailable.' : '') : data.error;
   const progress=data.progress;
@@ -238,13 +239,13 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   function draw() {
     if(disposed)return;
     el('[data-ig-error]').textContent=error;
-    const health=integrationHealth(data,kind);
+    const health=integrationHealth(data,kind,{failed:!!error});
     const healthElement=el('[data-ig-health]');
-    const healthKey=JSON.stringify([data?.status,data?.refreshing,data?.progress,data?.last_success_at,data?.checked_at,data?.error,data?.stale,data?.repo_errors,data?.project_mapping_error]);
+    const healthKey=JSON.stringify([!data&&!!error,data?.status,data?.refreshing,data?.progress,data?.last_success_at,data?.checked_at,data?.error,data?.stale,data?.repo_errors,data?.project_mapping_error]);
     if(healthElement.dataset.signature!==healthKey){healthElement.dataset.signature=healthKey;const issuesOpen=healthElement.querySelector('details')?.open;healthElement.innerHTML=health;if(issuesOpen && healthElement.querySelector('details'))healthElement.querySelector('details').open=true;}
     const all=entries(),filtered=selectIntegrations(all,state),pageSize=20;
     state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
-    const nextSignature=JSON.stringify([state,data,reportData,performanceData,performanceError,performanceDays,[...reviewCache]]);
+    const nextSignature=JSON.stringify([state,!!error,data,reportData,performanceData,performanceError,performanceDays,[...reviewCache]]);
     if(isCi) {
       const observations=ciObservations();
       const model=ciInsightsModel(observations,state);
@@ -303,7 +304,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
         if(!groups.has(group))groups.set(group,[]);groups.get(group).push(entry);
       }
       const result=el('#ig-results');result.setAttribute('aria-labelledby',`ig-tab-${state.tab}`);
-      replace(result,[...groups].map(([name,rows])=>`<div class="ig-group"><h2>${esc(name)}</h2>${rows.map(e=>integrationRow(e,kind)).join('')}</div>`).join('') || `<div class="ig-group ig-empty">${!data ? skeleton(isCi?'runs':'reviews',{rows:isCi?4:2}) : isCi && data.available===false && !all.length ? 'No CI reports available. Connection details are shown above.' : `No ${state.tab==='current'?'current ':''}${isCi?'runs':'reviews'} match this view.`}</div>`);
+      replace(result,[...groups].map(([name,rows])=>`<div class="ig-group"><h2>${esc(name)}</h2>${rows.map(e=>integrationRow(e,kind)).join('')}</div>`).join('') || `<div class="ig-group ig-empty">${!data ? (error ? `No ${isCi?'runs':'reviews'} could be loaded yet; retrying automatically.` : skeleton(isCi?'runs':'reviews',{rows:isCi?4:2})) : isCi && data.available===false && !all.length ? 'No CI reports available. Connection details are shown above.' : `No ${state.tab==='current'?'current ':''}${isCi?'runs':'reviews'} match this view.`}</div>`);
       animateChanges(container,'[data-tab] strong',tabCounts);
       animateChanges(result,'[data-entry] .ig-state strong',rowStates,entryKey,{count:false,target:node=>node.closest('[data-entry]')});
       el('[data-ig-count]').textContent=data ? `${filtered.length} matching ${isCi?'runs':'reviews'}${isCi?reportData?' in retained observations':' in the recent pipeline window':data.has_more?` · Showing the latest ${records(data.reviews).length}${Number.isFinite(data.total)?` of ${data.total}`:''} reviews; older records are outside this window`:''}` : '';
