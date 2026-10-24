@@ -47,6 +47,7 @@ export function tween(el,from,to,{format=v=>String(Math.round(v)),duration=300,w
 // Changed-value motion for views whose update path rewrites text (morph or innerHTML).
 // snapshotText() before the write, animateChanges() after it: a value that differs flashes, and a
 // single number with the same prefix/suffix (e.g. "10%" -> "20%") counts up from the old value.
+// With count (the default) a value replacing a placeholder without digits is first data: no motion.
 // keyOf pairs old and new nodes; the default (node identity) suits morph, a stable attribute
 // (an href, a data-key) suits innerHTML swaps. Under calm, the new text simply stays.
 const NUM=/^(\D*?)(-?\d+(?:\.\d+)?)(\D*)$/;
@@ -67,6 +68,7 @@ export function animateChanges(root,selector,before,keyOf=identity,{target=ident
   if(k==null||!before.has(k))continue;
   const old=before.get(k),now=el.textContent;
   if(old===now)continue;
+  if(count&&!/\d/.test(old))continue;// a placeholder ("…", "—") becoming a number is first data, not a change
   changed.push(el);
   if(isCalm())continue;
   const a=count&&old.trim().match(NUM),b=now.trim().match(NUM);

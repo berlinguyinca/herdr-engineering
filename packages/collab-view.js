@@ -1,6 +1,7 @@
 // Collaboration rooms: sign in with the BinView user pool, create rooms, chat, and invite
 // people by email. Remote messages use the shared safe Markdown renderer.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { enter, isCalm } from './motion.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
 import { renderLinks } from './collab-links.js';
@@ -697,9 +698,18 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (!shown.length) return;
       $('hcn-empty')?.remove();
       const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 60;
+      // The first batch is history and appears at once; later rows arrived live and slide in. A task
+      // status change reuses the flow graph's one-shot cx-flow-pulse glow. Calm mode: neither.
+      const live = !!log.querySelector('.cx-m, .cx-taskcard, .cx-event');
       const frag = document.createDocumentFragment();
-      for (const e of shown) frag.appendChild(eventRow(e));
+      const rows = shown.map((e) => {
+        const row = eventRow(e);
+        if (live && e.event_type === 'task_updated' && !isCalm()) row.classList.add('cx-flow-pulse');
+        frag.appendChild(row);
+        return row;
+      });
       log.appendChild(frag);
+      if (live) rows.forEach(enter);
       if (stick) log.scrollTop = log.scrollHeight; else $('hcn-jump').hidden = false;
     };
     log.addEventListener('scroll', () => { if (log.scrollTop + log.clientHeight >= log.scrollHeight - 60) $('hcn-jump').hidden = true; });

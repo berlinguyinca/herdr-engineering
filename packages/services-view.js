@@ -2,6 +2,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { reportFreshness } from './record-state.js';
 import { formatTimestamp, formatDuration } from './herdr-web-components/format.js';
+import { snapshotText, animateChanges } from './motion.js';
 
 const metadataObservation = service => service.catalog?.metadata_observation ?? service.metadata_observation;
 const localOnly = service => service.endpoint_scope === 'local_only' || service.catalog?.endpoint_scope === 'local_only';
@@ -148,7 +149,7 @@ export function renderServiceDetails(s) {
   ];
   return `${styles}<a data-service-back href="${SCOPE_PAGE[{herdr:'herdr',system:'system'}[serviceScope(s)] || 'local'].path}">← ${SCOPE_PAGE[{herdr:'herdr',system:'system'}[serviceScope(s)] || 'local'].title}</a><h1>${esc(s.service_name || s.service_id)}</h1>
     <p class="sc-intro">${esc(s.description || s.catalog?.purpose || 'Description not reported.')}</p>
-    <p><strong>${stateLabel(s)}</strong> · ${esc(serviceReason(s))} Last report <span data-service-age>${esc(lastSeen(s))}</span>.</p>
+    <p><strong data-service-state>${stateLabel(s)}</strong> · ${esc(serviceReason(s))} Last report <span data-service-age>${esc(lastSeen(s))}</span>.</p>
     ${s.lifecycle?.archived ? '<p class="sc-intro">Archived services are hidden from the current catalog. A healthy report restores this service automatically; its history is retained.</p>' : ''}
     <dl class="sc-detail">${fields.map(([k,v])=>`<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>
     <p>${endpoint(s)}</p>${reportedText(s.session_id) ? `<p><a data-owning-session href="#/herd/session/${esc(encodeURIComponent(s.session_id))}">Owning agent →</a></p>` : ''}`;
@@ -166,7 +167,9 @@ export function mountServiceDetails(root, client, initial) {
       const href=root.contains(focused) ? focused.getAttribute('href') : null;
       const restore=root.contains(focused);
       const scroll={x:window.scrollX,y:window.scrollY};
+      const before=snapshotText(root,'[data-service-state]',()=> 'state');
       root.innerHTML=renderServiceDetails(service)+'<p class="sc-meta" data-service-refresh role="status"></p>';
+      animateChanges(root,'[data-service-state]',before,()=> 'state',{count:false});
       if(restore) {
         const target=[...root.querySelectorAll('a')].find(anchor=>href && anchor.getAttribute('href')===href) || root.querySelector('[data-service-back]');
         target?.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);
@@ -219,6 +222,8 @@ export function mountServices(root, client, initial, {showAll = false, status, s
     <p id="sc-error" role="status" class="sc-meta"></p><div id="sc-results"></div>`;
   const el = id => root.querySelector(`#sc-${id}`);
   el('status').value = state.status; el('archived').checked = state.archived; el('group').value = state.group;
+  const filterKey=node=>node.closest('[data-filter]')?.dataset.filter;
+  const serviceKey=node=>node.closest('[data-service-id]')?.dataset.serviceId;
   function draw() {
     const focused=document.activeElement;
     const focusedRow=root.contains(focused) ? focused.closest('[data-service-id]') : null;
@@ -236,6 +241,10 @@ export function mountServices(root, client, initial, {showAll = false, status, s
     const counts = {current:0,unavailable:0,archived:0,unknown:0};
     scoped.forEach(s=>counts[serviceState(s)]++);
     const countButton = (key,label) => `<button type="button" data-filter="${key}" aria-pressed="${state.status===key}"><strong>${counts[key]}</strong>${label}</button>`;
+    // The panels are rebuilt with innerHTML (Task 19 moves them onto the patcher), so motion pairs
+    // old and new nodes by key: counts by filter, rows by service id (state label change = flash).
+    const countsBefore=snapshotText(root,'[data-filter] strong',filterKey);
+    const statesBefore=snapshotText(el('results'),'[data-service-id] .sc-health strong',serviceKey);
     el('counts').innerHTML = countButton('current','Reported healthy');
     el('history-counts').innerHTML = [['unavailable','Unavailable'],['unknown','Unconfirmed'],['archived','Archived']].map(([key,label])=>countButton(key,label)).join('');
     el('history-summary').textContent = `${scoped.length-counts.current} history and unconfirmed reports`;
@@ -253,6 +262,8 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       const summary=[...new Set(g.services.map(stateLabel))].map(label=>`${g.services.filter(s=>stateLabel(s)===label).length} ${label.toLowerCase()}`).join(' · ');
       return `<details class="sc-group" data-group="${esc(key)}" ${open?'open':''}><summary>${esc(g.label)}<span>${g.services.length} services · ${esc(summary)}</span></summary>${g.services.map(serviceRow).join('')}</details>`;
     }).join(''):`<herdr-empty message="${!scoped.length ? state.scope==='herdr' ? 'No services have a confirmed HerdR launch association yet. Discovered listeners are under Local services.' : state.scope==='system' ? 'No services have been confirmed as system units.' : 'No local services have been reported.' : 'No services match these filters. Choose a status count above, select All statuses, or clear your search to explore the catalog.'}"></herdr-empty>`;
+    animateChanges(root,'[data-filter] strong',countsBefore,filterKey);
+    animateChanges(el('results'),'[data-service-id] .sc-health strong',statesBefore,serviceKey,{count:false,target:node=>node.closest('[data-service-id]')});
     root.querySelectorAll('.sc-group').forEach(d=>d.addEventListener('toggle',()=>{if(d.isConnected)openGroups.set(d.dataset.group,d.open);}));
     if(focusKey && !focused.isConnected) {
       let target;
