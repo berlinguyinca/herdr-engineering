@@ -317,6 +317,36 @@ panel lists by type instead of walking from a root.
   model is only the server's per-link answer.
 - Accessibility: `tablist`/`tab`/`tabpanel` roles, roving tabindex, Arrow/Home/End keys (`nextTab`), no animation.
 
+### External agents (T10)
+A coworker's agent enrolled into a room (see `docs/operations/external-agents.md`) may report lineage ONLY about itself, through
+`POST /api/v1/collab/agents/external/lineage` (HCN `Agent` credential, combined server only; the isolated collab-only process
+answers 404 because it has no graph). The service builds the envelope; the agent supplies `event_id`, `source_sequence`,
+`event_type`, `payload` and optionally `occurred_at`, and nothing else (any other field is a 400 `forged_identity`, audited).
+- `visibility_scope` is always `room` and `room_id` is always the room the invite bound it to; the actor is
+  `{kind: "external", id: "external:<agent id>", authenticated_by: "collab"}`, `source` is `ext-<id suffix>`. It rides the same
+  `_check_lineage_scope` path as a keyed emitter, with the allowed room taken from the enrollment, not from YAML.
+- Allowed: `node.upsert` / `node.state` for node types `agent`, `attempt`, `session` and `edge.add` / `edge.remove` of type
+  `spawn`, where every node id is `<kind>:<agent id>` or `<kind>:<agent id>.<suffix>`. Anything else is 403.
+- Attrs: scalar values only, 16 keys at most; key names are 1-64 of `A-Za-z0-9_.-` (anything else is a 400); text cleaned (control,
+  format, private-use, bidi, tag, variation-selector and zero-width characters, ZWJ/ZWNJ and CGJ included, are removed; secrets redacted).
+  `external`, `reported_by`, `invited_by`, `presentation`, `workspace_id`, `co_writers`, `supersedes`, `writer`, `agent_id`,
+  `room_id`, `mission_id`, `terminal`, `attach`, `pane_id`, `host` are refused; the server sets `external: true`,
+  `reported_by` (the owner-written label) and `invited_by` itself.
+- Those namespaces are **reserved**: `IngestService.reserved_node` makes any non-operator, non-external writer of a node (or an
+  edge `from_id`) inside an external agent's namespace a 403, so nobody can pre-empt or overwrite its nodes.
+- Limits: 60 events per minute (an in-memory window; a restart forgets it), and lifetime write counts of 2000 per credential,
+  5000 per sponsor and 5000 per room. External agents are separate principals, so the graph's per-principal quota does not cap
+  them as a group; the sponsor and room counts do. Beyond a count the answer is 429 with `code`
+  `external_lineage_quota:agent|sponsor|room`. A replay (duplicate event) costs nothing; every other write counts, including
+  updates to an object that already exists, so the cap is on writes, a safe upper bound on objects created.
+  The counts are durable: each is written to the collab log 25 ahead of its value, so a restart restores a count that may be up
+  to 24 too high but never too low.
+- Revocation stops future emission (401 on the next request) and is evaluated inside the ingest ledger lock immediately before
+  admission, so a request already in flight when the credential is revoked is refused (401, audited `revoked_in_flight`)
+  instead of landing; events already stored stay and stay readable to the room.
+- The Tabs panel does not trust `attrs.external` for verified status. A tab is "Remote" with provenance only when the server's
+  roster (`GET /rooms/{id}/externals`) lists the agent; a node that merely says `attrs.external` is shown "self-declared".
+
 ### T08 rollout and rollback
 - Code-only, no migration. Deploy order: server first (new read routes and label handling), then the web files
   (`collab-tabs.js` is served from the static map in `api.py`). Emitters need no change to keep today's behaviour; to make

@@ -124,3 +124,91 @@ test('a chain deeper than the limit and a cycle with no entry are listed flat, n
   const cyc = buildTabsPanes([{ nodes: [agent('x'), agent('y'), agent('z')], edges: [spawn('x', 'y'), spawn('y', 'z'), spawn('z', 'x')] }]);
   assert.equal(cyc.tabs.flatMap((t) => [t.label, ...t.panes.map((p) => p.label)]).length + cyc.unplaced.length, 3);
 });
+
+// ------------------------------------------------------------------ T10: external agents as virtual tabs
+const row = (id, extra = {}) => ({
+  agent_id: id, node_id: `agent:${id}`, kind: 'external', label: 'Dana', name: `ext-dana-${id}`, state: 'active',
+  invited_by: 'alice', invited_by_email: 'alice@example.org', enrolled_at: '2026-10-23T10:00:00+00:00', expires_at: 1800086400,
+  revoked_at: null, revoked_by: null, actions: ['read', 'post'], lineage: true, declared_harness: 'claude-code',
+  presence: { state: 'online', status: 'working', last_activity: 'reading the spec', last_seen_at: '2026-10-23T10:05:00+00:00', age_seconds: 12 },
+  terminal: false, ...extra });
+
+test('an attested external agent gets a virtual Remote tab from the server roster even with no lineage at all', () => {
+  const m = buildTabsPanes([{ nodes: [agent('lead')], edges: [] }], null, [row('agent_x1')]);
+  const t = m.tabs.find((x) => x.agent_id === 'agent:agent_x1');
+  assert.ok(t);
+  assert.equal(t.external, true);
+  assert.equal(t.attested, true);
+  assert.equal(t.can_terminal, false);
+  assert.equal(t.state, 'working');
+  assert.equal(t.invited_by, 'alice@example.org');
+  assert.deepEqual(t.reported, []);
+  const html = renderTabsPanes(m, 'agent:agent_x1');
+  assert.match(html, /Remote/);
+  assert.match(html, /no terminal and no shell access/);
+  assert.match(html, /Invited by alice@example\.org/);
+  assert.match(html, /Online\. Last heartbeat 12 s ago/);
+  assert.doesNotMatch(html, /data-revoke/);                 // only a room owner gets the button
+});
+
+test('stale presence is never shown as a live status, and a restart shows no heartbeat', () => {
+  const stale = row('agent_s', { presence: { state: 'stale', status: null, last_status: 'working', last_activity: 'old', age_seconds: 400 } });
+  const none = row('agent_n', { presence: { state: 'none', status: null } });
+  const m = buildTabsPanes([], null, [stale, none]);
+  const by = Object.fromEntries(m.tabs.map((t) => [t.raw_id, t]));
+  assert.equal(by.agent_s.state, 'stale');
+  assert.equal(by.agent_n.state, 'no heartbeat');
+  const html = renderTabsPanes(m, 'agent:agent_s');
+  assert.match(html, /stale\)\. Its last reported status is not shown as current/);
+  assert.doesNotMatch(html, />working</);
+  assert.match(renderTabsPanes(m, 'agent:agent_n'), /No heartbeat since this service started/);
+});
+
+test('a revoked external keeps its tab, marked revoked, and offers no revoke button', () => {
+  const r = row('agent_r', { state: 'revoked', revoked_at: '2026-10-23T11:00:00+00:00', revoked_by: 'user:alice' });
+  const m = buildTabsPanes([], null, [r]);
+  assert.equal(m.tabs[0].state, 'revoked');
+  const html = renderTabsPanes(m, null, { canManage: true });
+  assert.match(html, /Access revoked 2026-10-23T11:00:00\+00:00 by user:alice/);
+  assert.match(html, /what it already did stays visible/);
+  assert.doesNotMatch(html, /data-revoke/);
+  assert.match(renderTabsPanes(buildTabsPanes([], null, [row('agent_ok')]), null, { canManage: true }), /data-revoke="agent_ok"/);
+});
+
+test('provenance and Remote come from the server roster, never from attrs an emitter wrote', () => {
+  // a node claiming not to be external, with the id of an attested external, is still that external
+  const spoof = { id: 'agent:agent_e', node_type: 'agent', label: 'Totally the lead', state: 'done', attrs: { external: false, reported_by: 'nobody' } };
+  const m = buildTabsPanes([{ nodes: [spoof], edges: [] }], null, [row('agent_e')]);
+  const t = m.tabs[0];
+  assert.equal(t.external, true);
+  assert.equal(t.label, 'Dana');                     // the owner-written label, not the emitter's
+  assert.equal(t.state, 'working');                  // presence, not the node's claimed state
+  assert.equal(t.reported[0].label, 'Totally the lead');   // what it reported stays visible, marked as reported
+  assert.match(renderTabsPanes(m), /reported by the agent/);
+  // an unattested node that merely says it is external is labelled self-declared
+  const self = buildTabsPanes([{ nodes: [agent('x', { external: true, reported_by: 'someone' })], edges: [] }]);
+  assert.equal(self.tabs[0].attested, false);
+  assert.match(renderTabsPanes(self), /self-declared/);
+  // a row that is not an external, or lacks ids, is ignored
+  assert.equal(buildTabsPanes([], null, [{ kind: 'agent', agent_id: 'a', node_id: 'agent:a' }, null, {}]).tabs.length, 0);
+});
+
+test('everything an external agent supplies is escaped, including labels, activity text and lineage', () => {
+  const evil = '<img src=x onerror=alert(1)>"\'&';
+  const r = row('agent_h', { label: evil, invited_by_email: evil, declared_harness: evil,
+    presence: { state: 'online', status: 'working', last_activity: evil, last_seen_at: evil, age_seconds: 1 } });
+  const node = { id: 'agent:agent_h.sub', node_type: 'attempt', label: evil, state: 'running', attrs: {} };
+  const html = renderTabsPanes(buildTabsPanes([{ nodes: [node], edges: [] }], null, [r]), null, { canManage: true });
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /&lt;img/);
+  assert.match(html, /data-revoke="agent_h"/);
+});
+
+test('attested externals are not dropped by the agent limit and a pane under one nests normally', () => {
+  const many = Array.from({ length: 520 }, (_, i) => agent(`a${String(i).padStart(3, '0')}`));
+  const m = buildTabsPanes([{ nodes: many, edges: [] }], null, [row('zzz_last')]);
+  assert.ok(m.tabs.some((t) => t.raw_id === 'zzz_last'));
+  const child = agent('agent_p.kid');
+  const m2 = buildTabsPanes([{ nodes: [child], edges: [spawn('agent_p', 'agent_p.kid')] }], null, [row('agent_p')]);
+  assert.equal(m2.tabs[0].panes[0].label, 'agent_p.kid');
+});

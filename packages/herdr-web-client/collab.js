@@ -124,6 +124,11 @@ export class CollabApi {
     const q = new URLSearchParams({ node_type: nodeType, room_id: room, limit: '500', ...(edgeType ? { edge_type: edgeType } : {}) });
     return this.call('GET', `/graph/nodes?${q}`);
   }
+  // External coworker / remote agents (T10). The invite code is returned once by inviteExternal.
+  externals(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/externals`); }
+  inviteExternal(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/invites`, body); }
+  revokeExternal(room, agentId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/${encodeURIComponent(agentId)}/revoke`, {}); }
+  revokeExternalInvite(room, inviteId) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/externals/invites/${encodeURIComponent(inviteId)}/revoke`, {}); }
   // Read-only lineage views of ONE room (T09). `step` replays the reader's own visible ledger up to that event;
   // omitted = now. The server filters by the caller's CURRENT membership.
   lineage(room, o = {}) {

@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from . import collab_external as ext
 from . import collab_models, ids
 from .redact import redact_text
 
@@ -147,11 +148,12 @@ _HELPER_BAD = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")   # all c
 
 
 class CollabError(Exception):
-    def __init__(self, status: int, message: str, reason: str | None = None):
+    def __init__(self, status: int, message: str, reason: str | None = None, code: str | None = None):
         super().__init__(message)
         self.status = status
         self.message = message
         self.reason = reason          # a stable machine-readable code, for callers that branch on it
+        self.code = code              # a stable machine-readable reason for refusals a client can act on (external agents)
 
 
 # control_plane.collab.summary_fix: the operator's standing room and requester agent that start a
@@ -217,7 +219,7 @@ class StaticTokenAuthenticator:
 
 
 class Principal:
-    __slots__ = ("kind", "id", "owner", "digest", "exp", "status", "approver", "admin")
+    __slots__ = ("kind", "id", "owner", "digest", "exp", "status", "approver", "admin", "external")
 
     def __init__(self, kind: str, id: str, owner: str, digest: str | None = None,
                  exp: float | None = None):
@@ -225,6 +227,7 @@ class Principal:
         self.status = "approved"       # approval mode sets this for people; agents are judged by their owner
         self.approver = False          # may approve or deny people waiting
         self.admin = False             # the operator on the tailnet-only listener: may also disable and remove
+        self.external = False          # an agent a coworker enrolled by invite (T10): bound to one room, never a person
 
     @property
     def key(self) -> str:
@@ -313,6 +316,9 @@ class CollabService:
         # The fabric lineage graph, attached by the combined (non collab-only) server. The graph never
         # calls back into this service: membership is handed to it as a per-request snapshot.
         self.graph_source = None      # callable returning the CURRENT projection (a rebuild replaces it)
+        # Writes an external agent's lineage through the ingest path (combined server only; None = refused).
+        # Called with (envelope, principal); the envelope is built here, never taken from the request.
+        self.lineage_sink = None
         self._users: dict[str, dict] = {}       # approval mode: user id -> {status, since, decided_by, decided_at, reason}
         self._sink = sink
         self._now = now or time.time
@@ -382,6 +388,14 @@ class CollabService:
         self._state_waiters: dict[str, int] = defaultdict(int)
         self._joins: dict[str, dict] = {}                    # token digest -> record
         self._joins_by_id: dict[str, str] = {}               # join id -> digest
+        self._externals_by_room: dict[str, list] = defaultdict(list)   # room id -> external agent ids (T10)
+        self._presence: dict[str, dict] = {}                 # external agent id -> last heartbeat; memory only, by design
+        # Lineage write counters per ("agent"|"sponsor"|"room", id). Each is made durable AHEAD of its value
+        # (reserve-ahead rows in the log), so after a restart a count can be too high by up to
+        # USAGE_RESERVE_STEP-1 but never too low.
+        self._usage: dict[tuple, int] = defaultdict(int)
+        self._usage_reserved: dict[tuple, int] = defaultdict(int)
+        self.redeem_failures: dict[str, int] = {}      # failed invite redemptions per client address (bounded)
         self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
         self._msg_room: dict[str, str] = {}                  # message event id -> room id
         self.stats = defaultdict(int)
@@ -478,6 +492,8 @@ class CollabService:
                 self._seq = ev["sequence"]
                 self._log.append(ev)
                 self._apply(ev)
+            for k, v in self._usage_reserved.items():
+                self._usage[k] = max(self._usage[k], v)      # restart: the durable ceiling, never lower than used
             # helper_task is always committed right before its helper_requested (two commits under one lock):
             # a text still waiting here belongs to a request whose second commit failed. Drop it.
             self._helper_text.clear()
@@ -498,7 +514,10 @@ class CollabService:
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
-        if t == "project_created":
+        if t == "external_usage_reserved":
+            k = (p["scope"], p["key"])
+            self._usage_reserved[k] = max(self._usage_reserved[k], int(p["reserved"]))
+        elif t == "project_created":
             self._projects[p["project_id"]] = {"name": p["name"], "members": {p["actor_user_id"]: "manager"}}
         elif t == "project_member_added":
             self._projects[p["project_id"]]["members"][p["subject_user_id"]] = p["role"]
@@ -548,9 +567,13 @@ class CollabService:
                 "instance_id": p.get("instance_id"), "status": "active",
                 "name": p.get("name") or _default_handle(p["harness_type"], p["agent_id"]),
                 "parent": p.get("parent_agent_id"), "join": p.get("join_digest"),
-                "cred_digest": p["secret_digest"], "expires_at": p["expires_at_epoch"]}
+                "cred_digest": p["secret_digest"], "expires_at": p["expires_at_epoch"],
+                "external": ({**p["external"], "enrolled_at": p["created_at"], "revoked_at": None}
+                             if isinstance(p.get("external"), dict) else None)}
             self._by_cred[p["secret_digest"]] = p["agent_id"]
             self._agents_by_owner[p["owner_user_id"]].add(p["agent_id"])
+            if isinstance(p.get("external"), dict):
+                self._externals_by_room[p["external"]["room_id"]].append(p["agent_id"])
             if p.get("action") == "helper.agent.create":
                 self._helper_minted.add(p["agent_id"])
             if p.get("join_digest") in self._joins:
@@ -561,7 +584,8 @@ class CollabService:
                 "prefix": p["name_prefix"], "max_uses": p["max_uses"], "uses": 0,
                 "expires_at": p["expires_at_epoch"], "room_id": p.get("room_id"),
                 "actions": list(p.get("actions") or []), "revoked": False, "created_at": p["created_at"],
-                "parent": p.get("parent_agent_id")}
+                "parent": p.get("parent_agent_id"),
+                "external": dict(p["external"]) if isinstance(p.get("external"), dict) else None}
             self._joins_by_id[p["join_id"]] = p["join_digest"]
         elif t == "join_token_revoked":
             if p["join_id"] in self._joins_by_id:
@@ -577,6 +601,10 @@ class CollabService:
             self._by_cred[p["secret_digest"]] = p["agent_id"]
         elif t == "agent_revoked":
             self._agents[p["agent_id"]]["status"] = "revoked"
+            if self._agents[p["agent_id"]].get("external"):
+                self._agents[p["agent_id"]]["external"]["revoked_at"] = p["created_at"]
+                self._agents[p["agent_id"]]["external"]["revoked_by"] = (
+                    "agent:" + p["actor_agent_id"] if p.get("actor_agent_id") else "user:" + str(p.get("actor_user_id")))
             self._prune_terminal(None, lambda k: k == "agent:" + p["agent_id"])
             for rid in self._requests_by_agent.get(p["agent_id"], ()):
                 self._requests[rid]["open"] = False
@@ -829,7 +857,9 @@ class CollabService:
                     self._audit_denied(Principal("agent", aid, agent["owner"]), "auth.agent", reason,
                                        resource_id=aid, agent_id=aid)
                     raise CollabError(401, "unauthorized")
-                return Principal("agent", aid, agent["owner"], digest)
+                pr = Principal("agent", aid, agent["owner"], digest)
+                pr.external = bool(agent.get("external"))
+                return pr
         self.stats["auth_failures"] += 1
         raise CollabError(401, "unauthorized")
 
@@ -925,6 +955,13 @@ class CollabService:
         if not m or not self._ok(agent["owner"]):
             return None  # owner lost membership: the agent loses it too
         allowed = frozenset(grant["actions"]) & ROLE_ACTIONS[m["role"]] & AGENT_ACTIONS
+        bound = agent.get("external")
+        if bound:
+            # An external agent is bound to the room it was invited into: a later grant anywhere else
+            # (by anyone) is inert, and it never holds more than EXTERNAL_ACTIONS.
+            if bound["room_id"] != room["id"] or self._now() >= bound["hard_expiry"]:
+                return None
+            allowed &= ext.EXTERNAL_ACTIONS
         h = self._helper_by_agent.get(pr.id)
         if h is not None and h["parent_agent_id"]:
             # a helper never holds more than the agent it works under holds right now (recursively)
@@ -976,7 +1013,8 @@ class CollabService:
 
     @staticmethod
     def _actor(pr: Principal, **extra) -> dict:
-        return {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None, **extra}
+        return {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None,
+                "actor_kind": "external" if pr.external else pr.kind, **extra}
 
     def _require_user(self, pr: Principal) -> None:
         if pr.is_agent:
@@ -984,6 +1022,13 @@ class CollabService:
             raise CollabError(403, "forbidden: agents cannot perform this operation")
 
     # ------------------------------------------------------------ quotas
+    def _no_external(self, pr: Principal) -> None:
+        """An external agent reads the room's chat and nothing else: not the roster (owner ids and
+        emails), the flow view, the task list or the room bundle."""
+        if pr.external:
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "forbidden")
+
     def _room_has_space(self, room: dict) -> None:
         if len(room["members"]) >= self.max_members_per_room:
             raise CollabError(429, "room member limit reached")
@@ -1455,7 +1500,7 @@ class CollabService:
             return {"tokens": [
                 {"join_id": r["id"], "harness_type": r["family"], "name_prefix": r["prefix"],
                  "uses": r["uses"], "max_uses": r["max_uses"], "expires_at": r["expires_at"],
-                 "room_id": r["room_id"], "actions": r["actions"],
+                 "room_id": r["room_id"], "actions": r["actions"], "external": bool(r.get("external")),
                  "status": "revoked" if r["revoked"] else ("expired" if now >= r["expires_at"] else (
                      "used up" if r["uses"] >= r["max_uses"] else "active"))}
                 for r in self._joins.values() if r["owner"] == pr.id and now - r["expires_at"] < 7 * 86400]}
@@ -1472,10 +1517,30 @@ class CollabService:
                     project_ids=[], resource_id=join_id))
         return {"ok": True}
 
-    def redeem_join_token(self, body: dict) -> dict:
+    @staticmethod
+    def _client_label(client: object) -> str:
+        """The address the HTTP layer resolved (its existing proxy convention), or "unknown". Only a
+        parseable IP is kept, so the counter and audit rows cannot be filled with free text."""
+        try:
+            return str(ipaddress.ip_address(str(client).strip())) if client else "unknown"
+        except ValueError:
+            return "unknown"
+
+    def _redeem_failed(self, client: object) -> None:
+        """Count a failed invite redemption per client address. Aggregate only (never one log row per
+        attempt, so unauthenticated traffic cannot grow the log); bounded at 256 addresses."""
+        self.stats["auth_failures"] += 1
+        who = self._client_label(client)
+        if who not in self.redeem_failures and len(self.redeem_failures) >= 256:
+            who = "other"
+        self.redeem_failures[who] = self.redeem_failures.get(who, 0) + 1
+
+    def redeem_join_token(self, body: dict, client: str | None = None) -> dict:
         """Public, token-authenticated: one use = one new agent for the token's owner."""
         token = body.get("token")
         if not isinstance(token, str) or not token.startswith("hcj_") or len(token) > 80:
+            with self._lock:
+                self._redeem_failed(client)
             raise CollabError(401, "unauthorized")
         digest = _digest(token)
         instance = body.get("instance_id")
@@ -1483,9 +1548,11 @@ class CollabService:
             rec = self._joins.get(digest)
             if (rec is None or rec["revoked"] or self._now() >= rec["expires_at"]
                     or rec["uses"] >= rec["max_uses"] or not self._ok(rec["owner"])):
-                self.stats["auth_failures"] += 1
+                self._redeem_failed(client)
                 raise CollabError(401, "unauthorized")
             self._throttle("join:" + digest, 120, 60.0, "join")
+            if rec.get("external"):
+                return self._redeem_external(rec, digest, body, client)
             owner = rec["owner"]
             self._agent_slots(owner)
             name = self._agent_names(owner, rec["prefix"], 1)[0]
@@ -1522,7 +1589,8 @@ class CollabService:
         with self._lock:
             rec, agent = self._joins.get(digest), self._agents.get(aid)
             if (rec is None or rec["revoked"] or self._now() >= rec["expires_at"] or not agent
-                    or agent.get("join") != digest or agent["status"] != "active"):
+                    or agent.get("join") != digest or agent["status"] != "active"
+                    or rec.get("external") or agent.get("external")):     # an external agent has no pane
                 self.stats["auth_failures"] += 1
                 raise CollabError(401, "unauthorized")
             self._throttle("joinlink:" + digest, 120, 60.0, "join link")
@@ -1530,6 +1598,413 @@ class CollabService:
                                           "instance_id": inst, "action": "agent.link", "outcome": "allowed",
                                           "project_ids": [], "resource_id": aid})
         return {"agent_id": aid, "instance_id": inst}
+
+    # ------------------------------------------------- external coworker / remote agents (T10)
+    # An external agent is an HCN agent record with an `external` block: bound to ONE room at invite
+    # time, sponsored (and accountable) by the room owner who invited it, limited to EXTERNAL_ACTIONS,
+    # with a hard credential expiry rotation cannot extend. It never gets a terminal, a task right or a
+    # pane link; its room_id is never taken from a request.
+    def _require_external(self, pr: Principal) -> dict:
+        agent = self._agents.get(pr.id) if pr.is_agent else None
+        if not agent or not agent.get("external"):
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "forbidden")
+        return agent
+
+    def _external_load(self, room_id: str) -> int:
+        """Live external agents plus open invites in one room (what the per-room cap counts)."""
+        now = self._now()
+        live = sum(1 for aid in self._externals_by_room.get(room_id, ())
+                   if (a := self._agents[aid])["status"] == "active" and now < a["external"]["hard_expiry"]
+                   and aid in self._rooms[room_id]["grants"])
+        invites = sum(1 for r in self._joins.values()
+                      if r.get("external") and r["external"]["room_id"] == room_id and not r["revoked"]
+                      and now < r["expires_at"] and r["uses"] < r["max_uses"])
+        return live + invites
+
+    def create_external_invite(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """The room owner invites a coworker's agent. The reply carries the one-time invite code (shown
+        once, stored only as a digest); the coworker's bridge redeems it at ``/agents/join``."""
+        self._require_user(pr)
+        unknown = set(body) - {"label", "actions", "lineage", "ttl_seconds", "credential_ttl_seconds"}
+        if unknown:
+            raise CollabError(400, "unknown field")
+        label = ext.clean_text(body.get("label"), ext.MAX_LABEL)
+        if not label:
+            raise CollabError(400, f"label is required (1-{ext.MAX_LABEL} printable characters)")
+        actions = body.get("actions", list(ext.DEFAULT_EXTERNAL_ACTIONS))
+        if (not isinstance(actions, list) or not actions
+                or not all(isinstance(a, str) and a in ext.EXTERNAL_ACTIONS for a in actions)):
+            raise CollabError(400, "actions must be a non-empty subset of read, post")
+        lineage = body.get("lineage", False)
+        if not isinstance(lineage, bool):
+            raise CollabError(400, "lineage must be true or false")
+
+        def span(name, default, lo, hi):
+            v = body.get(name, default)
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not lo <= v <= hi:
+                raise CollabError(400, f"{name} must be {int(lo)}-{int(hi)}")
+            return float(v)
+        ttl = span("ttl_seconds", ext.INVITE_TTL_DEFAULT, ext.INVITE_TTL_MIN, ext.INVITE_TTL_MAX)
+        cred_ttl = span("credential_ttl_seconds", ext.CRED_TTL_DEFAULT, ext.CRED_TTL_MIN, ext.CRED_TTL_MAX)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "external.invite")
+            self._throttle("extinvite:" + pr.id, ext.INVITES_PER_HOUR, 3600.0, "external invite")
+            if self._external_load(room_id) >= ext.MAX_EXTERNALS_PER_ROOM:
+                raise CollabError(429, "this room has as many external agents and open invites as it allows")
+            self._agent_slots(pr.id)
+            token, jid = "hcj_" + secrets.token_urlsafe(24), ids.new_id("collab")
+            expires = self._now() + ttl
+            block = {"room_id": room_id, "project_id": room["project_id"], "sponsor": pr.id, "label": label,
+                     "actions": sorted(set(actions)), "lineage": lineage, "cred_ttl": cred_ttl}
+            self._commit("join_token_created", self._actor(
+                pr, join_id=jid, join_digest=_digest(token), harness_type="external", name_prefix="ext",
+                max_uses=1, expires_at_epoch=expires, room_id=room_id, actions=block["actions"],
+                parent_agent_id=None, external=block, project_id=room["project_id"],
+                action="external.invite", outcome="allowed", project_ids=[room["project_id"]], resource_id=jid))
+        return {"invite_id": jid, "code": token, "expires_at": expires, "room_id": room_id, "label": label,
+                "actions": block["actions"], "lineage": lineage, "credential_ttl_seconds": cred_ttl,
+                "redeem": "POST /api/v1/collab/agents/join"}
+
+    def revoke_external_invite(self, pr: Principal, room_id: str, join_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "external.invite.revoke")
+            digest = self._joins_by_id.get(join_id)
+            rec = self._joins.get(digest) if digest else None
+            if not rec or not rec.get("external") or rec["external"]["room_id"] != room_id:
+                raise CollabError(404, "not found")
+            if not rec["revoked"]:
+                self._commit("join_token_revoked", self._actor(
+                    pr, join_id=join_id, room_id=room_id, project_id=room["project_id"],
+                    action="external.invite.revoke", outcome="allowed",
+                    project_ids=[room["project_id"]], resource_id=join_id))
+        return {"ok": True}
+
+    def _redeem_external(self, rec: dict, digest: str, body: dict, client: str | None = None) -> dict:
+        """Called with the lock held, after the token passed every check. One use = one external agent,
+        bound to the invite's room, granted exactly the invite's actions and no more."""
+        unknown = set(body) - {"token", "harness_type", "instance_id"}
+        if unknown:
+            raise CollabError(400, "unknown field")
+        x, owner = rec["external"], rec["owner"]
+        room = self._rooms.get(x["room_id"])
+        m = self._member(room, owner) if room else None
+        if not m or "invite" not in ROLE_ACTIONS[m["role"]]:
+            self._redeem_failed(client)
+            raise CollabError(401, "unauthorized")          # the sponsor no longer owns the room
+        if self._external_load(x["room_id"]) - 1 >= ext.MAX_EXTERNALS_PER_ROOM:   # this invite is already counted
+            raise CollabError(429, "this room has as many external agents as it allows")
+        self._agent_slots(owner)
+        aid, cred = ids.new_id("agent"), "hca_" + secrets.token_urlsafe(32)
+        device = "remote-" + secrets.token_hex(8)
+        now = self._now()
+        hard = now + x["cred_ttl"]
+        name = f"ext-{ext.slug(x['label'])}-{aid[-4:]}"
+        declared = ext.clean_text(body.get("harness_type"), 40) or "external"
+        block = {**x, "hard_expiry": hard}
+        block.pop("cred_ttl", None)
+        self._commit("agent_enrolled", {
+            "actor_user_id": owner, "actor_agent_id": None, "agent_id": aid, "owner_user_id": owner,
+            "code_digest": None, "join_digest": digest, "device_id": device, "harness_type": declared,
+            "name": name, "parent_agent_id": None, "instance_id": None, "secret_digest": _digest(cred),
+            "expires_at_epoch": hard, "external": block, "room_id": x["room_id"],
+            "actor_kind": "external", "client_ip": self._client_label(client),
+            "action": "external.enroll", "outcome": "allowed",
+            "project_ids": [x["project_id"]], "resource_id": aid})
+        self._commit("agent_granted", {
+            "actor_user_id": owner, "actor_agent_id": None, "project_id": x["project_id"],
+            "room_id": x["room_id"], "agent_id": aid, "actions": list(x["actions"]), "expires_at": hard,
+            "actor_kind": "user", "action": "external.grant", "outcome": "allowed",
+            "project_ids": [x["project_id"]], "resource_id": aid})
+        return {"agent_id": aid, "kind": "external", "name": name, "credential": cred, "device_id": device,
+                "expires_at": hard, "room_id": x["room_id"], "actions": list(x["actions"]),
+                "lineage": x["lineage"], "label": x["label"], "status": "active",
+                "terminal": False}
+
+    def _external_state(self, a: dict, room: dict, aid: str) -> str:
+        x = a["external"]
+        if a["status"] != "active":
+            return "revoked"
+        if self._now() >= x["hard_expiry"] or self._now() >= a["expires_at"]:
+            return "expired"
+        if aid not in room["grants"]:
+            return "removed"
+        return "active"
+
+    def _presence_view(self, aid: str, state: str) -> dict:
+        p = self._presence.get(aid)
+        if p is None:
+            return {"state": "none", "status": None, "note": "no heartbeat since this service started"}
+        age = self._now() - p["at"]
+        base = {"last_seen_at": self._iso(p["at"]), "last_activity": p["activity"], "age_seconds": int(age)}
+        if state == "active" and age < ext.PRESENCE_STALE:
+            return {"state": "online", "status": p["status"], **base}
+        return {"state": "stale" if state == "active" else "offline", "status": None,
+                "last_status": p["status"], **base}
+
+    def list_room_externals(self, pr: Principal, room_id: str) -> dict:
+        """The virtual-tab roster: every external agent ever invited into this room (revoked ones stay
+        listed, marked), with server-derived provenance and presence. People only, never guests/agents."""
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "external.list")
+            self._no_guest(pr, room)
+            owner = "invite" in (self._effective(pr, room) or (frozenset(), 0))[0]
+            rows = []
+            for aid in self._externals_by_room.get(room_id, ()):
+                a = self._agents[aid]
+                x = a["external"]
+                state = self._external_state(a, room, aid)
+                rows.append({
+                    "agent_id": aid, "node_id": "agent:" + aid, "kind": "external", "label": x["label"],
+                    "name": a["name"], "state": state, "invited_by": x["sponsor"],
+                    "invited_by_email": self._user_email.get(x["sponsor"]),
+                    "enrolled_at": x["enrolled_at"], "expires_at": min(a["expires_at"], x["hard_expiry"]),
+                    "revoked_at": x.get("revoked_at"), "revoked_by": x.get("revoked_by"),
+                    "actions": sorted(set(room["grants"].get(aid, {"actions": x["actions"]})["actions"])
+                                      & ext.EXTERNAL_ACTIONS),
+                    "lineage": bool(x["lineage"]), "declared_harness": a["harness_type"],
+                    "presence": self._presence_view(aid, state), "terminal": False})
+            invites = []
+            if owner:
+                now = self._now()
+                for r in self._joins.values():
+                    x = r.get("external")
+                    if (x and x["room_id"] == room_id and not r["revoked"] and now < r["expires_at"]
+                            and r["uses"] < r["max_uses"]):
+                        invites.append({"invite_id": r["id"], "label": x["label"], "actions": x["actions"],
+                                        "lineage": x["lineage"], "invited_by": x["sponsor"],
+                                        "expires_at": r["expires_at"]})
+        return {"room_id": room_id, "externals": rows, "invites": invites if owner else None,
+                "stale_after_seconds": ext.PRESENCE_STALE, "untrusted_text": True}
+
+    def revoke_external(self, pr: Principal, room_id: str, agent_id: str) -> dict:
+        """Any owner of the room (not only the sponsor) cuts an external agent off. The next request with
+        its credential is a 401; what it already posted or emitted stays visible."""
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "external.revoke")
+            a = self._agents.get(agent_id)
+            if not a or not a.get("external") or a["external"]["room_id"] != room_id:
+                raise CollabError(404, "not found")
+            if a["status"] == "active":
+                self._commit("agent_revoked", self._actor(
+                    pr, agent_id=agent_id, room_id=room_id, room_ids=[room_id], project_id=room["project_id"],
+                    action="external.revoke", outcome="allowed",
+                    project_ids=[room["project_id"]], resource_id=agent_id))
+        return {"ok": True, "state": "revoked"}
+
+    def external_me(self, pr: Principal) -> dict:
+        with self._lock:
+            a = self._require_external(pr)
+            x = a["external"]
+            return {"agent_id": pr.id, "kind": "external", "room_id": x["room_id"], "label": x["label"],
+                    "actions": list(x["actions"]), "lineage": bool(x["lineage"]),
+                    "expires_at": min(a["expires_at"], x["hard_expiry"]), "terminal": False,
+                    "heartbeat": {"statuses": list(ext.EXTERNAL_STATUSES), "stale_after_seconds": ext.PRESENCE_STALE}}
+
+    def external_leave(self, pr: Principal) -> dict:
+        """The external agent withdraws itself; the same revocation a room owner would apply."""
+        with self._lock:
+            a = self._require_external(pr)
+            x = a["external"]
+            self._commit("agent_revoked", self._actor(
+                pr, agent_id=pr.id, room_id=x["room_id"], room_ids=[x["room_id"]], project_id=x["project_id"],
+                action="external.leave", outcome="allowed", project_ids=[x["project_id"]], resource_id=pr.id))
+        return {"ok": True}
+
+    def external_heartbeat(self, pr: Principal, body: dict) -> dict:
+        """Presence and a status from a fixed list. Kept in memory (a heartbeat is not a log event); only
+        a CHANGE of status is written down, at most STATUS_CHANGES_PER_10_MIN times per agent."""
+        unknown = set(body) - {"status", "activity"}
+        if unknown:
+            raise CollabError(400, "unknown field")
+        status = body.get("status")
+        if not isinstance(status, str) or status not in ext.EXTERNAL_STATUSES:
+            raise CollabError(400, "status must be one of " + ", ".join(ext.EXTERNAL_STATUSES))
+        activity = body.get("activity")
+        if activity is not None and not isinstance(activity, str):
+            raise CollabError(400, "activity must be a string")
+        text = ext.clean_text(activity, ext.MAX_ACTIVITY) if activity else ""
+        with self._lock:
+            a = self._require_external(pr)
+            x = a["external"]
+            room = self._rooms.get(x["room_id"])
+            if room is None or self._effective(pr, room) is None:
+                self._audit_denied(pr, "external.heartbeat", "not_a_member", room_id=x["room_id"],
+                                   project_ids=[x["project_id"]], agent_id=pr.id)
+                raise CollabError(404, "not found")
+            self._throttle("hb:" + pr.id, ext.HEARTBEATS_PER_MINUTE, 60.0, "heartbeat")
+            prev = self._presence.get(pr.id)
+            self._presence[pr.id] = {"status": status, "activity": text, "at": self._now()}
+            if prev is None or prev["status"] != status:
+                now = self._now()
+                hits = [t for t in self._hits["extstatus:" + pr.id] if now - t < 600.0]
+                if len(hits) < ext.STATUS_CHANGES_PER_10_MIN:
+                    hits.append(now)
+                    self._hits["extstatus:" + pr.id] = hits
+                    self._commit("external_status_changed", self._actor(
+                        pr, agent_id=pr.id, room_id=x["room_id"], project_id=x["project_id"],
+                        status=status, action="external.status", outcome="allowed",
+                        project_ids=[x["project_id"]], resource_id=pr.id))
+        return {"ok": True, "stale_after_seconds": ext.PRESENCE_STALE}
+
+    def is_external_node(self, node_id: str) -> bool:
+        """Is this lineage node id inside an external agent's namespace? The ingest path reserves those
+        ids for the agent itself (an operator key excepted), so nobody can pre-empt or forge its nodes."""
+        aid = ext.namespace_of(node_id)
+        a = self._agents.get(aid) if aid else None
+        return bool(a and a.get("external"))
+
+    def _usage_take(self, items: list[tuple]) -> None:
+        """Count one lineage write against each ``(scope, key, cap)`` or refuse the lot. Called with the
+        lock held. A counter is made durable ahead of its value, so what a restart restores is never lower
+        than what was used. All the log rows are written before any counter moves."""
+        for scope, key, cap in items:
+            if self._usage[(scope, key)] >= cap:
+                self.stats["rate_limited"] += 1
+                raise CollabError(429, f"external lineage quota for this {scope} is used up",
+                                  code="external_lineage_quota:" + scope)
+        for scope, key, _ in items:
+            k = (scope, key)
+            if self._usage[k] + 1 > self._usage_reserved[k]:
+                self._commit("external_usage_reserved", {
+                    "actor_user_id": None, "actor_agent_id": None, "scope": scope, "key": key,
+                    "reserved": self._usage[k] + ext.USAGE_RESERVE_STEP})
+        for scope, key, _ in items:
+            self._usage[(scope, key)] += 1
+
+    def _usage_give_back(self, items: list[tuple]) -> None:
+        with self._lock:
+            for scope, key, _ in items:
+                self._usage[(scope, key)] = max(0, self._usage[(scope, key)] - 1)
+
+    def _credential_live(self, aid: str) -> bool:
+        """Is this external agent's credential still good right now? Read without the service lock: it is
+        evaluated inside the ingest ledger lock, and a lock-free read of a status that only ever moves from
+        active to revoked cannot deadlock against it."""
+        a = self._agents.get(aid)
+        return bool(a and a["status"] == "active" and self._now() < a["external"]["hard_expiry"])
+
+    def _refuse_lineage(self, pr: Principal, room_id: str) -> None:
+        with self._lock:
+            x = (self._agents.get(pr.id) or {}).get("external") or {}
+            self._audit_denied(pr, "external.lineage", "forbidden_node", room_id=room_id,
+                               project_ids=[x["project_id"]] if x else [], agent_id=pr.id)
+
+    def external_lineage(self, pr: Principal, body: dict) -> dict:
+        """Lineage an external agent reports about ITSELF. The server builds the envelope: room scope
+        and room id come from the enrollment, the actor from the credential, the source from the agent
+        id; the agent supplies only the event id, sequence and a payload that is re-validated here."""
+        from .graph import validate_lineage
+        unknown = set(body) - ext.LINEAGE_BODY_FIELDS
+        with self._lock:
+            a = self._require_external(pr)
+            x = a["external"]
+            room = self._rooms.get(x["room_id"])
+            if unknown:
+                self._audit_denied(pr, "external.lineage", "forged_identity", room_id=x["room_id"],
+                                   project_ids=[x["project_id"]], agent_id=pr.id)
+                self.stats["forged_identity"] += 1
+                raise CollabError(400, "scope and identity are derived from the enrollment, not the request")
+            if self.lineage_sink is None:
+                raise CollabError(404, "lineage is not accepted by this service")
+            if not x["lineage"]:
+                self._audit_denied(pr, "external.lineage", "forbidden", room_id=x["room_id"],
+                                   project_ids=[x["project_id"]], agent_id=pr.id)
+                raise CollabError(403, "this invite does not allow lineage")
+            if room is None or self._effective(pr, room) is None:
+                raise CollabError(404, "not found")
+            self._throttle("lin:" + pr.id, ext.LINEAGE_PER_MINUTE, 60.0, "lineage")
+            room_id, label, sponsor = x["room_id"], x["label"], x["sponsor"]
+        event_id, seq, etype = body.get("event_id"), body.get("source_sequence"), body.get("event_type")
+        if (not isinstance(event_id, str) or not _KEY_RE.match(event_id)
+                or isinstance(seq, bool) or not isinstance(seq, int) or not 0 <= seq < 2**53):
+            raise CollabError(400, "event_id (1-128 of A-Za-z0-9._:-) and an integer source_sequence are required")
+        payload = body.get("payload")
+        try:
+            op = validate_lineage(etype, payload)
+        except ValueError as exc:
+            raise CollabError(400, str(exc)) from None
+        aid = pr.id
+        attrs_in = payload.get("attrs") if isinstance(payload.get("attrs"), dict) else {}
+        if op["op"] in ("node.upsert", "node.state"):
+            if op["node_type"] not in ext.LINEAGE_NODE_TYPES or not ext.owns_node(aid, op["node_id"]):
+                self._refuse_lineage(pr, room_id)
+                raise CollabError(403, "an external agent may only write its own agent/attempt/session nodes")
+            entity = op["node_id"]
+        else:
+            if (op["edge_type"] not in ext.LINEAGE_EDGE_TYPES or op["from_type"] not in ext.LINEAGE_NODE_TYPES
+                    or op["to_type"] not in ext.LINEAGE_NODE_TYPES
+                    or not (ext.owns_node(aid, op["from_id"]) and ext.owns_node(aid, op["to_id"]))):
+                self._refuse_lineage(pr, room_id)
+                raise CollabError(403, "an external agent may only link its own nodes with spawn edges")
+            entity = op["from_id"]
+        clean_attrs = {}
+        for k, v in attrs_in.items():
+            if len(clean_attrs) >= 16:
+                raise CollabError(400, "too many attrs (16 at most)")
+            if not isinstance(k, str) or not ext.ATTR_KEY.fullmatch(k):
+                raise CollabError(400, "attr names are 1-64 of A-Za-z0-9._-")
+            if k in ext.RESERVED_ATTRS or k.startswith("_"):
+                raise CollabError(400, f"attrs.{k} is not allowed")
+            if isinstance(v, str):
+                v = ext.clean_text(v, 200)
+            elif not (v is None or isinstance(v, (bool, int, float))):
+                raise CollabError(400, f"attrs.{k} must be a short scalar")
+            clean_attrs[k] = v
+        if op["op"] == "edge.add" or op["op"] == "edge.remove":
+            if clean_attrs:
+                raise CollabError(400, "edges from external agents carry no attrs")
+            out_payload = {k: payload[k] for k in ("edge_type", "from_id", "to_id") if k in payload}
+            if op["op"] == "edge.remove":
+                out_payload["reason"] = ext.clean_text(payload.get("reason"), 200) or "removed"
+        elif op["op"] == "node.state":
+            out_payload = {"node_id": op["node_id"], "state": op["state"]}
+            if payload.get("reason") is not None:
+                out_payload["reason"] = ext.clean_text(payload.get("reason"), 200)
+        else:
+            out_payload = {"node_type": op["node_type"], "node_id": op["node_id"],
+                           "attrs": {**clean_attrs, "external": True, "reported_by": label, "invited_by": sponsor}}
+            if payload.get("label") is not None:
+                out_payload["label"] = ext.clean_text(payload.get("label"), 120)
+            if op["state"] is not None:
+                out_payload["state"] = op["state"]
+        envelope = {"schema_version": 2, "event_id": event_id, "source": "ext-" + aid[-12:].lower(),
+                    "source_sequence": seq, "entity_type": "lineage", "entity_id": entity, "event_type": etype,
+                    "payload": out_payload, "visibility_scope": "room", "room_id": room_id}
+        if body.get("occurred_at") is not None:
+            envelope["occurred_at"] = body["occurred_at"]
+        principal = {"kind": "external", "id": "external:" + aid, "authenticated_by": "collab"}
+        items = [("agent", aid, ext.LINEAGE_MAX_EVENTS), ("sponsor", sponsor, ext.LINEAGE_MAX_PER_SPONSOR),
+                 ("room", room_id, ext.LINEAGE_MAX_PER_ROOM)]
+        with self._lock:
+            self._usage_take(items)           # refused here, before the graph sees anything
+        try:
+            res = self.lineage_sink(envelope, principal, lambda: self._credential_live(aid))
+        except PermissionError:
+            self._usage_give_back(items)
+            if not self._credential_live(aid):            # revoked or expired while the request was in flight
+                with self._lock:
+                    self._audit_denied(pr, "external.lineage", "revoked_in_flight", room_id=room_id,
+                                       project_ids=[x["project_id"]], agent_id=aid)
+                raise CollabError(401, "unauthorized") from None
+            self._refuse_lineage(pr, room_id)
+            raise CollabError(403, "not permitted to modify this lineage object") from None
+        except ValueError as exc:
+            self._usage_give_back(items)
+            raise CollabError(400, str(exc)) from None
+        except Exception as exc:
+            self._usage_give_back(items)
+            if type(exc).__name__ == "EnvelopeConflict":
+                raise CollabError(409, str(exc)) from None
+            self.stats["lineage_failures"] += 1
+            raise CollabError(503, "lineage is unavailable") from None
+        dup = bool(((res or {}).get("envelope") or {}).get("duplicate"))
+        if dup:
+            self._usage_give_back(items)      # a replay writes nothing, so it costs nothing
+        return {"accepted": True, "duplicate": dup}
 
     def _file_request(self, owner: str, room_id: str, agent_id: str, actions: list[str]) -> str | None:
         """Ask on a person's behalf (their token was used); None when the room no longer takes it."""
@@ -1802,7 +2277,7 @@ class CollabService:
                            if r and r["open"] and r["room_id"] in self._rooms
                            and self._now() - r["created_epoch"] < REQUEST_TTL]
                 out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
-                            "instance_id": a.get("instance_id"),
+                            "instance_id": a.get("instance_id"), "external": bool(a.get("external")),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
                             "pending": pending})
         return {"agents": out}
@@ -1825,13 +2300,18 @@ class CollabService:
         cred = "hca_" + secrets.token_urlsafe(32)
         expires = self._now() + self.credential_ttl
         with self._lock:
+            if (self._agents.get(pr.id) or {}).get("status") != "active":
+                raise CollabError(401, "unauthorized")
+            bound = (self._agents.get(pr.id) or {}).get("external")
+            if bound:                                   # rotation replaces the secret; the life stays the invite's
+                expires = bound["hard_expiry"]
             helper = self._helper_by_agent.get(pr.id)
             if helper is not None:                       # a helper's credential never outlives the helper
                 expires = min(expires, helper["expires_epoch"])
             self._commit("credential_rotated", self._actor(
                 pr, agent_id=pr.id, secret_digest=_digest(cred), expires_at_epoch=expires,
                 action="agent.rotate", outcome="allowed",
-                project_ids=[], resource_id=pr.id))
+                project_ids=[bound["project_id"]] if bound else [], resource_id=pr.id))
         return {"agent_id": pr.id, "credential": cred, "expires_at": expires}
 
     def revoke_agent(self, pr: Principal, agent_id: str) -> dict:
@@ -2557,6 +3037,8 @@ class CollabService:
             agent = self._agents.get(body.get("agent_id")) if isinstance(body.get("agent_id"), str) else None
             if not agent or agent["owner"] != pr.id or agent["status"] != "active":
                 raise CollabError(404, "not found")
+            if agent.get("external"):
+                raise CollabError(403, "an external agent holds only the grant of its invite")
             self._helper_room_only(body["agent_id"], room_id)
             aid = body["agent_id"]
             actions = _actions(body.get("actions"))
@@ -2634,6 +3116,8 @@ class CollabService:
             if decision == "approve":
                 if not agent or agent["status"] != "active" or not self._member(room, agent["owner"]):
                     raise CollabError(404, "not found")
+                if agent.get("external"):
+                    raise CollabError(403, "an external agent holds only the grant of its invite")
                 self._helper_room_only(r["agent_id"], room_id)
                 actions = _actions(body["actions"]) if "actions" in body else list(r["actions"])
                 self._name_free(room, r["agent_id"], agent["name"])
@@ -2682,6 +3166,7 @@ class CollabService:
         deadline = time.monotonic() + wait
         with self._cv:
             self._authorize(pr, room_id, "read", "room.state")
+            self._no_external(pr)
             if self._state_waiters[pr.key] >= self.MAX_STATE_WAITERS:
                 raise CollabError(429, "too many open room views")
             self._state_waiters[pr.key] += 1
@@ -2729,6 +3214,7 @@ class CollabService:
         agent's own owner; everyone else just sees names, families and permissions."""
         with self._lock:
             room, first = self._authorize(pr, room_id, "read", "task.flow")
+            self._no_external(pr)
             if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
                 raise CollabError(403, "forbidden")
             self._housekeeping()
@@ -2744,6 +3230,7 @@ class CollabService:
                         "family": a.get("harness_type"), "owner_user_id": a.get("owner"),
                         "owner_email": self._user_email.get(a.get("owner")),
                         "actions": list(g["actions"]) if g else [],
+                        "external": bool(a.get("external")),
                         "status": "active" if g and a.get("status") == "active" else "removed",
                         "instance_id": a.get("instance_id") if a.get("owner") == pr.id else None,
                         "parent_agent_id": a.get("parent") if a.get("parent") in room["grants"] else None,
@@ -2830,6 +3317,8 @@ class CollabService:
             agent = self._agents.get(agent_id)
             if not agent or agent["owner"] != pr.id or agent["status"] != "active":
                 raise CollabError(404, "not found")
+            if agent.get("external"):
+                raise CollabError(403, "an external agent is not tied to a pane or session")
             self._throttle("link:" + pr.id, 120, 600.0, "agent link")
             self._commit("agent_linked", self._actor(
                 pr, agent_id=agent_id, instance_id=inst, action="agent.link", outcome="allowed",
@@ -2840,6 +3329,7 @@ class CollabService:
         """Capability summaries only: no device ids, hostnames, paths or instance ids."""
         with self._lock:
             room, _ = self._authorize(pr, room_id, "read", "agent.list")
+            self._no_external(pr)
             self._housekeeping()
             # A roster (who owns which agent): never for guests, like the member list.
             if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
@@ -2849,7 +3339,8 @@ class CollabService:
                 a = self._agents.get(aid)
                 if a and a["status"] == "active":
                     out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
-                                "owner_user_id": a["owner"], "actions": g["actions"]})
+                                "owner_user_id": a["owner"], "actions": g["actions"],
+                                "external": bool(a.get("external"))})
         return {"agents": out}
 
     # -- room <-> workspace and mission links
@@ -3047,8 +3538,8 @@ class CollabService:
                 if not m or m["role"] not in TERMINAL_ROLES:
                     raise CollabError(400, "terminal principals must be owners or contributors of the room")
             elif kind == "agent":
-                if ident not in room["grants"]:
-                    raise CollabError(400, "terminal agents must hold a grant in the room")
+                if ident not in room["grants"] or self._agents.get(ident, {}).get("external"):
+                    raise CollabError(400, "terminal agents must hold a grant in the room, and an external agent never does")
             else:
                 raise CollabError(400, "invalid terminal_principals")
         return grants, tp
@@ -3506,6 +3997,7 @@ class CollabService:
     def list_tasks(self, pr: Principal, room_id: str, limit: int = 100) -> dict:
         with self._lock:
             _, first = self._authorize(pr, room_id, "read", "task.list")
+            self._no_external(pr)
             rows = [(t["seq"], tid, t) for tid, t in self._tasks.items()
                     if t["room_id"] == room_id and t["seq"] >= first]
             rows.sort(key=lambda r: r[0], reverse=True)
@@ -3532,7 +4024,7 @@ class CollabService:
 
     def task_inbox(self, pr: Principal, limit: int = 20) -> dict:
         """Open tasks addressed to this agent, only where it STILL holds "execute"."""
-        if not pr.is_agent:
+        if not pr.is_agent or pr.external:
             raise CollabError(403, "forbidden")
         with self._lock:
             out = []
@@ -3553,7 +4045,7 @@ class CollabService:
         return {"tasks": out}
 
     def update_task(self, pr: Principal, task_id: str, body: dict) -> dict:
-        if not pr.is_agent:
+        if not pr.is_agent or pr.external:
             raise CollabError(403, "forbidden")
         with self._lock:
             t = self._tasks.get(task_id) if isinstance(task_id, str) else None
@@ -3597,6 +4089,10 @@ class CollabService:
             if not isinstance(text, str):
                 raise CollabError(400, "text must be a string")
             clean = _CONTROL.sub("", text)
+            if pr.external:               # untrusted: no invisible, direction-changing or tag characters
+                if len(text) > MAX_TEXT:
+                    raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
+                clean = ext.clean_text(text, MAX_TEXT, multiline=True)
             if not clean.strip() or len(clean) > MAX_TEXT:
                 raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
             reply = body.get("in_reply_to")
@@ -3615,7 +4111,9 @@ class CollabService:
                 return 200, {"event": self._view(self._log[prior[1] - 1], replayed=True), "replayed": True}
             now = self._now()
             hits = [t for t in self._hits[pr.key] if now - t < 60]
-            if len(hits) >= self.message_limit:
+            # an external agent posts at a third of the rate a person's own agent may; it still draws on
+            # its sponsor's budget below, so inviting more of them never buys more throughput
+            if len(hits) >= (self.message_limit // 3 if pr.external else self.message_limit):
                 self._hits[pr.key] = hits
                 self.stats["rate_limited"] += 1
                 raise CollabError(429, "message rate limit exceeded")
@@ -3633,7 +4131,7 @@ class CollabService:
             self._hits[okey] = ohits
             ev = self._commit("message", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
-                sender_kind=pr.kind, sender_id=pr.id, idempotency_key=key, fingerprint=fp,
+                sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
                 text=redact_text(clean), in_reply_to=reply, trust="untrusted",
                 visibility_scope="room", action="message.post", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
@@ -3649,8 +4147,8 @@ class CollabService:
                "correlation_id": p.get("correlation_id"), "causation_id": p.get("causation_id"),
                "visibility_scope": p.get("visibility_scope", "room")}
         if t == "message":
-            out.update(sender={"type": p["sender_kind"], "id": p["sender_id"],
-                               "owner_user_id": p["actor_user_id"]},
+            out.update(sender={"type": "external" if p.get("sender_external") else p["sender_kind"],
+                               "id": p["sender_id"], "owner_user_id": p["actor_user_id"]},
                        text=p["text"], trust="untrusted", in_reply_to=p.get("in_reply_to"))
         elif t in ("task_created", "task_updated"):
             out.update(actor_user_id=p.get("actor_user_id"), actor_agent_id=p.get("actor_agent_id"),
@@ -3680,6 +4178,8 @@ class CollabService:
             feed = self._by_room.get(room_id, [])
             lo = bisect.bisect_right(feed, max(cursor, first - 1), key=lambda e: e["sequence"])
             for ev in feed[lo:]:
+                if pr.external and ev["event_type"] != "message":
+                    continue                    # chat only: no membership, grant or task events
                 if guest and (ev["event_type"].startswith("helper_") or (
                         ev["event_type"].startswith("agent_") and ev["payload"].get("agent_id") in self._helper_minted)):
                     nxt = ev["sequence"]              # a guest never sees helpers, but the cursor moves past them
@@ -3715,6 +4215,7 @@ class CollabService:
                 out.append({"sequence": ev["sequence"], "event_type": ev["event_type"],
                             "action": p["action"], "outcome": p["outcome"], "reason": p.get("reason"),
                             "actor_user_id": p.get("actor_user_id"), "actor_agent_id": p.get("actor_agent_id"),
+                            "actor_kind": p.get("actor_kind"), "client_ip": p.get("client_ip"),
                             "room_id": p.get("room_id"), "resource_id": p.get("resource_id"),
                             "created_at": p["created_at"], "correlation_id": p.get("correlation_id")})
                 if ev["event_type"].startswith("helper_"):
@@ -3767,13 +4268,14 @@ class CollabService:
 
     # --------------------------------------------------------------- routing
     def dispatch(self, method: str, parts: list[str], query: dict, body: dict,
-                 authorization: str, device: str | None, operator: str | None = None):
+                 authorization: str, device: str | None, operator: str | None = None,
+                 client: str | None = None):
         """parts: path segments after /api/v1/collab. Returns (status, json) or a Stream."""
         try:
             if parts == ["agents", "enrollment", "complete"] and method == "POST":
                 return 201, self.complete_enrollment(body)
             if parts == ["agents", "join"] and method == "POST":
-                return 201, self.redeem_join_token(body)         # the token IS the authentication
+                return 201, self.redeem_join_token(body, client)  # the token IS the authentication
             if parts == ["agents", "join-link"] and method == "POST":
                 return 200, self.link_joined(body)
             if parts == ["config"] and method == "GET":
@@ -3809,6 +4311,8 @@ class CollabService:
                     return 200, self.list_my_agents(pr)
                 if parts == ["agents", "join-tokens"]:
                     return 200, self.list_join_tokens(pr)
+                if parts == ["agents", "external", "me"]:
+                    return 200, self.external_me(pr)
                 if parts[:1] == ["helpers"] and not pr.is_agent:     # agents use MCP; a person sees their agents'
                     if n == 1:
                         return 200, self.list_my_helpers(pr)
@@ -3859,6 +4363,8 @@ class CollabService:
                         return 200, self.list_room_agents(pr, rid)
                     if parts[2:] == ["invites"]:
                         return 200, self.list_invites(pr, rid)
+                    if parts[2:] == ["externals"]:
+                        return 200, self.list_room_externals(pr, rid)
                     if parts[2:] == ["agent-requests"]:
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["tasks"]:
@@ -3885,6 +4391,12 @@ class CollabService:
                     return 200, self.link_identity(pr, body)
                 if parts == ["agents", "connect"]:
                     return 201, self.connect_agent(pr, body)
+                if parts == ["agents", "external", "heartbeat"]:
+                    return 200, self.external_heartbeat(pr, body)
+                if parts == ["agents", "external", "lineage"]:
+                    return 200, self.external_lineage(pr, body)
+                if parts == ["agents", "external", "leave"]:
+                    return 200, self.external_leave(pr)
                 if parts == ["agents", "join-tokens"]:
                     return 201, self.create_join_token(pr, body)
                 if n == 4 and parts[:2] == ["agents", "join-tokens"] and parts[3] == "revoke":
@@ -3965,6 +4477,12 @@ class CollabService:
                         return 200, self.remove_member(pr, rid, parts[3])
                     if parts[2:] == ["agents"]:
                         return 201, self.grant_agent(pr, rid, body)
+                    if parts[2:] == ["externals", "invites"]:
+                        return 201, self.create_external_invite(pr, rid, body)
+                    if n == 6 and parts[2:4] == ["externals", "invites"] and parts[5] == "revoke":
+                        return 200, self.revoke_external_invite(pr, rid, parts[4])
+                    if n == 5 and parts[2] == "externals" and parts[4] == "revoke":
+                        return 200, self.revoke_external(pr, rid, parts[3])
                     if n == 5 and parts[2] == "agents" and parts[4] == "remove":
                         return 200, self.remove_agent_from_room(pr, rid, parts[3])
                     if parts[2:] == ["agent-requests", "approve-all"]:
@@ -3993,7 +4511,12 @@ class CollabService:
                         return self.post_message(pr, rid, body)
             raise CollabError(404, "not found")
         except CollabError as exc:
-            return exc.status, {"error": exc.message, **({"reason": exc.reason} if exc.reason else {})}
+            err = {"error": exc.message}
+            if exc.reason:
+                err["reason"] = exc.reason
+            if exc.code:
+                err["code"] = exc.code
+            return exc.status, err
 
 
 CATALOGUE_MAX = 500
