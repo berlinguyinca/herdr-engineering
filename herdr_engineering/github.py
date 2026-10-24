@@ -9,6 +9,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import math
 import threading
 import time
 import urllib.error
@@ -46,6 +47,12 @@ ISSUES_QUERY = """query($owner:String!,$name:String!,$cursor:String) {
 repository(owner:$owner,name:$name) {issues(first:100,after:$cursor,states:OPEN,
 orderBy:{field:UPDATED_AT,direction:DESC}) {totalCount pageInfo {hasNextPage endCursor}
 nodes {""" + ISSUE_FIELDS + """} } } rateLimit {remaining resetAt cost} }"""
+# Issues that left the open set since a watermark. filterBy.since filters on
+# updatedAt (G0 spike), so the read is bounded by the watermark already.
+CLOSED_QUERY = """query($owner:String!,$name:String!,$since:DateTime!,$cursor:String) {
+repository(owner:$owner,name:$name) {issues(first:100,after:$cursor,states:CLOSED,filterBy:{since:$since},
+orderBy:{field:UPDATED_AT,direction:DESC}) {totalCount pageInfo {hasNextPage endCursor}
+nodes {id number updatedAt} } } rateLimit {remaining resetAt cost} }"""
 DETAIL_QUERY = """query($owner:String!,$name:String!,$number:Int!) {
 repository(owner:$owner,name:$name) {issue(number:$number) {""" + ISSUE_FIELDS + """ body}}
 rateLimit {remaining resetAt cost} }"""
@@ -63,6 +70,10 @@ def _when(value):
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _iso(when):
+    return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _latest(*values):
@@ -206,6 +217,13 @@ class GitHubProvider:
             raise GitHubError("not_found")
         return self._connection(repository.get("issues"))
 
+    def closed_issues_page(self, repository_id, since, cursor=None):
+        data = self._query(CLOSED_QUERY, dict(self._repo_args(repository_id), since=since, cursor=cursor))
+        repository = data.get("repository")
+        if not isinstance(repository, dict):
+            raise GitHubError("not_found")
+        return self._connection(repository.get("issues"))
+
     def issue(self, repository_id, number):
         if not isinstance(number, int) or isinstance(number, bool) or number < 1:
             raise ValueError("issue number must be a positive integer")
@@ -310,16 +328,23 @@ class GitHubMonitor:
     the newest ``updatedAt`` as a change probe). A repository whose probe
     matches the values stored when its issues were last synced costs nothing
     more; a changed one is read newest first and stops below its watermark
-    minus ``WATERMARK_OVERLAP``.
+    minus ``WATERMARK_OVERLAP``, then reads the issues closed since then. If
+    the open count still disagrees (a delete or a transfer, which never pass
+    through CLOSED), that repository alone is read in full. As a safety net
+    every repository is read in full once per ``full_reconcile_interval``, at
+    most ``reconcile_per_pass`` per pass (default: enough to cover all of them
+    in one interval), staggered so a restart does not make them all due.
     """
 
     def __init__(self, *, provider_factory=None, interval=300, repo_limit=5000, issue_limit=100000, now=None,
-                 store=None):
+                 store=None, full_reconcile_interval=86400, reconcile_per_pass=None):
         self._factory = provider_factory or GitHubProvider
         self._interval = max(30, interval)
         self._repo_limit, self._issue_limit = repo_limit, issue_limit
         self._now = now or time.time
         self._store_factory = store
+        self._full_interval = max(self._interval, full_reconcile_interval)
+        self._reconcile_per_pass = reconcile_per_pass
         self._lock = threading.RLock()
         self._refresh_lock = threading.Lock()
         self._stop, self._wake = threading.Event(), threading.Event()
@@ -335,6 +360,7 @@ class GitHubMonitor:
         self._repos, self._issues, self._details = {}, {}, {}
         # per repository: the probe values its issues were last synced at, and the watermark
         self._marks, self._watermarks = {}, {}
+        self._full_at = {}  # repository -> time of its last full read (scheduled reconcile)
         self._resume_repos, self._issue_resume = None, {}
         self._store, self._store_viewer, self._store_dirty = None, None, False
 
@@ -447,6 +473,9 @@ class GitHubMonitor:
                 self._marks[rid] = synced
             if rid in snapshot.watermarks:
                 self._watermarks[rid] = snapshot.watermarks[rid]
+            # not persisted: spread the next full reads over one interval after a restart
+            offset = int(hashlib.sha256(rid.encode()).hexdigest()[:8], 16) % int(self._full_interval)
+            self._full_at[rid] = self._now() - offset
         if self._repos:
             self._view.update(available=True, status="stale", stale=True,
                               account=snapshot.viewer)
@@ -462,6 +491,7 @@ class GitHubMonitor:
             if snapshot is None:
                 # the stored catalog belonged to another viewer (now purged) or is unreadable
                 self._issues, self._marks, self._watermarks, self._issue_resume = {}, {}, {}, {}
+                self._full_at = {}
                 self._store_dirty = False
             return store
 
@@ -606,7 +636,7 @@ class GitHubMonitor:
             with self._lock:
                 self._check_generation()
                 self._repos = discovered
-                for table in (self._issues, self._marks, self._watermarks, self._issue_resume):
+                for table in (self._issues, self._marks, self._watermarks, self._issue_resume, self._full_at):
                     for key in [key for key in table if key not in discovered]:
                         del table[key]
                 self._resume_repos = discovered
@@ -619,6 +649,7 @@ class GitHubMonitor:
         if self._store_dirty and store is not None:
             self._flush(store)
         repos = sorted(discovered.values(), key=lambda r: (-r["open_issue_count"], r["repository_id"]))
+        due = self._due_reconciles(discovered)
         self._progress(phase="issues", issue_repositories_total=len(repos),
                        issues_total_known=sum(r["open_issue_count"] for r in repos))
         errors = {}
@@ -630,7 +661,7 @@ class GitHubMonitor:
                 continue
             self._progress(current_repository=rid)
             try:
-                if not self._sync_repository(provider, store, record):
+                if not self._sync_repository(provider, store, record, reconcile=rid in due):
                     return
                 done = [r for r in repos if r["issues_complete"]]
                 self._progress(issues_seen=sum(len(self._issues.get(r["repository_id"], {})) for r in done),
@@ -651,7 +682,16 @@ class GitHubMonitor:
                      last_success_at=self._view["last_success_at"] if errors else _stamp())
         self._progress(phase="complete", current_repository=None)
 
-    def _sync_repository(self, provider, store, record):
+    def _due_reconciles(self, discovered):
+        """Repositories whose scheduled full read is due, oldest first, at most N this pass."""
+        now = self._now()
+        with self._lock:
+            due = sorted((at, rid) for rid, at in self._full_at.items()
+                         if rid in discovered and now - at >= self._full_interval)
+        limit = self._reconcile_per_pass or max(1, math.ceil(len(discovered) * self._interval / self._full_interval))
+        return {rid for _, rid in due[:limit]}
+
+    def _sync_repository(self, provider, store, record, *, reconcile=False):
         """Bring one repository's issues up to date; ``False`` when stopped mid-read."""
         rid = record["repository_id"]
         probe = {"open": record["open_issue_count"], "newest": record["newest_updated_at"]}
@@ -661,7 +701,7 @@ class GitHubMonitor:
             watermark = self._watermarks.get(rid)
             resume = self._issue_resume.get(rid)
             unchanged = self._marks.get(rid) == probe and (probe["newest"] is not None or not probe["open"])
-        if resume is None and unchanged:
+        if resume is None and unchanged and not reconcile:
             with self._lock:
                 self._check_generation()
                 record.update(issues_complete=True, issues_loaded=len(stored), error=None)
@@ -669,15 +709,54 @@ class GitHubMonitor:
         if resume is None and not probe["open"]:
             # nothing is open: every stored issue left the open set, no read needed
             self._apply(store, record, probe, issues={}, upserts={}, removed=set(stored),
-                        watermark=_latest(watermark, probe["newest"]))
+                        watermark=_latest(watermark, probe["newest"]), full=True)
             return True
-        mode = "incremental" if watermark and _when(watermark) else "full"
-        fresh, cursor, cursors, mode = resume or ({}, None, set(), mode)
+        mode = "incremental" if watermark and _when(watermark) and not reconcile else "full"
+        if resume is not None:
+            mode = resume[3]
+        read = self._read_open(provider, record, stored, mode, watermark, resume)
+        if read is None:
+            return False
+        fresh, total = read
+        seen = [issue["updated_at"] for issue in fresh.values()]
+        if mode == "full":
+            issues, removed, upserts = dict(fresh), set(stored) - set(fresh), fresh
+        else:
+            since = _iso(_when(watermark) - WATERMARK_OVERLAP)
+            closed = self._read_closed(provider, rid, since)
+            if closed is None:
+                return False
+            seen += closed.values()
+            issues = {gid: issue for gid, issue in {**stored, **fresh}.items() if gid not in closed}
+            removed, upserts = set(closed) & (set(stored) | set(fresh)), {g: i for g, i in fresh.items() if g not in closed}
+            if len(issues) != total:
+                # deletes and transfers never pass through CLOSED: re-read this repository only
+                mode = "full"
+                read = self._read_open(provider, record, issues, mode, watermark, None)
+                if read is None:
+                    return False
+                full, _ = read
+                seen += [issue["updated_at"] for issue in full.values()]
+                removed = (set(stored) | set(fresh)) - set(full)
+                issues, upserts = dict(full), full
+        self._apply(store, record, probe, issues=issues, upserts=upserts, removed=removed,
+                    watermark=_latest(watermark, probe["newest"], *seen), full=mode == "full")
+        return True
+
+    def _read_open(self, provider, record, stored, mode, watermark, resume):
+        """Page open issues newest first: all of them (``full``) or down to the watermark overlap.
+
+        Returns ``(issues read, open totalCount)``, or ``None`` when stopped.
+        """
+        rid = record["repository_id"]
+        fresh, cursor, cursors, _ = resume or ({}, None, set(), mode)
         cutoff = _when(watermark) - WATERMARK_OVERLAP if mode == "incremental" else None
+        total = None
         while True:
             if self._stop.is_set():
-                return False
+                return None
             connection = provider.issues_page(rid, cursor)
+            total = connection["totalCount"] if total is None else total
             below = False
             for row in connection["nodes"]:
                 issue = _issue(row, rid)
@@ -694,7 +773,7 @@ class GitHubMonitor:
                 record["issues_loaded"] = len(candidate)
             self._update(rate_limit=provider.rate_limit)
             if below or not connection["pageInfo"]["hasNextPage"]:
-                break
+                return fresh, total
             cursor = connection["pageInfo"]["endCursor"]
             if cursor in cursors:
                 raise GitHubError("invalid_response")
@@ -702,15 +781,27 @@ class GitHubMonitor:
             with self._lock:
                 self._check_generation()
                 self._issue_resume[rid] = (fresh, cursor, cursors, mode)
-        if mode == "full":
-            issues, removed = dict(fresh), set(stored) - set(fresh)
-        else:
-            issues, removed = {**stored, **fresh}, set()
-        self._apply(store, record, probe, issues=issues, upserts=fresh, removed=removed,
-                    watermark=_latest(watermark, probe["newest"], *(i["updated_at"] for i in fresh.values())))
-        return True
 
-    def _apply(self, store, record, probe, *, issues, upserts, removed, watermark):
+    def _read_closed(self, provider, rid, since):
+        """``{github_id: updatedAt}`` of issues closed (or edited while closed) since ``since``."""
+        closed, cursor, cursors = {}, None, set()
+        while True:
+            if self._stop.is_set():
+                return None
+            connection = provider.closed_issues_page(rid, since, cursor)
+            for row in connection["nodes"]:
+                if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                    raise GitHubError("invalid_response")
+                closed[row["id"]] = row.get("updatedAt")
+            self._update(rate_limit=provider.rate_limit)
+            if not connection["pageInfo"]["hasNextPage"]:
+                return closed
+            cursor = connection["pageInfo"]["endCursor"]
+            if cursor in cursors:
+                raise GitHubError("invalid_response")
+            cursors.add(cursor)
+
+    def _apply(self, store, record, probe, *, issues, upserts, removed, watermark, full=False):
         """Commit one repository's completed sync to memory, then to the store.
 
         The probe values are recorded only here, after the issues are in, so a
@@ -724,6 +815,8 @@ class GitHubMonitor:
             self._issues[rid] = issues
             self._watermarks[rid] = watermark
             self._marks[rid] = probe
+            if full:
+                self._full_at[rid] = self._now()
             self._issue_resume.pop(rid, None)
             record.update(issues_complete=True, issues_loaded=len(issues), error=None)
             row = self._stored_repository(record)

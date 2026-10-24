@@ -281,3 +281,84 @@ def test_store_outage_keeps_serving_memory_and_flushes_after_recovery():
     fake.calls.clear()
     restarted.refresh()
     assert fake.calls == Counter({"repos": 2})
+
+
+# ---------------------------------------------------------------- G3
+
+
+def test_closed_issue_is_removed_with_a_tombstone():
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared)
+    monitor.refresh()
+    revision = MemoryGitHubStore(identity=fake.credential_identity, shared=shared).revision()
+    closed = [g for g, i in fake.repos["acme/app"].items() if i["number"] == 2][0]
+    fake.tick(600)
+    fake.edit("acme/app", closed, state="CLOSED")
+    fake.log.clear()
+    monitor.refresh()
+    assert numbers(monitor, "github.com/acme/app") == [1, 3, 4, 5]
+    assert [entry[:2] for entry in fake.log if entry[0] == "closed"] == [("closed", "github.com/acme/app")]
+    assert len(issue_calls(fake, "github.com/acme/app")) == 1  # newest page only: no full read
+    changes = MemoryGitHubStore(identity=fake.credential_identity, shared=shared).changes_since(revision)
+    assert [(item["kind"], item["key"]) for item in changes["removed"]] == [("issue", closed)]
+
+
+def test_deleted_issue_is_caught_by_the_count_check_and_one_repository_full_read():
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared)
+    monitor.refresh()
+    gone = [g for g, i in fake.repos["acme/app"].items() if i["number"] == 2][0]
+    fake.delete("acme/app", gone)  # no closed event, no updatedAt bump anywhere
+    fake.log.clear()
+    monitor.refresh()
+    assert numbers(monitor, "github.com/acme/app") == [1, 3, 4, 5]
+    assert {entry[1] for entry in fake.log if entry[0] in {"issues", "closed"}} == {"github.com/acme/app"}
+    # incremental read (newest page), then the full read from the first page
+    assert [entry[2] for entry in issue_calls(fake)] == [None, None, "2"]
+    restarted = monitor_for(fake, shared)
+    assert numbers(restarted, "github.com/acme/app") == [1, 3, 4, 5]
+
+
+def test_transferred_issue_disappears_from_the_source_repository():
+    fake = seeded()
+    monitor = monitor_for(fake, {})
+    monitor.refresh()
+    moved = [g for g, i in fake.repos["acme/app"].items() if i["number"] == 3][0]
+    row = fake.repos["acme/app"].pop(moved)
+    fake.repos["acme/lib"]["I_moved"] = dict(row, id="I_moved", number=42, updatedAt=_iso(fake.tick()))
+    monitor.refresh()
+    assert numbers(monitor, "github.com/acme/app") == [1, 2, 4, 5]
+    assert numbers(monitor, "github.com/acme/lib") == [6, 7, 8, 42]
+
+
+def test_scheduled_full_reconcile_touches_only_due_repositories_spread_across_passes():
+    fake = FakeGitHub(page_size=100)
+    for index in range(6):
+        fake.add_issue(f"acme/r{index}")
+    clock = [1_000_000.0]
+    monitor = monitor_for(fake, {}, now=lambda: clock[0], full_reconcile_interval=3000, reconcile_per_pass=2)
+    monitor.refresh()
+    clock[0] += 300
+    fake.log.clear()
+    monitor.refresh()
+    assert issue_calls(fake) == []  # nothing is due yet
+    touched = []
+    for _ in range(3):
+        clock[0] += 3000
+        fake.log.clear()
+        monitor.refresh()
+        touched.append({entry[1] for entry in issue_calls(fake)})
+    assert [len(batch) for batch in touched] == [2, 2, 2]
+    assert len(set().union(*touched)) == 6  # each pass took different repositories
+
+
+def test_restart_spreads_reconcile_instead_of_making_every_repository_due():
+    fake, shared = FakeGitHub(page_size=100), {}
+    for index in range(12):
+        fake.add_issue(f"acme/r{index}")
+    clock = [1_000_000.0]
+    monitor_for(fake, shared, now=lambda: clock[0], full_reconcile_interval=3000, reconcile_per_pass=12).refresh()
+    clock[0] += 10
+    fake.log.clear()
+    monitor_for(fake, shared, now=lambda: clock[0], full_reconcile_interval=3000, reconcile_per_pass=12).refresh()
+    assert len({entry[1] for entry in issue_calls(fake)}) < 12
