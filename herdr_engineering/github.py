@@ -341,6 +341,10 @@ class _Superseded(Exception):
     """A token rotation invalidated an in-flight catalog generation."""
 
 
+class _OverBudget(Exception):
+    """This pass spent its ``github.sync.point_budget``; the repository waits for the next pass."""
+
+
 class GitHubMonitor:
     """Background catalog sync, incremental against a persistent store.
 
@@ -362,17 +366,26 @@ class GitHubMonitor:
     every repository is read in full once per ``full_reconcile_interval``, at
     most ``reconcile_per_pass`` per pass (default: enough to cover all of them
     in one interval), staggered so a restart does not make them all due.
+
+    Each pass may spend ``github.sync.point_budget`` GraphQL points (the
+    reported ``rateLimit.cost``). The listing always completes; an issue read
+    is not started once the budget is spent, so the repositories that still
+    need one are deferred (``deferred_repos``), keep their cached rows, and come
+    first in the next pass, which resumes before listing again. A rate limit
+    mid-pass defers the rest the same way.
     """
 
     def __init__(self, *, provider_factory=None, interval=None, repo_limit=5000, issue_limit=100000, now=None,
-                 store=None, full_reconcile_interval=None, reconcile_per_pass=None, organizations=None):
+                 store=None, full_reconcile_interval=None, reconcile_per_pass=None, organizations=None,
+                 point_budget=None):
         self._factory = provider_factory or GitHubProvider
         self._repo_limit, self._issue_limit = repo_limit, issue_limit
         self._now = now or time.time
         self._store_factory = store
         self._retired = []  # superseded stores, closed once no pass can still hold their lock
         # github.sync.*: an explicit argument wins; None = read the YAML at the start of each pass
-        self._fixed_sync = {"interval": interval, "full_reconcile_interval": full_reconcile_interval}
+        self._fixed_sync = {"interval": interval, "full_reconcile_interval": full_reconcile_interval,
+                            "point_budget": point_budget}
         self._apply_sync_settings(strict=False)
         self._reconcile_per_pass = reconcile_per_pass
         # owner allowlist: a list, a callable returning one, or None = read the YAML each pass
@@ -393,6 +406,7 @@ class GitHubMonitor:
         # per repository: the probe values its issues were last synced at, and the watermark
         self._marks, self._watermarks = {}, {}
         self._full_at = {}  # repository -> time of its last full read (scheduled reconcile)
+        self._deferred = {}  # repository -> when it was first deferred (budget or rate limit)
         self._resume_repos, self._issue_resume = None, {}
         self._store, self._store_viewer, self._store_dirty = None, None, False
 
@@ -400,7 +414,7 @@ class GitHubMonitor:
     def _empty():
         return {"available": False, "status": "not_configured", "connection_generation": 0, "refreshing": False, "stale": False,
                 "partial": False, "account": None, "checked_at": None, "last_success_at": None,
-                "scope": {"owners": [], "excluded_repositories": 0, "restricted": False},
+                "scope": {"owners": [], "excluded_repositories": 0, "restricted": False}, "deferred_repos": [],
                 "error": None, "rate_limit": None, "progress": {"phase": "idle", "repositories_seen": 0,
                     "repositories_total": None, "issue_repositories_complete": 0, "issue_repositories_total": None,
                     "issues_seen": 0, "issues_total_known": None, "current_repository": None}}
@@ -443,6 +457,7 @@ class GitHubMonitor:
             settings = dict(GITHUB_SYNC_DEFAULTS, **{k: v for k, v in self._fixed_sync.items() if v is not None})
         self._interval = max(30, settings["interval"])
         self._full_interval = max(self._interval, settings["full_reconcile_interval"])
+        self._budget, self._spent = settings["point_budget"], 0
 
     def _retire(self, store):
         """Queue a superseded store for closing (lock held); a running pass may still hold its advisory lock."""
@@ -481,6 +496,11 @@ class GitHubMonitor:
             if view["last_success_at"]:
                 age = self._now() - datetime.fromisoformat(view["last_success_at"]).timestamp()
                 view["stale"] = view["stale"] or age > self._interval * 2
+            deferred = sorted((since, rid) for rid, since in self._deferred.items())
+            view["deferred_repos"] = [{"repository_id": rid, "deferred_since": _iso(datetime.fromtimestamp(since, UTC))}
+                                      for since, rid in deferred]
+            # a repository the budget keeps deferring shows as stale, not silently old (ruling 6)
+            view["stale"] = view["stale"] or any(self._now() - since > self._interval * 2 for since, _ in deferred)
             return view
 
     def repository_languages(self, *, start=True):
@@ -708,7 +728,7 @@ class GitHubMonitor:
                 # stop serving owners that left the allowlist now, not after the listing
                 for rid in [rid for rid, record in self._repos.items() if _owner(record) not in allow]:
                     for table in (self._repos, self._issues, self._marks, self._watermarks,
-                                  self._issue_resume, self._full_at):
+                                  self._issue_resume, self._full_at, self._deferred):
                         table.pop(rid, None)
                 if self._resume_repos is not None:
                     self._resume_repos = {rid: r for rid, r in self._resume_repos.items() if _owner(r) in allow}
@@ -716,6 +736,7 @@ class GitHubMonitor:
             discovered, cursor, cursors, excluded, owners = {}, None, set(), 0, set()
             while not self._stop.is_set():
                 account, connection = provider.repositories_page(cursor)
+                self._charge(provider)  # the listing is never cut short, but it counts
                 store = self._bind_viewer(account)
                 for row in connection["nodes"]:
                     record = _repository(row)
@@ -747,7 +768,8 @@ class GitHubMonitor:
             with self._lock:
                 self._check_generation()
                 self._repos = discovered
-                for table in (self._issues, self._marks, self._watermarks, self._issue_resume, self._full_at):
+                for table in (self._issues, self._marks, self._watermarks, self._issue_resume, self._full_at,
+                              self._deferred):
                     for key in [key for key in table if key not in discovered]:
                         del table[key]
                 self._resume_repos = discovered
@@ -766,11 +788,16 @@ class GitHubMonitor:
             self._progress(repositories_seen=len(discovered), repositories_total=len(discovered))
         if self._store_dirty and store is not None:
             self._flush(store)
-        repos = sorted(discovered.values(), key=lambda r: (-r["open_issue_count"], r["repository_id"]))
+        with self._lock:
+            deferred = dict(self._deferred)
+        # repositories an earlier pass deferred go first, the longest-waiting first
+        repos = sorted(discovered.values(), key=lambda r: (
+            r["repository_id"] not in deferred, deferred.get(r["repository_id"], 0),
+            -r["open_issue_count"], r["repository_id"]))
         due = self._due_reconciles(discovered)
         self._progress(phase="issues", issue_repositories_total=len(repos),
                        issues_total_known=sum(r["open_issue_count"] for r in repos))
-        errors = {}
+        errors, over_budget = {}, []
         for record in repos:
             if self._stop.is_set():
                 return
@@ -781,9 +808,15 @@ class GitHubMonitor:
             try:
                 if not self._sync_repository(provider, store, record, reconcile=rid in due):
                     return
+                with self._lock:
+                    self._deferred.pop(rid, None)
                 done = [r for r in repos if r["issues_complete"]]
                 self._progress(issues_seen=sum(len(self._issues.get(r["repository_id"], {})) for r in done),
                                issue_repositories_complete=len(done))
+            except _OverBudget:
+                # costs nothing more: later repositories still run, unchanged ones complete for free
+                over_budget.append(rid)
+                self._defer([rid])
             except GitHubError as exc:
                 with self._lock:
                     self._check_generation()
@@ -791,7 +824,19 @@ class GitHubMonitor:
                     record["issues_loaded"] = len(self._issues.get(rid, {}))
                 errors[rid] = str(exc)
                 if exc.reason in {"rate_limited", "authentication", "capacity"}:
+                    if exc.reason == "rate_limited":
+                        # the same as a spent budget: the rest waits, the cache stays
+                        self._defer(r["repository_id"] for r in repos if not r["issues_complete"])
                     raise
+        if over_budget:
+            # keep the resume state: the next pass continues with the deferred
+            # repositories before listing again (a partly read repository resumes at its cursor)
+            self._update(status="partial", partial=True, stale=False,
+                         error=f"The per-pass point budget ({self._budget}) was spent; "
+                               f"{len(over_budget)} repositories wait for the next pass.",
+                         last_success_at=_stamp())
+            self._progress(phase="complete", current_repository=None)
+            return
         with self._lock:
             self._check_generation()
             self._resume_repos, self._issue_resume = None, {}
@@ -799,6 +844,23 @@ class GitHubMonitor:
                      error="Some repository issues could not be refreshed." if errors else None,
                      last_success_at=self._view["last_success_at"] if errors else _stamp())
         self._progress(phase="complete", current_repository=None)
+
+    def _defer(self, rids):
+        now = self._now()
+        with self._lock:
+            self._check_generation()
+            for rid in rids:
+                self._deferred.setdefault(rid, now)
+
+    def _afford(self):
+        """Before an issue read: stop when this pass's point budget is spent."""
+        if self._spent >= self._budget:
+            raise _OverBudget()
+
+    def _charge(self, provider):
+        """Add the last call's GraphQL ``rateLimit.cost`` (1 when GitHub did not say) to this pass."""
+        cost = (provider.rate_limit or {}).get("cost") if isinstance(provider.rate_limit, dict) else None
+        self._spent += cost if isinstance(cost, int) and not isinstance(cost, bool) and cost >= 0 else 1
 
     def _due_reconciles(self, discovered):
         """Repositories whose scheduled full read is due, oldest first, at most N this pass."""
@@ -873,7 +935,9 @@ class GitHubMonitor:
         while True:
             if self._stop.is_set():
                 return None
+            self._afford()
             connection = provider.issues_page(rid, cursor)
+            self._charge(provider)
             total = connection["totalCount"] if total is None else total
             below = False
             for row in connection["nodes"]:
@@ -906,7 +970,9 @@ class GitHubMonitor:
         while True:
             if self._stop.is_set():
                 return None
+            self._afford()
             connection = provider.closed_issues_page(rid, since, cursor)
+            self._charge(provider)
             for row in connection["nodes"]:
                 if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                     raise GitHubError("invalid_response")

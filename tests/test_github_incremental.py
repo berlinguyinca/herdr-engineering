@@ -466,3 +466,125 @@ def test_fleet_file_github_section_carries_the_allowlist_list(tmp_path, fake_hos
     monitor.refresh()
     assert monitor.snapshot(start=False)["scope"]["owners"] == ["acme"]
     assert numbers(monitor) == [1, 2]
+
+
+# ---------------------------------------------------------------- G5
+
+
+def ladder(budget=None, **kwargs):
+    """r1..r4 with 4, 3, 2 and 1 open issues (so a pass visits them in that order), synced once."""
+    fake = FakeGitHub(page_size=100)
+    for index, count in enumerate((4, 3, 2, 1), start=1):
+        for _ in range(count):
+            fake.add_issue(f"acme/r{index}")
+    clock = [1_000_000.0]
+    monitor = monitor_for(fake, {}, now=lambda: clock[0], point_budget=budget or 1000, **kwargs)
+    monitor.refresh()
+    for index in range(1, 5):
+        gid = next(iter(fake.repos[f"acme/r{index}"]))
+        fake.edit(f"acme/r{index}", gid, title=f"edited r{index}")
+    return fake, monitor, clock
+
+
+def titles(monitor, rid):
+    return {row["title"] for row in monitor.issues(repository_id=rid, per_page=100, start=False)["issues"]}
+
+
+def touched(fake):
+    return [entry[1] for entry in fake.log if entry[0] in {"issues", "closed"}]
+
+
+def test_point_budget_processes_only_what_fits_and_defers_the_rest():
+    fake, monitor, clock = ladder()
+    monitor._fixed_sync["point_budget"] = 5  # listing 1 + two changed repos at 2 points each
+    fake.log.clear()
+    fake.calls.clear()
+    monitor.refresh()
+    assert fake.calls == Counter({"repos": 1, "issues": 2, "closed": 2})
+    assert set(touched(fake)) == {"github.com/acme/r1", "github.com/acme/r2"}
+    view = monitor.snapshot(start=False)
+    assert [row["repository_id"] for row in view["deferred_repos"]] == ["github.com/acme/r3", "github.com/acme/r4"]
+    assert view["status"] == "partial" and view["stale"] is False  # deferred, but not for long yet
+    assert "edited r1" in titles(monitor, "github.com/acme/r1")
+    assert "edited r3" not in titles(monitor, "github.com/acme/r3")  # previous cache kept and served
+    assert len(titles(monitor, "github.com/acme/r3")) == 2
+
+
+def test_deferred_repositories_come_first_in_the_next_pass():
+    fake, monitor, clock = ladder()
+    monitor._fixed_sync["point_budget"] = 5
+    monitor.refresh()
+    monitor._fixed_sync["point_budget"] = 1000
+    clock[0] += 300
+    fake.log.clear()
+    fake.calls.clear()
+    monitor.refresh()
+    assert fake.calls["repos"] == 0  # the deferred work resumes before anything is re-listed
+    assert touched(fake)[0] == "github.com/acme/r3"
+    assert set(touched(fake)) == {"github.com/acme/r3", "github.com/acme/r4"}
+    view = monitor.snapshot(start=False)
+    assert view["deferred_repos"] == [] and view["status"] == "ready"
+    assert "edited r4" in titles(monitor, "github.com/acme/r4")
+
+
+def test_repository_deferred_past_two_intervals_marks_the_catalog_stale():
+    fake, monitor, clock = ladder()
+    monitor._fixed_sync["point_budget"] = 5  # r3 and r4 deferred
+    monitor.refresh()
+    assert monitor.snapshot(start=False)["stale"] is False
+    clock[0] += 300
+    monitor._fixed_sync["point_budget"] = 2  # the resumed pass (no listing) fits r3 only
+    monitor.refresh()
+    clock[0] += 301
+    view = monitor.snapshot(start=False)
+    assert [row["repository_id"] for row in view["deferred_repos"]] == ["github.com/acme/r4"]
+    assert view["stale"] is True  # r4 has waited longer than 2 x 300 s
+
+
+def test_unchanged_repositories_are_never_deferred():
+    fake = FakeGitHub(page_size=100)
+    for name in ("acme/a", "acme/b", "acme/c"):
+        fake.add_issue(name)
+    monitor = monitor_for(fake, {}, point_budget=1)
+    monitor.refresh()  # the listing is never cut; the first sync defers everything that needs a read
+    assert len(monitor.snapshot(start=False)["deferred_repos"]) == 3
+    for _ in range(3):
+        monitor._fixed_sync["point_budget"] = 2
+        monitor.refresh()
+    assert monitor.snapshot(start=False)["deferred_repos"] == []
+    fake.edit("acme/b", next(iter(fake.repos["acme/b"])), title="changed")
+    monitor._fixed_sync["point_budget"] = 1
+    monitor.refresh()  # the listing spends the whole budget; only acme/b needs a read
+    assert [row["repository_id"] for row in monitor.snapshot(start=False)["deferred_repos"]] == ["github.com/acme/b"]
+
+
+def test_rate_limited_mid_pass_defers_the_rest_the_same_way():
+    from herdr_engineering.github import GitHubError
+    fake, monitor, clock = ladder()
+    original = fake.issues_page
+
+    def limited(repository_id, cursor=None):
+        if repository_id == "github.com/acme/r3":
+            raise GitHubError("rate_limited", retry_at=clock[0] + 120)
+        return original(repository_id, cursor)
+    fake.issues_page = limited
+    monitor.refresh()
+    view = monitor.snapshot(start=False)
+    assert view["status"] == "rate_limited"
+    assert [row["repository_id"] for row in view["deferred_repos"]] == ["github.com/acme/r3", "github.com/acme/r4"]
+    assert "edited r3" not in titles(monitor, "github.com/acme/r3")
+    fake.issues_page = original
+    clock[0] += 300
+    fake.log.clear()
+    fake.calls.clear()
+    monitor.refresh()
+    assert fake.calls["repos"] == 0 and touched(fake)[0] == "github.com/acme/r3"
+    assert monitor.snapshot(start=False)["deferred_repos"] == []
+
+
+def test_point_budget_is_read_from_yaml(fake_host_config):
+    fake_host_config({"github": {"sync": {"point_budget": 5}}})
+    fake, monitor, clock = ladder()
+    monitor._fixed_sync["point_budget"] = None
+    monitor.refresh()
+    assert len(monitor.snapshot(start=False)["deferred_repos"]) == 2

@@ -83,5 +83,9 @@ build_cleanup:
 #         interval: 300                  # seconds between sync passes
 #         full_reconcile_interval: 86400 # each repository is read in full once per this
 #                                        # many seconds (staggered), as a drift safety net
+#         point_budget: 400              # GraphQL points (rateLimit.cost) one pass may spend;
+#                                        # repositories that do not fit are deferred to the
+#                                        # next pass (listed as deferred_repos, stale after 2x
+#                                        # interval) and the cached rows keep being served
 # The catalog persists in control_plane.pg_dsn when it is set (migration 0006),
 # otherwise it lives in memory and a restart re-reads GitHub.

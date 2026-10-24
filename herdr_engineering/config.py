@@ -16,8 +16,10 @@ from typing import Any
 from .errors import InvalidError
 
 # github.sync (control-plane-web, read live from the fleet file's github section):
-# seconds between passes, and seconds between scheduled full reads of one repository.
-GITHUB_SYNC_DEFAULTS = {"interval": 300, "full_reconcile_interval": 86400}
+# seconds between passes, seconds between scheduled full reads of one repository, and
+# the GraphQL points (rateLimit.cost) one pass may spend before deferring the rest.
+# 400 points every 300 s stays under GitHub's 5000/hour even when every pass spends it.
+GITHUB_SYNC_DEFAULTS = {"interval": 300, "full_reconcile_interval": 86400, "point_budget": 400}
 
 DEFAULTS: dict[str, Any] = {
     "version": 1,

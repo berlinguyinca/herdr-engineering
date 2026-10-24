@@ -146,3 +146,19 @@ def test_invalid_full_reconcile_interval_is_rejected(tmp_path, value):
     p.write_text(yaml.safe_dump({"version": 1, "github": {"sync": {"full_reconcile_interval": value}}}))
     with pytest.raises(InvalidError, match="github.sync.full_reconcile_interval"):
         load_config([p])
+
+
+@pytest.mark.parametrize("key", ["interval", "point_budget"])
+@pytest.mark.parametrize("value", [0, -5, "many", True, 1.5])
+def test_invalid_sync_settings_are_rejected(tmp_path, key, value):
+    import yaml
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"version": 1, "github": {"sync": {key: value}}}))
+    with pytest.raises(InvalidError, match=f"github.sync.{key}"):
+        load_config([p])
+
+
+def test_sync_settings_default_and_override():
+    from herdr_engineering.config import github_sync
+    assert github_sync(None) == {"interval": 300, "full_reconcile_interval": 86400, "point_budget": 400}
+    assert github_sync({"point_budget": 50})["point_budget"] == 50
