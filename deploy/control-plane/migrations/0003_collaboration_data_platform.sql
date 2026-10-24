@@ -170,6 +170,22 @@ CREATE TABLE collab_skills (
     created_at timestamptz NOT NULL DEFAULT now(),
     CHECK ((scope = 'room') = (room_id IS NOT NULL))
 );
+-- Drafts store metadata and an immutable S3 reference, never generated code bytes.
+CREATE TABLE collab_skill_drafts (
+    draft_id text PRIMARY KEY,
+    skill_id text NOT NULL REFERENCES collab_skills(skill_id) ON DELETE CASCADE,
+    created_by text NOT NULL REFERENCES collab_users(user_id) ON DELETE CASCADE,
+    -- Publication target hint, not live ownership: private packages survive room deletion.
+    target_room_id text,
+    version text NOT NULL,
+    storage_key text NOT NULL UNIQUE,
+    sha256 text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    manifest jsonb NOT NULL CHECK (jsonb_typeof(manifest) = 'object'),
+    signature text NOT NULL,
+    key_id text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE collab_skill_versions (
     skill_id text NOT NULL REFERENCES collab_skills(skill_id) ON DELETE CASCADE,
     version text NOT NULL,
@@ -177,7 +193,18 @@ CREATE TABLE collab_skill_versions (
     sha256 text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
     status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'revoked')),
     created_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (skill_id, version)
+    manifest jsonb CHECK (jsonb_typeof(manifest) = 'object'),
+    signature text,
+    key_id text,
+    source_draft_id text UNIQUE REFERENCES collab_skill_drafts(draft_id),
+    PRIMARY KEY (skill_id, version),
+    CHECK (status = 'draft' OR (
+        manifest IS NOT NULL AND signature IS NOT NULL AND key_id IS NOT NULL
+        AND source_draft_id IS NOT NULL
+        AND signature ~ '^[0-9a-f]{128}$' AND length(key_id) > 0
+        AND (manifest->>'schema_version' = '1') IS TRUE
+        AND (manifest->>'skill_id' = skill_id) IS TRUE
+        AND (manifest->>'version' = version) IS TRUE))
 );
 CREATE TABLE collab_skill_installations (
     installation_id text PRIMARY KEY,
@@ -203,3 +230,48 @@ CREATE TABLE collab_audit_events (
     occurred_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX collab_audit_events_entity ON collab_audit_events(entity_type, entity_id, occurred_at);
+
+-- Published package identity/content is immutable; revocation is terminal.
+-- Parent deletion remains available for the existing privacy/scrub lifecycle.
+CREATE FUNCTION collab_skill_version_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.status != 'draft' AND EXISTS (
+            SELECT 1 FROM collab_skills WHERE skill_id = OLD.skill_id) THEN
+            RAISE EXCEPTION 'published skill versions cannot be deleted' USING ERRCODE = '23514';
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF OLD.status != 'draft' AND (
+        (to_jsonb(NEW) - 'status') IS DISTINCT FROM (to_jsonb(OLD) - 'status')
+        OR NEW.status NOT IN ('published', 'revoked')
+        OR (OLD.status = 'revoked' AND NEW.status != 'revoked')) THEN
+        RAISE EXCEPTION 'published skill versions are immutable' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER collab_skill_version_immutable BEFORE UPDATE OR DELETE ON collab_skill_versions
+    FOR EACH ROW EXECUTE FUNCTION collab_skill_version_immutable();
+
+CREATE FUNCTION collab_skill_identity_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (NEW.skill_id, NEW.owner_id, NEW.scope, NEW.room_id) IS DISTINCT FROM
+       (OLD.skill_id, OLD.owner_id, OLD.scope, OLD.room_id)
+       AND EXISTS (SELECT 1 FROM collab_skill_versions
+                   WHERE skill_id = OLD.skill_id AND status != 'draft') THEN
+        RAISE EXCEPTION 'published skill identity and scope are immutable' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER collab_skill_identity_immutable BEFORE UPDATE ON collab_skills
+    FOR EACH ROW EXECUTE FUNCTION collab_skill_identity_immutable();
+
+CREATE FUNCTION collab_skill_draft_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'skill drafts are immutable; create a new draft' USING ERRCODE = '23514';
+END;
+$$;
+CREATE TRIGGER collab_skill_draft_immutable BEFORE UPDATE ON collab_skill_drafts
+    FOR EACH ROW EXECUTE FUNCTION collab_skill_draft_immutable();
