@@ -302,3 +302,14 @@ textarea.cx-input { resize: vertical; font: inherit; }
 #hcn-p-files { min-width: 0; }
 #hcn-p-files textarea { width: 100%; box-sizing: border-box; resize: vertical; }
 #hcn-p-files [data-file-preview] { overflow-wrap: anywhere; }
+
+/* Shared skill library and package review, in both collaboration shells. */
+.cx-skills, .cx-skill, .cx-skill-review { min-width: 0; overflow-wrap: anywhere; }
+.cx-skill h2, .cx-skill-review h2, .cx-skill-review h3 { margin: 0; }
+.cx-skill p, .cx-skill-review p { margin: 0; }
+.cx-skill-review pre { margin: 0; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--surface-2); border-radius: var(--radius-sm); max-height: 280px; overflow: auto; }
+.cx-skill-review dd { margin: 0 0 8px; }
+.cx-skill-review li code { display: block; }
+.cx-skills textarea { box-sizing: border-box; width: 100%; min-width: 0; resize: vertical;
+  padding: 10px; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); }

@@ -114,7 +114,7 @@ export function collabRouteState({ surface = 'public', route = '/rooms', status 
   if (error) status = ({ unauthorized: 'signed-out', forbidden: 'forbidden', not_found: 'not-found',
     unavailable: 'degraded', network_error: 'degraded', invalid_response: 'degraded', rate_limited: 'degraded',
   })[error.code] || 'error';
-  return { surface, route: roomId ? '/room' : ['/agents', '/people'].includes(path) ? path : '/rooms', roomId, status };
+  return { surface, route: roomId ? '/room' : ['/agents', '/people', '/skills'].includes(path) ? path : '/rooms', roomId, status };
 }
 
 export class CollabApi {
@@ -169,6 +169,21 @@ export class CollabApi {
     return this.call('POST', `/rooms/${encodeURIComponent(roomId)}/uploads/preview`, { manifest });
   }
   skills(scope) { return this.call('GET', `/skills${scope == null ? '' : `?scope=${encodeURIComponent(scope)}`}`); }
+  skillDraft(draftId) { return this.call('GET', `/skills/drafts/${encodeURIComponent(draftId)}`); }
+  publishSkill(draftId, scope) {
+    return this.call('POST', `/skills/drafts/${encodeURIComponent(draftId)}/publish`, { scope });
+  }
+  async downloadSkill(skillId, version) {
+    const grant = await this.call('POST', `/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(version)}/download`, {});
+    let url;
+    try { url = new URL(grant.url); } catch { /* reject malformed grants below */ }
+    if (!url || url.protocol !== 'https:' || url.username || url.password
+        || typeof grant.expires_at !== 'number' || !Number.isFinite(grant.expires_at)
+        || grant.expires_at * 1000 <= Date.now() || grant.skill_id !== skillId || grant.version !== version) {
+      throw new CollabError('Invalid or expired skill download authorization', 200, 'invalid_response');
+    }
+    return grant;
+  }
   // approval: the people who asked to join (operator: everyone; approvers: those waiting)
   users(status) { return this.call('GET', `/admin/users${status ? `?status=${encodeURIComponent(status)}` : ''}`); }
   decideUser(user, action, reason) {
