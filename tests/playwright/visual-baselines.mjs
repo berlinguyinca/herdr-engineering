@@ -142,7 +142,9 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     if (extraCss) await page.addStyleTag({ content: extraCss });
     await page.evaluate(() => document.fonts.ready);
     await page.waitForTimeout(600);
-    await page.evaluate(NORMALIZE);
+    // the page re-renders on its poll and puts the random text back: keep rewriting it for as long as the page lives (a one-off pass raced
+    // the redraw and left an unnormalised digest in about half of the captures)
+    await page.evaluate((src) => { const fn = new Function(`return (${src})`)(); fn(); new MutationObserver(() => fn()).observe(document.body, { subtree: true, childList: true, characterData: true }); }, NORMALIZE.toString());
     // selecting a node scrolls the page by a run-dependent pixel; those surfaces are captured from the top (the chat, which scrolls to
     // its newest message on purpose, is not touched)
     if (surface.resetScroll) { await page.evaluate(() => { window.scrollTo(0, 0); document.scrollingElement.scrollTop = 0; }); await page.waitForTimeout(100); }
