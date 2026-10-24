@@ -209,3 +209,67 @@ test('renaming an agent posts the new name to the documented route', async () =>
   assert.deepEqual(calls[0].slice(0, 2), ['POST', '/api/v1/collab/agents/agent%201/rename']);
   assert.deepEqual(JSON.parse(calls[0][2]), { name: 'architect' });
 });
+
+test('collaboration administration encodes scope and keeps removal distinct from permanent deletion', async () => {
+  for (const access of ['public-token', 'operator']) {
+    const calls = [];
+    const api = new CollabApi(() => ({ access }), async (url, init) => {
+      calls.push([init.method, url, JSON.parse(init.body)]);
+      return response({ status: 'complete' });
+    });
+    assert.equal(typeof api.deletePerson, 'function');
+    await api.removeMember('r/1', 'u/1');
+    await api.deletePerson('u/1');
+    await api.approveMember('r/1', 'u/1');
+    await api.setUploadPermission('r/1', 'u/1', false);
+    await api.archiveRoom('r/1');
+    assert.deepEqual(calls, [
+      ['POST', '/api/v1/collab/rooms/r%2F1/members/u%2F1/remove', {}],
+      ['POST', '/api/v1/collab/admin/users/u%2F1/delete', {}],
+      ['POST', '/api/v1/collab/rooms/r%2F1/members/u%2F1/approve', {}],
+      ['POST', '/api/v1/collab/rooms/r%2F1/members/u%2F1/upload-permission', { file_upload_permission: false }],
+      ['POST', '/api/v1/collab/rooms/r%2F1/archive', {}],
+    ]);
+  }
+});
+
+test('collaboration administration renderers separate pending, removed and upload capabilities', async () => {
+  const view = await import('../collab-view.js');
+  assert.equal(typeof view.renderPeople, 'function');
+  assert.equal(typeof view.renderRoomAdministration, 'function');
+  const users = [{ user_id: 'a', email: '<Admin>', status: 'pending' }];
+  assert.doesNotMatch(view.renderPeople({ users }), /Delete person permanently/);
+  assert.match(view.renderPeople({ users, manage: true }), /Delete person permanently/);
+  assert.match(view.renderPeople({ users, manage: true }), /&lt;Admin&gt;/);
+  const html = view.renderRoomAdministration({ room: { name: '<Lab>', members: [
+    { user_id: 'owner', role: 'owner', email: 'owner', file_upload_permission: true },
+    { user_id: 'pending', role: 'contributor', email: 'pending', room_membership_status: 'pending' },
+    { user_id: 'member', role: 'contributor', email: '<Member>', room_membership_status: 'approved', file_upload_permission: false },
+    { user_id: 'removed', role: 'viewer', email: 'removed', room_membership_status: 'removed' },
+  ] }, canManage: true, invites: [] });
+  assert.match(html, /Approve member/);
+  assert.match(html, /Remove from room/);
+  assert.match(html, /Upload files/);
+  assert.match(html, /&lt;Member&gt;/);
+  assert.doesNotMatch(html, /data-rm="owner"|data-upload="pending"|data-rm="removed"/);
+  assert.doesNotMatch(view.renderRoomAdministration({ room: {}, canManage: false }), /data-upload|data-rm|Archive and delete/);
+});
+
+test('collaboration destructive confirmations explain retention and fail closed without a dialog', async (t) => {
+  const view = await import('../collab-view.js');
+  assert.equal(typeof view.confirmDeletePerson, 'function');
+  const prompts = [];
+  const previous = globalThis.confirm;
+  t.after(() => { if (previous === undefined) delete globalThis.confirm; else globalThis.confirm = previous; });
+  globalThis.confirm = (message) => { prompts.push(message); return false; };
+  assert.equal(view.confirmDeletePerson({ email: 'member@example.org' }), false);
+  assert.equal(view.confirmDeleteRoom({ name: 'Lab' }), false);
+  assert.match(prompts[0], /memberships.*sessions.*tokens.*invitations.*owned.agent.*authored messages/is);
+  assert.match(prompts[0], /archives/i);
+  assert.match(prompts[0], /room-owned files.*remain/i);
+  assert.match(prompts[1], /verif/i);
+  assert.match(prompts[1], /failed archive.*live room intact/i);
+  delete globalThis.confirm;
+  assert.equal(view.confirmDeletePerson({ user_id: 'member' }), false);
+  assert.equal(view.confirmDeleteRoom({ name: 'Lab' }), false);
+});
