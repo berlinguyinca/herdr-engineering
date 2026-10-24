@@ -59,7 +59,9 @@ def _ci_id(row):
 def _ci_item(row):
     label = f"{_text(str(row.get('repository') or ''))} · run #{row.get('run_number')}"
     return _item(_ci_id(row), label, row.get("state") or row.get("status"),
-                 repository=_text(str(row.get("repository") or "")), branch=_text(str(row.get("branch") or "")))
+                 repository=_text(str(row.get("repository") or "")), branch=_text(str(row.get("branch") or "")),
+                 run_number=row.get("run_number"),
+                 repo_filter=_text(str(row.get("provider_repo_id") or row.get("repository") or ""), 200))
 
 
 def _pr_item(p):

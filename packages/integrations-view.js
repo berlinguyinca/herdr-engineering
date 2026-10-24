@@ -10,6 +10,8 @@ import {renderCiPipeline,ciPipelineStyles,pipelineZoom,sameCiRepository,ciCompar
 import {mountCiHealth} from './ci-health-view.js';
 import {renderCiFix,ciFixStyles,fixRunKey,latestFix,fixIsActive,fixError} from './ci-fix-view.js';
 import {attachError,attachForms} from './terminal-attach.js';
+import {renderRelated} from './related-panel.js';
+import {entityHref} from './entity-links.js';
 
 const text = value => typeof value === 'string' ? value : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -118,17 +120,25 @@ export function activePiSessions(sessions) {
     && text(s.host_id) && text(s.terminal_id) && text(s.herdr_session)
     && s.interactive_ready!==false && !s.launch_pending);
 }
-export function renderPipeline(pipeline,{loading=false,error='',log=null,logError='',step='',actionMessage='',debugSessions=null,debugSessionId='',debugMessage='',collapseSuccess=false,zoom=1,fixHtml=''}={}) {
+export function renderPipeline(pipeline,{loading=false,error='',log=null,logError='',step='',actionMessage='',debugSessions=null,debugSessionId='',debugMessage='',collapseSuccess=false,zoom=1,fixHtml='',relatedHtml=''}={}) {
   if (!pipeline) return loading ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">Select a run to inspect its steps and logs.</p>';
   const tasks=records(pipeline.tasks);
   const completed=tasks.filter(t=>integrationOutcome(t)!=='current').length;
   return `<div class="ig-heading"><h2>Run #${esc(pipeline.run_number ?? '')}</h2><button type="button" class="hd-btn" data-close-inspector><span class="ig-back-label">Back to runs</span><span class="ig-close-label">Close</span></button></div>
     <p class="ig-note">${esc(pipeline.repository || '')}${pipeline.branch ? ` · ${esc(pipeline.branch)}` : ''}${pipeline.revision ? ` · <code>${esc(pipeline.revision)}</code>` : ''} · ${esc(human(stateOf(pipeline)) || 'Status unknown')} · ${elapsed(pipeline)}</p>
     <div class="ig-links">${external(pipeline.url,'Open in Woodpecker')}${pipeline.can_retry ? '<button class="hd-btn" type="button" data-ci-action="retry">Retry run</button>' : ''}${pipeline.can_cancel ? '<button class="hd-btn" type="button" data-ci-action="cancel">Cancel run</button>' : ''}</div>
+    ${relatedHtml}
     ${error ? `<p class="ig-warning" role="status">${esc(error)} Showing the last received details.</p>` : ''}${actionMessage ? `<p role="status" class="ig-note">${esc(actionMessage)}</p>` : ''}
     ${integrationOutcome(pipeline)==='failed' ? `<details class="ig-debug" data-debug-disclosure><summary>Debug with Pi</summary><p class="ig-note">Send the failed revision, step details and bounded log output to a Pi agent you choose.</p>${debugSessions===null ? '<p class="ig-note">Open this section to load active Pi agents.</p>' : `<label class="ig-note">Target Pi agent<select data-debug-session aria-label="Target Pi agent"><option value="">Choose an agent…</option>${debugSessions.map(s=>`<option value="${esc(s.session_id)}" ${s.session_id===debugSessionId?'selected':''}>${esc(short(s.display_name || s.title || s.summary || s.cwd || s.session_id,100))}${s.host_id?` · ${esc(short(s.host_id,60))}`:''}${pipeline.branch && s.branch===pipeline.branch?' · on this branch':''}</option>`).join('')}</select></label>${!debugSessions.length ? '<p class="ig-note">No active Pi agents with verified messaging are available.</p>' : ''}<button type="button" class="hd-btn" data-debug-send ${!debugSessionId?'disabled':''}>Send to Pi</button> <button type="button" class="hd-btn" data-debug-fix ${!debugSessionId?'disabled':''}>Fix with Pi</button><p class="ig-note">Fix with Pi asks the agent to reproduce the failure in a new worktree at this exact revision, fix it and open a pull request. It never merges.</p>`}${debugMessage ? `<p class="ig-note" role="status">${esc(debugMessage)}</p>` : ''}</details>` : ''}${integrationOutcome(pipeline)==='failed' ? fixHtml : ''}
     ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress><div class="ci-pipeline-controls" role="group" aria-label="Pipeline display"><button type="button" class="hd-btn" data-collapse-success aria-pressed="${collapseSuccess}">${collapseSuccess?'Expand successful steps':'Collapse successful steps'}</button><button type="button" class="hd-btn" data-pipeline-zoom="out" aria-label="Zoom out" ${zoom<=.75?'disabled':''}>−</button><button type="button" class="hd-btn" data-pipeline-zoom="reset" aria-label="Reset zoom">${Math.round(zoom*100)}%</button><button type="button" class="hd-btn" data-pipeline-zoom="in" aria-label="Zoom in" ${zoom>=1.5?'disabled':''}>+</button></div>${renderCiPipeline(pipeline,{step,collapseSuccess,zoom})}` : (!Array.isArray(pipeline.tasks) && loading && !error ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
     ${step ? `<h3>Step log</h3>${logError ? `<p class="ig-warning" role="status">${esc(logError)}</p>` : ''}${log===null ? '<p class="ig-note" role="status">Loading step output…</p>' : `<p class="ig-note">${age(log.checked_at,'Log checked')}${log.truncated?' · Output truncated':''}</p>${log.available===false ? `<p class="ig-note">${esc(log.error || 'Log output is not available yet.')}</p>` : `<pre class="ig-log" tabindex="0" aria-label="Step output">${esc(text(log.log)) || 'No output reported yet.'}</pre>`}`}` : ''}`;
+}
+
+// The filter names the entity it came from and links back to it (cross-linking), never from free text.
+function filterLink(repository,mission,session) {
+  const [kind,id]=repository?['project',repository]:mission?['mission',mission]:['session',session];
+  const href=entityHref(kind,id);
+  return href?`<a href="${esc(href)}">${esc(id)}</a>`:esc(id);
 }
 
 const styles=`<style>
@@ -143,7 +153,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const isCi=kind==='ci';
   const tabs=isCi ? [['current','Current'],['failed','Failed'],['finished','Finished']] : [['current','Current'],['changes','Changes requested'],['failed','Failed'],['finished','Finished']];
   const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,provider,mission,session,page:0,group:'project',branch:'',days:0};
-  let disposed=false,data=null,error='',selected=null,pipeline=null,detailError='',log=null,logError='',step='',actionMessage='';
+  let related=null,relatedFailed=false,disposed=false,data=null,error='',selected=null,pipeline=null,detailError='',log=null,logError='',step='',actionMessage='';
   let timer=null,clock=null,signature='',detailSignature='',chartSignature='';
   let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='',fixOperationId='';
@@ -161,7 +171,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
     ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="0">All retained history</option><option value="7">Last 7 days</option><option value="14">Last 14 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div data-ci-insights></div>' : ''}
-    ${repository || mission || session ? `<p class="ig-note">Filtered to ${esc(repository || mission || session)} · <a href="#/${kind}">Clear context</a></p>` : ''}
+    ${repository || mission || session ? `<p class="ig-note">Filtered to ${filterLink(repository,mission,session)} · <a href="#/${kind}">Clear context</a></p>` : ''}
     ${isCi ? '<details class="ci-charts" data-ci-charts><summary>Run durations · project, language & cache health</summary><div class="ig-controls ci-cache-controls"><label>Cache and trend window<select data-ci-performance-window><option value="7">Last 7 days</option><option value="14" selected>Last 14 days</option></select></label><p class="ci-chart-note">Cache and regression windows are limited to 7 or 14 days within the selected period.</p></div><div class="ci-charts-body" data-ci-charts-body></div></details>' : ''}
     <p class="ig-note" data-ig-count></p><div class="ig-layout"><section id="ig-results" role="tabpanel" aria-labelledby="ig-tab-${state.tab}"></section><aside class="ig-inspector" aria-label="Pipeline inspector" hidden></aside></div>
     <div class="ig-pages"><button type="button" class="hd-btn" data-page="previous">Previous</button><span data-ig-page></span><button type="button" class="hd-btn" data-page="next">Next</button></div><div data-ig-runners></div>${!isCi ? '<details class="ig-runners"><summary>Start a review</summary><p>Start Plannotator from the project workspace with <code>herdr-plannotator --help</code>. Its review link and upstream decision appear here when the launcher is connected to this control plane.</p></details>' : ''}`;
@@ -314,8 +324,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       const compared=candidates.find(record=>ciRunKey(record)===comparisonKey);
       const comparison=compared?ciComparisonModel(pipeline,{...observedDetails.get(comparisonKey),...compared,tasks:compared.tasks??observedDetails.get(comparisonKey)?.tasks}):null;
       const compareHtml=`<label class="ci-compare-control">Compare observed run<select data-ci-compare aria-label="Compare observed run"><option value="">No comparison</option>${candidates.map(record=>`<option value="${esc(ciRunKey(record))}" ${ciRunKey(record)===comparisonKey?'selected':''}>Run #${esc(record.run_number)} · ${esc(record.state||record.status||'Unknown')} · ${esc(record.branch||'Branch not reported')}</option>`).join('')}</select></label>${comparisonKey&&!compared?'<p class="ig-note">Compared run is no longer in retained observations.</p>':''}${renderCiComparison(comparison)}`;
-      const next=JSON.stringify([collapseSuccess,zoom,compareHtml,testSearch,testPage,runReports,pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,fixAvailable,fix,fixMessage,fixTerminal,fixTerminalError,fixIsActive(fix)?Math.floor(Date.now()/5000):0]);
-      if(detailSignature!==next){detailSignature=next;replace(inspector,'<div class="ig-active-pipeline">'+renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,collapseSuccess,zoom,fixHtml:renderCiFix({available:fixAvailable,fix,message:fixMessage,terminal:fixTerminal,terminalError:fixTerminalError})})+renderCiRunReports(runReports,{search:testSearch,page:testPage})+'</div><div class="ig-comparison-panel">'+compareHtml+'</div>');healthView?.selectedRun(pipeline);}
+      const next=JSON.stringify([collapseSuccess,zoom,compareHtml,testSearch,testPage,runReports,pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,fixAvailable,fix,fixMessage,fixTerminal,fixTerminalError,related,relatedFailed,fixIsActive(fix)?Math.floor(Date.now()/5000):0]);
+      if(detailSignature!==next){detailSignature=next;replace(inspector,'<div class="ig-active-pipeline">'+renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,collapseSuccess,zoom,fixHtml:renderCiFix({available:fixAvailable,fix,message:fixMessage,terminal:fixTerminal,terminalError:fixTerminalError}),relatedHtml:related||relatedFailed?renderRelated(related,{error:relatedFailed?'failed':null}):''})+renderCiRunReports(runReports,{search:testSearch,page:testPage})+'</div><div class="ig-comparison-panel">'+compareHtml+'</div>');healthView?.selectedRun(pipeline);}
     }
     tick();
   }
@@ -326,6 +336,11 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     try {const response=await fn(controller.signal);if(!disposed && !controller.signal.aborted)accept(response);}
     catch(err){if(!disposed && (!controller.signal.aborted || timeout))onError(err);}
     finally {clearTimeout(deadline);if(pending.get(key)===controller)pending.delete(key);draw();}
+  }
+  function refreshRelated() {
+    if(!selected || typeof client.related!=='function')return;
+    const key=selected.id,id=`${selected.providerId}:${selected.number}`;
+    request('related',signal=>client.related('ci',id,{signal}),response=>{if(selected?.id===key){related=response;relatedFailed=false;}},err=>{if(selected?.id===key){related=err?.status===404?{relations:{}}:null;relatedFailed=err?.status!==404;}});
   }
   function refreshDetail() {
     if(!selected)return;
@@ -376,15 +391,15 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     },()=>{error=`${title} could not refresh.${data?' Showing last received records.':' Retrying automatically.'}`;});
     refreshDetail();
   }
-  function cancelDetail() {for(const key of ['pipeline','log','debug-sessions','fix']){pending.get(key)?.abort();pending.delete(key);}}
+  function cancelDetail() {for(const key of ['pipeline','log','debug-sessions','fix','related']){pending.get(key)?.abort();pending.delete(key);}}
   function openCiRun(record){
     const entry=integrationEntries({pipelines:{history:[record]}})[0];
     if(!entry)return;
     if(selected?.id===entry.id){el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});return;}
     listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();
     selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number,providerUrl:JSON.parse(entry.id)[0]};
-    pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';fixOperationId='';fix=null;fixMessage='';sandboxOperationId='';fixTerminal=null;fixTerminalError='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';
-    draw();refreshDetail();el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});
+    pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';fixOperationId='';fix=null;fixMessage='';sandboxOperationId='';fixTerminal=null;fixTerminalError='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';related=null;relatedFailed=false;
+    draw();refreshDetail();refreshRelated();el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});
   }
   container.addEventListener('click',async event=>{
     if(disposed)return;
