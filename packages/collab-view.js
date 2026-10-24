@@ -6,6 +6,9 @@ import { renderFlow } from './collab-flow.js';
 import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
 import {
+  filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
+} from './collab-lineage.js';
+import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
@@ -559,7 +562,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
     const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['links', 'Workspaces']]), ...(canInvite ? [['people', 'People']] : [])];
+    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['links', 'Workspaces']]), ...(canInvite ? [['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
@@ -582,6 +585,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         ${operator ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helpers</div><div id="hcn-panic"></div><div class="hd-card__title">Host access requests</div><div id="hcn-egress"></div><div class="hd-card__title">External hosts</div><div id="hcn-hosts-table"></div></div>' : ''}
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helper profile</div><div id="hcn-profile-box"></div></div>' : ''}</section>`}
       ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-tabs" hidden aria-label="Primary agents and their subagents"><div id="hcn-tabs" aria-live="polite"></div></section>'}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><div id="hcn-lineage" class="cx-stack"></div></section>'}
       ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
@@ -831,6 +835,130 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       show();
       loadTabs().then(show);
     }
+
+    // ---- Lineage: graph, Gantt, replay and inspector. Read-only; the server filters every read by your CURRENT
+    // membership. Live = the head of your ledger (refreshed while open); a replay position is static.
+    const LIN = { step: null, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, pages: [], total: 0, next: null,
+      truncated: null, asOf: null, timeline: null, error: null, timelineError: null, html: '', pending: null, fails: 0, notice: null, busy: false, at: 0, seq: 0, bound: false, layout: null,
+      filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' } };
+    const linModel = () => {
+      const graphAll = mergePages(LIN.pages);
+      const filtered = filterGraph(graphAll, LIN.filters);
+      return { graphAll, filtered, asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, queued: LIN.pending !== null, notice: LIN.notice, busy: LIN.busy, view: LIN.view,
+        mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, total: LIN.total,
+        graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
+    };
+    const linFail = (e) => (/failed|404|not found/i.test(String(e && e.message)) ? 'No lineage is available for this room.' : 'Could not load the lineage. Press Retry, or choose Live.');
+    async function loadLineage(more = false) {
+      const my = ++LIN.seq;
+      let again = false;
+      LIN.busy = true; drawLineage(true);
+      try {
+        const g = await api.lineage(roomId, { step: LIN.step, offset: more ? LIN.next : 0 });
+        if (my !== LIN.seq || !alive) return;
+        let t = null;
+        LIN.timelineError = null;
+        if (LIN.view === 'gantt' || LIN.timeline) {
+          // the timeline is read at the position the graph answered for, so the two never disagree
+          try { t = await api.lineageTimeline(roomId, { step: g.as_of.head ? null : g.as_of.step }); } catch (e) { LIN.timelineError = 'The timeline could not be loaded.'; }
+          if (my !== LIN.seq || !alive) return;
+        }
+        LIN.pages = more ? [...LIN.pages, g] : [g];
+        LIN.total = g.total_nodes; LIN.next = g.next_offset; LIN.truncated = g.truncated_reason; LIN.asOf = g.as_of;
+        if (t) LIN.timeline = t;
+        LIN.error = null;
+        LIN.fails = 0;
+      } catch (e) {
+        if (my === LIN.seq) {
+          LIN.error = linFail(e);
+          LIN.fails += 1;
+          // a second failure at the same position falls back to Live instead of leaving the panel stuck
+          if (LIN.fails >= 2 && LIN.step !== null) { LIN.step = null; LIN.fails = 0; LIN.pages = []; LIN.notice = 'That position could not be loaded, so Live is shown.'; again = true; }
+        }
+      } finally { if (my === LIN.seq) { LIN.busy = false; LIN.at = Date.now(); } }
+      if (!alive || my !== LIN.seq) return;
+      const next = LIN.pending;
+      LIN.pending = null;
+      if (next) { LIN.step = next.step; LIN.notice = null; loadLineage(); return; }   // the latest choice made while busy
+      drawLineage(true);
+      if (again) loadLineage();
+    }
+    function drawLineage(force = false) {
+      const box = $('hcn-lineage');
+      if (!box) return;
+      if (!LIN.bound) bindLineage(box);
+      // live refresh only at the head of page one: a replay is static and "Load more" pages must survive
+      if (!force && LIN.step === null && !LIN.busy && LIN.pages.length <= 1 && Date.now() - LIN.at > 8000) { loadLineage(); }
+      else if (!force && !LIN.at && !LIN.busy) { loadLineage(); return; }
+      const m = linModel();
+      LIN.layout = layoutGraph(m.filtered);
+      const html = renderLineage(m);
+      if (LIN.html === html && box.innerHTML !== '') return;
+      const a = document.activeElement;
+      const key = a && box.contains(a) ? focusKey(a) : null;
+      const pos = key && typeof a.selectionStart === 'number' ? a.selectionStart : null;
+      LIN.html = html; box.innerHTML = html;
+      const sel = key && focusSelector(key);
+      const el = sel && box.querySelector(sel);
+      if (el) { el.focus({ preventScroll: true }); if (pos !== null && el.setSelectionRange && el.type === 'search') try { el.setSelectionRange(pos, pos); } catch { /* not selectable */ } }
+    }
+    function bindLineage(box) {
+      LIN.bound = true;
+      let slide = 0;
+      const goStep = (t) => {
+        const step = t === 'live' ? null : t;
+        if (LIN.busy) { LIN.pending = { step }; drawLineage(true); return; }      // keep the LATEST choice, apply it next
+        LIN.step = step; LIN.notice = null; LIN.error = null; if (step === null) LIN.pages = []; loadLineage();
+      };
+      box.addEventListener('click', (e) => {
+        const n = e.target.closest('[data-node]');
+        if (n) { LIN.sel = n.dataset.node; LIN.focus = n.dataset.node; drawLineage(true); return; }
+        const r = e.target.closest('[data-replay]');
+        if (e.target.closest('[data-retry]')) { loadLineage(); return; }
+        if (r && r.dataset.replay !== 'slider') { goStep(replayTarget(LIN.asOf, r.dataset.replay)); return; }
+        const v = e.target.closest('[data-view]');
+        if (v) { LIN.view = v.dataset.view; if (LIN.view === 'gantt' && !LIN.timeline) loadLineage(); else drawLineage(true); return; }
+        const md = e.target.closest('[data-mode]');
+        if (md) { LIN.mode = md.dataset.mode; drawLineage(true); return; }
+        if (e.target.closest('[data-more]') && !LIN.busy) loadLineage(true);
+      });
+      box.addEventListener('submit', (e) => { e.preventDefault(); });      // Enter in the search box filters; it never navigates
+      box.addEventListener('input', (e) => {
+        const f = e.target.dataset.filter;
+        if (f === 'q') { LIN.filters.q = e.target.value; drawLineage(true); }
+        else if (e.target.dataset.replay === 'slider') {
+          const out = box.querySelector('.lin-replay__status');
+          if (out) out.textContent = `Position ${e.target.value} of ${e.target.max}. Release to load.`;
+        }
+      });
+      box.addEventListener('change', (e) => {
+        const t = e.target;
+        if (t.dataset.replay === 'slider') { clearTimeout(slide); const v = t.value; slide = setTimeout(() => goStep(replayTarget(LIN.asOf, 'slider', v)), 150); return; }
+        if (t.dataset.clock !== undefined) { LIN.clock = t.value; drawLineage(true); return; }
+        const f = t.dataset.filter;
+        if (f === 'type' || f === 'etype') {
+          const set = f === 'type' ? LIN.filters.types : LIN.filters.edgeTypes;
+          if (t.checked) set.add(t.value); else set.delete(t.value);
+          drawLineage(true);
+        } else if (f === 'state') { LIN.filters.state = t.value; drawLineage(true); }
+      });
+      box.addEventListener('keydown', (e) => {
+        const n = e.target.closest && e.target.closest('g[data-node]');
+        if (n) {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); LIN.sel = n.dataset.node; LIN.focus = n.dataset.node; drawLineage(true); return; }
+          if (e.key === 'Escape') { LIN.sel = null; drawLineage(true); return; }
+          const to = LIN.layout && nextNode(LIN.layout, n.dataset.node, e.key);
+          if (to) { e.preventDefault(); LIN.focus = to; drawLineage(true); box.querySelector(`g[data-node="${CSS.escape(to)}"]`)?.focus(); }
+          return;
+        }
+        const tab = e.target.closest && e.target.closest('[data-view]');
+        if (tab && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
+          e.preventDefault(); LIN.view = tab.dataset.view === 'graph' ? 'gantt' : 'graph';
+          if (LIN.view === 'gantt' && !LIN.timeline) loadLineage(); else drawLineage(true);
+          box.querySelector(`[data-view="${LIN.view}"]`)?.focus();
+        }
+      });
+    }
     const setBadge = (k, n) => { const b = $(`hcn-b-${k}`); if (!b) return; b.hidden = !n; b.textContent = n > 99 ? '99+' : String(n); };
     const loadMine = async () => { try { S.mine = (await api.agents()).agents; } catch { /* keep the old list */ } };
     function paint() {
@@ -840,6 +968,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       else if (sub === 'flow') drawFlow();
       else if (sub === 'links') put('hcn-links', renderLinks(S.links, S.missions));
       else if (sub === 'tabs') drawTabs();
+      else if (sub === 'lineage') drawLineage();
       else if (sub === 'agents') { drawRoomAgents(); drawMyAgents(); drawRequests(); drawHelpers(); }
     }
     const paintPanel = async () => {

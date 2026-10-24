@@ -532,6 +532,15 @@ def test_lineage_key_scopes_reach_the_server_and_bad_entries_stop_startup(tmp_pa
     assert "operator" in str(e.value)
 
 
+def test_replay_history_is_validated_in_the_collab_slice(tmp_path):
+    central = make_file(tmp_path, collab=dict(COLLAB, replay_history="full"))
+    assert fcc.collab_values(fcc.load_fleet_config(central))["replay_history"] == "full"
+    central.unlink()
+    central = make_file(tmp_path, collab=dict(COLLAB, replay_history="everything"))
+    with pytest.raises(fcc.FleetConfigError, match="replay_history must be"):
+        fcc.collab_values(fcc.load_fleet_config(central))
+
+
 SUMMARY_FIX = {"room_id": "collab_room1", "requester_agent_id": "collab_agent1"}
 
 

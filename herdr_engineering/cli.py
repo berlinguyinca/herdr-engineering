@@ -530,6 +530,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="approval mode: any pool account may sign in and ask to join, and nothing works until "
                          "an approver or the operator approves it; --collab-cognito-group members are approved "
                          "on sight instead of being required")
+    p2.add_argument("--collab-replay-history", default=None, choices=["full", "since_join"],
+                    help="lineage replay window for members (default since_join; normally set by "
+                         "control_plane.collab.replay_history in the fleet config)")
     p2.add_argument("--collab-approver-group", action="append", default=[],
                     help="Cognito group whose members may approve new people (repeatable; approval mode)")
     p2.add_argument("--collab-public-port", type=int, default=None,
@@ -2481,6 +2484,11 @@ def _cmd_cp_web(args) -> int:
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
         collab = CollabService(StaticTokenAuthenticator(users), sink=sink)
+    if collab is not None:
+        history = getattr(args, "collab_replay_history", None) or "since_join"
+        if history not in ("full", "since_join"):
+            raise SystemExit("control_plane.collab.replay_history must be 'full' or 'since_join'")
+        collab.replay_history = history
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
@@ -2558,6 +2566,7 @@ COLLAB_CONFIG_KEYS = {
     "open_signup": ("collab_open_signup", bool),
     "approver_groups": ("collab_approver_group", list),
     "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
+    "replay_history": ("collab_replay_history", str),     # lineage replay: since_join (default) | full
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
 }

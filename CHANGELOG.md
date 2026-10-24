@@ -5,6 +5,18 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Lineage graph, Gantt timeline and replay (T09, stacked on #167, #165, #164)
+- Room workbench: new read-only "Lineage" panel (`packages/collab-lineage.js`): layered lineage graph, Gantt timeline with
+  head-change and stale markers, replay scrubber, filters and node inspector, each with a table alternative; keyboard
+  operable; nothing encoded by colour alone; all ids and labels escaped.
+- New read routes `GET /api/v1/collab/graph/lineage[/timeline|/events]` (room_id required, same membership 404, budgets, 240/min per person).
+  Replay at a position equals the live projection at that point and never shows what the reader cannot see now.
+  No migration, no new table (derived from the stored lineage events). See `docs/contracts/lineage-events.md` ("T09").
+- Replay is per room (a busy room cannot break another's), visibility is scanned in 128-event chunks so viewers do not stall
+  ingest, member responses no longer carry the global `admission` counter, the ledger window is counted in the reader's own visible events (exact steps, opaque page tokens), and the new
+  operator YAML `control_plane.collab.replay_history` (`since_join` default | `full`) sets how far back a member may replay.
+- Rollback: revert the PR (code only).
+
 ### Head-bound review quorum (T06)
 - Review round 4: head handling is conservative. A lower-sequence write after the applied one is ignored only if it repeats
   the applied head or a head that writer already reported earlier; any other head makes the PR `head_unverified`
