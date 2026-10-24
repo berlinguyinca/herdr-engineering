@@ -35,12 +35,27 @@ export async function loadActivity(client, missionTitles = async () => ({})) {
   return entriesFor(events || [], titles);
 }
 
+// event_id is unique only per principal (migration 0005), so the row key is actor id + event_id.
+// An event without an id is keyed by a hash of its content, never by its position: a position
+// shifts on every prepend, so new events would reuse old rows and never count as new.
+function hash(text) {
+  let h = 5381;
+  for (let i = 0; i < text.length; i += 1) h = ((h * 33) ^ text.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+export function eventKey(event) {
+  const actor = event && typeof event.actor === 'object' && event.actor ? String(event.actor.id ?? '') : '';
+  if (event?.event_id) return `${actor}|${event.event_id}`;
+  return `noid|${hash(JSON.stringify(event ?? null))}`;
+}
+
 function entriesFor(events, missionTitles) {
-  return events.map((event, index) => {
+  return events.map((event) => {
     const description = describeEvent(event, { missionTitles });
     const rawPayload = JSON.stringify(event.payload || {}, null, 2);
     return {
-      id: String(event.event_id || `index-${index}`),
+      id: eventKey(event),
       eventId: event.event_id || '',
       type: event.event_type || '',
       title: description.title, kind: description.kind, detail: description.detail, muted: description.muted,

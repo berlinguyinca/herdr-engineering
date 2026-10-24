@@ -81,3 +81,25 @@ test('a user scrolled away from the top sees "N new" and the list does not jump'
  const after=await page.evaluate(()=>({ids:[...document.querySelectorAll('.ac-row')].slice(0,3).map(x=>x.dataset.eventId),hidden:document.querySelector('[data-activity-new]').hidden}));
  assert.deepEqual(after,{ids:['ev-102','ev-101','ev-100'],hidden:true});
 }));
+
+test('rows are keyed per principal and events without an id keep a stable key across prepends',async()=>withPage(async(page,base)=>{
+ const shared=(actor,n)=>({...ev(n),event_id:'same-id',actor:{id:actor,kind:'agent'},payload:{actor}});
+ const noId={event_type:'HostHeartbeat',sequence:7,source_timestamp:'2026-01-01T00:00:07Z',payload:{anon:true}};
+ const state={events:[noId,shared('alice',2),shared('bob',1)]};
+ await boot(page,base,'/activity',api(state));
+ await until(()=>page.locator('.ac-row').count().then(n=>n===3),'three rows, including two principals sharing an event_id');
+ await page.evaluate(()=>{window.__rows=[...document.querySelectorAll('.ac-row')];});
+ state.events.unshift(ev(9));
+ await liveRefresh(page);
+ const r=await page.evaluate(()=>{const rows=[...document.querySelectorAll('.ac-row')];return {n:rows.length,kept:window.__rows.every(x=>rows.includes(x)),
+  first:rows[0].dataset.eventId,second:rows[1]===window.__rows[0]};});
+ assert.deepEqual(r,{n:4,kept:true,first:'ev-9',second:true});
+
+ // Scrolled away: a new id-less event counts toward the pill.
+ state.events=[...Array.from({length:40},(_,i)=>ev(200-i)),...state.events];
+ await liveRefresh(page);
+ await page.evaluate(()=>window.scrollTo(0,900));
+ state.events.unshift({...noId,sequence:8,source_timestamp:'2026-01-01T00:00:08Z',payload:{anon:2}});
+ await liveRefresh(page);
+ assert.equal(await page.locator('[data-activity-new]').textContent(),'1 new');
+}));
