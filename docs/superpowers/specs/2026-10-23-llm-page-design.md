@@ -306,3 +306,10 @@ The operator had not answered the questions above when slice 1 was built, so the
 - **Definitions as built.** Speed needs a stream, `usage_known`, and `gen_ms >= 50`. End-to-end throughput applies to non-stream requests only and is never called speed. TTFT and queue wait are reported only where recorded. An error is a v2 record with an error class or a status of 400 or more, or a v1 record with `success: false` (class `unclassified`). Token totals carry `lower_bound: true` when any successful v2 record had no usage object.
 - **Sources** are part of the group key, so numbers from `llm-proxy` and `transcript` are listed side by side and never added. Only `llm-proxy` exists until slice 5.
 - **Sessions.** Grouping or filtering by session uses `resolve_usage_session`, so the key is the dashboard session id or `unmatched:<raw id>`. Rows with no session id are left out of the per-session grouping but count everywhere else.
+
+### Slice 4 notes (per-agent view, as built)
+
+- **No new API route.** `GET /api/v1/llm/sessions/<id>` from the route list is not built: the stats, timeseries and errors routes already take `session=<dashboard id>` (which also matches usage rows resolved to it), so `#/llm/session/<id>` calls those.
+- **Page.** `#/llm/session/<id>` shows the agent name with a source badge, an "Open agent ↗" link to `#/herd/session/<id>` (replaced by a note when the id is not a known dashboard session), the same tiles and charts scoped to that agent, its models and its problems. When the agent's records carry no latency it says so.
+- **Links.** The agent and problem rows on `#/llm` link to the usage view. The session workspace header and each herd row get an "LLM usage" link. They carry no numbers (that would be one more request per row); the figures are on the usage page.
+- **Mission link not built.** `#/llm?mission=<id>` works in the API (`mission` filter) but no mission page links to it yet.
