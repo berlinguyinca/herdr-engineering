@@ -304,6 +304,7 @@ class CollabArchive:
                 await self.store.remove_job(pending['job_id'])
         count = 0
         for archive in await self.store.list_archives():
+            await self._io(self.storage.require_unversioned_archive_scrub)
             job = await self.store.get_job(archive.archive_id)
             if job and job['payload']['phase'] == 'export':
                 # Partial exports may already contain authored data. Re-export all

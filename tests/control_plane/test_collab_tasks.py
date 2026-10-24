@@ -58,7 +58,7 @@ class W:
         for u, role in (("bob", "contributor"), ("carol", "viewer"), ("dave", "guest")):
             s.add_member(self.alice, self.room, {"user_id": u, "role": role})
 
-    def agent(self, owner, actions=("read", "post", "execute", "instruct"), room=None, name=None):
+    def agent(self, owner, actions=("read", "post", "execute", "instruct"), room=None, name=None, delegate=True):
         pr = getattr(self, owner)
         body = {"harness_type": "claude-code", **({"name": name} if name else {})}
         info = self.s.connect_agent(pr, body)
@@ -67,6 +67,10 @@ class W:
         out = self.s.grant_agent(pr, room, {"agent_id": info["agent_id"], "actions": list(actions)})
         if out["status"] == "pending":
             self.s.decide_agent_request(self.alice, room, out["request_id"], {"decision": "approve"})
+        # Task protocol tests use an explicitly approved requester; attachment alone
+        # no longer authorizes Bob to use someone else's agent.
+        if delegate and room == self.room and owner != "bob" and self.s._member(self.s._rooms[room], "bob"):
+            self.s.set_agent_permission(pr, room, agent.id, "bob", "approved")
         return agent, info
 
 

@@ -316,6 +316,18 @@ class CollabStorage:
             raise StorageError('live file deletion failed') from None
 
 
+    def require_unversioned_archive_scrub(self) -> None:
+        """Current-object rewrites cannot erase historical versions or delete markers.
+
+        Check even if the current snapshot is already clean: older versions may
+        predate a previous scrub. Missing/denied inspection also fails closed.
+        """
+        try:
+            if self._archive._s3.get_bucket_versioning(Bucket=self.config.archive_bucket).get('Status') is not None:
+                raise ValueError('version-aware archive erasure required')
+        except Exception:
+            raise StorageError('archive version history cleanup could not be verified') from None
+
     def delete_skill_package(self, bucket: str | None, key: str) -> None:
         """Delete a journaled package and prove absence; never guess a legacy bucket.
 

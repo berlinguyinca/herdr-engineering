@@ -784,6 +784,7 @@ class CollabService:
             self._tasks[p["task_id"]] = {
                 "room_id": p["room_id"], "target": p["target_agent_id"], "text": p["text"],
                 "by_kind": p["created_by_kind"], "by_id": p["created_by_id"], "by_owner": p["actor_user_id"],
+                "delegation_admin": p.get("delegation_admin", False),
                 "root": p.get("root_user_id") or p["actor_user_id"],
                 "status": "pending", "result": None, "depth": p["depth"], "parent": p.get("parent_task_id"),
                 "created_at": p["created_at"], "created_epoch": p["created_epoch"],
@@ -933,7 +934,8 @@ class CollabService:
         elif t in ("agent_access_requested", "agent_access_approved", "agent_access_revoked") and "permission_id" in p:
             self._agent_permissions[(rid, p["agent_id"], uid)] = {
                 "permission_id": p["permission_id"], "room_id": rid, "agent_id": p["agent_id"],
-                "user_id": uid, "status": p["agent_permission_status"]}
+                "user_id": uid, "status": p["agent_permission_status"],
+                "expires_at": p.get("expires_at"), "request_id": p.get("request_id")}
         elif t in ("agent_revoked", "agent_grant_revoked", "agent_grant_expired"):
             for (room, aid, _), permission in self._agent_permissions.items():
                 if aid == p["agent_id"] and (t == "agent_revoked" or room == rid):
@@ -1092,10 +1094,7 @@ class CollabService:
 
     def set_agent_permission(self, pr: Principal, room_id: str, agent_id: str, uid: str, status: str,
                              *, idempotency_key: str | None = None) -> dict:
-        """Record per-member delegation, independently of the agent's room attachment.
-
-        Task submission/request envelopes are wired to these records by the subsequent task.
-        """
+        """Record per-member delegation, independently of the agent's room attachment."""
         kinds = {"pending": "agent_access_requested", "approved": "agent_access_approved",
                  "revoked": "agent_access_revoked"}
         if not isinstance(status, str) or status not in kinds:
@@ -1113,17 +1112,21 @@ class CollabService:
             transition, replayed = self._lifecycle_retry(pr, "agent.permission", room_id,
                 idempotency_key, {"agent_id": agent_id, "user_id": uid, "status": status})
             existing = self._agent_permissions.get((room_id, agent_id, uid))
-            if replayed or (existing and status == "pending" and existing["status"] == "approved"):
+            current = existing and (existing.get("expires_at") is None or self._now() < existing["expires_at"])
+            if replayed or (current and status == "pending" and existing["status"] == "approved"):
                 if not replayed and idempotency_key is not None:
                     self._confirm_lifecycle(pr, room, transition)
                 return {**existing, "agent_permission_status": existing["status"]}
             if not self._member(room, uid) or not self._ok(uid):
                 raise CollabError(409, "an approved room member is required")
-            if existing and existing["status"] == status and idempotency_key is None:
+            if current and existing["status"] == status and idempotency_key is None:
                 return {**existing, "agent_permission_status": existing["status"]}
             self._commit(kinds[status], self._actor(pr, room_id=room_id,
                 project_id=room["project_id"], agent_id=agent_id, subject_user_id=uid,
                 permission_id=existing["permission_id"] if existing else ids.new_id("permission"),
+                request_id=ids.new_id("grant") if status == "pending" else (existing or {}).get("request_id"),
+                owner_user_id=agent["owner"],
+                expires_at=room["grants"][agent_id]["expires_at"] if status == "approved" else None,
                 agent_permission_status=status, action="agent.access." + status,
                 outcome="allowed", project_ids=[room["project_id"]], resource_id=agent_id, **transition))
             permission = self._agent_permissions[(room_id, agent_id, uid)]
@@ -2958,8 +2961,21 @@ class CollabService:
     def list_agent_requests(self, pr: Principal, room_id: str) -> dict:
         self._require_user(pr)
         with self._lock:
-            room, _ = self._authorize(pr, room_id, "invite", "agent.request.list")
+            room = self._lifecycle_room(pr, room_id)
             now, out = self._now(), []
+            for (rid, aid, uid), permission in self._agent_permissions.items():
+                agent = self._agents.get(aid)
+                if (rid == room_id and permission["status"] == "pending" and agent
+                        and (pr.admin or agent["owner"] == pr.id) and self._member(room, uid)
+                        and self._ok(uid) and self._effective(Principal("agent", aid, agent["owner"]), room)):
+                    out.append({"request_id": permission.get("request_id") or permission["permission_id"], "agent_id": aid,
+                                "user_id": uid, "owner_user_id": agent["owner"],
+                                "name": agent["name"], "kind": "delegation", "actions": ["execute"],
+                                "harness_type": agent["harness_type"]})
+            if not pr.admin and (self._member(room, pr.id) or {}).get("role") != "owner":
+                if not out:
+                    self._authorize(pr, room_id, "invite", "agent.request.list")
+                return {"requests": out}
             for rid in self._requests_by_room.get(room_id, ()):
                 r = self._requests[rid]
                 a = self._agents.get(r["agent_id"])
@@ -2975,6 +2991,15 @@ class CollabService:
     def decide_agent_request(self, pr: Principal, room_id: str, request_id: str, body: dict) -> dict:
         self._require_user(pr)
         with self._lock:
+            for (rid, aid, uid), permission in self._agent_permissions.items():
+                if rid == room_id and (permission.get("request_id") or permission["permission_id"]) == request_id:
+                    if permission["status"] != "pending":
+                        raise CollabError(404, "not found")
+                    decision = body.get("decision")
+                    if decision not in ("approve", "deny"):
+                        raise CollabError(400, "decision must be approve or deny")
+                    self.set_agent_permission(pr, rid, aid, uid, "approved" if decision == "approve" else "revoked")
+                    return {"ok": True, "decision": decision}
             room, _ = self._authorize(pr, room_id, "invite", "agent.request.decide")
             r = self._requests.get(request_id)
             if (not r or not r["open"] or r["room_id"] != room_id
@@ -3271,6 +3296,8 @@ class CollabService:
             ikey = body.get("idempotency_key")
             if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
                 raise CollabError(400, "invalid idempotency_key")
+            if not pr.is_agent and not self._delegation_valid(pr, room, tid_):
+                return self._delegation_request(pr, room, tid_)
             if ikey is not None and (prior := self._idem.get((pr.key, room_id, "task:" + ikey))):
                 if prior[0] != _digest(json.dumps([room_id, tid_, text])):
                     raise CollabError(409, "idempotency_key already used for a different task")
@@ -3303,6 +3330,7 @@ class CollabService:
                 pr, project_id=room["project_id"], room_id=room_id, task_id=task_id,
                 target_agent_id=tid_, text=text, depth=depth, parent_task_id=parent,
                 created_by_kind=pr.kind, created_by_id=pr.id, created_epoch=now, root_user_id=root,
+                delegation_admin=pr.admin,
                 visibility_scope="room", action="task.create", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=task_id))
             if ikey is not None:
@@ -3377,11 +3405,30 @@ class CollabService:
                         and now - r["decided_epoch"] >= EGRESS_KEEP)]:
             del self._egress[rid]
 
-    def _creator_valid(self, t: dict, room: dict) -> bool:
+    def _delegation_valid(self, pr: Principal, room: dict, agent_id: str) -> bool:
+        member = self._member(room, pr.id)
+        if pr.admin or (member and member["role"] == "owner") or self._agents.get(agent_id, {}).get("owner") == pr.id:
+            return True
+        permission = self._agent_permissions.get((room["id"], agent_id, pr.id))
+        return bool(permission and permission["status"] == "approved"
+                    and (permission.get("expires_at") is None or self._now() < permission["expires_at"]))
+
+    def _delegation_request(self, pr: Principal, room: dict, agent_id: str) -> dict:
+        permission = self.set_agent_permission(pr, room["id"], agent_id, pr.id, "pending")
+        return {"room_id": room["id"], "agent_id": agent_id, "status": "pending",
+                "request_id": permission.get("request_id") or permission["permission_id"], "access_request_required": True,
+                "owner_user_id": self._agents[agent_id]["owner"], "user_id": pr.id,
+                "message": "Would you like to request access to me?"}
+
+    def _creator_valid(self, t: dict, room: dict, *, delegation=True) -> bool:
         """A task is only as good as its requester's CURRENT authority."""
         if t["by_kind"] == "user":
             m = self._member(room, t["by_id"])
-            return bool(m and "task" in ROLE_ACTIONS[m["role"]] and self._ok(t["by_id"]))
+            pr = Principal("user", t["by_id"], t["by_id"])
+            pr.admin = t.get("delegation_admin", False)
+            return bool(m and t["seq"] >= m["joined_seq"] and "task" in ROLE_ACTIONS[m["role"]]
+                        and self._ok(t["by_id"])
+                        and (not delegation or self._delegation_valid(pr, room, t["target"])))
         creator = self._agents.get(t["by_id"])
         if not creator:
             return False
@@ -3454,8 +3501,10 @@ class CollabService:
             room = self._rooms.get(t["room_id"]) if t else None
             eff = self._effective(pr, room) if room else None
             if (not t or t["target"] != pr.id or not eff or "execute" not in eff[0] or t["seq"] < eff[1]
-                    or not self._creator_valid(t, room)):
+                    or not self._creator_valid(t, room, delegation=False)):
                 raise CollabError(404, "not found")
+            if not self._creator_valid(t, room):
+                return self._delegation_request(Principal("user", t["by_id"], t["by_id"]), room, t["target"])
             bad = [k for k in body if k not in ("status", "result")]
             status = body.get("status")
             cur = self._task_status(t)
@@ -3567,7 +3616,8 @@ class CollabService:
                              "room_member_removed": "removed", "member_added": "approved", "member_removed": "removed"}
         if t in membership_status:
             out["room_membership_status"] = membership_status[t]
-        for field in ("membership_id", "permission_id", "agent_permission_status", "file_upload_permission"):
+        for field in ("membership_id", "permission_id", "agent_permission_status", "file_upload_permission",
+                      "request_id", "owner_user_id"):
             if field in p:
                 out[field] = p[field]
         out.update(extra)
@@ -3840,7 +3890,8 @@ class CollabService:
                 if parts == ["agents", "enrollment", "start"]:
                     return 201, self.start_enrollment(pr, body)
                 if n == 3 and parts[0] == "tasks" and parts[2] == "update":
-                    return 200, self.update_task(pr, parts[1], body)
+                    result = self.update_task(pr, parts[1], body)
+                    return (202 if result.get("access_request_required") else 200), result
                 if parts == ["agent", "rotate"]:
                     return 200, self.rotate_credential(pr)
                 if n == 3 and parts[0] == "agents" and parts[2] == "link":
@@ -3868,7 +3919,8 @@ class CollabService:
                     if n == 5 and parts[2] == "agent-requests" and parts[4] == "decide":
                         return 200, self.decide_agent_request(pr, rid, parts[3], body)
                     if parts[2:] == ["tasks"]:
-                        return 201, self.create_task(pr, rid, body)
+                        result = self.create_task(pr, rid, body)
+                        return (202 if result.get("access_request_required") else 201), result
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":
                         return 200, self.cancel_task(pr, rid, parts[3])
                     if parts[2:] == ["architecture-links"]:

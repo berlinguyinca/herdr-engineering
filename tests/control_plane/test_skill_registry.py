@@ -64,9 +64,11 @@ def env():
     with asyncio.Runner() as runner:
         run = runner.run
         conn = run(asyncpg.connect(dsn))
+        journal_conn = run(asyncpg.connect(dsn))
         try:
             run(conn.execute(f'CREATE SCHEMA {schema}'))
             run(conn.execute(f'SET search_path TO {schema}'))
+            run(journal_conn.execute(f'SET search_path TO {schema}'))
             run(Migrator(conn).apply(str(Path(__file__).parents[2] / 'deploy/control-plane/migrations')))
             run(conn.execute("""
                 INSERT INTO collab_users(user_id,status) VALUES
@@ -82,13 +84,14 @@ def env():
             """))
             s3, key, invalid = S3(), Ed25519PrivateKey.generate(), set()
             def registry():
-                return SkillRegistry(conn, s3=s3, bucket='skills', environment='test',
+                return SkillRegistry(conn, journal_conn=journal_conn, s3=s3, bucket='skills', environment='test',
                                      signing_key=key, key_id='test-key',
                                      trusted_keys={'test-key': key.public_key()},
                                      principal_valid=lambda p: p.key not in invalid,
                                      maintainers={'maintainer'})
             yield registry(), run, conn, s3, registry, invalid
         finally:
+            run(journal_conn.close())
             run(conn.execute('SET search_path TO public'))
             run(conn.execute(f'DROP SCHEMA {schema} CASCADE'))
             run(conn.close())
@@ -546,7 +549,7 @@ def test_forward_migration_upgrades_pre_registry_database_and_quarantines_unsign
         """))
         assert run(Migrator(conn).apply(str(migrations))) == [
             '0006_collaboration_skill_registry.sql', '0007_collaboration_analysis.sql',
-            '0008_collaboration_analysis_request_keys.sql']
+            '0008_collaboration_analysis_request_keys.sql', '0009_collaboration_skill_package_journal.sql']
         row = run(conn.fetchrow('SELECT * FROM collab_skill_versions'))
         assert row['status'] == 'revoked' and row['legacy_unverified']
         assert row['storage_key'] == 'old-package' and row['storage_bucket'] is None
@@ -603,6 +606,169 @@ def test_request_key_is_required_and_bounded(env, key):
     assert error.value.status == 400
     assert not s3.objects
     assert run(conn.fetchval('SELECT count(*) FROM collab_skill_drafts')) == 0
+
+
+@pytest.mark.parametrize('operation', ['draft', 'publish'])
+@pytest.mark.parametrize('failure', ['authority', 'commit'])
+def test_failed_package_put_retains_ownership_and_blocks_false_deletion(env, operation, failure):
+    from herdr_engineering.control_plane.collab_archive import CollabArchive
+    from herdr_engineering.control_plane.collab_storage import CollabStorage, S3Config, StorageError
+    from herdr_engineering.control_plane.collab_store import CollabStore
+    registry, run, conn, s3, _, invalid = env
+    draft = run(registry.create_skill_draft(user(), metadata())) if operation == 'publish' else None
+    original = s3.put_object
+    written = []
+    def put_then_revoke(**kwargs):
+        original(**kwargs)
+        written.append((kwargs['Bucket'], kwargs['Key']))
+        if failure == 'authority':
+            invalid.add(user().key)
+    s3.put_object = put_then_revoke
+    if failure == 'commit':
+        run(conn.execute("""
+            CREATE FUNCTION reject_skill_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'injected deferred commit failure'; END $$;
+            CREATE CONSTRAINT TRIGGER reject_skill_commit AFTER INSERT ON collab_audit_events
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+            WHEN (NEW.action IN ('skill.drafted', 'skill.published')) EXECUTE FUNCTION reject_skill_commit();
+        """))
+    with pytest.raises(Exception, match='forbidden|injected deferred commit failure'):
+        run(registry.publish_skill(user(), draft.draft_id, 'private') if draft
+            else registry.create_skill_draft(user(), metadata(request_key='orphan')))
+    assert len(written) == 1 and written[0] in s3.objects
+    store = CollabStore(conn)
+    storage = CollabStorage(S3Config(environment='test'), s3=s3)
+    s3.cleanup_failure = 'silent_delete'
+    with pytest.raises(StorageError, match='skill package cleanup'):
+        run(CollabArchive(store, storage).scrub_deleted_user('alice'))
+    assert run(conn.fetchval("SELECT status FROM collab_users WHERE user_id='alice'")) == 'disabled'
+    assert not run(conn.fetchval("SELECT EXISTS(SELECT 1 FROM collab_audit_events WHERE action='user.deleted')"))
+    assert any(ref['storage_key'] == written[0][1] for ref in run(store.jobs('scrub'))[0]['payload']['skill_packages'])
+    s3.cleanup_failure = None
+    assert run(CollabArchive(store, storage).scrub_deleted_user('alice')).status == 'complete'
+    assert not s3.objects
+
+
+def test_cancelled_package_write_keeps_lifecycle_lock_until_provider_stops(env):
+    import threading
+
+    from herdr_engineering.control_plane.collab_archive import CollabArchive
+    from herdr_engineering.control_plane.collab_storage import CollabStorage, S3Config
+    from herdr_engineering.control_plane.collab_store import CollabStore
+    registry, run, conn, s3, *_ = env
+    entered, release = threading.Event(), threading.Event()
+    original = s3.put_object
+    def slow_put(**kwargs):
+        entered.set()
+        assert release.wait(10)
+        original(**kwargs)
+    s3.put_object = slow_put
+    async def cancel():
+        task = asyncio.create_task(registry.create_skill_draft(user(), metadata()))
+        try:
+            async with asyncio.timeout(5):
+                while not entered.is_set():
+                    await asyncio.sleep(.001)
+            task.cancel()
+            await asyncio.sleep(.05)
+            task.cancel()
+            await asyncio.sleep(.05)
+            assert not task.done(), 'must retain lifecycle ownership while the PUT can still finish'
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    run(cancel())
+    assert len(s3.objects) == 1
+    store = CollabStore(conn)
+    assert len(run(store.skill_package_refs('alice'))) == 1
+    assert run(CollabArchive(store, CollabStorage(S3Config(environment='test'), s3=s3)).scrub_deleted_user('alice')).status == 'complete'
+    assert not s3.objects
+
+
+def test_ownership_journal_is_visible_before_put_and_survives_uncaptured_cascade(env):
+    from herdr_engineering.control_plane.collab_archive import CollabArchive
+    from herdr_engineering.control_plane.collab_storage import CollabStorage, S3Config
+    from herdr_engineering.control_plane.collab_store import CollabStore
+    registry, run, conn, s3, *_ = env
+    original = s3.put_object
+    async def create():
+        loop = asyncio.get_running_loop()
+        def inspect_then_put(**kwargs):
+            rows = asyncio.run_coroutine_threadsafe(registry.journal_conn.fetch(
+                'SELECT * FROM collab_skill_package_journal WHERE storage_key=$1', kwargs['Key']), loop).result(5)
+            assert len(rows) == 1
+            assert rows[0]['creator_id'] == 'alice' and rows[0]['request_key'] == 'draft:durable-first'
+            original(**kwargs)
+        s3.put_object = inspect_then_put
+        return await registry.create_skill_draft(user(), metadata(request_key='durable-first'))
+    run(create())
+    run(conn.execute("DELETE FROM collab_users WHERE user_id='alice'"))
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_drafts')) == 0
+    store = CollabStore(conn)
+    assert len(run(store.skill_package_refs('alice'))) == 1
+    with pytest.raises(ValueError, match='skill package cleanup'):
+        run(store.finish_scrub('alice', 'not-verified'))
+    assert run(CollabArchive(store, CollabStorage(S3Config(environment='test'), s3=s3)).scrub_deleted_user('alice')).status == 'complete'
+    assert not s3.objects
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_package_journal')) == 0
+
+
+@pytest.mark.parametrize('broken', ['transaction', 'unavailable'])
+def test_uncommittable_journal_prevents_any_put(env, broken):
+    registry, run, conn, s3, *_ = env
+    async def attempt():
+        if broken == 'transaction':
+            async with registry.journal_conn.transaction():
+                await registry.create_skill_draft(user(), metadata())
+        else:
+            await registry.journal_conn.close()
+            await registry.create_skill_draft(user(), metadata())
+    with pytest.raises(CollabError, match='package journal'):
+        run(attempt())
+    assert not s3.objects
+    assert run(conn.fetchval('SELECT count(*) FROM collab_skill_drafts')) == 0
+
+
+def test_lost_registry_connection_cannot_race_scrub_against_inflight_put(env):
+    import threading
+
+    import asyncpg
+
+    from herdr_engineering.control_plane.collab_archive import CollabArchive
+    from herdr_engineering.control_plane.collab_storage import CollabStorage, S3Config
+    from herdr_engineering.control_plane.collab_store import CollabStore
+    registry, run, conn, s3, *_ = env
+    entered, release = threading.Event(), threading.Event()
+    original = s3.put_object
+    def delayed_put(**kwargs):
+        entered.set()
+        assert release.wait(10)
+        original(**kwargs)
+    s3.put_object = delayed_put
+    archive = CollabArchive(CollabStore(conn), CollabStorage(S3Config(environment='test'), s3=s3))
+    async def disconnect():
+        writer = await asyncpg.connect(os.environ['HERDR_E2E_PG_DSN'])
+        await writer.execute('SET search_path TO ' + await conn.fetchval('SELECT current_schema()'))
+        second = copy.copy(registry)
+        second.conn = writer
+        task = asyncio.create_task(second.create_skill_draft(user(), metadata()))
+        try:
+            async with asyncio.timeout(5):
+                while not entered.is_set():
+                    await asyncio.sleep(.001)
+            await writer.close()
+            with pytest.raises(ValueError, match='lifecycle busy'):
+                await archive.scrub_deleted_user('alice')
+        finally:
+            release.set()
+            with pytest.raises(Exception):
+                await task
+            await writer.close()
+    run(disconnect())
+    assert len(s3.objects) == 1
+    assert run(archive.scrub_deleted_user('alice')).status == 'complete'
+    assert not s3.objects
 
 
 def test_forward_migration_accepts_previously_amended_0003_with_signed_rows(env):

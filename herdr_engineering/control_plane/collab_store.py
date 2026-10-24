@@ -517,6 +517,8 @@ class CollabStore:
             'JOIN collab_skills s USING(skill_id) WHERE s.owner_id=$1 OR d.created_by=$1 '
             'UNION SELECT v.storage_bucket AS bucket,v.storage_key FROM collab_skill_versions v '
             'JOIN collab_skills s USING(skill_id) WHERE s.owner_id=$1 '
+            'UNION SELECT storage_bucket AS bucket,storage_key FROM collab_skill_package_journal '
+            'WHERE creator_id=$1 '
             'ORDER BY bucket,storage_key', user_id)]
 
     async def start_scrub(self, user_id: str, job_id: str) -> dict:
@@ -556,6 +558,7 @@ class CollabStore:
             # Upload manifests are user-authored metadata; do not retain their content.
             await self._conn.execute("UPDATE collab_room_uploads SET manifest='{}'::jsonb WHERE created_by=$1", user_id)
             await self._conn.execute('DELETE FROM collab_users WHERE user_id=$1', user_id)
+            await self._conn.execute('DELETE FROM collab_skill_package_journal WHERE creator_id=$1', user_id)
             # Retain opaque creation fingerprints; FK deletion has removed the
             # actor attribution. Match identities exactly, never by substring.
             await self._conn.execute(
