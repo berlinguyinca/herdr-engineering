@@ -140,8 +140,8 @@ so the browser also stops refetching and re-rendering unchanged pages. The same 
 is applied to the other read-only JSON endpoints the polled views use (hosts, sessions,
 services, missions) as a cheap, generic win.
 
-**Config (YAML only, no env):** `github.sync.interval`, `github.sync.point_budget`,
-`github.sync.full_reconcile_interval`, `github.projects.*`.
+**Config (YAML only, no env):** `github.organizations`, `github.sync.interval`,
+`github.sync.point_budget`, `github.sync.full_reconcile_interval`, `github.projects.*`.
 
 ## Order of work (each step shippable and tested)
 
@@ -175,15 +175,26 @@ mechanics; which count of repos the staggered 24 h reconcile processes per pass.
 - Postgres (not files) for the GitHub store: the control plane already runs it. (Telemetry stays
   in files per an earlier decision; this is catalog data the UI queries.)
 - 24 h staggered full reconcile as the drift safety net.
-- Dark theme tokens included in the foundations step.
 - Generic ETag support on other polled endpoints, beyond GitHub.
 
-## Open questions for the operator
+## Operator decisions (2026-10-24)
 
-1. GitHub Projects: which projects (all the token can see, or a configured list), and what should
-   the page show (board by status column, or a flat item list)?
-2. Is a dark theme wanted now, or is that scope creep for this effort?
-3. Is "calm mode" (a visible motion toggle) wanted beyond following the OS reduced-motion setting?
+1. **Organization scoping.** The operator belongs to many GitHub organizations but contributes
+   to few. Which owners are synced is configuration: YAML `github.organizations` is an allowlist of
+   owner logins (organizations and the user's own account; empty or absent = everything the token
+   sees, as today). The allowlist applies to the repository listing (filtered by owner before any
+   issue fetch), to issues, and to Projects. Excluded owners cost zero issue/project calls and their
+   stored rows are removed on the next pass. The GitHub page shows which owners are in scope and
+   a count of excluded repositories, so a hidden org is visible, not silent.
+2. **Dark theme: in scope.** Token-based dark theme (follows `prefers-color-scheme`, with a manual
+   light/dark/auto control).
+3. **Calm mode: in scope.** A visible toggle sets `data-calm` on the root: no tweens, flashes,
+   pulses or enter/exit animation; state changes apply instantly. Defaults to on when the OS
+   requests reduced motion. Stored in `localStorage` (per viewer), read before first paint.
+
+Author's call on Projects (the operator did not specify the view): read-only, scoped by the same
+`github.organizations` allowlist, shown as a board grouped by the project's Status field with a
+flat-list toggle.
 
 ## Builder-check rulings (2026-10-24)
 
