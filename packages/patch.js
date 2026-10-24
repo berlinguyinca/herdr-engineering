@@ -19,7 +19,9 @@ export function patchAttr(el,name,value){
 }
 
 function calm(){
- return document.documentElement.hasAttribute('data-calm')||(typeof matchMedia==='function'&&matchMedia('(prefers-reduced-motion: reduce)').matches);
+ const v=document.documentElement.getAttribute('data-calm');
+ if(v==='off')return false;
+ return v!==null||(typeof matchMedia==='function'&&matchMedia('(prefers-reduced-motion: reduce)').matches);
 }
 
 function holdsSelection(el){
