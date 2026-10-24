@@ -18,6 +18,8 @@ export async function boot(page,base,hash,handler){
   const url=new URL(route.request().url());const p=url.pathname;
   reads[p]=(reads[p]||0)+1;
   const body=await handler(p,url);
+  if(body&&body.__hang)return; // never settles
+  if(body&&body.__raw!==undefined)return route.fulfill({status:body.__status||200,body:body.__raw});
   if(body&&body.__status)return route.fulfill({status:body.__status,json:body.json||{}});
   return route.fulfill({json:body??{}});
  });

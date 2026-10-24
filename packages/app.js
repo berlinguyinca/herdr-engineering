@@ -111,7 +111,7 @@ const ROUTES = {
 // on a route's first load.
 //
 // View contract: a view* function may return {refresh(hint), dispose()}; one that
-// returns nothing (an error or not-found page) gets NO_REFRESH.
+// returns nothing (an error or not-found page) is retried in place by rerenderView.
 const NO_REFRESH = { refresh() {}, dispose() {} };
 // These dashboards own their polling; SSE must preserve their filters and focus.
 const ownPolling = (view) => ({ refresh() {}, dispose: () => view.dispose() });
@@ -144,9 +144,12 @@ function unmountView() {
   if (currentView) { currentView.dispose(); currentView = null; }
 }
 
-// Retry for a page whose first load failed: re-run the route's view function in
-// place on the next event. A failed retry keeps the error page; a retry that
-// yields a real view adopts it.
+// Retry for a page whose first load failed or found nothing (e.g. "Mission not
+// found"): re-run the route's view function in place on the next event. A failed
+// retry keeps the page; a retry that yields a real view adopts it. A retry that
+// never settles stops blocking new ones after RETRY_TIMEOUT_MS (its late result is
+// discarded, since the next retry bumps the revision).
+const RETRY_TIMEOUT_MS = 15000;
 function rerenderView(load) {
   let running = false;
   return {
@@ -154,11 +157,15 @@ function rerenderView(load) {
       if (running) return;
       running = true;
       const revision = ++renderRevision;
+      const unwedge = setTimeout(() => { running = false; }, RETRY_TIMEOUT_MS);
       try {
         const view = await load(revision);
         if (view && revision === renderRevision) { unmountView(); mountView(view); }
         else if (view && revision !== renderRevision) view.dispose();
-      } catch { /* keep the last page; the next event retries */ } finally { running = false; }
+      } catch { /* keep the last page; the next event retries */ } finally {
+        clearTimeout(unwedge);
+        if (revision === renderRevision) running = false;
+      }
     },
     dispose() {},
   };
@@ -171,6 +178,8 @@ async function render() {
   const { parts } = route();
   const match = matchRoute(parts);
   const load = (rev) => ROUTES[match](parts, rev);
+  // As before, live events retry a failed or not-found page, except pages that stream their own detail.
+  const streamsOwnDetail = match === '/herd/session/:id' || (match === '/missions/:id' && decodeURIComponent(parts[1]).startsWith('pi:'));
   root.innerHTML = '<herdr-spinner label="Loading"></herdr-spinner>';
   let view;
   try {
@@ -178,13 +187,11 @@ async function render() {
   } catch (err) {
     if (revision !== renderRevision) return;
     root.innerHTML = `<herdr-error message="${esc(err.message || 'request failed')}"></herdr-error>`;
-    // As before, a live event retries a failed page, except pages that stream their own detail.
-    const streamsOwnDetail = match === '/herd/session/:id' || (match === '/missions/:id' && decodeURIComponent(parts[1]).startsWith('pi:'));
     if (!streamsOwnDetail) mountView(rerenderView(load));
     return;
   }
   if (revision !== renderRevision) { view?.dispose(); return; }
-  mountView(view || NO_REFRESH);
+  mountView(view || (streamsOwnDetail ? NO_REFRESH : rerenderView(load)));
 }
 
 // ------------------------------------------------------------- views

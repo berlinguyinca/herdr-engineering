@@ -82,3 +82,26 @@ test('non-Pi mission detail refreshes without a spinner and keeps open disclosur
  assert.deepEqual({brief:r.brief,open:r.open,h1:r.h1,spinners:r.spinners},{brief:true,open:true,h1:true,spinners:0});
  assert.match(r.sub,/review/);
 }));
+
+test('a not-found mission page recovers on a live event once the mission exists, even after a hung retry',async()=>withPage(async(page,base)=>{
+ let phase='missing';
+ const mission={mission_id:'m2',title:'Late mission',status:'EXECUTING',stage:'implementation',created_at:'2026-01-01T00:00:00Z',updated_at:'2026-01-01T00:00:00Z',source:'herdr',sessions:[]};
+ const reads=await boot(page,base,'/missions/m2',p=>{
+  if(p==='/api/v1/missions/m2')return phase==='missing'?{__raw:''}:phase==='hang'?{__hang:true}:structuredClone(mission);
+  if(p==='/api/v1/missions/m2/timeline')return {timeline:[]};
+  if(p==='/api/v1/events')return {events:[]};
+  if(p==='/api/v1/missions')return {missions:[]};
+  return {};
+ });
+ await page.locator('herdr-error[message="Mission not found"]').waitFor();
+ const emit=()=>page.evaluate(()=>window.__emit({event_id:`x-${Math.random()}`,event_type:'MissionStageChanged'}));
+ // A retry whose request never settles must not wedge later retries.
+ phase='hang';
+ const before=reads['/api/v1/missions/m2'];
+ await emit();await page.clock.runFor(6000);
+ await until(async()=>reads['/api/v1/missions/m2']>before,'hung retry issued');
+ phase='found';
+ await page.clock.runFor(30000);
+ await emit();await page.clock.runFor(6000);
+ await until(()=>page.locator('#view h1').innerText().then(t=>t==='Late mission').catch(()=>false),'mission rendered without reload',8000);
+}));
