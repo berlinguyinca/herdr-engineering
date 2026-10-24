@@ -9,7 +9,8 @@ interface:
   (``bridge._LoopRunner``) and serialised by a lock, the same pattern as
   ``DurableEventSink``.
 * ``MemoryGitHubStore``: no ``pg_dsn`` configured (collab-only mode, tests);
-  the catalog lives only as long as the process, as it did before G1.
+  the catalog lives only as long as the process, as it did before G1. Its
+  revisions start at a per-process base (``_memory_base``), never at 0.
 
 Rules (spec "Builder-check rulings" 1 and 2):
 
@@ -128,11 +129,34 @@ def _delta(revision: int, pruned_through: int, since: int, rows: list[dict], tom
 
 
 _MEMORY_SYNC_LOCK = threading.Lock()
+_MEMORY_REVISIONS = {"lock": threading.Lock(), "high": 0}
+
+
+def _note_memory_revision(revision: int) -> int:
+    with _MEMORY_REVISIONS["lock"]:
+        _MEMORY_REVISIONS["high"] = max(_MEMORY_REVISIONS["high"], revision)
+    return revision
+
+
+def _memory_base() -> int:
+    """Where a new in-memory catalog's revisions start.
+
+    The wall clock in microseconds (exact in a browser's JSON numbers), above
+    every revision this process has produced: a catalog that did not survive a
+    restart starts above the revisions its clients hold, and ``pruned_through``
+    starts there too, so every ``since`` from before answers ``resync``
+    instead of a silent, wrong delta. Postgres keeps its revisions and needs none.
+    """
+    with _MEMORY_REVISIONS["lock"]:
+        base = max(time.time_ns() // 1000, _MEMORY_REVISIONS["high"] + 1)
+        _MEMORY_REVISIONS["high"] = base
+        return base
 
 
 class _MemoryState:
     def __init__(self):
         self.lock = threading.RLock()
+        self.base = _memory_base()
         self.meta: dict | None = None
         self.repos: dict[str, dict] = {}       # rid -> {owner, data, watermark, rev}
         self.issues: dict[tuple, dict] = {}    # (rid, gid) -> {data, rev}
@@ -170,7 +194,8 @@ class MemoryGitHubStore:
         if self._retired:
             raise GitHubStoreRetired("this GitHub catalog store was replaced")
         if state.meta is None:
-            state.meta = {"identity": self._identity, "viewer": self._viewer, "revision": 0, "pruned_through": 0}
+            state.meta = {"identity": self._identity, "viewer": self._viewer,
+                          "revision": state.base, "pruned_through": state.base}
         elif not _matches(state.meta, self._identity, self._viewer):
             raise GitHubStoreIdentityMismatch("stored GitHub catalog belongs to another credential")
         elif state.meta["viewer"] is None and self._viewer is not None:
@@ -187,7 +212,7 @@ class MemoryGitHubStore:
 
     def _bump(self) -> int:
         self._state.meta["revision"] += 1
-        return self._state.meta["revision"]
+        return _note_memory_revision(self._state.meta["revision"])
 
     def _tombstone(self, kind: str, rid: str, key: str, rev: int) -> None:
         self._state.tombstones[(kind, rid, key)] = {"rev": rev, "removed_at": self._now()}
@@ -215,7 +240,7 @@ class MemoryGitHubStore:
                 return None
             if not _matches(state.meta, self._identity, self._viewer):
                 state.repos, state.issues, state.tombstones, state.details = {}, {}, {}, {}
-                revision = state.meta["revision"] + 1
+                revision = _note_memory_revision(state.meta["revision"] + 1)
                 state.meta = {"identity": self._identity, "viewer": self._viewer,
                               "revision": revision, "pruned_through": revision}
                 return None
@@ -328,7 +353,7 @@ class MemoryGitHubStore:
             if not (state.repos or state.issues or state.tombstones or state.details):
                 return  # nothing left: a repeated 401 must not move the revision
             state.repos, state.issues, state.tombstones, state.details = {}, {}, {}, {}
-            revision = state.meta["revision"] + 1
+            revision = _note_memory_revision(state.meta["revision"] + 1)
             state.meta.update(revision=revision, pruned_through=revision)
 
     def purge_owners_not_in(self, owners: set[str]) -> None:

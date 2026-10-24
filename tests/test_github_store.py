@@ -57,7 +57,13 @@ C = "github.com/other/tool"
 
 
 class _MemoryBackend:
+    name = "memory"
+
     def __init__(self):
+        self.shared = {}
+
+    def restart(self):
+        """A new process: the in-memory catalog is gone."""
         self.shared = {}
 
     def make(self, *, identity="tok-a", viewer="alice", now=None):
@@ -69,6 +75,11 @@ class _MemoryBackend:
 
 
 class _PgBackend:
+    name = "postgres"
+
+    def restart(self):
+        """A new process: the database keeps the catalog."""
+
     def __init__(self, *, migrate=True, details=True):
         import asyncpg
 
@@ -240,11 +251,12 @@ def test_changes_since_returns_newer_rows_and_tombstones(backend):
     assert store.changes_since(store.revision())["upserted"] == []
 
 
-def test_changes_since_zero_is_the_full_list(backend):
+def test_changes_since_the_starting_revision_is_the_full_list(backend):
     store = backend.make()
+    start = store.revision()  # 0 in Postgres; the process base in memory
     store.upsert_repositories([repo("acme/app")], scope=None)
     store.upsert_issues(A, [issue("I1", 1)], watermark="w")
-    delta = store.changes_since(0)
+    delta = store.changes_since(start)
     assert delta["resync"] is False
     assert {(row["kind"], row["key"]) for row in delta["upserted"]} == {("repository", A), ("issue", "I1")}
 
@@ -636,3 +648,48 @@ def test_purging_an_empty_catalog_does_not_move_the_revision(backend):
     revision = store.revision()
     store.purge()  # a revoked token is retried every minute: no new revision each time
     assert store.revision() == revision
+
+
+def test_a_new_memory_catalog_starts_above_every_earlier_one():
+    first = MemoryGitHubStore(identity="tok-a", shared={})
+    for name in ("acme/app", "acme/lib", "acme/tool"):
+        first.upsert_repositories([repo(name)], scope=None)
+    second = MemoryGitHubStore(identity="tok-a", shared={})  # a restarted process
+    assert second.revision() > first.revision()
+    assert second.changes_since(first.revision())["resync"] is True
+
+
+def _incremental():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_github_incremental_fakes_store",
+                                                  Path(__file__).with_name("test_github_incremental.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_restart_never_answers_an_old_since_with_a_silent_delta(backend):
+    from herdr_engineering.github import GitHubMonitor
+    fakes = _incremental()
+    fake = fakes.seeded()
+
+    def monitor():
+        return GitHubMonitor(provider_factory=lambda: fake, organizations=[],
+                             store=lambda identity, viewer=None: backend.make(identity=identity, viewer=viewer))
+    before = monitor()
+    before.refresh()
+    since = before.revision()
+    before.close()
+    gid = next(iter(fake.repos["acme/app"]))
+    fake.tick(600)
+    fake.edit("acme/app", gid, title="changed while down")
+    backend.restart()
+    after = monitor()
+    after.refresh()
+    delta = after.changes(kind="issues", since=since, start=False)
+    after.close()
+    if backend.name == "memory":  # nothing survived the restart: the old since cannot be answered
+        assert delta["resync"] is True and "changed while down" in {row["title"] for row in delta["issues"]}
+    else:  # the stored catalog survived: a true delta
+        assert delta["resync"] is False
+        assert [row["title"] for row in delta["upserted"]] == ["changed while down"]

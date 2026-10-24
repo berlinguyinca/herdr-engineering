@@ -146,8 +146,8 @@ def test_a_row_leaving_the_filter_is_removed_from_a_filtered_delta(server, fake)
     assert delta["upserted"] == [] and delta["removed"] == [{"repository_id": "github.com/acme/app", "key": gid}]
 
 
-@pytest.mark.parametrize("since", ["999999"])
-def test_stale_since_answers_resync_with_the_full_list(server, since):
+def test_stale_since_answers_resync_with_the_full_list(server):
+    since = server.github_monitor.revision() + 1000  # newer than anything this catalog wrote
     status, _, body = get(server, f"github/issues?since={since}")
     assert status == 200 and body["resync"] is True
     assert sorted(row["number"] for row in body["issues"]) == list(range(1, 9))  # unpaginated

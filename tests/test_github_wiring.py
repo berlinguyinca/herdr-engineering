@@ -38,7 +38,8 @@ def test_without_pg_dsn_the_store_is_in_memory_and_survives_factory_calls():
         assert isinstance(first, MemoryGitHubStore)
         first.upsert_repositories([{"repository_id": "github.com/a/b", "name_with_owner": "a/b"}], None)
         second = monitor._store_factory("fp", "viewer")
-        assert second.revision() == first.revision() == 1  # one process-lifetime catalog
+        assert second.revision() == first.revision()  # one process-lifetime catalog
+        assert first.changes_since(first.revision() - 1)["resync"] is False
     finally:
         monitor.close()
 
