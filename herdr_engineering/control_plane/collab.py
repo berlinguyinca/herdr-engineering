@@ -303,7 +303,10 @@ class CollabService:
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, summary_fix: dict | None = None,
-                 archive_service: Any = None, upload_service: Any = None, upload_runner: Any = None):
+                 archive_service: Any = None, upload_service: Any = None, upload_runner: Any = None,
+                 analysis_service: Any = None, analysis_runner: Any = None):
+        self.analysis_service = analysis_service
+        self.analysis_runner = analysis_runner
         self.archive_service = archive_service
         self.upload_service = upload_service
         self.upload_runner = upload_runner
@@ -381,6 +384,67 @@ class CollabService:
         self.stats = defaultdict(int)
 
     # ------------------------------------------------------------ plumbing
+    async def _analysis_operation(self, name, principal, *args, **kwargs):
+        if self.analysis_service is None:
+            raise CollabError(503, "relational analysis service unavailable")
+
+        async def authorize(room_id):
+            if not self.still_valid(principal):
+                raise CollabError(403, "credential or platform approval required")
+            if room_id in self._rooms:
+                raise CollabError(409, "room requires relational cutover before analysis")
+
+        try:
+            method = getattr(self.analysis_service, name)
+            if name == 'record_analysis_output':
+                return await method(*args, principal=principal, authorize=authorize, **kwargs)
+            return await method(principal, *args, authorize=authorize, **kwargs)
+        except CollabError:
+            raise
+        except Exception:
+            raise CollabError(503, "analysis operation unavailable; retry") from None
+
+    async def create_analysis_request(self, principal, room_id, prompt, file_ids, **kwargs):
+        return await self._analysis_operation('create_analysis_request', principal, room_id, prompt, file_ids, **kwargs)
+
+    async def record_analysis_output(self, request_id, output_manifest, *, principal):
+        return await self._analysis_operation('record_analysis_output', principal, request_id, output_manifest)
+
+    async def get_analysis_request(self, principal, request_id):
+        return await self._analysis_operation('get_analysis_request', principal, request_id)
+
+    async def get_analysis_artifact(self, principal, artifact_id):
+        return await self._analysis_operation('get_analysis_artifact', principal, artifact_id)
+
+    async def promote_analysis_to_skill(self, principal, artifact_id, scope, metadata):
+        return await self._analysis_operation('promote_analysis_to_skill', principal, artifact_id, scope, metadata)
+
+    def _analysis_http(self, method, parts, body, principal):
+        from dataclasses import asdict
+
+        if self.analysis_runner is None:
+            raise CollabError(503, "analysis event-loop runner unavailable")
+        if method == 'POST' and len(parts) == 3 and parts[0] == 'rooms' and parts[2] == 'analyses':
+            if set(body) - {'prompt', 'file_ids', 'target_agent_id', 'parent_artifact_id'}:
+                raise CollabError(400, 'invalid analysis arguments')
+            operation = self.create_analysis_request(principal, parts[1], body.get('prompt'), body.get('file_ids'),
+                target_agent_id=body.get('target_agent_id'), parent_artifact_id=body.get('parent_artifact_id'))
+            return 201, asdict(self.analysis_runner(operation))
+        if method == 'GET' and len(parts) == 2:
+            getter = self.get_analysis_request if parts[0] == 'analyses' else self.get_analysis_artifact
+            return 200, asdict(self.analysis_runner(getter(principal, parts[1])))
+        if method == 'POST' and len(parts) == 3 and parts[0] == 'analysis-artifacts' and parts[2] == 'promote':
+            if set(body) != {'scope', 'metadata'} or not isinstance(body['metadata'], dict):
+                raise CollabError(400, 'invalid promotion arguments')
+            metadata = copy.deepcopy(body['metadata'])
+            files = metadata.get('files')
+            if not isinstance(files, dict) or any(not isinstance(v, str) for v in files.values()):
+                raise CollabError(400, 'HTTP skill files must be UTF-8 text')
+            metadata['files'] = {k: v.encode('utf-8') for k, v in files.items()}
+            return 201, asdict(self.analysis_runner(self.promote_analysis_to_skill(
+                principal, parts[1], body['scope'], metadata)))
+        raise CollabError(404, 'not found')
+
     async def _upload_operation(self, name: str, pr: Principal, *args, room_id=None):
         if self.upload_service is None:
             raise CollabError(503, "relational upload service unavailable")
@@ -3601,6 +3665,9 @@ class CollabService:
             if pr.status != "approved" and parts != ["me"]:
                 self.stats["policy_denied"] += 1
                 raise CollabError(403, "waiting for approval")
+            if (parts[:1] in (["analyses"], ["analysis-artifacts"])
+                    or (n == 3 and parts[0] == 'rooms' and parts[2] == 'analyses')):
+                return self._analysis_http(method, parts, body, pr)
             if parts[:2] == ["admin", "users"]:
                 if method == "GET" and parts == ["admin", "users", "log"]:
                     return 200, self.user_log(pr)

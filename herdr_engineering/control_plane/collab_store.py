@@ -437,6 +437,8 @@ class CollabStore:
                 raise ValueError('room is not active')
             if await self._conn.fetchval('SELECT EXISTS(SELECT 1 FROM collab_skills WHERE room_id=$1)', room_id):
                 raise ValueError('room skill storage requires an archive exporter')
+            if await self._conn.fetchval('SELECT EXISTS(SELECT 1 FROM collab_analysis_requests WHERE room_id=$1)', room_id):
+                raise ValueError('room analysis provenance requires an archive exporter')
             if await self._conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM collab_room_uploads WHERE room_id=$1 AND (status!='available' OR manifest->>'schema_version'='1') AND COALESCE(manifest->>'cleanup_done','false')!='true')", room_id):
                 raise ValueError('room has unfinished uploads')
