@@ -58,6 +58,11 @@ class GitHubStoreNotMigrated(GitHubStoreUnavailable):
     """The catalog tables do not exist yet (code rolled before the migration): nothing is stored."""
 
 
+class GitHubStoreRetired(GitHubStoreUnavailable):
+    """The monitor replaced this store (token rotation, viewer bind): it may no longer read,
+    claim, purge or write, so a pass still holding it cannot touch the new catalog."""
+
+
 class GitHubStoreIdentityMismatch(RuntimeError):
     """The stored catalog belongs to another credential/viewer; call ``load()`` first."""
 
@@ -141,17 +146,25 @@ class MemoryGitHubStore:
         self._identity, self._viewer = identity, viewer
         self._now = now or time.time
         self._state: _MemoryState = (shared if shared is not None else {}).setdefault("state", _MemoryState())
+        self._retired = False
 
     def __repr__(self):
         return f"MemoryGitHubStore(identity={self._identity[:12]}..., viewer={self._viewer!r})"
 
+    def retire(self) -> None:
+        """Refuse every later operation (an operation in flight finishes first)."""
+        with self._state.lock:
+            self._retired = True
+
     def close(self) -> None:
-        pass
+        self.retire()
 
     # -- identity
 
     def _claim(self) -> dict:
         state = self._state
+        if self._retired:
+            raise GitHubStoreRetired("this GitHub catalog store was replaced")
         if state.meta is None:
             state.meta = {"identity": self._identity, "viewer": self._viewer, "revision": 0, "pruned_through": 0}
         elif not _matches(state.meta, self._identity, self._viewer):
@@ -191,6 +204,8 @@ class MemoryGitHubStore:
     def load(self) -> Snapshot | None:
         state = self._state
         with state.lock:
+            if self._retired:
+                raise GitHubStoreRetired("this GitHub catalog store was replaced")
             if state.meta is None:
                 self._claim()
                 return None
@@ -415,12 +430,19 @@ class GitHubStore:
         # asyncpg allows one operation per connection; request threads share the store.
         self._guard = threading.RLock()
         self._sync_guard = threading.Lock()
+        self._retired = False
 
     def __repr__(self):
         return f"GitHubStore(identity={self._identity[:12]}..., viewer={self._viewer!r})"
 
+    def retire(self) -> None:
+        """Refuse every later operation; one in flight (it holds the guard) finishes first."""
+        with self._guard:
+            self._retired = True
+
     def close(self) -> None:
         with self._guard:
+            self._retired = True
             for name in ("_conn", "_lock_conn"):
                 conn = getattr(self, name)
                 setattr(self, name, None)
@@ -439,6 +461,8 @@ class GitHubStore:
         """Run ``work(conn)`` (a coroutine) on the data connection, mapping failures."""
         import asyncpg
         with self._guard:
+            if self._retired:
+                raise GitHubStoreRetired("this GitHub catalog store was replaced")
             try:
                 self._conn = self._run(self._connect(self._conn))
                 return self._run(work(self._conn))

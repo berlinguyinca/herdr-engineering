@@ -469,8 +469,15 @@ class GitHubMonitor:
         self._budget, self._spent = settings["point_budget"], 0
 
     def _retire(self, store):
-        """Queue a superseded store for closing (lock held); a running pass may still hold its advisory lock."""
+        """Retire a superseded store (lock held) and queue it for closing.
+
+        Retired, it refuses every later read and write, so a pass still holding
+        it can neither purge nor claim the catalog its successor owns; it is
+        closed later because that pass may still hold its advisory lock.
+        """
         if store is not None and store not in self._retired:
+            with contextlib.suppress(Exception):
+                store.retire()
             self._retired.append(store)
 
     def _close_retired(self):
@@ -647,7 +654,9 @@ class GitHubMonitor:
         try:
             work(store)
         except Exception:
-            self._store_dirty = True
+            with self._lock:
+                if store is self._store:  # a refused superseded store says nothing about the current one
+                    self._store_dirty = True
             return
         if store is self._store:
             self._remember_revision(store)

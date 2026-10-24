@@ -723,3 +723,17 @@ def test_an_edit_on_a_closed_issue_never_lifts_the_watermark_past_an_unread_open
     assert monitor._due_reconciles(monitor._repos) == set()
     titles = {row["github_id"]: row["title"] for row in monitor.issues(per_page=100, start=False)["issues"]}
     assert titles[gids[0]] == "Y edited"
+
+
+def test_a_flush_on_a_superseded_store_cannot_purge_the_new_credentials_catalog():
+    fake, shared = seeded(), {}
+    monitor = monitor_for(fake, shared)
+    monitor.refresh()
+    old_store = monitor._store
+    fake.credential_identity = "fingerprint-two"  # rotation while a pass still holds old_store
+    monitor.refresh()
+    assert numbers(monitor) == list(range(1, 9))
+    monitor._flush(old_store)  # the old pass reaching its flush late
+    stored = MemoryGitHubStore(identity="fingerprint-two", shared=shared).load()
+    assert stored is not None and len(stored.repositories) == 3
+    assert monitor.revision() is not None  # a refused old store does not dirty the new catalog

@@ -560,3 +560,20 @@ def test_apply_repository_is_all_or_nothing(backend):
     assert set(snap.issues[A]) == {"I1", "I2"} and snap.issues[A]["I2"]["title"] == "issue 2"
     assert snap.watermarks[A] == "w1" and snap.repositories[A]["synced"] == {"open": 2}
     assert backend.make().revision() == before
+
+
+def test_retired_store_can_neither_purge_nor_claim(backend):
+    old = backend.make(identity="tok-a")
+    old.upsert_repositories([repo("acme/app")], scope=None)
+    old.retire()
+    new = backend.make(identity="tok-b")
+    assert new.load() is None
+    new.upsert_repositories([repo("other/tool")], scope=None)
+    for call in (old.load, old.revision, lambda: old.changes_since(0),
+                 lambda: old.upsert_repositories([repo("acme/lib")], scope=None)):
+        with pytest.raises(GitHubStoreUnavailable):
+            call()
+    assert set(backend.make(identity="tok-b").load().repositories) == {C}
+    with old.advisory_lock() as held:  # the pass that holds it can still release it
+        assert held in (True, False)
+    old.close()
