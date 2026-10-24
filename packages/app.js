@@ -15,6 +15,7 @@ import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
+import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
@@ -59,6 +60,7 @@ const NAV = [
   { path: '/github', label: 'Projects' },
   { path: '/ci', label: 'CI' },
   { path: '/reviews', label: 'Reviews' },
+  { path: '/review-gate', label: 'Review gate' },
   { path: '/hosts', label: 'Hosts' },
   { path: '/activity', label: 'Activity' },
   { path: '/analytics', label: 'Analytics' },
@@ -83,6 +85,7 @@ const ROUTES = {
   '/collab': viewCollab,
   '/ci': viewIntegrations,
   '/reviews': viewIntegrations,
+  '/review-gate': viewReviewGate,
   '/topology': viewTopology,
   '/missions': viewMissions,
   '/missions/:id': viewMission,
@@ -156,6 +159,10 @@ async function viewCollab() {
 
 async function viewGithub() {
   dashboardView = mountGithub(root, client);
+}
+
+async function viewReviewGate() {
+  dashboardView = mountReviewGate(root, client);
 }
 
 async function viewIntegrations(parts) {

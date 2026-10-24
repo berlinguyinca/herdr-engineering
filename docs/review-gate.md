@@ -345,6 +345,32 @@ same head is then reviewed again. A non-escalated PR answers 409, an unknown PR
 queue review; push a commit" means the current head cannot be queued again;
 push a new commit.
 
+### Dashboard
+
+The dashboard has a **Review gate** page (`#/review-gate`, after Reviews in the
+navigation). It reads `/api/v1/review-gate/prs`, `/queue`, `/notices` and
+`/main` every 5 seconds and shows:
+
+- an overview of PR counts per state and the time of the last gate tick;
+- main-branch status per repo: `state`, head and `last_green_sha` (first 12
+  characters), `failures` and the `culprits` PR numbers;
+- every gated PR with its state, review and CI-fix rounds, head SHA and
+  `reason`; select a row to see its `last_findings`;
+- the review queue (`depth`, claimed and queued jobs, the gate's `last_error`);
+- the newest notices with `channel` and whether delivery succeeded.
+
+Selecting an `escalated` PR shows a **Resume review** button. It asks for
+confirmation, then posts to the resume route above, so it needs an operator
+key. Without one the page shows "Only an operator key can resume a pull
+request" and nothing changes; other refusals (for example a 409 when the PR is
+no longer escalated) are shown as the server's message. After a successful
+resume the page refreshes at once.
+
+A "Showing data from <time>" warning on a panel means the latest read of that
+route failed; the panel keeps the last good data until a read succeeds again.
+"Could not load" means it has never succeeded. If any read answers 404 the gate
+is not enabled on this control plane: the page says so and stops polling.
+
 ## 7. Notifications
 
 When a PR needs work (`changes_requested` or `ci_red`), the gate tries, in
