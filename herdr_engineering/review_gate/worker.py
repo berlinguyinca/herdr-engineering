@@ -239,6 +239,11 @@ def load_worker_config(path: str) -> WorkerConfig:
         raise WorkerConfigError("worker config: cannot read the file") from None
     except yaml.YAMLError:
         raise WorkerConfigError("worker config: not valid YAML") from None
+    return parse_worker_config(raw)
+
+
+def parse_worker_config(raw) -> WorkerConfig:
+    """Validate an already-parsed worker mapping (the pool reuses it for its own YAML)."""
     raw = _mapping(raw, "worker config")
     _keys(raw, _TOP_KEYS, _TOP_KEYS - {"poll_seconds"}, "worker config")
     model_raw = _mapping(raw["model"], "worker config: model")
