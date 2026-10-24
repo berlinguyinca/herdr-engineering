@@ -472,3 +472,12 @@ def test_notice_stream_cannot_be_forged_by_ingest(ingest_gate_server, key):
     status, notices = request(server, "review-gate/notices")
     assert [(n["key"], n["kind"], n["channel"]) for n in notices] == [
         (str(pr), "escalated", "user")]
+
+
+def test_notices_route_survives_a_malformed_notice(gate_server):
+    repo = gate_server.repo
+    repo.record_event("pr_gate_notice", f"{REPO}#1", "notified", "{not json")
+    repo.record_event("pr_gate_notice", f"{REPO}#1", "notified", _notice("a" * 40, "user", 5.0))
+    status, notices = request(gate_server, "review-gate/notices")
+    assert status == 200 and len(notices) == 2
+    assert notices[0]["at"] == 5.0 and notices[1]["at"] is None

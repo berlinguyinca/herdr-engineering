@@ -32,7 +32,8 @@ touched) and every open, non-draft PR in it:
    description says why); only ``store.resume`` clears an escalation.
 6. In those three states the optional ``notifier`` is called on every tick
    (it is idempotent per head SHA and channel); its errors are logged by PR
-   key only and never block the gate.
+   key only and never block the gate. Each tick starts with
+   ``notifier.begin_tick()``: at most one external command launch per tick.
 
 Decisions and limits:
 - No approval carry-over. A correct carry-over compares each head's diff
@@ -228,6 +229,12 @@ class GateService:
     def _tick(self, counts: dict) -> None:
         if not self._config.enabled:
             return
+        begin_tick = getattr(self._notifier, "begin_tick", None)
+        if callable(begin_tick):
+            try:
+                begin_tick()  # one external launch per tick
+            except Exception:  # noqa: BLE001 - a notifier fault never blocks the gate
+                log.warning("review gate: notifier tick reset failed")
         try:
             snapshot = self._ci_snapshot()
             if not isinstance(snapshot, dict):

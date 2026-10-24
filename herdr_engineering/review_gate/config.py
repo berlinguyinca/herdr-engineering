@@ -167,6 +167,12 @@ def _argv(raw, key):
         raise ValueError(f"{where} must be a non-empty list of non-empty strings")
     if not os.path.isabs(val[0]):
         raise ValueError(f"{where}: first element must be an absolute path")
+    try:
+        exe_fields = [f for _l, f, _s, _c in string.Formatter().parse(val[0]) if f is not None]
+    except ValueError:
+        raise ValueError(f"{where}: malformed placeholder in the executable path") from None
+    if exe_fields:
+        raise ValueError(f"{where}: the executable path must not contain placeholders")
     for arg in val:
         try:
             parsed = list(string.Formatter().parse(arg))

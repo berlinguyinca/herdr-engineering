@@ -251,6 +251,8 @@ def test_notify_commands_are_argv_lists(tmp_path):
         ["/bin/x", "{repo"],
         ["/bin/x", "{repo!r}"],
         ["/bin/x", "{repo:>10}"],
+        ["/opt/{repo}/fix"],
+        ["/bin/{sha}", "x"],
     ],
 )
 def test_notify_rejects_bad_commands(tmp_path, bad):

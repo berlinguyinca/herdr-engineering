@@ -792,7 +792,8 @@ def test_service_notifies_ci_red_with_failures_then_on_later_ticks():
     assert len(notifier.calls) == 1
     key, state, sha, ref, failures = notifier.calls[0]
     assert (key, state, sha, ref) == (KEY, State.CI_RED, A, "feat/x")
-    assert failures  # the run names the status lists
+    assert failures == ("run 3 failure",)
+    assert app.statuses(A)[-1][4] == "CI failed: run 3 failure"
     svc.tick()
     assert len(notifier.calls) == 2 and notifier.calls[1][4] == ()
     assert [s[3] for s in app.statuses(A)] == ["pending", "failure"]
@@ -823,7 +824,7 @@ def test_service_notifies_ci_fix_cap_escalation_with_failures():
     ci.set(ci_row(A, "failure"))
     svc.tick()
     assert [c[1] for c in notifier.calls] == [State.ESCALATED]
-    assert notifier.calls[0][4]
+    assert notifier.calls[0][4] == ("run 1 failure",)
     assert "escalated" in app.statuses(A)[-1][4]
 
 
@@ -841,3 +842,52 @@ def test_service_calls_notifier_and_survives_its_exception(caplog):
     assert "notice write failed" not in caplog.text
     svc.tick()  # retried on the next tick
     assert len(notifier.calls) == 2
+
+
+class CountingRun:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        import subprocess
+
+        self.calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+
+def test_one_external_launch_per_tick_and_backlog_drains():
+    from herdr_engineering.review_gate.config import NotifyConfig
+    from herdr_engineering.review_gate.notifier import ENTITY, AuthorNotifier
+
+    svc, app, store, _, registry, ci = make()
+    run = CountingRun()
+    svc._notifier = AuthorNotifier(
+        store._repo,
+        config=NotifyConfig(fixer_command=("/usr/local/bin/fixer", "{number}")),
+        registry=registry,
+        dispatcher=lambda *a: {"status": "delivered"},
+        run=run,
+    )
+    c = "c" * 40
+    app.prs[REPO] = [pr(7, A), pr(8, B), pr(9, c)]
+    ci.set(ci_row(A, "failure", n=3), ci_row(B, "failure", n=4), ci_row(c, "failure", n=5))
+
+    def channels(number):
+        stream = store._repo.stream(ENTITY, f"{REPO}#{number}")
+        return [e["payload"]["channel"] for e in stream]
+
+    svc.tick()
+    assert run.calls == [["/usr/local/bin/fixer", "7"]]
+    assert channels(7) == ["author", "fixer"]
+    assert channels(8) == ["author"] and channels(9) == ["author"]  # deferred: no notice
+    svc.tick()
+    assert [c[1] for c in run.calls] == ["7", "8"]
+    assert channels(9) == ["author"]
+    svc.tick()
+    svc.tick()
+    svc.tick()
+    assert [c[1] for c in run.calls] == ["7", "8", "9"]
+    for n in (7, 8, 9):
+        assert channels(n) == ["author", "fixer"]
+    for sha in (A, B, c):
+        assert app.last_status(sha) == "failure"
