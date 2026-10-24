@@ -1,0 +1,11 @@
+Per-client gateway accounting, 2026-10-23. CORRECTION: earlier notes said the authorized Pi key reaches only global /v1/usage totals.
+That was wrong (my probe printed only the first 12 keys). /v1/usage also returns top_clients (client, requests, prompt/completion/total tokens, last_seen)
+and active_clients (client, models, requests, since, tokens), readable with the Pi provider key.
+Measurement: snapshot top_clients, 5 no-op requests through Pi-Bolt, snapshot, 5 through standard Pi 1.4.0, snapshot (bender):
+  client b8b14300... (the shared user identity): pi-bolt x5 -> +11 req, +10674 prompt, +445 completion | standard x5 -> +15 req, +13400 prompt, +515 completion
+  client service:bender-pi-failover:              pi-bolt x5 -> +5 req,  +559 prompt,  +77 completion  | standard x5 -> +8 req,  +1060 prompt, +2485 completion
+Both identities carry other live traffic (many Pi sessions share them), so the deltas CANNOT be attributed to either runtime. Not claimed.
+What the data does support: rows are keyed by authenticated client identity (a UUID or a service name), not by user-agent or runtime; both runtimes'
+requests land on the same identity's counters. So the bun user-agent does not by itself create a new client in these rows. Whether any gateway rule
+(rate limits, owner priority, affinity) reads the user-agent is not visible here.
+Not done: an isolated attribution test needs a dedicated, otherwise idle identity/key (not available), or operator-side request logs.
