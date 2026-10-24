@@ -32,7 +32,7 @@
   padding: 28px; border-radius: var(--radius); border: 1px dashed var(--border);
   color: var(--text-muted); justify-content: center;
 }
-.hd-error { border-color: var(--status-failed); color: var(--status-failed); background: #fef2f2; }
+.hd-error { border-color: var(--status-failed); color: var(--status-failed); background: var(--error-bg); }
 
 /* ---- ident (stable identity) ---- */
 .hd-ident {
@@ -148,9 +148,5 @@
 .hd-fleet__group { background: var(--surface-alt, #f3f4f6); font-size: 0.75rem; text-transform: uppercase; letter-spacing: .04em; }
 .hd-fleet__ref { color: var(--text-muted, #667085); font-family: ui-monospace, monospace; }
 .hd-fleet__cell { font-family: ui-monospace, monospace; }
-.hd-fleet__cell--drifted { background: #fff4e5; color: #8a4b00; font-weight: 600; }
-.hd-fleet__cell--missing { color: var(--text-muted, #667085); background: #f6f6f6; }
-@media (prefers-color-scheme: dark) {
-  .hd-fleet__cell--drifted { background: #3a2a10; color: #ffc46b; }
-  .hd-fleet__cell--missing { background: #1f2227; }
-}
+.hd-fleet__cell--drifted { background: var(--drift-bg); color: var(--drift-text); font-weight: 600; }
+.hd-fleet__cell--missing { color: var(--text-muted, #667085); background: var(--missing-bg); }
