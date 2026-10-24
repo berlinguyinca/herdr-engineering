@@ -377,7 +377,8 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
         if (ask && !window.confirm(ask)) return;
         b.disabled = true;
         try { await api.decideUser(b.dataset.user, act, ($('hcn-user-note').value || '').trim()); await showPeople(filter, showLog, turn); }
-        catch (e) { if (!isCurrent(turn) || cancelled(e)) return; $('hcn-people-msg').textContent = e.message; $('hcn-people-msg').setAttribute('role', 'alert'); b.disabled = false; }
+        catch (e) { if (!isCurrent(turn) || cancelled(e)) return; $('hcn-people-msg').textContent = e.message; $('hcn-people-msg').setAttribute('role', 'alert'); }
+        finally { if (isCurrent(turn)) b.disabled = false; }
       };
     });
     if (manage) {
@@ -890,11 +891,40 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const loadHelpers = async () => {
       if (!isCurrent(turn)) return;
       if (operator) {
-        try { S.egress = ((await api.egressRequests()).requests || []).filter((r) => r.room_id === roomId); } catch { /* keep the old list */ }
-        try { const h = await api.helpers(); S.helpers = h.helpers || []; S.paused = Boolean(h.paused); } catch { /* keep */ }
-      } else { try { S.helpers = (await api.myHelpers()).helpers || []; } catch { /* guests and old servers: no helper list */ } }
-      if (operator) { try { const x = await api.egressAllowlist(roomId); S.allow = x.allowlist || []; S.entries = Array.isArray(x.entries) ? x.entries : null; } catch { /* keep */ } }
-      if (canInvite) { try { S.profile = await api.roomProfile(roomId); } catch { /* not readable: keep */ } }
+        try {
+          const result = await api.egressRequests();
+          if (!isCurrent(turn)) return;
+          S.egress = (result.requests || []).filter((r) => r.room_id === roomId);
+        } catch { /* keep the old list */ }
+        if (!isCurrent(turn)) return;
+        try {
+          const h = await api.helpers();
+          if (!isCurrent(turn)) return;
+          S.helpers = h.helpers || []; S.paused = Boolean(h.paused);
+        } catch { /* keep */ }
+      } else {
+        try {
+          const result = await api.myHelpers();
+          if (!isCurrent(turn)) return;
+          S.helpers = result.helpers || [];
+        } catch { /* guests and old servers: no helper list */ }
+      }
+      if (!isCurrent(turn)) return;
+      if (operator) {
+        try {
+          const x = await api.egressAllowlist(roomId);
+          if (!isCurrent(turn)) return;
+          S.allow = x.allowlist || []; S.entries = Array.isArray(x.entries) ? x.entries : null;
+        } catch { /* keep */ }
+      }
+      if (!isCurrent(turn)) return;
+      if (canInvite) {
+        try {
+          const profile = await api.roomProfile(roomId);
+          if (!isCurrent(turn)) return;
+          S.profile = profile;
+        } catch { /* not readable: keep */ }
+      }
     };
     const drawHelpers = () => {
       if (operator) {
@@ -955,7 +985,13 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     };
 
     const setBadge = (k, n) => { const b = $(`hcn-b-${k}`); if (!b) return; b.hidden = !n; b.textContent = n > 99 ? '99+' : String(n); };
-    const loadMine = async () => { try { S.mine = (await api.agents()).agents; } catch { /* keep the old list */ } };
+    const loadMine = async () => {
+      try {
+        const { agents } = await api.agents();
+        if (!isCurrent(turn)) return;
+        S.mine = agents;
+      } catch { /* keep the old list */ }
+    };
     function paint() {
       setBadge('agents', (S.requests || []).length);
       setBadge('tasks', S.tasks.filter((t) => ['pending', 'accepted'].includes(t.status)).length);
@@ -966,7 +1002,9 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     const paintPanel = async () => {
       if (!isCurrent(turn)) return;
       if (sub === 'agents' && canPost) await loadMine();
+      if (!isCurrent(turn)) return;
       if (sub === 'agents') await loadHelpers();
+      if (!isCurrent(turn)) return;
       if (sub === 'people') await drawPeople();
       if (!alive || !isCurrent(turn)) return;
       paint();
@@ -992,20 +1030,22 @@ export function mountCollab(root, { fabricSessions = null, surface = root.datase
     };
     const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
     (async () => {
-      while (alive) {
+      while (alive && isCurrent(turn)) {
         if (document.hidden) { await new Promise((r) => { wake = r; }); continue; }
         ctl = new AbortController();
         try {
           const s = await api.state(roomId, since, cursor, 8, ctl.signal);
-          if (!alive) return;
+          if (!alive || !isCurrent(turn)) return;
           backoff = 1000;
           if (s.changed) { apply(s); since = s.has_more ? -1 : s.seq; } else since = s.seq;
         } catch (e) {
-          if (!alive) return;
+          if (!alive || !isCurrent(turn)) return;
           if (e.name === 'AbortError') continue;
           if (e instanceof AuthError) { dispose(); store.clear(); start(); return; }
           if (e.code === 'not_found') { dispose(); go('/rooms', turn); return; }
-          await sleep(backoff); backoff = Math.min(backoff * 2, 15000);
+          await sleep(backoff);
+          if (!alive || !isCurrent(turn)) return;
+          backoff = Math.min(backoff * 2, 15000);
         }
       }
     })();
