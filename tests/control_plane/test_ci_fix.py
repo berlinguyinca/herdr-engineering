@@ -431,7 +431,8 @@ def test_disabled_by_default_every_route_is_404():
                 ("ci/fix/claim", {"host": "bender"}, "runner"),
                 ("ci/fix/cifix_" + "0" * 26 + "/state", {"state": "failed"}, "runner"),
                 ("ci/fix/cifix_" + "0" * 26 + "/cancel", {}, "write"),
-                ("ci/fix", None, "write"), ("ci/fix/cifix_" + "0" * 26, None, "write")]:
+                ("ci/fix", None, "write"), ("ci/fix/cifix_" + "0" * 26, None, "write"),
+                ("ci/fix/config", None, "runner"), ("ci/fix?host=bender&active=1", None, "runner")]:
             assert call(server, path, body, key=key)[0] == 404, path
         assert call(server, "ci", key="write")[0] == 200                          # the rest of CI is untouched
     finally:
@@ -463,8 +464,93 @@ def test_public_listener_has_no_ci_fix_routes(acknowledged_sink, tmp_path):
                 ("POST", f"/api/v1/ci/fix/{fix}/state", {"state": "failed"}),
                 ("POST", f"/api/v1/ci/fix/{fix}/result", {}),
                 ("POST", f"/api/v1/ci/fix/{fix}/cancel", {}),
-                ("GET", "/api/v1/ci/fix", None), ("GET", f"/api/v1/ci/fix/{fix}", None)]:
+                ("GET", "/api/v1/ci/fix", None), ("GET", f"/api/v1/ci/fix/{fix}", None),
+                ("GET", "/api/v1/ci/fix/config", None)]:
             assert public.call(method, path, body, headers=headers)[0] == 404, path
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+# ------------------------------------------------------------------ runner support
+def test_runner_config_is_served_and_has_the_queue_timeout(api):
+    status, cfg = call(api, "ci/fix/config", key="runner")
+    assert status == 200 and cfg["hosts"] == ["bender", "beast"] and cfg["queue_timeout_minutes"] == 30
+    assert cfg["pull_request"]["draft"] is True
+    assert "token" not in json.dumps(cfg).lower()
+
+
+def test_defer_shows_a_reason_and_times_out_a_request_waiting_for_a_model():
+    clock = [1_000_000.0]
+    repo = ControlPlaneRepo(now=lambda: clock[0])
+    service = CIFixService(repo, ci_fix_config({**CONFIG, "queue_timeout_minutes": 10}))
+    monitor = SimpleNamespace(_factory=Provider)
+    fix, _ = service.request(monitor, "17", 12, "op")
+    out = service.claim("bender", {"kind": "no_model", "reason": "no model available: none listed"})
+    assert out["request"] is None and service.get(fix["id"])["state"] == "queued"
+    assert "none listed" in service.get(fix["id"])["reason"]
+    events = len(repo.stream("ci_fix", fix["id"]))
+    service.claim("beast", {"kind": "no_model", "reason": "no model available: none listed"})
+    assert len(repo.stream("ci_fix", fix["id"])) == events           # the same reason is not re-recorded
+    clock[0] += 11 * 60
+    service.claim("bender", {"kind": "no_model", "reason": "no model available: none listed"})
+    gone = service.get(fix["id"])
+    assert gone["state"] == "failed" and "gave up after 10 min" in gone["reason"]
+    assert service.claim("bender")["request"] is None                # and it cannot be claimed any more
+
+
+@pytest.mark.parametrize("defer", [{"kind": "other"}, {"kind": "no_model", "extra": 1}, "text", []])
+def test_defer_is_validated(defer):
+    _, service, monitor = make()
+    ask(service, monitor)
+    with pytest.raises(ValueError):
+        service.claim("bender", defer)
+
+
+def test_list_filters_by_host_and_active():
+    _, service, monitor = make()
+    first, _ = ask(service, monitor, number=1, op="a")
+    ask(service, monitor, number=2, op="b")
+    service.claim("bender")
+    assert [row["id"] for row in service.list(host="bender")["fixes"]] == [first["id"]]
+    assert [row["id"] for row in service.list(active=True)["fixes"]] == [first["id"]]
+    assert service.list(host="beast")["fixes"] == []
+    service.set_state(first["id"], "failed", reason="x")
+    assert service.list(active=True)["fixes"] == []
+
+
+def test_api_serves_the_runner_filters_and_defer(api):
+    fix = call(api, "ci/fix", {"repository": "17", "number": 12, "operation_id": "op"}, key="write")[1]["id"]
+    out = call(api, "ci/fix/claim", {"host": "bender", "defer": {"kind": "no_model", "reason": "none"}}, key="runner")[1]
+    assert out["request"] is None and out["reason"] == "none"
+    assert call(api, "ci/fix/claim", {"host": "bender"}, key="runner")[1]["request"]["id"] == fix
+    assert call(api, "ci/fix?host=bender&active=1", key="runner")[1]["fixes"][0]["id"] == fix
+    assert call(api, "ci/fix?host=beast&active=1", key="runner")[1]["fixes"] == []
+
+
+# ------------------------------------------------------------------ association with the agent's session
+def association(repo, session_id):
+    page = repo.inspector.query(session_id, role="viewer", view="conversation", limit=1)
+    return {key: value for key, value in page["summary"]["association"].items() if key != "_flags"}
+
+
+def test_the_agents_session_is_tied_to_the_run_branch_and_pull_request():
+    repo, service, monitor = make()
+    fix = claimed(service, monitor)
+    session = "herdr:bender:default:w7%3Ap1"
+    service.set_state(fix, "running", session_id=session, branch="herdr-ci-fix/12-bbbbbbb", model="m")
+    assert association(repo, session) == {"worktree": "ci-fix org/frontend:12", "branch": "herdr-ci-fix/12-bbbbbbb"}
+    service.set_state(fix, "finishing")
+    service.record_result(fix, {"pr_url": "https://github.com/org/frontend/pull/9", "pr_number": 9, "summary": "ok"})
+    assert association(repo, session)["pr"] == {"number": 9, "url": "https://github.com/org/frontend/pull/9",
+                                                "repo": "org/frontend"}
+    before = len(repo.stream("ci_fix", fix))
+    service.set_state(fix, "finishing", reason="same again")                      # replays add no second association
+    assert len(repo.stream("ci_fix", fix)) == before + 1
+
+
+def test_a_session_id_the_inspector_refuses_does_not_fail_the_transition():
+    _, service, monitor = make()
+    fix = claimed(service, monitor)
+    out = service.set_state(fix, "running", session_id="has spaces and !!", branch="herdr-ci-fix/12-bbbbbbb")
+    assert out["state"] == "running" and out["session_id"] == "has spaces and !!"

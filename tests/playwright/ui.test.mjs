@@ -1282,6 +1282,115 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
   },{BURST:'0'});
 });
 
+async function seedFailedRun(page,{fixes,fixStatus=200}={}) {
+  const state={fixes:fixes||[],posts:[],cancels:0,terminals:[]};
+  const failed={provider_url:'https://ci.example',provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure'};
+  await page.route('**/api/v1/ci',r=>r.fulfill({json:{available:true,status:'connected',pipelines:{'lab/spectra':[failed]}}}));
+  await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{repository:'7',number:42,status:'failure',commit:'a'.repeat(40),tasks:[{id:1,name:'Tests',state:'failure'}]}}}));
+  await page.route(/\/api\/v1\/ci\/fix(\/|\?|$)/,r=>{
+    const req=r.request(),url=new URL(req.url());
+    if(fixStatus!==200)return r.fulfill({status:fixStatus,json:{error:'not found'}});
+    if(req.method()==='POST' && url.pathname.endsWith('/cancel')){state.cancels++;state.fixes[0]={...state.fixes[0],cancel_requested:true};return r.fulfill({json:state.fixes[0]});}
+    if(req.method()==='POST'){
+      const body=req.postDataJSON();state.posts.push(body);
+      state.fixes=[{id:'cifix_new',state:'queued',reason:'waiting for a free host',repository:'7',number:42,requested_at:new Date().toISOString(),cancel_requested:false}];
+      return r.fulfill({status:202,json:state.fixes[0]});
+    }
+    return r.fulfill({json:{fixes:state.fixes}});
+  });
+  await page.route('**/api/v1/sessions/*/terminal',r=>{state.terminals.push(decodeURIComponent(new URL(r.request().url()).pathname.split('/')[4]));return r.fulfill({json:{viewer_host:'bender',recommended:'remote',commands:[{form:'remote',label:'From another machine (ssh to beast)',command:'ssh -t beast "herdr agent attach wK:pH"'},{form:'local',label:'On beast itself',command:'herdr agent attach wK:pH'}]}});});
+  return state;
+}
+const refreshView=page=>page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+async function openFailedRun(page,base) {
+  await page.goto(`${base}/#/ci?tab=failed`);
+  await page.getByRole('button',{name:'Run #42',exact:true}).click();
+}
+
+test('failed CI run: Fix in sandbox becomes a status card that follows the fix to a draft PR',async()=>{
+  await withApp(async({page,base})=>{
+    const state=await seedFailedRun(page);
+    await openFailedRun(page,base);
+    const button=page.getByRole('button',{name:'Fix in sandbox',exact:true});
+    await button.waitFor();
+    assert.match(await page.locator('[data-ci-fix]').innerText(),/never merges/);
+    await button.click();
+    await page.locator('[data-fix-state="queued"]').waitFor();
+    assert.match(await page.locator('[data-ci-fix]').innerText(),/Queued[\s\S]*waiting for a free host/);
+    assert.equal(await page.locator('[data-fix-sandbox]').count(),0);
+    assert.equal(state.posts.length,1);assert.equal(state.posts[0].repository,'7');assert.equal(state.posts[0].number,42);
+    assert.match(state.posts[0].operation_id,/^[0-9a-f-]{36}$/);
+    // The runner picks it up: host, model and the agent link appear on the next refresh.
+    state.fixes=[{...state.fixes[0],state:'running',reason:null,host:'beast',model:'qwen',started_at:new Date().toISOString(),session_id:'herdr:beast:default:wK%3ApH'}];
+    await refreshView(page);
+    await page.locator('[data-fix-state="running"]').waitFor();
+    const card=page.locator('[data-ci-fix]');
+    assert.match(await card.innerText(),/Pi is working[\s\S]*Host beast · Model qwen/);
+    assert.equal(await card.locator('[data-fix-agent]').getAttribute('href'),'#/herd/session/herdr%3Abeast%3Adefault%3AwK%253ApH');
+    // Terminal commands: both forms, the suggested one first, each copyable.
+    await card.getByRole('button',{name:'Terminal',exact:true}).click();
+    await card.locator('.ig-fix-cmd').first().waitFor();
+    assert.deepEqual(state.terminals,['herdr:beast:default:wK%3ApH']);
+    assert.equal(await card.locator('.ig-fix-cmd').count(),2);
+    assert.match(await card.locator('.ig-fix-cmd').first().innerText(),/ssh -t beast/);
+    await card.locator('[data-fix-copy]').first().click();
+    await page.getByRole('button',{name:'Copied',exact:true}).waitFor();
+    // Cancel is a request; the card says so and the button goes away.
+    await card.getByRole('button',{name:'Cancel',exact:true}).click();
+    await page.getByText('cancel requested').waitFor();
+    assert.equal(state.cancels,1);assert.equal(await card.locator('[data-fix-cancel]').count(),0);
+    // Done: a link to the draft PR, the diff stat and the flags; the new card replaces the button.
+    state.fixes=[{...state.fixes[0],state:'succeeded',cancel_requested:false,ended_at:new Date().toISOString(),result:{pr_url:'https://github.com/lab/spectra/pull/9',pr_number:9,files:2,insertions:10,deletions:3,commits:1,flags:['changes a workflow file'],summary:'Fixed the import.'}}];
+    await refreshView(page);
+    await page.locator('[data-fix-state="succeeded"]').waitFor();
+    assert.equal(await card.locator('[data-fix-pr]').getAttribute('href'),'https://github.com/lab/spectra/pull/9');
+    assert.match(await card.innerText(),/2 files · \+10 −3[\s\S]*changes a workflow file[\s\S]*Fixed the import\./);
+  },{BURST:'0'});
+});
+
+test('failed CI run: every fix state renders with its reason and failed fixes can be retried',async()=>{
+  await withApp(async({page,base})=>{
+    const state=await seedFailedRun(page,{fixes:[{id:'cifix_1',state:'queued',reason:'no model available',repository:'7',number:42,requested_at:new Date().toISOString()}]});
+    await openFailedRun(page,base);
+    await page.locator('[data-fix-state="queued"]').waitFor();
+    for(const [name,label,reason] of [['claimed','Starting',null],['preparing','Preparing the sandbox',null],['finishing','Checking the result',null],['no_change','Pi made no change','the agent changed nothing'],['failed','Failed','the sandbox ran out of time'],['cancelled','Cancelled','cancelled by the operator'],['expired','Expired','nobody picked it up']]) {
+      state.fixes=[{...state.fixes[0],state:name,reason}];
+      await refreshView(page);
+      await page.locator(`[data-fix-state="${name}"]`).waitFor();
+      const text=await page.locator('[data-ci-fix]').innerText();
+      assert.ok(text.includes(label),`${name}: ${text}`);
+      if(reason)assert.ok(text.includes(reason),`${name}: ${text}`);
+    }
+    // The fix is over, so a new one can be requested with a fresh operation.
+    await page.getByRole('button',{name:'Fix in sandbox again',exact:true}).click();
+    await page.locator('[data-fix-state="queued"]').waitFor();
+    assert.equal(state.posts.length,1);
+  },{BURST:'0'});
+});
+
+test('failed CI run: the fix card fits a 390px screen and escapes what the runner reports',async()=>{
+  await withApp(async({page,base})=>{
+    await page.setViewportSize({width:390,height:800});
+    await seedFailedRun(page,{fixes:[{id:'cifix_1',state:'failed',reason:'<img src=x onerror=window.pwned=1> '+'x'.repeat(300),repository:'7',number:42,requested_at:new Date().toISOString(),host:'h'.repeat(60),session_id:'s'}]});
+    await openFailedRun(page,base);
+    await page.locator('[data-fix-state="failed"]').waitFor();
+    assert.equal(await page.evaluate(()=>window.pwned),undefined);
+    assert.equal(await page.locator('[data-ci-fix] img').count(),0);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+  },{BURST:'0'});
+});
+
+test('failed CI run: no Fix in sandbox button when the control plane has the feature disabled',async()=>{
+  await withApp(async({page,base})=>{
+    await seedFailedRun(page,{fixStatus:404});
+    await openFailedRun(page,base);
+    await page.getByText('Debug with Pi',{exact:true}).waitFor();
+    await page.waitForTimeout(300);
+    assert.equal(await page.locator('[data-ci-fix]').count(),0);
+    assert.equal(await page.getByRole('button',{name:/Fix in sandbox/}).count(),0);
+  },{BURST:'0'});
+});
+
 test('hosts page lists the fleet version matrix and flags the host that differs', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/hosts`);

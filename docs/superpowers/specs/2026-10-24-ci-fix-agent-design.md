@@ -190,3 +190,49 @@ Defaults stand until you answer; each can change on request.
 4. **Network inside the box.** Default: the LLM gateway only, plus per-project allowlists. Alternative: open network like the collaboration agents have, which makes tests that fetch packages work but removes the main containment.
 5. **Interactive or headless.** Default: interactive Pi in a herdr tab you can attach to. Alternative: headless one-shot, simpler and cheaper to run, but you cannot step in.
 6. **Auto-trigger.** Default: click only. Say if failures on certain branches (for example `main`) should start a fix automatically; I would want the attention inbox and caps in place first.
+
+## Built notes (2026-10-24)
+
+Build-plan steps 1–5 are merged; step 6 (hardening against live hosts) is **not done**. The feature ships disabled (`ci_fix.enabled: false`) and nothing has been deployed or run against a real host, forge, herdr server or Woodpecker. Everything below that says "unverified" is an assumption in code, covered only by tests against fakes (plus local bubblewrap box tests).
+
+| Step | PR | What |
+|---|---|---|
+| 1 | #227 | Request, state fold, API, `ci_fix` YAML block (default disabled; routes 404 when off) |
+| 2 | #228 | Host runner: claim, mirror clone, pinned commit, prompt, per-host cap, stub agent |
+| 3 | #230 | Sandbox launcher (herdr pane + bubblewrap + egress proxy), watch loop, cleanup |
+| 4 | #231 | Result gate: checks, push of the fix branch only, draft PR, crash-repeat safety |
+| 5 | this PR | Dashboard: "Fix in sandbox" button, status card, Terminal commands, Cancel, PR link |
+
+### Decisions applied (the six defaults)
+
+1. The runner pushes the branch and opens the PR after the agent quits.
+2. The PR is a draft.
+3. Hosts come from YAML (`ci_fix.hosts`) and are off until listed.
+4. The sandbox reaches the LLM gateway plus per-project allowlisted hosts only.
+5. Interactive Pi in a herdr tab.
+6. Click-only trigger.
+
+### Deviations from the design
+
+- **One runner per host instead of round robin.** Each host's systemd timer claims one request at a time; a per-host cap and the global cap replace "round robin among hosts".
+- **Runner settings are served by the control plane** (`GET /api/v1/ci/fix/config`), so there is one YAML block and no runner-side config file.
+- **Claim `defer {kind: no_model}`** keeps a request queued with a visible reason and fails it after `queue_timeout_minutes` (default 30).
+- **Idle detection uses a screen fingerprint**, not herdr's idle state (unreliable; see memory `herdr-agent-status-idle-is-unreliable`). An unreadable screen is never counted as idle.
+- **The pane runs the boxed command via `pane run`**, not `herdr agent start --kind pi`, which runs the canonical `pi` directly and cannot be put in the box.
+- **The `ci-fix` session role is not set**; only the inspector association (branch, worktree label, PR) is written. Registration relies on herdr's detection with an explicit `pane report-agent` fallback.
+- **PR base** is the failing branch when it is known and exists on the remote, otherwise the remote's default branch. Only GitHub pull requests are supported.
+- **Systemd units are templates** in `deploy/control-plane/` and are not installed.
+- **UI:** the card polls with the page's existing 5 s refresh (no new timer); the button is hidden when the routes answer 404.
+
+### Spikes 1–6: status
+
+None has been run against a live system.
+
+1. **herdr detection under bubblewrap — unverified.** Fallback `pane report-agent` is coded but untested against a real herdr.
+2. **Transcript visibility — unverified.** Pi's session directory lives in the per-fix harness directory, which cleanup deletes, so the transcript is not kept after the fix. Decide whether to copy it out before cleanup.
+3. **`herdr worktree` with a mirror — not attempted.** A standalone `init`+`fetch` from the mirror (no remote, `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null`) is used instead; the request's "worktree" wording is met by the work copy's branch and label only.
+4. **Forge credentials — unverified.** The runner reads a token file (mode 0600) by path; which token scope works for pushing `herdr-ci-fix/*` and opening draft PRs has not been tried. No real GitHub API call has been made.
+5. **Woodpecker secrets on PR pipelines — unverified. Release blocker.** Settle the rule (approval required, or no secrets) before `ci_fix.enabled` is turned on anywhere.
+6. **Interactive Pi startup and first model call — unverified.** The 2026-10-22 hang with the prompt passed as an argument is not retested; the fixed instructions and untrusted CI context are written to `PROMPT.md` and handed to Pi by the launcher (see `HerdrPiLauncher`), which has only been exercised against fakes.
+
+Session id format `herdr:<host>:<server>:<urlencoded pane>` (server from `--herdr-session`, default `default`) is an assumption for the Terminal button and the agent link.
