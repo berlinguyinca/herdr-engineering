@@ -1,4 +1,5 @@
-import { boundedText, sandboxMarkup, textPreviewMarkup, TEXT_LIMIT } from './collab-preview-text.js';
+import { sandboxMarkup, TEXT_LIMIT } from './collab-preview-text.js';
+import { parsePreview } from './collab-preview-parser.js';
 import { renderMsp } from './collab-preview-msp.js';
 import { renderPdf, PDF_LIMIT } from './collab-preview-pdf.js';
 import { renderFlasheic } from './collab-preview-flasheic.js';
@@ -144,13 +145,17 @@ export function renderPreview(file, authorizedSource, options = {}) {
       try { bytes = await readPreviewBytes(file, authorizedSource, { signal, limit }); }
       catch (error) { if (/size limit/.test(error.message) && current()) { await asyncPreview(); return; } throw error; }
       if (!current()) return;
-      if (renderer.id === 'pdf') show(renderPdf(bytes));
+      if (renderer.id === 'pdf') {
+        const pdf = renderPdf(bytes, { signal });
+        show(pdf); await pdf.ready;
+      }
       else {
-        const text = boundedText(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-        show(renderer.id === 'msp' ? renderMsp(text) : sandboxMarkup(textPreviewMarkup(renderer.id, text), `${renderer.id} preview`));
+        const result = await parsePreview(renderer.id, bytes, { signal });
+        if (!current()) return;
+        show(renderer.id === 'msp' ? renderMsp(result.spectra) : sandboxMarkup(result.markup, `${renderer.id} preview`));
       }
     } catch (error) {
-      if (!disposed) { body.setAttribute('role', 'alert'); body.textContent = signal.aborted ? 'Preview timed out. Try again.' : `Preview unavailable: ${error.message}`; }
+      if (!disposed) { disposeChild(); body.setAttribute('role', 'alert'); body.textContent = signal.aborted ? 'Preview timed out. Try again.' : `Preview unavailable: ${error.message}`; }
     } finally { clearTimeout(deadline); }
   })();
   return root;

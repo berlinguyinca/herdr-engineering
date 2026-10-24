@@ -7,15 +7,21 @@ import { chromium } from 'playwright';
 
 // Real browser, shared client/view and renderers; HTTP fixtures are not live
 // storage/Flasheic/job integration proof. Adapter tests use explicit providers.
-function pdfFixture() {
-  const stream = 'BT /F1 24 Tf 30 100 Td (Preview PDF fixture) Tj ET';
-  const objects = ['<</Type/Catalog/Pages 2 0 R>>', '<</Type/Pages/Count 1/Kids[3 0 R]>>',
-    '<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 160]/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>',
-    '<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>', `<</Length ${stream.length}>>\nstream\n${stream}\nendstream`];
+function pdfFixture(pages = ['Preview PDF fixture'], action = '') {
+  const literal = text => text.replace(/[\\()]/g, char => '\\' + char);
+  const objects = [`<</Type/Catalog/Pages 2 0 R ${action}>>`, '', '<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>'];
+  const kids = [];
+  for (const text of pages) {
+    const page = objects.length + 1, stream = `BT /F1 14 Tf 10 100 Td (${literal(text)}) Tj ET`;
+    kids.push(`${page} 0 R`);
+    objects.push(`<</Type/Page/Parent 2 0 R/MediaBox[0 0 600 160]/Resources<</Font<</F1 3 0 R>>>>/Contents ${page + 1} 0 R>>`,
+      `<</Length ${stream.length}>>\nstream\n${stream}\nendstream`);
+  }
+  objects[1] = `<</Type/Pages/Count ${pages.length}/Kids[${kids.join(' ')}]>>`;
   let pdf = '%PDF-1.4\n'; const offsets = [0];
   objects.forEach((object, i) => { offsets.push(pdf.length); pdf += `${i + 1} 0 obj\n${object}\nendobj\n`; });
   const xref = pdf.length;
-  pdf += `xref\n0 6\n0000000000 65535 f \n${offsets.slice(1).map(offset => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<</Size 6/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF`;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.slice(1).map(offset => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<</Size ${objects.length + 1}/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF`;
   return pdf;
 }
 const contents = {
@@ -42,7 +48,7 @@ async function withPreviews(surface, fn) {
   try {
     const fallback = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
     browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], executablePath: process.env.PLAYWRIGHT_CHROMIUM || (existsSync(fallback) ? fallback : undefined) });
-    const page = await browser.newPage(); page.setDefaultTimeout(3000);
+    const page = await browser.newPage(); page.setDefaultTimeout(10000);
     const errors = []; page.on('pageerror', e => errors.push(e.message)); page.on('request', r => requests.push(r));
     const origin = `http://127.0.0.1:${server.address().port}`;
     const room = { room_id: 'r', name: 'Preview room', role: 'viewer', members: [] };
@@ -118,7 +124,7 @@ for (const surface of ['public', 'dashboard']) {
     await open('pdf');
     await page.locator('[data-file-preview] iframe[src^="blob:"]').waitFor();
     assert.equal(await page.locator('[data-file-preview] iframe').getAttribute('sandbox'), '');
-    await page.getByText(/browser.*PDF|PDF.*browser/i).waitFor();
+    await page.frameLocator('[data-file-preview] iframe').getByText('Preview PDF fixture', { exact: true }).waitFor();
     await open('fakepdf'); await page.locator('[data-file-preview] [role=alert]').filter({ hasText: /PDF/ }).waitFor();
     await open('unknown'); await page.getByText(/No preview renderer/).waitFor();
     await open('mzml'); await page.getByText(/Flasheic.*unavailable/).waitFor();
@@ -239,3 +245,124 @@ for (const outcome of ['success', 'rejection']) {
     assert.deepEqual(await page.evaluate(() => window.revokedArtifacts), [url], 'active child remains owned and is disposed with the parent');
   }));
 }
+
+// A PDF preview must contain painted pixels and searchable extracted text,
+// rather than merely a sandboxed native viewer that Chromium cannot display.
+test('preview PDF paints a page and searches inert text using a dedicated worker', async () => withPreviews('public', async ({ page, open }) => {
+  const workers = []; page.on('worker', worker => workers.push(worker.url()));
+  await open('pdf');
+  const frame = page.frameLocator('[data-file-preview] iframe');
+  await frame.getByText('Preview PDF fixture', { exact: true }).waitFor();
+  const image = frame.locator('img[alt="PDF page 1"]'); await image.waitFor();
+  const pixels = await image.evaluate(image => {
+    const canvas = document.createElement('canvas'); canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+    canvas.getContext('2d').drawImage(image, 0, 0);
+    return [...canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data].filter((n, i) => i % 4 !== 3 && n < 128).length;
+  });
+  assert.ok(pixels > 100, 'PDF glyphs must actually paint non-white pixels');
+  await page.getByRole('searchbox', { name: 'Search PDF' }).fill('fixture');
+  await page.getByRole('status').filter({ hasText: '1 matching page' }).waitFor();
+  await page.getByRole('searchbox', { name: 'Search PDF' }).fill('absent');
+  await page.getByRole('status').filter({ hasText: 'No matches' }).waitFor();
+  assert.ok(workers.some(url => url.endsWith('/vendor/pdfjs/pdf.worker.mjs')));
+  assert.equal(await page.locator('[data-file-preview] iframe').getAttribute('sandbox'), '');
+  assert.equal(await frame.locator('script,object,embed,a,form').count(), 0);
+}));
+
+for (const kind of ['markdown', 'json', 'xml', 'yaml', 'msp']) {
+  test(`preview ${kind} parser hang is terminated while room controls remain responsive`, async () => withPreviews('public', async ({ page, open }) => {
+    // Replace only the worker HTTP response, not the Worker API or parser client.
+    // This executes a real infinite loop on the isolated worker thread.
+    await page.route('**/collab-preview-worker.js', route => route.fulfill({ contentType: 'text/javascript', body: 'self.onmessage = () => { while (true) {} };' }));
+    await page.evaluate(() => {
+      window.workerTerminations = 0;
+      const terminate = Worker.prototype.terminate;
+      Worker.prototype.terminate = function () { window.workerTerminations++; return terminate.call(this); };
+      const schedule = window.setTimeout;
+      window.setTimeout = (fn, ms, ...args) => {
+        if (ms === 2000) {
+          window.setTimeout = schedule;
+          return schedule(fn, 250, ...args);
+        }
+        return schedule(fn, ms, ...args);
+      };
+    });
+    await open(kind === 'markdown' ? 'md' : kind);
+    await page.locator('[data-file-preview] [role=alert]').filter({ hasText: /timed out/i }).waitFor();
+    assert.equal(await page.evaluate(() => window.workerTerminations), 1);
+    await page.unroute('**/collab-preview-worker.js');
+    await open('json');
+    await page.frameLocator('[data-file-preview] iframe').getByText('42', { exact: true }).waitFor();
+    assert.equal(await page.locator('[data-file-id="json"] button:disabled').count(), 0);
+  }));
+}
+
+
+test('preview PDF multipage search and document actions remain inert', async () => withPreviews('dashboard', async ({ page, open, requests }) => {
+  const hostile = '<script>parent.pwned=1</script>';
+  const pdf = pdfFixture(['First page', `Second page ${hostile}`], '/OpenAction<</S/JavaScript/JS(app.alert\\(123\\))>>');
+  await page.route('https://objects.example/pdf?*', route => route.fulfill({ contentType: 'application/pdf', body: pdf }));
+  let dialogs = 0; page.on('dialog', dialog => { dialogs++; dialog.dismiss(); });
+  await open('pdf');
+  const frame = page.frameLocator('[data-file-preview] iframe');
+  await frame.getByText(`Second page ${hostile}`, { exact: true }).waitFor();
+  assert.equal(await frame.locator('img').count(), 2);
+  assert.equal(await frame.locator('script,iframe,object,embed,a,form').count(), 0);
+  assert.equal(await page.evaluate(() => window.pwned), undefined); assert.equal(dialogs, 0);
+  await page.getByRole('searchbox', { name: 'Search PDF' }).fill('second');
+  await page.getByRole('button', { name: 'Go to page 2' }).click();
+  assert.match(await page.locator('[data-file-preview] iframe').getAttribute('src'), /#pdf-page-2$/);
+  assert.equal(requests.some(request => request.url().includes('evil.example')), false);
+}));
+
+test('preview PDF page cap and malformed data fail visibly', async () => withPreviews('public', async ({ page, open }) => {
+  await page.route('https://objects.example/pdf?*', route => route.fulfill({ contentType: 'application/pdf', body: pdfFixture(Array(51).fill('Page')) }));
+  await open('pdf'); await page.locator('[data-file-preview] [role=alert]').filter({ hasText: /PDF page limit/ }).waitFor();
+  await page.unroute('https://objects.example/pdf?*');
+  await page.route('https://objects.example/pdf?*', route => route.fulfill({ contentType: 'application/pdf', body: '%PDF-1.7 broken' }));
+  await open('pdf'); await page.locator('[data-file-preview] [role=alert]').filter({ hasText: /Invalid PDF/ }).waitFor();
+  await open('json'); await page.frameLocator('[data-file-preview] iframe').getByText('42', { exact: true }).waitFor();
+}));
+
+test('preview PDF hung dedicated worker times out and terminates without a synchronous fallback', async () => withPreviews('public', async ({ page, open }) => {
+  await page.route('**/vendor/pdfjs/pdf.worker.mjs', route => route.fulfill({ contentType: 'text/javascript', body: 'while (true) {}' }));
+  await page.evaluate(async () => {
+    await import('/vendor/pdfjs/pdf.mjs');
+    window.pdfTerminations = 0;
+    const terminate = Worker.prototype.terminate;
+    Worker.prototype.terminate = function () { window.pdfTerminations++; return terminate.call(this); };
+    const schedule = window.setTimeout;
+    window.setTimeout = (fn, ms, ...args) => schedule(fn, ms === 15000 ? 500 : ms, ...args);
+  });
+  await open('pdf');
+  await page.locator('[data-file-preview] [role=alert]').filter({ hasText: /PDF preview timed out/ }).waitFor();
+  assert.equal(await page.evaluate(() => window.pdfTerminations), 1);
+  await open('json'); await page.frameLocator('[data-file-preview] iframe').getByText('42', { exact: true }).waitFor();
+}));
+
+test('preview replacement terminates an active parser before its deadline', async () => withPreviews('public', async ({ page, open }) => {
+  await page.route('**/collab-preview-worker.js', route => route.fulfill({ contentType: 'text/javascript', body: 'self.onmessage = () => { while (true) {} };' }));
+  await page.evaluate(() => {
+    window.parserTerminations = 0;
+    const terminate = Worker.prototype.terminate;
+    Worker.prototype.terminate = function () { window.parserTerminations++; return terminate.call(this); };
+  });
+  const workerStarted = page.waitForEvent('worker'); await open('md'); await workerStarted;
+  await open('unknown'); await page.getByText(/No preview renderer/).waitFor();
+  assert.equal(await page.evaluate(() => window.parserTerminations), 1);
+  assert.equal(await page.locator('[data-file-preview] [role=alert]').count(), 0);
+}));
+
+test('preview PDF preserves non-ASCII extracted text in its inert HTML document', async () => withPreviews('public', async ({ page, open }) => {
+  const pdf = pdfFixture(['café']).replace('/BaseFont/Helvetica', '/BaseFont/Helvetica/Encoding/WinAnsiEncoding');
+  // Rebuild xref offsets after changing the font dictionary.
+  const objects = [...pdf.matchAll(/(\d+) 0 obj\n/g)].map(match => match.index);
+  const xref = pdf.indexOf('xref\n');
+  const body = pdf.slice(0, xref) + `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${objects.map(offset => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<</Size ${objects.length + 1}/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF`;
+  await page.route('https://objects.example/pdf?*', route => route.fulfill({ contentType: 'application/pdf', body: Buffer.from(body, 'latin1') }));
+  await open('pdf');
+  const text = page.frameLocator('[data-file-preview] iframe').locator('p'); await text.waitFor();
+  assert.equal(await text.textContent(), 'café');
+  await page.getByRole('searchbox', { name: 'Search PDF' }).fill('café');
+  await page.getByRole('status').filter({ hasText: '1 matching page' }).waitFor();
+}));

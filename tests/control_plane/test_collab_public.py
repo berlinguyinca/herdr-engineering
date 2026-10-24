@@ -105,6 +105,11 @@ def test_public_listener_serves_bootstrap_import_graph_from_real_packages(stack)
         # bindings) rather than maintaining a hand-picked asset list. Each
         # discovered module is fetched from the real restricted listener.
         imports = re.compile(r"(?:^import\s+(?:[^;]+?\s+from\s+)?|^export\s+[^;]+?\s+from\s+)[\"']([^\"']+)[\"']", re.MULTILINE)
+        # Application-owned dynamic imports and module-worker URLs are also
+        # roots. Upstream browser bundles contain Node-only dynamic branches,
+        # which are not browser dependencies or public assets.
+        dynamic = re.compile(r"\bimport\(\s*[\"']([^\"']+)[\"']")
+        worker_urls = re.compile(r"new URL\(\s*[\"']([^\"']+\.m?js)[\"']\s*,\s*import\.meta\.url")
         while pending:
             path = pending.pop()
             if path in visited:
@@ -117,11 +122,16 @@ def test_public_listener_serves_bootstrap_import_graph_from_real_packages(stack)
             assert response.getheader("Content-Type").startswith("text/javascript"), path
             assert response.getheader("X-Content-Type-Options") == "nosniff"
             assert body == (ROOT_DIR / "packages" / path.lstrip("/")).read_bytes()
-            for specifier in imports.findall(body.decode()):
+            specifiers = imports.findall(body.decode())
+            if not path.startswith("/vendor/"):
+                specifiers += dynamic.findall(body.decode()) + worker_urls.findall(body.decode())
+            for specifier in specifiers:
                 assert specifier.startswith(("./", "../", "/")), specifier
                 pending.append(urljoin(path, specifier))
         assert {"/collab-view.js", "/collab-helpers.js", "/collab-previews.js",
-                "/collab-preview-pdf.js", "/herdr-web-client/collab.js"} <= visited
+                "/collab-preview-pdf.js", "/collab-preview-parser.js", "/collab-preview-worker.js",
+                "/vendor/pdfjs/pdf.mjs", "/vendor/pdfjs/pdf.worker.mjs",
+                "/herdr-web-client/collab.js"} <= visited
         connection.request("GET", "/app.js", headers=H)
         response = connection.getresponse()
         response.read()
@@ -312,3 +322,27 @@ def test_public_guide_is_served_and_names_no_private_infrastructure(stack):
     text = (ROOT_DIR / "packages" / "collab-guide.md").read_text()
     for bad in ("100.104", "tailnet", "192.168", "journalctl", "systemctl", "bender", "cubert", "herdr-cp"):
         assert bad not in text, bad
+
+
+def test_pdf_modules_and_fonts_use_correct_mime_on_both_listeners(stack):
+    import http.client
+
+    stack.srv.web_root = ROOT_DIR / "packages"
+    assets = [("vendor/pdfjs/pdf.mjs", "text/javascript"),
+              ("vendor/pdfjs/pdf.worker.mjs", "text/javascript")]
+    assets += [(str(path.relative_to(stack.srv.web_root)), "application/octet-stream")
+               for path in (stack.srv.web_root / "vendor/pdfjs/standard_fonts").iterdir()
+               if path.suffix in {".ttf", ".pfb"}]
+    for port in (stack.srv.port, stack.srv.public_port):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            for name, mime in assets:
+                connection.request("GET", "/" + name, headers={**H, "X-API-Key": "op"})
+                response = connection.getresponse()
+                assert response.read() == (stack.srv.web_root / name).read_bytes()
+                assert response.status == 200
+                assert response.getheader("Content-Type").startswith(mime), (port, name)
+        finally:
+            connection.close()
+    for name in ("pdf.sandbox.mjs", "pdf_viewer.mjs", "LICENSE", "NOTICE.md"):
+        assert stack.pub.call("GET", "/vendor/pdfjs/" + name, headers=H)[0] == 404

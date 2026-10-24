@@ -94,3 +94,59 @@ test('preview MSP annotations containing colons remain peaks and do not become m
   const { parseMsp } = await import('../collab-preview-msp.js');
   assert.deepEqual(parseMsp('Name: Annotated\nNum Peaks: 1\n10 2 "label: value"')[0].peaks, [[10, 2]]);
 });
+
+
+test('preview XML worker parser rejects malformed structures without a DOMParser', async () => {
+  const { textPreviewMarkup } = await import('../collab-preview-text.js');
+  assert.match(textPreviewMarkup('xml', '<root a="&lt;safe&gt;"><item>ok &amp; good</item><![CDATA[<literal>]]></root>'), /ok &amp; good/);
+  for (const xml of ['<a><b></a>', '<a/><b/>', '<a x="1" x="2"/>', '<a>&unknown;</a>', '<a x="<bad>"/>', '<a>bad & text</a>', '<a/>tail', '<a><!-- bad--comment --></a>']) {
+    assert.throws(() => textPreviewMarkup('xml', xml), /XML/);
+  }
+});
+
+test('preview worker returns validated results and rejects invalid UTF-8 and byte limits', async () => {
+  const { Worker: Thread } = await import('node:worker_threads');
+  const { parsePreview } = await import('../collab-preview-parser.js');
+  const previous = globalThis.Worker;
+  // Adapt the Node thread transport only; run the actual browser worker module.
+  globalThis.Worker = class {
+    constructor(url) {
+      this.thread = new Thread(new URL('data:text/javascript,' + encodeURIComponent(`
+        import { parentPort } from 'node:worker_threads';
+        globalThis.self = { postMessage: data => parentPort.postMessage(data) };
+        await import(${JSON.stringify(url.href)});
+        parentPort.on('message', data => self.onmessage({ data }));
+      `)));
+      this.thread.on('message', data => this.onmessage?.({ data }));
+      this.thread.on('error', () => this.onerror?.({ preventDefault() {} }));
+    }
+    postMessage(data, transfer) { this.thread.postMessage(data, transfer); }
+    terminate() { this.thread.terminate(); }
+  };
+  try {
+    for (const [kind, input, expected] of [
+      ['markdown', '# Worker heading', /<h1>Worker heading<\/h1>/],
+      ['json', '{"key":42}', /42/], ['xml', '<root>safe</root>', /safe/],
+      ['yaml', 'root:\n  value: safe', /safe/],
+    ]) {
+      const result = await parsePreview(kind, new TextEncoder().encode(input));
+      assert.equal(result.kind, kind); assert.match(result.markup, expected);
+    }
+    const msp = await parsePreview('msp', new TextEncoder().encode('Name: Worker\nNum Peaks: 1\n10 2'));
+    assert.deepEqual(msp.spectra[0].peaks, [[10, 2]]);
+    await assert.rejects(parsePreview('json', new TextEncoder().encode('{bad')), /JSON/);
+    await assert.rejects(parsePreview('markdown', new Uint8Array([0xff])), /encoded data|encoding/i);
+    await assert.rejects(parsePreview('markdown', new TextEncoder().encode('é'.repeat(100001))), /limit/);
+    await assert.rejects(parsePreview('markdown', new Uint8Array(), { signal: AbortSignal.abort() }), { name: 'AbortError' });
+  } finally { globalThis.Worker = previous; }
+});
+
+test('preview PDF vendor assets exactly match the pinned dependency including font licenses', async () => {
+  const { readFile, readdir } = await import('node:fs/promises');
+  const root = new URL('../../', import.meta.url);
+  const manifest = JSON.parse(await readFile(new URL('node_modules/pdfjs-dist/package.json', root)));
+  assert.equal(manifest.version, '6.4.299');
+  const copies = [['build/pdf.mjs', 'pdf.mjs'], ['build/pdf.worker.mjs', 'pdf.worker.mjs'], ['LICENSE', 'LICENSE']];
+  for (const name of await readdir(new URL('node_modules/pdfjs-dist/standard_fonts/', root))) copies.push([`standard_fonts/${name}`, `standard_fonts/${name}`]);
+  for (const [source, target] of copies) assert.deepEqual(await readFile(new URL(`packages/vendor/pdfjs/${target}`, root)), await readFile(new URL(`node_modules/pdfjs-dist/${source}`, root)), target);
+});
