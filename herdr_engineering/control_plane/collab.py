@@ -404,8 +404,9 @@ class CollabService:
         except Exception:
             raise CollabError(503, "analysis operation unavailable; retry") from None
 
-    async def create_analysis_request(self, principal, room_id, prompt, file_ids, **kwargs):
-        return await self._analysis_operation('create_analysis_request', principal, room_id, prompt, file_ids, **kwargs)
+    async def create_analysis_request(self, principal, room_id, prompt, file_ids, request_key=None, **kwargs):
+        return await self._analysis_operation('create_analysis_request', principal, room_id, prompt, file_ids,
+                                              request_key=request_key, **kwargs)
 
     async def record_analysis_output(self, request_id, output_manifest, *, principal):
         return await self._analysis_operation('record_analysis_output', principal, request_id, output_manifest)
@@ -425,9 +426,10 @@ class CollabService:
         if self.analysis_runner is None:
             raise CollabError(503, "analysis event-loop runner unavailable")
         if method == 'POST' and len(parts) == 3 and parts[0] == 'rooms' and parts[2] == 'analyses':
-            if set(body) - {'prompt', 'file_ids', 'target_agent_id', 'parent_artifact_id'}:
+            if set(body) - {'prompt', 'file_ids', 'target_agent_id', 'parent_artifact_id', 'request_key'}:
                 raise CollabError(400, 'invalid analysis arguments')
             operation = self.create_analysis_request(principal, parts[1], body.get('prompt'), body.get('file_ids'),
+                request_key=body.get('request_key'),
                 target_agent_id=body.get('target_agent_id'), parent_artifact_id=body.get('parent_artifact_id'))
             return 201, asdict(self.analysis_runner(operation))
         if method == 'GET' and len(parts) == 2:

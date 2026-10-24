@@ -545,7 +545,8 @@ def test_forward_migration_upgrades_pre_registry_database_and_quarantines_unsign
                 VALUES ('legacy-skill','1','old-package',repeat('b',64),'published');
         """))
         assert run(Migrator(conn).apply(str(migrations))) == [
-            '0006_collaboration_skill_registry.sql', '0007_collaboration_analysis.sql']
+            '0006_collaboration_skill_registry.sql', '0007_collaboration_analysis.sql',
+            '0008_collaboration_analysis_request_keys.sql']
         row = run(conn.fetchrow('SELECT * FROM collab_skill_versions'))
         assert row['status'] == 'revoked' and row['legacy_unverified']
         assert row['storage_key'] == 'old-package' and row['storage_bucket'] is None

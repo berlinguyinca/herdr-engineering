@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict
+from uuid import uuid4
 
 import pytest
 
@@ -39,6 +40,7 @@ def analysis(env):
 
 def request(analysis, **kwargs):
     service, run, _ = analysis
+    kwargs.setdefault('request_key', str(uuid4()))
     return run(service.create_analysis_request(agent(), 'room_one', 'Plot the TIC', ['source'], **kwargs))
 
 
@@ -71,7 +73,7 @@ def test_requests_resolve_only_safe_authorized_references_and_survive_restart(an
 def test_unauthorized_or_unpublished_files_fail_atomically(analysis, files):
     service, run, conn = analysis
     with pytest.raises(CollabError) as error:
-        run(service.create_analysis_request(agent(), 'room_one', 'plot', files))
+        run(service.create_analysis_request(agent(), 'room_one', 'plot', files, request_key='files'))
     assert error.value.status == 404
     assert run(conn.fetchval('SELECT count(*) FROM collab_analysis_requests')) == 0
 
@@ -80,7 +82,7 @@ def test_unauthorized_or_unpublished_files_fail_atomically(analysis, files):
 def test_malformed_file_selection_is_rejected(analysis, files):
     service, run, _ = analysis
     with pytest.raises(CollabError) as error:
-        run(service.create_analysis_request(agent(), 'room_one', 'plot', files))
+        run(service.create_analysis_request(agent(), 'room_one', 'plot', files, request_key='files'))
     assert error.value.status == 400
 
 
@@ -152,13 +154,13 @@ def test_chat_refinement_links_immutable_parent_and_explicit_files(analysis):
     service, run, _ = analysis
     first = artifact(analysis)
     refined = run(service.create_analysis_request(user(), 'room_one', 'Use a log scale', ['source', 'chart'],
-                                                 target_agent_id='agent_alice', parent_artifact_id=first.artifact_id))
+                                                 target_agent_id='agent_alice', parent_artifact_id=first.artifact_id, request_key='refine'))
     assert refined.parent_artifact_id == first.artifact_id
     assert refined.prompt == 'Use a log scale' and refined.requested_by == 'user:alice'
     assert run(service.get_analysis_artifact(user(), first.artifact_id)) == first
     with pytest.raises(CollabError):
         run(service.create_analysis_request(user('bob'), 'room_one', 'steal', ['source'],
-                                             target_agent_id='agent_bob', parent_artifact_id=first.artifact_id))
+                                             target_agent_id='agent_bob', parent_artifact_id=first.artifact_id, request_key='refine'))
 
 
 @pytest.mark.parametrize('scope', ['private', 'room'])
@@ -206,11 +208,17 @@ def test_mcp_roundtrip_keeps_provider_references_out_and_wraps_untrusted_content
     pr = service.authenticate('Agent ' + credentials['credential'], credentials['device_id'])
     run(analysis[2].execute("INSERT INTO collab_agents(agent_id,owner_id,name) VALUES ($1,'alice','Harness')", pr.id))
     run(analysis[2].execute("INSERT INTO collab_agent_room_attachments(room_id,agent_id,actions) VALUES ('room_one',$1,ARRAY['read','execute'])", pr.id))
-    args = {'room_id': 'room_one', 'prompt': 'Plot', 'file_ids': ['source']}
+    args = {'room_id': 'room_one', 'prompt': 'Plot', 'file_ids': ['source'], 'request_key': 'chat-1'}
     result = collab_mcp._call(service, pr, 'analysis_request', args)
     text = result['content'][0]['text']
     assert text.startswith(collab_mcp.UNTRUSTED) and 'SECRET' not in text
     req = json.loads(text.split('\n\n', 1)[1])
+    retry = collab_mcp._call(service, pr, 'analysis_request', args)
+    assert json.loads(retry['content'][0]['text'].split('\n\n', 1)[1]) == req
+    assert req['request_key'] == 'chat-1'
+    with pytest.raises(CollabError) as error:
+        collab_mcp._call(service, pr, 'analysis_request', {**args, 'prompt': 'Changed'})
+    assert error.value.status == 409
     out = collab_mcp._call(service, pr, 'analysis_record_output',
                           {'request_id': req['request_id'], 'output_manifest': output()})
     assert 'SECRET' not in str(out) and 'harness_only' in str(out)
@@ -225,8 +233,13 @@ def test_user_http_routes_create_refine_read_and_promote(analysis):
     backend, run, _ = analysis
     service = CollabService(StaticTokenAuthenticator({'alice': hashlib.sha256(b'token').hexdigest()}), analysis_service=backend, analysis_runner=run)
     status, req = service.dispatch('POST', ['rooms', 'room_one', 'analyses'], {},
-                                  {'prompt': 'Plot', 'file_ids': ['source'], 'target_agent_id': 'agent_alice'}, 'Bearer token', None)
+                                  {'prompt': 'Plot', 'file_ids': ['source'], 'target_agent_id': 'agent_alice', 'request_key': 'chat-1'}, 'Bearer token', None)
     assert status == 201
+    retry_status, retry = service.dispatch('POST', ['rooms', 'room_one', 'analyses'], {},
+        {'prompt': 'Plot', 'file_ids': ['source'], 'target_agent_id': 'agent_alice', 'request_key': 'chat-1'}, 'Bearer token', None)
+    assert retry_status == 201 and retry == req and req['request_key'] == 'chat-1'
+    assert service.dispatch('POST', ['rooms', 'room_one', 'analyses'], {},
+        {'prompt': 'Changed', 'file_ids': ['source'], 'target_agent_id': 'agent_alice', 'request_key': 'chat-1'}, 'Bearer token', None)[0] == 409
     result = run(backend.record_analysis_output(req['request_id'], output(), principal=agent()))
     status, got = service.dispatch('GET', ['analysis-artifacts', result.artifact_id], {}, {}, 'Bearer token', None)
     assert status == 200 and got['artifact_id'] == result.artifact_id
@@ -241,7 +254,7 @@ def test_missing_backend_fails_closed():
     service = CollabService(StaticTokenAuthenticator({}))
     with pytest.raises(CollabError) as error:
         collab_mcp._call(service, agent(), 'analysis_request',
-                         {'room_id': 'room_one', 'prompt': 'plot', 'file_ids': ['source']})
+                         {'room_id': 'room_one', 'prompt': 'plot', 'file_ids': ['source'], 'request_key': 'chat-1'})
     assert error.value.status == 503
 
 
@@ -380,5 +393,226 @@ def test_service_rejects_unmigrated_event_rooms(analysis):
     service = CollabService(StaticTokenAuthenticator({'alice': 'digest'}), analysis_service=backend, analysis_runner=run)
     service._rooms['room_one'] = {'id': 'room_one'}
     with pytest.raises(CollabError) as error:
-        run(service.create_analysis_request(user(), 'room_one', 'plot', ['source'], target_agent_id='agent_alice'))
+        run(service.create_analysis_request(user(), 'room_one', 'plot', ['source'], target_agent_id='agent_alice', request_key='cutover'))
     assert error.value.status == 409
+
+
+def test_request_retry_survives_restart_without_duplicate_record_or_audit(analysis, env):
+    from herdr_engineering.control_plane.collab_analysis import CollabAnalysis
+    service, run, conn = analysis
+    first = request(analysis, request_key='chat-retry')
+    second = run(CollabAnalysis(env[0]).create_analysis_request(
+        agent(), 'room_one', 'Plot the TIC', ['source'], request_key='chat-retry'))
+    assert first == second and second.request_key == 'chat-retry'
+    row = run(conn.fetchrow('SELECT * FROM collab_analysis_requests'))
+    assert row['creator_key'] == 'agent:agent_alice' and row['request_key'] == 'chat-retry'
+    assert run(conn.fetchval('SELECT count(*) FROM collab_analysis_requests')) == 1
+    assert run(conn.fetchval("SELECT count(*) FROM collab_audit_events WHERE action='analysis.requested'")) == 1
+
+
+@pytest.mark.parametrize('changes', [
+    {'prompt': 'Different'}, {'file_ids': ['chart']}, {'file_ids': ['source', 'chart']},
+    {'target_agent_id': 'agent_second'}, {'room_id': 'room_other'}, {'parent_artifact_id': 'another'},
+])
+def test_request_key_conflicts_cover_all_request_inputs(analysis, changes):
+    service, run, conn = analysis
+    run(conn.execute("""
+        INSERT INTO collab_agents(agent_id,owner_id,name) VALUES ('agent_second','alice','Second');
+        INSERT INTO collab_agent_room_attachments(room_id,agent_id,actions) VALUES
+            ('room_one','agent_second',ARRAY['read','execute']),
+            ('room_other','agent_alice',ARRAY['read','execute']);
+        INSERT INTO collab_room_memberships(room_id,user_id,status,role)
+            VALUES ('room_other','alice','approved','owner');
+    """))
+    args = {'room_id': 'room_one', 'prompt': 'Plot', 'file_ids': ['source'],
+            'target_agent_id': 'agent_alice', 'request_key': 'retry'}
+    first = run(service.create_analysis_request(user(), **args))
+    with pytest.raises(CollabError) as error:
+        run(service.create_analysis_request(user(), **{**args, **changes}))
+    assert error.value.status == 409
+    assert run(service.get_analysis_request(user(), first.request_id)) == first
+    assert run(conn.fetchval('SELECT count(*) FROM collab_analysis_requests')) == 1
+
+
+def test_request_keys_are_scoped_to_creator_not_owner(analysis):
+    service, run, conn = analysis
+    first = request(analysis, request_key='same')
+    second = run(service.create_analysis_request(user(), 'room_one', 'Plot the TIC', ['source'],
+                 target_agent_id='agent_alice', request_key='same'))
+    run(conn.execute("UPDATE collab_agent_room_attachments SET actions=ARRAY['read','execute'] WHERE agent_id='agent_bob'"))
+    third = run(service.create_analysis_request(agent('bob'), 'room_one', 'Plot the TIC', ['source'], request_key='same'))
+    assert len({first.request_id, second.request_id, third.request_id}) == 3
+
+
+@pytest.mark.parametrize('key', [None, '', '  ', [], 1, 'x' * 201])
+def test_request_key_is_required_and_bounded(analysis, key):
+    with pytest.raises(CollabError) as error:
+        request(analysis, request_key=key)
+    assert error.value.status == 400
+
+
+@pytest.mark.parametrize('conflict', [False, True])
+def test_concurrent_request_retries_are_serialized(analysis, env, conflict):
+    import asyncio
+    import copy
+    import os
+
+    import asyncpg
+
+    from herdr_engineering.control_plane.collab_analysis import CollabAnalysis
+
+    service, run, conn = analysis
+
+    async def race():
+        other = await asyncpg.connect(os.environ['HERDR_E2E_PG_DSN'])
+        try:
+            schema = await conn.fetchval('SELECT current_schema()')
+            await other.execute(f'SET search_path TO {schema}')
+            registry = copy.copy(env[0])
+            registry.conn = other
+            return await asyncio.gather(
+                service.create_analysis_request(agent(), 'room_one', 'Plot', ['source'], request_key='race'),
+                CollabAnalysis(registry).create_analysis_request(agent(), 'room_one',
+                    'Different' if conflict else 'Plot', ['source'], request_key='race'),
+                return_exceptions=True)
+        finally:
+            await other.close()
+
+    results = run(race())
+    if conflict:
+        errors = [r for r in results if isinstance(r, CollabError)]
+        assert len(errors) == 1 and errors[0].status == 409
+    else:
+        assert not isinstance(results[0], Exception) and results[0] == results[1]
+    assert run(conn.fetchval('SELECT count(*) FROM collab_analysis_requests')) == 1
+    assert run(conn.fetchval("SELECT count(*) FROM collab_audit_events WHERE action='analysis.requested'")) == 1
+
+
+@pytest.mark.parametrize('sql', [
+    "UPDATE collab_room_files SET sha256=repeat('c',64) WHERE file_id='source'",
+    "UPDATE collab_room_files SET status='failed' WHERE file_id='source'",
+    "UPDATE collab_agent_room_attachments SET actions=ARRAY['read'] WHERE agent_id='agent_alice'",
+    "UPDATE collab_room_memberships SET status='removed' WHERE user_id='alice'",
+])
+def test_request_retry_rechecks_authority_and_source_snapshot(analysis, sql):
+    _, run, conn = analysis
+    request(analysis, request_key='retry')
+    run(conn.execute(sql))
+    with pytest.raises(CollabError):
+        request(analysis, request_key='retry')
+    assert run(conn.fetchval('SELECT count(*) FROM collab_analysis_requests')) == 1
+
+
+def test_request_retry_rechecks_revocation_after_file_resolution(analysis, env, monkeypatch):
+    service, _, _ = analysis
+    request(analysis, request_key='retry')
+    original = service._check_files
+
+    async def resolve_then_revoke(*args):
+        await original(*args)
+        env[5].add(agent().key)
+
+    monkeypatch.setattr(service, '_check_files', resolve_then_revoke)
+    with pytest.raises(CollabError):
+        request(analysis, request_key='retry')
+
+
+@pytest.mark.parametrize('existing', [False, True])
+def test_request_rechecks_revocation_after_waiting_for_retry_lock(analysis, env, existing):
+    import asyncio
+    import os
+
+    import asyncpg
+
+    service, run, conn = analysis
+    if existing:
+        request(analysis, request_key='locked')
+
+    async def blocked_request():
+        other = await asyncpg.connect(os.environ['HERDR_E2E_PG_DSN'])
+        task = None
+        try:
+            await other.execute('BEGIN')
+            await other.execute('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
+                                '["analysis-request","agent:agent_alice","locked"]')
+            task = asyncio.create_task(service.create_analysis_request(
+                agent(), 'room_one', 'Plot the TIC', ['source'], request_key='locked'))
+
+            async def wait_for_lock():
+                while not await other.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted)",
+                        conn.get_server_pid()):
+                    if task.done():
+                        raise AssertionError('request did not wait for its creator/key lock')
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(wait_for_lock(), 5)
+            env[5].add(agent().key)
+            await other.execute('COMMIT')
+            with pytest.raises(CollabError) as error:
+                await task
+            assert error.value.status == 403
+        finally:
+            await other.close()
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    run(blocked_request())
+    assert run(conn.fetchval('SELECT count(*) FROM collab_analysis_requests')) == int(existing)
+    assert run(conn.fetchval("SELECT count(*) FROM collab_audit_events WHERE action='analysis.requested'")) == int(existing)
+
+
+def test_request_key_migration_preserves_legacy_records(analysis):
+    from pathlib import Path
+
+    from herdr_engineering.control_plane.db import Migrator
+
+    service, run, conn = analysis
+    run(conn.execute("""
+        ALTER TABLE collab_analysis_requests DROP COLUMN creator_key,
+            DROP COLUMN request_key, DROP COLUMN request_fingerprint;
+        DELETE FROM schema_migrations WHERE version='0008_collaboration_analysis_request_keys.sql';
+    """))
+    record = {'request_id': 'legacy', 'room_id': 'room_one', 'owner_id': 'alice',
+              'requested_by': 'agent:agent_alice', 'agent_id': 'agent_alice', 'prompt': 'Original',
+              'files': [{'file_id': 'source', 'sha256': 'a' * 64, 'size_bytes': 3}],
+              'parent_artifact_id': None, 'created_at': '2026-10-24T00:00:00+00:00', 'execution': 'harness_only'}
+    run(conn.execute("INSERT INTO collab_analysis_requests(request_id,room_id,owner_id,agent_id,record) "
+                     "VALUES ('legacy','room_one','alice','agent_alice',$1::jsonb)", json.dumps(record)))
+    assert run(Migrator(conn).apply(str(Path(__file__).parents[2] / 'deploy/control-plane/migrations'))) == [
+        '0008_collaboration_analysis_request_keys.sql']
+    row = run(conn.fetchrow("SELECT * FROM collab_analysis_requests WHERE request_id='legacy'"))
+    assert json.loads(row['record']) == record
+    assert row['creator_key'] is None and row['request_key'] is None and row['request_fingerprint'] is None
+    assert run(service.get_analysis_request(agent(), 'legacy')).request_key is None
+
+
+def test_request_key_uniqueness_is_enforced_by_database(analysis):
+    import asyncpg
+
+    _, run, conn = analysis
+    request(analysis, request_key='unique')
+    with pytest.raises(asyncpg.UniqueViolationError):
+        run(conn.execute("""
+            INSERT INTO collab_analysis_requests
+                (request_id,room_id,owner_id,agent_id,record,creator_key,request_key,request_fingerprint)
+            SELECT 'duplicate',room_id,owner_id,agent_id,record,creator_key,request_key,request_fingerprint
+            FROM collab_analysis_requests
+        """))
+
+
+@pytest.mark.parametrize('transport', ['http', 'mcp'])
+def test_transports_require_request_key(analysis, transport):
+    backend, run, _ = analysis
+    service = CollabService(StaticTokenAuthenticator({'alice': hashlib.sha256(b'token').hexdigest()}),
+                            analysis_service=backend, analysis_runner=run)
+    body = {'prompt': 'Plot', 'file_ids': ['source']}
+    if transport == 'http':
+        status, _ = service.dispatch('POST', ['rooms', 'room_one', 'analyses'], {},
+                                     {**body, 'target_agent_id': 'agent_alice'}, 'Bearer token', None)
+        assert status == 400
+    else:
+        with pytest.raises(CollabError) as error:
+            collab_mcp._call(service, agent(), 'analysis_request', {**body, 'room_id': 'room_one'})
+        assert error.value.status == 400
