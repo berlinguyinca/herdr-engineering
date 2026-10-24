@@ -510,6 +510,7 @@ _PUBLIC_STATIC = {
     "/collab-app.js": ("collab-app.js", "text/javascript"),
     "/collab.css": ("collab.css", "text/css"),
     "/collab-view.js": ("collab-view.js", "text/javascript"),
+    "/collab-helpers.js": ("collab-helpers.js", "text/javascript"),
     "/collab-files.js": ("collab-files.js", "text/javascript"),
     "/collab-previews.js": ("collab-previews.js", "text/javascript"),
     "/collab-preview-msp.js": ("collab-preview-msp.js", "text/javascript"),

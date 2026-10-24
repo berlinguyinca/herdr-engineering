@@ -195,3 +195,47 @@ test('preview PDF replacement revokes its ephemeral blob without exposing signed
   await open('json'); await page.frameLocator('[data-file-preview] iframe[title="json preview"]').getByText('42', { exact: true }).waitFor();
   assert.deepEqual(await page.evaluate(() => window.revokedPreviews), [url]);
 }));
+
+for (const outcome of ['success', 'rejection']) {
+  test(`preview artifact ${outcome} arriving after a newer selection has no effects`, async () => withPreviews('public', async ({ page, requests }) => {
+    await page.evaluate(async () => {
+      const { renderPreview } = await import('/collab-previews.js');
+      const file = { room_id: 'r', file_id: 'big', relative_path: 'big.md', status: 'available', size_bytes: 200001 };
+      const artifacts = ['md', 'pdf'].map(id => ({ room_id: 'r', file_id: id, relative_path: `${id}.${id}`, status: 'available' }));
+      window.artifactGrants = {};
+      window.revokedArtifacts = [];
+      const revoke = URL.revokeObjectURL.bind(URL);
+      URL.revokeObjectURL = value => {
+        window.revokedArtifacts.push(value);
+        revoke(value);
+      };
+      window.artifactPreview = renderPreview(file, { url: 'https://objects.example/big', expires_at: Date.now() / 1000 + 60 }, {
+        api: { fileAccess: (_room, id) => new Promise((resolve, reject) => { window.artifactGrants[id] = { resolve, reject }; }) },
+        jobs: { request: async () => ({ ...file, job_id: 'j', status: 'ready', artifacts }), status: async () => { throw new Error('Unexpected poll'); } },
+      });
+      const host = document.querySelector('[data-file-preview]'); host.replaceChildren(window.artifactPreview); host.hidden = false;
+      await window.artifactPreview.ready;
+      const buttons = [...host.querySelectorAll('button')];
+      // Keep the actual handler promises so each out-of-order completion is
+      // fully handled before asserting, without sleep-based race tests.
+      window.olderArtifact = buttons[0].onclick();
+      window.newerArtifact = buttons[1].onclick();
+      window.artifactGrants.pdf.resolve({ url: 'https://objects.example/pdf', expires_at: Date.now() / 1000 + 60 });
+      await window.newerArtifact;
+    });
+    const pdf = page.locator('[data-file-preview] iframe[src^="blob:"]'); await pdf.waitFor();
+    const url = await pdf.getAttribute('src');
+    await page.evaluate(async outcome => {
+      if (outcome === 'success') window.artifactGrants.md.resolve({ url: 'https://objects.example/md', expires_at: Date.now() / 1000 + 60 });
+      else window.artifactGrants.md.reject(new Error('Older permission denial'));
+      await window.olderArtifact;
+    }, outcome);
+    assert.equal(await pdf.count(), 1, 'newer PDF must remain selected');
+    assert.equal(await pdf.getAttribute('src'), url);
+    assert.deepEqual(await page.evaluate(() => window.revokedArtifacts), [], 'stale outcome must not dispose the active child');
+    assert.equal(requests.some(r => r.url().startsWith('https://objects.example/md')), false, 'stale success must not start content rendering');
+    assert.equal(await page.locator('[data-file-preview] [role=alert]').count(), 0);
+    await page.evaluate(() => window.artifactPreview.dispose());
+    assert.deepEqual(await page.evaluate(() => window.revokedArtifacts), [url], 'active child remains owned and is disposed with the parent');
+  }));
+}

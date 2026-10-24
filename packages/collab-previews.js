@@ -89,16 +89,17 @@ export function renderPreview(file, authorizedSource, options = {}) {
   heading.textContent = `Preview authorized: ${file.relative_path}`;
   body.setAttribute('role', 'status'); body.textContent = 'Loading preview…'; root.append(heading, body);
   const controller = new AbortController(), signal = controller.signal;
-  let disposed = false, child = null;
+  let disposed = false, child = null, selection = 0;
+  const disposeChild = () => { child?.dispose?.(); child = null; };
   const deadline = setTimeout(() => controller.abort(new DOMException('Preview timed out. Try again.', 'TimeoutError')), 60000);
   const current = () => !disposed && !signal.aborted;
   signal.addEventListener('abort', () => {
-    if (!disposed) { child?.dispose?.(); body.setAttribute('role', 'alert'); body.textContent = 'Preview timed out. Try again.'; }
+    if (!disposed) { disposeChild(); body.setAttribute('role', 'alert'); body.textContent = 'Preview timed out. Try again.'; }
   }, { once: true });
-  root.dispose = () => { disposed = true; clearTimeout(deadline); controller.abort(); child?.dispose?.(); };
+  root.dispose = () => { disposed = true; selection++; clearTimeout(deadline); controller.abort(); disposeChild(); };
   const show = element => {
     if (!current()) { element.dispose?.(); return; }
-    child?.dispose?.(); child = element; body.removeAttribute('role'); body.replaceChildren(element);
+    disposeChild(); child = element; body.removeAttribute('role'); body.replaceChildren(element);
   };
   const asyncPreview = async () => {
     let job = await requestAsyncPreview(file, { ...options, signal });
@@ -113,11 +114,15 @@ export function renderPreview(file, authorizedSource, options = {}) {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = `Preview ${artifact.relative_path}`;
       button.onclick = async () => {
         if (!current() || button.disabled) return;
+        // Authorization has no transport cancellation contract. Invalidate
+        // earlier selections before awaiting it, including their failure paths.
+        const turn = ++selection;
+        const selected = () => current() && turn === selection;
         button.disabled = true;
         try {
           const source = await openAuthorizedFile(artifact, { api: options.api, purpose: 'preview' });
-          if (current()) show(renderPreview(artifact, source, options));
-        } catch { if (current()) { body.setAttribute('role', 'alert'); body.textContent = 'Derived artifact access unavailable. Try again.'; } }
+          if (selected()) show(renderPreview(artifact, source, options));
+        } catch { if (selected()) { disposeChild(); body.setAttribute('role', 'alert'); body.textContent = 'Derived artifact access unavailable. Try again.'; } }
         finally { if (current()) button.disabled = false; }
       };
       artifacts.append(button);
