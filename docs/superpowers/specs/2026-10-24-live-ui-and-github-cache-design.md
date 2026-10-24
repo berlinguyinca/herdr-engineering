@@ -311,3 +311,24 @@ menu keyboard flow, shelf upload, and that a literal `@gert.pi /skill` is sent v
 
 Menu ranking, chip visuals, multipart limits mechanics, storage backend for file bytes (follow
 what collab already uses for attachments), helper CLI shape, migration of existing agent names.
+
+### Builder-check rulings, collab section (2026-10-24)
+
+Author's calls:
+- **Delivery.** Agents learn of mentions, handoffs and new files through the existing room-state
+  long-poll; nothing is pushed into a harness. A mention addresses and wakes that agent; agents
+  reply only when mentioned. `@here` = online people and agents, `@agents` = all registered
+  agents, `@all` = everyone in the room.
+- **Owner.** An agent's owner is the person whose credential linked it. An old alias that collides
+  with a new `<owner>.<harness>` name loses to the new name.
+- **Files.** An upload is attached to a message via `files`. The `@` menu's Files group inserts the
+  stable path `.collab/files/<name>` (latest version); a literal `@file` is never touched. The
+  helper writes into the agent's working directory.
+
+Operator-confirmed (2026-10-24, "as proposed"):
+- **Permissions.** Any room member may upload files, add versions, `/handoff` and `/decide`. Only
+  existing approvers may `/issue` and `/assign` (they write to GitHub). A file is deleted by its
+  uploader or a room admin; deletion is how quota is reclaimed.
+- **Commands.** `/summarize` posts a request that an online agent fulfils (no server-side LLM
+  call). `/decide` is stored as a room event that can be listed later. `/assign` maps people to
+  GitHub logins in YAML `collab.people.<name>.github`.
