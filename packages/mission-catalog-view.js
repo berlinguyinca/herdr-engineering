@@ -4,7 +4,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { freshnessAt, missionHealth } from './mission-live-view.js';
 import { recordOutcome, statusOutcome, recordVisibility, reportFreshness, reportTimestamp } from './record-state.js';
 import { patchList, patchText, morph } from './patch.js';
-import { snapshotText, animateChanges, easeValue } from './motion.js';
+import { snapshotText, animateChanges, easeValue, skeleton } from './motion.js';
 import { freshnessSources } from './freshness.js';
 
 const text = value => typeof value === 'string' ? value : '';
@@ -151,7 +151,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
       <label class="mc-search">Search missions<input id="mc-search" type="search" placeholder="Title, objective, activity or mission ID"></label>
       <label>Host<select id="mc-host"><option value="">All hosts</option></select></label>
       <label>Show<select id="mc-status"><option value="all">All groups</option>${GROUPS.filter(([key])=>currentGroup(key)).map(([key,label])=>`<option value="${key}">${label}</option>`).join('')}</select></label>
-    </div><p id="mc-result" class="mc-meta" role="status">Loading missions…</p><p class="ml-connection mc-meta" role="status"></p><div id="mc-groups" role="tabpanel" aria-labelledby="mc-tab-current"></div>`;
+    </div><p id="mc-result" class="mc-meta" role="status"></p><p class="ml-connection mc-meta" role="status"></p><div id="mc-groups" role="tabpanel" aria-labelledby="mc-tab-current"></div>`;
   const el = name => container.querySelector(`#mc-${name}`);
   el('status').value = state.status;
   const connection = container.querySelector('.ml-connection');
@@ -194,7 +194,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
       const list=group.querySelector('[data-rows]');
       patchList(list,rows.slice(0,limit).map(e=>({key:e.key,html:compactMissionRow(e)})),{key:item=>item.key,render:item=>item.html,update:updateRow,inPlace:true,animate:live&&!created});
       if(created||!live)for(const row of list.querySelectorAll('[data-entering]'))row.removeAttribute('data-entering');
-      morph(group.querySelector('[data-group-foot]'),`${rows.length?'':`<p class="mc-note">${liveLoaded&&recordedLoaded?'No missions in this group match your filters.':'Loading reports…'}</p>`}
+      morph(group.querySelector('[data-group-foot]'),`${rows.length?'':!liveLoaded&&!recordedLoaded?skeleton('missions',{rows:2}):`<p class="mc-note">${liveLoaded&&recordedLoaded?'No missions in this group match your filters.':'Waiting for the remaining report source.'}</p>`}
         ${rows.length>limit?`<div class="mc-more"><button class="hd-btn" data-more="${key}">Show ${Math.min(10,rows.length-limit)} more (${rows.length-limit} remaining)</button></div>`:''}`);
     }
   }
@@ -226,7 +226,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     animateChanges(el('counts'),'[data-filter] strong',filterCounts,filterKey);
     const hosts=[...new Set(all.map(e=>e.host).filter(Boolean))].sort();
     el('host').innerHTML='<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');el('host').value=state.host;
-    el('result').textContent=liveLoaded||recordedLoaded?`${selected.length} matching ${state.tab} missions${liveLoaded&&recordedLoaded?'':' · partial results (+): waiting for remaining source'} · live activity refreshes every 5 seconds`:'Loading missions…';
+    el('result').textContent=liveLoaded||recordedLoaded?`${selected.length} matching ${state.tab} missions${liveLoaded&&recordedLoaded?'':' · partial results (+): waiting for remaining source'} · live activity refreshes every 5 seconds`:'';
     const wanted=GROUPS.filter(([key])=>(state.tab==='current'?currentGroup(key):state.tab==='unconfirmed'?['lastknown','recorded'].includes(key):state.tab===key)&&(state.status==='all'||state.status===key));
     patchGroups(wanted,selected,live);
     if(focusKey){

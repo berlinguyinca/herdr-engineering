@@ -1,6 +1,6 @@
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {ciHealthModel,renderCiHeatmap,renderCiTree,ciHealthStyles} from './ci-health.js';
-import {snapshotText,animateChanges} from './motion.js';
+import {snapshotText,animateChanges,skeleton} from './motion.js';
 
 const modes=['hours','runs','7','14','30'];
 const scopes=['default','pr','all'];
@@ -119,11 +119,11 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     orderSignature=nextOrderSignature;
     const unavailable=history?.available===false;
     const hideHistory=unavailable&&!rows(history?.repos).length;
-    el('[data-health-status]').textContent=error || (!history?'Loading CI history…':unavailable?ciHealthUnavailable(history,history.missingClient):`${history.stale?'Stale history · ':''}${history.refreshing?'Refreshing history · ':''}${model.partial?'Partial history: coverage is incomplete. ':''}${state.mode==='runs'?'Last 24 matching runs per project; no date cutoff. ':'UTC timestamps. '}${contextCoverageUnknown()?'Context associations are unavailable for some runs; counts and coverage for this route are incomplete. ':context.mission || context.session?'Counts are limited to the current route context. ':''}Only completed success and failure outcomes contribute to pass/fail totals.`);
+    el('[data-health-status]').textContent=error || (!history?'':unavailable?ciHealthUnavailable(history,history.missingClient):`${history.stale?'Stale history · ':''}${history.refreshing?'Refreshing history · ':''}${model.partial?'Partial history: coverage is incomplete. ':''}${state.mode==='runs'?'Last 24 matching runs per project; no date cutoff. ':'UTC timestamps. '}${contextCoverageUnknown()?'Context associations are unavailable for some runs; counts and coverage for this route are incomplete. ':context.mission || context.session?'Counts are limited to the current route context. ':''}Only completed success and failure outcomes contribute to pass/fail totals.`);
     // The heatmap is rebuilt with innerHTML; a cell whose outcome symbol changed (same project and
     // bucket) flashes. A mode, scope or filter change re-keys the buckets, so it never flashes.
     const cellsBefore=nextOrderSignature===shownCells?snapshotText(el('[data-health-map]'),CELL,cellKey):null;
-    replace(el('[data-health-map]'),hideHistory?'':renderCiHeatmap(model));
+    replace(el('[data-health-map]'),!history&&!error?skeleton('CI history',{rows:3}):hideHistory?'':renderCiHeatmap(model));
     animateChanges(el('[data-health-map]'),CELL,cellsBefore,cellKey,{count:false});
     shownCells=nextOrderSignature;
     replace(el('[data-health-tree]'),hideHistory?'':selectedSlot()+renderCiTree(model,{selectedRunKey:selectedKey,expanded,limits:treeLimits})+selectedSteps());

@@ -1,6 +1,7 @@
 // Read-only Pi mission telemetry. Clocks redraw locally; polling never creates
 // activity events, attention notifications, or session control operations.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { skeleton } from './motion.js';
 
 const list = (value) => Array.isArray(value) ? value : [];
 const records = (value) => list(value).filter(item => item && typeof item === 'object' && !Array.isArray(item));
@@ -145,7 +146,7 @@ export function mountMissionActivity(container, client, missionKey, { onStatus =
   let projections = [], received = Date.now(), lastJson = '', fetchError = false;
   const disclosureStates = new Map();
   const explicitlyClosed = new Set();
-  container.innerHTML = `${styles}<div class="ml-connection muted"></div><div class="ml-content"><p>Loading mission activity…</p></div>`;
+  container.innerHTML = `${styles}<div class="ml-connection muted"></div><div class="ml-content">${skeleton('mission activity', { rows: 2, height: 64 })}</div>`;
   const content = container.querySelector('.ml-content'), connection = container.querySelector('.ml-connection');
   const rememberDisclosureChoice = event => {
     const summary = event.target.closest('summary');
