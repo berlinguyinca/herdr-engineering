@@ -443,3 +443,73 @@ def test_the_box_has_no_network_but_the_egress_proxy(box):
     while not box.blocked.exists() and time.time() < deadline:
         time.sleep(0.1)
     assert "evil.example" in box.blocked.read_text()                         # the refusal is logged on the host
+
+
+# ------------------------------------------------------------------ spikes 1-3 (verified against a real herdr 0.9.1)
+def test_every_herdr_call_addresses_the_named_server(tmp_path):
+    seen = []
+
+    def herdr(argv, **kwargs):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    make_launcher(tmp_path, herdr=herdr, herdr_session="ci")[0]._herdr(["workspace", "list"])
+    make_launcher(tmp_path, herdr=herdr)[0]._herdr(["workspace", "list"])
+    assert seen == [["herdr", "--session", "ci", "workspace", "list"], ["herdr", "workspace", "list"]]
+
+
+def test_the_runner_keeps_herdr_told_what_the_agent_is_doing_when_herdr_cannot_detect_it(tmp_path):
+    launcher, herdr = make_launcher(tmp_path)
+    herdr.agent_known = False                                  # herdr never detects Pi inside the box
+    fix = fix_record(tmp_path)
+    assert launcher.start(fix, CFG)["registration"] == "reported"
+    launcher.show_state(fix, "idle")
+    launcher.show_state(fix, "working")
+    reports = [call for call in herdr.calls if call[:2] == ["pane", "report-agent"]]
+    assert [call[call.index("--state") + 1] for call in reports] == ["working", "idle", "working"]
+    assert all("--agent-session-id" in call and call[-1] == "w7:p1" for call in reports)
+
+
+def test_when_herdr_detects_the_agent_it_owns_the_state(tmp_path):
+    launcher, herdr = make_launcher(tmp_path)
+    fix = fix_record(tmp_path)
+    assert launcher.start(fix, CFG)["registration"] == "detected"
+    launcher.show_state(fix, "idle")
+    assert not [call for call in herdr.calls if call[:2] == ["pane", "report-agent"]]
+
+
+def test_the_finished_conversation_is_copied_to_pi_history_before_the_box_is_removed(tmp_path, monkeypatch):
+    launcher, _ = make_launcher(tmp_path)
+    fix = fix_record(tmp_path)
+    launcher.start(fix, CFG)
+    run = tmp_path / "state" / "fixes" / fix["id"]
+    sessions = run / "harness" / "pi" / "sessions" / "--work--"
+    sessions.mkdir(parents=True)
+    (sessions / "2026-10-24T21-53-43-564Z_01a16fe7.jsonl").write_text('{"type":"session"}\n')
+    (sessions / "notes.txt").write_text("not a session file")
+    (sessions / "2026-10-24T21-54-00-000Z_big.jsonl").write_text("x" * 50)
+    (tmp_path / "outside.jsonl").write_text("secret operator file")
+    (sessions / "2026-10-24T21-55-00-000Z_link.jsonl").symlink_to(tmp_path / "outside.jsonl")
+    monkeypatch.setattr(runner, "TRANSCRIPT_MAX_BYTES", 40)
+    launcher.stop(fix)
+    kept = tmp_path / "pi-config" / "sessions" / f"--ci-fix-{fix['id']}--"
+    assert [path.name for path in kept.iterdir()] == ["2026-10-24T21-53-43-564Z_01a16fe7.jsonl"]
+    assert stat.S_IMODE((kept / "2026-10-24T21-53-43-564Z_01a16fe7.jsonl").stat().st_mode) == 0o600
+    assert not (run / "harness").exists()
+
+
+def test_a_launcher_wrapper_script_still_finds_the_files_it_runs(box, monkeypatch):
+    """pi on this host is a wrapper that execs node on files elsewhere under $HOME; the box must expose them."""
+    area = Path.home() / "herdr-agents" / f"ci-fix-test-bin-{uuid.uuid4().hex[:8]}"
+    (area / "bin").mkdir(parents=True)
+    (area / "lib").mkdir()
+    (area / "lib" / "real.sh").write_text("echo wrapper-target-visible\n")
+    (area / "bin" / "pi").write_text(f"#!/bin/sh\nexec '/usr/bin/env' 'sh' '{area}/lib/real.sh' \"$@\"\n")
+    (area / "bin" / "pi").chmod(0o755)
+    (area / "secret.txt").write_text("not named on the exec line")
+    monkeypatch.setenv("PATH", f"{area / 'bin'}:{os.environ['PATH']}")
+    try:
+        done = box.run(f"{area}/bin/pi; cat {area}/secret.txt 2>&1; echo rc=$?")
+    finally:
+        shutil.rmtree(area, ignore_errors=True)
+    assert "wrapper-target-visible" in done.stdout, done.stdout + done.stderr
+    assert "not named on the exec line" not in done.stdout

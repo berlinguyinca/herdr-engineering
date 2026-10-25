@@ -136,6 +136,33 @@ def _seed_attention(repo):
     return sid
 
 
+def _seed_related(repo, session_id, mission_id):
+    """Foreign keys for the Related panel: the dashboard agent gets a repository, branch and host, and
+    the mission gets a review, a pull request and a CI run on the same branch."""
+    repo.upsert_session(session_id, host_id="beast", repository_id="org/app", branch="fix/parser")
+    repo.upsert_review("rev-1", mission_id=mission_id, session_id=session_id, reviewer="codex",
+                       status="done", verdict="approved")
+    repo.upsert_pull_request("pr-rel", mission_id=mission_id, repository="org/app", number=214,
+                             status="open", branch="fix/parser")
+    repo.observe_ci_pipeline({"repository": "org/app", "provider_repo_id": 7, "run_number": 12,
+                              "branch": "fix/parser", "state": "success"})
+
+
+def _seed_missions(repo, m1, s1):
+    """Missions in each state for the story page: Alpha succeeded with an outcome, Gamma failed, Delta ended
+    before outcomes were kept, Beta (the base seed) still running."""
+    from herdr_engineering.control_plane.mission_outcome import MissionOutcomes, missions_config
+    outcomes = MissionOutcomes(repo, missions_config(None))
+    repo.mission_outcomes = outcomes
+    _seed_related(repo, s1, m1)
+    repo.set_mission_stage(m1, "complete")
+    repo.upsert_mission("gamma", title="Gamma", stage="implementation")
+    repo.set_mission_stage("gamma", "failed")
+    repo.upsert_mission("delta", title="Delta", stage="implementation")
+    repo.mission_outcomes = None
+    repo.set_mission_stage("delta", "complete")
+
+
 def main():
     repo = ControlPlaneRepo()
     _m1, _m2, _s1 = _seed(repo)
@@ -145,6 +172,10 @@ def main():
         _seed_llm(repo, _s1)
     if os.environ.get("ATTENTION_SEED") == "1":
         _seed_attention(repo)
+    if os.environ.get("RELATED_SEED") == "1":
+        _seed_related(repo, _s1, _m1)
+    if os.environ.get("MISSION_STORY_SEED") == "1":
+        _seed_missions(repo, _m1, _s1)
 
     svr = ControlPlaneServer(repo, host="127.0.0.1", port=0,
                              web_root=_REPO / "packages")

@@ -12,11 +12,11 @@ export function selectComponents(matrix, { driftedOnly = false } = {}) {
   return driftedOnly ? all.filter(c => c.drifted || c.missing) : all;
 }
 
-function cell(entry) {
+function cell(entry, host) {
   const state = entry?.state ?? 'missing';
   const text = entry?.version ? esc(entry.version) : '—';
   // Text carries the state too (never colour alone).
-  return `<td class="hd-fleet__cell hd-fleet__cell--${state}" title="${STATE_LABEL[state]}">${text}${state === 'drifted' ? ' <span aria-label="differs from fleet">≠</span>' : ''}</td>`;
+  return `<td class="hd-fleet__cell hd-fleet__cell--${state}" data-host-id="${esc(host)}" title="${STATE_LABEL[state]}">${text}${state === 'drifted' ? ' <span aria-label="differs from fleet">≠</span>' : ''}</td>`;
 }
 
 export function renderFleetMatrix(matrix, opts = {}, now = Date.now()) {
@@ -28,7 +28,7 @@ export function renderFleetMatrix(matrix, opts = {}, now = Date.now()) {
   const summary = matrix.summary ?? {};
   const head = hosts.map(h => {
     const stale = reportFreshness(h.collected_at, now, 60 * 60 * 1000) !== 'current';
-    return `<th scope="col">${esc(h.host)}<div class="hd-card__sub">${stale ? 'stale · ' : ''}${esc(formatTimestamp(h.collected_at))}</div></th>`;
+    return `<th scope="col" data-host-id="${esc(h.host)}">${esc(h.host)}<div class="hd-card__sub">${stale ? 'stale · ' : ''}${esc(formatTimestamp(h.collected_at))}</div></th>`;
   }).join('');
   let body = '';
   for (const group of ['tools', 'plugins']) {
@@ -36,7 +36,7 @@ export function renderFleetMatrix(matrix, opts = {}, now = Date.now()) {
     if (!rows.length) continue;
     body += `<tr><th class="hd-fleet__group" colspan="${hosts.length + 2}" scope="colgroup">${GROUP_LABEL[group]}</th></tr>`;
     body += rows.map(c => `<tr><th scope="row">${esc(c.name.replace(/^(claude|pi|codex):/, ''))}${/^(claude|pi|codex):/.test(c.name) ? ` <span class="hd-card__sub">${esc(c.name.split(':')[0])}</span>` : ''}</th>
-      <td class="hd-fleet__ref">${esc(c.reference ?? '—')}</td>${hosts.map(h => cell(c.hosts[h.host])).join('')}</tr>`).join('');
+      <td class="hd-fleet__ref">${esc(c.reference ?? '—')}</td>${hosts.map(h => cell(c.hosts[h.host], h.host)).join('')}</tr>`).join('');
   }
   if (!body) body = `<tr><td colspan="${hosts.length + 2}">Every host matches the fleet reference.</td></tr>`;
   return `<div class="hd-fleet" role="region" aria-label="Fleet versions" tabindex="0">

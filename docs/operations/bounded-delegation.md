@@ -13,7 +13,7 @@ control_plane:
   collab:
     delegation_enabled: true     # default false; YAML only (no environment variable, no command-line flag)
 ```
-It is a `control_plane.collab` key, so it works for both the combined server and `web --collab-only` (and for
+It is re-read on every request (T16 M15): editing it takes effect without a restart, and a missing, unreadable or non-boolean file means `false`. It is a `control_plane.collab` key, so it works for both the combined server and `web --collab-only` (and for
 `fleet config render-collab`). While it is `false` no delegation can be created, answered, proposed to or accepted; the MCP
 tools and the A2A skill/`tasks/*` methods are not advertised (A2A answers "no task state" as before). Rejecting a proposal,
 cancelling a task and reading what exists stay possible so an owner can clean up. Flipping it back to `false` is the kill switch:
@@ -30,7 +30,7 @@ none, so there `POST /rooms/{room}/delegations` answers 409 `graph_unavailable` 
    ```json
    {"target_agent_id": "agent_...", "text": "Why does the parser crash on empty input?",
     "scope": {"paths": ["src/parser/"], "nodes": ["commit:abc123"], "questions": [{"id": "q1", "text": "why does it crash?"}]},
-    "budget": {"max_proposals": 2, "max_steps": 20, "max_artifact_bytes": 16384, "max_tokens": 100000},
+    "budget": {"max_proposals": 2, "max_steps": 20, "max_artifact_bytes": 16384, "max_tokens": 100000, "max_turns": 60, "max_hops": 1},
     "expires_in_seconds": 3600, "output_kinds": ["analysis", "patch"]}
    ```
    * `scope.paths`: repository-relative files, or a directory ending in `/`. No `..`, absolute or drive paths, backslashes, `.git*`, `.husky`
@@ -38,7 +38,10 @@ none, so there `POST /rooms/{room}/delegations` answers 409 `graph_unavailable` 
      A patch needs `paths`; an analysis needs `questions` or `nodes`. The scope grants **no read access** to anything: it is the
      list a proposal's references and patch paths are checked against.
    * `budget`: `max_proposals` 1-5, `max_steps` 1-200 (progress calls + proposals), `max_artifact_bytes` 256-32768, `max_tokens`
-     (see limitations: advisory). `expires_in_seconds` 60-86400, never past the delegate's credential expiry.
+     (see limitations: advisory), `max_turns` 1-200 (default 60: every answer the delegate sends, i.e. accept, progress and each
+     proposal are the non-final turns; the next one closes the task `failed`, 409 `budget_exhausted`, while `complete` (the result), `decline`, `fail` and `cancel` are always allowed), `max_hops` 1-3
+     (default 1: the ceiling on delegation-chain depth; the delegate is hop 1 and an external agent has no route to delegate onward, so 1 is the
+     only depth reached today; it is echoed so a future onward path has the bound already). A task stored before `max_turns` existed has no turn ceiling (it is not failed on replay). `expires_in_seconds` 60-86400, never past the delegate's credential expiry.
    * `output_kinds` is a non-empty subset of `patch`, `doc`, `analysis`, `link`.
    * Only room owners delegate; at most 3 open delegations per agent, 20 per owner per 10 minutes; `idempotency_key` supported.
 3. The delegate (REST, MCP or A2A, same service methods) reads its inbox, answers `accept` | `decline`, may send `progress`, and
@@ -84,7 +87,7 @@ delegate, via `supersedes`) | `expired` (undecided after 3 days). Every decision
 ## Rate limits and quotas
 Delegate: 6 proposals per 10 minutes, 60 answers per minute, 120 inbox polls per minute, 30 proposals lifetime per credential. Sponsor:
 150 proposals lifetime across its delegates. Room: 40 proposals in quarantine at once. Owner: 60 decisions per minute. Task: `max_proposals`,
-`max_steps`. Overrunning `max_steps` or the reported-token budget closes the task (`failed`, 409 `budget_exhausted`, audited).
+`max_steps`, `max_turns`. Overrunning `max_steps`, `max_turns` or the reported-token budget closes the task (`failed`, 409 `budget_exhausted`, audited); a proposal submitted past `max_turns` closes it the same way).
 
 ## Audit
 Every create, answer, proposal, withdrawal, decision and promotion is an HCN log event with `actor_kind`, visible in the project audit
@@ -92,6 +95,10 @@ Every create, answer, proposal, withdrawal, decision and promotion is an HCN log
 budget) are audited `denied` with a reason, at most once a minute per reason.
 
 ## Protocol mapping (same checks everywhere)
+MCP `tools/list` is per agent (T16): an external agent is never offered the task tools it is always refused (`tasks_inbox`, `tasks_wait`,
+`task_update`, `task_create`, `agents_list`), sees the delegation tools only when it was enrolled with `proposals`, and an internal agent is
+never offered the external-only delegation and consultation tools. Calling a tool that is not listed is refused exactly as before.
+
 | Action | REST (`/api/v1/collab`) | MCP tool | A2A |
 |---|---|---|---|
 | inbox / status | `GET /delegations/inbox`, `GET /delegations/{id}` | `delegations_inbox` | `tasks/list` (extension), `tasks/get` |

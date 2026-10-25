@@ -82,6 +82,28 @@ def test_config_accepts_the_documented_block():
 
 
 # ------------------------------------------------------------------ request
+def test_repository_rules_deny_always_wins_and_allow_limits():
+    assert ci_fix_config(CONFIG)["repositories"] == {"allow": [], "deny": []}
+    _, service, monitor = make({**CONFIG, "repositories": {"deny": ["org/backend"]}})
+    ask(service, monitor, repository="17")                       # org/frontend is not denied
+    with pytest.raises(ValueError, match="not enabled for CI fix"):
+        ask(service, monitor, repository="18", op="op-2")
+    _, service, monitor = make({**CONFIG, "repositories": {"allow": ["ORG/frontend"], "deny": ["org/frontend"]}})
+    with pytest.raises(ValueError, match="not enabled for CI fix"):
+        ask(service, monitor, repository="17")                   # deny beats allow, case-insensitively
+    _, service, monitor = make({**CONFIG, "repositories": {"allow": ["org/frontend"]}})
+    ask(service, monitor, repository="17")
+    with pytest.raises(ValueError, match="not enabled for CI fix"):
+        ask(service, monitor, repository="18", op="op-2")        # not on a non-empty allow list
+
+
+@pytest.mark.parametrize("raw", [{"repositories": {"deny": ["nonsense"]}}, {"repositories": {"allow": "org/x"}},
+                                 {"repositories": {"other": []}}])
+def test_repository_rules_are_validated(raw):
+    with pytest.raises(ValueError, match="control_plane.ci_fix"):
+        ci_fix_config(raw)
+
+
 def test_request_validates_the_run_like_send_to_pi_and_stores_bounded_context():
     repo, service, monitor = make()
     view, created = ask(service, monitor, repository="17")

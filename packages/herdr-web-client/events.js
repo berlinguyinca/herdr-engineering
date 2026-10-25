@@ -2,27 +2,49 @@
 // Live updates via SSE, not polling. createEventSource is injected so tests
 // can supply a fake; the real browser uses the global EventSource.
 
+const SEEN_LIMIT = 500;
+
 export function connectEvents({
   url,
   onEvent = () => {},
   onError = () => {},
+  // Called on open and on every frame, keepalives included: proof the stream is alive even when
+  // nothing changes (the freshness chip uses it).
+  onContact = () => {},
   createEventSource = (u) => new EventSource(u),
   autoReconnectMs = 3000,
 }) {
   let es = null;
   let closed = false;
   let retryTimer = null;
+  // Page-lifetime dedupe so reconnect replays are not delivered twice.
+  const seenIds = new Set();
+
+  function isDuplicate(data) {
+    if (!data || typeof data !== 'object') return false;
+    if (data.event_id != null) {
+      if (seenIds.has(data.event_id)) return true;
+      seenIds.add(data.event_id);
+      if (seenIds.size > SEEN_LIMIT) seenIds.delete(seenIds.values().next().value);
+    }
+    return false;
+  }
 
   function open() {
     if (closed) return;
     es = createEventSource(url);
+    es.onopen = () => onContact();
     es.onmessage = (evt) => {
+      onContact();
       let data;
       try {
         data = JSON.parse(evt.data);
       } catch {
         return; // ignore malformed frames; never crash the UI
       }
+      // Stream bookkeeping frames are contact, not events: no view refreshes on them.
+      if (data && (data.event_type === 'StreamConnected' || data.event_type === 'StreamKeepalive')) return;
+      if (isDuplicate(data)) return;
       onEvent(data);
     };
     es.onerror = () => {

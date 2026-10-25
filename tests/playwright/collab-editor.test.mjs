@@ -195,7 +195,7 @@ test('a leading name follows the server precedence: an old agent name never beat
   await page.evaluate(() => window.collab.dispose());
 }));
 
-test('an ambiguous name is flagged with the unambiguous forms and a leading one is refused as a task', async () => withPage(async (page) => {
+test('an ambiguous name is flagged with the unambiguous forms and a leading one is refused as a task; a person handle is never ambiguous', async () => withPage(async (page) => {
   const twins = [
     { ...AGENTS[0], name: 'p1', aliases: ['lead'] },
     { agent_id: 'ana-id', name: 'gert', address: 'ana.codex', aliases: ['lead'], harness_type: 'codex', owner_user_id: 'owner', actions: ['read', 'post', 'execute'], skills: [] },
@@ -207,10 +207,14 @@ test('an ambiguous name is flagged with the unambiguous forms and a leading one 
   await input.press('Enter');
   await page.getByRole('alert').filter({ hasText: 'More than one agent or person is called @lead' }).waitFor();
   assert.equal(await input.inputValue(), '@lead fix it');
-  await input.fill('@gert look');                       // person gert and agent "gert": neither silently wins
-  await page.locator('.conversation-status').filter({ hasText: '@gert is ambiguous — use @ana.codex' }).waitFor();
-  await input.press('Enter');
-  await page.getByRole('alert').filter({ hasText: 'More than one agent or person is called @gert' }).waitFor();
   assert.deepEqual(requests, []);
+  // person gert and an agent named "gert": the person handle outranks the agent's name (as on the server), so
+  // "@gert ..." is a message to the person, never refused and never the agent's task
+  await input.fill('@gert look');
+  assert.equal(await page.locator('.conversation-status').filter({ hasText: 'ambiguous' }).count(), 0);
+  await input.press('Escape');
+  await input.press('Enter');
+  await page.getByRole('status').filter({ hasText: 'Message posted' }).waitFor();
+  assert.deepEqual(requests.map((r) => [r.path, r.body.text]), [['/rooms/room-one/messages', '@gert look']]);
   await page.evaluate(() => window.collab.dispose());
 }));

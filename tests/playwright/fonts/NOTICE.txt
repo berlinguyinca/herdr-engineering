@@ -1,0 +1,7 @@
+Bundled fonts used only to make screenshot baselines independent of the host's fonts (tests/playwright/visual-baselines.mjs).
+Each file is a SUBSET (only the code points the collaboration page paints).
+
+Liberation Sans / Liberation Mono (Regular, Bold)   SIL Open Font License 1.1, see OFL.txt
+Herdr Symbols (Regular, Bold)                        subset of DejaVu Sans, renamed as the Bitstream Vera licence requires;
+                                                     Copyright (c) 2003 Bitstream, Inc.; DejaVu changes are public domain; see DEJAVU-LICENSE.txt
+Herdr Symbols Two (Regular)                          subset of Noto Sans Symbols2 (U+23E9..23F3), SIL Open Font License 1.1, Copyright 2010-2020 Google Inc., 2015-2020 Google LLC

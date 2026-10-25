@@ -105,7 +105,7 @@ test('the overview falls back to the browser projection and says so when the ser
   assert.match(failed, /Browser-only agent/);
   assert.match(failed, /computed in this browser and may differ from the Attention page/);
   const loading = overview(data, { attention: { loaded: false, error: false } });
-  assert.match(loading, /Loading attention…/);
+  assert.match(loading, /role="status" aria-label="Loading attention"/);
   assert.doesNotMatch(loading, /Browser-only agent/);
   const disabled = overview(data, { attention: { loaded: true, error: false, disabled: true }, sessions: { loaded: true } });
   assert.match(disabled, /Browser-only agent/);

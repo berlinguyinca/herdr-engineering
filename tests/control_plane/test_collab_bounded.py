@@ -723,7 +723,7 @@ def test_state_survives_a_restart_including_a_decision_and_the_promotion(world):
     assert got[p1]["state"] == "superseded" and got[p2]["state"] == "accepted" and got[p2]["promoted"] is True
     task = again.list_delegations(alice, w.room)["delegations"][0]
     assert task["status"] == "accepted" and task["version"] == w.s._tasks[tid]["version"]
-    assert task["usage"] == {"steps": 2, "proposals": 2, "tokens_reported": 0}
+    assert task["usage"] == {"steps": 2, "proposals": 2, "tokens_reported": 0, "turns": 3}
     # fencing survives too: an old version is still stale, an accepted proposal still cannot be decided another way
     dig = got[p2]["digest"]
     assert code(again.decide_proposal, alice, w.room, p2, {"decision": "reject", "expected_digest": dig}) == 409

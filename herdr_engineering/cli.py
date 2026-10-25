@@ -172,8 +172,9 @@ def _build_parser() -> argparse.ArgumentParser:
     pj.add_argument("--user", default=None, help="fleet ssh user for ansible host_vars")
     pj.add_argument("--ansible-host", default=None,
                     help="tailnet MagicDNS/ip for ansible (defaults to ssh_target)")
-    pj.add_argument("--gateway", default="http://dev.lan:29999",
-                    help="fabric gateway URL the agent registers with")
+    pj.add_argument("--gateway", default=None,
+                    help="IGNORED for the fabric agent (warns); set fabric.url in "
+                         "fleet-config.yaml or fabric.gateway_url in config.yaml")
     pj.add_argument("--no-attach", action="store_true",
                     help="skip the herdr machine add step")
     pj.add_argument("--no-provision", action="store_true",
@@ -228,8 +229,9 @@ def _build_parser() -> argparse.ArgumentParser:
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
     pu.add_argument("--host", default=None, help="update only this host (default: all)")
-    pu.add_argument("--gateway", default="http://dev.lan:29999",
-                    help="fabric gateway URL the agent registers with")
+    pu.add_argument("--gateway", default=None,
+                    help="IGNORED for the fabric agent (warns); set fabric.url in "
+                         "fleet-config.yaml or fabric.gateway_url in config.yaml")
     pu.add_argument("--no-pull", action="store_true", help="skip controller git pull")
     pu.add_argument("--no-reinstall", action="store_true",
                     help="skip controller local pip reinstall")
@@ -516,6 +518,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default=None); p.add_argument("--port", type=int, default=None)
     p.set_defaults(func=_cmd_web)
 
+    from .architecture import command as _architecture_command
+    _architecture_command.register(sub)
+
     # control-plane --------------------------------------------------------
     p = sub.add_parser("control-plane",
                        help="HerdR Dev Fabric Control Plane (spec 0190)")
@@ -526,6 +531,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_migrate)
+    p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
+                         "never deletes: rows move to a quarantine file/table)")
+    p2.add_argument("--log-file", default=None, help="a collab-only JSON-lines log; without it the Postgres "
+                    "fabric_events table named by --fleet-config is used")
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT)
+    p2.add_argument("--apply", action="store_true", help="really move the rows (needs --confirm-quarantine)")
+    p2.add_argument("--confirm-quarantine", action="store_true", help="explicit confirmation for --apply")
+    p2.add_argument("--include-gap-tail", action="store_true",
+                    help="also set aside every row after the first missing sequence (may drop genuine events)")
+    p2.set_defaults(func=_cmd_cp_collab_repair)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -855,14 +870,15 @@ def _cmd_machines(args) -> int:
 
 def _cmd_fleet_join(args) -> int:
     from pathlib import Path
-    from .fleet import fleet_join
+    from .fleet import DEFAULT_GATEWAY, fleet_join, warn_gateway_ignored
+    warn_gateway_ignored(args.gateway)
     report = fleet_join(
         ssh_target=args.ssh_target,
         label=args.label,
         os_name=args.os,
         user=args.user,
         ansible_host=args.ansible_host or args.ssh_target,
-        gateway=args.gateway,
+        gateway=DEFAULT_GATEWAY,
         attach=not args.no_attach,
         provision=not args.no_provision,
         fleet_config=None if args.no_credentials else Path(args.fleet_config).expanduser(),
@@ -941,10 +957,11 @@ def _cmd_fleet_config(args) -> int:
 
 
 def _cmd_fleet_update(args) -> int:
-    from .fleet import fleet_update
+    from .fleet import DEFAULT_GATEWAY, fleet_update, warn_gateway_ignored
+    warn_gateway_ignored(args.gateway)
     report = fleet_update(
         host=args.host,
-        gateway=args.gateway,
+        gateway=DEFAULT_GATEWAY,
         pull_controller=not args.no_pull,
         reinstall_local=not args.no_reinstall,
     )
@@ -1211,8 +1228,8 @@ def _local_fabric_client():
 
 
 def _gateway_configured_or_reachable() -> bool:
-    """True when a gateway URL is configured (env HERDR_ENGINEERING_FABRIC_URL
-    or fabric.gateway_url in config) OR a gateway is currently reachable.
+    """True when a gateway URL is configured (fabric.url in the central host
+    config or fabric.gateway_url in config.yaml) OR a gateway is currently reachable.
     Used to warn about silent local-registry degradation (issue #77b)."""
     from .config import load_config
     from .errors import InvalidError
@@ -1964,8 +1981,8 @@ def _cmd_dev_agent(args) -> int:
     if not base:
         _print_json({
             "code": "config",
-            "message": "no gateway configured: set fabric.gateway_url or "
-                       "HERDR_ENGINEERING_FABRIC_URL",
+            "message": "no gateway configured: set fabric.url in the central "
+                       "fleet-config.yaml, or fabric.gateway_url in config.yaml",
         })
         return 1
     tailnet_ip = tailnet_ipv4()
@@ -2444,6 +2461,29 @@ def _cmd_cp_migrate(args) -> int:
     return 0
 
 
+def _cmd_cp_collab_repair(args) -> int:
+    import asyncio
+
+    from .control_plane import collab_repair
+    try:
+        if args.log_file:
+            report = collab_repair.repair_file(args.log_file, apply=args.apply, confirmed=args.confirm_quarantine,
+                                               cut_tail=args.include_gap_tail)
+        else:
+            async def _run():
+                conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
+                try:
+                    return await collab_repair.repair_postgres(conn, apply=args.apply, confirmed=args.confirm_quarantine,
+                                                               cut_tail=args.include_gap_tail)
+                finally:
+                    await conn.close()
+            report = asyncio.run(_run())
+    except (PermissionError, collab_repair.LogInUseError, collab_repair.SchemaTooOldError) as exc:
+        raise SystemExit(str(exc)) from None
+    _print_json({"ok": True, **report})
+    return 0
+
+
 def _parse_service_port(endpoint: str | None, default: int) -> int:
     """Best-effort port extraction from a URL/DSN (``http://rustfs:9000``)."""
     if not endpoint:
@@ -2514,6 +2554,8 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.sink import DurableEventSink
 
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
+    switch_store = fleet_store
+    replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
     lineage_key_scopes = {}
     if args.collab_only:
@@ -2527,7 +2569,7 @@ def _cmd_cp_web(args) -> int:
         if not (args.collab_log_file and args.collab_public_port and args.collab_cognito_pool):
             raise SystemExit("--collab-only needs --collab-log-file, --collab-public-port and a "
                              "Cognito pool (control_plane.collab.cognito_pool or --collab-cognito-pool)")
-        fleet_store = None
+        switch_store, fleet_store = fleet_store, None     # no fleet endpoint here, but the switches still reload
     elif fleet_store is not None:
         _install_fleet_host_config(fleet_store)
         names = (cp.get("collab") or {}).get("dashboard_hosts") if isinstance(cp.get("collab"), dict) else None
@@ -2573,6 +2615,11 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.attention_inbox import attention_config
     try:
         attention = attention_config(cp.get("attention"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.mission_outcome import missions_config
+    try:
+        missions = missions_config(cp.get("missions"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     from .control_plane.ci_fix import ci_fix_config
@@ -2639,7 +2686,7 @@ def _cmd_cp_web(args) -> int:
                                delegation_enabled=_delegation_switch(args, cp),
                                summary_fix=getattr(args, "collab_summary_fix", None))
         if args.collab_only:
-            collab.hydrate(sink.load())
+            collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
     elif args.collab_users_file:
         from pathlib import Path
 
@@ -2659,27 +2706,13 @@ def _cmd_cp_web(args) -> int:
         if history not in ("full", "since_join"):
             raise SystemExit("control_plane.collab.replay_history must be 'full' or 'since_join'")
         collab.replay_history = history
-        # T12: comments and steering. Settings are YAML only (no flag or env), and when a fleet file is in use the
-        # service re-reads them per request, so editing `kill_switch: true` takes effect without a restart.
+        from .control_plane.collab_attention import normalize_insights
+        from .control_plane.collab_context import normalize_contextual
         from .control_plane.collab_workbench import normalize_steering
         collab.steering = normalize_steering(getattr(args, "collab_steering", None))
-        if fleet_store is not None:
-            def _steering_from_yaml(_store=fleet_store):
-                section = _store.secure_section("control_plane")
-                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("steering")
-            collab.steering_source = _steering_from_yaml
-        # T14: contextual chat, consultation and cross-workspace links. Same rule: YAML only, off by default, re-read
-        # per request when a fleet file is in use so `kill_switch: true` needs no restart.
-        from .control_plane.collab_context import normalize_contextual
         collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
-        if fleet_store is not None:
-            def _contextual_from_yaml(_store=fleet_store):
-                section = _store.secure_section("control_plane")
-                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("contextual")
-            collab.contextual_source = _contextual_from_yaml
-        # T15: attention inbox, evidence-based progress and analytics. Same rule: YAML only, off by default, hot kill switch.
-        from .control_plane.collab_attention import normalize_insights
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
+        _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
         if fleet_store is not None:
             def _insights_from_yaml(_store=fleet_store):
                 section = _store.current().section("control_plane")
@@ -2718,7 +2751,7 @@ def _cmd_cp_web(args) -> int:
                              summary_config=cp.get("agent_summaries") or {},
                              review_quorum=_review_quorum_config(cp),
                              usage_retention=usage_retention, attention=attention,
-                             ci_fix=ci_fix,
+                             ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
@@ -2842,6 +2875,74 @@ def _apply_collab_config(args, cp) -> None:
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be a non-empty string")
             if getattr(args, dest) is None:
                 setattr(args, dest, value)
+
+
+# T16 M3/M15: EVERY collab feature switch is read per request through FleetConfigStore.secure_section, so a
+# missing, unreadable (unparseable, group/other-accessible) or invalid fleet file turns it OFF (or, for
+# replay_history, to the stricter value) identically. Adding a switch to COLLAB_CONFIG_KEYS without
+# registering it here fails tests/control_plane/test_t16_security.py.
+HOT_COLLAB_SWITCHES = {
+    "steering": ("steering_source", "dict"),
+    "contextual": ("contextual_source", "dict"),
+    "insights": ("insights_source", "dict"),
+    "delegation_enabled": ("delegation_source", "bool"),
+    "replay_history": ("replay_history_source", "str"),
+}
+# collab keys that are not feature switches (identity, listener and URL settings read once at startup)
+STARTUP_ONLY_COLLAB_KEYS = frozenset(COLLAB_CONFIG_KEYS) - frozenset(HOT_COLLAB_SWITCHES)
+
+
+# control_plane keys read ONCE at startup: editing them needs a restart (unlike HOT_COLLAB_SWITCHES)
+RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn", "architecture")
+
+
+def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
+    """Attach the hot, fail-closed sources of every collab switch (no-op without a fleet file). ``pinned`` names
+    switches given on the command line: the flag wins and the file is not consulted for them."""
+    if store is None:
+        return
+
+    def make(key):
+        def source(_store=store):
+            section = _store.secure_section("control_plane")          # raises while the file is unusable
+            collab_section = section.get("collab")
+            return collab_section.get(key) if isinstance(collab_section, dict) else None
+        return source
+    from .control_plane.collab_attention import normalize_insights
+    from .control_plane.collab_context import normalize_contextual
+    from .control_plane.collab_workbench import normalize_steering
+    normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights}
+
+    def check(key, value):
+        return normalizers[key](value) if key in normalizers else value
+    for key, (attr, kind) in HOT_COLLAB_SWITCHES.items():
+        base = make(key)
+        if kind == "bool":
+            def source(_base=base):
+                value = _base()
+                if value is None:
+                    return False
+                if not isinstance(value, bool):
+                    raise ValueError("delegation_enabled must be true or false")
+                return value
+        elif kind == "str":
+            def source(_base=base):
+                value = _base()
+                if value is None:
+                    return "since_join"
+                if value not in ("full", "since_join"):
+                    raise ValueError("replay_history must be 'full' or 'since_join'")
+                return value
+        else:
+            source = base
+        if key in pinned:
+            continue
+        setattr(collab, attr, source)
+        try:                       # an invalid block is not a startup error (the switch is simply OFF) but it is loud
+            check(key, source())
+        except Exception as exc:   # noqa: BLE001
+            logging.getLogger(__name__).error(
+                "control_plane.collab.%s is unusable (%s): the feature is OFF until the file is fixed", key, exc)
 
 
 def _delegation_switch(args, cp) -> bool:

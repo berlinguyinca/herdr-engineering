@@ -255,15 +255,15 @@ test('list page style carries the shared badge rules', () => {
   assert.match(HOST_CARD_STYLE, /\.hv-badge--crit/);
 });
 
-test('recently seen host without latest is not "no report since"; wording matches detail', () => {
+test('recently seen host without latest is not "no report for"; wording matches detail', () => {
   const host = { host_id: 'x', host_name: 'x', last_seen: iso(1000), latest: null };
   const card = renderHostCard(host, { now: NOW });
-  assert.doesNotMatch(card, /no report since/);
+  assert.doesNotMatch(card, /no report for/);
   assert.match(card, /registered, no telemetry/);
   assert.match(card, /No telemetry reported/);
   assert.match(renderHostDetail(host, [], { now: NOW }), /No telemetry reported/);
   const stale = reportingHost({ last_seen: iso(3_600_000) }); stale.latest.at = iso(3_600_000);
-  assert.match(renderHostCard(stale, { now: NOW }), /no report since/);
+  assert.match(renderHostCard(stale, { now: NOW }), /no report for <span data-stale-since="\d+">1 h 0 min<\/span>/);
 });
 
 test('safeHostId re-encodes a route segment and rejects malformed percent-encoding', () => {
