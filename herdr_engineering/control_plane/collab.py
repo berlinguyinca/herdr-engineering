@@ -4968,10 +4968,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                                          selection=selection, first=first, catalog=catalog)
                 self.stats["commands"] += 1
                 return 201, {"event": self._view(ev, viewer=pr, _ctx_cache={"github_refs": catalog})}
+            found = self._resolve_mentions(room_id, stored)
+            wakes = self._wake_targets(pr, room, room_id, found)      # C7: which agents' harnesses this may run
             ev = self._commit("message", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
                 sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
-                text=stored, mentions=self._resolve_mentions(room_id, stored), in_reply_to=reply, trust="untrusted",
+                text=stored, mentions=found, in_reply_to=reply, trust="untrusted",
+                **({"wakes": wakes} if wakes else {}),
                 **({"refs": refs} if (refs := self._resolve_refs(stored, not self._restricted(pr, room_id), catalog)) else {}),
                 **({"context": ctx} if ctx else {}), **({"files": files} if files else {}),
                 visibility_scope="room", action="message.post", outcome="allowed",

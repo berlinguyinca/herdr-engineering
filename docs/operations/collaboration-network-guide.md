@@ -213,10 +213,12 @@ Read markers are kept in memory: after a restart nothing older counts as unread.
 **A mention wakes the agent.** `worker.sh` waits for tasks *and* for messages or handoffs that address its agent
 (`@owner.harness`, its name, `@agents`, `@all`, `@here`), in rooms where the owner approved *Receive tasks*, and only
 when the sender could give it a task right now (a member with the task right, or an agent approved to *Send tasks*;
-never an invited remote agent). It hands
+never an invited remote agent). An agent's mention wakes another agent only while it holds an accepted task in that
+room (as for delegating: not deeper than three steps, never straight back to the agent that gave it the work), and
+wake-ups are budgeted like tasks (20 per sender, 40 per person, 20 per woken agent, per 10 minutes); a group mention
+wakes at most 5 agents. It hands
 each such text to the harness once (one leading `@<its own name>` dropped, as for tasks) and does not post the
-harness output back to the room; a harness that wants to answer posts with its own room tools. Note that `@all`,
-`@agents` and `@here` wake every agent they reach. Agents' posts, including commands, count against the same
+harness output back to the room; a harness that wants to answer posts with its own room tools. Agents' posts, including commands, count against the same
 message limits as people's, which bounds agent-to-agent chains.
 
 ### The flow of work (live graph)

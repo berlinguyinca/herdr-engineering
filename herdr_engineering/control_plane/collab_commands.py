@@ -51,6 +51,8 @@ HANDOFF_TTL = 7 * 24 * 3600.0   # a pending handoff older than this is shown as 
 HANDOFF_ANSWERS = 30            # accept/decline per principal per minute
 UNREAD_CAP = 99                 # an unread mention count stops counting here
 UNREAD_SCAN = 5000              # and looks at most this many of a room's newest events
+WAKE_FANOUT = 5                 # agents one group mention (@all, @agents, @here) may wake
+WAKE_SCAN = 5000                # a mention wait never looks further back than this many log events
 
 
 def parse_command(text: Any) -> tuple[str, str] | None:
@@ -211,8 +213,9 @@ class CommandsMixin:
             raise CollabError(400, "a handoff needs two different parties")
         if dst["kind"] == "agent" and (self._agents.get(dst["id"]) or {}).get("external"):
             raise CollabError(400, "a remote agent cannot take a handoff (it sees chat messages only)")
+        room = self._rooms[room_id]
         return {"handoff_id": ids.new_id("handoff"), "from": src, "to": dst, "note": tail[:MAX_NOTE],
-                "mentions": [dict(dst)]}
+                "mentions": [dict(dst)], "wakes": self._wake_targets(pr, room, room_id, [dst])}
 
     def _issue_draft(self, pr, room: dict, room_id: str, rest: str, reply, selection, first: int) -> dict:
         from .collab import CollabError
@@ -475,6 +478,61 @@ class CommandsMixin:
             self._read_upto[(room_id, pr.id)] = self._seq
 
     # ---------------------------------------------------------------- C7: mentions that wake an agent
+    def _wake_targets(self, pr, room: dict, room_id: str, found: list[dict]) -> list[str]:
+        """Which mentioned agents this post may wake (decided once, when it is posted, and stored as `wakes`).
+
+        A wake-up runs the agent's harness, so it follows the rules `create_task` enforces: the sender needs the
+        task right (a person) or `instruct` (an agent), never an external agent; an agent sender must hold an
+        accepted task in this room whose depth leaves room for one more step and must not wake the agent that gave
+        it that task; a target with MAX_OPEN_TASKS_PER_AGENT open tasks is not woken. Budgets as for tasks:
+        TASK_RATE per sender, TASK_RATE*2 per owner and TASK_RATE per target agent, per 10 minutes. A group mention
+        wakes at most WAKE_FANOUT agents."""
+        from .collab import MAX_OPEN_TASKS_PER_AGENT, MAX_TASK_DEPTH, TASK_RATE, Principal
+        if pr.external:
+            return []
+        eff = self._effective(pr, room)
+        if not eff or ("instruct" if pr.is_agent else "task") not in eff[0]:
+            return []
+        parents = None
+        if pr.is_agent:
+            parents = [t for tid in self._tasks_by_target.get(pr.id, ()) if (t := self._tasks.get(tid))
+                       and t["room_id"] == room_id and self._task_status(t) == "accepted"
+                       and t["depth"] + 1 <= MAX_TASK_DEPTH]
+            if not parents:
+                return []
+        wanted: list[tuple[str, bool]] = []
+        for m in found:
+            if m["kind"] == "agent":
+                wanted.append((m["id"], False))
+            elif m["kind"] == "group":
+                wanted += [(t["id"], True) for t in self._group_members(room_id, m["id"]) if t["kind"] == "agent"]
+        out, by_group, now = [], 0, self._now()
+        for aid, via_group in wanted:
+            if aid in out or aid == pr.id or (via_group and by_group >= WAKE_FANOUT):
+                continue
+            a = self._agents.get(aid)
+            teff = self._effective(Principal("agent", aid, a["owner"]), room) if a else None
+            if not teff or "execute" not in teff[0]:
+                continue
+            if parents is not None and all(t["by_kind"] == "agent" and t["by_id"] == aid for t in parents):
+                continue                                  # never straight back to the agent that gave the work
+            if sum(1 for tid in self._tasks_by_target.get(aid, ())
+                   if self._task_status(self._tasks[tid]) in ("pending", "accepted")) >= MAX_OPEN_TASKS_PER_AGENT:
+                continue
+            budgets = (("wake:" + pr.key, TASK_RATE), ("wake-owner:" + pr.owner, TASK_RATE * 2),
+                       ("wake-target:" + aid, TASK_RATE))
+            live = {k: [t for t in self._hits[k] if now - t < 600.0] for k, _ in budgets}
+            for k, v in live.items():
+                self._hits[k] = v
+            if any(len(live[k]) >= limit for k, limit in budgets):
+                self.stats["wake_limited"] += 1
+                continue
+            for k, _ in budgets:
+                self._hits[k].append(now)
+            out.append(aid)
+            by_group += via_group
+        return out
+
     def _may_wake(self, p: dict, room: dict) -> bool:
         """A wake-up runs the agent's harness, so its sender needs the authority create_task needs, NOW: a person
         with the room's "task" right, an agent with "instruct"; never a remote (external) agent."""
@@ -494,6 +552,7 @@ class CommandsMixin:
             now = self._seq
             if after < 0:
                 return {"mentions": [], "cursor": now}
+            after = max(after, now - WAKE_SCAN)        # never a full-history scan under the lock
             out, cursor = [], now
             rows = []
             for rid in sorted(self._rooms_by_agent.get(pr.id, ())):
@@ -507,8 +566,8 @@ class CommandsMixin:
             rows.sort(key=lambda r: r[0]["sequence"])
             for ev, room in rows:
                 p = ev["payload"]
-                if (p.get("sender_key") == pr.key or not self._mentions_for(p, pr)[1]
-                        or not self._may_wake(p, room)):
+                if (p.get("sender_key") == pr.key or pr.id not in (p.get("wakes") or ())
+                        or not self._mentions_for(p, pr)[1] or not self._may_wake(p, room)):
                     continue
                 if len(out) >= limit:
                     cursor = out[-1]["sequence"]

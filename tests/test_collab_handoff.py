@@ -257,3 +257,95 @@ def test_only_a_sender_who_could_give_the_agent_a_task_wakes_it(w):
     assert [m["event_id"] for m in wait(w, pi, c)["mentions"]] == [ok["event_id"], gone["event_id"]]
     w.s.remove_member(w.alice, w.room, "bob")                                    # authority is checked at delivery
     assert wait(w, pi, c)["mentions"] == []
+
+
+# ---------------------------------------------------------------- review fix: wake-ups obey the task rules
+
+def give(w, who, aid, text="work"):
+    return w.s.create_task(who, w.room, {"target_agent_id": aid, "text": text})["task_id"]
+
+
+def test_two_agents_cannot_ping_pong_wake_each_other(w):
+    a, a_id = agent(w, "alice", "pi", actions=("read", "post", "execute", "instruct"))
+    b, b_id = agent(w, "bob", "codex", actions=("read", "post", "execute", "instruct"))
+    ca, cb = wait(w, a, -1)["mention_cursor"], wait(w, b, -1)["mention_cursor"]
+    w.s.update_task(a, give(w, w.alice, a_id), {"status": "accepted"})      # a person gave A work
+    say(w, a, "@bob.codex please look")                                       # A, holding a task, wakes B
+    assert len(wait(w, b, cb)["mentions"]) == 1
+    say(w, b, "@alice.pi back to you")                                        # B holds no task: wakes nobody
+    say(w, b, "@alice.pi again")
+    assert wait(w, a, ca)["mentions"] == []
+
+
+def test_an_agent_cannot_wake_the_agent_that_gave_it_its_task(w):
+    a, a_id = agent(w, "alice", "pi", actions=("read", "post", "execute", "instruct"))
+    b, b_id = agent(w, "bob", "codex", actions=("read", "post", "execute", "instruct"))
+    w.s.update_task(a, give(w, w.alice, a_id), {"status": "accepted"})
+    t = w.s.create_task(a, w.room, {"target_agent_id": b_id, "text": "sub", "parent_task_id":
+                                    [x for x in w.s._tasks if w.s._tasks[x]["target"] == a_id][0]})["task_id"]
+    w.s.update_task(b, t, {"status": "accepted"})
+    ca = wait(w, a, -1)["mention_cursor"]
+    say(w, b, "@alice.pi done, your turn")                                    # straight back to the giver
+    assert wait(w, a, ca)["mentions"] == []
+
+
+def test_agent_wakes_are_budgeted_like_tasks(w):
+    from herdr_engineering.control_plane.collab import TASK_RATE  # noqa: PLC0415
+    w.s.message_limit = 500
+    a, a_id = agent(w, "alice", "pi", actions=("read", "post", "execute", "instruct"))
+    b, _ = agent(w, "bob", "codex")
+    w.s.update_task(a, give(w, w.alice, a_id), {"status": "accepted"})
+    cb = wait(w, b, -1)["mention_cursor"]
+    for i in range(TASK_RATE + 10):
+        say(w, a, f"@bob.codex step {i}")
+    assert len(wait(w, b, cb, )["mentions"]) <= 20
+    got, cur = 0, cb
+    while True:
+        out = wait(w, b, cur)
+        if not out["mentions"]:
+            break
+        got, cur = got + len(out["mentions"]), out["mention_cursor"]
+    assert got == TASK_RATE
+
+
+def test_a_group_mention_wakes_at_most_the_fan_out_cap(w):
+    from herdr_engineering.control_plane.collab_commands import WAKE_FANOUT  # noqa: PLC0415
+    w.s.max_agents_per_user = 60
+    w.s.max_agents_per_user = 60
+    a, a_id = agent(w, "alice", "pi", actions=("read", "post", "execute", "instruct"))
+    others = [agent(w, "bob", "codex") for _ in range(WAKE_FANOUT + 3)]
+    cursors = [wait(w, pr, -1)["mention_cursor"] for pr, _ in others]
+    w.s.update_task(a, give(w, w.alice, a_id), {"status": "accepted"})
+    say(w, a, "@agents status please")
+    woken = sum(1 for (pr, _), c in zip(others, cursors, strict=True) if wait(w, pr, c)["mentions"])
+    assert woken == WAKE_FANOUT
+    say(w, w.bob, "@all hello")                                               # a person's group mention: capped too
+    woken = sum(1 for (pr, _), c in zip(others, cursors, strict=True) if len(wait(w, pr, c)["mentions"]) == 2)
+    assert woken <= WAKE_FANOUT
+
+
+def test_a_person_still_wakes_an_agent_within_a_per_target_budget(w):
+    from herdr_engineering.control_plane.collab import TASK_RATE  # noqa: PLC0415
+    w.s.message_limit = 500
+    pi, _ = agent(w, "alice", "pi")
+    c = wait(w, pi, -1)["mention_cursor"]
+    for i in range(TASK_RATE + 5):
+        say(w, w.bob if i % 2 else w.alice, f"@alice.pi {i}")
+    got, cur = 0, c
+    while (out := wait(w, pi, cur))["mentions"]:
+        got, cur = got + len(out["mentions"]), out["mention_cursor"]
+    assert got == TASK_RATE
+
+
+def test_a_mention_cursor_far_in_the_past_is_clamped(w):
+    from herdr_engineering.control_plane.collab_commands import WAKE_SCAN  # noqa: PLC0415
+    pi, _ = agent(w, "alice", "pi")
+    old = say(w, w.bob, "@alice.pi ancient")
+    w.s.message_limit = 10 ** 6
+    for i in range(WAKE_SCAN + 5):
+        w.s._commit("decision", {"room_id": w.room, "project_id": w.s._rooms[w.room]["project_id"],
+                                 "sender_key": "user:bob", "sender_kind": "user", "sender_id": "bob",
+                                 "idempotency_key": f"z{i}", "fingerprint": "f", "decision": "x",
+                                 "actor_user_id": "bob", "actor_agent_id": None})
+    out = wait(w, pi, 0)
+    assert old["event_id"] not in [m["event_id"] for m in out["mentions"]]
