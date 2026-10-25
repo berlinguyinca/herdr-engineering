@@ -277,7 +277,8 @@ test('loading state is shown while the snapshot list is pending', () => withApp(
   const gate = new Promise(r => { release = r; });
   await page.route('**/api/v1/architecture/snapshots**', async r => { await gate; await r.continue(); });
   await page.goto(`${base}/#/architecture`);
-  await page.getByText(/loading/i).first().waitFor();
+  // The first load shows a skeleton: a status region named "Loading …" (no visible loading text).
+  await page.getByRole('status', {name: /loading/i}).first().waitFor();
   release();
   await page.locator('[data-testid="arch-graph"]').waitFor();
 }));
