@@ -422,11 +422,17 @@ class MemoryGitHubStore:
         listed = _owners(owners)
         with state.lock:
             self._claim()
-            rev = self._lazy_revision()
-            self._put_projects(incoming, rev)
-            gone = [pid for pid, p in state.projects.items() if pid not in incoming and p["owner"] in listed]
-            if gone:
-                self._remove_projects(gone, rev())
+            saved = (dict(state.meta), {k: dict(v) for k, v in state.projects.items()},
+                     dict(state.project_items), dict(state.tombstones))
+            try:  # all or nothing, like the Postgres transaction
+                rev = self._lazy_revision()
+                self._put_projects(incoming, rev)
+                gone = [pid for pid, p in state.projects.items() if pid not in incoming and p["owner"] in listed]
+                if gone:
+                    self._remove_projects(gone, rev())
+            except BaseException:
+                state.meta, state.projects, state.project_items, state.tombstones = saved
+                raise
 
     def purge(self) -> None:
         """Drop this credential's whole catalog, tombstones and details included (a revoked

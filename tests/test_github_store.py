@@ -878,3 +878,20 @@ def test_missing_projects_table_never_breaks_the_issue_catalog():
         assert made.make(identity="tok-b").load() is None
     finally:
         made.close()
+
+
+def test_memory_replace_projects_is_all_or_nothing(monkeypatch):
+    store = MemoryGitHubStore(identity="tok-a", viewer="alice", now=Clock(), shared={})
+    store.apply_project(project(P1), [item("PVTI_1")], [], None)
+    store.apply_project(project(P2, number=2), [item("PVTI_2")], [], None)
+    before, revision = store.load(), store.revision()
+
+    def broken(pids, rev):
+        raise RuntimeError("mid-write failure")
+    monkeypatch.setattr(store, "_remove_projects", broken)
+    with pytest.raises(RuntimeError):
+        store.replace_projects([project(P1, title="Renamed")], owners={"acme"})
+    after = store.load()
+    assert store.revision() == revision
+    assert after.projects == before.projects and after.project_items == before.project_items
+    assert store.changes_since(revision)["upserted"] == []
